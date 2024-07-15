@@ -537,6 +537,9 @@ impl Program {
         pager: Rc<Pager>,
     ) -> Result<StepResult<'a>> {
         loop {
+            if self.insns.is_empty() {
+                return Ok(StepResult::Done);
+            }
             let insn = &self.insns[state.pc as usize];
             trace_insn(self, state.pc as InsnReference, insn);
             let mut cursors = state.cursors.borrow_mut();
