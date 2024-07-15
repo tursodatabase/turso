@@ -1,10 +1,28 @@
 use super::{Completion, File, WriteCompletion, IO};
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use log::trace;
 use std::cell::RefCell;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::rc::Rc;
+use std::fmt;
+
+use thiserror::Error;
+use libc::{c_void, iovec};
+
+#[derive(Debug, Error)]
+enum LinuxIOError {
+    IOUringCQError(i32),
+}
+
+// Implement the Display trait to customize error messages
+impl fmt::Display for LinuxIOError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LinuxIOError::IOUringCQError(code) => write!(f, "IOUring completion queue error occurred with code {}", code),
+        }
+    }
+}
 
 pub struct LinuxIO {
     ring: Rc<RefCell<io_uring::IoUring>>,
@@ -38,6 +56,10 @@ impl IO for LinuxIO {
         let mut ring = self.ring.borrow_mut();
         ring.submit_and_wait(1)?;
         while let Some(cqe) = ring.completion().next() {
+            ensure!(
+                cqe.result() >= 0,
+                LinuxIOError::IOUringCQError(cqe.result())
+            );
             let c = unsafe { Rc::from_raw(cqe.user_data() as *const Completion) };
             c.complete();
         }
@@ -58,11 +80,25 @@ impl File for LinuxFile {
             let mut buf = c.buf_mut();
             let len = buf.len();
             let buf = buf.as_mut_ptr();
-            let ptr = Rc::into_raw(c.clone());
-            io_uring::opcode::Read::new(fd, buf, len as u32)
+            let ptr: *const Completion = Rc::into_raw(c.clone());
+            //TODO: Check where to instantiate Probe
+            let probe = io_uring::Probe::new();
+            if probe.is_supported(io_uring::opcode::Read::CODE) {
+                io_uring::opcode::Read::new(fd, buf, len as u32)
                 .offset(pos as u64)
                 .build()
                 .user_data(ptr as u64)
+            } else {
+                let iov: libc::iovec = libc::iovec {
+                    iov_base: buf as *mut c_void,
+                    iov_len: len,
+                };
+                let iov_ptr: *const iovec = &iov;
+                io_uring::opcode::Readv::new(fd, iov_ptr, len as u32)
+                .offset(pos as u64)
+                .build()
+                .user_data(ptr as u64)
+            }
         };
         let mut ring = self.ring.borrow_mut();
         unsafe {
