@@ -571,6 +571,8 @@ fn translate_condition_expr(
     target_jump: BranchOffset,
     jump_if_true: bool, // if true jump to target on op == true, if false invert op
 ) -> Result<()> {
+    program.is_translating_cond = true;
+    // there is a corresponding defer!(program.is_translating_cond = false); at the bottom of this function
     match expr {
         ast::Expr::Between { .. } => todo!(),
         ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
@@ -766,6 +768,7 @@ fn translate_condition_expr(
         } => {}
         _ => todo!("op {:?} not implemented", expr),
     }
+    program.is_translating_cond = false;
     Ok(())
 }
 
@@ -1403,7 +1406,7 @@ fn update_pragma(name: &str, value: i64, header: Rc<RefCell<DatabaseHeader>>, pa
 }
 
 fn maybe_apply_affinity(col: &Column, target_register: usize, program: &mut ProgramBuilder) {
-    if col.ty == crate::schema::Type::Real {
+    if col.ty == crate::schema::Type::Real && !program.is_translating_cond {
         program.emit_insn(Insn::RealAffinity {
             register: target_register,
         })

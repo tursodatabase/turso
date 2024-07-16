@@ -239,6 +239,7 @@ pub struct ProgramBuilder {
     next_insn_label: Option<BranchOffset>,
     // Cursors that are referenced by the program. Indexed by CursorID.
     cursor_ref: Vec<(String, Table)>,
+    pub is_translating_cond: bool,
 }
 
 impl ProgramBuilder {
@@ -252,6 +253,7 @@ impl ProgramBuilder {
             next_insn_label: None,
             cursor_ref: Vec::new(),
             constant_insns: Vec::new(),
+            is_translating_cond: false,
         }
     }
 
