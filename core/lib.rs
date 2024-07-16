@@ -33,7 +33,7 @@ pub use types::Value;
 
 pub struct Database {
     pager: Rc<Pager>,
-    schema: Rc<Schema>,
+    schema: Rc<RefCell<Schema>>,
     header: Rc<RefCell<DatabaseHeader>>,
 }
 
@@ -53,7 +53,7 @@ impl Database {
             page_source,
             io.clone(),
         )?);
-        let bootstrap_schema = Rc::new(Schema::new());
+        let bootstrap_schema = Rc::new(RefCell::new(Schema::new()));
         let conn = Connection {
             pager: pager.clone(),
             schema: bootstrap_schema.clone(),
@@ -83,7 +83,7 @@ impl Database {
                 }
             }
         }
-        let schema = Rc::new(schema);
+        let schema = Rc::new(RefCell::new(schema));
         let header = db_header;
         Ok(Database {
             pager,
@@ -103,7 +103,7 @@ impl Database {
 
 pub struct Connection {
     pager: Rc<Pager>,
-    schema: Rc<Schema>,
+    schema: Rc<RefCell<Schema>>,
     header: Rc<RefCell<DatabaseHeader>>,
 }
 
@@ -117,7 +117,7 @@ impl Connection {
             match cmd {
                 Cmd::Stmt(stmt) => {
                     let program = Rc::new(translate::translate(
-                        &self.schema,
+                        self.schema.clone(),
                         stmt,
                         self.header.clone(),
                         self.pager.clone(),
@@ -141,7 +141,7 @@ impl Connection {
             match cmd {
                 Cmd::Stmt(stmt) => {
                     let program = Rc::new(translate::translate(
-                        &self.schema,
+                        self.schema.clone(),
                         stmt,
                         self.header.clone(),
                         self.pager.clone(),
@@ -151,7 +151,7 @@ impl Connection {
                 }
                 Cmd::Explain(stmt) => {
                     let program = translate::translate(
-                        &self.schema,
+                        self.schema.clone(),
                         stmt,
                         self.header.clone(),
                         self.pager.clone(),
@@ -174,7 +174,7 @@ impl Connection {
             match cmd {
                 Cmd::Explain(stmt) => {
                     let program = translate::translate(
-                        &self.schema,
+                        self.schema.clone(),
                         stmt,
                         self.header.clone(),
                         self.pager.clone(),
@@ -184,7 +184,7 @@ impl Connection {
                 Cmd::ExplainQueryPlan(_stmt) => todo!(),
                 Cmd::Stmt(stmt) => {
                     let program = translate::translate(
-                        &self.schema,
+                        self.schema.clone(),
                         stmt,
                         self.header.clone(),
                         self.pager.clone(),

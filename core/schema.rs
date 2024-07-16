@@ -185,7 +185,7 @@ impl Default for PseudoTable {
     }
 }
 
-fn create_table(
+pub(crate) fn create_table(
     tbl_name: QualifiedName,
     body: CreateTableBody,
     root_page: usize,

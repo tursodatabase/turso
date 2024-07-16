@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use crate::function::{AggFunc, Func, SingleRowFunc};
 use crate::pager::Pager;
-use crate::schema::{Column, Schema, Table};
+use crate::schema::{create_table, Column, Schema, Table};
 use crate::sqlite3_ondisk::{DatabaseHeader, MIN_PAGE_CACHE_SIZE};
 use crate::util::normalize_ident;
 use crate::vdbe::{BranchOffset, Insn, Program, ProgramBuilder};
@@ -44,7 +44,8 @@ struct SrcTable {
 struct ColumnInfo {
     func: Option<Func>,
     args: Option<Vec<ast::Expr>>,
-    columns_to_allocate: usize, /* number of result columns this col will result on */
+    columns_to_allocate: usize,
+    /* number of result columns this col will result on */
 }
 
 impl ColumnInfo {
@@ -69,7 +70,7 @@ struct LimitInfo {
 
 /// Translate SQL statement into bytecode program.
 pub fn translate(
-    schema: &Schema,
+    schema: Rc<RefCell<Schema>>,
     stmt: ast::Stmt,
     database_header: Rc<RefCell<DatabaseHeader>>,
     pager: Rc<Pager>,
@@ -79,12 +80,26 @@ pub fn translate(
             let select = build_select(schema, select)?;
             translate_select(select)
         }
+        ast::Stmt::CreateTable {
+            temporary,
+            if_not_exists,
+            tbl_name,
+            body,
+        } => {
+            let root_page = database_header
+                .borrow_mut()
+                .get_next_available_page()
+                .unwrap();
+            let table = create_table(tbl_name, body, root_page)?;
+            schema.borrow_mut().add_table(Rc::new(table));
+            Ok(ProgramBuilder::new().build())
+        }
         ast::Stmt::Pragma(name, body) => translate_pragma(&name, body, database_header, pager),
         _ => todo!(),
     }
 }
 
-fn build_select(schema: &Schema, select: ast::Select) -> Result<Select> {
+fn build_select(schema: Rc<RefCell<Schema>>, select: ast::Select) -> Result<Select> {
     match select.body.select {
         ast::OneSelect::Select {
             columns,
@@ -107,7 +122,7 @@ fn build_select(schema: &Schema, select: ast::Select) -> Result<Select> {
             };
             let table_name = table_name.0;
             let maybe_alias = maybe_alias.map(|als| als.0);
-            let table = match schema.get_table(&table_name) {
+            let table = match schema.borrow_mut().get_table(&table_name) {
                 Some(table) => table,
                 None => anyhow::bail!("Parse error: no such table: {}", table_name),
             };
@@ -131,7 +146,7 @@ fn build_select(schema: &Schema, select: ast::Select) -> Result<Select> {
                     };
                     let table_name = &table_name.0;
                     let maybe_alias = maybe_alias.map(|als| als.0);
-                    let table = match schema.get_table(table_name) {
+                    let table = match schema.borrow_mut().get_table(table_name) {
                         Some(table) => table,
                         None => anyhow::bail!("Parse error: no such table: {}", table_name),
                     };

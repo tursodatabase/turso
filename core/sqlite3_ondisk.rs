@@ -68,6 +68,21 @@ pub struct DatabaseHeader {
     version_number: u32,
 }
 
+impl DatabaseHeader {
+    pub fn get_next_available_page(&mut self) -> Result<usize> {
+        if self.freelist_pages > 0 {
+            // Logic to get a page from the freelist
+            // For simplicity, let's assume we just decrement the freelist_pages
+            self.freelist_pages -= 1;
+            Ok(self.freelist_trunk_page as usize) // This is a simplification
+        } else {
+            // No freelist pages, use the next page after the current database size
+            self.database_size += 1;
+            Ok(self.database_size as usize)
+        }
+    }
+}
+
 pub fn begin_read_database_header(page_source: &PageSource) -> Result<Rc<RefCell<DatabaseHeader>>> {
     let drop_fn = Rc::new(|_buf| {});
     let buf = Buffer::allocate(512, drop_fn);
@@ -181,6 +196,12 @@ pub fn begin_write_database_header(header: &DatabaseHeader, pager: &Pager) -> Re
     let c = Rc::new(WriteCompletion::new(write_complete));
     page_source.write(0, buffer_to_copy.clone(), c).unwrap();
 
+    Ok(())
+}
+
+pub fn begin_write_new_table(header: &DatabaseHeader, page: &Pager) -> Result<()> {
+    // begin write new table
+    todo!();
     Ok(())
 }
 
