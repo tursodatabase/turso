@@ -5,10 +5,12 @@ use std::cell::RefCell;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::rc::Rc;
-use std::fmt;
-
+use std::{fmt, fs};
 use thiserror::Error;
 use libc::{c_void, iovec};
+use libc;
+use nix::sys::statfs::{statfs, Statfs};
+use nix::sys::statvfs::{statvfs, FsFlags};
 
 #[derive(Debug, Error)]
 enum LinuxIOError {
@@ -39,11 +41,24 @@ impl LinuxIO {
 
 impl IO for LinuxIO {
     fn open_file(&self, path: &str) -> Result<Rc<dyn File>> {
-        trace!("open_file(path = {})", path);
+        let stat = statvfs(path).unwrap();
+        trace!("open_file(path = {}, flags = {:#?})", path,  stat.flags());
+        /*if stat.flags() & vfs_flags::ST_RDONLY != 0 {
+            println!("Filesystem at {} is read-only.", path);
+        } else {
+            // Check for IO_DIRECT flag
+            if stat.f_flags & nix::sys::statvfs::vfs_flags::ST_NOATIME != 0 {
+                println!("Filesystem at {} supports IO_DIRECT flag.", path);
+            } else {
+                println!("Filesystem at {} does not support IO_DIRECT flag.", path);
+            }
+        }*/
+
+        //trace!("open_file(path = {}, fstype = {:#?})", path, fstype);
         let file = std::fs::File::options()
             .read(true)
             .write(true)
-            .custom_flags(libc::O_DIRECT)
+            //.custom_flags(libc::O_DIRECT)
             .open(path)?;
         Ok(Rc::new(LinuxFile {
             ring: self.ring.clone(),
@@ -56,10 +71,12 @@ impl IO for LinuxIO {
         let mut ring = self.ring.borrow_mut();
         ring.submit_and_wait(1)?;
         while let Some(cqe) = ring.completion().next() {
+            let result = cqe.result();
             ensure!(
-                cqe.result() >= 0,
-                LinuxIOError::IOUringCQError(cqe.result())
+                result >= 0,
+                LinuxIOError::IOUringCQError(result)
             );
+            //trace!("Read {} bytes", result);
             let c = unsafe { Rc::from_raw(cqe.user_data() as *const Completion) };
             c.complete();
         }
@@ -82,23 +99,30 @@ impl File for LinuxFile {
             let buf = buf.as_mut_ptr();
             let ptr: *const Completion = Rc::into_raw(c.clone());
             //TODO: Check where to instantiate Probe
-            let probe = io_uring::Probe::new();
-            if probe.is_supported(io_uring::opcode::Read::CODE) {
-                io_uring::opcode::Read::new(fd, buf, len as u32)
-                .offset(pos as u64)
-                .build()
-                .user_data(ptr as u64)
-            } else {
-                let iov: libc::iovec = libc::iovec {
-                    iov_base: buf as *mut c_void,
+            //let probe = io_uring::Probe::new();
+            //if probe.is_supported(io_uring::opcode::Read::CODE) {
+            io_uring::opcode::Read::new(fd, buf, len as u32)
+            .offset(pos as u64)
+            .build()
+            .user_data(ptr as u64)
+            /*let iovec = [libc::iovec {
+                iov_base: buf as *mut libc::c_void,
+                iov_len: len,
+            }];
+            io_uring::opcode::Readv::new(fd, iovec.as_ptr(), iovec.len() as u32)
+            //.offset(pos as u64)
+            .build()
+            .user_data(ptr as u64)*/
+            /*} else {
+                let iovec = [libc::iovec {
+                    iov_base: buf as *mut libc::c_void,
                     iov_len: len,
-                };
-                let iov_ptr: *const iovec = &iov;
-                io_uring::opcode::Readv::new(fd, iov_ptr, len as u32)
+                }];
+                io_uring::opcode::Readv::new(fd, iovec.as_ptr(), iovec.len() as u32)
                 .offset(pos as u64)
                 .build()
                 .user_data(ptr as u64)
-            }
+            }*/
         };
         let mut ring = self.ring.borrow_mut();
         unsafe {
