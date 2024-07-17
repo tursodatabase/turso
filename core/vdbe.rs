@@ -1198,9 +1198,11 @@ impl Program {
                     SingleRowFunc::Unicode => {
                         let reg_value = state.registers[*start_reg].borrow_mut();
                         if let OwnedValue::Text(text) = &*reg_value {
-                            let first_char = text.chars().next().unwrap_or('\0');
-                            let unicode_point = first_char as u32;
-                            state.registers[*dest] = OwnedValue::Integer(unicode_point as i64);
+                            if let Some(unicode_point) = exec_unicode(text) {
+                                state.registers[*dest] = OwnedValue::Integer(unicode_point as i64);
+                            } else {
+                                state.registers[*dest] = OwnedValue::Null;
+                            }
                         }
                         state.pc += 1;
                     }
