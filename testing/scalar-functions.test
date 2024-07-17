@@ -1,0 +1,10 @@
+#!/usr/bin/env tclsh
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+do_execsql_test unicode {
+  SELECT unicode('a');
+} {97}
+
+

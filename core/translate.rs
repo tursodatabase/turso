@@ -1024,6 +1024,26 @@ fn translate_expr(
                             });
                             Ok(target_register)
                         }
+                        SingleRowFunc::Unicode => {
+                            // Inside the SingleRowFunc::Unicode block
+                            let args = if let Some(args) = args {
+                                if args.len() != 1 {
+                                    anyhow::bail!("Parse error: unicode function requires exactly one argument");
+                                }
+                                args
+                            } else {
+                                anyhow::bail!("Parse error: unicode function requires arguments");
+                            };
+
+                            let arg_reg = program.alloc_register();
+                            translate_expr(program, select, &args[0], arg_reg)?;
+                            program.emit_insn(Insn::Function {
+                                func: SingleRowFunc::Unicode,
+                                start_reg: arg_reg,
+                                dest: target_register,
+                            });
+                            Ok(target_register)
+                        }
                     }
                 }
                 None => {

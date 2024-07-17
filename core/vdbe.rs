@@ -1195,6 +1195,15 @@ impl Program {
                         state.registers[*dest] = result;
                         state.pc += 1;
                     }
+                    SingleRowFunc::Unicode => {
+                        let reg_value = state.registers[*start_reg].borrow_mut();
+                        if let OwnedValue::Text(text) = &*reg_value {
+                            let first_char = text.chars().next().unwrap_or('\0');
+                            let unicode_point = first_char as u32;
+                            state.registers[*dest] = OwnedValue::Integer(unicode_point as i64);
+                        }
+                        state.pc += 1;
+                    }
                 },
             }
         }
@@ -1728,8 +1737,25 @@ fn exec_if(reg: &OwnedValue, null_reg: &OwnedValue, not: bool) -> bool {
     }
 }
 
+fn exec_unicode(input: &OwnedValue) -> Option<u32> {
+    if let OwnedValue::Text(text) = input {
+        let first_char = text.chars().next()?;
+        Some(first_char.into())
+    } else {
+        None
+    }
+}
+
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_unicode() {
+        assert_eq!(
+            exec_unicode(&OwnedValue::Text(Rc::new("a".to_string()))),
+            Some(97)
+        );
+    }
 
     #[test]
     fn test_like() {

@@ -114,7 +114,7 @@ This document describes the SQLite compatibility status of Limbo:
 | typeof(X)                    | No      |         |
 | unhex(X)                     | No      |         |
 | unhex(X,Y)                   | No      |         |
-| unicode(X)                   | No      |         |
+| unicode(X)                   | Yes     |         |
 | unlikely(X)                  | No      |         |
 | upper(X)                     | No      |         |
 | zeroblob(N)                  | No      |         |

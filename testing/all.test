@@ -3,6 +3,7 @@
 set testdir [file dirname $argv0]
 
 source $testdir/agg-functions.test
+source $testdir/scalar-functions.test
 source $testdir/coalesce.test
 source $testdir/join.test
 source $testdir/pragma.test
