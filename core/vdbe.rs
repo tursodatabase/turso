@@ -1197,12 +1197,10 @@ impl Program {
                     }
                     SingleRowFunc::Unicode => {
                         let reg_value = state.registers[*start_reg].borrow_mut();
-                        if let OwnedValue::Text(text) = &*reg_value {
-                            if let Some(unicode_point) = exec_unicode(text) {
-                                state.registers[*dest] = OwnedValue::Integer(unicode_point as i64);
-                            } else {
-                                state.registers[*dest] = OwnedValue::Null;
-                            }
+                        if let Some(unicode_point) = exec_unicode(reg_value) {
+                            state.registers[*dest] = OwnedValue::Integer(unicode_point as i64);
+                        } else {
+                            state.registers[*dest] = OwnedValue::Null;
                         }
                         state.pc += 1;
                     }
