@@ -3,8 +3,19 @@
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 
-do_execsql_test unicode {
+do_execsql_test unicode-a {
   SELECT unicode('a');
 } {97}
 
+do_execsql_test unicode-emoji {
+  SELECT unicode('😊');
+} {128522}
+
+do_execsql_test unicode-empty {
+  SELECT unicode('');
+} {NULL}
+
+do_execsql_test unicode-number {
+  SELECT unicode(23);
+} {50}
 

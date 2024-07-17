@@ -1755,6 +1755,23 @@ mod tests {
             exec_unicode(&OwnedValue::Text(Rc::new("a".to_string()))),
             Some(97)
         );
+        assert_eq!(
+            exec_unicode(&OwnedValue::Text(Rc::new("😊".to_string()))),
+            Some(128522)
+        );
+        assert_eq!(
+            exec_unicode(&OwnedValue::Text(Rc::new("".to_string()))),
+            None
+        );
+        assert_eq!(exec_unicode(&OwnedValue::Integer(23)), Some(50));
+        assert_eq!(exec_unicode(&OwnedValue::Integer(0)), None);
+        assert_eq!(exec_unicode(&OwnedValue::Float(0.0)), None);
+        assert_eq!(exec_unicode(&OwnedValue::Float(23.45)), None);
+        assert_eq!(exec_unicode(&OwnedValue::Null), None);
+        assert_eq!(
+            exec_unicode(&OwnedValue::Blob(Rc::new("apple".as_bytes().to_vec()))),
+            Some(97)
+        );
     }
 
     #[test]
