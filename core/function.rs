@@ -46,7 +46,7 @@ impl ToString for ScalarFunc {
 
 pub enum Func {
     Agg(AggFunc),
-    SingleRow(ScalarFunc),
+    Scalar(ScalarFunc),
 }
 
 impl FromStr for Func {
