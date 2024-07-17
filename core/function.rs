@@ -28,25 +28,25 @@ impl AggFunc {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum SingleRowFunc {
+pub enum ScalarFunc {
     Coalesce,
     Like,
     Unicode,
 }
 
-impl ToString for SingleRowFunc {
+impl ToString for ScalarFunc {
     fn to_string(&self) -> String {
         match self {
-            SingleRowFunc::Coalesce => "coalesce".to_string(),
-            SingleRowFunc::Like => "like(2)".to_string(),
-            SingleRowFunc::Unicode => "unicode".to_string(),
+            ScalarFunc::Coalesce => "coalesce".to_string(),
+            ScalarFunc::Like => "like(2)".to_string(),
+            ScalarFunc::Unicode => "unicode".to_string(),
         }
     }
 }
 
 pub enum Func {
     Agg(AggFunc),
-    SingleRow(SingleRowFunc),
+    SingleRow(ScalarFunc),
 }
 
 impl FromStr for Func {
@@ -62,9 +62,9 @@ impl FromStr for Func {
             "string_agg" => Ok(Func::Agg(AggFunc::StringAgg)),
             "sum" => Ok(Func::Agg(AggFunc::Sum)),
             "total" => Ok(Func::Agg(AggFunc::Total)),
-            "coalesce" => Ok(Func::SingleRow(SingleRowFunc::Coalesce)),
-            "like" => Ok(Func::SingleRow(SingleRowFunc::Like)),
-            "unicode" => Ok(Func::SingleRow(SingleRowFunc::Unicode)),
+            "coalesce" => Ok(Func::SingleRow(ScalarFunc::Coalesce)),
+            "like" => Ok(Func::SingleRow(ScalarFunc::Like)),
+            "unicode" => Ok(Func::SingleRow(ScalarFunc::Unicode)),
             _ => Err(()),
         }
     }

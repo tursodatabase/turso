@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::function::{AggFunc, Func, SingleRowFunc};
+use crate::function::{AggFunc, Func, ScalarFunc};
 use crate::pager::Pager;
 use crate::schema::{Column, Schema, Table};
 use crate::sqlite3_ondisk::{DatabaseHeader, MIN_PAGE_CACHE_SIZE};
@@ -790,7 +790,7 @@ fn translate_condition_expr(
                     program.mark_last_insn_constant();
                     let _ = translate_expr(program, select, lhs, column_reg)?;
                     program.emit_insn(Insn::Function {
-                        func: SingleRowFunc::Like,
+                        func: ScalarFunc::Like,
                         start_reg: pattern_reg,
                         dest: cur_reg,
                     });
@@ -967,7 +967,7 @@ fn translate_expr(
                 }
                 Some(Func::SingleRow(srf)) => {
                     match srf {
-                        SingleRowFunc::Coalesce => {
+                        ScalarFunc::Coalesce => {
                             let args = if let Some(args) = args {
                                 if args.len() < 2 {
                                     anyhow::bail!(
@@ -998,7 +998,7 @@ fn translate_expr(
 
                             Ok(target_register)
                         }
-                        SingleRowFunc::Like => {
+                        ScalarFunc::Like => {
                             let args = if let Some(args) = args {
                                 if args.len() < 2 {
                                     anyhow::bail!(
@@ -1020,12 +1020,12 @@ fn translate_expr(
                             program.emit_insn(Insn::Function {
                                 start_reg: target_register + 1,
                                 dest: target_register,
-                                func: SingleRowFunc::Like,
+                                func: ScalarFunc::Like,
                             });
                             Ok(target_register)
                         }
-                        SingleRowFunc::Unicode => {
-                            // Inside the SingleRowFunc::Unicode block
+                        ScalarFunc::Unicode => {
+                            // Inside the ScalarFunc::Unicode block
                             let args = if let Some(args) = args {
                                 if args.len() != 1 {
                                     anyhow::bail!("Parse error: unicode function requires exactly one argument");
@@ -1038,7 +1038,7 @@ fn translate_expr(
                             let arg_reg = program.alloc_register();
                             translate_expr(program, select, &args[0], arg_reg)?;
                             program.emit_insn(Insn::Function {
-                                func: SingleRowFunc::Unicode,
+                                func: ScalarFunc::Unicode,
                                 start_reg: arg_reg,
                                 dest: target_register,
                             });

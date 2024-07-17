@@ -1,5 +1,5 @@
 use crate::btree::BTreeCursor;
-use crate::function::{AggFunc, SingleRowFunc};
+use crate::function::{AggFunc, ScalarFunc};
 use crate::pager::Pager;
 use crate::schema::Table;
 use crate::types::{AggContext, Cursor, CursorResult, OwnedRecord, OwnedValue, Record};
@@ -235,9 +235,9 @@ pub enum Insn {
     // Function
     Function {
         // constant_mask: i32, // P1, not used for now
-        start_reg: usize,    // P2, start of argument registers
-        dest: usize,         // P3
-        func: SingleRowFunc, // P4
+        start_reg: usize, // P2, start of argument registers
+        dest: usize,      // P3
+        func: ScalarFunc, // P4
     },
 }
 
@@ -1173,8 +1173,8 @@ impl Program {
                     start_reg,
                     dest,
                 } => match func {
-                    SingleRowFunc::Coalesce => {}
-                    SingleRowFunc::Like => {
+                    ScalarFunc::Coalesce => {}
+                    ScalarFunc::Like => {
                         let start_reg = *start_reg;
                         assert!(
                             start_reg + 2 <= state.registers.len(),
@@ -1195,7 +1195,7 @@ impl Program {
                         state.registers[*dest] = result;
                         state.pc += 1;
                     }
-                    SingleRowFunc::Unicode => {
+                    ScalarFunc::Unicode => {
                         let reg_value = state.registers[*start_reg].borrow_mut();
                         if let Some(unicode_point) = exec_unicode(reg_value) {
                             state.registers[*dest] = OwnedValue::Integer(unicode_point as i64);
