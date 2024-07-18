@@ -24,6 +24,18 @@ impl<'a> Display for Value<'a> {
     }
 }
 
+impl Value {
+    pub fn try_as_string(&self) -> Value {
+        match self {
+            Value::Text(s) => Value::Text(s),
+            Value::Blob(b) => Value::Text(&String::from_utf8_lossy(b).to_string()),
+            Value::Integer(i) => Value::Text(&i.to_string()),
+            Value::Float(f) => Value::Text(&f.to_string()),
+            Value::Null => Value::Null,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum OwnedValue {
     Null,

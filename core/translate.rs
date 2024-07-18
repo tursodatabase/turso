@@ -1025,7 +1025,6 @@ fn translate_expr(
                             Ok(target_register)
                         }
                         ScalarFunc::Unicode => {
-                            // Inside the ScalarFunc::Unicode block
                             let args = if let Some(args) = args {
                                 if args.len() != 1 {
                                     anyhow::bail!("Parse error: unicode function requires exactly one argument");
