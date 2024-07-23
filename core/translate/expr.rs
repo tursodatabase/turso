@@ -466,23 +466,36 @@ pub fn translate_expr(
         }
         ast::Expr::FunctionCallStar { .. } => todo!(),
         ast::Expr::Id(ident) => {
-            // let (idx, col) = table.unwrap().get_column(&ident.0).unwrap();
-            let (idx, col_type, cursor_id, is_primary_key) =
-                resolve_ident_table(program, &ident.0, select, cursor_hint)?;
-            if is_primary_key {
-                program.emit_insn(Insn::RowId {
-                    cursor_id,
-                    dest: target_register,
-                });
-            } else {
-                program.emit_insn(Insn::Column {
-                    column: idx,
-                    dest: target_register,
-                    cursor_id,
-                });
+            match resolve_ident_table(program, &ident.0, select, cursor_hint)? {
+                Some((idx, col_type, cursor_id, is_primary_key)) => {
+                    if is_primary_key {
+                        program.emit_insn(Insn::RowId {
+                            cursor_id,
+                            dest: target_register,
+                        });
+                    } else {
+                        program.emit_insn(Insn::Column {
+                            column: idx,
+                            dest: target_register,
+                            cursor_id,
+                        });
+                    }
+                    maybe_apply_affinity(col_type, target_register, program);
+                    Ok(target_register)
+                }
+                None => {
+                    if ident.0.starts_with('"') {
+                        let s = ident.0.to_string();
+                        program.emit_insn(Insn::String8 {
+                            value: s[1..s.len() - 1].to_string(),
+                            dest: target_register,
+                        });
+                        Ok(target_register)
+                    } else {
+                        anyhow::bail!("Parse error: ambiguous column name {}", ident.0.as_str());
+                    }
+                }
             }
-            maybe_apply_affinity(col_type, target_register, program);
-            Ok(target_register)
         }
         ast::Expr::InList { .. } => todo!(),
         ast::Expr::InSelect { .. } => todo!(),
@@ -696,7 +709,7 @@ pub fn resolve_ident_table<'a>(
     ident: &String,
     select: &'a Select,
     cursor_hint: Option<usize>,
-) -> Result<(usize, Type, usize, bool)> {
+) -> Result<Option<(usize, Type, usize, bool)>> {
     let ident = normalize_ident(ident);
     let mut found = Vec::new();
     for join in &select.src_tables {
@@ -739,10 +752,10 @@ pub fn resolve_ident_table<'a>(
         }
     }
     if found.len() == 1 {
-        return Ok(found[0]);
+        return Ok(Some(found[0]));
     }
     if found.is_empty() {
-        anyhow::bail!("Parse error: column with name {} not found", ident.as_str());
+        return Ok(None);
     }
 
     anyhow::bail!("Parse error: ambiguous column name {}", ident.as_str());

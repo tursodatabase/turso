@@ -523,8 +523,12 @@ fn introspect_expression_for_cursors(
             )?);
         }
         ast::Expr::Id(ident) => {
-            let (_, _, cursor_id, _) = resolve_ident_table(program, &ident.0, select, cursor_hint)?;
-            cursors.push(cursor_id);
+            match resolve_ident_table(program, &ident.0, select, cursor_hint)? {
+                Some((_, _, cursor_id, _)) => {
+                    cursors.push(cursor_id);
+                }
+                None => anyhow::bail!("Parse error: ambiguous column name {}", ident.0.as_str()),
+            }
         }
         ast::Expr::Qualified(tbl, ident) => {
             let (_, _, cursor_id, _) =

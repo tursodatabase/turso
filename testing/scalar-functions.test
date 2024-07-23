@@ -243,3 +243,26 @@ do_execsql_test date-with-invalid-timezone {
   SELECT date('2023-05-18 15:30:45+25:00');
 } {{}}
 
+do_execsql_test length-double-quoted-text-non-column {
+  SELECT length("limbo") from users LIMIT 1;
+} {5}
+
+do_execsql_test upper-double-quoted-text-non-column {
+  SELECT upper("limbo") from users LIMIT 1;
+} {LIMBO}
+
+do_execsql_test lower-double-quoted-text-non-column {
+  SELECT lower("LIMBO") from users LIMIT 1;
+} {limbo}
+
+do_execsql_test length-double-quoted-text-existing-column {
+  SELECT length("first_name") from users LIMIT 1;
+} {5}
+
+do_execsql_test upper-double-quoted-text-existing-column {
+  SELECT upper("first_name") from users LIMIT 1;
+} {JAMIE}
+
+do_execsql_test lower-double-quoted-text-existing-column {
+  SELECT lower("first_name") from users LIMIT 1;
+} {jamie}
