@@ -8,7 +8,7 @@ SQLITE_EXEC ?= ./target/debug/limbo
 # Static library to use for SQLite C API compatibility tests.
 SQLITE_LIB ?= ./target/debug/liblimbo_sqlite3.a
 
-# Reference Implementation to Check Against
+# Reference implementation to check against
 ACTUAL_SQLITE_EXEC ?= sqlite3
 
 all: check-rust-version check-wasm-target limbo limbo-wasm
