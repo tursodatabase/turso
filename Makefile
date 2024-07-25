@@ -8,6 +8,9 @@ SQLITE_EXEC ?= ./target/debug/limbo
 # Static library to use for SQLite C API compatibility tests.
 SQLITE_LIB ?= ./target/debug/liblimbo_sqlite3.a
 
+# Reference Implementation to Check Against
+ACTUAL_SQLITE_EXEC ?= sqlite3
+
 all: check-rust-version check-wasm-target limbo limbo-wasm
 .PHONY: all
 
@@ -44,7 +47,7 @@ limbo-wasm:
 	cargo build --package limbo-wasm --target wasm32-wasi
 .PHONY: limbo-wasm
 
-test: limbo test-compat test-sqlite3
+test: limbo test-reference test-compat test-sqlite3
 .PHONY: test
 
 test-compat:
@@ -54,3 +57,7 @@ test-compat:
 test-sqlite3:
 	LIBS=../../$(SQLITE_LIB) make -C sqlite3/tests test
 .PHONY: test-sqlite3
+
+test-reference:
+	SQLITE_EXEC=$(ACTUAL_SQLITE_EXEC) ./testing/all.test
+.PHONY: test-reference
