@@ -66,7 +66,7 @@ impl<'a> ColumnInfo<'a> {
         matches!(self.func, Some(Func::Agg(_)))
     }
 }
-
+#[derive(Debug)]
 pub struct LeftJoinBookkeeping {
     // integer register that holds a flag that is set to true if the current row has a match for the left join
     pub match_flag_register: usize,
@@ -76,6 +76,7 @@ pub struct LeftJoinBookkeeping {
     pub on_match_jump_to_label: BranchOffset,
 }
 
+#[derive(Debug)]
 pub struct LoopInfo {
     // The table or table alias that we are looping over
     pub identifier: String,
@@ -90,7 +91,7 @@ pub struct LoopInfo {
     // The ID of the cursor that is opened for this table
     pub open_cursor: usize,
 }
-
+#[derive(Debug)]
 pub struct Select<'a> {
     pub columns: &'a Vec<ast::ResultColumn>,
     pub column_info: Vec<ColumnInfo<'a>>,
@@ -180,6 +181,43 @@ pub fn build_select<'a>(schema: &Schema, select: &'a ast::Select) -> Result<Sele
             let exist_aggregation = column_info
                 .iter()
                 .any(|info| info.is_aggregation_function());
+
+            if let Some(mut order_by) = select.order_by.clone() {
+                for column in order_by.iter_mut() {
+                    match &mut column.expr {
+                        ast::Expr::Literal(lit) => match lit {
+                            ast::Literal::Numeric(num) => {
+                                let num_i = match num.parse::<usize>() {
+                                    Ok(i) => i,
+                                    Err(_) => todo!(),
+                                };
+
+                                if let Some(new_column) = columns.get(num_i) {
+                                    match new_column {
+                                        ast::ResultColumn::Expr(expr, _) => {
+                                            column.expr = expr.clone()
+                                        }
+                                        ast::ResultColumn::Star => todo!(),
+                                        ast::ResultColumn::TableStar(_) => todo!(),
+                                    }
+                                }
+                            }
+                            _ => continue,
+                        },
+                        _ => continue,
+                    }
+                }
+                return Ok(Select {
+                    columns,
+                    column_info,
+                    src_tables: joins,
+                    limit: &select.limit,
+                    order_by: Some(order_by),
+                    exist_aggregation,
+                    where_clause,
+                    loops: Vec::new(),
+                });
+            }
             Ok(Select {
                 columns,
                 column_info,
