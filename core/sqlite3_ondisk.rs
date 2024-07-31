@@ -639,6 +639,63 @@ pub fn read_record(payload: &[u8]) -> Result<OwnedRecord> {
     Ok(OwnedRecord::new(values))
 }
 
+#[derive(Debug)]
+pub struct RecordOffset {
+    pub page_idx: usize,
+    pub cell_idx: usize,
+    pub offsets: Vec<usize>,
+    pub types: Vec<SerialType>,
+}
+
+pub fn serial_type_size(serial_type: &SerialType) -> usize {
+    match serial_type {
+        SerialType::Null | SerialType::ConstInt0 | SerialType::ConstInt1 => 0,
+        SerialType::UInt8 => 1,
+        SerialType::BEInt16 => 2,
+        SerialType::BEInt24 => 3,
+        SerialType::BEInt32 => 4,
+        SerialType::BEInt48 => 6,
+        SerialType::BEInt64 | SerialType::BEFloat64 => 8,
+        SerialType::Blob(n) => *n,
+        SerialType::String(n) => *n,
+    }
+}
+
+pub fn read_record_header(
+    page_idx: usize,
+    cell_idx: usize,
+    payload: &[u8],
+) -> Result<RecordOffset> {
+    let mut pos = 0;
+    let (header_size, nr) = read_varint(payload)?;
+    assert!((header_size as usize) >= nr);
+    let mut header_size = (header_size as usize) - nr;
+    pos += nr;
+    let mut serial_types = Vec::with_capacity(header_size);
+
+    let mut offsets = Vec::new();
+    let mut offset = header_size + 1;
+    while header_size > 0 {
+        let (serial_type, nr) = read_varint(&payload[pos..])?;
+        let serial_type = SerialType::try_from(serial_type)?;
+        let size = serial_type_size(&serial_type);
+        offsets.push(offset);
+        serial_types.push(serial_type);
+        assert!(pos + nr < payload.len());
+        pos += nr;
+        assert!(header_size >= nr);
+        header_size -= nr;
+        assert!(offset + size <= payload.len());
+        offset += size;
+    }
+    Ok(RecordOffset {
+        page_idx,
+        cell_idx,
+        offsets,
+        types: serial_types,
+    })
+}
+
 pub fn read_value(buf: &[u8], serial_type: &SerialType) -> Result<(OwnedValue, usize)> {
     match *serial_type {
         SerialType::Null => Ok((OwnedValue::Null, 0)),

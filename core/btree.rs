@@ -1,7 +1,7 @@
 use crate::pager::{Page, Pager};
 use crate::sqlite3_ondisk::{
-    read_varint, write_varint, BTreeCell, DatabaseHeader, PageContent, PageType, TableInteriorCell,
-    TableLeafCell,
+    read_value, read_varint, serial_type_size, write_varint, BTreeCell, DatabaseHeader,
+    PageContent, PageType, RecordOffset, TableInteriorCell, TableLeafCell,
 };
 use crate::types::{Cursor, CursorResult, OwnedRecord, OwnedValue};
 use crate::Result;
@@ -50,6 +50,7 @@ pub struct BTreeCursor {
     root_page: usize,
     page: RefCell<Option<Rc<MemPage>>>,
     rowid: RefCell<Option<u64>>,
+    offsets: RefCell<Option<RecordOffset>>,
     record: RefCell<Option<OwnedRecord>>,
     null_flag: bool,
     database_header: Rc<RefCell<DatabaseHeader>>,
@@ -66,13 +67,14 @@ impl BTreeCursor {
             root_page,
             page: RefCell::new(None),
             rowid: RefCell::new(None),
+            offsets: RefCell::new(None),
             record: RefCell::new(None),
             null_flag: false,
             database_header,
         }
     }
 
-    fn get_next_record(&mut self) -> Result<CursorResult<(Option<u64>, Option<OwnedRecord>)>> {
+    fn get_next_record(&mut self) -> Result<CursorResult<(Option<u64>, Option<RecordOffset>)>> {
         loop {
             let mem_page = {
                 let mem_page = self.page.borrow();
@@ -87,7 +89,8 @@ impl BTreeCursor {
             }
             let page = page.contents.read().unwrap();
             let page = page.as_ref().unwrap();
-            if mem_page.cell_idx() >= page.cell_count() {
+            let cell_idx = mem_page.cell_idx();
+            if cell_idx >= page.cell_count() {
                 let parent = mem_page.parent.clone();
                 match page.rightmost_pointer() {
                     Some(right_most_pointer) => {
@@ -106,7 +109,7 @@ impl BTreeCursor {
                     },
                 }
             }
-            let cell = page.cell_get(mem_page.cell_idx())?;
+            let cell = page.cell_get(cell_idx)?;
             match &cell {
                 BTreeCell::TableInteriorCell(TableInteriorCell {
                     _left_child_page,
@@ -124,7 +127,8 @@ impl BTreeCursor {
                     first_overflow_page: _,
                 }) => {
                     mem_page.advance();
-                    let record = crate::sqlite3_ondisk::read_record(_payload)?;
+                    let record =
+                        crate::sqlite3_ondisk::read_record_header(page_idx, cell_idx, _payload)?;
                     return Ok(CursorResult::Ok((Some(*_rowid), Some(record))));
                 }
                 BTreeCell::IndexInteriorCell(_) => {
@@ -764,7 +768,7 @@ fn find_free_cell(page_ref: &PageContent, db_header: Ref<DatabaseHeader>, amount
 
 impl Cursor for BTreeCursor {
     fn is_empty(&self) -> bool {
-        self.record.borrow().is_none()
+        self.offsets.borrow().is_none()
     }
 
     fn rewind(&mut self) -> Result<CursorResult<()>> {
@@ -773,7 +777,8 @@ impl Cursor for BTreeCursor {
         match self.get_next_record()? {
             CursorResult::Ok((rowid, next)) => {
                 self.rowid.replace(rowid);
-                self.record.replace(next);
+                self.offsets.replace(next);
+                self.record.replace(None);
                 Ok(CursorResult::Ok(()))
             }
             CursorResult::IO => Ok(CursorResult::IO),
@@ -784,7 +789,8 @@ impl Cursor for BTreeCursor {
         match self.get_next_record()? {
             CursorResult::Ok((rowid, next)) => {
                 self.rowid.replace(rowid);
-                self.record.replace(next);
+                self.offsets.replace(next);
+                self.record.replace(None);
                 Ok(CursorResult::Ok(()))
             }
             CursorResult::IO => Ok(CursorResult::IO),
@@ -801,6 +807,55 @@ impl Cursor for BTreeCursor {
     }
 
     fn record(&self) -> Result<Ref<Option<OwnedRecord>>> {
+        let owned_record = self.record.borrow();
+        if owned_record.is_some() {
+            return Ok(owned_record);
+        }
+        // drop our reference as it is no longer needed
+        std::mem::drop(owned_record);
+        let mut owned_record = Vec::new();
+
+        let record_offsets = self.offsets.borrow();
+        let record_offsets = record_offsets.as_ref();
+        if record_offsets.is_none() {
+            return Ok(self.record.borrow());
+        }
+
+        let record_offsets = record_offsets.unwrap();
+        let page = self.pager.read_page(record_offsets.page_idx).unwrap();
+        let page = RefCell::borrow(&page);
+        assert!(!page.is_locked());
+
+        let page = page.contents.read().unwrap();
+        let page = page.as_ref().unwrap();
+        let cell = &page.cell_get(record_offsets.cell_idx)?;
+        match &cell {
+            BTreeCell::TableInteriorCell(TableInteriorCell {
+                _left_child_page,
+                _rowid,
+            }) => {
+                unimplemented!()
+            }
+            BTreeCell::TableLeafCell(TableLeafCell {
+                _rowid,
+                _payload,
+                first_overflow_page: _,
+            }) => {
+                for (i, offset) in record_offsets.offsets.iter().enumerate() {
+                    let serial_type = &record_offsets.types[i];
+                    let payload = &_payload[*offset..*offset + serial_type_size(serial_type)];
+                    owned_record.push(read_value(payload, &serial_type).unwrap().0)
+                }
+                let mut record = self.record.borrow_mut();
+                *record = Some(OwnedRecord::new(owned_record))
+            }
+            BTreeCell::IndexInteriorCell(_) => {
+                unimplemented!();
+            }
+            BTreeCell::IndexLeafCell(_) => {
+                unimplemented!();
+            }
+        }
         Ok(self.record.borrow())
     }
 
