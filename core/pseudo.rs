@@ -50,6 +50,11 @@ impl Cursor for PseudoCursor {
         Ok(self.current.borrow())
     }
 
+    fn value_at(&self, col: usize) -> Result<Option<OwnedValue>> {
+        let record = self.current.borrow();
+        return Ok(record.as_ref().map(|r| r.values[col].clone()));
+    }
+
     fn insert(
         &mut self,
         key: &OwnedValue,

@@ -818,7 +818,9 @@ impl Cursor for BTreeCursor {
         let record_offsets = self.offsets.borrow();
         let record_offsets = record_offsets.as_ref();
         if record_offsets.is_none() {
-            return Ok(self.record.borrow());
+            let record = self.record.borrow();
+            assert!(record.is_none());
+            return Ok(record);
         }
 
         let record_offsets = record_offsets.unwrap();
@@ -857,6 +859,50 @@ impl Cursor for BTreeCursor {
             }
         }
         Ok(self.record.borrow())
+    }
+
+    fn value_at(&self, col: usize) -> Result<Option<OwnedValue>> {
+        let record_offsets = self.offsets.borrow();
+        let record_offsets = record_offsets.as_ref();
+        if record_offsets.is_none() {
+            let record = self.record.borrow();
+            assert!(record.is_none());
+            return Ok(record.as_ref().map(|r| r.values[col].clone()));
+        }
+
+        let record_offsets = record_offsets.unwrap();
+        let page = self.pager.read_page(record_offsets.page_idx).unwrap();
+        let page = RefCell::borrow(&page);
+        assert!(!page.is_locked());
+
+        let page = page.contents.read().unwrap();
+        let page = page.as_ref().unwrap();
+        let cell = &page.cell_get(record_offsets.cell_idx)?;
+        match &cell {
+            BTreeCell::TableInteriorCell(TableInteriorCell {
+                _left_child_page,
+                _rowid,
+            }) => {
+                unimplemented!()
+            }
+            BTreeCell::TableLeafCell(TableLeafCell {
+                _rowid,
+                _payload,
+                first_overflow_page: _,
+            }) => {
+                assert!(col < record_offsets.offsets.len());
+                let offset = record_offsets.offsets[col];
+                let serial_type = &record_offsets.types[col];
+                let payload = &_payload[offset..offset + serial_type_size(serial_type)];
+                Ok(Some(read_value(payload, &serial_type).unwrap().0))
+            }
+            BTreeCell::IndexInteriorCell(_) => {
+                unimplemented!();
+            }
+            BTreeCell::IndexLeafCell(_) => {
+                unimplemented!();
+            }
+        }
     }
 
     fn insert(

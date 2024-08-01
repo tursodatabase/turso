@@ -690,13 +690,9 @@ impl Program {
                     dest,
                 } => {
                     let cursor = cursors.get_mut(cursor_id).unwrap();
-                    if let Some(ref record) = *cursor.record()? {
+                    if let Some(record) = cursor.value_at(*column)? {
                         let null_flag = cursor.get_null_flag();
-                        state.registers[*dest] = if null_flag {
-                            OwnedValue::Null
-                        } else {
-                            record.values[*column].clone()
-                        };
+                        state.registers[*dest] = if null_flag { OwnedValue::Null } else { record };
                     } else {
                         state.registers[*dest] = OwnedValue::Null;
                     }

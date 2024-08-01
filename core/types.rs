@@ -370,6 +370,7 @@ pub trait Cursor {
     fn wait_for_completion(&mut self) -> Result<()>;
     fn rowid(&self) -> Result<Option<u64>>;
     fn record(&self) -> Result<Ref<Option<OwnedRecord>>>;
+    fn value_at(&self, col: usize) -> Result<Option<OwnedValue>>;
     fn insert(
         &mut self,
         key: &OwnedValue,
