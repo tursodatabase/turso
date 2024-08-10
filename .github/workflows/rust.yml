@@ -17,14 +17,33 @@ jobs:
     - name: Check formatting
       run: cargo fmt --check
 
-  build-native:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-
-    runs-on: ${{ matrix.os }}
-
+  build-linux:
+    runs-on: ubuntu-latest
     steps:
+    - uses: Swatinem/rust-cache@v2
+    - uses: actions/checkout@v3
+    - name: Build
+      run: cargo build --verbose
+    - name: Test
+      run: cargo test --verbose
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+    - uses: Swatinem/rust-cache@v2
+    - uses: actions/checkout@v3
+    - name: Build
+      run: cargo build --verbose
+    - name: Test
+      run: cargo test --verbose
+
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: C:\
+    steps:
+    - run: Get-PSDrive
     - uses: Swatinem/rust-cache@v2
     - uses: actions/checkout@v3
     - name: Build
