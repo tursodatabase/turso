@@ -75,6 +75,7 @@ pub enum ScalarFunc {
     Quote,
     SqliteVersion,
     UnixEpoch,
+    Hex,
 }
 
 impl Display for ScalarFunc {
@@ -108,6 +109,7 @@ impl Display for ScalarFunc {
             ScalarFunc::Quote => "quote".to_string(),
             ScalarFunc::SqliteVersion => "sqlite_version".to_string(),
             ScalarFunc::UnixEpoch => "unixepoch".to_string(),
+            ScalarFunc::Hex => "hex".to_string(),
         };
         write!(f, "{}", str)
     }
@@ -176,6 +178,7 @@ impl Func {
             "sqlite_version" => Ok(Func::Scalar(ScalarFunc::SqliteVersion)),
             "json" => Ok(Func::Json(JsonFunc::Json)),
             "unixepoch" => Ok(Func::Scalar(ScalarFunc::UnixEpoch)),
+            "hex" => Ok(Func::Scalar(ScalarFunc::Hex)),
             _ => Err(()),
         }
     }

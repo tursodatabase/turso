@@ -1534,6 +1534,11 @@ impl Program {
                                 };
                                 state.registers[*dest] = result.unwrap_or(OwnedValue::Null);
                             }
+                            ScalarFunc::Hex => {
+                                let reg_value = state.registers[*start_reg].borrow_mut();
+                                let result = exec_hex(reg_value);
+                                state.registers[*dest] = result;
+                            }
                             ScalarFunc::Random => {
                                 state.registers[*dest] = exec_random();
                             }
@@ -2132,6 +2137,19 @@ fn exec_substring(
     }
 }
 
+fn exec_hex(reg: &OwnedValue) -> OwnedValue {
+    match reg {
+        OwnedValue::Text(_)
+        | OwnedValue::Integer(_)
+        | OwnedValue::Float(_)
+        | OwnedValue::Blob(_) => {
+            let text = reg.to_string();
+            OwnedValue::Text(Rc::new(hex::encode_upper(text)))
+        }
+        _ => OwnedValue::Null,
+    }
+}
+
 fn exec_unicode(reg: &OwnedValue) -> OwnedValue {
     match reg {
         OwnedValue::Text(_)
@@ -2250,10 +2268,10 @@ fn execute_sqlite_version(version_integer: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        exec_abs, exec_char, exec_if, exec_length, exec_like, exec_lower, exec_ltrim, exec_minmax,
-        exec_nullif, exec_quote, exec_random, exec_round, exec_rtrim, exec_sign, exec_substring,
-        exec_trim, exec_unicode, exec_upper, execute_sqlite_version, get_new_rowid, Cursor,
-        CursorResult, LimboError, OwnedRecord, OwnedValue, Result,
+        exec_abs, exec_char, exec_hex, exec_if, exec_length, exec_like, exec_lower, exec_ltrim,
+        exec_minmax, exec_nullif, exec_quote, exec_random, exec_round, exec_rtrim, exec_sign,
+        exec_substring, exec_trim, exec_unicode, exec_upper, execute_sqlite_version, get_new_rowid,
+        Cursor, CursorResult, LimboError, OwnedRecord, OwnedValue, Result,
     };
     use mockall::{mock, predicate};
     use rand::{rngs::mock::StepRng, thread_rng};
@@ -2566,6 +2584,21 @@ mod tests {
         let input_int = OwnedValue::Integer(10);
         assert_eq!(exec_lower(&input_int).unwrap(), input_int);
         assert_eq!(exec_lower(&OwnedValue::Null).unwrap(), OwnedValue::Null)
+    }
+
+    #[test]
+    fn test_hex() {
+        let input_str = OwnedValue::Text(Rc::new("limbo".to_string()));
+        let expected_val = OwnedValue::Text(Rc::new(String::from("6C696D626F")));
+        assert_eq!(exec_hex(&input_str), expected_val);
+
+        let input_int = OwnedValue::Integer(100);
+        let expected_val = OwnedValue::Text(Rc::new(String::from("313030")));
+        assert_eq!(exec_hex(&input_int), expected_val);
+
+        let input_float = OwnedValue::Float(12.34);
+        let expected_val = OwnedValue::Text(Rc::new(String::from("31322E3334")));
+        assert_eq!(exec_hex(&input_float), expected_val);
     }
 
     #[test]
