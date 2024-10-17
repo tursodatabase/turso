@@ -11,6 +11,7 @@ pub(crate) fn peek_operator(input: &[SqlToken]) -> Option<(Operator, u8)> {
         Some(SqlToken::Ge) => Some((Operator::GtEq, 2)),
         Some(SqlToken::And) => Some((Operator::And, 1)),
         Some(SqlToken::Or) => Some((Operator::Or, 0)),
+        Some(SqlToken::Like) => Some((Operator::Like, 0)),
         Some(SqlToken::Plus) => Some((Operator::Plus, 3)),
         Some(SqlToken::Minus) => Some((Operator::Minus, 3)),
         Some(SqlToken::Asterisk) => Some((Operator::Multiply, 4)),

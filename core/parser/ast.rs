@@ -13,6 +13,7 @@ pub enum Operator {
     Minus = 9,
     Multiply = 10,
     Divide = 11,
+    Like = 12,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

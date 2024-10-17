@@ -39,6 +39,7 @@ pub enum SqlToken<'a> {
     Asc,
     Desc,
     Semicolon,
+    Like,
     Literal(&'a [u8]),
     Identifier(&'a [u8]),
 }
@@ -139,6 +140,7 @@ fn keyword<'i, E: ParserError<Stream<'i>> + AddContext<Stream<'i>, StrContext>>(
         join_related_stuff,
         asc_desc,
         tk_as.value(SqlToken::As),
+        tk_like.value(SqlToken::Like),
     ))
     .parse_next(input)
 }
@@ -162,6 +164,10 @@ fn ws<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8
 }
 
 const WS: &[u8] = &[b' ', b'\t', b'\r', b'\n'];
+
+fn tk_like<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8], E> {
+    literal(Caseless("LIKE")).parse_next(input)
+}
 
 fn tk_semicolon<'i, E: ParserError<Stream<'i>>>(
     input: &mut Stream<'i>,

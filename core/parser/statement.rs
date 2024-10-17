@@ -472,4 +472,37 @@ mod tests {
             }))
         );
     }
+
+    #[test]
+    fn select_star_from_mytable_where_column1_like_value() {
+        let mut input = "SELECT * FROM mytable WHERE column1 LIKE 'value'".to_string();
+        let result = parse_sql_statement(&mut input);
+        assert_eq!(
+            result,
+            Ok(SqlStatement::Select(SelectStatement {
+                columns: vec![ResultColumn::Star],
+                from: Some(FromClause {
+                    table: Table {
+                        name: "mytable".into(),
+                        alias: None,
+                        table_no: None
+                    },
+                    joins: vec![]
+                }),
+                where_clause: Some(Expression::Binary {
+                    lhs: Box::new(Expression::Column(Column {
+                        name: "column1".into(),
+                        alias: None,
+                        table_no: None,
+                        column_no: None
+                    })),
+                    op: Operator::Like,
+                    rhs: Box::new(Expression::Literal("value".into())),
+                }),
+                group_by: None,
+                order_by: None,
+                limit: None
+            }))
+        );
+    }
 }
