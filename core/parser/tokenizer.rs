@@ -38,6 +38,7 @@ pub enum SqlToken<'a> {
     On,
     Asc,
     Desc,
+    Semicolon,
     Literal(&'a [u8]),
     Identifier(&'a [u8]),
 }
@@ -56,6 +57,9 @@ pub fn parse_sql_string_to_tokens<
     while !stream.is_empty() {
         match parse_sql_token(&mut stream) {
             Ok(token) => {
+                if token == SqlToken::Semicolon {
+                    break;
+                }
                 tokens.push(token);
             }
             Err(e) => return Err(e),
@@ -132,9 +136,9 @@ fn keyword<'i, E: ParserError<Stream<'i>> + AddContext<Stream<'i>, StrContext>>(
         tk_not.value(SqlToken::Not),
         tk_group_by.value(SqlToken::GroupBy),
         tk_limit.value(SqlToken::Limit),
-        tk_as.value(SqlToken::As),
         join_related_stuff,
         asc_desc,
+        tk_as.value(SqlToken::As),
     ))
     .parse_next(input)
 }
@@ -148,6 +152,7 @@ fn sql_token<'i, E: ParserError<Stream<'i>> + AddContext<Stream<'i>, StrContext>
         mathy_operator,
         tk_literal.map(SqlToken::Literal),
         tk_identifier.map(SqlToken::Identifier),
+        tk_semicolon,
     ))
     .parse_next(input)
 }
@@ -158,64 +163,70 @@ fn ws<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8
 
 const WS: &[u8] = &[b' ', b'\t', b'\r', b'\n'];
 
+fn tk_semicolon<'i, E: ParserError<Stream<'i>>>(
+    input: &mut Stream<'i>,
+) -> PResult<SqlToken<'i>, E> {
+    literal(";").value(SqlToken::Semicolon).parse_next(input)
+}
+
 fn tk_join<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8], E> {
-    literal(Caseless("JOIN ")).parse_next(input)
+    literal(Caseless("JOIN")).parse_next(input)
 }
 
 fn tk_inner<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8], E> {
-    literal(Caseless("INNER ")).parse_next(input)
+    literal(Caseless("INNER")).parse_next(input)
 }
 
 fn tk_outer<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8], E> {
-    literal(Caseless("OUTER ")).parse_next(input)
+    literal(Caseless("OUTER")).parse_next(input)
 }
 
 fn tk_left<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8], E> {
-    literal(Caseless("LEFT ")).parse_next(input)
+    literal(Caseless("LEFT")).parse_next(input)
 }
 
 fn tk_on<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8], E> {
-    literal(Caseless("ON ")).parse_next(input)
+    literal(Caseless("ON")).parse_next(input)
 }
 
 fn tk_as<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8], E> {
-    literal(Caseless("AS ")).parse_next(input)
+    literal(Caseless("AS")).parse_next(input)
 }
 
 fn tk_select<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8], E> {
-    literal(Caseless("SELECT ")).parse_next(input)
+    literal(Caseless("SELECT")).parse_next(input)
 }
 
 fn tk_from<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8], E> {
-    literal(Caseless("FROM ")).parse_next(input)
+    literal(Caseless("FROM")).parse_next(input)
 }
 
 fn tk_where<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8], E> {
-    literal(Caseless("WHERE ")).parse_next(input)
+    literal(Caseless("WHERE")).parse_next(input)
 }
 
 fn tk_and<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8], E> {
-    literal(Caseless("AND ")).parse_next(input)
+    literal(Caseless("AND")).parse_next(input)
 }
 
 fn tk_or<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8], E> {
-    literal(Caseless("OR ")).parse_next(input)
+    literal(Caseless("OR")).parse_next(input)
 }
 
 fn tk_not<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8], E> {
-    literal(Caseless("NOT ")).parse_next(input)
+    literal(Caseless("NOT")).parse_next(input)
 }
 
 fn tk_group_by<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8], E> {
-    literal(Caseless("GROUP BY ")).parse_next(input)
+    literal(Caseless("GROUP BY")).parse_next(input)
 }
 
 fn tk_order_by<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8], E> {
-    literal(Caseless("ORDER BY ")).parse_next(input)
+    literal(Caseless("ORDER BY")).parse_next(input)
 }
 
 fn tk_limit<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8], E> {
-    literal(Caseless("LIMIT ")).parse_next(input)
+    literal(Caseless("LIMIT")).parse_next(input)
 }
 
 fn tk_eq<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8], E> {
@@ -294,7 +305,6 @@ fn tk_desc<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'
     literal(Caseless("DESC")).parse_next(input)
 }
 
-// add test for parse select
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,7 +407,7 @@ mod tests {
         assert_eq!(input, b"");
 
         // Test string literal
-        let mut input = "'string value".as_bytes();
+        let mut input = "'string value'".as_bytes();
         assert_eq!(
             parse_sql_token::<Error>(&mut input),
             Ok(SqlToken::Literal(b"string value"))
