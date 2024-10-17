@@ -4,6 +4,7 @@ use winnow::PResult;
 
 use super::ast::{Column, Expression};
 use super::operators::peek_operator;
+use super::utils::expect_token;
 use super::{SqlToken, SqlTokenStream};
 
 pub(crate) fn parse_expr(input: &mut SqlTokenStream, min_precedence: u8) -> PResult<Expression> {
@@ -45,6 +46,12 @@ fn parse_atom(input: &mut SqlTokenStream) -> PResult<Expression> {
             Ok(Expression::Literal(
                 std::str::from_utf8(value).unwrap().to_string(),
             ))
+        }
+        Some(SqlToken::ParenL) => {
+            input.next_token();
+            let expr = parse_expr(input, 0)?;
+            expect_token(input, SqlToken::ParenR)?;
+            Ok(Expression::Parenthesized(Box::new(expr)))
         }
         _ => Err(ErrMode::Backtrack(ContextError::new())),
     }

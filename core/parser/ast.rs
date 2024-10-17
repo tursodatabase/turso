@@ -32,6 +32,7 @@ pub enum Expression {
         op: Operator,
         rhs: Box<Expression>,
     },
+    Parenthesized(Box<Expression>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
