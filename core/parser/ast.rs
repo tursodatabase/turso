@@ -33,6 +33,10 @@ pub enum Expression {
         rhs: Box<Expression>,
     },
     Parenthesized(Box<Expression>),
+    FunctionCall {
+        name: String,
+        args: Option<Vec<Expression>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -404,4 +404,72 @@ mod tests {
             }))
         );
     }
+
+    #[test]
+    fn select_count_foo_from_mytable() {
+        let mut input = "SELECT COUNT(foo) FROM mytable".to_string();
+        let result = parse_sql_statement(&mut input);
+        assert_eq!(
+            result,
+            Ok(SqlStatement::Select(SelectStatement {
+                columns: vec![ResultColumn::Expr {
+                    expr: Expression::FunctionCall {
+                        name: "COUNT".into(),
+                        args: Some(vec![Expression::Column(Column {
+                            name: "foo".into(),
+                            alias: None,
+                            table_no: None,
+                            column_no: None
+                        })])
+                    },
+                    alias: None,
+                }],
+                from: Some(FromClause {
+                    table: Table {
+                        name: "mytable".into(),
+                        alias: None,
+                        table_no: None
+                    },
+                    joins: vec![]
+                }),
+                where_clause: None,
+                group_by: None,
+                order_by: None,
+                limit: None
+            }))
+        );
+    }
+
+    #[test]
+    fn select_length_count_1_from_mytable() {
+        let mut input = "SELECT LENGTH(COUNT(1)) FROM mytable".to_string();
+        let result = parse_sql_statement(&mut input);
+        assert_eq!(
+            result,
+            Ok(SqlStatement::Select(SelectStatement {
+                columns: vec![ResultColumn::Expr {
+                    expr: Expression::FunctionCall {
+                        name: "LENGTH".into(),
+                        args: Some(vec![Expression::FunctionCall {
+                            name: "COUNT".into(),
+                            args: Some(vec![Expression::Literal("1".into())]),
+                        }]),
+                    },
+                    alias: None,
+                }],
+                from: Some(FromClause {
+                    table: Table {
+                        name: "mytable".into(),
+                        alias: None,
+                        table_no: None
+                    },
+                    joins: vec![]
+                }),
+                where_clause: None,
+                group_by: None,
+                order_by: None,
+                limit: None
+            }))
+        );
+    }
 }
