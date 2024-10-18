@@ -24,7 +24,7 @@ fn parse_table(input: &mut SqlTokenStream) -> PResult<Table> {
             input.next_token();
             let alias = parse_optional_alias(input)?;
             Ok(Table {
-                name: std::str::from_utf8(name).unwrap().to_string(),
+                name: name.to_string(),
                 alias,
                 table_no: None,
             })

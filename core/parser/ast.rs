@@ -19,6 +19,7 @@ pub enum Operator {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
     pub name: String,
+    pub table_name: Option<String>,
     pub alias: Option<String>,
     pub table_no: Option<u64>,
     pub column_no: Option<u64>,

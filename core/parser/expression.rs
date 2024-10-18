@@ -57,28 +57,44 @@ fn parse_atom(input: &mut SqlTokenStream) -> PResult<Expression> {
             // it's a function call
             input.next_token().unwrap();
             input.next_token().unwrap();
-            let name = std::str::from_utf8(name).unwrap().to_string();
+            let name = name.to_string();
             return parse_function_call(name, input);
         } else {
+            // it's a column. handle qualified column case
+            let mut table_name = None;
+            let column_name = name.to_string();
             input.next_token();
+
+            // Check if the next token is a period, indicating a qualified column
+            if let Some(SqlToken::Period) = input.get(0) {
+                input.next_token();
+                table_name = Some(column_name);
+
+                // The column name should be the identifier after the dot
+                if let Some(SqlToken::Identifier(col_name)) = input.get(0) {
+                    input.next_token();
+                    return Ok(Expression::Column(Column {
+                        name: col_name.to_string(),
+                        alias: None,
+                        table_name,
+                        table_no: None,
+                        column_no: None,
+                    }));
+                } else {
+                    return Err(ErrMode::Backtrack(ContextError::new()));
+                }
+            }
+
             return Ok(Expression::Column(Column {
-                name: std::str::from_utf8(name).unwrap().to_string(),
+                name: column_name,
                 alias: None,
+                table_name,
                 table_no: None,
                 column_no: None,
             }));
         }
     }
     match input.get(0) {
-        Some(SqlToken::Identifier(name)) => {
-            input.next_token();
-            Ok(Expression::Column(Column {
-                name: std::str::from_utf8(name).unwrap().to_string(),
-                alias: None,
-                table_no: None,
-                column_no: None,
-            }))
-        }
         Some(SqlToken::Literal(value)) => {
             input.next_token();
             Ok(Expression::Literal(

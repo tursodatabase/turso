@@ -39,9 +39,10 @@ pub enum SqlToken<'a> {
     Asc,
     Desc,
     Semicolon,
+    Period,
     Like,
     Literal(&'a [u8]),
-    Identifier(&'a [u8]),
+    Identifier(&'a str),
 }
 
 type Stream<'i> = &'i [u8];
@@ -152,8 +153,12 @@ fn sql_token<'i, E: ParserError<Stream<'i>> + AddContext<Stream<'i>, StrContext>
         keyword,
         comparison_operator,
         mathy_operator,
+        tk_period.value(SqlToken::Period),
         tk_literal.map(SqlToken::Literal),
-        tk_identifier.map(SqlToken::Identifier),
+        tk_identifier.map(|bytes| {
+            let str = std::str::from_utf8(bytes).unwrap();
+            SqlToken::Identifier(str)
+        }),
         tk_semicolon,
     ))
     .parse_next(input)
@@ -167,6 +172,10 @@ const WS: &[u8] = &[b' ', b'\t', b'\r', b'\n'];
 
 fn tk_like<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8], E> {
     literal(Caseless("LIKE")).parse_next(input)
+}
+
+fn tk_period<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8], E> {
+    literal(".").parse_next(input)
 }
 
 fn tk_semicolon<'i, E: ParserError<Stream<'i>>>(
@@ -287,8 +296,14 @@ fn tk_slash<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&
     literal("/").parse_next(input)
 }
 
+const HIGHEST_ASCII_CHARACTER: u8 = 0x7F;
+
+fn utf8_compatible_identifier_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c > HIGHEST_ASCII_CHARACTER
+}
+
 fn tk_identifier<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8], E> {
-    take_while(1.., |b: u8| b.is_ascii_alphanumeric() || b == b'_').parse_next(input)
+    take_while(1.., utf8_compatible_identifier_char).parse_next(input)
 }
 
 fn tk_literal<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> PResult<&'i [u8], E> {
@@ -343,7 +358,8 @@ mod tests {
             ("+", SqlToken::Plus),
             ("-", SqlToken::Minus),
             ("/", SqlToken::Slash),
-            ("column_name", SqlToken::Identifier(b"column_name")),
+            ("column_name", SqlToken::Identifier("column_name")),
+            ("🤡", SqlToken::Identifier("🤡")),
             ("'string literal'", SqlToken::Literal(b"string literal")),
             ("123", SqlToken::Literal(b"123")),
             ("123.45", SqlToken::Literal(b"123.45")),
@@ -408,7 +424,7 @@ mod tests {
         let mut input = "column_name".as_bytes();
         assert_eq!(
             parse_sql_token::<Error>(&mut input),
-            Ok(SqlToken::Identifier(b"column_name"))
+            Ok(SqlToken::Identifier("column_name"))
         );
         assert_eq!(input, b"");
 
@@ -494,13 +510,13 @@ mod tests {
         let input = b"SELECT column1 FROM table WHERE condition ORDER BY column1 LIMIT 10";
         let expected = vec![
             SqlToken::Select,
-            SqlToken::Identifier(b"column1"),
+            SqlToken::Identifier("column1"),
             SqlToken::From,
-            SqlToken::Identifier(b"table"),
+            SqlToken::Identifier("table"),
             SqlToken::Where,
-            SqlToken::Identifier(b"condition"),
+            SqlToken::Identifier("condition"),
             SqlToken::OrderBy,
-            SqlToken::Identifier(b"column1"),
+            SqlToken::Identifier("column1"),
             SqlToken::Limit,
             SqlToken::Literal(b"10"),
         ];
@@ -512,15 +528,15 @@ mod tests {
         let input = b"select col1 from TABLE where COL1 = 'value' GROUP BY col1";
         let expected = vec![
             SqlToken::Select,
-            SqlToken::Identifier(b"col1"),
+            SqlToken::Identifier("col1"),
             SqlToken::From,
-            SqlToken::Identifier(b"TABLE"),
+            SqlToken::Identifier("TABLE"),
             SqlToken::Where,
-            SqlToken::Identifier(b"COL1"),
+            SqlToken::Identifier("COL1"),
             SqlToken::Eq,
             SqlToken::Literal(b"value"),
             SqlToken::GroupBy,
-            SqlToken::Identifier(b"col1"),
+            SqlToken::Identifier("col1"),
         ];
 
         let result = parse_sql_string_to_tokens::<Error>(input).unwrap();
@@ -534,16 +550,16 @@ mod tests {
             SqlToken::From,
             SqlToken::ParenL,
             SqlToken::Select,
-            SqlToken::Identifier(b"id"),
+            SqlToken::Identifier("id"),
             SqlToken::Comma,
-            SqlToken::Identifier(b"name"),
+            SqlToken::Identifier("name"),
             SqlToken::From,
-            SqlToken::Identifier(b"users"),
+            SqlToken::Identifier("users"),
             SqlToken::ParenR,
             SqlToken::As,
-            SqlToken::Identifier(b"subquery"),
+            SqlToken::Identifier("subquery"),
             SqlToken::Where,
-            SqlToken::Identifier(b"id"),
+            SqlToken::Identifier("id"),
             SqlToken::Gt,
             SqlToken::Literal(b"5"),
         ];

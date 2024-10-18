@@ -79,6 +79,7 @@ mod tests {
                         expr: Expression::Column(Column {
                             name: "mycolumn".into(),
                             alias: None,
+                            table_name: None,
                             table_no: None,
                             column_no: None
                         }),
@@ -88,6 +89,7 @@ mod tests {
                         expr: Expression::Column(Column {
                             name: "mycolumn2".into(),
                             alias: None,
+                            table_name: None,
                             table_no: None,
                             column_no: None
                         }),
@@ -195,6 +197,7 @@ mod tests {
                 where_clause: Some(Expression::Binary {
                     lhs: Box::new(Expression::Column(Column {
                         name: "column1".into(),
+                        table_name: None,
                         alias: None,
                         table_no: None,
                         column_no: None
@@ -231,6 +234,7 @@ mod tests {
                         lhs: Box::new(Expression::Column(Column {
                             name: "column1".into(),
                             alias: None,
+                            table_name: None,
                             table_no: None,
                             column_no: None
                         })),
@@ -242,6 +246,7 @@ mod tests {
                         lhs: Box::new(Expression::Column(Column {
                             name: "column2".into(),
                             alias: None,
+                            table_name: None,
                             table_no: None,
                             column_no: None
                         })),
@@ -280,6 +285,7 @@ mod tests {
                         Expression::Column(Column {
                             name: "column1".into(),
                             alias: None,
+                            table_name: None,
                             table_no: None,
                             column_no: None
                         }),
@@ -289,6 +295,7 @@ mod tests {
                         Expression::Column(Column {
                             name: "column2".into(),
                             alias: None,
+                            table_name: None,
                             table_no: None,
                             column_no: None
                         }),
@@ -298,6 +305,7 @@ mod tests {
                         Expression::Column(Column {
                             name: "column3".into(),
                             alias: None,
+                            table_name: None,
                             table_no: None,
                             column_no: None
                         }),
@@ -330,12 +338,14 @@ mod tests {
                     Expression::Column(Column {
                         name: "column1".into(),
                         alias: None,
+                        table_name: None,
                         table_no: None,
                         column_no: None
                     }),
                     Expression::Column(Column {
                         name: "column2".into(),
                         alias: None,
+                        table_name: None,
                         table_no: None,
                         column_no: None
                     }),
@@ -367,6 +377,7 @@ mod tests {
                         lhs: Box::new(Expression::Column(Column {
                             name: "column1".into(),
                             alias: None,
+                            table_name: None,
                             table_no: None,
                             column_no: None
                         })),
@@ -379,6 +390,7 @@ mod tests {
                             lhs: Box::new(Expression::Column(Column {
                                 name: "column2".into(),
                                 alias: None,
+                                table_name: None,
                                 table_no: None,
                                 column_no: None
                             })),
@@ -390,6 +402,7 @@ mod tests {
                             lhs: Box::new(Expression::Column(Column {
                                 name: "column3".into(),
                                 alias: None,
+                                table_name: None,
                                 table_no: None,
                                 column_no: None
                             })),
@@ -418,6 +431,7 @@ mod tests {
                         args: Some(vec![Expression::Column(Column {
                             name: "foo".into(),
                             alias: None,
+                            table_name: None,
                             table_no: None,
                             column_no: None
                         })])
@@ -493,12 +507,46 @@ mod tests {
                     lhs: Box::new(Expression::Column(Column {
                         name: "column1".into(),
                         alias: None,
+                        table_name: None,
                         table_no: None,
                         column_no: None
                     })),
                     op: Operator::Like,
                     rhs: Box::new(Expression::Literal("value".into())),
                 }),
+                group_by: None,
+                order_by: None,
+                limit: None
+            }))
+        );
+    }
+
+    #[test]
+    fn select_qualified_col_from_mytable_as_mtbl() {
+        let mut input = "SELECT mtbl.column1 FROM mytable AS mtbl".to_string();
+        let result = parse_sql_statement(&mut input);
+        assert_eq!(
+            result,
+            Ok(SqlStatement::Select(SelectStatement {
+                columns: vec![ResultColumn::Expr {
+                    expr: Expression::Column(Column {
+                        name: "column1".into(),
+                        table_name: Some("mtbl".into()),
+                        alias: None,
+                        table_no: None,
+                        column_no: None
+                    }),
+                    alias: None,
+                }],
+                from: Some(FromClause {
+                    table: Table {
+                        name: "mytable".into(),
+                        alias: Some("mtbl".into()),
+                        table_no: None
+                    },
+                    joins: vec![]
+                }),
+                where_clause: None,
                 group_by: None,
                 order_by: None,
                 limit: None

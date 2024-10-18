@@ -39,13 +39,13 @@ pub(crate) fn parse_optional_alias(input: &mut SqlTokenStream) -> PResult<Option
     if let Ok(()) = expect_token(input, SqlToken::As) {
         if let Some(SqlToken::Identifier(alias)) = input.get(0) {
             input.next_token();
-            Ok(Some(std::str::from_utf8(alias).unwrap().to_string()))
+            Ok(Some(alias.to_string()))
         } else {
             Err(ErrMode::Backtrack(ContextError::new()))
         }
     } else if let Some(SqlToken::Identifier(alias)) = input.get(0) {
         input.next_token();
-        Ok(Some(std::str::from_utf8(alias).unwrap().to_string()))
+        Ok(Some(alias.to_string()))
     } else {
         Ok(None)
     }
