@@ -45,6 +45,76 @@ pub enum SqlToken<'a> {
     Identifier(&'a str),
 }
 
+impl std::fmt::Display for SqlToken<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SqlToken::Literal(literal) => {
+                write!(f, "literal: {}", std::str::from_utf8(literal).unwrap())
+            }
+            SqlToken::Identifier(identifier) => write!(f, "identifier: {}", identifier),
+            SqlToken::Select => write!(f, "'SELECT'"),
+            SqlToken::From => write!(f, "'FROM'"),
+            SqlToken::Where => write!(f, "'WHERE'"),
+            SqlToken::And => write!(f, "'AND'"),
+            SqlToken::Or => write!(f, "'OR'"),
+            SqlToken::Not => write!(f, "'NOT'"),
+            SqlToken::As => write!(f, "'AS'"),
+            SqlToken::GroupBy => write!(f, "'GROUP BY'"),
+            SqlToken::OrderBy => write!(f, "'ORDER BY'"),
+            SqlToken::Limit => write!(f, "'LIMIT'"),
+            SqlToken::ParenL => write!(f, "'('"),
+            SqlToken::ParenR => write!(f, "')'"),
+            SqlToken::Comma => write!(f, "','"),
+            SqlToken::Asterisk => write!(f, "'*'"),
+            SqlToken::Plus => write!(f, "'+'"),
+            SqlToken::Minus => write!(f, "'-'"),
+            SqlToken::Slash => write!(f, "/"),
+            SqlToken::Eq => write!(f, "="),
+            SqlToken::Neq => write!(f, "!="),
+            SqlToken::Ge => write!(f, ">="),
+            SqlToken::Gt => write!(f, ">"),
+            SqlToken::Le => write!(f, "<="),
+            SqlToken::Lt => write!(f, "<"),
+            SqlToken::Join => write!(f, "JOIN"),
+            SqlToken::Left => write!(f, "LEFT"),
+            SqlToken::Inner => write!(f, "INNER"),
+            SqlToken::Outer => write!(f, "OUTER"),
+            SqlToken::On => write!(f, "ON"),
+            SqlToken::Asc => write!(f, "ASC"),
+            SqlToken::Desc => write!(f, "DESC"),
+            SqlToken::Semicolon => write!(f, ";"),
+            SqlToken::Period => write!(f, "."),
+            SqlToken::Like => write!(f, "LIKE"),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct SqlTokenStream<'a> {
+    tokens: Vec<SqlToken<'a>>,
+    index: usize,
+}
+
+impl<'a> SqlTokenStream<'a> {
+    pub fn next_token(&mut self) -> Option<SqlToken<'a>> {
+        if self.index < self.tokens.len() {
+            let token = self.tokens[self.index];
+            self.index += 1;
+            Some(token)
+        } else {
+            None
+        }
+    }
+
+    pub fn peek(&self, offset: usize) -> Option<SqlToken<'a>> {
+        if self.index + offset < self.tokens.len() {
+            Some(self.tokens[self.index + offset])
+        } else {
+            None
+        }
+    }
+}
+
 type Stream<'i> = &'i [u8];
 
 pub fn parse_sql_string_to_tokens<
@@ -52,7 +122,7 @@ pub fn parse_sql_string_to_tokens<
     E: ParserError<Stream<'i>> + AddContext<Stream<'i>, StrContext>,
 >(
     input: &'i [u8],
-) -> PResult<Vec<SqlToken<'i>>, E> {
+) -> PResult<SqlTokenStream<'i>, E> {
     let mut tokens = Vec::new();
     let mut stream = input;
 
@@ -68,7 +138,7 @@ pub fn parse_sql_string_to_tokens<
         }
     }
 
-    Ok(tokens)
+    Ok(SqlTokenStream { tokens, index: 0 })
 }
 
 fn parse_sql_token<'i, E: ParserError<Stream<'i>> + AddContext<Stream<'i>, StrContext>>(
@@ -508,63 +578,72 @@ mod tests {
     #[test]
     fn test_parse_sql_string_into_tokens() {
         let input = b"SELECT column1 FROM table WHERE condition ORDER BY column1 LIMIT 10";
-        let expected = vec![
-            SqlToken::Select,
-            SqlToken::Identifier("column1"),
-            SqlToken::From,
-            SqlToken::Identifier("table"),
-            SqlToken::Where,
-            SqlToken::Identifier("condition"),
-            SqlToken::OrderBy,
-            SqlToken::Identifier("column1"),
-            SqlToken::Limit,
-            SqlToken::Literal(b"10"),
-        ];
+        let expected = SqlTokenStream {
+            tokens: vec![
+                SqlToken::Select,
+                SqlToken::Identifier("column1"),
+                SqlToken::From,
+                SqlToken::Identifier("table"),
+                SqlToken::Where,
+                SqlToken::Identifier("condition"),
+                SqlToken::OrderBy,
+                SqlToken::Identifier("column1"),
+                SqlToken::Limit,
+                SqlToken::Literal(b"10"),
+            ],
+            index: 0,
+        };
 
         let result = parse_sql_string_to_tokens::<Error>(input);
         assert_eq!(result, Ok(expected));
 
         // Test with mixed case and literals
         let input = b"select col1 from TABLE where COL1 = 'value' GROUP BY col1";
-        let expected = vec![
-            SqlToken::Select,
-            SqlToken::Identifier("col1"),
-            SqlToken::From,
-            SqlToken::Identifier("TABLE"),
-            SqlToken::Where,
-            SqlToken::Identifier("COL1"),
-            SqlToken::Eq,
-            SqlToken::Literal(b"value"),
-            SqlToken::GroupBy,
-            SqlToken::Identifier("col1"),
-        ];
+        let expected = SqlTokenStream {
+            tokens: vec![
+                SqlToken::Select,
+                SqlToken::Identifier("col1"),
+                SqlToken::From,
+                SqlToken::Identifier("TABLE"),
+                SqlToken::Where,
+                SqlToken::Identifier("COL1"),
+                SqlToken::Eq,
+                SqlToken::Literal(b"value"),
+                SqlToken::GroupBy,
+                SqlToken::Identifier("col1"),
+            ],
+            index: 0,
+        };
 
-        let result = parse_sql_string_to_tokens::<Error>(input).unwrap();
-        assert_eq!(result, expected);
+        let result = parse_sql_string_to_tokens::<Error>(input);
+        assert_eq!(result, Ok(expected));
 
         // Test with new tokens
         let input = b"SELECT * FROM (SELECT id, name FROM users) AS subquery WHERE id > 5";
-        let expected = vec![
-            SqlToken::Select,
-            SqlToken::Asterisk,
-            SqlToken::From,
-            SqlToken::ParenL,
-            SqlToken::Select,
-            SqlToken::Identifier("id"),
-            SqlToken::Comma,
-            SqlToken::Identifier("name"),
-            SqlToken::From,
-            SqlToken::Identifier("users"),
-            SqlToken::ParenR,
-            SqlToken::As,
-            SqlToken::Identifier("subquery"),
-            SqlToken::Where,
-            SqlToken::Identifier("id"),
-            SqlToken::Gt,
-            SqlToken::Literal(b"5"),
-        ];
+        let expected = SqlTokenStream {
+            tokens: vec![
+                SqlToken::Select,
+                SqlToken::Asterisk,
+                SqlToken::From,
+                SqlToken::ParenL,
+                SqlToken::Select,
+                SqlToken::Identifier("id"),
+                SqlToken::Comma,
+                SqlToken::Identifier("name"),
+                SqlToken::From,
+                SqlToken::Identifier("users"),
+                SqlToken::ParenR,
+                SqlToken::As,
+                SqlToken::Identifier("subquery"),
+                SqlToken::Where,
+                SqlToken::Identifier("id"),
+                SqlToken::Gt,
+                SqlToken::Literal(b"5"),
+            ],
+            index: 0,
+        };
 
-        let result = parse_sql_string_to_tokens::<Error>(input).unwrap();
-        assert_eq!(result, expected);
+        let result = parse_sql_string_to_tokens::<Error>(input);
+        assert_eq!(result, Ok(expected));
     }
 }

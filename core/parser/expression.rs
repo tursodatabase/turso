@@ -1,13 +1,13 @@
-use winnow::error::{ContextError, ErrMode};
-use winnow::stream::Stream;
-use winnow::PResult;
-
 use super::ast::{Column, Expression};
 use super::operators::peek_operator;
-use super::utils::expect_token;
-use super::{SqlToken, SqlTokenStream};
+use super::tokenizer::SqlTokenStream;
+use super::utils::{expect_token, SqlParseError};
+use super::{Operator, SqlToken};
 
-pub(crate) fn parse_expr(input: &mut SqlTokenStream, min_precedence: u8) -> PResult<Expression> {
+pub(crate) fn parse_expr(
+    input: &mut SqlTokenStream,
+    min_precedence: u8,
+) -> Result<Expression, SqlParseError> {
     let mut lhs = parse_atom(input)?;
 
     loop {
@@ -30,16 +30,19 @@ pub(crate) fn parse_expr(input: &mut SqlTokenStream, min_precedence: u8) -> PRes
     Ok(lhs)
 }
 
-fn parse_function_call(name: String, input: &mut SqlTokenStream) -> PResult<Expression> {
+fn parse_function_call(
+    name: String,
+    input: &mut SqlTokenStream,
+) -> Result<Expression, SqlParseError> {
     // parse until we find a closing parenthesis. we expect to find Expr + comma, so we need to peek after
     // each Expr to see if we should continue parsing
     // at this point we have already consumed the opening parenthesis, so we can just parse the Expr
-    if let Some(SqlToken::ParenR) = input.get(0) {
+    if let Some(SqlToken::ParenR) = input.peek(0) {
         input.next_token();
         return Ok(Expression::FunctionCall { name, args: None });
     }
     let mut args = vec![parse_expr(input, 0)?];
-    while let Some(SqlToken::Comma) = input.get(0) {
+    while let Some(SqlToken::Comma) = input.peek(0) {
         input.next_token();
         args.push(parse_expr(input, 0)?);
     }
@@ -50,10 +53,10 @@ fn parse_function_call(name: String, input: &mut SqlTokenStream) -> PResult<Expr
     })
 }
 
-fn parse_atom(input: &mut SqlTokenStream) -> PResult<Expression> {
+fn parse_atom(input: &mut SqlTokenStream) -> Result<Expression, SqlParseError> {
     // if first token is an identifier, we need to check if it's a function call or a column
-    if let Some(SqlToken::Identifier(name)) = input.get(0) {
-        if let Some(SqlToken::ParenL) = input.get(1) {
+    if let Some(SqlToken::Identifier(name)) = input.peek(0) {
+        if let Some(SqlToken::ParenL) = input.peek(1) {
             // it's a function call
             input.next_token().unwrap();
             input.next_token().unwrap();
@@ -66,12 +69,12 @@ fn parse_atom(input: &mut SqlTokenStream) -> PResult<Expression> {
             input.next_token();
 
             // Check if the next token is a period, indicating a qualified column
-            if let Some(SqlToken::Period) = input.get(0) {
+            if let Some(SqlToken::Period) = input.peek(0) {
                 input.next_token();
                 table_name = Some(column_name);
 
                 // The column name should be the identifier after the dot
-                if let Some(SqlToken::Identifier(col_name)) = input.get(0) {
+                if let Some(SqlToken::Identifier(col_name)) = input.peek(0) {
                     input.next_token();
                     return Ok(Expression::Column(Column {
                         name: col_name.to_string(),
@@ -80,8 +83,13 @@ fn parse_atom(input: &mut SqlTokenStream) -> PResult<Expression> {
                         table_no: None,
                         column_no: None,
                     }));
+                } else if let Some(wrong_token) = input.peek(0) {
+                    return Err(SqlParseError::new(format!(
+                        "Expected column name after '.', got {}",
+                        wrong_token
+                    )));
                 } else {
-                    return Err(ErrMode::Backtrack(ContextError::new()));
+                    return Err(SqlParseError::new("Expected column name after '.'"));
                 }
             }
 
@@ -94,12 +102,41 @@ fn parse_atom(input: &mut SqlTokenStream) -> PResult<Expression> {
             }));
         }
     }
-    match input.get(0) {
+    match input.peek(0) {
         Some(SqlToken::Literal(value)) => {
             input.next_token();
-            Ok(Expression::Literal(
-                std::str::from_utf8(value).unwrap().to_string(),
-            ))
+            // try parsing bytes as string, then number, then blob
+            let maybe_string = std::str::from_utf8(value);
+            if let Ok(string) = maybe_string {
+                let maybe_number = string.parse::<f64>();
+                match maybe_number {
+                    Ok(_) => return Ok(Expression::LiteralNumber(string.to_string())),
+                    Err(_) => return Ok(Expression::LiteralString(string.to_string())),
+                }
+            }
+            return Ok(Expression::LiteralBlob(value.to_vec()));
+        }
+        Some(SqlToken::Asterisk) => {
+            input.next_token();
+            Ok(Expression::LiteralString("*".to_string()))
+        }
+        Some(SqlToken::Minus) => {
+            input.next_token();
+            let expr = parse_expr(input, 0)?;
+            Ok(Expression::Unary {
+                op: Operator::Minus,
+                expr: Box::new(expr),
+            })
+        }
+        Some(SqlToken::Like) => {
+            // like is also a function call, so we need to parse it as such
+            if let Some(SqlToken::ParenL) = input.peek(1) {
+                input.next_token();
+                input.next_token();
+                return parse_function_call("like".to_string(), input);
+            }
+
+            Err(SqlParseError::new("Expected '(' after 'like' when not used as a binary operator"))
         }
         Some(SqlToken::ParenL) => {
             input.next_token();
@@ -107,6 +144,10 @@ fn parse_atom(input: &mut SqlTokenStream) -> PResult<Expression> {
             expect_token(input, SqlToken::ParenR)?;
             Ok(Expression::Parenthesized(Box::new(expr)))
         }
-        _ => Err(ErrMode::Backtrack(ContextError::new())),
+        Some(wrong_token) => Err(SqlParseError::new(format!(
+            "Expected one of: literal, identifier, function call, or parenthesized expression, got {}",
+            wrong_token
+        ))),
+        None => Err(SqlParseError::new("Unexpected end of input")),
     }
 }

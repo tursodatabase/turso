@@ -1,20 +1,23 @@
-use winnow::PResult;
-
 use super::ast::{SelectStatement, SqlStatement};
 use super::clause::{
     parse_from_clause, parse_group_by_clause, parse_limit_clause, parse_order_by_clause,
     parse_where_clause,
 };
-use super::tokenizer::SqlToken;
-use super::utils::{expect_token, parse_result_columns};
-use super::{tokenizer, SqlTokenStream};
+use super::tokenizer::{self, SqlToken, SqlTokenStream};
+use super::utils::{expect_token, parse_result_columns, SqlParseError};
 
-pub fn parse_sql_statement(input: &mut str) -> PResult<SqlStatement> {
-    let tokens = tokenizer::parse_sql_string_to_tokens(input.as_bytes())?;
-    parse_select_statement(&mut tokens.as_slice()).map(SqlStatement::Select)
+pub fn parse_sql_statement(input: &mut str) -> Result<SqlStatement, SqlParseError> {
+    let token_stream = tokenizer::parse_sql_string_to_tokens::<()>(input.as_bytes());
+    match token_stream {
+        Ok(mut token_stream) => parse_select_statement(&mut token_stream).map(SqlStatement::Select),
+        Err(e) => Err(SqlParseError::new(format!(
+            "FIXME fix this garbage error - Tokenizer error: {}",
+            e
+        ))),
+    }
 }
 
-fn parse_select_statement(input: &mut SqlTokenStream) -> PResult<SelectStatement> {
+fn parse_select_statement(input: &mut SqlTokenStream) -> Result<SelectStatement, SqlParseError> {
     expect_token(input, SqlToken::Select)?;
 
     let columns = parse_result_columns(input)?;
@@ -36,6 +39,8 @@ fn parse_select_statement(input: &mut SqlTokenStream) -> PResult<SelectStatement
 
 #[cfg(test)]
 mod tests {
+    use std::{fs::File, io::Read};
+
     use crate::parser::{
         Column, Direction, Expression, FromClause, Join, JoinType, JoinVariant, Operator,
         ResultColumn, Table,
@@ -203,7 +208,7 @@ mod tests {
                         column_no: None
                     })),
                     op: Operator::Eq,
-                    rhs: Box::new(Expression::Literal("value".into()))
+                    rhs: Box::new(Expression::LiteralString("value".into()))
                 }),
                 group_by: None,
                 order_by: None,
@@ -239,7 +244,7 @@ mod tests {
                             column_no: None
                         })),
                         op: Operator::Eq,
-                        rhs: Box::new(Expression::Literal("value".into()))
+                        rhs: Box::new(Expression::LiteralString("value".into()))
                     }),
                     op: Operator::And,
                     rhs: Box::new(Expression::Binary {
@@ -251,7 +256,7 @@ mod tests {
                             column_no: None
                         })),
                         op: Operator::Gt,
-                        rhs: Box::new(Expression::Literal("10".into()))
+                        rhs: Box::new(Expression::LiteralNumber("10".into()))
                     })
                 }),
                 group_by: None,
@@ -382,7 +387,7 @@ mod tests {
                             column_no: None
                         })),
                         op: Operator::Eq,
-                        rhs: Box::new(Expression::Literal("value".into()))
+                        rhs: Box::new(Expression::LiteralString("value".into()))
                     }),
                     op: Operator::And,
                     rhs: Box::new(Expression::Parenthesized(Box::new(Expression::Binary {
@@ -395,7 +400,7 @@ mod tests {
                                 column_no: None
                             })),
                             op: Operator::Eq,
-                            rhs: Box::new(Expression::Literal("value2".into()))
+                            rhs: Box::new(Expression::LiteralString("value2".into()))
                         }),
                         op: Operator::Or,
                         rhs: Box::new(Expression::Binary {
@@ -407,7 +412,7 @@ mod tests {
                                 column_no: None
                             })),
                             op: Operator::Eq,
-                            rhs: Box::new(Expression::Literal("value3".into()))
+                            rhs: Box::new(Expression::LiteralString("value3".into()))
                         })
                     })))
                 }),
@@ -466,7 +471,7 @@ mod tests {
                         name: "LENGTH".into(),
                         args: Some(vec![Expression::FunctionCall {
                             name: "COUNT".into(),
-                            args: Some(vec![Expression::Literal("1".into())]),
+                            args: Some(vec![Expression::LiteralNumber("1".into())]),
                         }]),
                     },
                     alias: None,
@@ -512,7 +517,7 @@ mod tests {
                         column_no: None
                     })),
                     op: Operator::Like,
-                    rhs: Box::new(Expression::Literal("value".into())),
+                    rhs: Box::new(Expression::LiteralString("value".into())),
                 }),
                 group_by: None,
                 order_by: None,
@@ -552,5 +557,37 @@ mod tests {
                 limit: None
             }))
         );
+    }
+
+    #[test]
+    fn shitty_fuzzer() {
+        let current_dir = std::env::current_dir().unwrap();
+        // scraped all the SELECT tests from testing/*.test
+        let mut file = File::open(
+            current_dir
+                .join("parser")
+                .join("parser-shitty-fuzzer-input.txt"),
+        )
+        .expect("Failed to open parser-shitty-fuzzer-input.txt");
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+        let queries = contents.split('\n').collect::<Vec<&str>>();
+
+        let ignore_queries_starting_with_fail = true;
+        for query in queries {
+            let mut query = query.to_string();
+            if ignore_queries_starting_with_fail && query.starts_with("FAIL:") {
+                // skip these queries until i have the energy to fix them
+                println!("parser fuzzer skipping query: {}", query);
+                continue;
+            }
+            let result = parse_sql_statement(&mut query);
+            assert!(
+                result.is_ok(),
+                "Failed to parse query {}, error: {}",
+                query,
+                result.unwrap_err()
+            );
+        }
     }
 }

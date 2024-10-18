@@ -1,8 +1,8 @@
 use super::ast::Operator;
-use super::tokenizer::SqlToken;
+use super::tokenizer::{SqlToken, SqlTokenStream};
 
-pub(crate) fn peek_operator(input: &[SqlToken]) -> Option<(Operator, u8)> {
-    match input.get(0) {
+pub(crate) fn peek_operator(input: &SqlTokenStream) -> Option<(Operator, u8)> {
+    match input.peek(0) {
         Some(SqlToken::Eq) => Some((Operator::Eq, 2)),
         Some(SqlToken::Neq) => Some((Operator::NotEq, 2)),
         Some(SqlToken::Lt) => Some((Operator::Lt, 2)),

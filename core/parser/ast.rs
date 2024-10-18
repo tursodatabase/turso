@@ -1,5 +1,6 @@
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+
 pub enum Operator {
     Eq = 0,
     NotEq = 1,
@@ -28,7 +29,13 @@ pub struct Column {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expression {
     Column(Column),
-    Literal(String),
+    LiteralString(String),
+    LiteralNumber(String),
+    LiteralBlob(Vec<u8>),
+    Unary {
+        op: Operator,
+        expr: Box<Expression>,
+    },
     Binary {
         lhs: Box<Expression>,
         op: Operator,
@@ -48,6 +55,9 @@ pub enum ResultColumn {
         alias: Option<String>,
     },
     Star,
+    TableStar {
+        table: Table,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

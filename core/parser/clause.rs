@@ -1,13 +1,12 @@
-use winnow::error::{ContextError, ErrMode};
-use winnow::stream::Stream;
-use winnow::PResult;
-
 use super::ast::{Expression, FromClause, Join, JoinType, JoinVariant, Table};
 use super::expression::parse_expr;
-use super::utils::{expect_token, parse_optional_alias};
-use super::{Direction, SqlToken, SqlTokenStream};
+use super::tokenizer::SqlTokenStream;
+use super::utils::{expect_token, parse_optional_alias, SqlParseError};
+use super::{Direction, SqlToken};
 
-pub(crate) fn parse_from_clause(input: &mut SqlTokenStream) -> PResult<Option<FromClause>> {
+pub(crate) fn parse_from_clause(
+    input: &mut SqlTokenStream,
+) -> Result<Option<FromClause>, SqlParseError> {
     if let Err(_) = expect_token(input, SqlToken::From) {
         return Ok(None);
     }
@@ -18,8 +17,8 @@ pub(crate) fn parse_from_clause(input: &mut SqlTokenStream) -> PResult<Option<Fr
     Ok(Some(FromClause { table, joins }))
 }
 
-fn parse_table(input: &mut SqlTokenStream) -> PResult<Table> {
-    match input.get(0) {
+fn parse_table(input: &mut SqlTokenStream) -> Result<Table, SqlParseError> {
+    match input.peek(0) {
         Some(SqlToken::Identifier(name)) => {
             input.next_token();
             let alias = parse_optional_alias(input)?;
@@ -29,11 +28,15 @@ fn parse_table(input: &mut SqlTokenStream) -> PResult<Table> {
                 table_no: None,
             })
         }
-        _ => Err(ErrMode::Backtrack(ContextError::new())),
+        Some(wrong_token) => Err(SqlParseError::new(&format!(
+            "Expected identifier, got: {}",
+            wrong_token
+        ))),
+        None => Err(SqlParseError::new("Expected identifier, got EOF")),
     }
 }
 
-fn parse_joins(input: &mut SqlTokenStream) -> PResult<Vec<Join>> {
+fn parse_joins(input: &mut SqlTokenStream) -> Result<Vec<Join>, SqlParseError> {
     let mut joins = Vec::new();
 
     while let Ok(join) = parse_join(input) {
@@ -43,7 +46,7 @@ fn parse_joins(input: &mut SqlTokenStream) -> PResult<Vec<Join>> {
     Ok(joins)
 }
 
-fn parse_join(input: &mut SqlTokenStream) -> PResult<Join> {
+fn parse_join(input: &mut SqlTokenStream) -> Result<Join, SqlParseError> {
     let join_type = parse_join_type(input)?;
     expect_token(input, SqlToken::Join)?;
     let table = parse_table(input)?;
@@ -56,10 +59,10 @@ fn parse_join(input: &mut SqlTokenStream) -> PResult<Join> {
     })
 }
 
-fn parse_join_type(input: &mut SqlTokenStream) -> PResult<JoinType> {
+fn parse_join_type(input: &mut SqlTokenStream) -> Result<JoinType, SqlParseError> {
     let mut join_type = JoinType::new();
 
-    while let Some(token) = input.get(0) {
+    while let Some(token) = input.peek(0) {
         match token {
             SqlToken::Inner => {
                 input.next_token();
@@ -80,7 +83,7 @@ fn parse_join_type(input: &mut SqlTokenStream) -> PResult<JoinType> {
     Ok(join_type)
 }
 
-fn parse_on_clause(input: &mut SqlTokenStream) -> PResult<Option<Expression>> {
+fn parse_on_clause(input: &mut SqlTokenStream) -> Result<Option<Expression>, SqlParseError> {
     if let Ok(()) = expect_token(input, SqlToken::On) {
         parse_expr(input, 0).map(Some)
     } else {
@@ -88,7 +91,9 @@ fn parse_on_clause(input: &mut SqlTokenStream) -> PResult<Option<Expression>> {
     }
 }
 
-pub(crate) fn parse_where_clause(input: &mut SqlTokenStream) -> PResult<Option<Expression>> {
+pub(crate) fn parse_where_clause(
+    input: &mut SqlTokenStream,
+) -> Result<Option<Expression>, SqlParseError> {
     if let Ok(()) = expect_token(input, SqlToken::Where) {
         parse_expr(input, 0).map(Some)
     } else {
@@ -98,10 +103,10 @@ pub(crate) fn parse_where_clause(input: &mut SqlTokenStream) -> PResult<Option<E
 
 pub(crate) fn parse_group_by_clause(
     input: &mut SqlTokenStream,
-) -> PResult<Option<Vec<Expression>>> {
+) -> Result<Option<Vec<Expression>>, SqlParseError> {
     if let Ok(()) = expect_token(input, SqlToken::GroupBy) {
         let mut expressions = vec![parse_expr(input, 0)?];
-        while let Some(token) = input.get(0) {
+        while let Some(token) = input.peek(0) {
             if let SqlToken::Comma = token {
                 input.next_token();
                 expressions.push(parse_expr(input, 0)?);
@@ -117,10 +122,10 @@ pub(crate) fn parse_group_by_clause(
 
 pub(crate) fn parse_order_by_clause(
     input: &mut SqlTokenStream,
-) -> PResult<Option<Vec<(Expression, Direction)>>> {
+) -> Result<Option<Vec<(Expression, Direction)>>, SqlParseError> {
     if let Ok(()) = expect_token(input, SqlToken::OrderBy) {
         let mut expressions = vec![parse_order_by_expr(input)?];
-        while let Some(token) = input.get(0) {
+        while let Some(token) = input.peek(0) {
             if let SqlToken::Comma = token {
                 input.next_token();
                 expressions.push(parse_order_by_expr(input)?);
@@ -134,7 +139,9 @@ pub(crate) fn parse_order_by_clause(
     }
 }
 
-fn parse_order_by_expr(input: &mut SqlTokenStream) -> PResult<(Expression, Direction)> {
+fn parse_order_by_expr(
+    input: &mut SqlTokenStream,
+) -> Result<(Expression, Direction), SqlParseError> {
     let expr = parse_expr(input, 0)?;
     if let Ok(()) = expect_token(input, SqlToken::Asc) {
         Ok((expr, Direction::Ascending))
@@ -145,17 +152,17 @@ fn parse_order_by_expr(input: &mut SqlTokenStream) -> PResult<(Expression, Direc
     }
 }
 
-pub(crate) fn parse_limit_clause(input: &mut SqlTokenStream) -> PResult<Option<u64>> {
+pub(crate) fn parse_limit_clause(input: &mut SqlTokenStream) -> Result<Option<u64>, SqlParseError> {
     if let Ok(()) = expect_token(input, SqlToken::Limit) {
-        if let Some(SqlToken::Literal(limit)) = input.get(0) {
+        if let Some(SqlToken::Literal(limit)) = input.peek(0) {
             input.next_token();
             std::str::from_utf8(limit)
                 .unwrap()
                 .parse::<u64>()
                 .map(Some)
-                .map_err(|_| ErrMode::Backtrack(ContextError::new()))
+                .map_err(|_| SqlParseError::new("Expected integer literal after LIMIT"))
         } else {
-            Err(ErrMode::Backtrack(ContextError::new()))
+            Err(SqlParseError::new("Expected integer literal after LIMIT"))
         }
     } else {
         Ok(None)
