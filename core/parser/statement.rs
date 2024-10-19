@@ -6,7 +6,7 @@ use super::clause::{
 use super::tokenizer::{self, SqlTokenKind, SqlTokenStream};
 use super::utils::{expect_token, parse_result_columns, SqlParseError};
 
-pub fn parse_sql_statement(input: &mut str) -> Result<SqlStatement, SqlParseError> {
+pub fn parse_sql_statement(input: &str) -> Result<SqlStatement, SqlParseError> {
     let token_stream = tokenizer::parse_sql_string_to_tokens::<()>(input.as_bytes());
     match token_stream {
         Ok(mut token_stream) => parse_select_statement(&mut token_stream).map(SqlStatement::Select),
@@ -27,6 +27,8 @@ fn parse_select_statement(input: &mut SqlTokenStream) -> Result<SelectStatement,
     let order_by = parse_order_by_clause(input)?;
     let limit = parse_limit_clause(input)?;
 
+    assert_eof(input)?;
+
     Ok(SelectStatement {
         columns,
         from,
@@ -35,6 +37,16 @@ fn parse_select_statement(input: &mut SqlTokenStream) -> Result<SelectStatement,
         order_by,
         limit,
     })
+}
+
+fn assert_eof(input: &mut SqlTokenStream) -> Result<(), SqlParseError> {
+    if let Some(token) = input.peek(0) {
+        return Err(SqlParseError::new(format!(
+            "Unexpected token at end of input: {}",
+            token.print(&input.source)
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -62,7 +74,7 @@ mod tests {
                         alias: None,
                         table_no: None
                     },
-                    joins: vec![]
+                    joins: None,
                 }),
                 group_by: None,
                 order_by: None,
@@ -107,7 +119,7 @@ mod tests {
                         alias: None,
                         table_no: None
                     },
-                    joins: vec![]
+                    joins: None,
                 }),
                 group_by: None,
                 order_by: None,
@@ -131,7 +143,7 @@ mod tests {
                         alias: None,
                         table_no: None
                     },
-                    joins: vec![Join {
+                    joins: Some(vec![Join {
                         join_type: JoinType::new().with(JoinVariant::Inner),
                         table: Table {
                             name: "mytable2".into(),
@@ -139,7 +151,7 @@ mod tests {
                             table_no: None
                         },
                         on: None
-                    }]
+                    }]),
                 }),
                 group_by: None,
                 order_by: None,
@@ -163,7 +175,7 @@ mod tests {
                         alias: None,
                         table_no: None
                     },
-                    joins: vec![Join {
+                    joins: Some(vec![Join {
                         join_type: JoinType::new()
                             .with(JoinVariant::Left)
                             .with(JoinVariant::Outer),
@@ -173,7 +185,7 @@ mod tests {
                             table_no: None
                         },
                         on: None
-                    }]
+                    }]),
                 }),
                 where_clause: None,
                 group_by: None,
@@ -197,7 +209,7 @@ mod tests {
                         alias: None,
                         table_no: None
                     },
-                    joins: vec![]
+                    joins: None,
                 }),
                 where_clause: Some(Expression::Binary {
                     lhs: Box::new(Expression::Column(Column {
@@ -232,7 +244,7 @@ mod tests {
                         alias: None,
                         table_no: None
                     },
-                    joins: vec![]
+                    joins: None,
                 }),
                 where_clause: Some(Expression::Binary {
                     lhs: Box::new(Expression::Binary {
@@ -281,7 +293,7 @@ mod tests {
                         alias: None,
                         table_no: None
                     },
-                    joins: vec![]
+                    joins: None,
                 }),
                 where_clause: None,
                 group_by: None,
@@ -336,7 +348,7 @@ mod tests {
                         alias: None,
                         table_no: None
                     },
-                    joins: vec![]
+                    joins: None,
                 }),
                 where_clause: None,
                 group_by: Some(vec![
@@ -375,7 +387,7 @@ mod tests {
                         alias: None,
                         table_no: None
                     },
-                    joins: vec![]
+                    joins: None,
                 }),
                 where_clause: Some(Expression::Binary {
                     lhs: Box::new(Expression::Binary {
@@ -449,7 +461,7 @@ mod tests {
                         alias: None,
                         table_no: None
                     },
-                    joins: vec![]
+                    joins: None,
                 }),
                 where_clause: None,
                 group_by: None,
@@ -482,7 +494,7 @@ mod tests {
                         alias: None,
                         table_no: None
                     },
-                    joins: vec![]
+                    joins: None,
                 }),
                 where_clause: None,
                 group_by: None,
@@ -506,7 +518,7 @@ mod tests {
                         alias: None,
                         table_no: None
                     },
-                    joins: vec![]
+                    joins: None,
                 }),
                 where_clause: Some(Expression::Binary {
                     lhs: Box::new(Expression::Column(Column {
@@ -549,7 +561,7 @@ mod tests {
                         alias: Some("mtbl".into()),
                         table_no: None
                     },
-                    joins: vec![]
+                    joins: None,
                 }),
                 where_clause: None,
                 group_by: None,
@@ -557,6 +569,24 @@ mod tests {
                 limit: None
             }))
         );
+    }
+
+    #[test]
+    fn test_error_message() {
+        let test_cases = vec![
+            ("SELECT * FROM users WHERE column1 = 'value' ORDER BY", "Unexpected end of input"),
+            ("SELECT foo, bar FROM WHERE column1 = 'value'", "Expected identifier, got: 'WHERE' at position 21 near ' bar FROM WHERE column1 ='"),
+            ("SELECT * FROM users ORDER BY name ASCII", "Unexpected token at end of input: identifier: ASCII at position 34 near 'R BY name ASCII'"),
+        ];
+        for (input, expected_message) in test_cases {
+            let result = parse_sql_statement(&input);
+            assert_eq!(
+                result,
+                Err(SqlParseError {
+                    message: expected_message.into(),
+                })
+            );
+        }
     }
 
     #[test]

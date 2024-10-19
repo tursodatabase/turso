@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use winnow::ascii::Caseless;
-use winnow::combinator::{alt, delimited};
+use winnow::combinator::{alt, delimited, fail, terminated};
 use winnow::error::{AddContext, ParserError, StrContext};
 use winnow::token::{literal, take_while};
 use winnow::PResult;
@@ -38,11 +38,15 @@ pub enum SqlTokenKind {
     Inner,
     Outer,
     On,
+    In,
+    NotIn,
     Asc,
     Desc,
     Semicolon,
     Period,
     Like,
+    NotLike,
+    Glob,
     Literal,
     Identifier,
 }
@@ -50,7 +54,7 @@ pub enum SqlTokenKind {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct SqlToken {
     kind: SqlTokenKind,
-    span: Range<usize>,
+    span: Range<u32>,
 }
 
 impl SqlToken {
@@ -95,18 +99,23 @@ impl SqlToken {
             SqlTokenKind::Inner => format!("INNER"),
             SqlTokenKind::Outer => format!("OUTER"),
             SqlTokenKind::On => format!("ON"),
+            SqlTokenKind::In => format!("IN"),
+            SqlTokenKind::NotIn => format!("NOT IN"),
             SqlTokenKind::Asc => format!("ASC"),
             SqlTokenKind::Desc => format!("DESC"),
             SqlTokenKind::Semicolon => format!(";"),
             SqlTokenKind::Period => format!("."),
             SqlTokenKind::Like => format!("LIKE"),
+            SqlTokenKind::NotLike => format!("NOT LIKE"),
+            SqlTokenKind::Glob => format!("GLOB"),
         };
         // Add context before token start, but minimum is 0
         let error_span_left = std::cmp::max(0, self.span.start as i64 - 10);
         let error_span_right = std::cmp::min(source.len(), self.span.end as usize + 10);
         format!(
-            "{}, near '{}'",
+            "{} at position {} near '{}'",
             token_info,
+            self.span.start,
             std::str::from_utf8(&source[error_span_left as usize..error_span_right as usize])
                 .unwrap()
         )
@@ -243,25 +252,48 @@ fn mathy_operator<
     .parse_next(input)
 }
 
+fn peek_not_identifier_character<
+    'i,
+    E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
+>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<(), E> {
+    match input.first() {
+        Some(b) => {
+            if utf8_compatible_identifier_char(*b) {
+                fail(input)
+            } else {
+                Ok(())
+            }
+        }
+        None => Ok(()),
+    }
+}
+
 fn keyword<'i, E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>>(
     input: &mut Located<&'i [u8]>,
 ) -> PResult<SqlTokenKind, E> {
-    alt((
+    let choices = alt((
         tk_select.value(SqlTokenKind::Select),
         tk_from.value(SqlTokenKind::From),
         tk_where.value(SqlTokenKind::Where),
         tk_and.value(SqlTokenKind::And),
         tk_order_by.value(SqlTokenKind::OrderBy),
         tk_or.value(SqlTokenKind::Or),
+        tk_not_like.value(SqlTokenKind::NotLike),
+        tk_not_in.value(SqlTokenKind::NotIn),
         tk_not.value(SqlTokenKind::Not),
         tk_group_by.value(SqlTokenKind::GroupBy),
         tk_limit.value(SqlTokenKind::Limit),
         join_related_stuff,
         asc_desc,
         tk_as.value(SqlTokenKind::As),
+        tk_in.value(SqlTokenKind::In),
         tk_like.value(SqlTokenKind::Like),
-    ))
-    .parse_next(input)
+        tk_glob.value(SqlTokenKind::Glob),
+    ));
+
+    terminated(choices, peek_not_identifier_character).parse_next(input)
 }
 
 fn sql_token<'i, E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>>(
@@ -278,7 +310,10 @@ fn sql_token<'i, E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]
     ))
     .with_span()
     .parse_next(input)
-    .map(|(kind, span)| SqlToken { kind, span: span })
+    .map(|(kind, span)| SqlToken {
+        kind,
+        span: span.start as u32..span.end as u32,
+    })
 }
 
 fn ws<'i, E: ParserError<Located<&'i [u8]>>>(
@@ -289,10 +324,40 @@ fn ws<'i, E: ParserError<Located<&'i [u8]>>>(
 
 const WS: &[u8] = &[b' ', b'\t', b'\r', b'\n'];
 
+fn tk_in<'i, E: ParserError<Located<&'i [u8]>>>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<SqlTokenKind, E> {
+    literal(Caseless("IN"))
+        .value(SqlTokenKind::In)
+        .parse_next(input)
+}
+
+fn tk_not_in<'i, E: ParserError<Located<&'i [u8]>>>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<SqlTokenKind, E> {
+    literal(Caseless("NOT IN"))
+        .value(SqlTokenKind::NotIn)
+        .parse_next(input)
+}
+
+fn tk_not_like<'i, E: ParserError<Located<&'i [u8]>>>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<SqlTokenKind, E> {
+    literal(Caseless("NOT LIKE"))
+        .value(SqlTokenKind::NotLike)
+        .parse_next(input)
+}
+
 fn tk_like<'i, E: ParserError<Located<&'i [u8]>>>(
     input: &mut Located<&'i [u8]>,
 ) -> PResult<&'i [u8], E> {
     literal(Caseless("LIKE")).parse_next(input)
+}
+
+fn tk_glob<'i, E: ParserError<Located<&'i [u8]>>>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<&'i [u8], E> {
+    literal(Caseless("GLOB")).parse_next(input)
 }
 
 fn tk_period<'i, E: ParserError<Located<&'i [u8]>>>(

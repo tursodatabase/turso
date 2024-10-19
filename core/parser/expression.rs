@@ -1,7 +1,7 @@
 use super::ast::{Column, Expression};
 use super::operators::peek_operator;
 use super::tokenizer::{SqlTokenKind, SqlTokenStream};
-use super::utils::{expect_token, SqlParseError};
+use super::utils::{expect_token, next_token_is, SqlParseError};
 use super::Operator;
 
 pub(crate) fn parse_expr(
@@ -16,6 +16,18 @@ pub(crate) fn parse_expr(
             _ => break,
         };
 
+        // if operator is 'IN' or 'NOT IN', we need to parse the list of expressions
+        if op == Operator::In || op == Operator::NotIn {
+            input.next_token(); // Consume the operator
+            let list = parse_in_list_expr(input)?;
+            lhs = Expression::InList {
+                expr: Box::new(lhs),
+                list,
+                not: op == Operator::NotIn,
+            };
+            continue;
+        }
+
         input.next_token(); // Consume the operator
 
         let rhs = parse_expr(input, precedence + 1)?;
@@ -28,6 +40,21 @@ pub(crate) fn parse_expr(
     }
 
     Ok(lhs)
+}
+
+fn parse_in_list_expr(
+    input: &mut SqlTokenStream,
+) -> Result<Option<Vec<Expression>>, SqlParseError> {
+    expect_token(input, SqlTokenKind::ParenL)?;
+    if next_token_is(input, SqlTokenKind::ParenR) {
+        return Ok(None);
+    }
+    let mut list = vec![parse_expr(input, 0)?];
+    while next_token_is(input, SqlTokenKind::Comma) {
+        list.push(parse_expr(input, 0)?);
+    }
+    expect_token(input, SqlTokenKind::ParenR)?;
+    Ok(Some(list))
 }
 
 fn parse_function_call(
@@ -147,6 +174,20 @@ fn parse_atom(input: &mut SqlTokenStream) -> Result<Expression, SqlParseError> {
             Err(SqlParseError::new(
                 "Expected '(' after 'like' when not used as a binary operator",
             ))
+        }
+        Some(SqlTokenKind::Glob) => {
+            input.next_token().unwrap();
+            // if next token is a paren, it's a function call
+            // otherwise, it's a unary glob
+            if let Some(SqlTokenKind::ParenL) = input.peek_kind(0) {
+                input.next_token();
+                return parse_function_call("glob".to_string(), input);
+            }
+            let expr = parse_expr(input, 0)?;
+            Ok(Expression::Unary {
+                op: Operator::Glob,
+                expr: Box::new(expr),
+            })
         }
         Some(SqlTokenKind::ParenL) => {
             input.next_token().unwrap();

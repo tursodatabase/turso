@@ -40,51 +40,72 @@ fn parse_table(input: &mut SqlTokenStream) -> Result<Table, SqlParseError> {
     }
 }
 
-fn parse_joins(input: &mut SqlTokenStream) -> Result<Vec<Join>, SqlParseError> {
-    let mut joins = Vec::new();
+fn parse_joins(input: &mut SqlTokenStream) -> Result<Option<Vec<Join>>, SqlParseError> {
+    let mut joins = None;
 
-    while let Ok(join) = parse_join(input) {
-        joins.push(join);
+    while let Some(join) = parse_join(input)? {
+        if joins.is_none() {
+            joins = Some(vec![]);
+        }
+        joins.as_mut().unwrap().push(join);
     }
 
     Ok(joins)
 }
 
-fn parse_join(input: &mut SqlTokenStream) -> Result<Join, SqlParseError> {
-    let join_type = parse_join_type(input)?;
-    expect_token(input, SqlTokenKind::Join)?;
-    let table = parse_table(input)?;
-    let on = parse_on_clause(input)?;
+fn parse_join(input: &mut SqlTokenStream) -> Result<Option<Join>, SqlParseError> {
+    if let Some(join_type) = parse_join_type(input)? {
+        let table = parse_table(input)?;
+        let on = parse_on_clause(input)?;
+        return Ok(Some(Join {
+            join_type,
+            table,
+            on,
+        }));
+    }
 
-    Ok(Join {
-        join_type,
-        table,
-        on,
-    })
+    Ok(None)
 }
 
-fn parse_join_type(input: &mut SqlTokenStream) -> Result<JoinType, SqlParseError> {
+fn parse_join_type(input: &mut SqlTokenStream) -> Result<Option<JoinType>, SqlParseError> {
     let mut join_type = JoinType::new();
 
+    if let Some(SqlTokenKind::Comma) = input.peek_kind(0) {
+        input.next_token().unwrap();
+        return Ok(Some(join_type.with(JoinVariant::Inner)));
+    }
+
+    let mut has_qualifiers = false;
     while let Some(token_kind) = input.peek_kind(0) {
         match token_kind {
             SqlTokenKind::Inner => {
                 input.next_token();
                 join_type = join_type.with(JoinVariant::Inner);
+                has_qualifiers = true;
             }
             SqlTokenKind::Outer => {
                 input.next_token().unwrap();
                 join_type = join_type.with(JoinVariant::Outer);
+                has_qualifiers = true;
             }
             SqlTokenKind::Left => {
                 input.next_token().unwrap();
                 join_type = join_type.with(JoinVariant::Left);
+                has_qualifiers = true;
             }
             _ => break,
         }
     }
 
-    Ok(join_type)
+    if has_qualifiers {
+        expect_token(input, SqlTokenKind::Join)?;
+        return Ok(Some(join_type));
+    } else if let Some(SqlTokenKind::Join) = input.peek_kind(0) {
+        input.next_token().unwrap();
+        return Ok(Some(join_type));
+    } else {
+        return Ok(None);
+    }
 }
 
 fn parse_on_clause(input: &mut SqlTokenStream) -> Result<Option<Expression>, SqlParseError> {

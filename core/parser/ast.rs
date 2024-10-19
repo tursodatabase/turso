@@ -1,20 +1,24 @@
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-
 pub enum Operator {
-    Eq = 0,
-    NotEq = 1,
-    Lt = 2,
-    LtEq = 3,
-    Gt = 4,
-    GtEq = 5,
-    And = 6,
-    Or = 7,
-    Plus = 8,
-    Minus = 9,
-    Multiply = 10,
-    Divide = 11,
-    Like = 12,
+    Eq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+    And,
+    Or,
+    Plus,
+    Minus,
+    Multiply,
+    Divide,
+    Like,
+    NotLike,
+    Glob,
+    Not,
+    In,
+    NotIn,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +49,11 @@ pub enum Expression {
     FunctionCall {
         name: String,
         args: Option<Vec<Expression>>,
+    },
+    InList {
+        expr: Box<Expression>,
+        list: Option<Vec<Expression>>,
+        not: bool,
     },
 }
 
@@ -115,7 +124,7 @@ pub struct Join {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FromClause {
     pub table: Table,
-    pub joins: Vec<Join>,
+    pub joins: Option<Vec<Join>>,
 }
 
 #[repr(u8)]
