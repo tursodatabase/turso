@@ -187,7 +187,11 @@ pub(crate) fn parse_limit_clause(input: &mut SqlTokenStream) -> Result<Option<u6
                 .map(Some)
                 .map_err(|_| SqlParseError::new("Expected integer literal after LIMIT"))
         } else {
-            Err(SqlParseError::new("Expected integer literal after LIMIT"))
+            let got = input.peek(0).unwrap().print(&input.source);
+            Err(SqlParseError::new(&format!(
+                "Expected integer literal after LIMIT, got: {}",
+                got
+            )))
         }
     } else {
         Ok(None)

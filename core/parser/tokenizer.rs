@@ -1,9 +1,9 @@
 use std::ops::Range;
 
 use winnow::ascii::Caseless;
-use winnow::combinator::{alt, delimited, fail, terminated};
+use winnow::combinator::{alt, delimited, fail, opt, preceded, repeat, terminated};
 use winnow::error::{AddContext, ParserError, StrContext};
-use winnow::token::{literal, take_while};
+use winnow::token::{literal, one_of, take_till, take_while};
 use winnow::PResult;
 use winnow::{prelude::*, Located};
 
@@ -554,16 +554,77 @@ fn tk_identifier<'i, E: ParserError<Located<&'i [u8]>>>(
     take_while(1.., utf8_compatible_identifier_char).parse_next(input)
 }
 
-fn tk_literal<'i, E: ParserError<Located<&'i [u8]>>>(
+fn decimal<'i, E: ParserError<Located<&'i [u8]>>>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<&'i [u8], E> {
+    take_while(1.., |c: u8| c.is_ascii_digit()).parse_next(input)
+}
+
+fn float<'i, E: ParserError<Located<&'i [u8]>>>(
     input: &mut Located<&'i [u8]>,
 ) -> PResult<&'i [u8], E> {
     alt((
+        // Case one: .42
+        (
+            '.',
+            decimal,
+            opt((one_of(['e', 'E']), opt(one_of(['+', '-'])), decimal)),
+        )
+            .take(),
+        // Case two: 42e42 and 42.42e42
+        (
+            decimal,
+            opt(preceded('.', decimal)),
+            one_of(['e', 'E']),
+            opt(one_of(['+', '-'])),
+            decimal,
+        )
+            .take(),
+        // Case three: 42. and 42.42
+        (decimal, '.', opt(decimal)).take(),
+    ))
+    .parse_next(input)
+}
+
+fn double_singlequote_escape_sequence<'i, E: ParserError<Located<&'i [u8]>>>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<&'i [u8], E> {
+    literal("''").parse_next(input)
+}
+
+/// Parse a non-empty block of text that doesn't include '
+fn nonescaped_string_literal<'i, E: ParserError<Located<&'i [u8]>>>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<&'i [u8], E> {
+    // `take_till` parses a string of 0 or more characters that aren't one of the
+    // given characters.
+    let not_quote = take_till(1.., ['\'']);
+
+    // `verify` runs a parser, then runs a verification function on the output of
+    // the parser. The verification function accepts the output only if it
+    // returns true. In this case, we want to ensure that the output of take_till
+    // is non-empty.
+    not_quote.verify(|s: &[u8]| !s.is_empty()).parse_next(input)
+}
+
+fn tk_literal<'i, E: ParserError<Located<&'i [u8]>>>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<(), E> {
+    alt((
         delimited(
             literal("'"),
-            take_while(0.., |b: u8| b != b'\''),
+            repeat(
+                0..,
+                alt((
+                    nonescaped_string_literal,
+                    double_singlequote_escape_sequence,
+                )),
+            )
+            .fold(|| (), |_, _| ()),
             literal("'"),
         ),
-        take_while(1.., |b: u8| b.is_ascii_digit() || b == b'.'),
+        float.void(),
+        decimal.void(),
     ))
     .parse_next(input)
 }

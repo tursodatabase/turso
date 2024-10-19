@@ -80,7 +80,7 @@ select u.first_name, p.name from users u join products p on u.id = p.id and u.ag
 select json('{a:5,b:6}') ;
 SELECT json('{ MNO_123$xyz : 789 }');
 select json('{"a":5, "b":6, }');
-FAIL: SELECT json('{"a": ''abcd''}');
+SELECT json('{"a": ''abcd''}');
 SELECT json('{a: 0x0}')
 SELECT json('{a: 0xabcdef}')
 SELECT json('{a: -0xabcdef}')
