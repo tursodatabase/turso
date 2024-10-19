@@ -3,7 +3,7 @@ use std::ops::Range;
 use winnow::ascii::Caseless;
 use winnow::combinator::{alt, delimited, fail, opt, preceded, repeat, terminated};
 use winnow::error::{AddContext, ParserError, StrContext};
-use winnow::token::{literal, one_of, take_till, take_while};
+use winnow::token::{literal, one_of, take_while};
 use winnow::PResult;
 use winnow::{prelude::*, Located};
 
@@ -592,21 +592,6 @@ fn double_singlequote_escape_sequence<'i, E: ParserError<Located<&'i [u8]>>>(
     literal("''").parse_next(input)
 }
 
-/// Parse a non-empty block of text that doesn't include '
-fn nonescaped_string_literal<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    // `take_till` parses a string of 0 or more characters that aren't one of the
-    // given characters.
-    let not_quote = take_till(1.., ['\'']);
-
-    // `verify` runs a parser, then runs a verification function on the output of
-    // the parser. The verification function accepts the output only if it
-    // returns true. In this case, we want to ensure that the output of take_till
-    // is non-empty.
-    not_quote.verify(|s: &[u8]| !s.is_empty()).parse_next(input)
-}
-
 fn tk_literal<'i, E: ParserError<Located<&'i [u8]>>>(
     input: &mut Located<&'i [u8]>,
 ) -> PResult<(), E> {
@@ -616,7 +601,7 @@ fn tk_literal<'i, E: ParserError<Located<&'i [u8]>>>(
             repeat(
                 0..,
                 alt((
-                    nonescaped_string_literal,
+                    take_while(1.., |c| c != b'\''),
                     double_singlequote_escape_sequence,
                 )),
             )
