@@ -1,6 +1,6 @@
 use super::ast::ResultColumn;
 use super::expression::parse_expr;
-use super::tokenizer::{SqlToken, SqlTokenStream};
+use super::tokenizer::{SqlTokenKind, SqlTokenStream};
 use super::Table;
 
 use std::error::Error;
@@ -27,17 +27,27 @@ impl fmt::Display for SqlParseError {
 
 impl Error for SqlParseError {}
 
+pub(crate) fn next_token_is(input: &mut SqlTokenStream, expected: SqlTokenKind) -> bool {
+    if input.peek_kind(0) == Some(expected) {
+        input.next_token();
+        return true;
+    }
+
+    false
+}
+
 pub(crate) fn expect_token(
     input: &mut SqlTokenStream,
-    expected: SqlToken,
+    expected: SqlTokenKind,
 ) -> Result<(), SqlParseError> {
-    if input.peek(0) == Some(expected) {
+    if input.peek_kind(0) == Some(expected) {
         input.next_token();
         Ok(())
     } else if let Some(wrong_token) = input.peek(0) {
         Err(SqlParseError::new(format!(
-            "Expected token {}, got {}",
-            expected, wrong_token
+            "Expected token {:?}, got {}",
+            expected,
+            wrong_token.print(&input.source)
         )))
     } else {
         Err(SqlParseError::new("Expected token, got EOF"))
@@ -49,7 +59,7 @@ pub(crate) fn parse_result_columns(
 ) -> Result<Vec<ResultColumn>, SqlParseError> {
     let mut columns = vec![parse_result_column(input)?];
 
-    while let Ok(()) = expect_token(input, SqlToken::Comma) {
+    while next_token_is(input, SqlTokenKind::Comma) {
         columns.push(parse_result_column(input)?);
     }
 
@@ -57,16 +67,17 @@ pub(crate) fn parse_result_columns(
 }
 
 fn parse_result_column(input: &mut SqlTokenStream) -> Result<ResultColumn, SqlParseError> {
-    if let Ok(()) = expect_token(input, SqlToken::Asterisk) {
+    if next_token_is(input, SqlTokenKind::Asterisk) {
         Ok(ResultColumn::Star)
     } else {
-        match (input.peek(0), input.peek(1), input.peek(2)) {
+        match (input.peek_kind(0), input.peek_kind(1), input.peek_kind(2)) {
             (
-                Some(SqlToken::Identifier(name)),
-                Some(SqlToken::Period),
-                Some(SqlToken::Asterisk),
+                Some(SqlTokenKind::Identifier),
+                Some(SqlTokenKind::Period),
+                Some(SqlTokenKind::Asterisk),
             ) => {
-                input.next_token();
+                let name_token = input.next_token().unwrap();
+                let name = std::str::from_utf8(name_token.materialize(&input.source)).unwrap();
                 input.next_token();
                 input.next_token();
                 Ok(ResultColumn::TableStar {
@@ -89,15 +100,17 @@ fn parse_result_column(input: &mut SqlTokenStream) -> Result<ResultColumn, SqlPa
 pub(crate) fn parse_optional_alias(
     input: &mut SqlTokenStream,
 ) -> Result<Option<String>, SqlParseError> {
-    if let Ok(()) = expect_token(input, SqlToken::As) {
-        if let Some(SqlToken::Identifier(alias)) = input.peek(0) {
-            input.next_token();
+    if next_token_is(input, SqlTokenKind::As) {
+        if let Some(SqlTokenKind::Identifier) = input.peek_kind(0) {
+            let alias_token = input.next_token().unwrap();
+            let alias = std::str::from_utf8(alias_token.materialize(&input.source)).unwrap();
             Ok(Some(alias.to_string()))
         } else {
             Err(SqlParseError::new("Expected identifier after AS"))
         }
-    } else if let Some(SqlToken::Identifier(alias)) = input.peek(0) {
-        input.next_token();
+    } else if let Some(SqlTokenKind::Identifier) = input.peek_kind(0) {
+        let alias_token = input.next_token().unwrap();
+        let alias = std::str::from_utf8(alias_token.materialize(&input.source)).unwrap();
         Ok(Some(alias.to_string()))
     } else {
         Ok(None)

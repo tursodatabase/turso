@@ -3,7 +3,7 @@ use super::clause::{
     parse_from_clause, parse_group_by_clause, parse_limit_clause, parse_order_by_clause,
     parse_where_clause,
 };
-use super::tokenizer::{self, SqlToken, SqlTokenStream};
+use super::tokenizer::{self, SqlTokenKind, SqlTokenStream};
 use super::utils::{expect_token, parse_result_columns, SqlParseError};
 
 pub fn parse_sql_statement(input: &mut str) -> Result<SqlStatement, SqlParseError> {
@@ -18,7 +18,7 @@ pub fn parse_sql_statement(input: &mut str) -> Result<SqlStatement, SqlParseErro
 }
 
 fn parse_select_statement(input: &mut SqlTokenStream) -> Result<SelectStatement, SqlParseError> {
-    expect_token(input, SqlToken::Select)?;
+    expect_token(input, SqlTokenKind::Select)?;
 
     let columns = parse_result_columns(input)?;
     let from = parse_from_clause(input)?;

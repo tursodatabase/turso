@@ -10,6 +10,4 @@ mod utils;
 pub use ast::*;
 pub use statement::parse_sql_statement;
 
-use self::tokenizer::SqlToken;
-
 pub(crate) mod tokenizer;
