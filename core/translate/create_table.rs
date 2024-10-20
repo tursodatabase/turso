@@ -52,6 +52,7 @@ pub fn translate_create_table(
     let root_page = match schema_table.as_ref() {
         Table::BTree(btree) => btree.root_page,
         Table::Pseudo(_) => todo!(),
+        Table::Index(_rc) => todo!(),
     };
 
     program.emit_insn(Insn::OpenWriteAsync {
