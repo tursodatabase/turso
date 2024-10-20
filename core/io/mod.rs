@@ -85,7 +85,7 @@ pub type BufferDropFn = Rc<dyn Fn(BufferData)>;
 
 #[derive(Clone)]
 pub struct Buffer {
-    pub data: ManuallyDrop<BufferData>,
+    data: ManuallyDrop<BufferData>,
     drop: BufferDropFn,
 }
 
