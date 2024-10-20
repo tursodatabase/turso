@@ -160,7 +160,10 @@ pub fn parse_sql_string_to_tokens<
 >(
     input: &'i [u8],
 ) -> PResult<SqlTokenStream<'i>, E> {
-    let mut tokens = Vec::new();
+    // We'll use a heuristic to guess the initial capacity of the vector
+    // based on the length of the input.
+    let initial_vec_capacity = input.len() / 2;
+    let mut tokens = Vec::with_capacity(initial_vec_capacity);
     let mut stream = Located::new(input);
 
     while !stream.is_empty() {
