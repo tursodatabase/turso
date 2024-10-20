@@ -225,24 +225,6 @@ fn comparison_operator<
     .parse_next(input)
 }
 
-fn mathy_operator<
-    'i,
-    E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
->(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<SqlTokenKind, E> {
-    alt((
-        tk_plus.value(SqlTokenKind::Plus),
-        tk_minus.value(SqlTokenKind::Minus),
-        tk_slash.value(SqlTokenKind::Slash),
-        tk_asterisk.value(SqlTokenKind::Asterisk),
-        tk_paren_l.value(SqlTokenKind::ParenL),
-        tk_paren_r.value(SqlTokenKind::ParenR),
-        tk_comma.value(SqlTokenKind::Comma),
-    ))
-    .parse_next(input)
-}
-
 fn peek_not_identifier_character<
     'i,
     E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
@@ -528,20 +510,36 @@ fn sql_token<'i, E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]
         b'h' | b'H' => keywords_h_or_identifier,
         b'i' | b'I' => keywords_i_or_identifier,
         b'j' | b'J' => keywords_j_or_identifier,
+        b'k' | b'K' => tk_identifier.value(SqlTokenKind::Identifier),
         b'l' | b'L' => keywords_l_or_identifier,
+        b'm' | b'M' => tk_identifier.value(SqlTokenKind::Identifier),
         b'n' | b'N' => keywords_n_or_identifier,
         b'o' | b'O' => keywords_o_or_identifier,
+        b'p' | b'P' => tk_identifier.value(SqlTokenKind::Identifier),
+        b'q' | b'Q' => tk_identifier.value(SqlTokenKind::Identifier),
+        b'r' | b'R' => tk_identifier.value(SqlTokenKind::Identifier),
         b's' | b'S' => keywords_s_or_identifier,
         b't' | b'T' => keywords_t_or_identifier,
+        b'u' | b'U' => tk_identifier.value(SqlTokenKind::Identifier),
         b'w' | b'W' => keywords_w_or_identifier,
+        b'x' | b'X' => tk_identifier.value(SqlTokenKind::Identifier),
+        b'y' | b'Y' => tk_identifier.value(SqlTokenKind::Identifier),
+        b'z' | b'Z' => tk_identifier.value(SqlTokenKind::Identifier),
+        b'$' => tk_identifier.value(SqlTokenKind::Identifier),
         b'0'..=b'9' => alt((float, decimal)),
         b'.' => alt((float, tk_period.value(SqlTokenKind::Period))),
+        b',' => tk_comma.value(SqlTokenKind::Comma),
+        b';' => tk_semicolon.value(SqlTokenKind::Semicolon),
+        b'(' => tk_paren_l.value(SqlTokenKind::ParenL),
+        b')' => tk_paren_r.value(SqlTokenKind::ParenR),
+        b'+' => tk_plus.value(SqlTokenKind::Plus),
+        b'-' => tk_minus.value(SqlTokenKind::Minus),
+        b'*' => tk_asterisk.value(SqlTokenKind::Asterisk),
+        b'/' => tk_slash.value(SqlTokenKind::Slash),
+        b'\'' => tk_string_literal.value(SqlTokenKind::Literal),
         _ => alt((
             comparison_operator,
-            mathy_operator,
             tk_identifier.value(SqlTokenKind::Identifier),
-            tk_literal.value(SqlTokenKind::Literal),
-            tk_semicolon.value(SqlTokenKind::Semicolon),
         )),
     }
     .with_span()
@@ -705,25 +703,21 @@ fn double_singlequote_escape_sequence<'i, E: ParserError<Located<&'i [u8]>>>(
     literal("''").parse_next(input)
 }
 
-fn tk_literal<'i, E: ParserError<Located<&'i [u8]>>>(
+fn tk_string_literal<'i, E: ParserError<Located<&'i [u8]>>>(
     input: &mut Located<&'i [u8]>,
 ) -> PResult<(), E> {
-    alt((
-        delimited(
-            literal("'"),
-            repeat(
-                0..,
-                alt((
-                    take_while(1.., |c| c != b'\''),
-                    double_singlequote_escape_sequence,
-                )),
-            )
-            .fold(|| (), |_, _| ()),
-            literal("'"),
-        ),
-        float.void(),
-        decimal.void(),
-    ))
+    delimited(
+        literal("'"),
+        repeat(
+            0..,
+            alt((
+                take_while(1.., |c| c != b'\''),
+                double_singlequote_escape_sequence,
+            )),
+        )
+        .fold(|| (), |_, _| ()),
+        literal("'"),
+    )
     .parse_next(input)
 }
 
