@@ -1,6 +1,7 @@
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operator {
+    Between,
     Eq,
     NotEq,
     Lt,
@@ -32,6 +33,16 @@ pub struct Column {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expression {
+    Between {
+        lhs: Box<Expression>,
+        start: Box<Expression>,
+        end: Box<Expression>,
+    },
+    Case {
+        base: Option<Box<Expression>>,
+        when_then_pairs: Vec<(Expression, Expression)>,
+        else_expr: Option<Box<Expression>>,
+    },
     Column(Column),
     LiteralString(String),
     LiteralNumber(String),

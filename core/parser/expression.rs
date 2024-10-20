@@ -28,6 +28,21 @@ pub(crate) fn parse_expr(
             continue;
         }
 
+        // if operator is 'BETWEEN', we need to parse the start and end expressions,
+        // separated by 'AND'
+        if op == Operator::Between {
+            input.next_token();
+            let start = parse_atom(input)?;
+            expect_token(input, SqlTokenKind::And)?;
+            let end = parse_atom(input)?;
+            lhs = Expression::Between {
+                lhs: Box::new(lhs),
+                start: Box::new(start),
+                end: Box::new(end),
+            };
+            continue;
+        }
+
         input.next_token(); // Consume the operator
 
         let rhs = parse_expr(input, precedence + 1)?;
@@ -131,6 +146,7 @@ fn parse_atom(input: &mut SqlTokenStream) -> Result<Expression, SqlParseError> {
         }
     }
     match input.peek_kind(0) {
+        Some(SqlTokenKind::Case) => Ok(parse_case_expr(input)?),
         Some(SqlTokenKind::Literal) => {
             let literal_token = input.next_token().unwrap();
             let value = literal_token.materialize(&input.source);
@@ -206,4 +222,71 @@ fn parse_atom(input: &mut SqlTokenStream) -> Result<Expression, SqlParseError> {
         }
         None => Err(SqlParseError::new("Unexpected end of input")),
     }
+}
+
+fn parse_case_expr(input: &mut SqlTokenStream) -> Result<Expression, SqlParseError> {
+    expect_token(input, SqlTokenKind::Case)?;
+    // There are two types of case expressions: simple and searched.
+    // Simple case expressions have a WHEN and THEN for each condition.
+    // Searched case expressions have a single WHEN and THEN for all conditions.
+    // We can check if it's a searched case expression by checking if the next token is 'WHEN'
+    if let Some(SqlTokenKind::When) = input.peek_kind(0) {
+        return parse_case_expr_searched(input);
+    }
+    parse_case_expr_simple(input)
+}
+
+fn parse_case_expr_simple(input: &mut SqlTokenStream) -> Result<Expression, SqlParseError> {
+    let input_expression = parse_expr(input, 0)?;
+    let mut when_then_pairs = vec![];
+    if input.peek_kind(0) != Some(SqlTokenKind::When) {
+        return Err(SqlParseError::new(
+            "Expected 'WHEN' after base expression in simple case expression",
+        ));
+    }
+    while let Some(SqlTokenKind::When) = input.peek_kind(0) {
+        input.next_token();
+        let when_expr = parse_expr(input, 0)?;
+        expect_token(input, SqlTokenKind::Then)?;
+        let then_expr = parse_expr(input, 0)?;
+        when_then_pairs.push((when_expr, then_expr));
+    }
+    let mut else_expr = None;
+    if let Some(SqlTokenKind::Else) = input.peek_kind(0) {
+        input.next_token();
+        else_expr = Some(Box::new(parse_expr(input, 0)?));
+    }
+    expect_token(input, SqlTokenKind::End)?;
+    Ok(Expression::Case {
+        base: Some(Box::new(input_expression)),
+        when_then_pairs,
+        else_expr,
+    })
+}
+
+fn parse_case_expr_searched(input: &mut SqlTokenStream) -> Result<Expression, SqlParseError> {
+    if input.peek_kind(0) != Some(SqlTokenKind::When) {
+        return Err(SqlParseError::new(
+            "Expected 'WHEN' after base expression in searched case expression",
+        ));
+    }
+    let mut when_then_pairs = vec![];
+    while let Some(SqlTokenKind::When) = input.peek_kind(0) {
+        input.next_token();
+        let when_expr = parse_expr(input, 0)?;
+        expect_token(input, SqlTokenKind::Then)?;
+        let then_expr = parse_expr(input, 0)?;
+        when_then_pairs.push((when_expr, then_expr));
+    }
+    let mut else_expr = None;
+    if let Some(SqlTokenKind::Else) = input.peek_kind(0) {
+        input.next_token();
+        else_expr = Some(Box::new(parse_expr(input, 0)?));
+    }
+    expect_token(input, SqlTokenKind::End)?;
+    Ok(Expression::Case {
+        base: None,
+        when_then_pairs,
+        else_expr,
+    })
 }

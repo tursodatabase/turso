@@ -954,6 +954,132 @@ mod tests {
     }
 
     #[test]
+    fn select_with_between_operator() {
+        let mut input = "SELECT * FROM products WHERE price BETWEEN 10 AND 20".to_string();
+        let result = parse_sql_statement(&mut input);
+        assert_eq!(
+            result,
+            Ok(SqlStatement::Select(SelectStatement {
+                columns: vec![ResultColumn::Star],
+                from: Some(FromClause {
+                    table: Table {
+                        name: "products".into(),
+                        alias: None,
+                        table_no: None
+                    },
+                    joins: None,
+                }),
+                where_clause: Some(Expression::Between {
+                    lhs: Box::new(Expression::Column(Column {
+                        name: "price".into(),
+                        alias: None,
+                        table_name: None,
+                        table_no: None,
+                        column_no: None
+                    })),
+                    start: Box::new(Expression::LiteralNumber("10".into())),
+                    end: Box::new(Expression::LiteralNumber("20".into())),
+                }),
+                group_by: None,
+                order_by: None,
+                limit: None
+            }))
+        );
+    }
+
+    #[test]
+    fn select_with_case_expr_searched() {
+        let mut input =
+            "SELECT CASE WHEN age < 18 THEN 'minor' ELSE 'adult' END as age_group FROM users"
+                .to_string();
+        let result = parse_sql_statement(&mut input);
+        assert_eq!(
+            result,
+            Ok(SqlStatement::Select(SelectStatement {
+                columns: vec![ResultColumn::Expr {
+                    expr: Expression::Case {
+                        base: None,
+                        when_then_pairs: vec![(
+                            Expression::Binary {
+                                lhs: Box::new(Expression::Column(Column {
+                                    name: "age".into(),
+                                    alias: None,
+                                    table_name: None,
+                                    table_no: None,
+                                    column_no: None
+                                })),
+                                op: Operator::Lt,
+                                rhs: Box::new(Expression::LiteralNumber("18".into())),
+                            },
+                            Expression::LiteralString("minor".into())
+                        )],
+                        else_expr: Some(Box::new(Expression::LiteralString("adult".into()))),
+                    },
+                    alias: Some("age_group".into()),
+                }],
+                from: Some(FromClause {
+                    table: Table {
+                        name: "users".into(),
+                        alias: None,
+                        table_no: None
+                    },
+                    joins: None,
+                }),
+                where_clause: None,
+                group_by: None,
+                order_by: None,
+                limit: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn select_with_case_expr_base() {
+        let mut input = "SELECT CASE age WHEN 18 THEN 'eighteen' WHEN 19 THEN 'nineteen' ELSE 'other' END as age_word FROM users".to_string();
+        let result = parse_sql_statement(&mut input);
+        assert_eq!(
+            result,
+            Ok(SqlStatement::Select(SelectStatement {
+                columns: vec![ResultColumn::Expr {
+                    expr: Expression::Case {
+                        base: Some(Box::new(Expression::Column(Column {
+                            name: "age".into(),
+                            alias: None,
+                            table_name: None,
+                            table_no: None,
+                            column_no: None
+                        }))),
+                        when_then_pairs: vec![
+                            (
+                                Expression::LiteralNumber("18".into()),
+                                Expression::LiteralString("eighteen".into())
+                            ),
+                            (
+                                Expression::LiteralNumber("19".into()),
+                                Expression::LiteralString("nineteen".into())
+                            ),
+                        ],
+                        else_expr: Some(Box::new(Expression::LiteralString("other".into()))),
+                    },
+                    alias: Some("age_word".into()),
+                }],
+                from: Some(FromClause {
+                    table: Table {
+                        name: "users".into(),
+                        alias: None,
+                        table_no: None
+                    },
+                    joins: None,
+                }),
+                where_clause: None,
+                group_by: None,
+                order_by: None,
+                limit: None,
+            }))
+        );
+    }
+
+    #[test]
     fn test_error_message() {
         let test_cases = vec![
             ("SELECT * FROM users WHERE column1 = 'value' ORDER BY", "Unexpected end of input"),

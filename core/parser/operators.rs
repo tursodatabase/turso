@@ -16,6 +16,7 @@ pub(crate) fn peek_operator(input: &SqlTokenStream) -> Option<(Operator, u8)> {
         Some(SqlTokenKind::Like) => Some((Operator::Like, 10)),
         Some(SqlTokenKind::In) => Some((Operator::In, 10)),
         Some(SqlTokenKind::NotIn) => Some((Operator::NotIn, 10)),
+        Some(SqlTokenKind::Between) => Some((Operator::Between, 10)),
         Some(SqlTokenKind::Glob) => Some((Operator::Glob, 10)),
         Some(SqlTokenKind::Plus) => Some((Operator::Plus, 40)),
         Some(SqlTokenKind::Minus) => Some((Operator::Minus, 40)),

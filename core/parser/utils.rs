@@ -50,7 +50,10 @@ pub(crate) fn expect_token(
             wrong_token.print(&input.source)
         )))
     } else {
-        Err(SqlParseError::new("Expected token, got EOF"))
+        Err(SqlParseError::new(format!(
+            "Expected {:?}, got EOF",
+            expected
+        )))
     }
 }
 

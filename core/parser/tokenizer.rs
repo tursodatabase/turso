@@ -49,6 +49,13 @@ pub enum SqlTokenKind {
     Glob,
     Literal,
     Identifier,
+    Between,
+    Case,
+    Having,
+    When,
+    Then,
+    Else,
+    End,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -108,6 +115,13 @@ impl SqlToken {
             SqlTokenKind::Like => format!("LIKE"),
             SqlTokenKind::NotLike => format!("NOT LIKE"),
             SqlTokenKind::Glob => format!("GLOB"),
+            SqlTokenKind::Between => format!("BETWEEN"),
+            SqlTokenKind::Case => format!("CASE"),
+            SqlTokenKind::Having => format!("HAVING"),
+            SqlTokenKind::When => format!("WHEN"),
+            SqlTokenKind::Then => format!("THEN"),
+            SqlTokenKind::Else => format!("ELSE"),
+            SqlTokenKind::End => format!("END"),
         };
         // Add context before token start, but minimum is 0
         let error_span_left = std::cmp::max(0, self.span.start as i64 - 10);
@@ -265,6 +279,34 @@ fn keywords_a_or_identifier<
     choices.parse_next(input)
 }
 
+fn keywords_b_or_identifier<
+    'i,
+    E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
+>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<SqlTokenKind, E> {
+    let keywords = terminated(
+        alt((literal(Caseless("BETWEEN")).value(SqlTokenKind::Between),)),
+        peek_not_identifier_character,
+    );
+    let mut choices = alt((keywords, tk_identifier.value(SqlTokenKind::Identifier)));
+    choices.parse_next(input)
+}
+
+fn keywords_c_or_identifier<
+    'i,
+    E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
+>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<SqlTokenKind, E> {
+    let keywords = terminated(
+        alt((literal(Caseless("CASE")).value(SqlTokenKind::Case),)),
+        peek_not_identifier_character,
+    );
+    let mut choices = alt((keywords, tk_identifier.value(SqlTokenKind::Identifier)));
+    choices.parse_next(input)
+}
+
 fn keywords_d_or_identifier<
     'i,
     E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
@@ -273,6 +315,23 @@ fn keywords_d_or_identifier<
 ) -> PResult<SqlTokenKind, E> {
     let keywords = terminated(
         alt((literal(Caseless("DESC")).value(SqlTokenKind::Desc),)),
+        peek_not_identifier_character,
+    );
+    let mut choices = alt((keywords, tk_identifier.value(SqlTokenKind::Identifier)));
+    choices.parse_next(input)
+}
+
+fn keywords_e_or_identifier<
+    'i,
+    E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
+>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<SqlTokenKind, E> {
+    let keywords = terminated(
+        alt((
+            literal(Caseless("ELSE")).value(SqlTokenKind::Else),
+            literal(Caseless("END")).value(SqlTokenKind::End),
+        )),
         peek_not_identifier_character,
     );
     let mut choices = alt((keywords, tk_identifier.value(SqlTokenKind::Identifier)));
@@ -304,6 +363,20 @@ fn keywords_g_or_identifier<
             literal(Caseless("GLOB")).value(SqlTokenKind::Glob),
             literal(Caseless("GROUP BY")).value(SqlTokenKind::GroupBy),
         )),
+        peek_not_identifier_character,
+    );
+    let mut choices = alt((keywords, tk_identifier.value(SqlTokenKind::Identifier)));
+    choices.parse_next(input)
+}
+
+fn keywords_h_or_identifier<
+    'i,
+    E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
+>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<SqlTokenKind, E> {
+    let keywords = terminated(
+        alt((literal(Caseless("HAVING")).value(SqlTokenKind::Having),)),
         peek_not_identifier_character,
     );
     let mut choices = alt((keywords, tk_identifier.value(SqlTokenKind::Identifier)));
@@ -410,6 +483,20 @@ fn keywords_s_or_identifier<
     choices.parse_next(input)
 }
 
+fn keywords_t_or_identifier<
+    'i,
+    E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
+>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<SqlTokenKind, E> {
+    let keywords = terminated(
+        alt((literal(Caseless("THEN")).value(SqlTokenKind::Then),)),
+        peek_not_identifier_character,
+    );
+    let mut choices = alt((keywords, tk_identifier.value(SqlTokenKind::Identifier)));
+    choices.parse_next(input)
+}
+
 fn keywords_w_or_identifier<
     'i,
     E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
@@ -417,7 +504,10 @@ fn keywords_w_or_identifier<
     input: &mut Located<&'i [u8]>,
 ) -> PResult<SqlTokenKind, E> {
     let keywords = terminated(
-        alt((literal(Caseless("WHERE")).value(SqlTokenKind::Where),)),
+        alt((
+            literal(Caseless("WHERE")).value(SqlTokenKind::Where),
+            literal(Caseless("WHEN")).value(SqlTokenKind::When),
+        )),
         peek_not_identifier_character,
     );
     let mut choices = alt((keywords, tk_identifier.value(SqlTokenKind::Identifier)));
@@ -429,15 +519,20 @@ fn sql_token<'i, E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]
 ) -> PResult<SqlToken, E> {
     dispatch! {peek(any);
         b'a' | b'A' => keywords_a_or_identifier,
+        b'b' | b'B' => keywords_b_or_identifier,
+        b'c' | b'C' => keywords_c_or_identifier,
         b'd' | b'D' => keywords_d_or_identifier,
+        b'e' | b'E' => keywords_e_or_identifier,
         b'f' | b'F' => keywords_f_or_identifier,
         b'g' | b'G' => keywords_g_or_identifier,
+        b'h' | b'H' => keywords_h_or_identifier,
         b'i' | b'I' => keywords_i_or_identifier,
         b'j' | b'J' => keywords_j_or_identifier,
         b'l' | b'L' => keywords_l_or_identifier,
         b'n' | b'N' => keywords_n_or_identifier,
         b'o' | b'O' => keywords_o_or_identifier,
         b's' | b'S' => keywords_s_or_identifier,
+        b't' | b'T' => keywords_t_or_identifier,
         b'w' | b'W' => keywords_w_or_identifier,
         b'0'..=b'9' => alt((float, decimal)),
         b'.' => alt((float, tk_period.value(SqlTokenKind::Period))),
@@ -835,6 +930,55 @@ mod tests {
                 SqlToken {
                     kind: SqlTokenKind::Literal,
                     span: 0..6,
+                },
+            ),
+            (
+                "BETWEEN",
+                SqlToken {
+                    kind: SqlTokenKind::Between,
+                    span: 0..7,
+                },
+            ),
+            (
+                "CASE",
+                SqlToken {
+                    kind: SqlTokenKind::Case,
+                    span: 0..4,
+                },
+            ),
+            (
+                "HAVING",
+                SqlToken {
+                    kind: SqlTokenKind::Having,
+                    span: 0..6,
+                },
+            ),
+            (
+                "ELSE",
+                SqlToken {
+                    kind: SqlTokenKind::Else,
+                    span: 0..4,
+                },
+            ),
+            (
+                "END",
+                SqlToken {
+                    kind: SqlTokenKind::End,
+                    span: 0..3,
+                },
+            ),
+            (
+                "WHEN",
+                SqlToken {
+                    kind: SqlTokenKind::When,
+                    span: 0..4,
+                },
+            ),
+            (
+                "THEN",
+                SqlToken {
+                    kind: SqlTokenKind::Then,
+                    span: 0..4,
                 },
             ),
         ];
