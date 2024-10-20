@@ -572,6 +572,388 @@ mod tests {
     }
 
     #[test]
+    fn select_with_function_calls() {
+        let mut input = "SELECT COUNT(id), LENGTH(first_name) FROM users LIMIT 5".to_string();
+        let result = parse_sql_statement(&mut input);
+        assert_eq!(
+            result,
+            Ok(SqlStatement::Select(SelectStatement {
+                columns: vec![
+                    ResultColumn::Expr {
+                        expr: Expression::FunctionCall {
+                            name: "COUNT".into(),
+                            args: Some(vec![Expression::Column(Column {
+                                name: "id".into(),
+                                alias: None,
+                                table_name: None,
+                                table_no: None,
+                                column_no: None
+                            })])
+                        },
+                        alias: None,
+                    },
+                    ResultColumn::Expr {
+                        expr: Expression::FunctionCall {
+                            name: "LENGTH".into(),
+                            args: Some(vec![Expression::Column(Column {
+                                name: "first_name".into(),
+                                alias: None,
+                                table_name: None,
+                                table_no: None,
+                                column_no: None
+                            })])
+                        },
+                        alias: None,
+                    }
+                ],
+                from: Some(FromClause {
+                    table: Table {
+                        name: "users".into(),
+                        alias: None,
+                        table_no: None
+                    },
+                    joins: None,
+                }),
+                where_clause: None,
+                group_by: None,
+                order_by: None,
+                limit: Some(5)
+            }))
+        );
+    }
+
+    #[test]
+    fn select_with_case_insensitive_keywords() {
+        let mut input = "SeLeCt * FrOm UsErS wHeRe AgE > 50 LiMiT 10".to_string();
+        let result = parse_sql_statement(&mut input);
+        assert_eq!(
+            result,
+            Ok(SqlStatement::Select(SelectStatement {
+                columns: vec![ResultColumn::Star],
+                from: Some(FromClause {
+                    table: Table {
+                        name: "UsErS".into(),
+                        alias: None,
+                        table_no: None
+                    },
+                    joins: None,
+                }),
+                where_clause: Some(Expression::Binary {
+                    lhs: Box::new(Expression::Column(Column {
+                        name: "AgE".into(),
+                        alias: None,
+                        table_name: None,
+                        table_no: None,
+                        column_no: None
+                    })),
+                    op: Operator::Gt,
+                    rhs: Box::new(Expression::LiteralNumber("50".into()))
+                }),
+                group_by: None,
+                order_by: None,
+                limit: Some(10)
+            }))
+        );
+    }
+
+    #[test]
+    fn select_with_in_operator() {
+        let mut input =
+            "SELECT * FROM products WHERE name IN ('hat', 'shirt', 'shoes')".to_string();
+        let result = parse_sql_statement(&mut input);
+        assert_eq!(
+            result,
+            Ok(SqlStatement::Select(SelectStatement {
+                columns: vec![ResultColumn::Star],
+                from: Some(FromClause {
+                    table: Table {
+                        name: "products".into(),
+                        alias: None,
+                        table_no: None
+                    },
+                    joins: None,
+                }),
+                where_clause: Some(Expression::InList {
+                    expr: Box::new(Expression::Column(Column {
+                        name: "name".into(),
+                        alias: None,
+                        table_name: None,
+                        table_no: None,
+                        column_no: None
+                    })),
+                    list: Some(vec![
+                        Expression::LiteralString("hat".into()),
+                        Expression::LiteralString("shirt".into()),
+                        Expression::LiteralString("shoes".into())
+                    ]),
+                    not: false
+                }),
+                group_by: None,
+                order_by: None,
+                limit: None
+            }))
+        );
+    }
+
+    #[test]
+    fn select_with_not_in_operator() {
+        let mut input =
+            "SELECT * FROM products WHERE name NOT IN ('hat', 'shirt', 'shoes')".to_string();
+        let result = parse_sql_statement(&mut input);
+        assert_eq!(
+            result,
+            Ok(SqlStatement::Select(SelectStatement {
+                columns: vec![ResultColumn::Star],
+                from: Some(FromClause {
+                    table: Table {
+                        name: "products".into(),
+                        alias: None,
+                        table_no: None
+                    },
+                    joins: None,
+                }),
+                where_clause: Some(Expression::InList {
+                    expr: Box::new(Expression::Column(Column {
+                        name: "name".into(),
+                        alias: None,
+                        table_name: None,
+                        table_no: None,
+                        column_no: None
+                    })),
+                    list: Some(vec![
+                        Expression::LiteralString("hat".into()),
+                        Expression::LiteralString("shirt".into()),
+                        Expression::LiteralString("shoes".into())
+                    ]),
+                    not: true
+                }),
+                group_by: None,
+                order_by: None,
+                limit: None
+            }))
+        );
+    }
+
+    #[test]
+    fn select_with_like_operator() {
+        let mut input = "SELECT * FROM products WHERE name LIKE 'sweat%'".to_string();
+        let result = parse_sql_statement(&mut input);
+        assert_eq!(
+            result,
+            Ok(SqlStatement::Select(SelectStatement {
+                columns: vec![ResultColumn::Star],
+                from: Some(FromClause {
+                    table: Table {
+                        name: "products".into(),
+                        alias: None,
+                        table_no: None
+                    },
+                    joins: None,
+                }),
+                where_clause: Some(Expression::Binary {
+                    lhs: Box::new(Expression::Column(Column {
+                        name: "name".into(),
+                        alias: None,
+                        table_name: None,
+                        table_no: None,
+                        column_no: None
+                    })),
+                    op: Operator::Like,
+                    rhs: Box::new(Expression::LiteralString("sweat%".into()))
+                }),
+                group_by: None,
+                order_by: None,
+                limit: None
+            }))
+        );
+    }
+
+    #[test]
+    fn select_with_complex_where_clause() {
+        let mut input = "SELECT * FROM products WHERE (price > 50 AND name != 'hat') OR (name IN ('shirt', 'shoes') AND price < 30)".to_string();
+        let result = parse_sql_statement(&mut input);
+        assert_eq!(
+            result,
+            Ok(SqlStatement::Select(SelectStatement {
+                columns: vec![ResultColumn::Star],
+                from: Some(FromClause {
+                    table: Table {
+                        name: "products".into(),
+                        alias: None,
+                        table_no: None
+                    },
+                    joins: None,
+                }),
+                where_clause: Some(Expression::Binary {
+                    lhs: Box::new(Expression::Parenthesized(Box::new(Expression::Binary {
+                        lhs: Box::new(Expression::Binary {
+                            lhs: Box::new(Expression::Column(Column {
+                                name: "price".into(),
+                                alias: None,
+                                table_name: None,
+                                table_no: None,
+                                column_no: None
+                            })),
+                            op: Operator::Gt,
+                            rhs: Box::new(Expression::LiteralNumber("50".into()))
+                        }),
+                        op: Operator::And,
+                        rhs: Box::new(Expression::Binary {
+                            lhs: Box::new(Expression::Column(Column {
+                                name: "name".into(),
+                                alias: None,
+                                table_name: None,
+                                table_no: None,
+                                column_no: None
+                            })),
+                            op: Operator::NotEq,
+                            rhs: Box::new(Expression::LiteralString("hat".into()))
+                        })
+                    }))),
+                    op: Operator::Or,
+                    rhs: Box::new(Expression::Parenthesized(Box::new(Expression::Binary {
+                        lhs: Box::new(Expression::InList {
+                            expr: Box::new(Expression::Column(Column {
+                                name: "name".into(),
+                                alias: None,
+                                table_name: None,
+                                table_no: None,
+                                column_no: None
+                            })),
+                            list: Some(vec![
+                                Expression::LiteralString("shirt".into()),
+                                Expression::LiteralString("shoes".into())
+                            ]),
+                            not: false
+                        }),
+                        op: Operator::And,
+                        rhs: Box::new(Expression::Binary {
+                            lhs: Box::new(Expression::Column(Column {
+                                name: "price".into(),
+                                alias: None,
+                                table_name: None,
+                                table_no: None,
+                                column_no: None
+                            })),
+                            op: Operator::Lt,
+                            rhs: Box::new(Expression::LiteralNumber("30".into()))
+                        })
+                    })))
+                }),
+                group_by: None,
+                order_by: None,
+                limit: None
+            }))
+        );
+    }
+
+    #[test]
+    fn select_with_multiple_joins() {
+        let mut input = "SELECT u.first_name, p.name, o.order_date FROM users u JOIN products p ON u.id = p.user_id JOIN orders o ON u.id = o.user_id LIMIT 5".to_string();
+        let result = parse_sql_statement(&mut input);
+        assert_eq!(
+            result,
+            Ok(SqlStatement::Select(SelectStatement {
+                columns: vec![
+                    ResultColumn::Expr {
+                        expr: Expression::Column(Column {
+                            name: "first_name".into(),
+                            alias: None,
+                            table_name: Some("u".into()),
+                            table_no: None,
+                            column_no: None
+                        }),
+                        alias: None,
+                    },
+                    ResultColumn::Expr {
+                        expr: Expression::Column(Column {
+                            name: "name".into(),
+                            alias: None,
+                            table_name: Some("p".into()),
+                            table_no: None,
+                            column_no: None
+                        }),
+                        alias: None,
+                    },
+                    ResultColumn::Expr {
+                        expr: Expression::Column(Column {
+                            name: "order_date".into(),
+                            alias: None,
+                            table_name: Some("o".into()),
+                            table_no: None,
+                            column_no: None
+                        }),
+                        alias: None,
+                    }
+                ],
+                from: Some(FromClause {
+                    table: Table {
+                        name: "users".into(),
+                        alias: Some("u".into()),
+                        table_no: None
+                    },
+                    joins: Some(vec![
+                        Join {
+                            join_type: JoinType::new().with(JoinVariant::Inner),
+                            table: Table {
+                                name: "products".into(),
+                                alias: Some("p".into()),
+                                table_no: None
+                            },
+                            on: Some(Expression::Binary {
+                                lhs: Box::new(Expression::Column(Column {
+                                    name: "id".into(),
+                                    alias: None,
+                                    table_name: Some("u".into()),
+                                    table_no: None,
+                                    column_no: None
+                                })),
+                                op: Operator::Eq,
+                                rhs: Box::new(Expression::Column(Column {
+                                    name: "user_id".into(),
+                                    alias: None,
+                                    table_name: Some("p".into()),
+                                    table_no: None,
+                                    column_no: None
+                                }))
+                            })
+                        },
+                        Join {
+                            join_type: JoinType::new().with(JoinVariant::Inner),
+                            table: Table {
+                                name: "orders".into(),
+                                alias: Some("o".into()),
+                                table_no: None
+                            },
+                            on: Some(Expression::Binary {
+                                lhs: Box::new(Expression::Column(Column {
+                                    name: "id".into(),
+                                    alias: None,
+                                    table_name: Some("u".into()),
+                                    table_no: None,
+                                    column_no: None
+                                })),
+                                op: Operator::Eq,
+                                rhs: Box::new(Expression::Column(Column {
+                                    name: "user_id".into(),
+                                    alias: None,
+                                    table_name: Some("o".into()),
+                                    table_no: None,
+                                    column_no: None
+                                }))
+                            })
+                        }
+                    ]),
+                }),
+                where_clause: None,
+                group_by: None,
+                order_by: None,
+                limit: Some(5)
+            }))
+        );
+    }
+
+    #[test]
     fn test_error_message() {
         let test_cases = vec![
             ("SELECT * FROM users WHERE column1 = 'value' ORDER BY", "Unexpected end of input"),
