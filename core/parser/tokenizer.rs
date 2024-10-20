@@ -1,9 +1,9 @@
 use std::ops::Range;
 
 use winnow::ascii::Caseless;
-use winnow::combinator::{alt, delimited, fail, opt, preceded, repeat, terminated};
+use winnow::combinator::{alt, delimited, dispatch, fail, opt, peek, preceded, repeat, terminated};
 use winnow::error::{AddContext, ParserError, StrContext};
-use winnow::token::{literal, one_of, take_while};
+use winnow::token::{any, literal, one_of, take_while};
 use winnow::PResult;
 use winnow::{prelude::*, Located};
 
@@ -208,32 +208,6 @@ fn comparison_operator<
     .parse_next(input)
 }
 
-fn join_related_stuff<
-    'i,
-    E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
->(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<SqlTokenKind, E> {
-    alt((
-        tk_join.value(SqlTokenKind::Join),
-        tk_inner.value(SqlTokenKind::Inner),
-        tk_outer.value(SqlTokenKind::Outer),
-        tk_left.value(SqlTokenKind::Left),
-        tk_on.value(SqlTokenKind::On),
-    ))
-    .parse_next(input)
-}
-
-fn asc_desc<'i, E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<SqlTokenKind, E> {
-    alt((
-        tk_asc.value(SqlTokenKind::Asc),
-        tk_desc.value(SqlTokenKind::Desc),
-    ))
-    .parse_next(input)
-}
-
 fn mathy_operator<
     'i,
     E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
@@ -270,50 +244,214 @@ fn peek_not_identifier_character<
     }
 }
 
-fn keyword<'i, E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>>(
+fn keywords_a_or_identifier<
+    'i,
+    E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
+>(
     input: &mut Located<&'i [u8]>,
 ) -> PResult<SqlTokenKind, E> {
-    let choices = alt((
-        tk_select.value(SqlTokenKind::Select),
-        tk_from.value(SqlTokenKind::From),
-        tk_where.value(SqlTokenKind::Where),
-        tk_and.value(SqlTokenKind::And),
-        tk_order_by.value(SqlTokenKind::OrderBy),
-        tk_or.value(SqlTokenKind::Or),
-        tk_not_like.value(SqlTokenKind::NotLike),
-        tk_not_in.value(SqlTokenKind::NotIn),
-        tk_not.value(SqlTokenKind::Not),
-        tk_group_by.value(SqlTokenKind::GroupBy),
-        tk_limit.value(SqlTokenKind::Limit),
-        join_related_stuff,
-        asc_desc,
-        tk_as.value(SqlTokenKind::As),
-        tk_in.value(SqlTokenKind::In),
-        tk_like.value(SqlTokenKind::Like),
-        tk_glob.value(SqlTokenKind::Glob),
-    ));
+    let keywords = terminated(
+        alt((
+            literal(Caseless("AND")).value(SqlTokenKind::And),
+            literal(Caseless("ASC")).value(SqlTokenKind::Asc),
+            literal(Caseless("AS")).value(SqlTokenKind::As),
+        )),
+        peek_not_identifier_character,
+    );
+    let mut choices = alt((keywords, tk_identifier.value(SqlTokenKind::Identifier)));
+    choices.parse_next(input)
+}
 
-    terminated(choices, peek_not_identifier_character).parse_next(input)
+fn keywords_d_or_identifier<
+    'i,
+    E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
+>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<SqlTokenKind, E> {
+    let keywords = terminated(
+        alt((literal(Caseless("DESC")).value(SqlTokenKind::Desc),)),
+        peek_not_identifier_character,
+    );
+    let mut choices = alt((keywords, tk_identifier.value(SqlTokenKind::Identifier)));
+    choices.parse_next(input)
+}
+
+fn keywords_f_or_identifier<
+    'i,
+    E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
+>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<SqlTokenKind, E> {
+    let keywords = terminated(
+        alt((literal(Caseless("FROM")).value(SqlTokenKind::From),)),
+        peek_not_identifier_character,
+    );
+    let mut choices = alt((keywords, tk_identifier.value(SqlTokenKind::Identifier)));
+    choices.parse_next(input)
+}
+
+fn keywords_g_or_identifier<
+    'i,
+    E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
+>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<SqlTokenKind, E> {
+    let keywords = terminated(
+        alt((
+            literal(Caseless("GLOB")).value(SqlTokenKind::Glob),
+            literal(Caseless("GROUP BY")).value(SqlTokenKind::GroupBy),
+        )),
+        peek_not_identifier_character,
+    );
+    let mut choices = alt((keywords, tk_identifier.value(SqlTokenKind::Identifier)));
+    choices.parse_next(input)
+}
+
+fn keywords_i_or_identifier<
+    'i,
+    E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
+>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<SqlTokenKind, E> {
+    let keywords = terminated(
+        alt((
+            literal(Caseless("INNER")).value(SqlTokenKind::Inner),
+            literal(Caseless("IN")).value(SqlTokenKind::In),
+        )),
+        peek_not_identifier_character,
+    );
+    let mut choices = alt((keywords, tk_identifier.value(SqlTokenKind::Identifier)));
+    choices.parse_next(input)
+}
+
+fn keywords_j_or_identifier<
+    'i,
+    E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
+>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<SqlTokenKind, E> {
+    let keywords = terminated(
+        alt((literal(Caseless("JOIN")).value(SqlTokenKind::Join),)),
+        peek_not_identifier_character,
+    );
+    let mut choices = alt((keywords, tk_identifier.value(SqlTokenKind::Identifier)));
+    choices.parse_next(input)
+}
+
+fn keywords_l_or_identifier<
+    'i,
+    E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
+>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<SqlTokenKind, E> {
+    let keywords = terminated(
+        alt((
+            literal(Caseless("LEFT")).value(SqlTokenKind::Left),
+            literal(Caseless("LIKE")).value(SqlTokenKind::Like),
+            literal(Caseless("LIMIT")).value(SqlTokenKind::Limit),
+        )),
+        peek_not_identifier_character,
+    );
+    let mut choices = alt((keywords, tk_identifier.value(SqlTokenKind::Identifier)));
+    choices.parse_next(input)
+}
+
+fn keywords_n_or_identifier<
+    'i,
+    E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
+>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<SqlTokenKind, E> {
+    let keywords = terminated(
+        alt((
+            literal(Caseless("NOT IN")).value(SqlTokenKind::NotIn),
+            literal(Caseless("NOT LIKE")).value(SqlTokenKind::NotLike),
+            literal(Caseless("NOT")).value(SqlTokenKind::Not),
+        )),
+        peek_not_identifier_character,
+    );
+    let mut choices = alt((keywords, tk_identifier.value(SqlTokenKind::Identifier)));
+    choices.parse_next(input)
+}
+
+fn keywords_o_or_identifier<
+    'i,
+    E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
+>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<SqlTokenKind, E> {
+    let keywords = terminated(
+        alt((
+            literal(Caseless("ON")).value(SqlTokenKind::On),
+            literal(Caseless("ORDER BY")).value(SqlTokenKind::OrderBy),
+            literal(Caseless("OR")).value(SqlTokenKind::Or),
+            literal(Caseless("OUTER")).value(SqlTokenKind::Outer),
+        )),
+        peek_not_identifier_character,
+    );
+    let mut choices = alt((keywords, tk_identifier.value(SqlTokenKind::Identifier)));
+    choices.parse_next(input)
+}
+
+fn keywords_s_or_identifier<
+    'i,
+    E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
+>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<SqlTokenKind, E> {
+    let keywords = terminated(
+        alt((literal(Caseless("SELECT")).value(SqlTokenKind::Select),)),
+        peek_not_identifier_character,
+    );
+    let mut choices = alt((keywords, tk_identifier.value(SqlTokenKind::Identifier)));
+    choices.parse_next(input)
+}
+
+fn keywords_w_or_identifier<
+    'i,
+    E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
+>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<SqlTokenKind, E> {
+    let keywords = terminated(
+        alt((literal(Caseless("WHERE")).value(SqlTokenKind::Where),)),
+        peek_not_identifier_character,
+    );
+    let mut choices = alt((keywords, tk_identifier.value(SqlTokenKind::Identifier)));
+    choices.parse_next(input)
 }
 
 fn sql_token<'i, E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>>(
     input: &mut Located<&'i [u8]>,
 ) -> PResult<SqlToken, E> {
-    alt((
-        keyword,
-        comparison_operator,
-        mathy_operator,
-        tk_period.value(SqlTokenKind::Period),
-        tk_literal.value(SqlTokenKind::Literal),
-        tk_identifier.value(SqlTokenKind::Identifier),
-        tk_semicolon,
-    ))
+    dispatch! {peek(any);
+        b'a' | b'A' => keywords_a_or_identifier,
+        b'd' | b'D' => keywords_d_or_identifier,
+        b'f' | b'F' => keywords_f_or_identifier,
+        b'g' | b'G' => keywords_g_or_identifier,
+        b'i' | b'I' => keywords_i_or_identifier,
+        b'j' | b'J' => keywords_j_or_identifier,
+        b'l' | b'L' => keywords_l_or_identifier,
+        b'n' | b'N' => keywords_n_or_identifier,
+        b'o' | b'O' => keywords_o_or_identifier,
+        b's' | b'S' => keywords_s_or_identifier,
+        b'w' | b'W' => keywords_w_or_identifier,
+        b'0'..=b'9' => alt((float, decimal)),
+        b'.' => alt((float, tk_period.value(SqlTokenKind::Period))),
+        _ => alt((
+            comparison_operator,
+            mathy_operator,
+            tk_identifier.value(SqlTokenKind::Identifier),
+            tk_literal.value(SqlTokenKind::Literal),
+            tk_semicolon.value(SqlTokenKind::Semicolon),
+        )),
+    }
     .with_span()
-    .parse_next(input)
     .map(|(kind, span)| SqlToken {
         kind,
         span: span.start as u32..span.end as u32,
     })
+    .parse_next(input)
 }
 
 fn ws<'i, E: ParserError<Located<&'i [u8]>>>(
@@ -323,42 +461,6 @@ fn ws<'i, E: ParserError<Located<&'i [u8]>>>(
 }
 
 const WS: &[u8] = &[b' ', b'\t', b'\r', b'\n'];
-
-fn tk_in<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<SqlTokenKind, E> {
-    literal(Caseless("IN"))
-        .value(SqlTokenKind::In)
-        .parse_next(input)
-}
-
-fn tk_not_in<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<SqlTokenKind, E> {
-    literal(Caseless("NOT IN"))
-        .value(SqlTokenKind::NotIn)
-        .parse_next(input)
-}
-
-fn tk_not_like<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<SqlTokenKind, E> {
-    literal(Caseless("NOT LIKE"))
-        .value(SqlTokenKind::NotLike)
-        .parse_next(input)
-}
-
-fn tk_like<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal(Caseless("LIKE")).parse_next(input)
-}
-
-fn tk_glob<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal(Caseless("GLOB")).parse_next(input)
-}
 
 fn tk_period<'i, E: ParserError<Located<&'i [u8]>>>(
     input: &mut Located<&'i [u8]>,
@@ -372,96 +474,6 @@ fn tk_semicolon<'i, E: ParserError<Located<&'i [u8]>>>(
     literal(";")
         .value(SqlTokenKind::Semicolon)
         .parse_next(input)
-}
-
-fn tk_join<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal(Caseless("JOIN")).parse_next(input)
-}
-
-fn tk_inner<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal(Caseless("INNER")).parse_next(input)
-}
-
-fn tk_outer<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal(Caseless("OUTER")).parse_next(input)
-}
-
-fn tk_left<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal(Caseless("LEFT")).parse_next(input)
-}
-
-fn tk_on<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal(Caseless("ON")).parse_next(input)
-}
-
-fn tk_as<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal(Caseless("AS")).parse_next(input)
-}
-
-fn tk_select<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal(Caseless("SELECT")).parse_next(input)
-}
-
-fn tk_from<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal(Caseless("FROM")).parse_next(input)
-}
-
-fn tk_where<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal(Caseless("WHERE")).parse_next(input)
-}
-
-fn tk_and<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal(Caseless("AND")).parse_next(input)
-}
-
-fn tk_or<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal(Caseless("OR")).parse_next(input)
-}
-
-fn tk_not<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal(Caseless("NOT")).parse_next(input)
-}
-
-fn tk_group_by<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal(Caseless("GROUP BY")).parse_next(input)
-}
-
-fn tk_order_by<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal(Caseless("ORDER BY")).parse_next(input)
-}
-
-fn tk_limit<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal(Caseless("LIMIT")).parse_next(input)
 }
 
 fn tk_eq<'i, E: ParserError<Located<&'i [u8]>>>(
@@ -556,13 +568,15 @@ fn tk_identifier<'i, E: ParserError<Located<&'i [u8]>>>(
 
 fn decimal<'i, E: ParserError<Located<&'i [u8]>>>(
     input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    take_while(1.., |c: u8| c.is_ascii_digit()).parse_next(input)
+) -> PResult<SqlTokenKind, E> {
+    take_while(1.., |c: u8| c.is_ascii_digit())
+        .value(SqlTokenKind::Literal)
+        .parse_next(input)
 }
 
 fn float<'i, E: ParserError<Located<&'i [u8]>>>(
     input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
+) -> PResult<SqlTokenKind, E> {
     alt((
         // Case one: .42
         (
@@ -583,6 +597,7 @@ fn float<'i, E: ParserError<Located<&'i [u8]>>>(
         // Case three: 42. and 42.42
         (decimal, '.', opt(decimal)).take(),
     ))
+    .value(SqlTokenKind::Literal)
     .parse_next(input)
 }
 
@@ -612,18 +627,6 @@ fn tk_literal<'i, E: ParserError<Located<&'i [u8]>>>(
         decimal.void(),
     ))
     .parse_next(input)
-}
-
-fn tk_asc<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal(Caseless("ASC")).parse_next(input)
-}
-
-fn tk_desc<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal(Caseless("DESC")).parse_next(input)
 }
 
 #[cfg(test)]
