@@ -208,23 +208,6 @@ fn parse_sql_token<
     delimited(ws, sql_token, ws).parse_next(input)
 }
 
-fn comparison_operator<
-    'i,
-    E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
->(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<SqlTokenKind, E> {
-    alt((
-        tk_neq.value(SqlTokenKind::Neq),
-        tk_eq.value(SqlTokenKind::Eq),
-        tk_ge.value(SqlTokenKind::Ge),
-        tk_gt.value(SqlTokenKind::Gt),
-        tk_le.value(SqlTokenKind::Le),
-        tk_lt.value(SqlTokenKind::Lt),
-    ))
-    .parse_next(input)
-}
-
 fn peek_not_identifier_character<
     'i,
     E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]>, StrContext>,
@@ -537,16 +520,38 @@ fn sql_token<'i, E: ParserError<Located<&'i [u8]>> + AddContext<Located<&'i [u8]
         b'*' => tk_asterisk.value(SqlTokenKind::Asterisk),
         b'/' => tk_slash.value(SqlTokenKind::Slash),
         b'\'' => tk_string_literal.value(SqlTokenKind::Literal),
-        _ => alt((
-            comparison_operator,
-            tk_identifier.value(SqlTokenKind::Identifier),
-        )),
+        b'>' => comparison_operators_gt_ge,
+        b'<' => comparison_operators_lt_le_neq,
+        b'=' => literal('=').value(SqlTokenKind::Eq),
+        b'!' => literal("!=").value(SqlTokenKind::Neq),
+        _ => tk_identifier.value(SqlTokenKind::Identifier),
     }
     .with_span()
     .map(|(kind, span)| SqlToken {
         kind,
         span: span.start as u32..span.end as u32,
     })
+    .parse_next(input)
+}
+
+fn comparison_operators_gt_ge<'i, E: ParserError<Located<&'i [u8]>>>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<SqlTokenKind, E> {
+    alt((
+        literal(">=").value(SqlTokenKind::Ge),
+        literal(">").value(SqlTokenKind::Gt),
+    ))
+    .parse_next(input)
+}
+
+fn comparison_operators_lt_le_neq<'i, E: ParserError<Located<&'i [u8]>>>(
+    input: &mut Located<&'i [u8]>,
+) -> PResult<SqlTokenKind, E> {
+    alt((
+        literal("<=").value(SqlTokenKind::Le),
+        literal("<>").value(SqlTokenKind::Neq),
+        literal("<").value(SqlTokenKind::Lt),
+    ))
     .parse_next(input)
 }
 
@@ -570,42 +575,6 @@ fn tk_semicolon<'i, E: ParserError<Located<&'i [u8]>>>(
     literal(";")
         .value(SqlTokenKind::Semicolon)
         .parse_next(input)
-}
-
-fn tk_eq<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal("=").parse_next(input)
-}
-
-fn tk_neq<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    alt((literal("!="), literal("<>"))).parse_next(input)
-}
-
-fn tk_ge<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal(">=").parse_next(input)
-}
-
-fn tk_gt<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal(">").parse_next(input)
-}
-
-fn tk_le<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal("<=").parse_next(input)
-}
-
-fn tk_lt<'i, E: ParserError<Located<&'i [u8]>>>(
-    input: &mut Located<&'i [u8]>,
-) -> PResult<&'i [u8], E> {
-    literal("<").parse_next(input)
 }
 
 fn tk_paren_l<'i, E: ParserError<Located<&'i [u8]>>>(
