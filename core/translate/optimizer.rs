@@ -26,6 +26,7 @@ pub fn optimize_plan(mut select_plan: Plan) -> Result<Plan> {
         &select_plan.referenced_tables,
         &select_plan.available_indexes,
     )?;
+    update_column_info(&mut select_plan);
     eliminate_unnecessary_orderby(
         &mut select_plan.source,
         &mut select_plan.order_by,
@@ -61,7 +62,7 @@ fn _operator_is_already_ordered_by(
                     available_indexes,
                 )?;
                 let index_is_the_same = index_idx
-                    .map(|i| Rc::ptr_eq(&available_indexes[i], index))
+                    .map(|(i, _)| Rc::ptr_eq(&available_indexes[i], index))
                     .unwrap_or(false);
                 Ok(index_is_the_same)
             }
@@ -101,6 +102,40 @@ fn eliminate_unnecessary_orderby(
     }
 
     Ok(())
+}
+
+fn update_column_info(plan: &mut Plan) {
+    if let SourceOperator::Search { search, .. } = &plan.source {
+        if let Search::IndexSearch {
+            index, covering, ..
+        } = search
+        {
+            if !*covering {
+                return;
+            }
+
+            for col in plan.result_columns.iter_mut() {
+                if let ast::Expr::Column {
+                    index_name,
+                    table,
+                    column,
+                    ..
+                } = &mut col.expr
+                {
+                    let tbl_ref = &plan.referenced_tables[*table];
+                    let col = &tbl_ref.table.columns[*column];
+                    if !col.primary_key {
+                        *column = index
+                            .columns
+                            .iter()
+                            .position(|col_def| col_def.name == col.name)
+                            .unwrap();
+                    }
+                    *index_name = Some(index.name.clone())
+                }
+            }
+        }
+    }
 }
 
 /**
@@ -463,7 +498,7 @@ pub trait Optimizable {
         table_index: usize,
         referenced_tables: &[BTreeTableReference],
         available_indexes: &[Rc<Index>],
-    ) -> Result<Option<usize>>;
+    ) -> Result<Option<(usize, usize)>>;
 }
 
 impl Optimizable for ast::Expr {
@@ -482,18 +517,15 @@ impl Optimizable for ast::Expr {
         table_index: usize,
         referenced_tables: &[BTreeTableReference],
         available_indexes: &[Rc<Index>],
-    ) -> Result<Option<usize>> {
+    ) -> Result<Option<(usize, usize)>> {
         match self {
             ast::Expr::Column { table, column, .. } => {
                 for (idx, index) in available_indexes.iter().enumerate() {
-                    if index.table_name == referenced_tables[*table].table.name {
-                        let column = referenced_tables[*table]
-                            .table
-                            .columns
-                            .get(*column)
-                            .unwrap();
+                    let referenced_table = &referenced_tables[*table];
+                    if index.table_name == referenced_table.table.name {
+                        let column = referenced_table.table.columns.get(*column).unwrap();
                         if index.columns.first().unwrap().name == column.name {
-                            return Ok(Some(idx));
+                            return Ok(Some((idx, *table)));
                         }
                     }
                 }
@@ -519,6 +551,7 @@ impl Optimizable for ast::Expr {
             _ => Ok(None),
         }
     }
+
     fn check_constant(&self) -> Result<Option<ConstantPredicate>> {
         match self {
             ast::Expr::Literal(lit) => match lit {
@@ -687,7 +720,7 @@ pub fn try_extract_index_search_expression(
                 }
             }
 
-            if let Some(index_index) =
+            if let Some((index_index, table_index)) =
                 lhs.check_index_scan(table_index, referenced_tables, available_indexes)?
             {
                 match operator {
@@ -696,17 +729,31 @@ pub fn try_extract_index_search_expression(
                     | ast::Operator::GreaterEquals
                     | ast::Operator::Less
                     | ast::Operator::LessEquals => {
+                        let index = &available_indexes[index_index];
+                        let table = &referenced_tables[table_index];
+
+                        println!("table:{:?}", table.cols_prepare_to_read);
+                        println!("index:{:?}", index.columns);
+
+                        let covering = match &table.cols_prepare_to_read {
+                            Some(cols) => cols.iter().all(|col| {
+                                col.primary_key
+                                    || index.columns.iter().any(|idx_col| idx_col.name == col.name)
+                            }),
+                            None => false,
+                        };
                         return Ok(Either::Right(Search::IndexSearch {
                             index: available_indexes[index_index].clone(),
                             cmp_op: operator,
                             cmp_expr: *rhs,
+                            covering,
                         }));
                     }
                     _ => {}
                 }
             }
 
-            if let Some(index_index) =
+            if let Some((index_index, table_index)) =
                 rhs.check_index_scan(table_index, referenced_tables, available_indexes)?
             {
                 match operator {
@@ -715,10 +762,20 @@ pub fn try_extract_index_search_expression(
                     | ast::Operator::GreaterEquals
                     | ast::Operator::Less
                     | ast::Operator::LessEquals => {
+                        let index = &available_indexes[index_index];
+                        let table = &referenced_tables[table_index];
+                        let covering = match &table.cols_prepare_to_read {
+                            Some(cols) => cols.iter().all(|col| {
+                                col.primary_key
+                                    || index.columns.iter().any(|idx_col| idx_col.name == col.name)
+                            }),
+                            None => false,
+                        };
                         return Ok(Either::Right(Search::IndexSearch {
                             index: available_indexes[index_index].clone(),
                             cmp_op: operator,
                             cmp_expr: *lhs,
+                            covering,
                         }));
                     }
                     _ => {}

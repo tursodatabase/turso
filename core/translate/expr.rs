@@ -1391,14 +1391,27 @@ pub fn translate_expr(
             table,
             column,
             is_rowid_alias: is_primary_key,
+            index_name,
+            ..
         } => {
             let tbl_ref = referenced_tables.as_ref().unwrap().get(*table).unwrap();
-            let cursor_id = program.resolve_cursor_id(&tbl_ref.table_identifier);
+            let cursor_id = if let Some(index_name) = index_name {
+                program.resolve_cursor_id(&index_name)
+            } else {
+                program.resolve_cursor_id(&tbl_ref.table_identifier)
+            };
             if *is_primary_key {
-                program.emit_insn(Insn::RowId {
-                    cursor_id,
-                    dest: target_register,
-                });
+                if index_name.is_some() {
+                    program.emit_insn(Insn::IdxRowId {
+                        cursor_id,
+                        dest: target_register,
+                    });
+                } else {
+                    program.emit_insn(Insn::RowId {
+                        cursor_id,
+                        dest: target_register,
+                    });
+                }
             } else {
                 program.emit_insn(Insn::Column {
                     cursor_id,

@@ -8,11 +8,11 @@ use sqlite3_parser::ast;
 
 use crate::{
     function::AggFunc,
-    schema::{BTreeTable, Index},
+    schema::{BTreeTable, Column, Index},
     Result,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ResultSetColumn {
     pub expr: ast::Expr,
     // TODO: encode which aggregates (e.g. index bitmask of plan.aggregates) are present in this column
@@ -104,6 +104,20 @@ pub struct BTreeTableReference {
     pub table: Rc<BTreeTable>,
     pub table_identifier: String,
     pub table_index: usize,
+    pub cols_prepare_to_read: Option<Vec<Column>>,
+}
+
+impl BTreeTableReference {
+    pub fn push_col_to_read(&mut self, col: Column) {
+        match &mut self.cols_prepare_to_read {
+            Some(cols) => cols.push(col),
+            None => self.cols_prepare_to_read = Some(vec![col]),
+        }
+    }
+
+    pub fn set_cols_to_read(&mut self, cols: Vec<Column>) {
+        self.cols_prepare_to_read = Some(cols)
+    }
 }
 
 /// An enum that represents a search operation that can be used to search for a row in a table using an index
@@ -123,6 +137,7 @@ pub enum Search {
         index: Rc<Index>,
         cmp_op: ast::Operator,
         cmp_expr: ast::Expr,
+        covering: bool,
     },
 }
 

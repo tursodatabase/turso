@@ -330,6 +330,11 @@ pub enum Insn {
         dest: usize,
     },
 
+    IdxRowId {
+        cursor_id: CursorID,
+        dest: usize,
+    },
+
     // Seek to a rowid in the cursor. If not found, jump to the given PC. Otherwise, continue to the next instruction.
     SeekRowid {
         cursor_id: CursorID,
@@ -1524,6 +1529,16 @@ impl Program {
                 }
                 Insn::Blob { value, dest } => {
                     state.registers[*dest] = OwnedValue::Blob(Rc::new(value.clone()));
+                    state.pc += 1;
+                }
+
+                Insn::IdxRowId { cursor_id, dest } => {
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
+                    if let Some(rowid) = cursor.rowid()? {
+                        state.registers[*dest] = OwnedValue::Integer(rowid as i64);
+                    } else {
+                        state.registers[*dest] = OwnedValue::Null;
+                    }
                     state.pc += 1;
                 }
                 Insn::RowId { cursor_id, dest } => {

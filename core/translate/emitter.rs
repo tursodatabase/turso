@@ -425,18 +425,29 @@ fn init_source(
 
             let scan_loop_body_label = program.allocate_label();
             metadata.scan_loop_body_labels.push(scan_loop_body_label);
-            program.emit_insn(Insn::OpenReadAsync {
-                cursor_id: table_cursor_id,
-                root_page: table_reference.table.root_page,
-            });
-            program.emit_insn(Insn::OpenReadAwait);
 
-            if let Search::IndexSearch { index, .. } = search {
+            if let Search::IndexSearch {
+                index, covering, ..
+            } = search
+            {
+                if !*covering {
+                    program.emit_insn(Insn::OpenReadAsync {
+                        cursor_id: table_cursor_id,
+                        root_page: table_reference.table.root_page,
+                    });
+                    program.emit_insn(Insn::OpenReadAwait);
+                }
                 let index_cursor_id = program
                     .alloc_cursor_id(Some(index.name.clone()), Some(Table::Index(index.clone())));
                 program.emit_insn(Insn::OpenReadAsync {
                     cursor_id: index_cursor_id,
                     root_page: index.root_page,
+                });
+                program.emit_insn(Insn::OpenReadAwait);
+            } else {
+                program.emit_insn(Insn::OpenReadAsync {
+                    cursor_id: table_cursor_id,
+                    root_page: table_reference.table.root_page,
                 });
                 program.emit_insn(Insn::OpenReadAwait);
             }
@@ -593,7 +604,12 @@ fn open_loop(
             // Open the loop for the index search.
             // Primary key equality search is handled with a SeekRowid instruction which does not loop, since it is a single row lookup.
             if !matches!(search, Search::PrimaryKeyEq { .. }) {
-                let index_cursor_id = if let Search::IndexSearch { index, .. } = search {
+                let mut covering_index = false;
+                let index_cursor_id = if let Search::IndexSearch {
+                    index, covering, ..
+                } = search
+                {
+                    covering_index = *covering;
                     Some(program.resolve_cursor_id(&index.name))
                 } else {
                     None
@@ -722,10 +738,12 @@ fn open_loop(
                 }
 
                 if let Some(index_cursor_id) = index_cursor_id {
-                    program.emit_insn(Insn::DeferredSeek {
-                        index_cursor_id,
-                        table_cursor_id,
-                    });
+                    if !covering_index {
+                        program.emit_insn(Insn::DeferredSeek {
+                            index_cursor_id,
+                            table_cursor_id,
+                        });
+                    }
                 }
             }
 

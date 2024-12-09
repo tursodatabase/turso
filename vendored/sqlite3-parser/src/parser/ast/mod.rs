@@ -337,6 +337,8 @@ pub enum Expr {
         column: usize,
         /// is the column a rowid alias
         is_rowid_alias: bool,
+        /// read from index
+        index_name: Option<String>,
     },
     /// `IN`
     InList {

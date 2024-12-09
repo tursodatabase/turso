@@ -956,6 +956,22 @@ pub fn insn_to_str(
                 0,
                 "".to_string(),
             ),
+            Insn::IdxRowId { cursor_id, dest } => {
+                let (table_identifier, _) = &program.cursor_ref[*cursor_id];
+                (
+                    "IdxRowId",
+                    *cursor_id as i32,
+                    *dest as i32,
+                    0,
+                    OwnedValue::Text(Rc::new("".to_string())),
+                    0,
+                    format!(
+                        "r[{}]=rowid, {}.rowid",
+                        dest,
+                        table_identifier.as_ref().unwrap()
+                    ),
+                )
+            }
         };
     format!(
         "{:<4}  {:<17}  {:<4}  {:<4}  {:<4}  {:<13}  {:<2}  {}",
