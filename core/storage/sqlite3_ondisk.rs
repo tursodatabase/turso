@@ -806,21 +806,21 @@ impl TryFrom<u64> for SerialType {
     type Error = crate::error::LimboError;
 
     fn try_from(value: u64) -> Result<Self> {
-        match value {
-            0 => Ok(Self::Null),
-            1 => Ok(Self::UInt8),
-            2 => Ok(Self::BEInt16),
-            3 => Ok(Self::BEInt24),
-            4 => Ok(Self::BEInt32),
-            5 => Ok(Self::BEInt48),
-            6 => Ok(Self::BEInt64),
-            7 => Ok(Self::BEFloat64),
-            8 => Ok(Self::ConstInt0),
-            9 => Ok(Self::ConstInt1),
-            n if value >= 12 && value % 2 == 0 => Ok(Self::Blob(((n - 12) / 2) as usize)),
-            n if value >= 13 && value % 2 == 1 => Ok(Self::String(((n - 13) / 2) as usize)),
+        Ok(match value {
+            0 => Self::Null,
+            1 => Self::UInt8,
+            2 => Self::BEInt16,
+            3 => Self::BEInt24,
+            4 => Self::BEInt32,
+            5 => Self::BEInt48,
+            6 => Self::BEInt64,
+            7 => Self::BEFloat64,
+            8 => Self::ConstInt0,
+            9 => Self::ConstInt1,
+            n if value >= 12 && value % 2 == 0 => Self::Blob(((n - 12) / 2) as usize),
+            n if value >= 13 && value % 2 == 1 => Self::String(((n - 13) / 2) as usize),
             _ => crate::bail_corrupt_error!("Invalid serial type: {}", value),
-        }
+        })
     }
 }
 
