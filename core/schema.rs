@@ -58,16 +58,14 @@ impl Table {
     pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {
         match self {
             Self::BTree(table) => table.get_rowid_alias_column(),
-            Self::Index(_) |
-            Self::Pseudo(_) => None,
+            Self::Index(_) | Self::Pseudo(_) => None,
         }
     }
 
     pub fn column_is_rowid_alias(&self, col: &Column) -> bool {
         match self {
             Self::BTree(table) => table.column_is_rowid_alias(col),
-            Self::Index(_) |
-            Self::Pseudo(_) => false,
+            Self::Index(_) | Self::Pseudo(_) => false,
         }
     }
 
@@ -368,12 +366,12 @@ pub enum Type {
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
-            Type::Null => "NULL",
-            Type::Text => "TEXT",
-            Type::Numeric => "NUMERIC",
-            Type::Integer => "INTEGER",
-            Type::Real => "REAL",
-            Type::Blob => "BLOB",
+            Self::Null => "NULL",
+            Self::Text => "TEXT",
+            Self::Numeric => "NUMERIC",
+            Self::Integer => "INTEGER",
+            Self::Real => "REAL",
+            Self::Blob => "BLOB",
         };
         write!(f, "{}", s)
     }
