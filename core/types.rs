@@ -74,12 +74,12 @@ const NULL: OwnedValue = OwnedValue::Null;
 impl AggContext {
     pub fn final_value(&self) -> &OwnedValue {
         match self {
-            AggContext::Avg(acc, _count) => acc,
-            AggContext::Sum(acc) => acc,
-            AggContext::Count(count) => count,
-            AggContext::Max(max) => max.as_ref().unwrap_or(&NULL),
-            AggContext::Min(min) => min.as_ref().unwrap_or(&NULL),
-            AggContext::GroupConcat(s) => s,
+            Self::Avg(acc, _count) => acc,
+            Self::Sum(acc) => acc,
+            Self::Count(count) => count,
+            Self::Max(max) => max.as_ref().unwrap_or(&NULL),
+            Self::Min(min) => min.as_ref().unwrap_or(&NULL),
+            Self::GroupConcat(s) => s,
         }
     }
 }
@@ -88,44 +88,36 @@ impl AggContext {
 impl PartialOrd<OwnedValue> for OwnedValue {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
-            (OwnedValue::Integer(int_left), OwnedValue::Integer(int_right)) => {
-                int_left.partial_cmp(int_right)
-            }
-            (OwnedValue::Integer(int_left), OwnedValue::Float(float_right)) => {
+            (Self::Integer(int_left), Self::Integer(int_right)) => int_left.partial_cmp(int_right),
+            (Self::Integer(int_left), Self::Float(float_right)) => {
                 (*int_left as f64).partial_cmp(float_right)
             }
-            (OwnedValue::Float(float_left), OwnedValue::Integer(int_right)) => {
+            (Self::Float(float_left), Self::Integer(int_right)) => {
                 float_left.partial_cmp(&(*int_right as f64))
             }
-            (OwnedValue::Float(float_left), OwnedValue::Float(float_right)) => {
+            (Self::Float(float_left), Self::Float(float_right)) => {
                 float_left.partial_cmp(float_right)
             }
             // Numeric vs Text/Blob
-            (
-                OwnedValue::Integer(_) | OwnedValue::Float(_),
-                OwnedValue::Text(_) | OwnedValue::Blob(_),
-            ) => Some(std::cmp::Ordering::Less),
-            (
-                OwnedValue::Text(_) | OwnedValue::Blob(_),
-                OwnedValue::Integer(_) | OwnedValue::Float(_),
-            ) => Some(std::cmp::Ordering::Greater),
-
-            (OwnedValue::Text(text_left), OwnedValue::Text(text_right)) => {
-                text_left.partial_cmp(text_right)
+            (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => {
+                Some(std::cmp::Ordering::Less)
             }
+            (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => {
+                Some(std::cmp::Ordering::Greater)
+            }
+
+            (Self::Text(text_left), Self::Text(text_right)) => text_left.partial_cmp(text_right),
             // Text vs Blob
-            (OwnedValue::Text(_), OwnedValue::Blob(_)) => Some(std::cmp::Ordering::Less),
-            (OwnedValue::Blob(_), OwnedValue::Text(_)) => Some(std::cmp::Ordering::Greater),
+            (Self::Text(_), Self::Blob(_)) => Some(std::cmp::Ordering::Less),
+            (Self::Blob(_), Self::Text(_)) => Some(std::cmp::Ordering::Greater),
 
-            (OwnedValue::Blob(blob_left), OwnedValue::Blob(blob_right)) => {
-                blob_left.partial_cmp(blob_right)
-            }
-            (OwnedValue::Null, OwnedValue::Null) => Some(std::cmp::Ordering::Equal),
-            (OwnedValue::Null, _) => Some(std::cmp::Ordering::Less),
-            (_, OwnedValue::Null) => Some(std::cmp::Ordering::Greater),
-            (OwnedValue::Agg(a), OwnedValue::Agg(b)) => a.partial_cmp(b),
-            (OwnedValue::Agg(a), other) => a.final_value().partial_cmp(other),
-            (other, OwnedValue::Agg(b)) => other.partial_cmp(b.final_value()),
+            (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.partial_cmp(blob_right),
+            (Self::Null, Self::Null) => Some(std::cmp::Ordering::Equal),
+            (Self::Null, _) => Some(std::cmp::Ordering::Less),
+            (_, Self::Null) => Some(std::cmp::Ordering::Greater),
+            (Self::Agg(a), Self::Agg(b)) => a.partial_cmp(b),
+            (Self::Agg(a), other) => a.final_value().partial_cmp(other),
+            (other, Self::Agg(b)) => other.partial_cmp(b.final_value()),
             other => todo!("{:?}", other),
         }
     }
@@ -134,12 +126,12 @@ impl PartialOrd<OwnedValue> for OwnedValue {
 impl std::cmp::PartialOrd<AggContext> for AggContext {
     fn partial_cmp(&self, other: &AggContext) -> Option<std::cmp::Ordering> {
         match (self, other) {
-            (AggContext::Avg(a, _), AggContext::Avg(b, _)) => a.partial_cmp(b),
-            (AggContext::Sum(a), AggContext::Sum(b)) => a.partial_cmp(b),
-            (AggContext::Count(a), AggContext::Count(b)) => a.partial_cmp(b),
-            (AggContext::Max(a), AggContext::Max(b)) => a.partial_cmp(b),
-            (AggContext::Min(a), AggContext::Min(b)) => a.partial_cmp(b),
-            (AggContext::GroupConcat(a), AggContext::GroupConcat(b)) => a.partial_cmp(b),
+            (Self::Avg(a, _), Self::Avg(b, _)) => a.partial_cmp(b),
+            (Self::Sum(a), Self::Sum(b)) => a.partial_cmp(b),
+            (Self::Count(a), Self::Count(b)) => a.partial_cmp(b),
+            (Self::Max(a), Self::Max(b)) => a.partial_cmp(b),
+            (Self::Min(a), Self::Min(b)) => a.partial_cmp(b),
+            (Self::GroupConcat(a), Self::GroupConcat(b)) => a.partial_cmp(b),
             _ => None,
         }
     }
