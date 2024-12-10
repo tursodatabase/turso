@@ -182,9 +182,9 @@ impl std::ops::Add for OwnedValue {
 }
 
 impl std::ops::Add<f64> for OwnedValue {
-    type Output = OwnedValue;
+    type Output = Self;
 
-    fn add(self, rhs: f64) -> Self::Output {
+    fn add(self, rhs: f64) -> Self {
         match self {
             Self::Integer(int_left) => Self::Float(int_left as f64 + rhs),
             Self::Float(float_left) => Self::Float(float_left + rhs),

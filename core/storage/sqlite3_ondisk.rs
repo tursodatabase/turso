@@ -291,13 +291,13 @@ impl TryFrom<u8> for PageType {
     type Error = LimboError;
 
     fn try_from(value: u8) -> Result<Self> {
-        match value {
-            2 => Ok(Self::IndexInterior),
-            5 => Ok(Self::TableInterior),
-            10 => Ok(Self::IndexLeaf),
-            13 => Ok(Self::TableLeaf),
-            _ => Err(LimboError::Corrupt(format!("Invalid page type: {}", value))),
-        }
+        Ok(match value {
+            2 => Self::IndexInterior,
+            5 => Self::TableInterior,
+            10 => Self::IndexLeaf,
+            13 => Self::TableLeaf,
+            _ => return Err(LimboError::Corrupt(format!("Invalid page type: {}", value))),
+        })
     }
 }
 
