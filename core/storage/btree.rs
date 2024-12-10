@@ -121,8 +121,8 @@ impl BTreeCursor {
         Self {
             pager,
             root_page,
-            rowid: RefCell::new(None),
-            record: RefCell::new(None),
+            rowid: None.into(),
+            record: None.into(),
             null_flag: false,
             database_header,
             going_upwards: false,
@@ -130,8 +130,8 @@ impl BTreeCursor {
                 state: WriteState::Start,
                 new_pages: RefCell::new(Vec::with_capacity(4)),
                 scratch_cells: RefCell::new(vec![]),
-                rightmost_pointer: RefCell::new(None),
-                page_copy: RefCell::new(None),
+                rightmost_pointer: None.into(),
+                page_copy: None.into(),
             },
             stack: PageStack {
                 current_page: RefCell::new(-1),

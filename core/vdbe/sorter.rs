@@ -15,7 +15,7 @@ impl Sorter {
     pub fn new(order: Vec<bool>) -> Self {
         Self {
             records: vec![],
-            current: RefCell::new(None),
+            current: None.into(),
             order,
         }
     }

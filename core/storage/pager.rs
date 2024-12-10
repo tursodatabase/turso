@@ -129,8 +129,8 @@ impl DumbLruPageCache {
         Self {
             capacity,
             map: RefCell::new(HashMap::new()),
-            head: RefCell::new(None),
-            tail: RefCell::new(None),
+            head: None.into(),
+            tail: None.into(),
         }
     }
 
