@@ -112,7 +112,7 @@ fn main() {
     let connections = vec![SimConnection::Disconnected; opts.max_connections];
     let mut env = SimulatorEnv {
         opts,
-        tables: Vec::new(),
+        tables: vec![],
         connections,
         rng,
         io,
@@ -197,7 +197,7 @@ fn do_write(env: &mut SimulatorEnv, conn: &mut Rc<Connection>) -> Result<()> {
     }
 
     let columns = env.tables[table].columns.clone();
-    let mut row = Vec::new();
+    let mut row = vec![];
 
     // gen insert query
     for column in &columns {
@@ -236,7 +236,7 @@ fn compare_equal_rows(a: &[Vec<Value>], b: &[Vec<Value>]) {
 fn maybe_add_table(env: &mut SimulatorEnv, conn: &mut Rc<Connection>) -> Result<()> {
     if env.tables.len() < env.opts.max_tables {
         let table = Table {
-            rows: Vec::new(),
+            rows: vec![],
             name: gen_random_name(env),
             columns: gen_columns(env),
         };
@@ -289,7 +289,7 @@ fn gen_random_text(env: &mut SimulatorEnv) -> String {
 
 fn gen_columns(env: &mut SimulatorEnv) -> Vec<Column> {
     let mut column_range = env.rng.gen_range(1..128);
-    let mut columns = Vec::new();
+    let mut columns = vec![];
     while column_range > 0 {
         let column_type = match env.rng.gen_range(0..4) {
             0 => ColumnType::Integer,
@@ -316,7 +316,7 @@ fn get_all_rows(
     query: &str,
 ) -> Result<Vec<Vec<Value>>> {
     log::info!("running query '{}'", &query[0..query.len().min(4096)]);
-    let mut out = Vec::new();
+    let mut out = vec![];
     let rows = conn.query(query);
     if rows.is_err() {
         let err = rows.err();
@@ -334,7 +334,7 @@ fn get_all_rows(
         env.io.inject_fault(env.rng.gen_ratio(1, 10000));
         match rows.next_row()? {
             RowResult::Row(row) => {
-                let mut r = Vec::new();
+                let mut r = vec![];
                 for el in &row.values {
                     let v = match el {
                         limbo_core::Value::Null => Value::Null,
@@ -376,7 +376,7 @@ impl SimulatorIO {
     fn new(seed: u64, page_size: usize) -> Result<Self> {
         let inner = Box::new(PlatformIO::new()?);
         let fault = RefCell::new(false);
-        let files = RefCell::new(Vec::new());
+        let files = RefCell::new(vec![]);
         let rng = RefCell::new(ChaCha8Rng::seed_from_u64(seed));
         let nr_run_once_faults = RefCell::new(0);
         Ok(Self {

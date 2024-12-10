@@ -1,10 +1,6 @@
-use std::fmt::Display;
-use std::{cell::Ref, rc::Rc};
+use std::{cell::Ref, fmt::Display, rc::Rc};
 
-use crate::error::LimboError;
-use crate::Result;
-
-use crate::storage::sqlite3_ondisk::write_varint;
+use crate::{error::LimboError, storage::sqlite3_ondisk::write_varint, Result};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value<'a> {
@@ -124,7 +120,7 @@ impl PartialOrd<OwnedValue> for OwnedValue {
 }
 
 impl std::cmp::PartialOrd<AggContext> for AggContext {
-    fn partial_cmp(&self, other: &AggContext) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
             (Self::Avg(a, _), Self::Avg(b, _))
             | (Self::Sum(a), Self::Sum(b))
@@ -144,10 +140,10 @@ impl std::cmp::Ord for OwnedValue {
     }
 }
 
-impl std::ops::Add<OwnedValue> for OwnedValue {
-    type Output = OwnedValue;
+impl std::ops::Add for OwnedValue {
+    type Output = Self;
 
-    fn add(self, rhs: Self) -> Self::Output {
+    fn add(self, rhs: Self) -> Self {
         match (self, rhs) {
             (Self::Integer(int_left), Self::Integer(int_right)) => {
                 Self::Integer(int_left + int_right)
@@ -198,9 +194,9 @@ impl std::ops::Add<f64> for OwnedValue {
 }
 
 impl std::ops::Add<i64> for OwnedValue {
-    type Output = OwnedValue;
+    type Output = Self;
 
-    fn add(self, rhs: i64) -> Self::Output {
+    fn add(self, rhs: i64) -> Self {
         match self {
             Self::Integer(int_left) => Self::Integer(int_left + rhs),
             Self::Float(float_left) => Self::Float(float_left + rhs as f64),
@@ -227,10 +223,10 @@ impl std::ops::AddAssign<f64> for OwnedValue {
     }
 }
 
-impl std::ops::Div<OwnedValue> for OwnedValue {
-    type Output = OwnedValue;
+impl std::ops::Div for OwnedValue {
+    type Output = Self;
 
-    fn div(self, rhs: OwnedValue) -> Self::Output {
+    fn div(self, rhs: Self) -> Self {
         match (self, rhs) {
             (Self::Integer(int_left), Self::Integer(int_right)) => {
                 Self::Integer(int_left / int_right)
@@ -379,7 +375,7 @@ impl OwnedRecord {
             };
         }
 
-        let mut header_bytes_buf: Vec<u8> = Vec::new();
+        let mut header_bytes_buf: Vec<u8> = vec![];
         if header_size <= 126 {
             // common case
             header_size += 1;

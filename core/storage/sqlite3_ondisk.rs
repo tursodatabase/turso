@@ -566,7 +566,7 @@ fn finish_read_page(
     let inner = PageContent {
         offset: pos,
         buffer: buffer_ref.clone(),
-        overflow_cells: Vec::new(),
+        overflow_cells: vec![],
     };
     {
         let mut page = page.borrow_mut();

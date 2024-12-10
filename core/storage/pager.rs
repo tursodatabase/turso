@@ -664,7 +664,7 @@ pub fn allocate_page(
         page.contents = Some(PageContent {
             offset,
             buffer,
-            overflow_cells: Vec::new(),
+            overflow_cells: vec![],
         });
     }
     page_ref
