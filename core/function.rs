@@ -35,14 +35,14 @@ pub enum AggFunc {
 impl AggFunc {
     pub fn to_string(&self) -> &str {
         match self {
-            AggFunc::Avg => "avg",
-            AggFunc::Count => "count",
-            AggFunc::GroupConcat => "group_concat",
-            AggFunc::Max => "max",
-            AggFunc::Min => "min",
-            AggFunc::StringAgg => "string_agg",
-            AggFunc::Sum => "sum",
-            AggFunc::Total => "total",
+            Self::Avg => "avg",
+            Self::Count => "count",
+            Self::GroupConcat => "group_concat",
+            Self::Max => "max",
+            Self::Min => "min",
+            Self::StringAgg => "string_agg",
+            Self::Sum => "sum",
+            Self::Total => "total",
         }
     }
 }
@@ -89,43 +89,43 @@ pub enum ScalarFunc {
 impl Display for ScalarFunc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let str = match self {
-            ScalarFunc::Cast => "cast".to_string(),
-            ScalarFunc::Char => "char".to_string(),
-            ScalarFunc::Coalesce => "coalesce".to_string(),
-            ScalarFunc::Concat => "concat".to_string(),
-            ScalarFunc::ConcatWs => "concat_ws".to_string(),
-            ScalarFunc::Glob => "glob".to_string(),
-            ScalarFunc::IfNull => "ifnull".to_string(),
-            ScalarFunc::Instr => "instr".to_string(),
-            ScalarFunc::Like => "like(2)".to_string(),
-            ScalarFunc::Abs => "abs".to_string(),
-            ScalarFunc::Upper => "upper".to_string(),
-            ScalarFunc::Lower => "lower".to_string(),
-            ScalarFunc::Random => "random".to_string(),
-            ScalarFunc::RandomBlob => "randomblob".to_string(),
-            ScalarFunc::Trim => "trim".to_string(),
-            ScalarFunc::LTrim => "ltrim".to_string(),
-            ScalarFunc::RTrim => "rtrim".to_string(),
-            ScalarFunc::Round => "round".to_string(),
-            ScalarFunc::Length => "length".to_string(),
-            ScalarFunc::Min => "min".to_string(),
-            ScalarFunc::Max => "max".to_string(),
-            ScalarFunc::Nullif => "nullif".to_string(),
-            ScalarFunc::Sign => "sign".to_string(),
-            ScalarFunc::Substr => "substr".to_string(),
-            ScalarFunc::Substring => "substring".to_string(),
-            ScalarFunc::Date => "date".to_string(),
-            ScalarFunc::Time => "time".to_string(),
-            ScalarFunc::Typeof => "typeof".to_string(),
-            ScalarFunc::Unicode => "unicode".to_string(),
-            ScalarFunc::Quote => "quote".to_string(),
-            ScalarFunc::SqliteVersion => "sqlite_version".to_string(),
-            ScalarFunc::UnixEpoch => "unixepoch".to_string(),
-            ScalarFunc::Hex => "hex".to_string(),
-            ScalarFunc::Unhex => "unhex".to_string(),
-            ScalarFunc::ZeroBlob => "zeroblob".to_string(),
+            Self::Cast => "cast",
+            Self::Char => "char.",
+            Self::Coalesce => "coalesce",
+            Self::Concat => "concat",
+            Self::ConcatWs => "concat_ws",
+            Self::Glob => "glob",
+            Self::IfNull => "ifnull",
+            Self::Instr => "instr",
+            Self::Like => "like(2)",
+            Self::Abs => "abs",
+            Self::Upper => "upper",
+            Self::Lower => "lower",
+            Self::Random => "random",
+            Self::RandomBlob => "randomblob",
+            Self::Trim => "trim",
+            Self::LTrim => "ltrim",
+            Self::RTrim => "rtrim",
+            Self::Round => "round",
+            Self::Length => "length",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::Nullif => "nullif",
+            Self::Sign => "sign",
+            Self::Substr => "substr",
+            Self::Substring => "substring",
+            Self::Date => "date",
+            Self::Time => "time",
+            Self::Typeof => "typeof",
+            Self::Unicode => "unicode",
+            Self::Quote => "quote",
+            Self::SqliteVersion => "sqlite_version",
+            Self::UnixEpoch => "unixepoch",
+            Self::Hex => "hex",
+            Self::Unhex => "unhex",
+            Self::ZeroBlob => "zeroblob",
         };
-        write!(f, "{}", str)
+        write!(f, "{}", str.to_string())
     }
 }
 
@@ -140,10 +140,10 @@ pub enum Func {
 impl Display for Func {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Func::Agg(agg_func) => write!(f, "{}", agg_func.to_string()),
-            Func::Scalar(scalar_func) => write!(f, "{}", scalar_func),
+            Self::Agg(agg_func) => write!(f, "{}", agg_func.to_string()),
+            Self::Scalar(scalar_func) => write!(f, "{}", scalar_func),
             #[cfg(feature = "json")]
-            Func::Json(json_func) => write!(f, "{}", json_func),
+            Self::Json(json_func) => write!(f, "{}", json_func),
         }
     }
 }
