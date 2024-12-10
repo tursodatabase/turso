@@ -137,7 +137,7 @@ impl SourceOperator {
     pub fn id(&self) -> usize {
         match self {
             Self::Join { id, .. } | Self::Scan { id, .. } | Self::Search { id, .. } => *id,
-            SourceOperator::Nothing => unreachable!(),
+            Self::Nothing => unreachable!(),
         }
     }
 }

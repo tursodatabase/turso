@@ -539,10 +539,10 @@ impl Drop for SimulatorFile {
 impl ColumnType {
     pub fn as_str(&self) -> &str {
         match self {
-            ColumnType::Integer => "INTEGER",
-            ColumnType::Float => "FLOAT",
-            ColumnType::Text => "TEXT",
-            ColumnType::Blob => "BLOB",
+            Self::Integer => "INTEGER",
+            Self::Float => "FLOAT",
+            Self::Text => "TEXT",
+            Self::Blob => "BLOB",
         }
     }
 }
@@ -568,11 +568,11 @@ impl Table {
 impl Value {
     pub fn to_string(&self) -> String {
         match self {
-            Value::Null => "NULL".to_string(),
-            Value::Integer(i) => i.to_string(),
-            Value::Float(f) => f.to_string(),
-            Value::Text(t) => format!("'{}'", t.clone()),
-            Value::Blob(vec) => to_sqlite_blob(vec),
+            Self::Null => "NULL".to_string(),
+            Self::Integer(i) => i.to_string(),
+            Self::Float(f) => f.to_string(),
+            Self::Text(t) => format!("'{}'", t.clone()),
+            Self::Blob(vec) => to_sqlite_blob(vec),
         }
     }
 }

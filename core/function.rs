@@ -14,7 +14,7 @@ impl Display for JsonFunc {
             f,
             "{}",
             match self {
-                JsonFunc::Json => "json".to_string(),
+                Self::Json => "json".to_string(),
             }
         )
     }
