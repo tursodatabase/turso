@@ -155,7 +155,7 @@ pub struct FuncCtx {
 }
 
 impl Func {
-    pub fn resolve_function(name: &str, arg_count: usize) -> Result<Func, ()> {
+    pub fn resolve_function(name: &str, arg_count: usize) -> Result<Self, ()> {
         Ok(match name {
             "avg" => Self::Agg(AggFunc::Avg),
             "count" => Self::Agg(AggFunc::Count),
