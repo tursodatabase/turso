@@ -5,6 +5,7 @@ use std::{
 };
 
 use sqlite3_parser::ast;
+use strum::Display;
 
 use crate::{
     function::AggFunc,
@@ -205,19 +206,12 @@ impl SourceOperator {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Display)]
 pub enum Direction {
+    #[strum(to_string="ASC")]
     Ascending,
+    #[strum(to_string="DESC")]
     Descending,
-}
-
-impl Display for Direction {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        match self {
-            Direction::Ascending => write!(f, "ASC"),
-            Direction::Descending => write!(f, "DESC"),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

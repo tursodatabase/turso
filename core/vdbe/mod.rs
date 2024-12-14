@@ -43,6 +43,7 @@ use datetime::{exec_date, exec_time, exec_unixepoch};
 use rand::distributions::{Distribution, Uniform};
 use rand::{thread_rng, Rng};
 use regex::Regex;
+use strum::Display;
 use std::borrow::BorrowMut;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -56,23 +57,15 @@ pub type CursorID = usize;
 pub type PageIdx = usize;
 
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Display)]
 pub enum Func {
+    #[strum(to_string="{0}")]
     Scalar(ScalarFunc),
     #[cfg(feature = "json")]
+    #[strum(to_string="{0}")]
     Json(JsonFunc),
 }
 
-impl Display for Func {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let str = match self {
-            Func::Scalar(scalar_func) => scalar_func.to_string(),
-            #[cfg(feature = "json")]
-            Func::Json(json_func) => json_func.to_string(),
-        };
-        write!(f, "{}", str)
-    }
-}
 
 #[derive(Debug)]
 pub enum Insn {
