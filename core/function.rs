@@ -32,7 +32,7 @@ pub enum ScalarFunc {
     Ifnull,
     Iif,
     Instr,
-    #[strum(to_string="like(2)", serialize = "like")]
+    #[strum(to_string = "like(2)", serialize = "like")]
     Like,
     Abs,
     Upper,
@@ -115,7 +115,7 @@ impl Func {
             return Ok(Func::Json(json_func));
         }
 
-        //return Err if the string is not handled in any of the above if let blocks 
+        //return Err if the string is not handled in any of the above if let blocks
 
         Err(())
     }
