@@ -46,7 +46,6 @@ use regex::Regex;
 use std::borrow::BorrowMut;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::fmt::Display;
 use std::rc::{Rc, Weak};
 use strum::Display;
 
@@ -2304,7 +2303,7 @@ impl Program {
                                 };
                                 state.registers[*dest] = result;
                             }
-                            ScalarFunc::IfNull => {}
+                            ScalarFunc::Ifnull => {}
                             ScalarFunc::Iif => {}
                             ScalarFunc::Instr => {
                                 let reg_value = &state.registers[*start_reg];
@@ -2346,10 +2345,10 @@ impl Program {
                             | ScalarFunc::Typeof
                             | ScalarFunc::Unicode
                             | ScalarFunc::Quote
-                            | ScalarFunc::RandomBlob
+                            | ScalarFunc::Randomblob
                             | ScalarFunc::Sign
                             | ScalarFunc::Soundex
-                            | ScalarFunc::ZeroBlob => {
+                            | ScalarFunc::Zeroblob => {
                                 let reg_value = state.registers[*start_reg].borrow_mut();
                                 let result = match scalar_func {
                                     ScalarFunc::Sign => exec_sign(reg_value),
@@ -2361,8 +2360,8 @@ impl Program {
                                     ScalarFunc::Typeof => Some(exec_typeof(reg_value)),
                                     ScalarFunc::Unicode => Some(exec_unicode(reg_value)),
                                     ScalarFunc::Quote => Some(exec_quote(reg_value)),
-                                    ScalarFunc::RandomBlob => Some(exec_randomblob(reg_value)),
-                                    ScalarFunc::ZeroBlob => Some(exec_zeroblob(reg_value)),
+                                    ScalarFunc::Randomblob => Some(exec_randomblob(reg_value)),
+                                    ScalarFunc::Zeroblob => Some(exec_zeroblob(reg_value)),
                                     ScalarFunc::Soundex => Some(exec_soundex(reg_value)),
                                     _ => unreachable!(),
                                 };
@@ -2388,13 +2387,13 @@ impl Program {
                                 let result = exec_trim(&reg_value, pattern_value);
                                 state.registers[*dest] = result;
                             }
-                            ScalarFunc::LTrim => {
+                            ScalarFunc::Ltrim => {
                                 let reg_value = state.registers[*start_reg].clone();
                                 let pattern_value = state.registers.get(*start_reg + 1).cloned();
                                 let result = exec_ltrim(&reg_value, pattern_value);
                                 state.registers[*dest] = result;
                             }
-                            ScalarFunc::RTrim => {
+                            ScalarFunc::Rtrim => {
                                 let reg_value = state.registers[*start_reg].clone();
                                 let pattern_value = state.registers.get(*start_reg + 1).cloned();
                                 let result = exec_rtrim(&reg_value, pattern_value);
@@ -2447,7 +2446,7 @@ impl Program {
                                     exec_time(&state.registers[*start_reg..*start_reg + arg_count]);
                                 state.registers[*dest] = result;
                             }
-                            ScalarFunc::UnixEpoch => {
+                            ScalarFunc::Unixepoch => {
                                 if *start_reg == 0 {
                                     let unixepoch: String = exec_unixepoch(&OwnedValue::Text(
                                         Rc::new("now".to_string()),

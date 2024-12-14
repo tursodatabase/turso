@@ -1,13 +1,13 @@
-use strum::Display;
+use strum::{Display, EnumString};
 
 #[cfg(feature = "json")]
-#[derive(Debug, Clone, PartialEq, Display)]
+#[derive(Debug, Clone, PartialEq, Display, EnumString)]
 pub enum JsonFunc {
     #[strum(to_string = "json")]
     Json,
 }
 
-#[derive(Debug, Clone, PartialEq, Display)]
+#[derive(Debug, Clone, PartialEq, Display, EnumString)]
 #[strum(serialize_all = "snake_case")]
 pub enum AggFunc {
     Avg,
@@ -20,7 +20,7 @@ pub enum AggFunc {
     Total,
 }
 
-#[derive(Debug, Clone, PartialEq, strum_macros::Display)]
+#[derive(Debug, Clone, PartialEq, Display, EnumString)]
 #[strum(serialize_all = "snake_case")]
 pub enum ScalarFunc {
     Cast,
@@ -29,18 +29,19 @@ pub enum ScalarFunc {
     Concat,
     ConcatWs,
     Glob,
-    IfNull,
+    Ifnull,
     Iif,
     Instr,
+    #[strum(to_string="like(2)", serialize = "like")]
     Like,
     Abs,
     Upper,
     Lower,
     Random,
-    RandomBlob,
+    Randomblob,
     Trim,
-    LTrim,
-    RTrim,
+    Ltrim,
+    Rtrim,
     Round,
     Length,
     OctetLength,
@@ -57,10 +58,10 @@ pub enum ScalarFunc {
     Unicode,
     Quote,
     SqliteVersion,
-    UnixEpoch,
+    Unixepoch,
     Hex,
     Unhex,
-    ZeroBlob,
+    Zeroblob,
     LastInsertRowid,
     Replace,
 }
@@ -83,58 +84,39 @@ pub struct FuncCtx {
 }
 
 impl Func {
+    //taking help of strum EnumString to parse string to Enum
     pub fn resolve_function(name: &str, arg_count: usize) -> Result<Func, ()> {
-        match name {
-            "avg" => Ok(Func::Agg(AggFunc::Avg)),
-            "count" => Ok(Func::Agg(AggFunc::Count)),
-            "group_concat" => Ok(Func::Agg(AggFunc::GroupConcat)),
-            "max" if arg_count == 0 || arg_count == 1 => Ok(Func::Agg(AggFunc::Max)),
-            "max" if arg_count > 1 => Ok(Func::Scalar(ScalarFunc::Max)),
-            "min" if arg_count == 0 || arg_count == 1 => Ok(Func::Agg(AggFunc::Min)),
-            "min" if arg_count > 1 => Ok(Func::Scalar(ScalarFunc::Min)),
-            "nullif" if arg_count == 2 => Ok(Func::Scalar(ScalarFunc::Nullif)),
-            "string_agg" => Ok(Func::Agg(AggFunc::StringAgg)),
-            "sum" => Ok(Func::Agg(AggFunc::Sum)),
-            "total" => Ok(Func::Agg(AggFunc::Total)),
-            "char" => Ok(Func::Scalar(ScalarFunc::Char)),
-            "coalesce" => Ok(Func::Scalar(ScalarFunc::Coalesce)),
-            "concat" => Ok(Func::Scalar(ScalarFunc::Concat)),
-            "concat_ws" => Ok(Func::Scalar(ScalarFunc::ConcatWs)),
-            "glob" => Ok(Func::Scalar(ScalarFunc::Glob)),
-            "ifnull" => Ok(Func::Scalar(ScalarFunc::IfNull)),
-            "iif" => Ok(Func::Scalar(ScalarFunc::Iif)),
-            "instr" => Ok(Func::Scalar(ScalarFunc::Instr)),
-            "like" => Ok(Func::Scalar(ScalarFunc::Like)),
-            "abs" => Ok(Func::Scalar(ScalarFunc::Abs)),
-            "upper" => Ok(Func::Scalar(ScalarFunc::Upper)),
-            "lower" => Ok(Func::Scalar(ScalarFunc::Lower)),
-            "random" => Ok(Func::Scalar(ScalarFunc::Random)),
-            "randomblob" => Ok(Func::Scalar(ScalarFunc::RandomBlob)),
-            "trim" => Ok(Func::Scalar(ScalarFunc::Trim)),
-            "ltrim" => Ok(Func::Scalar(ScalarFunc::LTrim)),
-            "rtrim" => Ok(Func::Scalar(ScalarFunc::RTrim)),
-            "round" => Ok(Func::Scalar(ScalarFunc::Round)),
-            "length" => Ok(Func::Scalar(ScalarFunc::Length)),
-            "octet_length" => Ok(Func::Scalar(ScalarFunc::OctetLength)),
-            "sign" => Ok(Func::Scalar(ScalarFunc::Sign)),
-            "substr" => Ok(Func::Scalar(ScalarFunc::Substr)),
-            "substring" => Ok(Func::Scalar(ScalarFunc::Substring)),
-            "date" => Ok(Func::Scalar(ScalarFunc::Date)),
-            "time" => Ok(Func::Scalar(ScalarFunc::Time)),
-            "typeof" => Ok(Func::Scalar(ScalarFunc::Typeof)),
-            "last_insert_rowid" => Ok(Func::Scalar(ScalarFunc::LastInsertRowid)),
-            "unicode" => Ok(Func::Scalar(ScalarFunc::Unicode)),
-            "quote" => Ok(Func::Scalar(ScalarFunc::Quote)),
-            "sqlite_version" => Ok(Func::Scalar(ScalarFunc::SqliteVersion)),
-            "replace" => Ok(Func::Scalar(ScalarFunc::Replace)),
-            #[cfg(feature = "json")]
-            "json" => Ok(Func::Json(JsonFunc::Json)),
-            "unixepoch" => Ok(Func::Scalar(ScalarFunc::UnixEpoch)),
-            "hex" => Ok(Func::Scalar(ScalarFunc::Hex)),
-            "unhex" => Ok(Func::Scalar(ScalarFunc::Unhex)),
-            "zeroblob" => Ok(Func::Scalar(ScalarFunc::ZeroBlob)),
-            "soundex" => Ok(Func::Scalar(ScalarFunc::Soundex)),
-            _ => Err(()),
+        //try to parse the function name to be of AggFunc
+        if let Ok(agg_func) = name.parse::<AggFunc>() {
+            match agg_func {
+                AggFunc::Max | AggFunc::Min if arg_count > 1 => {
+                    // Handle min and max functions with respect to argument counter.
+                    return Ok(Func::Scalar(match agg_func {
+                        AggFunc::Max => ScalarFunc::Max,
+                        AggFunc::Min => ScalarFunc::Min,
+                        _ => unreachable!(),
+                    }));
+                }
+                _ => return Ok(Func::Agg(agg_func)),
+            }
         }
+
+        //try to parse the function name to be of ScalarFunc
+        if let Ok(scalar_func) = name.parse::<ScalarFunc>() {
+            match scalar_func {
+                //handling nullif condition
+                ScalarFunc::Nullif if arg_count != 2 => return Err(()), // Argument count validation.
+                _ => return Ok(Func::Scalar(scalar_func)),
+            }
+        }
+
+        #[cfg(feature = "json")]
+        if let Ok(json_func) = name.parse::<JsonFunc>() {
+            return Ok(Func::Json(json_func));
+        }
+
+        //return Err if the string is not handled in any of the above if let blocks 
+
+        Err(())
     }
 }

@@ -1044,7 +1044,7 @@ pub fn translate_expr(
                             });
                             Ok(target_register)
                         }
-                        ScalarFunc::IfNull => {
+                        ScalarFunc::Ifnull => {
                             let args = match args {
                                 Some(args) if args.len() == 2 => args,
                                 Some(_) => crate::bail_parse_error!(
@@ -1181,10 +1181,10 @@ pub fn translate_expr(
                         | ScalarFunc::Typeof
                         | ScalarFunc::Unicode
                         | ScalarFunc::Quote
-                        | ScalarFunc::RandomBlob
+                        | ScalarFunc::Randomblob
                         | ScalarFunc::Sign
                         | ScalarFunc::Soundex
-                        | ScalarFunc::ZeroBlob => {
+                        | ScalarFunc::Zeroblob => {
                             let args = if let Some(args) = args {
                                 if args.len() != 1 {
                                     crate::bail_parse_error!(
@@ -1333,7 +1333,7 @@ pub fn translate_expr(
                             });
                             Ok(target_register)
                         }
-                        ScalarFunc::UnixEpoch => {
+                        ScalarFunc::Unixepoch => {
                             let mut start_reg = 0;
                             match args {
                                 Some(args) if args.len() > 1 => {
@@ -1383,8 +1383,8 @@ pub fn translate_expr(
                             Ok(target_register)
                         }
                         ScalarFunc::Trim
-                        | ScalarFunc::LTrim
-                        | ScalarFunc::RTrim
+                        | ScalarFunc::Ltrim
+                        | ScalarFunc::Rtrim
                         | ScalarFunc::Round
                         | ScalarFunc::Unhex => {
                             let args = if let Some(args) = args {
