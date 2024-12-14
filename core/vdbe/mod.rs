@@ -43,12 +43,12 @@ use datetime::{exec_date, exec_time, exec_unixepoch};
 use rand::distributions::{Distribution, Uniform};
 use rand::{thread_rng, Rng};
 use regex::Regex;
-use strum::Display;
 use std::borrow::BorrowMut;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Display;
 use std::rc::{Rc, Weak};
+use strum::Display;
 
 pub type BranchOffset = i64;
 
@@ -59,13 +59,12 @@ pub type PageIdx = usize;
 #[allow(dead_code)]
 #[derive(Debug, Display)]
 pub enum Func {
-    #[strum(to_string="{0}")]
+    #[strum(to_string = "{0}")]
     Scalar(ScalarFunc),
     #[cfg(feature = "json")]
-    #[strum(to_string="{0}")]
+    #[strum(to_string = "{0}")]
     Json(JsonFunc),
 }
-
 
 #[derive(Debug)]
 pub enum Insn {

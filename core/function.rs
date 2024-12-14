@@ -8,7 +8,7 @@ pub enum JsonFunc {
 }
 
 #[derive(Debug, Clone, PartialEq, Display)]
-#[strum(serialize_all="snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum AggFunc {
     Avg,
     Count,
@@ -20,10 +20,8 @@ pub enum AggFunc {
     Total,
 }
 
-
-#[derive(Debug, Clone, PartialEq)]
-#[derive(strum_macros::Display)]
-#[strum(serialize_all="snake_case")]
+#[derive(Debug, Clone, PartialEq, strum_macros::Display)]
+#[strum(serialize_all = "snake_case")]
 pub enum ScalarFunc {
     Cast,
     Char,
@@ -69,15 +67,14 @@ pub enum ScalarFunc {
 
 #[derive(Debug, Display)]
 pub enum Func {
-    #[strum(to_string="{0}")]
+    #[strum(to_string = "{0}")]
     Agg(AggFunc),
-    #[strum(to_string="{0}")]
+    #[strum(to_string = "{0}")]
     Scalar(ScalarFunc),
     #[cfg(feature = "json")]
-    #[strum(to_string="{0}")]
+    #[strum(to_string = "{0}")]
     Json(JsonFunc),
 }
-
 
 #[derive(Debug)]
 pub struct FuncCtx {

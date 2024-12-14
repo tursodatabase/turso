@@ -208,9 +208,9 @@ impl SourceOperator {
 
 #[derive(Clone, Copy, Debug, PartialEq, Display)]
 pub enum Direction {
-    #[strum(to_string="ASC")]
+    #[strum(to_string = "ASC")]
     Ascending,
-    #[strum(to_string="DESC")]
+    #[strum(to_string = "DESC")]
     Descending,
 }
 
