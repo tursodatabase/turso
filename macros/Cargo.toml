@@ -1,5 +1,22 @@
 [package]
-name = "macros"
+name = "limbo_macros"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Macros for the Limbo database"
 
 [lib]
-proc-macro = true
+name = "limbo_macros"
+path = "lib.rs"
+
+[[test]]
+name = "tests"
+path = "tests/progress.rs"
+
+[dev-dependencies]
+trybuild = { version = "1.0.101", features = ["diff"]}
+
+[dependencies]
+limbo_macro_explain = { path = "explain" }

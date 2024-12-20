@@ -1,0 +1,19 @@
+[package]
+name = "limbo_macro_explain"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Explain derive macro for Insn opcodes"
+
+[lib]
+proc-macro = true
+name = "limbo_macro_explain"
+path = "lib.rs"
+
+[dependencies]
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full", "extra-traits"] }
+

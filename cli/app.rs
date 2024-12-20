@@ -1,4 +1,3 @@
-use crate::opcodes_dictionary::OPCODE_DESCRIPTIONS;
 use cli_table::{Cell, Table};
 use limbo_core::{Database, LimboError, RowResult, Value};
 
@@ -434,13 +433,13 @@ impl Limbo {
                 }
                 Command::Opcodes => {
                     if args.len() > 1 {
-                        for op in &OPCODE_DESCRIPTIONS {
+                        for op in &limbo_core::INSN_DESCRIPTIONS {
                             if op.name.eq_ignore_ascii_case(args.get(1).unwrap().trim()) {
                                 let _ = self.write_fmt(format_args!("{}", op));
                             }
                         }
                     } else {
-                        for op in &OPCODE_DESCRIPTIONS {
+                        for op in &limbo_core::INSN_DESCRIPTIONS {
                             let _ = self.write_fmt(format_args!("{}\n", op));
                         }
                     }

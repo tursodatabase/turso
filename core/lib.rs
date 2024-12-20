@@ -52,6 +52,9 @@ pub use storage::wal::CheckpointStatus;
 pub use storage::wal::Wal;
 pub use types::Value;
 
+pub use vdbe::InsnDescription;
+pub use vdbe::INSN_DESCRIPTIONS;
+
 pub static DATABASE_VERSION: OnceLock<String> = OnceLock::new();
 
 #[derive(Clone)]
