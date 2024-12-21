@@ -16,8 +16,18 @@ pub struct Database {
 #[wasm_bindgen]
 impl Database {
     #[wasm_bindgen(constructor)]
-    pub fn new(path: &str) -> Database {
-        let io: Arc<dyn limbo_core::IO> = Arc::new(PlatformIO { vfs: VFS::new() });
+    pub fn new(path: &str, options: JsValue) -> Database {
+        let use_opfs = js_sys::Reflect::get(&options, &JsValue::from_str("useOPFS"))
+            .unwrap_or(JsValue::FALSE)
+            .as_bool()
+            .unwrap_or(false);
+
+        let io: Arc<dyn limbo_core::IO> = if use_opfs {
+            Arc::new(PlatformIO { vfs: VFS::new() })
+        } else {
+            Arc::new(PlatformIO { vfs: VFS::new() })
+        };
+
         let file = io
             .open_file(path, limbo_core::OpenFlags::Create, false)
             .unwrap();

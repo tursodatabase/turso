@@ -70,7 +70,7 @@ const connect = async (path_opt) => {
     if (provider === "limbo-wasm") {
       const database = process.env.LIBSQL_DATABASE ?? path;
       const x = await import("limbo-wasm");
-      const options = {};
+      const options = { useOPFS: true };
       const db = new x.Database(database, options);
       return [db, x.SqliteError, provider];
     }

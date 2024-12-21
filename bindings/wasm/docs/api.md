@@ -119,3 +119,31 @@ This function is currently not supported.
 ### bind([...bindParameters]) ⇒ this
 
 This function is currently not supported.
+
+# OPFS Support
+
+The `limbo-wasm` library now supports the Origin Private File System (OPFS) for browser storage. This allows you to use the library in a browser environment with persistent storage.
+
+## Example Usage
+
+Here is an example of how to use `limbo-wasm` with OPFS:
+
+```javascript
+import { Database } from 'limbo-wasm';
+
+const db = new Database('hello.db');
+
+// Create a table
+db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+
+// Insert a user
+db.exec("INSERT INTO users (name) VALUES ('Alice')");
+
+// Query the users
+const stmt = db.prepare('SELECT * FROM users');
+const users = stmt.all();
+
+console.log(users);
+```
+
+In this example, the database is stored in the OPFS, allowing for persistent storage in the browser.

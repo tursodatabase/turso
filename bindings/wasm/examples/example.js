@@ -1,6 +1,6 @@
 import { Database } from 'limbo-wasm';
 
-const db = new Database('hello.db');
+const db = new Database('hello.db', { useOPFS: true });
 
 const stmt = db.prepare('SELECT * FROM users');
 
