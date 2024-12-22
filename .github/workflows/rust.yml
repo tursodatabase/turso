@@ -65,7 +65,8 @@ jobs:
         CARGO_C_FILE: cargo-c-x86_64-unknown-linux-musl.tar.gz
       run: |
         curl -L $LINK/$CARGO_C_FILE | tar xz -C ~/.cargo/bin
-
+    - name: Install wasm
+      run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
     - uses: actions/checkout@v2
     - name: Test
       run: make test
