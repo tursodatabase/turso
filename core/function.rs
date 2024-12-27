@@ -37,14 +37,14 @@ pub enum AggFunc {
 impl AggFunc {
     pub fn to_string(&self) -> &str {
         match self {
-            AggFunc::Avg => "avg",
-            AggFunc::Count => "count",
-            AggFunc::GroupConcat => "group_concat",
-            AggFunc::Max => "max",
-            AggFunc::Min => "min",
-            AggFunc::StringAgg => "string_agg",
-            AggFunc::Sum => "sum",
-            AggFunc::Total => "total",
+            Self::Avg => "avg",
+            Self::Count => "count",
+            Self::GroupConcat => "group_concat",
+            Self::Max => "max",
+            Self::Min => "min",
+            Self::StringAgg => "string_agg",
+            Self::Sum => "sum",
+            Self::Total => "total",
         }
     }
 }
@@ -96,46 +96,46 @@ pub enum ScalarFunc {
 impl Display for ScalarFunc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let str = match self {
-            ScalarFunc::Cast => "cast".to_string(),
-            ScalarFunc::Char => "char".to_string(),
-            ScalarFunc::Coalesce => "coalesce".to_string(),
-            ScalarFunc::Concat => "concat".to_string(),
-            ScalarFunc::ConcatWs => "concat_ws".to_string(),
-            ScalarFunc::Glob => "glob".to_string(),
-            ScalarFunc::IfNull => "ifnull".to_string(),
-            ScalarFunc::Iif => "iif".to_string(),
-            ScalarFunc::Instr => "instr".to_string(),
-            ScalarFunc::Like => "like(2)".to_string(),
-            ScalarFunc::Abs => "abs".to_string(),
-            ScalarFunc::Upper => "upper".to_string(),
-            ScalarFunc::Lower => "lower".to_string(),
-            ScalarFunc::Random => "random".to_string(),
-            ScalarFunc::RandomBlob => "randomblob".to_string(),
-            ScalarFunc::Trim => "trim".to_string(),
-            ScalarFunc::LTrim => "ltrim".to_string(),
-            ScalarFunc::RTrim => "rtrim".to_string(),
-            ScalarFunc::Round => "round".to_string(),
-            ScalarFunc::Length => "length".to_string(),
-            ScalarFunc::OctetLength => "octet_length".to_string(),
-            ScalarFunc::Min => "min".to_string(),
-            ScalarFunc::Max => "max".to_string(),
-            ScalarFunc::Nullif => "nullif".to_string(),
-            ScalarFunc::Sign => "sign".to_string(),
-            ScalarFunc::Substr => "substr".to_string(),
-            ScalarFunc::Substring => "substring".to_string(),
-            ScalarFunc::Soundex => "soundex".to_string(),
-            ScalarFunc::Date => "date".to_string(),
-            ScalarFunc::Time => "time".to_string(),
-            ScalarFunc::Typeof => "typeof".to_string(),
-            ScalarFunc::Unicode => "unicode".to_string(),
-            ScalarFunc::Quote => "quote".to_string(),
-            ScalarFunc::SqliteVersion => "sqlite_version".to_string(),
-            ScalarFunc::UnixEpoch => "unixepoch".to_string(),
-            ScalarFunc::Hex => "hex".to_string(),
-            ScalarFunc::Unhex => "unhex".to_string(),
-            ScalarFunc::ZeroBlob => "zeroblob".to_string(),
-            ScalarFunc::LastInsertRowid => "last_insert_rowid".to_string(),
-            ScalarFunc::Replace => "replace".to_string(),
+            Self::Cast => "cast".to_string(),
+            Self::Char => "char".to_string(),
+            Self::Coalesce => "coalesce".to_string(),
+            Self::Concat => "concat".to_string(),
+            Self::ConcatWs => "concat_ws".to_string(),
+            Self::Glob => "glob".to_string(),
+            Self::IfNull => "ifnull".to_string(),
+            Self::Iif => "iif".to_string(),
+            Self::Instr => "instr".to_string(),
+            Self::Like => "like(2)".to_string(),
+            Self::Abs => "abs".to_string(),
+            Self::Upper => "upper".to_string(),
+            Self::Lower => "lower".to_string(),
+            Self::Random => "random".to_string(),
+            Self::RandomBlob => "randomblob".to_string(),
+            Self::Trim => "trim".to_string(),
+            Self::LTrim => "ltrim".to_string(),
+            Self::RTrim => "rtrim".to_string(),
+            Self::Round => "round".to_string(),
+            Self::Length => "length".to_string(),
+            Self::OctetLength => "octet_length".to_string(),
+            Self::Min => "min".to_string(),
+            Self::Max => "max".to_string(),
+            Self::Nullif => "nullif".to_string(),
+            Self::Sign => "sign".to_string(),
+            Self::Substr => "substr".to_string(),
+            Self::Substring => "substring".to_string(),
+            Self::Soundex => "soundex".to_string(),
+            Self::Date => "date".to_string(),
+            Self::Time => "time".to_string(),
+            Self::Typeof => "typeof".to_string(),
+            Self::Unicode => "unicode".to_string(),
+            Self::Quote => "quote".to_string(),
+            Self::SqliteVersion => "sqlite_version".to_string(),
+            Self::UnixEpoch => "unixepoch".to_string(),
+            Self::Hex => "hex".to_string(),
+            Self::Unhex => "unhex".to_string(),
+            Self::ZeroBlob => "zeroblob".to_string(),
+            Self::LastInsertRowid => "last_insert_rowid".to_string(),
+            Self::Replace => "replace".to_string(),
         };
         write!(f, "{}", str)
     }
@@ -184,37 +184,36 @@ pub enum MathFuncArity {
 impl MathFunc {
     pub fn arity(&self) -> MathFuncArity {
         match self {
-            MathFunc::Pi => MathFuncArity::Nullary,
+            Self::Pi => MathFuncArity::Nullary,
+            Self::Acos
+            | Self::Acosh
+            | Self::Asin
+            | Self::Asinh
+            | Self::Atan
+            | Self::Atanh
+            | Self::Ceil
+            | Self::Ceiling
+            | Self::Cos
+            | Self::Cosh
+            | Self::Degrees
+            | Self::Exp
+            | Self::Floor
+            | Self::Ln
+            | Self::Log10
+            | Self::Log2
+            | Self::Radians
+            | Self::Sin
+            | Self::Sinh
+            | Self::Sqrt
+            | Self::Tan
+            | Self::Tanh
+            | Self::Trunc => MathFuncArity::Unary,
 
-            MathFunc::Acos
-            | MathFunc::Acosh
-            | MathFunc::Asin
-            | MathFunc::Asinh
-            | MathFunc::Atan
-            | MathFunc::Atanh
-            | MathFunc::Ceil
-            | MathFunc::Ceiling
-            | MathFunc::Cos
-            | MathFunc::Cosh
-            | MathFunc::Degrees
-            | MathFunc::Exp
-            | MathFunc::Floor
-            | MathFunc::Ln
-            | MathFunc::Log10
-            | MathFunc::Log2
-            | MathFunc::Radians
-            | MathFunc::Sin
-            | MathFunc::Sinh
-            | MathFunc::Sqrt
-            | MathFunc::Tan
-            | MathFunc::Tanh
-            | MathFunc::Trunc => MathFuncArity::Unary,
-
-            MathFunc::Atan2 | MathFunc::Mod | MathFunc::Pow | MathFunc::Power => {
+            Self::Atan2 | Self::Mod | Self::Pow | Self::Power => {
                 MathFuncArity::Binary
             }
 
-            MathFunc::Log => MathFuncArity::UnaryOrBinary,
+            Self::Log => MathFuncArity::UnaryOrBinary,
         }
     }
 }
@@ -222,35 +221,35 @@ impl MathFunc {
 impl Display for MathFunc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let str = match self {
-            MathFunc::Acos => "acos".to_string(),
-            MathFunc::Acosh => "acosh".to_string(),
-            MathFunc::Asin => "asin".to_string(),
-            MathFunc::Asinh => "asinh".to_string(),
-            MathFunc::Atan => "atan".to_string(),
-            MathFunc::Atan2 => "atan2".to_string(),
-            MathFunc::Atanh => "atanh".to_string(),
-            MathFunc::Ceil => "ceil".to_string(),
-            MathFunc::Ceiling => "ceiling".to_string(),
-            MathFunc::Cos => "cos".to_string(),
-            MathFunc::Cosh => "cosh".to_string(),
-            MathFunc::Degrees => "degrees".to_string(),
-            MathFunc::Exp => "exp".to_string(),
-            MathFunc::Floor => "floor".to_string(),
-            MathFunc::Ln => "ln".to_string(),
-            MathFunc::Log => "log".to_string(),
-            MathFunc::Log10 => "log10".to_string(),
-            MathFunc::Log2 => "log2".to_string(),
-            MathFunc::Mod => "mod".to_string(),
-            MathFunc::Pi => "pi".to_string(),
-            MathFunc::Pow => "pow".to_string(),
-            MathFunc::Power => "power".to_string(),
-            MathFunc::Radians => "radians".to_string(),
-            MathFunc::Sin => "sin".to_string(),
-            MathFunc::Sinh => "sinh".to_string(),
-            MathFunc::Sqrt => "sqrt".to_string(),
-            MathFunc::Tan => "tan".to_string(),
-            MathFunc::Tanh => "tanh".to_string(),
-            MathFunc::Trunc => "trunc".to_string(),
+            Self::Acos => "acos".to_string(),
+            Self::Acosh => "acosh".to_string(),
+            Self::Asin => "asin".to_string(),
+            Self::Asinh => "asinh".to_string(),
+            Self::Atan => "atan".to_string(),
+            Self::Atan2 => "atan2".to_string(),
+            Self::Atanh => "atanh".to_string(),
+            Self::Ceil => "ceil".to_string(),
+            Self::Ceiling => "ceiling".to_string(),
+            Self::Cos => "cos".to_string(),
+            Self::Cosh => "cosh".to_string(),
+            Self::Degrees => "degrees".to_string(),
+            Self::Exp => "exp".to_string(),
+            Self::Floor => "floor".to_string(),
+            Self::Ln => "ln".to_string(),
+            Self::Log => "log".to_string(),
+            Self::Log10 => "log10".to_string(),
+            Self::Log2 => "log2".to_string(),
+            Self::Mod => "mod".to_string(),
+            Self::Pi => "pi".to_string(),
+            Self::Pow => "pow".to_string(),
+            Self::Power => "power".to_string(),
+            Self::Radians => "radians".to_string(),
+            Self::Sin => "sin".to_string(),
+            Self::Sinh => "sinh".to_string(),
+            Self::Sqrt => "sqrt".to_string(),
+            Self::Tan => "tan".to_string(),
+            Self::Tanh => "tanh".to_string(),
+            Self::Trunc => "trunc".to_string(),
         };
         write!(f, "{}", str)
     }
@@ -269,12 +268,12 @@ pub enum Func {
 impl Display for Func {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Func::Agg(agg_func) => write!(f, "{}", agg_func.to_string()),
-            Func::Scalar(scalar_func) => write!(f, "{}", scalar_func),
-            Func::Math(math_func) => write!(f, "{}", math_func),
+            Self::Agg(agg_func) => write!(f, "{}", agg_func.to_string()),
+            Self::Scalar(scalar_func) => write!(f, "{}", scalar_func),
+            Self::Math(math_func) => write!(f, "{}", math_func),
             #[cfg(feature = "json")]
-            Func::Json(json_func) => write!(f, "{}", json_func),
-            Func::Extension(ext_func) => write!(f, "{}", ext_func),
+            Self::Json(json_func) => write!(f, "{}", json_func),
+            Self::Extension(ext_func) => write!(f, "{}", ext_func),
         }
     }
 }
