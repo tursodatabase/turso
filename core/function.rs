@@ -209,9 +209,7 @@ impl MathFunc {
             | Self::Tanh
             | Self::Trunc => MathFuncArity::Unary,
 
-            Self::Atan2 | Self::Mod | Self::Pow | Self::Power => {
-                MathFuncArity::Binary
-            }
+            Self::Atan2 | Self::Mod | Self::Pow | Self::Power => MathFuncArity::Binary,
 
             Self::Log => MathFuncArity::UnaryOrBinary,
         }

@@ -123,9 +123,7 @@ impl AggContext {
 impl PartialOrd<OwnedValue> for OwnedValue {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
-            (Self::Integer(int_left), Self::Integer(int_right)) => {
-                int_left.partial_cmp(int_right)
-            }
+            (Self::Integer(int_left), Self::Integer(int_right)) => int_left.partial_cmp(int_right),
             (Self::Integer(int_left), Self::Float(float_right)) => {
                 (*int_left as f64).partial_cmp(float_right)
             }
@@ -136,14 +134,12 @@ impl PartialOrd<OwnedValue> for OwnedValue {
                 float_left.partial_cmp(float_right)
             }
             // Numeric vs Text/Blob
-            (
-                Self::Integer(_) | Self::Float(_),
-                Self::Text(_) | Self::Blob(_),
-            ) => Some(std::cmp::Ordering::Less),
-            (
-                Self::Text(_) | Self::Blob(_),
-                Self::Integer(_) | Self::Float(_),
-            ) => Some(std::cmp::Ordering::Greater),
+            (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => {
+                Some(std::cmp::Ordering::Less)
+            }
+            (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => {
+                Some(std::cmp::Ordering::Greater)
+            }
 
             (Self::Text(text_left), Self::Text(text_right)) => {
                 text_left.value.partial_cmp(&text_right.value)
@@ -152,9 +148,7 @@ impl PartialOrd<OwnedValue> for OwnedValue {
             (Self::Text(_), Self::Blob(_)) => Some(std::cmp::Ordering::Less),
             (Self::Blob(_), Self::Text(_)) => Some(std::cmp::Ordering::Greater),
 
-            (Self::Blob(blob_left), Self::Blob(blob_right)) => {
-                blob_left.partial_cmp(blob_right)
-            }
+            (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.partial_cmp(blob_right),
             (Self::Null, Self::Null) => Some(std::cmp::Ordering::Equal),
             (Self::Null, _) => Some(std::cmp::Ordering::Less),
             (_, Self::Null) => Some(std::cmp::Ordering::Greater),
@@ -205,21 +199,15 @@ impl std::ops::Add<OwnedValue> for OwnedValue {
             (Self::Float(float_left), Self::Float(float_right)) => {
                 Self::Float(float_left + float_right)
             }
-            (Self::Text(string_left), Self::Text(string_right)) => {
-                Self::build_text(Rc::new(
-                    string_left.value.to_string() + &string_right.value.to_string(),
-                ))
-            }
-            (Self::Text(string_left), Self::Integer(int_right)) => {
-                Self::build_text(Rc::new(
-                    string_left.value.to_string() + &int_right.to_string(),
-                ))
-            }
-            (Self::Integer(int_left), Self::Text(string_right)) => {
-                Self::build_text(Rc::new(
-                    int_left.to_string() + &string_right.value.to_string(),
-                ))
-            }
+            (Self::Text(string_left), Self::Text(string_right)) => Self::build_text(Rc::new(
+                string_left.value.to_string() + &string_right.value.to_string(),
+            )),
+            (Self::Text(string_left), Self::Integer(int_right)) => Self::build_text(Rc::new(
+                string_left.value.to_string() + &int_right.to_string(),
+            )),
+            (Self::Integer(int_left), Self::Text(string_right)) => Self::build_text(Rc::new(
+                int_left.to_string() + &string_right.value.to_string(),
+            )),
             (Self::Text(string_left), Self::Float(float_right)) => {
                 let string_right = Self::Float(float_right).to_string();
                 Self::build_text(Rc::new(string_left.value.to_string() + &string_right))
