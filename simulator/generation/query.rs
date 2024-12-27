@@ -62,18 +62,18 @@ impl ArbitraryFrom<Table> for Query {
     fn arbitrary_from<R: Rng>(rng: &mut R, table: &Table) -> Self {
         frequency(
             vec![
-                (1, Box::new(|rng| Query::Create(Create::arbitrary(rng)))),
+                (1, Box::new(|rng| Self::Create(Create::arbitrary(rng)))),
                 (
                     100,
-                    Box::new(|rng| Query::Select(Select::arbitrary_from(rng, &vec![table]))),
+                    Box::new(|rng| Self::Select(Select::arbitrary_from(rng, &vec![table]))),
                 ),
                 (
                     100,
-                    Box::new(|rng| Query::Insert(Insert::arbitrary_from(rng, table))),
+                    Box::new(|rng| Self::Insert(Insert::arbitrary_from(rng, table))),
                 ),
                 (
                     0,
-                    Box::new(|rng| Query::Delete(Delete::arbitrary_from(rng, table))),
+                    Box::new(|rng| Self::Delete(Delete::arbitrary_from(rng, table))),
                 ),
             ],
             rng,
@@ -144,7 +144,7 @@ impl ArbitraryFrom<(&Table, bool)> for SimplePredicate {
             ),
         };
 
-        SimplePredicate(operator)
+        Self(operator)
     }
 }
 
@@ -222,15 +222,15 @@ impl ArbitraryFrom<(&str, &Value)> for Predicate {
     fn arbitrary_from<R: Rng>(rng: &mut R, (column_name, value): &(&str, &Value)) -> Self {
         one_of(
             vec![
-                Box::new(|rng| Predicate::Eq(column_name.to_string(), (*value).clone())),
+                Box::new(|rng| Self::Eq(column_name.to_string(), (*value).clone())),
                 Box::new(|rng| {
-                    Predicate::Gt(
+                    Self::Gt(
                         column_name.to_string(),
                         GTValue::arbitrary_from(rng, *value).0,
                     )
                 }),
                 Box::new(|rng| {
-                    Predicate::Lt(
+                    Self::Lt(
                         column_name.to_string(),
                         LTValue::arbitrary_from(rng, *value).0,
                     )
