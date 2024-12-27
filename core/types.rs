@@ -69,7 +69,7 @@ pub enum OwnedValue {
 impl OwnedValue {
     // A helper function that makes building a text OwnedValue easier.
     pub fn build_text(text: Rc<String>) -> Self {
-        OwnedValue::Text(LimboText::new(text))
+        Self::Text(LimboText::new(text))
     }
 }
 
@@ -109,12 +109,12 @@ const NULL: OwnedValue = OwnedValue::Null;
 impl AggContext {
     pub fn final_value(&self) -> &OwnedValue {
         match self {
-            AggContext::Avg(acc, _count) => acc,
-            AggContext::Sum(acc) => acc,
-            AggContext::Count(count) => count,
-            AggContext::Max(max) => max.as_ref().unwrap_or(&NULL),
-            AggContext::Min(min) => min.as_ref().unwrap_or(&NULL),
-            AggContext::GroupConcat(s) => s,
+            Self::Avg(acc, _count) => acc,
+            Self::Sum(acc) => acc,
+            Self::Count(count) => count,
+            Self::Max(max) => max.as_ref().unwrap_or(&NULL),
+            Self::Min(min) => min.as_ref().unwrap_or(&NULL),
+            Self::GroupConcat(s) => s,
         }
     }
 }
@@ -169,12 +169,12 @@ impl PartialOrd<OwnedValue> for OwnedValue {
 impl std::cmp::PartialOrd<AggContext> for AggContext {
     fn partial_cmp(&self, other: &AggContext) -> Option<std::cmp::Ordering> {
         match (self, other) {
-            (AggContext::Avg(a, _), AggContext::Avg(b, _)) => a.partial_cmp(b),
-            (AggContext::Sum(a), AggContext::Sum(b)) => a.partial_cmp(b),
-            (AggContext::Count(a), AggContext::Count(b)) => a.partial_cmp(b),
-            (AggContext::Max(a), AggContext::Max(b)) => a.partial_cmp(b),
-            (AggContext::Min(a), AggContext::Min(b)) => a.partial_cmp(b),
-            (AggContext::GroupConcat(a), AggContext::GroupConcat(b)) => a.partial_cmp(b),
+            (Self::Avg(a, _), Self::Avg(b, _)) => a.partial_cmp(b),
+            (Self::Sum(a), Self::Sum(b)) => a.partial_cmp(b),
+            (Self::Count(a), Self::Count(b)) => a.partial_cmp(b),
+            (Self::Max(a), Self::Max(b)) => a.partial_cmp(b),
+            (Self::Min(a), Self::Min(b)) => a.partial_cmp(b),
+            (Self::GroupConcat(a), Self::GroupConcat(b)) => a.partial_cmp(b),
             _ => None,
         }
     }

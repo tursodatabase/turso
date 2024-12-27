@@ -386,12 +386,12 @@ pub enum Type {
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
-            Type::Null => "NULL",
-            Type::Text => "TEXT",
-            Type::Numeric => "NUMERIC",
-            Type::Integer => "INTEGER",
-            Type::Real => "REAL",
-            Type::Blob => "BLOB",
+            Self::Null => "NULL",
+            Self::Text => "TEXT",
+            Self::Numeric => "NUMERIC",
+            Self::Integer => "INTEGER",
+            Self::Real => "REAL",
+            Self::Blob => "BLOB",
         };
         write!(f, "{}", s)
     }
