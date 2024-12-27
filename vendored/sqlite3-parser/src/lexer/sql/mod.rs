@@ -38,7 +38,7 @@ impl<'input> Parser<'input> {
         let scanner = Scanner::new(lexer);
         let ctx = Context::new(input);
         let parser = yyParser::new(ctx);
-        Parser {
+        Self {
             input,
             scanner,
             parser,
