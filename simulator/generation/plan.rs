@@ -120,7 +120,7 @@ impl Interactions {
 
 impl InteractionPlan {
     pub(crate) fn new() -> Self {
-        InteractionPlan {
+        Self {
             plan: Vec::new(),
             stack: Vec::new(),
             interaction_pointer: 0,

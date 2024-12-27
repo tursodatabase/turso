@@ -43,7 +43,7 @@ impl From<pest::error::Error<Rule>> for Error {
             pest::error::LineColLocation::Pos((l, c)) => (l, c),
             pest::error::LineColLocation::Span((l, c), (_, _)) => (l, c),
         };
-        Error::Message {
+        Self::Message {
             msg: err.to_string(),
             location: Some(Location { line, column }),
         }
@@ -52,7 +52,7 @@ impl From<pest::error::Error<Rule>> for Error {
 
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
-        Error::Message {
+        Self::Message {
             msg: err.to_string(),
             location: None,
         }
@@ -61,7 +61,7 @@ impl From<std::io::Error> for Error {
 
 impl From<std::str::Utf8Error> for Error {
     fn from(err: std::str::Utf8Error) -> Self {
-        Error::Message {
+        Self::Message {
             msg: err.to_string(),
             location: None,
         }
@@ -70,7 +70,7 @@ impl From<std::str::Utf8Error> for Error {
 
 impl ser::Error for Error {
     fn custom<T: Display>(msg: T) -> Self {
-        Error::Message {
+        Self::Message {
             msg: msg.to_string(),
             location: None,
         }
@@ -79,7 +79,7 @@ impl ser::Error for Error {
 
 impl de::Error for Error {
     fn custom<T: Display>(msg: T) -> Self {
-        Error::Message {
+        Self::Message {
             msg: msg.to_string(),
             location: None,
         }

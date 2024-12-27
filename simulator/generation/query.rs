@@ -18,7 +18,7 @@ impl Arbitrary for Create {
 impl ArbitraryFrom<Vec<Table>> for Select {
     fn arbitrary_from<R: Rng>(rng: &mut R, tables: &Vec<Table>) -> Self {
         let table = pick(tables, rng);
-        Select {
+        Self {
             table: table.name.clone(),
             predicate: Predicate::arbitrary_from(rng, table),
         }
@@ -28,7 +28,7 @@ impl ArbitraryFrom<Vec<Table>> for Select {
 impl ArbitraryFrom<Vec<&Table>> for Select {
     fn arbitrary_from<R: Rng>(rng: &mut R, tables: &Vec<&Table>) -> Self {
         let table = pick(tables, rng);
-        Select {
+        Self {
             table: table.name.clone(),
             predicate: Predicate::arbitrary_from(rng, *table),
         }
@@ -42,7 +42,7 @@ impl ArbitraryFrom<Table> for Insert {
             .iter()
             .map(|c| Value::arbitrary_from(rng, &c.column_type))
             .collect();
-        Insert {
+        Self {
             table: table.name.clone(),
             values,
         }
@@ -51,7 +51,7 @@ impl ArbitraryFrom<Table> for Insert {
 
 impl ArbitraryFrom<Table> for Delete {
     fn arbitrary_from<R: Rng>(rng: &mut R, table: &Table) -> Self {
-        Delete {
+        Self {
             table: table.name.clone(),
             predicate: Predicate::arbitrary_from(rng, table),
         }
@@ -151,7 +151,7 @@ impl ArbitraryFrom<(&Table, bool)> for SimplePredicate {
 impl ArbitraryFrom<(&Table, bool)> for CompoundPredicate {
     fn arbitrary_from<R: Rng>(rng: &mut R, (table, predicate_value): &(&Table, bool)) -> Self {
         // Decide if you want to create an AND or an OR
-        CompoundPredicate(if rng.gen_bool(0.7) {
+        Self(if rng.gen_bool(0.7) {
             // An AND for true requires each of its children to be true
             // An AND for false requires at least one of its children to be false
             if *predicate_value {

@@ -920,6 +920,6 @@ impl TakeOwnership for ast::Expr {
 
 impl TakeOwnership for SourceOperator {
     fn take_ownership(&mut self) -> Self {
-        std::mem::replace(self, SourceOperator::Nothing)
+        std::mem::replace(self, Self::Nothing)
     }
 }
