@@ -37,7 +37,7 @@ use crate::types::{
 };
 use crate::util::parse_schema_rows;
 #[cfg(feature = "json")]
-use crate::{function::JsonFunc, json::get_json, json::json_array};
+use crate::{function::JsonFunc, json::get_json, json::json_array, json::json_array_length};
 use crate::{Connection, Result, TransactionState};
 use crate::{Rows, DATABASE_VERSION};
 use limbo_macros::Description;
@@ -46,7 +46,7 @@ use datetime::{exec_date, exec_time, exec_unixepoch};
 
 use rand::distributions::{Distribution, Uniform};
 use rand::{thread_rng, Rng};
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use std::borrow::{Borrow, BorrowMut};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -117,6 +117,12 @@ pub enum Insn {
     // Place the result of bitwise NOT register P1 in dest register.
     BitNot {
         reg: usize,
+        dest: usize,
+    },
+    // Divide lhs by rhs and place the remainder in dest register.
+    Remainder {
+        lhs: usize,
+        rhs: usize,
         dest: usize,
     },
     // Jump to the instruction at address P1, P2, or P3 depending on whether in the most recent Compare instruction the P1 vector was less than, equal to, or greater than the P2 vector, respectively.
@@ -466,6 +472,14 @@ pub enum Insn {
 
     InsertAwait {
         cursor_id: usize,
+    },
+
+    DeleteAsync {
+        cursor_id: CursorID,
+    },
+
+    DeleteAwait {
+        cursor_id: CursorID,
     },
 
     NewRowid {
@@ -1214,6 +1228,103 @@ impl Program {
                             unimplemented!("{:?}", state.registers[reg]);
                         }
                     }
+                    state.pc += 1;
+                }
+                Insn::Remainder { lhs, rhs, dest } => {
+                    let lhs = *lhs;
+                    let rhs = *rhs;
+                    let dest = *dest;
+                    state.registers[dest] = match (&state.registers[lhs], &state.registers[rhs]) {
+                        (OwnedValue::Null, _)
+                        | (_, OwnedValue::Null)
+                        | (_, OwnedValue::Integer(0))
+                        | (_, OwnedValue::Float(0.0)) => OwnedValue::Null,
+                        (OwnedValue::Integer(lhs), OwnedValue::Integer(rhs)) => {
+                            OwnedValue::Integer(lhs % rhs)
+                        }
+                        (OwnedValue::Float(lhs), OwnedValue::Float(rhs)) => {
+                            OwnedValue::Float(((*lhs as i64) % (*rhs as i64)) as f64)
+                        }
+                        (OwnedValue::Float(lhs), OwnedValue::Integer(rhs)) => {
+                            OwnedValue::Float(((*lhs as i64) % rhs) as f64)
+                        }
+                        (OwnedValue::Integer(lhs), OwnedValue::Float(rhs)) => {
+                            OwnedValue::Float((lhs % *rhs as i64) as f64)
+                        }
+                        (lhs, OwnedValue::Agg(agg_rhs)) => match lhs {
+                            OwnedValue::Agg(agg_lhs) => {
+                                let acc = agg_lhs.final_value();
+                                let acc2 = agg_rhs.final_value();
+                                match (acc, acc2) {
+                                    (_, OwnedValue::Integer(0))
+                                    | (_, OwnedValue::Float(0.0))
+                                    | (_, OwnedValue::Null)
+                                    | (OwnedValue::Null, _) => OwnedValue::Null,
+                                    (OwnedValue::Integer(l), OwnedValue::Integer(r)) => {
+                                        OwnedValue::Integer(l % r)
+                                    }
+                                    (OwnedValue::Float(lh_f), OwnedValue::Float(rh_f)) => {
+                                        OwnedValue::Float(((*lh_f as i64) % (*rh_f as i64)) as f64)
+                                    }
+                                    (OwnedValue::Integer(lh_i), OwnedValue::Float(rh_f)) => {
+                                        OwnedValue::Float((lh_i % (*rh_f as i64)) as f64)
+                                    }
+                                    _ => {
+                                        todo!("{:?} {:?}", acc, acc2);
+                                    }
+                                }
+                            }
+                            OwnedValue::Integer(lh_i) => match agg_rhs.final_value() {
+                                OwnedValue::Null => OwnedValue::Null,
+                                OwnedValue::Float(rh_f) => {
+                                    OwnedValue::Float((lh_i % (*rh_f as i64)) as f64)
+                                }
+                                OwnedValue::Integer(rh_i) => OwnedValue::Integer(lh_i % rh_i),
+                                _ => {
+                                    todo!("{:?}", agg_rhs);
+                                }
+                            },
+                            OwnedValue::Float(lh_f) => match agg_rhs.final_value() {
+                                OwnedValue::Null => OwnedValue::Null,
+                                OwnedValue::Float(rh_f) => {
+                                    OwnedValue::Float(((*lh_f as i64) % (*rh_f as i64)) as f64)
+                                }
+                                OwnedValue::Integer(rh_i) => {
+                                    OwnedValue::Float(((*lh_f as i64) % rh_i) as f64)
+                                }
+                                _ => {
+                                    todo!("{:?}", agg_rhs);
+                                }
+                            },
+                            _ => todo!("{:?}", rhs),
+                        },
+                        (OwnedValue::Agg(aggctx), rhs) => match rhs {
+                            OwnedValue::Integer(rh_i) => match aggctx.final_value() {
+                                OwnedValue::Null => OwnedValue::Null,
+                                OwnedValue::Float(lh_f) => {
+                                    OwnedValue::Float(((*lh_f as i64) % rh_i) as f64)
+                                }
+                                OwnedValue::Integer(lh_i) => OwnedValue::Integer(lh_i % rh_i),
+                                _ => {
+                                    todo!("{:?}", aggctx);
+                                }
+                            },
+                            OwnedValue::Float(rh_f) => match aggctx.final_value() {
+                                OwnedValue::Null => OwnedValue::Null,
+                                OwnedValue::Float(lh_f) => {
+                                    OwnedValue::Float(((*lh_f as i64) % (*rh_f as i64)) as f64)
+                                }
+                                OwnedValue::Integer(lh_i) => {
+                                    OwnedValue::Float((lh_i % (*rh_f as i64)) as f64)
+                                }
+                                _ => {
+                                    todo!("{:?}", aggctx);
+                                }
+                            },
+                            _ => todo!("{:?}", rhs),
+                        },
+                        _ => todo!("{:?} {:?}", state.registers[lhs], state.registers[rhs]),
+                    };
                     state.pc += 1;
                 }
                 Insn::Null { dest, dest_end } => {
@@ -2281,6 +2392,21 @@ impl Program {
                                 Err(e) => return Err(e),
                             }
                         }
+                        #[cfg(feature = "json")]
+                        crate::function::Func::Json(JsonFunc::JsonArrayLength) => {
+                            let json_value = &state.registers[*start_reg];
+                            let path_value = if arg_count > 1 {
+                                Some(&state.registers[*start_reg + 1])
+                            } else {
+                                None
+                            };
+                            let json_array_length = json_array_length(json_value, path_value);
+
+                            match json_array_length {
+                                Ok(length) => state.registers[*dest] = length,
+                                Err(e) => return Err(e),
+                            }
+                        }
                         crate::function::Func::Scalar(scalar_func) => match scalar_func {
                             ScalarFunc::Cast => {
                                 assert!(arg_count == 2);
@@ -2669,6 +2795,16 @@ impl Program {
                             }
                         }
                     }
+                    state.pc += 1;
+                }
+                Insn::DeleteAsync { cursor_id } => {
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
+                    return_if_io!(cursor.delete());
+                    state.pc += 1;
+                }
+                Insn::DeleteAwait { cursor_id } => {
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
+                    cursor.wait_for_completion()?;
                     state.pc += 1;
                 }
                 Insn::NewRowid {
@@ -3166,10 +3302,31 @@ fn exec_char(values: Vec<OwnedValue>) -> OwnedValue {
 }
 
 fn construct_like_regex(pattern: &str) -> Regex {
-    let mut regex_pattern = String::from("(?i)^");
-    regex_pattern.push_str(&pattern.replace('%', ".*").replace('_', "."));
+    let mut regex_pattern = String::with_capacity(pattern.len() * 2);
+
+    regex_pattern.push('^');
+
+    for c in pattern.chars() {
+        match c {
+            '\\' => regex_pattern.push_str("\\\\"),
+            '%' => regex_pattern.push_str(".*"),
+            '_' => regex_pattern.push('.'),
+            ch => {
+                if regex_syntax::is_meta_character(c) {
+                    regex_pattern.push('\\');
+                }
+                regex_pattern.push(ch);
+            }
+        }
+    }
+
     regex_pattern.push('$');
-    Regex::new(&regex_pattern).unwrap()
+
+    RegexBuilder::new(&regex_pattern)
+        .case_insensitive(true)
+        .dot_matches_new_line(true)
+        .build()
+        .unwrap()
 }
 
 // Implements LIKE pattern matching. Caches the constructed regex if a cache is provided
@@ -3901,6 +4058,10 @@ mod tests {
             unimplemented!()
         }
 
+        fn delete(&mut self) -> Result<CursorResult<()>> {
+            unimplemented!()
+        }
+
         fn wait_for_completion(&mut self) -> Result<()> {
             unimplemented!()
         }
@@ -4317,11 +4478,17 @@ mod tests {
     }
 
     #[test]
+    fn test_like_with_escape_or_regexmeta_chars() {
+        assert!(exec_like(None, r#"\%A"#, r#"\A"#));
+        assert!(exec_like(None, "%a%a", "aaaa"));
+    }
+
+    #[test]
     fn test_like_no_cache() {
         assert!(exec_like(None, "a%", "aaaa"));
         assert!(exec_like(None, "%a%a", "aaaa"));
-        assert!(exec_like(None, "%a.a", "aaaa"));
-        assert!(exec_like(None, "a.a%", "aaaa"));
+        assert!(!exec_like(None, "%a.a", "aaaa"));
+        assert!(!exec_like(None, "a.a%", "aaaa"));
         assert!(!exec_like(None, "%a.ab", "aaaa"));
     }
 
@@ -4330,15 +4497,15 @@ mod tests {
         let mut cache = HashMap::new();
         assert!(exec_like(Some(&mut cache), "a%", "aaaa"));
         assert!(exec_like(Some(&mut cache), "%a%a", "aaaa"));
-        assert!(exec_like(Some(&mut cache), "%a.a", "aaaa"));
-        assert!(exec_like(Some(&mut cache), "a.a%", "aaaa"));
+        assert!(!exec_like(Some(&mut cache), "%a.a", "aaaa"));
+        assert!(!exec_like(Some(&mut cache), "a.a%", "aaaa"));
         assert!(!exec_like(Some(&mut cache), "%a.ab", "aaaa"));
 
         // again after values have been cached
         assert!(exec_like(Some(&mut cache), "a%", "aaaa"));
         assert!(exec_like(Some(&mut cache), "%a%a", "aaaa"));
-        assert!(exec_like(Some(&mut cache), "%a.a", "aaaa"));
-        assert!(exec_like(Some(&mut cache), "a.a%", "aaaa"));
+        assert!(!exec_like(Some(&mut cache), "%a.a", "aaaa"));
+        assert!(!exec_like(Some(&mut cache), "a.a%", "aaaa"));
         assert!(!exec_like(Some(&mut cache), "%a.ab", "aaaa"));
     }
 
