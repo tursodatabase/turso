@@ -82,3 +82,7 @@ do_execsql_test select_base_case_else {
 do_execsql_test select_base_case_noelse_null {
   select case 'null else' when 0 then 0 when 1 then 1 end;
 } {}
+
+do_execsql_test select_unknown_function {
+  select this_definitely_exists('lol');
+} {"Parse error: unknown function: this_definitely_exists"}

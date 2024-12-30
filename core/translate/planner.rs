@@ -362,7 +362,9 @@ pub fn prepare_select_plan<'a>(schema: &Schema, select: ast::Select) -> Result<P
                                             contains_aggregates,
                                         });
                                     }
-                                    _ => {}
+                                    _ => {
+                                        crate::bail_parse_error!("unknown function: {}", name.0);
+                                    }
                                 }
                             }
                             ast::Expr::FunctionCallStar {
