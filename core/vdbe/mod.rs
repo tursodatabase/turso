@@ -18,6 +18,7 @@
 //! https://www.sqlite.org/opcode.html
 
 pub mod builder;
+mod clock;
 mod datetime;
 pub mod explain;
 pub mod insn;
@@ -41,6 +42,7 @@ use crate::vdbe::insn::Insn;
 #[cfg(feature = "json")]
 use crate::{function::JsonFunc, json::get_json, json::json_array, json::json_array_length};
 use crate::{Connection, Result, Rows, TransactionState, DATABASE_VERSION};
+use clock::Clock;
 use datetime::{exec_date, exec_time, exec_unixepoch};
 use insn::{
     exec_add, exec_bit_and, exec_bit_not, exec_bit_or, exec_divide, exec_multiply, exec_remainder,
@@ -151,6 +153,7 @@ pub struct Program {
     pub comments: HashMap<BranchOffset, &'static str>,
     pub connection: Weak<Connection>,
     pub auto_commit: bool,
+    pub clock: Clock,
 }
 
 impl Program {
@@ -1520,25 +1523,30 @@ impl Program {
                                 state.registers[*dest] = result;
                             }
                             ScalarFunc::Date => {
-                                let result =
-                                    exec_date(&state.registers[*start_reg..*start_reg + arg_count]);
+                                let result = exec_date(
+                                    &state.registers[*start_reg..*start_reg + arg_count],
+                                    &self.clock,
+                                );
                                 state.registers[*dest] = result;
                             }
                             ScalarFunc::Time => {
-                                let result =
-                                    exec_time(&state.registers[*start_reg..*start_reg + arg_count]);
+                                let result = exec_time(
+                                    &state.registers[*start_reg..*start_reg + arg_count],
+                                    &self.clock,
+                                );
                                 state.registers[*dest] = result;
                             }
                             ScalarFunc::UnixEpoch => {
                                 if *start_reg == 0 {
                                     let unixepoch: String = exec_unixepoch(
                                         &OwnedValue::build_text(Rc::new("now".to_string())),
+                                        &self.clock,
                                     )?;
                                     state.registers[*dest] =
                                         OwnedValue::build_text(Rc::new(unixepoch));
                                 } else {
                                     let datetime_value = &state.registers[*start_reg];
-                                    let unixepoch = exec_unixepoch(datetime_value);
+                                    let unixepoch = exec_unixepoch(datetime_value, &self.clock);
                                     match unixepoch {
                                         Ok(time) => {
                                             state.registers[*dest] =

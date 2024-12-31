@@ -4,7 +4,7 @@ use std::{
     rc::{Rc, Weak},
 };
 
-use crate::{storage::sqlite3_ondisk::DatabaseHeader, Connection};
+use crate::{storage::sqlite3_ondisk::DatabaseHeader, vdbe::clock::Clock, Connection};
 
 use super::{BranchOffset, CursorID, Insn, InsnReference, Program, Table};
 
@@ -390,6 +390,7 @@ impl ProgramBuilder {
             comments: self.comments,
             connection,
             auto_commit: true,
+            clock: Clock::Real,
         }
     }
 }

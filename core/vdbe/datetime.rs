@@ -4,14 +4,15 @@ use chrono::{
 use std::rc::Rc;
 
 use crate::types::OwnedValue;
+use crate::vdbe::Clock;
 use crate::LimboError::InvalidModifier;
 use crate::Result;
 
 /// Implementation of the date() SQL function.
-pub fn exec_date(values: &[OwnedValue]) -> OwnedValue {
+pub fn exec_date(values: &[OwnedValue], clock: &Clock) -> OwnedValue {
     let maybe_dt = match values.first() {
-        None => parse_naive_date_time(&OwnedValue::build_text(Rc::new("now".to_string()))),
-        Some(value) => parse_naive_date_time(value),
+        None => parse_naive_date_time(&OwnedValue::build_text(Rc::new("now".to_string())), clock),
+        Some(value) => parse_naive_date_time(value, clock),
     };
     // early return, no need to look at modifiers if result invalid
     if maybe_dt.is_none() {
@@ -34,10 +35,10 @@ pub fn exec_date(values: &[OwnedValue]) -> OwnedValue {
 }
 
 /// Implementation of the time() SQL function.
-pub fn exec_time(time_value: &[OwnedValue]) -> OwnedValue {
+pub fn exec_time(time_value: &[OwnedValue], clock: &Clock) -> OwnedValue {
     let maybe_dt = match time_value.first() {
-        None => parse_naive_date_time(&OwnedValue::build_text(Rc::new("now".to_string()))),
-        Some(value) => parse_naive_date_time(value),
+        None => parse_naive_date_time(&OwnedValue::build_text(Rc::new("now".to_string())), clock),
+        Some(value) => parse_naive_date_time(value, clock),
     };
     // early return, no need to look at modifiers if result invalid
     if maybe_dt.is_none() {
@@ -111,8 +112,8 @@ fn apply_modifier(dt: &mut NaiveDateTime, modifier: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn exec_unixepoch(time_value: &OwnedValue) -> Result<String> {
-    let dt = parse_naive_date_time(time_value);
+pub fn exec_unixepoch(time_value: &OwnedValue, clock: &Clock) -> Result<String> {
+    let dt = parse_naive_date_time(time_value, clock);
     match dt {
         Some(dt) => Ok(get_unixepoch_from_naive_datetime(dt)),
         None => Ok(String::new()),
@@ -123,16 +124,16 @@ fn get_unixepoch_from_naive_datetime(value: NaiveDateTime) -> String {
     value.and_utc().timestamp().to_string()
 }
 
-fn parse_naive_date_time(time_value: &OwnedValue) -> Option<NaiveDateTime> {
+fn parse_naive_date_time(time_value: &OwnedValue, clock: &Clock) -> Option<NaiveDateTime> {
     match time_value {
-        OwnedValue::Text(s) => get_date_time_from_time_value_string(&s.value),
+        OwnedValue::Text(s) => get_date_time_from_time_value_string(&s.value, clock),
         OwnedValue::Integer(i) => get_date_time_from_time_value_integer(*i),
         OwnedValue::Float(f) => get_date_time_from_time_value_float(*f),
         _ => None,
     }
 }
 
-fn get_date_time_from_time_value_string(value: &str) -> Option<NaiveDateTime> {
+fn get_date_time_from_time_value_string(value: &str, clock: &Clock) -> Option<NaiveDateTime> {
     // Time-value formats:
     // 1-7. YYYY-MM-DD[THH:MM[:SS[.SSS]]]
     // 8-10. HH:MM[:SS[.SSS]]
@@ -143,7 +144,7 @@ fn get_date_time_from_time_value_string(value: &str) -> Option<NaiveDateTime> {
 
     // Check for 'now'
     if value.trim().eq_ignore_ascii_case("now") {
-        return Some(chrono::Local::now().to_utc().naive_utc());
+        return Some(clock.now().naive_utc());
     }
 
     // Check for Julian day number (integer or float)
@@ -401,7 +402,8 @@ mod tests {
 
     #[test]
     fn test_valid_get_date_from_time_value() {
-        let now = chrono::Local::now().to_utc().format("%Y-%m-%d").to_string();
+        let clock = Clock::sim_clock();
+        let now = clock.now().format("%Y-%m-%d").to_string();
 
         let prev_date_str = "2024-07-20";
         let test_date_str = "2024-07-21";
@@ -609,8 +611,10 @@ mod tests {
             (OwnedValue::Integer(2460513), test_date_str),
         ];
 
+        let clock = Clock::sim_clock();
+
         for (input, expected) in test_cases {
-            let result = exec_date(&[input.clone()]);
+            let result = exec_date(&[input.clone()], &clock);
             assert_eq!(
                 result,
                 OwnedValue::build_text(Rc::new(expected.to_string())),
@@ -650,8 +654,10 @@ mod tests {
             OwnedValue::build_text(Rc::new("2024-07-21T12:00:00UTC".to_string())), // Named timezone (not supported)
         ];
 
+        let clock = Clock::sim_clock();
+
         for case in invalid_cases.iter() {
-            let result = exec_date(&[case.clone()]);
+            let result = exec_date(&[case.clone()], &clock);
             match result {
                 OwnedValue::Text(ref result_str) if result_str.value.is_empty() => (),
                 _ => panic!(
@@ -664,7 +670,8 @@ mod tests {
 
     #[test]
     fn test_valid_get_time_from_datetime_value() {
-        let now = chrono::Local::now().to_utc().format("%H:%M:%S").to_string();
+        let clock = Clock::sim_clock();
+        let now = clock.now().format("%H:%M:%S").to_string();
 
         let test_time_str = "22:30:45";
         let prev_time_str = "20:30:45";
@@ -837,7 +844,7 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            let result = exec_time(&[input]);
+            let result = exec_time(&[input], &clock);
             if let OwnedValue::Text(result_str) = result {
                 assert_eq!(result_str.value.as_str(), expected);
             } else {
@@ -876,8 +883,10 @@ mod tests {
             OwnedValue::build_text(Rc::new("2024-07-21T12:00:00UTC".to_string())), // Named timezone (not supported)
         ];
 
+        let clock = Clock::sim_clock();
+
         for case in invalid_cases {
-            let result = exec_time(&[case.clone()]);
+            let result = exec_time(&[case.clone()], &clock);
             match result {
                 OwnedValue::Text(ref result_str) if result_str.value.is_empty() => (),
                 _ => panic!(
