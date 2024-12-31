@@ -26,7 +26,9 @@ pub mod sorter;
 
 use crate::error::{LimboError, SQLITE_CONSTRAINT_PRIMARYKEY};
 #[cfg(feature = "uuid")]
-use crate::ext::{exec_ts_from_uuid7, exec_uuid, exec_uuidblob, exec_uuidstr, ExtFunc, UuidFunc};
+use crate::ext::{
+    exec_ts_from_uuid7, exec_uuid, exec_uuidblob, exec_uuidstr, ExternalFunc, UuidFunc,
+};
 use crate::function::{AggFunc, FuncCtx, MathFunc, MathFuncArity, ScalarFunc};
 use crate::pseudo::PseudoCursor;
 use crate::result::LimboResult;
@@ -1570,7 +1572,7 @@ impl Program {
                         #[allow(unreachable_patterns)]
                         crate::function::Func::Extension(extfn) => match extfn {
                             #[cfg(feature = "uuid")]
-                            ExtFunc::Uuid(uuidfn) => match uuidfn {
+                            ExternalFunc::Uuid(uuidfn) => match uuidfn {
                                 UuidFunc::Uuid4Str => {
                                     state.registers[*dest] = exec_uuid(uuidfn, None)?
                                 }

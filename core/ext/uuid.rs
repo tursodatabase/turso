@@ -1,4 +1,4 @@
-use super::ExtFunc;
+use super::ExternalFunc;
 use crate::{
     types::{LimboText, OwnedValue},
     Database, LimboError,
@@ -16,15 +16,15 @@ pub enum UuidFunc {
 }
 
 impl UuidFunc {
-    pub fn resolve_function(name: &str, num_args: usize) -> Option<ExtFunc> {
+    pub fn resolve_function(name: &str, num_args: usize) -> Option<ExternalFunc> {
         match name {
-            "uuid4_str" => Some(ExtFunc::Uuid(Self::Uuid4Str)),
-            "uuid7" if num_args < 2 => Some(ExtFunc::Uuid(Self::Uuid7)),
-            "uuid_str" if num_args == 1 => Some(ExtFunc::Uuid(Self::UuidStr)),
-            "uuid_blob" if num_args == 1 => Some(ExtFunc::Uuid(Self::UuidBlob)),
-            "uuid7_timestamp_ms" if num_args == 1 => Some(ExtFunc::Uuid(Self::Uuid7TS)),
+            "uuid4_str" => Some(ExternalFunc::Uuid(Self::Uuid4Str)),
+            "uuid7" if num_args < 2 => Some(ExternalFunc::Uuid(Self::Uuid7)),
+            "uuid_str" if num_args == 1 => Some(ExternalFunc::Uuid(Self::UuidStr)),
+            "uuid_blob" if num_args == 1 => Some(ExternalFunc::Uuid(Self::UuidBlob)),
+            "uuid7_timestamp_ms" if num_args == 1 => Some(ExternalFunc::Uuid(Self::Uuid7TS)),
             // postgres_compatability
-            "gen_random_uuid" => Some(ExtFunc::Uuid(Self::Uuid4Str)),
+            "gen_random_uuid" => Some(ExternalFunc::Uuid(Self::Uuid4Str)),
             _ => None,
         }
     }

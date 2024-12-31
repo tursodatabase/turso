@@ -1,4 +1,3 @@
-use crate::ext::ExtFunc;
 use std::fmt;
 use std::fmt::{Debug, Display};
 use std::rc::Rc;
@@ -281,7 +280,7 @@ pub enum Func {
     Math(MathFunc),
     #[cfg(feature = "json")]
     Json(JsonFunc),
-    Extension(ExtFunc),
+    Extension(crate::ext::ExternalFunc),
     External(Rc<ExternalFunc>),
 }
 
@@ -390,7 +389,7 @@ impl Func {
             "tan" => Ok(Self::Math(MathFunc::Tan)),
             "tanh" => Ok(Self::Math(MathFunc::Tanh)),
             "trunc" => Ok(Self::Math(MathFunc::Trunc)),
-            _ => match ExtFunc::resolve_function(name, arg_count) {
+            _ => match crate::ext::ExternalFunc::resolve_function(name, arg_count) {
                 Some(ext_func) => Ok(Self::Extension(ext_func)),
                 None => Err(()),
             },
