@@ -1,7 +1,7 @@
 use sqlite3_parser::ast::{self, UnaryOperator};
 
 #[cfg(feature = "uuid")]
-use crate::ext::{ExtFunc, UuidFunc};
+use crate::ext::{ExternalFunc, UuidFunc};
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
 use crate::function::{AggFunc, Func, FuncCtx, MathFuncArity, ScalarFunc};
@@ -1732,7 +1732,7 @@ pub fn translate_expr(
                 }
                 Func::Extension(ext_func) => match ext_func {
                     #[cfg(feature = "uuid")]
-                    ExtFunc::Uuid(ref uuid_fn) => match uuid_fn {
+                    ExternalFunc::Uuid(ref uuid_fn) => match uuid_fn {
                         UuidFunc::UuidStr | UuidFunc::UuidBlob | UuidFunc::Uuid7TS => {
                             let args = if let Some(args) = args {
                                 if args.len() != 1 {
