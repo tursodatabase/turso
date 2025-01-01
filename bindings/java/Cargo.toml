@@ -1,0 +1,16 @@
+[package]
+name = "java-limbo"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "_java_limbo"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0"
+limbo_core = { path = "../../core" }
+jni = "0.21.1"
