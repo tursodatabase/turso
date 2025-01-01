@@ -1,5 +1,5 @@
 java_run: lib
-	javac limbo/HelloWorld.java && java -Djava.library.path=../../target/debug/ limbo.HelloWorld
+	javac limbo/Limbo.java && java -Djava.library.path=../../target/debug/ limbo.Limbo
 
 .PHONY: lib
 

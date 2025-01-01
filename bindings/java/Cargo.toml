@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [lib]
-name = "_java_limbo"
+name = "_limbo_java"
 crate-type = ["cdylib"]
 
 [dependencies]
