@@ -1,3 +1,5 @@
+package limbo;
+
 class HelloWorld {
     private static native String hello(String input);
 

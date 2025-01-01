@@ -1,10 +1,10 @@
 java_run: lib
-	javac HelloWorld.java && java -Djava.library.path=../../target/debug/ HelloWorld
+	javac limbo/HelloWorld.java && java -Djava.library.path=../../target/debug/ limbo.HelloWorld
 
 .PHONY: lib
 
 javah:
-	javah HelloWorld
+	javah limbo.HelloWorld
 
 lib:
 	cargo build

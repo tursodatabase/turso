@@ -55,7 +55,7 @@ struct Cursor {
 static mut CONNECTION: Option<Connection> = None;
 
 #[no_mangle]
-pub extern "system" fn Java_HelloWorld_hello<'local>(
+pub extern "system" fn Java_limbo_HelloWorld_hello<'local>(
     // Notice that this `env` argument is mutable. Any `JNIEnv` API that may
     // allocate new object references will take a mutable reference to the
     // environment.
