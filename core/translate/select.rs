@@ -1,6 +1,3 @@
-use std::rc::Weak;
-use std::{cell::RefCell, rc::Rc};
-
 use super::emitter::emit_program;
 use super::expr::get_name;
 use super::plan::SelectQueryType;
@@ -17,6 +14,9 @@ use crate::{schema::Schema, vdbe::Program, Result};
 use crate::{Connection, SymbolTable};
 use sqlite3_parser::ast;
 use sqlite3_parser::ast::ResultColumn;
+use std::collections::BTreeSet;
+use std::rc::Weak;
+use std::{cell::RefCell, rc::Rc};
 
 pub fn translate_select(
     schema: &Schema,
@@ -52,6 +52,7 @@ pub fn prepare_select_plan(schema: &Schema, select: ast::Select) -> Result<Plan>
             let mut plan = SelectPlan {
                 source,
                 result_columns: vec![],
+                related_columns: BTreeSet::new(),
                 where_clause: None,
                 group_by: None,
                 order_by: None,

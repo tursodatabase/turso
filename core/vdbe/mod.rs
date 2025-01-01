@@ -561,17 +561,8 @@ impl Program {
                     column,
                     dest,
                 } => {
-                    if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seek.take() {
-                        let index_cursor = cursors.get_mut(&index_cursor_id).unwrap();
-                        let rowid = index_cursor.rowid()?;
-                        let table_cursor = cursors.get_mut(&table_cursor_id).unwrap();
-                        match table_cursor.seek(SeekKey::TableRowId(rowid.unwrap()), SeekOp::EQ)? {
-                            CursorResult::Ok(_) => {}
-                            CursorResult::IO => {
-                                state.deferred_seek = Some((index_cursor_id, table_cursor_id));
-                                return Ok(StepResult::IO);
-                            }
-                        }
+                    if Self::deferred_seek(&mut state.deferred_seek, &mut cursors)? {
+                        return Ok(StepResult::IO);
                     }
 
                     let cursor = cursors.get_mut(cursor_id).unwrap();
@@ -750,17 +741,8 @@ impl Program {
                     state.pc += 1;
                 }
                 Insn::RowId { cursor_id, dest } => {
-                    if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seek.take() {
-                        let index_cursor = cursors.get_mut(&index_cursor_id).unwrap();
-                        let rowid = index_cursor.rowid()?;
-                        let table_cursor = cursors.get_mut(&table_cursor_id).unwrap();
-                        match table_cursor.seek(SeekKey::TableRowId(rowid.unwrap()), SeekOp::EQ)? {
-                            CursorResult::Ok(_) => {}
-                            CursorResult::IO => {
-                                state.deferred_seek = Some((index_cursor_id, table_cursor_id));
-                                return Ok(StepResult::IO);
-                            }
-                        }
+                    if Self::deferred_seek(&mut state.deferred_seek, &mut cursors)? {
+                        return Ok(StepResult::IO);
                     }
 
                     let cursor = cursors.get_mut(cursor_id).unwrap();
@@ -1855,6 +1837,26 @@ impl Program {
                 }
             }
         }
+    }
+
+    #[inline]
+    fn deferred_seek<'a>(
+        deferred_seek: &mut Option<(CursorID, CursorID)>,
+        cursors: &mut BTreeMap<CursorID, Box<dyn Cursor>>,
+    ) -> Result<bool> {
+        if let Some((index_cursor_id, table_cursor_id)) = deferred_seek.take() {
+            let index_cursor = cursors.get_mut(&index_cursor_id).unwrap();
+            let rowid = index_cursor.rowid()?;
+            let table_cursor = cursors.get_mut(&table_cursor_id).unwrap();
+            match table_cursor.seek(SeekKey::TableRowId(rowid.unwrap()), SeekOp::EQ)? {
+                CursorResult::Ok(_) => (),
+                CursorResult::IO => {
+                    *deferred_seek = Some((index_cursor_id, table_cursor_id));
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 }
 

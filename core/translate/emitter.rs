@@ -2,18 +2,18 @@
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::{Rc, Weak};
 
 use sqlite3_parser::ast::{self};
 
 use crate::schema::{Column, PseudoTable, Table};
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
-use crate::translate::plan::{DeletePlan, IterationDirection, Plan, Search};
+use crate::translate::plan::{ColumnBinding, DeletePlan, IterationDirection, Plan, Search};
 use crate::types::{OwnedRecord, OwnedValue};
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::ProgramBuilder;
-use crate::vdbe::{insn::Insn, BranchOffset, Program};
+use crate::vdbe::{insn::Insn, BranchOffset, CursorID, Program};
 use crate::{Connection, Result, SymbolTable};
 
 use super::expr::{
@@ -378,6 +378,7 @@ fn emit_query(
     open_loop(
         program,
         &mut plan.source,
+        &plan.related_columns,
         &plan.referenced_tables,
         metadata,
         syms,
@@ -470,6 +471,7 @@ fn emit_program_for_delete(
     open_loop(
         &mut program,
         &mut plan.source,
+        &plan.related_columns,
         &plan.referenced_tables,
         &mut metadata,
         syms,
@@ -726,6 +728,7 @@ fn init_source(
 fn open_loop(
     program: &mut ProgramBuilder,
     source: &mut SourceOperator,
+    related_columns: &BTreeSet<ColumnBinding>,
     referenced_tables: &[TableReference],
     metadata: &mut Metadata,
     syms: &SymbolTable,
@@ -800,7 +803,14 @@ fn open_loop(
             outer,
             ..
         } => {
-            open_loop(program, left, referenced_tables, metadata, syms)?;
+            open_loop(
+                program,
+                left,
+                related_columns,
+                referenced_tables,
+                metadata,
+                syms,
+            )?;
 
             let loop_labels = metadata
                 .loop_labels
@@ -818,7 +828,14 @@ fn open_loop(
                 jump_target_when_false = lj_meta.check_match_flag_label;
             }
 
-            open_loop(program, right, referenced_tables, metadata, syms)?;
+            open_loop(
+                program,
+                right,
+                related_columns,
+                referenced_tables,
+                metadata,
+                syms,
+            )?;
 
             if let Some(predicates) = predicates {
                 let jump_target_when_true = program.allocate_label();
@@ -1070,10 +1087,18 @@ fn open_loop(
                 }
 
                 if let Some(index_cursor_id) = index_cursor_id {
-                    program.emit_insn(Insn::DeferredSeek {
+                    if !try_index_cover(
+                        program,
+                        related_columns,
+                        &table_reference,
                         index_cursor_id,
                         table_cursor_id,
-                    });
+                    ) {
+                        program.emit_insn(Insn::DeferredSeek {
+                            index_cursor_id,
+                            table_cursor_id,
+                        });
+                    }
                 }
             }
 
@@ -1120,6 +1145,51 @@ fn open_loop(
         }
         SourceOperator::Nothing { .. } => Ok(()),
     }
+}
+
+fn try_index_cover(
+    program: &mut ProgramBuilder,
+    related_columns: &BTreeSet<ColumnBinding>,
+    table_reference: &BTreeTableReference,
+    index_cursor_id: CursorID,
+    table_cursor_id: CursorID,
+) -> bool {
+    let BTreeTableReference {
+        table, table_index, ..
+    } = table_reference;
+
+    if let (_, Some(Table::Index(index))) = &program.cursor_ref[index_cursor_id] {
+        let mut index_column_map = HashMap::with_capacity(index.columns.len());
+        let index_clone = Rc::clone(index);
+        for (i, index_column) in index_clone.columns.iter().enumerate() {
+            // SAFETY: the column in the index must exist in the table
+            let (pos, _) = table.get_column(&index_column.name).unwrap();
+            index_column_map.insert(pos, i);
+        }
+        for pk_name in table.primary_key_column_names.iter() {
+            // SAFETY: the primary key column must exist in the table
+            let (pos, _) = table.get_column(pk_name).unwrap();
+            index_column_map.insert(pos, index_column_map.len());
+        }
+
+        let len = table.columns.len();
+        let lower = ColumnBinding {
+            table: *table_index,
+            column: 0,
+        };
+
+        let is_cover = related_columns
+            .range(lower..)
+            .take(len)
+            .all(|binding| index_column_map.contains_key(&binding.column));
+        if is_cover {
+            program
+                .index_cover_cursors
+                .insert(table_cursor_id, (index_cursor_id, index_column_map));
+            return true;
+        }
+    }
+    false
 }
 
 /// SQLite (and so Limbo) processes joins as a nested loop.

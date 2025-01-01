@@ -28,6 +28,9 @@ pub struct ProgramBuilder {
     seekrowid_emitted_bitmask: u64,
     // map of instruction index to manual comment (used in EXPLAIN)
     comments: HashMap<BranchOffset, &'static str>,
+    // index cursor that can cover table cursor
+    // Table Cursor -> (Index Cursor, Map<table_column index, index_column index>)
+    pub index_cover_cursors: HashMap<CursorID, (CursorID, HashMap<usize, usize>)>,
 }
 
 impl ProgramBuilder {
@@ -44,6 +47,7 @@ impl ProgramBuilder {
             deferred_label_resolutions: Vec::new(),
             seekrowid_emitted_bitmask: 0,
             comments: HashMap::new(),
+            index_cover_cursors: HashMap::new(),
         }
     }
 

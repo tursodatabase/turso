@@ -11,6 +11,14 @@ use crate::{
     vdbe::BranchOffset,
     Result,
 };
+use core::fmt;
+use sqlite3_parser::ast;
+use std::cmp::Ordering;
+use std::collections::BTreeSet;
+use std::{
+    fmt::{Display, Formatter},
+    rc::Rc,
+};
 use crate::{
     schema::{PseudoTable, Type},
     translate::plan::Plan::{Delete, Select},
@@ -37,6 +45,26 @@ pub enum Plan {
     Delete(DeletePlan),
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct ColumnBinding {
+    pub table: usize,
+    pub column: usize,
+}
+
+impl PartialOrd<Self> for ColumnBinding {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ColumnBinding {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.table
+            .cmp(&other.table)
+            .then(self.column.cmp(&other.column))
+    }
+}
+
 /// The type of the query, either top level or subquery
 #[derive(Debug, Clone)]
 pub enum SelectQueryType {
@@ -55,6 +83,8 @@ pub struct SelectPlan {
     pub source: SourceOperator,
     /// the columns inside SELECT ... FROM
     pub result_columns: Vec<ResultSetColumn>,
+    /// the columns related to this plan,
+    pub related_columns: BTreeSet<ColumnBinding>,
     /// where clause split into a vec at 'AND' boundaries.
     pub where_clause: Option<Vec<ast::Expr>>,
     /// group by clause
@@ -82,6 +112,8 @@ pub struct DeletePlan {
     pub source: SourceOperator,
     /// the columns inside SELECT ... FROM
     pub result_columns: Vec<ResultSetColumn>,
+    /// the columns related to this plan,
+    pub related_columns: BTreeSet<ColumnBinding>,
     /// where clause split into a vec at 'AND' boundaries.
     pub where_clause: Option<Vec<ast::Expr>>,
     /// order by clause

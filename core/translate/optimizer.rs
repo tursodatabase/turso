@@ -1,13 +1,17 @@
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use sqlite3_parser::ast;
-
 use crate::{schema::Index, Result};
+use sqlite3_parser::ast;
+use sqlite3_parser::ast::{
+    FrameBound, FromClause, JoinConstraint, OneSelect, Over, ResultColumn, Select, SelectBody,
+    SelectTable, SortedColumn, Window,
+};
 
 use super::plan::{
-    get_table_ref_bitmask_for_ast_expr, get_table_ref_bitmask_for_operator, DeletePlan, Direction,
-    IterationDirection, Plan, Search, SelectPlan, SourceOperator, TableReference,
-    TableReferenceType,
+    get_table_ref_bitmask_for_ast_expr, get_table_ref_bitmask_for_operator, Aggregate,
+    TableReference, TableReferenceType, ColumnBinding, DeletePlan, Direction, GroupBy, IterationDirection, Plan,
+    ResultSetColumn, Search, SelectPlan, SourceOperator,
 };
 
 pub fn optimize_plan(plan: &mut Plan) -> Result<()> {
@@ -49,6 +53,17 @@ fn optimize_select_plan(plan: &mut SelectPlan) -> Result<()> {
         &mut plan.order_by,
         &plan.referenced_tables,
         &plan.available_indexes,
+    )?;
+
+    related_columns(
+        &plan.source,
+        &plan.result_columns,
+        &plan.where_clause,
+        &plan.group_by,
+        &plan.order_by,
+        &plan.aggregates,
+        &mut plan.related_columns,
+        &plan.referenced_tables,
     )?;
 
     Ok(())
@@ -640,6 +655,444 @@ fn eliminate_between(
         _ => (),
     }
 
+    Ok(())
+}
+
+fn related_columns(
+    operator: &SourceOperator,
+    result_columns: &[ResultSetColumn],
+    where_clause: &Option<Vec<ast::Expr>>,
+    group_by: &Option<GroupBy>,
+    order_by: &Option<Vec<(ast::Expr, Direction)>>,
+    aggregates: &[Aggregate],
+    related_columns: &mut BTreeSet<ColumnBinding>,
+    referenced_tables: &[BTreeTableReference],
+) -> Result<()> {
+    source_related_columns(operator, related_columns, referenced_tables)?;
+    for column in result_columns.iter() {
+        expr_related_columns(&column.expr, related_columns, referenced_tables)?;
+    }
+    if let Some(exprs) = where_clause {
+        for expr in exprs {
+            expr_related_columns(expr, related_columns, referenced_tables)?;
+        }
+    }
+    if let Some(group_by) = group_by {
+        for expr in group_by.exprs.iter() {
+            expr_related_columns(expr, related_columns, referenced_tables)?;
+        }
+
+        if let Some(exprs) = &group_by.having {
+            for expr in exprs {
+                expr_related_columns(expr, related_columns, referenced_tables)?;
+            }
+        }
+    }
+    if let Some(order_by) = order_by {
+        for (expr, _) in order_by {
+            expr_related_columns(expr, related_columns, referenced_tables)?;
+        }
+    }
+    for agg in aggregates {
+        for expr in agg.args.iter() {
+            expr_related_columns(expr, related_columns, referenced_tables)?;
+        }
+        expr_related_columns(&agg.original_expr, related_columns, referenced_tables)?;
+    }
+
+    Ok(())
+}
+
+fn source_related_columns(
+    source_operator: &SourceOperator,
+    related_columns: &mut BTreeSet<ColumnBinding>,
+    referenced_tables: &[BTreeTableReference],
+) -> Result<()> {
+    match source_operator {
+        SourceOperator::Join {
+            left,
+            right,
+            predicates,
+            ..
+        } => {
+            source_related_columns(left, related_columns, referenced_tables)?;
+            source_related_columns(right, related_columns, referenced_tables)?;
+
+            if let Some(exprs) = predicates {
+                for expr in exprs.iter() {
+                    expr_related_columns(expr, related_columns, referenced_tables)?;
+                }
+            }
+        }
+        SourceOperator::Scan { predicates, .. } => {
+            if let Some(predicates) = predicates {
+                for expr in predicates {
+                    expr_related_columns(expr, related_columns, referenced_tables)?;
+                }
+            }
+        }
+        SourceOperator::Search {
+            predicates, search, ..
+        } => {
+            if let Some(exprs) = predicates {
+                for expr in exprs.iter() {
+                    expr_related_columns(expr, related_columns, referenced_tables)?;
+                }
+            }
+            match search {
+                Search::RowidEq { cmp_expr }
+                | Search::RowidSearch { cmp_expr, .. }
+                | Search::IndexSearch { cmp_expr, .. } => {
+                    expr_related_columns(cmp_expr, related_columns, referenced_tables)?;
+                }
+            }
+        }
+        SourceOperator::Nothing => (),
+    }
+
+    Ok(())
+}
+
+fn from_clause_related_columns(
+    from: &FromClause,
+    related_columns: &mut BTreeSet<ColumnBinding>,
+    referenced_tables: &[BTreeTableReference],
+) -> Result<()> {
+    if let Some(select_table) = &from.select {
+        select_table_related_columns(select_table, related_columns, referenced_tables)?;
+    }
+    if let Some(joins) = &from.joins {
+        for join in joins.iter() {
+            select_table_related_columns(&join.table, related_columns, referenced_tables)?;
+
+            if let Some(constraint) = &join.constraint {
+                match constraint {
+                    JoinConstraint::On(expr) => {
+                        expr_related_columns(expr, related_columns, referenced_tables)?;
+                    }
+                    JoinConstraint::Using(_) => (),
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn select_table_related_columns(
+    select_table: &SelectTable,
+    related_columns: &mut BTreeSet<ColumnBinding>,
+    referenced_tables: &[BTreeTableReference],
+) -> Result<()> {
+    match select_table {
+        SelectTable::TableCall(_, exprs, _) => {
+            if let Some(exprs) = exprs {
+                for expr in exprs {
+                    expr_related_columns(expr, related_columns, referenced_tables)?;
+                }
+            }
+        }
+        SelectTable::Select(select, _) => {
+            select_related_columns(select, related_columns, referenced_tables)?;
+        }
+        SelectTable::Sub(from, _) => {
+            from_clause_related_columns(from, related_columns, referenced_tables)?;
+        }
+        SelectTable::Table(_, _, _) => (),
+    }
+
+    Ok(())
+}
+
+fn one_select_related_columns(
+    one_select: &OneSelect,
+    related_columns: &mut BTreeSet<ColumnBinding>,
+    referenced_tables: &[BTreeTableReference],
+) -> Result<()> {
+    match one_select {
+        OneSelect::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            window_clause,
+            ..
+        } => {
+            for column in columns {
+                match &column {
+                    ResultColumn::Expr(expr, _) => {
+                        expr_related_columns(expr, related_columns, referenced_tables)?;
+                    }
+                    ResultColumn::Star => {
+                        full_related_columns(related_columns, referenced_tables);
+                    }
+                    ResultColumn::TableStar(table_name) => {
+                        let Some(table_pos) = referenced_tables
+                            .iter()
+                            .position(|table| table.table.name == table_name.0)
+                        else {
+                            crate::bail_corrupt_error!(
+                                "Optimize error: no such table: {}",
+                                table_name
+                            )
+                        };
+                        for i in 0..referenced_tables[table_pos].table.columns.len() {
+                            related_columns.insert(ColumnBinding {
+                                table: table_pos,
+                                column: i,
+                            });
+                        }
+                    }
+                }
+            }
+            if let Some(from) = from {
+                from_clause_related_columns(&from, related_columns, referenced_tables)?;
+            }
+            if let Some(expr) = where_clause {
+                expr_related_columns(&expr, related_columns, referenced_tables)?;
+            }
+            if let Some(group_by) = group_by {
+                for expr in group_by.exprs.iter() {
+                    expr_related_columns(expr, related_columns, referenced_tables)?;
+                }
+                if let Some(expr) = &group_by.having {
+                    expr_related_columns(expr, related_columns, referenced_tables)?;
+                }
+            }
+            if let Some(windows) = window_clause {
+                for window in windows.iter().map(|window| &window.window) {
+                    window_related_columns(&window, related_columns, referenced_tables)?;
+                }
+            }
+        }
+        OneSelect::Values(rows) => {
+            for row in rows.iter() {
+                for expr in row {
+                    expr_related_columns(expr, related_columns, referenced_tables)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn select_related_columns(
+    select: &Select,
+    related_columns: &mut BTreeSet<ColumnBinding>,
+    referenced_tables: &[BTreeTableReference],
+) -> Result<()> {
+    let Select {
+        body: SelectBody { select, compounds },
+        order_by,
+        limit,
+        ..
+    } = &select;
+
+    one_select_related_columns(select, related_columns, referenced_tables)?;
+
+    if let Some(compounds) = compounds {
+        for compound in compounds {
+            one_select_related_columns(&compound.select, related_columns, referenced_tables)?;
+        }
+    }
+    order_by_related_columns(order_by, related_columns, referenced_tables)?;
+    if let Some(limit) = limit {
+        expr_related_columns(&limit.expr, related_columns, referenced_tables)?;
+        if let Some(offset) = &limit.offset {
+            expr_related_columns(offset, related_columns, referenced_tables)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn expr_related_columns(
+    expr: &ast::Expr,
+    related_columns: &mut BTreeSet<ColumnBinding>,
+    referenced_tables: &[BTreeTableReference],
+) -> Result<()> {
+    match expr {
+        ast::Expr::Between {
+            lhs, start, end, ..
+        } => {
+            expr_related_columns(lhs, related_columns, referenced_tables)?;
+            expr_related_columns(start, related_columns, referenced_tables)?;
+            expr_related_columns(end, related_columns, referenced_tables)?;
+        }
+        ast::Expr::Binary(lhs, _, rhs) => {
+            expr_related_columns(lhs, related_columns, referenced_tables)?;
+            expr_related_columns(rhs, related_columns, referenced_tables)?;
+        }
+        ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            if let Some(expr) = base {
+                expr_related_columns(expr, related_columns, referenced_tables)?;
+            }
+            for (lhs, rhs) in when_then_pairs {
+                expr_related_columns(lhs, related_columns, referenced_tables)?;
+                expr_related_columns(rhs, related_columns, referenced_tables)?;
+            }
+            if let Some(expr) = else_expr {
+                expr_related_columns(expr, related_columns, referenced_tables)?;
+            }
+        }
+        ast::Expr::Cast { expr, .. }
+        | ast::Expr::Collate(expr, _)
+        | ast::Expr::IsNull(expr)
+        | ast::Expr::NotNull(expr)
+        | ast::Expr::Unary(_, expr) => {
+            expr_related_columns(expr, related_columns, referenced_tables)?;
+        }
+        ast::Expr::Exists(select) => {
+            select_related_columns(select, related_columns, referenced_tables)?;
+        }
+        ast::Expr::FunctionCall {
+            args,
+            order_by,
+            filter_over,
+            ..
+        } => {
+            if let Some(exprs) = args {
+                for expr in exprs {
+                    expr_related_columns(expr, related_columns, referenced_tables)?;
+                }
+            }
+            order_by_related_columns(order_by, related_columns, referenced_tables)?;
+
+            if let Some(filter_over) = filter_over {
+                if let Some(over) = &filter_over.over_clause {
+                    match over.as_ref() {
+                        Over::Window(window) => {
+                            window_related_columns(window, related_columns, referenced_tables)?;
+                        }
+                        Over::Name(_) => (),
+                    }
+                }
+                if let Some(expr) = &filter_over.filter_clause {
+                    expr_related_columns(expr, related_columns, referenced_tables)?;
+                }
+            }
+        }
+        ast::Expr::FunctionCallStar { .. } => {
+            full_related_columns(related_columns, referenced_tables);
+        }
+        ast::Expr::Column { table, column, .. } => {
+            related_columns.insert(ColumnBinding {
+                table: *table,
+                column: *column,
+            });
+        }
+        ast::Expr::InList {
+            lhs, rhs: exprs, ..
+        }
+        | ast::Expr::InTable {
+            lhs, args: exprs, ..
+        } => {
+            expr_related_columns(lhs, related_columns, referenced_tables)?;
+            if let Some(exprs) = exprs {
+                for expr in exprs {
+                    expr_related_columns(expr, related_columns, referenced_tables)?;
+                }
+            }
+        }
+        ast::Expr::InSelect { lhs, rhs, .. } => {
+            expr_related_columns(lhs, related_columns, referenced_tables)?;
+            select_related_columns(rhs, related_columns, referenced_tables)?;
+        }
+        ast::Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            expr_related_columns(lhs, related_columns, referenced_tables)?;
+            expr_related_columns(rhs, related_columns, referenced_tables)?;
+            if let Some(expr) = escape {
+                expr_related_columns(expr, related_columns, referenced_tables)?;
+            }
+        }
+        ast::Expr::Parenthesized(exprs) => {
+            for expr in exprs {
+                expr_related_columns(expr, related_columns, referenced_tables)?;
+            }
+        }
+        ast::Expr::Raise(_, expr) => {
+            if let Some(expr) = expr {
+                expr_related_columns(expr, related_columns, referenced_tables)?;
+            }
+        }
+        ast::Expr::Subquery(select) => {
+            select_related_columns(select, related_columns, referenced_tables)?;
+        }
+
+        ast::Expr::Id(_)
+        | ast::Expr::DoublyQualified(_, _, _)
+        | ast::Expr::Literal(_)
+        | ast::Expr::Name(_)
+        | ast::Expr::Qualified(_, _)
+        | ast::Expr::Variable(_) => (),
+    }
+
+    Ok(())
+}
+
+#[inline]
+fn window_related_columns(
+    window: &Window,
+    related_columns: &mut BTreeSet<ColumnBinding>,
+    referenced_tables: &[BTreeTableReference],
+) -> Result<()> {
+    if let Some(partition_by) = &window.partition_by {
+        for expr in partition_by {
+            expr_related_columns(expr, related_columns, referenced_tables)?;
+        }
+    }
+    order_by_related_columns(&window.order_by, related_columns, referenced_tables)?;
+    if let Some(frame) = &window.frame_clause {
+        let mut fn_bound = |bound: &FrameBound| match bound {
+            FrameBound::Following(expr) | FrameBound::Preceding(expr) => {
+                expr_related_columns(expr, related_columns, referenced_tables)
+            }
+            FrameBound::CurrentRow
+            | FrameBound::UnboundedFollowing
+            | FrameBound::UnboundedPreceding => Ok(()),
+        };
+        fn_bound(&frame.start)?;
+
+        if let Some(end) = &frame.end {
+            fn_bound(end)?;
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+fn full_related_columns(
+    related_columns: &mut BTreeSet<ColumnBinding>,
+    referenced_tables: &[BTreeTableReference],
+) {
+    for (table_pos, reference_table) in referenced_tables.iter().enumerate() {
+        for i in 0..reference_table.table.columns.len() {
+            related_columns.insert(ColumnBinding {
+                table: table_pos,
+                column: i,
+            });
+        }
+    }
+}
+
+#[inline]
+fn order_by_related_columns(
+    order_by: &Option<Vec<SortedColumn>>,
+    related_columns: &mut BTreeSet<ColumnBinding>,
+    referenced_tables: &[BTreeTableReference],
+) -> Result<()> {
+    if let Some(sort_columns) = order_by {
+        for column in sort_columns {
+            expr_related_columns(&column.expr, related_columns, referenced_tables)?;
+        }
+    }
     Ok(())
 }
 
