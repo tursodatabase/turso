@@ -1976,20 +1976,19 @@ pub fn translate_expr(
                             column: columns_mapping[column],
                             dest: target_register,
                         });
+                    } else if *is_rowid_alias {
+                        program.emit_insn(Insn::RowId {
+                            cursor_id,
+                            dest: target_register,
+                        });
                     } else {
-                        if *is_rowid_alias {
-                            program.emit_insn(Insn::RowId {
-                                cursor_id,
-                                dest: target_register,
-                            });
-                        } else {
-                            program.emit_insn(Insn::Column {
-                                cursor_id,
-                                column: *column,
-                                dest: target_register,
-                            });
-                        }
+                        program.emit_insn(Insn::Column {
+                            cursor_id,
+                            column: *column,
+                            dest: target_register,
+                        });
                     }
+
                     let column = tbl_ref.table.get_column_at(*column);
                     maybe_apply_affinity(column.ty, target_register, program);
                     Ok(target_register)

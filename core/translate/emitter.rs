@@ -1090,7 +1090,7 @@ fn open_loop(
                     if !try_index_cover(
                         program,
                         related_columns,
-                        &table_reference,
+                        table_reference,
                         index_cursor_id,
                         table_cursor_id,
                     ) {
@@ -1172,15 +1172,16 @@ fn try_index_cover(
             index_column_map.insert(pos, index_column_map.len());
         }
 
-        let len = table.columns.len();
         let lower = ColumnBinding {
             table: *table_index,
             column: 0,
         };
-
+        let upper = ColumnBinding {
+            table: table_index + 1,
+            column: 0,
+        };
         let is_cover = related_columns
-            .range(lower..)
-            .take(len)
+            .range(lower..upper)
             .all(|binding| index_column_map.contains_key(&binding.column));
         if is_cover {
             program

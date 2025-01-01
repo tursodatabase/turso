@@ -1840,7 +1840,7 @@ impl Program {
     }
 
     #[inline]
-    fn deferred_seek<'a>(
+    fn deferred_seek(
         deferred_seek: &mut Option<(CursorID, CursorID)>,
         cursors: &mut BTreeMap<CursorID, Box<dyn Cursor>>,
     ) -> Result<bool> {

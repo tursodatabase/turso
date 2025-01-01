@@ -846,10 +846,10 @@ fn one_select_related_columns(
                 }
             }
             if let Some(from) = from {
-                from_clause_related_columns(&from, related_columns, referenced_tables)?;
+                from_clause_related_columns(from, related_columns, referenced_tables)?;
             }
             if let Some(expr) = where_clause {
-                expr_related_columns(&expr, related_columns, referenced_tables)?;
+                expr_related_columns(expr, related_columns, referenced_tables)?;
             }
             if let Some(group_by) = group_by {
                 for expr in group_by.exprs.iter() {
@@ -861,7 +861,7 @@ fn one_select_related_columns(
             }
             if let Some(windows) = window_clause {
                 for window in windows.iter().map(|window| &window.window) {
-                    window_related_columns(&window, related_columns, referenced_tables)?;
+                    window_related_columns(window, related_columns, referenced_tables)?;
                 }
             }
         }
