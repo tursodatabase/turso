@@ -162,7 +162,7 @@ impl Database {
     pub fn define_scalar_function<S: AsRef<str>>(
         &self,
         name: S,
-        func: impl Fn(&[Value]) -> Result<OwnedValue> + 'static,
+        func: impl Fn(Option<&[Value]>) -> Result<OwnedValue> + 'static,
     ) {
         let func = function::ExternalFunc {
             name: name.as_ref().to_string(),

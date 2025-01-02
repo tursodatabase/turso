@@ -1601,7 +1601,7 @@ impl Program {
                             _ => unreachable!(), // when more extension types are added
                         },
                         crate::function::Func::External(f) => {
-                            let result = (f.func)(&[])?;
+                            let result = (f.func)(None)?;
                             state.registers[*dest] = result;
                         }
                         crate::function::Func::Math(math_func) => match math_func.arity() {

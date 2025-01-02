@@ -5,7 +5,8 @@ use std::rc::Rc;
 
 pub struct ExternalFunc {
     pub name: String,
-    pub func: Box<dyn Fn(&[crate::types::Value]) -> crate::Result<crate::types::OwnedValue>>,
+    pub func:
+        Box<dyn Fn(Option<&[crate::types::Value]>) -> crate::Result<crate::types::OwnedValue>>,
 }
 
 impl Debug for ExternalFunc {
