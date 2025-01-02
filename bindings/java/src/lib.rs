@@ -1,4 +1,5 @@
 mod connection;
+mod cursor;
 
 use crate::connection::Connection;
 use jni::errors::JniError;
