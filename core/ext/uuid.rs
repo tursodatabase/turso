@@ -1,7 +1,7 @@
 use super::ExtFunc;
 use crate::{
     types::{LimboText, OwnedValue},
-    Database, LimboError,
+    Database, LimboError, Value,
 };
 use std::rc::Rc;
 use uuid::{ContextV7, Timestamp, Uuid};
@@ -19,7 +19,6 @@ impl UuidFunc {
     pub fn resolve_function(name: &str, num_args: usize) -> Option<ExtFunc> {
         match name {
             "uuid4_str" => Some(ExtFunc::Uuid(Self::Uuid4Str)),
-            "uuid7" if num_args < 2 => Some(ExtFunc::Uuid(Self::Uuid7)),
             "uuid_str" if num_args == 1 => Some(ExtFunc::Uuid(Self::UuidStr)),
             "uuid_blob" if num_args == 1 => Some(ExtFunc::Uuid(Self::UuidBlob)),
             "uuid7_timestamp_ms" if num_args == 1 => Some(ExtFunc::Uuid(Self::Uuid7TS)),
@@ -42,27 +41,28 @@ impl std::fmt::Display for UuidFunc {
     }
 }
 
-pub fn exec_uuid(var: &UuidFunc, sec: Option<&OwnedValue>) -> crate::Result<OwnedValue> {
+pub fn exec_uuid(var: &UuidFunc, _sec: Option<&OwnedValue>) -> crate::Result<OwnedValue> {
     match var {
         UuidFunc::Uuid4Str => Ok(OwnedValue::Text(LimboText::new(Rc::new(
             Uuid::new_v4().to_string(),
         )))),
-        UuidFunc::Uuid7 => {
-            let uuid = match sec {
-                Some(OwnedValue::Integer(ref seconds)) => {
-                    let ctx = ContextV7::new();
-                    if *seconds < 0 {
-                        // not valid unix timestamp, error or null?
-                        return Ok(OwnedValue::Null);
-                    }
-                    Uuid::new_v7(Timestamp::from_unix(ctx, *seconds as u64, 0))
-                }
-                _ => Uuid::now_v7(),
-            };
-            Ok(OwnedValue::Blob(Rc::new(uuid.into_bytes().to_vec())))
-        }
         _ => unreachable!(),
     }
+}
+
+pub fn exec_uuid7(sec: Option<&[Value]>) -> crate::Result<OwnedValue> {
+    let uuid = match sec {
+        Some([Value::Integer(ref seconds)]) => {
+            let ctx = ContextV7::new();
+            if *seconds < 0 {
+                // not valid unix timestamp, error or null?
+                return Ok(OwnedValue::Null);
+            }
+            Uuid::new_v7(Timestamp::from_unix(ctx, *seconds as u64, 0))
+        }
+        _ => Uuid::now_v7(),
+    };
+    Ok(OwnedValue::Blob(Rc::new(uuid.into_bytes().to_vec())))
 }
 
 pub fn exec_uuid4() -> crate::Result<OwnedValue> {
@@ -138,13 +138,13 @@ fn uuid_to_unix(uuid: &[u8; 16]) -> u64 {
 
 pub fn init(db: &mut Database) {
     db.define_scalar_function("uuid4", |_args| exec_uuid4());
+    db.define_scalar_function("uuid7", |sec| exec_uuid7(sec));
 }
 
 #[cfg(test)]
 #[cfg(feature = "uuid")]
 pub mod test {
-    use super::UuidFunc;
-    use crate::types::OwnedValue;
+    use crate::{types::OwnedValue, Value};
     #[test]
     fn test_exec_uuid_v4blob() {
         use super::exec_uuid4;
@@ -180,10 +180,9 @@ pub mod test {
 
     #[test]
     fn test_exec_uuid_v7_now() {
-        use super::{exec_uuid, UuidFunc};
+        use super::exec_uuid7;
         use uuid::Uuid;
-        let func = UuidFunc::Uuid7;
-        let owned_val = exec_uuid(&func, None);
+        let owned_val = exec_uuid7(None);
         match owned_val {
             Ok(OwnedValue::Blob(blob)) => {
                 assert_eq!(blob.len(), 16);
@@ -197,10 +196,9 @@ pub mod test {
 
     #[test]
     fn test_exec_uuid_v7_with_input() {
-        use super::{exec_uuid, UuidFunc};
+        use super::exec_uuid7;
         use uuid::Uuid;
-        let func = UuidFunc::Uuid7;
-        let owned_val = exec_uuid(&func, Some(&OwnedValue::Integer(946702800)));
+        let owned_val = exec_uuid7(Some(&[Value::Integer(946702800)]));
         match owned_val {
             Ok(OwnedValue::Blob(blob)) => {
                 assert_eq!(blob.len(), 16);
@@ -214,10 +212,9 @@ pub mod test {
 
     #[test]
     fn test_exec_uuid_v7_now_to_timestamp() {
-        use super::{exec_ts_from_uuid7, exec_uuid, UuidFunc};
+        use super::{exec_ts_from_uuid7, exec_uuid7};
         use uuid::Uuid;
-        let func = UuidFunc::Uuid7;
-        let owned_val = exec_uuid(&func, None);
+        let owned_val = exec_uuid7(None);
         match owned_val {
             Ok(OwnedValue::Blob(ref blob)) => {
                 assert_eq!(blob.len(), 16);
@@ -240,10 +237,9 @@ pub mod test {
 
     #[test]
     fn test_exec_uuid_v7_to_timestamp() {
-        use super::{exec_ts_from_uuid7, exec_uuid, UuidFunc};
+        use super::{exec_ts_from_uuid7, exec_uuid7};
         use uuid::Uuid;
-        let func = UuidFunc::Uuid7;
-        let owned_val = exec_uuid(&func, Some(&OwnedValue::Integer(946702800)));
+        let owned_val = exec_uuid7(Some(&[Value::Integer(946702800)]));
         match owned_val {
             Ok(OwnedValue::Blob(ref blob)) => {
                 assert_eq!(blob.len(), 16);
@@ -286,11 +282,11 @@ pub mod test {
 
     #[test]
     fn test_exec_uuid_v7_str_to_blob() {
-        use super::{exec_uuid, exec_uuidblob, exec_uuidstr, UuidFunc};
+        use super::{exec_uuid7, exec_uuidblob, exec_uuidstr};
         use uuid::Uuid;
         // convert a v7 blob to a string then back to a blob
         let owned_val = exec_uuidblob(
-            &exec_uuidstr(&exec_uuid(&UuidFunc::Uuid7, None).expect("uuid v7 blob to generate"))
+            &exec_uuidstr(&exec_uuid7(None).expect("uuid v7 blob to generate"))
                 .expect("uuid v7 string to generate"),
         );
         match owned_val {
@@ -323,12 +319,11 @@ pub mod test {
 
     #[test]
     fn test_exec_uuid_v7_blob_to_str() {
-        use super::{exec_uuid, exec_uuidstr};
+        use super::{exec_uuid7, exec_uuidstr};
         use uuid::Uuid;
         // convert a v7 blob to a string
         let owned_val = exec_uuidstr(
-            &exec_uuid(&UuidFunc::Uuid7, Some(&OwnedValue::Integer(123456789)))
-                .expect("uuid v7 blob to generate"),
+            &exec_uuid7(Some(&[Value::Integer(123456789)])).expect("uuid v7 blob to generate"),
         );
         match owned_val {
             Ok(OwnedValue::Text(v7str)) => {
