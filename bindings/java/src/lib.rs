@@ -1,6 +1,10 @@
-use jni::objects::{JClass, JString};
+mod connection;
+
+use crate::connection::Connection;
+use jni::errors::JniError;
+use jni::objects::{JClass, JObject, JString, JValue};
 use jni::JNIEnv;
-use std::rc::Rc;
+use lazy_static::lazy_static;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
@@ -12,12 +16,6 @@ struct Description {
     precision: Option<String>,
     scale: Option<String>,
     null_ok: Option<String>,
-}
-
-#[derive(Clone)]
-pub struct Connection {
-    conn: Arc<Mutex<Rc<limbo_core::Connection>>>,
-    io: Arc<limbo_core::PlatformIO>,
 }
 
 #[derive(Clone)]
@@ -52,30 +50,62 @@ struct Cursor {
     smt: Option<Arc<Mutex<limbo_core::Statement>>>,
 }
 
-static mut CONNECTION: Option<Connection> = None;
-
 #[no_mangle]
-pub extern "system" fn Java_limbo_HelloWorld_hello<'local>(
-    // Notice that this `env` argument is mutable. Any `JNIEnv` API that may
-    // allocate new object references will take a mutable reference to the
-    // environment.
+pub extern "system" fn Java_limbo_Limbo_connect<'local>(
     mut env: JNIEnv<'local>,
-    // this is the class that owns our static method. Not going to be used, but
-    // still needs to have an argument slot
     _class: JClass<'local>,
-    input: JString<'local>,
-) -> JString<'local> {
-    // First, we have to get the string out of java. Check out the `strings`
-    // module for more info on how this works.
-    let input: String = env
-        .get_string(&input)
-        .expect("Couldn't get java string!")
-        .into();
+    path: JString<'local>,
+) -> JObject<'local> {
+    match connect_internal(&mut env, path) {
+        Ok(obj) => obj,
+        Err(_) => JObject::null(),
+    }
+}
 
-    // Then we have to create a new java string to return. Again, more info
-    // in the `strings` module.
-    let output = env
-        .new_string(format!("Hello, {}!", input))
-        .expect("Couldn't create java string!");
-    output
+lazy_static! {
+    static ref CONNECTIONS: Mutex<Vec<Arc<Connection>>> = Mutex::new(Vec::new());
+}
+
+fn connect_internal<'local>(
+    env: &mut JNIEnv<'local>,
+    path: JString<'local>,
+) -> Result<JObject<'local>, JniError> {
+    let io = Arc::new(limbo_core::PlatformIO::new().map_err(|e| {
+        env.throw_new(
+            "java/lang/Exception",
+            format!("IO initialization failed: {:?}", e),
+        )
+        .unwrap();
+        JniError::Unknown
+    })?);
+
+    let path: String = env
+        .get_string(&path)
+        .expect("Failed to convert JString to Rust String")
+        .into();
+    let db = limbo_core::Database::open_file(io.clone(), &path).map_err(|e| {
+        env.throw_new(
+            "java/lang/Exception",
+            format!("Failed to open database: {:?}", e),
+        )
+        .unwrap();
+        JniError::Unknown
+    })?;
+
+    let conn = db.connect().clone();
+    let connection = Connection {
+        conn: Arc::new(Mutex::new(conn)),
+        io,
+    };
+
+    let mut connections = CONNECTIONS.lock().unwrap();
+    connections.push(Arc::new(connection));
+    let connection_id = (connections.len() - 1) as i64;
+
+    let connection_class = env.find_class("limbo/Connection").expect("Class not found");
+    let connection_obj = env
+        .new_object(connection_class, "(J)V", &[JValue::Long(connection_id)])
+        .expect("Object creation failed");
+
+    Ok(connection_obj)
 }

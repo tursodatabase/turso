@@ -1048,7 +1048,9 @@ version = "0.0.10"
 dependencies = [
  "anyhow",
  "jni",
+ "lazy_static",
  "limbo_core",
+ "rand",
 ]
 
 [[package]]

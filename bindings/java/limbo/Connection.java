@@ -1,12 +1,18 @@
 package limbo;
 
-import java.util.List;
-import java.util.Optional;
+import limbo.exceptions.InterfaceError;
+import limbo.exceptions.OperationalError;
 
 /**
  * Represents a connection to the database.
  */
 public class Connection {
+
+    private long connectionId;
+
+    public Connection(long connectionId) {
+        this.connectionId = connectionId;
+    }
 
     /**
      * Creates a new cursor object using this connection.
@@ -43,5 +49,13 @@ public class Connection {
      */
     public void rollback() throws OperationalError {
         // Implementation here
+    }
+
+    public long getConnectionId() {
+        return connectionId;
+    }
+
+    public void setConnectionId(long connectionId) {
+        this.connectionId = connectionId;
     }
 }

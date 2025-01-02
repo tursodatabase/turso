@@ -1,5 +1,8 @@
 package limbo;
 
+import limbo.exceptions.OperationalError;
+import limbo.exceptions.ProgrammingError;
+
 import java.util.List;
 import java.util.Optional;
 
@@ -8,15 +11,7 @@ import java.util.Optional;
  */
 public class Cursor {
     public int arraysize;
-    public Optional<Tuple<
-            String,
-            String,
-            Optional<String>,
-            Optional<String>,
-            Optional<String>,
-            Optional<String>,
-            Optional<String>
-            >> description;
+    public Optional<Description> description;
     public int rowcount;
 
     /**
