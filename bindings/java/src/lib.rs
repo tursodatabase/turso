@@ -96,13 +96,3 @@ fn connect_internal<'local>(
 
     Ok(Box::into_raw(Box::new(connection)) as jlong)
 }
-
-#[no_mangle]
-pub unsafe extern "system" fn Java_limbo_Limbo_test<'local>(
-    mut env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    connection_ptr: jlong
-) {
-    let connection = &mut *(connection_ptr as *mut Connection);
-    println!("test: {:?}", connection.hello);
-}
