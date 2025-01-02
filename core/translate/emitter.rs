@@ -1150,11 +1150,11 @@ fn open_loop(
 fn try_index_cover(
     program: &mut ProgramBuilder,
     related_columns: &BTreeSet<ColumnBinding>,
-    table_reference: &BTreeTableReference,
+    table_reference: &TableReference,
     index_cursor_id: CursorID,
     table_cursor_id: CursorID,
 ) -> bool {
-    let BTreeTableReference {
+    let TableReference {
         table, table_index, ..
     } = table_reference;
 
@@ -1167,7 +1167,7 @@ fn try_index_cover(
             index_column_map.insert(pos, i);
         }
         if let Some(pos) = table
-            .columns
+            .columns()
             .iter()
             .position(|column| column.is_rowid_alias)
         {

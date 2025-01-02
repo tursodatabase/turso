@@ -1,17 +1,17 @@
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
+use super::plan::{
+    get_table_ref_bitmask_for_ast_expr, get_table_ref_bitmask_for_operator, Aggregate,
+    ColumnBinding, DeletePlan, Direction, GroupBy, IterationDirection, Plan, ResultSetColumn,
+    Search, SelectPlan, SourceOperator, TableReference, TableReferenceType,
+};
+use crate::translate::optimizer;
 use crate::{schema::Index, Result};
 use sqlite3_parser::ast;
 use sqlite3_parser::ast::{
     FrameBound, FromClause, JoinConstraint, OneSelect, Over, ResultColumn, Select, SelectBody,
     SelectTable, SortedColumn, Window,
-};
-
-use super::plan::{
-    get_table_ref_bitmask_for_ast_expr, get_table_ref_bitmask_for_operator, Aggregate,
-    TableReference, TableReferenceType, ColumnBinding, DeletePlan, Direction, GroupBy, IterationDirection, Plan,
-    ResultSetColumn, Search, SelectPlan, SourceOperator,
 };
 
 pub fn optimize_plan(plan: &mut Plan) -> Result<()> {
@@ -666,7 +666,7 @@ fn related_columns(
     order_by: &Option<Vec<(ast::Expr, Direction)>>,
     aggregates: &[Aggregate],
     related_columns: &mut BTreeSet<ColumnBinding>,
-    referenced_tables: &[BTreeTableReference],
+    referenced_tables: &[TableReference],
 ) -> Result<()> {
     source_related_columns(operator, related_columns, referenced_tables)?;
     for column in result_columns.iter() {
@@ -706,7 +706,7 @@ fn related_columns(
 fn source_related_columns(
     source_operator: &SourceOperator,
     related_columns: &mut BTreeSet<ColumnBinding>,
-    referenced_tables: &[BTreeTableReference],
+    referenced_tables: &[TableReference],
 ) -> Result<()> {
     match source_operator {
         SourceOperator::Join {
@@ -747,7 +747,27 @@ fn source_related_columns(
                 }
             }
         }
-        SourceOperator::Nothing => (),
+        SourceOperator::Nothing { .. } => (),
+        SourceOperator::Subquery {
+            plan, predicates, ..
+        } => {
+            optimizer::related_columns(
+                &plan.source,
+                &plan.result_columns,
+                &plan.where_clause,
+                &plan.group_by,
+                &plan.order_by,
+                &plan.aggregates,
+                related_columns,
+                &plan.referenced_tables,
+            )?;
+
+            if let Some(predicates) = predicates {
+                for expr in predicates {
+                    expr_related_columns(expr, related_columns, referenced_tables)?;
+                }
+            }
+        }
     }
 
     Ok(())
@@ -756,7 +776,7 @@ fn source_related_columns(
 fn from_clause_related_columns(
     from: &FromClause,
     related_columns: &mut BTreeSet<ColumnBinding>,
-    referenced_tables: &[BTreeTableReference],
+    referenced_tables: &[TableReference],
 ) -> Result<()> {
     if let Some(select_table) = &from.select {
         select_table_related_columns(select_table, related_columns, referenced_tables)?;
@@ -782,7 +802,7 @@ fn from_clause_related_columns(
 fn select_table_related_columns(
     select_table: &SelectTable,
     related_columns: &mut BTreeSet<ColumnBinding>,
-    referenced_tables: &[BTreeTableReference],
+    referenced_tables: &[TableReference],
 ) -> Result<()> {
     match select_table {
         SelectTable::TableCall(_, exprs, _) => {
@@ -807,7 +827,7 @@ fn select_table_related_columns(
 fn one_select_related_columns(
     one_select: &OneSelect,
     related_columns: &mut BTreeSet<ColumnBinding>,
-    referenced_tables: &[BTreeTableReference],
+    referenced_tables: &[TableReference],
 ) -> Result<()> {
     match one_select {
         OneSelect::Select {
@@ -829,14 +849,14 @@ fn one_select_related_columns(
                     ResultColumn::TableStar(table_name) => {
                         let Some(table_pos) = referenced_tables
                             .iter()
-                            .position(|table| table.table.name == table_name.0)
+                            .position(|table| table.table.get_name() == table_name.0)
                         else {
                             crate::bail_corrupt_error!(
                                 "Optimize error: no such table: {}",
                                 table_name
                             )
                         };
-                        for i in 0..referenced_tables[table_pos].table.columns.len() {
+                        for i in 0..referenced_tables[table_pos].table.columns().len() {
                             related_columns.insert(ColumnBinding {
                                 table: table_pos,
                                 column: i,
@@ -880,7 +900,7 @@ fn one_select_related_columns(
 fn select_related_columns(
     select: &Select,
     related_columns: &mut BTreeSet<ColumnBinding>,
-    referenced_tables: &[BTreeTableReference],
+    referenced_tables: &[TableReference],
 ) -> Result<()> {
     let Select {
         body: SelectBody { select, compounds },
@@ -910,7 +930,7 @@ fn select_related_columns(
 fn expr_related_columns(
     expr: &ast::Expr,
     related_columns: &mut BTreeSet<ColumnBinding>,
-    referenced_tables: &[BTreeTableReference],
+    referenced_tables: &[TableReference],
 ) -> Result<()> {
     match expr {
         ast::Expr::Between {
@@ -1041,7 +1061,7 @@ fn expr_related_columns(
 fn window_related_columns(
     window: &Window,
     related_columns: &mut BTreeSet<ColumnBinding>,
-    referenced_tables: &[BTreeTableReference],
+    referenced_tables: &[TableReference],
 ) -> Result<()> {
     if let Some(partition_by) = &window.partition_by {
         for expr in partition_by {
@@ -1070,10 +1090,10 @@ fn window_related_columns(
 #[inline]
 fn full_related_columns(
     related_columns: &mut BTreeSet<ColumnBinding>,
-    referenced_tables: &[BTreeTableReference],
+    referenced_tables: &[TableReference],
 ) {
     for (table_pos, reference_table) in referenced_tables.iter().enumerate() {
-        for i in 0..reference_table.table.columns.len() {
+        for i in 0..reference_table.table.columns().len() {
             related_columns.insert(ColumnBinding {
                 table: table_pos,
                 column: i,
@@ -1086,7 +1106,7 @@ fn full_related_columns(
 fn order_by_related_columns(
     order_by: &Option<Vec<SortedColumn>>,
     related_columns: &mut BTreeSet<ColumnBinding>,
-    referenced_tables: &[BTreeTableReference],
+    referenced_tables: &[TableReference],
 ) -> Result<()> {
     if let Some(sort_columns) = order_by {
         for column in sort_columns {

@@ -11,18 +11,12 @@ use crate::{
     vdbe::BranchOffset,
     Result,
 };
-use core::fmt;
-use sqlite3_parser::ast;
-use std::cmp::Ordering;
-use std::collections::BTreeSet;
-use std::{
-    fmt::{Display, Formatter},
-    rc::Rc,
-};
 use crate::{
     schema::{PseudoTable, Type},
     translate::plan::Plan::{Delete, Select},
 };
+use std::cmp::Ordering;
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone)]
 pub struct ResultSetColumn {
@@ -45,7 +39,7 @@ pub enum Plan {
     Delete(DeletePlan),
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct ColumnBinding {
     pub table: usize,
     pub column: usize,
