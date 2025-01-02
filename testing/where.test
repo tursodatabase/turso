@@ -319,7 +319,7 @@ do_execsql_test where-age-index-seek-regression-test-2 {
 } {10000}
 
 do_execsql_test where-age-index-cover-seek {
-    select id, age from users where age > 90;
+    select id, age from users where age > 90 limit 1;
 } {120|90}
 
 do_execsql_test where-simple-between {

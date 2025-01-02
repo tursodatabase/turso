@@ -1166,12 +1166,11 @@ fn try_index_cover(
             let (pos, _) = table.get_column(&index_column.name).unwrap();
             index_column_map.insert(pos, i);
         }
-        if table.has_rowid {
-            let pos = table
-                .columns
-                .iter()
-                .position(|column| column.is_rowid_alias)
-                .unwrap();
+        if let Some(pos) = table
+            .columns
+            .iter()
+            .position(|column| column.is_rowid_alias)
+        {
             index_column_map.insert(pos, index_column_map.len());
         }
 
