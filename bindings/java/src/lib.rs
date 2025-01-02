@@ -1,11 +1,13 @@
 mod connection;
 
+use std::collections::HashMap;
 use crate::connection::Connection;
 use jni::errors::JniError;
 use jni::objects::{JClass, JObject, JString, JValue};
 use jni::JNIEnv;
 use lazy_static::lazy_static;
 use std::sync::{Arc, Mutex};
+use rand::random;
 
 #[derive(Clone, Debug)]
 struct Description {
@@ -63,7 +65,7 @@ pub extern "system" fn Java_limbo_Limbo_connect<'local>(
 }
 
 lazy_static! {
-    static ref CONNECTIONS: Mutex<Vec<Arc<Connection>>> = Mutex::new(Vec::new());
+    static ref CONNECTIONS: Mutex<HashMap<i64, Arc<Connection>>> = Mutex::new(HashMap::new());
 }
 
 fn connect_internal<'local>(
@@ -99,8 +101,8 @@ fn connect_internal<'local>(
     };
 
     let mut connections = CONNECTIONS.lock().unwrap();
-    connections.push(Arc::new(connection));
-    let connection_id = (connections.len() - 1) as i64;
+    let connection_id = random();
+    connections.insert(connection_id, Arc::new(connection));
 
     let connection_class = env.find_class("limbo/Connection").expect("Class not found");
     let connection_obj = env

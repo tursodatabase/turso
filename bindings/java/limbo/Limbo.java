@@ -9,6 +9,8 @@ public class Limbo {
     }
 
     public static void main(String[] args) {
+        Connection connection = connect("limbo.db");
+        System.out.println(connection.getConnectionId());
         System.out.println("helo world");
     }
 }
