@@ -1,17 +1,22 @@
 package limbo;
 
-import java.util.List;
 import java.util.Optional;
 
 /**
  * Represents a database cursor.
  */
 public class Cursor {
-    private long cursorId;
+    private long cursorPtr;
 
-    public Cursor(long cursorId) {
-        this.cursorId = cursorId;
+    public Cursor(long cursorPtr) {
+        this.cursorPtr = cursorPtr;
     }
 
-    public native Cursor execute(String sql, Optional<Tuple<Object, Object>> parameters);
+//    public Cursor execute(String sql, List<Tuple<Object, Object>> parameters) {
+//        System.out.println("sql: " + sql);
+//        execute(cursorPtr, sql, parameters);
+//        return this;
+//    }
+//
+//    private static native void execute(long cursorPtr, String sql, List<Tuple<Object, Object>> parameters);
 }

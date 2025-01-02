@@ -3,7 +3,7 @@ mod cursor;
 
 use crate::connection::Connection;
 use jni::errors::JniError;
-use jni::objects::{JClass, JString};
+use jni::objects::{JClass, JObject, JString};
 use jni::sys::jlong;
 use jni::JNIEnv;
 use std::sync::{Arc, Mutex};
@@ -18,6 +18,13 @@ struct Description {
     scale: Option<String>,
     null_ok: Option<String>,
 }
+
+#[derive(Clone, Debug)]
+struct Tuple<X, Y> {
+    x: X,
+    y: Y,
+}
+
 
 #[no_mangle]
 pub extern "system" fn Java_limbo_Limbo_connect<'local>(

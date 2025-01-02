@@ -7,10 +7,11 @@ import java.lang.Exception;
  */
 public class Connection {
 
-    private long connectionId;
+    // Pointer to the connection object
+    private long connectionPtr;
 
-    public Connection(long connectionId) {
-        this.connectionId = connectionId;
+    public Connection(long connectionPtr) {
+        this.connectionPtr = connectionPtr;
     }
 
     public native void test();
@@ -22,10 +23,11 @@ public class Connection {
      * @throws Exception If the cursor cannot be created.
      */
     public Cursor cursor() throws Exception {
-        return cursor(connectionId);
+        long cursorId = cursor(connectionPtr);
+        return new Cursor(cursorId);
     }
 
-    private native Cursor cursor(long connectionId);
+    private native long cursor(long connectionPtr);
 
     /**
      * Closes the connection to the database.
@@ -33,10 +35,10 @@ public class Connection {
      * @throws Exception If there is an error closing the connection.
      */
     public void close() throws Exception {
-        close(connectionId);
+        close(connectionPtr);
     }
 
-    private native void close(long connectionId);
+    private native void close(long connectionPtr);
 
     /**
      * Commits the current transaction.
@@ -45,13 +47,13 @@ public class Connection {
      */
     public void commit() throws Exception {
         try {
-            commit(connectionId);
+            commit(connectionPtr);
         } catch (Exception e) {
             System.out.println("caught exception: " + e);
         }
     }
 
-    private native void commit(long connectionId) throws Exception;
+    private native void commit(long connectionPtr) throws Exception;
 
     /**
      * Rolls back the current transaction.
@@ -59,8 +61,8 @@ public class Connection {
      * @throws Exception If there is an error during rollback.
      */
     public void rollback() throws Exception {
-        rollback(connectionId);
+        rollback(connectionPtr);
     }
 
-    private native void rollback(long connectionId) throws Exception;
+    private native void rollback(long connectionPtr) throws Exception;
 }

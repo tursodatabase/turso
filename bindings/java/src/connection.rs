@@ -18,9 +18,9 @@ unsafe impl Sync for Connection {}
 pub extern "system" fn Java_limbo_Connection_cursor<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
-    connection_id: jlong,
+    connection_ptr: jlong,
 ) -> jlong {
-    let connection = to_connection(connection_id);
+    let connection = to_connection(connection_ptr);
     let cursor = Cursor {
         array_size: 1,
         conn: connection.clone(),

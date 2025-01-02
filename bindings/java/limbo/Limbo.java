@@ -12,7 +12,7 @@ public class Limbo {
         Limbo limbo = new Limbo();
         Connection connection = limbo.getConnection("./limbo.db");
 
-        connection.cursor();
+        Cursor cursor = connection.cursor();
     }
 
     public Connection getConnection(String path) throws Exception {

@@ -1,8 +1,9 @@
 use crate::connection::Connection;
 use crate::Description;
-use jni::objects::{JClass, JObject, JString};
-use jni::sys::{jint, jlong, jobject};
+use jni::objects::{JClass, JList, JObject, JString};
+use jni::sys::{jlong, jstring};
 use jni::JNIEnv;
+use std::fmt::{Debug, Formatter, Pointer};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
@@ -37,17 +38,32 @@ pub struct Cursor {
     pub(crate) smt: Option<Arc<Mutex<limbo_core::Statement>>>,
 }
 
+impl Debug for Cursor {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cursor")
+            .field("array_size", &self.array_size)
+            .field("description", &self.description)
+            .field("rowcount", &self.rowcount)
+            .finish()
+    }
+}
+
 #[no_mangle]
-pub extern "system" fn Java_limbo_Cursor_execute(
-    env: JNIEnv,
-    _class: JClass,
-    cursor_id: jlong,
-    sql: JString,
-    parameters: JObject,
-) -> jlong {
-    todo!()
+pub extern "system" fn Java_limbo_Cursor_execute<'local>(
+    env: &mut JNIEnv<'local>,
+    _class: JClass<'local>,
+    cursor_ptr: jlong,
+    sql: jstring,
+) {
+    println!("sql: {:?}", sql);
 }
 
 fn to_cursor(cursor_ptr: jlong) -> &'static mut Cursor {
     unsafe { &mut *(cursor_ptr as *mut Cursor) }
+}
+
+fn stmt_is_dml(sql: &str) -> bool {
+    let sql = sql.trim();
+    let sql = sql.to_uppercase();
+    sql.starts_with("INSERT") || sql.starts_with("UPDATE") || sql.starts_with("DELETE")
 }
