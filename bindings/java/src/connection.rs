@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 pub struct Connection {
+    pub hello: String,
     pub conn: Arc<Mutex<Rc<limbo_core::Connection>>>,
     pub io: Arc<limbo_core::PlatformIO>,
 }

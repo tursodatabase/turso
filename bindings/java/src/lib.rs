@@ -1,13 +1,13 @@
 mod connection;
 
-use std::collections::HashMap;
 use crate::connection::Connection;
 use jni::errors::JniError;
-use jni::objects::{JClass, JObject, JString, JValue};
+use jni::objects::{JClass, JString};
+use jni::sys::jlong;
 use jni::JNIEnv;
 use lazy_static::lazy_static;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use rand::random;
 
 #[derive(Clone, Debug)]
 struct Description {
@@ -57,21 +57,14 @@ pub extern "system" fn Java_limbo_Limbo_connect<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     path: JString<'local>,
-) -> JObject<'local> {
-    match connect_internal(&mut env, path) {
-        Ok(obj) => obj,
-        Err(_) => JObject::null(),
-    }
-}
-
-lazy_static! {
-    static ref CONNECTIONS: Mutex<HashMap<i64, Arc<Connection>>> = Mutex::new(HashMap::new());
+) -> jlong {
+    connect_internal(&mut env, path).unwrap_or_else(|e| -1)
 }
 
 fn connect_internal<'local>(
     env: &mut JNIEnv<'local>,
     path: JString<'local>,
-) -> Result<JObject<'local>, JniError> {
+) -> Result<jlong, JniError> {
     let io = Arc::new(limbo_core::PlatformIO::new().map_err(|e| {
         env.throw_new(
             "java/lang/Exception",
@@ -96,18 +89,20 @@ fn connect_internal<'local>(
 
     let conn = db.connect().clone();
     let connection = Connection {
+        hello: "hello seonwoo hehe".to_string(),
         conn: Arc::new(Mutex::new(conn)),
         io,
     };
 
-    let mut connections = CONNECTIONS.lock().unwrap();
-    let connection_id = random();
-    connections.insert(connection_id, Arc::new(connection));
+    Ok(Box::into_raw(Box::new(connection)) as jlong)
+}
 
-    let connection_class = env.find_class("limbo/Connection").expect("Class not found");
-    let connection_obj = env
-        .new_object(connection_class, "(J)V", &[JValue::Long(connection_id)])
-        .expect("Object creation failed");
-
-    Ok(connection_obj)
+#[no_mangle]
+pub unsafe extern "system" fn Java_limbo_Limbo_test<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    connection_ptr: jlong
+) {
+    let connection = &mut *(connection_ptr as *mut Connection);
+    println!("test: {:?}", connection.hello);
 }

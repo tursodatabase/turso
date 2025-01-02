@@ -14,6 +14,8 @@ public class Connection {
         this.connectionId = connectionId;
     }
 
+    public native void test();
+
     /**
      * Creates a new cursor object using this connection.
      *
@@ -21,8 +23,10 @@ public class Connection {
      * @throws InterfaceError If the cursor cannot be created.
      */
     public Cursor cursor() throws InterfaceError {
-        return new Cursor();
+        return cursor(connectionId);
     }
+
+    private native Cursor cursor(long connectionId);
 
     /**
      * Closes the connection to the database.
@@ -30,8 +34,10 @@ public class Connection {
      * @throws OperationalError If there is an error closing the connection.
      */
     public void close() throws OperationalError {
-        // Implementation here
+        close(connectionId);
     }
+
+    private native void close(long connectionId);
 
     /**
      * Commits the current transaction.
@@ -39,8 +45,10 @@ public class Connection {
      * @throws OperationalError If there is an error during commit.
      */
     public void commit() throws OperationalError {
-        // Implementation here
+        commit(connectionId);
     }
+
+    private native void commit(long connectionId);
 
     /**
      * Rolls back the current transaction.
@@ -48,14 +56,8 @@ public class Connection {
      * @throws OperationalError If there is an error during rollback.
      */
     public void rollback() throws OperationalError {
-        // Implementation here
+        rollback(connectionId);
     }
 
-    public long getConnectionId() {
-        return connectionId;
-    }
-
-    public void setConnectionId(long connectionId) {
-        this.connectionId = connectionId;
-    }
+    private native void rollback(long connectionId);
 }

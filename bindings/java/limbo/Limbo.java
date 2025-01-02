@@ -2,15 +2,17 @@ package limbo;
 
 public class Limbo {
 
-    public static native Connection connect(String var0);
+    public static native long connect(String var0);
+    public static native void test(long connectionId);
 
     static {
         System.loadLibrary("_limbo_java");
     }
 
     public static void main(String[] args) {
-        Connection connection = connect("limbo.db");
-        System.out.println(connection.getConnectionId());
-        System.out.println("helo world");
+        long connectionId = connect("limbo.db");
+        System.out.println("connectionId: " + connectionId);
+
+        test(connectionId);
     }
 }
