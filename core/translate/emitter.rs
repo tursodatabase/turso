@@ -1166,9 +1166,12 @@ fn try_index_cover(
             let (pos, _) = table.get_column(&index_column.name).unwrap();
             index_column_map.insert(pos, i);
         }
-        for pk_name in table.primary_key_column_names.iter() {
-            // SAFETY: the primary key column must exist in the table
-            let (pos, _) = table.get_column(pk_name).unwrap();
+        if table.has_rowid {
+            let pos = table
+                .columns
+                .iter()
+                .position(|column| column.is_rowid_alias)
+                .unwrap();
             index_column_map.insert(pos, index_column_map.len());
         }
 
