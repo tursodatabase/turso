@@ -1,20 +1,27 @@
 package limbo;
 
-public class Limbo {
+import java.lang.Exception;
 
-    public static native long connect(String var0);
+public class Limbo {
 
     static {
         System.loadLibrary("_limbo_java");
     }
 
     public static void main(String[] args) throws Exception {
-        long connectionId = connect("limbo.db");
-        System.out.println("connectionId: " + connectionId);
-        Connection connection = new Connection(connectionId);
-        connection.cursor();
-        connection.close();
-        connection.commit();
+        Limbo limbo = new Limbo();
+        Connection connection = limbo.getConnection("./limbo.db");
+
         connection.cursor();
     }
+
+    public Connection getConnection(String path) throws Exception {
+        long connectionId = connect(path);
+        if (connectionId == -1) {
+            throw new Exception("Failed to initialize connection");
+        }
+        return new Connection(connectionId);
+    }
+
+    private static native long connect(String path);
 }

@@ -1,7 +1,6 @@
 package limbo;
 
-import limbo.exceptions.InterfaceError;
-import limbo.exceptions.OperationalError;
+import java.lang.Exception;
 
 /**
  * Represents a connection to the database.
@@ -20,9 +19,9 @@ public class Connection {
      * Creates a new cursor object using this connection.
      *
      * @return A new Cursor object.
-     * @throws InterfaceError If the cursor cannot be created.
+     * @throws Exception If the cursor cannot be created.
      */
-    public Cursor cursor() throws InterfaceError {
+    public Cursor cursor() throws Exception {
         return cursor(connectionId);
     }
 
@@ -31,9 +30,9 @@ public class Connection {
     /**
      * Closes the connection to the database.
      *
-     * @throws OperationalError If there is an error closing the connection.
+     * @throws Exception If there is an error closing the connection.
      */
-    public void close() throws OperationalError {
+    public void close() throws Exception {
         close(connectionId);
     }
 
@@ -42,22 +41,26 @@ public class Connection {
     /**
      * Commits the current transaction.
      *
-     * @throws OperationalError If there is an error during commit.
+     * @throws Exception If there is an error during commit.
      */
-    public void commit() throws OperationalError {
-        commit(connectionId);
+    public void commit() throws Exception {
+        try {
+            commit(connectionId);
+        } catch (Exception e) {
+            System.out.println("caught exception: " + e);
+        }
     }
 
-    private native void commit(long connectionId);
+    private native void commit(long connectionId) throws Exception;
 
     /**
      * Rolls back the current transaction.
      *
-     * @throws OperationalError If there is an error during rollback.
+     * @throws Exception If there is an error during rollback.
      */
-    public void rollback() throws OperationalError {
+    public void rollback() throws Exception {
         rollback(connectionId);
     }
 
-    private native void rollback(long connectionId);
+    private native void rollback(long connectionId) throws Exception;
 }

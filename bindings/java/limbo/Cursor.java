@@ -10,9 +10,11 @@ import java.util.Optional;
  * Represents a database cursor.
  */
 public class Cursor {
-    public int arraysize;
-    public Optional<Description> description;
-    public int rowcount;
+    private long cursorId;
+
+    public Cursor(long cursorId) {
+        this.cursorId = cursorId;
+    }
 
     /**
      * Prepares and executes a SQL statement using the connection.
