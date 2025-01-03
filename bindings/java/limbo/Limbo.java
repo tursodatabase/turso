@@ -14,6 +14,7 @@ public class Limbo {
 
         Cursor cursor = connection.cursor();
         cursor.execute("SELECT * FROM users;");
+        cursor.fetchOne();
     }
 
     public Connection getConnection(String path) throws Exception {

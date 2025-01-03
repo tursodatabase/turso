@@ -1,9 +1,10 @@
 mod connection;
 mod cursor;
+mod macros;
 
 use crate::connection::Connection;
 use jni::errors::JniError;
-use jni::objects::{JClass, JObject, JString};
+use jni::objects::{JClass, JString};
 use jni::sys::jlong;
 use jni::JNIEnv;
 use std::sync::{Arc, Mutex};
@@ -24,7 +25,6 @@ struct Tuple<X, Y> {
     x: X,
     y: Y,
 }
-
 
 #[no_mangle]
 pub extern "system" fn Java_limbo_Limbo_connect<'local>(

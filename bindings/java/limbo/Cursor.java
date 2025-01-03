@@ -19,4 +19,10 @@ public class Cursor {
     }
 
     private static native void execute(long cursorPtr, String sql);
+
+    public void fetchOne() {
+        fetchOne(cursorPtr);
+    }
+
+    private static native void fetchOne(long cursorPtr);
 }

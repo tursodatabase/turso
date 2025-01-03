@@ -1,9 +1,10 @@
 use crate::connection::Connection;
-use crate::Description;
+use crate::{eprint_return, Description};
 use jni::errors::JniError;
 use jni::objects::{JClass, JString};
 use jni::sys::jlong;
 use jni::JNIEnv;
+use limbo_core::IO;
 use std::fmt::{Debug, Formatter, Pointer};
 use std::sync::{Arc, Mutex};
 
@@ -56,28 +57,82 @@ pub extern "system" fn Java_limbo_Cursor_execute<'local>(
     cursor_ptr: jlong,
     sql: JString<'local>,
 ) -> Result<(), JniError> {
-    let sql: String = env.get_string(&sql).expect("Could not extract query").into();
+    let sql: String = env
+        .get_string(&sql)
+        .expect("Could not extract query")
+        .into();
 
     let stmt_is_dml = stmt_is_dml(&sql);
     if stmt_is_dml {
-        eprintln!("DML statements (INSERT/UPDATE/DELETE) are not fully supported in this version");
-        return Err(JniError::Other(-1));
+        return eprint_return!(
+            "DML statements (INSERT/UPDATE/DELETE) are not fully supported in this version",
+            JniError::Other(-1)
+        );
     }
 
     let cursor = to_cursor(cursor_ptr);
-    let conn_lock = cursor.conn.conn.lock().map_err(|_| {
-        eprintln!("Failed to acquire connection lock");
-        JniError::Other(-1)
-    })?;
+    let conn_lock = match cursor.conn.conn.lock() {
+        Ok(lock) => lock,
+        Err(_) => return eprint_return!("Failed to acquire connection lock", JniError::Other(-1)),
+    };
 
-    let statement = conn_lock.prepare(&sql).map_err(|e| {
-        eprintln!("Failed to prepare statement: {:?}", e);
-        JniError::Other(-1)
-    })?;
+    match conn_lock.prepare(&sql) {
+        Ok(statement) => {
+            cursor.smt = Some(Arc::new(Mutex::new(statement)));
+            Ok(())
+        }
+        Err(e) => {
+            eprint_return!(
+                &format!("Failed to prepare statement: {:?}", e),
+                JniError::Other(-1)
+            )
+        }
+    }
+}
 
-    cursor.smt = Some(Arc::new(Mutex::new(statement)));
+#[no_mangle]
+pub extern "system" fn Java_limbo_Cursor_fetchOne<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    cursor_ptr: jlong,
+) -> Result<(), JniError> {
+    let cursor = to_cursor(cursor_ptr);
 
-    Ok(())
+    if let Some(smt) = &cursor.smt {
+        let mut smt_lock = match smt.lock() {
+            Ok(lock) => lock,
+            Err(_) => {
+                return eprint_return!("Failed to acquire statement lock", JniError::Other(-1))
+            }
+        };
+
+        loop {
+            match smt_lock.step() {
+                Ok(limbo_core::StepResult::Row(row)) => {
+                    println!("Row result: {:?}", row.values);
+                }
+                Ok(limbo_core::StepResult::IO) => {
+                    if let Err(e) = cursor.conn.io.run_once() {
+                        return eprint_return!(&format!("IO Error: {:?}", e), JniError::Other(-1));
+                    }
+                }
+                Ok(limbo_core::StepResult::Interrupt) => {
+                    return Ok(());
+                }
+                Ok(limbo_core::StepResult::Done) => {
+                    return Ok(());
+                }
+                Ok(limbo_core::StepResult::Busy) => {
+                    return eprint_return!("Busy error", JniError::Other(-1));
+                }
+                Err(e) => {
+                    return eprint_return!(&format!("Step error: {:?}", e), JniError::Other(-1));
+                }
+            }
+        }
+    } else {
+        eprint_return!("No statement prepared for execution", JniError::Other(-1))
+    }
 }
 
 fn to_cursor(cursor_ptr: jlong) -> &'static mut Cursor {
