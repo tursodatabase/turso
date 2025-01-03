@@ -10,9 +10,10 @@ public class Limbo {
 
     public static void main(String[] args) throws Exception {
         Limbo limbo = new Limbo();
-        Connection connection = limbo.getConnection("./limbo.db");
+        Connection connection = limbo.getConnection("./database.db");
 
         Cursor cursor = connection.cursor();
+        cursor.execute("SELECT * FROM users;");
     }
 
     public Connection getConnection(String path) throws Exception {

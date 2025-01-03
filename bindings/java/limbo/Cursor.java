@@ -12,11 +12,11 @@ public class Cursor {
         this.cursorPtr = cursorPtr;
     }
 
-//    public Cursor execute(String sql, List<Tuple<Object, Object>> parameters) {
-//        System.out.println("sql: " + sql);
-//        execute(cursorPtr, sql, parameters);
-//        return this;
-//    }
-//
-//    private static native void execute(long cursorPtr, String sql, List<Tuple<Object, Object>> parameters);
+    // TODO: support parameters
+    public Cursor execute(String sql) {
+        execute(cursorPtr, sql);
+        return this;
+    }
+
+    private static native void execute(long cursorPtr, String sql);
 }

@@ -1,7 +1,8 @@
 use crate::connection::Connection;
 use crate::Description;
-use jni::objects::{JClass, JList, JObject, JString};
-use jni::sys::{jlong, jstring};
+use jni::errors::JniError;
+use jni::objects::{JClass, JString};
+use jni::sys::jlong;
 use jni::JNIEnv;
 use std::fmt::{Debug, Formatter, Pointer};
 use std::sync::{Arc, Mutex};
@@ -50,12 +51,33 @@ impl Debug for Cursor {
 
 #[no_mangle]
 pub extern "system" fn Java_limbo_Cursor_execute<'local>(
-    env: &mut JNIEnv<'local>,
+    mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     cursor_ptr: jlong,
-    sql: jstring,
-) {
-    println!("sql: {:?}", sql);
+    sql: JString<'local>,
+) -> Result<(), JniError> {
+    let sql: String = env.get_string(&sql).expect("Could not extract query").into();
+
+    let stmt_is_dml = stmt_is_dml(&sql);
+    if stmt_is_dml {
+        eprintln!("DML statements (INSERT/UPDATE/DELETE) are not fully supported in this version");
+        return Err(JniError::Other(-1));
+    }
+
+    let cursor = to_cursor(cursor_ptr);
+    let conn_lock = cursor.conn.conn.lock().map_err(|_| {
+        eprintln!("Failed to acquire connection lock");
+        JniError::Other(-1)
+    })?;
+
+    let statement = conn_lock.prepare(&sql).map_err(|e| {
+        eprintln!("Failed to prepare statement: {:?}", e);
+        JniError::Other(-1)
+    })?;
+
+    cursor.smt = Some(Arc::new(Mutex::new(statement)));
+
+    Ok(())
 }
 
 fn to_cursor(cursor_ptr: jlong) -> &'static mut Cursor {
