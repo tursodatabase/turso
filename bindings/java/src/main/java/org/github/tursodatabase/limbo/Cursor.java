@@ -1,6 +1,4 @@
-package limbo;
-
-import java.util.Optional;
+package org.github.tursodatabase.limbo;
 
 /**
  * Represents a database cursor.

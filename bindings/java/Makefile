@@ -1,10 +1,7 @@
 java_run: lib
-	javac limbo/Limbo.java && java -Djava.library.path=../../target/debug/ limbo.Limbo
+	LD_LIBRARY_PATH=../../target/debug ./gradlew run
 
 .PHONY: lib
-
-javah:
-	javah limbo.HelloWorld
 
 lib:
 	cargo build

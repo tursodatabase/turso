@@ -1,21 +1,10 @@
-package limbo;
+package org.github.tursodatabase.limbo;
 
 import java.lang.Exception;
 
 public class Limbo {
-
     static {
         System.loadLibrary("_limbo_java");
-    }
-
-    public static void main(String[] args) throws Exception {
-        Limbo limbo = new Limbo();
-        Connection connection = limbo.getConnection("./database.db");
-        connection.close();
-
-        Cursor cursor = connection.cursor();
-        cursor.execute("SELECT * FROM example_table;");
-        System.out.println("result: " + cursor.fetchOne());
     }
 
     public Connection getConnection(String path) throws Exception {

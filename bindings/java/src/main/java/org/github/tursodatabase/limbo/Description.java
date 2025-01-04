@@ -1,4 +1,4 @@
-package limbo;
+package org.github.tursodatabase.limbo;
 
 import java.util.Optional;
 
