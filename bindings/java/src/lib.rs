@@ -1,6 +1,8 @@
 mod connection;
 mod cursor;
 mod macros;
+mod utils;
+mod errors;
 
 use crate::connection::Connection;
 use jni::errors::JniError;
