@@ -104,7 +104,10 @@ pub extern "system" fn Java_limbo_Cursor_fetchOne<'local>(
             let mut smt_lock = match smt.lock() {
                 Ok(lock) => lock,
                 Err(_) => {
-                    return eprint_return_null!("Failed to acquire statement lock", JniError::Other(-1))
+                    return eprint_return_null!(
+                        "Failed to acquire statement lock",
+                        JniError::Other(-1)
+                    )
                 }
             };
 
@@ -112,28 +115,100 @@ pub extern "system" fn Java_limbo_Cursor_fetchOne<'local>(
                 Ok(limbo_core::StepResult::Row(row)) => {
                     return match row_to_obj_array(&mut env, &row) {
                         Ok(r) => r,
-                        Err(e) => eprint_return_null!(&format!("{:?}", e), JniError::Other(-1))
+                        Err(e) => eprint_return_null!(&format!("{:?}", e), JniError::Other(-1)),
                     }
                 }
                 Ok(limbo_core::StepResult::IO) => {
                     if let Err(e) = cursor.conn.io.run_once() {
-                        return eprint_return_null!(&format!("IO Error: {:?}", e), JniError::Other(-1));
+                        return eprint_return_null!(
+                            &format!("IO Error: {:?}", e),
+                            JniError::Other(-1)
+                        );
+                    }
+                }
+                Ok(limbo_core::StepResult::Interrupt) => return JObject::null(),
+                Ok(limbo_core::StepResult::Done) => return JObject::null(),
+                Ok(limbo_core::StepResult::Busy) => {
+                    return eprint_return_null!("Busy error", JniError::Other(-1));
+                }
+                Err(e) => {
+                    return eprint_return_null!(
+                        format!("Step error: {:?}", e),
+                        JniError::Other(-1)
+                    );
+                }
+            };
+        }
+    } else {
+        eprint_return_null!("No statement prepared for execution", JniError::Other(-1))
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_limbo_Cursor_fetchAll<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    cursor_ptr: jlong,
+) -> JObject<'local> {
+    let cursor = to_cursor(cursor_ptr);
+
+    if let Some(smt) = &cursor.smt {
+        let mut rows = Vec::new();
+        loop {
+            let mut smt_lock = match smt.lock() {
+                Ok(lock) => lock,
+                Err(_) => {
+                    return eprint_return_null!(
+                        "Failed to acquire statement lock",
+                        JniError::Other(-1)
+                    )
+                }
+            };
+
+            match smt_lock.step() {
+                Ok(limbo_core::StepResult::Row(row)) => match row_to_obj_array(&mut env, &row) {
+                    Ok(r) => rows.push(r),
+                    Err(e) => return eprint_return_null!(&format!("{:?}", e), JniError::Other(-1)),
+                },
+                Ok(limbo_core::StepResult::IO) => {
+                    if let Err(e) = cursor.conn.io.run_once() {
+                        return eprint_return_null!(
+                            &format!("IO Error: {:?}", e),
+                            JniError::Other(-1)
+                        );
                     }
                 }
                 Ok(limbo_core::StepResult::Interrupt) => {
-                    return JObject::null()
+                    return JObject::null();
                 }
                 Ok(limbo_core::StepResult::Done) => {
-                    return JObject::null()
+                    break;
                 }
                 Ok(limbo_core::StepResult::Busy) => {
                     return eprint_return_null!("Busy error", JniError::Other(-1));
                 }
                 Err(e) => {
-                    return eprint_return_null!(format!("Step error: {:?}", e), JniError::Other(-1));
+                    return eprint_return_null!(
+                        format!("Step error: {:?}", e),
+                        JniError::Other(-1)
+                    );
                 }
             };
         }
+
+        let array_class = env
+            .find_class("[Ljava/lang/Object;")
+            .expect("Failed to find Object array class");
+        let result_array = env
+            .new_object_array(rows.len() as i32, array_class, JObject::null())
+            .expect("Failed to create new object array");
+
+        for (i, row) in rows.into_iter().enumerate() {
+            env.set_object_array_element(&result_array, i as i32, row)
+                .expect("Failed to set object array element");
+        }
+
+        result_array.into()
     } else {
         eprint_return_null!("No statement prepared for execution", JniError::Other(-1))
     }
