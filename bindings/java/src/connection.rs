@@ -32,13 +32,12 @@ pub extern "system" fn Java_limbo_Connection_cursor<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_limbo_Connection_close<'local>(
+pub unsafe extern "system" fn Java_limbo_Connection_close<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
-    connection_id: jlong,
+    connection_ptr: jlong,
 ) {
-    let connection = to_connection(connection_id);
-    drop(connection.conn.clone());
+    let _boxed_connection = Box::from_raw(connection_ptr as *mut Connection);
 }
 
 #[no_mangle]

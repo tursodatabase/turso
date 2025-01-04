@@ -11,6 +11,7 @@ public class Limbo {
     public static void main(String[] args) throws Exception {
         Limbo limbo = new Limbo();
         Connection connection = limbo.getConnection("./database.db");
+        connection.close();
 
         Cursor cursor = connection.cursor();
         cursor.execute("SELECT * FROM example_table;");
