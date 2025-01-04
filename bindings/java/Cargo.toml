@@ -9,6 +9,7 @@ repository.workspace = true
 [lib]
 name = "_limbo_java"
 crate-type = ["cdylib"]
+path = "rs_src/lib.rs"
 
 [dependencies]
 anyhow = "1.0"
