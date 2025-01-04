@@ -5,12 +5,12 @@ mod macros;
 mod utils;
 
 use crate::connection::Connection;
+use crate::errors::ErrorCode;
 use jni::errors::JniError;
 use jni::objects::{JClass, JString};
 use jni::sys::jlong;
 use jni::JNIEnv;
 use std::sync::{Arc, Mutex};
-use crate::errors::ErrorCode;
 
 /// Establishes a connection to the database specified by the given path.
 ///

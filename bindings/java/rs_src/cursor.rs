@@ -1,4 +1,5 @@
 use crate::connection::Connection;
+use crate::errors::ErrorCode;
 use crate::utils::row_to_obj_array;
 use crate::{eprint_return, eprint_return_null};
 use jni::errors::JniError;
@@ -8,7 +9,6 @@ use jni::JNIEnv;
 use limbo_core::IO;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, Mutex};
-use crate::errors::ErrorCode;
 
 #[derive(Clone)]
 pub struct Cursor {
