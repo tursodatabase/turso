@@ -13,8 +13,8 @@ public class Limbo {
         Connection connection = limbo.getConnection("./database.db");
 
         Cursor cursor = connection.cursor();
-        cursor.execute("SELECT * FROM users;");
-        System.out.println(cursor.fetchOne());
+        cursor.execute("SELECT * FROM example_table;");
+        System.out.println("result: " + cursor.fetchOne());
     }
 
     public Connection getConnection(String path) throws Exception {

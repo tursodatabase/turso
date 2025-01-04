@@ -1,6 +1,6 @@
 use crate::connection::Connection;
 use crate::utils::row_to_obj_array;
-use crate::{eprint_return, Description};
+use crate::{eprint_return, eprint_return_null, Description};
 use jni::errors::JniError;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::jlong;
@@ -96,7 +96,7 @@ pub extern "system" fn Java_limbo_Cursor_fetchOne<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     cursor_ptr: jlong,
-) -> Result<JObject<'local>, JniError> {
+) -> JObject<'local> {
     let cursor = to_cursor(cursor_ptr);
 
     if let Some(smt) = &cursor.smt {
@@ -104,35 +104,38 @@ pub extern "system" fn Java_limbo_Cursor_fetchOne<'local>(
             let mut smt_lock = match smt.lock() {
                 Ok(lock) => lock,
                 Err(_) => {
-                    return eprint_return!("Failed to acquire statement lock", JniError::Other(-1))
+                    return eprint_return_null!("Failed to acquire statement lock", JniError::Other(-1))
                 }
             };
 
             match smt_lock.step() {
                 Ok(limbo_core::StepResult::Row(row)) => {
-                    return row_to_obj_array(&mut env, &row).map_err(Into::into);
+                    return match row_to_obj_array(&mut env, &row) {
+                        Ok(r) => r,
+                        Err(e) => eprint_return_null!(&format!("{:?}", e), JniError::Other(-1))
+                    }
                 }
                 Ok(limbo_core::StepResult::IO) => {
                     if let Err(e) = cursor.conn.io.run_once() {
-                        return eprint_return!(&format!("IO Error: {:?}", e), JniError::Other(-1));
+                        return eprint_return_null!(&format!("IO Error: {:?}", e), JniError::Other(-1));
                     }
                 }
                 Ok(limbo_core::StepResult::Interrupt) => {
-                    return Ok(JObject::null());
+                    return JObject::null()
                 }
                 Ok(limbo_core::StepResult::Done) => {
-                    return Ok(JObject::null());
+                    return JObject::null()
                 }
                 Ok(limbo_core::StepResult::Busy) => {
-                    return eprint_return!("Busy error", JniError::Other(-1));
+                    return eprint_return_null!("Busy error", JniError::Other(-1));
                 }
                 Err(e) => {
-                    return eprint_return!(format!("Step error: {:?}", e), JniError::Other(-1));
+                    return eprint_return_null!(format!("Step error: {:?}", e), JniError::Other(-1));
                 }
             };
         }
     } else {
-        eprint_return!("No statement prepared for execution", JniError::Other(-1))
+        eprint_return_null!("No statement prepared for execution", JniError::Other(-1))
     }
 }
 

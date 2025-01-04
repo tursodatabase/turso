@@ -6,3 +6,11 @@ macro_rules! eprint_return {
         Err($error)
     }};
 }
+
+#[macro_export]
+macro_rules! eprint_return_null {
+    ($log:expr, $error:expr) => {{
+        eprintln!("{}", $log);
+        JObject::null()
+    }};
+}
