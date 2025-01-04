@@ -1,6 +1,6 @@
 use crate::connection::Connection;
 use crate::utils::row_to_obj_array;
-use crate::{eprint_return, eprint_return_null, Description};
+use crate::{eprint_return, eprint_return_null};
 use jni::errors::JniError;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::jlong;
@@ -8,6 +8,7 @@ use jni::JNIEnv;
 use limbo_core::IO;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, Mutex};
+use crate::errors::ErrorCode;
 
 #[derive(Clone)]
 pub struct Cursor {
@@ -41,6 +42,17 @@ pub struct Cursor {
     pub(crate) smt: Option<Arc<Mutex<limbo_core::Statement>>>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct Description {
+    name: String,
+    type_code: String,
+    display_size: Option<String>,
+    internal_size: Option<String>,
+    precision: Option<String>,
+    scale: Option<String>,
+    null_ok: Option<String>,
+}
+
 impl Debug for Cursor {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Cursor")
@@ -51,6 +63,7 @@ impl Debug for Cursor {
     }
 }
 
+/// TODO: we should find a way to handle Error thrown by rust and how to handle those errors in java
 #[no_mangle]
 pub extern "system" fn Java_org_github_tursodatabase_limbo_Cursor_execute<'local>(
     mut env: JNIEnv<'local>,
@@ -67,7 +80,7 @@ pub extern "system" fn Java_org_github_tursodatabase_limbo_Cursor_execute<'local
     if stmt_is_dml {
         return eprint_return!(
             "DML statements (INSERT/UPDATE/DELETE) are not fully supported in this version",
-            JniError::Other(-1)
+            JniError::Other(ErrorCode::STATEMENT_IS_DML)
         );
     }
 

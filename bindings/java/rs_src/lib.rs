@@ -1,8 +1,8 @@
 mod connection;
 mod cursor;
+mod errors;
 mod macros;
 mod utils;
-mod errors;
 
 use crate::connection::Connection;
 use jni::errors::JniError;
@@ -10,25 +10,31 @@ use jni::objects::{JClass, JString};
 use jni::sys::jlong;
 use jni::JNIEnv;
 use std::sync::{Arc, Mutex};
+use crate::errors::ErrorCode;
 
-#[derive(Clone, Debug)]
-struct Description {
-    name: String,
-    type_code: String,
-    display_size: Option<String>,
-    internal_size: Option<String>,
-    precision: Option<String>,
-    scale: Option<String>,
-    null_ok: Option<String>,
-}
-
+/// Establishes a connection to the database specified by the given path.
+///
+/// This function is called from the Java side to create a connection to the database.
+/// It returns a pointer to the `Connection` object, which can be used in subsequent
+/// native function calls.
+///
+/// # Arguments
+///
+/// * `env` - The JNI environment pointer.
+/// * `_class` - The Java class calling this function.
+/// * `path` - A `JString` representing the path to the database file.
+///
+/// # Returns
+///
+/// A `jlong` representing the pointer to the newly created `Connection` object,
+/// or `-1` if the connection could not be established.
 #[no_mangle]
 pub extern "system" fn Java_org_github_tursodatabase_limbo_Limbo_connect<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     path: JString<'local>,
 ) -> jlong {
-    connect_internal(&mut env, path).unwrap_or_else(|e| -1)
+    connect_internal(&mut env, path).unwrap_or_else(|e| ErrorCode::CONNECTION_FAILURE as jlong)
 }
 
 fn connect_internal<'local>(

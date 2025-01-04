@@ -12,11 +12,12 @@ public class Cursor {
 
     // TODO: support parameters
     public Cursor execute(String sql) {
-        execute(cursorPtr, sql);
+         var result = execute(cursorPtr, sql);
+        System.out.println("resut: " + result);
         return this;
     }
 
-    private static native void execute(long cursorPtr, String sql);
+    private static native int execute(long cursorPtr, String sql);
 
     public Object fetchOne() throws Exception {
         Object result = fetchOne(cursorPtr);

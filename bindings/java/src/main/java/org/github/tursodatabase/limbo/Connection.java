@@ -14,8 +14,6 @@ public class Connection {
         this.connectionPtr = connectionPtr;
     }
 
-    public native void test();
-
     /**
      * Creates a new cursor object using this connection.
      *

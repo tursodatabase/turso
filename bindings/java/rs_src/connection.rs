@@ -11,9 +11,20 @@ pub struct Connection {
     pub(crate) io: Arc<limbo_core::PlatformIO>,
 }
 
-unsafe impl Send for Connection {}
-unsafe impl Sync for Connection {}
-
+/// Returns a pointer to a `Cursor` object.
+///
+/// The Java application will pass this pointer to native functions,
+/// which will use it to reference the `Cursor` object.
+///
+/// # Arguments
+///
+/// * `_env` - The JNI environment pointer.
+/// * `_class` - The Java class calling this function.
+/// * `connection_ptr` - A pointer to the `Connection` object.
+///
+/// # Returns
+///
+/// A `jlong` representing the pointer to the newly created `Cursor` object.
 #[no_mangle]
 pub extern "system" fn Java_org_github_tursodatabase_limbo_Connection_cursor<'local>(
     _env: JNIEnv<'local>,
@@ -31,6 +42,16 @@ pub extern "system" fn Java_org_github_tursodatabase_limbo_Connection_cursor<'lo
     Box::into_raw(Box::new(cursor)) as jlong
 }
 
+/// Closes the connection and releases the associated resources.
+///
+/// This function is called from the Java side to close the connection
+/// and free the memory allocated for the `Connection` object.
+///
+/// # Arguments
+///
+/// * `_env` - The JNI environment pointer.
+/// * `_class` - The Java class calling this function.
+/// * `connection_ptr` - A pointer to the `Connection` object to be closed.
 #[no_mangle]
 pub unsafe extern "system" fn Java_org_github_tursodatabase_limbo_Connection_close<'local>(
     _env: JNIEnv<'local>,
