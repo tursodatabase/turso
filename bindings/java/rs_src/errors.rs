@@ -1,5 +1,4 @@
 use jni::errors::{Error, JniError};
-use jni::sys::jlong;
 
 #[derive(Debug, Clone)]
 pub struct CustomError {

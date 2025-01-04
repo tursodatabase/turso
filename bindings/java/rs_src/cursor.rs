@@ -42,15 +42,16 @@ pub struct Cursor {
     pub(crate) smt: Option<Arc<Mutex<limbo_core::Statement>>>,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct Description {
-    name: String,
-    type_code: String,
-    display_size: Option<String>,
-    internal_size: Option<String>,
-    precision: Option<String>,
-    scale: Option<String>,
-    null_ok: Option<String>,
+    _name: String,
+    _type_code: String,
+    _display_size: Option<String>,
+    _internal_size: Option<String>,
+    _precision: Option<String>,
+    _scale: Option<String>,
+    _null_ok: Option<String>,
 }
 
 impl Debug for Cursor {
@@ -65,6 +66,7 @@ impl Debug for Cursor {
 
 /// TODO: we should find a way to handle Error thrown by rust and how to handle those errors in java
 #[no_mangle]
+#[allow(improper_ctypes_definitions, clippy::arc_with_non_send_sync)]
 pub extern "system" fn Java_org_github_tursodatabase_limbo_Cursor_execute<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,

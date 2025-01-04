@@ -34,9 +34,10 @@ pub extern "system" fn Java_org_github_tursodatabase_limbo_Limbo_connect<'local>
     _class: JClass<'local>,
     path: JString<'local>,
 ) -> jlong {
-    connect_internal(&mut env, path).unwrap_or_else(|e| ErrorCode::CONNECTION_FAILURE as jlong)
+    connect_internal(&mut env, path).unwrap_or_else(|_| ErrorCode::CONNECTION_FAILURE as jlong)
 }
 
+#[allow(improper_ctypes_definitions, clippy::arc_with_non_send_sync)] // TODO: remove
 fn connect_internal<'local>(
     env: &mut JNIEnv<'local>,
     path: JString<'local>,
