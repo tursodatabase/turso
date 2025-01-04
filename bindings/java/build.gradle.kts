@@ -17,6 +17,13 @@ dependencies {
 
 application {
     mainClass.set("org.github.tursodatabase.Main")
+
+    val limboSystemLibraryPath = System.getenv("LIMBO_SYSTEM_PATH")
+    if (limboSystemLibraryPath != null) {
+        applicationDefaultJvmArgs = listOf(
+            "-Djava.library.path=${System.getProperty("java.library.path")}:$limboSystemLibraryPath"
+        )
+    }
 }
 
 tasks.test {

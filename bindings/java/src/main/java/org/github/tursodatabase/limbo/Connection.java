@@ -8,7 +8,7 @@ import java.lang.Exception;
 public class Connection {
 
     // Pointer to the connection object
-    private long connectionPtr;
+    private final long connectionPtr;
 
     public Connection(long connectionPtr) {
         this.connectionPtr = connectionPtr;

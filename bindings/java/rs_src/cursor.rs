@@ -6,7 +6,7 @@ use jni::objects::{JClass, JObject, JString};
 use jni::sys::jlong;
 use jni::JNIEnv;
 use limbo_core::IO;
-use std::fmt::{Debug, Formatter, Pointer};
+use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
@@ -52,7 +52,7 @@ impl Debug for Cursor {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_limbo_Cursor_execute<'local>(
+pub extern "system" fn Java_org_github_tursodatabase_limbo_Cursor_execute<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     cursor_ptr: jlong,
@@ -92,7 +92,7 @@ pub extern "system" fn Java_limbo_Cursor_execute<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_limbo_Cursor_fetchOne<'local>(
+pub extern "system" fn Java_org_github_tursodatabase_limbo_Cursor_fetchOne<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     cursor_ptr: jlong,
@@ -145,7 +145,7 @@ pub extern "system" fn Java_limbo_Cursor_fetchOne<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_limbo_Cursor_fetchAll<'local>(
+pub extern "system" fn Java_org_github_tursodatabase_limbo_Cursor_fetchAll<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     cursor_ptr: jlong,

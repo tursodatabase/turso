@@ -22,14 +22,8 @@ struct Description {
     null_ok: Option<String>,
 }
 
-#[derive(Clone, Debug)]
-struct Tuple<X, Y> {
-    x: X,
-    y: Y,
-}
-
 #[no_mangle]
-pub extern "system" fn Java_limbo_Limbo_connect<'local>(
+pub extern "system" fn Java_org_github_tursodatabase_limbo_Limbo_connect<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     path: JString<'local>,

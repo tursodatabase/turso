@@ -1,5 +1,5 @@
 java_run: lib
-	LD_LIBRARY_PATH=../../target/debug ./gradlew run
+	export LIMBO_SYSTEM_PATH=../../target/debug && ./gradlew run
 
 .PHONY: lib
 

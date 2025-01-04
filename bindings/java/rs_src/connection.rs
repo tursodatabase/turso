@@ -15,7 +15,7 @@ unsafe impl Send for Connection {}
 unsafe impl Sync for Connection {}
 
 #[no_mangle]
-pub extern "system" fn Java_limbo_Connection_cursor<'local>(
+pub extern "system" fn Java_org_github_tursodatabase_limbo_Connection_cursor<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     connection_ptr: jlong,
@@ -32,7 +32,7 @@ pub extern "system" fn Java_limbo_Connection_cursor<'local>(
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn Java_limbo_Connection_close<'local>(
+pub unsafe extern "system" fn Java_org_github_tursodatabase_limbo_Connection_close<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     connection_ptr: jlong,
@@ -41,7 +41,7 @@ pub unsafe extern "system" fn Java_limbo_Connection_close<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_limbo_Connection_commit<'local>(
+pub extern "system" fn Java_org_github_tursodatabase_limbo_Connection_commit<'local>(
     _env: &mut JNIEnv<'local>,
     _class: JClass<'local>,
     _connection_id: jlong,
@@ -50,7 +50,7 @@ pub extern "system" fn Java_limbo_Connection_commit<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_limbo_Connection_rollback<'local>(
+pub extern "system" fn Java_org_github_tursodatabase_limbo_Connection_rollback<'local>(
     _env: &mut JNIEnv<'local>,
     _class: JClass<'local>,
     _connection_id: jlong,

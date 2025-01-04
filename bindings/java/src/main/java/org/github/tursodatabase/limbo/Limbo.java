@@ -3,8 +3,17 @@ package org.github.tursodatabase.limbo;
 import java.lang.Exception;
 
 public class Limbo {
-    static {
-        System.loadLibrary("_limbo_java");
+    private static volatile boolean initialized;
+
+    private Limbo() {
+        if (!initialized) {
+            System.loadLibrary("_limbo_java");
+            initialized = true;
+        }
+    }
+
+    public static Limbo create() {
+        return new Limbo();
     }
 
     public Connection getConnection(String path) throws Exception {
