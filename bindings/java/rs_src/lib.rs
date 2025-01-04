@@ -27,7 +27,7 @@ use crate::errors::ErrorCode;
 /// # Returns
 ///
 /// A `jlong` representing the pointer to the newly created `Connection` object,
-/// or `-1` if the connection could not be established.
+/// or [ErrorCode::CONNECTION_FAILURE] if the connection could not be established.
 #[no_mangle]
 pub extern "system" fn Java_org_github_tursodatabase_limbo_Limbo_connect<'local>(
     mut env: JNIEnv<'local>,
