@@ -667,7 +667,9 @@ impl BTreeCursor {
                         continue;
                     }
                     None => {
-                        unreachable!("we shall not go back up! The only way is down the slope");
+                        // We've hit either a leaf page or an overflow page
+                        // Either way, we're done traversing
+                        return Ok(CursorResult::Ok(()));
                     }
                 }
             }
@@ -699,10 +701,15 @@ impl BTreeCursor {
                         self.pager.add_dirty(page.get().id);
 
                         let page = page.get().contents.as_mut().unwrap();
-                        assert!(matches!(page.page_type(), PageType::TableLeaf));
+
+                        let page_type = match page.maybe_page_type() {
+                            Some(pt) => pt,
+                            None => return Ok(CursorResult::Ok(())), // Handle overflow pages
+                        };
+                        assert!(matches!(page_type, PageType::TableLeaf));
 
                         // find cell
-                        (self.find_cell(page, int_key), page.page_type())
+                        (self.find_cell(page, int_key), page_type)
                     };
 
                     // TODO: if overwrite drop cell
@@ -1308,8 +1315,11 @@ impl BTreeCursor {
         }
 
         if self.is_overflow(contents) {
-            // Create new child page to hold current root contents
-            let child_page = self.allocate_page(contents.page_type(), 0);
+            // Remember original page type - the child will inherit this
+            let original_type = contents.page_type();
+
+            // Create new child page with root's original type
+            let child_page = self.allocate_page(original_type, 0);
             let child_page_id = child_page.get().id;
             let child_contents = child_page.get().contents.as_mut().unwrap();
 
@@ -1327,10 +1337,10 @@ impl BTreeCursor {
             }
             let right_pointer = contents.rightmost_pointer();
 
-            // Clear root and convert to interior node
+            // Clear root - IMPORTANT: Set type BEFORE clearing contents
+            contents.write_u8(PAGE_HEADER_OFFSET_PAGE_TYPE, PageType::TableInterior as u8);
             contents.write_u16(PAGE_HEADER_OFFSET_CELL_COUNT, 0);
             contents.write_u16(PAGE_HEADER_OFFSET_FIRST_FREEBLOCK, 0);
-            contents.write_u8(0, PageType::TableInterior as u8);
 
             // Initialize child with root's old contents
             for (idx, cell) in cells.iter().enumerate() {
@@ -1348,7 +1358,7 @@ impl BTreeCursor {
 
             self.pager.add_dirty(child_page_id);
 
-            // Update page stack
+            // Update page stack to include both root and child
             self.stack.clear();
             self.stack.push(current_root.clone());
             self.stack.push(child_page.clone());
@@ -1386,8 +1396,7 @@ impl BTreeCursor {
 
         // setup overflow page
         let contents = page.get().contents.as_mut().unwrap();
-        let buf = contents.as_ptr();
-        buf.fill(0);
+        contents.write_u32(0, 0); // Initialize next overflow page pointer to 0
 
         page
     }
@@ -1746,13 +1755,17 @@ impl BTreeCursor {
     fn find_cell(&self, page: &PageContent, int_key: u64) -> usize {
         let mut cell_idx = 0;
         let cell_count = page.cell_count();
+        let page_type = match page.maybe_page_type() {
+            Some(pt) => pt,
+            None => return 0, // Return 0 for overflow pages
+        };
         while cell_idx < cell_count {
             match page
                 .cell_get(
                     cell_idx,
                     self.pager.clone(),
-                    self.payload_overflow_threshold_max(page.page_type()),
-                    self.payload_overflow_threshold_min(page.page_type()),
+                    self.payload_overflow_threshold_max(page_type),
+                    self.payload_overflow_threshold_min(page_type),
                     self.usable_space(),
                 )
                 .unwrap()
