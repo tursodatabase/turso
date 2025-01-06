@@ -1271,6 +1271,10 @@ impl BTreeCursor {
                 .expect("This shouldn't have happened, child page not found");
             let child_contents = child_page.get().contents.as_mut().unwrap();
 
+            // Defragment child before inserting its cells into root because root is smaller than child due to it
+            // containing header.
+            self.defragment_page(child_contents, self.database_header.borrow());
+
             let necessary_space = self.calculate_used_space(child_contents);
             let available_space = if is_page_1 {
                 self.usable_space() - DATABASE_HEADER_SIZE
