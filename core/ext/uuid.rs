@@ -71,6 +71,22 @@ pub fn exec_uuid4() -> crate::Result<OwnedValue> {
     )))
 }
 
+pub fn exec_uuid4str() -> crate::Result<OwnedValue> {
+    Ok(OwnedValue::Text(LimboText::new(Rc::new(Uuid::new_v4().to_string()))))
+}
+
+pub fn exec_uuid7() -> crate::Result<OwnedValue> {
+    Ok(OwnedValue::Blob(Rc::new(Uuid::new_v7(Timestamp::now(ContextV7::new())).into_bytes().to_vec())))
+}
+
+pub fn exec_uuid7_ts(ref seconds) -> crate::Result<OwnedValue> {
+    if(*seconds < 0){
+        return Ok(OwnedValue::Null);
+    }
+    let ctx = ContextV7::new();
+    Ok(OwnedValue::Blob(Rc::new(Uuid::new_v7(Timestamp::from_unix(ctx, *seconds as u64, 0)).into_bytes().to_vec())))
+}
+
 pub fn exec_uuidstr(reg: &OwnedValue) -> crate::Result<OwnedValue> {
     match reg {
         OwnedValue::Blob(blob) => {
