@@ -62,31 +62,31 @@ public final class LimboDB extends AbstractDB {
 
     // TODO: add support for JNI
     @Override
-    protected synchronized native long _open_utf8(byte[] file, int openFlags) throws SQLException;
+    protected synchronized native long openUtf8(byte[] file, int openFlags) throws SQLException;
 
     // TODO: add support for JNI
     @Override
-    protected synchronized native void _close() throws SQLException;
+    protected synchronized native void close0() throws SQLException;
 
     @Override
-    public synchronized int _exec(String sql) throws SQLException {
+    public synchronized int exec(String sql) throws SQLException {
         // TODO: add implementation
         throw new SQLFeatureNotSupportedException();
     }
 
     // TODO: add support for JNI
-    synchronized native int _exec_utf8(byte[] sqlUtf8) throws SQLException;
+    synchronized native int execUtf8(byte[] sqlUtf8) throws SQLException;
 
     // TODO: add support for JNI
     @Override
     public native void interrupt();
 
     @Override
-    protected void _open(String fileName, int openFlags) throws SQLException {
+    protected void open0(String fileName, int openFlags) throws SQLException {
         if (isOpen) {
             throwLimboException(LimboErrorCode.UNKNOWN_ERROR.code, "Already opened");
         }
-        dbPtr = _open_utf8(stringToUtf8ByteArray(fileName), openFlags);
+        dbPtr = openUtf8(stringToUtf8ByteArray(fileName), openFlags);
         isOpen = true;
     }
 
