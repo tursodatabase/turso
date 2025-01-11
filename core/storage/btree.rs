@@ -1302,7 +1302,7 @@ impl BTreeCursor {
                 self.pager.load_page(child_page.clone())?;
                 return Ok(CursorResult::IO);
             }
-    
+
             let child_contents = child_page.get().contents.as_mut().unwrap();
 
             // Defragment child before inserting its cells into root because root is smaller than child due to it
