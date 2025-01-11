@@ -910,7 +910,7 @@ impl BTreeCursor {
                 }
 
                 if !self.stack.has_parent() {
-                    self.balance_root();
+                    self.balance_root()?;
                     return Ok(CursorResult::Ok(()));
                 }
                 debug!("Balancing leaf. leaf={}", current_page.get().id);
@@ -996,7 +996,7 @@ impl BTreeCursor {
                 let (page_type, current_idx) = {
                     let current_page = self.stack.top();
                     let contents = current_page.get().contents.as_ref().unwrap();
-                    (contents.page_type().clone(), current_page.get().id)
+                    (contents.page_type(), current_page.get().id)
                 };
 
                 parent.set_dirty();
@@ -1012,8 +1012,8 @@ impl BTreeCursor {
                         .cell_get(
                             cell_idx,
                             self.pager.clone(),
-                            self.payload_overflow_threshold_max(page_type.clone()),
-                            self.payload_overflow_threshold_min(page_type.clone()),
+                            self.payload_overflow_threshold_max(page_type),
+                            self.payload_overflow_threshold_min(page_type),
                             self.usable_space(),
                         )
                         .unwrap();
@@ -1026,8 +1026,8 @@ impl BTreeCursor {
                     if found {
                         let (start, _len) = parent_contents.cell_get_raw_region(
                             cell_idx,
-                            self.payload_overflow_threshold_max(page_type.clone()),
-                            self.payload_overflow_threshold_min(page_type.clone()),
+                            self.payload_overflow_threshold_max(page_type),
+                            self.payload_overflow_threshold_min(page_type),
                             self.usable_space(),
                         );
                         right_pointer = start;
@@ -1220,27 +1220,8 @@ impl BTreeCursor {
         total_used
     }
 
-    fn estimate_cell_pointer_growth(&self) -> usize {
-        // In SQLite, we want to leave some space for future cell pointers
-        // Each cell pointer takes 2 bytes
-        const CELL_POINTER_SIZE: usize = 2;
-        const ESTIMATED_FUTURE_CELLS: usize = 4; // Leave room for a few more cells
-
-        CELL_POINTER_SIZE * ESTIMATED_FUTURE_CELLS
-    }
-
     fn is_overflow(&self, page: &PageContent) -> bool {
-        if !page.overflow_cells.is_empty() {
-            return true;
-        }
-
-        let used_space = self.calculate_used_space(page);
-        let available_space = self.usable_space();
-
-        // Check if we're about to exceed usable space
-        // We also need some buffer space for future cell pointers
-        let required_space = used_space + self.estimate_cell_pointer_growth();
-        required_space > available_space
+        !page.overflow_cells.is_empty()
     }
 
     fn is_underflow(&self, page: &PageContent) -> bool {
@@ -1257,66 +1238,11 @@ impl BTreeCursor {
         used_space < (usable_space / 2)
     }
 
-    fn balance_root(&mut self) {
+    fn balance_root(&mut self) -> Result<CursorResult<()>> {
         let current_root = self.stack.top();
         let contents = current_root.get().contents.as_mut().unwrap();
         let is_page_1 = current_root.get().id == 1;
         let offset = if is_page_1 { DATABASE_HEADER_SIZE } else { 0 };
-
-        if self.is_underflow(contents) {
-            let child_page_id = contents.rightmost_pointer().unwrap();
-            let child_page = self
-                .pager
-                .read_page(child_page_id as usize)
-                .expect("This shouldn't have happened, child page not found");
-            let child_contents = child_page.get().contents.as_mut().unwrap();
-
-            // Defragment child before inserting its cells into root because root is smaller than child due to it
-            // containing header.
-            self.defragment_page(child_contents, self.database_header.borrow());
-
-            let necessary_space = self.calculate_used_space(child_contents);
-            let available_space = if is_page_1 {
-                self.usable_space() - DATABASE_HEADER_SIZE
-            } else {
-                self.usable_space()
-            };
-
-            // If root can't consume child, leave it empty temporarily and handle it in balance_leaf step
-            if available_space < necessary_space {
-                return;
-            }
-
-            let grandchild_ptr = child_contents.rightmost_pointer();
-
-            let mut cells = Vec::new();
-            for idx in 0..child_contents.cell_count() {
-                let (start, len) = child_contents.cell_get_raw_region(
-                    idx,
-                    self.payload_overflow_threshold_max(child_contents.page_type()),
-                    self.payload_overflow_threshold_min(child_contents.page_type()),
-                    self.usable_space(),
-                );
-                let buf = child_contents.as_ptr();
-                cells.push(buf[start..start + len].to_vec());
-            }
-
-            // TODO: free the child page by adding it to the free list. Functionality has to be added to pager.rs
-
-            contents.write_u16(PAGE_HEADER_OFFSET_CELL_COUNT, 0);
-            contents.write_u16(PAGE_HEADER_OFFSET_FIRST_FREEBLOCK, 0);
-            if !contents.is_leaf() {
-                contents.write_u32(
-                    PAGE_HEADER_OFFSET_RIGHTMOST_PTR,
-                    grandchild_ptr.unwrap_or(0),
-                );
-            }
-
-            // Insert cells into root
-            for (idx, cell) in cells.iter().enumerate() {
-                self.insert_into_cell(contents, cell, idx);
-            }
-        }
 
         if self.is_overflow(contents) {
             // Remember original page type - the child will inherit this
@@ -1366,6 +1292,61 @@ impl BTreeCursor {
             self.stack.clear();
             self.stack.push(current_root.clone());
             self.stack.push(child_page.clone());
+            Ok(CursorResult::Ok(()))
+        } else if self.is_underflow(contents) {
+            let child_page_id = contents.rightmost_pointer().unwrap();
+            let child_page = self.pager.read_page(child_page_id as usize)?;
+
+            return_if_locked!(child_page);
+            if !child_page.is_loaded() {
+                self.pager.load_page(child_page.clone())?;
+                return Ok(CursorResult::IO);
+            }
+    
+            let child_contents = child_page.get().contents.as_mut().unwrap();
+
+            // Defragment child before inserting its cells into root because root is smaller than child due to it
+            // containing header.
+            self.defragment_page(child_contents, self.database_header.borrow());
+
+            let necessary_space = self.calculate_used_space(child_contents);
+            let available_space = if is_page_1 {
+                self.usable_space() - DATABASE_HEADER_SIZE
+            } else {
+                self.usable_space()
+            };
+
+            // If root can't consume child, leave it empty temporarily and handle it in balance_leaf step
+            if available_space < necessary_space {
+                return Ok(CursorResult::Ok(()));
+            }
+
+            let child_rightmost_pointer = child_contents.rightmost_pointer();
+
+            for idx in 0..child_contents.cell_count() {
+                let (start, len) = child_contents.cell_get_raw_region(
+                    idx,
+                    self.payload_overflow_threshold_max(child_contents.page_type()),
+                    self.payload_overflow_threshold_min(child_contents.page_type()),
+                    self.usable_space(),
+                );
+                let buf = child_contents.as_ptr();
+                self.insert_into_cell(contents, &buf[start..start + len], idx);
+            }
+
+            // TODO: free the child page by adding it to the free list. Functionality has to be added to pager.rs first.
+
+            contents.write_u16(PAGE_HEADER_OFFSET_CELL_COUNT, 0);
+            contents.write_u16(PAGE_HEADER_OFFSET_FIRST_FREEBLOCK, 0);
+            if !contents.is_leaf() {
+                contents.write_u32(
+                    PAGE_HEADER_OFFSET_RIGHTMOST_PTR,
+                    child_rightmost_pointer.unwrap_or(0),
+                );
+            }
+            Ok(CursorResult::Ok(()))
+        } else {
+            unreachable!("balance_root was called where we didn't have any overflow or underflow");
         }
     }
 
@@ -1400,7 +1381,8 @@ impl BTreeCursor {
 
         // setup overflow page
         let contents = page.get().contents.as_mut().unwrap();
-        contents.write_u32(0, 0); // Initialize next overflow page pointer to 0
+        let buf = contents.as_ptr();
+        buf.fill(0);
 
         page
     }
