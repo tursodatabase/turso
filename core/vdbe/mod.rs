@@ -600,8 +600,13 @@ impl Program {
                     root_page,
                 } => {
                     let (_, cursor_type) = self.cursor_ref.get(*cursor_id).unwrap();
-                    let cursor =
-                        BTreeCursor::new(pager.clone(), *root_page, self.database_header.clone());
+                    let is_index = cursor_type.is_index();
+                    let cursor = BTreeCursor::new(
+                        pager.clone(),
+                        *root_page,
+                        self.database_header.clone(),
+                        is_index,
+                    );
                     match cursor_type {
                         CursorType::BTreeTable(_) => {
                             btree_table_cursors.insert(*cursor_id, cursor);
@@ -2015,6 +2020,26 @@ impl Program {
                     }
                     state.pc += 1;
                 }
+                Insn::IdxInsertAsync {
+                    cursor_id,
+                    key_reg,
+                    record_reg,
+                    flag: _,
+                } => {
+                    let cursor = btree_index_cursors.get_mut(cursor_id).unwrap();
+                    let record = match &state.registers[*record_reg] {
+                        OwnedValue::Record(r) => r,
+                        _ => unreachable!("Not a record! Cannot insert a non record value."),
+                    };
+                    let key = &state.registers[*key_reg];
+                    return_if_io!(cursor.insert(key, record, true));
+                    state.pc += 1;
+                }
+                Insn::IdxInsertAwait { cursor_id } => {
+                    let cursor = btree_index_cursors.get_mut(cursor_id).unwrap();
+                    cursor.wait_for_completion()?;
+                    state.pc += 1;
+                }
                 Insn::DeleteAsync { cursor_id } => {
                     let cursor = btree_table_cursors.get_mut(cursor_id).unwrap();
                     return_if_io!(cursor.delete());
@@ -2077,8 +2102,12 @@ impl Program {
                 } => {
                     let (_, cursor_type) = self.cursor_ref.get(*cursor_id).unwrap();
                     let is_index = cursor_type.is_index();
-                    let cursor =
-                        BTreeCursor::new(pager.clone(), *root_page, self.database_header.clone());
+                    let cursor = BTreeCursor::new(
+                        pager.clone(),
+                        *root_page,
+                        self.database_header.clone(),
+                        is_index,
+                    );
                     if is_index {
                         btree_index_cursors.insert(*cursor_id, cursor);
                     } else {
@@ -2100,6 +2129,7 @@ impl Program {
                     state.pc += 1;
                 }
                 Insn::CreateBtree { db, root, flags } => {
+                    const FLAG_INDEX: usize = 2;
                     if *db > 0 {
                         // TODO: implement temp datbases
                         todo!("temp databases not implemented yet");
@@ -2108,6 +2138,7 @@ impl Program {
                         pager.clone(),
                         0,
                         self.database_header.clone(),
+                        *flags == FLAG_INDEX,
                     ));
 
                     let root_page = cursor.btree_create(*flags);

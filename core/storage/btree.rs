@@ -116,6 +116,8 @@ pub struct BTreeCursor {
     /// Page stack used to traverse the btree.
     /// Each cursor has a stack because each cursor traverses the btree independently.
     stack: PageStack,
+    /// Whether the cursor is an index cursor.
+    is_index: bool,
 }
 
 /// Stack of pages representing the tree traversal order.
@@ -141,6 +143,7 @@ impl BTreeCursor {
         pager: Rc<Pager>,
         root_page: usize,
         database_header: Rc<RefCell<DatabaseHeader>>,
+        is_index: bool,
     ) -> Self {
         Self {
             pager,
@@ -162,6 +165,7 @@ impl BTreeCursor {
                 cell_indices: RefCell::new([0; BTCURSOR_MAX_DEPTH + 1]),
                 stack: RefCell::new([const { None }; BTCURSOR_MAX_DEPTH + 1]),
             },
+            is_index,
         }
     }
 
