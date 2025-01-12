@@ -6,7 +6,7 @@ use crate::storage::sqlite3_ondisk::{
     TableInteriorCell, TableLeafCell,
 };
 use crate::types::{CursorResult, OwnedRecord, OwnedValue, SeekKey, SeekOp};
-use crate::Result;
+use crate::{LimboError, Result};
 
 use std::cell::{Ref, RefCell};
 use std::pin::Pin;
@@ -705,7 +705,6 @@ impl BTreeCursor {
                         // find cell
                         (self.find_cell(page, int_key), page.page_type())
                     };
-
                     // TODO: if overwrite drop cell
 
                     // insert cell
@@ -1787,8 +1786,52 @@ impl BTreeCursor {
         Ok(CursorResult::Ok(()))
     }
 
-    pub fn delete(&mut self) -> Result<CursorResult<()>> {
-        println!("rowid: {:?}", self.rowid.borrow());
+    fn delete(&mut self) -> Result<CursorResult<()>> {
+        let page = self.stack.top();
+        return_if_locked!(page);
+
+        let mut cell_idx = self.stack.current_cell_index() as usize;
+        let contents = page.get().contents.as_ref().unwrap();
+
+        println!("cell_idx: {}", cell_idx);
+        println!("cell_count: {}", contents.cell_count());
+        println!("cell_indices: {:?}", self.stack.cell_indices.borrow());
+        // cell_idx = 0; // for now hard code cell_idx to 0 for the test to pass.
+        if cell_idx >= contents.cell_count() {
+            return Err(LimboError::Corrupt(format!(
+                "Corrupted page: cell index {} is out of bounds for page with {} cells",
+                cell_idx,
+                contents.cell_count()
+            )));
+        }
+
+        // TODO: Clear overflow pages
+        
+        page.set_dirty();
+        self.pager.add_dirty(page.get().id);
+
+        let contents = page.get().contents.as_mut().unwrap();
+
+        // If this is an interior node, we need to handle deletion differently
+        if !contents.is_leaf() {
+            // For interior nodes:
+            // 1. Move cursor to largest entry in left subtree
+            // 2. Copy that entry to replace the one being deleted
+            // 3. Delete the leaf entry
+            //TODO
+        } else {
+            // For leaf nodes, simply remove the cell
+            self.drop_cell(contents, cell_idx);
+        }
+
+        // Only balance if free space > 2/3 of the page size
+        // let usable_space = self.usable_space();
+        // let free = self.compute_free_space(page.get().contents.as_ref().unwrap(), RefCell::borrow(&self.database_header)) as i32;
+        // if free * 3 > (usable_space * 2) as i32 {
+        //     println!("cell_indices: {:?}", self.stack.cell_indices.borrow());
+        //     println!("Balancing page {}", page.get().id);
+        //     return_if_io!(self.balance());
+        // }
         Ok(CursorResult::Ok(()))
     }
 
