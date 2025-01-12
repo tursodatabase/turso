@@ -511,17 +511,20 @@ pub enum CursorResult<T> {
     IO,
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum SeekOp {
     EQ,
     GE,
     GT,
 }
 
-#[derive(Clone, PartialEq, Debug)]
-pub enum SeekKey<'a> {
+/// Key type for the btree cursor.
+/// Tables, except WITHOUT ROWID, identify rows by their rowid.
+/// In indexes (and WITHOUT ROWID tables) the key is the record.
+#[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd)]
+pub enum BTreeKey {
     TableRowId(u64),
-    IndexKey(&'a OwnedRecord),
+    IndexKey(OwnedRecord),
 }
 
 #[cfg(test)]

@@ -879,13 +879,12 @@ pub fn insn_to_str(
             Insn::IdxInsertAsync {
                 cursor_id,
                 key_reg,
-                record_reg,
                 flag,
             } => (
                 "IdxInsertAsync",
                 *cursor_id as i32,
-                *record_reg as i32,
                 *key_reg as i32,
+                0,
                 OwnedValue::build_text(Rc::new("".to_string())),
                 *flag as u16,
                 "".to_string(),

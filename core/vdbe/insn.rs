@@ -421,9 +421,8 @@ pub enum Insn {
 
     IdxInsertAsync {
         cursor_id: usize,
-        key_reg: usize,    // Must be int.
-        record_reg: usize, // Blob of record data.
-        flag: usize,       // Flags used by insert, for now not used.
+        key_reg: usize, // In indexes, keys are records and there is no other payload.
+        flag: usize,    // Flags used by insert, for now not used.
     },
 
     IdxInsertAwait {
