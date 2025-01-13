@@ -454,11 +454,11 @@ impl BTreeCursor {
                             SeekOp::GE => *cell_rowid >= rowid_key,
                             SeekOp::EQ => *cell_rowid == rowid_key,
                         };
-                        self.stack.advance();
                         if found {
                             let record = crate::storage::sqlite3_ondisk::read_record(payload)?;
                             return Ok(CursorResult::Ok((Some(*cell_rowid), Some(record))));
                         }
+                        self.stack.advance();
                     }
                     BTreeCell::IndexLeafCell(IndexLeafCell { payload, .. }) => {
                         let SeekKey::IndexKey(index_key) = key else {
