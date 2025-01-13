@@ -94,7 +94,13 @@ impl Display for Query {
                     if i != 0 {
                         write!(f, ",")?;
                     }
-                    write!(f, "{} {}", column.name, column.column_type)?;
+                    write!(
+                        f,
+                        "{} {} {}",
+                        column.name,
+                        column.column_type,
+                        if column.primary { "PRIMARY KEY" } else { "" }
+                    )?;
                 }
 
                 write!(f, ")")

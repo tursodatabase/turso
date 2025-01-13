@@ -15,9 +15,20 @@ impl Arbitrary for Name {
 impl Arbitrary for Table {
     fn arbitrary<R: Rng>(rng: &mut R) -> Self {
         let name = Name::arbitrary(rng).0;
-        let columns = (1..=rng.gen_range(1..5))
+        let mut columns = (1..=rng.gen_range(1..5))
             .map(|_| Column::arbitrary(rng))
-            .collect();
+            .collect::<Vec<_>>();
+        // ensure only one column is primary
+        let mut primary_exists = false;
+        for column in columns.iter_mut() {
+            if column.primary {
+                if primary_exists {
+                    column.primary = false;
+                } else {
+                    primary_exists = true;
+                }
+            }
+        }
         Table {
             rows: Vec::new(),
             name,
@@ -30,10 +41,11 @@ impl Arbitrary for Column {
     fn arbitrary<R: Rng>(rng: &mut R) -> Self {
         let name = Name::arbitrary(rng).0;
         let column_type = ColumnType::arbitrary(rng);
+        let primary = rng.gen_bool(0.1);
         Self {
             name,
             column_type,
-            primary: false,
+            primary,
             unique: false,
         }
     }
