@@ -724,16 +724,26 @@ impl Program {
                                 btree_index_cursors,
                                 "Column"
                             );
-                            let record = cursor.record()?;
-                            if let Some(record) = record.as_ref() {
-                                state.registers[*dest] = if cursor.get_null_flag() {
-                                    OwnedValue::Null
+                            let record = {
+                                if cursor.is_index {
+                                    let key = cursor.key()?;
+                                    match key.as_ref() {
+                                        Some(BTreeKey::IndexKey(key)) => {
+                                            key.values[*column].clone()
+                                        }
+                                        None => OwnedValue::Null,
+                                        _ => panic!("Column: cursor is not an index cursor"),
+                                    }
                                 } else {
-                                    record.values[*column].clone()
-                                };
-                            } else {
-                                state.registers[*dest] = OwnedValue::Null;
-                            }
+                                    let record = cursor.record()?;
+                                    if let Some(record) = record.as_ref() {
+                                        record.values[*column].clone()
+                                    } else {
+                                        OwnedValue::Null
+                                    }
+                                }
+                            };
+                            state.registers[*dest] = record;
                         }
                         CursorType::Sorter => {
                             let cursor = sorter_cursors.get_mut(cursor_id).unwrap();
@@ -1097,7 +1107,10 @@ impl Program {
                     let cursor = btree_index_cursors.get_mut(cursor_id).unwrap();
                     let record_from_regs: OwnedRecord =
                         make_owned_record(&state.registers, start_reg, num_regs);
-                    if let Some(ref idx_record) = *cursor.record()? {
+                    if let Some(ref idx_record) = *cursor.key()? {
+                        let BTreeKey::IndexKey(idx_record) = idx_record else {
+                            panic!("IdxGE: cursor is not an index cursor");
+                        };
                         // omit the rowid from the idx_record, which is the last value
                         if idx_record.values[..idx_record.values.len() - 1]
                             >= *record_from_regs.values
@@ -1120,7 +1133,10 @@ impl Program {
                     let cursor = btree_index_cursors.get_mut(cursor_id).unwrap();
                     let record_from_regs: OwnedRecord =
                         make_owned_record(&state.registers, start_reg, num_regs);
-                    if let Some(ref idx_record) = *cursor.record()? {
+                    if let Some(ref idx_record) = *cursor.key()? {
+                        let BTreeKey::IndexKey(idx_record) = idx_record else {
+                            panic!("IdxGT: cursor is not an index cursor");
+                        };
                         // omit the rowid from the idx_record, which is the last value
                         if idx_record.values[..idx_record.values.len() - 1]
                             > *record_from_regs.values
@@ -2044,7 +2060,7 @@ impl Program {
                         _ => unreachable!("Not a record! Cannot insert a non record value."),
                     };
                     let key = BTreeKey::IndexKey(key.clone());
-                    return_if_io!(cursor.idx_insert(key, true));
+                    return_if_io!(cursor.idx_insert(key, false));
                     state.pc += 1;
                 }
                 Insn::IdxInsertAwait { cursor_id } => {

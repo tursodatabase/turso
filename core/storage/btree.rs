@@ -700,7 +700,10 @@ impl BTreeCursor {
                         self.pager.add_dirty(page.get().id);
 
                         let page = page.get().contents.as_mut().unwrap();
-                        assert!(matches!(page.page_type(), PageType::TableLeaf));
+                        assert!(matches!(
+                            page.page_type(),
+                            PageType::TableLeaf | PageType::IndexLeaf
+                        ));
 
                         // find cell
                         (self.find_cell(page, key)?, page.page_type())
@@ -1837,6 +1840,11 @@ impl BTreeCursor {
     }
 
     pub fn record(&self) -> Result<Ref<Option<OwnedRecord>>> {
+        if self.is_index {
+            panic!(
+                "record() called on an index cursor - indexes store the whole payload in the key"
+            );
+        }
         Ok(self.record.borrow())
     }
 
@@ -1918,6 +1926,7 @@ impl BTreeCursor {
                         BTreeKey::IndexKey(rec) => rec,
                     };
                     let cell_payload = crate::storage::sqlite3_ondisk::read_record(&cell.payload)?;
+
                     let cell_payload_without_rowid =
                         &cell_payload.values[..cell_payload.values.len() - 1];
                     key.values.as_slice() == cell_payload_without_rowid

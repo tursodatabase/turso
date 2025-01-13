@@ -75,6 +75,24 @@ pub fn translate_insert(
         _ => todo!(),
     };
 
+    let indexes_to_update = if let Some(indexes) = schema.indexes.get(table_name.0.as_str()) {
+        indexes
+            .iter()
+            .map(|index| {
+                (
+                    index.clone(),
+                    program.alloc_cursor_id(
+                        Some(index.name.clone()),
+                        CursorType::BTreeIndex(index.clone()),
+                    ),
+                    program.alloc_registers(index.columns.len() + 1), // +1 for the rowid
+                )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![]
+    };
+
     let column_mappings = resolve_columns_for_insert(&table, columns, values)?;
     // Check if rowid was provided (through INTEGER PRIMARY KEY as a rowid alias)
     let rowid_alias_index = table.columns.iter().position(|c| c.is_rowid_alias);
@@ -140,6 +158,14 @@ pub fn translate_insert(
         });
         program.emit_insn(Insn::OpenWriteAwait {});
 
+        for (index, cursor_id, _) in indexes_to_update.iter() {
+            program.emit_insn(Insn::OpenWriteAsync {
+                cursor_id: *cursor_id,
+                root_page: index.root_page,
+            });
+            program.emit_insn(Insn::OpenWriteAwait {});
+        }
+
         // Main loop
         // FIXME: rollback is not implemented. E.g. if you insert 2 rows and one fails to unique constraint violation,
         // the other row will still be inserted.
@@ -155,6 +181,14 @@ pub fn translate_insert(
             root_page,
         });
         program.emit_insn(Insn::OpenWriteAwait {});
+
+        for (index, cursor_id, _) in indexes_to_update.iter() {
+            program.emit_insn(Insn::OpenWriteAsync {
+                cursor_id: *cursor_id,
+                root_page: index.root_page,
+            });
+            program.emit_insn(Insn::OpenWriteAwait {});
+        }
 
         populate_column_registers(
             &mut program,
@@ -228,13 +262,53 @@ pub fn translate_insert(
         program.resolve_label(make_record_label, program.offset());
     }
 
-    // Create and insert the record
+    // Create the records for the indexes
+    for (index, cursor_id, index_record_reg) in indexes_to_update.iter() {
+        let start_reg = program.alloc_registers(index.columns.len() + 1);
+        for (i, column) in index.columns.iter().enumerate() {
+            let col_reg = start_reg + i;
+            let column_index = table
+                .columns
+                .iter()
+                .position(|c| c.name == column.name)
+                .unwrap();
+            program.emit_insn(Insn::Copy {
+                src_reg: column_registers_start + column_index,
+                dst_reg: col_reg,
+                amount: 0,
+            });
+        }
+        program.emit_insn(Insn::Copy {
+            src_reg: rowid_reg,
+            dst_reg: start_reg + index.columns.len(),
+            amount: 0,
+        });
+        program.emit_insn(Insn::MakeRecord {
+            start_reg,
+            count: index.columns.len() + 1, // +1 for the rowid
+            dest_reg: *index_record_reg,
+        });
+    }
+    // Create the record for the table
     program.emit_insn(Insn::MakeRecord {
         start_reg: column_registers_start,
         count: num_cols,
         dest_reg: record_register,
     });
 
+    // Insert the records for the indexes
+    for (_, cursor_id, index_record_reg) in indexes_to_update.iter() {
+        program.emit_insn(Insn::IdxInsertAsync {
+            cursor_id: *cursor_id,
+            key_reg: *index_record_reg,
+            flag: 0,
+        });
+        program.emit_insn(Insn::IdxInsertAwait {
+            cursor_id: *cursor_id,
+        });
+    }
+
+    // Insert the record for the table
     program.emit_insn(Insn::InsertAsync {
         cursor: cursor_id,
         key_reg: rowid_reg,
