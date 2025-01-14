@@ -1238,60 +1238,87 @@ impl BTreeCursor {
         used_space < (usable_space / 2)
     }
 
+    fn copy_node_content(&self, src: PageRef, dst: PageRef) -> Result<()> {
+        let src_contents = src.get().contents.as_ref().unwrap();
+        let dst_contents = dst.get().contents.as_mut().unwrap();
+
+        let src_buf = src_contents.as_ptr();
+        let dst_buf = dst_contents.as_ptr();
+
+        // Copy content area
+        let content_start = src_contents.cell_content_area() as usize;
+        let content_size = self.usable_space() - content_start;
+        dst_buf[content_start..content_start + content_size]
+            .copy_from_slice(&src_buf[content_start..content_start + content_size]);
+
+        // Copy header and cell pointer array
+        let header_and_pointers_size =
+            src_contents.header_size() + src_contents.cell_pointer_array_size();
+        dst_buf[..header_and_pointers_size].copy_from_slice(&src_buf[..header_and_pointers_size]);
+
+        // Copy overflow cells
+        dst_contents.overflow_cells = src_contents.overflow_cells.clone();
+
+        Ok(())
+    }
+
+    fn zero_page(&self, page: &PageRef, page_type: PageType, is_leaf: bool) {
+        let contents = page.get().contents.as_mut().unwrap();
+        let flags = if is_leaf {
+            page_type as u8
+        } else {
+            page_type as u8 & !0x08 // Clear leaf flag
+        };
+
+        contents.write_u8(PAGE_HEADER_OFFSET_PAGE_TYPE, flags);
+        contents.write_u16(PAGE_HEADER_OFFSET_FIRST_FREEBLOCK, 0);
+        contents.write_u16(PAGE_HEADER_OFFSET_CELL_COUNT, 0);
+        contents.write_u16(
+            PAGE_HEADER_OFFSET_CELL_CONTENT_AREA,
+            self.usable_space() as u16,
+        );
+        contents.write_u8(PAGE_HEADER_OFFSET_FRAGMENTED_BYTES_COUNT, 0);
+        contents.overflow_cells.clear();
+
+        if !is_leaf {
+            contents.write_u32(PAGE_HEADER_OFFSET_RIGHTMOST_PTR, 0);
+        }
+    }
+
     fn balance_root(&mut self) -> Result<CursorResult<()>> {
         let current_root = self.stack.top();
         let contents = current_root.get().contents.as_mut().unwrap();
         let is_page_1 = current_root.get().id == 1;
-        let offset = if is_page_1 { DATABASE_HEADER_SIZE } else { 0 };
 
         if self.is_overflow(contents) {
-            // Remember original page type - the child will inherit this
-            let original_type = contents.page_type();
+            let current_root = self.stack.top();
+            let contents = current_root.get().contents.as_mut().unwrap();
+            assert!(!contents.overflow_cells.is_empty());
 
-            // Create new child page with root's original type
+            let original_type = contents.page_type();
+            current_root.set_dirty();
+
             let child_page = self.allocate_page(original_type, 0);
             let child_page_id = child_page.get().id;
-            let child_contents = child_page.get().contents.as_mut().unwrap();
 
-            // Move all cells and right pointer from root to child
-            let mut cells = Vec::new();
-            for idx in 0..contents.cell_count() {
-                let (start, len) = contents.cell_get_raw_region(
-                    idx,
-                    self.payload_overflow_threshold_max(contents.page_type()),
-                    self.payload_overflow_threshold_min(contents.page_type()),
-                    self.usable_space(),
-                );
-                let buf = contents.as_ptr();
-                cells.push(buf[start..start + len].to_vec());
-            }
-            let right_pointer = contents.rightmost_pointer();
+            // Copy all root content to child, including overflow cells
+            self.copy_node_content(current_root.clone(), child_page.clone())?;
 
-            // Clear root - IMPORTANT: Set type BEFORE clearing contents
-            contents.write_u8(PAGE_HEADER_OFFSET_PAGE_TYPE, PageType::TableInterior as u8);
-            contents.write_u16(PAGE_HEADER_OFFSET_CELL_COUNT, 0);
-            contents.write_u16(PAGE_HEADER_OFFSET_FIRST_FREEBLOCK, 0);
+            // zero out root page to make it empty.
+            let is_leaf = false;
+            self.zero_page(&current_root, original_type, is_leaf);
 
-            // Initialize child with root's old contents
-            for (idx, cell) in cells.iter().enumerate() {
-                self.insert_into_cell(child_contents, cell, idx);
-            }
-            if !child_contents.is_leaf() {
-                child_contents
-                    .write_u32(PAGE_HEADER_OFFSET_RIGHTMOST_PTR, right_pointer.unwrap_or(0));
-            }
+            // Set child as rightmost pointer
+            contents.write_u32(PAGE_HEADER_OFFSET_RIGHTMOST_PTR, child_page_id as u32);
 
-            // Handle page 1 special case
-            if is_page_1 {
-                self.handle_page_one_special_case(child_contents, offset);
-            }
-
+            // Update pager's tracking
             self.pager.add_dirty(child_page_id);
 
             // Update page stack to include both root and child
             self.stack.clear();
             self.stack.push(current_root.clone());
             self.stack.push(child_page.clone());
+
             Ok(CursorResult::Ok(()))
         } else if self.is_underflow(contents) {
             let child_page_id = contents.rightmost_pointer().unwrap();
@@ -1309,61 +1336,32 @@ impl BTreeCursor {
             // containing header.
             self.defragment_page(child_contents, self.database_header.borrow());
 
-            let necessary_space = self.calculate_used_space(child_contents);
+            let root_free_space =
+                self.compute_free_space(contents, self.database_header.borrow()) as usize;
             let available_space = if is_page_1 {
-                self.usable_space() - DATABASE_HEADER_SIZE
+                root_free_space - DATABASE_HEADER_SIZE
             } else {
-                self.usable_space()
+                root_free_space
             };
 
-            // If root can't consume child, leave it empty temporarily and handle it in balance_leaf step
-            if available_space < necessary_space {
+            // If root can't consume child, leave it empty temporarily and handle it in balance_nonroot step
+            let child_free_space =
+                self.compute_free_space(child_contents, self.database_header.borrow()) as usize;
+            let child_used_space = self.usable_space() - child_free_space;
+
+            // If root doesn't have enough free space for child's content, leave it empty for balance_leaf
+            if available_space < child_used_space {
                 return Ok(CursorResult::Ok(()));
             }
 
-            let child_rightmost_pointer = child_contents.rightmost_pointer();
+            self.copy_node_content(child_page.clone(), current_root.clone())?;
 
-            for idx in 0..child_contents.cell_count() {
-                let (start, len) = child_contents.cell_get_raw_region(
-                    idx,
-                    self.payload_overflow_threshold_max(child_contents.page_type()),
-                    self.payload_overflow_threshold_min(child_contents.page_type()),
-                    self.usable_space(),
-                );
-                let buf = child_contents.as_ptr();
-                self.insert_into_cell(contents, &buf[start..start + len], idx);
-            }
+            // TODO: free the child page by adding it to the free list. Functionality has yet to be added to pager.rs first.
 
-            // TODO: free the child page by adding it to the free list. Functionality has to be added to pager.rs first.
-
-            contents.write_u16(PAGE_HEADER_OFFSET_CELL_COUNT, 0);
-            contents.write_u16(PAGE_HEADER_OFFSET_FIRST_FREEBLOCK, 0);
-            if !contents.is_leaf() {
-                contents.write_u32(
-                    PAGE_HEADER_OFFSET_RIGHTMOST_PTR,
-                    child_rightmost_pointer.unwrap_or(0),
-                );
-            }
             Ok(CursorResult::Ok(()))
         } else {
             unreachable!("balance_root was called where we didn't have any overflow or underflow");
         }
-    }
-
-    // Helper function to handle page 1's special case
-    fn handle_page_one_special_case(&self, contents: &mut PageContent, offset: usize) {
-        let (cell_pointer_offset, _) = contents.cell_pointer_array_offset_and_size();
-
-        // Update cell pointers to account for removed header
-        for cell_idx in 0..contents.cell_count() {
-            let cell_pointer_offset = cell_pointer_offset + (2 * cell_idx) - offset;
-            let pc = contents.read_u16(cell_pointer_offset);
-            contents.write_u16(cell_pointer_offset, pc - offset as u16);
-        }
-
-        contents.offset = 0;
-        let buf = contents.as_ptr();
-        buf.copy_within(DATABASE_HEADER_SIZE.., 0);
     }
 
     /// Allocate a new page to the btree via the pager.
@@ -1625,7 +1623,7 @@ impl BTreeCursor {
             write_varint_to_vec(record_buf.len() as u64, cell_payload);
         }
 
-        let payload_overflow_threshold_max = self.payload_overflow_threshold_max(page_type.clone());
+        let payload_overflow_threshold_max = self.payload_overflow_threshold_max(page_type);
         log::debug!(
             "fill_cell_payload(record_size={}, payload_overflow_threshold_max={})",
             record_buf.len(),
