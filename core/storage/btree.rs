@@ -1791,6 +1791,10 @@ impl BTreeCursor {
         return_if_locked!(page);
 
         let mut cell_idx = self.stack.current_cell_index() as usize;
+
+        // FIXME: This is HACK, seek() is returning next cell, so we need to go back one cell.
+        cell_idx -= 1;
+
         let contents = page.get().contents.as_ref().unwrap();
 
         println!("cell_idx: {}", cell_idx);
