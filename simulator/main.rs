@@ -12,6 +12,7 @@ use runner::io::SimulatorIO;
 use std::backtrace::Backtrace;
 use std::io::Write;
 use std::path::Path;
+use std::process::ExitCode;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -19,7 +20,7 @@ mod generation;
 mod model;
 mod runner;
 
-fn main() {
+fn main() -> ExitCode {
     init_logger();
 
     let cli_opts = SimulatorCLI::parse();
@@ -62,6 +63,8 @@ fn main() {
 
     let result = std::panic::catch_unwind(|| run_simulation(seed, &cli_opts, &db_path, &plan_path));
 
+    let mut error_triggered = false;
+
     if cli_opts.doublecheck {
         // Move the old database and plan file to a new location
         let old_db_path = db_path.with_extension("_old.db");
@@ -77,29 +80,35 @@ fn main() {
         match (result, result2) {
             (Ok(Ok(_)), Err(_)) => {
                 log::error!("doublecheck failed! first run succeeded, but second run panicked.");
+                error_triggered = true;
             }
             (Ok(Err(_)), Err(_)) => {
                 log::error!(
                     "doublecheck failed! first run failed assertion, but second run panicked."
                 );
+                error_triggered = true;
             }
             (Err(_), Ok(Ok(_))) => {
                 log::error!("doublecheck failed! first run panicked, but second run succeeded.");
+                error_triggered = true;
             }
             (Err(_), Ok(Err(_))) => {
                 log::error!(
                     "doublecheck failed! first run panicked, but second run failed assertion."
                 );
+                error_triggered = true;
             }
             (Ok(Ok(_)), Ok(Err(_))) => {
                 log::error!(
                     "doublecheck failed! first run succeeded, but second run failed assertion."
                 );
+                error_triggered = true;
             }
             (Ok(Err(_)), Ok(Ok(_))) => {
                 log::error!(
                     "doublecheck failed! first run failed assertion, but second run succeeded."
                 );
+                error_triggered = true;
             }
             (Err(_), Err(_)) | (Ok(_), Ok(_)) => {
                 // Compare the two database files byte by byte
@@ -107,6 +116,7 @@ fn main() {
                 let new_db = std::fs::read(&db_path).unwrap();
                 if old_db != new_db {
                     log::error!("doublecheck failed! database files are different.");
+                    error_triggered = true;
                 } else {
                     log::info!("doublecheck succeeded! database files are the same.");
                 }
@@ -130,13 +140,21 @@ fn main() {
             }
             Err(e) => {
                 log::error!("simulation failed: {:?}", e);
+                error_triggered = true;
             }
         }
+    } else {
+        error_triggered = true;
     }
     // Print the seed, the locations of the database and the plan file at the end again for easily accessing them.
     println!("database path: {:?}", db_path);
     println!("simulator plan path: {:?}", plan_path);
     println!("seed: {}", seed);
+
+    match error_triggered {
+        true => ExitCode::FAILURE,
+        false => ExitCode::SUCCESS,
+    }
 }
 
 fn run_simulation(
