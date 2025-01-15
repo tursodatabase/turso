@@ -1792,7 +1792,7 @@ impl BTreeCursor {
 
         let mut cell_idx = self.stack.current_cell_index() as usize;
 
-        // FIXME: This is HACK, seek() is returning next cell, so we need to go back one cell.
+        // FIXME: This is a HACK, seek() is returning next cell, so we need to go back one cell.
         cell_idx -= 1;
 
         let contents = page.get().contents.as_ref().unwrap();
@@ -1800,7 +1800,6 @@ impl BTreeCursor {
         println!("cell_idx: {}", cell_idx);
         println!("cell_count: {}", contents.cell_count());
         println!("cell_indices: {:?}", self.stack.cell_indices.borrow());
-        // cell_idx = 0; // for now hard code cell_idx to 0 for the test to pass.
         if cell_idx >= contents.cell_count() {
             return Err(LimboError::Corrupt(format!(
                 "Corrupted page: cell index {} is out of bounds for page with {} cells",

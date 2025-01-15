@@ -600,6 +600,10 @@ fn update_pragma(
             query_pragma("wal_checkpoint", header, program)?;
             Ok(())
         }
+        PragmaName::FreelistCount => {
+            query_pragma("freelist_count", header, program)?;
+            Ok(())
+        }
     }
 }
 
@@ -629,28 +633,20 @@ fn query_pragma(
                 value: "wal".into(),
                 dest: register,
             });
-            program.emit_insn(Insn::ResultRow {
-                start_reg: register,
-                count: 1,
-            });
         }
-        PragmaName::WalCheckpoint => {
-            // Checkpoint uses 3 registers: P1, P2, P3. Ref Insn::Checkpoint for more info.
-            // Allocate two more here as one was allocated at the top.
-            program.alloc_register();
-            program.alloc_register();
-            program.emit_insn(Insn::Checkpoint {
-                database: 0,
-                checkpoint_mode: CheckpointMode::Passive,
+        PragmaName::FreelistCount => {
+            let free_page_count = database_header.borrow().freelist_pages;
+            program.emit_insn(Insn::Integer {
+                value: free_page_count as i64,
                 dest: register,
-            });
-            program.emit_insn(Insn::ResultRow {
-                start_reg: register,
-                count: 3,
             });
         }
     }
 
+    program.emit_insn(Insn::ResultRow {
+        start_reg: register,
+        count: 1,
+    });
     Ok(())
 }
 

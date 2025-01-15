@@ -1593,6 +1593,8 @@ pub enum PragmaName {
     JournalMode,
     /// trigger a checkpoint to run on database(s) if WAL is enabled
     WalCheckpoint,
+    /// `freelist_count` pragma - number of free pages in the database file
+    FreelistCount,
 }
 
 impl FromStr for PragmaName {
@@ -1603,6 +1605,7 @@ impl FromStr for PragmaName {
             "cache_size" => Ok(PragmaName::CacheSize),
             "wal_checkpoint" => Ok(PragmaName::WalCheckpoint),
             "journal_mode" => Ok(PragmaName::JournalMode),
+            "freelist_count" => Ok(PragmaName::FreelistCount),
             _ => Err(()),
         }
     }

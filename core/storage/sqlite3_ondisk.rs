@@ -105,10 +105,10 @@ pub struct DatabaseHeader {
     pub database_size: u32,
 
     /// Page number of the first freelist trunk page.
-    freelist_trunk_page: u32,
+    pub freelist_trunk_page: u32,
 
     /// Total number of freelist pages.
-    freelist_pages: u32,
+    pub freelist_pages: u32,
 
     /// The schema cookie. Incremented when the database schema changes.
     schema_cookie: u32,
@@ -438,7 +438,7 @@ impl PageContent {
         u16::from_be_bytes([buf[self.offset + pos], buf[self.offset + pos + 1]])
     }
 
-    fn read_u32(&self, pos: usize) -> u32 {
+    pub fn read_u32(&self, pos: usize) -> u32 {
         let buf = self.as_ptr();
         u32::from_be_bytes([
             buf[self.offset + pos],
