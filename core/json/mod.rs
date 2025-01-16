@@ -1,6 +1,7 @@
 mod de;
 mod error;
 mod json_path;
+mod jsonb_de;
 mod ser;
 
 use std::rc::Rc;
