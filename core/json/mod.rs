@@ -49,6 +49,18 @@ pub fn get_json(json_value: &OwnedValue) -> crate::Result<OwnedValue> {
     }
 }
 
+pub fn get_jsonb(json_value: &OwnedValue) -> crate::Result<OwnedValue> {
+    match json_value {
+        OwnedValue::Null => Ok(OwnedValue::Null),
+        _ => {
+            let json_val = get_json_value(json_value)?;
+            let jsonb = serde_sqlite_jsonb::to_vec(&json_val).unwrap();
+
+            Ok(OwnedValue::Blob(Rc::new(jsonb)))
+        }
+    }
+}
+
 fn get_json_value(json_value: &OwnedValue) -> crate::Result<Val> {
     match json_value {
         OwnedValue::Text(ref t) => match crate::json::from_str::<Val>(&t.value) {
@@ -481,6 +493,43 @@ mod tests {
         match result {
             Ok(_) => panic!("Expected error for malformed JSON"),
             Err(e) => assert!(e.to_string().contains("malformed JSON")),
+        }
+    }
+
+    #[test]
+    fn test_get_jsonb_valid_json() {
+        let input = OwnedValue::build_text(Rc::new("{\"abc\":1}".to_string()));
+        let result = get_jsonb(&input).unwrap();
+        if let OwnedValue::Blob(result_blob) = result {
+            let expected: Vec<u8> = vec![
+                0x6C, // 6 byte OBJECT type header
+                0x37, // 3 byte TEXT type header
+                0x61, 0x62, 0x63, // "abc"
+                0x13, // 1 byte INT type header
+                0x31, // ASCII for "1"
+            ];
+            assert_eq!(*result_blob, expected);
+        } else {
+            panic!("Expected OwnedValue::Blob");
+        }
+    }
+
+    #[test]
+    fn test_get_jsonb_valid_jsonb() {
+        let binary_json = vec![
+            0x6C, // 6 byte OBJECT type header
+            0x37, // 3 byte TEXT type header
+            0x61, 0x62, 0x63, // "abc"
+            0x13, // 1 byte INT type header
+            0x31, // ASCII for "1"
+        ];
+        let input = OwnedValue::Blob(Rc::new(binary_json.clone()));
+        let result = get_jsonb(&input).unwrap();
+
+        if let OwnedValue::Blob(result_blob) = result {
+            assert_eq!(*result_blob, binary_json);
+        } else {
+            panic!("Expected OwnedValue::Blob");
         }
     }
 

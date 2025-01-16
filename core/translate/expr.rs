@@ -762,7 +762,7 @@ pub fn translate_expr(
                 }
                 #[cfg(feature = "json")]
                 Func::Json(j) => match j {
-                    JsonFunc::Json => {
+                    JsonFunc::Json | JsonFunc::Jsonb => {
                         let args = expect_arguments_exact!(args, 1, j);
 
                         translate_function(

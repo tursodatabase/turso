@@ -34,6 +34,7 @@ impl Display for ExternalFunc {
 #[derive(Debug, Clone, PartialEq)]
 pub enum JsonFunc {
     Json,
+    Jsonb,
     JsonArray,
     JsonArrayLength,
     JsonArrowExtract,
@@ -51,6 +52,7 @@ impl Display for JsonFunc {
             "{}",
             match self {
                 Self::Json => "json".to_string(),
+                Self::Jsonb => "jsonb".to_string(),
                 Self::JsonArray => "json_array".to_string(),
                 Self::JsonExtract => "json_extract".to_string(),
                 Self::JsonArrayLength => "json_array_length".to_string(),
@@ -385,6 +387,8 @@ impl Func {
             "replace" => Ok(Self::Scalar(ScalarFunc::Replace)),
             #[cfg(feature = "json")]
             "json" => Ok(Self::Json(JsonFunc::Json)),
+            #[cfg(feature = "json")]
+            "jsonb" => Ok(Self::Json(JsonFunc::Jsonb)),
             #[cfg(feature = "json")]
             "json_array_length" => Ok(Self::Json(JsonFunc::JsonArrayLength)),
             #[cfg(feature = "json")]

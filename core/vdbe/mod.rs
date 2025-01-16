@@ -27,6 +27,7 @@ pub mod sorter;
 use crate::error::{LimboError, SQLITE_CONSTRAINT_PRIMARYKEY};
 use crate::ext::ExtValue;
 use crate::function::{AggFunc, FuncCtx, MathFunc, MathFuncArity, ScalarFunc};
+use crate::json::get_jsonb;
 use crate::pseudo::PseudoCursor;
 use crate::result::LimboResult;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
@@ -1507,6 +1508,14 @@ impl Program {
                                 let json_str = get_json(json_value);
                                 match json_str {
                                     Ok(json) => state.registers[*dest] = json,
+                                    Err(e) => return Err(e),
+                                }
+                            }
+                            JsonFunc::Jsonb => {
+                                let json_value = &state.registers[*start_reg];
+                                let json_blob = get_jsonb(json_value);
+                                match json_blob {
+                                    Ok(json_blob) => state.registers[*dest] = json_blob,
                                     Err(e) => return Err(e),
                                 }
                             }
