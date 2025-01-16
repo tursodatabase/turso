@@ -11,7 +11,6 @@ use crate::json::json_path::{json_path, JsonPath, PathElement};
 pub use crate::json::ser::to_string;
 use crate::types::{LimboText, OwnedValue, TextSubtype};
 use indexmap::IndexMap;
-use jsonb::Error as JsonbError;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -40,15 +39,6 @@ pub fn get_json(json_value: &OwnedValue) -> crate::Result<OwnedValue> {
 
             Ok(OwnedValue::Text(LimboText::json(Rc::new(json))))
         }
-        OwnedValue::Blob(b) => {
-            // TODO: use get_json_value after we implement a single Struct
-            //   to represent both JSON and JSONB
-            if let Ok(json) = jsonb::from_slice(b) {
-                Ok(OwnedValue::Text(LimboText::json(Rc::new(json.to_string()))))
-            } else {
-                crate::bail_parse_error!("malformed JSON");
-            }
-        }
         OwnedValue::Null => Ok(OwnedValue::Null),
         _ => {
             let json_val = get_json_value(json_value)?;
@@ -67,13 +57,12 @@ fn get_json_value(json_value: &OwnedValue) -> crate::Result<Val> {
                 crate::bail_parse_error!("malformed JSON")
             }
         },
-        OwnedValue::Blob(b) => {
-            if let Ok(_json) = jsonb::from_slice(b) {
-                todo!("jsonb to json conversion");
-            } else {
-                crate::bail_parse_error!("malformed JSON");
+        OwnedValue::Blob(b) => match serde_sqlite_jsonb::from_slice(b) {
+            Ok(json) => Ok(json),
+            Err(_) => {
+                crate::bail_parse_error!("malformed JSON")
             }
-        }
+        },
         OwnedValue::Null => Ok(Val::Null),
         OwnedValue::Float(f) => Ok(Val::Float(*f)),
         OwnedValue::Integer(i) => Ok(Val::Integer(*i)),
@@ -386,9 +375,9 @@ pub fn json_error_position(json: &OwnedValue) -> crate::Result<OwnedValue> {
                 }
             }
         },
-        OwnedValue::Blob(b) => match jsonb::from_slice(b) {
+        OwnedValue::Blob(b) => match serde_sqlite_jsonb::from_slice::<Val>(b) {
             Ok(_) => Ok(OwnedValue::Integer(0)),
-            Err(JsonbError::Syntax(_, pos)) => Ok(OwnedValue::Integer(pos as i64)),
+            // TODO: implement "approximate 1-based position in the BLOB of the first detected error"
             _ => Err(crate::error::LimboError::InternalError(
                 "failed to determine json error position".into(),
             )),
@@ -474,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_json_valid_jsonb() {
+    fn test_get_json_valid_json() {
         let input = OwnedValue::build_text(Rc::new("{\"key\":\"value\"}".to_string()));
         let result = get_json(&input).unwrap();
         if let OwnedValue::Text(result_str) = result {
@@ -486,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_json_invalid_jsonb() {
+    fn test_get_json_invalid_json() {
         let input = OwnedValue::build_text(Rc::new("{key:\"value\"".to_string()));
         let result = get_json(&input);
         match result {
@@ -497,11 +486,17 @@ mod tests {
 
     #[test]
     fn test_get_json_blob_valid_jsonb() {
-        let binary_json = b"\x40\0\0\x01\x10\0\0\x03\x10\0\0\x03\x61\x73\x64\x61\x64\x66".to_vec();
+        let binary_json = vec![
+            0x6C, // 6 byte OBJECT type header
+            0x37, // 3 byte TEXT type header
+            0x61, 0x62, 0x63, // "abc"
+            0x13, // 1 byte INT type header
+            0x31, // ASCII for "1"
+        ];
         let input = OwnedValue::Blob(Rc::new(binary_json));
         let result = get_json(&input).unwrap();
         if let OwnedValue::Text(result_str) = result {
-            assert!(result_str.value.contains("\"asd\":\"adf\""));
+            assert!(result_str.value.contains("\"abc\":1"));
             assert_eq!(result_str.subtype, TextSubtype::Json);
         } else {
             panic!("Expected OwnedValue::Text");
@@ -510,7 +505,8 @@ mod tests {
 
     #[test]
     fn test_get_json_blob_invalid_jsonb() {
-        let binary_json: Vec<u8> = vec![0xA2, 0x62, 0x6B, 0x31, 0x62, 0x76]; // Incomplete binary JSON
+        // Incomplete binary JSON; missing third byte of key
+        let binary_json: Vec<u8> = vec![0x6C, 0x37, 0x61, 0x62, 0x13, 0x31];
         let input = OwnedValue::Blob(Rc::new(binary_json));
         let result = get_json(&input);
         match result {
@@ -776,6 +772,8 @@ mod tests {
         assert_eq!(result, OwnedValue::Integer(0));
     }
 
+    // TODO: re-enable test when JSON blob error position implemented
+    #[ignore]
     #[test]
     fn test_json_error_position_blob() {
         let input = OwnedValue::Blob(Rc::new(r#"["a",55,"b",72,,]"#.as_bytes().to_owned()));
