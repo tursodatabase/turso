@@ -1004,16 +1004,28 @@ pub fn try_extract_index_search_expression(
     }
 }
 
+fn expr_true() -> ast::Expr {
+    ast::Expr::Literal(ast::Literal::Numeric(1.to_string()))
+}
+
+fn expr_false() -> ast::Expr {
+    ast::Expr::Literal(ast::Literal::Numeric(0.to_string()))
+}
+
+fn expr_null() -> ast::Expr {
+    ast::Expr::Literal(ast::Literal::Null)
+}
+
 fn rewrite_expr(expr: &mut ast::Expr) -> Result<()> {
     match expr {
         ast::Expr::Id(id) => {
             // Convert "true" and "false" to 1 and 0
             if id.0.eq_ignore_ascii_case("true") {
-                *expr = ast::Expr::Literal(ast::Literal::Numeric(1.to_string()));
+                *expr = expr_true();
                 return Ok(());
             }
             if id.0.eq_ignore_ascii_case("false") {
-                *expr = ast::Expr::Literal(ast::Literal::Numeric(0.to_string()));
+                *expr = expr_false();
                 return Ok(());
             }
             Ok(())
@@ -1067,9 +1079,118 @@ fn rewrite_expr(expr: &mut ast::Expr) -> Result<()> {
             Ok(())
         }
         // Process other expressions recursively
-        ast::Expr::Binary(lhs, _, rhs) => {
+        ast::Expr::Binary(lhs, op, rhs) => {
             rewrite_expr(lhs)?;
             rewrite_expr(rhs)?;
+
+            if !matches!(
+                op,
+                ast::Operator::And
+                    | ast::Operator::Or
+                    | ast::Operator::Equals
+                    | ast::Operator::NotEquals
+            ) {
+                return Ok(());
+            }
+
+            let lhs_always_true = lhs.is_always_true()?;
+            let rhs_always_true = rhs.is_always_true()?;
+
+            let lhs_always_false = lhs.is_always_false()?;
+            let rhs_always_false = rhs.is_always_false()?;
+
+            let both_always_true = lhs_always_true && rhs_always_true;
+            let both_always_false = lhs_always_false && rhs_always_false;
+
+            let one_always_true = lhs_always_true || rhs_always_true;
+            let one_always_false = lhs_always_false || rhs_always_false;
+
+            let lhs_is_null = **lhs == expr_null();
+            let rhs_is_null = **rhs == expr_null();
+            let both_are_null = lhs_is_null && rhs_is_null;
+            let either_one_is_null = lhs_is_null || rhs_is_null;
+
+            let mixed_truth_values =
+                (lhs_always_true && rhs_always_false) || (lhs_always_false && rhs_always_true);
+
+            let null_if_either_is_null = |expr: ast::Expr| {
+                if either_one_is_null {
+                    expr_null()
+                } else {
+                    expr
+                }
+            };
+
+            match op {
+                ast::Operator::And => {
+                    // If both conditions are always true, the AND operation simplifies to true
+                    if both_always_true {
+                        *expr = expr_true();
+                        return Ok(());
+                    }
+                    // If both conditions are always false, the AND operation simplifies to false (or NULL if _both_ are NULL)
+                    if both_always_false {
+                        *expr = if both_are_null {
+                            expr_null()
+                        } else {
+                            expr_false()
+                        };
+                        return Ok(());
+                    }
+                    // If one condition is always false, the AND operation simplifies to false (or NULL if either is NULL)
+                    if one_always_false {
+                        *expr = null_if_either_is_null(expr_false());
+                        return Ok(());
+                    }
+                }
+                ast::Operator::Or => {
+                    // If one condition is always true, the OR operation simplifies to true
+                    if one_always_true {
+                        *expr = expr_true();
+                        return Ok(());
+                    }
+                    // If both conditions are always false, the OR operation simplifies to false (or NULL if either is NULL)
+                    if both_always_false {
+                        *expr = null_if_either_is_null(expr_false());
+                        return Ok(());
+                    }
+                }
+                ast::Operator::Equals => {
+                    // If both conditions are always true, == simplifies to true.
+                    if both_always_true {
+                        *expr = expr_true();
+                        return Ok(());
+                    }
+                    // If both conditions are always false, == simplifies to true (or NULL if either is NULL)
+                    if both_always_false {
+                        *expr = null_if_either_is_null(expr_true());
+                        return Ok(());
+                    }
+                    // If one is true and one is false, equality is always false (or NULL if either is NULL)
+                    if mixed_truth_values {
+                        *expr = null_if_either_is_null(expr_false());
+                        return Ok(());
+                    }
+                }
+                ast::Operator::NotEquals => {
+                    // If both conditions are always true, != simplifies to false
+                    if both_always_true {
+                        *expr = expr_false();
+                        return Ok(());
+                    }
+                    // If both conditions are always false, != simplifies to false, or NULL if either is NULL
+                    if both_always_false {
+                        *expr = null_if_either_is_null(expr_false());
+                        return Ok(());
+                    }
+                    // If one is true and one is false, inequality is always true (or NULL if either is NULL)
+                    if mixed_truth_values {
+                        *expr = null_if_either_is_null(expr_true());
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
             Ok(())
         }
         ast::Expr::FunctionCall { args, .. } => {

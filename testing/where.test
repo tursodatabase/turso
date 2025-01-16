@@ -383,3 +383,217 @@ do_execsql_test nested-parens-and-inside-or-regression-test {
         (id = 6 OR FALSE)
     );
 } {1}
+
+# Tests for handling of constant expressions in binary comparisons
+
+# AND operator tests
+do_execsql_test const-binary-and-true-true {
+    select true and true;
+} {1}
+
+do_execsql_test const-binary-and-true-false {
+    select true and false;
+} {0}
+
+do_execsql_test const-binary-and-false-true {
+    select false and true;
+} {0}
+
+do_execsql_test const-binary-and-false-false {
+    select false and false;
+} {0}
+
+do_execsql_test const-binary-and-true-null {
+    select true and null;
+} {{}}
+
+do_execsql_test const-binary-and-null-true {
+    select null and true;
+} {{}}
+
+do_execsql_test const-binary-and-false-null {
+    select false and null;
+} {0}
+
+do_execsql_test const-binary-and-null-false {
+    select null and false;
+} {0}
+
+do_execsql_test const-binary-and-null-null {
+    select null and null;
+} {{}}
+
+do_execsql_test const-binary-and-truthy-true {
+    select 2 and true;
+} {1}
+
+do_execsql_test const-binary-and-truthy-false {
+    select 2 and false;
+} {0}
+
+do_execsql_test const-binary-and-true-truthy {
+    select true and 2;
+} {1}
+
+do_execsql_test const-binary-and-false-truthy {
+    select false and 2;
+} {0}
+
+do_execsql_test const-binary-and-truthy-null {
+    select 2 and null;
+} {{}}
+
+do_execsql_test const-binary-and-null-truthy {
+    select null and 2;
+} {{}}
+
+# OR operator tests
+do_execsql_test const-binary-or-true-true {
+    select true or true;
+} {1}
+
+do_execsql_test const-binary-or-true-false {
+    select true or false;
+} {1}
+
+do_execsql_test const-binary-or-false-true {
+    select false or true;
+} {1}
+
+do_execsql_test const-binary-or-false-false {
+    select false or false;
+} {0}
+
+do_execsql_test const-binary-or-true-null {
+    select true or null;
+} {1}
+
+do_execsql_test const-binary-or-null-true {
+    select null or true;
+} {1}
+
+do_execsql_test const-binary-or-false-null {
+    select false or null;
+} {{}}
+
+do_execsql_test const-binary-or-null-false {
+    select null or false;
+} {{}}
+
+do_execsql_test const-binary-or-null-null {
+    select null or null;
+} {{}}
+
+do_execsql_test const-binary-or-truthy-false {
+    select 2 or false;
+} {1}
+
+do_execsql_test const-binary-or-false-truthy {
+    select false or 2;
+} {1}
+
+do_execsql_test const-binary-or-truthy-true {
+    select 2 or true;
+} {1}
+
+do_execsql_test const-binary-or-true-truthy {
+    select true or 2;
+} {1}
+
+do_execsql_test const-binary-or-truthy-null {
+    select 2 or null;
+} {1}
+
+do_execsql_test const-binary-or-null-truthy {
+    select null or 2;
+} {1}
+
+# Equals operator tests
+do_execsql_test const-binary-eq-true-true {
+    select true = true;
+} {1}
+
+do_execsql_test const-binary-eq-false-false {
+    select false = false;
+} {1}
+
+do_execsql_test const-binary-eq-true-false {
+    select true = false;
+} {0}
+
+do_execsql_test const-binary-eq-false-true {
+    select false = true;
+} {0}
+
+do_execsql_test const-binary-eq-null-true {
+    select null = true;
+} {{}}
+
+do_execsql_test const-binary-eq-true-null {
+    select true = null;
+} {{}}
+
+do_execsql_test const-binary-eq-null-null {
+    select null = null;
+} {{}}
+
+do_execsql_test const-binary-eq-truthy-true {
+    select 1 = true;
+} {1}
+
+do_execsql_test const-binary-eq-truthy-false {
+    select 42 = false;
+} {0}
+
+do_execsql_test const-binary-eq-truthy-null {
+    select 42 = null;
+} {{}}
+
+do_execsql_test const-binary-eq-null-truthy {
+    select null = 42;
+} {{}}
+
+# Not equals operator tests
+do_execsql_test const-binary-ne-true-true {
+    select true != true;
+} {0}
+
+do_execsql_test const-binary-ne-false-false {
+    select false != false;
+} {0}
+
+do_execsql_test const-binary-ne-true-false {
+    select true != false;
+} {1}
+
+do_execsql_test const-binary-ne-false-true {
+    select false != true;
+} {1}
+
+do_execsql_test const-binary-ne-null-true {
+    select null != true;
+} {{}}
+
+do_execsql_test const-binary-ne-true-null {
+    select true != null;
+} {{}}
+
+do_execsql_test const-binary-ne-null-null {
+    select null != null;
+} {{}}
+
+do_execsql_test const-binary-ne-truthy-true {
+    select 1 != true;
+} {0}
+
+do_execsql_test const-binary-ne-truthy-false {
+    select 2 != false;
+} {1}
+
+do_execsql_test const-binary-ne-truthy-null {
+    select 42 != null;
+} {{}}
+
+do_execsql_test const-binary-ne-null-truthy {
+    select null != 42;
+} {{}}
