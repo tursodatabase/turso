@@ -2443,4 +2443,46 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_clear_overflow_pages_no_overflow() -> Result<()> {
+        let (pager, db_header) = setup_test_env();
+        let cursor = BTreeCursor::new(pager.clone(), 1, db_header.clone());
+
+        let small_payload = vec![b'A'; 10];
+
+        // Create leaf cell with no overflow pages
+        let leaf_cell = BTreeCell::TableLeafCell(TableLeafCell {
+            _rowid: 1,
+            _payload: small_payload,
+            first_overflow_page: None,
+        });
+
+        let initial_freelist_pages = db_header.borrow().freelist_pages;
+
+        // Try to clear non-existent overflow pages
+        let clear_result = cursor.clear_overflow_pages(&leaf_cell)?;
+        match clear_result {
+            CursorResult::Ok(_) => {
+                // Verify freelist was not modified
+                assert_eq!(
+                    db_header.borrow().freelist_pages,
+                    initial_freelist_pages,
+                    "Freelist should not change when no overflow pages exist"
+                );
+
+                // Verify trunk page wasn't created
+                assert_eq!(
+                    db_header.borrow().freelist_trunk_page,
+                    0,
+                    "No trunk page should be created when no overflow pages exist"
+                );
+            }
+            CursorResult::IO => {
+                cursor.pager.io.run_once()?;
+            }
+        }
+
+        Ok(())
+    }
 }
