@@ -114,7 +114,7 @@ The current status of Limbo is:
 | PRAGMA foreign_key_check         | No         |                                                 |
 | PRAGMA foreign_key_list          | No         |                                                 |
 | PRAGMA foreign_keys              | No         |                                                 |
-| PRAGMA freelist_count            | No         |                                                 |
+| PRAGMA freelist_count            | Yes        |                                                 |
 | PRAGMA full_column_names         | Not Needed | deprecated in SQLite                            |
 | PRAGMA fullsync                  | No         |                                                 |
 | PRAGMA function_list             | No         |                                                 |
