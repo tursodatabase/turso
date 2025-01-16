@@ -436,6 +436,8 @@ impl Pager {
         self.page_cache.write().unwrap().clear();
     }
 
+    // Providing a page is optional, if provided it will be used to avoid reading the page from disk.
+    // This is implemented in accordance with sqlite freepage2() function.
     pub fn free_page(&self, page: Option<PageRef>, page_id: usize) -> Result<()> {
         if page_id < 2 || page_id > self.db_header.borrow().database_size as usize {
             return Err(LimboError::Corrupt(format!(
@@ -473,7 +475,8 @@ impl Pager {
                 self.add_dirty(trunk_page_id as usize);
 
                 trunk_page_contents.write_u32(4, number_of_leaf_pages + 1);
-                trunk_page_contents.write_u32(8, page_id as u32);
+                trunk_page_contents
+                    .write_u32((8 + (number_of_leaf_pages * 4)) as usize, page_id as u32);
                 page.clear_uptodate();
                 page.clear_loaded();
 
