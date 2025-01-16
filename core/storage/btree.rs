@@ -2020,9 +2020,6 @@ impl Cursor for BTreeCursor {
             self.usable_space(),
         )?;
 
-        println!("cell_idx: {}", cell_idx);
-        println!("cell_count: {}", contents.cell_count());
-        println!("cell_indices: {:?}", self.stack.cell_indices.borrow());
         if cell_idx >= contents.cell_count() {
             return Err(LimboError::Corrupt(format!(
                 "Corrupted page: cell index {} is out of bounds for page with {} cells",
@@ -2030,6 +2027,11 @@ impl Cursor for BTreeCursor {
                 contents.cell_count()
             )));
         }
+
+        let original_child_pointer = match &cell {
+            BTreeCell::TableInteriorCell(interior) => Some(interior._left_child_page),
+            _ => None,
+        };
 
         return_if_io!(self.clear_overflow_pages(&cell));
 
@@ -2046,17 +2048,47 @@ impl Cursor for BTreeCursor {
         let contents = page.get().contents.as_mut().unwrap();
 
         // If this is an interior node, we need to handle deletion differently
+        // For interior nodes:
+        // 1. Move cursor to largest entry in left subtree
+        // 2. Copy that entry to replace the one being deleted
+        // 3. Delete the leaf entry
         if !contents.is_leaf() {
-            // For interior nodes:
             // 1. Move cursor to largest entry in left subtree
+            return_if_io!(self.prev());
+
+            let leaf_page = self.stack.top();
+
             // 2. Copy that entry to replace the one being deleted
-            // 3. Delete the leaf entry
-            //TODO
+            let leaf_contents = leaf_page.get().contents.as_ref().unwrap();
+            let leaf_cell_idx = self.stack.current_cell_index() as usize - 1;
+            let predecessor_cell = leaf_contents.cell_get(
+                leaf_cell_idx,
+                self.pager.clone(),
+                self.payload_overflow_threshold_max(leaf_contents.page_type()),
+                self.payload_overflow_threshold_min(leaf_contents.page_type()),
+                self.usable_space(),
+            )?;
+
+            // 3. Create an interior cell from the leaf cell
+            let mut cell_payload: Vec<u8> = Vec::new();
+            match predecessor_cell {
+                BTreeCell::TableLeafCell(leaf_cell) => {
+                    // Format: [left child page (4 bytes)][rowid varint]
+                    if let Some(child_pointer) = original_child_pointer {
+                        cell_payload.extend_from_slice(&child_pointer.to_be_bytes());
+                        write_varint_to_vec(leaf_cell._rowid, &mut cell_payload);
+                    }
+                }
+                _ => unreachable!("Expected table leaf cell"),
+            }
+            self.drop_cell(contents, cell_idx);
+            self.insert_into_cell(contents, &cell_payload, cell_idx)
         } else {
             // For leaf nodes, simply remove the cell
             self.drop_cell(contents, cell_idx);
         }
 
+        // TODO: After balance_nonroot is extended.
         // Only balance if free space > 2/3 of the page size
         // let usable_space = self.usable_space();
         // let free = self.compute_free_space(page.get().contents.as_ref().unwrap(), RefCell::borrow(&self.database_header)) as i32;
@@ -2286,15 +2318,16 @@ mod tests {
     use crate::storage::database::FileStorage;
     use crate::storage::page_cache::DumbLruPageCache;
     use crate::storage::sqlite3_ondisk;
+    use crate::types::LimboText;
     use crate::{BufferPool, DatabaseStorage, WalFile, WalFileShared, WriteCompletion};
     use std::cell::RefCell;
     use std::sync::{Arc, RwLock};
 
-    fn setup_test_env() -> (Rc<Pager>, Rc<RefCell<DatabaseHeader>>) {
+    fn setup_test_env(database_size: u32) -> (Rc<Pager>, Rc<RefCell<DatabaseHeader>>) {
         let page_size = 512;
         let mut db_header = DatabaseHeader::default();
         db_header.page_size = page_size;
-        db_header.database_size = 5; // Important: set database size to account for our overflow pages
+        db_header.database_size = database_size;
         let db_header = Rc::new(RefCell::new(db_header));
 
         let buffer_pool = Rc::new(BufferPool::new(10));
@@ -2349,7 +2382,7 @@ mod tests {
 
     #[test]
     fn test_clear_overflow_pages() -> Result<()> {
-        let (pager, db_header) = setup_test_env();
+        let (pager, db_header) = setup_test_env(5);
         let cursor = BTreeCursor::new(pager.clone(), 1, db_header.clone());
 
         let max_local = cursor.payload_overflow_threshold_max(PageType::TableLeaf);
@@ -2446,7 +2479,7 @@ mod tests {
 
     #[test]
     fn test_clear_overflow_pages_no_overflow() -> Result<()> {
-        let (pager, db_header) = setup_test_env();
+        let (pager, db_header) = setup_test_env(5);
         let cursor = BTreeCursor::new(pager.clone(), 1, db_header.clone());
 
         let small_payload = vec![b'A'; 10];
