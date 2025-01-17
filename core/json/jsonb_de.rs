@@ -1,4 +1,5 @@
 use crate::{error, LimboError};
+use std::fmt::Formatter;
 use thiserror::Error;
 
 /// Maximum allowable depth of a sane JSON, after which we will return an error
@@ -42,6 +43,12 @@ enum JsonbType {
     Reserved3,
 }
 
+impl std::fmt::Display for JsonbType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
 impl Into<JsonbType> for u8 {
     fn into(self) -> JsonbType {
         match (self & 0x0f) {
@@ -66,6 +73,7 @@ impl Into<JsonbType> for u8 {
     }
 }
 
+// TODO: add position to the error - should be easy
 #[derive(Debug, Error, miette::Diagnostic)]
 pub enum JsonbError {
     #[error("JSONB Parse error: {0}")]
@@ -76,6 +84,8 @@ pub enum JsonbError {
     TooDeep,
     #[error("Expected JSONB value to have {0} bytes, but got {1}")]
     OutOfBounds(usize, usize),
+    #[error("Expected JSONB key to be a string, got: {0}")]
+    KeyNotAString(JsonbType),
 }
 
 pub type Result<T, E = JsonbError> = std::result::Result<T, E>;
@@ -92,6 +102,7 @@ pub fn jsonb_to_string(arr: &[u8]) -> Result<String> {
     }
 
     let (_, value_size) = header_and_value_size(arr, 0)?;
+    // TODO: can we come up with a better initial capacity?
     let mut result = String::with_capacity(value_size);
     jsonb_to_string_internal(arr, 0, &mut result)?;
 
@@ -137,6 +148,7 @@ fn jsonb_to_string_internal(arr: &[u8], depth: u16, result: &mut String) -> Resu
             let (value_slice, header_size, value_size) =
                 value_slice_from_header(arr, current_element)?;
 
+            // TODO: how can we spare an allocation here?
             result.push_str(&format!(
                 "\"{}\"",
                 String::from_utf8(value_slice.to_vec()).unwrap() // TODO: handle error
@@ -164,6 +176,40 @@ fn jsonb_to_string_internal(arr: &[u8], depth: u16, result: &mut String) -> Resu
             result.push(']');
 
             Ok(header_size + value_size)
+        }
+        JsonbType::Object => {
+            let (value_slice, header_size, object_size) =
+                value_slice_from_header(arr, current_element)?;
+            let mut obj_idx: usize = 0;
+
+            result.push('{');
+
+            while obj_idx < object_size {
+                let key_type: JsonbType = value_slice[obj_idx].into();
+
+                match key_type {
+                    JsonbType::Text | JsonbType::Text5 | JsonbType::TextJ | JsonbType::TextRaw => {}
+                    _ => return Err(JsonbError::KeyNotAString(key_type)),
+                };
+
+                let key_size =
+                    jsonb_to_string_internal(&value_slice[obj_idx..], depth + 1, result)?;
+                obj_idx += key_size;
+
+                result.push(':');
+
+                let value_size =
+                    jsonb_to_string_internal(&value_slice[obj_idx..], depth + 1, result)?;
+                obj_idx += value_size;
+
+                if obj_idx < object_size {
+                    result.push(',');
+                }
+            }
+
+            result.push('}');
+
+            Ok(header_size + object_size)
         }
         _ => unimplemented!(),
     }
@@ -332,5 +378,31 @@ mod tests {
             jsonb_to_string(&[0xcb, 0x06, 0x0b, 0xcb, 0x03, 0xc7, 0x01, b'1']).unwrap(),
             "[[],[\"1\"]]".to_string()
         );
+    }
+
+    #[test]
+    fn test_object() {
+        assert_eq!(jsonb_to_string(&[0x0c]).unwrap(), "{}".to_string());
+
+        assert_eq!(
+            jsonb_to_string(&[0x9c, 0x17, b'a', 0x10, 0x17, b'b', 0x11, 0x17, b'c', 0x12]).unwrap(),
+            "{\"a\":null,\"b\":true,\"c\":false}".to_string()
+        );
+    }
+
+    #[test]
+    fn test_object_invalid() {
+        match jsonb_to_string(&[0x9c, 0x17, b'a', 0x10, 0x17, b'b', 0x11, 0x17, b'c']) {
+            Err(JsonbError::OutOfBounds(expected, got)) => {
+                assert_eq!(expected, 9);
+                assert_eq!(got, 8);
+            }
+            _ => panic!("Expected OutOfBounds error"),
+        }
+
+        match jsonb_to_string(&[0x8c, 0x13, b'a', 0x10, 0x17, b'b', 0x11, 0x17, b'c']) {
+            Err(JsonbError::KeyNotAString(JsonbType::Int)) => {}
+            _ => panic!("Expected KeyNotAString error"),
+        }
     }
 }
