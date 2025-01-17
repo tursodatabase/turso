@@ -1,9 +1,11 @@
 use crate::{error, LimboError};
 use thiserror::Error;
 
+/// Maximum allowable depth of a sane JSON, after which we will return an error
 static MAX_JSONB_DEPTH: u16 = 2000;
 
 /// All possible JSONB types
+#[derive(Debug)]
 enum JsonbType {
     Null,
     True,
@@ -59,7 +61,7 @@ impl Into<JsonbType> for u8 {
             13 => JsonbType::Reserved1,
             14 => JsonbType::Reserved2,
             15 => JsonbType::Reserved3,
-            _ => unimplemented!(),
+            _ => unreachable!("0x0f mask will not allow for a bigger number"),
         }
     }
 }
@@ -72,6 +74,8 @@ pub enum JsonbError {
     CorruptedHeader(u8),
     #[error("Maximum JSONB depth exceeded: {0}", MAX_JSONB_DEPTH)]
     TooDeep,
+    #[error("Expected JSONB value to have {0} bytes, but got {1}")]
+    OutOfBounds(usize, usize),
 }
 
 pub type Result<T, E = JsonbError> = std::result::Result<T, E>;
@@ -83,38 +87,83 @@ impl From<JsonbError> for LimboError {
 }
 
 pub fn jsonb_to_string(arr: &[u8]) -> Result<String> {
-    jsonb_to_string_internal(arr, 0)
+    if arr.is_empty() {
+        return Ok("".to_string());
+    }
+
+    let (_, value_size) = header_and_value_size(arr, 0)?;
+    let mut result = String::with_capacity(value_size);
+    jsonb_to_string_internal(arr, 0, &mut result)?;
+
+    Ok(result)
 }
 
-fn jsonb_to_string_internal(arr: &[u8], depth: u16) -> Result<String> {
+/// Returns the amount of bytes consumed from `arr`
+fn jsonb_to_string_internal(arr: &[u8], depth: u16, result: &mut String) -> Result<usize> {
     if depth > MAX_JSONB_DEPTH {
         return Err(JsonbError::TooDeep);
     }
 
     if arr.is_empty() {
-        return Ok("".to_string());
+        return Ok(0);
     }
 
     let current_element = 0;
     let jsonb_type: JsonbType = arr[current_element].into();
 
     match jsonb_type {
-        JsonbType::Null => Ok("".to_string()),
-        JsonbType::True => Ok("true".to_string()),
-        JsonbType::False => Ok("false".to_string()),
+        JsonbType::Null => {
+            result.push_str("null");
+            Ok(1)
+        }
+        JsonbType::True => {
+            result.push_str("true");
+            Ok(1)
+        }
+        JsonbType::False => {
+            result.push_str("false");
+            Ok(1)
+        }
         JsonbType::Int => {
-            let value_slice = value_slice_from_header(arr, current_element)?;
+            let (value_slice, header_size, value_size) =
+                value_slice_from_header(arr, current_element)?;
 
-            from_ascii_digits(value_slice)
+            from_ascii_digits(value_slice, result)?;
+
+            Ok(header_size + value_size)
         }
         JsonbType::Text | JsonbType::TextJ | JsonbType::Text5 | JsonbType::TextRaw => {
             // TODO: Implement differences between those text types
-            let value_slice = value_slice_from_header(arr, current_element)?;
+            let (value_slice, header_size, value_size) =
+                value_slice_from_header(arr, current_element)?;
 
-            Ok(format!(
+            result.push_str(&format!(
                 "\"{}\"",
-                String::from_utf8(value_slice.to_vec()).unwrap()
-            ))
+                String::from_utf8(value_slice.to_vec()).unwrap() // TODO: handle error
+            ));
+
+            Ok(header_size + value_size)
+        }
+        JsonbType::Array => {
+            let (value_slice, header_size, value_size) =
+                value_slice_from_header(arr, current_element)?;
+            let mut arr_idx: usize = 0;
+
+            result.push('[');
+
+            while arr_idx < value_size {
+                let consumed =
+                    jsonb_to_string_internal(&value_slice[arr_idx..], depth + 1, result)?;
+                arr_idx += consumed;
+
+                if arr_idx < value_size {
+                    result.push(',');
+                }
+            }
+
+            result.push(']');
+
+            Ok(header_size + value_size)
         }
         _ => unimplemented!(),
     }
@@ -131,11 +180,25 @@ fn jsonb_to_string_internal(arr: &[u8], depth: u16) -> Result<String> {
 /// value_slice_from_header([0x13, b'1'], 0) -> [b'1']
 /// value_slice_from_header([0xc3, 0x01, b'1'], 0) -> [b'1']
 /// value_slice_from_header([0xd3, 0x00, 0x01, b'1'], 0) -> [b'1']
-fn value_slice_from_header(arr: &[u8], current_element: usize) -> Result<&[u8]> {
-    let header_mask = (arr[current_element] >> 4) & 0x0f;
+fn value_slice_from_header(arr: &[u8], current_element: usize) -> Result<(&[u8], usize, usize)> {
+    let (header_size, value_size) = header_and_value_size(arr, current_element)?;
 
-    let header_size = match header_mask {
-        0..12 => 1,
+    let start = current_element + header_size;
+    let end = start + value_size;
+
+    if end > arr.len() {
+        return Err(JsonbError::OutOfBounds(value_size, arr[start..].len()));
+    }
+
+    Ok((&arr[start..end], header_size, value_size))
+}
+
+fn header_and_value_size(arr: &[u8], current_element: usize) -> Result<(usize, usize)> {
+    let upper_four_bits = arr[current_element] >> 4;
+    let header_mask = upper_four_bits & 0x0f;
+
+    let bytes_to_read = match header_mask {
+        0..12 => 0,
         12 => 2,
         13 => 3,
         14 => 5,
@@ -143,23 +206,18 @@ fn value_slice_from_header(arr: &[u8], current_element: usize) -> Result<&[u8]> 
         _ => return Err(JsonbError::CorruptedHeader(header_mask)),
     };
 
-    let value_size: usize = if header_size == 1 {
-        1
+    if bytes_to_read == 0 {
+        Ok((1, usize::from(upper_four_bits)))
     } else {
         let mut size = 0;
-        for i in 1..header_size {
-            size |= (arr[current_element + i] as usize) << (8 * (header_size - i - 1));
+        for i in 1..bytes_to_read {
+            size |= (arr[current_element + i] as usize) << (8 * (bytes_to_read - i - 1));
         }
-        size
-    };
-
-    // TODO: Bound checks
-    Ok(&arr[current_element + header_size..current_element + header_size + value_size])
+        Ok((bytes_to_read, size))
+    }
 }
 
-fn from_ascii_digits(arr: &[u8]) -> Result<String> {
-    let mut result = String::new();
-
+fn from_ascii_digits(arr: &[u8], result: &mut String) -> Result<()> {
     for &char in arr {
         if char.is_ascii_digit() {
             result.push(char as char)
@@ -168,7 +226,7 @@ fn from_ascii_digits(arr: &[u8]) -> Result<String> {
         }
     }
 
-    Ok(result)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -182,7 +240,7 @@ mod tests {
 
     #[test]
     fn test_null() {
-        assert_eq!(jsonb_to_string(&[0x10]).unwrap(), "".to_string());
+        assert_eq!(jsonb_to_string(&[0x10]).unwrap(), "null".to_string());
     }
 
     #[test]
@@ -236,6 +294,43 @@ mod tests {
         assert_eq!(
             jsonb_to_string(&[0xc7, 0x03, b'f', b'o', b'o']).unwrap(),
             "\"foo\"".to_string()
+        );
+    }
+
+    #[test]
+    fn test_text_oob() {
+        match jsonb_to_string(&[0xc7, 0x03, b'f', b'o']) {
+            Err(JsonbError::OutOfBounds(expected, got)) => {
+                assert_eq!(expected, 3);
+                assert_eq!(got, 2);
+            }
+            _ => panic!("Expected OutOfBounds error"),
+        }
+    }
+
+    #[test]
+    fn test_array() {
+        assert_eq!(jsonb_to_string(&[0x0b]).unwrap(), "[]".to_string());
+
+        assert_eq!(
+            jsonb_to_string(&[0xcb, 0x04, 0x13, b'1', 0x13, b'2']).unwrap(),
+            "[1,2]".to_string()
+        );
+
+        assert_eq!(
+            jsonb_to_string(&[0xcb, 0x03, 0x10, 0x11, 0x12]).unwrap(),
+            "[null,true,false]".to_string()
+        );
+
+        assert_eq!(
+            jsonb_to_string(&[0xcb, 0x09, 0x13, b'1', 0x13, b'2', 0xc7, 0x03, b'f', b'o', b'o'])
+                .unwrap(),
+            "[1,2,\"foo\"]".to_string()
+        );
+
+        assert_eq!(
+            jsonb_to_string(&[0xcb, 0x06, 0x0b, 0xcb, 0x03, 0xc7, 0x01, b'1']).unwrap(),
+            "[[],[\"1\"]]".to_string()
         );
     }
 }
