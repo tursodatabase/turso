@@ -43,7 +43,11 @@ pub fn parse_schema_rows(rows: Option<Rows>, schema: &mut Schema, io: Arc<dyn IO
                             let root_page: i64 = row.get::<i64>(3)?;
                             match row.get::<&str>(4) {
                                 Ok(sql) => {
-                                    let index = schema::Index::from_sql(sql, root_page as usize)?;
+                                    let index = schema::Index::from_sql(
+                                        sql,
+                                        &schema.tables,
+                                        root_page as usize,
+                                    )?;
                                     schema.add_index(Rc::new(index));
                                 }
                                 _ => continue,

@@ -320,7 +320,7 @@ do_execsql_test where-age-index-seek-regression-test-2 {
 
 do_execsql_test where-age-index-cover-seek {
     select id, age from users where age > 90 limit 1;
-} {120|90}
+} {54|91}
 
 do_execsql_test where-simple-between {
     SELECT * FROM products WHERE price BETWEEN 70 AND 100;

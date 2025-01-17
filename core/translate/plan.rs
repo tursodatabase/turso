@@ -16,7 +16,7 @@ use crate::{
     translate::plan::Plan::{Delete, Select},
 };
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct ResultSetColumn {
@@ -77,8 +77,6 @@ pub struct SelectPlan {
     pub source: SourceOperator,
     /// the columns inside SELECT ... FROM
     pub result_columns: Vec<ResultSetColumn>,
-    /// the columns related to this plan,
-    pub related_columns: BTreeSet<ColumnBinding>,
     /// where clause split into a vec at 'AND' boundaries.
     pub where_clause: Option<Vec<ast::Expr>>,
     /// group by clause
@@ -106,8 +104,6 @@ pub struct DeletePlan {
     pub source: SourceOperator,
     /// the columns inside SELECT ... FROM
     pub result_columns: Vec<ResultSetColumn>,
-    /// the columns related to this plan,
-    pub related_columns: BTreeSet<ColumnBinding>,
     /// where clause split into a vec at 'AND' boundaries.
     pub where_clause: Option<Vec<ast::Expr>>,
     /// order by clause
@@ -324,6 +320,7 @@ pub enum Search {
         index: Rc<Index>,
         cmp_op: ast::Operator,
         cmp_expr: ast::Expr,
+        cover_mapping: Option<HashMap<usize, usize>>,
     },
 }
 

@@ -6,7 +6,6 @@ use crate::translate::planner::{parse_limit, parse_where};
 use crate::{schema::Schema, storage::sqlite3_ondisk::DatabaseHeader, vdbe::Program};
 use crate::{Connection, Result, SymbolTable};
 use sqlite3_parser::ast::{Expr, Limit, QualifiedName};
-use std::collections::BTreeSet;
 use std::rc::Weak;
 use std::{cell::RefCell, rc::Rc};
 
@@ -59,7 +58,6 @@ pub fn prepare_delete_plan(
             iter_dir: None,
         },
         result_columns: vec![],
-        related_columns: BTreeSet::new(),
         where_clause: resolved_where_clauses,
         order_by: None,
         limit: resolved_limit,

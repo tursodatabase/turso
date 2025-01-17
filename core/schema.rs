@@ -458,6 +458,7 @@ pub struct Index {
     pub root_page: usize,
     pub columns: Vec<IndexColumn>,
     pub unique: bool,
+    pub index_cover_mapping: HashMap<usize, usize>,
 }
 
 #[allow(dead_code)]
@@ -474,7 +475,11 @@ pub enum Order {
 }
 
 impl Index {
-    pub fn from_sql(sql: &str, root_page: usize) -> Result<Index> {
+    pub fn from_sql(
+        sql: &str,
+        tables: &HashMap<String, Rc<BTreeTable>>,
+        root_page: usize,
+    ) -> Result<Index> {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next()?;
         match cmd {
@@ -485,24 +490,44 @@ impl Index {
                 unique,
                 ..
             })) => {
+                let table_name = normalize_ident(&tbl_name.0);
+                let Some((_, table)) = tables.iter().find(|(t_name, _)| t_name == &&table_name)
+                else {
+                    crate::bail_corrupt_error!("Parse error: no such table: {}", tbl_name);
+                };
+                let mut index_cover_mapping = HashMap::with_capacity(columns.len());
                 let index_name = normalize_ident(&idx_name.name.0);
-                let index_columns = columns
-                    .into_iter()
-                    .map(|col| IndexColumn {
-                        name: normalize_ident(&col.expr.to_string()),
+
+                let mut index_columns = Vec::with_capacity(columns.len());
+
+                for (i, col) in columns.into_iter().enumerate() {
+                    let column_name = normalize_ident(&col.expr.to_string());
+                    // SAFETY: the column in the index must exist in the table
+                    let (pos, _) = table.get_column(&column_name).unwrap();
+                    index_cover_mapping.insert(pos, i);
+                    index_columns.push(IndexColumn {
+                        name: column_name,
                         order: match col.order {
                             Some(sqlite3_parser::ast::SortOrder::Asc) => Order::Ascending,
                             Some(sqlite3_parser::ast::SortOrder::Desc) => Order::Descending,
                             None => Order::Ascending,
                         },
                     })
-                    .collect();
+                }
+                if let Some(pos) = table
+                    .columns
+                    .iter()
+                    .position(|column| column.is_rowid_alias)
+                {
+                    index_cover_mapping.insert(pos, index_cover_mapping.len());
+                }
                 Ok(Index {
                     name: index_name,
-                    table_name: normalize_ident(&tbl_name.0),
+                    table_name,
                     root_page,
                     columns: index_columns,
                     unique,
+                    index_cover_mapping,
                 })
             }
             _ => todo!("Expected create index statement"),

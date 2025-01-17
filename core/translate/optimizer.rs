@@ -42,10 +42,23 @@ fn optimize_select_plan(plan: &mut SelectPlan) -> Result<()> {
         &plan.referenced_tables,
     )?;
 
+    let mut related_columns = BTreeSet::new();
+    collect_related_columns(
+        &plan.source,
+        &plan.result_columns,
+        &plan.where_clause,
+        &plan.group_by,
+        &plan.order_by,
+        &plan.aggregates,
+        &mut related_columns,
+        &plan.referenced_tables,
+    )?;
+
     use_indexes(
         &mut plan.source,
         &plan.referenced_tables,
         &plan.available_indexes,
+        &related_columns,
     )?;
 
     eliminate_unnecessary_orderby(
@@ -53,17 +66,6 @@ fn optimize_select_plan(plan: &mut SelectPlan) -> Result<()> {
         &mut plan.order_by,
         &plan.referenced_tables,
         &plan.available_indexes,
-    )?;
-
-    related_columns(
-        &plan.source,
-        &plan.result_columns,
-        &plan.where_clause,
-        &plan.group_by,
-        &plan.order_by,
-        &plan.aggregates,
-        &mut plan.related_columns,
-        &plan.referenced_tables,
     )?;
 
     Ok(())
@@ -78,10 +80,23 @@ fn optimize_delete_plan(plan: &mut DeletePlan) -> Result<()> {
         return Ok(());
     }
 
+    let mut related_columns = BTreeSet::new();
+    collect_related_columns(
+        &plan.source,
+        &plan.result_columns,
+        &plan.where_clause,
+        &None,
+        &plan.order_by,
+        &[],
+        &mut related_columns,
+        &plan.referenced_tables,
+    )?;
+
     use_indexes(
         &mut plan.source,
         &plan.referenced_tables,
         &plan.available_indexes,
+        &related_columns,
     )?;
 
     Ok(())
@@ -175,6 +190,7 @@ fn use_indexes(
     operator: &mut SourceOperator,
     referenced_tables: &[TableReference],
     available_indexes: &[Rc<Index>],
+    related_columns: &BTreeSet<ColumnBinding>,
 ) -> Result<()> {
     match operator {
         SourceOperator::Subquery { .. } => Ok(()),
@@ -205,8 +221,31 @@ fn use_indexes(
                     Either::Left(non_index_using_expr) => {
                         fs[i] = non_index_using_expr;
                     }
-                    Either::Right(index_search) => {
+                    Either::Right(mut index_search) => {
                         fs.remove(i);
+
+                        if let Search::IndexSearch {
+                            index,
+                            cover_mapping,
+                            ..
+                        } = &mut index_search
+                        {
+                            let lower = ColumnBinding {
+                                table: table_index,
+                                column: 0,
+                            };
+                            let upper = ColumnBinding {
+                                table: table_index + 1,
+                                column: 0,
+                            };
+                            let is_cover = related_columns.range(lower..upper).all(|binding| {
+                                index.index_cover_mapping.contains_key(&binding.column)
+                            });
+                            if is_cover {
+                                *cover_mapping = Some(index.index_cover_mapping.clone());
+                            }
+                        }
+
                         *operator = SourceOperator::Search {
                             id: *id,
                             table_reference: table_reference.clone(),
@@ -222,8 +261,8 @@ fn use_indexes(
             Ok(())
         }
         SourceOperator::Join { left, right, .. } => {
-            use_indexes(left, referenced_tables, available_indexes)?;
-            use_indexes(right, referenced_tables, available_indexes)?;
+            use_indexes(left, referenced_tables, available_indexes, related_columns)?;
+            use_indexes(right, referenced_tables, available_indexes, related_columns)?;
             Ok(())
         }
         SourceOperator::Nothing { .. } => Ok(()),
@@ -658,7 +697,7 @@ fn eliminate_between(
     Ok(())
 }
 
-fn related_columns(
+fn collect_related_columns(
     operator: &SourceOperator,
     result_columns: &[ResultSetColumn],
     where_clause: &Option<Vec<ast::Expr>>,
@@ -751,7 +790,7 @@ fn source_related_columns(
         SourceOperator::Subquery {
             plan, predicates, ..
         } => {
-            optimizer::related_columns(
+            optimizer::collect_related_columns(
                 &plan.source,
                 &plan.result_columns,
                 &plan.where_clause,
@@ -1392,6 +1431,7 @@ pub fn try_extract_index_search_expression(
                             index: available_indexes[index_index].clone(),
                             cmp_op: operator,
                             cmp_expr: *rhs,
+                            cover_mapping: None,
                         }));
                     }
                     _ => {}
@@ -1411,6 +1451,7 @@ pub fn try_extract_index_search_expression(
                             index: available_indexes[index_index].clone(),
                             cmp_op: operator,
                             cmp_expr: *lhs,
+                            cover_mapping: None,
                         }));
                     }
                     _ => {}
