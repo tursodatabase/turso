@@ -1575,6 +1575,15 @@ pub fn translate_expr(
                     });
                     Ok(target_register)
                 }
+                TableReferenceType::VirtualTable { .. } => {
+                    let cursor_id = program.resolve_cursor_id(&tbl_ref.table_identifier);
+                    program.emit_insn(Insn::VColumn {
+                        cursor_id: cursor_id,
+                        column: *column,
+                        dest: target_register,
+                    });
+                    Ok(target_register)
+                }
             }
         }
         ast::Expr::RowId { database: _, table } => {

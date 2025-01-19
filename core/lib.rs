@@ -22,10 +22,11 @@ use fallible_iterator::FallibleIterator;
 #[cfg(not(target_family = "wasm"))]
 use libloading::{Library, Symbol};
 #[cfg(not(target_family = "wasm"))]
-use limbo_ext::{ExtensionApi, ExtensionEntryPoint};
+use limbo_ext::{ExtensionApi, ExtensionEntryPoint, ResultCode};
+use limbo_ext::{VTabModuleImpl, Value as ExtValue, ValueType};
 use log::trace;
-use schema::Schema;
-use sqlite3_parser::ast;
+use schema::{Column, Schema};
+use sqlite3_parser::ast::{self};
 use sqlite3_parser::{ast::Cmd, lexer::sql::Parser};
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -40,8 +41,10 @@ use storage::pager::allocate_page;
 use storage::sqlite3_ondisk::{DatabaseHeader, DATABASE_HEADER_SIZE};
 pub use storage::wal::WalFile;
 pub use storage::wal::WalFileShared;
+use types::OwnedValue;
 pub use types::Value;
 use util::parse_schema_rows;
+use vdbe::VTabOpaqueCursor;
 
 pub use error::LimboError;
 use translate::select::prepare_select_plan;
@@ -75,6 +78,7 @@ pub struct Database {
     schema: Rc<RefCell<Schema>>,
     header: Rc<RefCell<DatabaseHeader>>,
     syms: Rc<RefCell<SymbolTable>>,
+    vtab_modules: Rc<RefCell<HashMap<String, Rc<VTabModuleImpl>>>>,
     // Shared structures of a Database are the parts that are common to multiple threads that might
     // create DB connections.
     _shared_page_cache: Arc<RwLock<DumbLruPageCache>>,
@@ -137,6 +141,7 @@ impl Database {
             _shared_page_cache: _shared_page_cache.clone(),
             _shared_wal: shared_wal.clone(),
             syms,
+            vtab_modules: Rc::new(RefCell::new(HashMap::new())),
         };
         let db = Arc::new(db);
         let conn = Rc::new(Connection {
@@ -509,10 +514,100 @@ impl Rows {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct VirtualTable {
+    name: String,
+    pub implementation: Rc<VTabModuleImpl>,
+    columns: Vec<Column>,
+}
+
+impl VirtualTable {
+    pub fn open(&self) -> VTabOpaqueCursor {
+        let cursor = unsafe { (self.implementation.open)() };
+        VTabOpaqueCursor::new(cursor)
+    }
+
+    pub fn filter(
+        &self,
+        cursor: &VTabOpaqueCursor,
+        arg_count: usize,
+        args: Vec<OwnedValue>,
+    ) -> Result<()> {
+        let mut filter_args = Vec::with_capacity(arg_count);
+        for i in 0..arg_count {
+            let ownedvalue_arg = args.get(i).unwrap();
+            let extvalue_arg: ExtValue = match ownedvalue_arg {
+                OwnedValue::Null => Ok(ExtValue::null()),
+                OwnedValue::Integer(i) => Ok(ExtValue::from_integer(*i)),
+                OwnedValue::Float(f) => Ok(ExtValue::from_float(*f)),
+                OwnedValue::Text(t) => Ok(ExtValue::from_text((*t.value).clone())),
+                OwnedValue::Blob(b) => Ok(ExtValue::from_blob((**b).clone())),
+                other => Err(LimboError::ExtensionError(format!(
+                    "Unsupported value type: {:?}",
+                    other
+                ))),
+            }?;
+            filter_args.push(extvalue_arg);
+        }
+        let rc = unsafe {
+            (self.implementation.filter)(cursor.as_ptr(), arg_count as i32, filter_args.as_ptr())
+        };
+        match rc {
+            ResultCode::OK => Ok(()),
+            _ => Err(LimboError::ExtensionError("Filter failed".to_string())),
+        }
+    }
+
+    pub fn column(&self, cursor: &VTabOpaqueCursor, column: usize) -> Result<OwnedValue> {
+        let val = unsafe { (self.implementation.column)(cursor.as_ptr(), column as u32) };
+        match &val.value_type {
+            ValueType::Null => Ok(OwnedValue::Null),
+            ValueType::Integer => match val.to_integer() {
+                Some(i) => Ok(OwnedValue::Integer(i)),
+                None => Err(LimboError::ExtensionError(
+                    "Failed to convert integer value".to_string(),
+                )),
+            },
+            ValueType::Float => match val.to_float() {
+                Some(f) => Ok(OwnedValue::Float(f)),
+                None => Err(LimboError::ExtensionError(
+                    "Failed to convert float value".to_string(),
+                )),
+            },
+            ValueType::Text => match val.to_text() {
+                Some(t) => Ok(OwnedValue::build_text(Rc::new(t))),
+                None => Err(LimboError::ExtensionError(
+                    "Failed to convert text value".to_string(),
+                )),
+            },
+            ValueType::Blob => match val.to_blob() {
+                Some(b) => Ok(OwnedValue::Blob(Rc::new(b))),
+                None => Err(LimboError::ExtensionError(
+                    "Failed to convert blob value".to_string(),
+                )),
+            },
+            ValueType::Error => Err(LimboError::ExtensionError(format!(
+                "Error value in column {}",
+                column
+            ))),
+        }
+    }
+
+    pub fn next(&self, cursor: &VTabOpaqueCursor) -> Result<bool> {
+        let rc = unsafe { (self.implementation.next)(cursor.as_ptr()) };
+        match rc {
+            ResultCode::OK => Ok(true),
+            ResultCode::EOF => Ok(false),
+            _ => Err(LimboError::ExtensionError("Next failed".to_string())),
+        }
+    }
+}
+
 pub(crate) struct SymbolTable {
     pub functions: HashMap<String, Rc<function::ExternalFunc>>,
     #[cfg(not(target_family = "wasm"))]
     extensions: Vec<(Library, *const ExtensionApi)>,
+    pub vtabs: HashMap<String, Rc<VirtualTable>>,
 }
 
 impl std::fmt::Debug for SymbolTable {
@@ -554,6 +649,7 @@ impl SymbolTable {
     pub fn new() -> Self {
         Self {
             functions: HashMap::new(),
+            vtabs: HashMap::new(),
             // TODO: wasm libs will be very different
             #[cfg(not(target_family = "wasm"))]
             extensions: Vec::new(),

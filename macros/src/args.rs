@@ -6,13 +6,14 @@ use syn::{Ident, LitStr, Token};
 pub(crate) struct RegisterExtensionInput {
     pub aggregates: Vec<Ident>,
     pub scalars: Vec<Ident>,
+    pub vtabs: Vec<Ident>,
 }
 
 impl syn::parse::Parse for RegisterExtensionInput {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let mut aggregates = Vec::new();
         let mut scalars = Vec::new();
-
+        let mut vtabs = Vec::new();
         while !input.is_empty() {
             if input.peek(syn::Ident) && input.peek2(Token![:]) {
                 let section_name: Ident = input.parse()?;
@@ -28,11 +29,15 @@ impl syn::parse::Parse for RegisterExtensionInput {
                     scalars = Punctuated::<Ident, Token![,]>::parse_terminated(&content)?
                         .into_iter()
                         .collect();
+                } else if section_name == "vtabs" {
+                    vtabs = Punctuated::<Ident, Token![,]>::parse_terminated(&content)?
+                        .into_iter()
+                        .collect();
                 } else {
                     return Err(syn::Error::new(section_name.span(), "Unknown section"));
                 }
             } else {
-                return Err(input.error("Expected aggregates: or scalars: section"));
+                return Err(input.error("Expected aggregates:, scalars:, or vtabs: section"));
             }
 
             if input.peek(Token![,]) {
@@ -43,6 +48,7 @@ impl syn::parse::Parse for RegisterExtensionInput {
         Ok(Self {
             aggregates,
             scalars,
+            vtabs,
         })
     }
 }

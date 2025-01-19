@@ -57,6 +57,7 @@ use sorter::Sorter;
 use std::borrow::BorrowMut;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::c_void;
 use std::num::NonZero;
 use std::rc::{Rc, Weak};
 
@@ -190,6 +191,18 @@ impl RegexCache {
     }
 }
 
+pub struct VTabOpaqueCursor(*mut c_void);
+
+impl VTabOpaqueCursor {
+    pub fn new(cursor: *mut c_void) -> Self {
+        Self(cursor)
+    }
+
+    pub fn as_ptr(&self) -> *mut c_void {
+        self.0
+    }
+}
+
 /// The program state describes the environment in which the program executes.
 pub struct ProgramState {
     pub pc: InsnReference,
@@ -197,6 +210,7 @@ pub struct ProgramState {
     btree_index_cursors: RefCell<BTreeMap<CursorID, BTreeCursor>>,
     pseudo_cursors: RefCell<BTreeMap<CursorID, PseudoCursor>>,
     sorter_cursors: RefCell<BTreeMap<CursorID, Sorter>>,
+    virtual_cursors: RefCell<BTreeMap<CursorID, VTabOpaqueCursor>>,
     registers: Vec<OwnedValue>,
     last_compare: Option<std::cmp::Ordering>,
     deferred_seek: Option<(CursorID, CursorID)>,
@@ -220,6 +234,7 @@ impl ProgramState {
             btree_index_cursors,
             pseudo_cursors,
             sorter_cursors,
+            virtual_cursors: RefCell::new(BTreeMap::new()),
             registers,
             last_compare: None,
             deferred_seek: None,
@@ -267,6 +282,7 @@ macro_rules! must_be_btree_cursor {
             CursorType::BTreeIndex(_) => $btree_index_cursors.get_mut(&$cursor_id).unwrap(),
             CursorType::Pseudo(_) => panic!("{} on pseudo cursor", $insn_name),
             CursorType::Sorter => panic!("{} on sorter cursor", $insn_name),
+            CursorType::VirtualTable(_) => panic!("{} on virtual table cursor", $insn_name),
         };
         cursor
     }};
@@ -318,6 +334,7 @@ impl Program {
             let mut btree_index_cursors = state.btree_index_cursors.borrow_mut();
             let mut pseudo_cursors = state.pseudo_cursors.borrow_mut();
             let mut sorter_cursors = state.sorter_cursors.borrow_mut();
+            let mut virtual_cursors = state.virtual_cursors.borrow_mut();
             match insn {
                 Insn::Init { target_pc } => {
                     assert!(target_pc.is_offset());
@@ -660,11 +677,72 @@ impl Program {
                         CursorType::Sorter => {
                             panic!("OpenReadAsync on sorter cursor");
                         }
+                        CursorType::VirtualTable(_) => {
+                            panic!("OpenReadAsync on virtual table cursor, use Insn::VOpenAsync instead");
+                        }
                     }
                     state.pc += 1;
                 }
                 Insn::OpenReadAwait => {
                     state.pc += 1;
+                }
+                Insn::VOpenAsync { cursor_id } => {
+                    let (_, cursor_type) = self.cursor_ref.get(*cursor_id).unwrap();
+                    let CursorType::VirtualTable(virtual_table) = cursor_type else {
+                        panic!("VOpenAsync on non-virtual table cursor");
+                    };
+                    let cursor = virtual_table.open();
+                    virtual_cursors.insert(*cursor_id, cursor);
+                    state.pc += 1;
+                }
+                Insn::VOpenAwait => {
+                    state.pc += 1;
+                }
+                Insn::VFilter {
+                    cursor_id,
+                    arg_count,
+                    args_reg,
+                } => {
+                    let (_, cursor_type) = self.cursor_ref.get(*cursor_id).unwrap();
+                    let CursorType::VirtualTable(virtual_table) = cursor_type else {
+                        panic!("VFilter on non-virtual table cursor");
+                    };
+                    let cursor = virtual_cursors.get(cursor_id).unwrap();
+                    let mut args = Vec::new();
+                    for i in 0..*arg_count {
+                        args.push(state.registers[args_reg + i].clone());
+                    }
+                    virtual_table.filter(cursor, *arg_count, args)?;
+                    state.pc += 1;
+                }
+                Insn::VColumn {
+                    cursor_id,
+                    column,
+                    dest,
+                } => {
+                    let (_, cursor_type) = self.cursor_ref.get(*cursor_id).unwrap();
+                    let CursorType::VirtualTable(virtual_table) = cursor_type else {
+                        panic!("VColumn on non-virtual table cursor");
+                    };
+                    let cursor = virtual_cursors.get(cursor_id).unwrap();
+                    state.registers[*dest] = virtual_table.column(cursor, *column)?;
+                    state.pc += 1;
+                }
+                Insn::VNext {
+                    cursor_id,
+                    pc_if_next,
+                } => {
+                    let (_, cursor_type) = self.cursor_ref.get(*cursor_id).unwrap();
+                    let CursorType::VirtualTable(virtual_table) = cursor_type else {
+                        panic!("VNextAsync on non-virtual table cursor");
+                    };
+                    let cursor = virtual_cursors.get_mut(cursor_id).unwrap();
+                    let has_more = virtual_table.next(cursor)?;
+                    if has_more {
+                        state.pc = pc_if_next.to_offset_int();
+                    } else {
+                        state.pc += 1;
+                    }
                 }
                 Insn::OpenPseudo {
                     cursor_id,
@@ -788,6 +866,11 @@ impl Program {
                             } else {
                                 state.registers[*dest] = OwnedValue::Null;
                             }
+                        }
+                        CursorType::VirtualTable(_) => {
+                            panic!(
+                                "Insn::Column on virtual table cursor, use Insn::VColumn instead"
+                            );
                         }
                     }
 
@@ -2211,6 +2294,9 @@ impl Program {
                         }
                         CursorType::Sorter => {
                             let _ = sorter_cursors.remove(cursor_id);
+                        }
+                        CursorType::VirtualTable(_) => {
+                            let _ = virtual_cursors.remove(cursor_id);
                         }
                     }
                     state.pc += 1;

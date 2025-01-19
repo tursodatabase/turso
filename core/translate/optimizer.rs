@@ -509,7 +509,11 @@ fn push_predicate(
                 .iter()
                 .position(|t| {
                     t.table_identifier == table_reference.table_identifier
-                        && t.reference_type == TableReferenceType::BTreeTable
+                        && matches!(
+                            t.reference_type,
+                            TableReferenceType::BTreeTable { .. }
+                                | TableReferenceType::VirtualTable { .. }
+                        )
                 })
                 .unwrap();
 

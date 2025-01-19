@@ -17,6 +17,7 @@ use super::{
     order_by::{order_by_sorter_insert, sorter_insert},
     plan::{
         IterationDirection, Search, SelectPlan, SelectQueryType, SourceOperator, TableReference,
+        TableReferenceType,
     },
 };
 
@@ -82,26 +83,40 @@ pub fn init_loop(
         SourceOperator::Scan {
             table_reference, ..
         } => {
+            let reftype = &table_reference.reference_type;
             let cursor_id = program.alloc_cursor_id(
                 Some(table_reference.table_identifier.clone()),
-                CursorType::BTreeTable(table_reference.btree().unwrap().clone()),
+                match reftype {
+                    TableReferenceType::BTreeTable => {
+                        CursorType::BTreeTable(table_reference.btree().unwrap().clone())
+                    }
+                    TableReferenceType::VirtualTable { .. } => {
+                        CursorType::VirtualTable(table_reference.virtual_table().unwrap().clone())
+                    }
+                    other => panic!("Invalid table reference type in Scan: {:?}", other),
+                },
             );
-            let root_page = table_reference.table.get_root_page();
 
-            match mode {
-                OperationMode::SELECT => {
+            match (mode, reftype) {
+                (OperationMode::SELECT, TableReferenceType::BTreeTable) => {
+                    let root_page = table_reference.table.get_root_page();
                     program.emit_insn(Insn::OpenReadAsync {
                         cursor_id,
                         root_page,
                     });
                     program.emit_insn(Insn::OpenReadAwait {});
                 }
-                OperationMode::DELETE => {
+                (OperationMode::DELETE, TableReferenceType::BTreeTable) => {
+                    let root_page = table_reference.table.get_root_page();
                     program.emit_insn(Insn::OpenWriteAsync {
                         cursor_id,
                         root_page,
                     });
                     program.emit_insn(Insn::OpenWriteAwait {});
+                }
+                (OperationMode::SELECT, TableReferenceType::VirtualTable { .. }) => {
+                    program.emit_insn(Insn::VOpenAsync { cursor_id });
+                    program.emit_insn(Insn::VOpenAwait {});
                 }
                 _ => {
                     unimplemented!()
@@ -308,14 +323,18 @@ pub fn open_loop(
             predicates,
             iter_dir,
         } => {
+            let ref_type = &table_reference.reference_type;
             let cursor_id = program.resolve_cursor_id(&table_reference.table_identifier);
-            if iter_dir
-                .as_ref()
-                .is_some_and(|dir| *dir == IterationDirection::Backwards)
-            {
-                program.emit_insn(Insn::LastAsync { cursor_id });
-            } else {
-                program.emit_insn(Insn::RewindAsync { cursor_id });
+
+            if !matches!(ref_type, TableReferenceType::VirtualTable { .. }) {
+                if iter_dir
+                    .as_ref()
+                    .is_some_and(|dir| *dir == IterationDirection::Backwards)
+                {
+                    program.emit_insn(Insn::LastAsync { cursor_id });
+                } else {
+                    program.emit_insn(Insn::RewindAsync { cursor_id });
+                }
             }
             let LoopLabels {
                 loop_start,
@@ -325,22 +344,46 @@ pub fn open_loop(
                 .labels_main_loop
                 .get(id)
                 .expect("scan has no loop labels");
-            program.emit_insn(
-                if iter_dir
-                    .as_ref()
-                    .is_some_and(|dir| *dir == IterationDirection::Backwards)
-                {
-                    Insn::LastAwait {
-                        cursor_id,
-                        pc_if_empty: loop_end,
+
+            match ref_type {
+                TableReferenceType::BTreeTable => program.emit_insn(
+                    if iter_dir
+                        .as_ref()
+                        .is_some_and(|dir| *dir == IterationDirection::Backwards)
+                    {
+                        Insn::LastAwait {
+                            cursor_id,
+                            pc_if_empty: loop_end,
+                        }
+                    } else {
+                        Insn::RewindAwait {
+                            cursor_id,
+                            pc_if_empty: loop_end,
+                        }
+                    },
+                ),
+                TableReferenceType::VirtualTable { args, .. } => {
+                    let start_reg = program.alloc_registers(args.len());
+                    let mut cur_reg = start_reg;
+                    for arg in args {
+                        let reg = cur_reg;
+                        cur_reg += 1;
+                        translate_expr(
+                            program,
+                            Some(referenced_tables),
+                            arg,
+                            reg,
+                            &t_ctx.resolver,
+                        )?;
                     }
-                } else {
-                    Insn::RewindAwait {
+                    program.emit_insn(Insn::VFilter {
                         cursor_id,
-                        pc_if_empty: loop_end,
-                    }
-                },
-            );
+                        arg_count: args.len(),
+                        args_reg: start_reg,
+                    });
+                }
+                other => panic!("Unsupported table reference type: {:?}", other),
+            }
             program.resolve_label(loop_start, program.offset());
 
             if let Some(preds) = predicates {
@@ -790,29 +833,42 @@ pub fn close_loop(
             iter_dir,
             ..
         } => {
+            let ref_type = &table_reference.reference_type;
             program.resolve_label(loop_labels.next, program.offset());
             let cursor_id = program.resolve_cursor_id(&table_reference.table_identifier);
-            if iter_dir
-                .as_ref()
-                .is_some_and(|dir| *dir == IterationDirection::Backwards)
-            {
-                program.emit_insn(Insn::PrevAsync { cursor_id });
-            } else {
-                program.emit_insn(Insn::NextAsync { cursor_id });
-            }
-            if iter_dir
-                .as_ref()
-                .is_some_and(|dir| *dir == IterationDirection::Backwards)
-            {
-                program.emit_insn(Insn::PrevAwait {
-                    cursor_id,
-                    pc_if_next: loop_labels.loop_start,
-                });
-            } else {
-                program.emit_insn(Insn::NextAwait {
-                    cursor_id,
-                    pc_if_next: loop_labels.loop_start,
-                });
+
+            match ref_type {
+                TableReferenceType::BTreeTable { .. } => {
+                    if iter_dir
+                        .as_ref()
+                        .is_some_and(|dir| *dir == IterationDirection::Backwards)
+                    {
+                        program.emit_insn(Insn::PrevAsync { cursor_id });
+                    } else {
+                        program.emit_insn(Insn::NextAsync { cursor_id });
+                    }
+                    if iter_dir
+                        .as_ref()
+                        .is_some_and(|dir| *dir == IterationDirection::Backwards)
+                    {
+                        program.emit_insn(Insn::PrevAwait {
+                            cursor_id,
+                            pc_if_next: loop_labels.loop_start,
+                        });
+                    } else {
+                        program.emit_insn(Insn::NextAwait {
+                            cursor_id,
+                            pc_if_next: loop_labels.loop_start,
+                        });
+                    }
+                }
+                TableReferenceType::VirtualTable { .. } => {
+                    program.emit_insn(Insn::VNext {
+                        cursor_id,
+                        pc_if_next: loop_labels.loop_start,
+                    });
+                }
+                other => unreachable!("Unsupported table reference type: {:?}", other),
             }
         }
         SourceOperator::Search {

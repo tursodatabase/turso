@@ -3,6 +3,7 @@ use std::{fmt::Display, os::raw::c_void};
 /// Error type is of type ExtError which can be
 /// either a user defined error or an error code
 #[repr(C)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ResultCode {
     OK = 0,
     Error = 1,
@@ -18,6 +19,7 @@ pub enum ResultCode {
     Unimplemented = 11,
     Internal = 12,
     Unavailable = 13,
+    EOF = 14,
 }
 
 impl ResultCode {
@@ -43,6 +45,7 @@ impl Display for ResultCode {
             ResultCode::Unimplemented => write!(f, "Unimplemented"),
             ResultCode::Internal => write!(f, "Internal Error"),
             ResultCode::Unavailable => write!(f, "Unavailable"),
+            ResultCode::EOF => write!(f, "EOF"),
         }
     }
 }
@@ -60,7 +63,7 @@ pub enum ValueType {
 
 #[repr(C)]
 pub struct Value {
-    value_type: ValueType,
+    pub value_type: ValueType,
     value: *mut c_void,
 }
 

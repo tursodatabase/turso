@@ -9,7 +9,7 @@ use crate::{
     function::AggFunc,
     schema::{BTreeTable, Column, Index, Table},
     vdbe::BranchOffset,
-    Result,
+    Result, VirtualTable,
 };
 use crate::{
     schema::{PseudoTable, Type},
@@ -237,6 +237,11 @@ pub enum TableReferenceType {
         /// The index of the first register in the query plan that contains the result columns of the subquery.
         result_columns_start_reg: usize,
     },
+    /// A virtual table.
+    VirtualTable {
+        /// Arguments to pass e.g. generate_series(1, 10, 2)
+        args: Vec<ast::Expr>,
+    },
 }
 
 /// A query plan has a list of TableReference objects, each of which represents a table or subquery.
@@ -256,9 +261,16 @@ pub struct TableReference {
 
 impl TableReference {
     pub fn btree(&self) -> Option<Rc<BTreeTable>> {
-        match self.reference_type {
+        match &self.reference_type {
             TableReferenceType::BTreeTable => self.table.btree(),
             TableReferenceType::Subquery { .. } => None,
+            TableReferenceType::VirtualTable { .. } => None,
+        }
+    }
+    pub fn virtual_table(&self) -> Option<Rc<VirtualTable>> {
+        match &self.reference_type {
+            TableReferenceType::VirtualTable { .. } => self.table.virtual_table(),
+            _ => None,
         }
     }
     pub fn new_subquery(identifier: String, table_index: usize, plan: &SelectPlan) -> Self {

@@ -331,7 +331,38 @@ fn parse_from_clause_table(
                 },
             ))
         }
-        _ => todo!(),
+        ast::SelectTable::TableCall(qualified_name, mut maybe_args, maybe_alias) => {
+            let normalized_name = normalize_ident(qualified_name.name.0.as_str());
+            let Some(vtab) = syms.vtabs.get(&normalized_name) else {
+                crate::bail_parse_error!("Virtual table {} not found", normalized_name);
+            };
+            let alias = maybe_alias
+                .as_ref()
+                .map(|a| match a {
+                    ast::As::As(id) => id.0.clone(),
+                    ast::As::Elided(id) => id.0.clone(),
+                })
+                .unwrap_or(normalized_name);
+
+            let table_reference = TableReference {
+                table: Table::Virtual(vtab.clone()),
+                table_identifier: alias.clone(),
+                table_index: cur_table_index,
+                reference_type: TableReferenceType::VirtualTable {
+                    args: maybe_args.take().unwrap_or_default(),
+                },
+            };
+            Ok((
+                table_reference.clone(),
+                SourceOperator::Scan {
+                    table_reference,
+                    predicates: None,
+                    id: operator_id_counter.get_next_id(),
+                    iter_dir: None,
+                },
+            ))
+        }
+        other => todo!("unsupported table type: {:?}", other),
     }
 }
 
