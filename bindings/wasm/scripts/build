@@ -1,7 +1,7 @@
 #!/bin/bash
+
 set -e
 
-# Define final output directories
 NODE_DIR="node"
 WEB_DIR="web"
 
@@ -14,8 +14,7 @@ npx wasm-pack build \
   --out-name index \
   --no-default-features \
   --features nodejs
-
-rm -rf pkg/package.json # don't want generated package.json
+rm -rf pkg/package.json
 mv pkg/* $NODE_DIR/dist/
 cp -r $NODE_DIR/src/* $NODE_DIR/dist/
 cd node/dist/
@@ -32,11 +31,10 @@ npx wasm-pack build \
   --out-name index \
   --no-default-features \
   --features web
-
-rm -rf pkg/package.json # don't want generated package.json
+rm -rf pkg/package.json
 mv pkg/* $WEB_DIR/dist/
-cp -r $WEB_DIR/src/* $WEB_DIR/dist/
 
+# TypeScript build
+npx tsc
 
-# mv $WEB_DIR/index.js $WEB_DIR/index.mjs
 rm -rf pkg
