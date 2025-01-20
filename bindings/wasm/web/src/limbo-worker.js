@@ -1,9 +1,6 @@
 import { VFS } from "./opfs.js";
 import init, { Database } from "../dist/index.js";
 
-let db = null;
-let currentStmt = null;
-
 async function initVFS() {
   const vfs = new VFS();
   await vfs.ready;
@@ -16,42 +13,41 @@ async function initAll() {
   await init();
 }
 
-initAll().then(() => {
-  self.postMessage({ type: "ready" });
+const initialized = initAll();
 
-  self.onmessage = (e) => {
-    try {
-      switch (e.data.op) {
-        case "createDb": {
-          db = new Database(e.data.path);
-          self.postMessage({ type: "success", op: "createDb" });
-          break;
-        }
-        case "exec": {
-          log(e.data.sql);
-          db.exec(e.data.sql);
-          self.postMessage({ type: "success", op: "exec" });
-          break;
-        }
-        case "prepare": {
-          currentStmt = db.prepare(e.data.sql);
-          const results = currentStmt.raw().all();
-          self.postMessage({ type: "result", result: results });
-          break;
-        }
-        case "get": {
-          const row = currentStmt?.raw().get();
-          self.postMessage({ type: "result", result: row });
-          break;
-        }
-      }
-    } catch (err) {
-      self.postMessage({ type: "error", error: err.toString() });
-    }
-  };
-}).catch((error) => {
-  self.postMessage({ type: "error", error: error.toString() });
-});
+// worker.ts
+
+let db = null;
+let stmt = null;
+
+const api = {
+  async createDb(path) {
+    await initialized;
+    db = new Database(path);
+  },
+  exec(sql) {
+    db.exec(sql);
+  },
+  prepare(sql) {
+    stmt = db.prepare(sql);
+  },
+  get() {
+    return stmt.get();
+  },
+  all() {
+    return stmt.all();
+  },
+};
+
+self.onmessage = async (e) => { // Make handler async
+  const { fn, args } = e.data;
+  try {
+    const result = await api[fn](...args); // Await the result
+    self.postMessage({ result });
+  } catch (err) {
+    self.postMessage({ error: err.message });
+  }
+};
 
 // logLevel:
 //

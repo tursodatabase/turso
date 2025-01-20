@@ -1,86 +1,63 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Limbo Test</title>
+   <title>Database Test</title>
+   <style>
+       .success { color: green; font-weight: bold; }
+       .error { color: red; font-weight: bold; }
+       .test-status { padding: 10px; margin: 5px; border-radius: 4px; }
+   </style>
 </head>
 <body>
-    <script type="module">
-        function waitForMessage(worker, type, op) {
-            return new Promise((resolve, reject) => {
-                const handler = (e) => {
-                    if (e.data.type === type && (!op || e.data.op === op)) {
-                        worker.removeEventListener('message', handler);
-                        resolve(e.data);
-                    } else if (e.data.type === 'error') {
-                        worker.removeEventListener('message', handler);
-                        reject(e.data.error);
-                    }
-                };
-                worker.addEventListener('message', handler);
-            });
-        }
+   <div id="results"></div>
 
-        async function runTests() {
-            // const worker = new Worker('./src/limbo-worker.js', { type: 'module' });
-            // const worker = new Worker('limbo-wasm/src/limbo-worker.js', { type: 'module' });
-            // const worker = new Worker('./node_modules/limbo-wasm/src/limbo-worker.js', { type: 'module' });
-            const worker = new Worker(new URL('limbo-wasm/limbo-worker.js', import.meta.url), { type: 'module' });
-            
-            // Wait for ready then send createDb
-            await waitForMessage(worker, 'ready');
-            worker.postMessage({
-                op: 'createDb',
-                path: 'test.db'
-            });
+   <script type="module">
+       import { DatabaseClient } from 'limbo-wasm';
 
-            // Wait for createDb success then send exec
-            await waitForMessage(worker, 'success', 'createDb');
-            worker.postMessage({
-                op: 'exec',
-                sql: `
-                    CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);
-                `
-            });
-            console.log("made it here");
+       function log(message, isError = false) {
+           const div = document.createElement('div');
+           div.className = `test-status ${isError ? 'error' : 'success'}`;
+           div.textContent = typeof message === 'string' ? message : JSON.stringify(message, null, 2);
+           document.getElementById('results').appendChild(div);
+       }
 
-            // Wait for exec success then send prepare
-            await waitForMessage(worker, 'success', 'exec');
-            worker.postMessage({
-                op: 'exec',
-                sql: `
-                    INSERT INTO users VALUES (1, 'Alice', 'alice@example.org');
-                `
-            });
+       async function runTests() {
+           const db = new DatabaseClient();
 
-            await waitForMessage(worker, 'success', 'exec');
-            worker.postMessage({
-                op: 'exec',
-                sql: `
-                    INSERT INTO users VALUES (2, 'Bob', 'bob@example.org');
-                `
-            });
+           try {
+               log('Starting up');
+               await db.init('test.db');
+               log('Database initialized');
 
-            await waitForMessage(worker, 'success', 'exec');
-            worker.postMessage({
-                op: 'exec',
-                sql: `
-                    INSERT INTO users VALUES (3, 'bill', 'bill@example.com');
-                `
-            });
+               await db.exec(`
+                   CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);
+               `);
+               log('Table created');
 
-            // Wait for exec success then send prepare
-            await waitForMessage(worker, 'success', 'exec');
-            worker.postMessage({
-                op: 'prepare',
-                sql: 'SELECT * FROM users;'
-            });
+               await db.exec(`
+                   INSERT INTO users VALUES (1, 'Alice', 'alice@example.org');
+               `);
+               await db.exec(`
+                   INSERT INTO users VALUES (2, 'Bob', 'bob@example.org');
 
-            const results = await waitForMessage(worker, 'result');
-            console.log('Query results:', results);
-        }
+               `);
+               await db.exec(`
+                   INSERT INTO users VALUES (3, 'bill', 'bill@example.com');
+               `);
+               log('Data inserted');
 
-        runTests().catch(console.error);
-    </script>
+               const stmt = await db.prepare('SELECT * FROM users;');
+               const results = await stmt.all();
+               log('Query results: ' + JSON.stringify(results));
+
+               db.close();
+               log('All tests completed successfully');
+           } catch (error) {
+               log(`Test failed: ${error.message}`, true);
+           }
+       }
+
+       runTests();
+   </script>
 </body>
 </html>
-

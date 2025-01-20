@@ -14,6 +14,9 @@ export default defineConfig({
       allow: ["./node_modules/limbo-wasm/web/dist"],
     },
   },
+  optimizeDeps: {
+    exclude: ["limbo-wasm"],
+  },
   worker: {
     format: "es",
     rollupOptions: {

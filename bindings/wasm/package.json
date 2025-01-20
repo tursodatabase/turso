@@ -15,10 +15,11 @@
   "exports": {
     ".": {
       "node": "./node/dist/index.cjs",
-      "browser": "./web/dist/index.js",
+      "browser": "./web/dist/interface.js",
       "default": "./web/dist/index.js"
     },
-    "./limbo-worker.js": "./web/dist/limbo-worker.js"
+    "./limbo-worker.js": "./web/dist/limbo-worker.js",
+    "./interface.js": "./web/dist/interface.js"
   },
   "files": [
     "node/dist",
