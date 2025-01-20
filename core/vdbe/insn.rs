@@ -1,4 +1,5 @@
 use std::num::NonZero;
+use std::rc::Rc;
 
 use super::{AggFunc, BranchOffset, CursorID, FuncCtx, PageIdx};
 use crate::types::{OwnedRecord, OwnedValue};
@@ -509,6 +510,12 @@ pub enum Insn {
         index: NonZero<usize>,
         dest: usize,
     },
+
+    Concat {
+        lhs: usize,
+        rhs: usize,
+        dest: usize,
+    },
 }
 
 fn cast_text_to_numerical(value: &str) -> OwnedValue {
@@ -836,5 +843,17 @@ fn compute_shr(lhs: i64, rhs: i64) -> i64 {
         lhs << (-rhs)
     } else {
         lhs >> rhs
+    }
+}
+
+pub fn exec_concat(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
+    let lhs_value = OwnedValue::value_to_string(lhs);
+    let rhs_value = OwnedValue::value_to_string(rhs);
+
+    if lhs_value.is_empty() || rhs_value.is_empty() {
+        OwnedValue::Null
+    } else {
+        let result = lhs_value + &rhs_value;
+        OwnedValue::build_text(Rc::new(result))
     }
 }
