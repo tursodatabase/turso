@@ -421,13 +421,9 @@ impl PageContent {
     }
 
     pub fn maybe_page_type(&self) -> Option<PageType> {
-        let page_type = self.read_u8(0);
-        match page_type {
-            2 => Some(PageType::IndexInterior),
-            5 => Some(PageType::TableInterior),
-            10 => Some(PageType::IndexLeaf),
-            13 => Some(PageType::TableLeaf),
-            _ => None, // This handles overflow pages and any other non-btree page types
+        match self.read_u8(0).try_into() {
+            Ok(v) => Some(v),
+            Err(_) => None, // this could be an overflow page
         }
     }
 
@@ -538,14 +534,11 @@ impl PageContent {
     }
 
     pub fn rightmost_pointer(&self) -> Option<u32> {
-        match self.maybe_page_type() {
-            Some(page_type) => match page_type {
-                PageType::IndexInterior => Some(self.read_u32(8)),
-                PageType::TableInterior => Some(self.read_u32(8)),
-                PageType::IndexLeaf => None,
-                PageType::TableLeaf => None,
-            },
-            None => None, // Handle overflow pages by returning None
+        match self.page_type() {
+            PageType::IndexInterior => Some(self.read_u32(8)),
+            PageType::TableInterior => Some(self.read_u32(8)),
+            PageType::IndexLeaf => None,
+            PageType::TableLeaf => None,
         }
     }
 
@@ -657,15 +650,11 @@ impl PageContent {
     }
 
     pub fn is_leaf(&self) -> bool {
-        // First check if this is a btree page by looking at the type
-        match self.maybe_page_type() {
-            Some(page_type) => match page_type {
-                PageType::IndexInterior => false,
-                PageType::TableInterior => false,
-                PageType::IndexLeaf => true,
-                PageType::TableLeaf => true,
-            },
-            None => false, // Overflow pages are not leaf pages
+        match self.page_type() {
+            PageType::IndexInterior => false,
+            PageType::TableInterior => false,
+            PageType::IndexLeaf => true,
+            PageType::TableLeaf => true,
         }
     }
 

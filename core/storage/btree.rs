@@ -667,9 +667,7 @@ impl BTreeCursor {
                         continue;
                     }
                     None => {
-                        // We've hit either a leaf page or an overflow page
-                        // Either way, we're done traversing
-                        return Ok(CursorResult::Ok(()));
+                        unreachable!("we shall not go back up! The only way is down the slope");
                     }
                 }
             }
@@ -701,15 +699,10 @@ impl BTreeCursor {
                         self.pager.add_dirty(page.get().id);
 
                         let page = page.get().contents.as_mut().unwrap();
-
-                        let page_type = match page.maybe_page_type() {
-                            Some(pt) => pt,
-                            None => return Ok(CursorResult::Ok(())), // Handle overflow pages
-                        };
-                        assert!(matches!(page_type, PageType::TableLeaf));
+                        assert!(matches!(page.page_type(), PageType::TableLeaf));
 
                         // find cell
-                        (self.find_cell(page, int_key), page_type)
+                        (self.find_cell(page, int_key), page.page_type())
                     };
 
                     // TODO: if overwrite drop cell
@@ -1198,44 +1191,20 @@ impl BTreeCursor {
         }
     }
 
-    fn calculate_used_space(&self, page: &PageContent) -> usize {
-        let mut total_used = 0;
-        total_used += page.header_size();
-        let (_, cell_array_size) = page.cell_pointer_array_offset_and_size();
-        total_used += cell_array_size;
-        for cell_idx in 0..page.cell_count() {
-            let (_, cell_len) = page.cell_get_raw_region(
-                cell_idx,
-                self.payload_overflow_threshold_max(page.page_type()),
-                self.payload_overflow_threshold_min(page.page_type()),
-                self.usable_space(),
-            );
-            total_used += cell_len;
-        }
-        for overflow_cell in &page.overflow_cells {
-            total_used += overflow_cell.payload.len();
-        }
-        total_used -= page.num_frag_free_bytes() as usize;
-
-        total_used
-    }
-
+    // Use this only inside balance_root
     fn is_overflow(&self, page: &PageContent) -> bool {
         !page.overflow_cells.is_empty()
     }
 
+    // Use this only inside balance_root
     fn is_underflow(&self, page: &PageContent) -> bool {
         // Root is special case - only underflow when empty with one child
         let current_page = self.stack.top();
         if current_page.get().id == self.root_page {
-            return page.cell_count() == 0 && !page.is_leaf();
+            page.cell_count() == 0 && !page.is_leaf()
+        } else {
+            false
         }
-
-        let used_space = self.calculate_used_space(page);
-        let usable_space = self.usable_space();
-
-        // Underflow if used space is less than 50% of usable space
-        used_space < (usable_space / 2)
     }
 
     fn copy_node_content(&self, src: PageRef, dst: PageRef) -> Result<()> {
@@ -1244,6 +1213,12 @@ impl BTreeCursor {
 
         let src_buf = src_contents.as_ptr();
         let dst_buf = dst_contents.as_ptr();
+
+        let dst_header_offset = if dst.get().id == 1 {
+            DATABASE_HEADER_SIZE
+        } else {
+            0
+        };
 
         // Copy content area
         let content_start = src_contents.cell_content_area() as usize;
@@ -1254,24 +1229,22 @@ impl BTreeCursor {
         // Copy header and cell pointer array
         let header_and_pointers_size =
             src_contents.header_size() + src_contents.cell_pointer_array_size();
-        dst_buf[..header_and_pointers_size].copy_from_slice(&src_buf[..header_and_pointers_size]);
-
-        // Copy overflow cells
-        dst_contents.overflow_cells = src_contents.overflow_cells.clone();
+        dst_buf[dst_header_offset..dst_header_offset + header_and_pointers_size].copy_from_slice(
+            &src_buf[src_contents.offset..src_contents.offset + header_and_pointers_size],
+        );
 
         Ok(())
     }
 
-    fn zero_page(&self, page: &PageRef, page_type: PageType, is_leaf: bool) {
+    // ** Zeros a page's important header offset locations and clears its overflow cells
+    // ** In SQLite this function is called from functions balance_nonroot(), balance_deeper() (root overflow balancing)
+    //    newDatabase(), btreeCreateTable() and clearDatabase()
+    // ** After calling this zero_page. We have to set flag byte (PAGE_HEADER_OFFSET_PAGE_TYPE) correctly, so
+    //    refer to SQLite source its usage.
+    fn zero_page(&self, page: &PageRef) {
         let contents = page.get().contents.as_mut().unwrap();
-        let flags = if is_leaf {
-            page_type as u8
-        } else {
-            page_type as u8 & !0x08 // Clear leaf flag
-        };
 
-        contents.write_u8(PAGE_HEADER_OFFSET_PAGE_TYPE, flags);
-        contents.write_u16(PAGE_HEADER_OFFSET_FIRST_FREEBLOCK, 0);
+        contents.write_u32(PAGE_HEADER_OFFSET_FIRST_FREEBLOCK, 0);
         contents.write_u16(PAGE_HEADER_OFFSET_CELL_COUNT, 0);
         contents.write_u16(
             PAGE_HEADER_OFFSET_CELL_CONTENT_AREA,
@@ -1279,10 +1252,6 @@ impl BTreeCursor {
         );
         contents.write_u8(PAGE_HEADER_OFFSET_FRAGMENTED_BYTES_COUNT, 0);
         contents.overflow_cells.clear();
-
-        if !is_leaf {
-            contents.write_u32(PAGE_HEADER_OFFSET_RIGHTMOST_PTR, 0);
-        }
     }
 
     fn balance_root(&mut self) -> Result<CursorResult<()>> {
@@ -1301,14 +1270,23 @@ impl BTreeCursor {
             let child_page = self.allocate_page(original_type, 0);
             let child_page_id = child_page.get().id;
 
-            // Copy all root content to child, including overflow cells
+            // Copy all root content to child
             self.copy_node_content(current_root.clone(), child_page.clone())?;
 
-            // zero out root page to make it empty.
-            let is_leaf = false;
-            self.zero_page(&current_root, original_type, is_leaf);
+            // Copy overflow cells to child from root page
+            let child_contents = child_page.get().contents.as_mut().unwrap();
+            let current_root_contents = current_root.get().contents.as_ref().unwrap();
+            child_contents.overflow_cells = current_root_contents.overflow_cells.clone();
 
-            // Set child as rightmost pointer
+            // zero out root page to make it empty.
+            self.zero_page(&current_root);
+
+            // Set root page_type as TableInterior
+            // Initially root page is of type TableLeaf and as the btree grows deeper the
+            // root page changes its type to TableInterior since it now points to a child page.
+            contents.write_u8(PAGE_HEADER_OFFSET_PAGE_TYPE, PageType::TableInterior as u8);
+
+            // Set child as root rightmost pointer
             contents.write_u32(PAGE_HEADER_OFFSET_RIGHTMOST_PTR, child_page_id as u32);
 
             // Update pager's tracking
@@ -1332,7 +1310,7 @@ impl BTreeCursor {
 
             let child_contents = child_page.get().contents.as_mut().unwrap();
 
-            // Defragment child before inserting its cells into root because root is smaller than child due to it
+            // Defragment child before inserting its cells into root, because root is smaller than child due to it
             // containing header.
             self.defragment_page(child_contents, self.database_header.borrow());
 
@@ -1739,10 +1717,7 @@ impl BTreeCursor {
     fn find_cell(&self, page: &PageContent, int_key: u64) -> usize {
         let mut cell_idx = 0;
         let cell_count = page.cell_count();
-        let page_type = match page.maybe_page_type() {
-            Some(pt) => pt,
-            None => return 0, // Return 0 for overflow pages
-        };
+        let page_type = page.page_type();
         while cell_idx < cell_count {
             match page
                 .cell_get(
