@@ -1043,10 +1043,14 @@ pub fn exec_add_imm(mut lhs: &OwnedValue, mut rhs: &OwnedValue) -> OwnedValue {
                 OwnedValue::Integer(result.0)
             }
         }
-        (OwnedValue::Float(f1), OwnedValue::Float(f2)) => OwnedValue::Integer((f1 + f2) as i64),
+        (OwnedValue::Float(f1), OwnedValue::Float(f2)) => {
+            OwnedValue::Integer(sqlite_float_to_integer(f1 + f2))
+        }
         (OwnedValue::Float(f), OwnedValue::Integer(i))
-        | (OwnedValue::Integer(i), OwnedValue::Float(f)) => OwnedValue::Integer(*f as i64 + *i),
-        (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
+        | (OwnedValue::Integer(i), OwnedValue::Float(f)) => {
+            OwnedValue::Integer(sqlite_float_to_integer(*f) + *i)
+        }
+        (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Integer(0),
         (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_add_imm(
             &cast_text_to_numerical(&lhs.value),
             &cast_text_to_numerical(&rhs.value),
@@ -1054,8 +1058,23 @@ pub fn exec_add_imm(mut lhs: &OwnedValue, mut rhs: &OwnedValue) -> OwnedValue {
         (OwnedValue::Text(text), other) | (other, OwnedValue::Text(text)) => {
             exec_add_imm(&cast_text_to_numerical(&text.value), other)
         }
+        // TODO maybe here it should return 0. Not sure yet
+        // There are no test cases in sqlite code base for AddImm
+        // so it is difficult to assert the correct behavior
         _ => todo!(),
     }
+}
+
+/// Converts float to int according to sqlite source code \
+/// https://github.com/sqlite/sqlite/blob/master/src/vdbemem.c#L767
+fn sqlite_float_to_integer(f: f64) -> i64 {
+    if f < -9223372036854774784.0 {
+        return i64::MIN;
+    }
+    if f > 9223372036854774784.0 {
+        return i64::MAX;
+    }
+    f as i64
 }
 
 #[cfg(test)]
