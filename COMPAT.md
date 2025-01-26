@@ -4,16 +4,24 @@ This document describes the compatibility of Limbo with SQLite.
 
 ## Table of contents:
 
-- [Features](#features)
-- [SQLite query language](#sqlite-query-language)
+- [Compatibility with SQLite](#compatibility-with-sqlite)
+  - [Table of contents:](#table-of-contents)
+  - [Features](#features)
+  - [SQLite query language](#sqlite-query-language)
     - [Statements](#statements)
-      - [PRAGMA Statements](#pragma)
+      - [PRAGMA](#pragma)
     - [Expressions](#expressions)
-    - [Functions](#functions)
-- [SQLite C API](#sqlite-c-api)
-- [SQLite VDBE opcodes](#sqlite-vdbe-opcodes)
-- [Extensions](#extensions)
+    - [SQL functions](#sql-functions)
+      - [Scalar functions](#scalar-functions)
+      - [Mathematical functions](#mathematical-functions)
+      - [Aggregate functions](#aggregate-functions)
+      - [Date and time functions](#date-and-time-functions)
+      - [JSON functions](#json-functions)
+  - [SQLite C API](#sqlite-c-api)
+  - [SQLite VDBE opcodes](#sqlite-vdbe-opcodes)
+  - [Extensions](#extensions)
     - [UUID](#uuid)
+    - [regexp](#regexp)
 
 ## Features
 
@@ -395,7 +403,7 @@ Modifiers:
 | Opcode         | Status |
 |----------------|--------|
 | Add            | Yes    |
-| AddImm         | No     |
+| AddImm         | Yes    |
 | Affinity       | No     |
 | AggFinal       | Yes    |
 | AggStep        | Yes    |
