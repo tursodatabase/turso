@@ -46,9 +46,9 @@ use crate::{
 use crate::{resolve_ext_path, Connection, Result, Rows, TransactionState, DATABASE_VERSION};
 use datetime::{exec_date, exec_datetime_full, exec_julianday, exec_time, exec_unixepoch};
 use insn::{
-    exec_add, exec_and, exec_bit_and, exec_bit_not, exec_bit_or, exec_boolean_not, exec_concat,
-    exec_divide, exec_multiply, exec_or, exec_remainder, exec_shift_left, exec_shift_right,
-    exec_subtract,
+    exec_add, exec_add_imm, exec_and, exec_bit_and, exec_bit_not, exec_bit_or, exec_boolean_not,
+    exec_concat, exec_divide, exec_multiply, exec_or, exec_remainder, exec_shift_left,
+    exec_shift_right, exec_subtract,
 };
 use likeop::{construct_like_escape_arg, exec_glob, exec_like_with_escape};
 use rand::distributions::{Distribution, Uniform};
@@ -330,6 +330,11 @@ impl Program {
                 Insn::Add { lhs, rhs, dest } => {
                     state.registers[*dest] =
                         exec_add(&state.registers[*lhs], &state.registers[*rhs]);
+                    state.pc += 1;
+                }
+                Insn::AddImm { lhs, rhs } => {
+                    state.registers[*lhs] =
+                        exec_add_imm(&state.registers[*lhs], &state.registers[*rhs]);
                     state.pc += 1;
                 }
                 Insn::Subtract { lhs, rhs, dest } => {

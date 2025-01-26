@@ -563,6 +563,11 @@ pub enum Insn {
         rhs: usize,
         dest: usize,
     },
+    /// Add two registers and store the result in the first register. Always returns an integer
+    AddImm {
+        lhs: usize,
+        rhs: usize,
+    },
 }
 
 fn cast_text_to_numerical(value: &str) -> OwnedValue {
@@ -1019,6 +1024,37 @@ pub fn exec_or(mut lhs: &OwnedValue, mut rhs: &OwnedValue) -> OwnedValue {
             exec_or(&cast_text_to_numerical(&text.value), other)
         }
         _ => OwnedValue::Integer(1),
+    }
+}
+
+pub fn exec_add_imm(mut lhs: &OwnedValue, mut rhs: &OwnedValue) -> OwnedValue {
+    if let OwnedValue::Agg(agg) = lhs {
+        lhs = agg.final_value();
+    }
+    if let OwnedValue::Agg(agg) = rhs {
+        rhs = agg.final_value();
+    }
+    match (lhs, rhs) {
+        (OwnedValue::Integer(lhs), OwnedValue::Integer(rhs)) => {
+            let result = lhs.overflowing_add(*rhs);
+            if result.1 {
+                OwnedValue::Integer(*lhs + *rhs)
+            } else {
+                OwnedValue::Integer(result.0)
+            }
+        }
+        (OwnedValue::Float(f1), OwnedValue::Float(f2)) => OwnedValue::Integer((f1 + f2) as i64),
+        (OwnedValue::Float(f), OwnedValue::Integer(i))
+        | (OwnedValue::Integer(i), OwnedValue::Float(f)) => OwnedValue::Integer(*f as i64 + *i),
+        (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
+        (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_add_imm(
+            &cast_text_to_numerical(&lhs.value),
+            &cast_text_to_numerical(&rhs.value),
+        ),
+        (OwnedValue::Text(text), other) | (other, OwnedValue::Text(text)) => {
+            exec_add_imm(&cast_text_to_numerical(&text.value), other)
+        }
+        _ => todo!(),
     }
 }
 

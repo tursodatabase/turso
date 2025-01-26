@@ -1138,6 +1138,15 @@ pub fn insn_to_str(
                 0,
                 format!("r[{}]=(r[{}] || r[{}])", dest, lhs, rhs),
             ),
+            Insn::AddImm { lhs, rhs } => (
+                "AddImm",
+                *lhs as i32,
+                *rhs as i32,
+                0,
+                OwnedValue::build_text(Rc::new("".to_string())),
+                0,
+                format!("r[{}]=r[{}]+r[{}]", lhs, lhs, rhs),
+            ),
         };
     format!(
         "{:<4}  {:<17}  {:<4}  {:<4}  {:<4}  {:<13}  {:<2}  {}",
