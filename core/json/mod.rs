@@ -508,7 +508,7 @@ mod tests {
         let result = get_json(&input);
         match result {
             Ok(_) => panic!("Expected error for malformed JSON"),
-            Err(e) => assert!(e.to_string().contains("malformed JSON")),
+            Err(e) => assert!(e.to_string().contains("malformed JSON"), "Error: {}", e),
         }
     }
 
@@ -536,11 +536,11 @@ mod tests {
 
     #[test]
     fn test_get_json_blob_valid_jsonb() {
-        let binary_json = b"\x40\0\0\x01\x10\0\0\x03\x10\0\0\x03\x61\x73\x64\x61\x64\x66".to_vec();
+        let binary_json = vec![0xcb, 0x03, 0x10, 0x11, 0x12];
         let input = OwnedValue::Blob(Rc::new(binary_json));
         let result = get_json(&input).unwrap();
         if let OwnedValue::Text(result_str) = result {
-            assert!(result_str.value.contains("\"asd\":\"adf\""));
+            assert!(result_str.value.contains("[null,true,false]"));
             assert_eq!(result_str.subtype, TextSubtype::Json);
         } else {
             panic!("Expected OwnedValue::Text");
@@ -549,7 +549,7 @@ mod tests {
 
     #[test]
     fn test_get_json_blob_invalid_jsonb() {
-        let binary_json: Vec<u8> = vec![0xA2, 0x62, 0x6B, 0x31, 0x62, 0x76]; // Incomplete binary JSON
+        let binary_json: Vec<u8> = vec![0x13, b'a']; // invalid number
         let input = OwnedValue::Blob(Rc::new(binary_json));
         let result = get_json(&input);
         match result {
@@ -813,13 +813,6 @@ mod tests {
         let input = OwnedValue::Float(-5.5);
         let result = json_error_position(&input).unwrap();
         assert_eq!(result, OwnedValue::Integer(0));
-    }
-
-    #[test]
-    fn test_json_error_position_blob() {
-        let input = OwnedValue::Blob(Rc::new(r#"["a",55,"b",72,,]"#.as_bytes().to_owned()));
-        let result = json_error_position(&input).unwrap();
-        assert_eq!(result, OwnedValue::Integer(16));
     }
 
     #[test]

@@ -53,7 +53,7 @@ impl From<pest::error::Error<Rule>> for Error {
 
 impl From<Error> for LimboError {
     fn from(err: Error) -> Self {
-        LimboError::ParseError(err.to_string())
+        LimboError::ParseError("malformed JSON".to_string())
     }
 }
 
