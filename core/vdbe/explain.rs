@@ -84,6 +84,19 @@ pub fn insn_to_str(
                 0,
                 format!("r[{}]=~r[{}]", dest, reg),
             ),
+            Insn::Checkpoint {
+                database,
+                checkpoint_mode: _,
+                dest,
+            } => (
+                "Checkpoint",
+                *database as i32,
+                *dest as i32,
+                0,
+                OwnedValue::build_text(Rc::new("".to_string())),
+                0,
+                format!("r[{}]=~r[{}]", dest, database),
+            ),
             Insn::Remainder { lhs, rhs, dest } => (
                 "Remainder",
                 *lhs as i32,
@@ -196,6 +209,7 @@ pub fn insn_to_str(
                 lhs,
                 rhs,
                 target_pc,
+                ..
             } => (
                 "Eq",
                 *lhs as i32,
@@ -214,6 +228,7 @@ pub fn insn_to_str(
                 lhs,
                 rhs,
                 target_pc,
+                ..
             } => (
                 "Ne",
                 *lhs as i32,
@@ -232,6 +247,7 @@ pub fn insn_to_str(
                 lhs,
                 rhs,
                 target_pc,
+                ..
             } => (
                 "Lt",
                 *lhs as i32,
@@ -245,6 +261,7 @@ pub fn insn_to_str(
                 lhs,
                 rhs,
                 target_pc,
+                ..
             } => (
                 "Le",
                 *lhs as i32,
@@ -263,6 +280,7 @@ pub fn insn_to_str(
                 lhs,
                 rhs,
                 target_pc,
+                ..
             } => (
                 "Gt",
                 *lhs as i32,
@@ -276,6 +294,7 @@ pub fn insn_to_str(
                 lhs,
                 rhs,
                 target_pc,
+                ..
             } => (
                 "Ge",
                 *lhs as i32,
@@ -293,12 +312,12 @@ pub fn insn_to_str(
             Insn::If {
                 reg,
                 target_pc,
-                null_reg,
+                jump_if_null,
             } => (
                 "If",
                 *reg as i32,
                 target_pc.to_debug_int(),
-                *null_reg as i32,
+                *jump_if_null as i32,
                 OwnedValue::build_text(Rc::new("".to_string())),
                 0,
                 format!("if r[{}] goto {}", reg, target_pc.to_debug_int()),
@@ -306,12 +325,12 @@ pub fn insn_to_str(
             Insn::IfNot {
                 reg,
                 target_pc,
-                null_reg,
+                jump_if_null,
             } => (
                 "IfNot",
                 *reg as i32,
                 target_pc.to_debug_int(),
-                *null_reg as i32,
+                *jump_if_null as i32,
                 OwnedValue::build_text(Rc::new("".to_string())),
                 0,
                 format!("if !r[{}] goto {}", reg, target_pc.to_debug_int()),
@@ -1070,6 +1089,54 @@ pub fn insn_to_str(
                 OwnedValue::build_text(Rc::new("".to_string())),
                 0,
                 format!("r[{}]=parameter({})", *dest, *index),
+            ),
+            Insn::ZeroOrNull { rg1, rg2, dest } => (
+                "ZeroOrNull",
+                *rg1 as i32,
+                *dest as i32,
+                *rg2 as i32,
+                OwnedValue::build_text(Rc::new("".to_string())),
+                0,
+                format!(
+                    "((r[{}]=NULL)|(r[{}]=NULL)) ? r[{}]=NULL : r[{}]=0",
+                    rg1, rg2, dest, dest
+                ),
+            ),
+            Insn::Not { reg, dest } => (
+                "Not",
+                *reg as i32,
+                *dest as i32,
+                0,
+                OwnedValue::build_text(Rc::new("".to_string())),
+                0,
+                format!("r[{}]=!r[{}]", dest, reg),
+            ),
+            Insn::Concat { lhs, rhs, dest } => (
+                "Concat",
+                *rhs as i32,
+                *lhs as i32,
+                *dest as i32,
+                OwnedValue::build_text(Rc::new("".to_string())),
+                0,
+                format!("r[{}]=r[{}] + r[{}]", dest, lhs, rhs),
+            ),
+            Insn::And { lhs, rhs, dest } => (
+                "And",
+                *rhs as i32,
+                *lhs as i32,
+                *dest as i32,
+                OwnedValue::build_text(Rc::new("".to_string())),
+                0,
+                format!("r[{}]=(r[{}] && r[{}])", dest, lhs, rhs),
+            ),
+            Insn::Or { lhs, rhs, dest } => (
+                "Or",
+                *rhs as i32,
+                *lhs as i32,
+                *dest as i32,
+                OwnedValue::build_text(Rc::new("".to_string())),
+                0,
+                format!("r[{}]=(r[{}] || r[{}])", dest, lhs, rhs),
             ),
         };
     format!(

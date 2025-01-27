@@ -1,7 +1,7 @@
 use super::emitter::emit_program;
 use super::expr::get_name;
 use super::plan::SelectQueryType;
-use crate::function::Func;
+use crate::function::{AggFunc, ExtFunc, Func};
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{Aggregate, Direction, GroupBy, Plan, ResultSetColumn, SelectPlan};
 use crate::translate::planner::{
@@ -11,8 +11,8 @@ use crate::translate::planner::{
 use crate::util::normalize_ident;
 use crate::SymbolTable;
 use crate::{schema::Schema, vdbe::builder::ProgramBuilder, Result};
-use sqlite3_parser::ast;
 use sqlite3_parser::ast::ResultColumn;
+use sqlite3_parser::ast::{self};
 
 pub fn translate_select(
     program: &mut ProgramBuilder,
@@ -69,10 +69,10 @@ pub fn prepare_select_plan(
             let mut aggregate_expressions = Vec::new();
             for (result_column_idx, column) in columns.iter_mut().enumerate() {
                 match column {
-                    ast::ResultColumn::Star => {
+                    ResultColumn::Star => {
                         plan.source.select_star(&mut plan.result_columns);
                     }
-                    ast::ResultColumn::TableStar(name) => {
+                    ResultColumn::TableStar(name) => {
                         let name_normalized = normalize_ident(name.0.as_str());
                         let referenced_table = plan
                             .referenced_tables
@@ -96,7 +96,7 @@ pub fn prepare_select_plan(
                             });
                         }
                     }
-                    ast::ResultColumn::Expr(ref mut expr, maybe_alias) => {
+                    ResultColumn::Expr(ref mut expr, maybe_alias) => {
                         bind_column_references(expr, &plan.referenced_tables)?;
                         match expr {
                             ast::Expr::FunctionCall {
@@ -116,9 +116,23 @@ pub fn prepare_select_plan(
                                     args_count,
                                 ) {
                                     Ok(Func::Agg(f)) => {
+                                        let agg_args = match (args, &f) {
+                                            (None, crate::function::AggFunc::Count0) => {
+                                                // COUNT() case
+                                                vec![ast::Expr::Literal(ast::Literal::Numeric(
+                                                    "1".to_string(),
+                                                ))]
+                                            }
+                                            (None, _) => crate::bail_parse_error!(
+                                                "Aggregate function {} requires arguments",
+                                                name.0
+                                            ),
+                                            (Some(args), _) => args.clone(),
+                                        };
+
                                         let agg = Aggregate {
                                             func: f,
-                                            args: args.as_ref().unwrap().clone(),
+                                            args: agg_args.clone(),
                                             original_expr: expr.clone(),
                                         };
                                         aggregate_expressions.push(agg.clone());
@@ -147,22 +161,45 @@ pub fn prepare_select_plan(
                                             contains_aggregates,
                                         });
                                     }
-                                    Err(_) => {
-                                        if syms.functions.contains_key(&name.0) {
-                                            let contains_aggregates = resolve_aggregates(
-                                                expr,
-                                                &mut aggregate_expressions,
-                                            );
-                                            plan.result_columns.push(ResultSetColumn {
-                                                name: get_name(
-                                                    maybe_alias.as_ref(),
+                                    Err(e) => {
+                                        if let Some(f) = syms.resolve_function(&name.0, args_count)
+                                        {
+                                            if let ExtFunc::Scalar(_) = f.as_ref().func {
+                                                let contains_aggregates = resolve_aggregates(
                                                     expr,
-                                                    &plan.referenced_tables,
-                                                    || format!("expr_{}", result_column_idx),
-                                                ),
-                                                expr: expr.clone(),
-                                                contains_aggregates,
-                                            });
+                                                    &mut aggregate_expressions,
+                                                );
+                                                plan.result_columns.push(ResultSetColumn {
+                                                    name: get_name(
+                                                        maybe_alias.as_ref(),
+                                                        expr,
+                                                        &plan.referenced_tables,
+                                                        || format!("expr_{}", result_column_idx),
+                                                    ),
+                                                    expr: expr.clone(),
+                                                    contains_aggregates,
+                                                });
+                                            } else {
+                                                let agg = Aggregate {
+                                                    func: AggFunc::External(f.func.clone().into()),
+                                                    args: args.as_ref().unwrap().clone(),
+                                                    original_expr: expr.clone(),
+                                                };
+                                                aggregate_expressions.push(agg.clone());
+                                                plan.result_columns.push(ResultSetColumn {
+                                                    name: get_name(
+                                                        maybe_alias.as_ref(),
+                                                        expr,
+                                                        &plan.referenced_tables,
+                                                        || format!("expr_{}", result_column_idx),
+                                                    ),
+                                                    expr: expr.clone(),
+                                                    contains_aggregates: true,
+                                                });
+                                            }
+                                            continue; // Continue with the normal flow instead of returning
+                                        } else {
+                                            return Err(e);
                                         }
                                     }
                                 }

@@ -18,6 +18,7 @@ fn bench(c: &mut Criterion) {
 fn limbo_bench(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("limbo");
     group.throughput(Throughput::Elements(1));
+    #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io.clone(), "../testing/testing.db").unwrap();
     let conn = db.connect();
@@ -45,7 +46,7 @@ fn limbo_bench(criterion: &mut Criterion) {
         let io = io.clone();
         b.iter(|| {
             let mut rows = stmt.query().unwrap();
-            match rows.next_row().unwrap() {
+            match rows.step().unwrap() {
                 limbo_core::StepResult::Row(row) => {
                     assert_eq!(row.get::<i64>(0).unwrap(), 1);
                 }
@@ -73,7 +74,7 @@ fn limbo_bench(criterion: &mut Criterion) {
             let io = io.clone();
             b.iter(|| {
                 let mut rows = stmt.query().unwrap();
-                match rows.next_row().unwrap() {
+                match rows.step().unwrap() {
                     limbo_core::StepResult::Row(row) => {
                         assert_eq!(row.get::<i64>(0).unwrap(), 1);
                     }
@@ -102,7 +103,7 @@ fn limbo_bench(criterion: &mut Criterion) {
             let io = io.clone();
             b.iter(|| {
                 let mut rows = stmt.query().unwrap();
-                match rows.next_row().unwrap() {
+                match rows.step().unwrap() {
                     limbo_core::StepResult::Row(row) => {
                         assert_eq!(row.get::<i64>(0).unwrap(), 1);
                     }

@@ -1,19 +1,56 @@
+use limbo_ext::{FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction};
 use std::fmt;
 use std::fmt::{Debug, Display};
 use std::rc::Rc;
 
-use limbo_extension::ScalarFunction;
+use crate::LimboError;
 
 pub struct ExternalFunc {
     pub name: String,
-    pub func: ScalarFunction,
+    pub func: ExtFunc,
+}
+
+#[derive(Debug, Clone)]
+pub enum ExtFunc {
+    Scalar(ScalarFunction),
+    Aggregate {
+        argc: usize,
+        init: InitAggFunction,
+        step: StepFunction,
+        finalize: FinalizeFunction,
+    },
+}
+
+impl ExtFunc {
+    pub fn agg_args(&self) -> Result<usize, ()> {
+        if let ExtFunc::Aggregate { argc, .. } = self {
+            return Ok(*argc);
+        }
+        Err(())
+    }
 }
 
 impl ExternalFunc {
-    pub fn new(name: &str, func: ScalarFunction) -> Self {
+    pub fn new_scalar(name: String, func: ScalarFunction) -> Self {
         Self {
-            name: name.to_string(),
-            func,
+            name,
+            func: ExtFunc::Scalar(func),
+        }
+    }
+
+    pub fn new_aggregate(
+        name: String,
+        argc: i32,
+        func: (InitAggFunction, StepFunction, FinalizeFunction),
+    ) -> Self {
+        Self {
+            name,
+            func: ExtFunc::Aggregate {
+                argc: argc as usize,
+                init: func.0,
+                step: func.1,
+                finalize: func.2,
+            },
         }
     }
 }
@@ -39,8 +76,10 @@ pub enum JsonFunc {
     JsonArrowExtract,
     JsonArrowShiftExtract,
     JsonExtract,
+    JsonObject,
     JsonType,
     JsonErrorPosition,
+    JsonValid,
 }
 
 #[cfg(feature = "json")]
@@ -56,29 +95,66 @@ impl Display for JsonFunc {
                 Self::JsonArrayLength => "json_array_length".to_string(),
                 Self::JsonArrowExtract => "->".to_string(),
                 Self::JsonArrowShiftExtract => "->>".to_string(),
+                Self::JsonObject => "json_object".to_string(),
                 Self::JsonType => "json_type".to_string(),
                 Self::JsonErrorPosition => "json_error_position".to_string(),
+                Self::JsonValid => "json_valid".to_string(),
             }
         )
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum AggFunc {
     Avg,
     Count,
+    Count0,
     GroupConcat,
     Max,
     Min,
     StringAgg,
     Sum,
     Total,
+    External(Rc<ExtFunc>),
+}
+
+impl PartialEq for AggFunc {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Avg, Self::Avg)
+            | (Self::Count, Self::Count)
+            | (Self::GroupConcat, Self::GroupConcat)
+            | (Self::Max, Self::Max)
+            | (Self::Min, Self::Min)
+            | (Self::StringAgg, Self::StringAgg)
+            | (Self::Sum, Self::Sum)
+            | (Self::Total, Self::Total) => true,
+            (Self::External(a), Self::External(b)) => Rc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
 }
 
 impl AggFunc {
+    pub fn num_args(&self) -> usize {
+        match self {
+            Self::Avg => 1,
+            Self::Count0 => 0,
+            Self::Count => 1,
+            Self::GroupConcat => 1,
+            Self::Max => 1,
+            Self::Min => 1,
+            Self::StringAgg => 2,
+            Self::Sum => 1,
+            Self::Total => 1,
+            Self::External(func) => func.agg_args().unwrap_or(0),
+        }
+    }
+
     pub fn to_string(&self) -> &str {
         match self {
             Self::Avg => "avg",
+            Self::Count0 => "count",
             Self::Count => "count",
             Self::GroupConcat => "group_concat",
             Self::Max => "max",
@@ -86,6 +162,7 @@ impl AggFunc {
             Self::StringAgg => "string_agg",
             Self::Sum => "sum",
             Self::Total => "total",
+            Self::External(_) => "extension function",
         }
     }
 }
@@ -138,10 +215,11 @@ pub enum ScalarFunc {
     Replace,
     #[cfg(not(target_family = "wasm"))]
     LoadExtension,
+    StrfTime,
 }
 
 impl Display for ScalarFunc {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let str = match self {
             Self::Cast => "cast".to_string(),
             Self::Changes => "changes".to_string(),
@@ -189,6 +267,7 @@ impl Display for ScalarFunc {
             Self::DateTime => "datetime".to_string(),
             #[cfg(not(target_family = "wasm"))]
             Self::LoadExtension => "load_extension".to_string(),
+            Self::StrfTime => "strftime".to_string(),
         };
         write!(f, "{}", str)
     }
@@ -270,7 +349,7 @@ impl MathFunc {
 }
 
 impl Display for MathFunc {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let str = match self {
             Self::Acos => "acos".to_string(),
             Self::Acosh => "acosh".to_string(),
@@ -336,19 +415,64 @@ pub struct FuncCtx {
 }
 
 impl Func {
-    pub fn resolve_function(name: &str, arg_count: usize) -> Result<Self, ()> {
+    pub fn resolve_function(name: &str, arg_count: usize) -> Result<Self, LimboError> {
         match name {
-            "avg" => Ok(Self::Agg(AggFunc::Avg)),
-            "count" => Ok(Self::Agg(AggFunc::Count)),
-            "group_concat" => Ok(Self::Agg(AggFunc::GroupConcat)),
-            "max" if arg_count == 0 || arg_count == 1 => Ok(Self::Agg(AggFunc::Max)),
+            "avg" => {
+                if arg_count != 1 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Self::Agg(AggFunc::Avg))
+            }
+            "count" => {
+                // Handle both COUNT() and COUNT(expr) cases
+                if arg_count == 0 {
+                    Ok(Self::Agg(AggFunc::Count0)) // COUNT() case
+                } else if arg_count == 1 {
+                    Ok(Self::Agg(AggFunc::Count)) // COUNT(expr) case
+                } else {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+            }
+            "group_concat" => {
+                if arg_count != 1 && arg_count != 2 {
+                    println!("{}", arg_count);
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Self::Agg(AggFunc::GroupConcat))
+            }
             "max" if arg_count > 1 => Ok(Self::Scalar(ScalarFunc::Max)),
-            "min" if arg_count == 0 || arg_count == 1 => Ok(Self::Agg(AggFunc::Min)),
+            "max" => {
+                if arg_count < 1 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Self::Agg(AggFunc::Max))
+            }
             "min" if arg_count > 1 => Ok(Self::Scalar(ScalarFunc::Min)),
+            "min" => {
+                if arg_count < 1 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Self::Agg(AggFunc::Min))
+            }
             "nullif" if arg_count == 2 => Ok(Self::Scalar(ScalarFunc::Nullif)),
-            "string_agg" => Ok(Self::Agg(AggFunc::StringAgg)),
-            "sum" => Ok(Self::Agg(AggFunc::Sum)),
-            "total" => Ok(Self::Agg(AggFunc::Total)),
+            "string_agg" => {
+                if arg_count != 2 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Self::Agg(AggFunc::StringAgg))
+            }
+            "sum" => {
+                if arg_count != 1 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Self::Agg(AggFunc::Sum))
+            }
+            "total" => {
+                if arg_count != 1 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Self::Agg(AggFunc::Total))
+            }
             "char" => Ok(Self::Scalar(ScalarFunc::Char)),
             "coalesce" => Ok(Self::Scalar(ScalarFunc::Coalesce)),
             "concat" => Ok(Self::Scalar(ScalarFunc::Concat)),
@@ -392,9 +516,13 @@ impl Func {
             #[cfg(feature = "json")]
             "json_extract" => Ok(Func::Json(JsonFunc::JsonExtract)),
             #[cfg(feature = "json")]
+            "json_object" => Ok(Func::Json(JsonFunc::JsonObject)),
+            #[cfg(feature = "json")]
             "json_type" => Ok(Func::Json(JsonFunc::JsonType)),
             #[cfg(feature = "json")]
             "json_error_position" => Ok(Self::Json(JsonFunc::JsonErrorPosition)),
+            #[cfg(feature = "json")]
+            "json_valid" => Ok(Self::Json(JsonFunc::JsonValid)),
             "unixepoch" => Ok(Self::Scalar(ScalarFunc::UnixEpoch)),
             "julianday" => Ok(Self::Scalar(ScalarFunc::JulianDay)),
             "hex" => Ok(Self::Scalar(ScalarFunc::Hex)),
@@ -432,7 +560,8 @@ impl Func {
             "trunc" => Ok(Self::Math(MathFunc::Trunc)),
             #[cfg(not(target_family = "wasm"))]
             "load_extension" => Ok(Self::Scalar(ScalarFunc::LoadExtension)),
-            _ => Err(()),
+            "strftime" => Ok(Self::Scalar(ScalarFunc::StrfTime)),
+            _ => crate::bail_parse_error!("no such function: {}", name),
         }
     }
 }

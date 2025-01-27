@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     rc::{Rc, Weak},
 };
@@ -30,6 +30,7 @@ pub struct ProgramBuilder {
     // map of instruction index to manual comment (used in EXPLAIN)
     comments: HashMap<InsnReference, &'static str>,
     pub parameters: Parameters,
+    pub columns: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +61,7 @@ impl ProgramBuilder {
             seekrowid_emitted_bitmask: 0,
             comments: HashMap::new(),
             parameters: Parameters::new(),
+            columns: Vec::new(),
         }
     }
 
@@ -83,7 +85,7 @@ impl ProgramBuilder {
         let cursor = self.next_free_cursor_id;
         self.next_free_cursor_id += 1;
         self.cursor_ref.push((table_identifier, cursor_type));
-        assert!(self.cursor_ref.len() == self.next_free_cursor_id);
+        assert_eq!(self.cursor_ref.len(), self.next_free_cursor_id);
         cursor
     }
 
@@ -158,6 +160,7 @@ impl ProgramBuilder {
                     lhs: _lhs,
                     rhs: _rhs,
                     target_pc,
+                    ..
                 } => {
                     resolve(target_pc, "Eq");
                 }
@@ -165,6 +168,7 @@ impl ProgramBuilder {
                     lhs: _lhs,
                     rhs: _rhs,
                     target_pc,
+                    ..
                 } => {
                     resolve(target_pc, "Ne");
                 }
@@ -172,6 +176,7 @@ impl ProgramBuilder {
                     lhs: _lhs,
                     rhs: _rhs,
                     target_pc,
+                    ..
                 } => {
                     resolve(target_pc, "Lt");
                 }
@@ -179,6 +184,7 @@ impl ProgramBuilder {
                     lhs: _lhs,
                     rhs: _rhs,
                     target_pc,
+                    ..
                 } => {
                     resolve(target_pc, "Le");
                 }
@@ -186,6 +192,7 @@ impl ProgramBuilder {
                     lhs: _lhs,
                     rhs: _rhs,
                     target_pc,
+                    ..
                 } => {
                     resolve(target_pc, "Gt");
                 }
@@ -193,20 +200,21 @@ impl ProgramBuilder {
                     lhs: _lhs,
                     rhs: _rhs,
                     target_pc,
+                    ..
                 } => {
                     resolve(target_pc, "Ge");
                 }
                 Insn::If {
                     reg: _reg,
                     target_pc,
-                    null_reg: _,
+                    jump_if_null: _,
                 } => {
                     resolve(target_pc, "If");
                 }
                 Insn::IfNot {
                     reg: _reg,
                     target_pc,
-                    null_reg: _,
+                    jump_if_null: _,
                 } => {
                     resolve(target_pc, "IfNot");
                 }
@@ -327,6 +335,7 @@ impl ProgramBuilder {
         mut self,
         database_header: Rc<RefCell<DatabaseHeader>>,
         connection: Weak<Connection>,
+        change_cnt_on: bool,
     ) -> Program {
         self.resolve_labels();
         assert!(
@@ -343,6 +352,9 @@ impl ProgramBuilder {
             connection,
             auto_commit: true,
             parameters: self.parameters,
+            n_change: Cell::new(0),
+            change_cnt_on,
+            columns: self.columns,
         }
     }
 }

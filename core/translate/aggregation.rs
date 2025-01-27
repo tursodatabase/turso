@@ -3,7 +3,7 @@ use sqlite3_parser::ast;
 use crate::{
     function::AggFunc,
     vdbe::{builder::ProgramBuilder, insn::Insn},
-    Result,
+    LimboError, Result,
 };
 
 use super::{
@@ -74,7 +74,7 @@ pub fn translate_aggregation_step(
             });
             target_register
         }
-        AggFunc::Count => {
+        AggFunc::Count | AggFunc::Count0 => {
             let expr_reg = if agg.args.is_empty() {
                 program.alloc_register()
             } else {
@@ -87,7 +87,11 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::Count,
+                func: if matches!(agg.func, AggFunc::Count0) {
+                    AggFunc::Count0
+                } else {
+                    AggFunc::Count
+                },
             });
             target_register
         }
@@ -226,6 +230,38 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: 0,
                 func: AggFunc::Total,
+            });
+            target_register
+        }
+        AggFunc::External(ref func) => {
+            let expr_reg = program.alloc_register();
+            let argc = func.agg_args().map_err(|_| {
+                LimboError::ExtensionError(
+                    "External aggregate function called with wrong number of arguments".to_string(),
+                )
+            })?;
+            if argc != agg.args.len() {
+                crate::bail_parse_error!(
+                    "External aggregate function called with wrong number of arguments"
+                );
+            }
+            for i in 0..argc {
+                if i != 0 {
+                    let _ = program.alloc_register();
+                }
+                let _ = translate_expr(
+                    program,
+                    Some(referenced_tables),
+                    &agg.args[i],
+                    expr_reg + i,
+                    resolver,
+                )?;
+            }
+            program.emit_insn(Insn::AggStep {
+                acc_reg: target_register,
+                col: expr_reg,
+                delimiter: 0,
+                func: AggFunc::External(func.clone()),
             });
             target_register
         }

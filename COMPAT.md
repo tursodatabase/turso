@@ -1,24 +1,42 @@
-# SQLite Compatibility
+# Compatibility with SQLite
 
-This document describes the SQLite compatibility status of Limbo:
+This document describes the compatibility of Limbo with SQLite.
 
-- [SQLite Compatibility](#sqlite-compatibility)
-    - [Limitations](#limitations)
-    - [SQL statements](#sql-statements)
-        - [SELECT Expressions](#select-expressions)
+## Table of contents:
+
+- [Compatibility with SQLite](#compatibility-with-sqlite)
+  - [Table of contents:](#table-of-contents)
+  - [Features](#features)
+  - [SQLite query language](#sqlite-query-language)
+    - [Statements](#statements)
+      - [PRAGMA](#pragma)
+    - [Expressions](#expressions)
     - [SQL functions](#sql-functions)
-        - [Scalar functions](#scalar-functions)
-        - [Aggregate functions](#aggregate-functions)
-        - [Date and time functions](#date-and-time-functions)
-        - [JSON functions](#json-functions)
-    - [SQLite API](#sqlite-api)
-    - [SQLite VDBE opcodes](#sqlite-vdbe-opcodes)
+      - [Scalar functions](#scalar-functions)
+      - [Mathematical functions](#mathematical-functions)
+      - [Aggregate functions](#aggregate-functions)
+      - [Date and time functions](#date-and-time-functions)
+      - [JSON functions](#json-functions)
+  - [SQLite C API](#sqlite-c-api)
+  - [SQLite VDBE opcodes](#sqlite-vdbe-opcodes)
+  - [Extensions](#extensions)
+    - [UUID](#uuid)
+    - [regexp](#regexp)
 
-## Limitations
+## Features
 
-* Limbo does not support database access from multiple processes.
+Limbo aims to be fully compatible with SQLite, with opt-in features not supported by SQLite.
 
-## SQL statements
+The current status of Limbo is:
+
+* ✅ SQLite file format is fully supported.
+* 🚧 SQLite query language [[status](#sqlite-query-language)]
+* 🚧 SQLite C API [[status](#sqlite-c-api)].
+* ⛔️ Concurrent access from multiple processes is not supported.
+
+## SQLite query language
+
+### Statements
 
 | Statement                 | Status  | Comment |
 | ------------------------- | ------- | ------- |
@@ -43,8 +61,6 @@ This document describes the SQLite compatibility status of Limbo:
 | INDEXED BY                | No      |         |
 | INSERT                    | Partial |         |
 | ON CONFLICT clause        | No      |         |
-| PRAGMA                    | Partial |         |
-| PRAGMA cache_size         | Yes     |         |
 | REINDEX                   | No      |         |
 | RELEASE SAVEPOINT         | No      |         |
 | REPLACE                   | No      |         |
@@ -69,7 +85,88 @@ This document describes the SQLite compatibility status of Limbo:
 | VACUUM                    | No      |         |
 | WITH clause               | No      |         |
 
-### SELECT Expressions
+#### [PRAGMA](https://www.sqlite.org/pragma.html)
+
+
+| Statement                        | Status     | Comment                                         |
+|----------------------------------|------------|-------------------------------------------------|
+| PRAGMA analysis_limit            | No         |                                                 |
+| PRAGMA application_id            | No         |                                                 |
+| PRAGMA auto_vacuum               | No         |                                                 |
+| PRAGMA automatic_index           | No         |                                                 |
+| PRAGMA busy_timeout              | No         |                                                 |
+| PRAGMA busy_timeout              | No         |                                                 |
+| PRAGMA cache_size                | Yes        |                                                 |
+| PRAGMA cache_spill               | No         |                                                 |
+| PRAGMA case_sensitive_like       | Not Needed | deprecated in SQLite                            |
+| PRAGMA cell_size_check           | No         |                                                 |
+| PRAGMA checkpoint_fullsync       | No         |                                                 |
+| PRAGMA collation_list            | No         |                                                 |
+| PRAGMA compile_options           | No         |                                                 |
+| PRAGMA count_changes             | Not Needed | deprecated in SQLite                            |
+| PRAGMA data_store_directory      | Not Needed | deprecated in SQLite                            |
+| PRAGMA data_version              | No         |                                                 |
+| PRAGMA database_list             | No         |                                                 |
+| PRAGMA default_cache_size        | Not Needed | deprecated in SQLite                            |
+| PRAGMA defer_foreign_keys        | No         |                                                 |
+| PRAGMA empty_result_callbacks    | Not Needed | deprecated in SQLite                            |
+| PRAGMA encoding                  | No         |                                                 |
+| PRAGMA foreign_key_check         | No         |                                                 |
+| PRAGMA foreign_key_list          | No         |                                                 |
+| PRAGMA foreign_keys              | No         |                                                 |
+| PRAGMA freelist_count            | No         |                                                 |
+| PRAGMA full_column_names         | Not Needed | deprecated in SQLite                            |
+| PRAGMA fullsync                  | No         |                                                 |
+| PRAGMA function_list             | No         |                                                 |
+| PRAGMA hard_heap_limit           | No         |                                                 |
+| PRAGMA ignore_check_constraints  | No         |                                                 |
+| PRAGMA incremental_vacuum        | No         |                                                 |
+| PRAGMA index_info                | No         |                                                 |
+| PRAGMA index_list                | No         |                                                 |
+| PRAGMA index_xinfo               | No         |                                                 |
+| PRAGMA integrity_check           | No         |                                                 |
+| PRAGMA journal_mode              | No         |                                                 |
+| PRAGMA journal_size_limit        | No         |                                                 |
+| PRAGMA legacy_alter_table        | No         |                                                 |
+| PRAGMA legacy_file_format        | No         |                                                 |
+| PRAGMA locking_mode              | No         |                                                 |
+| PRAGMA max_page_count            | No         |                                                 |
+| PRAGMA mmap_size                 | No         |                                                 |
+| PRAGMA module_list               | No         |                                                 |
+| PRAGMA optimize                  | No         |                                                 |
+| PRAGMA page_count                | No         |                                                 |
+| PRAGMA page_size                 | No         |                                                 |
+| PRAGMA parser_trace              | No         |                                                 |
+| PRAGMA pragma_list               | No         |                                                 |
+| PRAGMA query_only                | No         |                                                 |
+| PRAGMA quick_check               | No         |                                                 |
+| PRAGMA read_uncommitted          | No         |                                                 |
+| PRAGMA recursive_triggers        | No         |                                                 |
+| PRAGMA reverse_unordered_selects | No         |                                                 |
+| PRAGMA schema_version            | No         |                                                 |
+| PRAGMA secure_delete             | No         |                                                 |
+| PRAGMA short_column_names        | Not Needed | deprecated in SQLite                            |
+| PRAGMA shrink_memory             | No         |                                                 |
+| PRAGMA soft_heap_limit           | No         |                                                 |
+| PRAGMA stats                     | No         | Used for testing in SQLite                      |
+| PRAGMA synchronous               | No         |                                                 |
+| PRAGMA table_info                | No         |                                                 |
+| PRAGMA table_list                | No         |                                                 |
+| PRAGMA table_xinfo               | No         |                                                 |
+| PRAGMA temp_store                | No         |                                                 |
+| PRAGMA temp_store_directory      | Not Needed | deprecated in SQLite                            |
+| PRAGMA threads                   | No         |                                                 |
+| PRAGMA trusted_schema            | No         |                                                 |
+| PRAGMA user_version              | No         |                                                 |
+| PRAGMA vdbe_addoptrace           | No         |                                                 |
+| PRAGMA vdbe_debug                | No         |                                                 |
+| PRAGMA vdbe_listing              | No         |                                                 |
+| PRAGMA vdbe_trace                | No         |                                                 |
+| PRAGMA wal_autocheckpoint        | No         |                                                 |
+| PRAGMA wal_checkpoint            | Partial    | Not supported calling with param (pragma-value) |
+| PRAGMA writable_schema           | No         |                                                 |
+
+### Expressions
 
 Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 
@@ -96,14 +193,14 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | CASE WHEN THEN ELSE END      | Yes     |         |
 | RAISE                        | No      |         |
 
-## SQL functions
+### SQL functions
 
-### Scalar functions
+#### Scalar functions
 
 | Function                     | Status | Comment |
 |------------------------------|--------|---------|
 | abs(X)                       | Yes    |         |
-| changes()                    | No     |         |
+| changes()                    | Partial| Still need to support update statements and triggers |
 | char(X1,X2,...,XN)           | Yes    |         |
 | coalesce(X,Y,...)            | Yes    |         |
 | concat(X,...)                | Yes    |         |
@@ -149,7 +246,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | substr(X,Y)                  | Yes    |         |
 | substring(X,Y,Z)             | Yes    |         |
 | substring(X,Y)               | Yes    |         |
-| total_changes()              | No     |         |
+| total_changes()              | Partial| Still need to support update statements and triggers |
 | trim(X)                      | Yes    |         |
 | trim(X,Y)                    | Yes    |         |
 | typeof(X)                    | Yes    |         |
@@ -160,11 +257,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | upper(X)                     | Yes    |         |
 | zeroblob(N)                  | Yes    |         |
 
-
-
-
-
-### Mathematical functions
+#### Mathematical functions
 
 | Function   | Status | Comment |
 | ---------- | ------ | ------- |
@@ -199,7 +292,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | tanh(X)    | Yes    |         |
 | trunc(X)   | Yes    |         |
 
-### Aggregate functions
+#### Aggregate functions
 
 | Function                     | Status  | Comment |
 |------------------------------|---------|---------|
@@ -214,7 +307,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | sum(X)                       | Yes     |         |
 | total(X)                     | Yes     |         |
 
-### Date and time functions
+#### Date and time functions
 
 | Function    | Status  | Comment                      |
 |-------------|---------|------------------------------|
@@ -223,13 +316,14 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | datetime()  | Yes     | partially supports modifiers |
 | julianday() | Partial | does not support modifiers   |
 | unixepoch() | Partial | does not support modifiers   |
-| strftime()  | No      |                              |
+| strftime()  | Yes     | partially supports modifiers |
 | timediff()  | No      |                              |
 
-### Date and Time Modifiers
+Modifiers:
+
 |  Modifier      | Status|  Comment                        |
 |----------------|-------|---------------------------------|
-| Days           | Yes 	 |                                 | 
+| Days           | Yes 	 |                                 |
 | Hours          | Yes	 |                                 |
 | Minutes        | Yes	 |                                 |
 | Seconds        | Yes	 |                                 |
@@ -251,9 +345,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | Utc            |Partial| requires fixes to avoid double conversions.|
 | Subsec         | Yes   |                                  |
 
-
-
-### JSON functions
+#### JSON functions
 
 | Function                           | Status  | Comment                                                                                                                                      |
 |------------------------------------|---------|----------------------------------------------------------------------------------------------------------------------------------------------|
@@ -270,7 +362,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | json ->> path                      | Yes     |                                                                                                                                              |
 | json_insert(json,path,value,...)   |         |                                                                                                                                              |
 | jsonb_insert(json,path,value,...)  |         |                                                                                                                                              |
-| json_object(label1,value1,...)     |         |                                                                                                                                              |
+| json_object(label1,value1,...)     | Yes     | When keys are duplicated, only the last one processed is returned. This differs from sqlite, where the keys in the output can be duplicated  |
 | jsonb_object(label1,value1,...)    |         |                                                                                                                                              |
 | json_patch(json1,json2)            |         |                                                                                                                                              |
 | jsonb_patch(json1,json2)           |         |                                                                                                                                              |
@@ -283,7 +375,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | jsonb_set(json,path,value,...)     |         |                                                                                                                                              |
 | json_type(json)                    | Yes     |                                                                                                                                              |
 | json_type(json,path)               | Yes     |                                                                                                                                              |
-| json_valid(json)                   |         |                                                                                                                                              |
+| json_valid(json)                   | Yes     |                                                                                                                                              |
 | json_valid(json,flags)             |         |                                                                                                                                              |
 | json_quote(value)                  |         |                                                                                                                                              |
 | json_group_array(value)            |         |                                                                                                                                              |
@@ -295,7 +387,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | json_tree(json)                    |         |                                                                                                                                              |
 | json_tree(json,path)               |         |                                                                                                                                              |
 
-## SQLite API
+## SQLite C API
 
 | Interface           | Status  | Comment |
 |---------------------|---------|---------|
@@ -316,7 +408,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | AggFinal       | Yes    |
 | AggStep        | Yes    |
 | AggStep        | Yes    |
-| And            | No     |
+| And            | Yes    |
 | AutoCommit     | No     |
 | BitAnd         | Yes    |
 | BitNot         | Yes    |
@@ -328,7 +420,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | CollSeq        | No     |
 | Column         | Yes    |
 | Compare        | Yes    |
-| Concat         | No     |
+| Concat         | Yes    |
 | Copy           | Yes    |
 | Count          | No     |
 | CreateIndex    | No     |
@@ -394,7 +486,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | NextAsync      | Yes    |
 | NextAwait      | Yes    |
 | Noop           | No     |
-| Not            | No     |
+| Not            | Yes    |
 | NotExists      | Yes    |
 | NotFound       | No     |
 | NotNull        | Yes    |
@@ -409,7 +501,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | OpenWrite      | No     |
 | OpenWriteAsync | Yes    |
 | OpenWriteAwait | Yes    |
-| Or             | No     |
+| Or             | Yes    |
 | Pagecount      | No     |
 | Param          | No     |
 | ParseSchema    | No     |
@@ -479,13 +571,33 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | Variable       | No     |
 | VerifyCookie   | No     |
 | Yield          | Yes    |
+| ZeroOrNull     | Yes    |
 
-| LibSql Compatibility / Extensions |     |                                                               |
-|-----------------------------------|-----|---------------------------------------------------------------|
-| **UUID**                          |     | UUID's in limbo are `blobs` by default                        |
-| uuid4()                           | Yes | uuid version 4                                                |
-| uuid4_str()                       | Yes | uuid v4 string alias `gen_random_uuid()` for PG compatibility |
-| uuid7(X?)                         | Yes | uuid version 7, Optional arg for seconds since epoch          |
-| uuid7_timestamp_ms(X)             | Yes | Convert a uuid v7 to milliseconds since epoch                 |
-| uuid_str(X)                       | Yes | Convert a valid uuid to string                                |
-| uuid_blob(X)                      | Yes | Convert a valid uuid to blob                                  |
+##  Extensions
+
+Limbo has in-tree extensions.
+
+### UUID
+
+UUID's in Limbo are `blobs` by default.
+
+| Function              | Status | Comment                                                       | 
+|-----------------------|--------|---------------------------------------------------------------|
+| uuid4()               | Yes    | UUID version 4                                                |
+| uuid4_str()           | Yes    | UUID v4 string alias `gen_random_uuid()` for PG compatibility |
+| uuid7(X?)             | Yes    | UUID version 7 (optional parameter for seconds since epoch)   |
+| uuid7_timestamp_ms(X) | Yes    | Convert a UUID v7 to milliseconds since epoch                 |
+| uuid_str(X)           | Yes    | Convert a valid UUID to string                                |
+| uuid_blob(X)          | Yes    | Convert a valid UUID to blob                                  |
+
+### regexp
+
+The `regexp` extension is compatible with [sqlean-regexp](https://github.com/nalgeon/sqlean/blob/main/docs/regexp.md).
+
+| Function                                       | Status | Comment | 
+|------------------------------------------------|--------|---------|
+| regexp(pattern, source)                        | Yes    |         |
+| regexp_like(source, pattern)                   | Yes    |         |
+| regexp_substr(source, pattern)                 | Yes    |         |
+| regexp_capture(source, pattern[, n])           | No     |         |
+| regexp_replace(source, pattern, replacement)   | No     |         |

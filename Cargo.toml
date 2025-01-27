@@ -7,16 +7,22 @@ members = [
     "bindings/python",
     "bindings/rust",
     "bindings/wasm",
+	"bindings/go",
     "cli",
-    "sqlite3",
     "core",
+    "extensions/core",
+    "extensions/uuid",
+    "extensions/regexp",
+    "macros",
     "simulator",
-    "test", "macros", "limbo_extension", "extensions/uuid",
+    "sqlite3",
+    "tests",
+    "extensions/percentile",
 ]
 exclude = ["perf/latency/limbo"]
 
 [workspace.package]
-version = "0.0.12"
+version = "0.0.13"
 authors = ["the Limbo authors"]
 edition = "2021"
 license = "MIT"
@@ -49,6 +55,7 @@ dist = false
 github-attestations = true
 
 [profile.release]
+debug = "line-tables-only"
 codegen-units = 1
 panic = "abort"
 lto = true

@@ -105,7 +105,6 @@ pub struct BTreeCursor {
     rowid: RefCell<Option<u64>>,
     record: RefCell<Option<OwnedRecord>>,
     null_flag: bool,
-    database_header: Rc<RefCell<DatabaseHeader>>,
     /// Index internal pages are consumed on the way up, so we store going upwards flag in case
     /// we just moved to a parent page and the parent page is an internal index page which requires
     /// to be consumed.
@@ -137,18 +136,13 @@ struct PageStack {
 }
 
 impl BTreeCursor {
-    pub fn new(
-        pager: Rc<Pager>,
-        root_page: usize,
-        database_header: Rc<RefCell<DatabaseHeader>>,
-    ) -> Self {
+    pub fn new(pager: Rc<Pager>, root_page: usize) -> Self {
         Self {
             pager,
             root_page,
             rowid: RefCell::new(None),
             record: RefCell::new(None),
             null_flag: false,
-            database_header,
             going_upwards: false,
             write_info: WriteInfo {
                 state: WriteState::Start,
@@ -167,7 +161,7 @@ impl BTreeCursor {
 
     /// Check if the table is empty.
     /// This is done by checking if the root page has no cells.
-    fn is_empty_table(&mut self) -> Result<CursorResult<bool>> {
+    fn is_empty_table(&self) -> Result<CursorResult<bool>> {
         let page = self.pager.read_page(self.root_page)?;
         return_if_locked!(page);
 
@@ -473,7 +467,7 @@ impl BTreeCursor {
                                 &record.values[..record.values.len() - 1] >= &index_key.values
                             }
                             SeekOp::EQ => {
-                                &record.values[..record.values.len() - 1] == &index_key.values
+                                record.values[..record.values.len() - 1] == index_key.values
                             }
                         };
                         self.stack.advance();
@@ -542,7 +536,7 @@ impl BTreeCursor {
             match contents.rightmost_pointer() {
                 Some(right_most_pointer) => {
                     self.stack.set_cell_index(contents.cell_count() as i32 + 1);
-                    let mem_page = self.pager.read_page(right_most_pointer as usize).unwrap();
+                    let mem_page = self.pager.read_page(right_most_pointer as usize)?;
                     self.stack.push(mem_page);
                     continue;
                 }
@@ -643,7 +637,7 @@ impl BTreeCursor {
                         };
                         if target_leaf_page_is_in_the_left_subtree {
                             // we don't advance in case of index tree internal nodes because we will visit this node going up
-                            let mem_page = self.pager.read_page(*left_child_page as usize).unwrap();
+                            let mem_page = self.pager.read_page(*left_child_page as usize)?;
                             self.stack.push(mem_page);
                             found_cell = true;
                             break;
@@ -663,7 +657,7 @@ impl BTreeCursor {
                 match contents.rightmost_pointer() {
                     Some(right_most_pointer) => {
                         self.stack.advance();
-                        let mem_page = self.pager.read_page(right_most_pointer as usize).unwrap();
+                        let mem_page = self.pager.read_page(right_most_pointer as usize)?;
                         self.stack.push(mem_page);
                         continue;
                     }
@@ -716,7 +710,7 @@ impl BTreeCursor {
                     // insert
                     let overflow = {
                         let contents = page.get().contents.as_mut().unwrap();
-                        log::debug!(
+                        debug!(
                             "insert_into_page(overflow, cell_count={})",
                             contents.cell_count()
                         );
@@ -750,7 +744,7 @@ impl BTreeCursor {
     /// and the overflow cell count is used to determine if the page overflows,
     /// i.e. whether we need to balance the btree after the insert.
     fn insert_into_cell(&self, page: &mut PageContent, payload: &[u8], cell_idx: usize) {
-        let free = self.compute_free_space(page, RefCell::borrow(&self.database_header));
+        let free = self.compute_free_space(page, RefCell::borrow(&self.pager.db_header));
         const CELL_POINTER_SIZE_BYTES: usize = 2;
         let enough_space = payload.len() + CELL_POINTER_SIZE_BYTES <= free as usize;
         if !enough_space {
@@ -832,7 +826,7 @@ impl BTreeCursor {
         // then we need to do some more calculation to figure out where to insert the freeblock
         // in the freeblock linked list.
         let maxpc = {
-            let db_header = self.database_header.borrow();
+            let db_header = self.pager.db_header.borrow();
             let usable_space = (db_header.page_size - db_header.reserved_space as u16) as usize;
             usable_space as u16
         };
@@ -1027,15 +1021,13 @@ impl BTreeCursor {
                 // Right page pointer is u32 in right most pointer, and in cell is u32 too, so we can use a *u32 to hold where we want to change this value
                 let mut right_pointer = PAGE_HEADER_OFFSET_RIGHTMOST_PTR;
                 for cell_idx in 0..parent_contents.cell_count() {
-                    let cell = parent_contents
-                        .cell_get(
-                            cell_idx,
-                            self.pager.clone(),
-                            self.payload_overflow_threshold_max(page_type.clone()),
-                            self.payload_overflow_threshold_min(page_type.clone()),
-                            self.usable_space(),
-                        )
-                        .unwrap();
+                    let cell = parent_contents.cell_get(
+                        cell_idx,
+                        self.pager.clone(),
+                        self.payload_overflow_threshold_max(page_type.clone()),
+                        self.payload_overflow_threshold_min(page_type.clone()),
+                        self.usable_space(),
+                    )?;
                     let found = match cell {
                         BTreeCell::TableInteriorCell(interior) => {
                             interior._left_child_page as usize == current_idx
@@ -1065,7 +1057,7 @@ impl BTreeCursor {
                     contents.write_u16(PAGE_HEADER_OFFSET_FIRST_FREEBLOCK, 0);
                     contents.write_u16(PAGE_HEADER_OFFSET_CELL_COUNT, 0);
 
-                    let db_header = RefCell::borrow(&self.database_header);
+                    let db_header = RefCell::borrow(&self.pager.db_header);
                     let cell_content_area_start =
                         db_header.page_size - db_header.reserved_space as u16;
                     contents.write_u16(
@@ -1128,16 +1120,14 @@ impl BTreeCursor {
                     for page in new_pages.iter_mut().take(new_pages_len - 1) {
                         let contents = page.get().contents.as_mut().unwrap();
 
-                        assert!(contents.cell_count() == 1);
-                        let last_cell = contents
-                            .cell_get(
-                                contents.cell_count() - 1,
-                                self.pager.clone(),
-                                self.payload_overflow_threshold_max(contents.page_type()),
-                                self.payload_overflow_threshold_min(contents.page_type()),
-                                self.usable_space(),
-                            )
-                            .unwrap();
+                        assert_eq!(contents.cell_count(), 1);
+                        let last_cell = contents.cell_get(
+                            contents.cell_count() - 1,
+                            self.pager.clone(),
+                            self.payload_overflow_threshold_max(contents.page_type()),
+                            self.payload_overflow_threshold_min(contents.page_type()),
+                            self.usable_space(),
+                        )?;
                         let last_cell_pointer = match last_cell {
                             BTreeCell::TableInteriorCell(interior) => interior._left_child_page,
                             _ => unreachable!(),
@@ -1170,8 +1160,7 @@ impl BTreeCursor {
                         self.payload_overflow_threshold_max(contents.page_type()),
                         self.payload_overflow_threshold_min(contents.page_type()),
                         self.usable_space(),
-                    )
-                    .unwrap();
+                    )?;
 
                     if is_leaf {
                         // create a new divider cell and push
@@ -1299,7 +1288,7 @@ impl BTreeCursor {
     /// This marks the page as dirty and writes the page header.
     fn allocate_page(&self, page_type: PageType, offset: usize) -> PageRef {
         let page = self.pager.allocate_page().unwrap();
-        btree_init_page(&page, page_type, &self.database_header.borrow(), offset);
+        btree_init_page(&page, page_type, &self.pager.db_header.borrow(), offset);
         page
     }
 
@@ -1327,7 +1316,7 @@ impl BTreeCursor {
         // there are free blocks and enough space
         if page_ref.first_freeblock() != 0 && gap + 2 <= top {
             // find slot
-            let db_header = RefCell::borrow(&self.database_header);
+            let db_header = RefCell::borrow(&self.pager.db_header);
             let pc = find_free_cell(page_ref, db_header, amount);
             if pc != 0 {
                 return pc as u16;
@@ -1337,11 +1326,11 @@ impl BTreeCursor {
 
         if gap + 2 + amount > top {
             // defragment
-            self.defragment_page(page_ref, RefCell::borrow(&self.database_header));
+            self.defragment_page(page_ref, RefCell::borrow(&self.pager.db_header));
             top = page_ref.read_u16(PAGE_HEADER_OFFSET_CELL_CONTENT_AREA) as usize;
         }
 
-        let db_header = RefCell::borrow(&self.database_header);
+        let db_header = RefCell::borrow(&self.pager.db_header);
         top -= amount;
 
         page_ref.write_u16(PAGE_HEADER_OFFSET_CELL_CONTENT_AREA, top as u16);
@@ -1353,7 +1342,7 @@ impl BTreeCursor {
 
     /// Defragment a page. This means packing all the cells to the end of the page.
     fn defragment_page(&self, page: &PageContent, db_header: Ref<DatabaseHeader>) {
-        log::debug!("defragment_page");
+        debug!("defragment_page");
         let cloned_page = page.clone();
         // TODO(pere): usable space should include offset probably
         let usable_space = (db_header.page_size - db_header.reserved_space as u16) as u64;
@@ -1505,8 +1494,8 @@ impl BTreeCursor {
             }
 
             // Next should always be 0 (NULL) at this point since we have reached the end of the freeblocks linked list
-            assert!(
-                next == 0,
+            assert_eq!(
+                next, 0,
                 "corrupted page: freeblocks list not in ascending order"
             );
 
@@ -1555,7 +1544,7 @@ impl BTreeCursor {
         }
 
         let payload_overflow_threshold_max = self.payload_overflow_threshold_max(page_type.clone());
-        log::debug!(
+        debug!(
             "fill_cell_payload(record_size={}, payload_overflow_threshold_max={})",
             record_buf.len(),
             payload_overflow_threshold_max
@@ -1565,7 +1554,7 @@ impl BTreeCursor {
             cell_payload.extend_from_slice(record_buf.as_slice());
             return;
         }
-        log::debug!("fill_cell_payload(overflow)");
+        debug!("fill_cell_payload(overflow)");
 
         let payload_overflow_threshold_min = self.payload_overflow_threshold_min(page_type);
         // see e.g. https://github.com/sqlite/sqlite/blob/9591d3fe93936533c8c3b0dc4d025ac999539e11/src/dbstat.c#L371
@@ -1661,7 +1650,7 @@ impl BTreeCursor {
     /// The usable size of a page might be an odd number. However, the usable size is not allowed to be less than 480.
     /// In other words, if the page size is 512, then the reserved space size cannot exceed 32.
     fn usable_space(&self) -> usize {
-        let db_header = RefCell::borrow(&self.database_header);
+        let db_header = self.pager.db_header.borrow();
         (db_header.page_size - db_header.reserved_space as u16) as usize
     }
 

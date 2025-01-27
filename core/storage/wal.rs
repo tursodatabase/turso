@@ -25,6 +25,7 @@ pub const NO_LOCK: u32 = 0;
 pub const SHARED_LOCK: u32 = 1;
 pub const WRITE_LOCK: u32 = 2;
 
+#[derive(Debug)]
 pub enum CheckpointMode {
     Passive,
     Full,
@@ -66,7 +67,7 @@ impl LimboRwLock {
         }
     }
 
-    /// Locks exlusively. Returns true if it was successful, false if it couldn't lock it
+    /// Locks exclusively. Returns true if it was successful, false if it couldn't lock it
     pub fn write(&mut self) -> bool {
         let lock = self.lock.load(Ordering::SeqCst);
         match lock {
@@ -186,7 +187,7 @@ pub enum CheckpointStatus {
 // min_frame and max_frame is the range of frames that can be safely transferred from WAL to db
 // file.
 // current_page is a helper to iterate through all the pages that might have a frame in the safe
-// range. This is inneficient for now.
+// range. This is inefficient for now.
 struct OngoingCheckpoint {
     page: PageRef,
     state: CheckpointState,
@@ -197,7 +198,7 @@ struct OngoingCheckpoint {
 
 #[allow(dead_code)]
 pub struct WalFile {
-    io: Arc<dyn crate::io::IO>,
+    io: Arc<dyn IO>,
     buffer_pool: Rc<BufferPool>,
 
     sync_state: RefCell<SyncState>,
@@ -222,22 +223,22 @@ pub struct WalFile {
 /// that needs to be communicated between threads so this struct does the job.
 #[allow(dead_code)]
 pub struct WalFileShared {
-    wal_header: Arc<RwLock<sqlite3_ondisk::WalHeader>>,
+    wal_header: Arc<RwLock<WalHeader>>,
     min_frame: u64,
     max_frame: u64,
     nbackfills: u64,
     // Frame cache maps a Page to all the frames it has stored in WAL in ascending order.
-    // This is do to easily find the frame it must checkpoint each connection if a checkpoint is
+    // This is to easily find the frame it must checkpoint each connection if a checkpoint is
     // necessary.
     // One difference between SQLite and limbo is that we will never support multi process, meaning
     // we don't need WAL's index file. So we can do stuff like this without shared memory.
-    // TODO: this will need refactoring because this is incredible memory inneficient.
+    // TODO: this will need refactoring because this is incredible memory inefficient.
     frame_cache: HashMap<u64, Vec<u64>>,
-    // Another memory inneficient array made to just keep track of pages that are in frame_cache.
+    // Another memory inefficient array made to just keep track of pages that are in frame_cache.
     pages_in_frames: Vec<u64>,
     last_checksum: (u32, u32), // Check of last frame in WAL, this is a cumulative checksum over all frames in the WAL
     file: Rc<dyn File>,
-    /// read_locks is a list of read locks that can coexist with the max_frame nubmer stored in
+    /// read_locks is a list of read locks that can coexist with the max_frame number stored in
     /// value. There is a limited amount because and unbounded amount of connections could be
     /// fatal. Therefore, for now we copy how SQLite behaves with limited amounts of read max
     /// frames that is equal to 5
@@ -293,7 +294,7 @@ impl Wal for WalFile {
         self.max_frame_read_lock_index = max_read_mark_index as usize;
         self.max_frame = max_read_mark as u64;
         self.min_frame = shared.nbackfills + 1;
-        log::trace!(
+        trace!(
             "begin_read_tx(min_frame={}, max_frame={}, lock={})",
             self.min_frame,
             self.max_frame,
@@ -424,7 +425,7 @@ impl Wal for WalFile {
         );
         'checkpoint_loop: loop {
             let state = self.ongoing_checkpoint.state;
-            log::debug!("checkpoint(state={:?})", state);
+            debug!("checkpoint(state={:?})", state);
             match state {
                 CheckpointState::Start => {
                     // TODO(pere): check what frames are safe to checkpoint between many readers!
@@ -447,7 +448,7 @@ impl Wal for WalFile {
                     self.ongoing_checkpoint.max_frame = max_safe_frame;
                     self.ongoing_checkpoint.current_page = 0;
                     self.ongoing_checkpoint.state = CheckpointState::ReadFrame;
-                    log::trace!(
+                    trace!(
                         "checkpoint_start(min_frame={}, max_frame={})",
                         self.ongoing_checkpoint.max_frame,
                         self.ongoing_checkpoint.min_frame
@@ -475,11 +476,9 @@ impl Wal for WalFile {
                         if *frame >= self.ongoing_checkpoint.min_frame
                             && *frame <= self.ongoing_checkpoint.max_frame
                         {
-                            log::debug!(
+                            debug!(
                                 "checkpoint page(state={:?}, page={}, frame={})",
-                                state,
-                                page,
-                                *frame
+                                state, page, *frame
                             );
                             self.ongoing_checkpoint.page.get().id = page as usize;
 
@@ -553,13 +552,13 @@ impl Wal for WalFile {
         match state {
             SyncState::NotSyncing => {
                 let shared = self.shared.write().unwrap();
-                log::debug!("wal_sync");
+                debug!("wal_sync");
                 {
                     let syncing = self.syncing.clone();
                     *syncing.borrow_mut() = true;
                     let completion = Completion::Sync(SyncCompletion {
                         complete: Box::new(move |_| {
-                            log::debug!("wal_sync finish");
+                            debug!("wal_sync finish");
                             *syncing.borrow_mut() = false;
                         }),
                     });
@@ -671,7 +670,7 @@ impl WalFileShared {
             };
             let native = cfg!(target_endian = "big"); // if target_endian is
                                                       // already big then we don't care but if isn't, header hasn't yet been
-                                                      // encoded to big endian, therefore we wan't to swap bytes to compute this
+                                                      // encoded to big endian, therefore we want to swap bytes to compute this
                                                       // checksum.
             let checksums = (0, 0);
             let checksums = checksum_wal(

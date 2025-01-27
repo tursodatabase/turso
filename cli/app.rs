@@ -3,7 +3,7 @@ use crate::{
     opcodes_dictionary::OPCODE_DESCRIPTIONS,
 };
 use cli_table::{Cell, Table};
-use limbo_core::{Database, LimboError, Rows, StepResult, Value};
+use limbo_core::{Database, LimboError, Statement, StepResult, Value};
 
 use clap::{Parser, ValueEnum};
 use std::{
@@ -135,7 +135,7 @@ pub enum Command {
 
 impl Command {
     fn min_args(&self) -> usize {
-        (match self {
+        1 + match self {
             Self::Quit
             | Self::Schema
             | Self::Help
@@ -150,7 +150,7 @@ impl Command {
             | Self::NullValue
             | Self::LoadExtension => 1,
             Self::Import => 2,
-        } + 1) // argv0
+        } // argv0
     }
 
     fn usage(&self) -> &str {
@@ -337,7 +337,7 @@ impl Limbo {
             .map_err(|e| e.to_string())
     }
 
-    fn display_in_memory(&mut self) -> std::io::Result<()> {
+    fn display_in_memory(&mut self) -> io::Result<()> {
         if self.opts.db_file == ":memory:" {
             self.writeln("Connected to a transient in-memory database.")?;
             self.writeln("Use \".open FILENAME\" to reopen on a persistent database")?;
@@ -345,7 +345,7 @@ impl Limbo {
         Ok(())
     }
 
-    fn show_info(&mut self) -> std::io::Result<()> {
+    fn show_info(&mut self) -> io::Result<()> {
         let opts = format!("{}", self.opts);
         self.writeln(opts)
     }
@@ -445,6 +445,42 @@ impl Limbo {
                 return Ok(());
             }
         }
+        if line.trim_start().starts_with("--") {
+            if let Some(remaining) = line.split_once('\n') {
+                let after_comment = remaining.1.trim();
+                if !after_comment.is_empty() {
+                    rl.add_history_entry(after_comment.to_owned())?;
+                    self.buffer_input(after_comment);
+
+                    if after_comment.ends_with(';') {
+                        if self.opts.echo {
+                            let _ = self.writeln(after_comment);
+                        }
+                        let conn = self.conn.clone();
+                        let runner = conn.query_runner(after_comment.as_bytes());
+                        for output in runner {
+                            if let Err(e) = self.print_query_result(after_comment, output) {
+                                let _ = self.writeln(e.to_string());
+                            }
+                        }
+                        self.reset_input();
+                    } else {
+                        self.set_multiline_prompt();
+                    }
+                    self.interrupt_count.store(0, Ordering::SeqCst);
+                    return Ok(());
+                }
+            }
+            return Ok(());
+        }
+
+        if let Some(comment_pos) = line.find("--") {
+            let before_comment = line[..comment_pos].trim();
+            if !before_comment.is_empty() {
+                return self.handle_input_line(before_comment, rl);
+            }
+        }
+
         if line.ends_with(';') {
             self.buffer_input(line);
             let buff = self.input_buff.clone();
@@ -578,7 +614,7 @@ impl Limbo {
     fn print_query_result(
         &mut self,
         sql: &str,
-        mut output: Result<Option<Rows>, LimboError>,
+        mut output: Result<Option<Statement>, LimboError>,
     ) -> anyhow::Result<()> {
         match output {
             Ok(Some(ref mut rows)) => match self.opts.output_mode {
@@ -588,7 +624,7 @@ impl Limbo {
                         return Ok(());
                     }
 
-                    match rows.next_row() {
+                    match rows.step() {
                         Ok(StepResult::Row(row)) => {
                             for (i, value) in row.values.iter().enumerate() {
                                 if i > 0 {
@@ -633,7 +669,7 @@ impl Limbo {
                     }
                     let mut table_rows: Vec<Vec<_>> = vec![];
                     loop {
-                        match rows.next_row() {
+                        match rows.step() {
                             Ok(StepResult::Row(row)) => {
                                 table_rows.push(
                                     row.values
@@ -703,7 +739,7 @@ impl Limbo {
             Ok(Some(ref mut rows)) => {
                 let mut found = false;
                 loop {
-                    match rows.next_row()? {
+                    match rows.step()? {
                         StepResult::Row(row) => {
                             if let Some(Value::Text(schema)) = row.values.first() {
                                 let _ = self.write_fmt(format_args!("{};", schema));
@@ -724,9 +760,9 @@ impl Limbo {
                 if !found {
                     if let Some(table_name) = table {
                         let _ = self
-                            .write_fmt(format_args!("Error: Table '{}' not found.", table_name));
+                            .write_fmt(format_args!("-- Error: Table '{}' not found.", table_name));
                     } else {
-                        let _ = self.writeln("No tables or indexes found in the database.");
+                        let _ = self.writeln("-- No tables or indexes found in the database.");
                     }
                 }
             }
@@ -760,7 +796,7 @@ impl Limbo {
             Ok(Some(ref mut rows)) => {
                 let mut tables = String::new();
                 loop {
-                    match rows.next_row()? {
+                    match rows.step()? {
                         StepResult::Row(row) => {
                             if let Some(Value::Text(table)) = row.values.first() {
                                 tables.push_str(table);

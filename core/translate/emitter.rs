@@ -175,7 +175,11 @@ fn emit_program_for_select(
 
     // Finalize program
     epilogue(program, init_label, start_offset)?;
-
+    program.columns = plan
+        .result_columns
+        .iter()
+        .map(|rc| rc.name.clone())
+        .collect::<Vec<_>>();
     Ok(())
 }
 
@@ -286,13 +290,17 @@ fn emit_program_for_delete(
 
     // Finalize program
     epilogue(program, init_label, start_offset)?;
-
+    program.columns = plan
+        .result_columns
+        .iter()
+        .map(|rc| rc.name.clone())
+        .collect::<Vec<_>>();
     Ok(())
 }
 
-fn emit_delete_insns<'a>(
+fn emit_delete_insns(
     program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx<'a>,
+    t_ctx: &mut TranslateCtx,
     source: &SourceOperator,
     limit: &Option<usize>,
 ) -> Result<()> {

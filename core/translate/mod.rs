@@ -25,6 +25,7 @@ pub(crate) mod subquery;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, MIN_PAGE_CACHE_SIZE};
+use crate::storage::wal::CheckpointMode;
 use crate::translate::delete::translate_delete;
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vdbe::builder::CursorType;
@@ -48,6 +49,7 @@ pub fn translate(
     syms: &SymbolTable,
 ) -> Result<Program> {
     let mut program = ProgramBuilder::new();
+    let mut change_cnt_on = false;
 
     match stmt {
         ast::Stmt::AlterTable(_, _) => bail_parse_error!("ALTER TABLE not supported yet"),
@@ -79,6 +81,7 @@ pub fn translate(
             limit,
             ..
         } => {
+            change_cnt_on = true;
             translate_delete(&mut program, schema, &tbl_name, where_clause, limit, syms)?;
         }
         ast::Stmt::Detach(_) => bail_parse_error!("DETACH not supported yet"),
@@ -106,6 +109,7 @@ pub fn translate(
             body,
             returning,
         } => {
+            change_cnt_on = true;
             translate_insert(
                 &mut program,
                 schema,
@@ -120,7 +124,7 @@ pub fn translate(
         }
     }
 
-    Ok(program.build(database_header, connection))
+    Ok(program.build(database_header, connection, change_cnt_on))
 }
 
 /* Example:
@@ -291,12 +295,12 @@ fn check_automatic_pk_index_required(
 
                         for result in primary_key_column_results {
                             if let Err(e) = result {
-                                crate::bail_parse_error!("{}", e);
+                                bail_parse_error!("{}", e);
                             }
-                            let column_name = result.unwrap();
+                            let column_name = result?;
                             let column_def = columns.get(&ast::Name(column_name.clone()));
                             if column_def.is_none() {
-                                crate::bail_parse_error!("No such column: {}", column_name);
+                                bail_parse_error!("No such column: {}", column_name);
                             }
 
                             if matches!(
@@ -326,10 +330,7 @@ fn check_automatic_pk_index_required(
                         ast::ColumnConstraint::PrimaryKey { .. }
                     ) {
                         if primary_key_definition.is_some() {
-                            crate::bail_parse_error!(
-                                "table {} has more than one primary key",
-                                tbl_name
-                            );
+                            bail_parse_error!("table {} has more than one primary key", tbl_name);
                         }
                         let typename = col_def.col_type.as_ref().map(|t| t.name.as_str());
                         primary_key_definition =
@@ -340,7 +341,7 @@ fn check_automatic_pk_index_required(
 
             // Check if table has rowid
             if options.contains(ast::TableOptions::WITHOUT_ROWID) {
-                crate::bail_parse_error!("WITHOUT ROWID tables are not supported yet");
+                bail_parse_error!("WITHOUT ROWID tables are not supported yet");
             }
 
             // Check if we need an automatic index
@@ -364,7 +365,7 @@ fn check_automatic_pk_index_required(
             }
         }
         ast::CreateTableBody::AsSelect(_) => {
-            crate::bail_parse_error!("CREATE TABLE AS SELECT not supported yet")
+            bail_parse_error!("CREATE TABLE AS SELECT not supported yet")
         }
     }
 }
@@ -578,11 +579,11 @@ fn update_pragma(
         PragmaName::CacheSize => {
             let cache_size = match value {
                 ast::Expr::Literal(ast::Literal::Numeric(numeric_value)) => {
-                    numeric_value.parse::<i64>().unwrap()
+                    numeric_value.parse::<i64>()?
                 }
                 ast::Expr::Unary(ast::UnaryOperator::Negative, expr) => match *expr {
                     ast::Expr::Literal(ast::Literal::Numeric(numeric_value)) => {
-                        -numeric_value.parse::<i64>().unwrap()
+                        -numeric_value.parse::<i64>()?
                     }
                     _ => bail_parse_error!("Not a valid value"),
                 },
@@ -593,6 +594,10 @@ fn update_pragma(
         }
         PragmaName::JournalMode => {
             query_pragma("journal_mode", header, program)?;
+            Ok(())
+        }
+        PragmaName::WalCheckpoint => {
+            query_pragma("wal_checkpoint", header, program)?;
             Ok(())
         }
     }
@@ -614,19 +619,38 @@ fn query_pragma(
                 value: database_header.borrow().default_page_cache_size.into(),
                 dest: register,
             });
+            program.emit_insn(Insn::ResultRow {
+                start_reg: register,
+                count: 1,
+            });
         }
         PragmaName::JournalMode => {
             program.emit_insn(Insn::String8 {
                 value: "wal".into(),
                 dest: register,
             });
+            program.emit_insn(Insn::ResultRow {
+                start_reg: register,
+                count: 1,
+            });
+        }
+        PragmaName::WalCheckpoint => {
+            // Checkpoint uses 3 registers: P1, P2, P3. Ref Insn::Checkpoint for more info.
+            // Allocate two more here as one was allocated at the top.
+            program.alloc_register();
+            program.alloc_register();
+            program.emit_insn(Insn::Checkpoint {
+                database: 0,
+                checkpoint_mode: CheckpointMode::Passive,
+                dest: register,
+            });
+            program.emit_insn(Insn::ResultRow {
+                start_reg: register,
+                count: 3,
+            });
         }
     }
 
-    program.emit_insn(Insn::ResultRow {
-        start_reg: register,
-        count: 1,
-    });
     Ok(())
 }
 

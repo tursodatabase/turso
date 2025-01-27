@@ -48,7 +48,7 @@ impl Database {
 
     #[wasm_bindgen]
     pub fn exec(&self, _sql: &str) {
-        let _res = self.conn.execute(_sql).unwrap();
+        self.conn.execute(_sql).unwrap();
     }
 
     #[wasm_bindgen]
@@ -358,7 +358,7 @@ impl limbo_core::DatabaseStorage for DatabaseStorage {
 compile_error!("Features 'web' and 'nodejs' cannot be enabled at the same time");
 
 #[cfg(feature = "web")]
-#[wasm_bindgen(module = "/src/web-vfs.js")]
+#[wasm_bindgen(module = "/web/src/web-vfs.js")]
 extern "C" {
     type VFS;
     #[wasm_bindgen(constructor)]
@@ -384,7 +384,7 @@ extern "C" {
 }
 
 #[cfg(feature = "nodejs")]
-#[wasm_bindgen(module = "/vfs.js")]
+#[wasm_bindgen(module = "/node/src/vfs.cjs")]
 extern "C" {
     type VFS;
     #[wasm_bindgen(constructor)]

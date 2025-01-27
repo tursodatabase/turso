@@ -1,6 +1,11 @@
+use limbo_ext::{AggCtx, FinalizeFunction, StepFunction};
+
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
+use crate::pseudo::PseudoCursor;
+use crate::storage::btree::BTreeCursor;
 use crate::storage::sqlite3_ondisk::write_varint;
+use crate::vdbe::sorter::Sorter;
 use crate::Result;
 use std::fmt::Display;
 use std::rc::Rc;
@@ -72,6 +77,22 @@ impl OwnedValue {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternalAggState {
+    pub state: *mut AggCtx,
+    pub argc: usize,
+    pub step_fn: StepFunction,
+    pub finalize_fn: FinalizeFunction,
+    pub finalized_value: Option<OwnedValue>,
+}
+
+impl ExternalAggState {
+    pub fn cache_final_value(&mut self, value: OwnedValue) -> &OwnedValue {
+        self.finalized_value = Some(value);
+        self.finalized_value.as_ref().unwrap()
+    }
+}
+
 impl Display for OwnedValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -87,6 +108,9 @@ impl Display for OwnedValue {
                 AggContext::Max(max) => write!(f, "{}", max.as_ref().unwrap_or(&Self::Null)),
                 AggContext::Min(min) => write!(f, "{}", min.as_ref().unwrap_or(&Self::Null)),
                 AggContext::GroupConcat(s) => write!(f, "{}", s),
+                AggContext::External(v) => {
+                    write!(f, "{}", v.finalized_value.as_ref().unwrap_or(&Self::Null))
+                }
             },
             Self::Record(r) => write!(f, "{:?}", r),
         }
@@ -101,7 +125,7 @@ impl OwnedValue {
             Self::Float(fl) => ExtValue::from_float(*fl),
             Self::Text(text) => ExtValue::from_text(text.value.to_string()),
             Self::Blob(blob) => ExtValue::from_blob(blob.to_vec()),
-            Self::Agg(_) => todo!("Aggregate values not yet supported"),
+            Self::Agg(_) => todo!(),
             Self::Record(_) => todo!("Record values not yet supported"),
         }
     }
@@ -125,13 +149,19 @@ impl OwnedValue {
                 let Some(text) = v.to_text() else {
                     return OwnedValue::Null;
                 };
-                OwnedValue::build_text(std::rc::Rc::new(text))
+                OwnedValue::build_text(Rc::new(text))
             }
             ExtValueType::Blob => {
                 let Some(blob) = v.to_blob() else {
                     return OwnedValue::Null;
                 };
-                OwnedValue::Blob(std::rc::Rc::new(blob))
+                OwnedValue::Blob(Rc::new(blob))
+            }
+            ExtValueType::Error => {
+                let Some(err) = v.to_error() else {
+                    return OwnedValue::Null;
+                };
+                OwnedValue::Text(LimboText::new(Rc::new(err)))
             }
         }
     }
@@ -145,11 +175,21 @@ pub enum AggContext {
     Max(Option<OwnedValue>),
     Min(Option<OwnedValue>),
     GroupConcat(OwnedValue),
+    External(ExternalAggState),
 }
 
 const NULL: OwnedValue = OwnedValue::Null;
 
 impl AggContext {
+    pub fn compute_external(&mut self) {
+        if let Self::External(ext_state) = self {
+            if ext_state.finalized_value.is_none() {
+                let final_value = unsafe { (ext_state.finalize_fn)(ext_state.state) };
+                ext_state.cache_final_value(OwnedValue::from_ffi(&final_value));
+            }
+        }
+    }
+
     pub fn final_value(&self) -> &OwnedValue {
         match self {
             Self::Avg(acc, _count) => acc,
@@ -158,6 +198,7 @@ impl AggContext {
             Self::Max(max) => max.as_ref().unwrap_or(&NULL),
             Self::Min(min) => min.as_ref().unwrap_or(&NULL),
             Self::GroupConcat(s) => s,
+            Self::External(ext_state) => ext_state.finalized_value.as_ref().unwrap_or(&NULL),
         }
     }
 }
@@ -203,7 +244,7 @@ impl PartialOrd<OwnedValue> for OwnedValue {
     }
 }
 
-impl std::cmp::PartialOrd<AggContext> for AggContext {
+impl PartialOrd<AggContext> for AggContext {
     fn partial_cmp(&self, other: &AggContext) -> Option<std::cmp::Ordering> {
         match (self, other) {
             (Self::Avg(a, _), Self::Avg(b, _)) => a.partial_cmp(b),
@@ -217,9 +258,9 @@ impl std::cmp::PartialOrd<AggContext> for AggContext {
     }
 }
 
-impl std::cmp::Eq for OwnedValue {}
+impl Eq for OwnedValue {}
 
-impl std::cmp::Ord for OwnedValue {
+impl Ord for OwnedValue {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.partial_cmp(other).unwrap()
     }
@@ -376,6 +417,12 @@ pub fn to_value(value: &OwnedValue) -> Value<'_> {
                 None => Value::Null,
             },
             AggContext::GroupConcat(s) => to_value(s),
+            AggContext::External(ext_state) => to_value(
+                ext_state
+                    .finalized_value
+                    .as_ref()
+                    .unwrap_or(&OwnedValue::Null),
+            ),
         },
         OwnedValue::Record(_) => todo!(),
     }
@@ -560,7 +607,59 @@ impl OwnedRecord {
     }
 }
 
-#[derive(PartialEq, Debug)]
+pub enum Cursor {
+    Table(BTreeCursor),
+    Index(BTreeCursor),
+    Pseudo(PseudoCursor),
+    Sorter(Sorter),
+}
+
+impl Cursor {
+    pub fn new_table(cursor: BTreeCursor) -> Self {
+        Self::Table(cursor)
+    }
+
+    pub fn new_index(cursor: BTreeCursor) -> Self {
+        Self::Index(cursor)
+    }
+
+    pub fn new_pseudo(cursor: PseudoCursor) -> Self {
+        Self::Pseudo(cursor)
+    }
+
+    pub fn new_sorter(cursor: Sorter) -> Self {
+        Self::Sorter(cursor)
+    }
+
+    pub fn as_table_mut(&mut self) -> &mut BTreeCursor {
+        match self {
+            Self::Table(cursor) => cursor,
+            _ => panic!("Cursor is not a table"),
+        }
+    }
+
+    pub fn as_index_mut(&mut self) -> &mut BTreeCursor {
+        match self {
+            Self::Index(cursor) => cursor,
+            _ => panic!("Cursor is not an index"),
+        }
+    }
+
+    pub fn as_pseudo_mut(&mut self) -> &mut PseudoCursor {
+        match self {
+            Self::Pseudo(cursor) => cursor,
+            _ => panic!("Cursor is not a pseudo cursor"),
+        }
+    }
+
+    pub fn as_sorter_mut(&mut self) -> &mut Sorter {
+        match self {
+            Self::Sorter(cursor) => cursor,
+            _ => panic!("Cursor is not a sorter cursor"),
+        }
+    }
+}
+
 pub enum CursorResult<T> {
     Ok(T),
     IO,
@@ -616,7 +715,7 @@ mod tests {
         let header_length = record.values.len() + 1;
         let header = &buf[0..header_length];
         // First byte should be header size
-        assert!(header[0] == header_length as u8); // Header should be larger than number of values
+        assert_eq!(header[0], header_length as u8); // Header should be larger than number of values
 
         // Check that correct serial types were chosen
         assert_eq!(header[1] as u64, u64::from(SerialType::I8));

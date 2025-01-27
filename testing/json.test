@@ -506,3 +506,73 @@ do_execsql_test json_error_position_null {
 do_execsql_test json_error_position_complex {
   SELECT json_error_position('{a:null,{"h":[1,[1,2,3]],"j":"abc"}:true}');
 } {{9}}
+
+do_execsql_test json_object_simple {
+  SELECT json_object('key', 'value');
+} {{{"key":"value"}}}
+
+do_execsql_test json_object_nested {
+  SELECT json_object('grandparent',json_object('parent', json_object('child', 'value')));
+} {{{"grandparent":{"parent":{"child":"value"}}}}}
+
+do_execsql_test json_object_quoted_json {
+  SELECT json_object('parent', '{"child":"value"}');
+} {{{"parent":"{\"child\":\"value\"}"}}}
+
+do_execsql_test json_object_unquoted_json {
+  SELECT json_object('parent', json('{"child":"value"}'));
+} {{{"parent":{"child":"value"}}}}
+
+do_execsql_test json_object_multiple_values {
+    SELECT json_object('text', 'value', 'json', json_object('key', 'value'), 'int', 1, 'float', 1.5, 'null', null);
+} {{{"text":"value","json":{"key":"value"},"int":1,"float":1.5,"null":null}}}
+
+do_execsql_test json_object_empty {
+  SELECT json_object();
+} {{{}}}
+
+do_execsql_test json_object_json_array {
+    SELECT json_object('ex',json('[52,3]'));
+} {{{"ex":[52,3]}}}
+
+do_execsql_test json_from_json_object {
+    SELECT json(json_object('key','value'));
+} {{{"key":"value"}}}
+
+# FIXME: this behaviour differs from sqlite. Although, sqlite docs states
+# that this could change in a "future enhancement" (https://www.sqlite.org/json1.html#jobj)
+#do_execsql_test json_object_duplicated_keys {
+#    SELECT json_object('key', 'value', 'key', 'value2');
+#} {{{"key":"value2"}}}
+#
+
+do_execsql_test json_valid_1 {
+   SELECT json_valid('{"a":55,"b":72}');
+} {1}
+do_execsql_test json_valid_2 {
+   SELECT json_valid('["a",55,"b",72]');
+} {1}
+do_execsql_test json_valid_3 {
+   SELECT json_valid( CAST('{"a":1}' AS BLOB) );
+} {1}
+do_execsql_test json_valid_4 {
+  SELECT json_valid(123);
+} {1}
+do_execsql_test json_valid_5 {
+  SELECT json_valid(12.3);
+} {1}
+do_execsql_test json_valid_6 {
+  SELECT json_valid('not a valid json');
+} {0}
+do_execsql_test json_valid_7 {
+   SELECT json_valid('{"a":"55,"b":72}');
+} {0}
+do_execsql_test json_valid_8 {
+   SELECT json_valid('{"a":55 "b":72}');
+} {0}
+do_execsql_test json_valid_3 {
+   SELECT json_valid( CAST('{"a":"1}' AS BLOB) );
+} {0}
+do_execsql_test json_valid_9 {
+    SELECT json_valid(NULL);
+} {}

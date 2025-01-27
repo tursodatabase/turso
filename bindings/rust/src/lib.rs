@@ -11,7 +11,7 @@ use std::sync::Arc;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("SQL conversion failure: `{0}`")]
-    ToSqlConversionFailure(crate::BoxError),
+    ToSqlConversionFailure(BoxError),
 }
 
 impl From<limbo_core::LimboError> for Error {
@@ -110,7 +110,7 @@ pub enum Params {
 pub struct Transaction {}
 
 pub struct Rows {
-    _inner: Rc<limbo_core::Rows>,
+    _inner: Rc<limbo_core::Statement>,
 }
 
 impl Rows {

@@ -477,6 +477,7 @@ pub fn open_loop(
                                 lhs: rowid_reg,
                                 rhs: cmp_reg,
                                 target_pc: loop_end,
+                                jump_if_null: false,
                             });
                         }
                     }
@@ -498,6 +499,7 @@ pub fn open_loop(
                                 lhs: rowid_reg,
                                 rhs: cmp_reg,
                                 target_pc: loop_end,
+                                jump_if_null: false,
                             });
                         }
                     }
@@ -780,7 +782,7 @@ pub fn close_loop(
                     target_pc: lj_meta.label_match_flag_set_true,
                 });
 
-                assert!(program.offset() == jump_offset);
+                assert_eq!(program.offset(), jump_offset);
             }
 
             close_loop(program, t_ctx, left)?;

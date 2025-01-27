@@ -1,5 +1,7 @@
 mod args;
-use args::{ArgsAttr, ArgsSpec};
+use args::{RegisterExtensionInput, ScalarInfo};
+use quote::{format_ident, quote};
+use syn::{parse_macro_input, DeriveInput, ItemFn};
 extern crate proc_macro;
 use proc_macro::{token_stream::IntoIter, Group, TokenStream, TokenTree};
 use std::collections::HashMap;
@@ -136,122 +138,281 @@ fn generate_get_description(
     enum_impl.parse().unwrap()
 }
 
-use quote::quote;
-use syn::{parse_macro_input, Attribute, Block, ItemFn};
-/// Macro to transform the preferred API for scalar functions in extensions into
-/// an FFI-compatible function signature while validating argc
+/// Declare a scalar function for your extension. This requires the name:
+/// #[scalar(name = "example")] of what you wish to call your function with.
+/// Your function __must__ use the signature: `fn (args: &[Value]) -> Value`
+/// with proper spelling.
+/// ```ignore
+/// use limbo_ext::{scalar, Value};
+/// #[scalar(name = "double", alias = "twice")] // you can provide an <optional> alias
+/// fn double(args: &[Value]) -> Value {
+///       match arg.value_type() {
+///           ValueType::Float => {
+///               let val = arg.to_float().unwrap();
+///               Value::from_float(val * 2.0)
+///           }
+///           ValueType::Integer => {
+///               let val = arg.to_integer().unwrap();
+///               Value::from_integer(val * 2)
+///           }
+///       }
+///   } else {
+///       Value::null()
+///   }
+/// }
+/// ```
 #[proc_macro_attribute]
-pub fn export_scalar(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let mut input_fn = parse_macro_input!(item as ItemFn);
-
-    let fn_name = &input_fn.sig.ident;
-    let fn_body: &Block = &input_fn.block;
-
-    let mut extracted_spec: Option<ArgsSpec> = None;
-    let mut arg_err = None;
-    let kept_attrs: Vec<Attribute> = input_fn
-        .attrs
-        .into_iter()
-        .filter_map(|attr| {
-            if attr.path().is_ident("args") {
-                let parsed_attr = match attr.parse_args::<ArgsAttr>() {
-                    Ok(p) => p,
-                    Err(err) => {
-                        arg_err = Some(err.to_compile_error());
-                        return None;
-                    }
-                };
-                extracted_spec = Some(parsed_attr.spec);
-                None
-            } else {
-                Some(attr)
-            }
-        })
-        .collect();
-    input_fn.attrs = kept_attrs;
-    if let Some(arg_err) = arg_err {
-        return arg_err.into();
-    }
-    let spec = match extracted_spec {
-        Some(s) => s,
-        None => {
-            return syn::Error::new_spanned(
-                fn_name,
-                "Expected an attribute with integer or range: #[args(1)] #[args(0..2)], etc.",
-            )
-            .to_compile_error()
-            .into()
+pub fn scalar(attr: TokenStream, input: TokenStream) -> TokenStream {
+    let ast = parse_macro_input!(input as ItemFn);
+    let fn_name = &ast.sig.ident;
+    let scalar_info = parse_macro_input!(attr as ScalarInfo);
+    let name = &scalar_info.name;
+    let register_fn_name = format_ident!("register_{}", fn_name);
+    let fn_body = &ast.block;
+    let alias_check = if let Some(alias) = &scalar_info.alias {
+        quote! {
+            let Ok(alias_c_name) = std::ffi::CString::new(#alias) else {
+                return ::limbo_ext::ResultCode::Error;
+            };
+            (api.register_scalar_function)(
+                api.ctx,
+                alias_c_name.as_ptr(),
+                #fn_name,
+            );
         }
+    } else {
+        quote! {}
     };
-    let arg_check = match spec {
-        ArgsSpec::Exact(exact_count) => {
-            quote! {
-                if argc != #exact_count {
-                    log::error!(
-                        "{} was called with {} arguments, expected exactly {}",
-                        stringify!(#fn_name),
-                        argc,
-                        #exact_count
-                    );
-                    return ::limbo_extension::Value::null();
-                }
-            }
-        }
-        ArgsSpec::Range {
-            lower,
-            upper,
-            inclusive: true,
-        } => {
-            quote! {
-                if !(#lower..=#upper).contains(&argc) {
-                    log::error!(
-                        "{} was called with {} arguments, expected {}..={} range",
-                        stringify!(#fn_name),
-                        argc,
-                        #lower,
-                        #upper
-                    );
-                    return ::limbo_extension::Value::null();
-                }
-            }
-        }
-        ArgsSpec::Range {
-            lower,
-            upper,
-            inclusive: false,
-        } => {
-            quote! {
-                if !(#lower..#upper).contains(&argc) {
-                    log::error!(
-                        "{} was called with {} arguments, expected {}..{} (exclusive)",
-                        stringify!(#fn_name),
-                        argc,
-                        #lower,
-                        #upper
-                    );
-                    return ::limbo_extension::Value::null();
-                }
-            }
-        }
-    };
+
     let expanded = quote! {
-        #[export_name = stringify!(#fn_name)]
-        extern "C" fn #fn_name(argc: i32, argv: *const ::limbo_extension::Value) -> ::limbo_extension::Value {
-            #arg_check
+        #[no_mangle]
+        pub unsafe extern "C" fn #register_fn_name(
+            api: *const ::limbo_ext::ExtensionApi
+        ) -> ::limbo_ext::ResultCode {
+            if api.is_null() {
+                return ::limbo_ext::ResultCode::Error;
+            }
+            let api = unsafe { &*api };
+            let Ok(c_name) = std::ffi::CString::new(#name) else {
+                return ::limbo_ext::ResultCode::Error;
+            };
+            (api.register_scalar_function)(
+                api.ctx,
+                c_name.as_ptr(),
+                #fn_name,
+            );
+            #alias_check
+            ::limbo_ext::ResultCode::OK
+        }
 
-            // from_raw_parts doesn't currently accept null ptr
-            if argc == 0 || argv.is_null() {
-                log::debug!("{} was called with no arguments", stringify!(#fn_name));
-                let args: &[::limbo_extension::Value] = &[];
-                #fn_body
+        #[no_mangle]
+        pub unsafe extern "C" fn #fn_name(
+            argc: i32,
+            argv: *const ::limbo_ext::Value
+        ) -> ::limbo_ext::Value {
+            let args = if argv.is_null() || argc <= 0 {
+                &[]
             } else {
-                let ptr_slice = unsafe {
-                    std::slice::from_raw_parts(argv, argc as usize)
+                unsafe { std::slice::from_raw_parts(argv, argc as usize) }
+            };
+            #fn_body
+        }
+    };
+
+    TokenStream::from(expanded)
+}
+
+/// Define an aggregate function for your extension by deriving
+/// AggregateDerive on a struct that implements the AggFunc trait.
+/// ```ignore
+/// use limbo_ext::{register_extension, Value, AggregateDerive, AggFunc};
+///
+///#[derive(AggregateDerive)]
+///struct SumPlusOne;
+///
+///impl AggFunc for SumPlusOne {
+///   type State = i64;
+///   const NAME: &'static str = "sum_plus_one";
+///   const ARGS: i32 = 1;
+///   fn step(state: &mut Self::State, args: &[Value]) {
+///      let Some(val) = args[0].to_integer() else {
+///        return;
+///     };
+///     *state += val;
+///     }
+///     fn finalize(state: Self::State) -> Value {
+///        Value::from_integer(state + 1)
+///     }
+///}
+/// ```
+#[proc_macro_derive(AggregateDerive)]
+pub fn derive_agg_func(input: TokenStream) -> TokenStream {
+    let ast = parse_macro_input!(input as DeriveInput);
+    let struct_name = &ast.ident;
+
+    let step_fn_name = format_ident!("{}_step", struct_name);
+    let finalize_fn_name = format_ident!("{}_finalize", struct_name);
+    let init_fn_name = format_ident!("{}_init", struct_name);
+    let register_fn_name = format_ident!("register_{}", struct_name);
+
+    let expanded = quote! {
+        impl #struct_name {
+            #[no_mangle]
+            pub extern "C" fn #init_fn_name() -> *mut ::limbo_ext::AggCtx {
+                let state = Box::new(<#struct_name as ::limbo_ext::AggFunc>::State::default());
+                let ctx = Box::new(::limbo_ext::AggCtx {
+                    state: Box::into_raw(state) as *mut ::std::os::raw::c_void,
+                });
+                Box::into_raw(ctx)
+            }
+
+            #[no_mangle]
+            pub extern "C" fn #step_fn_name(
+                ctx: *mut ::limbo_ext::AggCtx,
+                argc: i32,
+                argv: *const ::limbo_ext::Value,
+            ) {
+                unsafe {
+                    let ctx = &mut *ctx;
+                    let state = &mut *(ctx.state as *mut <#struct_name as ::limbo_ext::AggFunc>::State);
+                    let args = std::slice::from_raw_parts(argv, argc as usize);
+                    <#struct_name as ::limbo_ext::AggFunc>::step(state, args);
+                }
+            }
+
+            #[no_mangle]
+            pub extern "C" fn #finalize_fn_name(
+                ctx: *mut ::limbo_ext::AggCtx
+            ) -> ::limbo_ext::Value {
+                unsafe {
+                    let ctx = &mut *ctx;
+                    let state = Box::from_raw(ctx.state as *mut <#struct_name as ::limbo_ext::AggFunc>::State);
+                    <#struct_name as ::limbo_ext::AggFunc>::finalize(*state)
+                }
+            }
+
+            #[no_mangle]
+            pub unsafe extern "C" fn #register_fn_name(
+                api: *const ::limbo_ext::ExtensionApi
+            ) -> ::limbo_ext::ResultCode {
+                if api.is_null() {
+                    return ::limbo_ext::ResultCode::Error;
+                }
+
+                let api = &*api;
+                let name_str = #struct_name::NAME;
+                let c_name = match std::ffi::CString::new(name_str) {
+                    Ok(cname) => cname,
+                    Err(_) => return ::limbo_ext::ResultCode::Error,
                 };
-                let args: &[::limbo_extension::Value] = ptr_slice;
-                #fn_body
+
+                (api.register_aggregate_function)(
+                    api.ctx,
+                    c_name.as_ptr(),
+                    #struct_name::ARGS,
+                    #struct_name::#init_fn_name
+                        as ::limbo_ext::InitAggFunction,
+                    #struct_name::#step_fn_name
+                        as ::limbo_ext::StepFunction,
+                    #struct_name::#finalize_fn_name
+                        as ::limbo_ext::FinalizeFunction,
+                )
             }
         }
     };
+
+    TokenStream::from(expanded)
+}
+
+/// Register your extension with 'core' by providing the relevant functions
+///```ignore
+///use limbo_ext::{register_extension, scalar, Value, AggregateDerive, AggFunc};
+///
+/// register_extension!{ scalars: { return_one }, aggregates: { SumPlusOne } }
+///
+///#[scalar(name = "one")]
+///fn return_one(args: &[Value]) -> Value {
+///  return Value::from_integer(1);
+///}
+///
+///#[derive(AggregateDerive)]
+///struct SumPlusOne;
+///
+///impl AggFunc for SumPlusOne {
+///   type State = i64;
+///   const NAME: &'static str = "sum_plus_one";
+///   const ARGS: i32 = 1;
+///
+///   fn step(state: &mut Self::State, args: &[Value]) {
+///      let Some(val) = args[0].to_integer() else {
+///        return;
+///      };
+///      *state += val;
+///     }
+///
+///     fn finalize(state: Self::State) -> Value {
+///        Value::from_integer(state + 1)
+///     }
+///}
+///
+/// ```
+#[proc_macro]
+pub fn register_extension(input: TokenStream) -> TokenStream {
+    let input_ast = parse_macro_input!(input as RegisterExtensionInput);
+    let RegisterExtensionInput {
+        aggregates,
+        scalars,
+    } = input_ast;
+
+    let scalar_calls = scalars.iter().map(|scalar_ident| {
+        let register_fn =
+            syn::Ident::new(&format!("register_{}", scalar_ident), scalar_ident.span());
+        quote! {
+            {
+                let result = unsafe { #register_fn(api)};
+                if !result.is_ok() {
+                    return result;
+                }
+            }
+        }
+    });
+
+    let aggregate_calls = aggregates.iter().map(|agg_ident| {
+        let register_fn = syn::Ident::new(&format!("register_{}", agg_ident), agg_ident.span());
+        quote! {
+            {
+                let result = unsafe{ #agg_ident::#register_fn(api)};
+                if !result.is_ok() {
+                    return result;
+                }
+            }
+        }
+    });
+    let static_aggregates = aggregate_calls.clone();
+    let static_scalars = scalar_calls.clone();
+
+    let expanded = quote! {
+        #[cfg(feature = "static")]
+        pub unsafe extern "C" fn register_extension_static(api: &::limbo_ext::ExtensionApi) -> ::limbo_ext::ResultCode {
+            let api = unsafe { &*api };
+            #(#static_scalars)*
+
+            #(#static_aggregates)*
+
+            ::limbo_ext::ResultCode::OK
+          }
+
+        #[cfg(not(feature = "static"))]
+            #[no_mangle]
+            pub unsafe extern "C" fn register_extension(api: &::limbo_ext::ExtensionApi) -> ::limbo_ext::ResultCode {
+                let api = unsafe { &*api };
+                #(#scalar_calls)*
+
+                #(#aggregate_calls)*
+
+                ::limbo_ext::ResultCode::OK
+            }
+    };
+
     TokenStream::from(expanded)
 }
