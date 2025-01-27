@@ -1,15 +1,56 @@
-use crate::{error, LimboError};
+use crate::json::error::Error;
+use crate::json::Val;
+use crate::{json, LimboError};
 use std::fmt::Formatter;
 use thiserror::Error;
 
 /// Maximum allowable depth of a sane JSON, after which we will return an error
 static MAX_JSONB_DEPTH: u16 = 2000;
 
+/// Represents a raw Jsonb value that does not own its data.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RawJsonb<'a> {
+    /// The underlying byte slice representing the JSONB data.
+    pub(crate) data: &'a [u8],
+}
+
+/// Converts a borrowed byte slice into a RawJsonb.
+/// This provides a convenient way to create a RawJsonb from existing data without copying.
+impl<'a> From<&'a [u8]> for RawJsonb<'a> {
+    fn from(data: &'a [u8]) -> Self {
+        Self { data }
+    }
+}
+
+impl TryFrom<RawJsonb<'_>> for Val {
+    type Error = json::JsonError;
+
+    fn try_from(raw: RawJsonb) -> Result<Val, Self::Error> {
+        match raw.to_string() {
+            // TODO: implement more efficient way to convert to Val without
+            //   converting to string first
+            Ok(s) => crate::json::from_str::<Val>(&s),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+/// Allows accessing the underlying byte slice as a reference.
+/// This enables easy integration with functions that expect a &[u8].
+impl AsRef<[u8]> for RawJsonb<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.data
+    }
+}
+
 /// All possible JSONB types
 #[derive(Debug)]
 enum JsonbType {
+    /// JSON null value
     Null,
+    /// JSON true value
     True,
+    /// JSON false value
     False,
     /// JSON integer value in the canonical RFC 8259 format, without extensions
     Int,
@@ -51,7 +92,7 @@ impl std::fmt::Display for JsonbType {
 
 impl Into<JsonbType> for u8 {
     fn into(self) -> JsonbType {
-        match (self & 0x0f) {
+        match self & 0x0f {
             0 => JsonbType::Null,
             1 => JsonbType::True,
             2 => JsonbType::False,
@@ -96,19 +137,37 @@ impl From<JsonbError> for LimboError {
     }
 }
 
-pub fn jsonb_to_string(arr: &[u8]) -> Result<String> {
-    if arr.is_empty() {
-        return Ok("".to_string());
+impl From<JsonbError> for Error {
+    fn from(value: JsonbError) -> Self {
+        Error::Message {
+            msg: value.to_string(),
+            location: None,
+        }
     }
-
-    let (_, value_size) = header_and_value_size(arr, 0)?;
-    // TODO: can we come up with a better initial capacity?
-    let mut result = String::with_capacity(value_size);
-    jsonb_to_string_internal(arr, 0, &mut result)?;
-
-    Ok(result)
 }
 
+impl<'a> RawJsonb<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { data }
+    }
+
+    /// Converts the JSONB value into a string.
+    pub fn to_string(self) -> Result<String> {
+        if self.data.is_empty() {
+            return Ok("".to_string());
+        }
+
+        let (_, value_size) = header_and_value_size(self.data, 0)?;
+        // TODO: can we come up with a better initial capacity?
+        let mut result = String::with_capacity(value_size);
+        jsonb_to_string_internal(self.data, 0, &mut result)?;
+
+        Ok(result)
+    }
+}
+
+/// Internal function that converts a JSONB value into a string.
+/// This function is recursive in case the value is an array or an object.
 /// Returns the amount of bytes consumed from `arr`
 fn jsonb_to_string_internal(arr: &[u8], depth: u16, result: &mut String) -> Result<usize> {
     if depth > MAX_JSONB_DEPTH {
@@ -148,11 +207,10 @@ fn jsonb_to_string_internal(arr: &[u8], depth: u16, result: &mut String) -> Resu
             let (value_slice, header_size, value_size) =
                 value_slice_from_header(arr, current_element)?;
 
-            // TODO: how can we spare an allocation here?
-            result.push_str(&format!(
-                "\"{}\"",
-                String::from_utf8(value_slice.to_vec()).unwrap() // TODO: handle error
-            ));
+            result.push('"');
+            // TODO: we should probably be more strict and not allow non-UTF8 characters
+            result.push_str(&String::from_utf8_lossy(value_slice));
+            result.push('"');
 
             Ok(header_size + value_size)
         }
@@ -281,71 +339,104 @@ mod tests {
 
     #[test]
     fn test_empty_arr() {
-        assert_eq!(jsonb_to_string(&[]).unwrap(), "".to_string());
+        assert_eq!(RawJsonb::new(&[]).to_string().unwrap(), "".to_string());
     }
 
     #[test]
     fn test_null() {
-        assert_eq!(jsonb_to_string(&[0x10]).unwrap(), "null".to_string());
+        assert_eq!(
+            RawJsonb::new(&[0x10]).to_string().unwrap(),
+            "null".to_string()
+        );
     }
 
     #[test]
     fn test_booleans() {
-        assert_eq!(jsonb_to_string(&[0x11]).unwrap(), "true".to_string());
-        assert_eq!(jsonb_to_string(&[0x12]).unwrap(), "false".to_string());
+        assert_eq!(
+            RawJsonb::new(&[0x11]).to_string().unwrap(),
+            "true".to_string()
+        );
+        assert_eq!(
+            RawJsonb::new(&[0x12]).to_string().unwrap(),
+            "false".to_string()
+        );
     }
 
     #[test]
     fn test_numbers() {
-        assert_eq!(jsonb_to_string(&[0x13, b'0']).unwrap(), "0".to_string());
-        assert_eq!(jsonb_to_string(&[0x13, b'1']).unwrap(), "1".to_string());
-        assert_eq!(jsonb_to_string(&[0x13, b'2']).unwrap(), "2".to_string());
-        assert_eq!(jsonb_to_string(&[0x13, b'9']).unwrap(), "9".to_string());
         assert_eq!(
-            jsonb_to_string(&[0xc3, 0x01, b'1']).unwrap(),
+            RawJsonb::new(&[0x13, b'0']).to_string().unwrap(),
+            "0".to_string()
+        );
+        assert_eq!(
+            RawJsonb::new(&[0x13, b'1']).to_string().unwrap(),
             "1".to_string()
         );
         assert_eq!(
-            jsonb_to_string(&[0xd3, 0x00, 0x01, b'1']).unwrap(),
+            RawJsonb::new(&[0x13, b'2']).to_string().unwrap(),
+            "2".to_string()
+        );
+        assert_eq!(
+            RawJsonb::new(&[0x13, b'9']).to_string().unwrap(),
+            "9".to_string()
+        );
+        assert_eq!(
+            RawJsonb::new(&[0xc3, 0x01, b'1']).to_string().unwrap(),
             "1".to_string()
         );
         assert_eq!(
-            jsonb_to_string(&[0xe3, 0x00, 0x00, 0x00, 0x01, b'1']).unwrap(),
+            RawJsonb::new(&[0xd3, 0x00, 0x01, b'1'])
+                .to_string()
+                .unwrap(),
             "1".to_string()
         );
         assert_eq!(
-            jsonb_to_string(&[0xf3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, b'1']).unwrap(),
+            RawJsonb::new(&[0xe3, 0x00, 0x00, 0x00, 0x01, b'1'])
+                .to_string()
+                .unwrap(),
             "1".to_string()
         );
         assert_eq!(
-            jsonb_to_string(&[0xd3, 0x00, 0x02, b'1', b'2']).unwrap(),
+            RawJsonb::new(&[0xf3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, b'1'])
+                .to_string()
+                .unwrap(),
+            "1".to_string()
+        );
+        assert_eq!(
+            RawJsonb::new(&[0xd3, 0x00, 0x02, b'1', b'2'])
+                .to_string()
+                .unwrap(),
             "12".to_string()
         );
         assert_eq!(
-            jsonb_to_string(&[0xc3, 0x03, b'1', b'2', b'3']).unwrap(),
+            RawJsonb::new(&[0xc3, 0x03, b'1', b'2', b'3'])
+                .to_string()
+                .unwrap(),
             "123".to_string()
         );
     }
 
     #[test]
     fn test_numbers_invalid() {
-        assert!(jsonb_to_string(&[0x13, b'a']).is_err());
-        assert!(jsonb_to_string(&[0x13, b'X']).is_err());
-        assert!(jsonb_to_string(&[0x13, 0]).is_err());
-        assert!(jsonb_to_string(&[0x13, 255]).is_err());
+        assert!(RawJsonb::new(&[0x13, b'a']).to_string().is_err());
+        assert!(RawJsonb::new(&[0x13, b'X']).to_string().is_err());
+        assert!(RawJsonb::new(&[0x13, 0]).to_string().is_err());
+        assert!(RawJsonb::new(&[0x13, 255]).to_string().is_err());
     }
 
     #[test]
     fn test_text() {
         assert_eq!(
-            jsonb_to_string(&[0xc7, 0x03, b'f', b'o', b'o']).unwrap(),
+            RawJsonb::new(&[0xc7, 0x03, b'f', b'o', b'o'])
+                .to_string()
+                .unwrap(),
             "\"foo\"".to_string()
         );
     }
 
     #[test]
     fn test_text_oob() {
-        match jsonb_to_string(&[0xc7, 0x03, b'f', b'o']) {
+        match RawJsonb::new(&[0xc7, 0x03, b'f', b'o']).to_string() {
             Err(JsonbError::OutOfBounds(expected, got)) => {
                 assert_eq!(expected, 3);
                 assert_eq!(got, 2);
@@ -356,43 +447,58 @@ mod tests {
 
     #[test]
     fn test_array() {
-        assert_eq!(jsonb_to_string(&[0x0b]).unwrap(), "[]".to_string());
+        assert_eq!(
+            RawJsonb::new(&[0x0b]).to_string().unwrap(),
+            "[]".to_string()
+        );
 
         assert_eq!(
-            jsonb_to_string(&[0xcb, 0x04, 0x13, b'1', 0x13, b'2']).unwrap(),
+            RawJsonb::new(&[0xcb, 0x04, 0x13, b'1', 0x13, b'2'])
+                .to_string()
+                .unwrap(),
             "[1,2]".to_string()
         );
 
         assert_eq!(
-            jsonb_to_string(&[0xcb, 0x03, 0x10, 0x11, 0x12]).unwrap(),
+            RawJsonb::new(&[0xcb, 0x03, 0x10, 0x11, 0x12])
+                .to_string()
+                .unwrap(),
             "[null,true,false]".to_string()
         );
 
         assert_eq!(
-            jsonb_to_string(&[0xcb, 0x09, 0x13, b'1', 0x13, b'2', 0xc7, 0x03, b'f', b'o', b'o'])
+            RawJsonb::new(&[0xcb, 0x09, 0x13, b'1', 0x13, b'2', 0xc7, 0x03, b'f', b'o', b'o'])
+                .to_string()
                 .unwrap(),
             "[1,2,\"foo\"]".to_string()
         );
 
         assert_eq!(
-            jsonb_to_string(&[0xcb, 0x06, 0x0b, 0xcb, 0x03, 0xc7, 0x01, b'1']).unwrap(),
+            RawJsonb::new(&[0xcb, 0x06, 0x0b, 0xcb, 0x03, 0xc7, 0x01, b'1'])
+                .to_string()
+                .unwrap(),
             "[[],[\"1\"]]".to_string()
         );
     }
 
     #[test]
     fn test_object() {
-        assert_eq!(jsonb_to_string(&[0x0c]).unwrap(), "{}".to_string());
+        assert_eq!(
+            RawJsonb::new(&[0x0c]).to_string().unwrap(),
+            "{}".to_string()
+        );
 
         assert_eq!(
-            jsonb_to_string(&[0x9c, 0x17, b'a', 0x10, 0x17, b'b', 0x11, 0x17, b'c', 0x12]).unwrap(),
+            RawJsonb::new(&[0x9c, 0x17, b'a', 0x10, 0x17, b'b', 0x11, 0x17, b'c', 0x12])
+                .to_string()
+                .unwrap(),
             "{\"a\":null,\"b\":true,\"c\":false}".to_string()
         );
     }
 
     #[test]
     fn test_object_invalid() {
-        match jsonb_to_string(&[0x9c, 0x17, b'a', 0x10, 0x17, b'b', 0x11, 0x17, b'c']) {
+        match RawJsonb::new(&[0x9c, 0x17, b'a', 0x10, 0x17, b'b', 0x11, 0x17, b'c']).to_string() {
             Err(JsonbError::OutOfBounds(expected, got)) => {
                 assert_eq!(expected, 9);
                 assert_eq!(got, 8);
@@ -400,7 +506,7 @@ mod tests {
             _ => panic!("Expected OutOfBounds error"),
         }
 
-        match jsonb_to_string(&[0x8c, 0x13, b'a', 0x10, 0x17, b'b', 0x11, 0x17, b'c']) {
+        match RawJsonb::new(&[0x8c, 0x13, b'a', 0x10, 0x17, b'b', 0x11, 0x17, b'c']).to_string() {
             Err(JsonbError::KeyNotAString(JsonbType::Int)) => {}
             _ => panic!("Expected KeyNotAString error"),
         }

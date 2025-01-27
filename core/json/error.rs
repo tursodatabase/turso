@@ -3,6 +3,7 @@ use serde::{de, ser};
 use std::fmt::{self, Display};
 
 use crate::json::de::Rule;
+use crate::LimboError;
 
 /// Alias for a `Result` with error type `json5::Error`
 pub type Result<T> = std::result::Result<T, Error>;
@@ -47,6 +48,12 @@ impl From<pest::error::Error<Rule>> for Error {
             msg: err.to_string(),
             location: Some(Location { line, column }),
         }
+    }
+}
+
+impl From<Error> for LimboError {
+    fn from(err: Error) -> Self {
+        LimboError::ParseError(err.to_string())
     }
 }
 
