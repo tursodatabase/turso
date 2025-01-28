@@ -20,7 +20,11 @@
     devShells = forAllSystems (
       system: let
         pkgs = nixpkgs.legacyPackages.${system};
-        rustStable = fenix.packages.${system}.stable.toolchain;
+        rust-stable = fenix.packages.${system}.stable;
+        rust-toolchain = rust-stable.toolchain;
+        rustfmt = rust-stable.rustfmt;
+        rust-src = rust-stable.rust-src;
+        rust-analyzer = rust-stable.rust-analyzer;
         wasmTarget = fenix.packages.${system}.targets.wasm32-wasi.latest.rust-std;
         extraDarwinInputs =
           if pkgs.stdenv.isDarwin
@@ -36,9 +40,13 @@
                 sqlite
                 gnumake
                 rustup # not used to install the toolchain, but the makefile uses it
-                rustStable
+                rust-toolchain
+                rust-src
+                rust-analyzer
+                rustfmt
                 wasmTarget
                 tcl
+                python3
               ]
               ++ extraDarwinInputs;
           };
