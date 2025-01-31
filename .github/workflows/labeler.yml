@@ -6,6 +6,7 @@ on:
 jobs:
   label:
     runs-on: ubuntu-latest
+    environment: // please set the environment where GH_TOKEN is set
     permissions:
       contents: read
       pull-requests: write
@@ -17,5 +18,5 @@ jobs:
             .github
       - uses: actions/labeler@v5
         with:
-          repo-token: "${{ secrets.GH_TOKEN }}"
+          repo-token: ${{ secrets.GH_TOKEN }}
           configuration-path: '.github/labeler.yml'
