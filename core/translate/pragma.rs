@@ -66,7 +66,7 @@ pub fn translate_pragma(
             query_pragma(pragma, schema, None, database_header.clone(), &mut program)?;
         }
         Some(ast::PragmaBody::Equals(value)) => match pragma {
-            PragmaName::TableInfo => {
+            PragmaName::TableInfo | PragmaName::TableList => {
                 query_pragma(
                     pragma,
                     schema,
@@ -88,7 +88,7 @@ pub fn translate_pragma(
             }
         },
         Some(ast::PragmaBody::Call(value)) => match pragma {
-            PragmaName::TableInfo => {
+            PragmaName::TableInfo | PragmaName::TableList => {
                 query_pragma(
                     pragma,
                     schema,
@@ -152,7 +152,7 @@ fn update_pragma(
             // TODO: Implement updating user_version
             todo!("updating user_version not yet implemented")
         }
-        PragmaName::TableInfo => {
+        PragmaName::TableInfo | PragmaName::TableList => {
             // because we need control over the write parameter for the transaction,
             // this should be unreachable. We have to force-call query_pragma before
             // getting here
@@ -243,6 +243,51 @@ fn query_pragma(
 
                     program.emit_result_row(base_reg, 6);
                 }
+            }
+        }
+        PragmaName::TableList => {
+            let table_name_filter = match value {
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(&name.0)),
+                _ => None,
+            };
+
+            let base_reg = register;
+            program.alloc_register();
+            program.alloc_register();
+            program.alloc_register();
+            program.alloc_register();
+            program.alloc_register();
+
+            // SQLite just queries the schema table, and then ordering comes
+            // from the sequence numbers that we have there. But for us, querying
+            // something here is a harder, as we would need to have the IO context.
+            //
+            // So we keep a creation timestamp and iterate over that.
+            let mut sorted_tables: Vec<_> = schema
+                .tables
+                .iter()
+                .filter(|(tbl_name, _)| match &table_name_filter {
+                    None => true,
+                    Some(name) => *tbl_name == name,
+                })
+                .collect();
+
+            sorted_tables.sort_by(|(_, a), (_, b)| b.created_at.cmp(&a.created_at));
+
+            for (_, table) in sorted_tables {
+                // schema - currently we only support "main", not "temp"
+                program.emit_string8("main".to_string(), base_reg);
+                // name
+                program.emit_string8(table.name.clone(), base_reg + 1);
+                // type - always "table" for now since we don't support views
+                program.emit_string8("table".to_string(), base_reg + 2);
+                // ncol - number of columns
+                program.emit_int(table.columns.len() as i64, base_reg + 3);
+                // wr - without rowid flag
+                program.emit_int((!table.has_rowid) as i64, base_reg + 4);
+                // strict - we don't track this yet, so always 0
+                program.emit_int(0, base_reg + 5);
+                program.emit_result_row(base_reg, 6);
             }
         }
         PragmaName::UserVersion => {

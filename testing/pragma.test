@@ -49,3 +49,15 @@ do_execsql_test_on_specific_db "testing/testing_user_version_10.db" pragma-user-
 do_execsql_test_on_specific_db ":memory:" pragma-user-version-default {
   PRAGMA user_version
 } {0}
+
+do_execsql_test_regex pragma-table-list {
+  PRAGMA table_list
+} {^main\|products\|table\|3\|0\|0\nmain\|users\|table\|10\|0\|0\nmain\|sqlite_schema\|table\|5\|0\|0}
+
+do_execsql_test pragma-table-list-equals {
+  PRAGMA table_list=products
+} {main|products|table|3|0|0}
+
+do_execsql_test pragma-table-list-calls {
+  PRAGMA table_list(users)
+} {main|users|table|10|0|0}
