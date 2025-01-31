@@ -18,6 +18,7 @@ func loadLibrary() error {
 	switch runtime.GOOS {
 	case "darwin":
 		libraryName = fmt.Sprintf("%s.dylib", libName)
+
 	case "linux":
 		libraryName = fmt.Sprintf("%s.so", libName)
 	default:
