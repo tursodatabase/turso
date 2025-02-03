@@ -1009,7 +1009,13 @@ fn rewrite_expr(expr: &mut ast::Expr) -> Result<()> {
         ast::Expr::Id(id) => {
             // Convert "true" and "false" to 1 and 0
             if id.0.eq_ignore_ascii_case("true") {
+                /*| encode_true_as_false */
                 *expr = ast::Expr::Literal(ast::Literal::Numeric(1.to_string()));
+                /*|| encode_false */
+                /*|
+                *expr = ast::Expr::Literal(ast::Literal::Numeric(0.to_string()));
+                */
+                /* |*/
                 return Ok(());
             }
             if id.0.eq_ignore_ascii_case("false") {
