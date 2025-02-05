@@ -628,8 +628,8 @@ fn rewrite_expr(expr: &mut ast::Expr) -> Result<()> {
                 *expr = ast::Expr::Literal(ast::Literal::Numeric(1.to_string()));
                 /*|| encode_false */
                 /*|
-                *expr = ast::Expr::Literal(ast::Literal::Numeric(0.to_string()));
-                */
+                 *expr = ast::Expr::Literal(ast::Literal::Numeric(0.to_string()));
+                 */
                 /* |*/
                 return Ok(());
             }
