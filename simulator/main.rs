@@ -14,7 +14,6 @@ use std::any::Any;
 use std::backtrace::Backtrace;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{ExitCode, Termination};
 use std::sync::{mpsc, Arc, Mutex};
 use tempfile::TempDir;
 
