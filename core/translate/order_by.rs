@@ -17,7 +17,7 @@ use super::{
     emitter::TranslateCtx,
     expr::translate_expr,
     plan::{Direction, ResultSetColumn, SelectPlan},
-    result_row::emit_result_row_and_limit,
+    result_row::{emit_offset, emit_result_row_and_limit},
 };
 
 // Metadata for handling ORDER BY operations
@@ -63,29 +63,38 @@ pub fn emit_order_by(
     let order_by = plan.order_by.as_ref().unwrap();
     let result_columns = &plan.result_columns;
     let sort_loop_start_label = program.allocate_label();
+    let sort_loop_next_label = program.allocate_label();
     let sort_loop_end_label = program.allocate_label();
     let mut pseudo_columns = vec![];
-    for (i, _) in order_by.iter().enumerate() {
+    for _ in 0..order_by.len() {
+        let ty = crate::schema::Type::Null;
         pseudo_columns.push(Column {
             // Names don't matter. We are tracking which result column is in which position in the ORDER BY clause in m.result_column_indexes_in_orderby_sorter.
-            name: format!("sort_key_{}", i),
+            name: None,
             primary_key: false,
-            ty: crate::schema::Type::Null,
+            ty,
+            ty_str: ty.to_string(),
             is_rowid_alias: false,
+            notnull: false,
+            default: None,
         });
     }
-    for (i, rc) in result_columns.iter().enumerate() {
+    for i in 0..result_columns.len() {
         // If any result columns are not in the ORDER BY sorter, it's because they are equal to a sort key and were already added to the pseudo columns above.
         if let Some(ref v) = t_ctx.result_columns_to_skip_in_orderby_sorter {
             if v.contains(&i) {
                 continue;
             }
         }
+        let ty = crate::schema::Type::Null;
         pseudo_columns.push(Column {
-            name: rc.expr.to_string(),
+            name: None,
             primary_key: false,
-            ty: crate::schema::Type::Null,
+            ty,
+            ty_str: ty.to_string(),
             is_rowid_alias: false,
+            notnull: false,
+            default: None,
         });
     }
 
@@ -117,6 +126,8 @@ pub fn emit_order_by(
     });
 
     program.resolve_label(sort_loop_start_label, program.offset());
+    emit_offset(program, t_ctx, plan, sort_loop_next_label)?;
+
     program.emit_insn(Insn::SorterData {
         cursor_id: sort_cursor,
         dest_reg: reg_sorter_data,
@@ -131,13 +142,14 @@ pub fn emit_order_by(
         let reg = start_reg + i;
         program.emit_insn(Insn::Column {
             cursor_id,
-            column: t_ctx.result_column_indexes_in_orderby_sorter[&i],
+            column: t_ctx.result_column_indexes_in_orderby_sorter[i],
             dest: reg,
         });
     }
 
     emit_result_row_and_limit(program, t_ctx, plan, start_reg, Some(sort_loop_end_label))?;
 
+    program.resolve_label(sort_loop_next_label, program.offset());
     program.emit_insn(Insn::SorterNext {
         cursor_id: sort_cursor,
         pc_if_next: sort_loop_start_label,
@@ -172,7 +184,7 @@ pub fn order_by_sorter_insert(
         let key_reg = start_reg + i;
         translate_expr(
             program,
-            Some(&plan.referenced_tables),
+            Some(&plan.table_references),
             expr,
             key_reg,
             &t_ctx.resolver,
@@ -193,7 +205,7 @@ pub fn order_by_sorter_insert(
         }
         translate_expr(
             program,
-            Some(&plan.referenced_tables),
+            Some(&plan.table_references),
             &rc.expr,
             cur_reg,
             &t_ctx.resolver,

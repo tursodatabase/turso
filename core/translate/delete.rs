@@ -1,25 +1,35 @@
 use crate::schema::Table;
 use crate::translate::emitter::emit_program;
 use crate::translate::optimizer::optimize_plan;
-use crate::translate::plan::{DeletePlan, Plan, SourceOperator};
+use crate::translate::plan::{DeletePlan, Operation, Plan};
 use crate::translate::planner::{parse_limit, parse_where};
-use crate::vdbe::builder::ProgramBuilder;
+use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::{schema::Schema, Result, SymbolTable};
 use sqlite3_parser::ast::{Expr, Limit, QualifiedName};
 
-use super::plan::{TableReference, TableReferenceType};
+use super::plan::TableReference;
 
 pub fn translate_delete(
-    program: &mut ProgramBuilder,
+    query_mode: QueryMode,
     schema: &Schema,
     tbl_name: &QualifiedName,
     where_clause: Option<Expr>,
     limit: Option<Box<Limit>>,
     syms: &SymbolTable,
-) -> Result<()> {
+) -> Result<ProgramBuilder> {
     let mut delete_plan = prepare_delete_plan(schema, tbl_name, where_clause, limit)?;
-    optimize_plan(&mut delete_plan)?;
-    emit_program(program, delete_plan, syms)
+    optimize_plan(&mut delete_plan, schema)?;
+    let Plan::Delete(ref delete) = delete_plan else {
+        panic!("delete_plan is not a DeletePlan");
+    };
+    let mut program = ProgramBuilder::new(ProgramBuilderOpts {
+        query_mode,
+        num_cursors: 1,
+        approx_num_insns: estimate_num_instructions(&delete),
+        approx_num_labels: 0,
+    });
+    emit_program(&mut program, delete_plan, syms)?;
+    Ok(program)
 }
 
 pub fn prepare_delete_plan(
@@ -33,35 +43,38 @@ pub fn prepare_delete_plan(
         None => crate::bail_corrupt_error!("Parse error: no such table: {}", tbl_name),
     };
 
-    let btree_table_ref = TableReference {
+    let table_references = vec![TableReference {
         table: Table::BTree(table.clone()),
-        table_identifier: table.name.clone(),
-        table_index: 0,
-        reference_type: TableReferenceType::BTreeTable,
-    };
-    let referenced_tables = vec![btree_table_ref.clone()];
+        identifier: table.name.clone(),
+        op: Operation::Scan { iter_dir: None },
+        join_info: None,
+    }];
+
+    let mut where_predicates = vec![];
 
     // Parse the WHERE clause
-    let resolved_where_clauses = parse_where(where_clause, &referenced_tables)?;
+    parse_where(where_clause, &table_references, None, &mut where_predicates)?;
 
-    // Parse the LIMIT clause
-    let resolved_limit = limit.and_then(|l| parse_limit(*l));
+    // Parse the LIMIT/OFFSET clause
+    let (resolved_limit, resolved_offset) = limit.map_or(Ok((None, None)), |l| parse_limit(*l))?;
 
     let plan = DeletePlan {
-        source: SourceOperator::Scan {
-            id: 0,
-            table_reference: btree_table_ref,
-            predicates: resolved_where_clauses.clone(),
-            iter_dir: None,
-        },
+        table_references,
         result_columns: vec![],
-        where_clause: resolved_where_clauses,
+        where_clause: where_predicates,
         order_by: None,
         limit: resolved_limit,
-        referenced_tables,
-        available_indexes: vec![],
+        offset: resolved_offset,
         contains_constant_false_condition: false,
     };
 
     Ok(Plan::Delete(plan))
+}
+
+fn estimate_num_instructions(plan: &DeletePlan) -> usize {
+    let base = 20;
+
+    let num_instructions = base + plan.table_references.len() * 10;
+
+    num_instructions
 }
