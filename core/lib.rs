@@ -22,7 +22,7 @@ mod vector;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use fallible_iterator::FallibleIterator;
+pub use fallible_iterator::FallibleIterator;
 #[cfg(not(target_family = "wasm"))]
 use libloading::{Library, Symbol};
 #[cfg(not(target_family = "wasm"))]
@@ -31,7 +31,7 @@ use limbo_ext::{ResultCode, VTabModuleImpl, Value as ExtValue};
 use log::trace;
 use parking_lot::RwLock;
 use schema::{Column, Schema};
-use sqlite3_parser::{ast, ast::Cmd, lexer::sql::Parser};
+pub use sqlite3_parser::{ast, ast::Cmd, lexer::sql::Parser};
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashMap;

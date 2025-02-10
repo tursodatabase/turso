@@ -3,6 +3,7 @@ use crate::{
     opcodes_dictionary::OPCODE_DESCRIPTIONS,
 };
 use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Row, Table};
+use limbo_core::{ast::Cmd, FallibleIterator, Parser as LimboParser};
 use limbo_core::{Database, LimboError, Statement, StepResult, Value};
 
 use clap::{Parser, ValueEnum};
@@ -101,6 +102,12 @@ impl std::fmt::Display for OutputMode {
     }
 }
 
+macro_rules! dbg_string {
+    ($val:expr) => {{
+        format!("{:#?}", $val)
+    }};
+}
+
 #[derive(Debug, Clone)]
 pub enum Command {
     /// Exit this program with return-code CODE
@@ -133,6 +140,8 @@ pub enum Command {
     Import,
     /// Loads an extension library
     LoadExtension,
+    /// Pretty print parsed SQL statement
+    PrettyPrintAst,
 }
 
 impl Command {
@@ -151,7 +160,8 @@ impl Command {
             | Self::Cwd
             | Self::Echo
             | Self::NullValue
-            | Self::LoadExtension => 1,
+            | Self::LoadExtension
+            | Self::PrettyPrintAst => 1,
             Self::Import => 2,
         } // argv0
     }
@@ -172,6 +182,7 @@ impl Command {
             Self::Echo => ".echo on|off",
             Self::Tables => ".tables",
             Self::LoadExtension => ".load",
+            Self::PrettyPrintAst => ".debugast",
             Self::Import => &IMPORT_HELP,
         }
     }
@@ -196,6 +207,7 @@ impl FromStr for Command {
             ".echo" => Ok(Self::Echo),
             ".import" => Ok(Self::Import),
             ".load" => Ok(Self::LoadExtension),
+            ".debugast" => Ok(Self::PrettyPrintAst),
             _ => Err("Unknown command".to_string()),
         }
     }
@@ -419,6 +431,17 @@ impl Limbo {
         }
     }
 
+    fn pretty_print_ast(&mut self, sql: &str) -> Result<(), String> {
+        let mut parser = LimboParser::new(sql.as_bytes());
+        let cmd = parser.next().map_err(|e| e.to_string())?;
+        if let Some(Cmd::Stmt(stmt)) = cmd {
+            println!("{}", sql);
+            let debug_stmt = dbg_string!(stmt);
+            let _ = self.writeln(&debug_stmt);
+        }
+        Ok(())
+    }
+
     fn write_fmt(&mut self, fmt: std::fmt::Arguments) -> io::Result<()> {
         let _ = self.writer.write_fmt(fmt);
         self.writer.write_all(b"\n")
@@ -609,6 +632,21 @@ impl Limbo {
                     #[cfg(not(target_family = "wasm"))]
                     if let Err(e) = self.handle_load_extension(args[1]) {
                         let _ = self.writeln(&e);
+                    }
+                }
+                Command::PrettyPrintAst => {
+                    // Look for first quote after the command
+                    if let Some(start) = line.find('"') {
+                        // Look for closing quote
+                        if let Some(end) = line[start + 1..].find('"') {
+                            let sql = &line[start + 1..start + 1 + end];
+                            let _ = self.pretty_print_ast(sql);
+                        } else {
+                            let _ = self.writeln("Error: Missing closing quote");
+                        }
+                    } else {
+                        let _ =
+                            self.writeln("Error: SQL statement must be wrapped in double quotes");
                     }
                 }
             }
