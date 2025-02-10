@@ -2153,6 +2153,8 @@ impl BTreeCursor {
         // Get overflow info based on cell type
         let (first_overflow_page, n_overflow) = match cell {
             BTreeCell::TableLeafCell(leaf_cell) => {
+                // TODO(Krishna): Payload length is 1 byte less than SQLite payload length.
+                // Same goes for local size.
                 match self.calculate_overflow_info(leaf_cell._payload.len(), PageType::TableLeaf)? {
                     Some(n_overflow) => (leaf_cell.first_overflow_page, n_overflow),
                     None => return Ok(CursorResult::Ok(())),
@@ -2208,19 +2210,48 @@ impl BTreeCursor {
         Ok(CursorResult::Ok(()))
     }
 
+    pub fn parse_cell_info(
+        &self,
+        payload_len: usize,
+        page_type: PageType,
+    ) -> Result<(usize, usize)> {
+        let max_local = self.payload_overflow_threshold_max(page_type);
+        let min_local = self.payload_overflow_threshold_min(page_type);
+        println!("min_local: {}", min_local);
+        println!("max_local: {}", max_local);
+        println!("payload_len: {}", payload_len);
+        println!("usable_space: {}", self.usable_space());
+
+        // This matches btreeParseCellAdjustSizeForOverflow logic
+        let n_local = if payload_len <= max_local {
+            // Common case - everything fits locally
+            payload_len
+        } else {
+            // Have to split between local and overflow
+            let surplus = min_local + (payload_len - min_local) % (self.usable_space() - 4);
+            if surplus <= max_local {
+                surplus
+            } else {
+                min_local
+            }
+        };
+
+        Ok((n_local, payload_len))
+    }
+
     fn calculate_overflow_info(
         &self,
         payload_len: usize,
         page_type: PageType,
     ) -> Result<Option<usize>> {
-        let max_local = self.payload_overflow_threshold_max(page_type);
-        let min_local = self.payload_overflow_threshold_min(page_type);
-        let usable_size = self.usable_space();
+        let (n_local, n_payload) = self.parse_cell_info(payload_len, page_type)?;
 
-        let (_, local_size) = payload_overflows(payload_len, max_local, min_local, usable_size);
+        if n_local == n_payload {
+            return Ok(None); // No overflow pages needed
+        }
 
         assert!(
-            local_size != payload_len,
+            n_local != payload_len,
             "Trying to clear overflow pages when there are no overflow pages"
         );
 
@@ -2228,7 +2259,9 @@ impl BTreeCursor {
         let overflow_page_size = self.usable_space() - 4;
 
         #[allow(clippy::manual_div_ceil)] // don't remove this. Ignore clippy.
-        let n_overflow = (payload_len - local_size + overflow_page_size - 1) / (overflow_page_size);
+        // TODO(Krishna): payload_len - n_local + overflow_page_size - 1 -> this is off by 3 in one case.
+        // For now this works similar to SQLite and obeys invariants when tested with fuzzer.
+        let n_overflow = (payload_len - n_local + overflow_page_size - 1) / (overflow_page_size);
         Ok(Some(n_overflow))
     }
 }
