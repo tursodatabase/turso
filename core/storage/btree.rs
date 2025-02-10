@@ -714,7 +714,7 @@ impl BTreeCursor {
                     .state
                     .mut_write_info()
                     .expect("can't insert while counting");
-                write_info.state.clone()
+                write_info.state
             };
             match write_state {
                 WriteState::Start => {
@@ -778,7 +778,7 @@ impl BTreeCursor {
             };
         };
         self.state = CursorState::None;
-        return ret;
+        ret
     }
 
     /// Insert a record into a cell.
@@ -1216,7 +1216,7 @@ impl BTreeCursor {
                 let (page_type, current_idx) = {
                     let current_page = self.stack.top();
                     let contents = current_page.get().contents.as_ref().unwrap();
-                    (contents.page_type().clone(), current_page.get().id)
+                    (contents.page_type(), current_page.get().id)
                 };
 
                 parent.set_dirty();
@@ -1231,8 +1231,8 @@ impl BTreeCursor {
                     let cell = parent_contents.cell_get(
                         cell_idx,
                         self.pager.clone(),
-                        self.payload_overflow_threshold_max(page_type.clone()),
-                        self.payload_overflow_threshold_min(page_type.clone()),
+                        self.payload_overflow_threshold_max(page_type),
+                        self.payload_overflow_threshold_min(page_type),
                         self.usable_space(),
                     )?;
                     let found = match cell {
@@ -1244,8 +1244,8 @@ impl BTreeCursor {
                     if found {
                         let (start, _len) = parent_contents.cell_get_raw_region(
                             cell_idx,
-                            self.payload_overflow_threshold_max(page_type.clone()),
-                            self.payload_overflow_threshold_min(page_type.clone()),
+                            self.payload_overflow_threshold_max(page_type),
+                            self.payload_overflow_threshold_min(page_type),
                             self.usable_space(),
                         );
                         right_pointer = start;
@@ -1731,7 +1731,7 @@ impl BTreeCursor {
             write_varint_to_vec(record_buf.len() as u64, cell_payload);
         }
 
-        let payload_overflow_threshold_max = self.payload_overflow_threshold_max(page_type.clone());
+        let payload_overflow_threshold_max = self.payload_overflow_threshold_max(page_type);
         debug!(
             "fill_cell_payload(record_size={}, payload_overflow_threshold_max={})",
             record_buf.len(),
@@ -2213,8 +2213,8 @@ impl BTreeCursor {
         payload_len: usize,
         page_type: PageType,
     ) -> Result<Option<usize>> {
-        let max_local = self.payload_overflow_threshold_max(page_type.clone());
-        let min_local = self.payload_overflow_threshold_min(page_type.clone());
+        let max_local = self.payload_overflow_threshold_max(page_type);
+        let min_local = self.payload_overflow_threshold_min(page_type);
         let usable_size = self.usable_space();
 
         let (_, local_size) = payload_overflows(payload_len, max_local, min_local, usable_size);
