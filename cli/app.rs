@@ -435,7 +435,9 @@ impl Limbo {
         let mut parser = LimboParser::new(sql.as_bytes());
         let cmd = parser.next().map_err(|e| e.to_string())?;
         if let Some(Cmd::Stmt(stmt)) = cmd {
+            let _ = self.writeln("\n=== Input SQL ===");
             let _ = self.writeln(sql);
+            let _ = self.writeln("\n=== AST ===");
             let debug_stmt = dbg_string!(stmt);
             let _ = self.writeln(&debug_stmt);
         }
