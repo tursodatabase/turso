@@ -182,7 +182,7 @@ impl Command {
             Self::Echo => ".echo on|off",
             Self::Tables => ".tables",
             Self::LoadExtension => ".load",
-            Self::PrettyPrintAst => ".debugast",
+            Self::PrettyPrintAst => ".pprint <\"sql statement\">",
             Self::Import => &IMPORT_HELP,
         }
     }
@@ -207,7 +207,7 @@ impl FromStr for Command {
             ".echo" => Ok(Self::Echo),
             ".import" => Ok(Self::Import),
             ".load" => Ok(Self::LoadExtension),
-            ".debugast" => Ok(Self::PrettyPrintAst),
+            ".pprint" => Ok(Self::PrettyPrintAst),
             _ => Err("Unknown command".to_string()),
         }
     }
@@ -986,6 +986,7 @@ Special Commands:
 .open <database_file>      Open and connect to a database file.
 .output <mode>             Change the output mode. Available modes are 'raw' and 'pretty'.
 .schema <table_name>       Show the schema of the specified table.
+.pprint <"sql statement">  Pretty print the SQL statement.
 .tables <pattern>          List names of tables matching LIKE pattern TABLE
 .opcodes                   Display all the opcodes defined by the virtual machine
 .cd <directory>            Change the current working directory.
