@@ -715,7 +715,6 @@ pub fn json_quote(value: &OwnedValue) -> crate::Result<OwnedValue> {
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
 
     use super::*;
     use crate::types::OwnedValue;
@@ -815,7 +814,7 @@ mod tests {
     #[test]
     fn test_get_json_blob_valid_jsonb() {
         let binary_json = b"\x40\0\0\x01\x10\0\0\x03\x10\0\0\x03\x61\x73\x64\x61\x64\x66".to_vec();
-        let input = OwnedValue::Blob(Rc::new(binary_json));
+        let input = OwnedValue::Blob(binary_json);
         let result = get_json(&input, None).unwrap();
         if let OwnedValue::Text(result_str) = result {
             assert!(result_str.as_str().contains("\"asd\":\"adf\""));
@@ -828,7 +827,7 @@ mod tests {
     #[test]
     fn test_get_json_blob_invalid_jsonb() {
         let binary_json: Vec<u8> = vec![0xA2, 0x62, 0x6B, 0x31, 0x62, 0x76]; // Incomplete binary JSON
-        let input = OwnedValue::Blob(Rc::new(binary_json));
+        let input = OwnedValue::Blob(binary_json);
         let result = get_json(&input, None);
         match result {
             Ok(_) => panic!("Expected error for malformed JSON"),
@@ -877,7 +876,7 @@ mod tests {
 
     #[test]
     fn test_json_array_blob_invalid() {
-        let blob = OwnedValue::Blob(Rc::new("1".as_bytes().to_vec()));
+        let blob = OwnedValue::Blob("1".as_bytes().to_vec());
 
         let input = vec![blob];
 
@@ -1072,7 +1071,7 @@ mod tests {
 
     #[test]
     fn test_json_error_position_blob() {
-        let input = OwnedValue::Blob(Rc::new(r#"["a",55,"b",72,,]"#.as_bytes().to_owned()));
+        let input = OwnedValue::Blob(r#"["a",55,"b",72,,]"#.as_bytes().to_owned());
         let result = json_error_position(&input).unwrap();
         assert_eq!(result, OwnedValue::Integer(16));
     }

@@ -1,7 +1,6 @@
 use crate::vdbe::builder::CursorType;
 
 use super::{Insn, InsnReference, OwnedValue, Program};
-use std::rc::Rc;
 
 pub fn insn_to_str(
     program: &Program,
@@ -643,7 +642,7 @@ pub fn insn_to_str(
                 0,
                 *dest as i32,
                 0,
-                OwnedValue::Blob(Rc::new(value.clone())),
+                OwnedValue::Blob(value.clone()), // TODO Why not owned blob here?
                 0,
                 format!(
                     "r[{}]={} (len={})",

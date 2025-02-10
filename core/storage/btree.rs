@@ -2576,7 +2576,7 @@ mod tests {
             let mut cursor = BTreeCursor::new(pager.clone(), root_page);
             for (key, size) in sequence.iter() {
                 let key = OwnedValue::Integer(*key);
-                let value = Record::new(vec![OwnedValue::Blob(Rc::new(vec![0; *size]))]);
+                let value = Record::new(vec![OwnedValue::Blob(vec![0; *size])]);
                 log::info!("insert key:{}", key);
                 cursor.insert(&key, &value, false).unwrap();
                 log::info!(
@@ -2632,7 +2632,7 @@ mod tests {
                     insert_id
                 );
                 let key = OwnedValue::Integer(key);
-                let value = Record::new(vec![OwnedValue::Blob(Rc::new(vec![0; size]))]);
+                let value = Record::new(vec![OwnedValue::Blob(vec![0; size])]);
                 cursor.insert(&key, &value, false).unwrap();
             }
             log::info!(

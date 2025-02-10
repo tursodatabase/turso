@@ -542,7 +542,7 @@ impl VirtualTable {
                 OwnedValue::Integer(i) => Ok(ExtValue::from_integer(*i)),
                 OwnedValue::Float(f) => Ok(ExtValue::from_float(*f)),
                 OwnedValue::Text(t) => Ok(ExtValue::from_text(t.as_str().to_string())),
-                OwnedValue::Blob(b) => Ok(ExtValue::from_blob((**b).clone())),
+                OwnedValue::Blob(b) => Ok(ExtValue::from_blob(b.clone())), // BLOB cloning here
                 other => Err(LimboError::ExtensionError(format!(
                     "Unsupported value type: {:?}",
                     other

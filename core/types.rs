@@ -9,7 +9,6 @@ use crate::vdbe::sorter::Sorter;
 use crate::vdbe::VTabOpaqueCursor;
 use crate::Result;
 use std::fmt::Display;
-use std::rc::Rc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value<'a> {
@@ -84,7 +83,7 @@ pub enum OwnedValue {
     Integer(i64),
     Float(f64),
     Text(Text),
-    Blob(Rc<Vec<u8>>),
+    Blob(Vec<u8>),
     Agg(Box<AggContext>), // TODO(pere): make this without Box. Currently this might cause cache miss but let's leave it for future analysis
     Record(Record),
 }
@@ -103,7 +102,7 @@ impl OwnedValue {
     }
 
     pub fn from_blob(data: Vec<u8>) -> Self {
-        OwnedValue::Blob(std::rc::Rc::new(data))
+        OwnedValue::Blob(data)
     }
 
     pub fn to_text(&self) -> Option<&str> {
@@ -248,7 +247,7 @@ impl OwnedValue {
                 let Some(blob) = v.to_blob() else {
                     return Ok(OwnedValue::Null);
                 };
-                Ok(OwnedValue::Blob(Rc::new(blob)))
+                Ok(OwnedValue::Blob(blob))
             }
             ExtValueType::Error => {
                 let Some(err) = v.to_error_details() else {
@@ -482,7 +481,7 @@ impl From<Value<'_>> for OwnedValue {
             Value::Integer(i) => OwnedValue::Integer(i),
             Value::Float(f) => OwnedValue::Float(f),
             Value::Text(s) => OwnedValue::Text(Text::from_str(s)),
-            Value::Blob(b) => OwnedValue::Blob(Rc::new(b.to_owned())),
+            Value::Blob(b) => OwnedValue::Blob(b.to_owned()),
         }
     }
 }
@@ -765,7 +764,6 @@ pub enum SeekKey<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::rc::Rc;
 
     #[test]
     fn test_serialize_null() {
@@ -900,8 +898,9 @@ mod tests {
 
     #[test]
     fn test_serialize_blob() {
-        let blob = Rc::new(vec![1, 2, 3, 4, 5]);
-        let record = Record::new(vec![OwnedValue::Blob(blob.clone())]);
+        let blob = vec![1, 2, 3, 4, 5];
+        let blob_len = blob.len();
+        let record = Record::new(vec![OwnedValue::Blob(blob)]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
 
@@ -914,7 +913,7 @@ mod tests {
         // Check the actual blob bytes
         assert_eq!(&buf[2..7], &[1, 2, 3, 4, 5]);
         // Check that buffer length is correct
-        assert_eq!(buf.len(), header_length + blob.len());
+        assert_eq!(buf.len(), header_length + blob_len);
     }
 
     #[test]
