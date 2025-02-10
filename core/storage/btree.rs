@@ -15,8 +15,7 @@ use std::rc::Rc;
 
 use super::pager::PageRef;
 use super::sqlite3_ondisk::{
-    payload_overflows, write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell,
-    DATABASE_HEADER_SIZE,
+    write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell, DATABASE_HEADER_SIZE,
 };
 
 /*
@@ -2712,6 +2711,98 @@ mod tests {
     #[test]
     pub fn btree_insert_fuzz_run_overflow() {
         btree_insert_fuzz_run(64, 32, |rng| (rng.next_u32() % 32 * 1024) as usize);
+    }
+
+    #[test]
+    pub fn btree_delete_fuzz_ex() {
+        // Test specific sequences that could trigger edge cases
+        for sequence in [
+            // Test deleting from a simple tree
+            &[
+                (100, 100, true), // (key, size, delete?)
+                (200, 100, true),
+                (300, 100, false), // Keep this one
+                (400, 100, true),
+            ]
+            .as_slice(),
+            &[
+                (1000, 5000, true),
+                (2000, 100, true),
+                (3000, 5000, false),
+                (4000, 100, true),
+            ]
+            .as_slice(),
+            &[
+                (10, 3000, true),
+                (20, 3000, true),
+                (30, 3000, false),
+                (40, 3000, true),
+                (50, 3000, true),
+            ]
+            .as_slice(),
+        ] {
+            let (pager, root_page) = empty_btree();
+            let mut cursor = BTreeCursor::new(pager.clone(), root_page);
+
+            // First insert all records
+            for &(key, size, _) in sequence.iter() {
+                let key = OwnedValue::Integer(key);
+                let value = Record::new(vec![OwnedValue::Blob(Rc::new(vec![0; size]))]);
+                log::info!("Inserting key: {}", key);
+                cursor.insert(&key, &value, false).unwrap();
+            }
+
+            log::info!(
+                "After inserts:\n{}",
+                format_btree(pager.clone(), root_page, 0)
+            );
+
+            // Then delete specified records
+            for &(key, _, should_delete) in sequence.iter() {
+                if should_delete {
+                    let seek_key = SeekKey::TableRowId(key as u64);
+                    log::info!("Deleting key: {}", key);
+                    assert!(
+                        matches!(
+                            cursor.seek(seek_key.clone(), SeekOp::EQ).unwrap(),
+                            CursorResult::Ok(true)
+                        ),
+                        "key {} not found before delete",
+                        key
+                    );
+                    cursor.delete().unwrap();
+
+                    // Verify deletion
+                    assert!(
+                        matches!(
+                            cursor.seek(seek_key.clone(), SeekOp::EQ).unwrap(),
+                            CursorResult::Ok(false)
+                        ),
+                        "key {} still exists after delete",
+                        key
+                    );
+                }
+            }
+
+            for &(key, _, should_delete) in sequence.iter() {
+                let seek_key = SeekKey::TableRowId(key as u64);
+                let exists = matches!(
+                    cursor.seek(seek_key.clone(), SeekOp::EQ).unwrap(),
+                    CursorResult::Ok(true)
+                );
+                assert_eq!(
+                    !should_delete, exists,
+                    "key {} existence status is wrong after deletions",
+                    key
+                );
+            }
+
+            // TODO(Krishna): uncomment this once we have added balancing to delete.
+            // Validate btree structure
+            // if matches!(validate_btree(pager.clone(), root_page), (_, false)) {
+            //     panic!("invalid btree after deletions");
+            // }
+        }
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
