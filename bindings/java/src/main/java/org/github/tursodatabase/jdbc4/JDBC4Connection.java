@@ -7,15 +7,24 @@ import java.util.Properties;
 import java.util.concurrent.Executor;
 import org.github.tursodatabase.annotations.SkipNullableCheck;
 import org.github.tursodatabase.core.LimboConnection;
+import org.github.tursodatabase.core.LimboStatement;
 
-public class JDBC4Connection extends LimboConnection {
+public class JDBC4Connection implements Connection {
+
+  private final LimboConnection connection;
+
+  private Map<String, Class<?>> typeMap = new HashMap<>();
 
   public JDBC4Connection(String url, String filePath) throws SQLException {
-    super(url, filePath);
+    this.connection = new LimboConnection(url, filePath);
   }
 
   public JDBC4Connection(String url, String filePath, Properties properties) throws SQLException {
-    super(url, filePath, properties);
+    this.connection = new LimboConnection(url, filePath, properties);
+  }
+
+  public LimboStatement prepare(String sql) throws SQLException {
+    return connection.prepare(sql);
   }
 
   @Override
@@ -33,29 +42,15 @@ public class JDBC4Connection extends LimboConnection {
   @Override
   public Statement createStatement(
       int resultSetType, int resultSetConcurrency, int resultSetHoldability) throws SQLException {
-    checkOpen();
-    checkCursor(resultSetType, resultSetConcurrency, resultSetHoldability);
+    connection.checkOpen();
+    connection.checkCursor(resultSetType, resultSetConcurrency, resultSetHoldability);
 
     return new JDBC4Statement(this);
   }
 
   @Override
-  public PreparedStatement prepareStatement(String sql) throws SQLException {
-    return new JDBC4PreparedStatement(this, sql);
-  }
-
-  @Override
-  @SkipNullableCheck
-  public CallableStatement prepareCall(String sql) throws SQLException {
-    // TODO
-    return null;
-  }
-
-  @Override
-  @SkipNullableCheck
   public String nativeSQL(String sql) throws SQLException {
-    // TODO
-    return "";
+    return sql;
   }
 
   @Override
@@ -81,12 +76,12 @@ public class JDBC4Connection extends LimboConnection {
 
   @Override
   public void close() throws SQLException {
-    super.close();
+    connection.close();
   }
 
   @Override
   public boolean isClosed() throws SQLException {
-    return super.isClosed();
+    return connection.isClosed();
   }
 
   @Override
@@ -108,13 +103,10 @@ public class JDBC4Connection extends LimboConnection {
   }
 
   @Override
-  public void setCatalog(String catalog) throws SQLException {
-    // TODO
-  }
+  public void setCatalog(String catalog) throws SQLException {}
 
   @Override
   public String getCatalog() throws SQLException {
-    // TODO
     return "";
   }
 
@@ -142,40 +134,29 @@ public class JDBC4Connection extends LimboConnection {
   }
 
   @Override
-  @SkipNullableCheck
-  public PreparedStatement prepareStatement(String sql, int resultSetType, int resultSetConcurrency)
-      throws SQLException {
-    // TODO
-    return null;
-  }
-
-  @Override
-  @SkipNullableCheck
-  public CallableStatement prepareCall(String sql, int resultSetType, int resultSetConcurrency)
-      throws SQLException {
-    // TODO
-    return null;
-  }
-
-  @Override
   public Map<String, Class<?>> getTypeMap() throws SQLException {
-    // TODO
-    return new HashMap<>();
+    return this.typeMap;
   }
 
   @Override
   public void setTypeMap(Map<String, Class<?>> map) throws SQLException {
-    // TODO
-  }
-
-  @Override
-  public void setHoldability(int holdability) throws SQLException {
-    // TODO
+    synchronized (this) {
+      this.typeMap = map;
+    }
   }
 
   @Override
   public int getHoldability() throws SQLException {
-    return 0;
+    connection.checkOpen();
+    return ResultSet.CLOSE_CURSORS_AT_COMMIT;
+  }
+
+  @Override
+  public void setHoldability(int holdability) throws SQLException {
+    connection.checkOpen();
+    if (holdability != ResultSet.CLOSE_CURSORS_AT_COMMIT) {
+      throw new SQLException("Limbo only supports CLOSE_CURSORS_AT_COMMIT");
+    }
   }
 
   @Override
@@ -203,76 +184,95 @@ public class JDBC4Connection extends LimboConnection {
   }
 
   @Override
-  @SkipNullableCheck
-  public PreparedStatement prepareStatement(
-      String sql, int resultSetType, int resultSetConcurrency, int resultSetHoldability)
-      throws SQLException {
-    // TODO
-    return null;
+  public CallableStatement prepareCall(String sql) throws SQLException {
+    return prepareCall(
+        sql,
+        ResultSet.TYPE_FORWARD_ONLY,
+        ResultSet.CONCUR_READ_ONLY,
+        ResultSet.CLOSE_CURSORS_AT_COMMIT);
   }
 
   @Override
-  @SkipNullableCheck
+  public CallableStatement prepareCall(String sql, int resultSetType, int resultSetConcurrency)
+      throws SQLException {
+    return prepareCall(sql, resultSetType, resultSetConcurrency, ResultSet.CLOSE_CURSORS_AT_COMMIT);
+  }
+
+  @Override
   public CallableStatement prepareCall(
       String sql, int resultSetType, int resultSetConcurrency, int resultSetHoldability)
       throws SQLException {
-    // TODO
-    return null;
+    throw new SQLException("Limbo does not support stored procedures");
   }
 
   @Override
-  @SkipNullableCheck
+  public PreparedStatement prepareStatement(String sql) throws SQLException {
+    return prepareStatement(sql, ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
+  }
+
+  @Override
+  public PreparedStatement prepareStatement(String sql, int resultSetType, int resultSetConcurrency)
+      throws SQLException {
+    return prepareStatement(
+        sql, resultSetType, resultSetConcurrency, ResultSet.CLOSE_CURSORS_AT_COMMIT);
+  }
+
+  @Override
+  public PreparedStatement prepareStatement(
+      String sql, int resultSetType, int resultSetConcurrency, int resultSetHoldability)
+      throws SQLException {
+    connection.checkOpen();
+    connection.checkCursor(resultSetType, resultSetConcurrency, resultSetHoldability);
+    return new JDBC4PreparedStatement(this, sql);
+  }
+
+  @Override
   public PreparedStatement prepareStatement(String sql, int autoGeneratedKeys) throws SQLException {
-    // TODO
-    return null;
+    return prepareStatement(sql);
   }
 
   @Override
-  @SkipNullableCheck
   public PreparedStatement prepareStatement(String sql, int[] columnIndexes) throws SQLException {
-    // TODO
-    return null;
+    // TODO: maybe we can enhance this functionality by using columnIndexes
+    return prepareStatement(sql);
   }
 
   @Override
-  @SkipNullableCheck
   public PreparedStatement prepareStatement(String sql, String[] columnNames) throws SQLException {
-    // TODO
-    return null;
+    // TODO: maybe we can enhance this functionality by using columnNames
+    return prepareStatement(sql);
   }
 
   @Override
-  @SkipNullableCheck
   public Clob createClob() throws SQLException {
-    // TODO
-    return null;
+    throw new SQLFeatureNotSupportedException("createClob not supported");
   }
 
   @Override
-  @SkipNullableCheck
   public Blob createBlob() throws SQLException {
-    // TODO
-    return null;
+    throw new SQLFeatureNotSupportedException("createBlob not supported");
   }
 
   @Override
-  @SkipNullableCheck
   public NClob createNClob() throws SQLException {
-    // TODO
-    return null;
+    throw new SQLFeatureNotSupportedException("createNClob not supported");
   }
 
   @Override
   @SkipNullableCheck
   public SQLXML createSQLXML() throws SQLException {
-    // TODO
-    return null;
+    throw new SQLFeatureNotSupportedException("createSQLXML not supported");
   }
 
   @Override
   public boolean isValid(int timeout) throws SQLException {
-    // TODO
-    return false;
+    if (isClosed()) {
+      return false;
+    }
+
+    try (Statement statement = createStatement()) {
+      return statement.execute("select 1;");
+    }
   }
 
   @Override
@@ -326,7 +326,11 @@ public class JDBC4Connection extends LimboConnection {
 
   @Override
   public void abort(Executor executor) throws SQLException {
-    // TODO
+    if (isClosed()) {
+      return;
+    }
+
+    close();
   }
 
   @Override
@@ -350,5 +354,15 @@ public class JDBC4Connection extends LimboConnection {
   public boolean isWrapperFor(Class<?> iface) throws SQLException {
     // TODO
     return false;
+  }
+
+  public void setBusyTimeout(int busyTimeout) {
+    // TODO: add support for busy timeout
+  }
+
+  /** @return busy timeout in milliseconds. */
+  public int getBusyTimeout() {
+    // TODO: add support for busyTimeout
+    return 0;
   }
 }
