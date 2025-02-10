@@ -2216,10 +2216,6 @@ impl BTreeCursor {
     ) -> Result<(usize, usize)> {
         let max_local = self.payload_overflow_threshold_max(page_type);
         let min_local = self.payload_overflow_threshold_min(page_type);
-        println!("min_local: {}", min_local);
-        println!("max_local: {}", max_local);
-        println!("payload_len: {}", payload_len);
-        println!("usable_space: {}", self.usable_space());
 
         // This matches btreeParseCellAdjustSizeForOverflow logic
         let n_local = if payload_len <= max_local {
@@ -2872,7 +2868,7 @@ mod tests {
         let usable_size = cursor.usable_space();
 
         // Create a large payload that will definitely trigger overflow
-        let large_payload = vec![b'A'; max_local + usable_size];
+        let large_payload = vec![b'A'; max_local + usable_size + 900];
 
         // Setup overflow pages (2, 3, 4) with linking
         let mut current_page = 2u32;
