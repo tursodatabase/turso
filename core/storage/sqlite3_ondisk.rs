@@ -1061,7 +1061,7 @@ pub fn read_value(buf: &[u8], serial_type: &SerialType) -> Result<(OwnedValue, u
             let bytes = buf[0..n].to_vec();
             Ok((
                 OwnedValue::Text(Text {
-                    value: Rc::new(bytes),
+                    value: bytes,
                     subtype: TextSubtype::Text,
                 }),
                 n,

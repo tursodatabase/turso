@@ -50,7 +50,7 @@ pub enum TextSubtype {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Text {
-    pub value: Rc<Vec<u8>>,
+    pub value: Vec<u8>,
     pub subtype: TextSubtype,
 }
 
@@ -61,14 +61,14 @@ impl Text {
 
     pub fn new(value: &str) -> Self {
         Self {
-            value: Rc::new(value.as_bytes().to_vec()),
+            value: value.as_bytes().to_vec(),
             subtype: TextSubtype::Text,
         }
     }
 
     pub fn json(value: &str) -> Self {
         Self {
-            value: Rc::new(value.as_bytes().to_vec()),
+            value: value.as_bytes().to_vec(),
             subtype: TextSubtype::Json,
         }
     }
