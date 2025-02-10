@@ -2229,15 +2229,6 @@ impl BTreeCursor {
 
         #[allow(clippy::manual_div_ceil)] // don't remove this. Ignore clippy.
         let n_overflow = (payload_len - local_size + overflow_page_size - 1) / (overflow_page_size);
-        println!(
-            "payload_len - local_size + overflow_page_size: {:?}",
-            payload_len - local_size + overflow_page_size
-        );
-        println!("overflow page size: {:?}", overflow_page_size);
-        if n_overflow == 0 {
-            return Err(LimboError::Corrupt("Invalid overflow calculation".into()));
-        }
-
         Ok(Some(n_overflow))
     }
 }
