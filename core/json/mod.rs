@@ -406,16 +406,16 @@ fn json_extract_single<'a>(
             },
             PathElement::ArrayLocator(idx) => match current_element {
                 Val::Array(array) => {
-                    let mut idx = *idx;
+                    if let Some(mut idx) = *idx {
+                        if idx < 0 {
+                            idx += array.len() as i32;
+                        }
 
-                    if idx < 0 {
-                        idx += array.len() as i32;
-                    }
-
-                    if idx < array.len() as i32 {
-                        current_element = &array[idx as usize];
-                    } else {
-                        return Ok(None);
+                        if idx < array.len() as i32 {
+                            current_element = &array[idx as usize];
+                        } else {
+                            return Ok(None);
+                        }
                     }
                 }
                 _ => return Ok(None),
@@ -449,7 +449,10 @@ fn json_path_from_owned_value(path: &OwnedValue, strict: bool) -> crate::Result<
             }
             OwnedValue::Null => return Ok(None),
             OwnedValue::Integer(i) => JsonPath {
-                elements: vec![PathElement::Root(), PathElement::ArrayLocator(*i as i32)],
+                elements: vec![
+                    PathElement::Root(),
+                    PathElement::ArrayLocator(Some(*i as i32)),
+                ],
             },
             OwnedValue::Float(f) => JsonPath {
                 elements: vec![
@@ -485,8 +488,9 @@ fn find_target<'a>(json: &'a mut Val, path: &JsonPath) -> Option<Target<'a>> {
             PathElement::ArrayLocator(index) => match current {
                 Val::Array(arr) => {
                     if let Some(index) = match index {
-                        i if *i < 0 => arr.len().checked_sub(i.unsigned_abs() as usize),
-                        i => ((*i as usize) < arr.len()).then_some(*i as usize),
+                        Some(i) if *i < 0 => arr.len().checked_sub(i.unsigned_abs() as usize),
+                        Some(i) => ((*i as usize) < arr.len()).then_some(*i as usize),
+                        None => Some(arr.len()),
                     } {
                         if is_last {
                             return Some(Target::Array(arr, index));
@@ -538,8 +542,9 @@ fn find_or_create_target<'a>(json: &'a mut Val, path: &JsonPath) -> Option<Targe
             PathElement::ArrayLocator(index) => match current {
                 Val::Array(arr) => {
                     if let Some(index) = match index {
-                        i if *i < 0 => arr.len().checked_sub(i.unsigned_abs() as usize),
-                        i => Some(*i as usize),
+                        Some(i) if *i < 0 => arr.len().checked_sub(i.unsigned_abs() as usize),
+                        Some(i) => Some(*i as usize),
+                        None => Some(arr.len()),
                     } {
                         if is_last {
                             if index == arr.len() {
@@ -1247,7 +1252,7 @@ mod tests {
             Val::String("second".to_string()),
         ]);
         let path = JsonPath {
-            elements: vec![PathElement::ArrayLocator(0)],
+            elements: vec![PathElement::ArrayLocator(Some(0))],
         };
 
         match find_target(&mut val, &path) {
@@ -1263,7 +1268,7 @@ mod tests {
             Val::String("second".to_string()),
         ]);
         let path = JsonPath {
-            elements: vec![PathElement::ArrayLocator(-1)],
+            elements: vec![PathElement::ArrayLocator(Some(-1))],
         };
 
         match find_target(&mut val, &path) {
@@ -1305,7 +1310,7 @@ mod tests {
     fn test_mutate_json() {
         let mut val = Val::Array(vec![Val::String("test".to_string())]);
         let path = JsonPath {
-            elements: vec![PathElement::ArrayLocator(0)],
+            elements: vec![PathElement::ArrayLocator(Some(0))],
         };
 
         let result = mutate_json_by_path(&mut val, path, |target| match target {
@@ -1324,7 +1329,7 @@ mod tests {
     fn test_mutate_json_none() {
         let mut val = Val::Array(vec![]);
         let path = JsonPath {
-            elements: vec![PathElement::ArrayLocator(0)],
+            elements: vec![PathElement::ArrayLocator(Some(0))],
         };
 
         let result: Option<()> = mutate_json_by_path(&mut val, path, |_| {
@@ -1410,7 +1415,7 @@ mod tests {
 
         let result = result.unwrap();
         match &result.elements[..] {
-            [PathElement::Root(), PathElement::ArrayLocator(index)] if *index == 3 => {}
+            [PathElement::Root(), PathElement::ArrayLocator(index)] if *index == Some(3) => {}
             _ => panic!("Expected root and array locator"),
         }
     }
@@ -1637,8 +1642,8 @@ mod tests {
         assert!(result.is_ok());
 
         assert_eq!(
-            result.unwrap(),
-            OwnedValue::build_text(Rc::new("[456,789]".to_string()))
+            result.unwrap().to_string(),
+            OwnedValue::build_text(Rc::new("[456,789]".to_string())).to_string()
         );
     }
 
