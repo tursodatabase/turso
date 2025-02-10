@@ -126,7 +126,7 @@ pub enum JsonbError {
     #[error("Expected JSONB value to have {0} bytes, but got {1}")]
     OutOfBounds(usize, usize),
     #[error("Expected JSONB key to be a string, got: {0}")]
-    KeyNotAString(JsonbType),
+    KeyNotAString(String),
 }
 
 pub type Result<T, E = JsonbError> = std::result::Result<T, E>;
@@ -249,7 +249,7 @@ fn jsonb_to_string_internal(arr: &[u8], depth: u16, result: &mut String) -> Resu
 
                 match key_type {
                     JsonbType::Text | JsonbType::Text5 | JsonbType::TextJ | JsonbType::TextRaw => {}
-                    _ => return Err(JsonbError::KeyNotAString(key_type)),
+                    _ => return Err(JsonbError::KeyNotAString(key_type.to_string())),
                 };
 
                 let key_size =
@@ -509,7 +509,7 @@ mod tests {
         }
 
         match RawJsonb::new(&[0x8c, 0x13, b'a', 0x10, 0x17, b'b', 0x11, 0x17, b'c']).to_string() {
-            Err(JsonbError::KeyNotAString(JsonbType::Int)) => {}
+            Err(JsonbError::KeyNotAString(_)) => {}
             _ => panic!("Expected KeyNotAString error"),
         }
     }
