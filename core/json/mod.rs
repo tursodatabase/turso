@@ -16,7 +16,6 @@ use jsonb::Error as JsonbError;
 use ser::to_string_pretty;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::rc::Rc;
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 #[serde(untagged)]
