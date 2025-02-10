@@ -1642,8 +1642,8 @@ mod tests {
         assert!(result.is_ok());
 
         assert_eq!(
-            result.unwrap().to_string(),
-            OwnedValue::build_text(Rc::new("[456,789]".to_string())).to_string()
+            result.unwrap(),
+            OwnedValue::build_text(Rc::new("[456,789]".to_string()))
         );
     }
 
