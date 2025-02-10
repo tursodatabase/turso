@@ -1,3 +1,4 @@
+use crate::VirtualTable;
 use crate::{util::normalize_ident, Result};
 use core::fmt;
 use fallible_iterator::FallibleIterator;
@@ -47,6 +48,7 @@ impl Schema {
 pub enum Table {
     BTree(Rc<BTreeTable>),
     Pseudo(Rc<PseudoTable>),
+    Virtual(Rc<VirtualTable>),
 }
 
 impl Table {
@@ -54,6 +56,7 @@ impl Table {
         match self {
             Table::BTree(table) => table.root_page,
             Table::Pseudo(_) => unimplemented!(),
+            Table::Virtual(_) => unimplemented!(),
         }
     }
 
@@ -61,13 +64,15 @@ impl Table {
         match self {
             Self::BTree(table) => &table.name,
             Self::Pseudo(_) => "",
+            Self::Virtual(table) => &table.name,
         }
     }
 
-    pub fn get_column_at(&self, index: usize) -> &Column {
+    pub fn get_column_at(&self, index: usize) -> Option<&Column> {
         match self {
-            Self::BTree(table) => table.columns.get(index).unwrap(),
-            Self::Pseudo(table) => table.columns.get(index).unwrap(),
+            Self::BTree(table) => table.columns.get(index),
+            Self::Pseudo(table) => table.columns.get(index),
+            Self::Virtual(table) => table.columns.get(index),
         }
     }
 
@@ -75,6 +80,7 @@ impl Table {
         match self {
             Self::BTree(table) => &table.columns,
             Self::Pseudo(table) => &table.columns,
+            Self::Virtual(table) => &table.columns,
         }
     }
 
@@ -82,6 +88,14 @@ impl Table {
         match self {
             Self::BTree(table) => Some(table.clone()),
             Self::Pseudo(_) => None,
+            Self::Virtual(_) => None,
+        }
+    }
+
+    pub fn virtual_table(&self) -> Option<Rc<VirtualTable>> {
+        match self {
+            Self::Virtual(table) => Some(table.clone()),
+            _ => None,
         }
     }
 }
@@ -91,6 +105,7 @@ impl PartialEq for Table {
         match (self, other) {
             (Self::BTree(a), Self::BTree(b)) => Rc::ptr_eq(a, b),
             (Self::Pseudo(a), Self::Pseudo(b)) => Rc::ptr_eq(a, b),
+            (Self::Virtual(a), Self::Virtual(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -123,7 +138,7 @@ impl BTreeTable {
     pub fn get_column(&self, name: &str) -> Option<(usize, &Column)> {
         let name = normalize_ident(name);
         for (i, column) in self.columns.iter().enumerate() {
-            if column.name == name {
+            if column.name.as_ref().map_or(false, |n| *n == name) {
                 return Some((i, column));
             }
         }
@@ -135,7 +150,7 @@ impl BTreeTable {
         let cmd = parser.next()?;
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateTable { tbl_name, body, .. })) => {
-                create_table(tbl_name, body, root_page)
+                create_table(tbl_name, *body, root_page)
             }
             _ => todo!("Expected CREATE TABLE statement"),
         }
@@ -149,7 +164,7 @@ impl BTreeTable {
                 sql.push_str(",\n");
             }
             sql.push_str("  ");
-            sql.push_str(&column.name);
+            sql.push_str(column.name.as_ref().expect("column name is None"));
             sql.push(' ');
             sql.push_str(&column.ty.to_string());
         }
@@ -174,16 +189,19 @@ impl PseudoTable {
 
     pub fn add_column(&mut self, name: &str, ty: Type, primary_key: bool) {
         self.columns.push(Column {
-            name: normalize_ident(name),
+            name: Some(normalize_ident(name)),
             ty,
+            ty_str: ty.to_string(),
             primary_key,
             is_rowid_alias: false,
+            notnull: false,
+            default: None,
         });
     }
     pub fn get_column(&self, name: &str) -> Option<(usize, &Column)> {
         let name = normalize_ident(name);
         for (i, column) in self.columns.iter().enumerate() {
-            if column.name == name {
+            if column.name.as_ref().map_or(false, |n| *n == name) {
                 return Some((i, column));
             }
         }
@@ -243,47 +261,76 @@ fn create_table(
                 // and the value of this column are the same.
                 // https://www.sqlite.org/lang_createtable.html#rowids_and_the_integer_primary_key
                 let mut typename_exactly_integer = false;
-                let ty = match col_def.col_type {
+                let (ty, ty_str) = match col_def.col_type {
                     Some(data_type) => {
+                        let s = data_type.name.as_str();
+                        let ty_str = if matches!(
+                            s.to_uppercase().as_str(),
+                            "TEXT" | "INT" | "INTEGER" | "BLOB" | "REAL"
+                        ) {
+                            s.to_uppercase().to_string()
+                        } else {
+                            s.to_string()
+                        };
+
                         // https://www.sqlite.org/datatype3.html
-                        let type_name = data_type.name.as_str().to_uppercase();
+                        let type_name = ty_str.to_uppercase();
                         if type_name.contains("INT") {
                             typename_exactly_integer = type_name == "INTEGER";
-                            Type::Integer
+                            (Type::Integer, ty_str)
                         } else if type_name.contains("CHAR")
                             || type_name.contains("CLOB")
                             || type_name.contains("TEXT")
                         {
-                            Type::Text
-                        } else if type_name.contains("BLOB") || type_name.is_empty() {
-                            Type::Blob
+                            (Type::Text, ty_str)
+                        } else if type_name.contains("BLOB") {
+                            (Type::Blob, ty_str)
+                        } else if type_name.is_empty() {
+                            (Type::Blob, "".to_string())
                         } else if type_name.contains("REAL")
                             || type_name.contains("FLOA")
                             || type_name.contains("DOUB")
                         {
-                            Type::Real
+                            (Type::Real, ty_str)
                         } else {
-                            Type::Numeric
+                            (Type::Numeric, ty_str)
                         }
                     }
-                    None => Type::Null,
+                    None => (Type::Null, "".to_string()),
                 };
-                let mut primary_key = col_def.constraints.iter().any(|c| {
-                    matches!(
-                        c.constraint,
-                        sqlite3_parser::ast::ColumnConstraint::PrimaryKey { .. }
-                    )
-                });
+
+                let mut default = None;
+                let mut primary_key = false;
+                let mut notnull = false;
+                for c_def in &col_def.constraints {
+                    match &c_def.constraint {
+                        sqlite3_parser::ast::ColumnConstraint::PrimaryKey { .. } => {
+                            primary_key = true;
+                        }
+                        sqlite3_parser::ast::ColumnConstraint::NotNull { .. } => {
+                            notnull = true;
+                        }
+                        sqlite3_parser::ast::ColumnConstraint::Default(expr) => {
+                            default = Some(expr.clone())
+                        }
+                        _ => {}
+                    }
+                }
+
                 if primary_key {
                     primary_key_column_names.push(name.clone());
                 } else if primary_key_column_names.contains(&name) {
                     primary_key = true;
                 }
+
                 cols.push(Column {
-                    name: normalize_ident(&name),
+                    name: Some(normalize_ident(&name)),
                     ty,
+                    ty_str,
                     primary_key,
                     is_rowid_alias: typename_exactly_integer && primary_key,
+                    notnull,
+                    default,
                 });
             }
             if options.contains(TableOptions::WITHOUT_ROWID) {
@@ -328,10 +375,14 @@ pub fn _build_pseudo_table(columns: &[ResultColumn]) -> PseudoTable {
 
 #[derive(Debug, Clone)]
 pub struct Column {
-    pub name: String,
+    pub name: Option<String>,
     pub ty: Type,
+    // many sqlite operations like table_info retain the original string
+    pub ty_str: String,
     pub primary_key: bool,
     pub is_rowid_alias: bool,
+    pub notnull: bool,
+    pub default: Option<Expr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -347,7 +398,7 @@ pub enum Type {
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
-            Self::Null => "NULL",
+            Self::Null => "",
             Self::Text => "TEXT",
             Self::Numeric => "NUMERIC",
             Self::Integer => "INTEGER",
@@ -366,34 +417,49 @@ pub fn sqlite_schema_table() -> BTreeTable {
         primary_key_column_names: vec![],
         columns: vec![
             Column {
-                name: "type".to_string(),
+                name: Some("type".to_string()),
                 ty: Type::Text,
+                ty_str: "TEXT".to_string(),
                 primary_key: false,
                 is_rowid_alias: false,
+                notnull: false,
+                default: None,
             },
             Column {
-                name: "name".to_string(),
+                name: Some("name".to_string()),
                 ty: Type::Text,
+                ty_str: "TEXT".to_string(),
                 primary_key: false,
                 is_rowid_alias: false,
+                notnull: false,
+                default: None,
             },
             Column {
-                name: "tbl_name".to_string(),
+                name: Some("tbl_name".to_string()),
                 ty: Type::Text,
+                ty_str: "TEXT".to_string(),
                 primary_key: false,
                 is_rowid_alias: false,
+                notnull: false,
+                default: None,
             },
             Column {
-                name: "rootpage".to_string(),
+                name: Some("rootpage".to_string()),
                 ty: Type::Integer,
+                ty_str: "INT".to_string(),
                 primary_key: false,
                 is_rowid_alias: false,
+                notnull: false,
+                default: None,
             },
             Column {
-                name: "sql".to_string(),
+                name: Some("sql".to_string()),
                 ty: Type::Text,
+                ty_str: "TEXT".to_string(),
                 primary_key: false,
                 is_rowid_alias: false,
+                notnull: false,
+                default: None,
             },
         ],
     }
@@ -712,6 +778,79 @@ mod tests {
     }
 
     #[test]
+    pub fn test_default_value() -> Result<()> {
+        let sql = r#"CREATE TABLE t1 (a INTEGER DEFAULT 23);"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+        let column = table.get_column("a").unwrap().1;
+        let default = column.default.clone().unwrap();
+        assert_eq!(default.to_string(), "23");
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_col_notnull() -> Result<()> {
+        let sql = r#"CREATE TABLE t1 (a INTEGER NOT NULL);"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+        let column = table.get_column("a").unwrap().1;
+        assert_eq!(column.notnull, true);
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_col_notnull_negative() -> Result<()> {
+        let sql = r#"CREATE TABLE t1 (a INTEGER);"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+        let column = table.get_column("a").unwrap().1;
+        assert_eq!(column.notnull, false);
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_col_type_string_integer() -> Result<()> {
+        let sql = r#"CREATE TABLE t1 (a InTeGeR);"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+        let column = table.get_column("a").unwrap().1;
+        assert_eq!(column.ty_str, "INTEGER");
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_col_type_string_int() -> Result<()> {
+        let sql = r#"CREATE TABLE t1 (a InT);"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+        let column = table.get_column("a").unwrap().1;
+        assert_eq!(column.ty_str, "INT");
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_col_type_string_blob() -> Result<()> {
+        let sql = r#"CREATE TABLE t1 (a bLoB);"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+        let column = table.get_column("a").unwrap().1;
+        assert_eq!(column.ty_str, "BLOB");
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_col_type_string_empty() -> Result<()> {
+        let sql = r#"CREATE TABLE t1 (a);"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+        let column = table.get_column("a").unwrap().1;
+        assert_eq!(column.ty_str, "");
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_col_type_string_some_nonsense() -> Result<()> {
+        let sql = r#"CREATE TABLE t1 (a someNonsenseName);"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+        let column = table.get_column("a").unwrap().1;
+        assert_eq!(column.ty_str, "someNonsenseName");
+        Ok(())
+    }
+
+    #[test]
     pub fn test_sqlite_schema() {
         let expected = r#"CREATE TABLE sqlite_schema (
   type TEXT,
@@ -781,10 +920,13 @@ mod tests {
             has_rowid: true,
             primary_key_column_names: vec!["nonexistent".to_string()],
             columns: vec![Column {
-                name: "a".to_string(),
+                name: Some("a".to_string()),
                 ty: Type::Integer,
+                ty_str: "INT".to_string(),
                 primary_key: false,
                 is_rowid_alias: false,
+                notnull: false,
+                default: None,
             }],
         };
 

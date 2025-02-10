@@ -62,7 +62,7 @@ limbo-wasm:
 	cargo build --package limbo-wasm --target wasm32-wasi
 .PHONY: limbo-wasm
 
-test: limbo test-compat test-sqlite3 test-shell test-extensions
+test: limbo test-compat test-vector test-sqlite3 test-shell test-extensions
 .PHONY: test
 
 test-extensions: limbo
@@ -78,6 +78,18 @@ test-compat:
 	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/all.test
 .PHONY: test-compat
 
+test-vector:
+	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/vector.test
+.PHONY: test-vector
+
+test-time:
+	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/time.test
+.PHONY: test-time
+
 test-sqlite3: limbo-c
 	LIBS="$(SQLITE_LIB)" HEADERS="$(SQLITE_LIB_HEADERS)" make -C sqlite3/tests test
 .PHONY: test-sqlite3
+
+test-json:
+	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/json.test
+.PHONY: test-json

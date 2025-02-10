@@ -25,12 +25,19 @@ pub trait ArbitraryFrom<T> {
     fn arbitrary_from<R: Rng>(rng: &mut R, t: T) -> Self;
 }
 
+/// ArbitraryFromMaybe trait for fallibally generating random values from a given value
+pub trait ArbitraryFromMaybe<T> {
+    fn arbitrary_from_maybe<R: Rng>(rng: &mut R, t: T) -> Option<Self>
+    where
+        Self: Sized;
+}
+
 /// Frequency is a helper function for composing different generators with different frequency
-/// of occurences.
+/// of occurrences.
 /// The type signature for the `N` parameter is a bit complex, but it
 /// roughly corresponds to a type that can be summed, compared, subtracted and sampled, which are
 /// the operations we require for the implementation.
-// todo: switch to a simpler type signature that can accomodate all integer and float types, which
+// todo: switch to a simpler type signature that can accommodate all integer and float types, which
 //       should be enough for our purposes.
 pub(crate) fn frequency<
     'a,
@@ -54,10 +61,40 @@ pub(crate) fn frequency<
     unreachable!()
 }
 
-/// one_of is a helper function for composing different generators with equal probability of occurence.
+/// one_of is a helper function for composing different generators with equal probability of occurrence.
 pub(crate) fn one_of<'a, T, R: Rng>(choices: Vec<Box<dyn Fn(&mut R) -> T + 'a>>, rng: &mut R) -> T {
     let index = rng.gen_range(0..choices.len());
     choices[index](rng)
+}
+
+/// backtrack is a helper function for composing different "failable" generators.
+/// The function takes a list of functions that return an Option<T>, along with number of retries
+/// to make before giving up.
+pub(crate) fn backtrack<'a, T, R: Rng>(
+    mut choices: Vec<(u32, Box<dyn Fn(&mut R) -> Option<T> + 'a>)>,
+    rng: &mut R,
+) -> T {
+    loop {
+        // If there are no more choices left, we give up
+        let choices_ = choices
+            .iter()
+            .enumerate()
+            .filter(|(_, (retries, _))| *retries > 0)
+            .collect::<Vec<_>>();
+        if choices_.is_empty() {
+            panic!("backtrack: no more choices left");
+        }
+        // Run a one_of on the remaining choices
+        let (choice_index, choice) = pick(&choices_, rng);
+        let choice_index = *choice_index;
+        // If the choice returns None, we decrement the number of retries and try again
+        let result = choice.1(rng);
+        if let Some(result) = result {
+            return result;
+        } else {
+            choices[choice_index].0 -= 1;
+        }
+    }
 }
 
 /// pick is a helper function for uniformly picking a random element from a slice

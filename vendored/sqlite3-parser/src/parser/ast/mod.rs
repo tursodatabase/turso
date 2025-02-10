@@ -7,6 +7,8 @@ use std::num::ParseIntError;
 use std::ops::Deref;
 use std::str::{self, Bytes, FromStr};
 
+use strum_macros::{EnumIter, EnumString};
+
 use fmt::{ToTokens, TokenStream};
 use indexmap::{IndexMap, IndexSet};
 
@@ -69,18 +71,18 @@ pub(crate) enum ExplainKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Stmt {
     /// `ALTER TABLE`: table name, body
-    AlterTable(QualifiedName, AlterTableBody),
+    AlterTable(Box<(QualifiedName, AlterTableBody)>),
     /// `ANALYSE`: object name
     Analyze(Option<QualifiedName>),
     /// `ATTACH DATABASE`
     Attach {
         /// filename
         // TODO distinction between ATTACH and ATTACH DATABASE
-        expr: Expr,
+        expr: Box<Expr>,
         /// schema name
-        db_name: Expr,
+        db_name: Box<Expr>,
         /// password
-        key: Option<Expr>,
+        key: Option<Box<Expr>>,
     },
     /// `BEGIN`: tx type, tx name
     Begin(Option<TransactionType>, Option<Name>),
@@ -93,13 +95,13 @@ pub enum Stmt {
         /// `IF NOT EXISTS`
         if_not_exists: bool,
         /// index name
-        idx_name: QualifiedName,
+        idx_name: Box<QualifiedName>,
         /// table name
         tbl_name: Name,
         /// indexed columns or expressions
         columns: Vec<SortedColumn>,
         /// partial index
-        where_clause: Option<Expr>,
+        where_clause: Option<Box<Expr>>,
     },
     /// `CREATE TABLE`
     CreateTable {
@@ -110,29 +112,10 @@ pub enum Stmt {
         /// table name
         tbl_name: QualifiedName,
         /// table body
-        body: CreateTableBody,
+        body: Box<CreateTableBody>,
     },
     /// `CREATE TRIGGER`
-    CreateTrigger {
-        /// `TEMPORARY`
-        temporary: bool,
-        /// `IF NOT EXISTS`
-        if_not_exists: bool,
-        /// trigger name
-        trigger_name: QualifiedName,
-        /// `BEFORE`/`AFTER`/`INSTEAD OF`
-        time: Option<TriggerTime>,
-        /// `DELETE`/`INSERT`/`UPDATE`
-        event: TriggerEvent,
-        /// table name
-        tbl_name: QualifiedName,
-        /// `FOR EACH ROW`
-        for_each_row: bool,
-        /// `WHEN`
-        when_clause: Option<Expr>,
-        /// statements
-        commands: Vec<TriggerCmd>,
-    },
+    CreateTrigger(Box<CreateTrigger>),
     /// `CREATE VIEW`
     CreateView {
         /// `TEMPORARY`
@@ -147,35 +130,11 @@ pub enum Stmt {
         select: Box<Select>,
     },
     /// `CREATE VIRTUAL TABLE`
-    CreateVirtualTable {
-        /// `IF NOT EXISTS`
-        if_not_exists: bool,
-        /// table name
-        tbl_name: QualifiedName,
-        /// module
-        module_name: Name,
-        /// args
-        args: Option<Vec<String>>, // TODO smol str
-    },
+    CreateVirtualTable(Box<CreateVirtualTable>),
     /// `DELETE`
-    Delete {
-        /// CTE
-        with: Option<With>,
-        /// `FROM` table name
-        tbl_name: QualifiedName,
-        /// `INDEXED`
-        indexed: Option<Indexed>,
-        /// `WHERE` clause
-        where_clause: Option<Expr>,
-        /// `RETURNING`
-        returning: Option<Vec<ResultColumn>>,
-        /// `ORDER BY`
-        order_by: Option<Vec<SortedColumn>>,
-        /// `LIMIT`
-        limit: Option<Box<Limit>>,
-    },
+    Delete(Box<Delete>),
     /// `DETACH DATABASE`: db name
-    Detach(Expr), // TODO distinction between DETACH and DETACH DATABASE
+    Detach(Box<Expr>), // TODO distinction between DETACH and DETACH DATABASE
     /// `DROP INDEX`
     DropIndex {
         /// `IF EXISTS`
@@ -205,22 +164,9 @@ pub enum Stmt {
         view_name: QualifiedName,
     },
     /// `INSERT`
-    Insert {
-        /// CTE
-        with: Option<With>,
-        /// `OR`
-        or_conflict: Option<ResolveType>, // TODO distinction between REPLACE and INSERT OR REPLACE
-        /// table name
-        tbl_name: QualifiedName,
-        /// `COLUMNS`
-        columns: Option<DistinctNames>,
-        /// `VALUES` or `SELECT`
-        body: InsertBody,
-        /// `RETURNING`
-        returning: Option<Vec<ResultColumn>>,
-    },
+    Insert(Box<Insert>),
     /// `PRAGMA`: pragma name, body
-    Pragma(QualifiedName, Option<PragmaBody>),
+    Pragma(Box<QualifiedName>, Option<Box<PragmaBody>>),
     /// `REINDEX`
     Reindex {
         /// collation or index or table name
@@ -240,30 +186,106 @@ pub enum Stmt {
     /// `SELECT`
     Select(Box<Select>),
     /// `UPDATE`
-    Update {
-        /// CTE
-        with: Option<With>,
-        /// `OR`
-        or_conflict: Option<ResolveType>,
-        /// table name
-        tbl_name: QualifiedName,
-        /// `INDEXED`
-        indexed: Option<Indexed>,
-        /// `SET` assignments
-        sets: Vec<Set>,
-        /// `FROM`
-        from: Option<FromClause>,
-        /// `WHERE` clause
-        where_clause: Option<Expr>,
-        /// `RETURNING`
-        returning: Option<Vec<ResultColumn>>,
-        /// `ORDER BY`
-        order_by: Option<Vec<SortedColumn>>,
-        /// `LIMIT`
-        limit: Option<Box<Limit>>,
-    },
+    Update(Box<Update>),
     /// `VACUUM`: database name, into expr
-    Vacuum(Option<Name>, Option<Expr>),
+    Vacuum(Option<Name>, Option<Box<Expr>>),
+}
+
+/// `CREATE VIRTUAL TABLE`
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateVirtualTable {
+    /// `IF NOT EXISTS`
+    pub if_not_exists: bool,
+    /// table name
+    pub tbl_name: QualifiedName,
+    /// module name
+    pub module_name: Name,
+    /// args
+    pub args: Option<Vec<String>>, // TODO smol str
+}
+
+/// `CREATE TRIGGER
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateTrigger {
+    /// `TEMPORARY`
+    pub temporary: bool,
+    /// `IF NOT EXISTS`
+    pub if_not_exists: bool,
+    /// trigger name
+    pub trigger_name: QualifiedName,
+    /// `BEFORE`/`AFTER`/`INSTEAD OF`
+    pub time: Option<TriggerTime>,
+    /// `DELETE`/`INSERT`/`UPDATE`
+    pub event: TriggerEvent,
+    /// table name
+    pub tbl_name: QualifiedName,
+    /// `FOR EACH ROW`
+    pub for_each_row: bool,
+    /// `WHEN`
+    pub when_clause: Option<Expr>,
+    /// statements
+    pub commands: Vec<TriggerCmd>,
+}
+
+/// `INSERT`
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Insert {
+    /// CTE
+    pub with: Option<With>,
+    /// `OR`
+    pub or_conflict: Option<ResolveType>, // TODO distinction between REPLACE and INSERT OR REPLACE
+    /// table name
+    pub tbl_name: QualifiedName,
+    /// `COLUMNS`
+    pub columns: Option<DistinctNames>,
+    /// `VALUES` or `SELECT`
+    pub body: InsertBody,
+    /// `RETURNING`
+    pub returning: Option<Vec<ResultColumn>>,
+}
+
+/// `UPDATE` clause
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Update {
+    /// CTE
+    pub with: Option<With>,
+    /// `OR`
+    pub or_conflict: Option<ResolveType>,
+    /// table name
+    pub tbl_name: QualifiedName,
+    /// `INDEXED`
+    pub indexed: Option<Indexed>,
+    /// `SET` assignments
+    pub sets: Vec<Set>,
+    /// `FROM`
+    pub from: Option<FromClause>,
+    /// `WHERE` clause
+    pub where_clause: Option<Box<Expr>>,
+    /// `RETURNING`
+    pub returning: Option<Vec<ResultColumn>>,
+    /// `ORDER BY`
+    pub order_by: Option<Vec<SortedColumn>>,
+    /// `LIMIT`
+    pub limit: Option<Box<Limit>>,
+}
+
+/// `DELETE`
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Delete {
+    /// CTE
+    pub with: Option<With>,
+    /// `FROM` table name
+    pub tbl_name: QualifiedName,
+    /// `INDEXED`
+    pub indexed: Option<Indexed>,
+    /// `WHERE` clause
+    pub where_clause: Option<Box<Expr>>,
+    /// `RETURNING`
+    pub returning: Option<Vec<ResultColumn>>,
+    /// `ORDER BY`
+    pub order_by: Option<Vec<SortedColumn>>,
+    /// `LIMIT`
+    pub limit: Option<Box<Limit>>,
 }
 
 /// SQL expression
@@ -769,22 +791,26 @@ pub enum CompoundOperator {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OneSelect {
     /// `SELECT`
-    Select {
-        /// `DISTINCT`
-        distinctness: Option<Distinctness>,
-        /// columns
-        columns: Vec<ResultColumn>,
-        /// `FROM` clause
-        from: Option<FromClause>,
-        /// `WHERE` clause
-        where_clause: Option<Expr>,
-        /// `GROUP BY`
-        group_by: Option<GroupBy>,
-        /// `WINDOW` definition
-        window_clause: Option<Vec<WindowDef>>,
-    },
+    Select(Box<SelectInner>),
     /// `VALUES`
     Values(Vec<Vec<Expr>>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// `SELECT` core
+pub struct SelectInner {
+    /// `DISTINCT`
+    pub distinctness: Option<Distinctness>,
+    /// columns
+    pub columns: Vec<ResultColumn>,
+    /// `FROM` clause
+    pub from: Option<FromClause>,
+    /// `WHERE` clause
+    pub where_clause: Option<Expr>,
+    /// `GROUP BY`
+    pub group_by: Option<GroupBy>,
+    /// `WINDOW` definition
+    pub window_clause: Option<Vec<WindowDef>>,
 }
 
 /// `SELECT` ... `FROM` clause
@@ -1003,7 +1029,7 @@ pub struct GroupBy {
     /// expressions
     pub exprs: Vec<Expr>,
     /// `HAVING`
-    pub having: Option<Expr>, // HAVING clause on a non-aggregate query
+    pub having: Option<Box<Expr>>, // HAVING clause on a non-aggregate query
 }
 
 /// identifier or one of several keywords or `INDEXED`
@@ -1585,27 +1611,19 @@ pub type PragmaValue = Expr; // TODO
 
 /// `PRAGMA` value
 // https://sqlite.org/pragma.html
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, EnumIter, EnumString, strum::Display)]
+#[strum(serialize_all = "snake_case")]
 pub enum PragmaName {
     /// `cache_size` pragma
     CacheSize,
     /// `journal_mode` pragma
     JournalMode,
+    /// Return the total number of pages in the database file.
+    PageCount,
+    /// returns information about the columns of a table
+    TableInfo,
     /// trigger a checkpoint to run on database(s) if WAL is enabled
     WalCheckpoint,
-}
-
-impl FromStr for PragmaName {
-    type Err = ();
-
-    fn from_str(input: &str) -> Result<Self, Self::Err> {
-        match input {
-            "cache_size" => Ok(PragmaName::CacheSize),
-            "wal_checkpoint" => Ok(PragmaName::WalCheckpoint),
-            "journal_mode" => Ok(PragmaName::JournalMode),
-            _ => Err(()),
-        }
-    }
 }
 
 /// `CREATE TRIGGER` time
@@ -1638,42 +1656,54 @@ pub enum TriggerEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TriggerCmd {
     /// `UPDATE`
-    Update {
-        /// `OR`
-        or_conflict: Option<ResolveType>,
-        /// table name
-        tbl_name: Name,
-        /// `SET` assignments
-        sets: Vec<Set>,
-        /// `FROM`
-        from: Option<FromClause>,
-        /// `WHERE` clause
-        where_clause: Option<Expr>,
-    },
+    Update(Box<TriggerCmdUpdate>),
     /// `INSERT`
-    Insert {
-        /// `OR`
-        or_conflict: Option<ResolveType>,
-        /// table name
-        tbl_name: Name,
-        /// `COLUMNS`
-        col_names: Option<DistinctNames>,
-        /// `SELECT` or `VALUES`
-        select: Box<Select>,
-        /// `ON CONLICT` clause
-        upsert: Option<Upsert>,
-        /// `RETURNING`
-        returning: Option<Vec<ResultColumn>>,
-    },
+    Insert(Box<TriggerCmdInsert>),
     /// `DELETE`
-    Delete {
-        /// table name
-        tbl_name: Name,
-        /// `WHERE` clause
-        where_clause: Option<Expr>,
-    },
+    Delete(Box<TriggerCmdDelete>),
     /// `SELECT`
     Select(Box<Select>),
+}
+
+/// `UPDATE` trigger command
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TriggerCmdUpdate {
+    /// `OR`
+    pub or_conflict: Option<ResolveType>,
+    /// table name
+    pub tbl_name: Name,
+    /// `SET` assignments
+    pub sets: Vec<Set>,
+    /// `FROM`
+    pub from: Option<FromClause>,
+    /// `WHERE` clause
+    pub where_clause: Option<Expr>,
+}
+
+/// `INSERT` trigger command
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TriggerCmdInsert {
+    /// `OR`
+    pub or_conflict: Option<ResolveType>,
+    /// table name
+    pub tbl_name: Name,
+    /// `COLUMNS`
+    pub col_names: Option<DistinctNames>,
+    /// `SELECT` or `VALUES`
+    pub select: Box<Select>,
+    /// `ON CONFLICT` clause
+    pub upsert: Option<Upsert>,
+    /// `RETURNING`
+    pub returning: Option<Vec<ResultColumn>>,
+}
+
+/// `DELETE` trigger command
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TriggerCmdDelete {
+    /// table name
+    pub tbl_name: Name,
+    /// `WHERE` clause
+    pub where_clause: Option<Expr>,
 }
 
 /// Conflict resolution types
@@ -1775,9 +1805,9 @@ pub enum TransactionType {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Upsert {
     /// conflict targets
-    pub index: Option<UpsertIndex>,
+    pub index: Option<Box<UpsertIndex>>,
     /// `DO` clause
-    pub do_clause: UpsertDo,
+    pub do_clause: Box<UpsertDo>,
     /// next upsert
     pub next: Option<Box<Upsert>>,
 }
@@ -1878,9 +1908,9 @@ pub enum FrameBound {
     /// `CURRENT ROW`
     CurrentRow,
     /// `FOLLOWING`
-    Following(Expr),
+    Following(Box<Expr>),
     /// `PRECEDING`
-    Preceding(Expr),
+    Preceding(Box<Expr>),
     /// `UNBOUNDED FOLLOWING`
     UnboundedFollowing,
     /// `UNBOUNDED PRECEDING`
@@ -1902,7 +1932,8 @@ pub enum FrameExclude {
 
 #[cfg(test)]
 mod test {
-    use super::Name;
+    use super::{Name, PragmaName};
+    use strum::IntoEnumIterator;
 
     #[test]
     fn test_dequote() {
@@ -1912,6 +1943,16 @@ mod test {
         assert_eq!(name(r#""x""#), "x");
         assert_eq!(name(r#""x""y""#), "x\"y");
         assert_eq!(name("[x]"), "x");
+    }
+
+    #[test]
+    // pragma pragma_list expects this to be sorted. We can avoid allocations there if we keep
+    // the list sorted.
+    fn pragma_list_sorted() {
+        let pragma_strings: Vec<String> = PragmaName::iter().map(|x| x.to_string()).collect();
+        let mut pragma_strings_sorted = pragma_strings.clone();
+        pragma_strings_sorted.sort();
+        assert_eq!(pragma_strings, pragma_strings_sorted);
     }
 
     fn name(s: &'static str) -> Name {

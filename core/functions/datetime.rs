@@ -29,7 +29,7 @@ pub fn exec_strftime(values: &[OwnedValue]) -> OwnedValue {
     }
 
     let format_str = match &values[0] {
-        OwnedValue::Text(text) => text.value.to_string(),
+        OwnedValue::Text(text) => text.as_str().to_string(),
         OwnedValue::Integer(num) => num.to_string(),
         OwnedValue::Float(num) => format!("{:.14}", num),
         _ => return OwnedValue::Null,
@@ -82,7 +82,7 @@ fn modify_dt(
         if let OwnedValue::Text(ref text_rc) = modifier {
             // TODO: to prevent double conversion and properly support 'utc'/'localtime', we also
             // need to keep track of the current timezone and apply it to the modifier.
-            match apply_modifier(dt, &text_rc.value) {
+            match apply_modifier(dt, text_rc.as_str()) {
                 Ok(true) => subsec_requested = true,
                 Ok(false) => {}
                 Err(_) => return OwnedValue::build_text(Rc::new(String::new())),
@@ -122,6 +122,7 @@ fn format_dt(dt: NaiveDateTime, output_type: DateTimeOutput, subsec: bool) -> St
 // Not as fast as if the formatting was native to chrono, but a good enough
 // for now, just to have the feature implemented
 fn strftime_format(dt: &NaiveDateTime, format_str: &str) -> String {
+    use crate::functions::strftime::CustomStrftimeItems;
     use std::fmt::Write;
     // Necessary to remove %f and %J that are exclusive formatters to sqlite
     // Chrono does not support them, so it is necessary to replace the modifiers manually
@@ -130,13 +131,13 @@ fn strftime_format(dt: &NaiveDateTime, format_str: &str) -> String {
     let copy_format = format_str
         .to_string()
         .replace("%J", &format!("{:.9}", to_julian_day_exact(dt)));
-    // Just change the formatting here to have fractional seconds using chrono builtin modifier
-    let copy_format = copy_format.replace("%f", "%S.%3f");
+
+    let items = CustomStrftimeItems::new(&copy_format);
 
     // The write! macro is used here as chrono's format can panic if the formatting string contains
     // unknown specifiers. By using a writer, we can catch the panic and handle the error
     let mut formatted = String::new();
-    match write!(formatted, "{}", dt.format(&copy_format)) {
+    match write!(formatted, "{}", dt.format_with_items(items)) {
         Ok(_) => formatted,
         // On sqlite when the formatting fails nothing is printed
         Err(_) => "".to_string(),
@@ -381,7 +382,7 @@ fn get_unixepoch_from_naive_datetime(value: NaiveDateTime) -> String {
 
 fn parse_naive_date_time(time_value: &OwnedValue) -> Option<NaiveDateTime> {
     match time_value {
-        OwnedValue::Text(s) => get_date_time_from_time_value_string(&s.value),
+        OwnedValue::Text(s) => get_date_time_from_time_value_string(s.as_str()),
         OwnedValue::Integer(i) => get_date_time_from_time_value_integer(*i),
         OwnedValue::Float(f) => get_date_time_from_time_value_float(*f),
         _ => None,
@@ -1099,7 +1100,7 @@ mod tests {
         for (input, expected) in test_cases {
             let result = exec_time(&[input]);
             if let OwnedValue::Text(result_str) = result {
-                assert_eq!(result_str.value.as_str(), expected);
+                assert_eq!(result_str.as_str(), expected);
             } else {
                 panic!("Expected OwnedValue::Text, but got: {:?}", result);
             }

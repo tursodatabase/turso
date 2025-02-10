@@ -1,9 +1,8 @@
+use sqlite3_parser::ast::{self, CreateTableBody, Expr, FunctionTail, Literal};
 use std::{rc::Rc, sync::Arc};
 
-use sqlite3_parser::ast::{Expr, FunctionTail, Literal};
-
 use crate::{
-    schema::{self, Schema},
+    schema::{self, Column, Schema, Type},
     Result, Statement, StepResult, IO,
 };
 
@@ -34,7 +33,8 @@ pub fn parse_schema_rows(
         let mut automatic_indexes = Vec::new();
         loop {
             match rows.step()? {
-                StepResult::Row(row) => {
+                StepResult::Row => {
+                    let row = rows.row().unwrap();
                     let ty = row.get::<&str>(0)?;
                     if ty != "table" && ty != "index" {
                         continue;
@@ -307,6 +307,77 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
     }
 }
 
+pub fn columns_from_create_table_body(body: ast::CreateTableBody) -> Result<Vec<Column>, ()> {
+    let CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
+        return Err(());
+    };
+
+    Ok(columns
+        .into_iter()
+        .filter_map(|(name, column_def)| {
+            // if column_def.col_type includes HIDDEN, omit it for now
+            if let Some(data_type) = column_def.col_type.as_ref() {
+                if data_type.name.as_str().contains("HIDDEN") {
+                    return None;
+                }
+            }
+            let column = Column {
+                name: Some(name.0),
+                ty: match column_def.col_type {
+                    Some(ref data_type) => {
+                        // https://www.sqlite.org/datatype3.html
+                        let type_name = data_type.name.as_str().to_uppercase();
+                        if type_name.contains("INT") {
+                            Type::Integer
+                        } else if type_name.contains("CHAR")
+                            || type_name.contains("CLOB")
+                            || type_name.contains("TEXT")
+                        {
+                            Type::Text
+                        } else if type_name.contains("BLOB") || type_name.is_empty() {
+                            Type::Blob
+                        } else if type_name.contains("REAL")
+                            || type_name.contains("FLOA")
+                            || type_name.contains("DOUB")
+                        {
+                            Type::Real
+                        } else {
+                            Type::Numeric
+                        }
+                    }
+                    None => Type::Null,
+                },
+                default: column_def
+                    .constraints
+                    .iter()
+                    .find_map(|c| match &c.constraint {
+                        sqlite3_parser::ast::ColumnConstraint::Default(val) => Some(val.clone()),
+                        _ => None,
+                    }),
+                notnull: column_def.constraints.iter().any(|c| {
+                    matches!(
+                        c.constraint,
+                        sqlite3_parser::ast::ColumnConstraint::NotNull { .. }
+                    )
+                }),
+                ty_str: column_def
+                    .col_type
+                    .clone()
+                    .map(|t| t.name.to_string())
+                    .unwrap_or_default(),
+                primary_key: column_def.constraints.iter().any(|c| {
+                    matches!(
+                        c.constraint,
+                        sqlite3_parser::ast::ColumnConstraint::PrimaryKey { .. }
+                    )
+                }),
+                is_rowid_alias: false,
+            };
+            Some(column)
+        })
+        .collect::<Vec<_>>())
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -428,7 +499,7 @@ pub mod tests {
     }
 
     #[test]
-    fn test_expressions_equivalent_multiplicaiton() {
+    fn test_expressions_equivalent_multiplication() {
         let expr1 = Expr::Binary(
             Box::new(Expr::Literal(Literal::Numeric("42.0".to_string()))),
             Multiply,

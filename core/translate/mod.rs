@@ -18,26 +18,26 @@ pub(crate) mod optimizer;
 pub(crate) mod order_by;
 pub(crate) mod plan;
 pub(crate) mod planner;
+pub(crate) mod pragma;
 pub(crate) mod result_row;
 pub(crate) mod select;
 pub(crate) mod subquery;
 
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
-use crate::storage::sqlite3_ondisk::{DatabaseHeader, MIN_PAGE_CACHE_SIZE};
-use crate::storage::wal::CheckpointMode;
+use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::translate::delete::translate_delete;
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
-use crate::vdbe::builder::CursorType;
+use crate::vdbe::builder::{CursorType, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::{builder::ProgramBuilder, insn::Insn, Program};
 use crate::{bail_parse_error, Connection, LimboError, Result, SymbolTable};
 use insert::translate_insert;
 use select::translate_select;
-use sqlite3_parser::ast::{self, fmt::ToTokens, PragmaName};
+use sqlite3_parser::ast::{self, fmt::ToTokens};
+use sqlite3_parser::ast::{Delete, Insert};
 use std::cell::RefCell;
 use std::fmt::Display;
 use std::rc::{Rc, Weak};
-use std::str::FromStr;
 
 /// Translate SQL statement into bytecode program.
 pub fn translate(
@@ -47,12 +47,12 @@ pub fn translate(
     pager: Rc<Pager>,
     connection: Weak<Connection>,
     syms: &SymbolTable,
+    query_mode: QueryMode,
 ) -> Result<Program> {
-    let mut program = ProgramBuilder::new();
     let mut change_cnt_on = false;
 
-    match stmt {
-        ast::Stmt::AlterTable(_, _) => bail_parse_error!("ALTER TABLE not supported yet"),
+    let program = match stmt {
+        ast::Stmt::AlterTable(_) => bail_parse_error!("ALTER TABLE not supported yet"),
         ast::Stmt::Analyze(_) => bail_parse_error!("ANALYZE not supported yet"),
         ast::Stmt::Attach { .. } => bail_parse_error!("ATTACH not supported yet"),
         ast::Stmt::Begin(_, _) => bail_parse_error!("BEGIN not supported yet"),
@@ -68,50 +68,55 @@ pub fn translate(
                 bail_parse_error!("TEMPORARY table not supported yet");
             }
 
-            translate_create_table(&mut program, tbl_name, body, if_not_exists, schema)?;
+            translate_create_table(query_mode, tbl_name, *body, if_not_exists, schema)?
         }
         ast::Stmt::CreateTrigger { .. } => bail_parse_error!("CREATE TRIGGER not supported yet"),
         ast::Stmt::CreateView { .. } => bail_parse_error!("CREATE VIEW not supported yet"),
         ast::Stmt::CreateVirtualTable { .. } => {
             bail_parse_error!("CREATE VIRTUAL TABLE not supported yet")
         }
-        ast::Stmt::Delete {
-            tbl_name,
-            where_clause,
-            limit,
-            ..
-        } => {
+        ast::Stmt::Delete(delete) => {
+            let Delete {
+                tbl_name,
+                where_clause,
+                limit,
+                ..
+            } = *delete;
             change_cnt_on = true;
-            translate_delete(&mut program, schema, &tbl_name, where_clause, limit, syms)?;
+            translate_delete(query_mode, schema, &tbl_name, where_clause, limit, syms)?
         }
         ast::Stmt::Detach(_) => bail_parse_error!("DETACH not supported yet"),
         ast::Stmt::DropIndex { .. } => bail_parse_error!("DROP INDEX not supported yet"),
         ast::Stmt::DropTable { .. } => bail_parse_error!("DROP TABLE not supported yet"),
         ast::Stmt::DropTrigger { .. } => bail_parse_error!("DROP TRIGGER not supported yet"),
         ast::Stmt::DropView { .. } => bail_parse_error!("DROP VIEW not supported yet"),
-        ast::Stmt::Pragma(name, body) => {
-            translate_pragma(&mut program, &name, body, database_header.clone(), pager)?;
-        }
+        ast::Stmt::Pragma(name, body) => pragma::translate_pragma(
+            query_mode,
+            &schema,
+            &name,
+            body.map(|b| *b),
+            database_header.clone(),
+            pager,
+        )?,
         ast::Stmt::Reindex { .. } => bail_parse_error!("REINDEX not supported yet"),
         ast::Stmt::Release(_) => bail_parse_error!("RELEASE not supported yet"),
         ast::Stmt::Rollback { .. } => bail_parse_error!("ROLLBACK not supported yet"),
         ast::Stmt::Savepoint(_) => bail_parse_error!("SAVEPOINT not supported yet"),
-        ast::Stmt::Select(select) => {
-            translate_select(&mut program, schema, *select, syms)?;
-        }
+        ast::Stmt::Select(select) => translate_select(query_mode, schema, *select, syms)?,
         ast::Stmt::Update { .. } => bail_parse_error!("UPDATE not supported yet"),
         ast::Stmt::Vacuum(_, _) => bail_parse_error!("VACUUM not supported yet"),
-        ast::Stmt::Insert {
-            with,
-            or_conflict,
-            tbl_name,
-            columns,
-            body,
-            returning,
-        } => {
+        ast::Stmt::Insert(insert) => {
+            let Insert {
+                with,
+                or_conflict,
+                tbl_name,
+                columns,
+                body,
+                returning,
+            } = *insert;
             change_cnt_on = true;
             translate_insert(
-                &mut program,
+                query_mode,
                 schema,
                 &with,
                 &or_conflict,
@@ -120,9 +125,9 @@ pub fn translate(
                 &body,
                 &returning,
                 syms,
-            )?;
+            )?
         }
-    }
+    };
 
     Ok(program.build(database_header, connection, change_cnt_on))
 }
@@ -197,23 +202,9 @@ fn emit_schema_entry(
         prev_largest_reg: 0,
     });
 
-    let type_reg = program.alloc_register();
-    program.emit_insn(Insn::String8 {
-        value: entry_type.as_str().to_string(),
-        dest: type_reg,
-    });
-
-    let name_reg = program.alloc_register();
-    program.emit_insn(Insn::String8 {
-        value: name.to_string(),
-        dest: name_reg,
-    });
-
-    let tbl_name_reg = program.alloc_register();
-    program.emit_insn(Insn::String8 {
-        value: tbl_name.to_string(),
-        dest: tbl_name_reg,
-    });
+    let type_reg = program.emit_string8_new_reg(entry_type.as_str().to_string());
+    program.emit_string8_new_reg(name.to_string());
+    program.emit_string8_new_reg(tbl_name.to_string());
 
     let rootpage_reg = program.alloc_register();
     program.emit_insn(Insn::Copy {
@@ -224,15 +215,9 @@ fn emit_schema_entry(
 
     let sql_reg = program.alloc_register();
     if let Some(sql) = sql {
-        program.emit_insn(Insn::String8 {
-            value: sql,
-            dest: sql_reg,
-        });
+        program.emit_string8(sql, sql_reg);
     } else {
-        program.emit_insn(Insn::Null {
-            dest: sql_reg,
-            dest_end: None,
-        });
+        program.emit_null(sql_reg);
     }
 
     let record_reg = program.alloc_register();
@@ -251,6 +236,11 @@ fn emit_schema_entry(
     program.emit_insn(Insn::InsertAwait {
         cursor_id: sqlite_schema_cursor_id,
     });
+}
+
+struct PrimaryKeyColumnInfo<'a> {
+    name: &'a String,
+    is_descending: bool,
 }
 
 /// Check if an automatic PRIMARY KEY index is required for the table.
@@ -282,10 +272,13 @@ fn check_automatic_pk_index_required(
                         columns: pk_cols, ..
                     } = &constraint.constraint
                     {
-                        let primary_key_column_results: Vec<Result<&String>> = pk_cols
+                        let primary_key_column_results: Vec<Result<PrimaryKeyColumnInfo>> = pk_cols
                             .iter()
                             .map(|col| match &col.expr {
-                                ast::Expr::Id(name) => Ok(&name.0),
+                                ast::Expr::Id(name) => Ok(PrimaryKeyColumnInfo {
+                                    name: &name.0,
+                                    is_descending: matches!(col.order, Some(ast::SortOrder::Desc)),
+                                }),
                                 _ => Err(LimboError::ParseError(
                                     "expressions prohibited in PRIMARY KEY and UNIQUE constraints"
                                         .to_string(),
@@ -297,7 +290,9 @@ fn check_automatic_pk_index_required(
                             if let Err(e) = result {
                                 bail_parse_error!("{}", e);
                             }
-                            let column_name = result?;
+                            let pk_info = result?;
+
+                            let column_name = pk_info.name;
                             let column_def = columns.get(&ast::Name(column_name.clone()));
                             if column_def.is_none() {
                                 bail_parse_error!("No such column: {}", column_name);
@@ -314,8 +309,11 @@ fn check_automatic_pk_index_required(
                                 let column_def = column_def.unwrap();
                                 let typename =
                                     column_def.col_type.as_ref().map(|t| t.name.as_str());
-                                primary_key_definition =
-                                    Some(PrimaryKeyDefinitionType::Simple { typename });
+                                let is_descending = pk_info.is_descending;
+                                primary_key_definition = Some(PrimaryKeyDefinitionType::Simple {
+                                    typename,
+                                    is_descending,
+                                });
                             }
                         }
                     }
@@ -333,8 +331,10 @@ fn check_automatic_pk_index_required(
                             bail_parse_error!("table {} has more than one primary key", tbl_name);
                         }
                         let typename = col_def.col_type.as_ref().map(|t| t.name.as_str());
-                        primary_key_definition =
-                            Some(PrimaryKeyDefinitionType::Simple { typename });
+                        primary_key_definition = Some(PrimaryKeyDefinitionType::Simple {
+                            typename,
+                            is_descending: false,
+                        });
                     }
                 }
             }
@@ -347,9 +347,13 @@ fn check_automatic_pk_index_required(
             // Check if we need an automatic index
             let needs_auto_index = if let Some(primary_key_definition) = &primary_key_definition {
                 match primary_key_definition {
-                    PrimaryKeyDefinitionType::Simple { typename } => {
-                        let is_integer = typename.is_some() && typename.unwrap() == "INTEGER";
-                        !is_integer
+                    PrimaryKeyDefinitionType::Simple {
+                        typename,
+                        is_descending,
+                    } => {
+                        let is_integer =
+                            typename.is_some() && typename.unwrap().to_uppercase() == "INTEGER";
+                        !is_integer || *is_descending
                     }
                     PrimaryKeyDefinitionType::Composite => true,
                 }
@@ -371,31 +375,29 @@ fn check_automatic_pk_index_required(
 }
 
 fn translate_create_table(
-    program: &mut ProgramBuilder,
+    query_mode: QueryMode,
     tbl_name: ast::QualifiedName,
     body: ast::CreateTableBody,
     if_not_exists: bool,
     schema: &Schema,
-) -> Result<()> {
+) -> Result<ProgramBuilder> {
+    let mut program = ProgramBuilder::new(ProgramBuilderOpts {
+        query_mode,
+        num_cursors: 1,
+        approx_num_insns: 30,
+        approx_num_labels: 1,
+    });
     if schema.get_table(tbl_name.name.0.as_str()).is_some() {
         if if_not_exists {
-            let init_label = program.allocate_label();
-            program.emit_insn(Insn::Init {
-                target_pc: init_label,
-            });
+            let init_label = program.emit_init();
             let start_offset = program.offset();
-            program.emit_insn(Insn::Halt {
-                err_code: 0,
-                description: String::new(),
-            });
+            program.emit_halt();
             program.resolve_label(init_label, program.offset());
-            program.emit_insn(Insn::Transaction { write: true });
+            program.emit_transaction(true);
             program.emit_constant_insns();
-            program.emit_insn(Insn::Goto {
-                target_pc: start_offset,
-            });
+            program.emit_goto(start_offset);
 
-            return Ok(());
+            return Ok(program);
         }
         bail_parse_error!("Table {} already exists", tbl_name);
     }
@@ -403,10 +405,7 @@ fn translate_create_table(
     let sql = create_table_body_to_str(&tbl_name, &body);
 
     let parse_schema_label = program.allocate_label();
-    let init_label = program.allocate_label();
-    program.emit_insn(Insn::Init {
-        target_pc: init_label,
-    });
+    let init_label = program.emit_init();
     let start_offset = program.offset();
     // TODO: ReadCookie
     // TODO: If
@@ -445,7 +444,7 @@ fn translate_create_table(
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L2856-L2871
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L1334C5-L1336C65
 
-    let index_root_reg = check_automatic_pk_index_required(&body, program, &tbl_name.name.0)?;
+    let index_root_reg = check_automatic_pk_index_required(&body, &mut program, &tbl_name.name.0)?;
     if let Some(index_root_reg) = index_root_reg {
         program.emit_insn(Insn::CreateBtree {
             db: 0,
@@ -468,7 +467,7 @@ fn translate_create_table(
 
     // Add the table entry to sqlite_schema
     emit_schema_entry(
-        program,
+        &mut program,
         sqlite_schema_cursor_id,
         SchemaEntryType::Table,
         &tbl_name.name.0,
@@ -484,7 +483,7 @@ fn translate_create_table(
             PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX, tbl_name.name.0
         );
         emit_schema_entry(
-            program,
+            &mut program,
             sqlite_schema_cursor_id,
             SchemaEntryType::Index,
             &index_name,
@@ -497,7 +496,7 @@ fn translate_create_table(
     program.resolve_label(parse_schema_label, program.offset());
     // TODO: SetCookie
     //
-    // TODO: remove format, it sucks for performance but is convinient
+    // TODO: remove format, it sucks for performance but is convenient
     let parse_schema_where_clause = format!("tbl_name = '{}' AND type != 'trigger'", tbl_name);
     program.emit_insn(Insn::ParseSchema {
         db: sqlite_schema_cursor_id,
@@ -505,181 +504,21 @@ fn translate_create_table(
     });
 
     // TODO: SqlExec
-    program.emit_insn(Insn::Halt {
-        err_code: 0,
-        description: String::new(),
-    });
+    program.emit_halt();
     program.resolve_label(init_label, program.offset());
-    program.emit_insn(Insn::Transaction { write: true });
+    program.emit_transaction(true);
     program.emit_constant_insns();
-    program.emit_insn(Insn::Goto {
-        target_pc: start_offset,
-    });
+    program.emit_goto(start_offset);
 
-    Ok(())
+    Ok(program)
 }
 
 enum PrimaryKeyDefinitionType<'a> {
-    Simple { typename: Option<&'a str> },
+    Simple {
+        typename: Option<&'a str>,
+        is_descending: bool,
+    },
     Composite,
-}
-
-fn translate_pragma(
-    program: &mut ProgramBuilder,
-    name: &ast::QualifiedName,
-    body: Option<ast::PragmaBody>,
-    database_header: Rc<RefCell<DatabaseHeader>>,
-    pager: Rc<Pager>,
-) -> Result<()> {
-    let init_label = program.allocate_label();
-    program.emit_insn(Insn::Init {
-        target_pc: init_label,
-    });
-    let start_offset = program.offset();
-    let mut write = false;
-    match body {
-        None => {
-            let pragma_name = &name.name.0;
-            query_pragma(pragma_name, database_header.clone(), program)?;
-        }
-        Some(ast::PragmaBody::Equals(value)) => {
-            write = true;
-            update_pragma(&name.name.0, value, database_header.clone(), pager, program)?;
-        }
-        Some(ast::PragmaBody::Call(_)) => {
-            todo!()
-        }
-    };
-    program.emit_insn(Insn::Halt {
-        err_code: 0,
-        description: String::new(),
-    });
-    program.resolve_label(init_label, program.offset());
-    program.emit_insn(Insn::Transaction { write });
-    program.emit_constant_insns();
-    program.emit_insn(Insn::Goto {
-        target_pc: start_offset,
-    });
-
-    Ok(())
-}
-
-fn update_pragma(
-    name: &str,
-    value: ast::Expr,
-    header: Rc<RefCell<DatabaseHeader>>,
-    pager: Rc<Pager>,
-    program: &mut ProgramBuilder,
-) -> Result<()> {
-    let pragma = match PragmaName::from_str(name) {
-        Ok(pragma) => pragma,
-        Err(()) => bail_parse_error!("Not a valid pragma name"),
-    };
-    match pragma {
-        PragmaName::CacheSize => {
-            let cache_size = match value {
-                ast::Expr::Literal(ast::Literal::Numeric(numeric_value)) => {
-                    numeric_value.parse::<i64>()?
-                }
-                ast::Expr::Unary(ast::UnaryOperator::Negative, expr) => match *expr {
-                    ast::Expr::Literal(ast::Literal::Numeric(numeric_value)) => {
-                        -numeric_value.parse::<i64>()?
-                    }
-                    _ => bail_parse_error!("Not a valid value"),
-                },
-                _ => bail_parse_error!("Not a valid value"),
-            };
-            update_cache_size(cache_size, header, pager);
-            Ok(())
-        }
-        PragmaName::JournalMode => {
-            query_pragma("journal_mode", header, program)?;
-            Ok(())
-        }
-        PragmaName::WalCheckpoint => {
-            query_pragma("wal_checkpoint", header, program)?;
-            Ok(())
-        }
-    }
-}
-
-fn query_pragma(
-    name: &str,
-    database_header: Rc<RefCell<DatabaseHeader>>,
-    program: &mut ProgramBuilder,
-) -> Result<()> {
-    let pragma = match PragmaName::from_str(name) {
-        Ok(pragma) => pragma,
-        Err(()) => bail_parse_error!("Not a valid pragma name"),
-    };
-    let register = program.alloc_register();
-    match pragma {
-        PragmaName::CacheSize => {
-            program.emit_insn(Insn::Integer {
-                value: database_header.borrow().default_page_cache_size.into(),
-                dest: register,
-            });
-            program.emit_insn(Insn::ResultRow {
-                start_reg: register,
-                count: 1,
-            });
-        }
-        PragmaName::JournalMode => {
-            program.emit_insn(Insn::String8 {
-                value: "wal".into(),
-                dest: register,
-            });
-            program.emit_insn(Insn::ResultRow {
-                start_reg: register,
-                count: 1,
-            });
-        }
-        PragmaName::WalCheckpoint => {
-            // Checkpoint uses 3 registers: P1, P2, P3. Ref Insn::Checkpoint for more info.
-            // Allocate two more here as one was allocated at the top.
-            program.alloc_register();
-            program.alloc_register();
-            program.emit_insn(Insn::Checkpoint {
-                database: 0,
-                checkpoint_mode: CheckpointMode::Passive,
-                dest: register,
-            });
-            program.emit_insn(Insn::ResultRow {
-                start_reg: register,
-                count: 3,
-            });
-        }
-    }
-
-    Ok(())
-}
-
-fn update_cache_size(value: i64, header: Rc<RefCell<DatabaseHeader>>, pager: Rc<Pager>) {
-    let mut cache_size_unformatted: i64 = value;
-    let mut cache_size = if cache_size_unformatted < 0 {
-        let kb = cache_size_unformatted.abs() * 1024;
-        kb / 512 // assume 512 page size for now
-    } else {
-        value
-    } as usize;
-
-    if cache_size < MIN_PAGE_CACHE_SIZE {
-        // update both in memory and stored disk value
-        cache_size = MIN_PAGE_CACHE_SIZE;
-        cache_size_unformatted = MIN_PAGE_CACHE_SIZE as i64;
-    }
-
-    // update in-memory header
-    header.borrow_mut().default_page_cache_size = cache_size_unformatted
-        .try_into()
-        .unwrap_or_else(|_| panic!("invalid value, too big for a i32 {}", value));
-
-    // update in disk
-    let header_copy = header.borrow().clone();
-    pager.write_database_header(&header_copy);
-
-    // update cache size
-    pager.change_page_cache_size(cache_size);
 }
 
 struct TableFormatter<'a> {

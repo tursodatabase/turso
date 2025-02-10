@@ -8,14 +8,14 @@ use crate::{
     parameters::Parameters,
     schema::{BTreeTable, Index, PseudoTable},
     storage::sqlite3_ondisk::DatabaseHeader,
-    Connection,
+    translate::plan::{ResultSetColumn, TableReference},
+    Connection, VirtualTable,
 };
 
 use super::{BranchOffset, CursorID, Insn, InsnReference, Program};
 #[allow(dead_code)]
 pub struct ProgramBuilder {
     next_free_register: usize,
-    next_free_label: i32,
     next_free_cursor_id: usize,
     insns: Vec<Insn>,
     // for temporarily storing instructions that will be put after Transaction opcode
@@ -23,14 +23,15 @@ pub struct ProgramBuilder {
     next_insn_label: Option<BranchOffset>,
     // Cursors that are referenced by the program. Indexed by CursorID.
     pub cursor_ref: Vec<(Option<String>, CursorType)>,
-    // Hashmap of label to insn reference. Resolved in build().
-    label_to_resolved_offset: HashMap<i32, u32>,
+    /// A vector where index=label number, value=resolved offset. Resolved in build().
+    label_to_resolved_offset: Vec<Option<InsnReference>>,
     // Bitmask of cursors that have emitted a SeekRowid instruction.
     seekrowid_emitted_bitmask: u64,
-    // map of instruction index to manual comment (used in EXPLAIN)
-    comments: HashMap<InsnReference, &'static str>,
+    // map of instruction index to manual comment (used in EXPLAIN only)
+    comments: Option<HashMap<InsnReference, &'static str>>,
     pub parameters: Parameters,
-    pub columns: Vec<String>,
+    pub result_columns: Vec<ResultSetColumn>,
+    pub table_references: Vec<TableReference>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +40,7 @@ pub enum CursorType {
     BTreeIndex(Rc<Index>),
     Pseudo(Rc<PseudoTable>),
     Sorter,
+    VirtualTable(Rc<VirtualTable>),
 }
 
 impl CursorType {
@@ -47,21 +49,38 @@ impl CursorType {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryMode {
+    Normal,
+    Explain,
+}
+
+pub struct ProgramBuilderOpts {
+    pub query_mode: QueryMode,
+    pub num_cursors: usize,
+    pub approx_num_insns: usize,
+    pub approx_num_labels: usize,
+}
+
 impl ProgramBuilder {
-    pub fn new() -> Self {
+    pub fn new(opts: ProgramBuilderOpts) -> Self {
         Self {
             next_free_register: 1,
-            next_free_label: 0,
             next_free_cursor_id: 0,
-            insns: Vec::new(),
+            insns: Vec::with_capacity(opts.approx_num_insns),
             next_insn_label: None,
-            cursor_ref: Vec::new(),
+            cursor_ref: Vec::with_capacity(opts.num_cursors),
             constant_insns: Vec::new(),
-            label_to_resolved_offset: HashMap::new(),
+            label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
             seekrowid_emitted_bitmask: 0,
-            comments: HashMap::new(),
+            comments: if opts.query_mode == QueryMode::Explain {
+                Some(HashMap::new())
+            } else {
+                None
+            },
             parameters: Parameters::new(),
-            columns: Vec::new(),
+            result_columns: Vec::new(),
+            table_references: Vec::new(),
         }
     }
 
@@ -91,15 +110,83 @@ impl ProgramBuilder {
 
     pub fn emit_insn(&mut self, insn: Insn) {
         if let Some(label) = self.next_insn_label {
-            self.label_to_resolved_offset
-                .insert(label.to_label_value(), self.insns.len() as InsnReference);
+            self.label_to_resolved_offset.insert(
+                label.to_label_value() as usize,
+                Some(self.insns.len() as InsnReference),
+            );
             self.next_insn_label = None;
         }
         self.insns.push(insn);
     }
 
+    pub fn emit_string8(&mut self, value: String, dest: usize) {
+        self.emit_insn(Insn::String8 { value, dest });
+    }
+
+    pub fn emit_string8_new_reg(&mut self, value: String) -> usize {
+        let dest = self.alloc_register();
+        self.emit_insn(Insn::String8 { value, dest });
+        dest
+    }
+
+    pub fn emit_int(&mut self, value: i64, dest: usize) {
+        self.emit_insn(Insn::Integer { value, dest });
+    }
+
+    pub fn emit_bool(&mut self, value: bool, dest: usize) {
+        self.emit_insn(Insn::Integer {
+            value: if value { 1 } else { 0 },
+            dest,
+        });
+    }
+
+    pub fn emit_null(&mut self, dest: usize) {
+        self.emit_insn(Insn::Null {
+            dest,
+            dest_end: None,
+        });
+    }
+
+    pub fn emit_result_row(&mut self, start_reg: usize, count: usize) {
+        self.emit_insn(Insn::ResultRow { start_reg, count });
+    }
+
+    pub fn emit_halt(&mut self) {
+        self.emit_insn(Insn::Halt {
+            err_code: 0,
+            description: String::new(),
+        });
+    }
+
+    // no users yet, but I want to avoid someone else in the future
+    // just adding parameters to emit_halt! If you use this, remove the
+    // clippy warning please.
+    #[allow(dead_code)]
+    pub fn emit_halt_err(&mut self, err_code: usize, description: String) {
+        self.emit_insn(Insn::Halt {
+            err_code,
+            description,
+        });
+    }
+
+    pub fn emit_init(&mut self) -> BranchOffset {
+        let target_pc = self.allocate_label();
+        self.emit_insn(Insn::Init { target_pc });
+        target_pc
+    }
+
+    pub fn emit_transaction(&mut self, write: bool) {
+        self.emit_insn(Insn::Transaction { write });
+    }
+
+    pub fn emit_goto(&mut self, target_pc: BranchOffset) {
+        self.emit_insn(Insn::Goto { target_pc });
+    }
+
     pub fn add_comment(&mut self, insn_index: BranchOffset, comment: &'static str) {
-        self.comments.insert(insn_index.to_offset_int(), comment);
+        if let Some(comments) = &mut self.comments {
+            comments.insert(insn_index.to_offset_int(), comment);
+        }
     }
 
     // Emit an instruction that will be put at the end of the program (after Transaction statement).
@@ -119,8 +206,9 @@ impl ProgramBuilder {
     }
 
     pub fn allocate_label(&mut self) -> BranchOffset {
-        self.next_free_label -= 1;
-        BranchOffset::Label(self.next_free_label)
+        let label_n = self.label_to_resolved_offset.len();
+        self.label_to_resolved_offset.push(None);
+        BranchOffset::Label(label_n as u32)
     }
 
     // Effectively a GOTO <next insn> without the need to emit an explicit GOTO instruction.
@@ -133,8 +221,8 @@ impl ProgramBuilder {
     pub fn resolve_label(&mut self, label: BranchOffset, to_offset: BranchOffset) {
         assert!(matches!(label, BranchOffset::Label(_)));
         assert!(matches!(to_offset, BranchOffset::Offset(_)));
-        self.label_to_resolved_offset
-            .insert(label.to_label_value(), to_offset.to_offset_int());
+        self.label_to_resolved_offset[label.to_label_value() as usize] =
+            Some(to_offset.to_offset_int());
     }
 
     /// Resolve unresolved labels to a specific offset in the instruction list.
@@ -145,10 +233,16 @@ impl ProgramBuilder {
     pub fn resolve_labels(&mut self) {
         let resolve = |pc: &mut BranchOffset, insn_name: &str| {
             if let BranchOffset::Label(label) = pc {
-                let to_offset = *self.label_to_resolved_offset.get(label).unwrap_or_else(|| {
-                    panic!("Reference to undefined label in {}: {}", insn_name, label)
-                });
-                *pc = BranchOffset::Offset(to_offset);
+                let to_offset = self
+                    .label_to_resolved_offset
+                    .get(*label as usize)
+                    .unwrap_or_else(|| {
+                        panic!("Reference to undefined label in {}: {}", insn_name, label)
+                    });
+                *pc = BranchOffset::Offset(
+                    to_offset
+                        .unwrap_or_else(|| panic!("Unresolved label in {}: {}", insn_name, label)),
+                );
             }
         };
         for insn in self.insns.iter_mut() {
@@ -310,10 +404,16 @@ impl ProgramBuilder {
                 Insn::IdxGT { target_pc, .. } => {
                     resolve(target_pc, "IdxGT");
                 }
-                Insn::IsNull { src: _, target_pc } => {
+                Insn::IsNull { reg: _, target_pc } => {
                     resolve(target_pc, "IsNull");
                 }
-                _ => continue,
+                Insn::VNext { pc_if_next, .. } => {
+                    resolve(pc_if_next, "VNext");
+                }
+                Insn::VFilter { pc_if_empty, .. } => {
+                    resolve(pc_if_empty, "VFilter");
+                }
+                _ => {}
             }
         }
         self.label_to_resolved_offset.clear();
@@ -354,7 +454,8 @@ impl ProgramBuilder {
             parameters: self.parameters,
             n_change: Cell::new(0),
             change_cnt_on,
-            columns: self.columns,
+            result_columns: self.result_columns,
+            table_references: self.table_references,
         }
     }
 }

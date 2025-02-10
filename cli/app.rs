@@ -2,7 +2,7 @@ use crate::{
     import::{ImportFile, IMPORT_HELP},
     opcodes_dictionary::OPCODE_DESCRIPTIONS,
 };
-use cli_table::{Cell, Table};
+use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Row, Table};
 use limbo_core::{Database, LimboError, Statement, StepResult, Value};
 
 use clap::{Parser, ValueEnum};
@@ -625,8 +625,10 @@ impl Limbo {
                     }
 
                     match rows.step() {
-                        Ok(StepResult::Row(row)) => {
+                        Ok(StepResult::Row) => {
+                            let row = rows.row().unwrap();
                             for (i, value) in row.values.iter().enumerate() {
+                                let value = value.to_value();
                                 if i > 0 {
                                     let _ = self.writer.write(b"|");
                                 }
@@ -667,24 +669,42 @@ impl Limbo {
                         println!("Query interrupted.");
                         return Ok(());
                     }
-                    let mut table_rows: Vec<Vec<_>> = vec![];
+                    let mut table = Table::new();
+                    table
+                        .set_content_arrangement(ContentArrangement::Dynamic)
+                        .set_truncation_indicator("…")
+                        .apply_modifier("││──├─┼┤│─┼├┤┬┴┌┐└┘");
+                    if rows.num_columns() > 0 {
+                        let header = (0..rows.num_columns())
+                            .map(|i| {
+                                let name = rows.get_column_name(i).cloned().unwrap_or_default();
+                                Cell::new(name).add_attribute(Attribute::Bold)
+                            })
+                            .collect::<Vec<_>>();
+                        table.set_header(header);
+                    }
                     loop {
                         match rows.step() {
-                            Ok(StepResult::Row(row)) => {
-                                table_rows.push(
-                                    row.values
-                                        .iter()
-                                        .map(|value| match value {
-                                            Value::Null => self.opts.null_value.clone().cell(),
-                                            Value::Integer(i) => i.to_string().cell(),
-                                            Value::Float(f) => f.to_string().cell(),
-                                            Value::Text(s) => s.cell(),
-                                            Value::Blob(b) => {
-                                                format!("{}", String::from_utf8_lossy(b)).cell()
-                                            }
-                                        })
-                                        .collect(),
-                                );
+                            Ok(StepResult::Row) => {
+                                let record = rows.row().unwrap();
+                                let mut row = Row::new();
+                                row.max_height(1);
+                                for value in &record.values {
+                                    let (content, alignment) = match value.to_value() {
+                                        Value::Null => {
+                                            (self.opts.null_value.clone(), CellAlignment::Left)
+                                        }
+                                        Value::Integer(i) => (i.to_string(), CellAlignment::Right),
+                                        Value::Float(f) => (f.to_string(), CellAlignment::Right),
+                                        Value::Text(s) => (s.to_string(), CellAlignment::Left),
+                                        Value::Blob(b) => (
+                                            String::from_utf8_lossy(b).to_string(),
+                                            CellAlignment::Left,
+                                        ),
+                                    };
+                                    row.add_cell(Cell::new(content).set_alignment(alignment));
+                                }
+                                table.add_row(row);
                             }
                             Ok(StepResult::IO) => {
                                 self.io.run_once()?;
@@ -704,10 +724,9 @@ impl Limbo {
                             }
                         }
                     }
-                    if let Ok(table) = table_rows.table().display() {
+
+                    if table.header().is_some() {
                         let _ = self.write_fmt(format_args!("{}", table));
-                    } else {
-                        let _ = self.writeln("Error displaying table.");
                     }
                 }
             },
@@ -740,8 +759,11 @@ impl Limbo {
                 let mut found = false;
                 loop {
                     match rows.step()? {
-                        StepResult::Row(row) => {
-                            if let Some(Value::Text(schema)) = row.values.first() {
+                        StepResult::Row => {
+                            let row = rows.row().unwrap();
+                            if let Some(Value::Text(schema)) =
+                                row.values.first().map(|v| v.to_value())
+                            {
                                 let _ = self.write_fmt(format_args!("{};", schema));
                                 found = true;
                             }
@@ -797,8 +819,11 @@ impl Limbo {
                 let mut tables = String::new();
                 loop {
                     match rows.step()? {
-                        StepResult::Row(row) => {
-                            if let Some(Value::Text(table)) = row.values.first() {
+                        StepResult::Row => {
+                            let row = rows.row().unwrap();
+                            if let Some(Value::Text(table)) =
+                                row.values.first().map(|v| v.to_value())
+                            {
                                 tables.push_str(table);
                                 tables.push(' ');
                             }

@@ -65,4 +65,34 @@ class JDBC4ConnectionTest {
   void prepare_simple_create_table() throws Exception {
     connection.prepare("CREATE TABLE users (id INT PRIMARY KEY, username TEXT)");
   }
+
+  @Test
+  void calling_close_multiple_times_throws_no_exception() throws Exception {
+    assertFalse(connection.isClosed());
+    connection.close();
+    assertTrue(connection.isClosed());
+    connection.close();
+  }
+
+  @Test
+  void calling_methods_on_closed_connection_should_throw_exception() throws Exception {
+    connection.close();
+    assertTrue(connection.isClosed());
+    assertThrows(
+        SQLException.class,
+        () ->
+            connection.createStatement(
+                ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY, -1));
+  }
+
+  @Test
+  void isValid_should_return_true_on_open_connection() throws SQLException {
+    assertTrue(connection.isValid(10));
+  }
+
+  @Test
+  void isValid_should_return_false_on_closed_connection() throws SQLException {
+    connection.close();
+    assertFalse(connection.isValid(10));
+  }
 }

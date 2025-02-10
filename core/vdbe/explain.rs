@@ -363,6 +363,63 @@ pub fn insn_to_str(
                 0,
                 "".to_string(),
             ),
+            Insn::VOpenAsync { cursor_id } => (
+                "VOpenAsync",
+                *cursor_id as i32,
+                0,
+                0,
+                OwnedValue::build_text(Rc::new("".to_string())),
+                0,
+                "".to_string(),
+            ),
+            Insn::VOpenAwait => (
+                "VOpenAwait",
+                0,
+                0,
+                0,
+                OwnedValue::build_text(Rc::new("".to_string())),
+                0,
+                "".to_string(),
+            ),
+            Insn::VFilter {
+                cursor_id,
+                pc_if_empty,
+                arg_count,
+                ..
+            } => (
+                "VFilter",
+                *cursor_id as i32,
+                pc_if_empty.to_debug_int(),
+                *arg_count as i32,
+                OwnedValue::build_text(Rc::new("".to_string())),
+                0,
+                "".to_string(),
+            ),
+            Insn::VColumn {
+                cursor_id,
+                column,
+                dest,
+            } => (
+                "VColumn",
+                *cursor_id as i32,
+                *column as i32,
+                *dest as i32,
+                OwnedValue::build_text(Rc::new("".to_string())),
+                0,
+                "".to_string(),
+            ),
+            Insn::VNext {
+                cursor_id,
+                pc_if_next,
+            } => (
+                "VNext",
+                *cursor_id as i32,
+                pc_if_next.to_debug_int(),
+                0,
+                OwnedValue::build_text(Rc::new("".to_string())),
+                0,
+                "".to_string(),
+            ),
             Insn::OpenPseudo {
                 cursor_id,
                 content_reg,
@@ -409,17 +466,21 @@ pub fn insn_to_str(
                 dest,
             } => {
                 let (table_identifier, cursor_type) = &program.cursor_ref[*cursor_id];
-                let column_name = match cursor_type {
+                let column_name: Option<&String> = match cursor_type {
                     CursorType::BTreeTable(table) => {
-                        Some(&table.columns.get(*column).unwrap().name)
+                        let name = table.columns.get(*column).unwrap().name.as_ref();
+                        name
                     }
                     CursorType::BTreeIndex(index) => {
-                        Some(&index.columns.get(*column).unwrap().name)
+                        let name = &index.columns.get(*column).unwrap().name;
+                        Some(name)
                     }
                     CursorType::Pseudo(pseudo_table) => {
-                        Some(&pseudo_table.columns.get(*column).unwrap().name)
+                        let name = pseudo_table.columns.get(*column).unwrap().name.as_ref();
+                        name
                     }
                     CursorType::Sorter => None,
+                    CursorType::VirtualTable(v) => v.columns.get(*column).unwrap().name.as_ref(),
                 };
                 (
                     "Column",
@@ -957,6 +1018,22 @@ pub fn insn_to_str(
                 0,
                 "".to_string(),
             ),
+            Insn::OffsetLimit {
+                limit_reg,
+                combined_reg,
+                offset_reg,
+            } => (
+                "OffsetLimit",
+                *limit_reg as i32,
+                *combined_reg as i32,
+                *offset_reg as i32,
+                OwnedValue::build_text(Rc::new("".to_string())),
+                0,
+                format!(
+                    "if r[{}]>0 then r[{}]=r[{}]+max(0,r[{}]) else r[{}]=(-1)",
+                    limit_reg, combined_reg, limit_reg, offset_reg, combined_reg
+                ),
+            ),
             Insn::OpenWriteAsync {
                 cursor_id,
                 root_page,
@@ -1018,14 +1095,14 @@ pub fn insn_to_str(
                 0,
                 "".to_string(),
             ),
-            Insn::IsNull { src, target_pc } => (
+            Insn::IsNull { reg, target_pc } => (
                 "IsNull",
-                *src as i32,
+                *reg as i32,
                 target_pc.to_debug_int(),
                 0,
                 OwnedValue::build_text(Rc::new("".to_string())),
                 0,
-                format!("if (r[{}]==NULL) goto {}", src, target_pc.to_debug_int()),
+                format!("if (r[{}]==NULL) goto {}", reg, target_pc.to_debug_int()),
             ),
             Insn::ParseSchema { db, where_clause } => (
                 "ParseSchema",
@@ -1137,6 +1214,24 @@ pub fn insn_to_str(
                 OwnedValue::build_text(Rc::new("".to_string())),
                 0,
                 format!("r[{}]=(r[{}] || r[{}])", dest, lhs, rhs),
+            ),
+            Insn::Noop => (
+                "Noop",
+                0,
+                0,
+                0,
+                OwnedValue::build_text(Rc::new("".to_string())),
+                0,
+                String::new(),
+            ),
+            Insn::PageCount { db, dest } => (
+                "Pagecount",
+                *db as i32,
+                *dest as i32,
+                0,
+                OwnedValue::build_text(Rc::new("".to_string())),
+                0,
+                "".to_string(),
             ),
         };
     format!(

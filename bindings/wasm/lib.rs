@@ -71,10 +71,13 @@ impl RowIterator {
 
     #[wasm_bindgen]
     pub fn next(&mut self) -> JsValue {
-        match self.inner.borrow_mut().step() {
-            Ok(limbo_core::StepResult::Row(row)) => {
+        let mut stmt = self.inner.borrow_mut();
+        match stmt.step() {
+            Ok(limbo_core::StepResult::Row) => {
+                let row = stmt.row().unwrap();
                 let row_array = Array::new();
-                for value in row.values {
+                for value in &row.values {
+                    let value = value.to_value();
                     let value = to_js_value(value);
                     row_array.push(&value);
                 }
@@ -109,10 +112,13 @@ impl Statement {
     }
 
     pub fn get(&self) -> JsValue {
-        match self.inner.borrow_mut().step() {
-            Ok(limbo_core::StepResult::Row(row)) => {
+        let mut stmt = self.inner.borrow_mut();
+        match stmt.step() {
+            Ok(limbo_core::StepResult::Row) => {
+                let row = stmt.row().unwrap();
                 let row_array = js_sys::Array::new();
-                for value in row.values {
+                for value in &row.values {
+                    let value = value.to_value();
                     let value = to_js_value(value);
                     row_array.push(&value);
                 }
@@ -129,10 +135,13 @@ impl Statement {
     pub fn all(&self) -> js_sys::Array {
         let array = js_sys::Array::new();
         loop {
-            match self.inner.borrow_mut().step() {
-                Ok(limbo_core::StepResult::Row(row)) => {
+            let mut stmt = self.inner.borrow_mut();
+            match stmt.step() {
+                Ok(limbo_core::StepResult::Row) => {
+                    let row = stmt.row().unwrap();
                     let row_array = js_sys::Array::new();
-                    for value in row.values {
+                    for value in &row.values {
+                        let value = value.to_value();
                         let value = to_js_value(value);
                         row_array.push(&value);
                     }
@@ -192,7 +201,7 @@ fn to_js_value(value: limbo_core::Value) -> JsValue {
         }
         limbo_core::Value::Float(f) => JsValue::from(f),
         limbo_core::Value::Text(t) => JsValue::from_str(t),
-        limbo_core::Value::Blob(b) => js_sys::Uint8Array::from(b.as_slice()).into(),
+        limbo_core::Value::Blob(b) => js_sys::Uint8Array::from(b).into(),
     }
 }
 

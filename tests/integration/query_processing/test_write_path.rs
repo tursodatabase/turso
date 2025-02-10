@@ -7,7 +7,8 @@ use std::rc::Rc;
 #[test]
 fn test_simple_overflow_page() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new("CREATE TABLE test (x INTEGER PRIMARY KEY, t TEXT);");
+    let tmp_db =
+        TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY, t TEXT);");
     let conn = tmp_db.connect_limbo();
 
     let mut huge_text = String::new();
@@ -40,16 +41,17 @@ fn test_simple_overflow_page() -> anyhow::Result<()> {
     match conn.query(list_query) {
         Ok(Some(ref mut rows)) => loop {
             match rows.step()? {
-                StepResult::Row(row) => {
-                    let first_value = &row.values[0];
-                    let text = &row.values[1];
+                StepResult::Row => {
+                    let row = rows.row().unwrap();
+                    let first_value = row.values[0].to_value();
+                    let text = row.values[1].to_value();
                     let id = match first_value {
-                        Value::Integer(i) => *i as i32,
-                        Value::Float(f) => *f as i32,
+                        Value::Integer(i) => i as i32,
+                        Value::Float(f) => f as i32,
                         _ => unreachable!(),
                     };
                     let text = match text {
-                        Value::Text(t) => *t,
+                        Value::Text(t) => t,
                         _ => unreachable!(),
                     };
                     assert_eq!(1, id);
@@ -75,7 +77,8 @@ fn test_simple_overflow_page() -> anyhow::Result<()> {
 #[test]
 fn test_sequential_overflow_page() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new("CREATE TABLE test (x INTEGER PRIMARY KEY, t TEXT);");
+    let tmp_db =
+        TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY, t TEXT);");
     let conn = tmp_db.connect_limbo();
     let iterations = 10_usize;
 
@@ -113,16 +116,17 @@ fn test_sequential_overflow_page() -> anyhow::Result<()> {
     match conn.query(list_query) {
         Ok(Some(ref mut rows)) => loop {
             match rows.step()? {
-                StepResult::Row(row) => {
-                    let first_value = &row.values[0];
-                    let text = &row.values[1];
+                StepResult::Row => {
+                    let row = rows.row().unwrap();
+                    let first_value = row.values[0].to_value();
+                    let text = row.values[1].to_value();
                     let id = match first_value {
-                        Value::Integer(i) => *i as i32,
-                        Value::Float(f) => *f as i32,
+                        Value::Integer(i) => i as i32,
+                        Value::Float(f) => f as i32,
                         _ => unreachable!(),
                     };
                     let text = match text {
-                        Value::Text(t) => *t,
+                        Value::Text(t) => t,
                         _ => unreachable!(),
                     };
                     let huge_text = &huge_texts[current_index];
@@ -152,7 +156,7 @@ fn test_sequential_overflow_page() -> anyhow::Result<()> {
 fn test_sequential_write() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
 
-    let tmp_db = TempDatabase::new("CREATE TABLE test (x INTEGER PRIMARY KEY);");
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY);");
     let conn = tmp_db.connect_limbo();
 
     let list_query = "SELECT * FROM test";
@@ -184,11 +188,12 @@ fn test_sequential_write() -> anyhow::Result<()> {
         match conn.query(list_query) {
             Ok(Some(ref mut rows)) => loop {
                 match rows.step()? {
-                    StepResult::Row(row) => {
+                    StepResult::Row => {
+                        let row = rows.row().unwrap();
                         let first_value = row.values.first().expect("missing id");
-                        let id = match first_value {
-                            Value::Integer(i) => *i as i32,
-                            Value::Float(f) => *f as i32,
+                        let id = match first_value.to_value() {
+                            Value::Integer(i) => i as i32,
+                            Value::Float(f) => f as i32,
                             _ => unreachable!(),
                         };
                         assert_eq!(current_read_index, id);
@@ -219,7 +224,7 @@ fn test_sequential_write() -> anyhow::Result<()> {
 /// https://github.com/tursodatabase/limbo/pull/679
 fn test_regression_multi_row_insert() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new("CREATE TABLE test (x REAL);");
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x REAL);");
     let conn = tmp_db.connect_limbo();
 
     let insert_query = "INSERT INTO test VALUES (-2), (-3), (-1)";
@@ -249,10 +254,11 @@ fn test_regression_multi_row_insert() -> anyhow::Result<()> {
     match conn.query(list_query) {
         Ok(Some(ref mut rows)) => loop {
             match rows.step()? {
-                StepResult::Row(row) => {
+                StepResult::Row => {
+                    let row = rows.row().unwrap();
                     let first_value = row.values.first().expect("missing id");
-                    let id = match first_value {
-                        Value::Float(f) => *f as i32,
+                    let id = match first_value.to_value() {
+                        Value::Float(f) => f as i32,
                         _ => panic!("expected float"),
                     };
                     actual_ids.push(id);
@@ -284,7 +290,7 @@ fn test_regression_multi_row_insert() -> anyhow::Result<()> {
 #[test]
 fn test_statement_reset() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new("create table test (i integer);");
+    let tmp_db = TempDatabase::new_with_rusqlite("create table test (i integer);");
     let conn = tmp_db.connect_limbo();
 
     conn.execute("insert into test values (1)")?;
@@ -294,8 +300,9 @@ fn test_statement_reset() -> anyhow::Result<()> {
 
     loop {
         match stmt.step()? {
-            StepResult::Row(row) => {
-                assert_eq!(row.values[0], Value::Integer(1));
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                assert_eq!(row.values[0].to_value(), Value::Integer(1));
                 break;
             }
             StepResult::IO => tmp_db.io.run_once()?,
@@ -307,8 +314,9 @@ fn test_statement_reset() -> anyhow::Result<()> {
 
     loop {
         match stmt.step()? {
-            StepResult::Row(row) => {
-                assert_eq!(row.values[0], Value::Integer(1));
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                assert_eq!(row.values[0].to_value(), Value::Integer(1));
                 break;
             }
             StepResult::IO => tmp_db.io.run_once()?,
@@ -323,7 +331,7 @@ fn test_statement_reset() -> anyhow::Result<()> {
 #[ignore]
 fn test_wal_checkpoint() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new("CREATE TABLE test (x INTEGER PRIMARY KEY);");
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY);");
     // threshold is 1000 by default
     let iterations = 1001_usize;
     let conn = tmp_db.connect_limbo();
@@ -356,11 +364,12 @@ fn test_wal_checkpoint() -> anyhow::Result<()> {
     match conn.query(list_query) {
         Ok(Some(ref mut rows)) => loop {
             match rows.step()? {
-                StepResult::Row(row) => {
-                    let first_value = &row.values[0];
+                StepResult::Row => {
+                    let row = rows.row().unwrap();
+                    let first_value = row.values[0].to_value();
                     let id = match first_value {
-                        Value::Integer(i) => *i as i32,
-                        Value::Float(f) => *f as i32,
+                        Value::Integer(i) => i as i32,
+                        Value::Float(f) => f as i32,
                         _ => unreachable!(),
                     };
                     assert_eq!(current_index, id as usize);
@@ -386,7 +395,7 @@ fn test_wal_checkpoint() -> anyhow::Result<()> {
 #[test]
 fn test_wal_restart() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new("CREATE TABLE test (x INTEGER PRIMARY KEY);");
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY);");
     // threshold is 1000 by default
 
     fn insert(i: usize, conn: &Rc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
@@ -419,10 +428,11 @@ fn test_wal_restart() -> anyhow::Result<()> {
             if let Some(ref mut rows) = conn.query(list_query)? {
                 loop {
                     match rows.step()? {
-                        StepResult::Row(row) => {
-                            let first_value = &row.values[0];
+                        StepResult::Row => {
+                            let row = rows.row().unwrap();
+                            let first_value = row.values[0].to_value();
                             let count = match first_value {
-                                Value::Integer(i) => *i as i32,
+                                Value::Integer(i) => i,
                                 _ => unreachable!(),
                             };
                             debug!("counted {}", count);

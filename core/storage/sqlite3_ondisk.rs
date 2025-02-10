@@ -46,13 +46,14 @@ use crate::io::{Buffer, Completion, ReadCompletion, SyncCompletion, WriteComplet
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::pager::Pager;
-use crate::types::{OwnedRecord, OwnedValue};
+use crate::types::{OwnedValue, Record, Text, TextSubtype};
 use crate::{File, Result};
 use log::trace;
+use parking_lot::RwLock;
 use std::cell::RefCell;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use super::pager::PageRef;
 
@@ -105,10 +106,10 @@ pub struct DatabaseHeader {
     pub database_size: u32,
 
     /// Page number of the first freelist trunk page.
-    freelist_trunk_page: u32,
+    pub freelist_trunk_page: u32,
 
     /// Total number of freelist pages.
-    freelist_pages: u32,
+    pub freelist_pages: u32,
 
     /// The schema cookie. Incremented when the database schema changes.
     schema_cookie: u32,
@@ -332,7 +333,7 @@ pub fn begin_write_database_header(header: &DatabaseHeader, pager: &Pager) -> Re
     Ok(())
 }
 
-fn write_header_to_buf(buf: &mut [u8], header: &DatabaseHeader) {
+pub fn write_header_to_buf(buf: &mut [u8], header: &DatabaseHeader) {
     buf[0..16].copy_from_slice(&header.magic);
     buf[16..18].copy_from_slice(&header.page_size.to_be_bytes());
     buf[18] = header.write_version;
@@ -361,7 +362,7 @@ fn write_header_to_buf(buf: &mut [u8], header: &DatabaseHeader) {
 }
 
 #[repr(u8)]
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum PageType {
     IndexInterior = 2,
     TableInterior = 5,
@@ -428,7 +429,7 @@ impl PageContent {
         }
     }
 
-    fn read_u8(&self, pos: usize) -> u8 {
+    pub fn read_u8(&self, pos: usize) -> u8 {
         let buf = self.as_ptr();
         buf[self.offset + pos]
     }
@@ -438,7 +439,7 @@ impl PageContent {
         u16::from_be_bytes([buf[self.offset + pos], buf[self.offset + pos + 1]])
     }
 
-    fn read_u32(&self, pos: usize) -> u32 {
+    pub fn read_u32(&self, pos: usize) -> u32 {
         let buf = self.as_ptr();
         u32::from_be_bytes([
             buf[self.offset + pos],
@@ -947,7 +948,7 @@ impl TryFrom<u64> for SerialType {
     }
 }
 
-pub fn read_record(payload: &[u8]) -> Result<OwnedRecord> {
+pub fn read_record(payload: &[u8]) -> Result<Record> {
     let mut pos = 0;
     let (header_size, nr) = read_varint(payload)?;
     assert!((header_size as usize) >= nr);
@@ -968,7 +969,7 @@ pub fn read_record(payload: &[u8]) -> Result<OwnedRecord> {
         pos += n;
         values.push(value);
     }
-    Ok(OwnedRecord::new(values))
+    Ok(Record::new(values))
 }
 
 pub fn read_value(buf: &[u8], serial_type: &SerialType) -> Result<(OwnedValue, usize)> {
@@ -1058,8 +1059,13 @@ pub fn read_value(buf: &[u8], serial_type: &SerialType) -> Result<(OwnedValue, u
                 );
             }
             let bytes = buf[0..n].to_vec();
-            let value = unsafe { String::from_utf8_unchecked(bytes) };
-            Ok((OwnedValue::build_text(value.into()), n))
+            Ok((
+                OwnedValue::Text(Text {
+                    value: Rc::new(bytes),
+                    subtype: TextSubtype::Text,
+                }),
+                n,
+            ))
         }
     }
 }
@@ -1123,11 +1129,9 @@ pub fn write_varint(buf: &mut [u8], value: u64) -> usize {
 }
 
 pub fn write_varint_to_vec(value: u64, payload: &mut Vec<u8>) {
-    let mut varint: Vec<u8> = vec![0; 9];
-    let n = write_varint(&mut varint.as_mut_slice()[0..9], value);
-    write_varint(&mut varint, value);
-    varint.truncate(n);
-    payload.extend_from_slice(&varint);
+    let mut varint = [0u8; 9];
+    let n = write_varint(&mut varint, value);
+    payload.extend_from_slice(&varint[0..n]);
 }
 
 pub fn begin_read_wal_header(io: &Rc<dyn File>) -> Result<Arc<RwLock<WalHeader>>> {
@@ -1147,7 +1151,7 @@ pub fn begin_read_wal_header(io: &Rc<dyn File>) -> Result<Arc<RwLock<WalHeader>>
 fn finish_read_wal_header(buf: Rc<RefCell<Buffer>>, header: Arc<RwLock<WalHeader>>) -> Result<()> {
     let buf = buf.borrow();
     let buf = buf.as_slice();
-    let mut header = header.write().unwrap();
+    let mut header = header.write();
     header.magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
     header.file_format = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
     header.page_size = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);

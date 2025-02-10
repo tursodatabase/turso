@@ -6,6 +6,7 @@ use crate::pseudo::PseudoCursor;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::sqlite3_ondisk::write_varint;
 use crate::vdbe::sorter::Sorter;
+use crate::vdbe::VTabOpaqueCursor;
 use crate::Result;
 use std::fmt::Display;
 use std::rc::Rc;
@@ -15,8 +16,8 @@ pub enum Value<'a> {
     Null,
     Integer(i64),
     Float(f64),
-    Text(&'a String),
-    Blob(&'a Vec<u8>),
+    Text(&'a str),
+    Blob(&'a [u8]),
 }
 
 impl Display for Value<'_> {
@@ -31,6 +32,16 @@ impl Display for Value<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OwnedValueType {
+    Null,
+    Integer,
+    Float,
+    Text,
+    Blob,
+    Error,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TextSubtype {
     Text,
@@ -38,24 +49,32 @@ pub enum TextSubtype {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct LimboText {
-    pub value: Rc<String>,
+pub struct Text {
+    pub value: Rc<Vec<u8>>,
     pub subtype: TextSubtype,
 }
 
-impl LimboText {
+impl Text {
+    pub fn from_str<S: Into<String>>(value: S) -> Self {
+        Self::new(Rc::new(value.into()))
+    }
+
     pub fn new(value: Rc<String>) -> Self {
         Self {
-            value,
+            value: Rc::new(value.as_bytes().to_vec()),
             subtype: TextSubtype::Text,
         }
     }
 
     pub fn json(value: Rc<String>) -> Self {
         Self {
-            value,
+            value: Rc::new(value.as_bytes().to_vec()),
             subtype: TextSubtype::Json,
         }
+    }
+
+    pub fn as_str(&self) -> &str {
+        unsafe { std::str::from_utf8_unchecked(self.value.as_ref()) }
     }
 }
 
@@ -64,16 +83,90 @@ pub enum OwnedValue {
     Null,
     Integer(i64),
     Float(f64),
-    Text(LimboText),
+    Text(Text),
     Blob(Rc<Vec<u8>>),
     Agg(Box<AggContext>), // TODO(pere): make this without Box. Currently this might cause cache miss but let's leave it for future analysis
-    Record(OwnedRecord),
+    Record(Record),
 }
 
 impl OwnedValue {
     // A helper function that makes building a text OwnedValue easier.
     pub fn build_text(text: Rc<String>) -> Self {
-        Self::Text(LimboText::new(text))
+        Self::Text(Text::new(text))
+    }
+
+    pub fn to_blob(&self) -> Option<&[u8]> {
+        match self {
+            Self::Blob(blob) => Some(blob),
+            _ => None,
+        }
+    }
+
+    pub fn from_blob(data: Vec<u8>) -> Self {
+        OwnedValue::Blob(std::rc::Rc::new(data))
+    }
+
+    pub fn to_text(&self) -> Option<&str> {
+        match self {
+            OwnedValue::Text(t) => Some(t.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn from_text(text: &str) -> Self {
+        OwnedValue::Text(Text::new(Rc::new(text.to_string())))
+    }
+
+    pub fn value_type(&self) -> OwnedValueType {
+        match self {
+            OwnedValue::Null => OwnedValueType::Null,
+            OwnedValue::Integer(_) => OwnedValueType::Integer,
+            OwnedValue::Float(_) => OwnedValueType::Float,
+            OwnedValue::Text(_) => OwnedValueType::Text,
+            OwnedValue::Blob(_) => OwnedValueType::Blob,
+            OwnedValue::Agg(_) => OwnedValueType::Null, // Map Agg to Null for FFI
+            OwnedValue::Record(_) => OwnedValueType::Null, // Map Record to Null for FFI
+        }
+    }
+
+    pub fn to_value(&self) -> Value<'_> {
+        match self {
+            OwnedValue::Null => Value::Null,
+            OwnedValue::Integer(i) => Value::Integer(*i),
+            OwnedValue::Float(f) => Value::Float(*f),
+            OwnedValue::Text(s) => Value::Text(s.as_str()),
+            OwnedValue::Blob(b) => Value::Blob(b),
+            OwnedValue::Agg(a) => match a.as_ref() {
+                AggContext::Avg(acc, _count) => match acc {
+                    OwnedValue::Integer(i) => Value::Integer(*i),
+                    OwnedValue::Float(f) => Value::Float(*f),
+                    _ => Value::Float(0.0),
+                },
+                AggContext::Sum(acc) => match acc {
+                    OwnedValue::Integer(i) => Value::Integer(*i),
+                    OwnedValue::Float(f) => Value::Float(*f),
+                    _ => Value::Float(0.0),
+                },
+                AggContext::Count(count) => count.to_value(),
+                AggContext::Max(max) => match max {
+                    Some(max) => max.to_value(),
+                    None => Value::Null,
+                },
+                AggContext::Min(min) => match min {
+                    Some(min) => min.to_value(),
+                    None => Value::Null,
+                },
+                AggContext::GroupConcat(s) => s.to_value(),
+                AggContext::External(ext_state) => {
+                    let v = ext_state
+                        .finalized_value
+                        .as_ref()
+                        .unwrap_or(&OwnedValue::Null);
+                    v.to_value()
+                }
+            },
+            OwnedValue::Record(_) => todo!(),
+        }
     }
 }
 
@@ -99,7 +192,7 @@ impl Display for OwnedValue {
             Self::Null => write!(f, "NULL"),
             Self::Integer(i) => write!(f, "{}", i),
             Self::Float(fl) => write!(f, "{:?}", fl),
-            Self::Text(s) => write!(f, "{}", s.value),
+            Self::Text(s) => write!(f, "{}", s.as_str()),
             Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b)),
             Self::Agg(a) => match a.as_ref() {
                 AggContext::Avg(acc, _count) => write!(f, "{}", acc),
@@ -123,45 +216,48 @@ impl OwnedValue {
             Self::Null => ExtValue::null(),
             Self::Integer(i) => ExtValue::from_integer(*i),
             Self::Float(fl) => ExtValue::from_float(*fl),
-            Self::Text(text) => ExtValue::from_text(text.value.to_string()),
+            Self::Text(text) => ExtValue::from_text(text.as_str().to_string()),
             Self::Blob(blob) => ExtValue::from_blob(blob.to_vec()),
             Self::Agg(_) => todo!(),
             Self::Record(_) => todo!("Record values not yet supported"),
         }
     }
 
-    pub fn from_ffi(v: &ExtValue) -> Self {
+    pub fn from_ffi(v: &ExtValue) -> Result<Self> {
         match v.value_type() {
-            ExtValueType::Null => OwnedValue::Null,
+            ExtValueType::Null => Ok(OwnedValue::Null),
             ExtValueType::Integer => {
                 let Some(int) = v.to_integer() else {
-                    return OwnedValue::Null;
+                    return Ok(OwnedValue::Null);
                 };
-                OwnedValue::Integer(int)
+                Ok(OwnedValue::Integer(int))
             }
             ExtValueType::Float => {
                 let Some(float) = v.to_float() else {
-                    return OwnedValue::Null;
+                    return Ok(OwnedValue::Null);
                 };
-                OwnedValue::Float(float)
+                Ok(OwnedValue::Float(float))
             }
             ExtValueType::Text => {
                 let Some(text) = v.to_text() else {
-                    return OwnedValue::Null;
+                    return Ok(OwnedValue::Null);
                 };
-                OwnedValue::build_text(Rc::new(text))
+                Ok(OwnedValue::build_text(Rc::new(text.to_string())))
             }
             ExtValueType::Blob => {
                 let Some(blob) = v.to_blob() else {
-                    return OwnedValue::Null;
+                    return Ok(OwnedValue::Null);
                 };
-                OwnedValue::Blob(Rc::new(blob))
+                Ok(OwnedValue::Blob(Rc::new(blob)))
             }
             ExtValueType::Error => {
-                let Some(err) = v.to_error() else {
-                    return OwnedValue::Null;
+                let Some(err) = v.to_error_details() else {
+                    return Ok(OwnedValue::Null);
                 };
-                OwnedValue::Text(LimboText::new(Rc::new(err)))
+                match err {
+                    (_, Some(msg)) => Err(LimboError::ExtensionError(msg)),
+                    (code, None) => Err(LimboError::ExtensionError(code.to_string())),
+                }
             }
         }
     }
@@ -181,13 +277,15 @@ pub enum AggContext {
 const NULL: OwnedValue = OwnedValue::Null;
 
 impl AggContext {
-    pub fn compute_external(&mut self) {
+    pub fn compute_external(&mut self) -> Result<()> {
         if let Self::External(ext_state) = self {
             if ext_state.finalized_value.is_none() {
                 let final_value = unsafe { (ext_state.finalize_fn)(ext_state.state) };
-                ext_state.cache_final_value(OwnedValue::from_ffi(&final_value));
+                ext_state.cache_final_value(OwnedValue::from_ffi(&final_value)?);
+                unsafe { final_value.free() };
             }
         }
+        Ok(())
     }
 
     pub fn final_value(&self) -> &OwnedValue {
@@ -284,21 +382,21 @@ impl std::ops::Add<OwnedValue> for OwnedValue {
                 Self::Float(float_left + float_right)
             }
             (Self::Text(string_left), Self::Text(string_right)) => Self::build_text(Rc::new(
-                string_left.value.to_string() + &string_right.value.to_string(),
+                string_left.as_str().to_string() + &string_right.as_str(),
             )),
             (Self::Text(string_left), Self::Integer(int_right)) => Self::build_text(Rc::new(
-                string_left.value.to_string() + &int_right.to_string(),
+                string_left.as_str().to_string() + &int_right.to_string(),
             )),
-            (Self::Integer(int_left), Self::Text(string_right)) => Self::build_text(Rc::new(
-                int_left.to_string() + &string_right.value.to_string(),
-            )),
+            (Self::Integer(int_left), Self::Text(string_right)) => {
+                Self::build_text(Rc::new(int_left.to_string() + &string_right.as_str()))
+            }
             (Self::Text(string_left), Self::Float(float_right)) => {
                 let string_right = Self::Float(float_right).to_string();
-                Self::build_text(Rc::new(string_left.value.to_string() + &string_right))
+                Self::build_text(Rc::new(string_left.as_str().to_string() + &string_right))
             }
             (Self::Float(float_left), Self::Text(string_right)) => {
                 let string_left = Self::Float(float_left).to_string();
-                Self::build_text(Rc::new(string_left + &string_right.value.to_string()))
+                Self::build_text(Rc::new(string_left + &string_right.as_str()))
             }
             (lhs, Self::Null) => lhs,
             (Self::Null, rhs) => rhs,
@@ -383,98 +481,59 @@ impl From<Value<'_>> for OwnedValue {
             Value::Null => OwnedValue::Null,
             Value::Integer(i) => OwnedValue::Integer(i),
             Value::Float(f) => OwnedValue::Float(f),
-            Value::Text(s) => OwnedValue::Text(LimboText::new(Rc::new(s.to_owned()))),
+            Value::Text(s) => OwnedValue::Text(Text::from_str(s)),
             Value::Blob(b) => OwnedValue::Blob(Rc::new(b.to_owned())),
         }
     }
 }
 
-pub fn to_value(value: &OwnedValue) -> Value<'_> {
-    match value {
-        OwnedValue::Null => Value::Null,
-        OwnedValue::Integer(i) => Value::Integer(*i),
-        OwnedValue::Float(f) => Value::Float(*f),
-        OwnedValue::Text(s) => Value::Text(&s.value),
-        OwnedValue::Blob(b) => Value::Blob(b),
-        OwnedValue::Agg(a) => match a.as_ref() {
-            AggContext::Avg(acc, _count) => match acc {
-                OwnedValue::Integer(i) => Value::Integer(*i),
-                OwnedValue::Float(f) => Value::Float(*f),
-                _ => Value::Float(0.0),
-            },
-            AggContext::Sum(acc) => match acc {
-                OwnedValue::Integer(i) => Value::Integer(*i),
-                OwnedValue::Float(f) => Value::Float(*f),
-                _ => Value::Float(0.0),
-            },
-            AggContext::Count(count) => to_value(count),
-            AggContext::Max(max) => match max {
-                Some(max) => to_value(max),
-                None => Value::Null,
-            },
-            AggContext::Min(min) => match min {
-                Some(min) => to_value(min),
-                None => Value::Null,
-            },
-            AggContext::GroupConcat(s) => to_value(s),
-            AggContext::External(ext_state) => to_value(
-                ext_state
-                    .finalized_value
-                    .as_ref()
-                    .unwrap_or(&OwnedValue::Null),
-            ),
-        },
-        OwnedValue::Record(_) => todo!(),
-    }
-}
-
 pub trait FromValue<'a> {
-    fn from_value(value: &Value<'a>) -> Result<Self>
+    fn from_value(value: &'a OwnedValue) -> Result<Self>
     where
         Self: Sized + 'a;
 }
 
 impl<'a> FromValue<'a> for i64 {
-    fn from_value(value: &Value<'a>) -> Result<Self> {
+    fn from_value(value: &'a OwnedValue) -> Result<Self> {
         match value {
-            Value::Integer(i) => Ok(*i),
+            OwnedValue::Integer(i) => Ok(*i),
             _ => Err(LimboError::ConversionError("Expected integer value".into())),
         }
     }
 }
 
 impl<'a> FromValue<'a> for String {
-    fn from_value(value: &Value<'a>) -> Result<Self> {
+    fn from_value(value: &'a OwnedValue) -> Result<Self> {
         match value {
-            Value::Text(s) => Ok(s.to_string()),
+            OwnedValue::Text(s) => Ok(s.as_str().to_string()),
             _ => Err(LimboError::ConversionError("Expected text value".into())),
         }
     }
 }
 
 impl<'a> FromValue<'a> for &'a str {
-    fn from_value(value: &Value<'a>) -> Result<&'a str> {
+    fn from_value(value: &'a OwnedValue) -> Result<Self> {
         match value {
-            Value::Text(s) => Ok(s),
+            OwnedValue::Text(s) => Ok(s.as_str()),
             _ => Err(LimboError::ConversionError("Expected text value".into())),
         }
     }
 }
 
-#[derive(Debug)]
-pub struct Record<'a> {
-    pub values: Vec<Value<'a>>,
-}
-
-impl<'a> Record<'a> {
-    pub fn new(values: Vec<Value<'a>>) -> Self {
-        Self { values }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct OwnedRecord {
+pub struct Record {
     pub values: Vec<OwnedValue>,
+}
+
+impl Record {
+    pub fn get<'a, T: FromValue<'a> + 'a>(&'a self, idx: usize) -> Result<T> {
+        let value = &self.values[idx];
+        T::from_value(value)
+    }
+
+    pub fn count(&self) -> usize {
+        self.values.len()
+    }
 }
 
 const I8_LOW: i64 = -128;
@@ -546,7 +605,7 @@ impl From<SerialType> for u64 {
     }
 }
 
-impl OwnedRecord {
+impl Record {
     pub fn new(values: Vec<OwnedValue>) -> Self {
         Self { values }
     }
@@ -581,7 +640,7 @@ impl OwnedRecord {
                     }
                 }
                 OwnedValue::Float(f) => buf.extend_from_slice(&f.to_be_bytes()),
-                OwnedValue::Text(t) => buf.extend_from_slice(t.value.as_bytes()),
+                OwnedValue::Text(t) => buf.extend_from_slice(&t.value),
                 OwnedValue::Blob(b) => buf.extend_from_slice(b),
                 // non serializable
                 OwnedValue::Agg(_) => unreachable!(),
@@ -612,6 +671,7 @@ pub enum Cursor {
     Index(BTreeCursor),
     Pseudo(PseudoCursor),
     Sorter(Sorter),
+    Virtual(VTabOpaqueCursor),
 }
 
 impl Cursor {
@@ -658,8 +718,16 @@ impl Cursor {
             _ => panic!("Cursor is not a sorter cursor"),
         }
     }
+
+    pub fn as_virtual_mut(&mut self) -> &mut VTabOpaqueCursor {
+        match self {
+            Self::Virtual(cursor) => cursor,
+            _ => panic!("Cursor is not a virtual cursor"),
+        }
+    }
 }
 
+#[derive(Debug)]
 pub enum CursorResult<T> {
     Ok(T),
     IO,
@@ -675,7 +743,7 @@ pub enum SeekOp {
 #[derive(Clone, PartialEq, Debug)]
 pub enum SeekKey<'a> {
     TableRowId(u64),
-    IndexKey(&'a OwnedRecord),
+    IndexKey(&'a Record),
 }
 
 #[cfg(test)]
@@ -685,7 +753,7 @@ mod tests {
 
     #[test]
     fn test_serialize_null() {
-        let record = OwnedRecord::new(vec![OwnedValue::Null]);
+        let record = Record::new(vec![OwnedValue::Null]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
 
@@ -701,7 +769,7 @@ mod tests {
 
     #[test]
     fn test_serialize_integers() {
-        let record = OwnedRecord::new(vec![
+        let record = Record::new(vec![
             OwnedValue::Integer(42),                // Should use SERIAL_TYPE_I8
             OwnedValue::Integer(1000),              // Should use SERIAL_TYPE_I16
             OwnedValue::Integer(1_000_000),         // Should use SERIAL_TYPE_I24
@@ -777,7 +845,7 @@ mod tests {
     #[test]
     fn test_serialize_float() {
         #[warn(clippy::approx_constant)]
-        let record = OwnedRecord::new(vec![OwnedValue::Float(3.15555)]);
+        let record = Record::new(vec![OwnedValue::Float(3.15555)]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
 
@@ -798,7 +866,7 @@ mod tests {
     #[test]
     fn test_serialize_text() {
         let text = Rc::new("hello".to_string());
-        let record = OwnedRecord::new(vec![OwnedValue::Text(LimboText::new(text.clone()))]);
+        let record = Record::new(vec![OwnedValue::Text(Text::new(text.clone()))]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
 
@@ -817,7 +885,7 @@ mod tests {
     #[test]
     fn test_serialize_blob() {
         let blob = Rc::new(vec![1, 2, 3, 4, 5]);
-        let record = OwnedRecord::new(vec![OwnedValue::Blob(blob.clone())]);
+        let record = Record::new(vec![OwnedValue::Blob(blob.clone())]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
 
@@ -836,11 +904,11 @@ mod tests {
     #[test]
     fn test_serialize_mixed_types() {
         let text = Rc::new("test".to_string());
-        let record = OwnedRecord::new(vec![
+        let record = Record::new(vec![
             OwnedValue::Null,
             OwnedValue::Integer(42),
             OwnedValue::Float(3.15),
-            OwnedValue::Text(LimboText::new(text.clone())),
+            OwnedValue::Text(Text::new(text.clone())),
         ]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
