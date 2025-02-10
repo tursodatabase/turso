@@ -405,7 +405,7 @@ pub fn json_error_position(json: &OwnedValue) -> crate::Result<OwnedValue> {
                 }
             }
         },
-        OwnedValue::Blob(b) => {
+        OwnedValue::Blob(_b) => {
             unimplemented!("json_error_position for JSONB is not implemented")
         }
         OwnedValue::Null => Ok(OwnedValue::Null),
@@ -972,7 +972,7 @@ pub fn is_json_valid(json_value: &OwnedValue) -> crate::Result<OwnedValue> {
             Ok(_) => Ok(OwnedValue::Integer(1)),
             Err(_) => Ok(OwnedValue::Integer(0)),
         },
-        OwnedValue::Blob(b) => unimplemented!("is_json_valid is not implemented for JSONB"),
+        OwnedValue::Blob(_b) => unimplemented!("is_json_valid is not implemented for JSONB"),
         OwnedValue::Null => Ok(OwnedValue::Null),
         _ => Ok(OwnedValue::Integer(1)),
     }

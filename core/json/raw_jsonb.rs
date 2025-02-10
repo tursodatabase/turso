@@ -132,14 +132,14 @@ pub enum JsonbError {
 pub type Result<T, E = JsonbError> = std::result::Result<T, E>;
 
 impl From<JsonbError> for LimboError {
-    fn from(value: JsonbError) -> Self {
+    fn from(_value: JsonbError) -> Self {
         // TODO: should we expose better error messages?
         LimboError::ParseError("malformed JSON".to_string())
     }
 }
 
 impl From<JsonbError> for Error {
-    fn from(value: JsonbError) -> Self {
+    fn from(_value: JsonbError) -> Self {
         // TODO: should we expose better error messages?
         Error::Message {
             msg: "malformed JSON".to_string(),
