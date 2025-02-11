@@ -9,39 +9,39 @@ import org.junit.jupiter.api.Test;
 
 class JDBC4DatabaseMetaDataTest {
 
-  private JDBC4Connection connection;
-  private JDBC4DatabaseMetaData metaData;
+	private JDBC4Connection connection;
+	private JDBC4DatabaseMetaData metaData;
 
-  @BeforeEach
-  void set_up() throws Exception {
-    String filePath = TestUtils.createTempFile();
-    String url = "jdbc:sqlite:" + filePath;
-    connection = new JDBC4Connection(url, filePath, new Properties());
-    metaData = new JDBC4DatabaseMetaData(connection);
-  }
+	@BeforeEach
+	void set_up() throws Exception {
+		String filePath = TestUtils.createTempFile();
+		String url = "jdbc:sqlite:" + filePath;
+		connection = new JDBC4Connection(url, filePath, new Properties());
+		metaData = new JDBC4DatabaseMetaData(connection);
+	}
 
-  @Test
-  void getURL_should_return_non_empty_string() {
-    assertFalse(metaData.getURL().isEmpty());
-  }
+	@Test
+	void getURL_should_return_non_empty_string() {
+		assertFalse(metaData.getURL().isEmpty());
+	}
 
-  @Test
-  void getDriverName_should_not_return_empty_string() {
-    assertFalse(metaData.getDriverName().isEmpty());
-  }
+	@Test
+	void getDriverName_should_not_return_empty_string() {
+		assertFalse(metaData.getDriverName().isEmpty());
+	}
 
-  @Test
-  void test_getDriverMajorVersion() {
-    metaData.getDriverMajorVersion();
-  }
+	@Test
+	void test_getDriverMajorVersion() {
+		metaData.getDriverMajorVersion();
+	}
 
-  @Test
-  void test_getDriverMinorVersion() {
-    metaData.getDriverMinorVersion();
-  }
+	@Test
+	void test_getDriverMinorVersion() {
+		metaData.getDriverMinorVersion();
+	}
 
-  @Test
-  void getDriverVersion_should_not_return_empty_string() {
-    assertFalse(metaData.getDriverVersion().isEmpty());
-  }
+	@Test
+	void getDriverVersion_should_not_return_empty_string() {
+		assertFalse(metaData.getDriverVersion().isEmpty());
+	}
 }

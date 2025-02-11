@@ -12,5 +12,5 @@ import java.lang.annotation.Target;
 @Retention(RetentionPolicy.SOURCE)
 @Target({ElementType.METHOD, ElementType.CONSTRUCTOR})
 public @interface NativeInvocation {
-  String invokedFrom() default "";
+	String invokedFrom() default "";
 }

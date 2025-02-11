@@ -10,27 +10,27 @@ import org.junit.jupiter.api.Test;
 
 public class IntegrationTest {
 
-  private JDBC4Connection connection;
+	private JDBC4Connection connection;
 
-  @BeforeEach
-  void setUp() throws Exception {
-    String filePath = TestUtils.createTempFile();
-    String url = "jdbc:sqlite:" + filePath;
-    connection = new JDBC4Connection(url, filePath, new Properties());
-  }
+	@BeforeEach
+	void setUp() throws Exception {
+		String filePath = TestUtils.createTempFile();
+		String url = "jdbc:sqlite:" + filePath;
+		connection = new JDBC4Connection(url, filePath, new Properties());
+	}
 
-  @Test
-  void create_table_multi_inserts_select() throws Exception {
-    Statement stmt = createDefaultStatement();
-    stmt.execute("CREATE TABLE users (id INT PRIMARY KEY, username TEXT);");
-    stmt.execute("INSERT INTO users VALUES (1, 'seonwoo');");
-    stmt.execute("INSERT INTO users VALUES (2, 'seonwoo');");
-    stmt.execute("INSERT INTO users VALUES (3, 'seonwoo');");
-    stmt.execute("SELECT * FROM users");
-  }
+	@Test
+	void create_table_multi_inserts_select() throws Exception {
+		Statement stmt = createDefaultStatement();
+		stmt.execute("CREATE TABLE users (id INT PRIMARY KEY, username TEXT);");
+		stmt.execute("INSERT INTO users VALUES (1, 'seonwoo');");
+		stmt.execute("INSERT INTO users VALUES (2, 'seonwoo');");
+		stmt.execute("INSERT INTO users VALUES (3, 'seonwoo');");
+		stmt.execute("SELECT * FROM users");
+	}
 
-  private Statement createDefaultStatement() throws SQLException {
-    return connection.createStatement(
-        ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY, ResultSet.CLOSE_CURSORS_AT_COMMIT);
-  }
+	private Statement createDefaultStatement() throws SQLException {
+		return connection.createStatement(
+				ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY, ResultSet.CLOSE_CURSORS_AT_COMMIT);
+	}
 }
