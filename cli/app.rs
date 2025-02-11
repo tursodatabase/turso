@@ -102,6 +102,7 @@ impl std::fmt::Display for OutputMode {
     }
 }
 
+// similar to dbg! but returns a string
 macro_rules! dbg_string {
     ($val:expr) => {{
         format!("{:#?}", $val)
@@ -140,7 +141,7 @@ pub enum Command {
     Import,
     /// Loads an extension library
     LoadExtension,
-    /// Pretty print parsed SQL statement
+    /// Parse and pretty print a SQL statement
     PrettyPrintAst,
 }
 
