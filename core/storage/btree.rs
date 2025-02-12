@@ -1,14 +1,10 @@
-<<<<<<< HEAD
 use tracing::debug;
 
-=======
->>>>>>> d7863400 (Added comments and changed logging to trace.)
 use crate::storage::pager::Pager;
 use crate::storage::sqlite3_ondisk::{
     read_btree_cell, read_varint, BTreeCell, DatabaseHeader, PageContent, PageType,
     TableInteriorCell, TableLeafCell,
 };
-use log::debug;
 
 use crate::types::{CursorResult, OwnedValue, Record, SeekKey, SeekOp};
 use crate::{LimboError, Result};
@@ -2412,10 +2408,10 @@ fn to_static_buf(buf: &[u8]) -> &'static [u8] {
 
 #[cfg(test)]
 mod tests {
-    use log::trace;
     use rand_chacha::rand_core::RngCore;
     use rand_chacha::rand_core::SeedableRng;
     use rand_chacha::ChaCha8Rng;
+    use tracing::trace;
 
     use super::*;
     use crate::io::{Buffer, Completion, MemoryIO, OpenFlags, IO};
