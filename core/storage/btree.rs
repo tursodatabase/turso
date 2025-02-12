@@ -1,10 +1,14 @@
+<<<<<<< HEAD
 use tracing::debug;
 
+=======
+>>>>>>> d7863400 (Added comments and changed logging to trace.)
 use crate::storage::pager::Pager;
 use crate::storage::sqlite3_ondisk::{
     read_btree_cell, read_varint, BTreeCell, DatabaseHeader, PageContent, PageType,
     TableInteriorCell, TableLeafCell,
 };
+use log::debug;
 
 use crate::types::{CursorResult, OwnedValue, Record, SeekKey, SeekOp};
 use crate::{LimboError, Result};
@@ -2209,6 +2213,16 @@ impl BTreeCursor {
         Ok(CursorResult::Ok(()))
     }
 
+    /// Calculates how much of a cell's payload should be stored locally vs in overflow pages
+    ///
+    /// Parameters:
+    /// - payload_len: Total length of the payload data
+    /// - page_type: Type of the B-tree page (affects local storage thresholds)
+    ///
+    /// Returns:
+    /// - A tuple of (n_local, payload_len) where:
+    ///   - n_local: Amount of payload to store locally on the page
+    ///   - payload_len: Total payload length (unchanged from input)
     pub fn parse_cell_info(
         &self,
         payload_len: usize,
@@ -2222,7 +2236,13 @@ impl BTreeCursor {
             // Common case - everything fits locally
             payload_len
         } else {
-            // Have to split between local and overflow
+            // For payloads that need overflow pages:
+            // Calculate how much should be stored locally using the following formula:
+            // surplus = min_local + (payload_len - min_local) % (usable_space - 4)
+            //
+            // This tries to minimize unused space on overflow pages while keeping
+            // the local storage between min_local and max_local thresholds.
+            // The (usable_space - 4) factor accounts for overhead in overflow pages.
             let surplus = min_local + (payload_len - min_local) % (self.usable_space() - 4);
             if surplus <= max_local {
                 surplus
@@ -2255,7 +2275,9 @@ impl BTreeCursor {
 
         #[allow(clippy::manual_div_ceil)] // don't remove this. Ignore clippy.
         // TODO(Krishna): payload_len - n_local + overflow_page_size - 1 -> this is off by 3 in one case.
+        // Investigate this further.
         // For now this works similar to SQLite and obeys invariants when tested with fuzzer.
+        // using rust's div_ceil will add + 1 to result we want. Clippy will suggest us to use div_ceil but don't.
         let n_overflow = (payload_len - n_local + overflow_page_size - 1) / (overflow_page_size);
         Ok(Some(n_overflow))
     }
@@ -2390,6 +2412,7 @@ fn to_static_buf(buf: &[u8]) -> &'static [u8] {
 
 #[cfg(test)]
 mod tests {
+    use log::trace;
     use rand_chacha::rand_core::RngCore;
     use rand_chacha::rand_core::SeedableRng;
     use rand_chacha::ChaCha8Rng;
@@ -2744,11 +2767,11 @@ mod tests {
             for &(key, size, _) in sequence.iter() {
                 let key = OwnedValue::Integer(key);
                 let value = Record::new(vec![OwnedValue::Blob(Rc::new(vec![0; size]))]);
-                log::info!("Inserting key: {}", key);
+                trace!("Inserting key: {}", key);
                 cursor.insert(&key, &value, false).unwrap();
             }
 
-            log::info!(
+            trace!(
                 "After inserts:\n{}",
                 format_btree(pager.clone(), root_page, 0)
             );
@@ -2757,7 +2780,7 @@ mod tests {
             for &(key, _, should_delete) in sequence.iter() {
                 if should_delete {
                     let seek_key = SeekKey::TableRowId(key as u64);
-                    log::info!("Deleting key: {}", key);
+                    trace!("Deleting key: {}", key);
                     assert!(
                         matches!(
                             cursor.seek(seek_key.clone(), SeekOp::EQ).unwrap(),
