@@ -1169,11 +1169,11 @@ pub fn exec_or(mut lhs: &OwnedValue, mut rhs: &OwnedValue) -> OwnedValue {
         | (OwnedValue::Float(0.0), OwnedValue::Float(0.0))
         | (OwnedValue::Integer(0), OwnedValue::Integer(0)) => OwnedValue::Integer(0),
         (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_or(
-            &cast_text_to_numerical(lhs.as_str()),
-            &cast_text_to_numerical(rhs.as_str()),
+            &cast_text_to_real(lhs.as_str()),
+            &cast_text_to_real(rhs.as_str()),
         ),
         (OwnedValue::Text(text), other) | (other, OwnedValue::Text(text)) => {
-            exec_or(&cast_text_to_numerical(text.as_str()), other)
+            exec_or(&cast_text_to_real(text.as_str()), other)
         }
         _ => OwnedValue::Integer(1),
     }
