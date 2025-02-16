@@ -272,30 +272,11 @@ pub fn translate_condition_expr(
                 }
             }
         }
-        ast::Expr::Literal(lit) => match lit {
-            ast::Literal::Numeric(val) => {
-                let maybe_int = val.parse::<i64>();
-                if let Ok(int_value) = maybe_int {
-                    let reg = program.alloc_register();
-                    program.emit_insn(Insn::Integer {
-                        value: int_value,
-                        dest: reg,
-                    });
-                    emit_cond_jump(program, condition_metadata, reg);
-                } else {
-                    crate::bail_parse_error!("unsupported literal type in condition");
-                }
-            }
-            ast::Literal::String(string) => {
-                let reg = program.alloc_register();
-                program.emit_insn(Insn::String8 {
-                    value: string.clone(),
-                    dest: reg,
-                });
-                emit_cond_jump(program, condition_metadata, reg);
-            }
-            unimpl => todo!("literal {:?} not implemented", unimpl),
-        },
+        ast::Expr::Literal(_) => {
+            let reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
+            emit_cond_jump(program, condition_metadata, reg);
+        }
         ast::Expr::InList { lhs, not, rhs } => {
             // lhs is e.g. a column reference
             // rhs is an Option<Vec<Expr>>
