@@ -3698,9 +3698,9 @@ fn cast_text_to_real(text: &str) -> OwnedValue {
     }
     // Try to find longest valid prefix that parses as a float
     // TODO: inefficient
-    let mut end_index = trimmed.len() - 1;
-    while end_index > 0 {
-        if let Ok(num) = trimmed[..=end_index].parse::<f64>() {
+    let mut end_index = trimmed.len().saturating_sub(1) as isize;
+    while end_index >= 0 {
+        if let Ok(num) = trimmed[..=end_index as usize].parse::<f64>() {
             return OwnedValue::Float(num);
         }
         end_index -= 1;
