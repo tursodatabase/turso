@@ -3515,6 +3515,7 @@ fn exec_if(reg: &OwnedValue, jump_if_null: bool, not: bool) -> bool {
         OwnedValue::Integer(0) | OwnedValue::Float(0.0) => not,
         OwnedValue::Integer(_) | OwnedValue::Float(_) => !not,
         OwnedValue::Null => jump_if_null,
+        OwnedValue::Text(t) => exec_if(&cast_text_to_real(t.as_str()), jump_if_null, not),
         _ => false,
     }
 }
