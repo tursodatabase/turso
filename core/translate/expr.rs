@@ -272,7 +272,7 @@ pub fn translate_condition_expr(
                 }
             }
         }
-        ast::Expr::Literal(_) | ast::Expr::Cast { .. } => {
+        ast::Expr::Literal(_) | ast::Expr::Cast { .. } | ast::Expr::FunctionCall { .. }  => {
             let reg = program.alloc_register();
             translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
             emit_cond_jump(program, condition_metadata, reg);
