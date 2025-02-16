@@ -3580,7 +3580,15 @@ fn exec_cast(value: &OwnedValue, datatype: &str) -> OwnedValue {
                 let text = String::from_utf8_lossy(b);
                 cast_text_to_numeric(&text)
             }
-            OwnedValue::Text(t) => cast_text_to_numeric(t.as_str()),
+            OwnedValue::Text(t) => {
+                let text = t.as_str();
+                // Looks like a float
+                if text.contains('.') || text.contains('e') || text.contains('E') {
+                    cast_text_to_real(text)
+                } else {
+                    cast_text_to_integer(text)
+                }
+            }
             OwnedValue::Integer(i) => OwnedValue::Integer(*i),
             OwnedValue::Float(f) => OwnedValue::Float(*f),
             _ => value.clone(), // TODO probably wrong
@@ -3672,14 +3680,15 @@ fn affinity(datatype: &str) -> Affinity {
 /// The CAST operator understands decimal integers only — conversion of hexadecimal integers stops at the "x" in the "0x" prefix of the hexadecimal integer string and thus result of the CAST is always zero.
 fn cast_text_to_integer(text: &str) -> OwnedValue {
     let text = text.trim();
+
     if let Ok(i) = text.parse::<i64>() {
         return OwnedValue::Integer(i);
     }
     // Try to find longest valid prefix that parses as an integer
     // TODO: inefficient
-    let mut end_index = text.len() - 1;
-    while end_index > 0 {
-        if let Ok(i) = text[..=end_index].parse::<i64>() {
+    let mut end_index = text.len().saturating_sub(1) as isize;
+    while end_index >= 0 {
+        if let Ok(i) = text[..=end_index as usize].parse::<i64>() {
             return OwnedValue::Integer(i);
         }
         end_index -= 1;
