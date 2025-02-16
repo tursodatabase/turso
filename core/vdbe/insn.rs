@@ -1050,58 +1050,65 @@ pub fn exec_boolean_not(mut reg: &OwnedValue) -> OwnedValue {
 }
 
 pub fn exec_concat(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
+    // Use Debug implementation for f64 to not lose precision
     match (lhs, rhs) {
         (OwnedValue::Text(lhs_text), OwnedValue::Text(rhs_text)) => {
-            OwnedValue::build_text(&(lhs_text.as_str().to_string() + rhs_text.as_str()))
+            OwnedValue::build_text(&format!("{}{}", lhs_text.as_str(), rhs_text.as_str()))
         }
         (OwnedValue::Text(lhs_text), OwnedValue::Integer(rhs_int)) => {
-            OwnedValue::build_text(&(lhs_text.as_str().to_string() + &rhs_int.to_string()))
+            OwnedValue::build_text(&format!("{}{}", lhs_text.as_str(), rhs_int))
         }
         (OwnedValue::Text(lhs_text), OwnedValue::Float(rhs_float)) => {
-            OwnedValue::build_text(&(lhs_text.as_str().to_string() + &rhs_float.to_string()))
+            OwnedValue::build_text(&format!("{}{:?}", lhs_text.as_str(), rhs_float))
         }
-        (OwnedValue::Text(lhs_text), OwnedValue::Agg(rhs_agg)) => OwnedValue::build_text(
-            (lhs_text.as_str().to_string() + &rhs_agg.final_value().to_string()).as_str(),
-        ),
+        (OwnedValue::Text(lhs_text), OwnedValue::Agg(rhs_agg)) => OwnedValue::build_text(&format!(
+            "{:?}{:?}",
+            lhs_text.as_str(),
+            rhs_agg.final_value()
+        )),
 
         (OwnedValue::Integer(lhs_int), OwnedValue::Text(rhs_text)) => {
-            OwnedValue::build_text(&(lhs_int.to_string() + rhs_text.as_str()))
+            OwnedValue::build_text(&format!("{}{}", lhs_int, rhs_text.as_str()))
         }
         (OwnedValue::Integer(lhs_int), OwnedValue::Integer(rhs_int)) => {
-            OwnedValue::build_text(&(lhs_int.to_string() + &rhs_int.to_string()))
+            OwnedValue::build_text(&format!("{}{}", lhs_int, rhs_int))
         }
         (OwnedValue::Integer(lhs_int), OwnedValue::Float(rhs_float)) => {
-            OwnedValue::build_text(&(lhs_int.to_string() + &rhs_float.to_string()))
+            OwnedValue::build_text(&format!("{}{:?}", lhs_int, rhs_float))
         }
         (OwnedValue::Integer(lhs_int), OwnedValue::Agg(rhs_agg)) => {
-            OwnedValue::build_text(&(lhs_int.to_string() + &rhs_agg.final_value().to_string()))
+            OwnedValue::build_text(&format!("{}{:?}", lhs_int, rhs_agg.final_value()))
         }
 
         (OwnedValue::Float(lhs_float), OwnedValue::Text(rhs_text)) => {
-            OwnedValue::build_text(&(lhs_float.to_string() + rhs_text.as_str()))
+            OwnedValue::build_text(&format!("{:?}{}", lhs_float, rhs_text.as_str()))
         }
         (OwnedValue::Float(lhs_float), OwnedValue::Integer(rhs_int)) => {
-            OwnedValue::build_text(&(lhs_float.to_string() + &rhs_int.to_string()))
+            OwnedValue::build_text(&format!("{:?}{}", lhs_float, rhs_int))
         }
         (OwnedValue::Float(lhs_float), OwnedValue::Float(rhs_float)) => {
-            OwnedValue::build_text(&(lhs_float.to_string() + &rhs_float.to_string()))
+            OwnedValue::build_text(&format!("{:?}{:?}", lhs_float, rhs_float))
         }
         (OwnedValue::Float(lhs_float), OwnedValue::Agg(rhs_agg)) => {
-            OwnedValue::build_text(&(lhs_float.to_string() + &rhs_agg.final_value().to_string()))
+            OwnedValue::build_text(&format!("{:?}{}", lhs_float, rhs_agg.final_value()))
         }
 
-        (OwnedValue::Agg(lhs_agg), OwnedValue::Text(rhs_text)) => {
-            OwnedValue::build_text(&(lhs_agg.final_value().to_string() + rhs_text.as_str()))
-        }
+        (OwnedValue::Agg(lhs_agg), OwnedValue::Text(rhs_text)) => OwnedValue::build_text(&format!(
+            "{:?}{:?}",
+            lhs_agg.final_value(),
+            rhs_text.as_str()
+        )),
         (OwnedValue::Agg(lhs_agg), OwnedValue::Integer(rhs_int)) => {
-            OwnedValue::build_text(&(lhs_agg.final_value().to_string() + &rhs_int.to_string()))
+            OwnedValue::build_text(&format!("{:?}{:?}", lhs_agg.final_value(), rhs_int))
         }
         (OwnedValue::Agg(lhs_agg), OwnedValue::Float(rhs_float)) => {
-            OwnedValue::build_text(&(lhs_agg.final_value().to_string() + &rhs_float.to_string()))
+            OwnedValue::build_text(&format!("{:?}{}", lhs_agg.final_value(), rhs_float))
         }
-        (OwnedValue::Agg(lhs_agg), OwnedValue::Agg(rhs_agg)) => OwnedValue::build_text(
-            &(lhs_agg.final_value().to_string() + &rhs_agg.final_value().to_string()),
-        ),
+        (OwnedValue::Agg(lhs_agg), OwnedValue::Agg(rhs_agg)) => OwnedValue::build_text(&format!(
+            "{:?}{:?}",
+            lhs_agg.final_value(),
+            rhs_agg.final_value()
+        )),
 
         (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
         (OwnedValue::Blob(_), _) | (_, OwnedValue::Blob(_)) => {
