@@ -1454,7 +1454,7 @@ impl BTreeCursor {
                 (new_root_page.get().id, child.get().id, child)
             };
 
-            info!("Balancing root. root={}, rightmost={}", root_id, child_id);
+            debug!("Balancing root. root={}, rightmost={}", root_id, child_id);
             let root = new_root_page.clone();
 
             self.root_page = root_id;
@@ -1970,10 +1970,6 @@ impl BTreeCursor {
     }
 
     pub fn delete(&mut self) -> Result<CursorResult<()>> {
-        if self.stack.current() as i32 == -1 {
-            return Ok(CursorResult::Ok(()));
-        }
-
         let page = self.stack.top();
         return_if_locked!(page);
 
@@ -2277,7 +2273,7 @@ impl PageStack {
             .as_ref()
             .unwrap()
             .clone();
-        info!(
+        debug!(
             "pagestack::top(current={}, page_id={})",
             current,
             page.get().id

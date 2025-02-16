@@ -2578,7 +2578,7 @@ impl Program {
                     } else {
                         get_cursor_as_table_mut(&mut cursors, *cursor_id)
                     };
-
+                    // place holdeer, destroy not implemented
                     return_if_io!(cursor.delete());
                     state.pc += 1;
                 }
