@@ -1,6 +1,6 @@
 use super::{
     plan::{
-        Aggregate, JoinInfo, Operation, Plan, ResultSetColumn, SelectPlan, SelectQueryType,
+        Aggregate, EvalAt, JoinInfo, Operation, Plan, ResultSetColumn, SelectPlan, SelectQueryType,
         TableReference, WhereTerm,
     },
     select::prepare_select_plan,
@@ -534,11 +534,11 @@ pub fn parse_where(
             bind_column_references(expr, table_references, result_columns)?;
         }
         for expr in predicates {
-            let eval_at_loop = get_rightmost_table_referenced_in_expr(&expr)?;
+            let eval_at = determine_where_to_eval_expr(&expr)?;
             out_where_clause.push(WhereTerm {
                 expr,
                 from_outer_join: false,
-                eval_at_loop,
+                eval_at,
             });
         }
         Ok(())
@@ -554,48 +554,115 @@ pub fn parse_where(
   and it needs to be the rightmost table referenced in the expression, because otherwise
   the condition would be evaluated before a row is read from that table.
 */
-fn get_rightmost_table_referenced_in_expr<'a>(predicate: &'a ast::Expr) -> Result<usize> {
-    let mut max_table_idx = 0;
+fn determine_where_to_eval_expr<'a>(predicate: &'a ast::Expr) -> Result<EvalAt> {
+    let mut eval_at: EvalAt = EvalAt::BeforeLoop;
     match predicate {
         ast::Expr::Binary(e1, _, e2) => {
-            max_table_idx = max_table_idx.max(get_rightmost_table_referenced_in_expr(e1)?);
-            max_table_idx = max_table_idx.max(get_rightmost_table_referenced_in_expr(e2)?);
+            eval_at = eval_at.max(determine_where_to_eval_expr(e1)?);
+            eval_at = eval_at.max(determine_where_to_eval_expr(e2)?);
         }
-        ast::Expr::Column { table, .. } => {
-            max_table_idx = max_table_idx.max(*table);
+        ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
+            eval_at = eval_at.max(EvalAt::Loop(*table));
         }
         ast::Expr::Id(_) => {
             /* Id referring to column will already have been rewritten as an Expr::Column */
             /* we only get here with literal 'true' or 'false' etc  */
         }
         ast::Expr::Qualified(_, _) => {
-            unreachable!("Qualified should be resolved to a Column before optimizer")
+            unreachable!("Qualified should be resolved to a Column before resolving eval_at")
         }
         ast::Expr::Literal(_) => {}
         ast::Expr::Like { lhs, rhs, .. } => {
-            max_table_idx = max_table_idx.max(get_rightmost_table_referenced_in_expr(lhs)?);
-            max_table_idx = max_table_idx.max(get_rightmost_table_referenced_in_expr(rhs)?);
+            eval_at = eval_at.max(determine_where_to_eval_expr(lhs)?);
+            eval_at = eval_at.max(determine_where_to_eval_expr(rhs)?);
         }
         ast::Expr::FunctionCall {
             args: Some(args), ..
         } => {
             for arg in args {
-                max_table_idx = max_table_idx.max(get_rightmost_table_referenced_in_expr(arg)?);
+                eval_at = eval_at.max(determine_where_to_eval_expr(arg)?);
             }
         }
         ast::Expr::InList { lhs, rhs, .. } => {
-            max_table_idx = max_table_idx.max(get_rightmost_table_referenced_in_expr(lhs)?);
+            eval_at = eval_at.max(determine_where_to_eval_expr(lhs)?);
             if let Some(rhs_list) = rhs {
                 for rhs_expr in rhs_list {
-                    max_table_idx =
-                        max_table_idx.max(get_rightmost_table_referenced_in_expr(rhs_expr)?);
+                    eval_at = eval_at.max(determine_where_to_eval_expr(rhs_expr)?);
                 }
             }
         }
-        _ => {}
+        Expr::Between {
+            lhs, start, end, ..
+        } => {
+            eval_at = eval_at.max(determine_where_to_eval_expr(lhs)?);
+            eval_at = eval_at.max(determine_where_to_eval_expr(start)?);
+            eval_at = eval_at.max(determine_where_to_eval_expr(end)?);
+        }
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            if let Some(base) = base {
+                eval_at = eval_at.max(determine_where_to_eval_expr(base)?);
+            }
+            for (when, then) in when_then_pairs {
+                eval_at = eval_at.max(determine_where_to_eval_expr(when)?);
+                eval_at = eval_at.max(determine_where_to_eval_expr(then)?);
+            }
+            if let Some(else_expr) = else_expr {
+                eval_at = eval_at.max(determine_where_to_eval_expr(else_expr)?);
+            }
+        }
+        Expr::Cast { expr, .. } => {
+            eval_at = eval_at.max(determine_where_to_eval_expr(expr)?);
+        }
+        Expr::Collate(expr, _) => {
+            eval_at = eval_at.max(determine_where_to_eval_expr(expr)?);
+        }
+        Expr::DoublyQualified(_, _, _) => {
+            unreachable!("DoublyQualified should be resolved to a Column before resolving eval_at")
+        }
+        Expr::Exists(_) => {
+            todo!("exists not supported yet")
+        }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args.as_ref().unwrap_or(&vec![]).iter() {
+                eval_at = eval_at.max(determine_where_to_eval_expr(arg)?);
+            }
+        }
+        Expr::FunctionCallStar { .. } => {}
+        Expr::InSelect { .. } => {
+            todo!("in select not supported yet")
+        }
+        Expr::InTable { .. } => {
+            todo!("in table not supported yet")
+        }
+        Expr::IsNull(expr) => {
+            eval_at = eval_at.max(determine_where_to_eval_expr(expr)?);
+        }
+        Expr::Name(_) => {}
+        Expr::NotNull(expr) => {
+            eval_at = eval_at.max(determine_where_to_eval_expr(expr)?);
+        }
+        Expr::Parenthesized(exprs) => {
+            for expr in exprs.iter() {
+                eval_at = eval_at.max(determine_where_to_eval_expr(expr)?);
+            }
+        }
+        Expr::Raise(_, _) => {
+            todo!("raise not supported yet")
+        }
+        Expr::Subquery(_) => {
+            todo!("subquery not supported yet")
+        }
+        Expr::Unary(_, expr) => {
+            eval_at = eval_at.max(determine_where_to_eval_expr(expr)?);
+        }
+        Expr::Variable(_) => {}
     }
 
-    Ok(max_table_idx)
+    Ok(eval_at)
 }
 
 fn parse_join<'a>(
@@ -679,15 +746,15 @@ fn parse_join<'a>(
                 }
                 for pred in preds {
                     let cur_table_idx = scope.tables.len() - 1;
-                    let eval_at_loop = if outer {
-                        cur_table_idx
+                    let eval_at = if outer {
+                        EvalAt::Loop(cur_table_idx)
                     } else {
-                        get_rightmost_table_referenced_in_expr(&pred)?
+                        determine_where_to_eval_expr(&pred)?
                     };
                     out_where_clause.push(WhereTerm {
                         expr: pred,
                         from_outer_join: outer,
-                        eval_at_loop,
+                        eval_at,
                     });
                 }
             }
@@ -749,15 +816,15 @@ fn parse_join<'a>(
                             is_rowid_alias: right_col.is_rowid_alias,
                         }),
                     );
-                    let eval_at_loop = if outer {
-                        cur_table_idx
+                    let eval_at = if outer {
+                        EvalAt::Loop(cur_table_idx)
                     } else {
-                        get_rightmost_table_referenced_in_expr(&expr)?
+                        determine_where_to_eval_expr(&expr)?
                     };
                     out_where_clause.push(WhereTerm {
                         expr,
                         from_outer_join: outer,
-                        eval_at_loop,
+                        eval_at,
                     });
                 }
                 using = Some(distinct_names);

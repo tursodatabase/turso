@@ -237,7 +237,7 @@ pub fn open_loop(
                 // E.g. SELECT foo FROM (SELECT bar as foo FROM t1) sub WHERE sub.foo > 10
                 for cond in predicates
                     .iter()
-                    .filter(|cond| cond.eval_at_loop == table_index)
+                    .filter(|cond| cond.should_eval_at_loop(table_index))
                 {
                     let jump_target_when_true = program.allocate_label();
                     let condition_metadata = ConditionMetadata {
@@ -311,7 +311,7 @@ pub fn open_loop(
 
                 for cond in predicates
                     .iter()
-                    .filter(|cond| cond.eval_at_loop == table_index)
+                    .filter(|cond| cond.should_eval_at_loop(table_index))
                 {
                     let jump_target_when_true = program.allocate_label();
                     let condition_metadata = ConditionMetadata {
@@ -483,7 +483,7 @@ pub fn open_loop(
                 }
                 for cond in predicates
                     .iter()
-                    .filter(|cond| cond.eval_at_loop == table_index)
+                    .filter(|cond| cond.should_eval_at_loop(table_index))
                 {
                     let jump_target_when_true = program.allocate_label();
                     let condition_metadata = ConditionMetadata {

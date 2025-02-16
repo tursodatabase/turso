@@ -11,6 +11,7 @@ use crate::vdbe::{insn::Insn, BranchOffset};
 use crate::{Result, SymbolTable};
 
 use super::aggregation::emit_ungrouped_aggregation;
+use super::expr::{translate_condition_expr, ConditionMetadata};
 use super::group_by::{emit_group_by, init_group_by, GroupByMetadata};
 use super::main_loop::{close_loop, emit_loop, init_loop, open_loop, LeftJoinMetadata, LoopLabels};
 use super::order_by::{emit_order_by, init_order_by, SortMetadata};
@@ -240,6 +241,23 @@ pub fn emit_query<'a>(
         &plan.table_references,
         &OperationMode::SELECT,
     )?;
+
+    for where_term in plan.where_clause.iter().filter(|wt| wt.is_constant()) {
+        let jump_target_when_true = program.allocate_label();
+        let condition_metadata = ConditionMetadata {
+            jump_if_condition_is_true: false,
+            jump_target_when_false: after_main_loop_label,
+            jump_target_when_true,
+        };
+        translate_condition_expr(
+            program,
+            &plan.table_references,
+            &where_term.expr,
+            condition_metadata,
+            &mut t_ctx.resolver,
+        )?;
+        program.resolve_label(jump_target_when_true, program.offset());
+    }
 
     // Set up main query execution loop
     open_loop(program, t_ctx, &plan.table_references, &plan.where_clause)?;

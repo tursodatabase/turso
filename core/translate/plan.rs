@@ -1,6 +1,7 @@
 use core::fmt;
 use limbo_sqlite3_parser::ast;
 use std::{
+    cmp::Ordering,
     fmt::{Display, Formatter},
     rc::Rc,
 };
@@ -60,10 +61,49 @@ pub struct WhereTerm {
     /// regardless of which tables it references.
     /// We also cannot e.g. short circuit the entire query in the optimizer if the condition is statically false.
     pub from_outer_join: bool,
-    /// The loop index where to evaluate the condition.
-    /// For example, in `SELECT * FROM u JOIN p WHERE u.id = 5`, the condition can already be evaluated at the first loop (idx 0),
-    /// because that is the rightmost table that it references.
-    pub eval_at_loop: usize,
+    pub eval_at: EvalAt,
+}
+
+impl WhereTerm {
+    pub fn is_constant(&self) -> bool {
+        self.eval_at == EvalAt::BeforeLoop
+    }
+
+    pub fn should_eval_at_loop(&self, loop_idx: usize) -> bool {
+        self.eval_at == EvalAt::Loop(loop_idx)
+    }
+}
+
+/// The loop index where to evaluate the condition.
+/// For example, in `SELECT * FROM u JOIN p WHERE u.id = 5`, the condition can already be evaluated at the first loop (idx 0),
+/// because that is the rightmost table that it references.
+///
+/// Conditions like 1=2 can be evaluated before the main loop is opened, because they are constant.
+/// In theory we should be able to statically analyze them all and reduce them to a single boolean value,
+/// but that is not implemented yet.
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
+pub enum EvalAt {
+    Loop(usize),
+    BeforeLoop,
+}
+
+#[allow(clippy::non_canonical_partial_ord_impl)]
+impl PartialOrd for EvalAt {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        match (self, other) {
+            (EvalAt::Loop(a), EvalAt::Loop(b)) => a.partial_cmp(b),
+            (EvalAt::BeforeLoop, EvalAt::BeforeLoop) => Some(Ordering::Equal),
+            (EvalAt::BeforeLoop, _) => Some(Ordering::Less),
+            (_, EvalAt::BeforeLoop) => Some(Ordering::Greater),
+        }
+    }
+}
+
+impl Ord for EvalAt {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other)
+            .expect("total ordering not implemented for EvalAt")
+    }
 }
 
 /// A query plan is either a SELECT or a DELETE (for now)
