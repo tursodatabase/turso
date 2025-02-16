@@ -14,8 +14,8 @@ plugins {
     id("com.diffplug.spotless") version "6.13.0"
 }
 
-group = "org.github.tursodatabase"
-version = "0.0.1-SNAPSHOT"
+group = properties["projectGroup"]!!
+version = properties["projectVersion"]!!
 
 java {
     sourceCompatibility = JavaVersion.VERSION_1_8
@@ -26,7 +26,7 @@ publishing {
     publications {
         create<MavenPublication>("mavenJava") {
             from(components["java"])
-            groupId = "org.github.tursodatabase"
+            groupId = "tech.turso"
             artifactId = "limbo"
             version = "0.0.1-SNAPSHOT"
         }
@@ -60,6 +60,14 @@ application {
 tasks.jar {
     from("libs") {
         into("libs")
+    }
+}
+
+sourceSets {
+    test {
+        resources {
+            file("src/main/resource/limbo-jdbc.properties")
+        }
     }
 }
 
@@ -118,10 +126,10 @@ tasks.withType<JavaCompile> {
         disableAllChecks = true
         check("NullAway", CheckSeverity.ERROR)
 
-        option("NullAway:AnnotatedPackages", "org.github.tursodatabase")
+        option("NullAway:AnnotatedPackages", "tech.turso")
         option(
             "NullAway:CustomNullableAnnotations",
-            "org.github.tursodatabase.annotations.Nullable,org.github.tursodatabase.annotations.SkipNullableCheck"
+            "tech.turso.annotations.Nullable,tech.turso.annotations.SkipNullableCheck"
         )
     }
     if (name.lowercase().contains("test")) {

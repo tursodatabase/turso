@@ -1,13 +1,13 @@
 use super::{Buffer, Completion, File, OpenFlags, IO};
 use crate::Result;
 
-use log::debug;
 use std::{
     cell::{Cell, RefCell, UnsafeCell},
     collections::BTreeMap,
     rc::Rc,
     sync::Arc,
 };
+use tracing::debug;
 
 pub struct MemoryIO {
     pages: UnsafeCell<BTreeMap<usize, MemPage>>,
@@ -78,11 +78,8 @@ impl File for MemoryFile {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: Rc<Completion>) -> Result<()> {
-        let r = match &*c {
-            Completion::Read(r) => r,
-            _ => unreachable!(),
-        };
+    fn pread(&self, pos: usize, c: Completion) -> Result<()> {
+        let r = c.as_read();
         let buf_len = r.buf().len();
         if buf_len == 0 {
             c.complete(0);
@@ -122,7 +119,7 @@ impl File for MemoryFile {
         Ok(())
     }
 
-    fn pwrite(&self, pos: usize, buffer: Rc<RefCell<Buffer>>, c: Rc<Completion>) -> Result<()> {
+    fn pwrite(&self, pos: usize, buffer: Rc<RefCell<Buffer>>, c: Completion) -> Result<()> {
         let buf = buffer.borrow();
         let buf_len = buf.len();
         if buf_len == 0 {
@@ -159,7 +156,7 @@ impl File for MemoryFile {
         Ok(())
     }
 
-    fn sync(&self, c: Rc<Completion>) -> Result<()> {
+    fn sync(&self, c: Completion) -> Result<()> {
         // no-op
         c.complete(0);
         Ok(())

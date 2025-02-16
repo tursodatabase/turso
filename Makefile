@@ -71,7 +71,7 @@ test-extensions: limbo
 .PHONY: test-extensions
 
 test-shell: limbo 
-	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/shelltests.py
+	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/cli_tests/cli_test_cases.py
 .PHONY: test-shell
 
 test-compat:
@@ -93,3 +93,7 @@ test-sqlite3: limbo-c
 test-json:
 	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/json.test
 .PHONY: test-json
+
+clickbench:
+	./perf/clickbench/benchmark.sh
+.PHONY: clickbench

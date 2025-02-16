@@ -1,5 +1,5 @@
-use log::{debug, trace};
 use std::collections::HashMap;
+use tracing::{debug, trace};
 
 use parking_lot::RwLock;
 use std::fmt::Formatter;
@@ -630,7 +630,7 @@ impl Wal for WalFile {
                             *syncing.borrow_mut() = false;
                         }),
                     });
-                    shared.file.sync(Rc::new(completion))?;
+                    shared.file.sync(completion)?;
                 }
                 self.sync_state.replace(SyncState::Syncing);
                 Ok(CheckpointStatus::IO)
@@ -720,7 +720,7 @@ impl WalFileShared {
                 Ok(header) => header,
                 Err(err) => panic!("Couldn't read header page: {:?}", err),
             };
-            log::info!("recover not implemented yet");
+            tracing::info!("recover not implemented yet");
             // TODO: Return a completion instead.
             io.run_once()?;
             wal_header

@@ -44,7 +44,7 @@ pub fn to_limbo_statement(ptr: jlong) -> Result<&'static mut LimboStatement> {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_github_tursodatabase_core_LimboStatement_step<'local>(
+pub extern "system" fn Java_tech_turso_core_LimboStatement_step<'local>(
     mut env: JNIEnv<'local>,
     obj: JObject<'local>,
     stmt_ptr: jlong,
@@ -90,7 +90,7 @@ pub extern "system" fn Java_org_github_tursodatabase_core_LimboStatement_step<'l
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_github_tursodatabase_core_LimboStatement__1close<'local>(
+pub extern "system" fn Java_tech_turso_core_LimboStatement__1close<'local>(
     _env: JNIEnv<'local>,
     _obj: JObject<'local>,
     stmt_ptr: jlong,
@@ -102,10 +102,9 @@ fn row_to_obj_array<'local>(
     env: &mut JNIEnv<'local>,
     row: &limbo_core::Row,
 ) -> Result<JObject<'local>> {
-    let obj_array =
-        env.new_object_array(row.values.len() as i32, "java/lang/Object", JObject::null())?;
+    let obj_array = env.new_object_array(row.len() as i32, "java/lang/Object", JObject::null())?;
 
-    for (i, value) in row.values.iter().enumerate() {
+    for (i, value) in row.get_values().iter().enumerate() {
         let value = value.to_value();
         let obj = match value {
             limbo_core::Value::Null => JObject::null(),
@@ -127,7 +126,7 @@ fn row_to_obj_array<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_github_tursodatabase_core_LimboStatement_columns<'local>(
+pub extern "system" fn Java_tech_turso_core_LimboStatement_columns<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject<'local>,
     stmt_ptr: jlong,
@@ -139,18 +138,17 @@ pub extern "system" fn Java_org_github_tursodatabase_core_LimboStatement_columns
         .unwrap();
 
     for i in 0..num_columns {
-        if let Some(column_name) = stmt.stmt.get_column_name(i) {
-            let str = env.new_string(column_name).unwrap();
-            env.set_object_array_element(&obj_arr, i as i32, str)
-                .unwrap();
-        }
+        let column_name = stmt.stmt.get_column_name(i);
+        let str = env.new_string(column_name.as_str()).unwrap();
+        env.set_object_array_element(&obj_arr, i as i32, str)
+            .unwrap();
     }
 
     obj_arr.into()
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_github_tursodatabase_core_LimboStatement_bindNull<'local>(
+pub extern "system" fn Java_tech_turso_core_LimboStatement_bindNull<'local>(
     mut env: JNIEnv<'local>,
     obj: JObject<'local>,
     stmt_ptr: jlong,
@@ -170,7 +168,7 @@ pub extern "system" fn Java_org_github_tursodatabase_core_LimboStatement_bindNul
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_github_tursodatabase_core_LimboStatement_bindLong<'local>(
+pub extern "system" fn Java_tech_turso_core_LimboStatement_bindLong<'local>(
     mut env: JNIEnv<'local>,
     obj: JObject<'local>,
     stmt_ptr: jlong,
@@ -193,7 +191,7 @@ pub extern "system" fn Java_org_github_tursodatabase_core_LimboStatement_bindLon
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_github_tursodatabase_core_LimboStatement_bindDouble<'local>(
+pub extern "system" fn Java_tech_turso_core_LimboStatement_bindDouble<'local>(
     mut env: JNIEnv<'local>,
     obj: JObject<'local>,
     stmt_ptr: jlong,
@@ -216,7 +214,7 @@ pub extern "system" fn Java_org_github_tursodatabase_core_LimboStatement_bindDou
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_github_tursodatabase_core_LimboStatement_bindText<'local>(
+pub extern "system" fn Java_tech_turso_core_LimboStatement_bindText<'local>(
     mut env: JNIEnv<'local>,
     obj: JObject<'local>,
     stmt_ptr: jlong,
@@ -244,7 +242,7 @@ pub extern "system" fn Java_org_github_tursodatabase_core_LimboStatement_bindTex
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_github_tursodatabase_core_LimboStatement_bindBlob<'local>(
+pub extern "system" fn Java_tech_turso_core_LimboStatement_bindBlob<'local>(
     mut env: JNIEnv<'local>,
     obj: JObject<'local>,
     stmt_ptr: jlong,
@@ -296,16 +294,12 @@ fn to_limbo_step_result<'local>(
     if let Some(res) = result {
         ctor_args.push(JValue::Object(&res));
         env.new_object(
-            "org/github/tursodatabase/core/LimboStepResult",
+            "tech/turso/core/LimboStepResult",
             "(I[Ljava/lang/Object;)V",
             &ctor_args,
         )
     } else {
-        env.new_object(
-            "org/github/tursodatabase/core/LimboStepResult",
-            "(I)V",
-            &ctor_args,
-        )
+        env.new_object("tech/turso/core/LimboStepResult", "(I)V", &ctor_args)
     }
     .unwrap_or_else(|_| JObject::null())
 }

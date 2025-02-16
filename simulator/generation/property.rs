@@ -3,10 +3,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     model::{
-        query::{Create, Delete, Distinctness, Insert, Predicate, Query, Select},
+        query::{
+            select::{Distinctness, Predicate, ResultColumn},
+            Create, Delete, Drop, Insert, Query, Select,
+        },
         table::Value,
     },
-    runner::env::SimulatorEnv,
+    runner::env::{SimulatorEnv, SimulatorEnvTrait},
 };
 
 use super::{
@@ -94,6 +97,34 @@ pub(crate) enum Property {
         predicate: Predicate,
         queries: Vec<Query>,
     },
+    // Drop-Select is a property in which selecting from a dropped table
+    // should result in an error.
+    // The execution of the property is as follows
+    //     DROP TABLE <t>
+    //     I_0
+    //     I_1
+    //     ...
+    //     I_n
+    //     SELECT * FROM <t> WHERE <predicate> -> Error
+    // The interactions in the middle has the following constraints;
+    // - There will be no errors in the middle interactions.
+    // - The table `t` will not be created, no table will be renamed to `t`.
+    DropSelect {
+        table: String,
+        queries: Vec<Query>,
+        select: Select,
+    },
+    // Select-Select-Optimizer is a property in which we test the optimizer by
+    // running two equivalent select queries, one with `SELECT <predicate> from <t>`
+    // and the other with `SELECT * from <t> WHERE <predicate>`. As highlighted by
+    // Rigger et al. in Non-Optimizing Reference Engine Construction(NoREC), SQLite
+    // tends to optimize `where` statements while keeping the result column expressions
+    // unoptimized. This property is used to test the optimizer. The property is successful
+    // if the two queries return the same number of rows.
+    SelectSelectOptimizer {
+        table: String,
+        predicate: Predicate,
+    },
 }
 
 impl Property {
@@ -103,6 +134,8 @@ impl Property {
             Property::DoubleCreateFailure { .. } => "Double-Create-Failure".to_string(),
             Property::SelectLimit { .. } => "Select-Limit".to_string(),
             Property::DeleteSelect { .. } => "Delete-Select".to_string(),
+            Property::DropSelect { .. } => "Drop-Select".to_string(),
+            Property::SelectSelectOptimizer { .. } => "Select-Select-Optimizer".to_string(),
         }
     }
     /// interactions construct a list of interactions, which is an executable representation of the property.
@@ -137,8 +170,8 @@ impl Property {
                     message: format!("table {} exists", insert.table()),
                     func: Box::new({
                         let table_name = table.clone();
-                        move |_: &Vec<ResultSet>, env: &SimulatorEnv| {
-                            Ok(env.tables.iter().any(|t| t.name == table_name))
+                        move |_: &Vec<ResultSet>, env: &dyn SimulatorEnvTrait| {
+                            Ok(env.tables().iter().any(|t| t.name == table_name))
                         }
                     }),
                 });
@@ -149,7 +182,7 @@ impl Property {
                         row.iter().map(|v| v.to_string()).collect::<Vec<String>>(),
                         insert.table(),
                     ),
-                    func: Box::new(move |stack: &Vec<ResultSet>, _: &SimulatorEnv| {
+                    func: Box::new(move |stack: &Vec<ResultSet>, _: &dyn SimulatorEnvTrait| {
                         let rows = stack.last().unwrap();
                         match rows {
                             Ok(rows) => Ok(rows.iter().any(|r| r == &row)),
@@ -173,8 +206,8 @@ impl Property {
                 let assumption = Interaction::Assumption(Assertion {
                     message: "Double-Create-Failure should not be called on an existing table"
                         .to_string(),
-                    func: Box::new(move |_: &Vec<ResultSet>, env: &SimulatorEnv| {
-                        Ok(!env.tables.iter().any(|t| t.name == table_name))
+                    func: Box::new(move |_: &Vec<ResultSet>, env: &dyn SimulatorEnvTrait| {
+                        Ok(!env.tables().iter().any(|t| t.name == table_name))
                     }),
                 });
 
@@ -187,7 +220,7 @@ impl Property {
                     message:
                         "creating two tables with the name should result in a failure for the second query"
                             .to_string(),
-                    func: Box::new(move |stack: &Vec<ResultSet>, _: &SimulatorEnv| {
+                    func: Box::new(move |stack: &Vec<ResultSet>, _: &dyn SimulatorEnvTrait| {
                         let last = stack.last().unwrap();
                         match last {
                             Ok(_) => Ok(false),
@@ -212,8 +245,8 @@ impl Property {
                     message: format!("table {} exists", table_name),
                     func: Box::new({
                         let table_name = table_name.clone();
-                        move |_: &Vec<ResultSet>, env: &SimulatorEnv| {
-                            Ok(env.tables.iter().any(|t| t.name == table_name))
+                        move |_: &Vec<ResultSet>, env: &dyn SimulatorEnvTrait| {
+                            Ok(env.tables().iter().any(|t| t.name == table_name))
                         }
                     }),
                 });
@@ -224,7 +257,7 @@ impl Property {
 
                 let assertion = Interaction::Assertion(Assertion {
                     message: "select query should respect the limit clause".to_string(),
-                    func: Box::new(move |stack: &Vec<ResultSet>, _: &SimulatorEnv| {
+                    func: Box::new(move |stack: &Vec<ResultSet>, _: &dyn SimulatorEnvTrait| {
                         let last = stack.last().unwrap();
                         match last {
                             Ok(rows) => Ok(limit >= rows.len()),
@@ -248,8 +281,8 @@ impl Property {
                     message: format!("table {} exists", table),
                     func: Box::new({
                         let table = table.clone();
-                        move |_: &Vec<ResultSet>, env: &SimulatorEnv| {
-                            Ok(env.tables.iter().any(|t| t.name == table))
+                        move |_: &Vec<ResultSet>, env: &dyn SimulatorEnvTrait| {
+                            Ok(env.tables().iter().any(|t| t.name == table))
                         }
                     }),
                 });
@@ -259,7 +292,7 @@ impl Property {
                         "select '{}' should return no values for table '{}'",
                         predicate, table,
                     ),
-                    func: Box::new(move |stack: &Vec<ResultSet>, _: &SimulatorEnv| {
+                    func: Box::new(move |stack: &Vec<ResultSet>, _: &dyn SimulatorEnvTrait| {
                         let rows = stack.last().unwrap();
                         match rows {
                             Ok(rows) => Ok(rows.is_empty()),
@@ -275,6 +308,7 @@ impl Property {
 
                 let select = Interaction::Query(Query::Select(Select {
                     table: table.clone(),
+                    result_columns: vec![ResultColumn::Star],
                     predicate: predicate.clone(),
                     limit: None,
                     distinct: Distinctness::All,
@@ -289,6 +323,117 @@ impl Property {
 
                 interactions
             }
+            Property::DropSelect {
+                table,
+                queries,
+                select,
+            } => {
+                let assumption = Interaction::Assumption(Assertion {
+                    message: format!("table {} exists", table),
+                    func: Box::new({
+                        let table = table.clone();
+                        move |_: &Vec<ResultSet>, env: &dyn SimulatorEnvTrait| {
+                            Ok(env.tables().iter().any(|t| t.name == table))
+                        }
+                    }),
+                });
+
+                let table_name = table.clone();
+
+                let assertion = Interaction::Assertion(Assertion {
+                    message: format!(
+                        "select query should result in an error for table '{}'",
+                        table
+                    ),
+                    func: Box::new(move |stack: &Vec<ResultSet>, _: &dyn SimulatorEnvTrait| {
+                        let last = stack.last().unwrap();
+                        match last {
+                            Ok(_) => Ok(false),
+                            Err(e) => Ok(e
+                                .to_string()
+                                .contains(&format!("Table {table_name} does not exist"))),
+                        }
+                    }),
+                });
+
+                let drop = Interaction::Query(Query::Drop(Drop {
+                    table: table.clone(),
+                }));
+
+                let select = Interaction::Query(Query::Select(select.clone()));
+
+                let mut interactions = Vec::new();
+
+                interactions.push(assumption);
+                interactions.push(drop);
+                interactions.extend(queries.clone().into_iter().map(Interaction::Query));
+                interactions.push(select);
+                interactions.push(assertion);
+
+                interactions
+            }
+            Property::SelectSelectOptimizer { table, predicate } => {
+                let assumption = Interaction::Assumption(Assertion {
+                    message: format!("table {} exists", table),
+                    func: Box::new({
+                        let table = table.clone();
+                        move |_: &Vec<ResultSet>, env: &dyn SimulatorEnvTrait| {
+                            Ok(env.tables().iter().any(|t| t.name == table))
+                        }
+                    }),
+                });
+
+                let select1 = Interaction::Query(Query::Select(Select {
+                    table: table.clone(),
+                    result_columns: vec![ResultColumn::Expr(predicate.clone())],
+                    predicate: Predicate::true_(),
+                    limit: None,
+                    distinct: Distinctness::All,
+                }));
+
+                let select2 = Interaction::Query(Query::Select(Select {
+                    table: table.clone(),
+                    result_columns: vec![ResultColumn::Star],
+                    predicate: predicate.clone(),
+                    limit: None,
+                    distinct: Distinctness::All,
+                }));
+
+                let assertion = Interaction::Assertion(Assertion {
+                    message: "select queries should return the same amount of results".to_string(),
+                    func: Box::new(move |stack: &Vec<ResultSet>, _: &dyn SimulatorEnvTrait| {
+                        let select_star = stack.last().unwrap();
+                        let select_predicate = stack.get(stack.len() - 2).unwrap();
+                        match (select_predicate, select_star) {
+                            (Ok(rows1), Ok(rows2)) => {
+                                // If rows1 results have more than 1 column, there is a problem
+                                if rows1.iter().find(|vs| vs.len() > 1).is_some() {
+                                    return Err(LimboError::InternalError(
+                                        "Select query without the star should return only one column".to_string(),
+                                    ));
+                                }
+                                // Count the 1s in the select query without the star
+                                let rows1 = rows1
+                                    .iter()
+                                    .filter(|vs| {
+                                        let v = vs.first().unwrap();
+                                        if let Value::Integer(i) = v {
+                                            *i == 1
+                                        } else {
+                                            false
+                                        }
+                                    })
+                                    .count();
+
+                                Ok(rows1 == rows2.len())
+                            }
+                            _ => Ok(false),
+                        }
+                    }),
+                });
+
+                vec![assumption, select1, select2, assertion]
+            }
         }
     }
 }
@@ -298,6 +443,8 @@ pub(crate) struct Remaining {
     pub(crate) read: f64,
     pub(crate) write: f64,
     pub(crate) create: f64,
+    pub(crate) delete: f64,
+    pub(crate) drop: f64,
 }
 
 pub(crate) fn remaining(env: &SimulatorEnv, stats: &InteractionStats) -> Remaining {
@@ -310,11 +457,19 @@ pub(crate) fn remaining(env: &SimulatorEnv, stats: &InteractionStats) -> Remaini
     let remaining_create = ((env.opts.max_interactions as f64 * env.opts.create_percent / 100.0)
         - (stats.create_count as f64))
         .max(0.0);
+    let remaining_delete = ((env.opts.max_interactions as f64 * env.opts.delete_percent / 100.0)
+        - (stats.delete_count as f64))
+        .max(0.0);
+    let remaining_drop = ((env.opts.max_interactions as f64 * env.opts.drop_percent / 100.0)
+        - (stats.drop_count as f64))
+        .max(0.0);
 
     Remaining {
         read: remaining_read,
         write: remaining_write,
         create: remaining_create,
+        delete: remaining_delete,
+        drop: remaining_drop,
     }
 }
 
@@ -373,6 +528,7 @@ fn property_insert_values_select<R: rand::Rng>(
     // Select the row
     let select_query = Select {
         table: table.name.clone(),
+        result_columns: vec![ResultColumn::Star],
         predicate: Predicate::arbitrary_from(rng, (table, &row)),
         limit: None,
         distinct: Distinctness::All,
@@ -392,6 +548,7 @@ fn property_select_limit<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Prope
     // Select the table
     let select = Select {
         table: table.name.clone(),
+        result_columns: vec![ResultColumn::Star],
         predicate: Predicate::arbitrary_from(rng, table),
         limit: Some(rng.gen_range(1..=5)),
         distinct: Distinctness::All,
@@ -479,6 +636,60 @@ fn property_delete_select<R: rand::Rng>(
         queries,
     }
 }
+
+fn property_drop_select<R: rand::Rng>(
+    rng: &mut R,
+    env: &SimulatorEnv,
+    remaining: &Remaining,
+) -> Property {
+    // Get a random table
+    let table = pick(&env.tables, rng);
+
+    // Create random queries respecting the constraints
+    let mut queries = Vec::new();
+    // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
+    // - [-] The table `t` will not be created, no table will be renamed to `t`. (todo: update this constraint once ALTER is implemented)
+    for _ in 0..rng.gen_range(0..3) {
+        let query = Query::arbitrary_from(rng, (env, remaining));
+        match &query {
+            Query::Create(Create { table: t }) => {
+                // - The table `t` will not be created
+                if t.name == table.name {
+                    continue;
+                }
+            }
+            _ => (),
+        }
+        queries.push(query);
+    }
+
+    let select = Select {
+        table: table.name.clone(),
+        result_columns: vec![ResultColumn::Star],
+        predicate: Predicate::arbitrary_from(rng, table),
+        limit: None,
+        distinct: Distinctness::All,
+    };
+
+    Property::DropSelect {
+        table: table.name.clone(),
+        queries,
+        select,
+    }
+}
+
+fn property_select_select_optimizer<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Property {
+    // Get a random table
+    let table = pick(&env.tables, rng);
+    // Generate a random predicate
+    let predicate = Predicate::arbitrary_from(rng, table);
+
+    Property::SelectSelectOptimizer {
+        table: table.name.clone(),
+        predicate,
+    }
+}
+
 impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
     fn arbitrary_from<R: rand::Rng>(
         rng: &mut R,
@@ -502,6 +713,15 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
                 (
                     f64::min(remaining_.read, remaining_.write),
                     Box::new(|rng: &mut R| property_delete_select(rng, env, &remaining_)),
+                ),
+                (
+                    // remaining_.drop,
+                    0.0,
+                    Box::new(|rng: &mut R| property_drop_select(rng, env, &remaining_)),
+                ),
+                (
+                    remaining_.read / 2.0,
+                    Box::new(|rng: &mut R| property_select_select_optimizer(rng, env)),
                 ),
             ],
             rng,

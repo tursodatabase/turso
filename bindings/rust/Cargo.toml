@@ -1,7 +1,7 @@
 # Copyright 2025 the Limbo authors. All rights reserved. MIT license.
 
 [package]
-name = "limbo_libsql"
+name = "limbo"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -9,7 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-limbo_core = { path = "../../core" }
+limbo_core = { workspace = true, features = ["io_uring"] }
 thiserror = "2.0.9"
 
 [dev-dependencies]

@@ -9,7 +9,7 @@ mod json;
 pub mod mvcc;
 mod parameters;
 mod pseudo;
-mod result;
+pub mod result;
 mod schema;
 mod storage;
 mod translate;
@@ -28,10 +28,10 @@ use libloading::{Library, Symbol};
 #[cfg(not(target_family = "wasm"))]
 use limbo_ext::{ExtensionApi, ExtensionEntryPoint};
 use limbo_ext::{ResultCode, VTabModuleImpl, Value as ExtValue};
-use log::trace;
+use limbo_sqlite3_parser::{ast, ast::Cmd, lexer::sql::Parser};
 use parking_lot::RwLock;
 use schema::{Column, Schema};
-use sqlite3_parser::{ast, ast::Cmd, lexer::sql::Parser};
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::num::NonZero;
@@ -42,7 +42,9 @@ use storage::btree::btree_init_page;
 use storage::database::FileStorage;
 use storage::page_cache::DumbLruPageCache;
 use storage::pager::allocate_page;
+pub use storage::pager::PageRef;
 use storage::sqlite3_ondisk::{DatabaseHeader, DATABASE_HEADER_SIZE};
+pub use storage::wal::CheckpointMode;
 pub use storage::wal::WalFile;
 pub use storage::wal::WalFileShared;
 use types::OwnedValue;
@@ -159,6 +161,7 @@ impl Database {
             pager,
             schema: schema.clone(),
             header,
+            auto_commit: RefCell::new(true),
             transaction_state: RefCell::new(TransactionState::None),
             last_insert_rowid: Cell::new(0),
             last_change: Cell::new(0),
@@ -177,6 +180,7 @@ impl Database {
             schema: self.schema.clone(),
             header: self.header.clone(),
             last_insert_rowid: Cell::new(0),
+            auto_commit: RefCell::new(true),
             transaction_state: RefCell::new(TransactionState::None),
             last_change: Cell::new(0),
             total_changes: Cell::new(0),
@@ -238,7 +242,7 @@ pub fn maybe_init_database_file(file: &Rc<dyn File>, io: &Arc<dyn IO>) -> Result
                 let completion = Completion::Write(WriteCompletion::new(Box::new(move |_| {
                     *flag_complete.borrow_mut() = true;
                 })));
-                file.pwrite(0, contents.buffer.clone(), Rc::new(completion))?;
+                file.pwrite(0, contents.buffer.clone(), completion)?;
             }
             let mut limit = 100;
             loop {
@@ -261,6 +265,7 @@ pub struct Connection {
     pager: Rc<Pager>,
     schema: Rc<RefCell<Schema>>,
     header: Rc<RefCell<DatabaseHeader>>,
+    auto_commit: RefCell<bool>,
     transaction_state: RefCell<TransactionState>,
     last_insert_rowid: Cell<u64>,
     last_change: Cell<i64>,
@@ -270,7 +275,7 @@ pub struct Connection {
 impl Connection {
     pub fn prepare(self: &Rc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         let sql = sql.as_ref();
-        trace!("Preparing: {}", sql);
+        tracing::trace!("Preparing: {}", sql);
         let db = &self.db;
         let mut parser = Parser::new(sql.as_bytes());
         let syms = &db.syms.borrow();
@@ -299,7 +304,7 @@ impl Connection {
 
     pub fn query(self: &Rc<Connection>, sql: impl AsRef<str>) -> Result<Option<Statement>> {
         let sql = sql.as_ref();
-        trace!("Querying: {}", sql);
+        tracing::trace!("Querying: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next()?;
         match cmd {
@@ -345,6 +350,7 @@ impl Connection {
                             &self.schema.borrow(),
                             *select,
                             &self.db.syms.borrow(),
+                            None,
                         )?;
                         optimize_plan(&mut plan, &self.schema.borrow())?;
                         println!("{}", plan);
@@ -482,8 +488,12 @@ impl Statement {
         self.program.result_columns.len()
     }
 
-    pub fn get_column_name(&self, idx: usize) -> Option<&String> {
-        self.program.result_columns[idx].name(&self.program.table_references)
+    pub fn get_column_name(&self, idx: usize) -> Cow<String> {
+        let column = &self.program.result_columns[idx];
+        match column.name(&self.program.table_references) {
+            Some(name) => Cow::Borrowed(name),
+            None => Cow::Owned(column.expr.to_string()),
+        }
     }
 
     pub fn parameters(&self) -> &parameters::Parameters {

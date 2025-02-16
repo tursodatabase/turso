@@ -1,8 +1,8 @@
 use crate::{Completion, File, LimboError, OpenFlags, Result, IO};
-use log::{debug, trace};
 use std::cell::RefCell;
 use std::io::{Read, Seek, Write};
 use std::rc::Rc;
+use tracing::{debug, trace};
 
 pub struct WindowsIO {}
 
@@ -54,14 +54,11 @@ impl File for WindowsFile {
         unimplemented!()
     }
 
-    fn pread(&self, pos: usize, c: Rc<Completion>) -> Result<()> {
+    fn pread(&self, pos: usize, c: Completion) -> Result<()> {
         let mut file = self.file.borrow_mut();
         file.seek(std::io::SeekFrom::Start(pos as u64))?;
         {
-            let r = match c.as_ref() {
-                Completion::Read(r) => r,
-                _ => unreachable!(),
-            };
+            let r = c.as_read();
             let mut buf = r.buf_mut();
             let buf = buf.as_mut_slice();
             file.read_exact(buf)?;
@@ -70,12 +67,7 @@ impl File for WindowsFile {
         Ok(())
     }
 
-    fn pwrite(
-        &self,
-        pos: usize,
-        buffer: Rc<RefCell<crate::Buffer>>,
-        c: Rc<Completion>,
-    ) -> Result<()> {
+    fn pwrite(&self, pos: usize, buffer: Rc<RefCell<crate::Buffer>>, c: Completion) -> Result<()> {
         let mut file = self.file.borrow_mut();
         file.seek(std::io::SeekFrom::Start(pos as u64))?;
         let buf = buffer.borrow();
@@ -85,7 +77,7 @@ impl File for WindowsFile {
         Ok(())
     }
 
-    fn sync(&self, c: Rc<Completion>) -> Result<()> {
+    fn sync(&self, c: Completion) -> Result<()> {
         let file = self.file.borrow_mut();
         file.sync_all().map_err(LimboError::IOError)?;
         c.complete(0);

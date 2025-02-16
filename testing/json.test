@@ -637,6 +637,10 @@ do_execsql_test json_object_simple {
   SELECT json_object('key', 'value');
 } {{{"key":"value"}}}
 
+do_execsql_test json_object_f64 {
+  SELECT json_object('key', 40.7128);
+} {{{"key":40.7128}}}
+
 do_execsql_test json_object_nested {
   SELECT json_object('grandparent',json_object('parent', json_object('child', 'value')));
 } {{{"grandparent":{"parent":{"child":"value"}}}}}
@@ -759,7 +763,7 @@ do_execsql_test json-patch-add-all-dup-keys-from-patch {
         '{"z":{}, "z":5, "z":100}'
     );
 } {{{"x":100,"x":200,"z":100}}}
-do_execsql_test json-patch-first-occurance-patch {
+do_execsql_test json-patch-first-occurrence-patch {
     select json_patch('{"x":100,"x":200}','{"x":{}, "x":5, "x":100}');
 } {{{"x":100,"x":200}}}
 do_execsql_test json-patch-complex-nested-dup-keys {

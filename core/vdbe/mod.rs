@@ -55,7 +55,7 @@ use crate::{resolve_ext_path, Connection, Result, TransactionState, DATABASE_VER
 use insn::{
     exec_add, exec_and, exec_bit_and, exec_bit_not, exec_bit_or, exec_boolean_not, exec_concat,
     exec_divide, exec_multiply, exec_or, exec_remainder, exec_shift_left, exec_shift_right,
-    exec_subtract,
+    exec_subtract, Cookie,
 };
 use likeop::{construct_like_escape_arg, exec_glob, exec_like_with_escape};
 use rand::distributions::{Distribution, Uniform};
@@ -411,7 +411,6 @@ pub struct Program {
     pub comments: Option<HashMap<InsnReference, &'static str>>,
     pub parameters: crate::parameters::Parameters,
     pub connection: Weak<Connection>,
-    pub auto_commit: bool,
     pub n_change: Cell<i64>,
     pub change_cnt_on: bool,
     pub result_columns: Vec<ResultSetColumn>,
@@ -1020,7 +1019,7 @@ impl Program {
                                 state.registers[*dest] = if cursor.get_null_flag() {
                                     OwnedValue::Null
                                 } else {
-                                    record.values[*column].clone()
+                                    record.get_value(*column).clone()
                                 };
                             } else {
                                 state.registers[*dest] = OwnedValue::Null;
@@ -1029,7 +1028,7 @@ impl Program {
                         CursorType::Sorter => {
                             let cursor = get_cursor_as_sorter_mut(&mut cursors, *cursor_id);
                             if let Some(record) = cursor.record() {
-                                state.registers[*dest] = record.values[*column].clone();
+                                state.registers[*dest] = record.get_value(*column).clone();
                             } else {
                                 state.registers[*dest] = OwnedValue::Null;
                             }
@@ -1037,7 +1036,7 @@ impl Program {
                         CursorType::Pseudo(_) => {
                             let cursor = get_cursor_as_pseudo_mut(&mut cursors, *cursor_id);
                             if let Some(record) = cursor.record() {
-                                state.registers[*dest] = record.values[*column].clone();
+                                state.registers[*dest] = record.get_value(*column).clone();
                             } else {
                                 state.registers[*dest] = OwnedValue::Null;
                             }
@@ -1131,37 +1130,7 @@ impl Program {
                             )));
                         }
                     }
-                    log::trace!("Halt auto_commit {}", self.auto_commit);
-                    let connection = self
-                        .connection
-                        .upgrade()
-                        .expect("only weak ref to connection?");
-                    let current_state = connection.transaction_state.borrow().clone();
-                    if current_state == TransactionState::Read {
-                        pager.end_read_tx()?;
-                        return Ok(StepResult::Done);
-                    }
-                    return if self.auto_commit {
-                        match pager.end_tx() {
-                            Ok(crate::storage::wal::CheckpointStatus::IO) => Ok(StepResult::IO),
-                            Ok(crate::storage::wal::CheckpointStatus::Done(_)) => {
-                                if self.change_cnt_on {
-                                    if let Some(conn) = self.connection.upgrade() {
-                                        conn.set_changes(self.n_change.get());
-                                    }
-                                }
-                                Ok(StepResult::Done)
-                            }
-                            Err(e) => Err(e),
-                        }
-                    } else {
-                        if self.change_cnt_on {
-                            if let Some(conn) = self.connection.upgrade() {
-                                conn.set_changes(self.n_change.get());
-                            }
-                        }
-                        return Ok(StepResult::Done);
-                    };
+                    return self.halt(pager);
                 }
                 Insn::Transaction { write } => {
                     let connection = self.connection.upgrade().unwrap();
@@ -1177,14 +1146,14 @@ impl Program {
 
                     if updated && matches!(current_state, TransactionState::None) {
                         if let LimboResult::Busy = pager.begin_read_tx()? {
-                            log::trace!("begin_read_tx busy");
+                            tracing::trace!("begin_read_tx busy");
                             return Ok(StepResult::Busy);
                         }
                     }
 
                     if updated && matches!(new_transaction_state, TransactionState::Write) {
                         if let LimboResult::Busy = pager.begin_write_tx()? {
-                            log::trace!("begin_write_tx busy");
+                            tracing::trace!("begin_write_tx busy");
                             return Ok(StepResult::Busy);
                         }
                     }
@@ -1194,6 +1163,34 @@ impl Program {
                             .replace(new_transaction_state.clone());
                     }
                     state.pc += 1;
+                }
+                Insn::AutoCommit {
+                    auto_commit,
+                    rollback,
+                } => {
+                    let conn = self.connection.upgrade().unwrap();
+                    if *auto_commit != *conn.auto_commit.borrow() {
+                        if *rollback {
+                            todo!("Rollback is not implemented");
+                        } else {
+                            conn.auto_commit.replace(*auto_commit);
+                        }
+                    } else {
+                        if !*auto_commit {
+                            return Err(LimboError::TxError(
+                                "cannot start a transaction within a transaction".to_string(),
+                            ));
+                        } else if *rollback {
+                            return Err(LimboError::TxError(
+                                "cannot rollback - no transaction is active".to_string(),
+                            ));
+                        } else {
+                            return Err(LimboError::TxError(
+                                "cannot commit - no transaction is active".to_string(),
+                            ));
+                        }
+                    }
+                    return self.halt(pager);
                 }
                 Insn::Goto { target_pc } => {
                     assert!(target_pc.is_offset());
@@ -1234,7 +1231,7 @@ impl Program {
                     state.pc += 1;
                 }
                 Insn::String8 { value, dest } => {
-                    state.registers[*dest] = OwnedValue::build_text(Rc::new(value.into()));
+                    state.registers[*dest] = OwnedValue::build_text(value);
                     state.pc += 1;
                 }
                 Insn::Blob { value, dest } => {
@@ -1402,9 +1399,33 @@ impl Program {
                     let record_from_regs: Record =
                         make_owned_record(&state.registers, start_reg, num_regs);
                     if let Some(ref idx_record) = *cursor.record()? {
-                        // omit the rowid from the idx_record, which is the last value
-                        if idx_record.values[..idx_record.values.len() - 1]
-                            >= *record_from_regs.values
+                        // Compare against the same number of values
+                        if idx_record.get_values()[..record_from_regs.len()]
+                            >= record_from_regs.get_values()[..]
+                        {
+                            state.pc = target_pc.to_offset_int();
+                        } else {
+                            state.pc += 1;
+                        }
+                    } else {
+                        state.pc = target_pc.to_offset_int();
+                    };
+                }
+                Insn::IdxLE {
+                    cursor_id,
+                    start_reg,
+                    num_regs,
+                    target_pc,
+                } => {
+                    assert!(target_pc.is_offset());
+                    let mut cursors = state.cursors.borrow_mut();
+                    let cursor = get_cursor_as_index_mut(&mut cursors, *cursor_id);
+                    let record_from_regs: Record =
+                        make_owned_record(&state.registers, start_reg, num_regs);
+                    if let Some(ref idx_record) = *cursor.record()? {
+                        // Compare against the same number of values
+                        if idx_record.get_values()[..record_from_regs.len()]
+                            <= record_from_regs.get_values()[..]
                         {
                             state.pc = target_pc.to_offset_int();
                         } else {
@@ -1426,9 +1447,33 @@ impl Program {
                     let record_from_regs: Record =
                         make_owned_record(&state.registers, start_reg, num_regs);
                     if let Some(ref idx_record) = *cursor.record()? {
-                        // omit the rowid from the idx_record, which is the last value
-                        if idx_record.values[..idx_record.values.len() - 1]
-                            > *record_from_regs.values
+                        // Compare against the same number of values
+                        if idx_record.get_values()[..record_from_regs.len()]
+                            > record_from_regs.get_values()[..]
+                        {
+                            state.pc = target_pc.to_offset_int();
+                        } else {
+                            state.pc += 1;
+                        }
+                    } else {
+                        state.pc = target_pc.to_offset_int();
+                    };
+                }
+                Insn::IdxLT {
+                    cursor_id,
+                    start_reg,
+                    num_regs,
+                    target_pc,
+                } => {
+                    assert!(target_pc.is_offset());
+                    let mut cursors = state.cursors.borrow_mut();
+                    let cursor = get_cursor_as_index_mut(&mut cursors, *cursor_id);
+                    let record_from_regs: Record =
+                        make_owned_record(&state.registers, start_reg, num_regs);
+                    if let Some(ref idx_record) = *cursor.record()? {
+                        // Compare against the same number of values
+                        if idx_record.get_values()[..record_from_regs.len()]
+                            < record_from_regs.get_values()[..]
                         {
                             state.pc = target_pc.to_offset_int();
                         } else {
@@ -1511,11 +1556,9 @@ impl Program {
                                     }
                                 }
                             }
-                            AggFunc::GroupConcat | AggFunc::StringAgg => {
-                                OwnedValue::Agg(Box::new(AggContext::GroupConcat(
-                                    OwnedValue::build_text(Rc::new("".to_string())),
-                                )))
-                            }
+                            AggFunc::GroupConcat | AggFunc::StringAgg => OwnedValue::Agg(Box::new(
+                                AggContext::GroupConcat(OwnedValue::build_text("")),
+                            )),
                             AggFunc::External(func) => match func.as_ref() {
                                 ExtFunc::Aggregate {
                                     init,
@@ -1744,7 +1787,7 @@ impl Program {
                     order,
                 } => {
                     let order = order
-                        .values
+                        .get_values()
                         .iter()
                         .map(|v| match v {
                             OwnedValue::Integer(i) => *i == 0,
@@ -2146,19 +2189,31 @@ impl Program {
                             }
                             ScalarFunc::Trim => {
                                 let reg_value = state.registers[*start_reg].clone();
-                                let pattern_value = state.registers.get(*start_reg + 1).cloned();
+                                let pattern_value = if func.arg_count == 2 {
+                                    state.registers.get(*start_reg + 1).cloned()
+                                } else {
+                                    None
+                                };
                                 let result = exec_trim(&reg_value, pattern_value);
                                 state.registers[*dest] = result;
                             }
                             ScalarFunc::LTrim => {
                                 let reg_value = state.registers[*start_reg].clone();
-                                let pattern_value = state.registers.get(*start_reg + 1).cloned();
+                                let pattern_value = if func.arg_count == 2 {
+                                    state.registers.get(*start_reg + 1).cloned()
+                                } else {
+                                    None
+                                };
                                 let result = exec_ltrim(&reg_value, pattern_value);
                                 state.registers[*dest] = result;
                             }
                             ScalarFunc::RTrim => {
                                 let reg_value = state.registers[*start_reg].clone();
-                                let pattern_value = state.registers.get(*start_reg + 1).cloned();
+                                let pattern_value = if func.arg_count == 2 {
+                                    state.registers.get(*start_reg + 1).cloned()
+                                } else {
+                                    None
+                                };
                                 let result = exec_rtrim(&reg_value, pattern_value);
                                 state.registers[*dest] = result;
                             }
@@ -2195,7 +2250,11 @@ impl Program {
                             ScalarFunc::Substr | ScalarFunc::Substring => {
                                 let str_value = &state.registers[*start_reg];
                                 let start_value = &state.registers[*start_reg + 1];
-                                let length_value = &state.registers[*start_reg + 2];
+                                let length_value = if func.arg_count == 3 {
+                                    Some(&state.registers[*start_reg + 2])
+                                } else {
+                                    None
+                                };
                                 let result = exec_substring(str_value, start_value, length_value);
                                 state.registers[*dest] = result;
                             }
@@ -2222,18 +2281,15 @@ impl Program {
                             }
                             ScalarFunc::JulianDay => {
                                 if *start_reg == 0 {
-                                    let julianday: String = exec_julianday(
-                                        &OwnedValue::build_text(Rc::new("now".to_string())),
-                                    )?;
-                                    state.registers[*dest] =
-                                        OwnedValue::build_text(Rc::new(julianday));
+                                    let julianday: String =
+                                        exec_julianday(&OwnedValue::build_text("now"))?;
+                                    state.registers[*dest] = OwnedValue::build_text(&julianday);
                                 } else {
                                     let datetime_value = &state.registers[*start_reg];
                                     let julianday = exec_julianday(datetime_value);
                                     match julianday {
                                         Ok(time) => {
-                                            state.registers[*dest] =
-                                                OwnedValue::build_text(Rc::new(time))
+                                            state.registers[*dest] = OwnedValue::build_text(&time)
                                         }
                                         Err(e) => {
                                             return Err(LimboError::ParseError(format!(
@@ -2246,18 +2302,15 @@ impl Program {
                             }
                             ScalarFunc::UnixEpoch => {
                                 if *start_reg == 0 {
-                                    let unixepoch: String = exec_unixepoch(
-                                        &OwnedValue::build_text(Rc::new("now".to_string())),
-                                    )?;
-                                    state.registers[*dest] =
-                                        OwnedValue::build_text(Rc::new(unixepoch));
+                                    let unixepoch: String =
+                                        exec_unixepoch(&OwnedValue::build_text("now"))?;
+                                    state.registers[*dest] = OwnedValue::build_text(&unixepoch);
                                 } else {
                                     let datetime_value = &state.registers[*start_reg];
                                     let unixepoch = exec_unixepoch(datetime_value);
                                     match unixepoch {
                                         Ok(time) => {
-                                            state.registers[*dest] =
-                                                OwnedValue::build_text(Rc::new(time))
+                                            state.registers[*dest] = OwnedValue::build_text(&time)
                                         }
                                         Err(e) => {
                                             return Err(LimboError::ParseError(format!(
@@ -2272,7 +2325,7 @@ impl Program {
                                 let version_integer: i64 =
                                     DATABASE_VERSION.get().unwrap().parse()?;
                                 let version = execute_sqlite_version(version_integer);
-                                state.registers[*dest] = OwnedValue::build_text(Rc::new(version));
+                                state.registers[*dest] = OwnedValue::build_text(&version);
                             }
                             ScalarFunc::SqliteSourceId => {
                                 let src_id = format!(
@@ -2280,7 +2333,7 @@ impl Program {
                                     info::build::BUILT_TIME_SQLITE,
                                     info::build::GIT_COMMIT_HASH.unwrap_or("unknown")
                                 );
-                                state.registers[*dest] = OwnedValue::build_text(Rc::new(src_id));
+                                state.registers[*dest] = OwnedValue::build_text(&src_id);
                             }
                             ScalarFunc::Replace => {
                                 assert_eq!(arg_count, 3);
@@ -2425,7 +2478,7 @@ impl Program {
                         let pc: u32 = pc
                             .try_into()
                             .unwrap_or_else(|_| panic!("EndCoroutine: pc overflow: {}", pc));
-                        state.pc = pc - 1; // yield jump is always next to yield. Here we substract 1 to go back to yield instruction
+                        state.pc = pc - 1; // yield jump is always next to yield. Here we subtract 1 to go back to yield instruction
                     } else {
                         unreachable!();
                     }
@@ -2703,7 +2756,7 @@ impl Program {
                         todo!("temp databases not implemented yet");
                     }
                     // SQLite returns "0" on an empty database, and 2 on the first insertion,
-                    // so we'll mimick that behavior.
+                    // so we'll mimic that behavior.
                     let mut pages = pager.db_header.borrow().database_size.into();
                     if pages == 1 {
                         pages = 0;
@@ -2724,6 +2777,18 @@ impl Program {
                     let mut schema = RefCell::borrow_mut(&conn.schema);
                     // TODO: This function below is synchronous, make it not async
                     parse_schema_rows(Some(stmt), &mut schema, conn.pager.io.clone())?;
+                    state.pc += 1;
+                }
+                Insn::ReadCookie { db, dest, cookie } => {
+                    if *db > 0 {
+                        // TODO: implement temp databases
+                        todo!("temp databases not implemented yet");
+                    }
+                    let cookie_value = match cookie {
+                        Cookie::UserVersion => pager.db_header.borrow().user_version.into(),
+                        cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
+                    };
+                    state.registers[*dest] = OwnedValue::Integer(cookie_value);
                     state.pc += 1;
                 }
                 Insn::ShiftRight { lhs, rhs, dest } => {
@@ -2780,6 +2845,41 @@ impl Program {
             }
         }
     }
+
+    fn halt(&self, pager: Rc<Pager>) -> Result<StepResult> {
+        let connection = self
+            .connection
+            .upgrade()
+            .expect("only weak ref to connection?");
+        let auto_commit = *connection.auto_commit.borrow();
+        tracing::trace!("Halt auto_commit {}", auto_commit);
+        return if auto_commit {
+            let current_state = connection.transaction_state.borrow().clone();
+            if current_state == TransactionState::Read {
+                pager.end_read_tx()?;
+                return Ok(StepResult::Done);
+            }
+            match pager.end_tx() {
+                Ok(crate::storage::wal::CheckpointStatus::IO) => Ok(StepResult::IO),
+                Ok(crate::storage::wal::CheckpointStatus::Done(_)) => {
+                    if self.change_cnt_on {
+                        if let Some(conn) = self.connection.upgrade() {
+                            conn.set_changes(self.n_change.get());
+                        }
+                    }
+                    Ok(StepResult::Done)
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            if self.change_cnt_on {
+                if let Some(conn) = self.connection.upgrade() {
+                    conn.set_changes(self.n_change.get());
+                }
+            }
+            return Ok(StepResult::Done);
+        };
+    }
 }
 
 fn get_new_rowid<R: Rng>(cursor: &mut BTreeCursor, mut rng: R) -> Result<CursorResult<i64>> {
@@ -2824,10 +2924,10 @@ fn make_owned_record(registers: &[OwnedValue], start_reg: &usize, count: &usize)
 }
 
 fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
-    if !log::log_enabled!(log::Level::Trace) {
+    if !tracing::enabled!(tracing::Level::TRACE) {
         return;
     }
-    log::trace!(
+    tracing::trace!(
         "{}",
         explain::insn_to_str(
             program,
@@ -2880,7 +2980,7 @@ fn get_indent_count(indent_count: usize, curr_insn: &Insn, prev_insn: Option<&In
 
 fn exec_lower(reg: &OwnedValue) -> Option<OwnedValue> {
     match reg {
-        OwnedValue::Text(t) => Some(OwnedValue::build_text(Rc::new(t.as_str().to_lowercase()))),
+        OwnedValue::Text(t) => Some(OwnedValue::build_text(&t.as_str().to_lowercase())),
         t => Some(t.to_owned()),
     }
 }
@@ -2909,7 +3009,7 @@ fn exec_octet_length(reg: &OwnedValue) -> OwnedValue {
 
 fn exec_upper(reg: &OwnedValue) -> Option<OwnedValue> {
     match reg {
-        OwnedValue::Text(t) => Some(OwnedValue::build_text(Rc::new(t.as_str().to_uppercase()))),
+        OwnedValue::Text(t) => Some(OwnedValue::build_text(&t.as_str().to_uppercase())),
         t => Some(t.to_owned()),
     }
 }
@@ -2927,7 +3027,7 @@ fn exec_concat_strings(registers: &[OwnedValue]) -> OwnedValue {
             OwnedValue::Record(_) => unreachable!(),
         }
     }
-    OwnedValue::build_text(Rc::new(result))
+    OwnedValue::build_text(&result)
 }
 
 fn exec_concat_ws(registers: &[OwnedValue]) -> OwnedValue {
@@ -2955,7 +3055,7 @@ fn exec_concat_ws(registers: &[OwnedValue]) -> OwnedValue {
         }
     }
 
-    OwnedValue::build_text(Rc::new(result))
+    OwnedValue::build_text(&result)
 }
 
 fn exec_sign(reg: &OwnedValue) -> Option<OwnedValue> {
@@ -3000,15 +3100,15 @@ fn exec_sign(reg: &OwnedValue) -> Option<OwnedValue> {
 /// Generates the Soundex code for a given word
 pub fn exec_soundex(reg: &OwnedValue) -> OwnedValue {
     let s = match reg {
-        OwnedValue::Null => return OwnedValue::build_text(Rc::new("?000".to_string())),
+        OwnedValue::Null => return OwnedValue::build_text("?000"),
         OwnedValue::Text(s) => {
             // return ?000 if non ASCII alphabet character is found
             if !s.as_str().chars().all(|c| c.is_ascii_alphabetic()) {
-                return OwnedValue::build_text(Rc::new("?000".to_string()));
+                return OwnedValue::build_text("?000");
             }
             s.clone()
         }
-        _ => return OwnedValue::build_text(Rc::new("?000".to_string())), // For unsupported types, return NULL
+        _ => return OwnedValue::build_text("?000"), // For unsupported types, return NULL
     };
 
     // Remove numbers and spaces
@@ -3019,7 +3119,7 @@ pub fn exec_soundex(reg: &OwnedValue) -> OwnedValue {
         .collect::<String>()
         .replace(" ", "");
     if word.is_empty() {
-        return OwnedValue::build_text(Rc::new("0000".to_string()));
+        return OwnedValue::build_text("0000");
     }
 
     let soundex_code = |c| match c {
@@ -3085,7 +3185,7 @@ pub fn exec_soundex(reg: &OwnedValue) -> OwnedValue {
 
     // Retain the first 4 characters and convert to uppercase
     result.truncate(4);
-    OwnedValue::build_text(Rc::new(result.to_uppercase()))
+    OwnedValue::build_text(&result.to_uppercase())
 }
 
 fn exec_abs(reg: &OwnedValue) -> Result<OwnedValue> {
@@ -3133,7 +3233,7 @@ fn exec_randomblob(reg: &OwnedValue) -> OwnedValue {
 
 fn exec_quote(value: &OwnedValue) -> OwnedValue {
     match value {
-        OwnedValue::Null => OwnedValue::build_text(OwnedValue::Null.to_string().into()),
+        OwnedValue::Null => OwnedValue::build_text(&OwnedValue::Null.to_string()),
         OwnedValue::Integer(_) | OwnedValue::Float(_) => value.to_owned(),
         OwnedValue::Blob(_) => todo!(),
         OwnedValue::Text(s) => {
@@ -3142,12 +3242,15 @@ fn exec_quote(value: &OwnedValue) -> OwnedValue {
             for c in s.as_str().chars() {
                 if c == '\0' {
                     break;
+                } else if c == '\'' {
+                    quoted.push('\'');
+                    quoted.push(c);
                 } else {
                     quoted.push(c);
                 }
             }
             quoted.push('\'');
-            OwnedValue::build_text(Rc::new(quoted))
+            OwnedValue::build_text(&quoted)
         }
         _ => OwnedValue::Null, // For unsupported types, return NULL
     }
@@ -3164,7 +3267,7 @@ fn exec_char(values: Vec<OwnedValue>) -> OwnedValue {
             }
         })
         .collect();
-    OwnedValue::build_text(Rc::new(result))
+    OwnedValue::build_text(&result)
 }
 
 fn construct_like_regex(pattern: &str) -> Regex {
@@ -3238,39 +3341,31 @@ fn exec_nullif(first_value: &OwnedValue, second_value: &OwnedValue) -> OwnedValu
 fn exec_substring(
     str_value: &OwnedValue,
     start_value: &OwnedValue,
-    length_value: &OwnedValue,
+    length_value: Option<&OwnedValue>,
 ) -> OwnedValue {
-    if let (OwnedValue::Text(str), OwnedValue::Integer(start), OwnedValue::Integer(length)) =
-        (str_value, start_value, length_value)
-    {
-        let start = *start as usize;
-        let str_len = str.as_str().len();
+    if let (OwnedValue::Text(str), OwnedValue::Integer(start)) = (str_value, start_value) {
+        let str_len = str.as_str().len() as i64;
 
-        if start > str_len {
-            return OwnedValue::build_text(Rc::new("".to_string()));
-        }
-
-        let start_idx = start - 1;
-        let end = if *length != -1 {
-            start_idx + *length as usize
+        // The left-most character of X is number 1.
+        // If Y is negative then the first character of the substring is found by counting from the right rather than the left.
+        let first_position = if *start < 0 {
+            str_len.saturating_sub((*start).abs())
         } else {
-            str_len
+            *start - 1
         };
-        let substring = &str.as_str()[start_idx..end.min(str_len)];
-
-        OwnedValue::build_text(Rc::new(substring.to_string()))
-    } else if let (OwnedValue::Text(str), OwnedValue::Integer(start)) = (str_value, start_value) {
-        let start = *start as usize;
-        let str_len = str.as_str().len();
-
-        if start > str_len {
-            return OwnedValue::build_text(Rc::new("".to_string()));
-        }
-
-        let start_idx = start - 1;
-        let substring = &str.as_str()[start_idx..str_len];
-
-        OwnedValue::build_text(Rc::new(substring.to_string()))
+        // If Z is negative then the abs(Z) characters preceding the Y-th character are returned.
+        let last_position = match length_value {
+            Some(OwnedValue::Integer(length)) => first_position + *length,
+            _ => str_len,
+        };
+        let (start, end) = if first_position <= last_position {
+            (first_position, last_position)
+        } else {
+            (last_position, first_position)
+        };
+        OwnedValue::build_text(
+            &str.as_str()[start.clamp(-0, str_len) as usize..end.clamp(0, str_len) as usize],
+        )
     } else {
         OwnedValue::Null
     }
@@ -3315,11 +3410,11 @@ fn exec_instr(reg: &OwnedValue, pattern: &OwnedValue) -> OwnedValue {
 
 fn exec_typeof(reg: &OwnedValue) -> OwnedValue {
     match reg {
-        OwnedValue::Null => OwnedValue::build_text(Rc::new("null".to_string())),
-        OwnedValue::Integer(_) => OwnedValue::build_text(Rc::new("integer".to_string())),
-        OwnedValue::Float(_) => OwnedValue::build_text(Rc::new("real".to_string())),
-        OwnedValue::Text(_) => OwnedValue::build_text(Rc::new("text".to_string())),
-        OwnedValue::Blob(_) => OwnedValue::build_text(Rc::new("blob".to_string())),
+        OwnedValue::Null => OwnedValue::build_text("null"),
+        OwnedValue::Integer(_) => OwnedValue::build_text("integer"),
+        OwnedValue::Float(_) => OwnedValue::build_text("real"),
+        OwnedValue::Text(_) => OwnedValue::build_text("text"),
+        OwnedValue::Blob(_) => OwnedValue::build_text("blob"),
         OwnedValue::Agg(ctx) => exec_typeof(ctx.final_value()),
         OwnedValue::Record(_) => unimplemented!(),
     }
@@ -3332,7 +3427,7 @@ fn exec_hex(reg: &OwnedValue) -> OwnedValue {
         | OwnedValue::Float(_)
         | OwnedValue::Blob(_) => {
             let text = reg.to_string();
-            OwnedValue::build_text(Rc::new(hex::encode_upper(text)))
+            OwnedValue::build_text(&hex::encode_upper(text))
         }
         _ => OwnedValue::Null,
     }
@@ -3416,15 +3511,11 @@ fn exec_trim(reg: &OwnedValue, pattern: Option<OwnedValue>) -> OwnedValue {
         (reg, Some(pattern)) => match reg {
             OwnedValue::Text(_) | OwnedValue::Integer(_) | OwnedValue::Float(_) => {
                 let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
-                OwnedValue::build_text(Rc::new(
-                    reg.to_string().trim_matches(&pattern_chars[..]).to_string(),
-                ))
+                OwnedValue::build_text(reg.to_string().trim_matches(&pattern_chars[..]))
             }
             _ => reg.to_owned(),
         },
-        (OwnedValue::Text(t), None) => {
-            OwnedValue::build_text(Rc::new(t.as_str().trim().to_string()))
-        }
+        (OwnedValue::Text(t), None) => OwnedValue::build_text(t.as_str().trim()),
         (reg, _) => reg.to_owned(),
     }
 }
@@ -3435,17 +3526,11 @@ fn exec_ltrim(reg: &OwnedValue, pattern: Option<OwnedValue>) -> OwnedValue {
         (reg, Some(pattern)) => match reg {
             OwnedValue::Text(_) | OwnedValue::Integer(_) | OwnedValue::Float(_) => {
                 let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
-                OwnedValue::build_text(Rc::new(
-                    reg.to_string()
-                        .trim_start_matches(&pattern_chars[..])
-                        .to_string(),
-                ))
+                OwnedValue::build_text(reg.to_string().trim_start_matches(&pattern_chars[..]))
             }
             _ => reg.to_owned(),
         },
-        (OwnedValue::Text(t), None) => {
-            OwnedValue::build_text(Rc::new(t.as_str().trim_start().to_string()))
-        }
+        (OwnedValue::Text(t), None) => OwnedValue::build_text(t.as_str().trim_start()),
         (reg, _) => reg.to_owned(),
     }
 }
@@ -3456,17 +3541,11 @@ fn exec_rtrim(reg: &OwnedValue, pattern: Option<OwnedValue>) -> OwnedValue {
         (reg, Some(pattern)) => match reg {
             OwnedValue::Text(_) | OwnedValue::Integer(_) | OwnedValue::Float(_) => {
                 let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
-                OwnedValue::build_text(Rc::new(
-                    reg.to_string()
-                        .trim_end_matches(&pattern_chars[..])
-                        .to_string(),
-                ))
+                OwnedValue::build_text(reg.to_string().trim_end_matches(&pattern_chars[..]))
             }
             _ => reg.to_owned(),
         },
-        (OwnedValue::Text(t), None) => {
-            OwnedValue::build_text(Rc::new(t.as_str().trim_end().to_string()))
-        }
+        (OwnedValue::Text(t), None) => OwnedValue::build_text(t.as_str().trim_end()),
         (reg, _) => reg.to_owned(),
     }
 }
@@ -3509,7 +3588,7 @@ fn exec_cast(value: &OwnedValue, datatype: &str) -> OwnedValue {
         Affinity::Text => {
             // Convert everything to text representation
             // TODO: handle encoding and whatever sqlite3_snprintf does
-            OwnedValue::build_text(Rc::new(value.to_string()))
+            OwnedValue::build_text(&value.to_string())
         }
         Affinity::Real => match value {
             OwnedValue::Blob(b) => {
@@ -3535,7 +3614,7 @@ fn exec_cast(value: &OwnedValue, datatype: &str) -> OwnedValue {
             // then the result is the greatest possible signed integer and if the REAL is less than the least possible signed integer (-9223372036854775808)
             // then the result is the least possible signed integer.
             OwnedValue::Float(f) => {
-                let i = f.floor() as i128;
+                let i = f.trunc() as i128;
                 if i > i64::MAX as i128 {
                     OwnedValue::Integer(i64::MAX)
                 } else if i < i64::MIN as i128 {
@@ -3586,7 +3665,7 @@ fn exec_replace(source: &OwnedValue, pattern: &OwnedValue, replacement: &OwnedVa
             let result = source
                 .as_str()
                 .replace(pattern.as_str(), replacement.as_str());
-            OwnedValue::build_text(Rc::new(result))
+            OwnedValue::build_text(&result)
         }
         _ => unreachable!("text cast should never fail"),
     }
@@ -3846,7 +3925,7 @@ mod tests {
 
     #[test]
     fn test_length() {
-        let input_str = OwnedValue::build_text(Rc::new(String::from("bob")));
+        let input_str = OwnedValue::build_text("bob");
         let expected_len = OwnedValue::Integer(3);
         assert_eq!(exec_length(&input_str), expected_len);
 
@@ -3865,60 +3944,57 @@ mod tests {
 
     #[test]
     fn test_quote() {
-        let input = OwnedValue::build_text(Rc::new(String::from("abc\0edf")));
-        let expected = OwnedValue::build_text(Rc::new(String::from("'abc'")));
+        let input = OwnedValue::build_text("abc\0edf");
+        let expected = OwnedValue::build_text("'abc'");
         assert_eq!(exec_quote(&input), expected);
 
         let input = OwnedValue::Integer(123);
         let expected = OwnedValue::Integer(123);
         assert_eq!(exec_quote(&input), expected);
 
-        let input = OwnedValue::build_text(Rc::new(String::from("hello''world")));
-        let expected = OwnedValue::build_text(Rc::new(String::from("'hello''world'")));
+        let input = OwnedValue::build_text("hello''world");
+        let expected = OwnedValue::build_text("'hello''''world'");
         assert_eq!(exec_quote(&input), expected);
     }
 
     #[test]
     fn test_typeof() {
         let input = OwnedValue::Null;
-        let expected: OwnedValue = OwnedValue::build_text(Rc::new("null".to_string()));
+        let expected: OwnedValue = OwnedValue::build_text("null");
         assert_eq!(exec_typeof(&input), expected);
 
         let input = OwnedValue::Integer(123);
-        let expected: OwnedValue = OwnedValue::build_text(Rc::new("integer".to_string()));
+        let expected: OwnedValue = OwnedValue::build_text("integer");
         assert_eq!(exec_typeof(&input), expected);
 
         let input = OwnedValue::Float(123.456);
-        let expected: OwnedValue = OwnedValue::build_text(Rc::new("real".to_string()));
+        let expected: OwnedValue = OwnedValue::build_text("real");
         assert_eq!(exec_typeof(&input), expected);
 
-        let input = OwnedValue::build_text(Rc::new("hello".to_string()));
-        let expected: OwnedValue = OwnedValue::build_text(Rc::new("text".to_string()));
+        let input = OwnedValue::build_text("hello");
+        let expected: OwnedValue = OwnedValue::build_text("text");
         assert_eq!(exec_typeof(&input), expected);
 
         let input = OwnedValue::Blob(Rc::new("limbo".as_bytes().to_vec()));
-        let expected: OwnedValue = OwnedValue::build_text(Rc::new("blob".to_string()));
+        let expected: OwnedValue = OwnedValue::build_text("blob");
         assert_eq!(exec_typeof(&input), expected);
 
         let input = OwnedValue::Agg(Box::new(AggContext::Sum(OwnedValue::Integer(123))));
-        let expected = OwnedValue::build_text(Rc::new("integer".to_string()));
+        let expected = OwnedValue::build_text("integer");
         assert_eq!(exec_typeof(&input), expected);
     }
 
     #[test]
     fn test_unicode() {
         assert_eq!(
-            exec_unicode(&OwnedValue::build_text(Rc::new("a".to_string()))),
+            exec_unicode(&OwnedValue::build_text("a")),
             OwnedValue::Integer(97)
         );
         assert_eq!(
-            exec_unicode(&OwnedValue::build_text(Rc::new("😊".to_string()))),
+            exec_unicode(&OwnedValue::build_text("😊")),
             OwnedValue::Integer(128522)
         );
-        assert_eq!(
-            exec_unicode(&OwnedValue::build_text(Rc::new("".to_string()))),
-            OwnedValue::Null
-        );
+        assert_eq!(exec_unicode(&OwnedValue::build_text("")), OwnedValue::Null);
         assert_eq!(
             exec_unicode(&OwnedValue::Integer(23)),
             OwnedValue::Integer(50)
@@ -3948,17 +4024,11 @@ mod tests {
         assert_eq!(exec_min(input_int_vec.clone()), OwnedValue::Integer(-1));
         assert_eq!(exec_max(input_int_vec.clone()), OwnedValue::Integer(10));
 
-        let str1 = OwnedValue::build_text(Rc::new(String::from("A")));
-        let str2 = OwnedValue::build_text(Rc::new(String::from("z")));
+        let str1 = OwnedValue::build_text("A");
+        let str2 = OwnedValue::build_text("z");
         let input_str_vec = vec![&str2, &str1];
-        assert_eq!(
-            exec_min(input_str_vec.clone()),
-            OwnedValue::build_text(Rc::new(String::from("A")))
-        );
-        assert_eq!(
-            exec_max(input_str_vec.clone()),
-            OwnedValue::build_text(Rc::new(String::from("z")))
-        );
+        assert_eq!(exec_min(input_str_vec.clone()), OwnedValue::build_text("A"));
+        assert_eq!(exec_max(input_str_vec.clone()), OwnedValue::build_text("z"));
 
         let input_null_vec = vec![&OwnedValue::Null, &OwnedValue::Null];
         assert_eq!(exec_min(input_null_vec.clone()), OwnedValue::Null);
@@ -3968,102 +4038,102 @@ mod tests {
         assert_eq!(exec_min(input_mixed_vec.clone()), OwnedValue::Integer(10));
         assert_eq!(
             exec_max(input_mixed_vec.clone()),
-            OwnedValue::build_text(Rc::new(String::from("A")))
+            OwnedValue::build_text("A")
         );
     }
 
     #[test]
     fn test_trim() {
-        let input_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice     ")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("Bob and Alice")));
+        let input_str = OwnedValue::build_text("     Bob and Alice     ");
+        let expected_str = OwnedValue::build_text("Bob and Alice");
         assert_eq!(exec_trim(&input_str, None), expected_str);
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice     ")));
-        let pattern_str = OwnedValue::build_text(Rc::new(String::from("Bob and")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("Alice")));
+        let input_str = OwnedValue::build_text("     Bob and Alice     ");
+        let pattern_str = OwnedValue::build_text("Bob and");
+        let expected_str = OwnedValue::build_text("Alice");
         assert_eq!(exec_trim(&input_str, Some(pattern_str)), expected_str);
     }
 
     #[test]
     fn test_ltrim() {
-        let input_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice     ")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("Bob and Alice     ")));
+        let input_str = OwnedValue::build_text("     Bob and Alice     ");
+        let expected_str = OwnedValue::build_text("Bob and Alice     ");
         assert_eq!(exec_ltrim(&input_str, None), expected_str);
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice     ")));
-        let pattern_str = OwnedValue::build_text(Rc::new(String::from("Bob and")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("Alice     ")));
+        let input_str = OwnedValue::build_text("     Bob and Alice     ");
+        let pattern_str = OwnedValue::build_text("Bob and");
+        let expected_str = OwnedValue::build_text("Alice     ");
         assert_eq!(exec_ltrim(&input_str, Some(pattern_str)), expected_str);
     }
 
     #[test]
     fn test_rtrim() {
-        let input_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice     ")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice")));
+        let input_str = OwnedValue::build_text("     Bob and Alice     ");
+        let expected_str = OwnedValue::build_text("     Bob and Alice");
         assert_eq!(exec_rtrim(&input_str, None), expected_str);
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice     ")));
-        let pattern_str = OwnedValue::build_text(Rc::new(String::from("Bob and")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice")));
+        let input_str = OwnedValue::build_text("     Bob and Alice     ");
+        let pattern_str = OwnedValue::build_text("Bob and");
+        let expected_str = OwnedValue::build_text("     Bob and Alice");
         assert_eq!(exec_rtrim(&input_str, Some(pattern_str)), expected_str);
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice     ")));
-        let pattern_str = OwnedValue::build_text(Rc::new(String::from("and Alice")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("     Bob")));
+        let input_str = OwnedValue::build_text("     Bob and Alice     ");
+        let pattern_str = OwnedValue::build_text("and Alice");
+        let expected_str = OwnedValue::build_text("     Bob");
         assert_eq!(exec_rtrim(&input_str, Some(pattern_str)), expected_str);
     }
 
     #[test]
     fn test_soundex() {
-        let input_str = OwnedValue::build_text(Rc::new(String::from("Pfister")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("P236")));
+        let input_str = OwnedValue::build_text("Pfister");
+        let expected_str = OwnedValue::build_text("P236");
         assert_eq!(exec_soundex(&input_str), expected_str);
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("husobee")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("H210")));
+        let input_str = OwnedValue::build_text("husobee");
+        let expected_str = OwnedValue::build_text("H210");
         assert_eq!(exec_soundex(&input_str), expected_str);
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("Tymczak")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("T522")));
+        let input_str = OwnedValue::build_text("Tymczak");
+        let expected_str = OwnedValue::build_text("T522");
         assert_eq!(exec_soundex(&input_str), expected_str);
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("Ashcraft")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("A261")));
+        let input_str = OwnedValue::build_text("Ashcraft");
+        let expected_str = OwnedValue::build_text("A261");
         assert_eq!(exec_soundex(&input_str), expected_str);
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("Robert")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("R163")));
+        let input_str = OwnedValue::build_text("Robert");
+        let expected_str = OwnedValue::build_text("R163");
         assert_eq!(exec_soundex(&input_str), expected_str);
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("Rupert")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("R163")));
+        let input_str = OwnedValue::build_text("Rupert");
+        let expected_str = OwnedValue::build_text("R163");
         assert_eq!(exec_soundex(&input_str), expected_str);
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("Rubin")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("R150")));
+        let input_str = OwnedValue::build_text("Rubin");
+        let expected_str = OwnedValue::build_text("R150");
         assert_eq!(exec_soundex(&input_str), expected_str);
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("Kant")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("K530")));
+        let input_str = OwnedValue::build_text("Kant");
+        let expected_str = OwnedValue::build_text("K530");
         assert_eq!(exec_soundex(&input_str), expected_str);
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("Knuth")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("K530")));
+        let input_str = OwnedValue::build_text("Knuth");
+        let expected_str = OwnedValue::build_text("K530");
         assert_eq!(exec_soundex(&input_str), expected_str);
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("x")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("X000")));
+        let input_str = OwnedValue::build_text("x");
+        let expected_str = OwnedValue::build_text("X000");
         assert_eq!(exec_soundex(&input_str), expected_str);
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("闪电五连鞭")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("?000")));
+        let input_str = OwnedValue::build_text("闪电五连鞭");
+        let expected_str = OwnedValue::build_text("?000");
         assert_eq!(exec_soundex(&input_str), expected_str);
     }
 
     #[test]
     fn test_upper_case() {
-        let input_str = OwnedValue::build_text(Rc::new(String::from("Limbo")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("LIMBO")));
+        let input_str = OwnedValue::build_text("Limbo");
+        let expected_str = OwnedValue::build_text("LIMBO");
         assert_eq!(exec_upper(&input_str).unwrap(), expected_str);
 
         let input_int = OwnedValue::Integer(10);
@@ -4073,8 +4143,8 @@ mod tests {
 
     #[test]
     fn test_lower_case() {
-        let input_str = OwnedValue::build_text(Rc::new(String::from("Limbo")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("limbo")));
+        let input_str = OwnedValue::build_text("Limbo");
+        let expected_str = OwnedValue::build_text("limbo");
         assert_eq!(exec_lower(&input_str).unwrap(), expected_str);
 
         let input_int = OwnedValue::Integer(10);
@@ -4084,38 +4154,38 @@ mod tests {
 
     #[test]
     fn test_hex() {
-        let input_str = OwnedValue::build_text(Rc::new("limbo".to_string()));
-        let expected_val = OwnedValue::build_text(Rc::new(String::from("6C696D626F")));
+        let input_str = OwnedValue::build_text("limbo");
+        let expected_val = OwnedValue::build_text("6C696D626F");
         assert_eq!(exec_hex(&input_str), expected_val);
 
         let input_int = OwnedValue::Integer(100);
-        let expected_val = OwnedValue::build_text(Rc::new(String::from("313030")));
+        let expected_val = OwnedValue::build_text("313030");
         assert_eq!(exec_hex(&input_int), expected_val);
 
         let input_float = OwnedValue::Float(12.34);
-        let expected_val = OwnedValue::build_text(Rc::new(String::from("31322E3334")));
+        let expected_val = OwnedValue::build_text("31322E3334");
         assert_eq!(exec_hex(&input_float), expected_val);
     }
 
     #[test]
     fn test_unhex() {
-        let input = OwnedValue::build_text(Rc::new(String::from("6f")));
+        let input = OwnedValue::build_text("6f");
         let expected = OwnedValue::Blob(Rc::new(vec![0x6f]));
         assert_eq!(exec_unhex(&input, None), expected);
 
-        let input = OwnedValue::build_text(Rc::new(String::from("6f")));
+        let input = OwnedValue::build_text("6f");
         let expected = OwnedValue::Blob(Rc::new(vec![0x6f]));
         assert_eq!(exec_unhex(&input, None), expected);
 
-        let input = OwnedValue::build_text(Rc::new(String::from("611")));
+        let input = OwnedValue::build_text("611");
         let expected = OwnedValue::Null;
         assert_eq!(exec_unhex(&input, None), expected);
 
-        let input = OwnedValue::build_text(Rc::new(String::from("")));
+        let input = OwnedValue::build_text("");
         let expected = OwnedValue::Blob(Rc::new(vec![]));
         assert_eq!(exec_unhex(&input, None), expected);
 
-        let input = OwnedValue::build_text(Rc::new(String::from("61x")));
+        let input = OwnedValue::build_text("61x");
         let expected = OwnedValue::Null;
         assert_eq!(exec_unhex(&input, None), expected);
 
@@ -4137,7 +4207,7 @@ mod tests {
         assert_eq!(exec_abs(&float_negative_reg).unwrap(), float_positive_reg);
 
         assert_eq!(
-            exec_abs(&OwnedValue::build_text(Rc::new(String::from("a")))).unwrap(),
+            exec_abs(&OwnedValue::build_text("a")).unwrap(),
             OwnedValue::Float(0.0)
         );
         assert_eq!(exec_abs(&OwnedValue::Null).unwrap(), OwnedValue::Null);
@@ -4150,19 +4220,16 @@ mod tests {
     fn test_char() {
         assert_eq!(
             exec_char(vec![OwnedValue::Integer(108), OwnedValue::Integer(105)]),
-            OwnedValue::build_text(Rc::new("li".to_string()))
+            OwnedValue::build_text("li")
         );
-        assert_eq!(
-            exec_char(vec![]),
-            OwnedValue::build_text(Rc::new("".to_string()))
-        );
+        assert_eq!(exec_char(vec![]), OwnedValue::build_text(""));
         assert_eq!(
             exec_char(vec![OwnedValue::Null]),
-            OwnedValue::build_text(Rc::new("".to_string()))
+            OwnedValue::build_text("")
         );
         assert_eq!(
-            exec_char(vec![OwnedValue::build_text(Rc::new("a".to_string()))]),
-            OwnedValue::build_text(Rc::new("".to_string()))
+            exec_char(vec![OwnedValue::build_text("a")]),
+            OwnedValue::build_text("")
         );
     }
 
@@ -4233,19 +4300,19 @@ mod tests {
                 expected_len: 1,
             },
             TestCase {
-                input: OwnedValue::build_text(Rc::new(String::from(""))),
+                input: OwnedValue::build_text(""),
                 expected_len: 1,
             },
             TestCase {
-                input: OwnedValue::build_text(Rc::new(String::from("5"))),
+                input: OwnedValue::build_text("5"),
                 expected_len: 5,
             },
             TestCase {
-                input: OwnedValue::build_text(Rc::new(String::from("0"))),
+                input: OwnedValue::build_text("0"),
                 expected_len: 1,
             },
             TestCase {
-                input: OwnedValue::build_text(Rc::new(String::from("-1"))),
+                input: OwnedValue::build_text("-1"),
                 expected_len: 1,
             },
             TestCase {
@@ -4285,11 +4352,11 @@ mod tests {
         assert_eq!(exec_round(&input_val, Some(precision_val)), expected_val);
 
         let input_val = OwnedValue::Float(123.456);
-        let precision_val = OwnedValue::build_text(Rc::new(String::from("1")));
+        let precision_val = OwnedValue::build_text("1");
         let expected_val = OwnedValue::Float(123.5);
         assert_eq!(exec_round(&input_val, Some(precision_val)), expected_val);
 
-        let input_val = OwnedValue::build_text(Rc::new(String::from("123.456")));
+        let input_val = OwnedValue::build_text("123.456");
         let precision_val = OwnedValue::Integer(2);
         let expected_val = OwnedValue::Float(123.46);
         assert_eq!(exec_round(&input_val, Some(precision_val)), expected_val);
@@ -4343,8 +4410,8 @@ mod tests {
         );
         assert_eq!(
             exec_nullif(
-                &OwnedValue::build_text(Rc::new("limbo".to_string())),
-                &OwnedValue::build_text(Rc::new("limbo".to_string()))
+                &OwnedValue::build_text("limbo"),
+                &OwnedValue::build_text("limbo")
             ),
             OwnedValue::Null
         );
@@ -4359,100 +4426,100 @@ mod tests {
         );
         assert_eq!(
             exec_nullif(
-                &OwnedValue::build_text(Rc::new("limbo".to_string())),
-                &OwnedValue::build_text(Rc::new("limb".to_string()))
+                &OwnedValue::build_text("limbo"),
+                &OwnedValue::build_text("limb")
             ),
-            OwnedValue::build_text(Rc::new("limbo".to_string()))
+            OwnedValue::build_text("limbo")
         );
     }
 
     #[test]
     fn test_substring() {
-        let str_value = OwnedValue::build_text(Rc::new("limbo".to_string()));
+        let str_value = OwnedValue::build_text("limbo");
         let start_value = OwnedValue::Integer(1);
         let length_value = OwnedValue::Integer(3);
-        let expected_val = OwnedValue::build_text(Rc::new(String::from("lim")));
+        let expected_val = OwnedValue::build_text("lim");
         assert_eq!(
-            exec_substring(&str_value, &start_value, &length_value),
+            exec_substring(&str_value, &start_value, Some(&length_value)),
             expected_val
         );
 
-        let str_value = OwnedValue::build_text(Rc::new("limbo".to_string()));
+        let str_value = OwnedValue::build_text("limbo");
         let start_value = OwnedValue::Integer(1);
         let length_value = OwnedValue::Integer(10);
-        let expected_val = OwnedValue::build_text(Rc::new(String::from("limbo")));
+        let expected_val = OwnedValue::build_text("limbo");
         assert_eq!(
-            exec_substring(&str_value, &start_value, &length_value),
+            exec_substring(&str_value, &start_value, Some(&length_value)),
             expected_val
         );
 
-        let str_value = OwnedValue::build_text(Rc::new("limbo".to_string()));
+        let str_value = OwnedValue::build_text("limbo");
         let start_value = OwnedValue::Integer(10);
         let length_value = OwnedValue::Integer(3);
-        let expected_val = OwnedValue::build_text(Rc::new(String::from("")));
+        let expected_val = OwnedValue::build_text("");
         assert_eq!(
-            exec_substring(&str_value, &start_value, &length_value),
+            exec_substring(&str_value, &start_value, Some(&length_value)),
             expected_val
         );
 
-        let str_value = OwnedValue::build_text(Rc::new("limbo".to_string()));
+        let str_value = OwnedValue::build_text("limbo");
         let start_value = OwnedValue::Integer(3);
         let length_value = OwnedValue::Null;
-        let expected_val = OwnedValue::build_text(Rc::new(String::from("mbo")));
+        let expected_val = OwnedValue::build_text("mbo");
         assert_eq!(
-            exec_substring(&str_value, &start_value, &length_value),
+            exec_substring(&str_value, &start_value, Some(&length_value)),
             expected_val
         );
 
-        let str_value = OwnedValue::build_text(Rc::new("limbo".to_string()));
+        let str_value = OwnedValue::build_text("limbo");
         let start_value = OwnedValue::Integer(10);
         let length_value = OwnedValue::Null;
-        let expected_val = OwnedValue::build_text(Rc::new(String::from("")));
+        let expected_val = OwnedValue::build_text("");
         assert_eq!(
-            exec_substring(&str_value, &start_value, &length_value),
+            exec_substring(&str_value, &start_value, Some(&length_value)),
             expected_val
         );
     }
 
     #[test]
     fn test_exec_instr() {
-        let input = OwnedValue::build_text(Rc::new(String::from("limbo")));
-        let pattern = OwnedValue::build_text(Rc::new(String::from("im")));
+        let input = OwnedValue::build_text("limbo");
+        let pattern = OwnedValue::build_text("im");
         let expected = OwnedValue::Integer(2);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
-        let input = OwnedValue::build_text(Rc::new(String::from("limbo")));
-        let pattern = OwnedValue::build_text(Rc::new(String::from("limbo")));
+        let input = OwnedValue::build_text("limbo");
+        let pattern = OwnedValue::build_text("limbo");
         let expected = OwnedValue::Integer(1);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
-        let input = OwnedValue::build_text(Rc::new(String::from("limbo")));
-        let pattern = OwnedValue::build_text(Rc::new(String::from("o")));
+        let input = OwnedValue::build_text("limbo");
+        let pattern = OwnedValue::build_text("o");
         let expected = OwnedValue::Integer(5);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
-        let input = OwnedValue::build_text(Rc::new(String::from("liiiiimbo")));
-        let pattern = OwnedValue::build_text(Rc::new(String::from("ii")));
+        let input = OwnedValue::build_text("liiiiimbo");
+        let pattern = OwnedValue::build_text("ii");
         let expected = OwnedValue::Integer(2);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
-        let input = OwnedValue::build_text(Rc::new(String::from("limbo")));
-        let pattern = OwnedValue::build_text(Rc::new(String::from("limboX")));
+        let input = OwnedValue::build_text("limbo");
+        let pattern = OwnedValue::build_text("limboX");
         let expected = OwnedValue::Integer(0);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
-        let input = OwnedValue::build_text(Rc::new(String::from("limbo")));
-        let pattern = OwnedValue::build_text(Rc::new(String::from("")));
+        let input = OwnedValue::build_text("limbo");
+        let pattern = OwnedValue::build_text("");
         let expected = OwnedValue::Integer(1);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
-        let input = OwnedValue::build_text(Rc::new(String::from("")));
-        let pattern = OwnedValue::build_text(Rc::new(String::from("limbo")));
+        let input = OwnedValue::build_text("");
+        let pattern = OwnedValue::build_text("limbo");
         let expected = OwnedValue::Integer(0);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
-        let input = OwnedValue::build_text(Rc::new(String::from("")));
-        let pattern = OwnedValue::build_text(Rc::new(String::from("")));
+        let input = OwnedValue::build_text("");
+        let pattern = OwnedValue::build_text("");
         let expected = OwnedValue::Integer(1);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
@@ -4461,13 +4528,13 @@ mod tests {
         let expected = OwnedValue::Null;
         assert_eq!(exec_instr(&input, &pattern), expected);
 
-        let input = OwnedValue::build_text(Rc::new(String::from("limbo")));
+        let input = OwnedValue::build_text("limbo");
         let pattern = OwnedValue::Null;
         let expected = OwnedValue::Null;
         assert_eq!(exec_instr(&input, &pattern), expected);
 
         let input = OwnedValue::Null;
-        let pattern = OwnedValue::build_text(Rc::new(String::from("limbo")));
+        let pattern = OwnedValue::build_text("limbo");
         let expected = OwnedValue::Null;
         assert_eq!(exec_instr(&input, &pattern), expected);
 
@@ -4492,7 +4559,7 @@ mod tests {
         assert_eq!(exec_instr(&input, &pattern), expected);
 
         let input = OwnedValue::Float(12.34);
-        let pattern = OwnedValue::build_text(Rc::new(String::from(".")));
+        let pattern = OwnedValue::build_text(".");
         let expected = OwnedValue::Integer(3);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
@@ -4507,11 +4574,11 @@ mod tests {
         assert_eq!(exec_instr(&input, &pattern), expected);
 
         let input = OwnedValue::Blob(Rc::new(vec![0x61, 0x62, 0x63, 0x64, 0x65]));
-        let pattern = OwnedValue::build_text(Rc::new(String::from("cd")));
+        let pattern = OwnedValue::build_text("cd");
         let expected = OwnedValue::Integer(3);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
-        let input = OwnedValue::build_text(Rc::new(String::from("abcde")));
+        let input = OwnedValue::build_text("abcde");
         let pattern = OwnedValue::Blob(Rc::new(vec![0x63, 0x64]));
         let expected = OwnedValue::Integer(3);
         assert_eq!(exec_instr(&input, &pattern), expected);
@@ -4547,19 +4614,19 @@ mod tests {
         let expected = Some(OwnedValue::Integer(-1));
         assert_eq!(exec_sign(&input), expected);
 
-        let input = OwnedValue::build_text(Rc::new("abc".to_string()));
+        let input = OwnedValue::build_text("abc");
         let expected = Some(OwnedValue::Null);
         assert_eq!(exec_sign(&input), expected);
 
-        let input = OwnedValue::build_text(Rc::new("42".to_string()));
+        let input = OwnedValue::build_text("42");
         let expected = Some(OwnedValue::Integer(1));
         assert_eq!(exec_sign(&input), expected);
 
-        let input = OwnedValue::build_text(Rc::new("-42".to_string()));
+        let input = OwnedValue::build_text("-42");
         let expected = Some(OwnedValue::Integer(-1));
         assert_eq!(exec_sign(&input), expected);
 
-        let input = OwnedValue::build_text(Rc::new("0".to_string()));
+        let input = OwnedValue::build_text("0");
         let expected = Some(OwnedValue::Integer(0));
         assert_eq!(exec_sign(&input), expected);
 
@@ -4602,15 +4669,15 @@ mod tests {
         let expected = OwnedValue::Blob(Rc::new(vec![]));
         assert_eq!(exec_zeroblob(&input), expected);
 
-        let input = OwnedValue::build_text(Rc::new("5".to_string()));
+        let input = OwnedValue::build_text("5");
         let expected = OwnedValue::Blob(Rc::new(vec![0; 5]));
         assert_eq!(exec_zeroblob(&input), expected);
 
-        let input = OwnedValue::build_text(Rc::new("-5".to_string()));
+        let input = OwnedValue::build_text("-5");
         let expected = OwnedValue::Blob(Rc::new(vec![]));
         assert_eq!(exec_zeroblob(&input), expected);
 
-        let input = OwnedValue::build_text(Rc::new("text".to_string()));
+        let input = OwnedValue::build_text("text");
         let expected = OwnedValue::Blob(Rc::new(vec![]));
         assert_eq!(exec_zeroblob(&input), expected);
 
@@ -4632,101 +4699,101 @@ mod tests {
 
     #[test]
     fn test_replace() {
-        let input_str = OwnedValue::build_text(Rc::new(String::from("bob")));
-        let pattern_str = OwnedValue::build_text(Rc::new(String::from("b")));
-        let replace_str = OwnedValue::build_text(Rc::new(String::from("a")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("aoa")));
+        let input_str = OwnedValue::build_text("bob");
+        let pattern_str = OwnedValue::build_text("b");
+        let replace_str = OwnedValue::build_text("a");
+        let expected_str = OwnedValue::build_text("aoa");
         assert_eq!(
             exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("bob")));
-        let pattern_str = OwnedValue::build_text(Rc::new(String::from("b")));
-        let replace_str = OwnedValue::build_text(Rc::new(String::from("")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("o")));
+        let input_str = OwnedValue::build_text("bob");
+        let pattern_str = OwnedValue::build_text("b");
+        let replace_str = OwnedValue::build_text("");
+        let expected_str = OwnedValue::build_text("o");
         assert_eq!(
             exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("bob")));
-        let pattern_str = OwnedValue::build_text(Rc::new(String::from("b")));
-        let replace_str = OwnedValue::build_text(Rc::new(String::from("abc")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("abcoabc")));
+        let input_str = OwnedValue::build_text("bob");
+        let pattern_str = OwnedValue::build_text("b");
+        let replace_str = OwnedValue::build_text("abc");
+        let expected_str = OwnedValue::build_text("abcoabc");
         assert_eq!(
             exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("bob")));
-        let pattern_str = OwnedValue::build_text(Rc::new(String::from("a")));
-        let replace_str = OwnedValue::build_text(Rc::new(String::from("b")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("bob")));
+        let input_str = OwnedValue::build_text("bob");
+        let pattern_str = OwnedValue::build_text("a");
+        let replace_str = OwnedValue::build_text("b");
+        let expected_str = OwnedValue::build_text("bob");
         assert_eq!(
             exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("bob")));
-        let pattern_str = OwnedValue::build_text(Rc::new(String::from("")));
-        let replace_str = OwnedValue::build_text(Rc::new(String::from("a")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("bob")));
+        let input_str = OwnedValue::build_text("bob");
+        let pattern_str = OwnedValue::build_text("");
+        let replace_str = OwnedValue::build_text("a");
+        let expected_str = OwnedValue::build_text("bob");
         assert_eq!(
             exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("bob")));
+        let input_str = OwnedValue::build_text("bob");
         let pattern_str = OwnedValue::Null;
-        let replace_str = OwnedValue::build_text(Rc::new(String::from("a")));
+        let replace_str = OwnedValue::build_text("a");
         let expected_str = OwnedValue::Null;
         assert_eq!(
             exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("bo5")));
+        let input_str = OwnedValue::build_text("bo5");
         let pattern_str = OwnedValue::Integer(5);
-        let replace_str = OwnedValue::build_text(Rc::new(String::from("a")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("boa")));
+        let replace_str = OwnedValue::build_text("a");
+        let expected_str = OwnedValue::build_text("boa");
         assert_eq!(
             exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("bo5.0")));
+        let input_str = OwnedValue::build_text("bo5.0");
         let pattern_str = OwnedValue::Float(5.0);
-        let replace_str = OwnedValue::build_text(Rc::new(String::from("a")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("boa")));
+        let replace_str = OwnedValue::build_text("a");
+        let expected_str = OwnedValue::build_text("boa");
         assert_eq!(
             exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("bo5")));
+        let input_str = OwnedValue::build_text("bo5");
         let pattern_str = OwnedValue::Float(5.0);
-        let replace_str = OwnedValue::build_text(Rc::new(String::from("a")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("bo5")));
+        let replace_str = OwnedValue::build_text("a");
+        let expected_str = OwnedValue::build_text("bo5");
         assert_eq!(
             exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("bo5.0")));
+        let input_str = OwnedValue::build_text("bo5.0");
         let pattern_str = OwnedValue::Float(5.0);
         let replace_str = OwnedValue::Float(6.0);
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("bo6.0")));
+        let expected_str = OwnedValue::build_text("bo6.0");
         assert_eq!(
             exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
 
         // todo: change this test to use (0.1 + 0.2) instead of 0.3 when decimals are implemented.
-        let input_str = OwnedValue::build_text(Rc::new(String::from("tes3")));
+        let input_str = OwnedValue::build_text("tes3");
         let pattern_str = OwnedValue::Integer(3);
         let replace_str = OwnedValue::Agg(Box::new(AggContext::Sum(OwnedValue::Float(0.3))));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("tes0.3")));
+        let expected_str = OwnedValue::build_text("tes0.3");
         assert_eq!(
             exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str

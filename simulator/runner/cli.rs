@@ -49,6 +49,8 @@ pub struct SimulatorCLI {
         help = "enable watch mode that reruns the simulation on file changes"
     )]
     pub watch: bool,
+    #[clap(long, help = "run differential testing between sqlite and Limbo")]
+    pub differential: bool,
 }
 
 impl SimulatorCLI {
@@ -64,7 +66,7 @@ impl SimulatorCLI {
             return Err("Minimum size cannot be greater than maximum size".to_string());
         }
 
-        // Make sure uncompatible options are not set
+        // Make sure incompatible options are not set
         if self.shrink && self.doublecheck {
             return Err("Cannot use shrink and doublecheck at the same time".to_string());
         }

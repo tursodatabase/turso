@@ -318,8 +318,9 @@ impl<Clock: LogicalClock, T: Sync + Send + Clone + Debug + 'static> MvStore<Cloc
                     .ok_or(DatabaseError::NoSuchTransactionID(tx_id))?;
                 let tx = tx.value().read().unwrap();
                 assert_eq!(tx.state, TransactionState::Active);
-                let version_is_visible_to_current_tx = is_version_visible(&self.txs, &tx, rv);
-                if !version_is_visible_to_current_tx {
+                // A transaction cannot delete a version that it cannot see,
+                // nor can it conflict with it.
+                if !rv.is_visible_to(&tx, &self.txs) {
                     continue;
                 }
                 if is_write_write_conflict(&self.txs, &tx, rv) {
@@ -366,11 +367,14 @@ impl<Clock: LogicalClock, T: Sync + Send + Clone + Debug + 'static> MvStore<Cloc
         assert_eq!(tx.state, TransactionState::Active);
         if let Some(row_versions) = self.rows.get(&id) {
             let row_versions = row_versions.value().read().unwrap();
-            for rv in row_versions.iter().rev() {
-                if is_version_visible(&self.txs, &tx, rv) {
-                    tx.insert_to_read_set(id);
-                    return Ok(Some(rv.row.clone()));
-                }
+            if let Some(rv) = row_versions
+                .iter()
+                .rev()
+                .filter(|rv| rv.is_visible_to(&tx, &self.txs))
+                .next()
+            {
+                tx.insert_to_read_set(id);
+                return Ok(Some(rv.row.clone()));
             }
         }
         Ok(None)
@@ -534,7 +538,7 @@ impl<Clock: LogicalClock, T: Sync + Send + Clone + Debug + 'static> MvStore<Cloc
                     }
                     if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
                         if id == tx_id {
-                            // New version is valid UNTIL committing transaction's end timestamp
+                            // Old version is valid UNTIL committing transaction's end timestamp
                             // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
                             row_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
                             self.insert_version_raw(
@@ -763,12 +767,14 @@ pub(crate) fn is_write_write_conflict<T>(
     }
 }
 
-pub(crate) fn is_version_visible<T>(
-    txs: &SkipMap<TxID, RwLock<Transaction>>,
-    tx: &Transaction,
-    rv: &RowVersion<T>,
-) -> bool {
-    is_begin_visible(txs, tx, rv) && is_end_visible(txs, tx, rv)
+impl<T> RowVersion<T> {
+    pub fn is_visible_to(
+        &self,
+        tx: &Transaction,
+        txs: &SkipMap<TxID, RwLock<Transaction>>,
+    ) -> bool {
+        is_begin_visible(txs, tx, self) && is_end_visible(txs, tx, self)
+    }
 }
 
 fn is_begin_visible<T>(

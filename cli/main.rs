@@ -1,6 +1,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 mod app;
 mod import;
+mod input;
 mod opcodes_dictionary;
 
 use rustyline::{error::ReadlineError, DefaultEditor};
@@ -8,17 +9,17 @@ use std::sync::atomic::Ordering;
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
-    let mut app = app::Limbo::new()?;
     let mut rl = DefaultEditor::new()?;
+    let mut app = app::Limbo::new(&mut rl)?;
     let home = dirs::home_dir().expect("Could not determine home directory");
     let history_file = home.join(".limbo_history");
     if history_file.exists() {
-        rl.load_history(history_file.as_path())?;
+        app.rl.load_history(history_file.as_path())?;
     }
     loop {
-        let readline = rl.readline(&app.prompt);
+        let readline = app.rl.readline(&app.prompt);
         match readline {
-            Ok(line) => match app.handle_input_line(line.trim(), &mut rl) {
+            Ok(line) => match app.handle_input_line(line.trim()) {
                 Ok(_) => {}
                 Err(e) => {
                     eprintln!("{}", e);
@@ -36,6 +37,7 @@ fn main() -> anyhow::Result<()> {
                 continue;
             }
             Err(ReadlineError::Eof) => {
+                app.handle_remaining_input();
                 let _ = app.close_conn();
                 break;
             }

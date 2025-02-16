@@ -1,0 +1,10 @@
+Error: pretty output can only be written to a tty
+SELECT 'TEST_ECHO'; 
+TEST_ECHO
+Settings:
+Output mode: raw
+DB: testing/testing.db
+Output: limbo_output.txt
+Null value: LIMBO
+CWD: /home/krobichaud/Projects/open_source_projects/limbo
+Echo: off

@@ -9,7 +9,7 @@ use rand::prelude::*;
 use runner::cli::SimulatorCLI;
 use runner::env::SimulatorEnv;
 use runner::execution::{execute_plans, Execution, ExecutionHistory, ExecutionResult};
-use runner::watch;
+use runner::{differential, watch};
 use std::any::Any;
 use std::backtrace::Backtrace;
 use std::io::Write;
@@ -85,9 +85,29 @@ fn main() -> Result<(), String> {
 
     if cli_opts.watch {
         watch_mode(seed, &cli_opts, &paths, last_execution.clone()).unwrap();
+    } else if cli_opts.differential {
+        differential_testing(env, plans, last_execution.clone())
     } else {
-        run_simulator(seed, &cli_opts, &paths, env, plans, last_execution.clone());
+        run_simulator(&cli_opts, &paths, env, plans, last_execution.clone());
     }
+
+    // Print the seed, the locations of the database and the plan file at the end again for easily accessing them.
+    println!("database path: {:?}", paths.db);
+    if cli_opts.doublecheck {
+        println!("doublecheck database path: {:?}", paths.doublecheck_db);
+    } else if cli_opts.shrink {
+        println!("shrunk database path: {:?}", paths.shrunk_db);
+    }
+    println!("simulator plan path: {:?}", paths.plan);
+    println!(
+        "simulator plan serialized path: {:?}",
+        paths.plan.with_extension("plan.json")
+    );
+    if cli_opts.shrink {
+        println!("shrunk plan path: {:?}", paths.shrunk_plan);
+    }
+    println!("simulator history path: {:?}", paths.history);
+    println!("seed: {}", seed);
 
     Ok(())
 }
@@ -153,7 +173,6 @@ fn watch_mode(
 }
 
 fn run_simulator(
-    seed: u64,
     cli_opts: &SimulatorCLI,
     paths: &Paths,
     env: SimulatorEnv,
@@ -233,6 +252,10 @@ fn run_simulator(
                         })
                         .collect::<Vec<_>>();
 
+                    // Write the shrunk plan to a file
+                    let mut f = std::fs::File::create(&paths.shrunk_plan).unwrap();
+                    f.write_all(shrunk_plans[0].to_string().as_bytes()).unwrap();
+
                     let last_execution = Arc::new(Mutex::new(*last_execution));
 
                     let shrunk = SandboxedResult::from(
@@ -270,33 +293,10 @@ fn run_simulator(
                             log::error!("shrinking failed, the error was not properly reproduced");
                         }
                     }
-
-                    // Write the shrunk plan to a file
-                    let shrunk_plan = std::fs::read(&paths.shrunk_plan).unwrap();
-                    let mut f = std::fs::File::create(&paths.shrunk_plan).unwrap();
-                    f.write_all(&shrunk_plan).unwrap();
                 }
             }
         }
     }
-
-    // Print the seed, the locations of the database and the plan file at the end again for easily accessing them.
-    println!("database path: {:?}", paths.db);
-    if cli_opts.doublecheck {
-        println!("doublecheck database path: {:?}", paths.doublecheck_db);
-    } else if cli_opts.shrink {
-        println!("shrunk database path: {:?}", paths.shrunk_db);
-    }
-    println!("simulator plan path: {:?}", paths.plan);
-    println!(
-        "simulator plan serialized path: {:?}",
-        paths.plan.with_extension("plan.json")
-    );
-    if cli_opts.shrink {
-        println!("shrunk plan path: {:?}", paths.shrunk_plan);
-    }
-    println!("simulator history path: {:?}", paths.history);
-    println!("seed: {}", seed);
 }
 
 fn doublecheck(
@@ -359,6 +359,29 @@ fn doublecheck(
                 log::info!("doublecheck succeeded! database files are the same.");
             }
         }
+    }
+}
+
+fn differential_testing(
+    env: SimulatorEnv,
+    plans: Vec<InteractionPlan>,
+    last_execution: Arc<Mutex<Execution>>,
+) {
+    let env = Arc::new(Mutex::new(env));
+    let result = SandboxedResult::from(
+        std::panic::catch_unwind(|| {
+            let plan = plans[0].clone();
+            differential::run_simulation(env, &mut [plan], last_execution.clone())
+        }),
+        last_execution.clone(),
+    );
+
+    if let SandboxedResult::Correct = result {
+        log::info!("simulation succeeded");
+        println!("simulation succeeded");
+    } else {
+        log::error!("simulation failed");
+        println!("simulation failed");
     }
 }
 
@@ -430,7 +453,7 @@ fn setup_simulation(
     let mut env = SimulatorEnv::new(seed, cli_opts, db_path);
 
     // todo: the loading works correctly because of a hacky decision
-    // Rigth now, the plan generation is the only point we use the rng, so the environment doesn't
+    // Right now, the plan generation is the only point we use the rng, so the environment doesn't
     // even need it. In the future, especially with multi-connections and multi-threading, we might
     // use the RNG for more things such as scheduling, so this assumption will fail.  When that happens,
     // we'll need to reachitect this logic by saving and loading RNG state.

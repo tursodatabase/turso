@@ -168,7 +168,7 @@ def test_uuid(pipe):
 
 
 def test_regexp(pipe):
-    extension_path = "./target/debug/liblimbo_regexp.so"
+    extension_path = "./target/debug/liblimbo_regexp"
 
     # before extension loads, assert no function
     run_test(pipe, "SELECT regexp('a.c', 'abc');", returns_error_no_func)
@@ -189,6 +189,21 @@ def test_regexp(pipe):
     )
     run_test(
         pipe, "SELECT regexp_substr('the year is unknow', '[0-9]+');", returns_null
+    )
+    run_test(
+        pipe,
+        "select regexp_replace('the year is 2021', '[0-9]+', '2050') = 'the year is 2050';",
+        validate_true,
+    )
+    run_test(
+        pipe,
+        "select regexp_replace('the year is 2021', '2k21', '2050') = 'the year is 2021';",
+        validate_true,
+    )
+    run_test(
+        pipe,
+        "select regexp_replace('the year is 2021', '([0-9]+)', '$1 or 2050') = 'the year is 2021 or 2050';",
+        validate_true,
     )
 
 
@@ -213,7 +228,7 @@ def validate_percentile_disc(res):
 
 
 def test_aggregates(pipe):
-    extension_path = "./target/debug/liblimbo_percentile.so"
+    extension_path = "./target/debug/liblimbo_percentile"
     # assert no function before extension loads
     run_test(
         pipe,
@@ -302,7 +317,7 @@ def validate_base64_decode(a):
 
 
 def test_crypto(pipe):
-    extension_path = "./target/debug/liblimbo_crypto.so"
+    extension_path = "./target/debug/liblimbo_crypto"
     # assert no function before extension loads
     run_test(
         pipe,

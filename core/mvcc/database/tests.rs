@@ -699,7 +699,7 @@ fn test_snapshot_isolation_tx_visible1() {
             },
         };
         tracing::debug!("Testing visibility of {row_version:?}");
-        is_version_visible(&txs, &current_tx, &row_version)
+        row_version.is_visible_to(&current_tx, &txs)
     };
 
     // begin visible:   transaction committed with ts < current_tx.begin_ts

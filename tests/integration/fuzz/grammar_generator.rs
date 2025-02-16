@@ -26,7 +26,7 @@ pub enum SymbolType {
         random_length: usize,
     },
     Int {
-        range: Range<i32>,
+        range: Range<i64>,
     },
     #[allow(dead_code)]
     Optional {
@@ -63,7 +63,7 @@ pub fn rand_str(fixed_prefix: &str, random_length: usize) -> SymbolType {
     }
 }
 
-pub fn rand_int(range: Range<i32>) -> SymbolType {
+pub fn rand_int(range: Range<i64>) -> SymbolType {
     SymbolType::Int { range }
 }
 

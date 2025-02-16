@@ -2,7 +2,7 @@ use crate::{function::ExternalFunc, util::columns_from_create_table_body, Databa
 use fallible_iterator::FallibleIterator;
 use limbo_ext::{ExtensionApi, InitAggFunction, ResultCode, ScalarFunction, VTabModuleImpl};
 pub use limbo_ext::{FinalizeFunction, StepFunction, Value as ExtValue, ValueType as ExtValueType};
-use sqlite3_parser::{
+use limbo_sqlite3_parser::{
     ast::{Cmd, Stmt},
     lexer::sql::Parser,
 };
@@ -127,7 +127,7 @@ impl Database {
         let Stmt::CreateTable { body, .. } = stmt else {
             return ResultCode::Error;
         };
-        let Ok(columns) = columns_from_create_table_body(body) else {
+        let Ok(columns) = columns_from_create_table_body(*body) else {
             return ResultCode::Error;
         };
         let vtab_module = self.vtab_modules.get(name).unwrap().clone();
@@ -153,6 +153,7 @@ impl Database {
     }
 
     pub fn register_builtins(&self) -> Result<(), String> {
+        #[allow(unused_variables)]
         let ext_api = self.build_limbo_ext();
         #[cfg(feature = "uuid")]
         if unsafe { !limbo_uuid::register_extension_static(&ext_api).is_ok() } {

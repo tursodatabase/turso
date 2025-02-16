@@ -75,7 +75,7 @@ pub extern "C" fn rows_get_value(ctx: *mut c_void, col_idx: usize) -> *const c_v
     let ctx = LimboRows::from_ptr(ctx);
 
     if let Some(row) = ctx.stmt.row() {
-        if let Some(value) = row.values.get(col_idx) {
+        if let Some(value) = row.get_values().get(col_idx) {
             let value = value.to_value();
             return LimboValue::from_value(&value).to_ptr();
         }
@@ -115,12 +115,7 @@ pub extern "C" fn rows_get_column_name(rows_ptr: *mut c_void, idx: i32) -> *cons
         return std::ptr::null_mut();
     }
     let name = rows.stmt.get_column_name(idx as usize);
-    let cstr = std::ffi::CString::new(
-        name.as_ref()
-            .unwrap_or(&&format!("column_{}", idx))
-            .as_bytes(),
-    )
-    .expect("Failed to create CString");
+    let cstr = std::ffi::CString::new(name.as_bytes()).expect("Failed to create CString");
     cstr.into_raw() as *const c_char
 }
 

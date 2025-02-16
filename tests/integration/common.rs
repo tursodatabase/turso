@@ -1,4 +1,5 @@
 use limbo_core::{CheckpointStatus, Connection, Database, IO};
+use rand::{rng, RngCore};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -13,7 +14,7 @@ pub struct TempDatabase {
 #[allow(dead_code, clippy::arc_with_non_send_sync)]
 impl TempDatabase {
     pub fn new_empty() -> Self {
-        Self::new("test.db")
+        Self::new(&format!("test-{}.db", rng().next_u32()))
     }
 
     pub fn new(db_name: &str) -> Self {
@@ -99,16 +100,16 @@ mod tests {
 
         let columns = stmt.num_columns();
         assert_eq!(columns, 3);
-        assert_eq!(stmt.get_column_name(0), Some(&"foo".to_string()));
-        assert_eq!(stmt.get_column_name(1), Some(&"bar".to_string()));
-        assert_eq!(stmt.get_column_name(2), Some(&"baz".to_string()));
+        assert_eq!(stmt.get_column_name(0), "foo".into());
+        assert_eq!(stmt.get_column_name(1), "bar".into());
+        assert_eq!(stmt.get_column_name(2), "baz".into());
 
         let stmt = conn.prepare("select foo, bar from test;")?;
 
         let columns = stmt.num_columns();
         assert_eq!(columns, 2);
-        assert_eq!(stmt.get_column_name(0), Some(&"foo".to_string()));
-        assert_eq!(stmt.get_column_name(1), Some(&"bar".to_string()));
+        assert_eq!(stmt.get_column_name(0), "foo".into());
+        assert_eq!(stmt.get_column_name(1), "bar".into());
 
         let stmt = conn.prepare("delete from test;")?;
         let columns = stmt.num_columns();

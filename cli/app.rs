@@ -1,12 +1,13 @@
 use crate::{
     import::{ImportFile, IMPORT_HELP},
+    input::{get_io, get_writer, DbLocation, Io, OutputMode, Settings, HELP_MSG},
     opcodes_dictionary::OPCODE_DESCRIPTIONS,
 };
-use cli_table::format::{Border, HorizontalLine, Separator, VerticalLine};
-use cli_table::{Cell, Style, Table};
+use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Row, Table};
 use limbo_core::{Database, LimboError, Statement, StepResult, Value};
 
 use clap::{Parser, ValueEnum};
+use rustyline::DefaultEditor;
 use std::{
     io::{self, Write},
     path::PathBuf,
@@ -50,60 +51,10 @@ pub struct Opts {
     pub io: Io,
 }
 
-#[derive(Copy, Clone)]
-pub enum DbLocation {
-    Memory,
-    Path,
-}
-
-#[derive(Copy, Clone, ValueEnum)]
-pub enum Io {
-    Syscall,
-    #[cfg(all(target_os = "linux", feature = "io_uring"))]
-    IoUring,
-}
-
-impl Default for Io {
-    /// Custom Default impl with cfg! macro, to provide compile-time default to Clap based on platform
-    /// The cfg! could be elided, but Clippy complains
-    /// The default value can still be overridden with the Clap argument
-    fn default() -> Self {
-        match cfg!(all(target_os = "linux", feature = "io_uring")) {
-            true => {
-                #[cfg(all(target_os = "linux", feature = "io_uring"))]
-                {
-                    Io::IoUring
-                }
-                #[cfg(any(
-                    not(target_os = "linux"),
-                    all(target_os = "linux", not(feature = "io_uring"))
-                ))]
-                {
-                    Io::Syscall
-                }
-            }
-            false => Io::Syscall,
-        }
-    }
-}
-
-#[derive(ValueEnum, Copy, Clone, Debug, PartialEq, Eq)]
-pub enum OutputMode {
-    Raw,
-    Pretty,
-}
-
-impl std::fmt::Display for OutputMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.to_possible_value()
-            .expect("no values are skipped")
-            .get_name()
-            .fmt(f)
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum Command {
+    /// Exit this program with return-code CODE
+    Exit,
     /// Quit the shell
     Quit,
     /// Open a database file
@@ -122,7 +73,7 @@ pub enum Command {
     Cwd,
     /// Display information about settings
     ShowInfo,
-    /// Set the value of NULL to be printedin 'raw' mode
+    /// Set the value of NULL to be printed in 'raw' mode
     NullValue,
     /// Toggle 'echo' mode to repeat commands before execution
     Echo,
@@ -132,18 +83,22 @@ pub enum Command {
     Import,
     /// Loads an extension library
     LoadExtension,
+    /// Dump the current database as a list of SQL statements
+    Dump,
 }
 
 impl Command {
     fn min_args(&self) -> usize {
         1 + match self {
-            Self::Quit
+            Self::Exit
+            | Self::Quit
             | Self::Schema
             | Self::Help
             | Self::Opcodes
             | Self::ShowInfo
             | Self::Tables
-            | Self::SetOutput => 0,
+            | Self::SetOutput
+            | Self::Dump => 0,
             Self::Open
             | Self::OutputMode
             | Self::Cwd
@@ -151,11 +106,12 @@ impl Command {
             | Self::NullValue
             | Self::LoadExtension => 1,
             Self::Import => 2,
-        } // argv0
+        }
     }
 
     fn usage(&self) -> &str {
         match self {
+            Self::Exit => ".exit ?<CODE>",
             Self::Quit => ".quit",
             Self::Open => ".open <file>",
             Self::Help => ".help",
@@ -169,6 +125,7 @@ impl Command {
             Self::Echo => ".echo on|off",
             Self::Tables => ".tables",
             Self::LoadExtension => ".load",
+            Self::Dump => ".dump",
             Self::Import => &IMPORT_HELP,
         }
     }
@@ -178,6 +135,7 @@ impl FromStr for Command {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            ".exit" => Ok(Self::Exit),
             ".quit" => Ok(Self::Quit),
             ".open" => Ok(Self::Open),
             ".help" => Ok(Self::Help),
@@ -192,6 +150,7 @@ impl FromStr for Command {
             ".echo" => Ok(Self::Echo),
             ".import" => Ok(Self::Import),
             ".load" => Ok(Self::LoadExtension),
+            ".dump" => Ok(Self::Dump),
             _ => Err("Unknown command".to_string()),
         }
     }
@@ -199,7 +158,7 @@ impl FromStr for Command {
 
 const PROMPT: &str = "limbo> ";
 
-pub struct Limbo {
+pub struct Limbo<'a> {
     pub prompt: String,
     io: Arc<dyn limbo_core::IO>,
     writer: Box<dyn Write>,
@@ -207,58 +166,36 @@ pub struct Limbo {
     pub interrupt_count: Arc<AtomicUsize>,
     input_buff: String,
     opts: Settings,
+    pub rl: &'a mut DefaultEditor,
 }
 
-pub struct Settings {
-    output_filename: String,
-    db_file: String,
-    null_value: String,
-    output_mode: OutputMode,
-    echo: bool,
-    is_stdout: bool,
-    io: Io,
-}
-
-impl From<&Opts> for Settings {
-    fn from(opts: &Opts) -> Self {
-        Self {
-            null_value: String::new(),
-            output_mode: opts.output_mode,
-            echo: false,
-            is_stdout: opts.output.is_empty(),
-            output_filename: opts.output.clone(),
-            db_file: opts
-                .database
-                .as_ref()
-                .map_or(":memory:".to_string(), |p| p.to_string_lossy().to_string()),
-            io: opts.io,
-        }
-    }
-}
-
-impl std::fmt::Display for Settings {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Settings:\nOutput mode: {}\nDB: {}\nOutput: {}\nNull value: {}\nCWD: {}\nEcho: {}",
-            self.output_mode,
-            self.db_file,
-            match self.is_stdout {
-                true => "STDOUT",
-                false => &self.output_filename,
-            },
-            self.null_value,
-            std::env::current_dir().unwrap().display(),
-            match self.echo {
-                true => "on",
-                false => "off",
+macro_rules! query_internal {
+    ($self:expr, $query:expr, $body:expr) => {{
+        let rows = $self.conn.query($query)?;
+        if let Some(mut rows) = rows {
+            loop {
+                match rows.step()? {
+                    StepResult::Row => {
+                        let row = rows.row().unwrap();
+                        $body(row)?;
+                    }
+                    StepResult::IO => {
+                        $self.io.run_once()?;
+                    }
+                    StepResult::Interrupt => break,
+                    StepResult::Done => break,
+                    StepResult::Busy => {
+                        Err(LimboError::InternalError("database is busy".into()))?;
+                    }
+                }
             }
-        )
-    }
+        }
+        Ok::<(), LimboError>(())
+    }};
 }
 
-impl Limbo {
-    pub fn new() -> anyhow::Result<Self> {
+impl<'a> Limbo<'a> {
+    pub fn new(rl: &'a mut rustyline::DefaultEditor) -> anyhow::Result<Self> {
         let opts = Opts::parse();
         let db_file = opts
             .database
@@ -290,6 +227,7 @@ impl Limbo {
             interrupt_count,
             input_buff: String::new(),
             opts: Settings::from(&opts),
+            rl,
         };
         if opts.sql.is_some() {
             app.handle_first_input(opts.sql.as_ref().unwrap());
@@ -306,13 +244,7 @@ impl Limbo {
         if cmd.trim().starts_with('.') {
             self.handle_dot_command(cmd);
         } else {
-            let conn = self.conn.clone();
-            let runner = conn.query_runner(cmd.as_bytes());
-            for output in runner {
-                if let Err(e) = self.print_query_result(cmd, output) {
-                    let _ = self.writeln(e.to_string());
-                }
-            }
+            self.run_query(cmd);
         }
         std::process::exit(0);
     }
@@ -336,6 +268,80 @@ impl Limbo {
         self.conn
             .load_extension(ext_path)
             .map_err(|e| e.to_string())
+    }
+
+    fn dump_table(&mut self, name: &str) -> Result<(), LimboError> {
+        let query = format!("pragma table_info={}", name);
+        let mut cols = vec![];
+        query_internal!(
+            self,
+            query,
+            |row: &limbo_core::Row| -> Result<(), LimboError> {
+                let name: &str = row.get::<&str>(1)?;
+                cols.push(name.to_string());
+                Ok(())
+            }
+        )?;
+        // FIXME: sqlite has logic to check rowid and optionally preserve
+        // it, but it requires pragma index_list, and it seems to be relevant
+        // only for indexes.
+        let cols_str = cols.join(", ");
+        let select = format!("select {} from {}", cols_str, name);
+        query_internal!(
+            self,
+            select,
+            |row: &limbo_core::Row| -> Result<(), LimboError> {
+                let values = row
+                    .get_values()
+                    .into_iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let _ = self.write_fmt(format_args!("INSERT INTO {} VALUES({});", name, values))?;
+                Ok(())
+            }
+        )?;
+        Ok(())
+    }
+
+    fn dump_database(&mut self) -> anyhow::Result<()> {
+        self.writeln("PRAGMA foreign_keys=OFF;")?;
+        self.writeln("BEGIN TRANSACTION;")?;
+        // FIXME: At this point, SQLite executes the following:
+        // sqlite3_exec(p->db, "SAVEPOINT dump; PRAGMA writable_schema=ON", 0, 0, 0);
+        // we don't have those yet, so don't.
+        let query = r#"
+    SELECT name, type, sql
+    FROM sqlite_schema AS o
+    WHERE type == 'table'
+        AND sql NOT NULL
+    ORDER BY tbl_name = 'sqlite_sequence', rowid"#;
+
+        let res = query_internal!(
+            self,
+            query,
+            |row: &limbo_core::Row| -> Result<(), LimboError> {
+                let sql: &str = row.get::<&str>(2)?;
+                let name: &str = row.get::<&str>(0)?;
+                let _ = self.write_fmt(format_args!("{};", sql))?;
+                self.dump_table(name)
+            }
+        );
+
+        match res {
+            Ok(_) => Ok(()),
+            Err(LimboError::Corrupt(x)) => {
+                // FIXME: SQLite at this point retry the query with a different
+                // order by, but for simplicity we are just ignoring for now
+                self.writeln("/****** CORRUPTION ERROR *******/")?;
+                Err(LimboError::Corrupt(x))
+            }
+            Err(x) => Err(x),
+        }?;
+
+        self.conn.close()?;
+        self.writeln("COMMIT;")?;
+        Ok(())
     }
 
     fn display_in_memory(&mut self) -> io::Result<()> {
@@ -430,19 +436,35 @@ impl Limbo {
         self.input_buff.push(' ');
     }
 
-    pub fn handle_input_line(
-        &mut self,
-        line: &str,
-        rl: &mut rustyline::DefaultEditor,
-    ) -> anyhow::Result<()> {
+    fn run_query(&mut self, input: &str) {
+        let echo = self.opts.echo;
+        if echo {
+            let _ = self.writeln(&input);
+        }
+        let conn = self.conn.clone();
+        let runner = conn.query_runner(input.as_bytes());
+        for output in runner {
+            if let Err(_) = self.print_query_result(&input, output) {
+                break;
+            }
+        }
+        self.reset_input();
+    }
+
+    fn reset_line(&mut self, line: &str) -> rustyline::Result<()> {
+        self.rl.add_history_entry(line.to_owned())?;
+        self.interrupt_count.store(0, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub fn handle_input_line(&mut self, line: &str) -> anyhow::Result<()> {
         if self.input_buff.is_empty() {
             if line.is_empty() {
                 return Ok(());
             }
             if line.starts_with('.') {
                 self.handle_dot_command(line);
-                rl.add_history_entry(line.to_owned())?;
-                self.interrupt_count.store(0, Ordering::SeqCst);
+                let _ = self.reset_line(line);
                 return Ok(());
             }
         }
@@ -450,10 +472,8 @@ impl Limbo {
             if let Some(remaining) = line.split_once('\n') {
                 let after_comment = remaining.1.trim();
                 if !after_comment.is_empty() {
-                    rl.add_history_entry(after_comment.to_owned())?;
-                    self.buffer_input(after_comment);
-
                     if after_comment.ends_with(';') {
+                        self.run_query(after_comment);
                         if self.opts.echo {
                             let _ = self.writeln(after_comment);
                         }
@@ -465,11 +485,12 @@ impl Limbo {
                             }
                         }
                         self.reset_input();
+                        return self.handle_input_line(after_comment);
                     } else {
                         self.set_multiline_prompt();
+                        let _ = self.reset_line(line);
+                        return Ok(());
                     }
-                    self.interrupt_count.store(0, Ordering::SeqCst);
-                    return Ok(());
                 }
             }
             return Ok(());
@@ -478,31 +499,18 @@ impl Limbo {
         if let Some(comment_pos) = line.find("--") {
             let before_comment = line[..comment_pos].trim();
             if !before_comment.is_empty() {
-                return self.handle_input_line(before_comment, rl);
+                return self.handle_input_line(before_comment);
             }
         }
-
         if line.ends_with(';') {
             self.buffer_input(line);
             let buff = self.input_buff.clone();
-            let echo = self.opts.echo;
-            if echo {
-                let _ = self.writeln(&buff);
-            }
-            let conn = self.conn.clone();
-            let runner = conn.query_runner(buff.as_bytes());
-            for output in runner {
-                if let Err(e) = self.print_query_result(&buff, output) {
-                    let _ = self.writeln(e.to_string());
-                }
-            }
-            self.reset_input();
+            self.run_query(buff.as_str());
         } else {
-            self.buffer_input(line);
+            self.buffer_input(format!("{}\n", line).as_str());
             self.set_multiline_prompt();
         }
-        rl.add_history_entry(line.to_owned())?;
-        self.interrupt_count.store(0, Ordering::SeqCst);
+        self.reset_line(line)?;
         Ok(())
     }
 
@@ -520,6 +528,10 @@ impl Limbo {
                 return;
             }
             match cmd {
+                Command::Exit => {
+                    let code = args.get(1).and_then(|c| c.parse::<i32>().ok()).unwrap_or(0);
+                    std::process::exit(code);
+                }
                 Command::Quit => {
                     let _ = self.writeln("Exiting Limbo SQL Shell.");
                     let _ = self.close_conn();
@@ -603,6 +615,11 @@ impl Limbo {
                         let _ = self.writeln(&e);
                     }
                 }
+                Command::Dump => {
+                    if let Err(e) = self.dump_database() {
+                        let _ = self.write_fmt(format_args!("/****** ERROR: {} ******/", e));
+                    }
+                }
             }
         } else {
             let _ = self.write_fmt(format_args!(
@@ -628,7 +645,7 @@ impl Limbo {
                     match rows.step() {
                         Ok(StepResult::Row) => {
                             let row = rows.row().unwrap();
-                            for (i, value) in row.values.iter().enumerate() {
+                            for (i, value) in row.get_values().iter().enumerate() {
                                 let value = value.to_value();
                                 if i > 0 {
                                     let _ = self.writer.write(b"|");
@@ -670,35 +687,42 @@ impl Limbo {
                         println!("Query interrupted.");
                         return Ok(());
                     }
-                    let mut table_rows: Vec<Vec<_>> = vec![];
+                    let mut table = Table::new();
+                    table
+                        .set_content_arrangement(ContentArrangement::Dynamic)
+                        .set_truncation_indicator("…")
+                        .apply_modifier("││──├─┼┤│─┼├┤┬┴┌┐└┘");
                     if rows.num_columns() > 0 {
-                        let columns = (0..rows.num_columns())
+                        let header = (0..rows.num_columns())
                             .map(|i| {
-                                rows.get_column_name(i)
-                                    .map(|name| name.cell().bold(true))
-                                    .unwrap_or_else(|| " ".cell())
+                                let name = rows.get_column_name(i);
+                                Cell::new(name).add_attribute(Attribute::Bold)
                             })
                             .collect::<Vec<_>>();
-                        table_rows.push(columns);
+                        table.set_header(header);
                     }
                     loop {
                         match rows.step() {
                             Ok(StepResult::Row) => {
-                                let row = rows.row().unwrap();
-                                table_rows.push(
-                                    row.values
-                                        .iter()
-                                        .map(|value| match value.to_value() {
-                                            Value::Null => self.opts.null_value.clone().cell(),
-                                            Value::Integer(i) => i.to_string().cell(),
-                                            Value::Float(f) => f.to_string().cell(),
-                                            Value::Text(s) => s.cell(),
-                                            Value::Blob(b) => {
-                                                format!("{}", String::from_utf8_lossy(b)).cell()
-                                            }
-                                        })
-                                        .collect(),
-                                );
+                                let record = rows.row().unwrap();
+                                let mut row = Row::new();
+                                row.max_height(1);
+                                for value in record.get_values() {
+                                    let (content, alignment) = match value.to_value() {
+                                        Value::Null => {
+                                            (self.opts.null_value.clone(), CellAlignment::Left)
+                                        }
+                                        Value::Integer(i) => (i.to_string(), CellAlignment::Right),
+                                        Value::Float(f) => (f.to_string(), CellAlignment::Right),
+                                        Value::Text(s) => (s.to_string(), CellAlignment::Left),
+                                        Value::Blob(b) => (
+                                            String::from_utf8_lossy(b).to_string(),
+                                            CellAlignment::Left,
+                                        ),
+                                    };
+                                    row.add_cell(Cell::new(content).set_alignment(alignment));
+                                }
+                                table.add_row(row);
                             }
                             Ok(StepResult::IO) => {
                                 self.io.run_once()?;
@@ -718,7 +742,10 @@ impl Limbo {
                             }
                         }
                     }
-                    self.print_table(table_rows);
+
+                    if table.header().is_some() {
+                        let _ = self.write_fmt(format_args!("{}", table));
+                    }
                 }
             },
             Ok(None) => {}
@@ -727,45 +754,12 @@ impl Limbo {
                     "{:?}",
                     miette::Error::from(err).with_source_code(sql.to_owned())
                 ));
+                anyhow::bail!("We have to throw here, even if we printed error");
             }
         }
         // for now let's cache flush always
         self.conn.cacheflush()?;
         Ok(())
-    }
-
-    fn print_table(&mut self, table_rows: Vec<Vec<cli_table::CellStruct>>) {
-        if table_rows.is_empty() {
-            return;
-        }
-
-        let horizontal_line = HorizontalLine::new('┌', '┐', '┬', '─');
-        let horizontal_line_mid = HorizontalLine::new('├', '┤', '┼', '─');
-        let horizontal_line_bottom = HorizontalLine::new('└', '┘', '┴', '─');
-        let vertical_line = VerticalLine::new('│');
-
-        let border = Border::builder()
-            .top(horizontal_line)
-            .bottom(horizontal_line_bottom)
-            .left(vertical_line.clone())
-            .right(vertical_line.clone())
-            .build();
-
-        let separator = Separator::builder()
-            .column(Some(vertical_line))
-            .row(Some(horizontal_line_mid))
-            .build();
-
-        if let Ok(table) = table_rows
-            .table()
-            .border(border)
-            .separator(separator)
-            .display()
-        {
-            let _ = self.write_fmt(format_args!("{}", table));
-        } else {
-            let _ = self.writeln("Error displaying table.");
-        }
     }
 
     fn display_schema(&mut self, table: Option<&str>) -> anyhow::Result<()> {
@@ -787,7 +781,7 @@ impl Limbo {
                         StepResult::Row => {
                             let row = rows.row().unwrap();
                             if let Some(Value::Text(schema)) =
-                                row.values.first().map(|v| v.to_value())
+                                row.get_values().first().map(|v| v.to_value())
                             {
                                 let _ = self.write_fmt(format_args!("{};", schema));
                                 found = true;
@@ -847,7 +841,7 @@ impl Limbo {
                         StepResult::Row => {
                             let row = rows.row().unwrap();
                             if let Some(Value::Text(table)) =
-                                row.values.first().map(|v| v.to_value())
+                                row.get_values().first().map(|v| v.to_value())
                             {
                                 tables.push_str(table);
                                 tables.push(' ');
@@ -890,99 +884,14 @@ impl Limbo {
 
         Ok(())
     }
-}
 
-fn get_writer(output: &str) -> Box<dyn Write> {
-    match output {
-        "" => Box::new(io::stdout()),
-        _ => match std::fs::File::create(output) {
-            Ok(file) => Box::new(file),
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                Box::new(io::stdout())
-            }
-        },
+    pub fn handle_remaining_input(&mut self) {
+        if self.input_buff.is_empty() {
+            return;
+        }
+
+        let buff = self.input_buff.clone();
+        self.run_query(buff.as_str());
+        self.reset_input();
     }
 }
-
-fn get_io(db_location: DbLocation, io_choice: Io) -> anyhow::Result<Arc<dyn limbo_core::IO>> {
-    Ok(match db_location {
-        DbLocation::Memory => Arc::new(limbo_core::MemoryIO::new()?),
-        DbLocation::Path => {
-            match io_choice {
-                Io::Syscall => {
-                    // We are building for Linux/macOS and syscall backend has been selected
-                    #[cfg(target_family = "unix")]
-                    {
-                        Arc::new(limbo_core::UnixIO::new()?)
-                    }
-                    // We are not building for Linux/macOS and syscall backend has been selected
-                    #[cfg(not(target_family = "unix"))]
-                    {
-                        Arc::new(limbo_core::PlatformIO::new()?)
-                    }
-                }
-                // We are building for Linux and io_uring backend has been selected
-                #[cfg(all(target_os = "linux", feature = "io_uring"))]
-                Io::IoUring => Arc::new(limbo_core::UringIO::new()?),
-            }
-        }
-    })
-}
-
-const HELP_MSG: &str = r#"
-Limbo SQL Shell Help
-==============
-Welcome to the Limbo SQL Shell! You can execute any standard SQL command here.
-In addition to standard SQL commands, the following special commands are available:
-
-Special Commands:
------------------
-.quit                      Stop interpreting input stream and exit.
-.show                      Display current settings.
-.open <database_file>      Open and connect to a database file.
-.output <mode>             Change the output mode. Available modes are 'raw' and 'pretty'.
-.schema <table_name>       Show the schema of the specified table.
-.tables <pattern>          List names of tables matching LIKE pattern TABLE
-.opcodes                   Display all the opcodes defined by the virtual machine
-.cd <directory>            Change the current working directory.
-.nullvalue <string>        Set the value to be displayed for null values.
-.echo on|off               Toggle echo mode to repeat commands before execution.
-.import --csv FILE TABLE   Import csv data from FILE into TABLE
-.help                      Display this help message.
-
-Usage Examples:
----------------
-1. To quit the Limbo SQL Shell:
-   .quit
-
-2. To open a database file at path './employees.db':
-   .open employees.db
-
-3. To view the schema of a table named 'employees':
-   .schema employees
-
-4. To list all tables:
-   .tables
-
-5. To list all available SQL opcodes:
-   .opcodes
-
-6. To change the current output mode to 'pretty':
-   .mode pretty
-
-7. Send output to STDOUT if no file is specified:
-   .output
-
-8. To change the current working directory to '/tmp':
-   .cd /tmp
-
-9. Show the current values of settings:
-   .show
-
-10. To import csv file 'sample.csv' into 'csv_table' table:
-   .import --csv sample.csv csv_table
-
-Note:
-- All SQL commands must end with a semicolon (;).
-- Special commands do not require a semicolon."#;
