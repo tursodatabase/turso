@@ -53,9 +53,9 @@ use crate::{
 };
 use crate::{resolve_ext_path, Connection, Result, TransactionState, DATABASE_VERSION};
 use insn::{
-    exec_add, exec_and, exec_bit_and, exec_bit_not, exec_bit_or, exec_boolean_not, exec_concat,
-    exec_divide, exec_multiply, exec_or, exec_remainder, exec_shift_left, exec_shift_right,
-    exec_subtract, Cookie,
+    cast_text_to_numerical, exec_add, exec_and, exec_bit_and, exec_bit_not, exec_bit_or,
+    exec_boolean_not, exec_concat, exec_divide, exec_multiply, exec_or, exec_remainder,
+    exec_shift_left, exec_shift_right, exec_subtract, Cookie,
 };
 use likeop::{construct_like_escape_arg, exec_glob, exec_like_with_escape};
 use rand::distributions::{Distribution, Uniform};
@@ -3580,15 +3580,7 @@ fn exec_cast(value: &OwnedValue, datatype: &str) -> OwnedValue {
                 let text = String::from_utf8_lossy(b);
                 cast_text_to_numeric(&text)
             }
-            OwnedValue::Text(t) => {
-                let text = t.as_str();
-                // Looks like a float
-                if text.contains('.') || text.contains('e') || text.contains('E') {
-                    cast_text_to_real(text)
-                } else {
-                    cast_text_to_integer(text)
-                }
-            }
+            OwnedValue::Text(t) => cast_text_to_numerical(t.as_str()),
             OwnedValue::Integer(i) => OwnedValue::Integer(*i),
             OwnedValue::Float(f) => OwnedValue::Float(*f),
             _ => value.clone(), // TODO probably wrong

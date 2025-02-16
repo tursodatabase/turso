@@ -1,6 +1,6 @@
 use std::num::NonZero;
 
-use super::{AggFunc, BranchOffset, CursorID, FuncCtx, PageIdx};
+use super::{cast_text_to_integer, AggFunc, BranchOffset, CursorID, FuncCtx, PageIdx};
 use crate::storage::wal::CheckpointMode;
 use crate::types::{OwnedValue, Record};
 use crate::vdbe::cast_text_to_real;
@@ -689,13 +689,19 @@ pub enum Cookie {
     UserVersion = 6,
 }
 
-fn cast_text_to_numerical(value: &str) -> OwnedValue {
-    if let Ok(x) = value.parse::<i64>() {
-        OwnedValue::Integer(x)
-    } else if let Ok(x) = value.parse::<f64>() {
-        OwnedValue::Float(x)
+pub fn cast_text_to_numerical(value: &str) -> OwnedValue {
+    if value.contains('.') || value.contains('e') || value.contains('E') {
+        let OwnedValue::Float(f) = cast_text_to_real(value) else {
+            panic!("cast_text_to_numerical: expected float, got {}", value);
+        };
+        // If the value is within floating point precision of an integer, return an integer.
+        if f.fract() == 0.0 {
+            OwnedValue::Integer(f.trunc() as i64)
+        } else {
+            OwnedValue::Float(f)
+        }
     } else {
-        OwnedValue::Integer(0)
+        cast_text_to_integer(value)
     }
 }
 
