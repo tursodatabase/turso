@@ -78,7 +78,7 @@ impl Text {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum OwnedValue {
     Null,
     Integer(i64),
@@ -87,6 +87,12 @@ pub enum OwnedValue {
     Blob(Rc<Vec<u8>>),
     Agg(Box<AggContext>), // TODO(pere): make this without Box. Currently this might cause cache miss but let's leave it for future analysis
     Record(Record),
+}
+
+impl PartialEq for OwnedValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.partial_cmp(other) == Some(std::cmp::Ordering::Equal)
+    }
 }
 
 impl OwnedValue {
