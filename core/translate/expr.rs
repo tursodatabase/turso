@@ -396,49 +396,9 @@ pub fn translate_condition_expr(
                 program.resolve_label(jump_target_when_true, program.offset());
             }
         }
-        ast::Expr::Like {
-            lhs,
-            not,
-            op,
-            rhs,
-            escape: _,
-        } => {
+        ast::Expr::Like { not, .. } => {
             let cur_reg = program.alloc_register();
-            match op {
-                ast::LikeOperator::Like | ast::LikeOperator::Glob => {
-                    let start_reg = program.alloc_registers(2);
-                    let mut constant_mask = 0;
-                    translate_and_mark(
-                        program,
-                        Some(referenced_tables),
-                        lhs,
-                        start_reg + 1,
-                        resolver,
-                    )?;
-                    let _ =
-                        translate_expr(program, Some(referenced_tables), rhs, start_reg, resolver)?;
-                    if matches!(rhs.as_ref(), ast::Expr::Literal(_)) {
-                        program.mark_last_insn_constant();
-                        constant_mask = 1;
-                    }
-                    let func = match op {
-                        ast::LikeOperator::Like => ScalarFunc::Like,
-                        ast::LikeOperator::Glob => ScalarFunc::Glob,
-                        _ => unreachable!(),
-                    };
-                    program.emit_insn(Insn::Function {
-                        constant_mask,
-                        start_reg,
-                        dest: cur_reg,
-                        func: FuncCtx {
-                            func: Func::Scalar(func),
-                            arg_count: 2,
-                        },
-                    });
-                }
-                ast::LikeOperator::Match => todo!(),
-                ast::LikeOperator::Regexp => todo!(),
-            }
+            translate_like_base(program, Some(referenced_tables), expr, cur_reg, resolver)?;
             if !*not {
                 emit_cond_jump(program, condition_metadata, cur_reg);
             } else if condition_metadata.jump_if_condition_is_true {
@@ -1955,7 +1915,21 @@ pub fn translate_expr(
         ast::Expr::InSelect { .. } => todo!(),
         ast::Expr::InTable { .. } => todo!(),
         ast::Expr::IsNull(_) => todo!(),
-        ast::Expr::Like { .. } => todo!(),
+        ast::Expr::Like { not, .. } => {
+            let like_reg = if *not {
+                program.alloc_register()
+            } else {
+                target_register
+            };
+            translate_like_base(program, referenced_tables, expr, like_reg, resolver)?;
+            if *not {
+                program.emit_insn(Insn::Not {
+                    reg: like_reg,
+                    dest: target_register,
+                });
+            }
+            Ok(target_register)
+        }
         ast::Expr::Literal(lit) => match lit {
             ast::Literal::Numeric(val) => {
                 let maybe_int = val.parse::<i64>();
@@ -2143,6 +2117,55 @@ pub fn translate_expr(
             Ok(target_register)
         }
     }
+}
+
+fn translate_like_base(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&[TableReference]>,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let ast::Expr::Like {
+        lhs,
+        op,
+        rhs,
+        escape: _,
+        ..
+    } = expr
+    else {
+        crate::bail_parse_error!("expected Like expression");
+    };
+    match op {
+        ast::LikeOperator::Like | ast::LikeOperator::Glob => {
+            let start_reg = program.alloc_registers(2);
+            let mut constant_mask = 0;
+            translate_and_mark(program, referenced_tables, lhs, start_reg + 1, resolver)?;
+            let _ = translate_expr(program, referenced_tables, rhs, start_reg, resolver)?;
+            if matches!(rhs.as_ref(), ast::Expr::Literal(_)) {
+                program.mark_last_insn_constant();
+                constant_mask = 1;
+            }
+            let func = match op {
+                ast::LikeOperator::Like => ScalarFunc::Like,
+                ast::LikeOperator::Glob => ScalarFunc::Glob,
+                _ => unreachable!(),
+            };
+            program.emit_insn(Insn::Function {
+                constant_mask,
+                start_reg,
+                dest: target_register,
+                func: FuncCtx {
+                    func: Func::Scalar(func),
+                    arg_count: 2,
+                },
+            });
+        }
+        ast::LikeOperator::Match => todo!(),
+        ast::LikeOperator::Regexp => todo!(),
+    }
+
+    Ok(target_register)
 }
 
 /// Emits a whole insn for a function call.
