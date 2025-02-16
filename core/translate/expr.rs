@@ -237,7 +237,19 @@ pub fn translate_condition_expr(
                 resolver,
             )?;
         }
-        ast::Expr::Binary(lhs, op, rhs) => {
+        ast::Expr::Binary(lhs, op, rhs)
+            if matches!(
+                op,
+                ast::Operator::Greater
+                    | ast::Operator::GreaterEquals
+                    | ast::Operator::Less
+                    | ast::Operator::LessEquals
+                    | ast::Operator::Equals
+                    | ast::Operator::NotEquals
+                    | ast::Operator::Is
+                    | ast::Operator::IsNot
+            ) =>
+        {
             let lhs_reg = program.alloc_register();
             let rhs_reg = program.alloc_register();
             translate_and_mark(program, Some(referenced_tables), lhs, lhs_reg, resolver)?;
@@ -267,10 +279,13 @@ pub fn translate_condition_expr(
                 ast::Operator::IsNot => {
                     emit_cmp_null_insn!(program, condition_metadata, Ne, Eq, lhs_reg, rhs_reg)
                 }
-                _ => {
-                    todo!("op {:?} not implemented", op);
-                }
+                _ => unreachable!(),
             }
+        }
+        ast::Expr::Binary(_, _, _) => {
+            let result_reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), expr, result_reg, resolver)?;
+            emit_cond_jump(program, condition_metadata, result_reg);
         }
         ast::Expr::Literal(_)
         | ast::Expr::Cast { .. }
