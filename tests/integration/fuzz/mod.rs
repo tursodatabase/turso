@@ -10,8 +10,10 @@ mod tests {
 
     use crate::{
         common::TempDatabase,
-        fuzz::grammar_generator::{rand_int, rand_str, GrammarGenerator},
+        fuzz::grammar_generator::{const_str, rand_int, rand_str, GrammarGenerator},
     };
+
+    use super::grammar_generator::SymbolHandle;
 
     fn rng_from_time() -> (ChaCha8Rng, u64) {
         let seed = std::time::SystemTime::now()
@@ -451,15 +453,42 @@ mod tests {
         }
     }
 
-    #[test]
-    pub fn logical_expression_fuzz_run() {
-        let _ = env_logger::try_init();
-        let g = GrammarGenerator::new();
+    struct TestTable {
+        pub name: &'static str,
+        pub columns: Vec<&'static str>,
+    }
+
+    /// Expressions that can be used in both SELECT and WHERE positions.
+    struct CommonBuilders {
+        pub bin_op: SymbolHandle,
+        pub unary_infix_op: SymbolHandle,
+        pub scalar: SymbolHandle,
+        pub paren: SymbolHandle,
+        pub coalesce_expr: SymbolHandle,
+        pub cast_expr: SymbolHandle,
+        pub case_expr: SymbolHandle,
+        pub cmp_op: SymbolHandle,
+        pub number: SymbolHandle,
+    }
+
+    /// Expressions that can be used only in WHERE position due to Limbo limitations.
+    struct PredicateBuilders {
+        pub in_op: SymbolHandle,
+    }
+
+    fn common_builders(g: &GrammarGenerator, tables: Option<&[TestTable]>) -> CommonBuilders {
         let (expr, expr_builder) = g.create_handle();
         let (bin_op, bin_op_builder) = g.create_handle();
         let (unary_infix_op, unary_infix_op_builder) = g.create_handle();
         let (scalar, scalar_builder) = g.create_handle();
         let (paren, paren_builder) = g.create_handle();
+        let (like_pattern, like_pattern_builder) = g.create_handle();
+        let (glob_pattern, glob_pattern_builder) = g.create_handle();
+        let (coalesce_expr, coalesce_expr_builder) = g.create_handle();
+        let (cast_expr, cast_expr_builder) = g.create_handle();
+        let (case_expr, case_expr_builder) = g.create_handle();
+        let (cmp_op, cmp_op_builder) = g.create_handle();
+        let (column, column_builder) = g.create_handle();
 
         paren_builder
             .concat("")
@@ -486,7 +515,6 @@ mod tests {
             .push(expr)
             .build();
 
-        let (like_pattern, like_pattern_builder) = g.create_handle();
         like_pattern_builder
             .choice()
             .option_str("%")
@@ -495,7 +523,6 @@ mod tests {
             .repeat(1..10, "")
             .build();
 
-        let (glob_pattern, glob_pattern_builder) = g.create_handle();
         glob_pattern_builder
             .choice()
             .option_str("*")
@@ -505,7 +532,6 @@ mod tests {
             .repeat(1..10, "")
             .build();
 
-        let (coalesce_expr, coalesce_expr_builder) = g.create_handle();
         coalesce_expr_builder
             .concat("")
             .push_str("COALESCE(")
@@ -513,7 +539,6 @@ mod tests {
             .push_str(")")
             .build();
 
-        let (cast_expr, cast_expr_builder) = g.create_handle();
         cast_expr_builder
             .concat(" ")
             .push_str("CAST ( (")
@@ -524,7 +549,6 @@ mod tests {
             .push_str(")")
             .build();
 
-        let (case_expr, case_expr_builder) = g.create_handle();
         case_expr_builder
             .concat(" ")
             .push_str("CASE (")
@@ -593,21 +617,185 @@ mod tests {
             )
             .build();
 
+        let number = g
+            .create()
+            .choice()
+            .option_symbol(rand_int(-0xff..0x100))
+            .option_symbol(rand_int(-0xffff..0x10000))
+            .option_symbol(rand_int(-0xffffff..0x1000000))
+            .option_symbol(rand_int(-0xffffffff..0x100000000))
+            .option_symbol(rand_int(-0xffffffffffff..0x1000000000000))
+            .build();
+
+        let mut column_builder = column_builder
+            .choice()
+            .option(
+                g.create()
+                    .concat(" ")
+                    .push_str("(")
+                    .push(column)
+                    .push_str(")")
+                    .build(),
+            )
+            .option(number)
+            .option(
+                g.create()
+                    .concat(" ")
+                    .push_str("(")
+                    .push(column)
+                    .push(g.create().choice().options_str(["+", "-"]).build())
+                    .push(column)
+                    .push_str(")")
+                    .build(),
+            );
+
+        if let Some(tables) = tables {
+            for table in tables.iter() {
+                for column in table.columns.iter() {
+                    column_builder = column_builder
+                        .option_symbol_w(const_str(&format!("{}.{}", table.name, column)), 1.0);
+                }
+            }
+        }
+
+        column_builder.build();
+
+        cmp_op_builder
+            .concat(" ")
+            .push(column)
+            .push(
+                g.create()
+                    .choice()
+                    .options_str(["=", "<>", ">", "<", ">=", "<=", "IS", "IS NOT"])
+                    .build(),
+            )
+            .push(column)
+            .build();
+
         expr_builder
             .choice()
-            .option_w(cast_expr, 1.0)
-            .option_w(case_expr, 1.0)
-            .option_w(unary_infix_op, 2.0)
             .option_w(bin_op, 3.0)
+            .option_w(unary_infix_op, 2.0)
             .option_w(paren, 2.0)
             .option_w(scalar, 4.0)
-            // unfortunately, sqlite behaves weirdly when IS operator is used with TRUE/FALSE constants
-            // e.g. 8 IS TRUE == 1 (although 8 = TRUE == 0)
-            // so, we do not use TRUE/FALSE constants as they will produce diff with sqlite results
+            .option_w(coalesce_expr, 1.0)
+            .option_w(cast_expr, 1.0)
+            .option_w(case_expr, 1.0)
+            .option_w(cmp_op, 1.0)
+            // .option_w(in_op, 1.0)
             .options_str(["1", "0", "NULL", "2.0", "1.5", "-0.5", "-2.0", "(1 / 0)"])
             .build();
 
-        let sql = g.create().concat(" ").push_str("SELECT").push(expr).build();
+        CommonBuilders {
+            bin_op,
+            unary_infix_op,
+            scalar,
+            paren,
+            coalesce_expr,
+            cast_expr,
+            case_expr,
+            cmp_op,
+            number,
+        }
+    }
+
+    fn predicate_builders(g: &GrammarGenerator, tables: Option<&[TestTable]>) -> PredicateBuilders {
+        let (in_op, in_op_builder) = g.create_handle();
+        let (column, column_builder) = g.create_handle();
+        let mut column_builder = column_builder
+            .choice()
+            .option(
+                g.create()
+                    .concat(" ")
+                    .push_str("(")
+                    .push(column)
+                    .push_str(")")
+                    .build(),
+            )
+            .option_symbol(rand_int(-0xffffffff..0x100000000))
+            .option(
+                g.create()
+                    .concat(" ")
+                    .push_str("(")
+                    .push(column)
+                    .push(g.create().choice().options_str(["+", "-"]).build())
+                    .push(column)
+                    .push_str(")")
+                    .build(),
+            );
+
+        if let Some(tables) = tables {
+            for table in tables.iter() {
+                for column in table.columns.iter() {
+                    column_builder = column_builder
+                        .option_symbol_w(const_str(&format!("{}.{}", table.name, column)), 1.0);
+                }
+            }
+        }
+
+        column_builder.build();
+
+        in_op_builder
+            .concat(" ")
+            .push(column)
+            .push(g.create().choice().options_str(["IN", "NOT IN"]).build())
+            .push_str("(")
+            .push(
+                g.create()
+                    .concat("")
+                    .push(column)
+                    .repeat(1..5, ", ")
+                    .build(),
+            )
+            .push_str(")")
+            .build();
+
+        PredicateBuilders { in_op }
+    }
+
+    fn build_logical_expr(
+        g: &GrammarGenerator,
+        common: &CommonBuilders,
+        predicate: Option<&PredicateBuilders>,
+    ) -> SymbolHandle {
+        let (handle, builder) = g.create_handle();
+        let mut builder = builder
+            .choice()
+            .option_w(common.cast_expr, 1.0)
+            .option_w(common.case_expr, 1.0)
+            .option_w(common.cmp_op, 1.0)
+            .option_w(common.coalesce_expr, 1.0)
+            .option_w(common.unary_infix_op, 2.0)
+            .option_w(common.bin_op, 3.0)
+            .option_w(common.paren, 2.0)
+            .option_w(common.scalar, 4.0)
+            // unfortunately, sqlite behaves weirdly when IS operator is used with TRUE/FALSE constants
+            // e.g. 8 IS TRUE == 1 (although 8 = TRUE == 0)
+            // so, we do not use TRUE/FALSE constants as they will produce diff with sqlite results
+            .options_str(["1", "0", "NULL", "2.0", "1.5", "-0.5", "-2.0", "(1 / 0)"]);
+
+        if let Some(predicate) = predicate {
+            builder = builder.option_w(predicate.in_op, 1.0);
+        }
+
+        builder.build();
+
+        handle
+    }
+
+    #[test]
+    pub fn logical_expression_fuzz_run() {
+        let _ = env_logger::try_init();
+        let g = GrammarGenerator::new();
+        let builders = common_builders(&g, None);
+        let expr = build_logical_expr(&g, &builders, None);
+
+        let sql = g
+            .create()
+            .concat(" ")
+            .push_str("SELECT ")
+            .push(expr)
+            .build();
 
         let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
@@ -663,105 +851,39 @@ mod tests {
     pub fn table_logical_expression_fuzz_run() {
         let _ = env_logger::try_init();
         let g = GrammarGenerator::new();
-        let (expr, expr_builder) = g.create_handle();
-        let (value, value_builder) = g.create_handle();
-        let (cmp_op, cmp_op_builder) = g.create_handle();
-        let (bin_op, bin_op_builder) = g.create_handle();
-        let (in_op, in_op_builder) = g.create_handle();
-        let (paren, paren_builder) = g.create_handle();
-
-        let number = g
-            .create()
-            .choice()
-            .option_symbol(rand_int(-0xff..0x100))
-            .option_symbol(rand_int(-0xffff..0x10000))
-            .option_symbol(rand_int(-0xffffff..0x1000000))
-            .option_symbol(rand_int(-0xffffffff..0x100000000))
-            .option_symbol(rand_int(-0xffffffffffff..0x1000000000000))
-            .build();
-        value_builder
-            .choice()
-            .option(
-                g.create()
-                    .concat(" ")
-                    .push_str("(")
-                    .push(value)
-                    .push_str(")")
-                    .build(),
-            )
-            .option(number)
-            .options_str(["x", "y", "z"])
-            .option(
-                g.create()
-                    .concat(" ")
-                    .push_str("(")
-                    .push(value)
-                    .push(g.create().choice().options_str(["+", "-"]).build())
-                    .push(value)
-                    .push_str(")")
-                    .build(),
-            )
-            .build();
-
-        paren_builder
-            .concat("")
-            .push_str("(")
-            .push(expr)
-            .push_str(")")
-            .build();
-
-        cmp_op_builder
-            .concat(" ")
-            .push(value)
-            .push(
-                g.create()
-                    .choice()
-                    .options_str(["=", "<>", ">", "<", ">=", "<=", "IS", "IS NOT"])
-                    .build(),
-            )
-            .push(value)
-            .build();
-
-        bin_op_builder
-            .concat(" ")
-            .push(expr)
-            .push(g.create().choice().options_str(["AND", "OR"]).build())
-            .push(expr)
-            .build();
-
-        in_op_builder
-            .concat(" ")
-            .push(value)
-            .push(g.create().choice().options_str(["IN", "NOT IN"]).build())
-            .push_str("(")
-            .push(g.create().concat("").push(value).repeat(1..5, ", ").build())
-            .push_str(")")
-            .build();
-
-        expr_builder
-            .choice()
-            .options_str(["1", "0"])
-            .option_w(paren, 10.0)
-            .option_w(cmp_op, 10.0)
-            .option_w(bin_op, 10.0)
-            .option_w(in_op, 10.0)
-            .build();
+        let tables = vec![TestTable {
+            name: "t",
+            columns: vec!["x", "y", "z"],
+        }];
+        let builders = common_builders(&g, Some(&tables));
+        let predicate = predicate_builders(&g, Some(&tables));
+        let expr = build_logical_expr(&g, &builders, Some(&predicate));
 
         let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
-        assert_eq!(
-            limbo_exec_rows(&db, &limbo_conn, "CREATE TABLE t(x, y, z)"),
-            sqlite_exec_rows(&sqlite_conn, "CREATE TABLE t(x, y, z)")
-        );
+        for table in tables.iter() {
+            assert_eq!(
+                limbo_exec_rows(
+                    &db,
+                    &limbo_conn,
+                    &format!("CREATE TABLE {} ({})", table.name, table.columns.join(", "))
+                ),
+                sqlite_exec_rows(
+                    &sqlite_conn,
+                    &format!("CREATE TABLE {} ({})", table.name, table.columns.join(", "))
+                )
+            );
+        }
+
         let (mut rng, seed) = rng_from_time();
         log::info!("seed: {}", seed);
 
         for _ in 0..100 {
             let (x, y, z) = (
-                g.generate(&mut rng, number, 1),
-                g.generate(&mut rng, number, 1),
-                g.generate(&mut rng, number, 1),
+                g.generate(&mut rng, builders.number, 1),
+                g.generate(&mut rng, builders.number, 1),
+                g.generate(&mut rng, builders.number, 1),
             );
             let query = format!("INSERT INTO t VALUES ({}, {}, {})", x, y, z);
             log::info!("insert: {}", query);
@@ -778,7 +900,7 @@ mod tests {
             .push(expr)
             .build();
 
-        for _ in 0..128 {
+        for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
             log::info!("query: {}", query);
             let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
