@@ -517,6 +517,17 @@ pub enum Insn {
     DeleteAwait {
         cursor_id: CursorID,
     },
+    DestroyAsync {
+        cursor_id: CursorID,
+        root_page: usize,
+        // auto_vaccum: usize, // p2
+        p3: usize, // p3 = 0 if destroyed in main db,1 if deleted fromaux db
+    },
+    DestroyAwait {
+        cursor_id: CursorID,
+        root_page: usize,
+        p3: usize,
+    },
 
     NewRowid {
         cursor: CursorID,        // P1

@@ -2175,7 +2175,12 @@ pub fn translate_and_mark(
 }
 
 /// Sanitaizes a string literal by removing single quote at front and back
-/// and escaping double single quotes
+/// if exists and escaping double single quotes
 pub fn sanitize_string(input: &str) -> String {
-    input[1..input.len() - 1].replace("''", "'").to_string()
+    if (input.starts_with("'") && input.ends_with("'"))
+        || (input.starts_with("\"") && input.ends_with("\""))
+    {
+        return input[1..input.len() - 1].replace("''", "'").to_string();
+    }
+    input.replace("''", "'").to_string()
 }

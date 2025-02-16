@@ -57,7 +57,7 @@ impl<'a> Resolver<'a> {
 pub struct TranslateCtx<'a> {
     // A typical query plan is a nested loop. Each loop has its own LoopLabels (see the definition of LoopLabels for more details)
     pub labels_main_loop: Vec<LoopLabels>,
-    // label for the instruction that jumps to the next phase of the query after the main loop
+    // label forprologuprologo the instruction that jumps to the next phase of the query after the main loop
     // we don't know ahead of time what that is (GROUP BY, ORDER BY, etc.)
     pub label_main_loop_end: Option<BranchOffset>,
     // First register of the aggregation results
@@ -97,7 +97,7 @@ pub enum OperationMode {
 }
 
 /// Initialize the program with basic setup and return initial metadata and labels
-fn prologue<'a>(
+pub fn prologue<'a>(
     program: &mut ProgramBuilder,
     syms: &'a SymbolTable,
     table_count: usize,
@@ -109,6 +109,7 @@ fn prologue<'a>(
         target_pc: init_label,
     });
 
+    program.emit_null(1);
     let start_offset = program.offset();
 
     let t_ctx = TranslateCtx {
@@ -133,7 +134,7 @@ fn prologue<'a>(
 /// Clean up and finalize the program, resolving any remaining labels
 /// Note that although these are the final instructions, typically an SQLite
 /// query will jump to the Transaction instruction via init_label.
-fn epilogue(
+pub fn epilogue(
     program: &mut ProgramBuilder,
     init_label: BranchOffset,
     start_offset: BranchOffset,
@@ -284,8 +285,8 @@ fn emit_program_for_delete(
         plan.result_columns.len(),
     )?;
 
-    // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     let after_main_loop_label = program.allocate_label();
+    // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     if plan.contains_constant_false_condition {
         program.emit_insn(Insn::Goto {
             target_pc: after_main_loop_label,
@@ -322,7 +323,7 @@ fn emit_program_for_delete(
     Ok(())
 }
 
-fn emit_delete_insns(
+pub fn emit_delete_insns(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     table_references: &[TableReference],

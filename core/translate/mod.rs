@@ -9,6 +9,8 @@
 
 pub(crate) mod aggregation;
 pub(crate) mod delete;
+pub(crate) mod destroy;
+pub(crate) mod drop;
 pub(crate) mod emitter;
 pub(crate) mod expr;
 pub(crate) mod group_by;
@@ -31,6 +33,7 @@ use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vdbe::builder::{CursorType, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::{builder::ProgramBuilder, insn::Insn, Program};
 use crate::{bail_parse_error, Connection, LimboError, Result, SymbolTable};
+use drop::translate_drop_table;
 use insert::translate_insert;
 use select::translate_select;
 use sqlite3_parser::ast::{self, fmt::ToTokens};
@@ -85,7 +88,13 @@ pub fn translate(
         }
         ast::Stmt::Detach(_) => bail_parse_error!("DETACH not supported yet"),
         ast::Stmt::DropIndex { .. } => bail_parse_error!("DROP INDEX not supported yet"),
-        ast::Stmt::DropTable { .. } => bail_parse_error!("DROP TABLE not supported yet"),
+        ast::Stmt::DropTable {
+            tbl_name,
+            if_exists,
+        } => {
+            translate_drop_table(query_mode, tbl_name, schema, if_exists, syms)?
+            // delete all tables
+        }
         ast::Stmt::DropTrigger { .. } => bail_parse_error!("DROP TRIGGER not supported yet"),
         ast::Stmt::DropView { .. } => bail_parse_error!("DROP VIEW not supported yet"),
         ast::Stmt::Pragma(name, body) => pragma::translate_pragma(

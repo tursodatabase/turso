@@ -974,6 +974,32 @@ pub fn insn_to_str(
                 0,
                 "".to_string(),
             ),
+            Insn::DestroyAsync {
+                cursor_id,
+                root_page,
+                p3,
+            } => (
+                "DestroyAsync",
+                *root_page as i32,
+                2,
+                *p3 as i32,
+                OwnedValue::build_text(Rc::new("".to_string())),
+                0,
+                "".to_string(),
+            ),
+            Insn::DestroyAwait {
+                cursor_id,
+                root_page,
+                p3,
+            } => (
+                "DestroyAwait",
+                *root_page as i32,
+                2,
+                *p3 as i32,
+                OwnedValue::build_text(Rc::new("".to_string())),
+                0,
+                "".to_string(),
+            ),
             Insn::NewRowid {
                 cursor,
                 rowid_reg,

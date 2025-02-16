@@ -2499,6 +2499,57 @@ impl Program {
                     self.n_change.set(prev_changes + 1);
                     state.pc += 1;
                 }
+                Insn::DestroyAsync {
+                    cursor_id,
+                    root_page,
+                    p3,
+                } => {
+                    let (_, cursor_type) = self.cursor_ref.get(*cursor_id).unwrap();
+                    let mut cursors = state.cursors.borrow_mut();
+                    let is_index = cursor_type.is_index();
+                    let c = BTreeCursor::new(pager.clone(), *root_page);
+                    if is_index {
+                        cursors
+                            .get_mut(*cursor_id)
+                            .unwrap()
+                            .replace(Cursor::new_index(c));
+                    } else {
+                        cursors
+                            .get_mut(*cursor_id)
+                            .unwrap()
+                            .replace(Cursor::new_table(c));
+                    };
+
+                    let cursor: &mut BTreeCursor = if is_index {
+                        get_cursor_as_index_mut(&mut cursors, *cursor_id)
+                    } else {
+                        get_cursor_as_table_mut(&mut cursors, *cursor_id)
+                    };
+
+                    return_if_io!(cursor.delete());
+                    state.pc += 1;
+                }
+                Insn::DestroyAwait {
+                    cursor_id,
+                    root_page,
+                    p3,
+                } => {
+                    let mut cursors = state.cursors.borrow_mut();
+
+                    let (_, cursor_type) = self.cursor_ref.get(*cursor_id).unwrap();
+                    let is_index = cursor_type.is_index();
+                    let cursor: &mut BTreeCursor = if is_index {
+                        get_cursor_as_index_mut(&mut cursors, *cursor_id)
+                    } else {
+                        get_cursor_as_table_mut(&mut cursors, *cursor_id)
+                    };
+                    cursor.wait_for_completion()?;
+                    // TODO: check if active reader VMs
+                    // if there are active readers, error out
+
+                    // TODO: implement autovaccume condition
+                    state.pc += 1;
+                }
                 Insn::NewRowid {
                     cursor, rowid_reg, ..
                 } => {
