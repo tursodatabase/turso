@@ -446,7 +446,17 @@ pub fn translate_condition_expr(
                 target_pc: condition_metadata.jump_target_when_false,
             });
         }
-        _ => todo!("op {:?} not implemented", expr),
+        ast::Expr::Unary(_, _) => {
+            // This is an inefficient implementation for op::NOT, because translate_expr() will emit an Insn::Not,
+            // and then we immediately emit an Insn::If/Insn::IfNot for the conditional jump. In reality we would not
+            // like to emit the negation instruction Insn::Not at all, since we could just emit the "opposite" jump instruction
+            // directly. However, using translate_expr() directly simplifies our conditional jump code for unary expressions,
+            // and we'd rather be correct than maximally efficient, for now.
+            let expr_reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
+            emit_cond_jump(program, condition_metadata, expr_reg);
+        }
+        other => todo!("expression {:?} not implemented", other),
     }
     Ok(())
 }
