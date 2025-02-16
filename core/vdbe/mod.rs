@@ -3680,7 +3680,9 @@ fn affinity(datatype: &str) -> Affinity {
 /// The CAST operator understands decimal integers only — conversion of hexadecimal integers stops at the "x" in the "0x" prefix of the hexadecimal integer string and thus result of the CAST is always zero.
 fn cast_text_to_integer(text: &str) -> OwnedValue {
     let text = text.trim();
-
+    if text.is_empty() {
+        return OwnedValue::Integer(0);
+    }
     if let Ok(i) = text.parse::<i64>() {
         return OwnedValue::Integer(i);
     }
@@ -3702,6 +3704,9 @@ fn cast_text_to_integer(text: &str) -> OwnedValue {
 /// If there is no prefix that can be interpreted as a real number, the result of the conversion is 0.0.
 fn cast_text_to_real(text: &str) -> OwnedValue {
     let trimmed = text.trim_start();
+    if trimmed.is_empty() {
+        return OwnedValue::Float(0.0);
+    }
     if let Ok(num) = trimmed.parse::<f64>() {
         return OwnedValue::Float(num);
     }
