@@ -3,6 +3,7 @@ use std::num::NonZero;
 use super::{AggFunc, BranchOffset, CursorID, FuncCtx, PageIdx};
 use crate::storage::wal::CheckpointMode;
 use crate::types::{OwnedValue, Record};
+use crate::vdbe::cast_text_to_real;
 use limbo_macros::Description;
 
 /// Flags provided to comparison instructions (e.g. Eq, Ne) which determine behavior related to NULL values.
@@ -1023,7 +1024,7 @@ pub fn exec_boolean_not(mut reg: &OwnedValue) -> OwnedValue {
         OwnedValue::Null => OwnedValue::Null,
         OwnedValue::Integer(i) => OwnedValue::Integer((*i == 0) as i64),
         OwnedValue::Float(f) => OwnedValue::Integer((*f == 0.0) as i64),
-        OwnedValue::Text(text) => exec_boolean_not(&cast_text_to_numerical(text.as_str())),
+        OwnedValue::Text(text) => exec_boolean_not(&cast_text_to_real(text.as_str())),
         _ => todo!(),
     }
 }
