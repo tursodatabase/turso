@@ -928,7 +928,14 @@ pub fn exec_remainder(mut lhs: &OwnedValue, mut rhs: &OwnedValue) -> OwnedValue 
                 OwnedValue::Float((lhs % rhs_int) as f64)
             }
         }
-        other => todo!("remainder not implemented for: {:?} {:?}", lhs, other),
+        (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_remainder(
+            &cast_text_to_numerical(lhs.as_str()),
+            &cast_text_to_numerical(rhs.as_str()),
+        ),
+        (OwnedValue::Text(text), other) | (other, OwnedValue::Text(text)) => {
+            exec_remainder(&cast_text_to_numerical(text.as_str()), other)
+        }
+        _ => todo!(),
     }
 }
 
