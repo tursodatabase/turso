@@ -898,17 +898,37 @@ pub fn exec_remainder(mut lhs: &OwnedValue, mut rhs: &OwnedValue) -> OwnedValue 
         | (_, OwnedValue::Null)
         | (_, OwnedValue::Integer(0))
         | (_, OwnedValue::Float(0.0)) => OwnedValue::Null,
-        (OwnedValue::Integer(lhs), OwnedValue::Integer(rhs)) => OwnedValue::Integer(lhs % rhs),
+        (OwnedValue::Integer(lhs), OwnedValue::Integer(rhs)) => {
+            if rhs == &0 {
+                OwnedValue::Null
+            } else {
+                OwnedValue::Integer(lhs % rhs)
+            }
+        }
         (OwnedValue::Float(lhs), OwnedValue::Float(rhs)) => {
-            OwnedValue::Float(((*lhs as i64) % (*rhs as i64)) as f64)
+            let rhs_int = *rhs as i64;
+            if rhs_int == 0 {
+                OwnedValue::Null
+            } else {
+                OwnedValue::Float(((*lhs as i64) % rhs_int) as f64)
+            }
         }
         (OwnedValue::Float(lhs), OwnedValue::Integer(rhs)) => {
-            OwnedValue::Float(((*lhs as i64) % rhs) as f64)
+            if rhs == &0 {
+                OwnedValue::Null
+            } else {
+                OwnedValue::Float(((*lhs as i64) % rhs) as f64)
+            }
         }
         (OwnedValue::Integer(lhs), OwnedValue::Float(rhs)) => {
-            OwnedValue::Float((lhs % *rhs as i64) as f64)
+            let rhs_int = *rhs as i64;
+            if rhs_int == 0 {
+                OwnedValue::Null
+            } else {
+                OwnedValue::Float((lhs % rhs_int) as f64)
+            }
         }
-        _ => todo!(),
+        other => todo!("remainder not implemented for: {:?} {:?}", lhs, other),
     }
 }
 
