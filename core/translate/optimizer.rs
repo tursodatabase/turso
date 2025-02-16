@@ -367,7 +367,6 @@ impl Optimizable for ast::Expr {
     fn check_constant(&self) -> Result<Option<ConstantPredicate>> {
         match self {
             Self::Literal(lit) => match lit {
-                ast::Literal::Null => Ok(Some(ConstantPredicate::AlwaysFalse)),
                 ast::Literal::Numeric(b) => {
                     if let Ok(int_value) = b.parse::<i64>() {
                         return Ok(Some(if int_value == 0 {
