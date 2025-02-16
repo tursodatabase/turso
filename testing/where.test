@@ -472,3 +472,95 @@ foreach {operator} {
     # NULL comparison AND id=1
     do_execsql_test where-binary-one-operand-null-and-$operator "select first_name from users where first_name $operator NULL AND id = 1" {}
 }
+
+# Test literals in WHERE clause
+do_execsql_test where-literal-string {
+    select count(*) from users where 'yes';
+} {0}
+
+# FIXME: should return 0
+#do_execsql_test where-literal-number {
+#    select count(*) from users where x'DEADBEEF';
+#} {0}
+
+# Test CAST in WHERE clause
+do_execsql_test where-cast-string-to-int {
+    select count(*) from users where cast('1' as integer);
+} {10000}
+
+do_execsql_test where-cast-float-to-int {
+    select count(*) from users where cast('0' as integer);
+} {0}
+
+# Test FunctionCall in WHERE clause
+do_execsql_test where-function-length {
+    select count(*) from users where length(first_name);
+} {10000}
+
+# Test CASE in WHERE clause
+do_execsql_test where-case-simple {
+    select count(*) from users where 
+    case when age > 0 then 1 else 0 end;
+} {10000}
+
+do_execsql_test where-case-searched {
+    select count(*) from users where 
+    case age 
+        when 0 then 0
+        else 1
+    end;
+} {10000}
+
+# Test unary operators in WHERE clause
+do_execsql_test where-unary-not {
+    select count(*) from users where not (id = 1);
+} {9999}
+
+do_execsql_test where-unary-plus {
+    select count(*) from users where +1;
+} {10000}
+
+do_execsql_test where-unary-minus {
+    select count(*) from users where -1;
+} {10000}
+
+do_execsql_test where-unary-bitnot {
+    select count(*) from users where ~1;
+} {10000}
+
+# Test binary math operators in WHERE clause
+do_execsql_test where-binary-add {
+    select count(*) from users where 1 + 1;
+} {10000}
+
+do_execsql_test where-binary-subtract {
+    select count(*) from users where 2 - 1;
+} {10000}
+
+do_execsql_test where-binary-multiply {
+    select count(*) from users where 2 * 1;
+} {10000}
+
+do_execsql_test where-binary-divide {
+    select count(*) from users where 2 / 2;
+} {10000}
+
+do_execsql_test where-binary-modulo {
+    select count(*) from users where 3 % 2;
+} {10000}
+
+do_execsql_test where-binary-shift-left {
+    select count(*) from users where 1 << 1;
+} {10000}
+
+do_execsql_test where-binary-shift-right {
+    select count(*) from users where 2 >> 1;
+} {10000}
+
+do_execsql_test where-binary-bitwise-and {
+    select count(*) from users where 3 & 1;
+} {10000}
+
+do_execsql_test where-binary-bitwise-or {
+    select count(*) from users where 2 | 1;
+} {10000}
