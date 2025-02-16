@@ -276,7 +276,8 @@ pub fn translate_condition_expr(
         | ast::Expr::Cast { .. }
         | ast::Expr::FunctionCall { .. }
         | ast::Expr::Column { .. }
-        | ast::Expr::RowId { .. } => {
+        | ast::Expr::RowId { .. }
+        | ast::Expr::Case { .. } => {
             let reg = program.alloc_register();
             translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
             emit_cond_jump(program, condition_metadata, reg);
