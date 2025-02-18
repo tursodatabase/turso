@@ -1,0 +1,23 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Ruby build artifacts
+*.gem
+*.rbc
+.bundle
+.config
+coverage/
+InstalledFiles
+lib/bundler/man/
+pkg/
+rdoc/
+tmp/
+
+# OS generated files
+.DS_Store
+*.swp
+*~
+.project
+.idea
+.vscode

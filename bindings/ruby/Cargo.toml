@@ -1,0 +1,14 @@
+[package]
+name = "ruby-limbo"
+version = "0.1.0"
+authors = ["Your Name <you@example.com>"]
+edition = "2018"
+license = "MIT"
+repository = "https://github.com/tursodatabase/limbo"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rutie = "0.8.0"
+limbo_core = { path = "../../core", features = ["io_uring"] }
