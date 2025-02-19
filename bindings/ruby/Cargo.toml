@@ -1,10 +1,10 @@
 [package]
 name = "ruby-limbo"
-version = "0.1.0"
-authors = ["Your Name <you@example.com>"]
-edition = "2018"
-license = "MIT"
-repository = "https://github.com/tursodatabase/limbo"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 crate-type = ["cdylib"]
