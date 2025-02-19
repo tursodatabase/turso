@@ -183,6 +183,18 @@ impl OwnedValue {
             OwnedValue::Blob(b) => out.extend_from_slice(b),
         };
     }
+
+    pub fn to_i64(&self) -> i64 {
+        match self {
+            Self::Integer(i) => *i,
+            Self::Float(f) => *f as i64,
+            Self::Text(t) => t.as_str().parse::<i64>().unwrap_or(0),
+            Self::Null => 0,
+            Self::Blob(_) => 0,
+            Self::Agg(ctx) => ctx.final_value().to_i64(),
+            Self::Record(_) => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

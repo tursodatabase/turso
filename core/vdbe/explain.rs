@@ -1389,6 +1389,15 @@ pub fn insn_to_str(
                 0,
                 format!("auto_commit={}, rollback={}", auto_commit, rollback),
             ),
+            Insn::AddImm { reg, value } => (
+                "AddImm",
+                *value as i32,
+                *reg as i32,
+                0,
+                OwnedValue::build_text(""),
+                0,
+                format!("r[{}]=r[{}]+{}", reg, reg, value),
+            ),
         };
     format!(
         "{:<4}  {:<17}  {:<4}  {:<4}  {:<4}  {:<13}  {:<2}  {}",
