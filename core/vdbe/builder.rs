@@ -198,6 +198,14 @@ impl ProgramBuilder {
         self.emit_insn(Insn::Goto { target_pc });
     }
 
+    #[allow(dead_code)]
+    pub fn emit_add_imm(&mut self, reg: usize, constant: i64) {
+        self.emit_insn(Insn::AddImm {
+            reg,
+            value: constant,
+        });
+    }
+
     pub fn add_comment(&mut self, insn_index: BranchOffset, comment: &'static str) {
         if let Some(comments) = &mut self.comments {
             comments.insert(insn_index.to_offset_int(), comment);
