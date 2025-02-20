@@ -1,0 +1,26 @@
+PATH
+  remote: .
+  specs:
+    limbo (0.0.0)
+      rb_sys (~> 0.9.39)
+
+GEM
+  remote: https://rubygems.org/
+  specs:
+    rake (13.2.1)
+    rake-compiler (1.2.9)
+      rake
+    rake-compiler-dock (1.9.1)
+    rb_sys (0.9.110)
+      rake-compiler-dock (= 1.9.1)
+
+PLATFORMS
+  aarch64-linux
+  ruby
+
+DEPENDENCIES
+  limbo!
+  rake-compiler (~> 1.2.0)
+
+BUNDLED WITH
+   2.5.22

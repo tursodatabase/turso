@@ -1,0 +1,13 @@
+require "rb_sys/extensiontask"
+require "debug"
+
+GEMSPEC = Gem::Specification.load("limbo.gemspec")
+
+ENV["RB_SYS_CARGO_MANIFEST_DIR"] = File.expand_path(".", __dir__)
+ENV["RB_SYS_CARGO_TARGET_DIR"] = File.expand_path("tmp/target", __dir__)
+RbSys::ExtensionTask.new("limbo", GEMSPEC) do |ext|
+  def ext.extconf = "./ext/limbo/extconf.rb"
+
+  # If you want to use `rb-sys-dock` for cross-compilation:
+  ext.cross_compile = true
+end

@@ -1,7 +1,6 @@
 require 'minitest/autorun'
-require 'rutie'
+require 'limbo'
 require_relative '../target/release/liblimbo'
-
 module Limbo
   class Connection
     def initialize(path)

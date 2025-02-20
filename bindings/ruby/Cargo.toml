@@ -7,8 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [lib]
+name = "limbo"
 crate-type = ["cdylib"]
 
 [dependencies]
-rutie = "0.8.0"
-limbo_core = { path = "../../core", features = ["io_uring"] }
+magnus = "0.7"
+limbo_core = { workspace = true, features = ["io_uring"] }
