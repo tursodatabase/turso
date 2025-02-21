@@ -36,6 +36,7 @@ pub fn translate_select(
     });
 
     if let ast::OneSelect::Values(values) = &select.body.select.as_ref() {
+        program.alloc_registers(values[0].len() + 1);
         emit_values(&mut program, &values)?;
         return Ok(program);
     }
