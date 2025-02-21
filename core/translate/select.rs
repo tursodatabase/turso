@@ -1,6 +1,7 @@
 use super::emitter::emit_program;
 use super::plan::{select_star, Operation, Search, SelectQueryType};
 use super::planner::Scope;
+use super::values::emit_values;
 use crate::function::{AggFunc, ExtFunc, Func};
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{Aggregate, Direction, GroupBy, Plan, ResultSetColumn, SelectPlan};
@@ -21,18 +22,24 @@ pub fn translate_select(
     select: ast::Select,
     syms: &SymbolTable,
 ) -> Result<ProgramBuilder> {
-    let mut select_plan = prepare_select_plan(schema, select, syms, None)?;
+    let mut select_plan = prepare_select_plan(schema, select.clone(), syms, None)?;
     optimize_plan(&mut select_plan, schema)?;
-    let Plan::Select(ref select) = select_plan else {
+    let Plan::Select(ref select_ref) = select_plan else {
         panic!("select_plan is not a SelectPlan");
     };
 
     let mut program = ProgramBuilder::new(ProgramBuilderOpts {
         query_mode,
-        num_cursors: count_plan_required_cursors(select),
-        approx_num_insns: estimate_num_instructions(select),
-        approx_num_labels: estimate_num_labels(select),
+        num_cursors: count_plan_required_cursors(select_ref),
+        approx_num_insns: estimate_num_instructions(select_ref),
+        approx_num_labels: estimate_num_labels(select_ref),
     });
+
+    if let ast::OneSelect::Values(values) = &select.body.select.as_ref() {
+        emit_values(&mut program, &values)?;
+        return Ok(program);
+    }
+
     emit_program(&mut program, select_plan, syms)?;
     Ok(program)
 }
@@ -375,7 +382,43 @@ pub fn prepare_select_plan<'a>(
             // Return the unoptimized query plan
             Ok(Plan::Select(plan))
         }
-        _ => todo!(),
+        ast::OneSelect::Values(values) => {
+            // New VALUES handling
+            if values.is_empty() {
+                crate::bail_parse_error!("VALUES clause cannot be empty");
+            }
+
+            let first_row_len = values[0].len();
+            if first_row_len == 0 {
+                crate::bail_parse_error!("VALUES rows must have at least one column");
+            }
+
+            // Create result columns from first row
+            let mut result_columns = Vec::with_capacity(first_row_len);
+            for i in 0..first_row_len {
+                result_columns.push(ResultSetColumn {
+                    expr: values[0][i].clone(),
+                    alias: None,
+                    contains_aggregates: false,
+                });
+            }
+
+            // Create minimal plan since VALUES just returns constant rows
+            let plan = SelectPlan {
+                table_references: vec![], // No tables needed
+                result_columns,
+                where_clause: vec![],
+                group_by: None,
+                order_by: None,
+                aggregates: vec![],
+                limit: None,
+                offset: None,
+                contains_constant_false_condition: false,
+                query_type: SelectQueryType::TopLevel,
+            };
+
+            Ok(Plan::Select(plan))
+        }
     }
 }
 

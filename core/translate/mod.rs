@@ -23,6 +23,7 @@ pub(crate) mod result_row;
 pub(crate) mod select;
 pub(crate) mod subquery;
 pub(crate) mod transaction;
+pub(crate) mod values;
 
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
