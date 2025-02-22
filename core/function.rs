@@ -1,9 +1,8 @@
+use crate::LimboError;
 use limbo_ext::{FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction};
 use std::fmt;
 use std::fmt::{Debug, Display};
 use std::rc::Rc;
-
-use crate::LimboError;
 
 pub struct ExternalFunc {
     pub name: String,

@@ -21,6 +21,30 @@ pub enum OwnedValueType {
     Error,
 }
 
+impl From<ExtValueType> for OwnedValueType {
+    fn from(val: ExtValueType) -> Self {
+        match val {
+            ExtValueType::Integer => Self::Integer,
+            ExtValueType::Float => Self::Float,
+            ExtValueType::Blob => Self::Blob,
+            ExtValueType::Text => Self::Text,
+            _ => Self::Null,
+        }
+    }
+}
+
+impl Into<crate::schema::Type> for OwnedValueType {
+    fn into(self) -> crate::schema::Type {
+        match self {
+            OwnedValueType::Integer => crate::schema::Type::Integer,
+            OwnedValueType::Float => crate::schema::Type::Real,
+            OwnedValueType::Blob => crate::schema::Type::Blob,
+            OwnedValueType::Text => crate::schema::Type::Text,
+            _ => crate::schema::Type::Null,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TextSubtype {
     Text,

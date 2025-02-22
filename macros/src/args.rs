@@ -8,6 +8,7 @@ pub(crate) struct RegisterExtensionInput {
     pub scalars: Vec<Ident>,
     pub vtabs: Vec<Ident>,
     pub vfs: Vec<Ident>,
+    pub types: Vec<Ident>,
 }
 
 impl syn::parse::Parse for RegisterExtensionInput {
@@ -16,11 +17,12 @@ impl syn::parse::Parse for RegisterExtensionInput {
         let mut scalars = Vec::new();
         let mut vtabs = Vec::new();
         let mut vfs = Vec::new();
+        let mut types = Vec::new();
         while !input.is_empty() {
             if input.peek(syn::Ident) && input.peek2(Token![:]) {
                 let section_name: Ident = input.parse()?;
                 input.parse::<Token![:]>()?;
-                let names = ["aggregates", "scalars", "vtabs", "vfs"];
+                let names = ["aggregates", "scalars", "vtabs", "vfs", "types"];
                 if names.contains(&section_name.to_string().as_str()) {
                     let content;
                     syn::braced!(content in input);
@@ -33,7 +35,10 @@ impl syn::parse::Parse for RegisterExtensionInput {
                         "scalars" => scalars = parsed_items,
                         "vtabs" => vtabs = parsed_items,
                         "vfs" => vfs = parsed_items,
-                        _ => unreachable!(),
+                        "types" => types = parsed_items,
+                        _ => {
+                            return Err(syn::Error::new(section_name.span(), "Invalid section"));
+                        }
                     };
 
                     if input.peek(Token![,]) {
@@ -43,7 +48,8 @@ impl syn::parse::Parse for RegisterExtensionInput {
                     return Err(syn::Error::new(section_name.span(), "Unknown section"));
                 }
             } else {
-                return Err(input.error("Expected aggregates:, scalars:, or vtabs: section"));
+                return Err(input
+                    .error("Expected 'aggregates:', 'scalars:', 'types:', or 'vtabs:' section"));
             }
         }
 
@@ -52,6 +58,7 @@ impl syn::parse::Parse for RegisterExtensionInput {
             scalars,
             vtabs,
             vfs,
+            types,
         })
     }
 }

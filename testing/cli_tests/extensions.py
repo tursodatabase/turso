@@ -28,8 +28,16 @@ def validate_string_uuid(res):
     return len(res) == 36
 
 
+def validate_ts(res):
+    return res.isdigit()
+
+
+def null(res):
+    return res == ""
+
+
 def test_uuid():
-    limbo = TestLimboShell()
+    limbo = TestLimboShell("CREATE TABLE test (id UUID);")
     specific_time = "01945ca0-3189-76c0-9a8f-caf310fc8b8e"
     # these are built into the binary, so we just test they work
     limbo.run_test_fn(
@@ -57,6 +65,27 @@ def test_uuid():
         validate_string_uuid,
         "scalar alias's are registered properly",
     )
+    limbo.run_test_fn("CREATE TABLE users (id UUID, name TEXT);", null)
+    limbo.run_test_fn("INSERT INTO USERS (name) values ('test');", null)
+    limbo.run_test_fn("SELECT id from users;", validate_string_uuid)
+    limbo.run_test_fn(
+        "INSERT INTO USERS (id, name) values (unixepoch(), 'next');", null
+    )
+    limbo.run_test_fn("SELECT id from users where name = 'next';", validate_string_uuid)
+    limbo.run_test_fn(
+        "SELECT uuid7_timestamp_ms(id) / 1000 from users where name = 'next';",
+        validate_ts,
+    )
+    limbo.execute_dot("CREATE TABLE users2 (id uuid, name TEXT);")
+    limbo.execute_dot("INSERT INTO users2 (name) values ('test');")
+    limbo.execute_dot("INSERT INTO users2 (name) values ('next');")
+    limbo.run_test_fn(
+        "SELECT id from users2 where name = 'next';", validate_string_uuid
+    )
+    limbo.run_test_fn(
+        "SELECT uuid7_timestamp_ms(id) / 1000 from users2 where name = 'next';",
+        validate_ts,
+    )
     limbo.quit()
 
 
@@ -66,10 +95,6 @@ def true(res):
 
 def false(res):
     return res == "0"
-
-
-def null(res):
-    return res == ""
 
 
 def test_regexp():

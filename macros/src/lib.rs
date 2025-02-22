@@ -879,6 +879,7 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
         scalars,
         vtabs,
         vfs,
+        types,
     } = input_ast;
 
     let scalar_calls = scalars.iter().map(|scalar_ident| {

@@ -4,8 +4,8 @@ mod vfs_modules;
 pub use limbo_macros::VfsDerive;
 pub use limbo_macros::{register_extension, scalar, AggregateDerive, VTabModuleDerive};
 use std::{
+    ffi::{c_char, c_void},
     fmt::Display,
-    os::raw::{c_char, c_void},
 };
 pub use types::{ResultCode, Value, ValueType};
 pub use vfs_modules::{RegisterVfsFn, VfsFileImpl, VfsImpl};
@@ -74,6 +74,9 @@ pub type RegisterModuleFn = unsafe extern "C" fn(
     module: VTabModuleImpl,
     kind: VTabKind,
 ) -> ResultCode;
+
+pub type RegisterCustomTypeFn =
+    unsafe extern "C" fn(ctx: *mut c_void, module: *const CustomTypeImpl) -> ResultCode;
 
 pub type InitAggFunction = unsafe extern "C" fn() -> *mut AggCtx;
 pub type StepFunction = unsafe extern "C" fn(ctx: *mut AggCtx, argc: i32, argv: *const Value);
@@ -183,3 +186,20 @@ pub trait VTabCursor: Sized {
     fn eof(&self) -> bool;
     fn next(&mut self) -> ResultCode;
 }
+
+#[repr(C)]
+#[derive(Clone, Debug)]
+pub struct CustomTypeImpl {
+    pub name: *const c_char,
+    pub type_of: ValueType,
+    pub generate: CustomTypeGenerateFn,
+}
+
+pub trait CustomType: Default + Sized {
+    const NAME: &'static str;
+    const TYPE: ValueType;
+    fn generate(col_name: Option<&str>, insert_val: Option<&Value>) -> Value;
+}
+
+pub type CustomTypeGenerateFn =
+    unsafe extern "C" fn(col_name: *const c_char, insert_val: *const Value) -> Value;

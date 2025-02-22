@@ -328,9 +328,11 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
     }
 }
 
-pub fn columns_from_create_table_body(body: &ast::CreateTableBody) -> crate::Result<Vec<Column>> {
+pub fn columns_from_create_table_body(
+    body: ast::CreateTableBody,
+) -> Result<Vec<Column>, LimboError> {
     let CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
-        return Err(crate::LimboError::ParseError(
+        return Err(LimboError::ParseError(
             "CREATE TABLE body must contain columns and constraints".to_string(),
         ));
     };
