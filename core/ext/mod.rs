@@ -4,6 +4,7 @@ mod dynamic;
 use crate::UringIO;
 use crate::IO;
 use crate::{function::ExternalFunc, Connection, Database, LimboError};
+pub mod foreign_types;
 use limbo_ext::{
     ExtensionApi, InitAggFunction, ResultCode, ScalarFunction, VTabKind, VTabModuleImpl, VfsImpl,
 };

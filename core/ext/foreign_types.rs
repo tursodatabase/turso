@@ -6,34 +6,37 @@ use std::{ffi::CString, fmt::Display, rc::Rc};
 /// Because we don't want to add additional opcodes, types that are
 /// defined in extensions will operate internally as functions.
 #[derive(Clone, Debug)]
-pub struct TsFunc {
-    pub ext_type: Rc<ExternType>,
-    pub op: TsFuncOp,
+pub struct ForeignTypeFunc {
+    pub ext_type: Rc<ForeignType>,
+    pub op: ForeignTypeOp,
 }
 
-impl TsFunc {
-    pub fn new(ext_type: Rc<ExternType>, op: TsFuncOp) -> Self {
-        Self { ext_type, op }
+impl ForeignTypeFunc {
+    pub fn new_generate(ext_type: Rc<ForeignType>) -> Self {
+        Self {
+            ext_type,
+            op: ForeignTypeOp::Generate,
+        }
     }
 }
 
-impl Display for TsFunc {
+impl Display for ForeignTypeFunc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let kind = match self.op {
-            TsFuncOp::Generate => "generate",
+            ForeignTypeOp::Generate => "generate",
         };
         write!(f, "{}: {}", self.ext_type.name, kind)
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum TsFuncOp {
+pub enum ForeignTypeOp {
     Generate,
     // TODO
 }
 
 #[derive(Default)]
-pub struct TypeRegistry(Vec<(String, Rc<ExternType>)>);
+pub struct TypeRegistry(Vec<(String, Rc<ForeignType>)>);
 impl TypeRegistry {
     pub fn new() -> Self {
         Self(Vec::new())
@@ -41,10 +44,10 @@ impl TypeRegistry {
 
     pub fn register(&mut self, name: &str, ctx: *const CustomTypeImpl, _type: OwnedValueType) {
         self.0
-            .push((name.to_string(), ExternType::new(name, ctx, _type).into()));
+            .push((name.to_string(), ForeignType::new(name, ctx, _type).into()));
     }
 
-    pub fn get(&self, name: &str) -> Option<Rc<ExternType>> {
+    pub fn get(&self, name: &str) -> Option<Rc<ForeignType>> {
         self.0
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
@@ -53,13 +56,13 @@ impl TypeRegistry {
 }
 
 #[derive(Clone, Debug)]
-pub struct ExternType {
+pub struct ForeignType {
     pub name: String,
     ctx: Box<CustomTypeImpl>,
     _type: OwnedValueType,
 }
 
-impl ExternType {
+impl ForeignType {
     pub fn new(name: &str, ctx: *const CustomTypeImpl, type_of: OwnedValueType) -> Self {
         Self {
             name: name.to_string(),

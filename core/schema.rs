@@ -1,5 +1,4 @@
-use crate::VirtualTable;
-use crate::{util::normalize_ident, Result};
+use crate::{util::normalize_ident, Result, VirtualTable};
 use core::fmt;
 use fallible_iterator::FallibleIterator;
 use limbo_sqlite3_parser::ast::{Expr, Literal, TableOptions};

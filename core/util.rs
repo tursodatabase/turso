@@ -329,7 +329,7 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
 }
 
 pub fn columns_from_create_table_body(
-    body: ast::CreateTableBody,
+    body: &ast::CreateTableBody,
 ) -> Result<Vec<Column>, LimboError> {
     let CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
         return Err(LimboError::ParseError(
