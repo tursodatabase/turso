@@ -913,4 +913,41 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    pub fn values_statement_edge_cases() {
+        let db = TempDatabase::new_empty();
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+    
+        let test_cases = vec![
+            "VALUES (NULL)",
+            "VALUES (1), (2), (3)",
+            "VALUES (1, 2, 3)",
+            "VALUES ('hello', 1, NULL)",
+            "VALUES (1.5, -2.5, 0.0)",
+            "VALUES (9223372036854775807)",
+            "VALUES (-9223372036854775808)",
+            "VALUES (1, 'text with spaces', NULL)",
+            "VALUES (''), ('a'), ('ab')",
+            "VALUES (NULL, NULL), (1, 2)",
+            "VALUES (1), (2), (NULL), (4)",
+            "VALUES (1.0, 2.0), (3.0, 4.0)",
+            "VALUES (-1, -2), (-3, -4)",
+            "VALUES (1), (NULL), ('text')",
+        ];
+    
+        for query in test_cases {
+            println!("query: {:?}", query);
+            log::info!("Testing query: {}", query);
+            let limbo = limbo_exec_rows(&db, &limbo_conn, query);
+            let sqlite = sqlite_exec_rows(&sqlite_conn, query);
+            
+            assert_eq!(
+                limbo, sqlite,
+                "query: {}, limbo: {:?}, sqlite: {:?}",
+                query, limbo, sqlite
+            );
+        }
+    }
 }
