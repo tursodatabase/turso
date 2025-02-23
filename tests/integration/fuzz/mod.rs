@@ -920,6 +920,7 @@ mod tests {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
     
+        // Test edge cases and specific scenarios 
         let test_cases = vec![
             "VALUES (NULL)",
             "VALUES (1), (2), (3)",
@@ -927,7 +928,7 @@ mod tests {
             "VALUES ('hello', 1, NULL)",
             "VALUES (1.5, -2.5, 0.0)",
             "VALUES (9223372036854775807)",
-            "VALUES (-9223372036854775808)",
+            "VALUES (-9223372036854775808)",  
             "VALUES (1, 'text with spaces', NULL)",
             "VALUES (''), ('a'), ('ab')",
             "VALUES (NULL, NULL), (1, 2)",
@@ -935,10 +936,23 @@ mod tests {
             "VALUES (1.0, 2.0), (3.0, 4.0)",
             "VALUES (-1, -2), (-3, -4)",
             "VALUES (1), (NULL), ('text')",
+            "VALUES (0.0), (-0.0), (1.0/0.0)",
+            "VALUES ('text''with''quotes')",
+            "VALUES ('Monty Python and the Holy Grail', 1975, 8.2)",
+            "VALUES ('And Now for Something Completely Different', 1971, 7.5)",
+            // Unary ops tests
+            "VALUES (-1)", 
+            "VALUES (+1)",
+            "VALUES (+9223372036854775807)",
+            "VALUES (-1.7976931348623157e308)",
+            "VALUES (+1.7976931348623157e308)",
+            "VALUES (-0)",
+            "VALUES (+0)",
+            "VALUES (-NULL)",
+            "VALUES (-(1))",
         ];
     
         for query in test_cases {
-            println!("query: {:?}", query);
             log::info!("Testing query: {}", query);
             let limbo = limbo_exec_rows(&db, &limbo_conn, query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, query);

@@ -12,6 +12,19 @@ pub fn emit_values(program: &mut ProgramBuilder, values: &[Vec<ast::Expr>]) -> R
 
     let start_reg = 1;
     let first_row_len = values[0].len();
+    
+    let needs_binary_regs = values.iter().any(|row| {
+        row.iter().any(|expr| matches!(expr, ast::Expr::Binary(..)))
+    });
+    
+    let binary_regs = if needs_binary_regs { 2 } else { 0 };
+    let total_regs = start_reg + first_row_len + binary_regs;
+
+    for _ in 0..total_regs {
+        program.alloc_register();
+    }
+
+    let temp_reg = start_reg + first_row_len;
 
     for row in values {
         if row.len() != first_row_len {
@@ -22,10 +35,11 @@ pub fn emit_values(program: &mut ProgramBuilder, values: &[Vec<ast::Expr>]) -> R
 
         for (i, expr) in row.iter().enumerate() {
             let reg = start_reg + i;
+
             match expr {
                 ast::Expr::Literal(lit) => match lit {
                     Literal::String(s) => {
-                        let s = &s[1..s.len()-1];
+                        let s = &s[1..s.len()-1];  
                         let s = s.replace("''", "'");
                         program.emit_insn(Insn::String8 {
                             value: s,
@@ -60,10 +74,15 @@ pub fn emit_values(program: &mut ProgramBuilder, values: &[Vec<ast::Expr>]) -> R
                 },
                 ast::Expr::Unary(op, expr) => {
                     match (&op, expr.as_ref()) {
+                        (_, ast::Expr::Literal(Literal::Null)) => {
+                            program.emit_insn(Insn::Null {
+                                dest: reg,
+                                dest_end: None,
+                            });
+                        },
                         (ast::UnaryOperator::Negative | ast::UnaryOperator::Positive, ast::Expr::Literal(Literal::Numeric(numeric_value))) => {
                             let multiplier = if let ast::UnaryOperator::Negative = op { -1 } else { 1 };
                             
-                            // Special case: check for negating i64::MAX+1 to get i64::MIN
                             if multiplier == -1 && numeric_value == "9223372036854775808" {
                                 program.emit_insn(Insn::Integer {
                                     value: i64::MIN,
@@ -87,14 +106,66 @@ pub fn emit_values(program: &mut ProgramBuilder, values: &[Vec<ast::Expr>]) -> R
                         },
                         _ => {
                             return Err(LimboError::ParseError(
-                                "VALUES only supports literal values and unary on numbers".into(),
+                                "VALUES only supports unary operations on NULL and numbers".into(),
+                            ))
+                        }
+                    }
+                },
+                ast::Expr::Binary(lhs, op, rhs) => {
+                    if !needs_binary_regs {
+                        return Err(LimboError::InternalError("binary operation found but no registers allocated".into()));
+                    }
+                    
+                    match (lhs.as_ref(), op, rhs.as_ref()) {
+                        (
+                            ast::Expr::Literal(Literal::Numeric(lhs)),
+                            ast::Operator::Divide,
+                            ast::Expr::Literal(Literal::Numeric(rhs))
+                        ) => {
+                            let lhs_reg = temp_reg;
+                            if let Ok(int_val) = lhs.parse::<i64>() {
+                                program.emit_insn(Insn::Integer {
+                                    value: int_val,
+                                    dest: lhs_reg, 
+                                });
+                            } else {
+                                let float_val = lhs.parse::<f64>()?;
+                                program.emit_insn(Insn::Real {
+                                    value: float_val,
+                                    dest: lhs_reg,
+                                });
+                            }
+
+                            let rhs_reg = temp_reg + 1;
+                            if let Ok(int_val) = rhs.parse::<i64>() {
+                                program.emit_insn(Insn::Integer {
+                                    value: int_val,
+                                    dest: rhs_reg,
+                                });
+                            } else {
+                                let float_val = rhs.parse::<f64>()?;
+                                program.emit_insn(Insn::Real {
+                                    value: float_val,
+                                    dest: rhs_reg,
+                                });
+                            }
+
+                            program.emit_insn(Insn::Divide {
+                                lhs: lhs_reg,
+                                rhs: rhs_reg, 
+                                dest: reg,
+                            });
+                        }
+                        _ => {
+                            return Err(LimboError::ParseError(
+                                "VALUES only supports division operations on numbers".into(),
                             ))
                         }
                     }
                 },
                 _ => {
                     return Err(LimboError::ParseError(
-                        "VALUES only supports literal values and unary operations".into(),
+                        "VALUES only supports literals, unary and basic arithmetic operations".into(),
                     ))
                 }
             }
