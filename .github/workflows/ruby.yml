@@ -1,0 +1,66 @@
+name: Ruby
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - v*
+  pull_request:
+    branches:
+      - main
+
+env:
+  working-directory: bindings/ruby
+
+jobs:
+  configure-strategy:
+    runs-on: ubuntu-latest
+    outputs:
+      ruby-versions: ${{ steps.gen-matrix.outputs.ruby-versions }}
+    steps:
+      - id: gen-matrix
+        run: |
+          if [ ${{ github.event_name }} == "pull_request" ]; then
+            echo "ruby-versions=[\"3.4\"]" >> $GITHUB_OUTPUT
+          else
+            echo "ruby-versions=[\"3.1\",\"3.2\",\"3.3\",\"3.4\"]" >> $GITHUB_OUTPUT
+          fi
+
+  test:
+    needs: configure-strategy
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+        ruby-version: ${{ fromJson(needs.configure-strategy.outputs.ruby-versions) }}
+    runs-on: ${{ matrix.os }}
+
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Ruby ${{ matrix.ruby-version }}
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby-version }}
+          bundler-cache: true
+
+      - name: Install dependencies
+        run: bundle install
+
+      - name: compile
+        run: rake compile
+
+      - name: Run test
+        run: rake test
+

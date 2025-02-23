@@ -1,3 +1,8 @@
-require_relative "limbo/limbo"
+# frozen_string_literal: true
 
-p distance [1,2], [3,4]
+require_relative "limbo/version"
+require_relative "limbo.so"
+
+module Limbo
+  autoload :Compat, "limbo/compat"
+end

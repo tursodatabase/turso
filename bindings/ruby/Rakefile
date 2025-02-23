@@ -1,5 +1,15 @@
+# frozen_string_literal: true
+
+require "bundler/gem_tasks"
+require "minitest/test_task"
+
+Minitest::TestTask.create
+
+require "standard/rake"
+
 require "rb_sys/extensiontask"
-require "debug"
+
+task build: :compile
 
 GEMSPEC = Gem::Specification.load("limbo.gemspec")
 
@@ -11,3 +21,5 @@ RbSys::ExtensionTask.new("limbo", GEMSPEC) do |ext|
   # If you want to use `rb-sys-dock` for cross-compilation:
   ext.cross_compile = true
 end
+
+task default: %i[compile test standard]

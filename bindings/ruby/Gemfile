@@ -3,5 +3,9 @@ source "https://rubygems.org"
 gemspec
 
 group :development, :test do
+  gem "minitest", "~> 5.16"
+  gem "rake", "~> 13.0"
   gem "rake-compiler", "~> 1.2.0"
+  gem "rb_sys", "~> 0.9.63"
+  gem "standard", "~> 1.3"
 end
