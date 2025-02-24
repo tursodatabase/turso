@@ -918,14 +918,14 @@ mod tests {
     pub fn values_expression_fuzz_run() {
         let _ = env_logger::try_init();
         let g = GrammarGenerator::new();
-    
+
         let (expr, expr_builder) = g.create_handle();
         let (values_row, values_row_builder) = g.create_handle();
         let (values_list, values_list_builder) = g.create_handle();
         let (literal, literal_builder) = g.create_handle();
         let (number, number_builder) = g.create_handle();
         let (string, string_builder) = g.create_handle();
-    
+
         number_builder
             .choice()
             .option_symbol(rand_int(-5..10))
@@ -933,25 +933,26 @@ mod tests {
             .option_symbol(rand_int(-100000..100000))
             .option_str("NULL")
             .build();
-    
+
         string_builder
             .concat("")
-            .push_str("'")  // Open quote
+            .push_str("'") // Open quote
             .push_symbol(rand_str("abc123", 10))
-            .push_str("'")  // Close quote
+            .push_str("'") // Close quote
             .build();
-    
+
         literal_builder
             .choice()
             .option(number)
-            .option(string) 
+            .option(string)
             .option_str("NULL")
             .option_str("1.5")
             .option_str("-2.5")
             .option_str("0.0")
             .build();
-    
-        let fixed_columns = g.create()
+
+        let fixed_columns = g
+            .create()
             .concat("")
             .push(literal)
             .push_str(", ")
@@ -959,39 +960,45 @@ mod tests {
             .push_str(", ")
             .push(literal)
             .build();
-    
+
         values_row_builder
             .concat("")
             .push_str("(")
             .push(fixed_columns)
             .push_str(")")
             .build();
-    
+
         values_list_builder
             .concat("")
-            .push(g.create().concat("").push(values_row).repeat(1..10, ", ").build())
+            .push(
+                g.create()
+                    .concat("")
+                    .push(values_row)
+                    .repeat(1..10, ", ")
+                    .build(),
+            )
             .build();
-    
+
         expr_builder
             .concat("")
             .push_str("VALUES ")
             .push(values_list)
             .build();
-    
+
         let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
-    
+
         let (mut rng, seed) = rng_from_time();
         log::info!("seed: {}", seed);
-    
+
         for i in 0..1024 {
             let query = g.generate(&mut rng, expr, 50);
             log::info!("Query {} of 0..1024: {}", i, query);
-    
+
             let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
-    
+
             assert_eq!(
                 limbo, sqlite,
                 "Query: {}\nLimbo result: {:?}\nSQLite result: {:?}",
@@ -1005,8 +1012,8 @@ mod tests {
         let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
-    
-        // Test edge cases and specific scenarios 
+
+        // Test edge cases and specific scenarios
         let test_cases = vec![
             "VALUES (NULL)",
             "VALUES (1), (2), (3)",
@@ -1014,7 +1021,7 @@ mod tests {
             "VALUES ('hello', 1, NULL)",
             "VALUES (1.5, -2.5, 0.0)",
             "VALUES (9223372036854775807)",
-            "VALUES (-9223372036854775808)",  
+            "VALUES (-9223372036854775808)",
             "VALUES (1, 'text with spaces', NULL)",
             "VALUES (''), ('a'), ('ab')",
             "VALUES (NULL, NULL), (1, 2)",
@@ -1027,7 +1034,7 @@ mod tests {
             "VALUES ('Monty Python and the Holy Grail', 1975, 8.2)",
             "VALUES ('And Now for Something Completely Different', 1971, 7.5)",
             // Unary ops tests
-            "VALUES (-1)", 
+            "VALUES (-1)",
             "VALUES (+1)",
             "VALUES (+9223372036854775807)",
             "VALUES (-1.7976931348623157e308)",
@@ -1037,12 +1044,12 @@ mod tests {
             "VALUES (-NULL)",
             "VALUES (-(1))",
         ];
-    
+
         for query in test_cases {
             log::info!("Testing query: {}", query);
             let limbo = limbo_exec_rows(&db, &limbo_conn, query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, query);
-            
+
             assert_eq!(
                 limbo, sqlite,
                 "query: {}, limbo: {:?}, sqlite: {:?}",

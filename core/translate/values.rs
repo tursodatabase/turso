@@ -1,6 +1,6 @@
 use crate::{
-    translate::expr::translate_expr,
     translate::emitter::Resolver,
+    translate::expr::translate_expr,
     vdbe::{builder::ProgramBuilder, insn::Insn, BranchOffset},
     LimboError, Result, SymbolTable,
 };
@@ -28,7 +28,7 @@ pub fn emit_values(program: &mut ProgramBuilder, values: &[Vec<ast::Expr>]) -> R
     for row in values {
         if row.len() != first_row_len {
             return Err(LimboError::ParseError(
-                "all VALUES rows must have the same number of values".into(),  
+                "all VALUES rows must have the same number of values".into(),
             ));
         }
 
@@ -45,7 +45,7 @@ pub fn emit_values(program: &mut ProgramBuilder, values: &[Vec<ast::Expr>]) -> R
 
     program.emit_insn(Insn::Halt {
         err_code: 0,
-        description: String::new(), 
+        description: String::new(),
     });
 
     program.resolve_label(goto_target, program.offset());
