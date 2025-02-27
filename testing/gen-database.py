@@ -57,7 +57,30 @@ for product in product_list:
         VALUES (?, ?)
     ''', (product, price))
 
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS counter (
+        id INTEGER PRIMARY KEY,
+        t TEXT,
+        r REAL,
+        i INTEGER,
+        b BLOB
+    )
+''')
 
+for _ in range(3):
+    cursor.execute('''
+        INSERT INTO counter (t, r, i, b) VALUES ('ONE', 1, 1, 'ONE')
+    ''')
+    cursor.execute('''
+        INSERT INTO counter (t, r, i, b) VALUES ('TWO', 2, 2, 'TWO');
+    ''')
+    cursor.execute('''
+        INSERT INTO counter (t, r, i, b) VALUES ('THREE', 3, 3, 'THREE');
+    ''')
+
+cursor.execute('''
+    INSERT INTO counter (t, r, i, b) VALUES (NULL, NULL, NULL, NULL);
+''')
 
 conn.commit()
 conn.close()

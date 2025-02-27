@@ -47,6 +47,42 @@ do_execsql_test select-count-constant-false {
   SELECT count(*) FROM users WHERE false;
 } {0}
 
+do_execsql_test select-count-star {
+  SELECT count(*) FROM counter;
+} {10}
+
+do_execsql_test select-count-field-t {
+  SELECT count(t) FROM counter;
+} {9}
+
+do_execsql_test select-count-field-i {
+  SELECT count(i) FROM counter;
+} {9}
+
+do_execsql_test select-count-field-r {
+  SELECT count(r) FROM counter;
+} {9}
+
+do_execsql_test select-count-field-b {
+  SELECT count(b) FROM counter;
+} {9}
+
+do_execsql_test select-count-field-t-distinct {
+  SELECT count(distinct t) FROM counter;
+} {3}
+
+do_execsql_test select-count-field-i-distinct {
+  SELECT count(distinct i) FROM counter;
+} {3}
+
+do_execsql_test select-count-field-r-distinct {
+  SELECT count(distinct r) FROM counter;
+} {3}
+
+do_execsql_test select-count-field-b-distinct {
+  SELECT count(distinct b) FROM counter;
+} {3}
+
 do_execsql_test select-max {
   SELECT max(age) FROM users;
 } {100}

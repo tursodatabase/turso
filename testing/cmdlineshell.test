@@ -22,7 +22,14 @@ CREATE TABLE products (
         name TEXT,
         price REAL
     );
-CREATE INDEX age_idx on users (age);"}
+CREATE INDEX age_idx on users (age);
+CREATE TABLE counter (
+        id INTEGER PRIMARY KEY,
+        t TEXT,
+        r REAL,
+        i INTEGER,
+        b BLOB
+    );"}
 
 # FIXME sqlite does something different with .schema than what we are doing
 #do_execsql_test_on_specific_db testing/testing_norowidalias.db schema {
@@ -100,3 +107,13 @@ do_execsql_test_on_specific_db testing/testing.db schema-2 {
 # do_execsql_test_on_specific_db testing/testing.db schema-1 {
 #   .tables
 # } {"products users"}
+
+ do_execsql_test_on_specific_db testing/testing.db schema-3 {
+   .schema counter
+ } {"CREATE TABLE counter (
+        id INTEGER PRIMARY KEY,
+        t TEXT,
+        r REAL,
+        i INTEGER,
+        b BLOB
+    );"}
