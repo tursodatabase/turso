@@ -457,7 +457,7 @@ fn json_path_from_owned_value(path: &OwnedValue, strict: bool) -> crate::Result<
                 )
             }
             OwnedValue::Float(f) => {
-                let path = format!("$.{}", f.to_string());
+                let path = format!("$.{}", f);
                 let len = path.len();
                 JsonPath::new(
                     path,
