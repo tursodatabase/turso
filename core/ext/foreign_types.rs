@@ -89,7 +89,7 @@ impl ForeignType {
         let val = insert_val.unwrap_or(OwnedValue::Null).to_ffi();
         let value = unsafe { ((*ctx).generate)(col.as_ptr(), &val as *const limbo_ext::Value) };
         unsafe {
-            val.free();
+            val.__free_internal_type();
         }
         OwnedValue::from_ffi(value)
     }

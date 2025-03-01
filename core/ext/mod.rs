@@ -6,7 +6,8 @@ use crate::IO;
 use crate::{function::ExternalFunc, Connection, Database, LimboError};
 pub mod foreign_types;
 use limbo_ext::{
-    ExtensionApi, InitAggFunction, ResultCode, ScalarFunction, VTabKind, VTabModuleImpl, VfsImpl,
+    CustomTypeImpl, ExtensionApi, InitAggFunction, ResultCode, ScalarFunction, VTabKind,
+    VTabModuleImpl, VfsImpl,
 };
 pub use limbo_ext::{FinalizeFunction, StepFunction, Value as ExtValue, ValueType as ExtValueType};
 use std::{
@@ -90,6 +91,17 @@ unsafe extern "C" fn register_module(
     let conn = unsafe { &mut *(ctx as *mut Connection) };
 
     conn.register_module_impl(&name_str, module, kind)
+}
+
+unsafe extern "C" fn register_extension_type(
+    ctx: *mut c_void,
+    module: *const CustomTypeImpl,
+) -> ResultCode {
+    if ctx.is_null() {
+        return ResultCode::Error;
+    }
+    let db = unsafe { &mut *(ctx as *mut Connection) };
+    db.register_extension_type_impl(module)
 }
 
 #[allow(clippy::arc_with_non_send_sync)]
@@ -231,6 +243,26 @@ impl Connection {
             .borrow_mut()
             .vtab_modules
             .insert(name.to_string(), vmodule.into());
+        ResultCode::OK
+    }
+
+    fn register_extension_type_impl(&mut self, type_impl: *const CustomTypeImpl) -> ResultCode {
+        let name = unsafe { CStr::from_ptr((*type_impl).name) }
+            .to_str()
+            .unwrap_or_default();
+        {
+            if self.syms.borrow_mut().type_registry.get(name).is_some() {
+                // type already registered
+                return ResultCode::OK;
+            }
+        }
+        let ot = unsafe { (*type_impl).type_of } as ExtValueType;
+        {
+            self.syms
+                .borrow_mut()
+                .type_registry
+                .register(name, type_impl, ot.into());
+        }
         ResultCode::OK
     }
 
