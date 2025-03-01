@@ -148,6 +148,7 @@ pub enum AggFunc {
     Sum,
     Total,
     External(Rc<ExtFunc>),
+    CountDistinct,
 }
 
 impl PartialEq for AggFunc {
@@ -173,6 +174,7 @@ impl AggFunc {
             Self::Avg => 1,
             Self::Count0 => 0,
             Self::Count => 1,
+            Self::CountDistinct => 1,
             Self::GroupConcat => 1,
             Self::Max => 1,
             Self::Min => 1,
@@ -188,6 +190,7 @@ impl AggFunc {
             Self::Avg => "avg",
             Self::Count0 => "count",
             Self::Count => "count",
+            Self::CountDistinct => "count",
             Self::GroupConcat => "group_concat",
             Self::Max => "max",
             Self::Min => "min",

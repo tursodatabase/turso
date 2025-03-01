@@ -68,7 +68,7 @@ use regex::{Regex, RegexBuilder};
 use sorter::Sorter;
 use std::borrow::BorrowMut;
 use std::cell::{Cell, RefCell, RefMut};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::num::NonZero;
 use std::rc::{Rc, Weak};
@@ -1641,6 +1641,9 @@ impl Program {
                             AggFunc::Count | AggFunc::Count0 => {
                                 OwnedValue::Agg(Box::new(AggContext::Count(OwnedValue::Integer(0))))
                             }
+                            AggFunc::CountDistinct => {
+                                OwnedValue::Agg(Box::new(AggContext::CountDistinct(HashSet::new())))
+                            }
                             AggFunc::Max => {
                                 let col = state.registers[*col].clone();
                                 match col {
@@ -1741,6 +1744,28 @@ impl Program {
                             {
                                 *count += 1;
                             };
+                        }
+                        AggFunc::CountDistinct => {
+                            let col = state.registers[*col].clone();
+                            if matches!(&state.registers[*acc_reg], OwnedValue::Null) {
+                                state.registers[*acc_reg] = OwnedValue::Agg(Box::new(
+                                    AggContext::CountDistinct(HashSet::new()),
+                                ));
+                            }
+                            let OwnedValue::Agg(agg) = state.registers[*acc_reg].borrow_mut()
+                            else {
+                                unreachable!();
+                            };
+                            let AggContext::CountDistinct(hashset) = agg.borrow_mut() else {
+                                unreachable!();
+                            };
+
+                            if matches!(col, OwnedValue::Null) == false {
+                                let key = format!("{}", col);
+                                if !hashset.contains(key.as_str()) {
+                                    hashset.insert(key.to_string());
+                                }
+                            }
                         }
                         AggFunc::Max => {
                             let col = state.registers[*col].clone();
@@ -1894,9 +1919,13 @@ impl Program {
                                 };
                                 state.registers[*register] = value;
                             }
-                            AggFunc::Count | AggFunc::Count0 => {
-                                let AggContext::Count(count) = agg.borrow_mut() else {
-                                    unreachable!();
+                            AggFunc::Count | AggFunc::Count0 | AggFunc::CountDistinct => {
+                                let count = match agg.borrow_mut() {
+                                    AggContext::CountDistinct(hashset) => {
+                                        &OwnedValue::Integer(hashset.len() as i64)
+                                    }
+                                    AggContext::Count(count) => count,
+                                    _ => unreachable!(),
                                 };
                                 state.registers[*register] = count.clone();
                             }

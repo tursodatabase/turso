@@ -1,6 +1,7 @@
 use std::rc::Rc;
 
 use limbo_sqlite3_parser::ast;
+use limbo_sqlite3_parser::ast::Expr;
 
 use crate::{
     function::AggFunc,
@@ -473,7 +474,7 @@ pub fn translate_aggregation_step_groupby(
             });
             target_register
         }
-        AggFunc::Count | AggFunc::Count0 => {
+        AggFunc::Count | AggFunc::Count0 | AggFunc::CountDistinct => {
             let expr_reg = program.alloc_register();
             emit_column(program, expr_reg);
             program.emit_insn(Insn::AggStep {
@@ -483,7 +484,17 @@ pub fn translate_aggregation_step_groupby(
                 func: if matches!(agg.func, AggFunc::Count0) {
                     AggFunc::Count0
                 } else {
-                    AggFunc::Count
+                    if matches!(
+                        agg.original_expr.clone(),
+                        Expr::FunctionCall {
+                            distinctness: Some(_),
+                            ..
+                        }
+                    ) {
+                        AggFunc::CountDistinct
+                    } else {
+                        AggFunc::Count
+                    }
                 },
             });
             target_register

@@ -1,10 +1,10 @@
-use limbo_sqlite3_parser::ast;
-
 use crate::{
     function::AggFunc,
     vdbe::{builder::ProgramBuilder, insn::Insn},
     LimboError, Result,
 };
+use limbo_sqlite3_parser::ast;
+use limbo_sqlite3_parser::ast::Expr;
 
 use super::{
     emitter::{Resolver, TranslateCtx},
@@ -74,7 +74,7 @@ pub fn translate_aggregation_step(
             });
             target_register
         }
-        AggFunc::Count | AggFunc::Count0 => {
+        AggFunc::Count | AggFunc::Count0 | AggFunc::CountDistinct => {
             let expr_reg = if agg.args.is_empty() {
                 program.alloc_register()
             } else {
@@ -90,7 +90,17 @@ pub fn translate_aggregation_step(
                 func: if matches!(agg.func, AggFunc::Count0) {
                     AggFunc::Count0
                 } else {
-                    AggFunc::Count
+                    if matches!(
+                        agg.original_expr.clone(),
+                        Expr::FunctionCall {
+                            distinctness: Some(_),
+                            ..
+                        }
+                    ) {
+                        AggFunc::CountDistinct
+                    } else {
+                        AggFunc::Count
+                    }
                 },
             });
             target_register

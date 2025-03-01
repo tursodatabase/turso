@@ -1,4 +1,5 @@
 use limbo_ext::{AggCtx, FinalizeFunction, StepFunction};
+use std::collections::HashSet;
 
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
@@ -141,6 +142,7 @@ impl Display for OwnedValue {
                 AggContext::Avg(acc, _count) => write!(f, "{}", acc),
                 AggContext::Sum(acc) => write!(f, "{}", acc),
                 AggContext::Count(count) => write!(f, "{}", count),
+                AggContext::CountDistinct(a) => write!(f, "{}", a.len()),
                 AggContext::Max(max) => write!(f, "{}", max.as_ref().unwrap_or(&Self::Null)),
                 AggContext::Min(min) => write!(f, "{}", min.as_ref().unwrap_or(&Self::Null)),
                 AggContext::GroupConcat(s) => write!(f, "{}", s),
@@ -215,6 +217,7 @@ pub enum AggContext {
     Avg(OwnedValue, OwnedValue), // acc and count
     Sum(OwnedValue),
     Count(OwnedValue),
+    CountDistinct(HashSet<String>),
     Max(Option<OwnedValue>),
     Min(Option<OwnedValue>),
     GroupConcat(OwnedValue),
@@ -239,6 +242,7 @@ impl AggContext {
             Self::Avg(acc, _count) => acc,
             Self::Sum(acc) => acc,
             Self::Count(count) => count,
+            Self::CountDistinct(_) => unreachable!(),
             Self::Max(max) => max.as_ref().unwrap_or(&NULL),
             Self::Min(min) => min.as_ref().unwrap_or(&NULL),
             Self::GroupConcat(s) => s,
