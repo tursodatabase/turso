@@ -6,6 +6,8 @@ use limbo_sqlite3_parser::ast::{
 };
 
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
+use crate::ext::foreign_types::{ForeignType, ForeignTypeFunc};
+use crate::function::{Func, FuncCtx};
 use crate::schema::Table;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode};
@@ -413,16 +415,31 @@ fn populate_column_registers(
             } else {
                 target_reg
             };
-            translate_expr(
-                program,
-                None,
-                value.get(value_index).expect("value index out of bounds"),
-                reg,
-                resolver,
-            )?;
+            if let Some(ext_type) = resolver
+                .symbol_table
+                .type_registry
+                .get(mapping.column.ty_str.as_ref())
+            {
+                handle_inserted_external_value(
+                    program,
+                    value.get(value_index),
+                    mapping,
+                    reg,
+                    ext_type,
+                    resolver,
+                )?;
+            } else {
+                translate_expr(program, None, &value[value_index], reg, resolver)?;
+            }
             if write_directly_to_rowid_reg {
                 program.emit_insn(Insn::SoftNull { reg: target_reg });
             }
+        } else if let Some(ext_type) = resolver
+            .symbol_table
+            .type_registry
+            .get(&mapping.column.ty_str)
+        {
+            handle_inserted_external_value(program, None, mapping, target_reg, ext_type, resolver)?;
         } else {
             // Column was not specified - use NULL if it is nullable, otherwise error
             // Rowid alias columns can be NULL because we will autogenerate a rowid in that case.
@@ -441,6 +458,53 @@ fn populate_column_registers(
             }
         }
     }
+    Ok(())
+}
+
+fn handle_inserted_external_value(
+    program: &mut ProgramBuilder,
+    expr: Option<&Expr>,
+    mapping: &ColumnMapping,
+    target_reg: usize,
+    ext_type: Rc<ForeignType>,
+    resolver: &Resolver,
+) -> Result<()> {
+    // argv[0] = column name
+    // argv[1] = ?inserted value
+    let args_start = program.alloc_registers(2);
+    if let Some(name) = mapping.column.name.as_ref() {
+        // if column has a name, copy it to the second argument register
+        program.emit_insn(Insn::String8 {
+            value: name.to_string(),
+            dest: args_start,
+        });
+        program.mark_last_insn_constant();
+    } else {
+        program.emit_insn(Insn::Null {
+            dest: args_start,
+            dest_end: None,
+        });
+    }
+
+    // translate and store the insertion value in the second arg, if provided
+    if let Some(expr) = expr {
+        translate_expr(program, None, expr, args_start + 1, resolver)?;
+    } else {
+        program.emit_insn(Insn::Null {
+            dest: args_start + 1,
+            dest_end: None,
+        });
+    }
+    // call the generate function
+    program.emit_insn(Insn::Function {
+        func: FuncCtx {
+            func: Func::ForeignType(ForeignTypeFunc::new_generate(ext_type.clone())),
+            arg_count: 2,
+        },
+        dest: target_reg,
+        start_reg: args_start,
+        constant_mask: 0,
+    });
     Ok(())
 }
 
