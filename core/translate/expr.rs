@@ -858,6 +858,9 @@ pub fn translate_expr(
                 Func::Agg(_) => {
                     crate::bail_parse_error!("aggregation function in non-aggregation context")
                 }
+                Func::ForeignType(_) => {
+                    unreachable!("ForeignType functions are used internally")
+                }
                 Func::External(_) => {
                     let regs = program.alloc_registers(args_count);
                     if let Some(args) = args {
