@@ -1,7 +1,10 @@
-use limbo_ext::{register_extension, scalar, ResultCode, Value, ValueType};
+use limbo_ext::{
+    register_extension, scalar, CustomType, CustomTypeDerive, ResultCode, Value, ValueType,
+};
 
 register_extension! {
-    scalars: {uuid4_str, uuid4_blob, uuid7_str, uuid7, uuid7_ts, uuid_str, uuid_blob }
+    scalars: {uuid4_str, uuid4_blob, uuid7_str, uuid7, uuid7_ts, uuid_str, uuid_blob },
+    types: { UUID }
 }
 
 #[scalar(name = "uuid4_str", alias = "gen_random_uuid")]
@@ -132,4 +135,23 @@ fn uuid_to_unix(uuid: &[u8; 16]) -> u64 {
         | ((uuid[3] as u64) << 16)
         | ((uuid[4] as u64) << 8)
         | (uuid[5] as u64)
+}
+
+#[derive(CustomTypeDerive, Default)]
+pub struct UUID;
+
+impl CustomType for UUID {
+    const NAME: &'static str = "UUID";
+    const TYPE: ValueType = ValueType::Text;
+
+    fn generate(_col_name: Option<&str>, insert_val: Option<&Value>) -> Value {
+        // if value inserted is a unix timestamp, store a uuidv7. otherwise store a uuidv4
+        if let Some(val) = insert_val {
+            let maybe_ts = val.to_integer().unwrap_or(0);
+            let ctx = uuid::ContextV7::new();
+            let ts = uuid::Timestamp::from_unix(ctx, maybe_ts as u64, 0);
+            return Value::from_text(uuid::Uuid::new_v7(ts).to_string());
+        }
+        Value::from_text(uuid::Uuid::new_v4().to_string())
+    }
 }

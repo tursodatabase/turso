@@ -874,7 +874,7 @@ pub fn derive_type(input: TokenStream) -> TokenStream {
                 type_of: Self::TYPE,
                 generate: Self::#generate_fn_name,
             }));
-            (api.register_extension_type)(api.ctx, module as *const ::limbo_ext::CustomTypeImpl)
+            (api.register_custom_type)(api.ctx, module as *const ::limbo_ext::CustomTypeImpl)
         }
       }
     };
