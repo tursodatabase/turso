@@ -857,7 +857,11 @@ pub fn derive_type(input: TokenStream) -> TokenStream {
             } else {
                 ::std::ffi::CStr::from_ptr(col_name as *mut i8).to_str().map_or(None, |s| Some(s))
             };
-            let val = if insert_val.is_null() { None } else { Some(&*insert_val) };
+            let val = if insert_val.is_null() {
+                &::limbo_ext::Value::null()
+            } else {
+                 &*(insert_val)
+            };
             <#struct_name as ::limbo_ext::CustomType>::generate(col_name, val)
         }
 

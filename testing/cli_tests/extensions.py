@@ -75,16 +75,20 @@ def test_uuid():
     limbo.run_test_fn(
         "SELECT uuid7_timestamp_ms(id) / 1000 from users where name = 'next';",
         validate_ts,
-    )
-    limbo.execute_dot("CREATE TABLE users2 (id uuid, name TEXT);")
-    limbo.execute_dot("INSERT INTO users2 (name) values ('test');")
-    limbo.execute_dot("INSERT INTO users2 (name) values ('next');")
-    limbo.run_test_fn(
-        "SELECT id from users2 where name = 'next';", validate_string_uuid
+        "unixepoch() inserted to ID column",
     )
     limbo.run_test_fn(
-        "SELECT uuid7_timestamp_ms(id) / 1000 from users2 where name = 'next';",
-        validate_ts,
+        "INSERT INTO users (id, name) values (1740853356, 'testing');", null
+    )
+    limbo.run_test_fn(
+        "SELECT id from users where name = 'testing';",
+        validate_string_uuid,
+        "correct uuid was inserted to ID field",
+    )
+    limbo.run_test_fn(
+        "SELECT uuid7_timestamp_ms(id) / 1000 from users where name = 'testing';",
+        lambda x: x == "1740853356",
+        "correct uuid was inserted to ID field when unix timestamp was inserted to ID column",
     )
     limbo.quit()
 
