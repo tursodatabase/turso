@@ -21,6 +21,7 @@ pub struct ExtensionApi {
     pub register_aggregate_function: RegisterAggFn,
     pub register_module: RegisterModuleFn,
     pub register_vfs: RegisterVfsFn,
+    pub register_custom_type: RegisterCustomTypeFn,
     pub builtin_vfs: *mut *const VfsImpl,
     pub builtin_vfs_count: i32,
 }
