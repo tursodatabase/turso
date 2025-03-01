@@ -936,13 +936,25 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
                     let result = api.add_builtin_vfs(unsafe { #static_register()});
                     if !result.is_ok() {
                         return result;
-                }
+                     }
             }
+        }
+    });
+    let types_calls = types.iter().map(|typ_ident| {
+        let register_fn = syn::Ident::new(&format!("register_{}", typ_ident), typ_ident.span());
+        quote! {
+        {
+                let result = unsafe{ #typ_ident::#register_fn(api)};
+                if !result.is_ok() {
+                    return result;
+                }
+        }
         }
     });
     let static_aggregates = aggregate_calls.clone();
     let static_scalars = scalar_calls.clone();
     let static_vtabs = vtab_calls.clone();
+    let static_types = types_calls.clone();
 
     let expanded = quote! {
     #[cfg(not(target_family = "wasm"))]
@@ -961,6 +973,8 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
                 #[cfg(not(target_family = "wasm"))]
                 #(#static_vfs)*
 
+                #(#static_types)*
+
                 ::limbo_ext::ResultCode::OK
               }
 
@@ -974,6 +988,8 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
                 #(#vtab_calls)*
 
                 #(#vfs_calls)*
+
+                #(#types_calls)*
 
                 ::limbo_ext::ResultCode::OK
             }

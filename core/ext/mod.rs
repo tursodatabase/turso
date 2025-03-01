@@ -272,14 +272,10 @@ impl Connection {
             register_scalar_function,
             register_aggregate_function,
             register_module,
-<<<<<<< HEAD
             register_vfs,
             builtin_vfs: std::ptr::null_mut(),
             builtin_vfs_count: 0,
-||||||| parent of 6b73c198 (Add custom type registration to extension api)
-=======
             register_custom_type,
->>>>>>> 6b73c198 (Add custom type registration to extension api)
         }
     }
 
