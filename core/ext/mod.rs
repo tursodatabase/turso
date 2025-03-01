@@ -134,6 +134,7 @@ pub fn add_builtin_vfs_extensions(
             register_aggregate_function,
             register_vfs,
             register_module,
+            register_custom_type,
             builtin_vfs: vfslist.as_mut_ptr(),
             builtin_vfs_count: 0,
         },

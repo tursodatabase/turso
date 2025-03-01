@@ -839,6 +839,48 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
+#[proc_macro_derive(CustomTypeDerive)]
+pub fn derive_type(input: TokenStream) -> TokenStream {
+    let ast = parse_macro_input!(input as DeriveInput);
+    let struct_name = &ast.ident;
+    let generate_fn_name = format_ident!("generate_{}", struct_name);
+    let register_fn_name = format_ident!("register_{}", struct_name);
+    let output = quote! {
+        impl #struct_name {
+       #[no_mangle]
+        pub unsafe extern "C" fn #generate_fn_name(
+            col_name: *const ::std::ffi::c_char,
+            insert_val: *const ::limbo_ext::Value)
+        ->  ::limbo_ext::Value {
+            let col_name = if col_name.is_null() {
+                None
+            } else {
+                ::std::ffi::CStr::from_ptr(col_name as *mut i8).to_str().map_or(None, |s| Some(s))
+            };
+            let val = if insert_val.is_null() { None } else { Some(&*insert_val) };
+            <#struct_name as ::limbo_ext::CustomType>::generate(col_name, val)
+        }
+
+        #[no_mangle]
+        pub unsafe extern "C" fn #register_fn_name(api: *const ::limbo_ext::ExtensionApi) -> ::limbo_ext::ResultCode {
+            if api.is_null() {
+                return ::limbo_ext::ResultCode::Error;
+            }
+            let api = &*api;
+            let name = <#struct_name as ::limbo_ext::CustomType>::NAME;
+            let name_c = std::ffi::CString::new(name).unwrap();
+            let module = ::std::boxed::Box::into_raw(::std::boxed::Box::new(::limbo_ext::CustomTypeImpl {
+                name: name_c.as_ptr() as *const ::std::ffi::c_char,
+                type_of: Self::TYPE,
+                generate: Self::#generate_fn_name,
+            }));
+            (api.register_extension_type)(api.ctx, module as *const ::limbo_ext::CustomTypeImpl)
+        }
+      }
+    };
+    TokenStream::from(output)
+}
+
 /// Register your extension with 'core' by providing the relevant functions
 ///```ignore
 ///use limbo_ext::{register_extension, scalar, Value, AggregateDerive, AggFunc};
