@@ -652,7 +652,7 @@ impl VirtualTable {
         if let ast::Cmd::Stmt(ast::Stmt::CreateTable { body, .. }) = parser.next()?.ok_or(
             LimboError::ParseError("Failed to parse schema from virtual table module".to_string()),
         )? {
-            let columns = columns_from_create_table_body(&body)?;
+            let columns = columns_from_create_table_body(&body, syms)?;
             let vtab = Rc::new(VirtualTable {
                 name: tbl_name.unwrap_or(module_name).to_owned(),
                 implementation: module.implementation.clone(),

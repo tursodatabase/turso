@@ -63,7 +63,11 @@ pub fn parse_schema_rows(
                                 let vtab = syms.vtabs.get(name).unwrap().clone();
                                 schema.add_virtual_table(vtab);
                             } else {
-                                let table = schema::BTreeTable::from_sql(sql, root_page as usize)?;
+                                let table = schema::BTreeTable::from_sql(
+                                    sql,
+                                    root_page as usize,
+                                    Some(&syms.type_registry),
+                                )?;
                                 schema.add_btree_table(Rc::new(table));
                             }
                         }
@@ -330,6 +334,7 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
 
 pub fn columns_from_create_table_body(
     body: &ast::CreateTableBody,
+    syms: &SymbolTable,
 ) -> Result<Vec<Column>, LimboError> {
     let CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
         return Err(LimboError::ParseError(
@@ -366,6 +371,8 @@ pub fn columns_from_create_table_body(
                             || type_name.contains("DOUB")
                         {
                             Type::Real
+                        } else if let Some(ext_type) = syms.type_registry.get(&type_name) {
+                            ext_type.type_of().into()
                         } else {
                             Type::Numeric
                         }
