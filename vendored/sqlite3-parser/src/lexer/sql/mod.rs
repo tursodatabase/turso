@@ -28,7 +28,9 @@ pub use error::Error;
 pub struct Parser<'input> {
     input: &'input [u8],
     scanner: Scanner<Tokenizer>,
+    /// lemon parser
     parser: yyParser<'input>,
+    had_error: bool,
 }
 
 impl<'input> Parser<'input> {
@@ -42,12 +44,14 @@ impl<'input> Parser<'input> {
             input,
             scanner,
             parser,
+            had_error: false,
         }
     }
     /// Parse new `input`
     pub fn reset(&mut self, input: &'input [u8]) {
         self.input = input;
         self.scanner.reset();
+        self.had_error = false;
     }
     /// Current line position in input
     pub fn line(&self) -> u64 {
@@ -56,6 +60,16 @@ impl<'input> Parser<'input> {
     /// Current column position in input
     pub fn column(&self) -> usize {
         self.scanner.column()
+    }
+
+    /// Current byte offset in input
+    pub fn offset(&self) -> usize {
+        self.scanner.offset()
+    }
+
+    /// Public API for sqlite3ParserFinalize()
+    pub fn finalize(&mut self) {
+        self.parser.sqlite3ParserFinalize();
     }
 }
 
@@ -171,6 +185,10 @@ impl FallibleIterator for Parser<'_> {
 
     fn next(&mut self) -> Result<Option<Cmd>, Error> {
         //print!("line: {}, column: {}: ", self.scanner.line(), self.scanner.column());
+        // if we have already encountered an error, return None to signal that to fallible_iterator that we are done parsing
+        if self.had_error {
+            return Ok(None);
+        }
         self.parser.ctx.reset();
         let mut last_token_parsed = TK_EOF;
         let mut eof = false;
@@ -182,6 +200,17 @@ impl FallibleIterator for Parser<'_> {
                 }
                 (start, Some(tuple), end) => (start, tuple, end),
             };
+
+            if token_type == TK_ILLEGAL {
+                //  break out of parsing loop and return error
+                self.parser.sqlite3ParserFinalize();
+                self.had_error = true;
+                return Err(Error::UnrecognizedToken(
+                    Some((self.scanner.line(), self.scanner.column())),
+                    Some(start.into()),
+                ));
+            }
+
             let token = if token_type >= TK_WINDOW {
                 debug_assert!(
                     token_type == TK_OVER || token_type == TK_FILTER || token_type == TK_WINDOW
@@ -221,22 +250,38 @@ impl FallibleIterator for Parser<'_> {
                     self.parser
                         .sqlite3Parser(TK_SEMI, sentinel(self.input.len()))
                 );
+                if self.parser.ctx.error().is_some() {
+                    self.had_error = true;
+                }
             }
             try_with_position!(
                 self.scanner,
                 self.parser
                     .sqlite3Parser(TK_EOF, sentinel(self.input.len()))
             );
+            if self.parser.ctx.error().is_some() {
+                self.had_error = true;
+            }
         }
         self.parser.sqlite3ParserFinalize();
         if let Some(e) = self.parser.ctx.error() {
-            let err = Error::ParserError(e, Some((self.scanner.line(), self.scanner.column())));
+            let err = Error::ParserError(
+                e,
+                Some((self.scanner.line(), self.scanner.column())),
+                Some((self.offset() - 1).into()),
+            );
+            self.had_error = true;
             return Err(err);
         }
         let cmd = self.parser.ctx.cmd();
         if let Some(ref cmd) = cmd {
             if let Err(e) = cmd.check() {
-                let err = Error::ParserError(e, Some((self.scanner.line(), self.scanner.column())));
+                let err = Error::ParserError(
+                    e,
+                    Some((self.scanner.line(), self.scanner.column())),
+                    Some((self.offset() - 1).into()),
+                );
+                self.had_error = true;
                 return Err(err);
             }
         }
@@ -259,8 +304,8 @@ impl Tokenizer {
 }
 
 /// ```rust
-/// use sqlite3_parser::lexer::sql::Tokenizer;
-/// use sqlite3_parser::lexer::Scanner;
+/// use limbo_sqlite3_parser::lexer::sql::Tokenizer;
+/// use limbo_sqlite3_parser::lexer::Scanner;
 ///
 /// let tokenizer = Tokenizer::new();
 /// let input = b"PRAGMA parser_trace=ON;";
@@ -332,7 +377,7 @@ impl Splitter for Tokenizer {
                         if let Some(i) = end {
                             Ok((None, i + 1))
                         } else {
-                            Err(Error::UnterminatedBlockComment(None))
+                            Err(Error::UnterminatedBlockComment(None, None))
                         }
                     } else {
                         Ok((Some((&data[..1], TK_SLASH)), 1))
@@ -381,10 +426,10 @@ impl Splitter for Tokenizer {
                     if *b == b'=' {
                         Ok((Some((&data[..2], TK_NE)), 2))
                     } else {
-                        Err(Error::ExpectedEqualsSign(None))
+                        Err(Error::ExpectedEqualsSign(None, None))
                     }
                 } else {
-                    Err(Error::ExpectedEqualsSign(None))
+                    Err(Error::ExpectedEqualsSign(None, None))
                 }
             }
             b'|' => {
@@ -419,7 +464,7 @@ impl Splitter for Tokenizer {
                     // Keep original quotes / '[' ... ’]'
                     Ok((Some((&data[0..=i], TK_ID)), i + 1))
                 } else {
-                    Err(Error::UnterminatedBracket(None))
+                    Err(Error::UnterminatedBracket(None, None))
                 }
             }
             b'?' => {
@@ -428,7 +473,12 @@ impl Splitter for Tokenizer {
                         // do not include the '?' in the token
                         Ok((Some((&data[1..=i], TK_VARIABLE)), i + 1))
                     }
-                    None => Ok((Some((&data[1..], TK_VARIABLE)), data.len())),
+                    None => {
+                        if !data[1..].is_empty() && data[1..].iter().all(|ch| *ch == b'0') {
+                            return Err(Error::BadVariableName(None, None));
+                        }
+                        Ok((Some((&data[1..], TK_VARIABLE)), data.len()))
+                    }
                 }
             }
             b'$' | b'@' | b'#' | b':' => {
@@ -437,14 +487,14 @@ impl Splitter for Tokenizer {
                     .skip(1)
                     .position(|&b| !is_identifier_continue(b))
                 {
-                    Some(0) => Err(Error::BadVariableName(None)),
+                    Some(0) => Err(Error::BadVariableName(None, None)),
                     Some(i) => {
                         // '$' is included as part of the name
                         Ok((Some((&data[..=i], TK_VARIABLE)), i + 1))
                     }
                     None => {
                         if data.len() == 1 {
-                            return Err(Error::BadVariableName(None));
+                            return Err(Error::BadVariableName(None, None));
                         }
                         Ok((Some((data, TK_VARIABLE)), data.len()))
                     }
@@ -461,9 +511,19 @@ impl Splitter for Tokenizer {
                     Ok(self.identifierish(data))
                 }
             }
-            _ => Err(Error::UnrecognizedToken(None)),
+            // Return TK_ILLEGAL
+            _ => handle_unrecognized(data),
         }
     }
+}
+
+fn handle_unrecognized(data: &[u8]) -> Result<(Option<Token<'_>>, usize), Error> {
+    let mut end = 1;
+    while end < data.len() && !data[end].is_ascii_whitespace() {
+        end += 1;
+    }
+
+    Ok((Some((&data[..end], TokenType::TK_ILLEGAL)), end))
 }
 
 fn literal(data: &[u8], quote: u8) -> Result<(Option<Token<'_>>, usize), Error> {
@@ -493,26 +553,30 @@ fn literal(data: &[u8], quote: u8) -> Result<(Option<Token<'_>>, usize), Error> 
         // keep original quotes in the token
         Ok((Some((&data[0..i], tt)), i))
     } else {
-        Err(Error::UnterminatedLiteral(None))
+        Err(Error::UnterminatedLiteral(None, None))
     }
 }
 
 fn blob_literal(data: &[u8]) -> Result<(Option<Token<'_>>, usize), Error> {
     debug_assert!(data[0] == b'x' || data[0] == b'X');
     debug_assert_eq!(data[1], b'\'');
-    if let Some((i, b)) = data
-        .iter()
-        .enumerate()
-        .skip(2)
-        .find(|&(_, &b)| !b.is_ascii_hexdigit())
-    {
-        if *b != b'\'' || i % 2 != 0 {
-            return Err(Error::MalformedBlobLiteral(None));
+
+    let mut end = 2;
+    let mut valid = true;
+    while end < data.len() && data[end] != b'\'' {
+        if !data[end].is_ascii_hexdigit() {
+            valid = false;
         }
-        Ok((Some((&data[2..i], TK_BLOB)), i + 1))
-    } else {
-        Err(Error::MalformedBlobLiteral(None))
+        end += 1;
     }
+
+    let total_len = if end < data.len() { end + 1 } else { end };
+
+    if !valid || (end - 2) % 2 != 0 || end >= data.len() {
+        return Ok((Some((&data[..total_len], TokenType::TK_ILLEGAL)), total_len));
+    }
+
+    Ok((Some((&data[2..end], TokenType::TK_BLOB)), total_len))
 }
 
 fn number(data: &[u8]) -> Result<(Option<Token<'_>>, usize), Error> {
@@ -532,7 +596,7 @@ fn number(data: &[u8]) -> Result<(Option<Token<'_>>, usize), Error> {
         } else if b == b'e' || b == b'E' {
             return exponential_part(data, i);
         } else if is_identifier_start(b) {
-            return Err(Error::BadNumber(None));
+            return Err(Error::BadNumber(None, None));
         }
         Ok((Some((&data[..i], TK_INTEGER)), i))
     } else {
@@ -546,13 +610,13 @@ fn hex_integer(data: &[u8]) -> Result<(Option<Token<'_>>, usize), Error> {
     if let Some((i, b)) = find_end_of_number(data, 2, u8::is_ascii_hexdigit)? {
         // Must not be empty (Ox is invalid)
         if i == 2 || is_identifier_start(b) {
-            return Err(Error::MalformedHexInteger(None));
+            return Err(Error::MalformedHexInteger(None, None));
         }
         Ok((Some((&data[..i], TK_INTEGER)), i))
     } else {
         // Must not be empty (Ox is invalid)
         if data.len() == 2 {
-            return Err(Error::MalformedHexInteger(None));
+            return Err(Error::MalformedHexInteger(None, None));
         }
         Ok((Some((data, TK_INTEGER)), data.len()))
     }
@@ -564,7 +628,7 @@ fn fractional_part(data: &[u8], i: usize) -> Result<(Option<Token<'_>>, usize), 
         if b == b'e' || b == b'E' {
             return exponential_part(data, i);
         } else if is_identifier_start(b) {
-            return Err(Error::BadNumber(None));
+            return Err(Error::BadNumber(None, None));
         }
         Ok((Some((&data[..i], TK_FLOAT)), i))
     } else {
@@ -579,17 +643,17 @@ fn exponential_part(data: &[u8], i: usize) -> Result<(Option<Token<'_>>, usize),
         let i = if *b == b'+' || *b == b'-' { i + 1 } else { i };
         if let Some((j, b)) = find_end_of_number(data, i + 1, u8::is_ascii_digit)? {
             if j == i + 1 || is_identifier_start(b) {
-                return Err(Error::BadNumber(None));
+                return Err(Error::BadNumber(None, None));
             }
             Ok((Some((&data[..j], TK_FLOAT)), j))
         } else {
             if data.len() == i + 1 {
-                return Err(Error::BadNumber(None));
+                return Err(Error::BadNumber(None, None));
             }
             Ok((Some((data, TK_FLOAT)), data.len()))
         }
     } else {
-        Err(Error::BadNumber(None))
+        Err(Error::BadNumber(None, None))
     }
 }
 
@@ -606,7 +670,7 @@ fn find_end_of_number(
             {
                 continue;
             }
-            return Err(Error::BadNumber(None));
+            return Err(Error::BadNumber(None, None));
         } else {
             return Ok(Some((j, b)));
         }
@@ -660,7 +724,7 @@ mod tests {
         let mut s = Scanner::new(tokenizer);
         expect_token(&mut s, input, b"SELECT", TokenType::TK_SELECT)?;
         let err = s.scan(input).unwrap_err();
-        assert!(matches!(err, Error::BadNumber(_)));
+        assert!(matches!(err, Error::BadNumber(_, _)));
         Ok(())
     }
 

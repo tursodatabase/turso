@@ -137,3 +137,7 @@ Carolyn|118
 Katelyn|40
 Erik|88
 Collin|15}
+
+do_execsql_test case-insensitive-alias {
+    select u.first_name as fF, count(1) > 0 as cC from users u where fF = 'Jamie' group by fF order by cC;
+} {Jamie|1}

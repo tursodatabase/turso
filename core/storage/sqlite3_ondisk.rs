@@ -46,13 +46,14 @@ use crate::io::{Buffer, Completion, ReadCompletion, SyncCompletion, WriteComplet
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::pager::Pager;
-use crate::types::{OwnedRecord, OwnedValue};
+use crate::types::{OwnedValue, Record, Text, TextSubtype};
 use crate::{File, Result};
-use log::trace;
+use parking_lot::RwLock;
 use std::cell::RefCell;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tracing::trace;
 
 use super::pager::PageRef;
 
@@ -105,10 +106,10 @@ pub struct DatabaseHeader {
     pub database_size: u32,
 
     /// Page number of the first freelist trunk page.
-    freelist_trunk_page: u32,
+    pub freelist_trunk_page: u32,
 
     /// Total number of freelist pages.
-    freelist_pages: u32,
+    pub freelist_pages: u32,
 
     /// The schema cookie. Incremented when the database schema changes.
     schema_cookie: u32,
@@ -127,7 +128,7 @@ pub struct DatabaseHeader {
     text_encoding: u32,
 
     /// The "user version" as read and set by the user_version pragma.
-    user_version: u32,
+    pub user_version: u32,
 
     /// True (non-zero) for incremental-vacuum mode. False (zero) otherwise.
     incremental_vacuum_enabled: u32,
@@ -231,7 +232,7 @@ impl Default for DatabaseHeader {
             default_page_cache_size: 500, // pages
             vacuum_mode_largest_root_page: 0,
             text_encoding: 1, // utf-8
-            user_version: 1,
+            user_version: 0,
             incremental_vacuum_enabled: 0,
             application_id: 0,
             reserved_for_expansion: [0; 20],
@@ -252,8 +253,8 @@ pub fn begin_read_database_header(
         let header = header.clone();
         finish_read_database_header(buf, header).unwrap();
     });
-    let c = Rc::new(Completion::Read(ReadCompletion::new(buf, complete)));
-    page_io.read_page(1, c.clone())?;
+    let c = Completion::Read(ReadCompletion::new(buf, complete));
+    page_io.read_page(1, c)?;
     Ok(result)
 }
 
@@ -263,7 +264,7 @@ fn finish_read_database_header(
 ) -> Result<()> {
     let buf = buf.borrow();
     let buf = buf.as_slice();
-    let mut header = std::cell::RefCell::borrow_mut(&header);
+    let mut header = RefCell::borrow_mut(&header);
     header.magic.copy_from_slice(&buf[0..16]);
     header.page_size = u16::from_be_bytes([buf[16], buf[17]]);
     header.write_version = buf[18];
@@ -301,47 +302,38 @@ pub fn begin_write_database_header(header: &DatabaseHeader, pager: &Pager) -> Re
     let buffer_to_copy = Rc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
     let buffer_to_copy_in_cb = buffer_to_copy.clone();
 
-    let header_cb = header.clone();
-    let complete = Box::new(move |buffer: Rc<RefCell<Buffer>>| {
-        let header = header_cb.clone();
-        let buffer: Buffer = buffer.borrow().clone();
+    let read_complete = Box::new(move |buffer: Rc<RefCell<Buffer>>| {
+        let buffer = buffer.borrow().clone();
         let buffer = Rc::new(RefCell::new(buffer));
-        {
-            let mut buf_mut = std::cell::RefCell::borrow_mut(&buffer);
-            let buf = buf_mut.as_mut_slice();
-            write_header_to_buf(buf, &header);
-            let mut buffer_to_copy = std::cell::RefCell::borrow_mut(&buffer_to_copy_in_cb);
-            let buffer_to_copy_slice = buffer_to_copy.as_mut_slice();
-
-            buffer_to_copy_slice.copy_from_slice(buf);
-        }
+        let mut buf_mut = buffer.borrow_mut();
+        write_header_to_buf(buf_mut.as_mut_slice(), &header);
+        let mut dest_buf = buffer_to_copy_in_cb.borrow_mut();
+        dest_buf.as_mut_slice().copy_from_slice(buf_mut.as_slice());
     });
 
     let drop_fn = Rc::new(|_buf| {});
     let buf = Rc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
-    let c = Rc::new(Completion::Read(ReadCompletion::new(buf.clone(), complete)));
-    page_source.read_page(1, c.clone())?;
+    let c = Completion::Read(ReadCompletion::new(buf, read_complete));
+    page_source.read_page(1, c)?;
     // run get header block
     pager.io.run_once()?;
 
-    let buffer_in_cb = buffer_to_copy.clone();
+    let buffer_to_copy_in_cb = buffer_to_copy.clone();
     let write_complete = Box::new(move |bytes_written: i32| {
-        let buf = buffer_in_cb.clone();
-        let buf_len = std::cell::RefCell::borrow(&buf).len();
+        let buf_len = buffer_to_copy_in_cb.borrow().len();
         if bytes_written < buf_len as i32 {
-            log::error!("wrote({bytes_written}) less than expected({buf_len})");
+            tracing::error!("wrote({bytes_written}) less than expected({buf_len})");
         }
         // finish_read_database_header(buf, header).unwrap();
     });
-    let c = Rc::new(Completion::Write(WriteCompletion::new(write_complete)));
-    page_source
-        .write_page(0, buffer_to_copy.clone(), c)
-        .unwrap();
+
+    let c = Completion::Write(WriteCompletion::new(write_complete));
+    page_source.write_page(0, buffer_to_copy, c)?;
 
     Ok(())
 }
 
-fn write_header_to_buf(buf: &mut [u8], header: &DatabaseHeader) {
+pub fn write_header_to_buf(buf: &mut [u8], header: &DatabaseHeader) {
     buf[0..16].copy_from_slice(&header.magic);
     buf[16..18].copy_from_slice(&header.page_size.to_be_bytes());
     buf[18] = header.write_version;
@@ -370,7 +362,7 @@ fn write_header_to_buf(buf: &mut [u8], header: &DatabaseHeader) {
 }
 
 #[repr(u8)]
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum PageType {
     IndexInterior = 2,
     TableInterior = 5,
@@ -437,7 +429,7 @@ impl PageContent {
         }
     }
 
-    fn read_u8(&self, pos: usize) -> u8 {
+    pub fn read_u8(&self, pos: usize) -> u8 {
         let buf = self.as_ptr();
         buf[self.offset + pos]
     }
@@ -447,30 +439,36 @@ impl PageContent {
         u16::from_be_bytes([buf[self.offset + pos], buf[self.offset + pos + 1]])
     }
 
-    fn read_u32(&self, pos: usize) -> u32 {
+    pub fn read_u16_no_offset(&self, pos: usize) -> u16 {
         let buf = self.as_ptr();
-        u32::from_be_bytes([
-            buf[self.offset + pos],
-            buf[self.offset + pos + 1],
-            buf[self.offset + pos + 2],
-            buf[self.offset + pos + 3],
-        ])
+        u16::from_be_bytes([buf[pos], buf[pos + 1]])
+    }
+
+    pub fn read_u32(&self, pos: usize) -> u32 {
+        let buf = self.as_ptr();
+        read_u32(buf, self.offset + pos)
     }
 
     pub fn write_u8(&self, pos: usize, value: u8) {
-        log::debug!("write_u8(pos={}, value={})", pos, value);
+        tracing::debug!("write_u8(pos={}, value={})", pos, value);
         let buf = self.as_ptr();
         buf[self.offset + pos] = value;
     }
 
     pub fn write_u16(&self, pos: usize, value: u16) {
-        log::debug!("write_u16(pos={}, value={})", pos, value);
+        tracing::debug!("write_u16(pos={}, value={})", pos, value);
         let buf = self.as_ptr();
         buf[self.offset + pos..self.offset + pos + 2].copy_from_slice(&value.to_be_bytes());
     }
 
+    pub fn write_u16_no_offset(&self, pos: usize, value: u16) {
+        tracing::debug!("write_u16(pos={}, value={})", pos, value);
+        let buf = self.as_ptr();
+        buf[pos..pos + 2].copy_from_slice(&value.to_be_bytes());
+    }
+
     pub fn write_u32(&self, pos: usize, value: u32) {
-        log::debug!("write_u32(pos={}, value={})", pos, value);
+        tracing::debug!("write_u32(pos={}, value={})", pos, value);
         let buf = self.as_ptr();
         buf[self.offset + pos..self.offset + pos + 4].copy_from_slice(&value.to_be_bytes());
     }
@@ -485,8 +483,27 @@ impl PageContent {
         self.read_u16(1)
     }
 
+    /// The number of cells on the page.
     pub fn cell_count(&self) -> usize {
         self.read_u16(3) as usize
+    }
+
+    /// The size of the cell pointer array in bytes.
+    /// 2 bytes per cell pointer
+    pub fn cell_pointer_array_size(&self) -> usize {
+        const CELL_POINTER_SIZE_BYTES: usize = 2;
+        self.cell_count() * CELL_POINTER_SIZE_BYTES
+    }
+
+    /// The start of the unallocated region.
+    /// Effectively: the offset after the page header + the cell pointer array.
+    pub fn unallocated_region_start(&self) -> usize {
+        let (cell_ptr_array_start, cell_ptr_array_size) = self.cell_pointer_array_offset_and_size();
+        cell_ptr_array_start + cell_ptr_array_size
+    }
+
+    pub fn unallocated_region_size(&self) -> usize {
+        self.cell_content_area() as usize - self.unallocated_region_start()
     }
 
     /// The start of the cell content area.
@@ -495,6 +512,17 @@ impl PageContent {
     /// = the cell content area pointer moves leftward as cells are added to the page
     pub fn cell_content_area(&self) -> u16 {
         self.read_u16(5)
+    }
+
+    /// The size of the page header in bytes.
+    /// 8 bytes for leaf pages, 12 bytes for interior pages (due to storing rightmost child pointer)
+    pub fn header_size(&self) -> usize {
+        match self.page_type() {
+            PageType::IndexInterior => 12,
+            PageType::TableInterior => 12,
+            PageType::IndexLeaf => 8,
+            PageType::TableLeaf => 8,
+        }
     }
 
     /// The total number of bytes in all fragments is stored in the fifth field of the b-tree page header.
@@ -512,6 +540,16 @@ impl PageContent {
         }
     }
 
+    pub fn rightmost_pointer_raw(&self) -> Option<*mut u8> {
+        match self.page_type() {
+            PageType::IndexInterior | PageType::TableInterior => {
+                Some(unsafe { self.as_ptr().as_mut_ptr().add(self.offset + 8) })
+            }
+            PageType::IndexLeaf => None,
+            PageType::TableLeaf => None,
+        }
+    }
+
     pub fn cell_get(
         &self,
         idx: usize,
@@ -520,18 +558,13 @@ impl PageContent {
         payload_overflow_threshold_min: usize,
         usable_size: usize,
     ) -> Result<BTreeCell> {
-        log::debug!("cell_get(idx={})", idx);
+        tracing::debug!("cell_get(idx={})", idx);
         let buf = self.as_ptr();
 
         let ncells = self.cell_count();
         // the page header is 12 bytes for interior pages, 8 bytes for leaf pages
         // this is because the 4 last bytes in the interior page's header are used for the rightmost pointer.
-        let cell_pointer_array_start = match self.page_type() {
-            PageType::IndexInterior => 12,
-            PageType::TableInterior => 12,
-            PageType::IndexLeaf => 8,
-            PageType::TableLeaf => 8,
-        };
+        let cell_pointer_array_start = self.header_size();
         assert!(idx < ncells, "cell_get: idx out of bounds");
         let cell_pointer = cell_pointer_array_start + (idx * 2);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
@@ -552,17 +585,12 @@ impl PageContent {
     /// The cell pointers are arranged in key order with:
     /// - left-most cell (the cell with the smallest key) first and
     /// - the right-most cell (the cell with the largest key) last.
-    pub fn cell_get_raw_pointer_region(&self) -> (usize, usize) {
-        let cell_start = match self.page_type() {
-            PageType::IndexInterior => 12,
-            PageType::TableInterior => 12,
-            PageType::IndexLeaf => 8,
-            PageType::TableLeaf => 8,
-        };
-        (self.offset + cell_start, self.cell_count() * 2)
+    pub fn cell_pointer_array_offset_and_size(&self) -> (usize, usize) {
+        let header_size = self.header_size();
+        (self.offset + header_size, self.cell_pointer_array_size())
     }
 
-    /* Get region of a cell's payload */
+    /// Get region of a cell's payload
     pub fn cell_get_raw_region(
         &self,
         idx: usize,
@@ -572,15 +600,10 @@ impl PageContent {
     ) -> (usize, usize) {
         let buf = self.as_ptr();
         let ncells = self.cell_count();
-        let cell_pointer_array_start = match self.page_type() {
-            PageType::IndexInterior => 12,
-            PageType::TableInterior => 12,
-            PageType::IndexLeaf => 8,
-            PageType::TableLeaf => 8,
-        };
+        let (cell_pointer_array_start, _) = self.cell_pointer_array_offset_and_size();
         assert!(idx < ncells, "cell_get: idx out of bounds");
         let cell_pointer = cell_pointer_array_start + (idx * 2); // pointers are 2 bytes each
-        let cell_pointer = self.read_u16(cell_pointer) as usize;
+        let cell_pointer = self.read_u16_no_offset(cell_pointer) as usize;
         let start = cell_pointer;
         let len = match self.page_type() {
             PageType::IndexInterior => {
@@ -668,8 +691,8 @@ pub fn begin_read_page(
             page.set_error();
         }
     });
-    let c = Rc::new(Completion::Read(ReadCompletion::new(buf, complete)));
-    page_io.read_page(page_idx, c.clone())?;
+    let c = Completion::Read(ReadCompletion::new(buf, complete));
+    page_io.read_page(page_idx, c)?;
     Ok(())
 }
 
@@ -699,12 +722,12 @@ pub fn begin_write_btree_page(
     page: &PageRef,
     write_counter: Rc<RefCell<usize>>,
 ) -> Result<()> {
-    log::trace!("begin_write_btree_page(page={})", page.get().id);
+    trace!("begin_write_btree_page(page={})", page.get().id);
     let page_source = &pager.page_io;
     let page_finish = page.clone();
 
     let page_id = page.get().id;
-    log::trace!("begin_write_btree_page(page_id={})", page_id);
+    trace!("begin_write_btree_page(page_id={})", page_id);
     let buffer = {
         let page = page.get();
         let contents = page.contents.as_ref().unwrap();
@@ -715,18 +738,18 @@ pub fn begin_write_btree_page(
     let write_complete = {
         let buf_copy = buffer.clone();
         Box::new(move |bytes_written: i32| {
-            log::trace!("finish_write_btree_page");
+            trace!("finish_write_btree_page");
             let buf_copy = buf_copy.clone();
             let buf_len = buf_copy.borrow().len();
             *write_counter.borrow_mut() -= 1;
 
             page_finish.clear_dirty();
             if bytes_written < buf_len as i32 {
-                log::error!("wrote({bytes_written}) less than expected({buf_len})");
+                tracing::error!("wrote({bytes_written}) less than expected({buf_len})");
             }
         })
     };
-    let c = Rc::new(Completion::Write(WriteCompletion::new(write_complete)));
+    let c = Completion::Write(WriteCompletion::new(write_complete));
     page_source.write_page(page_id, buffer.clone(), c)?;
     Ok(())
 }
@@ -739,7 +762,7 @@ pub fn begin_sync(page_io: Rc<dyn DatabaseStorage>, syncing: Rc<RefCell<bool>>) 
             *syncing.borrow_mut() = false;
         }),
     });
-    page_io.sync(Rc::new(completion))?;
+    page_io.sync(completion)?;
     Ok(())
 }
 
@@ -881,6 +904,7 @@ fn read_payload(unread: &[u8], payload_size: usize, pager: Rc<Pager>) -> (Vec<u8
             assert!(left_to_read > 0);
             let page;
             loop {
+                // FIXME(pere): this looks terrible, what did i do lmao
                 let page_ref = pager.read_page(next_overflow as usize);
                 if let Ok(p) = page_ref {
                     page = p;
@@ -903,158 +927,261 @@ fn read_payload(unread: &[u8], payload_size: usize, pager: Rc<Pager>) -> (Vec<u8
     }
 }
 
-#[derive(Debug, PartialEq)]
-pub enum SerialType {
-    Null,
-    UInt8,
-    BEInt16,
-    BEInt24,
-    BEInt32,
-    BEInt48,
-    BEInt64,
-    BEFloat64,
-    ConstInt0,
-    ConstInt1,
-    Blob(usize),
-    String(usize),
+pub type SerialType = u64;
+
+pub const SERIAL_TYPE_NULL: SerialType = 0;
+pub const SERIAL_TYPE_INT8: SerialType = 1;
+pub const SERIAL_TYPE_BEINT16: SerialType = 2;
+pub const SERIAL_TYPE_BEINT24: SerialType = 3;
+pub const SERIAL_TYPE_BEINT32: SerialType = 4;
+pub const SERIAL_TYPE_BEINT48: SerialType = 5;
+pub const SERIAL_TYPE_BEINT64: SerialType = 6;
+pub const SERIAL_TYPE_BEFLOAT64: SerialType = 7;
+pub const SERIAL_TYPE_CONSTINT0: SerialType = 8;
+pub const SERIAL_TYPE_CONSTINT1: SerialType = 9;
+
+pub trait SerialTypeExt {
+    fn is_null(self) -> bool;
+    fn is_int8(self) -> bool;
+    fn is_beint16(self) -> bool;
+    fn is_beint24(self) -> bool;
+    fn is_beint32(self) -> bool;
+    fn is_beint48(self) -> bool;
+    fn is_beint64(self) -> bool;
+    fn is_befloat64(self) -> bool;
+    fn is_constint0(self) -> bool;
+    fn is_constint1(self) -> bool;
+    fn is_blob(self) -> bool;
+    fn is_string(self) -> bool;
+    fn blob_size(self) -> usize;
+    fn string_size(self) -> usize;
+    fn is_valid(self) -> bool;
 }
 
-impl TryFrom<u64> for SerialType {
-    type Error = crate::error::LimboError;
+impl SerialTypeExt for u64 {
+    fn is_null(self) -> bool {
+        self == SERIAL_TYPE_NULL
+    }
 
-    fn try_from(value: u64) -> Result<Self> {
-        match value {
-            0 => Ok(Self::Null),
-            1 => Ok(Self::UInt8),
-            2 => Ok(Self::BEInt16),
-            3 => Ok(Self::BEInt24),
-            4 => Ok(Self::BEInt32),
-            5 => Ok(Self::BEInt48),
-            6 => Ok(Self::BEInt64),
-            7 => Ok(Self::BEFloat64),
-            8 => Ok(Self::ConstInt0),
-            9 => Ok(Self::ConstInt1),
-            n if value >= 12 && value % 2 == 0 => Ok(Self::Blob(((n - 12) / 2) as usize)),
-            n if value >= 13 && value % 2 == 1 => Ok(Self::String(((n - 13) / 2) as usize)),
-            _ => crate::bail_corrupt_error!("Invalid serial type: {}", value),
-        }
+    fn is_int8(self) -> bool {
+        self == SERIAL_TYPE_INT8
+    }
+
+    fn is_beint16(self) -> bool {
+        self == SERIAL_TYPE_BEINT16
+    }
+
+    fn is_beint24(self) -> bool {
+        self == SERIAL_TYPE_BEINT24
+    }
+
+    fn is_beint32(self) -> bool {
+        self == SERIAL_TYPE_BEINT32
+    }
+
+    fn is_beint48(self) -> bool {
+        self == SERIAL_TYPE_BEINT48
+    }
+
+    fn is_beint64(self) -> bool {
+        self == SERIAL_TYPE_BEINT64
+    }
+
+    fn is_befloat64(self) -> bool {
+        self == SERIAL_TYPE_BEFLOAT64
+    }
+
+    fn is_constint0(self) -> bool {
+        self == SERIAL_TYPE_CONSTINT0
+    }
+
+    fn is_constint1(self) -> bool {
+        self == SERIAL_TYPE_CONSTINT1
+    }
+
+    fn is_blob(self) -> bool {
+        self >= 12 && self % 2 == 0
+    }
+
+    fn is_string(self) -> bool {
+        self >= 13 && self % 2 == 1
+    }
+
+    fn blob_size(self) -> usize {
+        debug_assert!(self.is_blob());
+        ((self - 12) / 2) as usize
+    }
+
+    fn string_size(self) -> usize {
+        debug_assert!(self.is_string());
+        ((self - 13) / 2) as usize
+    }
+
+    fn is_valid(self) -> bool {
+        self <= 9 || self.is_blob() || self.is_string()
     }
 }
 
-pub fn read_record(payload: &[u8]) -> Result<OwnedRecord> {
+pub fn validate_serial_type(value: u64) -> Result<SerialType> {
+    if value.is_valid() {
+        Ok(value)
+    } else {
+        crate::bail_corrupt_error!("Invalid serial type: {}", value)
+    }
+}
+
+pub fn read_record(payload: &[u8]) -> Result<Record> {
     let mut pos = 0;
     let (header_size, nr) = read_varint(payload)?;
     assert!((header_size as usize) >= nr);
     let mut header_size = (header_size as usize) - nr;
     pos += nr;
+
     let mut serial_types = Vec::with_capacity(header_size);
     while header_size > 0 {
         let (serial_type, nr) = read_varint(&payload[pos..])?;
-        let serial_type = SerialType::try_from(serial_type)?;
+        let serial_type = validate_serial_type(serial_type)?;
         serial_types.push(serial_type);
         pos += nr;
         assert!(header_size >= nr);
         header_size -= nr;
     }
+
     let mut values = Vec::with_capacity(serial_types.len());
-    for serial_type in &serial_types {
+    for &serial_type in &serial_types {
         let (value, n) = read_value(&payload[pos..], serial_type)?;
         pos += n;
         values.push(value);
     }
-    Ok(OwnedRecord::new(values))
+
+    Ok(Record::new(values))
 }
 
-pub fn read_value(buf: &[u8], serial_type: &SerialType) -> Result<(OwnedValue, usize)> {
-    match *serial_type {
-        SerialType::Null => Ok((OwnedValue::Null, 0)),
-        SerialType::UInt8 => {
-            if buf.is_empty() {
-                crate::bail_corrupt_error!("Invalid UInt8 value");
-            }
-            Ok((OwnedValue::Integer(buf[0] as i64), 1))
-        }
-        SerialType::BEInt16 => {
-            if buf.len() < 2 {
-                crate::bail_corrupt_error!("Invalid BEInt16 value");
-            }
-            Ok((
-                OwnedValue::Integer(i16::from_be_bytes([buf[0], buf[1]]) as i64),
-                2,
-            ))
-        }
-        SerialType::BEInt24 => {
-            if buf.len() < 3 {
-                crate::bail_corrupt_error!("Invalid BEInt24 value");
-            }
-            Ok((
-                OwnedValue::Integer(i32::from_be_bytes([0, buf[0], buf[1], buf[2]]) as i64),
-                3,
-            ))
-        }
-        SerialType::BEInt32 => {
-            if buf.len() < 4 {
-                crate::bail_corrupt_error!("Invalid BEInt32 value");
-            }
-            Ok((
-                OwnedValue::Integer(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64),
-                4,
-            ))
-        }
-        SerialType::BEInt48 => {
-            if buf.len() < 6 {
-                crate::bail_corrupt_error!("Invalid BEInt48 value");
-            }
-            Ok((
-                OwnedValue::Integer(i64::from_be_bytes([
-                    0, 0, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5],
-                ])),
-                6,
-            ))
-        }
-        SerialType::BEInt64 => {
-            if buf.len() < 8 {
-                crate::bail_corrupt_error!("Invalid BEInt64 value");
-            }
-            Ok((
-                OwnedValue::Integer(i64::from_be_bytes([
-                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-                ])),
-                8,
-            ))
-        }
-        SerialType::BEFloat64 => {
-            if buf.len() < 8 {
-                crate::bail_corrupt_error!("Invalid BEFloat64 value");
-            }
-            Ok((
-                OwnedValue::Float(f64::from_be_bytes([
-                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-                ])),
-                8,
-            ))
-        }
-        SerialType::ConstInt0 => Ok((OwnedValue::Integer(0), 0)),
-        SerialType::ConstInt1 => Ok((OwnedValue::Integer(1), 0)),
-        SerialType::Blob(n) => {
-            if buf.len() < n {
-                crate::bail_corrupt_error!("Invalid Blob value");
-            }
-            Ok((OwnedValue::Blob(buf[0..n].to_vec().into()), n))
-        }
-        SerialType::String(n) => {
-            if buf.len() < n {
-                crate::bail_corrupt_error!(
-                    "Invalid String value, length {} < expected length {}",
-                    buf.len(),
-                    n
-                );
-            }
-            let bytes = buf[0..n].to_vec();
-            let value = unsafe { String::from_utf8_unchecked(bytes) };
-            Ok((OwnedValue::build_text(value.into()), n))
-        }
+pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(OwnedValue, usize)> {
+    if serial_type.is_null() {
+        return Ok((OwnedValue::Null, 0));
     }
+
+    if serial_type.is_int8() {
+        if buf.is_empty() {
+            crate::bail_corrupt_error!("Invalid UInt8 value");
+        }
+        let val = buf[0] as i8;
+        return Ok((OwnedValue::Integer(val as i64), 1));
+    }
+
+    if serial_type.is_beint16() {
+        if buf.len() < 2 {
+            crate::bail_corrupt_error!("Invalid BEInt16 value");
+        }
+        return Ok((
+            OwnedValue::Integer(i16::from_be_bytes([buf[0], buf[1]]) as i64),
+            2,
+        ));
+    }
+
+    if serial_type.is_beint24() {
+        if buf.len() < 3 {
+            crate::bail_corrupt_error!("Invalid BEInt24 value");
+        }
+        let sign_extension = if buf[0] <= 127 { 0 } else { 255 };
+        return Ok((
+            OwnedValue::Integer(i32::from_be_bytes([sign_extension, buf[0], buf[1], buf[2]]) as i64),
+            3,
+        ));
+    }
+
+    if serial_type.is_beint32() {
+        if buf.len() < 4 {
+            crate::bail_corrupt_error!("Invalid BEInt32 value");
+        }
+        return Ok((
+            OwnedValue::Integer(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64),
+            4,
+        ));
+    }
+
+    if serial_type.is_beint48() {
+        if buf.len() < 6 {
+            crate::bail_corrupt_error!("Invalid BEInt48 value");
+        }
+        let sign_extension = if buf[0] <= 127 { 0 } else { 255 };
+        return Ok((
+            OwnedValue::Integer(i64::from_be_bytes([
+                sign_extension,
+                sign_extension,
+                buf[0],
+                buf[1],
+                buf[2],
+                buf[3],
+                buf[4],
+                buf[5],
+            ])),
+            6,
+        ));
+    }
+
+    if serial_type.is_beint64() {
+        if buf.len() < 8 {
+            crate::bail_corrupt_error!("Invalid BEInt64 value");
+        }
+        return Ok((
+            OwnedValue::Integer(i64::from_be_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ])),
+            8,
+        ));
+    }
+
+    if serial_type.is_befloat64() {
+        if buf.len() < 8 {
+            crate::bail_corrupt_error!("Invalid BEFloat64 value");
+        }
+        return Ok((
+            OwnedValue::Float(f64::from_be_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ])),
+            8,
+        ));
+    }
+
+    if serial_type.is_constint0() {
+        return Ok((OwnedValue::Integer(0), 0));
+    }
+
+    if serial_type.is_constint1() {
+        return Ok((OwnedValue::Integer(1), 0));
+    }
+
+    if serial_type.is_blob() {
+        let n = serial_type.blob_size();
+        if buf.len() < n {
+            crate::bail_corrupt_error!("Invalid Blob value");
+        }
+        return Ok((OwnedValue::Blob(Rc::new(buf[0..n].to_vec())), n));
+    }
+
+    if serial_type.is_string() {
+        let n = serial_type.string_size();
+        if buf.len() < n {
+            crate::bail_corrupt_error!(
+                "Invalid String value, length {} < expected length {}",
+                buf.len(),
+                n
+            );
+        }
+        let bytes = buf[0..n].to_vec();
+        return Ok((
+            OwnedValue::Text(Text {
+                value: Rc::new(bytes),
+                subtype: TextSubtype::Text,
+            }),
+            n,
+        ));
+    }
+
+    // This should never happen if validate_serial_type is used correctly
+    crate::bail_corrupt_error!("Invalid serial type: {}", serial_type)
 }
 
 pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
@@ -1116,11 +1243,9 @@ pub fn write_varint(buf: &mut [u8], value: u64) -> usize {
 }
 
 pub fn write_varint_to_vec(value: u64, payload: &mut Vec<u8>) {
-    let mut varint: Vec<u8> = vec![0; 9];
-    let n = write_varint(&mut varint.as_mut_slice()[0..9], value);
-    write_varint(&mut varint, value);
-    varint.truncate(n);
-    payload.extend_from_slice(&varint);
+    let mut varint = [0u8; 9];
+    let n = write_varint(&mut varint, value);
+    payload.extend_from_slice(&varint[0..n]);
 }
 
 pub fn begin_read_wal_header(io: &Rc<dyn File>) -> Result<Arc<RwLock<WalHeader>>> {
@@ -1132,7 +1257,7 @@ pub fn begin_read_wal_header(io: &Rc<dyn File>) -> Result<Arc<RwLock<WalHeader>>
         let header = header.clone();
         finish_read_wal_header(buf, header).unwrap();
     });
-    let c = Rc::new(Completion::Read(ReadCompletion::new(buf, complete)));
+    let c = Completion::Read(ReadCompletion::new(buf, complete));
     io.pread(0, c)?;
     Ok(result)
 }
@@ -1140,7 +1265,7 @@ pub fn begin_read_wal_header(io: &Rc<dyn File>) -> Result<Arc<RwLock<WalHeader>>
 fn finish_read_wal_header(buf: Rc<RefCell<Buffer>>, header: Arc<RwLock<WalHeader>>) -> Result<()> {
     let buf = buf.borrow();
     let buf = buf.as_slice();
-    let mut header = header.write().unwrap();
+    let mut header = header.write();
     header.magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
     header.file_format = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
     header.page_size = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
@@ -1158,7 +1283,7 @@ pub fn begin_read_wal_frame(
     buffer_pool: Rc<BufferPool>,
     page: PageRef,
 ) -> Result<()> {
-    log::trace!(
+    trace!(
         "begin_read_wal_frame(offset={}, page={})",
         offset,
         page.get().id
@@ -1174,7 +1299,7 @@ pub fn begin_read_wal_frame(
         let frame = frame.clone();
         finish_read_page(2, buf, frame).unwrap();
     });
-    let c = Rc::new(Completion::Read(ReadCompletion::new(buf, complete)));
+    let c = Completion::Read(ReadCompletion::new(buf, complete));
     io.pread(offset, c)?;
     Ok(())
 }
@@ -1238,7 +1363,6 @@ pub fn begin_write_wal_frame(
     *write_counter.borrow_mut() += 1;
     let write_complete = {
         let buf_copy = buffer.clone();
-        log::info!("finished");
         Box::new(move |bytes_written: i32| {
             let buf_copy = buf_copy.clone();
             let buf_len = buf_copy.borrow().len();
@@ -1246,11 +1370,11 @@ pub fn begin_write_wal_frame(
 
             page_finish.clear_dirty();
             if bytes_written < buf_len as i32 {
-                log::error!("wrote({bytes_written}) less than expected({buf_len})");
+                tracing::error!("wrote({bytes_written}) less than expected({buf_len})");
             }
         })
     };
-    let c = Rc::new(Completion::Write(WriteCompletion::new(write_complete)));
+    let c = Completion::Write(WriteCompletion::new(write_complete));
     io.pwrite(offset, buffer.clone(), c)?;
     Ok(checksums)
 }
@@ -1277,13 +1401,13 @@ pub fn begin_write_wal_header(io: &Rc<dyn File>, header: &WalHeader) -> Result<(
     let write_complete = {
         Box::new(move |bytes_written: i32| {
             if bytes_written < WAL_HEADER_SIZE as i32 {
-                log::error!(
+                tracing::error!(
                     "wal header wrote({bytes_written}) less than expected({WAL_HEADER_SIZE})"
                 );
             }
         })
     };
-    let c = Rc::new(Completion::Write(WriteCompletion::new(write_complete)));
+    let c = Completion::Write(WriteCompletion::new(write_complete));
     io.pwrite(0, buffer.clone(), c)?;
     Ok(())
 }
@@ -1314,7 +1438,7 @@ pub fn payload_overflows(
 /// The 32-bit integers are big-endian if the magic number in the first 4 bytes of the WAL header is 0x377f0683
 /// and the integers are little-endian if the magic number is 0x377f0682.
 /// The checksum values are always stored in the frame header in a big-endian format regardless of which byte order is used to compute the checksum.
-
+///
 /// The checksum algorithm only works for content which is a multiple of 8 bytes in length.
 /// In other words, if the inputs are x(0) through x(N) then N must be odd.
 /// The checksum algorithm is as follows:
@@ -1334,7 +1458,7 @@ pub fn checksum_wal(
     input: (u32, u32),
     native_endian: bool, // Sqlite interprets big endian as "native"
 ) -> (u32, u32) {
-    assert!(buf.len() % 8 == 0, "buffer must be a multiple of 8");
+    assert_eq!(buf.len() % 8, 0, "buffer must be a multiple of 8");
     let mut s0: u32 = input.0;
     let mut s1: u32 = input.1;
     let mut i = 0;
@@ -1360,8 +1484,12 @@ pub fn checksum_wal(
 
 impl WalHeader {
     pub fn as_bytes(&self) -> &[u8] {
-        unsafe { std::mem::transmute::<&WalHeader, &[u8; std::mem::size_of::<WalHeader>()]>(self) }
+        unsafe { std::mem::transmute::<&WalHeader, &[u8; size_of::<WalHeader>()]>(self) }
     }
+}
+
+pub fn read_u32(buf: &[u8], pos: usize) -> u32 {
+    u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]])
 }
 
 #[cfg(test)]
@@ -1370,115 +1498,90 @@ mod tests {
     use rstest::rstest;
 
     #[rstest]
-    #[case(0, SerialType::Null)]
-    #[case(1, SerialType::UInt8)]
-    #[case(2, SerialType::BEInt16)]
-    #[case(3, SerialType::BEInt24)]
-    #[case(4, SerialType::BEInt32)]
-    #[case(5, SerialType::BEInt48)]
-    #[case(6, SerialType::BEInt64)]
-    #[case(7, SerialType::BEFloat64)]
-    #[case(8, SerialType::ConstInt0)]
-    #[case(9, SerialType::ConstInt1)]
-    #[case(12, SerialType::Blob(0))]
-    #[case(13, SerialType::String(0))]
-    #[case(14, SerialType::Blob(1))]
-    #[case(15, SerialType::String(1))]
-    fn test_read_serial_type(#[case] input: u64, #[case] expected: SerialType) {
-        let result = SerialType::try_from(input).unwrap();
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn test_read_invalid_serial_type() {
-        let result = SerialType::try_from(10);
-        assert!(result.is_err());
-    }
-
-    #[rstest]
-    #[case(&[], SerialType::Null, OwnedValue::Null)]
-    #[case(&[255], SerialType::UInt8, OwnedValue::Integer(255))]
-    #[case(&[0x12, 0x34], SerialType::BEInt16, OwnedValue::Integer(0x1234))]
-    #[case(&[0x12, 0x34, 0x56], SerialType::BEInt24, OwnedValue::Integer(0x123456))]
-    #[case(&[0x12, 0x34, 0x56, 0x78], SerialType::BEInt32, OwnedValue::Integer(0x12345678))]
-    #[case(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC], SerialType::BEInt48, OwnedValue::Integer(0x123456789ABC))]
-    #[case(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xFF], SerialType::BEInt64, OwnedValue::Integer(0x123456789ABCDEFF))]
-    #[case(&[64, 9, 33, 251, 84, 68, 45, 24], SerialType::BEFloat64, OwnedValue::Float(std::f64::consts::PI))]
-    #[case(&[], SerialType::ConstInt0, OwnedValue::Integer(0))]
-    #[case(&[], SerialType::ConstInt1, OwnedValue::Integer(1))]
-    #[case(&[1, 2, 3], SerialType::Blob(3), OwnedValue::Blob(vec![1, 2, 3].into()))]
-    #[case(&[65, 66, 67], SerialType::String(3), OwnedValue::build_text("ABC".to_string().into()))]
+    #[case(&[], SERIAL_TYPE_NULL, OwnedValue::Null)]
+    #[case(&[255], SERIAL_TYPE_INT8, OwnedValue::Integer(-1))]
+    #[case(&[0x12, 0x34], SERIAL_TYPE_BEINT16, OwnedValue::Integer(0x1234))]
+    #[case(&[0xFE], SERIAL_TYPE_INT8, OwnedValue::Integer(-2))]
+    #[case(&[0x12, 0x34, 0x56], SERIAL_TYPE_BEINT24, OwnedValue::Integer(0x123456))]
+    #[case(&[0x12, 0x34, 0x56, 0x78], SERIAL_TYPE_BEINT32, OwnedValue::Integer(0x12345678))]
+    #[case(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC], SERIAL_TYPE_BEINT48, OwnedValue::Integer(0x123456789ABC))]
+    #[case(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xFF], SERIAL_TYPE_BEINT64, OwnedValue::Integer(0x123456789ABCDEFF))]
+    #[case(&[0x40, 0x09, 0x21, 0xFB, 0x54, 0x44, 0x2D, 0x18], SERIAL_TYPE_BEFLOAT64, OwnedValue::Float(std::f64::consts::PI))]
+    #[case(&[1, 2], SERIAL_TYPE_CONSTINT0, OwnedValue::Integer(0))]
+    #[case(&[65, 66], SERIAL_TYPE_CONSTINT1, OwnedValue::Integer(1))]
+    #[case(&[1, 2, 3], 18, OwnedValue::Blob(vec![1, 2, 3].into()))]
+    #[case(&[65, 66, 67], 19, OwnedValue::build_text("ABC"))]
+    #[case(&[0x80], SERIAL_TYPE_INT8, OwnedValue::Integer(-128))]
+    #[case(&[0x80, 0], SERIAL_TYPE_BEINT16, OwnedValue::Integer(-32768))]
+    #[case(&[0x80, 0, 0], SERIAL_TYPE_BEINT24, OwnedValue::Integer(-8388608))]
+    #[case(&[0x80, 0, 0, 0], SERIAL_TYPE_BEINT32, OwnedValue::Integer(-2147483648))]
+    #[case(&[0x80, 0, 0, 0, 0, 0], SERIAL_TYPE_BEINT48, OwnedValue::Integer(-140737488355328))]
+    #[case(&[0x80, 0, 0, 0, 0, 0, 0, 0], SERIAL_TYPE_BEINT64, OwnedValue::Integer(-9223372036854775808))]
+    #[case(&[0x7f], SERIAL_TYPE_INT8, OwnedValue::Integer(127))]
+    #[case(&[0x7f, 0xff], SERIAL_TYPE_BEINT16, OwnedValue::Integer(32767))]
+    #[case(&[0x7f, 0xff, 0xff], SERIAL_TYPE_BEINT24, OwnedValue::Integer(8388607))]
+    #[case(&[0x7f, 0xff, 0xff, 0xff], SERIAL_TYPE_BEINT32, OwnedValue::Integer(2147483647))]
+    #[case(&[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff], SERIAL_TYPE_BEINT48, OwnedValue::Integer(140737488355327))]
+    #[case(&[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], SERIAL_TYPE_BEINT64, OwnedValue::Integer(9223372036854775807))]
     fn test_read_value(
         #[case] buf: &[u8],
         #[case] serial_type: SerialType,
         #[case] expected: OwnedValue,
     ) {
-        let result = read_value(buf, &serial_type).unwrap();
-        assert_eq!(result, (expected, buf.len()));
+        let result = read_value(buf, serial_type).unwrap();
+        assert_eq!(result.0, expected);
+    }
+
+    #[test]
+    fn test_serial_type_helpers() {
+        assert!(SERIAL_TYPE_NULL.is_null());
+        assert!(SERIAL_TYPE_INT8.is_int8());
+        assert!(SERIAL_TYPE_BEINT16.is_beint16());
+        assert!(SERIAL_TYPE_BEINT24.is_beint24());
+        assert!(SERIAL_TYPE_BEINT32.is_beint32());
+        assert!(SERIAL_TYPE_BEINT48.is_beint48());
+        assert!(SERIAL_TYPE_BEINT64.is_beint64());
+        assert!(SERIAL_TYPE_BEFLOAT64.is_befloat64());
+        assert!(SERIAL_TYPE_CONSTINT0.is_constint0());
+        assert!(SERIAL_TYPE_CONSTINT1.is_constint1());
+
+        assert!(12u64.is_blob());
+        assert!(14u64.is_blob());
+        assert!(13u64.is_string());
+        assert!(15u64.is_string());
+
+        assert_eq!(12u64.blob_size(), 0);
+        assert_eq!(14u64.blob_size(), 1);
+        assert_eq!(16u64.blob_size(), 2);
+
+        assert_eq!(13u64.string_size(), 0);
+        assert_eq!(15u64.string_size(), 1);
+        assert_eq!(17u64.string_size(), 2);
     }
 
     #[rstest]
-    #[case(&[], SerialType::UInt8)]
-    #[case(&[0x12], SerialType::BEInt16)]
-    #[case(&[0x12, 0x34], SerialType::BEInt24)]
-    #[case(&[0x12, 0x34, 0x56], SerialType::BEInt32)]
-    #[case(&[0x12, 0x34, 0x56, 0x78], SerialType::BEInt48)]
-    #[case(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE], SerialType::BEInt64)]
-    #[case(&[64, 9, 33, 251, 84, 68, 45], SerialType::BEFloat64)]
-    #[case(&[1, 2], SerialType::Blob(3))]
-    #[case(&[65, 66], SerialType::String(3))]
-    // TODO: UTF-8 validation is disabled #[case(&[192], SerialType::String(1))] // invalid UTF-8 sequence
-    fn test_read_invalid_value(#[case] buf: &[u8], #[case] serial_type: SerialType) {
-        let result = read_value(buf, &serial_type);
-        assert!(result.is_err());
-    }
-
-    #[rstest]
-    #[case(&[0x01], (1, 1))]
-    #[case(&[0x81, 0x01], (129, 2))]
-    #[case(&[0x81, 0x81, 0x01], (16513, 3))]
-    #[case(&[0x81, 0x81, 0x81, 0x01], (2113665, 4))]
-    #[case(&[0x81, 0x81, 0x81, 0x81, 0x01], (270549121, 5))]
-    #[case(&[0x81, 0x81, 0x81, 0x81, 0x81, 0x01], (34630287489, 6))]
-    #[case(&[0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x01], (4432676798593, 7))]
-    #[case(&[0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x01], (567382630219905, 8))]
-    #[case(&[0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x01], (145249953336295681, 9))]
-    fn read_varint_test(#[case] input: &[u8], #[case] expected: (u64, usize)) {
-        let result = read_varint(input).unwrap();
+    #[case(0, SERIAL_TYPE_NULL)]
+    #[case(1, SERIAL_TYPE_INT8)]
+    #[case(2, SERIAL_TYPE_BEINT16)]
+    #[case(3, SERIAL_TYPE_BEINT24)]
+    #[case(4, SERIAL_TYPE_BEINT32)]
+    #[case(5, SERIAL_TYPE_BEINT48)]
+    #[case(6, SERIAL_TYPE_BEINT64)]
+    #[case(7, SERIAL_TYPE_BEFLOAT64)]
+    #[case(8, SERIAL_TYPE_CONSTINT0)]
+    #[case(9, SERIAL_TYPE_CONSTINT1)]
+    #[case(12, 12)] // Blob(0)
+    #[case(13, 13)] // String(0)
+    #[case(14, 14)] // Blob(1)
+    #[case(15, 15)] // String(1)
+    fn test_validate_serial_type(#[case] input: u64, #[case] expected: SerialType) {
+        let result = validate_serial_type(input).unwrap();
         assert_eq!(result, expected);
     }
 
     #[test]
-    fn test_read_invalid_varint() {
-        let buf = [0b11111110];
-        let result = read_varint(&buf);
+    fn test_invalid_serial_type() {
+        let result = validate_serial_type(10);
         assert!(result.is_err());
-    }
-
-    // **    0x00                      becomes  0x00000000
-    // **    0x7f                      becomes  0x0000007f
-    // **    0x81 0x00                 becomes  0x00000080
-    // **    0x82 0x00                 becomes  0x00000100
-    // **    0x80 0x7f                 becomes  0x0000007f
-    // **    0x81 0x91 0xd1 0xac 0x78  becomes  0x12345678
-    // **    0x81 0x81 0x81 0x81 0x01  becomes  0x10204081
-    #[rstest]
-    #[case((0, 1), &[0x00])]
-    #[case((1, 1), &[0x01])]
-    #[case((129, 2), &[0x81, 0x01] )]
-    #[case((16513, 3), &[0x81, 0x81, 0x01] )]
-    #[case((2113665, 4), &[0x81, 0x81, 0x81, 0x01] )]
-    #[case((270549121, 5), &[0x81, 0x81, 0x81, 0x81, 0x01] )]
-    #[case((34630287489, 6), &[0x81, 0x81, 0x81, 0x81, 0x81, 0x01] )]
-    #[case((4432676798593, 7), &[0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x01] )]
-    #[case((567382630219905, 8), &[0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x01] )]
-    #[case((145249953336295681, 9), &[0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x01] )]
-    fn test_write_varint(#[case] value: (u64, usize), #[case] output: &[u8]) {
-        let mut buf: [u8; 10] = [0; 10];
-        let n = write_varint(&mut buf, value.0);
-        assert_eq!(n, value.1);
-        for i in 0..output.len() {
-            assert_eq!(buf[i], output[i]);
-        }
     }
 }

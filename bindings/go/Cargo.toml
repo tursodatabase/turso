@@ -1,0 +1,24 @@
+[package]
+name = "limbo-go"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "_limbo_go"
+crate-type = ["cdylib"]
+path = "rs_src/lib.rs"
+
+[features]
+default = ["io_uring"]
+io_uring = ["limbo_core/io_uring"]
+
+
+[dependencies]
+limbo_core = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+limbo_core = { workspace = true, features = ["io_uring"] }

@@ -21,3 +21,14 @@ cd shell && make
 ```console
 ./mobibench -p <benchmark-directory> -n 1000 -d 0
 ```
+
+## Clickbench
+
+We have a modified version of the Clickbench benchmark script that can be run with:
+
+```shell
+make clickbench
+```
+
+This will build Limbo in release mode, create a database, and run the benchmarks with a small subset of the Clickbench dataset.
+It will run the queries for both Limbo and SQLite, and print the results.

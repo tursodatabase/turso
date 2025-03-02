@@ -3,18 +3,40 @@
   "collaborators": [
     "the Limbo authors"
   ],
-  "version": "0.0.10",
+  "version": "0.0.15",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/penberg/limbo"
+    "url": "https://github.com/tursodatabase/limbo"
+  },
+  "type": "module",
+  "main": "./node/dist/index.cjs",
+  "module": "./web/dist/index.js",
+  "exports": {
+    ".": {
+      "node": "./node/dist/index.cjs",
+      "browser": "./web/dist/index.js",
+      "default": "./web/dist/index.js"
+    },
+    "./limbo-worker.js": "./web/dist/limbo-worker.js"
   },
   "files": [
-    "snippets",
-    "limbo_wasm_bg.wasm",
-    "limbo_wasm.js",
-    "limbo_wasm.d.ts"
+    "node/dist",
+    "web/dist"
   ],
-  "main": "limbo_wasm.js",
-  "types": "limbo_wasm.d.ts"
+  "scripts": {
+    "dev": "cd web && vite",
+    "test": "cd web && vitest",
+    "test:ui": "cd web && vitest --ui"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.1",
+    "@vitest/ui": "^2.1.8",
+    "happy-dom": "^16.3.0",
+    "playwright": "^1.49.1",
+    "vite": "^6.0.7",
+    "vite-plugin-wasm": "^3.4.1",
+    "vitest": "^2.1.8",
+    "wasm-pack": "^0.13.1"
+  }
 }

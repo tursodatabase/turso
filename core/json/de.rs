@@ -4,142 +4,11 @@ use pest_derive::Parser;
 use serde::de;
 use serde::forward_to_deserialize_any;
 use std::collections::VecDeque;
-use std::f64;
 
 use crate::json::error::{self, Error, Result};
 
 #[derive(Parser)]
-#[grammar_inline = r#"
-// see https://spec.json5.org/#syntactic-grammar and
-// https://spec.json5.org/#lexical-grammar
-
-COMMENT = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" | "//" ~ (!line_terminator ~ ANY)* }
-
-WHITESPACE = _{
-  "\u{0009}" |
-  "\u{000B}" |
-  "\u{000C}" |
-  "\u{0020}" |
-  "\u{00A0}" |
-  "\u{FEFF}" |
-  SPACE_SEPARATOR |
-  line_terminator
-}
-
-array = { "[" ~ "]" | "[" ~ value ~ ("," ~ value)* ~ ","? ~ "]" }
-
-boolean = @{ "true" | "false" }
-
-char_escape_sequence = @{ single_escape_char | non_escape_char }
-
-char_literal = @{ !("\\" | line_terminator) ~ ANY }
-
-decimal_integer_literal = _{ "0" | ASCII_NONZERO_DIGIT ~ ASCII_DIGIT* }
-
-decimal_literal = _{
-  decimal_integer_literal ~ "." ~ ASCII_DIGIT* ~ exponent_part? |
-  "." ~ ASCII_DIGIT+~ exponent_part? |
-  decimal_integer_literal ~ exponent_part?
-}
-
-double_quote_char = _{
-  "\\" ~ escape_sequence |
-  line_continuation |
-  !"\"" ~ char_literal
-}
-
-escape_char = _{ single_escape_char | ASCII_DIGIT | "x" | "u" }
-
-escape_sequence = _{
-  char_escape_sequence |
-  nul_escape_sequence |
-  "x" ~ hex_escape_sequence |
-  "u" ~ unicode_escape_sequence
-}
-
-exponent_part = _{ ^"e" ~ ("+" | "-")? ~ ASCII_DIGIT+ }
-
-hex_escape_sequence = @{ ASCII_HEX_DIGIT{2} }
-
-hex_integer_literal = _{ ("+" | "-")? ~ ^"0x" ~ ASCII_HEX_DIGIT+ }
-
-identifier = ${ identifier_start ~ identifier_part* }
-
-identifier_part = _{
-  identifier_start |
-  &(
-    NONSPACING_MARK |
-    DIACRITIC | // not sure about this, spec says "Combining spacing mark (Mc)"
-    DECIMAL_NUMBER |
-    CONNECTOR_PUNCTUATION |
-    "\u{200C}" |
-    "\u{200D}"
-  ) ~ char_literal
-}
-
-identifier_start = _{
-  &(unicode_letter | "$" | "_") ~ char_literal |
-  "\\u" ~ unicode_escape_sequence
-}
-
-key = _{ identifier | string }
-
-line_continuation = _{ "\\" ~ line_terminator_sequence }
-
-line_terminator = _{ "\u{000A}" | "\u{000D}" | "\u{2028}" | "\u{2029}" }
-
-line_terminator_sequence = _{ "\u{000D}" ~ "\u{000A}" | line_terminator }
-
-non_escape_char = _{ !(escape_char | line_terminator) ~ ANY }
-
-nul_escape_sequence = @{ "0" }
-
-null = @{ "null" }
-
-number = @{ ("+" | "-")? ~ numeric_literal }
-
-numeric_literal = _{
-  hex_integer_literal |
-  decimal_literal |
-  "Infinity" |
-  "NaN"
-}
-
-object = { "{" ~ "}" | "{" ~ pair ~ ("," ~ pair)* ~ ","? ~ "}" }
-
-pair = _{ key ~ ":" ~ value }
-
-single_escape_char = _{ "'" | "\"" | "\\" | "b" | "f" | "n" | "r" | "t" | "v" }
-
-single_quote_char = _{
-  "\\" ~ escape_sequence |
-  line_continuation |
-  !"'" ~ char_literal
-}
-
-double_single_quote_char = _{
-  "\\" ~ escape_sequence |
-  line_continuation |
-  !("''") ~ char_literal
-}
-
-string = ${ "\"" ~ double_quote_char* ~ "\"" | "''" ~ double_single_quote_char* ~ "''" | "'" ~ single_quote_char* ~ "'" }
-
-text = _{ SOI ~ value ~ EOI }
-
-unicode_escape_sequence = @{ ASCII_HEX_DIGIT{4} }
-
-unicode_letter = _{
-  UPPERCASE_LETTER |
-  LOWERCASE_LETTER |
-  TITLECASE_LETTER |
-  MODIFIER_LETTER |
-  OTHER_LETTER |
-  LETTER_NUMBER
-}
-
-value = _{ null | boolean | string | number | object | array }
-"#]
+#[grammar = "json/json.pest"]
 struct Parser;
 
 /// Deserialize an instance of type `T` from a string of JSON5 text. Can fail if the input is
@@ -167,11 +36,11 @@ impl<'de> Deserializer<'de> {
     }
 
     fn from_pair(pair: Pair<'de, Rule>) -> Self {
-        Deserializer { pair: Some(pair) }
+        Self { pair: Some(pair) }
     }
 }
 
-impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
+impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
     type Error = Error;
 
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value>
@@ -633,5 +502,61 @@ impl<'de> de::VariantAccess<'de> for Variant<'de> {
             },
             None => Err(de::Error::custom("expected an object")),
         }
+    }
+}
+
+pub mod ordered_object {
+
+    use crate::json::Val;
+    use serde::de::{MapAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S>(pairs: &Vec<(String, Val)>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(pairs.len()))?;
+        for (k, v) in pairs {
+            if let Val::Removed = v {
+                continue;
+            }
+            map.serialize_entry(k, v)?;
+        }
+        map.end()
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<(String, Val)>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct OrderedMapVisitor;
+
+        impl<'de> Visitor<'de> for OrderedMapVisitor {
+            type Value = Vec<(String, Val)>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a map")
+            }
+
+            fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut pairs = match access.size_hint() {
+                    Some(size) => Vec::with_capacity(size),
+                    None => Vec::new(),
+                };
+
+                while let Some((key, value)) = access.next_entry()? {
+                    pairs.push((key, value));
+                }
+
+                Ok(pairs)
+            }
+        }
+
+        deserializer.deserialize_map(OrderedMapVisitor)
     }
 }

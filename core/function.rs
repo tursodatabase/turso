@@ -1,11 +1,90 @@
-use crate::ext::ExtFunc;
+use limbo_ext::{FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction};
 use std::fmt;
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
+use std::rc::Rc;
+
+use crate::LimboError;
+
+pub struct ExternalFunc {
+    pub name: String,
+    pub func: ExtFunc,
+}
+
+#[derive(Debug, Clone)]
+pub enum ExtFunc {
+    Scalar(ScalarFunction),
+    Aggregate {
+        argc: usize,
+        init: InitAggFunction,
+        step: StepFunction,
+        finalize: FinalizeFunction,
+    },
+}
+
+impl ExtFunc {
+    pub fn agg_args(&self) -> Result<usize, ()> {
+        if let ExtFunc::Aggregate { argc, .. } = self {
+            return Ok(*argc);
+        }
+        Err(())
+    }
+}
+
+impl ExternalFunc {
+    pub fn new_scalar(name: String, func: ScalarFunction) -> Self {
+        Self {
+            name,
+            func: ExtFunc::Scalar(func),
+        }
+    }
+
+    pub fn new_aggregate(
+        name: String,
+        argc: i32,
+        func: (InitAggFunction, StepFunction, FinalizeFunction),
+    ) -> Self {
+        Self {
+            name,
+            func: ExtFunc::Aggregate {
+                argc: argc as usize,
+                init: func.0,
+                step: func.1,
+                finalize: func.2,
+            },
+        }
+    }
+}
+
+impl Debug for ExternalFunc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name)
+    }
+}
+
+impl Display for ExternalFunc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name)
+    }
+}
+
 #[cfg(feature = "json")]
 #[derive(Debug, Clone, PartialEq)]
 pub enum JsonFunc {
     Json,
     JsonArray,
+    JsonArrayLength,
+    JsonArrowExtract,
+    JsonArrowShiftExtract,
+    JsonExtract,
+    JsonObject,
+    JsonType,
+    JsonErrorPosition,
+    JsonValid,
+    JsonPatch,
+    JsonRemove,
+    JsonPretty,
+    JsonSet,
+    JsonQuote,
 }
 
 #[cfg(feature = "json")]
@@ -15,36 +94,107 @@ impl Display for JsonFunc {
             f,
             "{}",
             match self {
-                JsonFunc::Json => "json".to_string(),
-                JsonFunc::JsonArray => "json_array".to_string(),
+                Self::Json => "json".to_string(),
+                Self::JsonArray => "json_array".to_string(),
+                Self::JsonExtract => "json_extract".to_string(),
+                Self::JsonArrayLength => "json_array_length".to_string(),
+                Self::JsonArrowExtract => "->".to_string(),
+                Self::JsonArrowShiftExtract => "->>".to_string(),
+                Self::JsonObject => "json_object".to_string(),
+                Self::JsonType => "json_type".to_string(),
+                Self::JsonErrorPosition => "json_error_position".to_string(),
+                Self::JsonValid => "json_valid".to_string(),
+                Self::JsonPatch => "json_patch".to_string(),
+                Self::JsonRemove => "json_remove".to_string(),
+                Self::JsonPretty => "json_pretty".to_string(),
+                Self::JsonSet => "json_set".to_string(),
+                Self::JsonQuote => "json_quote".to_string(),
             }
         )
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
+pub enum VectorFunc {
+    Vector,
+    Vector32,
+    Vector64,
+    VectorExtract,
+    VectorDistanceCos,
+}
+
+impl Display for VectorFunc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let str = match self {
+            Self::Vector => "vector".to_string(),
+            Self::Vector32 => "vector32".to_string(),
+            Self::Vector64 => "vector64".to_string(),
+            Self::VectorExtract => "vector_extract".to_string(),
+            Self::VectorDistanceCos => "vector_distance_cos".to_string(),
+        };
+        write!(f, "{}", str)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum AggFunc {
     Avg,
     Count,
+    Count0,
     GroupConcat,
     Max,
     Min,
     StringAgg,
     Sum,
     Total,
+    External(Rc<ExtFunc>),
+}
+
+impl PartialEq for AggFunc {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Avg, Self::Avg)
+            | (Self::Count, Self::Count)
+            | (Self::GroupConcat, Self::GroupConcat)
+            | (Self::Max, Self::Max)
+            | (Self::Min, Self::Min)
+            | (Self::StringAgg, Self::StringAgg)
+            | (Self::Sum, Self::Sum)
+            | (Self::Total, Self::Total) => true,
+            (Self::External(a), Self::External(b)) => Rc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
 }
 
 impl AggFunc {
+    pub fn num_args(&self) -> usize {
+        match self {
+            Self::Avg => 1,
+            Self::Count0 => 0,
+            Self::Count => 1,
+            Self::GroupConcat => 1,
+            Self::Max => 1,
+            Self::Min => 1,
+            Self::StringAgg => 2,
+            Self::Sum => 1,
+            Self::Total => 1,
+            Self::External(func) => func.agg_args().unwrap_or(0),
+        }
+    }
+
     pub fn to_string(&self) -> &str {
         match self {
-            AggFunc::Avg => "avg",
-            AggFunc::Count => "count",
-            AggFunc::GroupConcat => "group_concat",
-            AggFunc::Max => "max",
-            AggFunc::Min => "min",
-            AggFunc::StringAgg => "string_agg",
-            AggFunc::Sum => "sum",
-            AggFunc::Total => "total",
+            Self::Avg => "avg",
+            Self::Count0 => "count",
+            Self::Count => "count",
+            Self::GroupConcat => "group_concat",
+            Self::Max => "max",
+            Self::Min => "min",
+            Self::StringAgg => "string_agg",
+            Self::Sum => "sum",
+            Self::Total => "total",
+            Self::External(_) => "extension function",
         }
     }
 }
@@ -52,6 +202,7 @@ impl AggFunc {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScalarFunc {
     Cast,
+    Changes,
     Char,
     Coalesce,
     Concat,
@@ -81,61 +232,78 @@ pub enum ScalarFunc {
     Soundex,
     Date,
     Time,
+    TotalChanges,
+    DateTime,
     Typeof,
     Unicode,
     Quote,
     SqliteVersion,
+    SqliteSourceId,
     UnixEpoch,
+    JulianDay,
     Hex,
     Unhex,
     ZeroBlob,
     LastInsertRowid,
     Replace,
+    #[cfg(not(target_family = "wasm"))]
+    LoadExtension,
+    StrfTime,
+    Printf,
 }
 
 impl Display for ScalarFunc {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let str = match self {
-            ScalarFunc::Cast => "cast".to_string(),
-            ScalarFunc::Char => "char".to_string(),
-            ScalarFunc::Coalesce => "coalesce".to_string(),
-            ScalarFunc::Concat => "concat".to_string(),
-            ScalarFunc::ConcatWs => "concat_ws".to_string(),
-            ScalarFunc::Glob => "glob".to_string(),
-            ScalarFunc::IfNull => "ifnull".to_string(),
-            ScalarFunc::Iif => "iif".to_string(),
-            ScalarFunc::Instr => "instr".to_string(),
-            ScalarFunc::Like => "like(2)".to_string(),
-            ScalarFunc::Abs => "abs".to_string(),
-            ScalarFunc::Upper => "upper".to_string(),
-            ScalarFunc::Lower => "lower".to_string(),
-            ScalarFunc::Random => "random".to_string(),
-            ScalarFunc::RandomBlob => "randomblob".to_string(),
-            ScalarFunc::Trim => "trim".to_string(),
-            ScalarFunc::LTrim => "ltrim".to_string(),
-            ScalarFunc::RTrim => "rtrim".to_string(),
-            ScalarFunc::Round => "round".to_string(),
-            ScalarFunc::Length => "length".to_string(),
-            ScalarFunc::OctetLength => "octet_length".to_string(),
-            ScalarFunc::Min => "min".to_string(),
-            ScalarFunc::Max => "max".to_string(),
-            ScalarFunc::Nullif => "nullif".to_string(),
-            ScalarFunc::Sign => "sign".to_string(),
-            ScalarFunc::Substr => "substr".to_string(),
-            ScalarFunc::Substring => "substring".to_string(),
-            ScalarFunc::Soundex => "soundex".to_string(),
-            ScalarFunc::Date => "date".to_string(),
-            ScalarFunc::Time => "time".to_string(),
-            ScalarFunc::Typeof => "typeof".to_string(),
-            ScalarFunc::Unicode => "unicode".to_string(),
-            ScalarFunc::Quote => "quote".to_string(),
-            ScalarFunc::SqliteVersion => "sqlite_version".to_string(),
-            ScalarFunc::UnixEpoch => "unixepoch".to_string(),
-            ScalarFunc::Hex => "hex".to_string(),
-            ScalarFunc::Unhex => "unhex".to_string(),
-            ScalarFunc::ZeroBlob => "zeroblob".to_string(),
-            ScalarFunc::LastInsertRowid => "last_insert_rowid".to_string(),
-            ScalarFunc::Replace => "replace".to_string(),
+            Self::Cast => "cast".to_string(),
+            Self::Changes => "changes".to_string(),
+            Self::Char => "char".to_string(),
+            Self::Coalesce => "coalesce".to_string(),
+            Self::Concat => "concat".to_string(),
+            Self::ConcatWs => "concat_ws".to_string(),
+            Self::Glob => "glob".to_string(),
+            Self::IfNull => "ifnull".to_string(),
+            Self::Iif => "iif".to_string(),
+            Self::Instr => "instr".to_string(),
+            Self::Like => "like(2)".to_string(),
+            Self::Abs => "abs".to_string(),
+            Self::Upper => "upper".to_string(),
+            Self::Lower => "lower".to_string(),
+            Self::Random => "random".to_string(),
+            Self::RandomBlob => "randomblob".to_string(),
+            Self::Trim => "trim".to_string(),
+            Self::LTrim => "ltrim".to_string(),
+            Self::RTrim => "rtrim".to_string(),
+            Self::Round => "round".to_string(),
+            Self::Length => "length".to_string(),
+            Self::OctetLength => "octet_length".to_string(),
+            Self::Min => "min".to_string(),
+            Self::Max => "max".to_string(),
+            Self::Nullif => "nullif".to_string(),
+            Self::Sign => "sign".to_string(),
+            Self::Substr => "substr".to_string(),
+            Self::Substring => "substring".to_string(),
+            Self::Soundex => "soundex".to_string(),
+            Self::Date => "date".to_string(),
+            Self::Time => "time".to_string(),
+            Self::TotalChanges => "total_changes".to_string(),
+            Self::Typeof => "typeof".to_string(),
+            Self::Unicode => "unicode".to_string(),
+            Self::Quote => "quote".to_string(),
+            Self::SqliteVersion => "sqlite_version".to_string(),
+            Self::SqliteSourceId => "sqlite_source_id".to_string(),
+            Self::JulianDay => "julianday".to_string(),
+            Self::UnixEpoch => "unixepoch".to_string(),
+            Self::Hex => "hex".to_string(),
+            Self::Unhex => "unhex".to_string(),
+            Self::ZeroBlob => "zeroblob".to_string(),
+            Self::LastInsertRowid => "last_insert_rowid".to_string(),
+            Self::Replace => "replace".to_string(),
+            Self::DateTime => "datetime".to_string(),
+            #[cfg(not(target_family = "wasm"))]
+            Self::LoadExtension => "load_extension".to_string(),
+            Self::StrfTime => "strftime".to_string(),
+            Self::Printf => "printf".to_string(),
         };
         write!(f, "{}", str)
     }
@@ -184,97 +352,96 @@ pub enum MathFuncArity {
 impl MathFunc {
     pub fn arity(&self) -> MathFuncArity {
         match self {
-            MathFunc::Pi => MathFuncArity::Nullary,
+            Self::Pi => MathFuncArity::Nullary,
+            Self::Acos
+            | Self::Acosh
+            | Self::Asin
+            | Self::Asinh
+            | Self::Atan
+            | Self::Atanh
+            | Self::Ceil
+            | Self::Ceiling
+            | Self::Cos
+            | Self::Cosh
+            | Self::Degrees
+            | Self::Exp
+            | Self::Floor
+            | Self::Ln
+            | Self::Log10
+            | Self::Log2
+            | Self::Radians
+            | Self::Sin
+            | Self::Sinh
+            | Self::Sqrt
+            | Self::Tan
+            | Self::Tanh
+            | Self::Trunc => MathFuncArity::Unary,
 
-            MathFunc::Acos
-            | MathFunc::Acosh
-            | MathFunc::Asin
-            | MathFunc::Asinh
-            | MathFunc::Atan
-            | MathFunc::Atanh
-            | MathFunc::Ceil
-            | MathFunc::Ceiling
-            | MathFunc::Cos
-            | MathFunc::Cosh
-            | MathFunc::Degrees
-            | MathFunc::Exp
-            | MathFunc::Floor
-            | MathFunc::Ln
-            | MathFunc::Log10
-            | MathFunc::Log2
-            | MathFunc::Radians
-            | MathFunc::Sin
-            | MathFunc::Sinh
-            | MathFunc::Sqrt
-            | MathFunc::Tan
-            | MathFunc::Tanh
-            | MathFunc::Trunc => MathFuncArity::Unary,
+            Self::Atan2 | Self::Mod | Self::Pow | Self::Power => MathFuncArity::Binary,
 
-            MathFunc::Atan2 | MathFunc::Mod | MathFunc::Pow | MathFunc::Power => {
-                MathFuncArity::Binary
-            }
-
-            MathFunc::Log => MathFuncArity::UnaryOrBinary,
+            Self::Log => MathFuncArity::UnaryOrBinary,
         }
     }
 }
 
 impl Display for MathFunc {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let str = match self {
-            MathFunc::Acos => "acos".to_string(),
-            MathFunc::Acosh => "acosh".to_string(),
-            MathFunc::Asin => "asin".to_string(),
-            MathFunc::Asinh => "asinh".to_string(),
-            MathFunc::Atan => "atan".to_string(),
-            MathFunc::Atan2 => "atan2".to_string(),
-            MathFunc::Atanh => "atanh".to_string(),
-            MathFunc::Ceil => "ceil".to_string(),
-            MathFunc::Ceiling => "ceiling".to_string(),
-            MathFunc::Cos => "cos".to_string(),
-            MathFunc::Cosh => "cosh".to_string(),
-            MathFunc::Degrees => "degrees".to_string(),
-            MathFunc::Exp => "exp".to_string(),
-            MathFunc::Floor => "floor".to_string(),
-            MathFunc::Ln => "ln".to_string(),
-            MathFunc::Log => "log".to_string(),
-            MathFunc::Log10 => "log10".to_string(),
-            MathFunc::Log2 => "log2".to_string(),
-            MathFunc::Mod => "mod".to_string(),
-            MathFunc::Pi => "pi".to_string(),
-            MathFunc::Pow => "pow".to_string(),
-            MathFunc::Power => "power".to_string(),
-            MathFunc::Radians => "radians".to_string(),
-            MathFunc::Sin => "sin".to_string(),
-            MathFunc::Sinh => "sinh".to_string(),
-            MathFunc::Sqrt => "sqrt".to_string(),
-            MathFunc::Tan => "tan".to_string(),
-            MathFunc::Tanh => "tanh".to_string(),
-            MathFunc::Trunc => "trunc".to_string(),
+            Self::Acos => "acos".to_string(),
+            Self::Acosh => "acosh".to_string(),
+            Self::Asin => "asin".to_string(),
+            Self::Asinh => "asinh".to_string(),
+            Self::Atan => "atan".to_string(),
+            Self::Atan2 => "atan2".to_string(),
+            Self::Atanh => "atanh".to_string(),
+            Self::Ceil => "ceil".to_string(),
+            Self::Ceiling => "ceiling".to_string(),
+            Self::Cos => "cos".to_string(),
+            Self::Cosh => "cosh".to_string(),
+            Self::Degrees => "degrees".to_string(),
+            Self::Exp => "exp".to_string(),
+            Self::Floor => "floor".to_string(),
+            Self::Ln => "ln".to_string(),
+            Self::Log => "log".to_string(),
+            Self::Log10 => "log10".to_string(),
+            Self::Log2 => "log2".to_string(),
+            Self::Mod => "mod".to_string(),
+            Self::Pi => "pi".to_string(),
+            Self::Pow => "pow".to_string(),
+            Self::Power => "power".to_string(),
+            Self::Radians => "radians".to_string(),
+            Self::Sin => "sin".to_string(),
+            Self::Sinh => "sinh".to_string(),
+            Self::Sqrt => "sqrt".to_string(),
+            Self::Tan => "tan".to_string(),
+            Self::Tanh => "tanh".to_string(),
+            Self::Trunc => "trunc".to_string(),
         };
         write!(f, "{}", str)
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub enum Func {
     Agg(AggFunc),
     Scalar(ScalarFunc),
     Math(MathFunc),
+    Vector(VectorFunc),
     #[cfg(feature = "json")]
     Json(JsonFunc),
-    Extension(ExtFunc),
+    External(Rc<ExternalFunc>),
 }
 
 impl Display for Func {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Func::Agg(agg_func) => write!(f, "{}", agg_func.to_string()),
-            Func::Scalar(scalar_func) => write!(f, "{}", scalar_func),
-            Func::Math(math_func) => write!(f, "{}", math_func),
+            Self::Agg(agg_func) => write!(f, "{}", agg_func.to_string()),
+            Self::Scalar(scalar_func) => write!(f, "{}", scalar_func),
+            Self::Math(math_func) => write!(f, "{}", math_func),
+            Self::Vector(vector_func) => write!(f, "{}", vector_func),
             #[cfg(feature = "json")]
-            Func::Json(json_func) => write!(f, "{}", json_func),
-            Func::Extension(ext_func) => write!(f, "{}", ext_func),
+            Self::Json(json_func) => write!(f, "{}", json_func),
+            Self::External(generic_func) => write!(f, "{}", generic_func),
         }
     }
 }
@@ -286,92 +453,170 @@ pub struct FuncCtx {
 }
 
 impl Func {
-    pub fn resolve_function(name: &str, arg_count: usize) -> Result<Func, ()> {
+    pub fn resolve_function(name: &str, arg_count: usize) -> Result<Self, LimboError> {
         match name {
-            "avg" => Ok(Func::Agg(AggFunc::Avg)),
-            "count" => Ok(Func::Agg(AggFunc::Count)),
-            "group_concat" => Ok(Func::Agg(AggFunc::GroupConcat)),
-            "max" if arg_count == 0 || arg_count == 1 => Ok(Func::Agg(AggFunc::Max)),
-            "max" if arg_count > 1 => Ok(Func::Scalar(ScalarFunc::Max)),
-            "min" if arg_count == 0 || arg_count == 1 => Ok(Func::Agg(AggFunc::Min)),
-            "min" if arg_count > 1 => Ok(Func::Scalar(ScalarFunc::Min)),
-            "nullif" if arg_count == 2 => Ok(Func::Scalar(ScalarFunc::Nullif)),
-            "string_agg" => Ok(Func::Agg(AggFunc::StringAgg)),
-            "sum" => Ok(Func::Agg(AggFunc::Sum)),
-            "total" => Ok(Func::Agg(AggFunc::Total)),
-            "char" => Ok(Func::Scalar(ScalarFunc::Char)),
-            "coalesce" => Ok(Func::Scalar(ScalarFunc::Coalesce)),
-            "concat" => Ok(Func::Scalar(ScalarFunc::Concat)),
-            "concat_ws" => Ok(Func::Scalar(ScalarFunc::ConcatWs)),
-            "glob" => Ok(Func::Scalar(ScalarFunc::Glob)),
-            "ifnull" => Ok(Func::Scalar(ScalarFunc::IfNull)),
-            "iif" => Ok(Func::Scalar(ScalarFunc::Iif)),
-            "instr" => Ok(Func::Scalar(ScalarFunc::Instr)),
-            "like" => Ok(Func::Scalar(ScalarFunc::Like)),
-            "abs" => Ok(Func::Scalar(ScalarFunc::Abs)),
-            "upper" => Ok(Func::Scalar(ScalarFunc::Upper)),
-            "lower" => Ok(Func::Scalar(ScalarFunc::Lower)),
-            "random" => Ok(Func::Scalar(ScalarFunc::Random)),
-            "randomblob" => Ok(Func::Scalar(ScalarFunc::RandomBlob)),
-            "trim" => Ok(Func::Scalar(ScalarFunc::Trim)),
-            "ltrim" => Ok(Func::Scalar(ScalarFunc::LTrim)),
-            "rtrim" => Ok(Func::Scalar(ScalarFunc::RTrim)),
-            "round" => Ok(Func::Scalar(ScalarFunc::Round)),
-            "length" => Ok(Func::Scalar(ScalarFunc::Length)),
-            "octet_length" => Ok(Func::Scalar(ScalarFunc::OctetLength)),
-            "sign" => Ok(Func::Scalar(ScalarFunc::Sign)),
-            "substr" => Ok(Func::Scalar(ScalarFunc::Substr)),
-            "substring" => Ok(Func::Scalar(ScalarFunc::Substring)),
-            "date" => Ok(Func::Scalar(ScalarFunc::Date)),
-            "time" => Ok(Func::Scalar(ScalarFunc::Time)),
-            "typeof" => Ok(Func::Scalar(ScalarFunc::Typeof)),
-            "last_insert_rowid" => Ok(Func::Scalar(ScalarFunc::LastInsertRowid)),
-            "unicode" => Ok(Func::Scalar(ScalarFunc::Unicode)),
-            "quote" => Ok(Func::Scalar(ScalarFunc::Quote)),
-            "sqlite_version" => Ok(Func::Scalar(ScalarFunc::SqliteVersion)),
-            "replace" => Ok(Func::Scalar(ScalarFunc::Replace)),
+            "avg" => {
+                if arg_count != 1 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Self::Agg(AggFunc::Avg))
+            }
+            "count" => {
+                // Handle both COUNT() and COUNT(expr) cases
+                if arg_count == 0 {
+                    Ok(Self::Agg(AggFunc::Count0)) // COUNT() case
+                } else if arg_count == 1 {
+                    Ok(Self::Agg(AggFunc::Count)) // COUNT(expr) case
+                } else {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+            }
+            "group_concat" => {
+                if arg_count != 1 && arg_count != 2 {
+                    println!("{}", arg_count);
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Self::Agg(AggFunc::GroupConcat))
+            }
+            "max" if arg_count > 1 => Ok(Self::Scalar(ScalarFunc::Max)),
+            "max" => {
+                if arg_count < 1 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Self::Agg(AggFunc::Max))
+            }
+            "min" if arg_count > 1 => Ok(Self::Scalar(ScalarFunc::Min)),
+            "min" => {
+                if arg_count < 1 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Self::Agg(AggFunc::Min))
+            }
+            "nullif" if arg_count == 2 => Ok(Self::Scalar(ScalarFunc::Nullif)),
+            "string_agg" => {
+                if arg_count != 2 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Self::Agg(AggFunc::StringAgg))
+            }
+            "sum" => {
+                if arg_count != 1 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Self::Agg(AggFunc::Sum))
+            }
+            "total" => {
+                if arg_count != 1 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Self::Agg(AggFunc::Total))
+            }
+            "char" => Ok(Self::Scalar(ScalarFunc::Char)),
+            "coalesce" => Ok(Self::Scalar(ScalarFunc::Coalesce)),
+            "concat" => Ok(Self::Scalar(ScalarFunc::Concat)),
+            "concat_ws" => Ok(Self::Scalar(ScalarFunc::ConcatWs)),
+            "changes" => Ok(Self::Scalar(ScalarFunc::Changes)),
+            "total_changes" => Ok(Self::Scalar(ScalarFunc::TotalChanges)),
+            "glob" => Ok(Self::Scalar(ScalarFunc::Glob)),
+            "ifnull" => Ok(Self::Scalar(ScalarFunc::IfNull)),
+            "iif" => Ok(Self::Scalar(ScalarFunc::Iif)),
+            "instr" => Ok(Self::Scalar(ScalarFunc::Instr)),
+            "like" => Ok(Self::Scalar(ScalarFunc::Like)),
+            "abs" => Ok(Self::Scalar(ScalarFunc::Abs)),
+            "upper" => Ok(Self::Scalar(ScalarFunc::Upper)),
+            "lower" => Ok(Self::Scalar(ScalarFunc::Lower)),
+            "random" => Ok(Self::Scalar(ScalarFunc::Random)),
+            "randomblob" => Ok(Self::Scalar(ScalarFunc::RandomBlob)),
+            "trim" => Ok(Self::Scalar(ScalarFunc::Trim)),
+            "ltrim" => Ok(Self::Scalar(ScalarFunc::LTrim)),
+            "rtrim" => Ok(Self::Scalar(ScalarFunc::RTrim)),
+            "round" => Ok(Self::Scalar(ScalarFunc::Round)),
+            "length" => Ok(Self::Scalar(ScalarFunc::Length)),
+            "octet_length" => Ok(Self::Scalar(ScalarFunc::OctetLength)),
+            "sign" => Ok(Self::Scalar(ScalarFunc::Sign)),
+            "substr" => Ok(Self::Scalar(ScalarFunc::Substr)),
+            "substring" => Ok(Self::Scalar(ScalarFunc::Substring)),
+            "date" => Ok(Self::Scalar(ScalarFunc::Date)),
+            "time" => Ok(Self::Scalar(ScalarFunc::Time)),
+            "datetime" => Ok(Self::Scalar(ScalarFunc::DateTime)),
+            "typeof" => Ok(Self::Scalar(ScalarFunc::Typeof)),
+            "last_insert_rowid" => Ok(Self::Scalar(ScalarFunc::LastInsertRowid)),
+            "unicode" => Ok(Self::Scalar(ScalarFunc::Unicode)),
+            "quote" => Ok(Self::Scalar(ScalarFunc::Quote)),
+            "sqlite_version" => Ok(Self::Scalar(ScalarFunc::SqliteVersion)),
+            "sqlite_source_id" => Ok(Self::Scalar(ScalarFunc::SqliteSourceId)),
+            "replace" => Ok(Self::Scalar(ScalarFunc::Replace)),
             #[cfg(feature = "json")]
-            "json" => Ok(Func::Json(JsonFunc::Json)),
+            "json" => Ok(Self::Json(JsonFunc::Json)),
             #[cfg(feature = "json")]
-            "json_array" => Ok(Func::Json(JsonFunc::JsonArray)),
-            "unixepoch" => Ok(Func::Scalar(ScalarFunc::UnixEpoch)),
-            "hex" => Ok(Func::Scalar(ScalarFunc::Hex)),
-            "unhex" => Ok(Func::Scalar(ScalarFunc::Unhex)),
-            "zeroblob" => Ok(Func::Scalar(ScalarFunc::ZeroBlob)),
-            "soundex" => Ok(Func::Scalar(ScalarFunc::Soundex)),
-            "acos" => Ok(Func::Math(MathFunc::Acos)),
-            "acosh" => Ok(Func::Math(MathFunc::Acosh)),
-            "asin" => Ok(Func::Math(MathFunc::Asin)),
-            "asinh" => Ok(Func::Math(MathFunc::Asinh)),
-            "atan" => Ok(Func::Math(MathFunc::Atan)),
-            "atan2" => Ok(Func::Math(MathFunc::Atan2)),
-            "atanh" => Ok(Func::Math(MathFunc::Atanh)),
-            "ceil" => Ok(Func::Math(MathFunc::Ceil)),
-            "ceiling" => Ok(Func::Math(MathFunc::Ceiling)),
-            "cos" => Ok(Func::Math(MathFunc::Cos)),
-            "cosh" => Ok(Func::Math(MathFunc::Cosh)),
-            "degrees" => Ok(Func::Math(MathFunc::Degrees)),
-            "exp" => Ok(Func::Math(MathFunc::Exp)),
-            "floor" => Ok(Func::Math(MathFunc::Floor)),
-            "ln" => Ok(Func::Math(MathFunc::Ln)),
-            "log" => Ok(Func::Math(MathFunc::Log)),
-            "log10" => Ok(Func::Math(MathFunc::Log10)),
-            "log2" => Ok(Func::Math(MathFunc::Log2)),
-            "mod" => Ok(Func::Math(MathFunc::Mod)),
-            "pi" => Ok(Func::Math(MathFunc::Pi)),
-            "pow" => Ok(Func::Math(MathFunc::Pow)),
-            "power" => Ok(Func::Math(MathFunc::Power)),
-            "radians" => Ok(Func::Math(MathFunc::Radians)),
-            "sin" => Ok(Func::Math(MathFunc::Sin)),
-            "sinh" => Ok(Func::Math(MathFunc::Sinh)),
-            "sqrt" => Ok(Func::Math(MathFunc::Sqrt)),
-            "tan" => Ok(Func::Math(MathFunc::Tan)),
-            "tanh" => Ok(Func::Math(MathFunc::Tanh)),
-            "trunc" => Ok(Func::Math(MathFunc::Trunc)),
-            _ => match ExtFunc::resolve_function(name, arg_count) {
-                Some(ext_func) => Ok(Func::Extension(ext_func)),
-                None => Err(()),
-            },
+            "json_array_length" => Ok(Self::Json(JsonFunc::JsonArrayLength)),
+            #[cfg(feature = "json")]
+            "json_array" => Ok(Self::Json(JsonFunc::JsonArray)),
+            #[cfg(feature = "json")]
+            "json_extract" => Ok(Func::Json(JsonFunc::JsonExtract)),
+            #[cfg(feature = "json")]
+            "json_object" => Ok(Func::Json(JsonFunc::JsonObject)),
+            #[cfg(feature = "json")]
+            "json_type" => Ok(Func::Json(JsonFunc::JsonType)),
+            #[cfg(feature = "json")]
+            "json_error_position" => Ok(Self::Json(JsonFunc::JsonErrorPosition)),
+            #[cfg(feature = "json")]
+            "json_valid" => Ok(Self::Json(JsonFunc::JsonValid)),
+            #[cfg(feature = "json")]
+            "json_patch" => Ok(Self::Json(JsonFunc::JsonPatch)),
+            #[cfg(feature = "json")]
+            "json_remove" => Ok(Self::Json(JsonFunc::JsonRemove)),
+            #[cfg(feature = "json")]
+            "json_pretty" => Ok(Self::Json(JsonFunc::JsonPretty)),
+            #[cfg(feature = "json")]
+            "json_set" => Ok(Self::Json(JsonFunc::JsonSet)),
+            #[cfg(feature = "json")]
+            "json_quote" => Ok(Self::Json(JsonFunc::JsonQuote)),
+            "unixepoch" => Ok(Self::Scalar(ScalarFunc::UnixEpoch)),
+            "julianday" => Ok(Self::Scalar(ScalarFunc::JulianDay)),
+            "hex" => Ok(Self::Scalar(ScalarFunc::Hex)),
+            "unhex" => Ok(Self::Scalar(ScalarFunc::Unhex)),
+            "zeroblob" => Ok(Self::Scalar(ScalarFunc::ZeroBlob)),
+            "soundex" => Ok(Self::Scalar(ScalarFunc::Soundex)),
+            "acos" => Ok(Self::Math(MathFunc::Acos)),
+            "acosh" => Ok(Self::Math(MathFunc::Acosh)),
+            "asin" => Ok(Self::Math(MathFunc::Asin)),
+            "asinh" => Ok(Self::Math(MathFunc::Asinh)),
+            "atan" => Ok(Self::Math(MathFunc::Atan)),
+            "atan2" => Ok(Self::Math(MathFunc::Atan2)),
+            "atanh" => Ok(Self::Math(MathFunc::Atanh)),
+            "ceil" => Ok(Self::Math(MathFunc::Ceil)),
+            "ceiling" => Ok(Self::Math(MathFunc::Ceiling)),
+            "cos" => Ok(Self::Math(MathFunc::Cos)),
+            "cosh" => Ok(Self::Math(MathFunc::Cosh)),
+            "degrees" => Ok(Self::Math(MathFunc::Degrees)),
+            "exp" => Ok(Self::Math(MathFunc::Exp)),
+            "floor" => Ok(Self::Math(MathFunc::Floor)),
+            "ln" => Ok(Self::Math(MathFunc::Ln)),
+            "log" => Ok(Self::Math(MathFunc::Log)),
+            "log10" => Ok(Self::Math(MathFunc::Log10)),
+            "log2" => Ok(Self::Math(MathFunc::Log2)),
+            "mod" => Ok(Self::Math(MathFunc::Mod)),
+            "pi" => Ok(Self::Math(MathFunc::Pi)),
+            "pow" => Ok(Self::Math(MathFunc::Pow)),
+            "power" => Ok(Self::Math(MathFunc::Power)),
+            "radians" => Ok(Self::Math(MathFunc::Radians)),
+            "sin" => Ok(Self::Math(MathFunc::Sin)),
+            "sinh" => Ok(Self::Math(MathFunc::Sinh)),
+            "sqrt" => Ok(Self::Math(MathFunc::Sqrt)),
+            "tan" => Ok(Self::Math(MathFunc::Tan)),
+            "tanh" => Ok(Self::Math(MathFunc::Tanh)),
+            "trunc" => Ok(Self::Math(MathFunc::Trunc)),
+            #[cfg(not(target_family = "wasm"))]
+            "load_extension" => Ok(Self::Scalar(ScalarFunc::LoadExtension)),
+            "strftime" => Ok(Self::Scalar(ScalarFunc::StrfTime)),
+            "printf" => Ok(Self::Scalar(ScalarFunc::Printf)),
+            "vector" => Ok(Self::Vector(VectorFunc::Vector)),
+            "vector32" => Ok(Self::Vector(VectorFunc::Vector32)),
+            "vector64" => Ok(Self::Vector(VectorFunc::Vector64)),
+            "vector_extract" => Ok(Self::Vector(VectorFunc::VectorExtract)),
+            "vector_distance_cos" => Ok(Self::Vector(VectorFunc::VectorDistanceCos)),
+            _ => crate::bail_parse_error!("no such function: {}", name),
         }
     }
 }

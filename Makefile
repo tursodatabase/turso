@@ -9,6 +9,9 @@ SQLITE_EXEC ?= ./target/debug/limbo
 
 # Static library to use for SQLite C API compatibility tests.
 BASE_SQLITE_LIB = ./target/$(CURRENT_RUST_TARGET)/debug/liblimbo_sqlite3.a
+# Static library headers to use for SQLITE C API compatibility tests
+BASE_SQLITE_LIB_HEADERS = ./target/$(CURRENT_RUST_TARGET)/debug/include/limbo_sqlite3
+
 
 # On darwin link core foundation
 ifeq ($(UNAME_S),Darwin)
@@ -16,6 +19,8 @@ ifeq ($(UNAME_S),Darwin)
 else
     SQLITE_LIB ?= ../../$(BASE_SQLITE_LIB)
 endif
+
+SQLITE_LIB_HEADERS ?= ../../$(BASE_SQLITE_LIB_HEADERS)
 
 all: check-rust-version check-wasm-target limbo limbo-wasm
 .PHONY: all
@@ -57,17 +62,38 @@ limbo-wasm:
 	cargo build --package limbo-wasm --target wasm32-wasi
 .PHONY: limbo-wasm
 
-test: limbo test-compat test-sqlite3 test-shell
+test: limbo test-compat test-vector test-sqlite3 test-shell test-extensions
 .PHONY: test
 
-test-shell: limbo
-	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/shelltests.py
+test-extensions: limbo
+	cargo build --package limbo_regexp
+	./testing/cli_tests/extensions.py
+.PHONY: test-extensions
+
+test-shell: limbo 
+	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/cli_tests/cli_test_cases.py
 .PHONY: test-shell
 
 test-compat:
 	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/all.test
 .PHONY: test-compat
 
+test-vector:
+	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/vector.test
+.PHONY: test-vector
+
+test-time:
+	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/time.test
+.PHONY: test-time
+
 test-sqlite3: limbo-c
-	LIBS="$(SQLITE_LIB)" make -C sqlite3/tests test
+	LIBS="$(SQLITE_LIB)" HEADERS="$(SQLITE_LIB_HEADERS)" make -C sqlite3/tests test
 .PHONY: test-sqlite3
+
+test-json:
+	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/json.test
+.PHONY: test-json
+
+clickbench:
+	./perf/clickbench/benchmark.sh
+.PHONY: clickbench

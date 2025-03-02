@@ -1,0 +1,25 @@
+[package]
+name = "limbo_series"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Limbo series extension"
+
+[features]
+static = ["limbo_ext/static"]
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+
+[dependencies]
+limbo_ext = { workspace = true, features = ["static"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
+
+[dev-dependencies]
+quickcheck = "1.0.3"
+quickcheck_macros = "1.0.0"

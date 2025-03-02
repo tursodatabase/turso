@@ -1,0 +1,2 @@
+[env]
+LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_MATH_FUNCTIONS" # necessary for rusqlite dependency in order to bundle SQLite with math functions included

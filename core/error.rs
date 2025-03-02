@@ -1,6 +1,8 @@
+use std::num::NonZero;
+
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, miette::Diagnostic)]
 pub enum LimboError {
     #[error("Corrupt database: {0}")]
     Corrupt(String),
@@ -10,20 +12,23 @@ pub enum LimboError {
     InternalError(String),
     #[error("Parse error: {0}")]
     ParseError(String),
-    #[error("Parse error: {0}")]
-    LexerError(#[from] sqlite3_parser::lexer::sql::Error),
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LexerError(#[from] limbo_sqlite3_parser::lexer::sql::Error),
     #[error("Conversion error: {0}")]
     ConversionError(String),
     #[error("Env variable error: {0}")]
     EnvVarError(#[from] std::env::VarError),
+    #[error("Transaction error: {0}")]
+    TxError(String),
     #[error("I/O error: {0}")]
     IOError(#[from] std::io::Error),
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "io_uring"))]
     #[error("I/O error: {0}")]
-    LinuxIOError(String),
+    UringIOError(String),
     #[error("Locking error: {0}")]
     LockingError(String),
-    #[cfg(target_os = "macos")]
+    #[cfg(target_family = "unix")]
     #[error("I/O error: {0}")]
     RustixIOError(#[from] rustix::io::Errno),
     #[error("Parse error: {0}")]
@@ -36,8 +41,18 @@ pub enum LimboError {
     InvalidTime(String),
     #[error("Modifier parsing error: {0}")]
     InvalidModifier(String),
+    #[error("Invalid argument supplied: {0}")]
+    InvalidArgument(String),
+    #[error("Invalid formatter supplied: {0}")]
+    InvalidFormatter(String),
     #[error("Runtime error: {0}")]
     Constraint(String),
+    #[error("Extension error: {0}")]
+    ExtensionError(String),
+    #[error("Unbound parameter at index {0}")]
+    Unbound(NonZero<usize>),
+    #[error("Runtime error: integer overflow")]
+    IntegerOverflow,
 }
 
 #[macro_export]
@@ -59,6 +74,12 @@ macro_rules! bail_constraint_error {
     ($($arg:tt)*) => {
         return Err($crate::error::LimboError::Constraint(format!($($arg)*)))
     };
+}
+
+impl From<limbo_ext::ResultCode> for LimboError {
+    fn from(err: limbo_ext::ResultCode) -> Self {
+        LimboError::ExtensionError(err.to_string())
+    }
 }
 
 pub const SQLITE_CONSTRAINT: usize = 19;

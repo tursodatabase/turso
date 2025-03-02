@@ -11,6 +11,18 @@ do_execsql_test select-const-2 {
   SELECT 2
 } {2}
 
+do_execsql_test select-true {
+  SELECT true
+} {1}
+
+do_execsql_test select-false {
+  SELECT false
+} {0}
+
+do_execsql_test select-text-escape-1 {
+  SELECT '''a'
+} {'a}
+
 do_execsql_test select-blob-empty {
   SELECT x'';
 } {}
@@ -25,6 +37,15 @@ do_execsql_test select-blob-emoji {
 
 do_execsql_test select-limit-0 {
   SELECT id FROM users LIMIT 0;
+} {}
+
+# ORDER BY id here because sqlite uses age_idx here and we (yet) don't so force it to evaluate in ID order
+do_execsql_test select-limit-true {
+  SELECT id FROM users ORDER BY id LIMIT true;
+} {1}
+
+do_execsql_test select-limit-false {
+  SELECT id FROM users ORDER BY id LIMIT false;
 } {}
 
 do_execsql_test realify {
@@ -59,6 +80,14 @@ do_execsql_test select_with_quoting_2 {
   select "users".`id` from users where `users`.[id] = 5;
 } {5}
 
+do_execsql_test select-rowid {
+    select rowid, first_name from users u where rowid = 5;
+} {5|Edward}
+
+do_execsql_test select-rowid-2 {
+    select u.rowid, first_name from users u where rowid = 5;
+} {5|Edward}
+
 do_execsql_test seekrowid {
     select * from users u where u.id = 5;
 } {"5|Edward|Miller|christiankramer@example.com|725-281-1033|08522 English Plain|Lake Keith|ID|23283|15"}
@@ -79,6 +108,60 @@ do_execsql_test select_base_case_else {
   select case 1 when 0 then 'zero' when 1 then 'one' else 'two' end;
 } {one}
 
+do_execsql_test select_base_case_null_result {
+  select case NULL when 0 then 'first' else 'second' end;
+  select case NULL when NULL then 'first' else 'second' end;
+  select case 0 when 0 then 'first' else 'second' end;
+} {second
+second
+first}
+
 do_execsql_test select_base_case_noelse_null {
   select case 'null else' when 0 then 0 when 1 then 1 end;
+} {}
+
+do_execsql_test select-is-null {
+    select null is null, (1 / 0) is null, null is (1 / 0), (1 / 0) is (1 / 0);
+    select 4 is null, '4' is null, 0 is null, (1 / 2) is null;
+} {1|1|1|1
+0|0|0|0}
+
+do_execsql_test select-is-not-null {
+    select null is not null, (1 / 0) is not null, null is not (1 / 0), (1 / 0) is not (1 / 0);
+    select 4 is not null, '4' is not null, 0 is not null, (1 / 2) is not null;
+} {0|0|0|0
+1|1|1|1}
+
+do_execsql_test select_bin_shr {
+  select 997623670 >> 0, 997623670 >> 1, 997623670 >> 10, 997623670 >> 30;
+  select -997623670 >> 0, -997623670 >> 1, -997623670 >> 10, -997623670 >> 30;
+  select 997623670 << 0, 997623670 << -1, 997623670 << -10, 997623670 << -30;
+  select -997623670 << 0, -997623670 << -1, -997623670 << -10, -997623670 << -30;
+} {997623670|498811835|974241|0
+-997623670|-498811835|-974242|-1
+997623670|498811835|974241|0
+-997623670|-498811835|-974242|-1}
+
+do_execsql_test select_bin_shl {
+  select 997623670 << 0, 997623670 << 1, 997623670 << 10, 997623670 << 30;
+  select -997623670 << 0, -997623670 << 1, -997623670 << 10, -997623670 << 30;
+  select 997623670 >> 0, 997623670 >> -1, 997623670 >> -10, 997623670 >> -30;
+  select -997623670 >> 0, -997623670 >> -1, -997623670 >> -10, -997623670 >> -30;
+} {997623670|1995247340|1021566638080|1071190259091374080
+-997623670|-1995247340|-1021566638080|-1071190259091374080
+997623670|1995247340|1021566638080|1071190259091374080
+-997623670|-1995247340|-1021566638080|-1071190259091374080}
+
+# Test LIKE in SELECT position
+do_execsql_test select-like-expression {
+    select 'bar' like 'bar%'
+} {1}
+
+do_execsql_test select-not-like-expression {
+    select 'bar' not like 'bar%'
+} {0}
+
+# regression test for float divisor being cast to zero int and panicking
+do_execsql_test select-like-expression {
+    select 2 % 0.5
 } {}
