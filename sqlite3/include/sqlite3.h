@@ -13,9 +13,7 @@
 
 #define SQLITE_NOMEM 7
 
-#define SQLITE_NOTFOUND 12
-
-#define SQLITE_CANTOPEN 14
+#define SQLITE_NOTFOUND 14
 
 #define SQLITE_MISUSE 21
 

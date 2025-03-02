@@ -36,14 +36,13 @@ fn main() {
                     let mut rows = stmt.query().unwrap();
                     let mut count = 0;
                     loop {
-                        let row = rows.step().unwrap();
+                        let row = rows.next_row().unwrap();
                         match row {
-                            limbo_core::StepResult::Row(_) => {
-                                let row = statement.row();
+                            limbo_core::RowResult::Row(_) => {
                                 count += 1;
                             }
-                            limbo_core::StepResult::IO => yield,
-                            limbo_core::StepResult::Done => break,
+                            limbo_core::RowResult::IO => yield,
+                            limbo_core::RowResult::Done => break,
                         }
                     }
                     assert!(count == 100);

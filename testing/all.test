@@ -5,7 +5,6 @@ set testdir [file dirname $argv0]
 source $testdir/cmdlineshell.test
 source $testdir/agg-functions.test
 source $testdir/coalesce.test
-source $testdir/delete.test
 source $testdir/glob.test
 source $testdir/join.test
 source $testdir/insert.test
@@ -18,12 +17,4 @@ source $testdir/pragma.test
 source $testdir/scalar-functions.test
 source $testdir/scalar-functions-datetime.test
 source $testdir/select.test
-source $testdir/subquery.test
 source $testdir/where.test
-source $testdir/compare.test
-source $testdir/changes.test
-source $testdir/total-changes.test
-source $testdir/offset.test
-source $testdir/scalar-functions-printf.test
-# Disabled until https://github.com/tursodatabase/limbo/issues/1004 is fixed
-# source $testdir/transactions.test

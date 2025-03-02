@@ -56,29 +56,20 @@ impl Stmt {
     /// Like `sqlite3_column_count` but more limited
     pub fn column_count(&self) -> ColumnCount {
         match self {
-            Self::Delete(delete) => {
-                let Delete { returning, .. } = &**delete;
-                match returning {
-                    Some(returning) => column_count(returning),
-                    None => ColumnCount::None,
-                }
-            }
-            Self::Insert(insert) => {
-                let Insert { returning, .. } = &**insert;
-                match returning {
-                    Some(returning) => column_count(returning),
-                    None => ColumnCount::None,
-                }
-            }
+            Self::Delete {
+                returning: Some(returning),
+                ..
+            } => column_count(returning),
+            Self::Insert {
+                returning: Some(returning),
+                ..
+            } => column_count(returning),
             Self::Pragma(..) => ColumnCount::Dynamic,
             Self::Select(s) => s.column_count(),
-            Self::Update(update) => {
-                let Update { returning, .. } = &**update;
-                match returning {
-                    Some(returning) => column_count(returning),
-                    None => ColumnCount::None,
-                }
-            }
+            Self::Update {
+                returning: Some(returning),
+                ..
+            } => column_count(returning),
             _ => ColumnCount::None,
         }
     }
@@ -103,28 +94,22 @@ impl Stmt {
     /// check for extra rules
     pub fn check(&self) -> Result<(), ParserError> {
         match self {
-            Self::AlterTable(alter_table) => {
-                let (old_name, body) = &**alter_table;
-                match body {
-                    AlterTableBody::RenameTo(new_name) => {
-                        if *new_name == old_name.name {
-                            return Err(custom_err!(
-                                "there is already another table or index with this name: {}",
-                                new_name
-                            ));
-                        }
+            Self::AlterTable(old_name, AlterTableBody::RenameTo(new_name)) => {
+                if *new_name == old_name.name {
+                    return Err(custom_err!(
+                        "there is already another table or index with this name: {}",
+                        new_name
+                    ));
+                }
+                Ok(())
+            }
+            Self::AlterTable(.., AlterTableBody::AddColumn(cd)) => {
+                for c in cd {
+                    if let ColumnConstraint::PrimaryKey { .. } = c {
+                        return Err(custom_err!("Cannot add a PRIMARY KEY column"));
+                    } else if let ColumnConstraint::Unique(..) = c {
+                        return Err(custom_err!("Cannot add a UNIQUE column"));
                     }
-                    AlterTableBody::AddColumn(cd) => {
-                        for c in cd {
-                            if let ColumnConstraint::PrimaryKey { .. } = c {
-                                return Err(custom_err!("Cannot add a PRIMARY KEY column"));
-                            }
-                            if let ColumnConstraint::Unique(..) = c {
-                                return Err(custom_err!("Cannot add a UNIQUE column"));
-                            }
-                        }
-                    }
-                    _ => {}
                 }
                 Ok(())
             }
@@ -168,47 +153,31 @@ impl Stmt {
                     _ => Ok(()),
                 }
             }
-            Self::Delete(delete) => {
-                let Delete {
-                    order_by, limit, ..
-                } = &**delete;
-                if let Some(_) = order_by {
-                    if limit.is_none() {
-                        return Err(custom_err!("ORDER BY without LIMIT on DELETE"));
-                    }
+            Self::Delete {
+                order_by: Some(_),
+                limit: None,
+                ..
+            } => Err(custom_err!("ORDER BY without LIMIT on DELETE")),
+            Self::Insert {
+                columns: Some(columns),
+                body: InsertBody::Select(select, ..),
+                ..
+            } => match select.body.select.column_count() {
+                ColumnCount::Fixed(n) if n != columns.len() => {
+                    Err(custom_err!("{} values for {} columns", n, columns.len()))
                 }
-                Ok(())
-            }
-            Self::Insert(insert) => {
-                let Insert { columns, body, .. } = &**insert;
-                if columns.is_none() {
-                    return Ok(());
-                }
-                let columns = columns.as_ref().unwrap();
-                match &*body {
-                    InsertBody::Select(select, ..) => match select.body.select.column_count() {
-                        ColumnCount::Fixed(n) if n != columns.len() => {
-                            Err(custom_err!("{} values for {} columns", n, columns.len()))
-                        }
-                        _ => Ok(()),
-                    },
-                    InsertBody::DefaultValues => {
-                        Err(custom_err!("0 values for {} columns", columns.len()))
-                    }
-                }
-            }
-            Self::Update(update) => {
-                let Update {
-                    order_by, limit, ..
-                } = &**update;
-                if let Some(_) = order_by {
-                    if limit.is_none() {
-                        return Err(custom_err!("ORDER BY without LIMIT on UPDATE"));
-                    }
-                }
-
-                Ok(())
-            }
+                _ => Ok(()),
+            },
+            Self::Insert {
+                columns: Some(columns),
+                body: InsertBody::DefaultValues,
+                ..
+            } => Err(custom_err!("0 values for {} columns", columns.len())),
+            Self::Update {
+                order_by: Some(_),
+                limit: None,
+                ..
+            } => Err(custom_err!("ORDER BY without LIMIT on UPDATE")),
             _ => Ok(()),
         }
     }
@@ -225,9 +194,6 @@ impl CreateTableBody {
         {
             let mut generated_count = 0;
             for c in columns.values() {
-                if c.col_name == "rowid" {
-                    return Err(custom_err!("cannot use reserved word: ROWID"));
-                }
                 for cs in &c.constraints {
                     if let ColumnConstraint::Generated { .. } = cs.constraint {
                         generated_count += 1;
@@ -326,10 +292,7 @@ impl OneSelect {
     /// Like `sqlite3_column_count` but more limited
     pub fn column_count(&self) -> ColumnCount {
         match self {
-            Self::Select(select) => {
-                let SelectInner { columns, .. } = &**select;
-                column_count(columns)
-            }
+            Self::Select { columns, .. } => column_count(columns),
             Self::Values(values) => {
                 assert!(!values.is_empty()); // TODO Validate
                 ColumnCount::Fixed(values[0].len())

@@ -3,46 +3,22 @@
 [workspace]
 resolver = "2"
 members = [
-    "bindings/go",
-    "bindings/java",
     "bindings/python",
-    "bindings/rust",
     "bindings/wasm",
     "cli",
-    "core",
-    "extensions/core",
-    "extensions/crypto", 
-	"extensions/kvstore",
-    "extensions/percentile",
-    "extensions/regexp",
-    "extensions/series",
-    "extensions/time",
-    "extensions/uuid",
-    "macros",
-    "simulator",
     "sqlite3",
-    "tests",
+    "core",
+    "simulator",
+    "test", "macros",
 ]
 exclude = ["perf/latency/limbo"]
 
 [workspace.package]
-version = "0.0.15"
+version = "0.0.10"
 authors = ["the Limbo authors"]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/tursodatabase/limbo"
-
-[workspace.dependencies]
-limbo_core = { path = "core", version = "0.0.15" }
-limbo_crypto = { path = "extensions/crypto", version = "0.0.15" }
-limbo_ext = { path = "extensions/core", version = "0.0.15" }
-limbo_macros = { path = "macros", version = "0.0.15" }
-limbo_percentile = { path = "extensions/percentile", version = "0.0.15" }
-limbo_regexp = { path = "extensions/regexp", version = "0.0.15" }
-limbo_series = { path = "extensions/series", version = "0.0.15" }
-limbo_time = { path = "extensions/time", version = "0.0.15" }
-limbo_uuid = { path = "extensions/uuid", version = "0.0.15" }
-limbo_sqlite3_parser = { path = "vendored/sqlite3-parser", version = "0.0.15" }
+repository = "https://github.com/penberg/limbo"
 
 # Config for 'cargo dist'
 [workspace.metadata.dist]
@@ -71,7 +47,6 @@ dist = false
 github-attestations = true
 
 [profile.release]
-debug = "line-tables-only"
 codegen-units = 1
 panic = "abort"
 lto = true

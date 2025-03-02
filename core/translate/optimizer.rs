@@ -1,113 +1,93 @@
-use std::{collections::HashMap, rc::Rc};
+use std::rc::Rc;
 
-use limbo_sqlite3_parser::ast;
+use sqlite3_parser::ast;
 
-use crate::{
-    schema::{Index, Schema},
-    Result,
-};
+use crate::{schema::Index, Result};
 
 use super::plan::{
-    DeletePlan, Direction, IterationDirection, Operation, Plan, Search, SelectPlan, TableReference,
-    WhereTerm,
+    get_table_ref_bitmask_for_ast_expr, get_table_ref_bitmask_for_operator, BTreeTableReference,
+    Direction, IterationDirection, Plan, Search, SourceOperator,
 };
-
-pub fn optimize_plan(plan: &mut Plan, schema: &Schema) -> Result<()> {
-    match plan {
-        Plan::Select(plan) => optimize_select_plan(plan, schema),
-        Plan::Delete(plan) => optimize_delete_plan(plan, schema),
-    }
-}
 
 /**
  * Make a few passes over the plan to optimize it.
  * TODO: these could probably be done in less passes,
  * but having them separate makes them easier to understand
  */
-fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
-    optimize_subqueries(plan, schema)?;
-    rewrite_exprs_select(plan)?;
+pub fn optimize_plan(mut select_plan: Plan) -> Result<Plan> {
+    eliminate_between(&mut select_plan.source, &mut select_plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
-        eliminate_constant_conditions(&mut plan.where_clause)?
+        eliminate_constants(&mut select_plan.source, &mut select_plan.where_clause)?
     {
-        plan.contains_constant_false_condition = true;
-        return Ok(());
+        select_plan.contains_constant_false_condition = true;
+        return Ok(select_plan);
     }
-
-    use_indexes(
-        &mut plan.table_references,
-        &schema.indexes,
-        &mut plan.where_clause,
+    push_predicates(
+        &mut select_plan.source,
+        &mut select_plan.where_clause,
+        &select_plan.referenced_tables,
     )?;
-
-    eliminate_unnecessary_orderby(plan, schema)?;
-
-    Ok(())
-}
-
-fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
-    rewrite_exprs_delete(plan)?;
-    if let ConstantConditionEliminationResult::ImpossibleCondition =
-        eliminate_constant_conditions(&mut plan.where_clause)?
-    {
-        plan.contains_constant_false_condition = true;
-        return Ok(());
-    }
-
     use_indexes(
-        &mut plan.table_references,
-        &schema.indexes,
-        &mut plan.where_clause,
+        &mut select_plan.source,
+        &select_plan.referenced_tables,
+        &select_plan.available_indexes,
     )?;
-
-    Ok(())
+    eliminate_unnecessary_orderby(
+        &mut select_plan.source,
+        &mut select_plan.order_by,
+        &select_plan.referenced_tables,
+        &select_plan.available_indexes,
+    )?;
+    Ok(select_plan)
 }
 
-fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
-    for table in plan.table_references.iter_mut() {
-        if let Operation::Subquery { plan, .. } = &mut table.op {
-            optimize_select_plan(&mut *plan, schema)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn query_is_already_ordered_by(
-    table_references: &[TableReference],
+fn _operator_is_already_ordered_by(
+    operator: &mut SourceOperator,
     key: &mut ast::Expr,
-    available_indexes: &HashMap<String, Vec<Rc<Index>>>,
+    referenced_tables: &[BTreeTableReference],
+    available_indexes: &Vec<Rc<Index>>,
 ) -> Result<bool> {
-    let first_table = table_references.first();
-    if first_table.is_none() {
-        return Ok(false);
-    }
-    let table_reference = first_table.unwrap();
-    match &table_reference.op {
-        Operation::Scan { .. } => Ok(key.is_rowid_alias_of(0)),
-        Operation::Search(search) => match search {
-            Search::RowidEq { .. } => Ok(key.is_rowid_alias_of(0)),
-            Search::RowidSearch { .. } => Ok(key.is_rowid_alias_of(0)),
+    match operator {
+        SourceOperator::Scan {
+            table_reference, ..
+        } => Ok(key.is_rowid_alias_of(table_reference.table_index)),
+        SourceOperator::Search {
+            table_reference,
+            search,
+            ..
+        } => match search {
+            Search::RowidEq { .. } => Ok(key.is_rowid_alias_of(table_reference.table_index)),
+            Search::RowidSearch { .. } => Ok(key.is_rowid_alias_of(table_reference.table_index)),
             Search::IndexSearch { index, .. } => {
-                let index_rc = key.check_index_scan(0, &table_reference, available_indexes)?;
-                let index_is_the_same =
-                    index_rc.map(|irc| Rc::ptr_eq(index, &irc)).unwrap_or(false);
+                let index_idx = key.check_index_scan(
+                    table_reference.table_index,
+                    referenced_tables,
+                    available_indexes,
+                )?;
+                let index_is_the_same = index_idx
+                    .map(|i| Rc::ptr_eq(&available_indexes[i], index))
+                    .unwrap_or(false);
                 Ok(index_is_the_same)
             }
         },
+        SourceOperator::Join { left, .. } => {
+            _operator_is_already_ordered_by(left, key, referenced_tables, available_indexes)
+        }
         _ => Ok(false),
     }
 }
 
-fn eliminate_unnecessary_orderby(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
-    if plan.order_by.is_none() {
-        return Ok(());
-    }
-    if plan.table_references.len() == 0 {
+fn eliminate_unnecessary_orderby(
+    operator: &mut SourceOperator,
+    order_by: &mut Option<Vec<(ast::Expr, Direction)>>,
+    referenced_tables: &[BTreeTableReference],
+    available_indexes: &Vec<Rc<Index>>,
+) -> Result<()> {
+    if order_by.is_none() {
         return Ok(());
     }
 
-    let o = plan.order_by.as_mut().unwrap();
+    let o = order_by.as_mut().unwrap();
 
     if o.len() != 1 {
         // TODO: handle multiple order by keys
@@ -117,55 +97,78 @@ fn eliminate_unnecessary_orderby(plan: &mut SelectPlan, schema: &Schema) -> Resu
     let (key, direction) = o.first_mut().unwrap();
 
     let already_ordered =
-        query_is_already_ordered_by(&plan.table_references, key, &schema.indexes)?;
+        _operator_is_already_ordered_by(operator, key, referenced_tables, available_indexes)?;
 
     if already_ordered {
-        push_scan_direction(&mut plan.table_references[0], direction);
-        plan.order_by = None;
+        push_scan_direction(operator, direction);
+        *order_by = None;
     }
 
     Ok(())
 }
 
 /**
- * Use indexes where possible.
- * Right now we make decisions about using indexes ONLY based on condition expressions, not e.g. ORDER BY or others.
- * This is just because we are WIP.
- *
- * When this function is called, condition expressions from both the actual WHERE clause and the JOIN clauses are in the where_clause vector.
- * If we find a condition that can be used to index scan, we pop it off from the where_clause vector and put it into a Search operation.
- * We put it there simply because it makes it a bit easier to track during translation.
+ * Use indexes where possible
  */
 fn use_indexes(
-    table_references: &mut [TableReference],
-    available_indexes: &HashMap<String, Vec<Rc<Index>>>,
-    where_clause: &mut Vec<WhereTerm>,
+    operator: &mut SourceOperator,
+    referenced_tables: &[BTreeTableReference],
+    available_indexes: &[Rc<Index>],
 ) -> Result<()> {
-    if where_clause.is_empty() {
-        return Ok(());
-    }
+    match operator {
+        SourceOperator::Search { .. } => Ok(()),
+        SourceOperator::Scan {
+            table_reference,
+            predicates: filter,
+            id,
+            ..
+        } => {
+            if filter.is_none() {
+                return Ok(());
+            }
 
-    'outer: for (table_index, table_reference) in table_references.iter_mut().enumerate() {
-        if let Operation::Scan { .. } = &mut table_reference.op {
-            let mut i = 0;
-            while i < where_clause.len() {
-                let cond = where_clause.get_mut(i).unwrap();
-                if let Some(index_search) = try_extract_index_search_expression(
-                    cond,
+            let fs = filter.as_mut().unwrap();
+            for i in 0..fs.len() {
+                let f = fs[i].take_ownership();
+                let table_index = referenced_tables
+                    .iter()
+                    .position(|t| {
+                        Rc::ptr_eq(&t.table, &table_reference.table)
+                            && t.table_identifier == table_reference.table_identifier
+                    })
+                    .unwrap();
+                match try_extract_index_search_expression(
+                    f,
                     table_index,
-                    &table_reference,
+                    referenced_tables,
                     available_indexes,
                 )? {
-                    where_clause.remove(i);
-                    table_reference.op = Operation::Search(index_search);
-                    continue 'outer;
-                }
-                i += 1;
-            }
-        }
-    }
+                    Either::Left(non_index_using_expr) => {
+                        fs[i] = non_index_using_expr;
+                    }
+                    Either::Right(index_search) => {
+                        fs.remove(i);
+                        *operator = SourceOperator::Search {
+                            id: *id,
+                            table_reference: table_reference.clone(),
+                            predicates: Some(fs.clone()),
+                            search: index_search,
+                        };
 
-    Ok(())
+                        return Ok(());
+                    }
+                }
+            }
+
+            Ok(())
+        }
+        SourceOperator::Join { left, right, .. } => {
+            use_indexes(left, referenced_tables, available_indexes)?;
+            use_indexes(right, referenced_tables, available_indexes)?;
+            Ok(())
+        }
+        SourceOperator::Nothing => Ok(()),
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -174,77 +177,365 @@ enum ConstantConditionEliminationResult {
     ImpossibleCondition,
 }
 
-/// Removes predicates that are always true.
-/// Returns a ConstantEliminationResult indicating whether any predicates are always false.
-/// This is used to determine whether the query can be aborted early.
-fn eliminate_constant_conditions(
-    where_clause: &mut Vec<WhereTerm>,
+// removes predicates that are always true
+// returns a ConstantEliminationResult indicating whether any predicates are always false
+fn eliminate_constants(
+    operator: &mut SourceOperator,
+    where_clause: &mut Option<Vec<ast::Expr>>,
 ) -> Result<ConstantConditionEliminationResult> {
-    let mut i = 0;
-    while i < where_clause.len() {
-        let predicate = &where_clause[i];
-        if predicate.expr.is_always_true()? {
-            // true predicates can be removed since they don't affect the result
-            where_clause.remove(i);
-        } else if predicate.expr.is_always_false()? {
-            // any false predicate in a list of conjuncts (AND-ed predicates) will make the whole list false,
-            // except an outer join condition, because that just results in NULLs, not skipping the whole loop
-            if predicate.from_outer_join {
+    if let Some(predicates) = where_clause {
+        let mut i = 0;
+        while i < predicates.len() {
+            let predicate = &predicates[i];
+            if predicate.is_always_true()? {
+                // true predicates can be removed since they don't affect the result
+                predicates.remove(i);
+            } else if predicate.is_always_false()? {
+                // any false predicate in a list of conjuncts (AND-ed predicates) will make the whole list false
+                predicates.truncate(0);
+                return Ok(ConstantConditionEliminationResult::ImpossibleCondition);
+            } else {
                 i += 1;
-                continue;
             }
-            where_clause.truncate(0);
-            return Ok(ConstantConditionEliminationResult::ImpossibleCondition);
-        } else {
+        }
+    }
+    match operator {
+        SourceOperator::Join {
+            left,
+            right,
+            predicates,
+            outer,
+            ..
+        } => {
+            if eliminate_constants(left, where_clause)?
+                == ConstantConditionEliminationResult::ImpossibleCondition
+            {
+                return Ok(ConstantConditionEliminationResult::ImpossibleCondition);
+            }
+            if eliminate_constants(right, where_clause)?
+                == ConstantConditionEliminationResult::ImpossibleCondition
+                && !*outer
+            {
+                return Ok(ConstantConditionEliminationResult::ImpossibleCondition);
+            }
+
+            if predicates.is_none() {
+                return Ok(ConstantConditionEliminationResult::Continue);
+            }
+
+            let predicates = predicates.as_mut().unwrap();
+
+            let mut i = 0;
+            while i < predicates.len() {
+                let predicate = &mut predicates[i];
+                if predicate.is_always_true()? {
+                    predicates.remove(i);
+                } else if predicate.is_always_false()? {
+                    if !*outer {
+                        predicates.truncate(0);
+                        return Ok(ConstantConditionEliminationResult::ImpossibleCondition);
+                    }
+                    // in an outer join, we can't skip rows, so just replace all constant false predicates with 0
+                    // so we don't later have to evaluate anything more complex or special-case the identifiers true and false
+                    // which are just aliases for 1 and 0
+                    *predicate = ast::Expr::Literal(ast::Literal::Numeric("0".to_string()));
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+
+            Ok(ConstantConditionEliminationResult::Continue)
+        }
+        SourceOperator::Scan { predicates, .. } => {
+            if let Some(ps) = predicates {
+                let mut i = 0;
+                while i < ps.len() {
+                    let predicate = &ps[i];
+                    if predicate.is_always_true()? {
+                        // true predicates can be removed since they don't affect the result
+                        ps.remove(i);
+                    } else if predicate.is_always_false()? {
+                        // any false predicate in a list of conjuncts (AND-ed predicates) will make the whole list false
+                        ps.truncate(0);
+                        return Ok(ConstantConditionEliminationResult::ImpossibleCondition);
+                    } else {
+                        i += 1;
+                    }
+                }
+
+                if ps.is_empty() {
+                    *predicates = None;
+                }
+            }
+            Ok(ConstantConditionEliminationResult::Continue)
+        }
+        SourceOperator::Search { predicates, .. } => {
+            if let Some(predicates) = predicates {
+                let mut i = 0;
+                while i < predicates.len() {
+                    let predicate = &predicates[i];
+                    if predicate.is_always_true()? {
+                        // true predicates can be removed since they don't affect the result
+                        predicates.remove(i);
+                    } else if predicate.is_always_false()? {
+                        // any false predicate in a list of conjuncts (AND-ed predicates) will make the whole list false
+                        predicates.truncate(0);
+                        return Ok(ConstantConditionEliminationResult::ImpossibleCondition);
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+
+            Ok(ConstantConditionEliminationResult::Continue)
+        }
+        SourceOperator::Nothing => Ok(ConstantConditionEliminationResult::Continue),
+    }
+}
+
+/**
+  Recursively pushes predicates down the tree, as far as possible.
+  Where a predicate is pushed determines at which loop level it will be evaluated.
+  For example, in SELECT * FROM t1 JOIN t2 JOIN t3 WHERE t1.a = t2.a AND t2.b = t3.b AND t1.c = 1
+  the predicate t1.c = 1 can be pushed to t1 and will be evaluated in the first (outermost) loop,
+  the predicate t1.a = t2.a can be pushed to t2 and will be evaluated in the second loop
+  while t2.b = t3.b will be evaluated in the third loop.
+*/
+fn push_predicates(
+    operator: &mut SourceOperator,
+    where_clause: &mut Option<Vec<ast::Expr>>,
+    referenced_tables: &Vec<BTreeTableReference>,
+) -> Result<()> {
+    // First try to push down any predicates from the WHERE clause
+    if let Some(predicates) = where_clause {
+        let mut i = 0;
+        while i < predicates.len() {
+            // Take ownership of predicate to try pushing it down
+            let predicate = predicates[i].take_ownership();
+            // If predicate was successfully pushed (None returned), remove it from WHERE
+            let Some(predicate) = push_predicate(operator, predicate, referenced_tables)? else {
+                predicates.remove(i);
+                continue;
+            };
+            predicates[i] = predicate;
             i += 1;
         }
+        // Clean up empty WHERE clause
+        if predicates.is_empty() {
+            *where_clause = None;
+        }
     }
 
-    Ok(ConstantConditionEliminationResult::Continue)
+    match operator {
+        SourceOperator::Join {
+            left,
+            right,
+            predicates,
+            outer,
+            ..
+        } => {
+            // Recursively push predicates down both sides of join
+            push_predicates(left, where_clause, referenced_tables)?;
+            push_predicates(right, where_clause, referenced_tables)?;
+
+            if predicates.is_none() {
+                return Ok(());
+            }
+
+            let predicates = predicates.as_mut().unwrap();
+
+            let mut i = 0;
+            while i < predicates.len() {
+                let predicate_owned = predicates[i].take_ownership();
+
+                // For a join like SELECT * FROM left INNER JOIN right ON left.id = right.id AND left.name = 'foo'
+                // the predicate 'left.name = 'foo' can already be evaluated in the outer loop (left side of join)
+                // because the row can immediately be skipped if left.name != 'foo'.
+                // But for a LEFT JOIN, we can't do this since we need to ensure that all rows from the left table are included,
+                // even if there are no matching rows from the right table. This is why we can't push LEFT JOIN predicates to the left side.
+                let push_result = if *outer {
+                    Some(predicate_owned)
+                } else {
+                    push_predicate(left, predicate_owned, referenced_tables)?
+                };
+
+                // Try pushing to left side first (see comment above for reasoning)
+                let Some(predicate) = push_result else {
+                    predicates.remove(i);
+                    continue;
+                };
+
+                // Then try right side
+                let Some(predicate) = push_predicate(right, predicate, referenced_tables)? else {
+                    predicates.remove(i);
+                    continue;
+                };
+
+                // If neither side could take it, keep in join predicates (not sure if this actually happens in practice)
+                // this is effectively the same as pushing to the right side, so maybe it could be removed and assert here
+                // that we don't reach this code
+                predicates[i] = predicate;
+                i += 1;
+            }
+
+            Ok(())
+        }
+        // Base cases - nowhere else to push to
+        SourceOperator::Scan { .. } => Ok(()),
+        SourceOperator::Search { .. } => Ok(()),
+        SourceOperator::Nothing => Ok(()),
+    }
 }
 
-fn push_scan_direction(table: &mut TableReference, direction: &Direction) {
-    if let Operation::Scan {
-        ref mut iter_dir, ..
-    } = table.op
-    {
-        if iter_dir.is_none() {
-            match direction {
-                Direction::Ascending => *iter_dir = Some(IterationDirection::Forwards),
-                Direction::Descending => *iter_dir = Some(IterationDirection::Backwards),
+/**
+  Push a single predicate down the tree, as far as possible.
+  Returns Ok(None) if the predicate was pushed, otherwise returns itself as Ok(Some(predicate))
+*/
+fn push_predicate(
+    operator: &mut SourceOperator,
+    predicate: ast::Expr,
+    referenced_tables: &Vec<BTreeTableReference>,
+) -> Result<Option<ast::Expr>> {
+    match operator {
+        SourceOperator::Scan {
+            predicates,
+            table_reference,
+            ..
+        } => {
+            // Find position of this table in referenced_tables array
+            let table_index = referenced_tables
+                .iter()
+                .position(|t| t.table_identifier == table_reference.table_identifier)
+                .unwrap();
+
+            // Get bitmask showing which tables this predicate references
+            let predicate_bitmask =
+                get_table_ref_bitmask_for_ast_expr(referenced_tables, &predicate)?;
+
+            // Each table has a bit position based on join order from left to right
+            // e.g. in SELECT * FROM t1 JOIN t2 JOIN t3
+            // t1 is position 0 (001), t2 is position 1 (010), t3 is position 2 (100)
+            // To push a predicate to a given table, it can only reference that table and tables to its left
+            // Example: For table t2 at position 1 (bit 010):
+            // - Can push: 011 (t2 + t1), 001 (just t1), 010 (just t2)
+            // - Can't push: 110 (t2 + t3)
+            let next_table_on_the_right_in_join_bitmask = 1 << (table_index + 1);
+            if predicate_bitmask >= next_table_on_the_right_in_join_bitmask {
+                return Ok(Some(predicate));
+            }
+
+            // Add predicate to this table's filters
+            if predicates.is_none() {
+                predicates.replace(vec![predicate]);
+            } else {
+                predicates.as_mut().unwrap().push(predicate);
+            }
+
+            Ok(None)
+        }
+        // Search nodes don't exist yet at this point; Scans are transformed to Search in use_indexes()
+        SourceOperator::Search { .. } => unreachable!(),
+        SourceOperator::Join {
+            left,
+            right,
+            predicates: join_on_preds,
+            outer,
+            ..
+        } => {
+            // Try pushing to left side first
+            let push_result_left = push_predicate(left, predicate, referenced_tables)?;
+            if push_result_left.is_none() {
+                return Ok(None);
+            }
+            // Then try right side
+            let push_result_right =
+                push_predicate(right, push_result_left.unwrap(), referenced_tables)?;
+            if push_result_right.is_none() {
+                return Ok(None);
+            }
+
+            // For LEFT JOIN, predicates must stay at join level
+            if *outer {
+                return Ok(Some(push_result_right.unwrap()));
+            }
+
+            let pred = push_result_right.unwrap();
+
+            // Get bitmasks for tables referenced in predicate and both sides of join
+            let table_refs_bitmask = get_table_ref_bitmask_for_ast_expr(referenced_tables, &pred)?;
+            let left_bitmask = get_table_ref_bitmask_for_operator(referenced_tables, left)?;
+            let right_bitmask = get_table_ref_bitmask_for_operator(referenced_tables, right)?;
+
+            // If predicate doesn't reference tables from both sides, it can't be a join condition
+            if table_refs_bitmask & left_bitmask == 0 || table_refs_bitmask & right_bitmask == 0 {
+                return Ok(Some(pred));
+            }
+
+            // Add as join predicate since it references both sides
+            if join_on_preds.is_none() {
+                join_on_preds.replace(vec![pred]);
+            } else {
+                join_on_preds.as_mut().unwrap().push(pred);
+            }
+
+            Ok(None)
+        }
+        SourceOperator::Nothing => Ok(Some(predicate)),
+    }
+}
+
+fn push_scan_direction(operator: &mut SourceOperator, direction: &Direction) {
+    match operator {
+        SourceOperator::Scan { iter_dir, .. } => {
+            if iter_dir.is_none() {
+                match direction {
+                    Direction::Ascending => *iter_dir = Some(IterationDirection::Forwards),
+                    Direction::Descending => *iter_dir = Some(IterationDirection::Backwards),
+                }
             }
         }
+        _ => todo!(),
     }
 }
 
-fn rewrite_exprs_select(plan: &mut SelectPlan) -> Result<()> {
-    for rc in plan.result_columns.iter_mut() {
-        rewrite_expr(&mut rc.expr)?;
-    }
-    for agg in plan.aggregates.iter_mut() {
-        rewrite_expr(&mut agg.original_expr)?;
-    }
-    for cond in plan.where_clause.iter_mut() {
-        rewrite_expr(&mut cond.expr)?;
-    }
-    if let Some(group_by) = &mut plan.group_by {
-        for expr in group_by.exprs.iter_mut() {
-            rewrite_expr(expr)?;
-        }
-    }
-    if let Some(order_by) = &mut plan.order_by {
-        for (expr, _) in order_by.iter_mut() {
-            rewrite_expr(expr)?;
-        }
+fn eliminate_between(
+    operator: &mut SourceOperator,
+    where_clauses: &mut Option<Vec<ast::Expr>>,
+) -> Result<()> {
+    if let Some(predicates) = where_clauses {
+        *predicates = predicates.drain(..).map(convert_between_expr).collect();
     }
 
-    Ok(())
-}
+    match operator {
+        SourceOperator::Join {
+            left,
+            right,
+            predicates,
+            ..
+        } => {
+            eliminate_between(left, where_clauses)?;
+            eliminate_between(right, where_clauses)?;
 
-fn rewrite_exprs_delete(plan: &mut DeletePlan) -> Result<()> {
-    for cond in plan.where_clause.iter_mut() {
-        rewrite_expr(&mut cond.expr)?;
+            if let Some(predicates) = predicates {
+                *predicates = predicates.drain(..).map(convert_between_expr).collect();
+            }
+        }
+        SourceOperator::Scan {
+            predicates: Some(preds),
+            ..
+        } => {
+            *preds = preds.drain(..).map(convert_between_expr).collect();
+        }
+        SourceOperator::Search {
+            predicates: Some(preds),
+            ..
+        } => {
+            *preds = preds.drain(..).map(convert_between_expr).collect();
+        }
+        _ => (),
     }
+
     Ok(())
 }
 
@@ -275,15 +566,15 @@ pub trait Optimizable {
     fn check_index_scan(
         &mut self,
         table_index: usize,
-        table_reference: &TableReference,
-        available_indexes: &HashMap<String, Vec<Rc<Index>>>,
-    ) -> Result<Option<Rc<Index>>>;
+        referenced_tables: &[BTreeTableReference],
+        available_indexes: &[Rc<Index>],
+    ) -> Result<Option<usize>>;
 }
 
 impl Optimizable for ast::Expr {
     fn is_rowid_alias_of(&self, table_index: usize) -> bool {
         match self {
-            Self::Column {
+            ast::Expr::Column {
                 table,
                 is_rowid_alias,
                 ..
@@ -294,69 +585,41 @@ impl Optimizable for ast::Expr {
     fn check_index_scan(
         &mut self,
         table_index: usize,
-        table_reference: &TableReference,
-        available_indexes: &HashMap<String, Vec<Rc<Index>>>,
-    ) -> Result<Option<Rc<Index>>> {
+        referenced_tables: &[BTreeTableReference],
+        available_indexes: &[Rc<Index>],
+    ) -> Result<Option<usize>> {
         match self {
-            Self::Column { table, column, .. } => {
+            ast::Expr::Column { table, column, .. } => {
                 if *table != table_index {
                     return Ok(None);
                 }
-                let Some(available_indexes_for_table) =
-                    available_indexes.get(table_reference.table.get_name())
-                else {
-                    return Ok(None);
-                };
-                let Some(column) = table_reference.table.get_column_at(*column) else {
-                    return Ok(None);
-                };
-                for index in available_indexes_for_table.iter() {
-                    if let Some(name) = column.name.as_ref() {
-                        if &index.columns.first().unwrap().name == name {
-                            return Ok(Some(index.clone()));
+                for (idx, index) in available_indexes.iter().enumerate() {
+                    if index.table_name == referenced_tables[*table].table.name {
+                        let column = referenced_tables[*table]
+                            .table
+                            .columns
+                            .get(*column)
+                            .unwrap();
+                        if index.columns.first().unwrap().name == column.name {
+                            return Ok(Some(idx));
                         }
                     }
                 }
                 Ok(None)
             }
-            Self::Binary(lhs, op, rhs) => {
-                // Only consider index scans for binary ops that are comparisons.
-                // e.g. "t1.id = t2.id" is a valid index scan, but "t1.id + 1" is not.
-                //
-                // TODO/optimization: consider detecting index scan on e.g. table t1 in
-                // "WHERE t1.id + 1 = t2.id"
-                // here the Expr could be rewritten to "t1.id = t2.id - 1"
-                // and then t1.id could be used as an index key.
-                if !matches!(
-                    *op,
-                    ast::Operator::Equals
-                        | ast::Operator::Greater
-                        | ast::Operator::GreaterEquals
-                        | ast::Operator::Less
-                        | ast::Operator::LessEquals
-                ) {
-                    return Ok(None);
-                }
+            ast::Expr::Binary(lhs, op, rhs) => {
                 let lhs_index =
-                    lhs.check_index_scan(table_index, &table_reference, available_indexes)?;
+                    lhs.check_index_scan(table_index, referenced_tables, available_indexes)?;
                 if lhs_index.is_some() {
                     return Ok(lhs_index);
                 }
                 let rhs_index =
-                    rhs.check_index_scan(table_index, &table_reference, available_indexes)?;
+                    rhs.check_index_scan(table_index, referenced_tables, available_indexes)?;
                 if rhs_index.is_some() {
                     // swap lhs and rhs
-                    let swapped_operator = match *op {
-                        ast::Operator::Equals => ast::Operator::Equals,
-                        ast::Operator::Greater => ast::Operator::Less,
-                        ast::Operator::GreaterEquals => ast::Operator::LessEquals,
-                        ast::Operator::Less => ast::Operator::Greater,
-                        ast::Operator::LessEquals => ast::Operator::GreaterEquals,
-                        _ => unreachable!(),
-                    };
                     let lhs_new = rhs.take_ownership();
                     let rhs_new = lhs.take_ownership();
-                    *self = Self::Binary(Box::new(lhs_new), swapped_operator, Box::new(rhs_new));
+                    *self = ast::Expr::Binary(Box::new(lhs_new), *op, Box::new(rhs_new));
                     return Ok(rhs_index);
                 }
                 Ok(None)
@@ -366,7 +629,18 @@ impl Optimizable for ast::Expr {
     }
     fn check_constant(&self) -> Result<Option<ConstantPredicate>> {
         match self {
-            Self::Literal(lit) => match lit {
+            ast::Expr::Id(id) => {
+                // true and false are special constants that are effectively aliases for 1 and 0
+                if id.0.eq_ignore_ascii_case("true") {
+                    return Ok(Some(ConstantPredicate::AlwaysTrue));
+                }
+                if id.0.eq_ignore_ascii_case("false") {
+                    return Ok(Some(ConstantPredicate::AlwaysFalse));
+                }
+                return Ok(None);
+            }
+            ast::Expr::Literal(lit) => match lit {
+                ast::Literal::Null => Ok(Some(ConstantPredicate::AlwaysFalse)),
                 ast::Literal::Numeric(b) => {
                     if let Ok(int_value) = b.parse::<i64>() {
                         return Ok(Some(if int_value == 0 {
@@ -407,7 +681,7 @@ impl Optimizable for ast::Expr {
                 }
                 _ => Ok(None),
             },
-            Self::Unary(op, expr) => {
+            ast::Expr::Unary(op, expr) => {
                 if *op == ast::UnaryOperator::Not {
                     let trivial = expr.check_constant()?;
                     return Ok(trivial.map(|t| match t {
@@ -423,7 +697,7 @@ impl Optimizable for ast::Expr {
 
                 Ok(None)
             }
-            Self::InList { lhs: _, not, rhs } => {
+            ast::Expr::InList { lhs: _, not, rhs } => {
                 if rhs.is_none() {
                     return Ok(Some(if *not {
                         ConstantPredicate::AlwaysTrue
@@ -442,7 +716,7 @@ impl Optimizable for ast::Expr {
 
                 Ok(None)
             }
-            Self::Binary(lhs, op, rhs) => {
+            ast::Expr::Binary(lhs, op, rhs) => {
                 let lhs_trivial = lhs.check_constant()?;
                 let rhs_trivial = rhs.check_constant()?;
                 match op {
@@ -482,52 +756,31 @@ impl Optimizable for ast::Expr {
     }
 }
 
-fn opposite_cmp_op(op: ast::Operator) -> ast::Operator {
-    match op {
-        ast::Operator::Equals => ast::Operator::Equals,
-        ast::Operator::Greater => ast::Operator::Less,
-        ast::Operator::GreaterEquals => ast::Operator::LessEquals,
-        ast::Operator::Less => ast::Operator::Greater,
-        ast::Operator::LessEquals => ast::Operator::GreaterEquals,
-        _ => panic!("unexpected operator: {:?}", op),
-    }
+pub enum Either<T, U> {
+    Left(T),
+    Right(U),
 }
 
 pub fn try_extract_index_search_expression(
-    cond: &mut WhereTerm,
+    expr: ast::Expr,
     table_index: usize,
-    table_reference: &TableReference,
-    available_indexes: &HashMap<String, Vec<Rc<Index>>>,
-) -> Result<Option<Search>> {
-    if !cond.should_eval_at_loop(table_index) {
-        return Ok(None);
-    }
-    match &mut cond.expr {
-        ast::Expr::Binary(lhs, operator, rhs) => {
+    referenced_tables: &[BTreeTableReference],
+    available_indexes: &[Rc<Index>],
+) -> Result<Either<ast::Expr, Search>> {
+    match expr {
+        ast::Expr::Binary(mut lhs, operator, mut rhs) => {
             if lhs.is_rowid_alias_of(table_index) {
                 match operator {
                     ast::Operator::Equals => {
-                        let rhs_owned = rhs.take_ownership();
-                        return Ok(Some(Search::RowidEq {
-                            cmp_expr: WhereTerm {
-                                expr: rhs_owned,
-                                from_outer_join: cond.from_outer_join,
-                                eval_at: cond.eval_at,
-                            },
-                        }));
+                        return Ok(Either::Right(Search::RowidEq { cmp_expr: *rhs }));
                     }
                     ast::Operator::Greater
                     | ast::Operator::GreaterEquals
                     | ast::Operator::Less
                     | ast::Operator::LessEquals => {
-                        let rhs_owned = rhs.take_ownership();
-                        return Ok(Some(Search::RowidSearch {
-                            cmp_op: *operator,
-                            cmp_expr: WhereTerm {
-                                expr: rhs_owned,
-                                from_outer_join: cond.from_outer_join,
-                                eval_at: cond.eval_at,
-                            },
+                        return Ok(Either::Right(Search::RowidSearch {
+                            cmp_op: operator,
+                            cmp_expr: *rhs,
                         }));
                     }
                     _ => {}
@@ -537,35 +790,23 @@ pub fn try_extract_index_search_expression(
             if rhs.is_rowid_alias_of(table_index) {
                 match operator {
                     ast::Operator::Equals => {
-                        let lhs_owned = lhs.take_ownership();
-                        return Ok(Some(Search::RowidEq {
-                            cmp_expr: WhereTerm {
-                                expr: lhs_owned,
-                                from_outer_join: cond.from_outer_join,
-                                eval_at: cond.eval_at,
-                            },
-                        }));
+                        return Ok(Either::Right(Search::RowidEq { cmp_expr: *lhs }));
                     }
                     ast::Operator::Greater
                     | ast::Operator::GreaterEquals
                     | ast::Operator::Less
                     | ast::Operator::LessEquals => {
-                        let lhs_owned = lhs.take_ownership();
-                        return Ok(Some(Search::RowidSearch {
-                            cmp_op: opposite_cmp_op(*operator),
-                            cmp_expr: WhereTerm {
-                                expr: lhs_owned,
-                                from_outer_join: cond.from_outer_join,
-                                eval_at: cond.eval_at,
-                            },
+                        return Ok(Either::Right(Search::RowidSearch {
+                            cmp_op: operator,
+                            cmp_expr: *lhs,
                         }));
                     }
                     _ => {}
                 }
             }
 
-            if let Some(index_rc) =
-                lhs.check_index_scan(table_index, &table_reference, available_indexes)?
+            if let Some(index_index) =
+                lhs.check_index_scan(table_index, referenced_tables, available_indexes)?
             {
                 match operator {
                     ast::Operator::Equals
@@ -573,23 +814,18 @@ pub fn try_extract_index_search_expression(
                     | ast::Operator::GreaterEquals
                     | ast::Operator::Less
                     | ast::Operator::LessEquals => {
-                        let rhs_owned = rhs.take_ownership();
-                        return Ok(Some(Search::IndexSearch {
-                            index: index_rc,
-                            cmp_op: *operator,
-                            cmp_expr: WhereTerm {
-                                expr: rhs_owned,
-                                from_outer_join: cond.from_outer_join,
-                                eval_at: cond.eval_at,
-                            },
+                        return Ok(Either::Right(Search::IndexSearch {
+                            index: available_indexes[index_index].clone(),
+                            cmp_op: operator,
+                            cmp_expr: *rhs,
                         }));
                     }
                     _ => {}
                 }
             }
 
-            if let Some(index_rc) =
-                rhs.check_index_scan(table_index, &table_reference, available_indexes)?
+            if let Some(index_index) =
+                rhs.check_index_scan(table_index, referenced_tables, available_indexes)?
             {
                 match operator {
                     ast::Operator::Equals
@@ -597,41 +833,24 @@ pub fn try_extract_index_search_expression(
                     | ast::Operator::GreaterEquals
                     | ast::Operator::Less
                     | ast::Operator::LessEquals => {
-                        let lhs_owned = lhs.take_ownership();
-                        return Ok(Some(Search::IndexSearch {
-                            index: index_rc,
-                            cmp_op: opposite_cmp_op(*operator),
-                            cmp_expr: WhereTerm {
-                                expr: lhs_owned,
-                                from_outer_join: cond.from_outer_join,
-                                eval_at: cond.eval_at,
-                            },
+                        return Ok(Either::Right(Search::IndexSearch {
+                            index: available_indexes[index_index].clone(),
+                            cmp_op: operator,
+                            cmp_expr: *lhs,
                         }));
                     }
                     _ => {}
                 }
             }
 
-            Ok(None)
+            Ok(Either::Left(ast::Expr::Binary(lhs, operator, rhs)))
         }
-        _ => Ok(None),
+        _ => Ok(Either::Left(expr)),
     }
 }
 
-fn rewrite_expr(expr: &mut ast::Expr) -> Result<()> {
+fn convert_between_expr(expr: ast::Expr) -> ast::Expr {
     match expr {
-        ast::Expr::Id(id) => {
-            // Convert "true" and "false" to 1 and 0
-            if id.0.eq_ignore_ascii_case("true") {
-                *expr = ast::Expr::Literal(ast::Literal::Numeric(1.to_string()));
-                return Ok(());
-            }
-            if id.0.eq_ignore_ascii_case("false") {
-                *expr = ast::Expr::Literal(ast::Literal::Numeric(0.to_string()));
-                return Ok(());
-            }
-            Ok(())
-        }
         ast::Expr::Between {
             lhs,
             not,
@@ -639,66 +858,53 @@ fn rewrite_expr(expr: &mut ast::Expr) -> Result<()> {
             end,
         } => {
             // Convert `y NOT BETWEEN x AND z` to `x > y OR y > z`
-            let (lower_op, upper_op) = if *not {
+            let (lower_op, upper_op) = if not {
                 (ast::Operator::Greater, ast::Operator::Greater)
             } else {
                 // Convert `y BETWEEN x AND z` to `x <= y AND y <= z`
                 (ast::Operator::LessEquals, ast::Operator::LessEquals)
             };
 
-            rewrite_expr(start)?;
-            rewrite_expr(lhs)?;
-            rewrite_expr(end)?;
+            let lower_bound = ast::Expr::Binary(start, lower_op, lhs.clone());
+            let upper_bound = ast::Expr::Binary(lhs, upper_op, end);
 
-            let start = start.take_ownership();
-            let lhs = lhs.take_ownership();
-            let end = end.take_ownership();
-
-            let lower_bound = ast::Expr::Binary(Box::new(start), lower_op, Box::new(lhs.clone()));
-            let upper_bound = ast::Expr::Binary(Box::new(lhs), upper_op, Box::new(end));
-
-            if *not {
-                *expr = ast::Expr::Binary(
+            if not {
+                ast::Expr::Binary(
                     Box::new(lower_bound),
                     ast::Operator::Or,
                     Box::new(upper_bound),
-                );
+                )
             } else {
-                *expr = ast::Expr::Binary(
+                ast::Expr::Binary(
                     Box::new(lower_bound),
                     ast::Operator::And,
                     Box::new(upper_bound),
-                );
+                )
             }
-            Ok(())
         }
-        ast::Expr::Parenthesized(ref mut exprs) => {
-            for subexpr in exprs.iter_mut() {
-                rewrite_expr(subexpr)?;
-            }
-            let exprs = std::mem::take(exprs);
-            *expr = ast::Expr::Parenthesized(exprs);
-            Ok(())
+        ast::Expr::Parenthesized(mut exprs) => {
+            ast::Expr::Parenthesized(exprs.drain(..).map(convert_between_expr).collect())
         }
         // Process other expressions recursively
-        ast::Expr::Binary(lhs, _, rhs) => {
-            rewrite_expr(lhs)?;
-            rewrite_expr(rhs)?;
-            Ok(())
-        }
-        ast::Expr::FunctionCall { args, .. } => {
-            if let Some(args) = args {
-                for arg in args.iter_mut() {
-                    rewrite_expr(arg)?;
-                }
-            }
-            Ok(())
-        }
-        ast::Expr::Unary(_, arg) => {
-            rewrite_expr(arg)?;
-            Ok(())
-        }
-        _ => Ok(()),
+        ast::Expr::Binary(lhs, op, rhs) => ast::Expr::Binary(
+            Box::new(convert_between_expr(*lhs)),
+            op,
+            Box::new(convert_between_expr(*rhs)),
+        ),
+        ast::Expr::FunctionCall {
+            name,
+            distinctness,
+            args,
+            order_by,
+            filter_over,
+        } => ast::Expr::FunctionCall {
+            name,
+            distinctness,
+            args: args.map(|args| args.into_iter().map(convert_between_expr).collect()),
+            order_by,
+            filter_over,
+        },
+        _ => expr,
     }
 }
 
@@ -709,5 +915,11 @@ trait TakeOwnership {
 impl TakeOwnership for ast::Expr {
     fn take_ownership(&mut self) -> Self {
         std::mem::replace(self, ast::Expr::Literal(ast::Literal::Null))
+    }
+}
+
+impl TakeOwnership for SourceOperator {
+    fn take_ownership(&mut self) -> Self {
+        std::mem::replace(self, SourceOperator::Nothing)
     }
 }

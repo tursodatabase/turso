@@ -19,137 +19,524 @@
 
 pub mod builder;
 pub mod explain;
-pub mod insn;
-pub mod likeop;
 pub mod sorter;
 
+mod datetime;
+
 use crate::error::{LimboError, SQLITE_CONSTRAINT_PRIMARYKEY};
-use crate::ext::ExtValue;
-use crate::function::{AggFunc, ExtFunc, FuncCtx, MathFunc, MathFuncArity, ScalarFunc, VectorFunc};
-use crate::functions::datetime::{
-    exec_date, exec_datetime_full, exec_julianday, exec_strftime, exec_time, exec_unixepoch,
-};
-use crate::functions::printf::exec_printf;
-use crate::info;
+#[cfg(feature = "uuid")]
+use crate::ext::{exec_ts_from_uuid7, exec_uuid, exec_uuidblob, exec_uuidstr, ExtFunc, UuidFunc};
+use crate::function::{AggFunc, FuncCtx, MathFunc, MathFuncArity, ScalarFunc};
 use crate::pseudo::PseudoCursor;
-use crate::result::LimboResult;
-use crate::schema::{affinity, Affinity};
+use crate::schema::Table;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
-use crate::storage::wal::CheckpointResult;
 use crate::storage::{btree::BTreeCursor, pager::Pager};
-use crate::translate::plan::{ResultSetColumn, TableReference};
 use crate::types::{
-    AggContext, Cursor, CursorResult, ExternalAggState, OwnedValue, Record, SeekKey, SeekOp,
+    AggContext, Cursor, CursorResult, OwnedRecord, OwnedValue, Record, SeekKey, SeekOp,
 };
-use crate::util::{
-    cast_real_to_integer, cast_text_to_integer, cast_text_to_numeric, cast_text_to_real,
-    checked_cast_text_to_numeric, parse_schema_rows, RoundToPrecision,
-};
-use crate::vdbe::builder::CursorType;
-use crate::vdbe::insn::Insn;
-use crate::vector::{vector32, vector64, vector_distance_cos, vector_extract};
+use crate::util::parse_schema_rows;
 #[cfg(feature = "json")]
-use crate::{
-    function::JsonFunc, json::get_json, json::is_json_valid, json::json_array,
-    json::json_array_length, json::json_arrow_extract, json::json_arrow_shift_extract,
-    json::json_error_position, json::json_extract, json::json_object, json::json_patch,
-    json::json_quote, json::json_remove, json::json_set, json::json_type,
-};
-use crate::{resolve_ext_path, Connection, Result, TransactionState, DATABASE_VERSION};
-use insn::{
-    exec_add, exec_and, exec_bit_and, exec_bit_not, exec_bit_or, exec_boolean_not, exec_concat,
-    exec_divide, exec_multiply, exec_or, exec_remainder, exec_shift_left, exec_shift_right,
-    exec_subtract, Cookie,
-};
-use likeop::{construct_like_escape_arg, exec_glob, exec_like_with_escape};
+use crate::{function::JsonFunc, json::get_json, json::json_array};
+use crate::{Connection, Result, TransactionState};
+use crate::{Rows, DATABASE_VERSION};
+use macros::Description;
+
+use datetime::{exec_date, exec_time, exec_unixepoch};
+
 use rand::distributions::{Distribution, Uniform};
 use rand::{thread_rng, Rng};
-use regex::{Regex, RegexBuilder};
-use sorter::Sorter;
-use std::borrow::BorrowMut;
-use std::cell::{Cell, RefCell, RefMut};
-use std::collections::HashMap;
-use std::ffi::c_void;
-use std::num::NonZero;
+use regex::Regex;
+use std::borrow::{Borrow, BorrowMut};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::{Rc, Weak};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-/// Represents a target for a jump instruction.
-/// Stores 32-bit ints to keep the enum word-sized.
-pub enum BranchOffset {
-    /// A label is a named location in the program.
-    /// If there are references to it, it must always be resolved to an Offset
-    /// via program.resolve_label().
-    Label(u32),
-    /// An offset is a direct index into the instruction list.
-    Offset(InsnReference),
-    /// A placeholder is a temporary value to satisfy the compiler.
-    /// It must be set later.
-    Placeholder,
-}
-
-impl BranchOffset {
-    /// Returns true if the branch offset is a label.
-    pub fn is_label(&self) -> bool {
-        matches!(self, BranchOffset::Label(_))
-    }
-
-    /// Returns true if the branch offset is an offset.
-    pub fn is_offset(&self) -> bool {
-        matches!(self, BranchOffset::Offset(_))
-    }
-
-    /// Returns the offset value. Panics if the branch offset is a label or placeholder.
-    pub fn to_offset_int(&self) -> InsnReference {
-        match self {
-            BranchOffset::Label(v) => unreachable!("Unresolved label: {}", v),
-            BranchOffset::Offset(v) => *v,
-            BranchOffset::Placeholder => unreachable!("Unresolved placeholder"),
-        }
-    }
-
-    /// Returns the label value. Panics if the branch offset is an offset or placeholder.
-    pub fn to_label_value(&self) -> u32 {
-        match self {
-            BranchOffset::Label(v) => *v,
-            BranchOffset::Offset(_) => unreachable!("Offset cannot be converted to label value"),
-            BranchOffset::Placeholder => unreachable!("Unresolved placeholder"),
-        }
-    }
-
-    /// Returns the branch offset as a signed integer.
-    /// Used in explain output, where we don't want to panic in case we have an unresolved
-    /// label or placeholder.
-    pub fn to_debug_int(&self) -> i32 {
-        match self {
-            BranchOffset::Label(v) => *v as i32,
-            BranchOffset::Offset(v) => *v as i32,
-            BranchOffset::Placeholder => i32::MAX,
-        }
-    }
-
-    /// Adds an integer value to the branch offset.
-    /// Returns a new branch offset.
-    /// Panics if the branch offset is a label or placeholder.
-    pub fn add<N: Into<u32>>(self, n: N) -> BranchOffset {
-        BranchOffset::Offset(self.to_offset_int() + n.into())
-    }
-}
-
+pub type BranchOffset = i64;
 pub type CursorID = usize;
 
 pub type PageIdx = usize;
 
-// Index of insn in list of insns
-type InsnReference = u32;
+#[derive(Description, Debug)]
+pub enum Insn {
+    // Initialize the program state and jump to the given PC.
+    Init {
+        target_pc: BranchOffset,
+    },
+    // Write a NULL into register dest. If dest_end is Some, then also write NULL into register dest_end and every register in between dest and dest_end. If dest_end is not set, then only register dest is set to NULL.
+    Null {
+        dest: usize,
+        dest_end: Option<usize>,
+    },
+    // Move the cursor P1 to a null row. Any Column operations that occur while the cursor is on the null row will always write a NULL.
+    NullRow {
+        cursor_id: CursorID,
+    },
+    // Add two registers and store the result in a third register.
+    Add {
+        lhs: usize,
+        rhs: usize,
+        dest: usize,
+    },
+    // Subtract rhs from lhs and store in dest
+    Subtract {
+        lhs: usize,
+        rhs: usize,
+        dest: usize,
+    },
+    // Multiply two registers and store the result in a third register.
+    Multiply {
+        lhs: usize,
+        rhs: usize,
+        dest: usize,
+    },
+    // Divide lhs by rhs and store the result in a third register.
+    Divide {
+        lhs: usize,
+        rhs: usize,
+        dest: usize,
+    },
+    // Compare two vectors of registers in reg(P1)..reg(P1+P3-1) (call this vector "A") and in reg(P2)..reg(P2+P3-1) ("B"). Save the result of the comparison for use by the next Jump instruct.
+    Compare {
+        start_reg_a: usize,
+        start_reg_b: usize,
+        count: usize,
+    },
+    // Place the result of rhs bitwise AND lhs in third register.
+    BitAnd {
+        lhs: usize,
+        rhs: usize,
+        dest: usize,
+    },
+    // Place the result of rhs bitwise OR lhs in third register.
+    BitOr {
+        lhs: usize,
+        rhs: usize,
+        dest: usize,
+    },
+    // Place the result of bitwise NOT register P1 in dest register.
+    BitNot {
+        reg: usize,
+        dest: usize,
+    },
+    // Jump to the instruction at address P1, P2, or P3 depending on whether in the most recent Compare instruction the P1 vector was less than, equal to, or greater than the P2 vector, respectively.
+    Jump {
+        target_pc_lt: BranchOffset,
+        target_pc_eq: BranchOffset,
+        target_pc_gt: BranchOffset,
+    },
+    // Move the P3 values in register P1..P1+P3-1 over into registers P2..P2+P3-1. Registers P1..P1+P3-1 are left holding a NULL. It is an error for register ranges P1..P1+P3-1 and P2..P2+P3-1 to overlap. It is an error for P3 to be less than 1.
+    Move {
+        source_reg: usize,
+        dest_reg: usize,
+        count: usize,
+    },
+    // If the given register is a positive integer, decrement it by decrement_by and jump to the given PC.
+    IfPos {
+        reg: usize,
+        target_pc: BranchOffset,
+        decrement_by: usize,
+    },
+    // If the given register is not NULL, jump to the given PC.
+    NotNull {
+        reg: usize,
+        target_pc: BranchOffset,
+    },
+    // Compare two registers and jump to the given PC if they are equal.
+    Eq {
+        lhs: usize,
+        rhs: usize,
+        target_pc: BranchOffset,
+    },
+    // Compare two registers and jump to the given PC if they are not equal.
+    Ne {
+        lhs: usize,
+        rhs: usize,
+        target_pc: BranchOffset,
+    },
+    // Compare two registers and jump to the given PC if the left-hand side is less than the right-hand side.
+    Lt {
+        lhs: usize,
+        rhs: usize,
+        target_pc: BranchOffset,
+    },
+    // Compare two registers and jump to the given PC if the left-hand side is less than or equal to the right-hand side.
+    Le {
+        lhs: usize,
+        rhs: usize,
+        target_pc: BranchOffset,
+    },
+    // Compare two registers and jump to the given PC if the left-hand side is greater than the right-hand side.
+    Gt {
+        lhs: usize,
+        rhs: usize,
+        target_pc: BranchOffset,
+    },
+    // Compare two registers and jump to the given PC if the left-hand side is greater than or equal to the right-hand side.
+    Ge {
+        lhs: usize,
+        rhs: usize,
+        target_pc: BranchOffset,
+    },
+    /// Jump to target_pc if r\[reg\] != 0 or (r\[reg\] == NULL && r\[null_reg\] != 0)
+    If {
+        reg: usize,              // P1
+        target_pc: BranchOffset, // P2
+        /// P3. If r\[reg\] is null, jump iff r\[null_reg\] != 0
+        null_reg: usize,
+    },
+    /// Jump to target_pc if r\[reg\] != 0 or (r\[reg\] == NULL && r\[null_reg\] != 0)
+    IfNot {
+        reg: usize,              // P1
+        target_pc: BranchOffset, // P2
+        /// P3. If r\[reg\] is null, jump iff r\[null_reg\] != 0
+        null_reg: usize,
+    },
+    // Open a cursor for reading.
+    OpenReadAsync {
+        cursor_id: CursorID,
+        root_page: PageIdx,
+    },
 
-#[derive(Debug)]
-pub enum StepResult {
+    // Await for the completion of open cursor.
+    OpenReadAwait,
+
+    // Open a cursor for a pseudo-table that contains a single row.
+    OpenPseudo {
+        cursor_id: CursorID,
+        content_reg: usize,
+        num_fields: usize,
+    },
+
+    // Rewind the cursor to the beginning of the B-Tree.
+    RewindAsync {
+        cursor_id: CursorID,
+    },
+
+    // Await for the completion of cursor rewind.
+    RewindAwait {
+        cursor_id: CursorID,
+        pc_if_empty: BranchOffset,
+    },
+
+    LastAsync {
+        cursor_id: CursorID,
+    },
+
+    LastAwait {
+        cursor_id: CursorID,
+        pc_if_empty: BranchOffset,
+    },
+
+    // Read a column from the current row of the cursor.
+    Column {
+        cursor_id: CursorID,
+        column: usize,
+        dest: usize,
+    },
+
+    // Make a record and write it to destination register.
+    MakeRecord {
+        start_reg: usize, // P1
+        count: usize,     // P2
+        dest_reg: usize,  // P3
+    },
+
+    // Emit a row of results.
+    ResultRow {
+        start_reg: usize, // P1
+        count: usize,     // P2
+    },
+
+    // Advance the cursor to the next row.
+    NextAsync {
+        cursor_id: CursorID,
+    },
+
+    // Await for the completion of cursor advance.
+    NextAwait {
+        cursor_id: CursorID,
+        pc_if_next: BranchOffset,
+    },
+
+    PrevAsync {
+        cursor_id: CursorID,
+    },
+
+    PrevAwait {
+        cursor_id: CursorID,
+        pc_if_next: BranchOffset,
+    },
+
+    // Halt the program.
+    Halt {
+        err_code: usize,
+        description: String,
+    },
+
+    // Start a transaction.
+    Transaction {
+        write: bool,
+    },
+
+    // Branch to the given PC.
+    Goto {
+        target_pc: BranchOffset,
+    },
+
+    // Stores the current program counter into register 'return_reg' then jumps to address target_pc.
+    Gosub {
+        target_pc: BranchOffset,
+        return_reg: usize,
+    },
+
+    // Returns to the program counter stored in register 'return_reg'.
+    Return {
+        return_reg: usize,
+    },
+
+    // Write an integer value into a register.
+    Integer {
+        value: i64,
+        dest: usize,
+    },
+
+    // Write a float value into a register
+    Real {
+        value: f64,
+        dest: usize,
+    },
+
+    // If register holds an integer, transform it to a float
+    RealAffinity {
+        register: usize,
+    },
+
+    // Write a string value into a register.
+    String8 {
+        value: String,
+        dest: usize,
+    },
+
+    // Write a blob value into a register.
+    Blob {
+        value: Vec<u8>,
+        dest: usize,
+    },
+
+    // Read the rowid of the current row.
+    RowId {
+        cursor_id: CursorID,
+        dest: usize,
+    },
+
+    // Seek to a rowid in the cursor. If not found, jump to the given PC. Otherwise, continue to the next instruction.
+    SeekRowid {
+        cursor_id: CursorID,
+        src_reg: usize,
+        target_pc: BranchOffset,
+    },
+
+    // P1 is an open index cursor and P3 is a cursor on the corresponding table. This opcode does a deferred seek of the P3 table cursor to the row that corresponds to the current row of P1.
+    // This is a deferred seek. Nothing actually happens until the cursor is used to read a record. That way, if no reads occur, no unnecessary I/O happens.
+    DeferredSeek {
+        index_cursor_id: CursorID,
+        table_cursor_id: CursorID,
+    },
+
+    // If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.
+    // If cursor_id refers to an SQL index, then start_reg is the first in an array of num_regs registers that are used as an unpacked index key.
+    // Seek to the first index entry that is greater than or equal to the given key. If not found, jump to the given PC. Otherwise, continue to the next instruction.
+    SeekGE {
+        is_index: bool,
+        cursor_id: CursorID,
+        start_reg: usize,
+        num_regs: usize,
+        target_pc: BranchOffset,
+    },
+
+    // If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.
+    // If cursor_id refers to an SQL index, then start_reg is the first in an array of num_regs registers that are used as an unpacked index key.
+    // Seek to the first index entry that is greater than the given key. If not found, jump to the given PC. Otherwise, continue to the next instruction.
+    SeekGT {
+        is_index: bool,
+        cursor_id: CursorID,
+        start_reg: usize,
+        num_regs: usize,
+        target_pc: BranchOffset,
+    },
+
+    // The P4 register values beginning with P3 form an unpacked index key that omits the PRIMARY KEY. Compare this key value against the index that P1 is currently pointing to, ignoring the PRIMARY KEY or ROWID fields at the end.
+    // If the P1 index entry is greater or equal than the key value then jump to P2. Otherwise fall through to the next instruction.
+    IdxGE {
+        cursor_id: CursorID,
+        start_reg: usize,
+        num_regs: usize,
+        target_pc: BranchOffset,
+    },
+
+    // The P4 register values beginning with P3 form an unpacked index key that omits the PRIMARY KEY. Compare this key value against the index that P1 is currently pointing to, ignoring the PRIMARY KEY or ROWID fields at the end.
+    // If the P1 index entry is greater than the key value then jump to P2. Otherwise fall through to the next instruction.
+    IdxGT {
+        cursor_id: CursorID,
+        start_reg: usize,
+        num_regs: usize,
+        target_pc: BranchOffset,
+    },
+
+    // Decrement the given register and jump to the given PC if the result is zero.
+    DecrJumpZero {
+        reg: usize,
+        target_pc: BranchOffset,
+    },
+
+    AggStep {
+        acc_reg: usize,
+        col: usize,
+        delimiter: usize,
+        func: AggFunc,
+    },
+
+    AggFinal {
+        register: usize,
+        func: AggFunc,
+    },
+
+    // Open a sorter.
+    SorterOpen {
+        cursor_id: CursorID, // P1
+        columns: usize,      // P2
+        order: OwnedRecord,  // P4. 0 if ASC and 1 if DESC
+    },
+
+    // Insert a row into the sorter.
+    SorterInsert {
+        cursor_id: CursorID,
+        record_reg: usize,
+    },
+
+    // Sort the rows in the sorter.
+    SorterSort {
+        cursor_id: CursorID,
+        pc_if_empty: BranchOffset,
+    },
+
+    // Retrieve the next row from the sorter.
+    SorterData {
+        cursor_id: CursorID,  // P1
+        dest_reg: usize,      // P2
+        pseudo_cursor: usize, // P3
+    },
+
+    // Advance to the next row in the sorter.
+    SorterNext {
+        cursor_id: CursorID,
+        pc_if_next: BranchOffset,
+    },
+
+    // Function
+    Function {
+        constant_mask: i32, // P1
+        start_reg: usize,   // P2, start of argument registers
+        dest: usize,        // P3
+        func: FuncCtx,      // P4
+    },
+
+    InitCoroutine {
+        yield_reg: usize,
+        jump_on_definition: BranchOffset,
+        start_offset: BranchOffset,
+    },
+
+    EndCoroutine {
+        yield_reg: usize,
+    },
+
+    Yield {
+        yield_reg: usize,
+        end_offset: BranchOffset,
+    },
+
+    InsertAsync {
+        cursor: CursorID,
+        key_reg: usize,    // Must be int.
+        record_reg: usize, // Blob of record data.
+        flag: usize,       // Flags used by insert, for now not used.
+    },
+
+    InsertAwait {
+        cursor_id: usize,
+    },
+
+    NewRowid {
+        cursor: CursorID,        // P1
+        rowid_reg: usize,        // P2  Destination register to store the new rowid
+        prev_largest_reg: usize, // P3 Previous largest rowid in the table (Not used for now)
+    },
+
+    MustBeInt {
+        reg: usize,
+    },
+
+    SoftNull {
+        reg: usize,
+    },
+
+    NotExists {
+        cursor: CursorID,
+        rowid_reg: usize,
+        target_pc: BranchOffset,
+    },
+
+    OpenWriteAsync {
+        cursor_id: CursorID,
+        root_page: PageIdx,
+    },
+
+    OpenWriteAwait {},
+
+    Copy {
+        src_reg: usize,
+        dst_reg: usize,
+        amount: usize, // 0 amount means we include src_reg, dst_reg..=dst_reg+amount = src_reg..=src_reg+amount
+    },
+
+    /// Allocate a new b-tree.
+    CreateBtree {
+        /// Allocate b-tree in main database if zero or in temp database if non-zero (P1).
+        db: usize,
+        /// The root page of the new b-tree (P2).
+        root: usize,
+        /// Flags (P3).
+        flags: usize,
+    },
+
+    /// Close a cursor.
+    Close {
+        cursor_id: CursorID,
+    },
+
+    /// Check if the register is null.
+    IsNull {
+        /// Source register (P1).
+        src: usize,
+
+        /// Jump to this PC if the register is null (P2).
+        target_pc: BranchOffset,
+    },
+    ParseSchema {
+        db: usize,
+        where_clause: String,
+    },
+}
+
+// Index of insn in list of insns
+type InsnReference = usize;
+
+pub enum StepResult<'a> {
     Done,
     IO,
-    Row,
+    Row(Record<'a>),
     Interrupt,
-    Busy,
 }
 
 /// If there is I/O, the instruction is restarted.
@@ -163,197 +550,45 @@ macro_rules! return_if_io {
     };
 }
 
-macro_rules! call_external_function {
-    (
-        $func_ptr:expr,
-        $dest_register:expr,
-        $state:expr,
-        $arg_count:expr,
-        $start_reg:expr
-    ) => {{
-        if $arg_count == 0 {
-            let result_c_value: ExtValue = unsafe { ($func_ptr)(0, std::ptr::null()) };
-            match OwnedValue::from_ffi(result_c_value) {
-                Ok(result_ov) => {
-                    $state.registers[$dest_register] = result_ov;
-                }
-                Err(e) => {
-                    return Err(e);
-                }
-            }
-        } else {
-            let register_slice = &$state.registers[$start_reg..$start_reg + $arg_count];
-            let mut ext_values: Vec<ExtValue> = Vec::with_capacity($arg_count);
-            for ov in register_slice.iter() {
-                let val = ov.to_ffi();
-                ext_values.push(val);
-            }
-            let argv_ptr = ext_values.as_ptr();
-            let result_c_value: ExtValue = unsafe { ($func_ptr)($arg_count as i32, argv_ptr) };
-            for arg in ext_values {
-                unsafe { arg.free() };
-            }
-            match OwnedValue::from_ffi(result_c_value) {
-                Ok(result_ov) => {
-                    $state.registers[$dest_register] = result_ov;
-                }
-                Err(e) => {
-                    return Err(e);
-                }
-            }
-        }
-    }};
-}
-
 struct RegexCache {
     like: HashMap<String, Regex>,
     glob: HashMap<String, Regex>,
 }
-
 impl RegexCache {
     fn new() -> Self {
-        Self {
+        RegexCache {
             like: HashMap::new(),
             glob: HashMap::new(),
         }
     }
 }
 
-fn get_cursor_as_table_mut<'long, 'short>(
-    cursors: &'short mut RefMut<'long, Vec<Option<Cursor>>>,
-    cursor_id: CursorID,
-) -> &'short mut BTreeCursor {
-    let cursor = cursors
-        .get_mut(cursor_id)
-        .expect("cursor id out of bounds")
-        .as_mut()
-        .expect("cursor not allocated")
-        .as_table_mut();
-    cursor
-}
-
-fn get_cursor_as_index_mut<'long, 'short>(
-    cursors: &'short mut RefMut<'long, Vec<Option<Cursor>>>,
-    cursor_id: CursorID,
-) -> &'short mut BTreeCursor {
-    let cursor = cursors
-        .get_mut(cursor_id)
-        .expect("cursor id out of bounds")
-        .as_mut()
-        .expect("cursor not allocated")
-        .as_index_mut();
-    cursor
-}
-
-fn get_cursor_as_pseudo_mut<'long, 'short>(
-    cursors: &'short mut RefMut<'long, Vec<Option<Cursor>>>,
-    cursor_id: CursorID,
-) -> &'short mut PseudoCursor {
-    let cursor = cursors
-        .get_mut(cursor_id)
-        .expect("cursor id out of bounds")
-        .as_mut()
-        .expect("cursor not allocated")
-        .as_pseudo_mut();
-    cursor
-}
-
-fn get_cursor_as_sorter_mut<'long, 'short>(
-    cursors: &'short mut RefMut<'long, Vec<Option<Cursor>>>,
-    cursor_id: CursorID,
-) -> &'short mut Sorter {
-    let cursor = cursors
-        .get_mut(cursor_id)
-        .expect("cursor id out of bounds")
-        .as_mut()
-        .expect("cursor not allocated")
-        .as_sorter_mut();
-    cursor
-}
-
-fn get_cursor_as_virtual_mut<'long, 'short>(
-    cursors: &'short mut RefMut<'long, Vec<Option<Cursor>>>,
-    cursor_id: CursorID,
-) -> &'short mut VTabOpaqueCursor {
-    let cursor = cursors
-        .get_mut(cursor_id)
-        .expect("cursor id out of bounds")
-        .as_mut()
-        .expect("cursor not allocated")
-        .as_virtual_mut();
-    cursor
-}
-
-struct Bitfield<const N: usize>([u64; N]);
-
-impl<const N: usize> Bitfield<N> {
-    fn new() -> Self {
-        Self([0; N])
-    }
-
-    fn set(&mut self, bit: usize) {
-        assert!(bit < N * 64, "bit out of bounds");
-        self.0[bit / 64] |= 1 << (bit % 64);
-    }
-
-    fn unset(&mut self, bit: usize) {
-        assert!(bit < N * 64, "bit out of bounds");
-        self.0[bit / 64] &= !(1 << (bit % 64));
-    }
-
-    fn get(&self, bit: usize) -> bool {
-        assert!(bit < N * 64, "bit out of bounds");
-        (self.0[bit / 64] & (1 << (bit % 64))) != 0
-    }
-}
-
-pub struct VTabOpaqueCursor(*const c_void);
-
-impl VTabOpaqueCursor {
-    pub fn new(cursor: *const c_void) -> Result<Self> {
-        if cursor.is_null() {
-            return Err(LimboError::InternalError(
-                "VTabOpaqueCursor: cursor is null".into(),
-            ));
-        }
-        Ok(Self(cursor))
-    }
-
-    pub fn as_ptr(&self) -> *const c_void {
-        self.0
-    }
-}
-
 /// The program state describes the environment in which the program executes.
 pub struct ProgramState {
-    pub pc: InsnReference,
-    cursors: RefCell<Vec<Option<Cursor>>>,
+    pub pc: BranchOffset,
+    cursors: RefCell<BTreeMap<CursorID, Box<dyn Cursor>>>,
     registers: Vec<OwnedValue>,
-    pub(crate) result_row: Option<Record>,
     last_compare: Option<std::cmp::Ordering>,
     deferred_seek: Option<(CursorID, CursorID)>,
-    ended_coroutine: Bitfield<4>, // flag to indicate that a coroutine has ended (key is the yield register. currently we assume that the yield register is always between 0-255, YOLO)
+    ended_coroutine: bool, // flag to notify yield coroutine finished
     regex_cache: RegexCache,
     interrupted: bool,
-    parameters: HashMap<NonZero<usize>, OwnedValue>,
 }
 
 impl ProgramState {
-    pub fn new(max_registers: usize, max_cursors: usize) -> Self {
-        let cursors: RefCell<Vec<Option<Cursor>>> =
-            RefCell::new((0..max_cursors).map(|_| None).collect());
-        let registers = vec![OwnedValue::Null; max_registers];
+    pub fn new(max_registers: usize) -> Self {
+        let cursors = RefCell::new(BTreeMap::new());
+        let mut registers = Vec::with_capacity(max_registers);
+        registers.resize(max_registers, OwnedValue::Null);
         Self {
             pc: 0,
             cursors,
             registers,
-            result_row: None,
             last_compare: None,
             deferred_seek: None,
-            ended_coroutine: Bitfield::new(),
+            ended_coroutine: false,
             regex_cache: RegexCache::new(),
             interrupted: false,
-            parameters: HashMap::new(),
         }
     }
 
@@ -372,57 +607,17 @@ impl ProgramState {
     pub fn is_interrupted(&self) -> bool {
         self.interrupted
     }
-
-    pub fn bind_at(&mut self, index: NonZero<usize>, value: OwnedValue) {
-        self.parameters.insert(index, value);
-    }
-
-    pub fn get_parameter(&self, index: NonZero<usize>) -> Option<&OwnedValue> {
-        self.parameters.get(&index)
-    }
-
-    pub fn reset(&mut self) {
-        self.pc = 0;
-        self.cursors.borrow_mut().iter_mut().for_each(|c| *c = None);
-        self.registers
-            .iter_mut()
-            .for_each(|r| *r = OwnedValue::Null);
-        self.last_compare = None;
-        self.deferred_seek = None;
-        self.ended_coroutine.0 = [0; 4];
-        self.regex_cache.like.clear();
-        self.interrupted = false;
-        self.parameters.clear();
-    }
-}
-
-macro_rules! must_be_btree_cursor {
-    ($cursor_id:expr, $cursor_ref:expr, $cursors:expr, $insn_name:expr) => {{
-        let (_, cursor_type) = $cursor_ref.get($cursor_id).unwrap();
-        let cursor = match cursor_type {
-            CursorType::BTreeTable(_) => get_cursor_as_table_mut(&mut $cursors, $cursor_id),
-            CursorType::BTreeIndex(_) => get_cursor_as_index_mut(&mut $cursors, $cursor_id),
-            CursorType::Pseudo(_) => panic!("{} on pseudo cursor", $insn_name),
-            CursorType::Sorter => panic!("{} on sorter cursor", $insn_name),
-            CursorType::VirtualTable(_) => panic!("{} on virtual table cursor", $insn_name),
-        };
-        cursor
-    }};
 }
 
 #[derive(Debug)]
 pub struct Program {
     pub max_registers: usize,
     pub insns: Vec<Insn>,
-    pub cursor_ref: Vec<(Option<String>, CursorType)>,
+    pub cursor_ref: Vec<(Option<String>, Option<Table>)>,
     pub database_header: Rc<RefCell<DatabaseHeader>>,
-    pub comments: Option<HashMap<InsnReference, &'static str>>,
-    pub parameters: crate::parameters::Parameters,
+    pub comments: HashMap<BranchOffset, &'static str>,
     pub connection: Weak<Connection>,
-    pub n_change: Cell<i64>,
-    pub change_cnt_on: bool,
-    pub result_columns: Vec<ResultSetColumn>,
-    pub table_references: Vec<TableReference>,
+    pub auto_commit: bool,
 }
 
 impl Program {
@@ -444,80 +639,579 @@ impl Program {
         }
     }
 
-    pub fn step(&self, state: &mut ProgramState, pager: Rc<Pager>) -> Result<StepResult> {
+    pub fn step<'a>(
+        &self,
+        state: &'a mut ProgramState,
+        pager: Rc<Pager>,
+    ) -> Result<StepResult<'a>> {
         loop {
             if state.is_interrupted() {
                 return Ok(StepResult::Interrupt);
             }
             let insn = &self.insns[state.pc as usize];
             trace_insn(self, state.pc as InsnReference, insn);
+            let mut cursors = state.cursors.borrow_mut();
             match insn {
                 Insn::Init { target_pc } => {
-                    assert!(target_pc.is_offset());
-                    state.pc = target_pc.to_offset_int();
+                    assert!(*target_pc >= 0);
+                    state.pc = *target_pc;
                 }
                 Insn::Add { lhs, rhs, dest } => {
-                    state.registers[*dest] =
-                        exec_add(&state.registers[*lhs], &state.registers[*rhs]);
+                    let lhs = *lhs;
+                    let rhs = *rhs;
+                    let dest = *dest;
+                    match (&state.registers[lhs], &state.registers[rhs]) {
+                        (OwnedValue::Integer(lhs), OwnedValue::Integer(rhs)) => {
+                            state.registers[dest] = OwnedValue::Integer(lhs + rhs);
+                        }
+                        (OwnedValue::Float(lhs), OwnedValue::Float(rhs)) => {
+                            state.registers[dest] = OwnedValue::Float(lhs + rhs);
+                        }
+                        (OwnedValue::Float(f), OwnedValue::Integer(i))
+                        | (OwnedValue::Integer(i), OwnedValue::Float(f)) => {
+                            state.registers[dest] = OwnedValue::Float(*f + *i as f64);
+                        }
+                        (OwnedValue::Null, _) | (_, OwnedValue::Null) => {
+                            state.registers[dest] = OwnedValue::Null;
+                        }
+                        (OwnedValue::Agg(aggctx), other) | (other, OwnedValue::Agg(aggctx)) => {
+                            match other {
+                                OwnedValue::Null => {
+                                    state.registers[dest] = OwnedValue::Null;
+                                }
+                                OwnedValue::Integer(i) => match aggctx.final_value() {
+                                    OwnedValue::Float(acc) => {
+                                        state.registers[dest] = OwnedValue::Float(acc + *i as f64);
+                                    }
+                                    OwnedValue::Integer(acc) => {
+                                        state.registers[dest] = OwnedValue::Integer(acc + i);
+                                    }
+                                    _ => {
+                                        todo!("{:?}", aggctx);
+                                    }
+                                },
+                                OwnedValue::Float(f) => match aggctx.final_value() {
+                                    OwnedValue::Float(acc) => {
+                                        state.registers[dest] = OwnedValue::Float(acc + f);
+                                    }
+                                    OwnedValue::Integer(acc) => {
+                                        state.registers[dest] = OwnedValue::Float(*acc as f64 + f);
+                                    }
+                                    _ => {
+                                        todo!("{:?}", aggctx);
+                                    }
+                                },
+                                OwnedValue::Agg(aggctx2) => {
+                                    let acc = aggctx.final_value();
+                                    let acc2 = aggctx2.final_value();
+                                    match (acc, acc2) {
+                                        (OwnedValue::Integer(acc), OwnedValue::Integer(acc2)) => {
+                                            state.registers[dest] = OwnedValue::Integer(acc + acc2);
+                                        }
+                                        (OwnedValue::Float(acc), OwnedValue::Float(acc2)) => {
+                                            state.registers[dest] = OwnedValue::Float(acc + acc2);
+                                        }
+                                        (OwnedValue::Integer(acc), OwnedValue::Float(acc2)) => {
+                                            state.registers[dest] =
+                                                OwnedValue::Float(*acc as f64 + acc2);
+                                        }
+                                        (OwnedValue::Float(acc), OwnedValue::Integer(acc2)) => {
+                                            state.registers[dest] =
+                                                OwnedValue::Float(acc + *acc2 as f64);
+                                        }
+                                        _ => {
+                                            todo!("{:?} {:?}", acc, acc2);
+                                        }
+                                    }
+                                }
+                                rest => unimplemented!("{:?}", rest),
+                            }
+                        }
+                        _ => {
+                            todo!();
+                        }
+                    }
                     state.pc += 1;
                 }
                 Insn::Subtract { lhs, rhs, dest } => {
-                    state.registers[*dest] =
-                        exec_subtract(&state.registers[*lhs], &state.registers[*rhs]);
+                    let lhs = *lhs;
+                    let rhs = *rhs;
+                    let dest = *dest;
+                    match (&state.registers[lhs], &state.registers[rhs]) {
+                        (OwnedValue::Integer(lhs), OwnedValue::Integer(rhs)) => {
+                            state.registers[dest] = OwnedValue::Integer(lhs - rhs);
+                        }
+                        (OwnedValue::Float(lhs), OwnedValue::Float(rhs)) => {
+                            state.registers[dest] = OwnedValue::Float(lhs - rhs);
+                        }
+                        (OwnedValue::Float(lhs), OwnedValue::Integer(rhs)) => {
+                            state.registers[dest] = OwnedValue::Float(lhs - *rhs as f64);
+                        }
+                        (OwnedValue::Integer(lhs), OwnedValue::Float(rhs)) => {
+                            state.registers[dest] = OwnedValue::Float(*lhs as f64 - rhs);
+                        }
+                        (OwnedValue::Null, _) | (_, OwnedValue::Null) => {
+                            state.registers[dest] = OwnedValue::Null;
+                        }
+                        (OwnedValue::Agg(aggctx), rhs) => match rhs {
+                            OwnedValue::Null => {
+                                state.registers[dest] = OwnedValue::Null;
+                            }
+                            OwnedValue::Integer(i) => match aggctx.final_value() {
+                                OwnedValue::Float(acc) => {
+                                    state.registers[dest] = OwnedValue::Float(acc - *i as f64);
+                                }
+                                OwnedValue::Integer(acc) => {
+                                    state.registers[dest] = OwnedValue::Integer(acc - i);
+                                }
+                                _ => {
+                                    todo!("{:?}", aggctx);
+                                }
+                            },
+                            OwnedValue::Float(f) => match aggctx.final_value() {
+                                OwnedValue::Float(acc) => {
+                                    state.registers[dest] = OwnedValue::Float(acc - f);
+                                }
+                                OwnedValue::Integer(acc) => {
+                                    state.registers[dest] = OwnedValue::Float(*acc as f64 - f);
+                                }
+                                _ => {
+                                    todo!("{:?}", aggctx);
+                                }
+                            },
+                            OwnedValue::Agg(aggctx2) => {
+                                let acc = aggctx.final_value();
+                                let acc2 = aggctx2.final_value();
+                                match (acc, acc2) {
+                                    (OwnedValue::Integer(acc), OwnedValue::Integer(acc2)) => {
+                                        state.registers[dest] = OwnedValue::Integer(acc - acc2);
+                                    }
+                                    (OwnedValue::Float(acc), OwnedValue::Float(acc2)) => {
+                                        state.registers[dest] = OwnedValue::Float(acc - acc2);
+                                    }
+                                    (OwnedValue::Integer(acc), OwnedValue::Float(acc2)) => {
+                                        state.registers[dest] =
+                                            OwnedValue::Float(*acc as f64 - acc2);
+                                    }
+                                    (OwnedValue::Float(acc), OwnedValue::Integer(acc2)) => {
+                                        state.registers[dest] =
+                                            OwnedValue::Float(acc - *acc2 as f64);
+                                    }
+                                    _ => {
+                                        todo!("{:?} {:?}", acc, acc2);
+                                    }
+                                }
+                            }
+                            rest => unimplemented!("{:?}", rest),
+                        },
+                        (lhs, OwnedValue::Agg(aggctx)) => match lhs {
+                            OwnedValue::Null => {
+                                state.registers[dest] = OwnedValue::Null;
+                            }
+                            OwnedValue::Integer(i) => match aggctx.final_value() {
+                                OwnedValue::Float(acc) => {
+                                    state.registers[dest] = OwnedValue::Float(*i as f64 - acc);
+                                }
+                                OwnedValue::Integer(acc) => {
+                                    state.registers[dest] = OwnedValue::Integer(i - acc);
+                                }
+                                _ => {
+                                    todo!("{:?}", aggctx);
+                                }
+                            },
+                            OwnedValue::Float(f) => match aggctx.final_value() {
+                                OwnedValue::Float(acc) => {
+                                    state.registers[dest] = OwnedValue::Float(f - acc);
+                                }
+                                OwnedValue::Integer(acc) => {
+                                    state.registers[dest] = OwnedValue::Float(f - *acc as f64);
+                                }
+                                _ => {
+                                    todo!("{:?}", aggctx);
+                                }
+                            },
+                            rest => unimplemented!("{:?}", rest),
+                        },
+                        others => {
+                            todo!("{:?}", others);
+                        }
+                    }
                     state.pc += 1;
                 }
                 Insn::Multiply { lhs, rhs, dest } => {
-                    state.registers[*dest] =
-                        exec_multiply(&state.registers[*lhs], &state.registers[*rhs]);
+                    let lhs = *lhs;
+                    let rhs = *rhs;
+                    let dest = *dest;
+                    match (&state.registers[lhs], &state.registers[rhs]) {
+                        (OwnedValue::Integer(lhs), OwnedValue::Integer(rhs)) => {
+                            state.registers[dest] = OwnedValue::Integer(lhs * rhs);
+                        }
+                        (OwnedValue::Float(lhs), OwnedValue::Float(rhs)) => {
+                            state.registers[dest] = OwnedValue::Float(lhs * rhs);
+                        }
+                        (OwnedValue::Integer(i), OwnedValue::Float(f))
+                        | (OwnedValue::Float(f), OwnedValue::Integer(i)) => {
+                            state.registers[dest] = OwnedValue::Float(*i as f64 * { *f });
+                        }
+                        (OwnedValue::Null, _) | (_, OwnedValue::Null) => {
+                            state.registers[dest] = OwnedValue::Null;
+                        }
+                        (OwnedValue::Agg(aggctx), other) | (other, OwnedValue::Agg(aggctx)) => {
+                            match other {
+                                OwnedValue::Null => {
+                                    state.registers[dest] = OwnedValue::Null;
+                                }
+                                OwnedValue::Integer(i) => match aggctx.final_value() {
+                                    OwnedValue::Float(acc) => {
+                                        state.registers[dest] = OwnedValue::Float(acc * *i as f64);
+                                    }
+                                    OwnedValue::Integer(acc) => {
+                                        state.registers[dest] = OwnedValue::Integer(acc * i);
+                                    }
+                                    _ => {
+                                        todo!("{:?}", aggctx);
+                                    }
+                                },
+                                OwnedValue::Float(f) => match aggctx.final_value() {
+                                    OwnedValue::Float(acc) => {
+                                        state.registers[dest] = OwnedValue::Float(acc * f);
+                                    }
+                                    OwnedValue::Integer(acc) => {
+                                        state.registers[dest] = OwnedValue::Float(*acc as f64 * f);
+                                    }
+                                    _ => {
+                                        todo!("{:?}", aggctx);
+                                    }
+                                },
+                                OwnedValue::Agg(aggctx2) => {
+                                    let acc = aggctx.final_value();
+                                    let acc2 = aggctx2.final_value();
+                                    match (acc, acc2) {
+                                        (OwnedValue::Integer(acc), OwnedValue::Integer(acc2)) => {
+                                            state.registers[dest] = OwnedValue::Integer(acc * acc2);
+                                        }
+                                        (OwnedValue::Float(acc), OwnedValue::Float(acc2)) => {
+                                            state.registers[dest] = OwnedValue::Float(acc * acc2);
+                                        }
+                                        (OwnedValue::Integer(acc), OwnedValue::Float(acc2)) => {
+                                            state.registers[dest] =
+                                                OwnedValue::Float(*acc as f64 * acc2);
+                                        }
+                                        (OwnedValue::Float(acc), OwnedValue::Integer(acc2)) => {
+                                            state.registers[dest] =
+                                                OwnedValue::Float(acc * *acc2 as f64);
+                                        }
+                                        _ => {
+                                            todo!("{:?} {:?}", acc, acc2);
+                                        }
+                                    }
+                                }
+                                rest => unimplemented!("{:?}", rest),
+                            }
+                        }
+                        others => {
+                            todo!("{:?}", others);
+                        }
+                    }
                     state.pc += 1;
                 }
                 Insn::Divide { lhs, rhs, dest } => {
-                    state.registers[*dest] =
-                        exec_divide(&state.registers[*lhs], &state.registers[*rhs]);
-                    state.pc += 1;
-                }
-                Insn::Remainder { lhs, rhs, dest } => {
-                    state.registers[*dest] =
-                        exec_remainder(&state.registers[*lhs], &state.registers[*rhs]);
+                    let lhs = *lhs;
+                    let rhs = *rhs;
+                    let dest = *dest;
+                    match (&state.registers[lhs], &state.registers[rhs]) {
+                        // If the divisor is zero, the result is NULL.
+                        (_, OwnedValue::Integer(0)) | (_, OwnedValue::Float(0.0)) => {
+                            state.registers[dest] = OwnedValue::Null;
+                        }
+                        (OwnedValue::Integer(lhs), OwnedValue::Integer(rhs)) => {
+                            state.registers[dest] = OwnedValue::Integer(lhs / rhs);
+                        }
+                        (OwnedValue::Float(lhs), OwnedValue::Float(rhs)) => {
+                            state.registers[dest] = OwnedValue::Float(lhs / rhs);
+                        }
+                        (OwnedValue::Float(lhs), OwnedValue::Integer(rhs)) => {
+                            state.registers[dest] = OwnedValue::Float(lhs / *rhs as f64);
+                        }
+                        (OwnedValue::Integer(lhs), OwnedValue::Float(rhs)) => {
+                            state.registers[dest] = OwnedValue::Float(*lhs as f64 / rhs);
+                        }
+                        (OwnedValue::Null, _) | (_, OwnedValue::Null) => {
+                            state.registers[dest] = OwnedValue::Null;
+                        }
+                        (OwnedValue::Agg(aggctx), rhs) => match rhs {
+                            OwnedValue::Null => {
+                                state.registers[dest] = OwnedValue::Null;
+                            }
+                            OwnedValue::Integer(i) => match aggctx.final_value() {
+                                OwnedValue::Float(acc) => {
+                                    state.registers[dest] = OwnedValue::Float(acc / *i as f64);
+                                }
+                                OwnedValue::Integer(acc) => {
+                                    state.registers[dest] = OwnedValue::Integer(acc / i);
+                                }
+                                _ => {
+                                    todo!("{:?}", aggctx);
+                                }
+                            },
+                            OwnedValue::Float(f) => match aggctx.final_value() {
+                                OwnedValue::Float(acc) => {
+                                    state.registers[dest] = OwnedValue::Float(acc / f);
+                                }
+                                OwnedValue::Integer(acc) => {
+                                    state.registers[dest] = OwnedValue::Float(*acc as f64 / f);
+                                }
+                                _ => {
+                                    todo!("{:?}", aggctx);
+                                }
+                            },
+                            OwnedValue::Agg(aggctx2) => {
+                                let acc = aggctx.final_value();
+                                let acc2 = aggctx2.final_value();
+                                match (acc, acc2) {
+                                    (OwnedValue::Integer(acc), OwnedValue::Integer(acc2)) => {
+                                        state.registers[dest] = OwnedValue::Integer(acc / acc2);
+                                    }
+                                    (OwnedValue::Float(acc), OwnedValue::Float(acc2)) => {
+                                        state.registers[dest] = OwnedValue::Float(acc / acc2);
+                                    }
+                                    (OwnedValue::Integer(acc), OwnedValue::Float(acc2)) => {
+                                        state.registers[dest] =
+                                            OwnedValue::Float(*acc as f64 / acc2);
+                                    }
+                                    (OwnedValue::Float(acc), OwnedValue::Integer(acc2)) => {
+                                        state.registers[dest] =
+                                            OwnedValue::Float(acc / *acc2 as f64);
+                                    }
+                                    _ => {
+                                        todo!("{:?} {:?}", acc, acc2);
+                                    }
+                                }
+                            }
+                            rest => unimplemented!("{:?}", rest),
+                        },
+                        (lhs, OwnedValue::Agg(aggctx)) => match lhs {
+                            OwnedValue::Null => {
+                                state.registers[dest] = OwnedValue::Null;
+                            }
+                            OwnedValue::Integer(i) => match aggctx.final_value() {
+                                OwnedValue::Float(acc) => {
+                                    state.registers[dest] = OwnedValue::Float(*i as f64 / acc);
+                                }
+                                OwnedValue::Integer(acc) => {
+                                    state.registers[dest] = OwnedValue::Integer(i / acc);
+                                }
+                                _ => {
+                                    todo!("{:?}", aggctx);
+                                }
+                            },
+                            OwnedValue::Float(f) => match aggctx.final_value() {
+                                OwnedValue::Float(acc) => {
+                                    state.registers[dest] = OwnedValue::Float(f / acc);
+                                }
+                                OwnedValue::Integer(acc) => {
+                                    state.registers[dest] = OwnedValue::Float(f / *acc as f64);
+                                }
+                                _ => {
+                                    todo!("{:?}", aggctx);
+                                }
+                            },
+                            rest => unimplemented!("{:?}", rest),
+                        },
+                        others => {
+                            todo!("{:?}", others);
+                        }
+                    }
                     state.pc += 1;
                 }
                 Insn::BitAnd { lhs, rhs, dest } => {
-                    state.registers[*dest] =
-                        exec_bit_and(&state.registers[*lhs], &state.registers[*rhs]);
+                    let lhs = *lhs;
+                    let rhs = *rhs;
+                    let dest = *dest;
+                    match (&state.registers[lhs], &state.registers[rhs]) {
+                        // handle 0 and null cases
+                        (OwnedValue::Null, _) | (_, OwnedValue::Null) => {
+                            state.registers[dest] = OwnedValue::Null;
+                        }
+                        (_, OwnedValue::Integer(0))
+                        | (OwnedValue::Integer(0), _)
+                        | (_, OwnedValue::Float(0.0))
+                        | (OwnedValue::Float(0.0), _) => {
+                            state.registers[dest] = OwnedValue::Integer(0);
+                        }
+                        (OwnedValue::Integer(lh), OwnedValue::Integer(rh)) => {
+                            state.registers[dest] = OwnedValue::Integer(lh & rh);
+                        }
+                        (OwnedValue::Float(lh), OwnedValue::Float(rh)) => {
+                            state.registers[dest] = OwnedValue::Integer(*lh as i64 & *rh as i64);
+                        }
+                        (OwnedValue::Float(lh), OwnedValue::Integer(rh)) => {
+                            state.registers[dest] = OwnedValue::Integer(*lh as i64 & rh);
+                        }
+                        (OwnedValue::Integer(lh), OwnedValue::Float(rh)) => {
+                            state.registers[dest] = OwnedValue::Integer(lh & *rh as i64);
+                        }
+                        (OwnedValue::Agg(aggctx), other) | (other, OwnedValue::Agg(aggctx)) => {
+                            match other {
+                                OwnedValue::Agg(aggctx2) => {
+                                    match (aggctx.final_value(), aggctx2.final_value()) {
+                                        (OwnedValue::Integer(lh), OwnedValue::Integer(rh)) => {
+                                            state.registers[dest] = OwnedValue::Integer(lh & rh);
+                                        }
+                                        (OwnedValue::Float(lh), OwnedValue::Float(rh)) => {
+                                            state.registers[dest] =
+                                                OwnedValue::Integer(*lh as i64 & *rh as i64);
+                                        }
+                                        (OwnedValue::Integer(lh), OwnedValue::Float(rh)) => {
+                                            state.registers[dest] =
+                                                OwnedValue::Integer(lh & *rh as i64);
+                                        }
+                                        (OwnedValue::Float(lh), OwnedValue::Integer(rh)) => {
+                                            state.registers[dest] =
+                                                OwnedValue::Integer(*lh as i64 & rh);
+                                        }
+                                        _ => {
+                                            unimplemented!(
+                                                "{:?} {:?}",
+                                                aggctx.final_value(),
+                                                aggctx2.final_value()
+                                            );
+                                        }
+                                    }
+                                }
+                                other => match (aggctx.final_value(), other) {
+                                    (OwnedValue::Null, _) | (_, OwnedValue::Null) => {
+                                        state.registers[dest] = OwnedValue::Null;
+                                    }
+                                    (_, OwnedValue::Integer(0))
+                                    | (OwnedValue::Integer(0), _)
+                                    | (_, OwnedValue::Float(0.0))
+                                    | (OwnedValue::Float(0.0), _) => {
+                                        state.registers[dest] = OwnedValue::Integer(0);
+                                    }
+                                    (OwnedValue::Integer(lh), OwnedValue::Integer(rh)) => {
+                                        state.registers[dest] = OwnedValue::Integer(lh & rh);
+                                    }
+                                    (OwnedValue::Float(lh), OwnedValue::Integer(rh)) => {
+                                        state.registers[dest] =
+                                            OwnedValue::Integer(*lh as i64 & rh);
+                                    }
+                                    (OwnedValue::Integer(lh), OwnedValue::Float(rh)) => {
+                                        state.registers[dest] =
+                                            OwnedValue::Integer(lh & *rh as i64);
+                                    }
+                                    _ => {
+                                        unimplemented!("{:?} {:?}", aggctx.final_value(), other);
+                                    }
+                                },
+                            }
+                        }
+                        _ => {
+                            unimplemented!("{:?} {:?}", state.registers[lhs], state.registers[rhs]);
+                        }
+                    }
                     state.pc += 1;
                 }
                 Insn::BitOr { lhs, rhs, dest } => {
-                    state.registers[*dest] =
-                        exec_bit_or(&state.registers[*lhs], &state.registers[*rhs]);
+                    let lhs = *lhs;
+                    let rhs = *rhs;
+                    let dest = *dest;
+                    match (&state.registers[lhs], &state.registers[rhs]) {
+                        (OwnedValue::Null, _) | (_, OwnedValue::Null) => {
+                            state.registers[dest] = OwnedValue::Null;
+                        }
+                        (OwnedValue::Integer(lh), OwnedValue::Integer(rh)) => {
+                            state.registers[dest] = OwnedValue::Integer(lh | rh);
+                        }
+                        (OwnedValue::Float(lh), OwnedValue::Integer(rh)) => {
+                            state.registers[dest] = OwnedValue::Integer(*lh as i64 | rh);
+                        }
+                        (OwnedValue::Integer(lh), OwnedValue::Float(rh)) => {
+                            state.registers[dest] = OwnedValue::Integer(lh | *rh as i64);
+                        }
+                        (OwnedValue::Float(lh), OwnedValue::Float(rh)) => {
+                            state.registers[dest] = OwnedValue::Integer(*lh as i64 | *rh as i64);
+                        }
+                        (OwnedValue::Agg(aggctx), other) | (other, OwnedValue::Agg(aggctx)) => {
+                            match other {
+                                OwnedValue::Agg(aggctx2) => {
+                                    let final_lhs = aggctx.final_value();
+                                    let final_rhs = aggctx2.final_value();
+                                    match (final_lhs, final_rhs) {
+                                        (OwnedValue::Integer(lh), OwnedValue::Integer(rh)) => {
+                                            state.registers[dest] = OwnedValue::Integer(lh | rh);
+                                        }
+                                        (OwnedValue::Float(lh), OwnedValue::Float(rh)) => {
+                                            state.registers[dest] =
+                                                OwnedValue::Integer(*lh as i64 | *rh as i64);
+                                        }
+                                        (OwnedValue::Integer(lh), OwnedValue::Float(rh)) => {
+                                            state.registers[dest] =
+                                                OwnedValue::Integer(lh | *rh as i64);
+                                        }
+                                        (OwnedValue::Float(lh), OwnedValue::Integer(rh)) => {
+                                            state.registers[dest] =
+                                                OwnedValue::Integer(*lh as i64 | rh);
+                                        }
+                                        _ => {
+                                            unimplemented!("{:?} {:?}", final_lhs, final_rhs);
+                                        }
+                                    }
+                                }
+                                other => match (aggctx.final_value(), other) {
+                                    (OwnedValue::Null, _) | (_, OwnedValue::Null) => {
+                                        state.registers[dest] = OwnedValue::Null;
+                                    }
+                                    (OwnedValue::Integer(lh), OwnedValue::Integer(rh)) => {
+                                        state.registers[dest] = OwnedValue::Integer(lh | rh);
+                                    }
+                                    (OwnedValue::Float(lh), OwnedValue::Integer(rh)) => {
+                                        state.registers[dest] =
+                                            OwnedValue::Integer(*lh as i64 | rh);
+                                    }
+                                    (OwnedValue::Integer(lh), OwnedValue::Float(rh)) => {
+                                        state.registers[dest] =
+                                            OwnedValue::Integer(lh | *rh as i64);
+                                    }
+                                    _ => {
+                                        unimplemented!("{:?} {:?}", aggctx.final_value(), other);
+                                    }
+                                },
+                            }
+                        }
+                        _ => {
+                            unimplemented!("{:?} {:?}", state.registers[lhs], state.registers[rhs]);
+                        }
+                    }
                     state.pc += 1;
                 }
                 Insn::BitNot { reg, dest } => {
-                    state.registers[*dest] = exec_bit_not(&state.registers[*reg]);
-                    state.pc += 1;
-                }
-                Insn::Checkpoint {
-                    database: _,
-                    checkpoint_mode: _,
-                    dest,
-                } => {
-                    let result = self.connection.upgrade().unwrap().checkpoint();
-                    match result {
-                        Ok(CheckpointResult {
-                            num_wal_frames: num_wal_pages,
-                            num_checkpointed_frames: num_checkpointed_pages,
-                        }) => {
-                            // https://sqlite.org/pragma.html#pragma_wal_checkpoint
-                            // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
-                            state.registers[*dest] = OwnedValue::Integer(0);
-                            // 2nd col: # modified pages written to wal file
-                            state.registers[*dest + 1] = OwnedValue::Integer(num_wal_pages as i64);
-                            // 3rd col: # pages moved to db after checkpoint
-                            state.registers[*dest + 2] =
-                                OwnedValue::Integer(num_checkpointed_pages as i64);
+                    let reg = *reg;
+                    let dest = *dest;
+                    match &state.registers[reg] {
+                        OwnedValue::Integer(i) => state.registers[dest] = OwnedValue::Integer(!i),
+                        OwnedValue::Float(f) => {
+                            state.registers[dest] = OwnedValue::Integer(!{ *f as i64 })
                         }
-                        Err(_err) => state.registers[*dest] = OwnedValue::Integer(1),
+                        OwnedValue::Null => {
+                            state.registers[dest] = OwnedValue::Null;
+                        }
+                        OwnedValue::Agg(aggctx) => match aggctx.final_value() {
+                            OwnedValue::Integer(i) => {
+                                state.registers[dest] = OwnedValue::Integer(!i);
+                            }
+                            OwnedValue::Float(f) => {
+                                state.registers[dest] = OwnedValue::Integer(!{ *f as i64 });
+                            }
+                            OwnedValue::Null => {
+                                state.registers[dest] = OwnedValue::Null;
+                            }
+                            _ => unimplemented!("{:?}", aggctx),
+                        },
+                        _ => {
+                            unimplemented!("{:?}", state.registers[reg]);
+                        }
                     }
-
                     state.pc += 1;
                 }
                 Insn::Null { dest, dest_end } => {
@@ -531,9 +1225,7 @@ impl Program {
                     state.pc += 1;
                 }
                 Insn::NullRow { cursor_id } => {
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor =
-                        must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "NullRow");
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
                     cursor.set_null_flag(true);
                     state.pc += 1;
                 }
@@ -569,9 +1261,6 @@ impl Program {
                     target_pc_eq,
                     target_pc_gt,
                 } => {
-                    assert!(target_pc_lt.is_offset());
-                    assert!(target_pc_eq.is_offset());
-                    assert!(target_pc_gt.is_offset());
                     let cmp = state.last_compare.take();
                     if cmp.is_none() {
                         return Err(LimboError::InternalError(
@@ -583,7 +1272,8 @@ impl Program {
                         std::cmp::Ordering::Equal => *target_pc_eq,
                         std::cmp::Ordering::Greater => *target_pc_gt,
                     };
-                    state.pc = target_pc.to_offset_int();
+                    assert!(target_pc >= 0);
+                    state.pc = target_pc;
                 }
                 Insn::Move {
                     source_reg,
@@ -606,12 +1296,12 @@ impl Program {
                     target_pc,
                     decrement_by,
                 } => {
-                    assert!(target_pc.is_offset());
+                    assert!(*target_pc >= 0);
                     let reg = *reg;
                     let target_pc = *target_pc;
                     match &state.registers[reg] {
                         OwnedValue::Integer(n) if *n > 0 => {
-                            state.pc = target_pc.to_offset_int();
+                            state.pc = target_pc;
                             state.registers[reg] = OwnedValue::Integer(*n - *decrement_by as i64);
                         }
                         OwnedValue::Integer(_) => {
@@ -625,7 +1315,7 @@ impl Program {
                     }
                 }
                 Insn::NotNull { reg, target_pc } => {
-                    assert!(target_pc.is_offset());
+                    assert!(*target_pc >= 0);
                     let reg = *reg;
                     let target_pc = *target_pc;
                     match &state.registers[reg] {
@@ -633,7 +1323,7 @@ impl Program {
                             state.pc += 1;
                         }
                         _ => {
-                            state.pc = target_pc.to_offset_int();
+                            state.pc = target_pc;
                         }
                     }
                 }
@@ -642,26 +1332,18 @@ impl Program {
                     lhs,
                     rhs,
                     target_pc,
-                    flags,
                 } => {
-                    assert!(target_pc.is_offset());
+                    assert!(*target_pc >= 0);
                     let lhs = *lhs;
                     let rhs = *rhs;
                     let target_pc = *target_pc;
-                    let cond = state.registers[lhs] == state.registers[rhs];
-                    let nulleq = flags.has_nulleq();
-                    let jump_if_null = flags.has_jump_if_null();
                     match (&state.registers[lhs], &state.registers[rhs]) {
                         (_, OwnedValue::Null) | (OwnedValue::Null, _) => {
-                            if (nulleq && cond) || (!nulleq && jump_if_null) {
-                                state.pc = target_pc.to_offset_int();
-                            } else {
-                                state.pc += 1;
-                            }
+                            state.pc = target_pc;
                         }
                         _ => {
                             if state.registers[lhs] == state.registers[rhs] {
-                                state.pc = target_pc.to_offset_int();
+                                state.pc = target_pc;
                             } else {
                                 state.pc += 1;
                             }
@@ -672,26 +1354,18 @@ impl Program {
                     lhs,
                     rhs,
                     target_pc,
-                    flags,
                 } => {
-                    assert!(target_pc.is_offset());
+                    assert!(*target_pc >= 0);
                     let lhs = *lhs;
                     let rhs = *rhs;
                     let target_pc = *target_pc;
-                    let cond = state.registers[lhs] != state.registers[rhs];
-                    let nulleq = flags.has_nulleq();
-                    let jump_if_null = flags.has_jump_if_null();
                     match (&state.registers[lhs], &state.registers[rhs]) {
                         (_, OwnedValue::Null) | (OwnedValue::Null, _) => {
-                            if (nulleq && cond) || (!nulleq && jump_if_null) {
-                                state.pc = target_pc.to_offset_int();
-                            } else {
-                                state.pc += 1;
-                            }
+                            state.pc = target_pc;
                         }
                         _ => {
                             if state.registers[lhs] != state.registers[rhs] {
-                                state.pc = target_pc.to_offset_int();
+                                state.pc = target_pc;
                             } else {
                                 state.pc += 1;
                             }
@@ -702,24 +1376,18 @@ impl Program {
                     lhs,
                     rhs,
                     target_pc,
-                    flags,
                 } => {
-                    assert!(target_pc.is_offset());
+                    assert!(*target_pc >= 0);
                     let lhs = *lhs;
                     let rhs = *rhs;
                     let target_pc = *target_pc;
-                    let jump_if_null = flags.has_jump_if_null();
                     match (&state.registers[lhs], &state.registers[rhs]) {
                         (_, OwnedValue::Null) | (OwnedValue::Null, _) => {
-                            if jump_if_null {
-                                state.pc = target_pc.to_offset_int();
-                            } else {
-                                state.pc += 1;
-                            }
+                            state.pc = target_pc;
                         }
                         _ => {
                             if state.registers[lhs] < state.registers[rhs] {
-                                state.pc = target_pc.to_offset_int();
+                                state.pc = target_pc;
                             } else {
                                 state.pc += 1;
                             }
@@ -730,24 +1398,18 @@ impl Program {
                     lhs,
                     rhs,
                     target_pc,
-                    flags,
                 } => {
-                    assert!(target_pc.is_offset());
+                    assert!(*target_pc >= 0);
                     let lhs = *lhs;
                     let rhs = *rhs;
                     let target_pc = *target_pc;
-                    let jump_if_null = flags.has_jump_if_null();
                     match (&state.registers[lhs], &state.registers[rhs]) {
                         (_, OwnedValue::Null) | (OwnedValue::Null, _) => {
-                            if jump_if_null {
-                                state.pc = target_pc.to_offset_int();
-                            } else {
-                                state.pc += 1;
-                            }
+                            state.pc = target_pc;
                         }
                         _ => {
                             if state.registers[lhs] <= state.registers[rhs] {
-                                state.pc = target_pc.to_offset_int();
+                                state.pc = target_pc;
                             } else {
                                 state.pc += 1;
                             }
@@ -758,24 +1420,18 @@ impl Program {
                     lhs,
                     rhs,
                     target_pc,
-                    flags,
                 } => {
-                    assert!(target_pc.is_offset());
+                    assert!(*target_pc >= 0);
                     let lhs = *lhs;
                     let rhs = *rhs;
                     let target_pc = *target_pc;
-                    let jump_if_null = flags.has_jump_if_null();
                     match (&state.registers[lhs], &state.registers[rhs]) {
                         (_, OwnedValue::Null) | (OwnedValue::Null, _) => {
-                            if jump_if_null {
-                                state.pc = target_pc.to_offset_int();
-                            } else {
-                                state.pc += 1;
-                            }
+                            state.pc = target_pc;
                         }
                         _ => {
                             if state.registers[lhs] > state.registers[rhs] {
-                                state.pc = target_pc.to_offset_int();
+                                state.pc = target_pc;
                             } else {
                                 state.pc += 1;
                             }
@@ -786,24 +1442,18 @@ impl Program {
                     lhs,
                     rhs,
                     target_pc,
-                    flags,
                 } => {
-                    assert!(target_pc.is_offset());
+                    assert!(*target_pc >= 0);
                     let lhs = *lhs;
                     let rhs = *rhs;
                     let target_pc = *target_pc;
-                    let jump_if_null = flags.has_jump_if_null();
                     match (&state.registers[lhs], &state.registers[rhs]) {
                         (_, OwnedValue::Null) | (OwnedValue::Null, _) => {
-                            if jump_if_null {
-                                state.pc = target_pc.to_offset_int();
-                            } else {
-                                state.pc += 1;
-                            }
+                            state.pc = target_pc;
                         }
                         _ => {
                             if state.registers[lhs] >= state.registers[rhs] {
-                                state.pc = target_pc.to_offset_int();
+                                state.pc = target_pc;
                             } else {
                                 state.pc += 1;
                             }
@@ -813,11 +1463,11 @@ impl Program {
                 Insn::If {
                     reg,
                     target_pc,
-                    jump_if_null,
+                    null_reg,
                 } => {
-                    assert!(target_pc.is_offset());
-                    if exec_if(&state.registers[*reg], *jump_if_null, false) {
-                        state.pc = target_pc.to_offset_int();
+                    assert!(*target_pc >= 0);
+                    if exec_if(&state.registers[*reg], &state.registers[*null_reg], false) {
+                        state.pc = *target_pc;
                     } else {
                         state.pc += 1;
                     }
@@ -825,11 +1475,11 @@ impl Program {
                 Insn::IfNot {
                     reg,
                     target_pc,
-                    jump_if_null,
+                    null_reg,
                 } => {
-                    assert!(target_pc.is_offset());
-                    if exec_if(&state.registers[*reg], *jump_if_null, true) {
-                        state.pc = target_pc.to_offset_int();
+                    assert!(*target_pc >= 0);
+                    if exec_if(&state.registers[*reg], &state.registers[*null_reg], true) {
+                        state.pc = *target_pc;
                     } else {
                         state.pc += 1;
                     }
@@ -838,224 +1488,33 @@ impl Program {
                     cursor_id,
                     root_page,
                 } => {
-                    let (_, cursor_type) = self.cursor_ref.get(*cursor_id).unwrap();
-                    let cursor = BTreeCursor::new(pager.clone(), *root_page);
-                    let mut cursors = state.cursors.borrow_mut();
-                    match cursor_type {
-                        CursorType::BTreeTable(_) => {
-                            cursors
-                                .get_mut(*cursor_id)
-                                .unwrap()
-                                .replace(Cursor::new_table(cursor));
-                        }
-                        CursorType::BTreeIndex(_) => {
-                            cursors
-                                .get_mut(*cursor_id)
-                                .unwrap()
-                                .replace(Cursor::new_index(cursor));
-                        }
-                        CursorType::Pseudo(_) => {
-                            panic!("OpenReadAsync on pseudo cursor");
-                        }
-                        CursorType::Sorter => {
-                            panic!("OpenReadAsync on sorter cursor");
-                        }
-                        CursorType::VirtualTable(_) => {
-                            panic!("OpenReadAsync on virtual table cursor, use Insn::VOpenAsync instead");
-                        }
-                    }
+                    let cursor = Box::new(BTreeCursor::new(
+                        pager.clone(),
+                        *root_page,
+                        self.database_header.clone(),
+                    ));
+                    cursors.insert(*cursor_id, cursor);
                     state.pc += 1;
                 }
                 Insn::OpenReadAwait => {
                     state.pc += 1;
-                }
-                Insn::VOpenAsync { cursor_id } => {
-                    let (_, cursor_type) = self.cursor_ref.get(*cursor_id).unwrap();
-                    let CursorType::VirtualTable(virtual_table) = cursor_type else {
-                        panic!("VOpenAsync on non-virtual table cursor");
-                    };
-                    let cursor = virtual_table.open()?;
-                    state
-                        .cursors
-                        .borrow_mut()
-                        .insert(*cursor_id, Some(Cursor::Virtual(cursor)));
-                    state.pc += 1;
-                }
-                Insn::VCreate {
-                    module_name,
-                    table_name,
-                    args_reg,
-                } => {
-                    let module_name = state.registers[*module_name].to_string();
-                    let table_name = state.registers[*table_name].to_string();
-                    let args = if let Some(args_reg) = args_reg {
-                        if let OwnedValue::Record(rec) = &state.registers[*args_reg] {
-                            rec.get_values().iter().map(|v| v.to_ffi()).collect()
-                        } else {
-                            return Err(LimboError::InternalError(
-                                "VCreate: args_reg is not a record".to_string(),
-                            ));
-                        }
-                    } else {
-                        vec![]
-                    };
-                    let Some(conn) = self.connection.upgrade() else {
-                        return Err(crate::LimboError::ExtensionError(
-                            "Failed to upgrade Connection".to_string(),
-                        ));
-                    };
-                    let table = crate::VirtualTable::from_args(
-                        Some(&table_name),
-                        &module_name,
-                        args,
-                        &conn.db.syms.borrow(),
-                        limbo_ext::VTabKind::VirtualTable,
-                        None,
-                    )?;
-                    {
-                        conn.db
-                            .syms
-                            .as_ref()
-                            .borrow_mut()
-                            .vtabs
-                            .insert(table_name, table.clone());
-                    }
-                    state.pc += 1;
-                }
-                Insn::VOpenAwait => {
-                    state.pc += 1;
-                }
-                Insn::VFilter {
-                    cursor_id,
-                    pc_if_empty,
-                    arg_count,
-                    args_reg,
-                } => {
-                    let (_, cursor_type) = self.cursor_ref.get(*cursor_id).unwrap();
-                    let CursorType::VirtualTable(virtual_table) = cursor_type else {
-                        panic!("VFilter on non-virtual table cursor");
-                    };
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor = get_cursor_as_virtual_mut(&mut cursors, *cursor_id);
-                    let mut args = Vec::new();
-                    for i in 0..*arg_count {
-                        args.push(state.registers[args_reg + i].clone());
-                    }
-                    let has_rows = virtual_table.filter(cursor, *arg_count, args)?;
-                    if !has_rows {
-                        state.pc = pc_if_empty.to_offset_int();
-                    } else {
-                        state.pc += 1;
-                    }
-                }
-                Insn::VColumn {
-                    cursor_id,
-                    column,
-                    dest,
-                } => {
-                    let (_, cursor_type) = self.cursor_ref.get(*cursor_id).unwrap();
-                    let CursorType::VirtualTable(virtual_table) = cursor_type else {
-                        panic!("VColumn on non-virtual table cursor");
-                    };
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor = get_cursor_as_virtual_mut(&mut cursors, *cursor_id);
-                    state.registers[*dest] = virtual_table.column(cursor, *column)?;
-                    state.pc += 1;
-                }
-                Insn::VUpdate {
-                    cursor_id,
-                    arg_count,
-                    start_reg,
-                    conflict_action,
-                    ..
-                } => {
-                    let (_, cursor_type) = self.cursor_ref.get(*cursor_id).unwrap();
-                    let CursorType::VirtualTable(virtual_table) = cursor_type else {
-                        panic!("VUpdate on non-virtual table cursor");
-                    };
-
-                    if *arg_count < 2 {
-                        return Err(LimboError::InternalError(
-                            "VUpdate: arg_count must be at least 2 (rowid and insert_rowid)"
-                                .to_string(),
-                        ));
-                    }
-                    let mut argv = Vec::with_capacity(*arg_count);
-                    for i in 0..*arg_count {
-                        if let Some(value) = state.registers.get(*start_reg + i) {
-                            argv.push(value.clone());
-                        } else {
-                            return Err(LimboError::InternalError(format!(
-                                "VUpdate: register out of bounds at {}",
-                                *start_reg + i
-                            )));
-                        }
-                    }
-                    let result = virtual_table.update(&argv);
-                    match result {
-                        Ok(Some(new_rowid)) => {
-                            if *conflict_action == 5 {
-                                // ResolveType::Replace
-                                if let Some(conn) = self.connection.upgrade() {
-                                    conn.update_last_rowid(new_rowid as u64);
-                                }
-                            }
-                            state.pc += 1;
-                        }
-                        Ok(None) => {
-                            // no-op or successful update without rowid return
-                            state.pc += 1;
-                        }
-                        Err(e) => {
-                            // virtual table update failed
-                            return Err(LimboError::ExtensionError(format!(
-                                "Virtual table update failed: {}",
-                                e
-                            )));
-                        }
-                    }
-                }
-                Insn::VNext {
-                    cursor_id,
-                    pc_if_next,
-                } => {
-                    let (_, cursor_type) = self.cursor_ref.get(*cursor_id).unwrap();
-                    let CursorType::VirtualTable(virtual_table) = cursor_type else {
-                        panic!("VNextAsync on non-virtual table cursor");
-                    };
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor = get_cursor_as_virtual_mut(&mut cursors, *cursor_id);
-                    let has_more = virtual_table.next(cursor)?;
-                    if has_more {
-                        state.pc = pc_if_next.to_offset_int();
-                    } else {
-                        state.pc += 1;
-                    }
                 }
                 Insn::OpenPseudo {
                     cursor_id,
                     content_reg: _,
                     num_fields: _,
                 } => {
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor = PseudoCursor::new();
-                    cursors
-                        .get_mut(*cursor_id)
-                        .unwrap()
-                        .replace(Cursor::new_pseudo(cursor));
+                    let cursor = Box::new(PseudoCursor::new());
+                    cursors.insert(*cursor_id, cursor);
                     state.pc += 1;
                 }
                 Insn::RewindAsync { cursor_id } => {
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor =
-                        must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "RewindAsync");
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
                     return_if_io!(cursor.rewind());
                     state.pc += 1;
                 }
                 Insn::LastAsync { cursor_id } => {
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor =
-                        must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "LastAsync");
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
                     return_if_io!(cursor.last());
                     state.pc += 1;
                 }
@@ -1063,13 +1522,10 @@ impl Program {
                     cursor_id,
                     pc_if_empty,
                 } => {
-                    assert!(pc_if_empty.is_offset());
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor =
-                        must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "LastAwait");
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
                     cursor.wait_for_completion()?;
                     if cursor.is_empty() {
-                        state.pc = pc_if_empty.to_offset_int();
+                        state.pc = *pc_if_empty;
                     } else {
                         state.pc += 1;
                     }
@@ -1078,13 +1534,10 @@ impl Program {
                     cursor_id,
                     pc_if_empty,
                 } => {
-                    assert!(pc_if_empty.is_offset());
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor =
-                        must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "RewindAwait");
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
                     cursor.wait_for_completion()?;
                     if cursor.is_empty() {
-                        state.pc = pc_if_empty.to_offset_int();
+                        state.pc = *pc_if_empty;
                     } else {
                         state.pc += 1;
                     }
@@ -1094,11 +1547,10 @@ impl Program {
                     column,
                     dest,
                 } => {
-                    let mut cursors = state.cursors.borrow_mut();
                     if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seek.take() {
-                        let index_cursor = get_cursor_as_index_mut(&mut cursors, index_cursor_id);
+                        let index_cursor = cursors.get_mut(&index_cursor_id).unwrap();
                         let rowid = index_cursor.rowid()?;
-                        let table_cursor = get_cursor_as_table_mut(&mut cursors, table_cursor_id);
+                        let table_cursor = cursors.get_mut(&table_cursor_id).unwrap();
                         match table_cursor.seek(SeekKey::TableRowId(rowid.unwrap()), SeekOp::EQ)? {
                             CursorResult::Ok(_) => {}
                             CursorResult::IO => {
@@ -1107,49 +1559,18 @@ impl Program {
                             }
                         }
                     }
-                    let (_, cursor_type) = self.cursor_ref.get(*cursor_id).unwrap();
-                    match cursor_type {
-                        CursorType::BTreeTable(_) | CursorType::BTreeIndex(_) => {
-                            let cursor = must_be_btree_cursor!(
-                                *cursor_id,
-                                self.cursor_ref,
-                                cursors,
-                                "Column"
-                            );
-                            let record = cursor.record()?;
-                            if let Some(record) = record.as_ref() {
-                                state.registers[*dest] = if cursor.get_null_flag() {
-                                    OwnedValue::Null
-                                } else {
-                                    record.get_value(*column).clone()
-                                };
-                            } else {
-                                state.registers[*dest] = OwnedValue::Null;
-                            }
-                        }
-                        CursorType::Sorter => {
-                            let cursor = get_cursor_as_sorter_mut(&mut cursors, *cursor_id);
-                            if let Some(record) = cursor.record() {
-                                state.registers[*dest] = record.get_value(*column).clone();
-                            } else {
-                                state.registers[*dest] = OwnedValue::Null;
-                            }
-                        }
-                        CursorType::Pseudo(_) => {
-                            let cursor = get_cursor_as_pseudo_mut(&mut cursors, *cursor_id);
-                            if let Some(record) = cursor.record() {
-                                state.registers[*dest] = record.get_value(*column).clone();
-                            } else {
-                                state.registers[*dest] = OwnedValue::Null;
-                            }
-                        }
-                        CursorType::VirtualTable(_) => {
-                            panic!(
-                                "Insn::Column on virtual table cursor, use Insn::VColumn instead"
-                            );
-                        }
-                    }
 
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
+                    if let Some(ref record) = *cursor.record()? {
+                        let null_flag = cursor.get_null_flag();
+                        state.registers[*dest] = if null_flag {
+                            OwnedValue::Null
+                        } else {
+                            record.values[*column].clone()
+                        };
+                    } else {
+                        state.registers[*dest] = OwnedValue::Null;
+                    }
                     state.pc += 1;
                 }
                 Insn::MakeRecord {
@@ -1162,23 +1583,18 @@ impl Program {
                     state.pc += 1;
                 }
                 Insn::ResultRow { start_reg, count } => {
-                    let record = make_owned_record(&state.registers, start_reg, count);
-                    state.result_row = Some(record);
+                    let record = make_record(&state.registers, start_reg, count);
                     state.pc += 1;
-                    return Ok(StepResult::Row);
+                    return Ok(StepResult::Row(record));
                 }
                 Insn::NextAsync { cursor_id } => {
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor =
-                        must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "NextAsync");
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
                     cursor.set_null_flag(false);
                     return_if_io!(cursor.next());
                     state.pc += 1;
                 }
                 Insn::PrevAsync { cursor_id } => {
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor =
-                        must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "PrevAsync");
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
                     cursor.set_null_flag(false);
                     return_if_io!(cursor.prev());
                     state.pc += 1;
@@ -1187,13 +1603,11 @@ impl Program {
                     cursor_id,
                     pc_if_next,
                 } => {
-                    let mut cursors = state.cursors.borrow_mut();
-                    assert!(pc_if_next.is_offset());
-                    let cursor =
-                        must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "PrevAwait");
+                    assert!(*pc_if_next >= 0);
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
                     cursor.wait_for_completion()?;
                     if !cursor.is_empty() {
-                        state.pc = pc_if_next.to_offset_int();
+                        state.pc = *pc_if_next;
                     } else {
                         state.pc += 1;
                     }
@@ -1202,13 +1616,11 @@ impl Program {
                     cursor_id,
                     pc_if_next,
                 } => {
-                    assert!(pc_if_next.is_offset());
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor =
-                        must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "NextAwait");
+                    assert!(*pc_if_next >= 0);
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
                     cursor.wait_for_completion()?;
                     if !cursor.is_empty() {
-                        state.pc = pc_if_next.to_offset_int();
+                        state.pc = *pc_if_next;
                     } else {
                         state.pc += 1;
                     }
@@ -1232,83 +1644,63 @@ impl Program {
                             )));
                         }
                     }
-                    return self.halt(pager);
+                    log::trace!("Halt auto_commit {}", self.auto_commit);
+                    if self.auto_commit {
+                        return match pager.end_tx() {
+                            Ok(crate::storage::wal::CheckpointStatus::IO) => Ok(StepResult::IO),
+                            Ok(crate::storage::wal::CheckpointStatus::Done) => Ok(StepResult::Done),
+                            Err(e) => Err(e),
+                        };
+                    } else {
+                        return Ok(StepResult::Done);
+                    }
                 }
                 Insn::Transaction { write } => {
                     let connection = self.connection.upgrade().unwrap();
-                    let current_state = connection.transaction_state.borrow().clone();
-                    let (new_transaction_state, updated) = match (&current_state, write) {
-                        (TransactionState::Write, true) => (TransactionState::Write, false),
-                        (TransactionState::Write, false) => (TransactionState::Write, false),
-                        (TransactionState::Read, true) => (TransactionState::Write, true),
-                        (TransactionState::Read, false) => (TransactionState::Read, false),
-                        (TransactionState::None, true) => (TransactionState::Write, true),
-                        (TransactionState::None, false) => (TransactionState::Read, true),
-                    };
-
-                    if updated && matches!(current_state, TransactionState::None) {
-                        if let LimboResult::Busy = pager.begin_read_tx()? {
-                            tracing::trace!("begin_read_tx busy");
-                            return Ok(StepResult::Busy);
+                    if let Some(db) = connection.db.upgrade() {
+                        // TODO(pere): are backpointers good ?? this looks ugly af
+                        // upgrade transaction if needed
+                        let new_transaction_state =
+                            match (db.transaction_state.borrow().clone(), write) {
+                                (crate::TransactionState::Write, true) => TransactionState::Write,
+                                (crate::TransactionState::Write, false) => TransactionState::Write,
+                                (crate::TransactionState::Read, true) => TransactionState::Write,
+                                (crate::TransactionState::Read, false) => TransactionState::Read,
+                                (crate::TransactionState::None, true) => TransactionState::Read,
+                                (crate::TransactionState::None, false) => TransactionState::Read,
+                            };
+                        // TODO(Pere):
+                        //  1. lock wal
+                        //  2. lock shared
+                        //  3. lock write db if write
+                        db.transaction_state.replace(new_transaction_state.clone());
+                        if matches!(new_transaction_state, TransactionState::Write) {
+                            pager.begin_read_tx()?;
+                        } else {
+                            pager.begin_write_tx()?;
                         }
-                    }
-
-                    if updated && matches!(new_transaction_state, TransactionState::Write) {
-                        if let LimboResult::Busy = pager.begin_write_tx()? {
-                            tracing::trace!("begin_write_tx busy");
-                            return Ok(StepResult::Busy);
-                        }
-                    }
-                    if updated {
-                        connection
-                            .transaction_state
-                            .replace(new_transaction_state.clone());
                     }
                     state.pc += 1;
                 }
-                Insn::AutoCommit {
-                    auto_commit,
-                    rollback,
-                } => {
-                    let conn = self.connection.upgrade().unwrap();
-                    if *auto_commit != *conn.auto_commit.borrow() {
-                        if *rollback {
-                            todo!("Rollback is not implemented");
-                        } else {
-                            conn.auto_commit.replace(*auto_commit);
-                        }
-                    } else if !*auto_commit {
-                        return Err(LimboError::TxError(
-                            "cannot start a transaction within a transaction".to_string(),
-                        ));
-                    } else if *rollback {
-                        return Err(LimboError::TxError(
-                            "cannot rollback - no transaction is active".to_string(),
-                        ));
-                    } else {
-                        return Err(LimboError::TxError(
-                            "cannot commit - no transaction is active".to_string(),
-                        ));
-                    }
-                    return self.halt(pager);
-                }
                 Insn::Goto { target_pc } => {
-                    assert!(target_pc.is_offset());
-                    state.pc = target_pc.to_offset_int();
+                    assert!(*target_pc >= 0);
+                    state.pc = *target_pc;
                 }
                 Insn::Gosub {
                     target_pc,
                     return_reg,
                 } => {
-                    assert!(target_pc.is_offset());
-                    state.registers[*return_reg] = OwnedValue::Integer((state.pc + 1) as i64);
-                    state.pc = target_pc.to_offset_int();
+                    assert!(*target_pc >= 0);
+                    state.registers[*return_reg] = OwnedValue::Integer(state.pc + 1);
+                    state.pc = *target_pc;
                 }
                 Insn::Return { return_reg } => {
                     if let OwnedValue::Integer(pc) = state.registers[*return_reg] {
-                        let pc: u32 = pc
-                            .try_into()
-                            .unwrap_or_else(|_| panic!("Return register is negative: {}", pc));
+                        if pc < 0 {
+                            return Err(LimboError::InternalError(
+                                "Return register is negative".to_string(),
+                            ));
+                        }
                         state.pc = pc;
                     } else {
                         return Err(LimboError::InternalError(
@@ -1331,7 +1723,7 @@ impl Program {
                     state.pc += 1;
                 }
                 Insn::String8 { value, dest } => {
-                    state.registers[*dest] = OwnedValue::build_text(value);
+                    state.registers[*dest] = OwnedValue::build_text(Rc::new(value.into()));
                     state.pc += 1;
                 }
                 Insn::Blob { value, dest } => {
@@ -1339,11 +1731,10 @@ impl Program {
                     state.pc += 1;
                 }
                 Insn::RowId { cursor_id, dest } => {
-                    let mut cursors = state.cursors.borrow_mut();
                     if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seek.take() {
-                        let index_cursor = get_cursor_as_index_mut(&mut cursors, index_cursor_id);
+                        let index_cursor = cursors.get_mut(&index_cursor_id).unwrap();
                         let rowid = index_cursor.rowid()?;
-                        let table_cursor = get_cursor_as_table_mut(&mut cursors, table_cursor_id);
+                        let table_cursor = cursors.get_mut(&table_cursor_id).unwrap();
                         match table_cursor.seek(SeekKey::TableRowId(rowid.unwrap()), SeekOp::EQ)? {
                             CursorResult::Ok(_) => {}
                             CursorResult::IO => {
@@ -1353,30 +1744,11 @@ impl Program {
                         }
                     }
 
-                    if let Some(Cursor::Table(btree_cursor)) = cursors.get_mut(*cursor_id).unwrap()
-                    {
-                        if let Some(ref rowid) = btree_cursor.rowid()? {
-                            state.registers[*dest] = OwnedValue::Integer(*rowid as i64);
-                        } else {
-                            state.registers[*dest] = OwnedValue::Null;
-                        }
-                    } else if let Some(Cursor::Virtual(virtual_cursor)) =
-                        cursors.get_mut(*cursor_id).unwrap()
-                    {
-                        let (_, cursor_type) = self.cursor_ref.get(*cursor_id).unwrap();
-                        let CursorType::VirtualTable(virtual_table) = cursor_type else {
-                            panic!("VUpdate on non-virtual table cursor");
-                        };
-                        let rowid = virtual_table.rowid(virtual_cursor);
-                        if rowid != 0 {
-                            state.registers[*dest] = OwnedValue::Integer(rowid);
-                        } else {
-                            state.registers[*dest] = OwnedValue::Null;
-                        }
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
+                    if let Some(ref rowid) = cursor.rowid()? {
+                        state.registers[*dest] = OwnedValue::Integer(*rowid as i64);
                     } else {
-                        return Err(LimboError::InternalError(
-                            "RowId: cursor is not a table or virtual cursor".to_string(),
-                        ));
+                        state.registers[*dest] = OwnedValue::Null;
                     }
                     state.pc += 1;
                 }
@@ -1385,13 +1757,11 @@ impl Program {
                     src_reg,
                     target_pc,
                 } => {
-                    assert!(target_pc.is_offset());
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor = get_cursor_as_table_mut(&mut cursors, *cursor_id);
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
                     let rowid = match &state.registers[*src_reg] {
                         OwnedValue::Integer(rowid) => *rowid as u64,
                         OwnedValue::Null => {
-                            state.pc = target_pc.to_offset_int();
+                            state.pc = *target_pc;
                             continue;
                         }
                         other => {
@@ -1402,7 +1772,7 @@ impl Program {
                     };
                     let found = return_if_io!(cursor.seek(SeekKey::TableRowId(rowid), SeekOp::EQ));
                     if !found {
-                        state.pc = target_pc.to_offset_int();
+                        state.pc = *target_pc;
                     } else {
                         state.pc += 1;
                     }
@@ -1421,22 +1791,20 @@ impl Program {
                     target_pc,
                     is_index,
                 } => {
-                    assert!(target_pc.is_offset());
-                    let mut cursors = state.cursors.borrow_mut();
                     if *is_index {
-                        let cursor = get_cursor_as_index_mut(&mut cursors, *cursor_id);
-                        let record_from_regs: Record =
+                        let cursor = cursors.get_mut(cursor_id).unwrap();
+                        let record_from_regs: OwnedRecord =
                             make_owned_record(&state.registers, start_reg, num_regs);
                         let found = return_if_io!(
                             cursor.seek(SeekKey::IndexKey(&record_from_regs), SeekOp::GE)
                         );
                         if !found {
-                            state.pc = target_pc.to_offset_int();
+                            state.pc = *target_pc;
                         } else {
                             state.pc += 1;
                         }
                     } else {
-                        let cursor = get_cursor_as_table_mut(&mut cursors, *cursor_id);
+                        let cursor = cursors.get_mut(cursor_id).unwrap();
                         let rowid = match &state.registers[*start_reg] {
                             OwnedValue::Null => {
                                 // All integer values are greater than null so we just rewind the cursor
@@ -1454,7 +1822,7 @@ impl Program {
                         let found =
                             return_if_io!(cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE));
                         if !found {
-                            state.pc = target_pc.to_offset_int();
+                            state.pc = *target_pc;
                         } else {
                             state.pc += 1;
                         }
@@ -1467,22 +1835,20 @@ impl Program {
                     target_pc,
                     is_index,
                 } => {
-                    assert!(target_pc.is_offset());
-                    let mut cursors = state.cursors.borrow_mut();
                     if *is_index {
-                        let cursor = get_cursor_as_index_mut(&mut cursors, *cursor_id);
-                        let record_from_regs: Record =
+                        let cursor = cursors.get_mut(cursor_id).unwrap();
+                        let record_from_regs: OwnedRecord =
                             make_owned_record(&state.registers, start_reg, num_regs);
                         let found = return_if_io!(
                             cursor.seek(SeekKey::IndexKey(&record_from_regs), SeekOp::GT)
                         );
                         if !found {
-                            state.pc = target_pc.to_offset_int();
+                            state.pc = *target_pc;
                         } else {
                             state.pc += 1;
                         }
                     } else {
-                        let cursor = get_cursor_as_table_mut(&mut cursors, *cursor_id);
+                        let cursor = cursors.get_mut(cursor_id).unwrap();
                         let rowid = match &state.registers[*start_reg] {
                             OwnedValue::Null => {
                                 // All integer values are greater than null so we just rewind the cursor
@@ -1500,7 +1866,7 @@ impl Program {
                         let found =
                             return_if_io!(cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GT));
                         if !found {
-                            state.pc = target_pc.to_offset_int();
+                            state.pc = *target_pc;
                         } else {
                             state.pc += 1;
                         }
@@ -1512,47 +1878,22 @@ impl Program {
                     num_regs,
                     target_pc,
                 } => {
-                    assert!(target_pc.is_offset());
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor = get_cursor_as_index_mut(&mut cursors, *cursor_id);
-                    let record_from_regs: Record =
+                    assert!(*target_pc >= 0);
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
+                    let record_from_regs: OwnedRecord =
                         make_owned_record(&state.registers, start_reg, num_regs);
                     if let Some(ref idx_record) = *cursor.record()? {
-                        // Compare against the same number of values
-                        if idx_record.get_values()[..record_from_regs.len()]
-                            >= record_from_regs.get_values()[..]
+                        // omit the rowid from the idx_record, which is the last value
+                        if idx_record.values[..idx_record.values.len() - 1]
+                            >= *record_from_regs.values
                         {
-                            state.pc = target_pc.to_offset_int();
+                            state.pc = *target_pc;
                         } else {
                             state.pc += 1;
                         }
                     } else {
-                        state.pc = target_pc.to_offset_int();
-                    };
-                }
-                Insn::IdxLE {
-                    cursor_id,
-                    start_reg,
-                    num_regs,
-                    target_pc,
-                } => {
-                    assert!(target_pc.is_offset());
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor = get_cursor_as_index_mut(&mut cursors, *cursor_id);
-                    let record_from_regs: Record =
-                        make_owned_record(&state.registers, start_reg, num_regs);
-                    if let Some(ref idx_record) = *cursor.record()? {
-                        // Compare against the same number of values
-                        if idx_record.get_values()[..record_from_regs.len()]
-                            <= record_from_regs.get_values()[..]
-                        {
-                            state.pc = target_pc.to_offset_int();
-                        } else {
-                            state.pc += 1;
-                        }
-                    } else {
-                        state.pc = target_pc.to_offset_int();
-                    };
+                        state.pc = *target_pc;
+                    }
                 }
                 Insn::IdxGT {
                     cursor_id,
@@ -1560,55 +1901,29 @@ impl Program {
                     num_regs,
                     target_pc,
                 } => {
-                    assert!(target_pc.is_offset());
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor = get_cursor_as_index_mut(&mut cursors, *cursor_id);
-                    let record_from_regs: Record =
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
+                    let record_from_regs: OwnedRecord =
                         make_owned_record(&state.registers, start_reg, num_regs);
                     if let Some(ref idx_record) = *cursor.record()? {
-                        // Compare against the same number of values
-                        if idx_record.get_values()[..record_from_regs.len()]
-                            > record_from_regs.get_values()[..]
+                        // omit the rowid from the idx_record, which is the last value
+                        if idx_record.values[..idx_record.values.len() - 1]
+                            > *record_from_regs.values
                         {
-                            state.pc = target_pc.to_offset_int();
+                            state.pc = *target_pc;
                         } else {
                             state.pc += 1;
                         }
                     } else {
-                        state.pc = target_pc.to_offset_int();
-                    };
-                }
-                Insn::IdxLT {
-                    cursor_id,
-                    start_reg,
-                    num_regs,
-                    target_pc,
-                } => {
-                    assert!(target_pc.is_offset());
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor = get_cursor_as_index_mut(&mut cursors, *cursor_id);
-                    let record_from_regs: Record =
-                        make_owned_record(&state.registers, start_reg, num_regs);
-                    if let Some(ref idx_record) = *cursor.record()? {
-                        // Compare against the same number of values
-                        if idx_record.get_values()[..record_from_regs.len()]
-                            < record_from_regs.get_values()[..]
-                        {
-                            state.pc = target_pc.to_offset_int();
-                        } else {
-                            state.pc += 1;
-                        }
-                    } else {
-                        state.pc = target_pc.to_offset_int();
-                    };
+                        state.pc = *target_pc;
+                    }
                 }
                 Insn::DecrJumpZero { reg, target_pc } => {
-                    assert!(target_pc.is_offset());
+                    assert!(*target_pc >= 0);
                     match state.registers[*reg] {
                         OwnedValue::Integer(n) => {
                             let n = n - 1;
                             if n == 0 {
-                                state.pc = target_pc.to_offset_int();
+                                state.pc = *target_pc;
                             } else {
                                 state.registers[*reg] = OwnedValue::Integer(n);
                                 state.pc += 1;
@@ -1638,7 +1953,7 @@ impl Program {
                                 // Total() never throws an integer overflow.
                                 OwnedValue::Agg(Box::new(AggContext::Sum(OwnedValue::Float(0.0))))
                             }
-                            AggFunc::Count | AggFunc::Count0 => {
+                            AggFunc::Count => {
                                 OwnedValue::Agg(Box::new(AggContext::Count(OwnedValue::Integer(0))))
                             }
                             AggFunc::Max => {
@@ -1675,26 +1990,11 @@ impl Program {
                                     }
                                 }
                             }
-                            AggFunc::GroupConcat | AggFunc::StringAgg => OwnedValue::Agg(Box::new(
-                                AggContext::GroupConcat(OwnedValue::build_text("")),
-                            )),
-                            AggFunc::External(func) => match func.as_ref() {
-                                ExtFunc::Aggregate {
-                                    init,
-                                    step,
-                                    finalize,
-                                    argc,
-                                } => OwnedValue::Agg(Box::new(AggContext::External(
-                                    ExternalAggState {
-                                        state: unsafe { (init)() },
-                                        argc: *argc,
-                                        step_fn: *step,
-                                        finalize_fn: *finalize,
-                                        finalized_value: None,
-                                    },
-                                ))),
-                                _ => unreachable!("scalar function called in aggregate context"),
-                            },
+                            AggFunc::GroupConcat | AggFunc::StringAgg => {
+                                OwnedValue::Agg(Box::new(AggContext::GroupConcat(
+                                    OwnedValue::build_text(Rc::new("".to_string())),
+                                )))
+                            }
                         };
                     }
                     match func {
@@ -1721,13 +2021,7 @@ impl Program {
                             };
                             *acc += col;
                         }
-                        AggFunc::Count | AggFunc::Count0 => {
-                            let col = state.registers[*col].clone();
-                            if matches!(&state.registers[*acc_reg], OwnedValue::Null) {
-                                state.registers[*acc_reg] = OwnedValue::Agg(Box::new(
-                                    AggContext::Count(OwnedValue::Integer(0)),
-                                ));
-                            }
+                        AggFunc::Count => {
                             let OwnedValue::Agg(agg) = state.registers[*acc_reg].borrow_mut()
                             else {
                                 unreachable!();
@@ -1735,12 +2029,7 @@ impl Program {
                             let AggContext::Count(count) = agg.borrow_mut() else {
                                 unreachable!();
                             };
-
-                            if (matches!(func, AggFunc::Count) && matches!(col, OwnedValue::Null))
-                                == false
-                            {
-                                *count += 1;
-                            };
+                            *count += 1;
                         }
                         AggFunc::Max => {
                             let col = state.registers[*col].clone();
@@ -1845,103 +2134,33 @@ impl Program {
                                 *acc += col;
                             }
                         }
-                        AggFunc::External(_) => {
-                            let (step_fn, state_ptr, argc) = {
-                                let OwnedValue::Agg(agg) = &state.registers[*acc_reg] else {
-                                    unreachable!();
-                                };
-                                let AggContext::External(agg_state) = agg.as_ref() else {
-                                    unreachable!();
-                                };
-                                (agg_state.step_fn, agg_state.state, agg_state.argc)
-                            };
-                            if argc == 0 {
-                                unsafe { step_fn(state_ptr, 0, std::ptr::null()) };
-                            } else {
-                                let register_slice = &state.registers[*col..*col + argc];
-                                let mut ext_values: Vec<ExtValue> = Vec::with_capacity(argc);
-                                for ov in register_slice.iter() {
-                                    ext_values.push(ov.to_ffi());
-                                }
-                                let argv_ptr = ext_values.as_ptr();
-                                unsafe { step_fn(state_ptr, argc as i32, argv_ptr) };
-                                for ext_value in ext_values {
-                                    unsafe { ext_value.free() };
-                                }
-                            }
-                        }
                     };
                     state.pc += 1;
                 }
                 Insn::AggFinal { register, func } => {
                     match state.registers[*register].borrow_mut() {
-                        OwnedValue::Agg(agg) => match func {
-                            AggFunc::Avg => {
-                                let AggContext::Avg(acc, count) = agg.borrow_mut() else {
-                                    unreachable!();
-                                };
-                                *acc /= count.clone();
-                                state.registers[*register] = acc.clone();
-                            }
-                            AggFunc::Sum | AggFunc::Total => {
-                                let AggContext::Sum(acc) = agg.borrow_mut() else {
-                                    unreachable!();
-                                };
-                                let value = match acc {
-                                    OwnedValue::Integer(i) => OwnedValue::Integer(*i),
-                                    OwnedValue::Float(f) => OwnedValue::Float(*f),
-                                    _ => OwnedValue::Float(0.0),
-                                };
-                                state.registers[*register] = value;
-                            }
-                            AggFunc::Count | AggFunc::Count0 => {
-                                let AggContext::Count(count) = agg.borrow_mut() else {
-                                    unreachable!();
-                                };
-                                state.registers[*register] = count.clone();
-                            }
-                            AggFunc::Max => {
-                                let AggContext::Max(acc) = agg.borrow_mut() else {
-                                    unreachable!();
-                                };
-                                match acc {
-                                    Some(value) => state.registers[*register] = value.clone(),
-                                    None => state.registers[*register] = OwnedValue::Null,
+                        OwnedValue::Agg(agg) => {
+                            match func {
+                                AggFunc::Avg => {
+                                    let AggContext::Avg(acc, count) = agg.borrow_mut() else {
+                                        unreachable!();
+                                    };
+                                    *acc /= count.clone();
                                 }
-                            }
-                            AggFunc::Min => {
-                                let AggContext::Min(acc) = agg.borrow_mut() else {
-                                    unreachable!();
-                                };
-                                match acc {
-                                    Some(value) => state.registers[*register] = value.clone(),
-                                    None => state.registers[*register] = OwnedValue::Null,
-                                }
-                            }
-                            AggFunc::GroupConcat | AggFunc::StringAgg => {
-                                let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
-                                    unreachable!();
-                                };
-                                state.registers[*register] = acc.clone();
-                            }
-                            AggFunc::External(_) => {
-                                agg.compute_external()?;
-                                let AggContext::External(agg_state) = agg.borrow_mut() else {
-                                    unreachable!();
-                                };
-                                match &agg_state.finalized_value {
-                                    Some(value) => state.registers[*register] = value.clone(),
-                                    None => state.registers[*register] = OwnedValue::Null,
-                                }
-                            }
-                        },
+                                AggFunc::Sum | AggFunc::Total => {}
+                                AggFunc::Count => {}
+                                AggFunc::Max => {}
+                                AggFunc::Min => {}
+                                AggFunc::GroupConcat | AggFunc::StringAgg => {}
+                            };
+                        }
                         OwnedValue::Null => {
                             // when the set is empty
                             match func {
                                 AggFunc::Total => {
                                     state.registers[*register] = OwnedValue::Float(0.0);
                                 }
-                                AggFunc::Count | AggFunc::Count0 => {
+                                AggFunc::Count => {
                                     state.registers[*register] = OwnedValue::Integer(0);
                                 }
                                 _ => {}
@@ -1959,76 +2178,68 @@ impl Program {
                     order,
                 } => {
                     let order = order
-                        .get_values()
+                        .values
                         .iter()
                         .map(|v| match v {
                             OwnedValue::Integer(i) => *i == 0,
                             _ => unreachable!(),
                         })
                         .collect();
-                    let cursor = Sorter::new(order);
-                    let mut cursors = state.cursors.borrow_mut();
-                    cursors
-                        .get_mut(*cursor_id)
-                        .unwrap()
-                        .replace(Cursor::new_sorter(cursor));
+                    let cursor = Box::new(sorter::Sorter::new(order));
+                    cursors.insert(*cursor_id, cursor);
                     state.pc += 1;
                 }
                 Insn::SorterData {
                     cursor_id,
                     dest_reg,
-                    pseudo_cursor,
+                    pseudo_cursor: sorter_cursor,
                 } => {
-                    let mut cursors = state.cursors.borrow_mut();
-                    let sorter_cursor = get_cursor_as_sorter_mut(&mut cursors, *cursor_id);
-                    let record = match sorter_cursor.record() {
-                        Some(record) => record.clone(),
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
+                    let record = match *cursor.record()? {
+                        Some(ref record) => record.clone(),
                         None => {
                             state.pc += 1;
                             continue;
                         }
                     };
                     state.registers[*dest_reg] = OwnedValue::Record(record.clone());
-                    let pseudo_cursor = get_cursor_as_pseudo_mut(&mut cursors, *pseudo_cursor);
-                    pseudo_cursor.insert(record);
+                    let sorter_cursor = cursors.get_mut(sorter_cursor).unwrap();
+                    sorter_cursor.insert(&OwnedValue::Integer(0), &record, false)?; // fix key later
                     state.pc += 1;
                 }
                 Insn::SorterInsert {
                     cursor_id,
                     record_reg,
                 } => {
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor = get_cursor_as_sorter_mut(&mut cursors, *cursor_id);
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
                     let record = match &state.registers[*record_reg] {
                         OwnedValue::Record(record) => record,
                         _ => unreachable!("SorterInsert on non-record register"),
                     };
-                    cursor.insert(record);
+                    // TODO: set correct key
+                    cursor.insert(&OwnedValue::Integer(0), record, false)?;
                     state.pc += 1;
                 }
                 Insn::SorterSort {
                     cursor_id,
                     pc_if_empty,
                 } => {
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor = get_cursor_as_sorter_mut(&mut cursors, *cursor_id);
-                    if cursor.is_empty() {
-                        state.pc = pc_if_empty.to_offset_int();
-                    } else {
-                        cursor.sort();
+                    if let Some(cursor) = cursors.get_mut(cursor_id) {
+                        cursor.rewind()?;
                         state.pc += 1;
+                    } else {
+                        state.pc = *pc_if_empty;
                     }
                 }
                 Insn::SorterNext {
                     cursor_id,
                     pc_if_next,
                 } => {
-                    assert!(pc_if_next.is_offset());
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor = get_cursor_as_sorter_mut(&mut cursors, *cursor_id);
-                    cursor.next();
-                    if cursor.has_more() {
-                        state.pc = pc_if_next.to_offset_int();
+                    assert!(*pc_if_next >= 0);
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
+                    return_if_io!(cursor.next());
+                    if !cursor.is_empty() {
+                        state.pc = *pc_if_next;
                     } else {
                         state.pc += 1;
                     }
@@ -2042,164 +2253,30 @@ impl Program {
                     let arg_count = func.arg_count;
                     match &func.func {
                         #[cfg(feature = "json")]
-                        crate::function::Func::Json(json_func) => match json_func {
-                            JsonFunc::Json => {
-                                let json_value = &state.registers[*start_reg];
-                                let json_str = get_json(json_value, None);
-                                match json_str {
-                                    Ok(json) => state.registers[*dest] = json,
-                                    Err(e) => return Err(e),
-                                }
+                        crate::function::Func::Json(JsonFunc::Json) => {
+                            let json_value = &state.registers[*start_reg];
+                            let json_str = get_json(json_value);
+                            match json_str {
+                                Ok(json) => state.registers[*dest] = json,
+                                Err(e) => return Err(e),
                             }
-                            JsonFunc::JsonArray | JsonFunc::JsonObject => {
-                                let reg_values =
-                                    &state.registers[*start_reg..*start_reg + arg_count];
+                        }
+                        #[cfg(feature = "json")]
+                        crate::function::Func::Json(JsonFunc::JsonArray) => {
+                            let reg_values = state.registers[*start_reg..*start_reg + arg_count]
+                                .iter()
+                                .collect();
 
-                                let json_func = match json_func {
-                                    JsonFunc::JsonArray => json_array,
-                                    JsonFunc::JsonObject => json_object,
-                                    _ => unreachable!(),
-                                };
-                                let json_result = json_func(reg_values);
+                            let json_array = json_array(reg_values);
 
-                                match json_result {
-                                    Ok(json) => state.registers[*dest] = json,
-                                    Err(e) => return Err(e),
-                                }
+                            match json_array {
+                                Ok(json) => state.registers[*dest] = json,
+                                Err(e) => return Err(e),
                             }
-                            JsonFunc::JsonExtract => {
-                                let result = match arg_count {
-                                    0 => json_extract(&OwnedValue::Null, &[]),
-                                    _ => {
-                                        let val = &state.registers[*start_reg];
-                                        let reg_values = &state.registers
-                                            [*start_reg + 1..*start_reg + arg_count];
-
-                                        json_extract(val, reg_values)
-                                    }
-                                };
-
-                                match result {
-                                    Ok(json) => state.registers[*dest] = json,
-                                    Err(e) => return Err(e),
-                                }
-                            }
-                            JsonFunc::JsonArrowExtract | JsonFunc::JsonArrowShiftExtract => {
-                                assert_eq!(arg_count, 2);
-                                let json = &state.registers[*start_reg];
-                                let path = &state.registers[*start_reg + 1];
-                                let json_func = match json_func {
-                                    JsonFunc::JsonArrowExtract => json_arrow_extract,
-                                    JsonFunc::JsonArrowShiftExtract => json_arrow_shift_extract,
-                                    _ => unreachable!(),
-                                };
-                                let json_str = json_func(json, path);
-                                match json_str {
-                                    Ok(json) => state.registers[*dest] = json,
-                                    Err(e) => return Err(e),
-                                }
-                            }
-                            JsonFunc::JsonArrayLength | JsonFunc::JsonType => {
-                                let json_value = &state.registers[*start_reg];
-                                let path_value = if arg_count > 1 {
-                                    Some(&state.registers[*start_reg + 1])
-                                } else {
-                                    None
-                                };
-                                let func_result = match json_func {
-                                    JsonFunc::JsonArrayLength => {
-                                        json_array_length(json_value, path_value)
-                                    }
-                                    JsonFunc::JsonType => json_type(json_value, path_value),
-                                    _ => unreachable!(),
-                                };
-
-                                match func_result {
-                                    Ok(result) => state.registers[*dest] = result,
-                                    Err(e) => return Err(e),
-                                }
-                            }
-                            JsonFunc::JsonErrorPosition => {
-                                let json_value = &state.registers[*start_reg];
-                                match json_error_position(json_value) {
-                                    Ok(pos) => state.registers[*dest] = pos,
-                                    Err(e) => return Err(e),
-                                }
-                            }
-                            JsonFunc::JsonValid => {
-                                let json_value = &state.registers[*start_reg];
-                                state.registers[*dest] = is_json_valid(json_value)?;
-                            }
-                            JsonFunc::JsonPatch => {
-                                assert_eq!(arg_count, 2);
-                                assert!(*start_reg + 1 < state.registers.len());
-                                let target = &state.registers[*start_reg];
-                                let patch = &state.registers[*start_reg + 1];
-                                state.registers[*dest] = json_patch(target, patch)?;
-                            }
-                            JsonFunc::JsonRemove => {
-                                state.registers[*dest] = json_remove(
-                                    &state.registers[*start_reg..*start_reg + arg_count],
-                                )?;
-                            }
-                            JsonFunc::JsonPretty => {
-                                let json_value = &state.registers[*start_reg];
-                                let indent = if arg_count > 1 {
-                                    Some(&state.registers[*start_reg + 1])
-                                } else {
-                                    None
-                                };
-
-                                // Blob should be converted to Ascii in a lossy way
-                                // However, Rust strings uses utf-8
-                                // so the behavior at the moment is slightly different
-                                // To the way blobs are parsed here in SQLite.
-                                let indent = match indent {
-                                    Some(value) => match value {
-                                        OwnedValue::Text(text) => text.as_str(),
-                                        OwnedValue::Integer(val) => &val.to_string(),
-                                        OwnedValue::Float(val) => &val.to_string(),
-                                        OwnedValue::Blob(val) => &String::from_utf8_lossy(val),
-                                        OwnedValue::Agg(ctx) => match ctx.final_value() {
-                                            OwnedValue::Text(text) => text.as_str(),
-                                            OwnedValue::Integer(val) => &val.to_string(),
-                                            OwnedValue::Float(val) => &val.to_string(),
-                                            OwnedValue::Blob(val) => &String::from_utf8_lossy(val),
-                                            _ => "    ",
-                                        },
-                                        _ => "    ",
-                                    },
-                                    // If the second argument is omitted or is NULL, then indentation is four spaces per level
-                                    None => "    ",
-                                };
-
-                                let json_str = get_json(json_value, Some(indent))?;
-                                state.registers[*dest] = json_str;
-                            }
-                            JsonFunc::JsonSet => {
-                                let reg_values =
-                                    &state.registers[*start_reg + 1..*start_reg + arg_count];
-
-                                let json_result =
-                                    json_set(&state.registers[*start_reg], reg_values);
-
-                                match json_result {
-                                    Ok(json) => state.registers[*dest] = json,
-                                    Err(e) => return Err(e),
-                                }
-                            }
-                            JsonFunc::JsonQuote => {
-                                let json_value = &state.registers[*start_reg];
-
-                                match json_quote(json_value) {
-                                    Ok(result) => state.registers[*dest] = result,
-                                    Err(e) => return Err(e),
-                                }
-                            }
-                        },
+                        }
                         crate::function::Func::Scalar(scalar_func) => match scalar_func {
                             ScalarFunc::Cast => {
-                                assert_eq!(arg_count, 2);
+                                assert!(arg_count == 2);
                                 assert!(*start_reg + 1 < state.registers.len());
                                 let reg_value_argument = state.registers[*start_reg].clone();
                                 let OwnedValue::Text(reg_value_type) =
@@ -2207,14 +2284,8 @@ impl Program {
                                 else {
                                     unreachable!("Cast with non-text type");
                                 };
-                                let result =
-                                    exec_cast(&reg_value_argument, reg_value_type.as_str());
+                                let result = exec_cast(&reg_value_argument, &reg_value_type.value);
                                 state.registers[*dest] = result;
-                            }
-                            ScalarFunc::Changes => {
-                                let res = &self.connection.upgrade().unwrap().last_change;
-                                let changes = res.get();
-                                state.registers[*dest] = OwnedValue::Integer(changes);
                             }
                             ScalarFunc::Char => {
                                 let reg_values =
@@ -2223,7 +2294,7 @@ impl Program {
                             }
                             ScalarFunc::Coalesce => {}
                             ScalarFunc::Concat => {
-                                let result = exec_concat_strings(
+                                let result = exec_concat(
                                     &state.registers[*start_reg..*start_reg + arg_count],
                                 );
                                 state.registers[*dest] = result;
@@ -2246,8 +2317,8 @@ impl Program {
                                         };
                                         OwnedValue::Integer(exec_glob(
                                             cache,
-                                            pattern.as_str(),
-                                            text.as_str(),
+                                            &pattern.value,
+                                            &text.value,
                                         )
                                             as i64)
                                     }
@@ -2275,40 +2346,9 @@ impl Program {
                             }
                             ScalarFunc::Like => {
                                 let pattern = &state.registers[*start_reg];
-                                let match_expression = &state.registers[*start_reg + 1];
-
-                                let pattern = match pattern {
-                                    OwnedValue::Text(_) => pattern,
-                                    _ => &exec_cast(pattern, "TEXT"),
-                                };
-                                let match_expression = match match_expression {
-                                    OwnedValue::Text(_) => match_expression,
-                                    _ => &exec_cast(match_expression, "TEXT"),
-                                };
-
-                                let result = match (pattern, match_expression) {
-                                    (
-                                        OwnedValue::Text(pattern),
-                                        OwnedValue::Text(match_expression),
-                                    ) if arg_count == 3 => {
-                                        let escape = match construct_like_escape_arg(
-                                            &state.registers[*start_reg + 2],
-                                        ) {
-                                            Ok(x) => x,
-                                            Err(e) => return Err(e),
-                                        };
-
-                                        OwnedValue::Integer(exec_like_with_escape(
-                                            pattern.as_str(),
-                                            match_expression.as_str(),
-                                            escape,
-                                        )
-                                            as i64)
-                                    }
-                                    (
-                                        OwnedValue::Text(pattern),
-                                        OwnedValue::Text(match_expression),
-                                    ) => {
+                                let text = &state.registers[*start_reg + 1];
+                                let result = match (pattern, text) {
+                                    (OwnedValue::Text(pattern), OwnedValue::Text(text)) => {
                                         let cache = if *constant_mask > 0 {
                                             Some(&mut state.regex_cache.like)
                                         } else {
@@ -2316,19 +2356,15 @@ impl Program {
                                         };
                                         OwnedValue::Integer(exec_like(
                                             cache,
-                                            pattern.as_str(),
-                                            match_expression.as_str(),
+                                            &pattern.value,
+                                            &text.value,
                                         )
                                             as i64)
                                     }
-                                    (OwnedValue::Null, _) | (_, OwnedValue::Null) => {
-                                        OwnedValue::Null
-                                    }
                                     _ => {
-                                        unreachable!("Like failed");
+                                        unreachable!("Like on non-text registers");
                                     }
                                 };
-
                                 state.registers[*dest] = result;
                             }
                             ScalarFunc::Abs
@@ -2346,7 +2382,7 @@ impl Program {
                                 let reg_value = state.registers[*start_reg].borrow_mut();
                                 let result = match scalar_func {
                                     ScalarFunc::Sign => exec_sign(reg_value),
-                                    ScalarFunc::Abs => Some(exec_abs(reg_value)?),
+                                    ScalarFunc::Abs => exec_abs(reg_value),
                                     ScalarFunc::Lower => exec_lower(reg_value),
                                     ScalarFunc::Upper => exec_upper(reg_value),
                                     ScalarFunc::Length => Some(exec_length(reg_value)),
@@ -2377,31 +2413,19 @@ impl Program {
                             }
                             ScalarFunc::Trim => {
                                 let reg_value = state.registers[*start_reg].clone();
-                                let pattern_value = if func.arg_count == 2 {
-                                    state.registers.get(*start_reg + 1).cloned()
-                                } else {
-                                    None
-                                };
+                                let pattern_value = state.registers.get(*start_reg + 1).cloned();
                                 let result = exec_trim(&reg_value, pattern_value);
                                 state.registers[*dest] = result;
                             }
                             ScalarFunc::LTrim => {
                                 let reg_value = state.registers[*start_reg].clone();
-                                let pattern_value = if func.arg_count == 2 {
-                                    state.registers.get(*start_reg + 1).cloned()
-                                } else {
-                                    None
-                                };
+                                let pattern_value = state.registers.get(*start_reg + 1).cloned();
                                 let result = exec_ltrim(&reg_value, pattern_value);
                                 state.registers[*dest] = result;
                             }
                             ScalarFunc::RTrim => {
                                 let reg_value = state.registers[*start_reg].clone();
-                                let pattern_value = if func.arg_count == 2 {
-                                    state.registers.get(*start_reg + 1).cloned()
-                                } else {
-                                    None
-                                };
+                                let pattern_value = state.registers.get(*start_reg + 1).cloned();
                                 let result = exec_rtrim(&reg_value, pattern_value);
                                 state.registers[*dest] = result;
                             }
@@ -2438,11 +2462,7 @@ impl Program {
                             ScalarFunc::Substr | ScalarFunc::Substring => {
                                 let str_value = &state.registers[*start_reg];
                                 let start_value = &state.registers[*start_reg + 1];
-                                let length_value = if func.arg_count == 3 {
-                                    Some(&state.registers[*start_reg + 2])
-                                } else {
-                                    None
-                                };
+                                let length_value = &state.registers[*start_reg + 2];
                                 let result = exec_substring(str_value, start_value, length_value);
                                 state.registers[*dest] = result;
                             }
@@ -2456,49 +2476,20 @@ impl Program {
                                     exec_time(&state.registers[*start_reg..*start_reg + arg_count]);
                                 state.registers[*dest] = result;
                             }
-                            ScalarFunc::TotalChanges => {
-                                let res = &self.connection.upgrade().unwrap().total_changes;
-                                let total_changes = res.get();
-                                state.registers[*dest] = OwnedValue::Integer(total_changes);
-                            }
-                            ScalarFunc::DateTime => {
-                                let result = exec_datetime_full(
-                                    &state.registers[*start_reg..*start_reg + arg_count],
-                                );
-                                state.registers[*dest] = result;
-                            }
-                            ScalarFunc::JulianDay => {
-                                if *start_reg == 0 {
-                                    let julianday: String =
-                                        exec_julianday(&OwnedValue::build_text("now"))?;
-                                    state.registers[*dest] = OwnedValue::build_text(&julianday);
-                                } else {
-                                    let datetime_value = &state.registers[*start_reg];
-                                    let julianday = exec_julianday(datetime_value);
-                                    match julianday {
-                                        Ok(time) => {
-                                            state.registers[*dest] = OwnedValue::build_text(&time)
-                                        }
-                                        Err(e) => {
-                                            return Err(LimboError::ParseError(format!(
-                                                "Error encountered while parsing datetime value: {}",
-                                                e
-                                            )));
-                                        }
-                                    }
-                                }
-                            }
                             ScalarFunc::UnixEpoch => {
                                 if *start_reg == 0 {
-                                    let unixepoch: String =
-                                        exec_unixepoch(&OwnedValue::build_text("now"))?;
-                                    state.registers[*dest] = OwnedValue::build_text(&unixepoch);
+                                    let unixepoch: String = exec_unixepoch(
+                                        &OwnedValue::build_text(Rc::new("now".to_string())),
+                                    )?;
+                                    state.registers[*dest] =
+                                        OwnedValue::build_text(Rc::new(unixepoch));
                                 } else {
                                     let datetime_value = &state.registers[*start_reg];
                                     let unixepoch = exec_unixepoch(datetime_value);
                                     match unixepoch {
                                         Ok(time) => {
-                                            state.registers[*dest] = OwnedValue::build_text(&time)
+                                            state.registers[*dest] =
+                                                OwnedValue::build_text(Rc::new(time))
                                         }
                                         Err(e) => {
                                             return Err(LimboError::ParseError(format!(
@@ -2513,78 +2504,47 @@ impl Program {
                                 let version_integer: i64 =
                                     DATABASE_VERSION.get().unwrap().parse()?;
                                 let version = execute_sqlite_version(version_integer);
-                                state.registers[*dest] = OwnedValue::build_text(&version);
-                            }
-                            ScalarFunc::SqliteSourceId => {
-                                let src_id = format!(
-                                    "{} {}",
-                                    info::build::BUILT_TIME_SQLITE,
-                                    info::build::GIT_COMMIT_HASH.unwrap_or("unknown")
-                                );
-                                state.registers[*dest] = OwnedValue::build_text(&src_id);
+                                state.registers[*dest] = OwnedValue::build_text(Rc::new(version));
                             }
                             ScalarFunc::Replace => {
-                                assert_eq!(arg_count, 3);
+                                assert!(arg_count == 3);
                                 let source = &state.registers[*start_reg];
                                 let pattern = &state.registers[*start_reg + 1];
                                 let replacement = &state.registers[*start_reg + 2];
                                 state.registers[*dest] = exec_replace(source, pattern, replacement);
                             }
-                            #[cfg(not(target_family = "wasm"))]
-                            ScalarFunc::LoadExtension => {
-                                let extension = &state.registers[*start_reg];
-                                let ext = resolve_ext_path(&extension.to_string())?;
-                                if let Some(conn) = self.connection.upgrade() {
-                                    conn.load_extension(ext)?;
+                        },
+                        crate::function::Func::Extension(extfn) => match extfn {
+                            #[cfg(feature = "uuid")]
+                            ExtFunc::Uuid(uuidfn) => match uuidfn {
+                                UuidFunc::Uuid4 | UuidFunc::Uuid4Str => {
+                                    state.registers[*dest] = exec_uuid(uuidfn, None)?
                                 }
-                            }
-                            ScalarFunc::StrfTime => {
-                                let result = exec_strftime(
-                                    &state.registers[*start_reg..*start_reg + arg_count],
-                                );
-                                state.registers[*dest] = result;
-                            }
-                            ScalarFunc::Printf => {
-                                let result = exec_printf(
-                                    &state.registers[*start_reg..*start_reg + arg_count],
-                                )?;
-                                state.registers[*dest] = result;
-                            }
-                        },
-                        crate::function::Func::Vector(vector_func) => match vector_func {
-                            VectorFunc::Vector => {
-                                let result =
-                                    vector32(&state.registers[*start_reg..*start_reg + arg_count])?;
-                                state.registers[*dest] = result;
-                            }
-                            VectorFunc::Vector32 => {
-                                let result =
-                                    vector32(&state.registers[*start_reg..*start_reg + arg_count])?;
-                                state.registers[*dest] = result;
-                            }
-                            VectorFunc::Vector64 => {
-                                let result =
-                                    vector64(&state.registers[*start_reg..*start_reg + arg_count])?;
-                                state.registers[*dest] = result;
-                            }
-                            VectorFunc::VectorExtract => {
-                                let result = vector_extract(
-                                    &state.registers[*start_reg..*start_reg + arg_count],
-                                )?;
-                                state.registers[*dest] = result;
-                            }
-                            VectorFunc::VectorDistanceCos => {
-                                let result = vector_distance_cos(
-                                    &state.registers[*start_reg..*start_reg + arg_count],
-                                )?;
-                                state.registers[*dest] = result;
-                            }
-                        },
-                        crate::function::Func::External(f) => match f.func {
-                            ExtFunc::Scalar(f) => {
-                                call_external_function! {f, *dest, state, arg_count, *start_reg };
-                            }
-                            _ => unreachable!("aggregate called in scalar context"),
+                                UuidFunc::Uuid7 => match arg_count {
+                                    0 => {
+                                        state.registers[*dest] =
+                                            exec_uuid(uuidfn, None).unwrap_or(OwnedValue::Null);
+                                    }
+                                    1 => {
+                                        let reg_value = state.registers[*start_reg].borrow();
+                                        state.registers[*dest] = exec_uuid(uuidfn, Some(reg_value))
+                                            .unwrap_or(OwnedValue::Null);
+                                    }
+                                    _ => unreachable!(),
+                                },
+                                _ => {
+                                    // remaining accept 1 arg
+                                    let reg_value = state.registers[*start_reg].borrow();
+                                    state.registers[*dest] = match uuidfn {
+                                        UuidFunc::Uuid7TS => Some(exec_ts_from_uuid7(reg_value)),
+                                        UuidFunc::UuidStr => exec_uuidstr(reg_value).ok(),
+                                        UuidFunc::UuidBlob => exec_uuidblob(reg_value).ok(),
+                                        _ => unreachable!(),
+                                    }
+                                    .unwrap_or(OwnedValue::Null);
+                                }
+                            },
+                            _ => unreachable!(), // when more extension types are added
                         },
                         crate::function::Func::Math(math_func) => match math_func.arity() {
                             MathFuncArity::Nullary => match math_func {
@@ -2649,24 +2609,13 @@ impl Program {
                     jump_on_definition,
                     start_offset,
                 } => {
-                    assert!(jump_on_definition.is_offset());
-                    let start_offset = start_offset.to_offset_int();
-                    state.registers[*yield_reg] = OwnedValue::Integer(start_offset as i64);
-                    state.ended_coroutine.unset(*yield_reg);
-                    let jump_on_definition = jump_on_definition.to_offset_int();
-                    state.pc = if jump_on_definition == 0 {
-                        state.pc + 1
-                    } else {
-                        jump_on_definition
-                    };
+                    state.registers[*yield_reg] = OwnedValue::Integer(*start_offset);
+                    state.pc = *jump_on_definition;
                 }
                 Insn::EndCoroutine { yield_reg } => {
                     if let OwnedValue::Integer(pc) = state.registers[*yield_reg] {
-                        state.ended_coroutine.set(*yield_reg);
-                        let pc: u32 = pc
-                            .try_into()
-                            .unwrap_or_else(|_| panic!("EndCoroutine: pc overflow: {}", pc));
-                        state.pc = pc - 1; // yield jump is always next to yield. Here we subtract 1 to go back to yield instruction
+                        state.ended_coroutine = true;
+                        state.pc = pc - 1; // yield jump is always next to yield. Here we substract 1 to go back to yield instruction
                     } else {
                         unreachable!();
                     }
@@ -2676,22 +2625,15 @@ impl Program {
                     end_offset,
                 } => {
                     if let OwnedValue::Integer(pc) = state.registers[*yield_reg] {
-                        if state.ended_coroutine.get(*yield_reg) {
-                            state.pc = end_offset.to_offset_int();
+                        if state.ended_coroutine {
+                            state.pc = *end_offset;
                         } else {
-                            let pc: u32 = pc
-                                .try_into()
-                                .unwrap_or_else(|_| panic!("Yield: pc overflow: {}", pc));
-                            // swap the program counter with the value in the yield register
-                            // this is the mechanism that allows jumping back and forth between the coroutine and the caller
+                            // swap
                             (state.pc, state.registers[*yield_reg]) =
-                                (pc, OwnedValue::Integer((state.pc + 1) as i64));
+                                (pc, OwnedValue::Integer(state.pc + 1));
                         }
                     } else {
-                        unreachable!(
-                            "yield_reg {} contains non-integer value: {:?}",
-                            *yield_reg, state.registers[*yield_reg]
-                        );
+                        unreachable!();
                     }
                 }
                 Insn::InsertAsync {
@@ -2700,22 +2642,17 @@ impl Program {
                     record_reg,
                     flag: _,
                 } => {
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor = get_cursor_as_table_mut(&mut cursors, *cursor);
+                    let cursor = cursors.get_mut(cursor).unwrap();
                     let record = match &state.registers[*record_reg] {
                         OwnedValue::Record(r) => r,
                         _ => unreachable!("Not a record! Cannot insert a non record value."),
                     };
                     let key = &state.registers[*key_reg];
-                    // NOTE(pere): Sending moved_before == true is okay because we moved before but
-                    // if we were to set to false after starting a balance procedure, it might
-                    // leave undefined state.
                     return_if_io!(cursor.insert(key, record, true));
                     state.pc += 1;
                 }
                 Insn::InsertAwait { cursor_id } => {
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor = get_cursor_as_table_mut(&mut cursors, *cursor_id);
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
                     cursor.wait_for_completion()?;
                     // Only update last_insert_rowid for regular table inserts, not schema modifications
                     if cursor.root_page() != 1 {
@@ -2723,61 +2660,25 @@ impl Program {
                             if let Some(conn) = self.connection.upgrade() {
                                 conn.update_last_rowid(rowid);
                             }
-                            let prev_changes = self.n_change.get();
-                            self.n_change.set(prev_changes + 1);
                         }
                     }
-                    state.pc += 1;
-                }
-                Insn::DeleteAsync { cursor_id } => {
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor = get_cursor_as_table_mut(&mut cursors, *cursor_id);
-                    return_if_io!(cursor.delete());
-                    state.pc += 1;
-                }
-                Insn::DeleteAwait { cursor_id } => {
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor = get_cursor_as_table_mut(&mut cursors, *cursor_id);
-                    cursor.wait_for_completion()?;
-                    let prev_changes = self.n_change.get();
-                    self.n_change.set(prev_changes + 1);
                     state.pc += 1;
                 }
                 Insn::NewRowid {
                     cursor, rowid_reg, ..
                 } => {
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor = get_cursor_as_table_mut(&mut cursors, *cursor);
+                    let cursor = cursors.get_mut(cursor).unwrap();
                     // TODO: make io handle rng
                     let rowid = return_if_io!(get_new_rowid(cursor, thread_rng()));
                     state.registers[*rowid_reg] = OwnedValue::Integer(rowid);
                     state.pc += 1;
                 }
                 Insn::MustBeInt { reg } => {
-                    match &state.registers[*reg] {
+                    match state.registers[*reg] {
                         OwnedValue::Integer(_) => {}
-                        OwnedValue::Float(f) => match cast_real_to_integer(*f) {
-                            Ok(i) => state.registers[*reg] = OwnedValue::Integer(i),
-                            Err(_) => crate::bail_parse_error!(
-                                "MustBeInt: the value in register cannot be cast to integer"
-                            ),
-                        },
-                        OwnedValue::Text(text) => {
-                            match checked_cast_text_to_numeric(text.as_str()) {
-                                Ok(OwnedValue::Integer(i)) => {
-                                    state.registers[*reg] = OwnedValue::Integer(i)
-                                }
-                                Ok(OwnedValue::Float(f)) => {
-                                    state.registers[*reg] = OwnedValue::Integer(f as i64)
-                                }
-                                _ => crate::bail_parse_error!(
-                                    "MustBeInt: the value in register cannot be cast to integer"
-                                ),
-                            }
-                        }
                         _ => {
                             crate::bail_parse_error!(
-                                "MustBeInt: the value in register cannot be cast to integer"
+                                "MustBeInt: the value in the register is not an integer"
                             );
                         }
                     };
@@ -2792,46 +2693,13 @@ impl Program {
                     rowid_reg,
                     target_pc,
                 } => {
-                    let mut cursors = state.cursors.borrow_mut();
-                    let cursor =
-                        must_be_btree_cursor!(*cursor, self.cursor_ref, cursors, "NotExists");
+                    let cursor = cursors.get_mut(cursor).unwrap();
                     let exists = return_if_io!(cursor.exists(&state.registers[*rowid_reg]));
                     if exists {
                         state.pc += 1;
                     } else {
-                        state.pc = target_pc.to_offset_int();
+                        state.pc = *target_pc;
                     }
-                }
-                Insn::OffsetLimit {
-                    limit_reg,
-                    combined_reg,
-                    offset_reg,
-                } => {
-                    let limit_val = match state.registers[*limit_reg] {
-                        OwnedValue::Integer(val) => val,
-                        _ => {
-                            return Err(LimboError::InternalError(
-                                "OffsetLimit: the value in limit_reg is not an integer".into(),
-                            ));
-                        }
-                    };
-                    let offset_val = match state.registers[*offset_reg] {
-                        OwnedValue::Integer(val) if val < 0 => 0,
-                        OwnedValue::Integer(val) if val >= 0 => val,
-                        _ => {
-                            return Err(LimboError::InternalError(
-                                "OffsetLimit: the value in offset_reg is not an integer".into(),
-                            ));
-                        }
-                    };
-
-                    let offset_limit_sum = limit_val.overflowing_add(offset_val);
-                    if limit_val <= 0 || offset_limit_sum.1 {
-                        state.registers[*combined_reg] = OwnedValue::Integer(-1);
-                    } else {
-                        state.registers[*combined_reg] = OwnedValue::Integer(offset_limit_sum.0);
-                    }
-                    state.pc += 1;
                 }
                 // this cursor may be reused for next insert
                 // Update: tablemoveto is used to travers on not exists, on insert depending on flags if nonseek it traverses again.
@@ -2840,21 +2708,12 @@ impl Program {
                     cursor_id,
                     root_page,
                 } => {
-                    let (_, cursor_type) = self.cursor_ref.get(*cursor_id).unwrap();
-                    let mut cursors = state.cursors.borrow_mut();
-                    let is_index = cursor_type.is_index();
-                    let cursor = BTreeCursor::new(pager.clone(), *root_page);
-                    if is_index {
-                        cursors
-                            .get_mut(*cursor_id)
-                            .unwrap()
-                            .replace(Cursor::new_index(cursor));
-                    } else {
-                        cursors
-                            .get_mut(*cursor_id)
-                            .unwrap()
-                            .replace(Cursor::new_table(cursor));
-                    }
+                    let cursor = Box::new(BTreeCursor::new(
+                        pager.clone(),
+                        *root_page,
+                        self.database_header.clone(),
+                    ));
+                    cursors.insert(*cursor_id, cursor);
                     state.pc += 1;
                 }
                 Insn::OpenWriteAwait {} => {
@@ -2870,42 +2729,31 @@ impl Program {
                     }
                     state.pc += 1;
                 }
-                Insn::CreateBtree { db, root, flags } => {
+                Insn::CreateBtree { db, root, flags: _ } => {
                     if *db > 0 {
-                        // TODO: implement temp databases
+                        // TODO: implement temp datbases
                         todo!("temp databases not implemented yet");
                     }
-                    let mut cursor = Box::new(BTreeCursor::new(pager.clone(), 0));
+                    let mut cursor = Box::new(BTreeCursor::new(
+                        pager.clone(),
+                        0,
+                        self.database_header.clone(),
+                    ));
 
-                    let root_page = cursor.btree_create(*flags);
+                    let root_page = cursor.btree_create(1);
                     state.registers[*root] = OwnedValue::Integer(root_page as i64);
                     state.pc += 1;
                 }
                 Insn::Close { cursor_id } => {
-                    let mut cursors = state.cursors.borrow_mut();
-                    cursors.get_mut(*cursor_id).unwrap().take();
+                    cursors.remove(cursor_id);
                     state.pc += 1;
                 }
-                Insn::IsNull { reg, target_pc } => {
-                    if matches!(state.registers[*reg], OwnedValue::Null) {
-                        state.pc = target_pc.to_offset_int();
+                Insn::IsNull { src, target_pc } => {
+                    if matches!(state.registers[*src], OwnedValue::Null) {
+                        state.pc = *target_pc;
                     } else {
                         state.pc += 1;
                     }
-                }
-                Insn::PageCount { db, dest } => {
-                    if *db > 0 {
-                        // TODO: implement temp databases
-                        todo!("temp databases not implemented yet");
-                    }
-                    // SQLite returns "0" on an empty database, and 2 on the first insertion,
-                    // so we'll mimic that behavior.
-                    let mut pages = pager.db_header.borrow().database_size.into();
-                    if pages == 1 {
-                        pages = 0;
-                    }
-                    state.registers[*dest] = OwnedValue::Integer(pages);
-                    state.pc += 1;
                 }
                 Insn::ParseSchema {
                     db: _,
@@ -2917,129 +2765,23 @@ impl Program {
                         "SELECT * FROM  sqlite_schema WHERE {}",
                         where_clause
                     ))?;
+                    let rows = Rows { stmt };
                     let mut schema = RefCell::borrow_mut(&conn.schema);
-                    // TODO: This function below is synchronous, make it async
-                    parse_schema_rows(
-                        Some(stmt),
-                        &mut schema,
-                        conn.pager.io.clone(),
-                        &conn.db.syms.borrow(),
-                    )?;
+                    // TODO: This function below is synchronous, make it not async
+                    parse_schema_rows(Some(rows), &mut schema, conn.pager.io.clone())?;
                     state.pc += 1;
-                }
-                Insn::ReadCookie { db, dest, cookie } => {
-                    if *db > 0 {
-                        // TODO: implement temp databases
-                        todo!("temp databases not implemented yet");
-                    }
-                    let cookie_value = match cookie {
-                        Cookie::UserVersion => pager.db_header.borrow().user_version.into(),
-                        cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
-                    };
-                    state.registers[*dest] = OwnedValue::Integer(cookie_value);
-                    state.pc += 1;
-                }
-                Insn::ShiftRight { lhs, rhs, dest } => {
-                    state.registers[*dest] =
-                        exec_shift_right(&state.registers[*lhs], &state.registers[*rhs]);
-                    state.pc += 1;
-                }
-                Insn::ShiftLeft { lhs, rhs, dest } => {
-                    state.registers[*dest] =
-                        exec_shift_left(&state.registers[*lhs], &state.registers[*rhs]);
-                    state.pc += 1;
-                }
-                Insn::Variable { index, dest } => {
-                    state.registers[*dest] = state
-                        .get_parameter(*index)
-                        .ok_or(LimboError::Unbound(*index))?
-                        .clone();
-                    state.pc += 1;
-                }
-                Insn::ZeroOrNull { rg1, rg2, dest } => {
-                    if state.registers[*rg1] == OwnedValue::Null
-                        || state.registers[*rg2] == OwnedValue::Null
-                    {
-                        state.registers[*dest] = OwnedValue::Null
-                    } else {
-                        state.registers[*dest] = OwnedValue::Integer(0);
-                    }
-                    state.pc += 1;
-                }
-                Insn::Not { reg, dest } => {
-                    state.registers[*dest] = exec_boolean_not(&state.registers[*reg]);
-                    state.pc += 1;
-                }
-                Insn::Concat { lhs, rhs, dest } => {
-                    state.registers[*dest] =
-                        exec_concat(&state.registers[*lhs], &state.registers[*rhs]);
-                    state.pc += 1;
-                }
-                Insn::And { lhs, rhs, dest } => {
-                    state.registers[*dest] =
-                        exec_and(&state.registers[*lhs], &state.registers[*rhs]);
-                    state.pc += 1;
-                }
-                Insn::Or { lhs, rhs, dest } => {
-                    state.registers[*dest] =
-                        exec_or(&state.registers[*lhs], &state.registers[*rhs]);
-                    state.pc += 1;
-                }
-                Insn::Noop => {
-                    // Do nothing
-                    // Advance the program counter for the next opcode
-                    state.pc += 1
                 }
             }
-        }
-    }
-
-    fn halt(&self, pager: Rc<Pager>) -> Result<StepResult> {
-        let connection = self
-            .connection
-            .upgrade()
-            .expect("only weak ref to connection?");
-        let auto_commit = *connection.auto_commit.borrow();
-        tracing::trace!("Halt auto_commit {}", auto_commit);
-        if auto_commit {
-            let current_state = connection.transaction_state.borrow().clone();
-            if current_state == TransactionState::Read {
-                pager.end_read_tx()?;
-                return Ok(StepResult::Done);
-            }
-            match pager.end_tx() {
-                Ok(crate::storage::wal::CheckpointStatus::IO) => Ok(StepResult::IO),
-                Ok(crate::storage::wal::CheckpointStatus::Done(_)) => {
-                    if self.change_cnt_on {
-                        if let Some(conn) = self.connection.upgrade() {
-                            conn.set_changes(self.n_change.get());
-                        }
-                    }
-                    Ok(StepResult::Done)
-                }
-                Err(e) => Err(e),
-            }
-        } else {
-            if self.change_cnt_on {
-                if let Some(conn) = self.connection.upgrade() {
-                    conn.set_changes(self.n_change.get());
-                }
-            }
-            Ok(StepResult::Done)
         }
     }
 }
 
-fn get_new_rowid<R: Rng>(cursor: &mut BTreeCursor, mut rng: R) -> Result<CursorResult<i64>> {
+fn get_new_rowid<R: Rng>(cursor: &mut Box<dyn Cursor>, mut rng: R) -> Result<CursorResult<i64>> {
     match cursor.seek_to_last()? {
         CursorResult::Ok(()) => {}
         CursorResult::IO => return Ok(CursorResult::IO),
     }
-    let mut rowid = cursor
-        .rowid()?
-        .unwrap_or(0) // if BTree is empty - use 0 as initial value for rowid
-        .checked_add(1) // add 1 but be careful with overflows
-        .unwrap_or(u64::MAX); // in case of overflow - use u64::MAX
+    let mut rowid = cursor.rowid()?.unwrap_or(0) + 1;
     if rowid > i64::MAX.try_into().unwrap() {
         let distribution = Uniform::from(1..=i64::MAX);
         let max_attempts = 100;
@@ -3063,29 +2805,34 @@ fn get_new_rowid<R: Rng>(cursor: &mut BTreeCursor, mut rng: R) -> Result<CursorR
     Ok(CursorResult::Ok(rowid.try_into().unwrap()))
 }
 
-fn make_owned_record(registers: &[OwnedValue], start_reg: &usize, count: &usize) -> Record {
+fn make_record<'a>(registers: &'a [OwnedValue], start_reg: &usize, count: &usize) -> Record<'a> {
     let mut values = Vec::with_capacity(*count);
     for r in registers.iter().skip(*start_reg).take(*count) {
-        values.push(r.clone())
+        values.push(crate::types::to_value(r))
     }
     Record::new(values)
 }
 
+fn make_owned_record(registers: &[OwnedValue], start_reg: &usize, count: &usize) -> OwnedRecord {
+    let mut values = Vec::with_capacity(*count);
+    for r in registers.iter().skip(*start_reg).take(*count) {
+        values.push(r.clone())
+    }
+    OwnedRecord::new(values)
+}
+
 fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
-    if !tracing::enabled!(tracing::Level::TRACE) {
+    if !log::log_enabled!(log::Level::Trace) {
         return;
     }
-    tracing::trace!(
+    log::trace!(
         "{}",
         explain::insn_to_str(
             program,
             addr,
             insn,
             String::new(),
-            program
-                .comments
-                .as_ref()
-                .and_then(|comments| comments.get(&{ addr }).copied())
+            program.comments.get(&(addr as BranchOffset)).copied()
         )
     );
 }
@@ -3096,10 +2843,7 @@ fn print_insn(program: &Program, addr: InsnReference, insn: &Insn, indent: Strin
         addr,
         insn,
         indent,
-        program
-            .comments
-            .as_ref()
-            .and_then(|comments| comments.get(&{ addr }).copied()),
+        program.comments.get(&(addr as BranchOffset)).copied(),
     );
     println!("{}", s);
 }
@@ -3128,7 +2872,7 @@ fn get_indent_count(indent_count: usize, curr_insn: &Insn, prev_insn: Option<&In
 
 fn exec_lower(reg: &OwnedValue) -> Option<OwnedValue> {
     match reg {
-        OwnedValue::Text(t) => Some(OwnedValue::build_text(&t.as_str().to_lowercase())),
+        OwnedValue::Text(t) => Some(OwnedValue::build_text(Rc::new(t.value.to_lowercase()))),
         t => Some(t.to_owned()),
     }
 }
@@ -3157,16 +2901,16 @@ fn exec_octet_length(reg: &OwnedValue) -> OwnedValue {
 
 fn exec_upper(reg: &OwnedValue) -> Option<OwnedValue> {
     match reg {
-        OwnedValue::Text(t) => Some(OwnedValue::build_text(&t.as_str().to_uppercase())),
+        OwnedValue::Text(t) => Some(OwnedValue::build_text(Rc::new(t.value.to_uppercase()))),
         t => Some(t.to_owned()),
     }
 }
 
-fn exec_concat_strings(registers: &[OwnedValue]) -> OwnedValue {
+fn exec_concat(registers: &[OwnedValue]) -> OwnedValue {
     let mut result = String::new();
     for reg in registers {
         match reg {
-            OwnedValue::Text(text) => result.push_str(text.as_str()),
+            OwnedValue::Text(text) => result.push_str(&text.value),
             OwnedValue::Integer(i) => result.push_str(&i.to_string()),
             OwnedValue::Float(f) => result.push_str(&f.to_string()),
             OwnedValue::Agg(aggctx) => result.push_str(&aggctx.final_value().to_string()),
@@ -3175,7 +2919,7 @@ fn exec_concat_strings(registers: &[OwnedValue]) -> OwnedValue {
             OwnedValue::Record(_) => unreachable!(),
         }
     }
-    OwnedValue::build_text(&result)
+    OwnedValue::build_text(Rc::new(result))
 }
 
 fn exec_concat_ws(registers: &[OwnedValue]) -> OwnedValue {
@@ -3184,9 +2928,9 @@ fn exec_concat_ws(registers: &[OwnedValue]) -> OwnedValue {
     }
 
     let separator = match &registers[0] {
-        OwnedValue::Text(text) => text.as_str().to_string(),
-        OwnedValue::Integer(i) => i.to_string(),
-        OwnedValue::Float(f) => f.to_string(),
+        OwnedValue::Text(text) => text.value.clone(),
+        OwnedValue::Integer(i) => Rc::new(i.to_string()),
+        OwnedValue::Float(f) => Rc::new(f.to_string()),
         _ => return OwnedValue::Null,
     };
 
@@ -3196,14 +2940,14 @@ fn exec_concat_ws(registers: &[OwnedValue]) -> OwnedValue {
             result.push_str(&separator);
         }
         match reg {
-            OwnedValue::Text(text) => result.push_str(text.as_str()),
+            OwnedValue::Text(text) => result.push_str(&text.value),
             OwnedValue::Integer(i) => result.push_str(&i.to_string()),
             OwnedValue::Float(f) => result.push_str(&f.to_string()),
             _ => continue,
         }
     }
 
-    OwnedValue::build_text(&result)
+    OwnedValue::build_text(Rc::new(result))
 }
 
 fn exec_sign(reg: &OwnedValue) -> Option<OwnedValue> {
@@ -3211,9 +2955,9 @@ fn exec_sign(reg: &OwnedValue) -> Option<OwnedValue> {
         OwnedValue::Integer(i) => *i as f64,
         OwnedValue::Float(f) => *f,
         OwnedValue::Text(s) => {
-            if let Ok(i) = s.as_str().parse::<i64>() {
+            if let Ok(i) = s.value.parse::<i64>() {
                 i as f64
-            } else if let Ok(f) = s.as_str().parse::<f64>() {
+            } else if let Ok(f) = s.value.parse::<f64>() {
                 f
             } else {
                 return Some(OwnedValue::Null);
@@ -3248,26 +2992,26 @@ fn exec_sign(reg: &OwnedValue) -> Option<OwnedValue> {
 /// Generates the Soundex code for a given word
 pub fn exec_soundex(reg: &OwnedValue) -> OwnedValue {
     let s = match reg {
-        OwnedValue::Null => return OwnedValue::build_text("?000"),
+        OwnedValue::Null => return OwnedValue::build_text(Rc::new("?000".to_string())),
         OwnedValue::Text(s) => {
             // return ?000 if non ASCII alphabet character is found
-            if !s.as_str().chars().all(|c| c.is_ascii_alphabetic()) {
-                return OwnedValue::build_text("?000");
+            if !s.value.chars().all(|c| c.is_ascii_alphabetic()) {
+                return OwnedValue::build_text(Rc::new("?000".to_string()));
             }
             s.clone()
         }
-        _ => return OwnedValue::build_text("?000"), // For unsupported types, return NULL
+        _ => return OwnedValue::build_text(Rc::new("?000".to_string())), // For unsupported types, return NULL
     };
 
     // Remove numbers and spaces
     let word: String = s
-        .as_str()
+        .value
         .chars()
-        .filter(|c| !c.is_ascii_digit())
+        .filter(|c| !c.is_digit(10))
         .collect::<String>()
         .replace(" ", "");
     if word.is_empty() {
-        return OwnedValue::build_text("0000");
+        return OwnedValue::build_text(Rc::new("0000".to_string()));
     }
 
     let soundex_code = |c| match c {
@@ -3305,7 +3049,7 @@ pub fn exec_soundex(reg: &OwnedValue) -> OwnedValue {
 
     // Remove adjacent same digits
     let tmp = tmp.chars().fold(String::new(), |mut acc, ch| {
-        if !acc.ends_with(ch) {
+        if acc.chars().last() != Some(ch) {
             acc.push(ch);
         }
         acc
@@ -3321,7 +3065,7 @@ pub fn exec_soundex(reg: &OwnedValue) -> OwnedValue {
 
     // If the first symbol is a digit, replace it with the saved first letter
     if let Some(first_digit) = result.chars().next() {
-        if first_digit.is_ascii_digit() {
+        if first_digit.is_digit(10) {
             result.replace_range(0..1, &first_letter.to_string());
         }
     }
@@ -3333,28 +3077,27 @@ pub fn exec_soundex(reg: &OwnedValue) -> OwnedValue {
 
     // Retain the first 4 characters and convert to uppercase
     result.truncate(4);
-    OwnedValue::build_text(&result.to_uppercase())
+    OwnedValue::build_text(Rc::new(result.to_uppercase()))
 }
 
-fn exec_abs(reg: &OwnedValue) -> Result<OwnedValue> {
+fn exec_abs(reg: &OwnedValue) -> Option<OwnedValue> {
     match reg {
         OwnedValue::Integer(x) => {
-            match i64::checked_abs(*x) {
-                Some(y) => Ok(OwnedValue::Integer(y)),
-                // Special case: if we do the abs of "-9223372036854775808", it causes overflow.
-                // return IntegerOverflow error
-                None => Err(LimboError::IntegerOverflow),
+            if x < &0 {
+                Some(OwnedValue::Integer(-x))
+            } else {
+                Some(OwnedValue::Integer(*x))
             }
         }
         OwnedValue::Float(x) => {
             if x < &0.0 {
-                Ok(OwnedValue::Float(-x))
+                Some(OwnedValue::Float(-x))
             } else {
-                Ok(OwnedValue::Float(*x))
+                Some(OwnedValue::Float(*x))
             }
         }
-        OwnedValue::Null => Ok(OwnedValue::Null),
-        _ => Ok(OwnedValue::Float(0.0)),
+        OwnedValue::Null => Some(OwnedValue::Null),
+        _ => Some(OwnedValue::Float(0.0)),
     }
 }
 
@@ -3369,7 +3112,7 @@ fn exec_randomblob(reg: &OwnedValue) -> OwnedValue {
     let length = match reg {
         OwnedValue::Integer(i) => *i,
         OwnedValue::Float(f) => *f as i64,
-        OwnedValue::Text(t) => t.as_str().parse().unwrap_or(1),
+        OwnedValue::Text(t) => t.value.parse().unwrap_or(1),
         _ => 1,
     }
     .max(1) as usize;
@@ -3381,24 +3124,21 @@ fn exec_randomblob(reg: &OwnedValue) -> OwnedValue {
 
 fn exec_quote(value: &OwnedValue) -> OwnedValue {
     match value {
-        OwnedValue::Null => OwnedValue::build_text(&OwnedValue::Null.to_string()),
+        OwnedValue::Null => OwnedValue::build_text(OwnedValue::Null.to_string().into()),
         OwnedValue::Integer(_) | OwnedValue::Float(_) => value.to_owned(),
         OwnedValue::Blob(_) => todo!(),
         OwnedValue::Text(s) => {
-            let mut quoted = String::with_capacity(s.as_str().len() + 2);
+            let mut quoted = String::with_capacity(s.value.len() + 2);
             quoted.push('\'');
-            for c in s.as_str().chars() {
+            for c in s.value.chars() {
                 if c == '\0' {
                     break;
-                } else if c == '\'' {
-                    quoted.push('\'');
-                    quoted.push(c);
                 } else {
                     quoted.push(c);
                 }
             }
             quoted.push('\'');
-            OwnedValue::build_text(&quoted)
+            OwnedValue::build_text(Rc::new(quoted))
         }
         _ => OwnedValue::Null, // For unsupported types, return NULL
     }
@@ -3415,35 +3155,14 @@ fn exec_char(values: Vec<OwnedValue>) -> OwnedValue {
             }
         })
         .collect();
-    OwnedValue::build_text(&result)
+    OwnedValue::build_text(Rc::new(result))
 }
 
 fn construct_like_regex(pattern: &str) -> Regex {
-    let mut regex_pattern = String::with_capacity(pattern.len() * 2);
-
-    regex_pattern.push('^');
-
-    for c in pattern.chars() {
-        match c {
-            '\\' => regex_pattern.push_str("\\\\"),
-            '%' => regex_pattern.push_str(".*"),
-            '_' => regex_pattern.push('.'),
-            ch => {
-                if regex_syntax::is_meta_character(c) {
-                    regex_pattern.push('\\');
-                }
-                regex_pattern.push(ch);
-            }
-        }
-    }
-
+    let mut regex_pattern = String::from("(?i)^");
+    regex_pattern.push_str(&pattern.replace('%', ".*").replace('_', "."));
     regex_pattern.push('$');
-
-    RegexBuilder::new(&regex_pattern)
-        .case_insensitive(true)
-        .dot_matches_new_line(true)
-        .build()
-        .unwrap()
+    Regex::new(&regex_pattern).unwrap()
 }
 
 // Implements LIKE pattern matching. Caches the constructed regex if a cache is provided
@@ -3460,6 +3179,31 @@ fn exec_like(regex_cache: Option<&mut HashMap<String, Regex>>, pattern: &str, te
         }
     } else {
         let re = construct_like_regex(pattern);
+        re.is_match(text)
+    }
+}
+
+fn construct_glob_regex(pattern: &str) -> Regex {
+    let mut regex_pattern = String::from("^");
+    regex_pattern.push_str(&pattern.replace('*', ".*").replace("?", "."));
+    regex_pattern.push('$');
+    Regex::new(&regex_pattern).unwrap()
+}
+
+// Implements GLOB pattern matching. Caches the constructed regex if a cache is provided
+fn exec_glob(regex_cache: Option<&mut HashMap<String, Regex>>, pattern: &str, text: &str) -> bool {
+    if let Some(cache) = regex_cache {
+        match cache.get(pattern) {
+            Some(re) => re.is_match(text),
+            None => {
+                let re = construct_glob_regex(pattern);
+                let res = re.is_match(text);
+                cache.insert(pattern.to_string(), re);
+                res
+            }
+        }
+    } else {
+        let re = construct_glob_regex(pattern);
         re.is_match(text)
     }
 }
@@ -3489,31 +3233,39 @@ fn exec_nullif(first_value: &OwnedValue, second_value: &OwnedValue) -> OwnedValu
 fn exec_substring(
     str_value: &OwnedValue,
     start_value: &OwnedValue,
-    length_value: Option<&OwnedValue>,
+    length_value: &OwnedValue,
 ) -> OwnedValue {
-    if let (OwnedValue::Text(str), OwnedValue::Integer(start)) = (str_value, start_value) {
-        let str_len = str.as_str().len() as i64;
+    if let (OwnedValue::Text(str), OwnedValue::Integer(start), OwnedValue::Integer(length)) =
+        (str_value, start_value, length_value)
+    {
+        let start = *start as usize;
+        let str_len = str.value.len();
 
-        // The left-most character of X is number 1.
-        // If Y is negative then the first character of the substring is found by counting from the right rather than the left.
-        let first_position = if *start < 0 {
-            str_len.saturating_sub((*start).abs())
+        if start > str_len {
+            return OwnedValue::build_text(Rc::new("".to_string()));
+        }
+
+        let start_idx = start - 1;
+        let end = if *length != -1 {
+            start_idx + *length as usize
         } else {
-            *start - 1
+            str_len
         };
-        // If Z is negative then the abs(Z) characters preceding the Y-th character are returned.
-        let last_position = match length_value {
-            Some(OwnedValue::Integer(length)) => first_position + *length,
-            _ => str_len,
-        };
-        let (start, end) = if first_position <= last_position {
-            (first_position, last_position)
-        } else {
-            (last_position, first_position)
-        };
-        OwnedValue::build_text(
-            &str.as_str()[start.clamp(-0, str_len) as usize..end.clamp(0, str_len) as usize],
-        )
+        let substring = &str.value[start_idx..end.min(str_len)];
+
+        OwnedValue::build_text(Rc::new(substring.to_string()))
+    } else if let (OwnedValue::Text(str), OwnedValue::Integer(start)) = (str_value, start_value) {
+        let start = *start as usize;
+        let str_len = str.value.len();
+
+        if start > str_len {
+            return OwnedValue::build_text(Rc::new("".to_string()));
+        }
+
+        let start_idx = start - 1;
+        let substring = &str.value[start_idx..str_len];
+
+        OwnedValue::build_text(Rc::new(substring.to_string()))
     } else {
         OwnedValue::Null
     }
@@ -3534,7 +3286,7 @@ fn exec_instr(reg: &OwnedValue, pattern: &OwnedValue) -> OwnedValue {
 
     let reg_str;
     let reg = match reg {
-        OwnedValue::Text(s) => s.as_str(),
+        OwnedValue::Text(s) => s.value.as_str(),
         _ => {
             reg_str = reg.to_string();
             reg_str.as_str()
@@ -3543,7 +3295,7 @@ fn exec_instr(reg: &OwnedValue, pattern: &OwnedValue) -> OwnedValue {
 
     let pattern_str;
     let pattern = match pattern {
-        OwnedValue::Text(s) => s.as_str(),
+        OwnedValue::Text(s) => s.value.as_str(),
         _ => {
             pattern_str = pattern.to_string();
             pattern_str.as_str()
@@ -3558,11 +3310,11 @@ fn exec_instr(reg: &OwnedValue, pattern: &OwnedValue) -> OwnedValue {
 
 fn exec_typeof(reg: &OwnedValue) -> OwnedValue {
     match reg {
-        OwnedValue::Null => OwnedValue::build_text("null"),
-        OwnedValue::Integer(_) => OwnedValue::build_text("integer"),
-        OwnedValue::Float(_) => OwnedValue::build_text("real"),
-        OwnedValue::Text(_) => OwnedValue::build_text("text"),
-        OwnedValue::Blob(_) => OwnedValue::build_text("blob"),
+        OwnedValue::Null => OwnedValue::build_text(Rc::new("null".to_string())),
+        OwnedValue::Integer(_) => OwnedValue::build_text(Rc::new("integer".to_string())),
+        OwnedValue::Float(_) => OwnedValue::build_text(Rc::new("real".to_string())),
+        OwnedValue::Text(_) => OwnedValue::build_text(Rc::new("text".to_string())),
+        OwnedValue::Blob(_) => OwnedValue::build_text(Rc::new("blob".to_string())),
         OwnedValue::Agg(ctx) => exec_typeof(ctx.final_value()),
         OwnedValue::Record(_) => unimplemented!(),
     }
@@ -3575,7 +3327,7 @@ fn exec_hex(reg: &OwnedValue) -> OwnedValue {
         | OwnedValue::Float(_)
         | OwnedValue::Blob(_) => {
             let text = reg.to_string();
-            OwnedValue::build_text(&hex::encode_upper(text))
+            OwnedValue::build_text(Rc::new(hex::encode_upper(text)))
         }
         _ => OwnedValue::Null,
     }
@@ -3627,35 +3379,30 @@ fn exec_unicode(reg: &OwnedValue) -> OwnedValue {
 
 fn _to_float(reg: &OwnedValue) -> f64 {
     match reg {
-        OwnedValue::Text(x) => match cast_text_to_numeric(x.as_str()) {
-            OwnedValue::Integer(i) => i as f64,
-            OwnedValue::Float(f) => f,
-            _ => unreachable!(),
-        },
+        OwnedValue::Text(x) => x.value.parse().unwrap_or(0.0),
         OwnedValue::Integer(x) => *x as f64,
         OwnedValue::Float(x) => *x,
-        OwnedValue::Agg(ctx) => _to_float(ctx.final_value()),
         _ => 0.0,
     }
 }
 
 fn exec_round(reg: &OwnedValue, precision: Option<OwnedValue>) -> OwnedValue {
-    let reg = _to_float(reg);
-    let round = |reg: f64, f: f64| {
-        let precision = if f < 1.0 { 0.0 } else { f };
-        OwnedValue::Float(reg.round_to_precision(precision as i32))
+    let precision = match precision {
+        Some(OwnedValue::Text(x)) => x.value.parse().unwrap_or(0.0),
+        Some(OwnedValue::Integer(x)) => x as f64,
+        Some(OwnedValue::Float(x)) => x,
+        Some(OwnedValue::Null) => return OwnedValue::Null,
+        _ => 0.0,
     };
-    match precision {
-        Some(OwnedValue::Text(x)) => match cast_text_to_numeric(x.as_str()) {
-            OwnedValue::Integer(i) => round(reg, i as f64),
-            OwnedValue::Float(f) => round(reg, f),
-            _ => unreachable!(),
-        },
-        Some(OwnedValue::Integer(i)) => round(reg, i as f64),
-        Some(OwnedValue::Float(f)) => round(reg, f),
-        None => round(reg, 0.0),
-        _ => OwnedValue::Null,
-    }
+
+    let reg = match reg {
+        OwnedValue::Agg(ctx) => _to_float(ctx.final_value()),
+        _ => _to_float(reg),
+    };
+
+    let precision = if precision < 1.0 { 0.0 } else { precision };
+    let multiplier = 10f64.powi(precision as i32);
+    OwnedValue::Float(((reg * multiplier).round()) / multiplier)
 }
 
 // Implements TRIM pattern matching.
@@ -3664,11 +3411,13 @@ fn exec_trim(reg: &OwnedValue, pattern: Option<OwnedValue>) -> OwnedValue {
         (reg, Some(pattern)) => match reg {
             OwnedValue::Text(_) | OwnedValue::Integer(_) | OwnedValue::Float(_) => {
                 let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
-                OwnedValue::build_text(reg.to_string().trim_matches(&pattern_chars[..]))
+                OwnedValue::build_text(Rc::new(
+                    reg.to_string().trim_matches(&pattern_chars[..]).to_string(),
+                ))
             }
             _ => reg.to_owned(),
         },
-        (OwnedValue::Text(t), None) => OwnedValue::build_text(t.as_str().trim()),
+        (OwnedValue::Text(t), None) => OwnedValue::build_text(Rc::new(t.value.trim().to_string())),
         (reg, _) => reg.to_owned(),
     }
 }
@@ -3679,11 +3428,17 @@ fn exec_ltrim(reg: &OwnedValue, pattern: Option<OwnedValue>) -> OwnedValue {
         (reg, Some(pattern)) => match reg {
             OwnedValue::Text(_) | OwnedValue::Integer(_) | OwnedValue::Float(_) => {
                 let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
-                OwnedValue::build_text(reg.to_string().trim_start_matches(&pattern_chars[..]))
+                OwnedValue::build_text(Rc::new(
+                    reg.to_string()
+                        .trim_start_matches(&pattern_chars[..])
+                        .to_string(),
+                ))
             }
             _ => reg.to_owned(),
         },
-        (OwnedValue::Text(t), None) => OwnedValue::build_text(t.as_str().trim_start()),
+        (OwnedValue::Text(t), None) => {
+            OwnedValue::build_text(Rc::new(t.value.trim_start().to_string()))
+        }
         (reg, _) => reg.to_owned(),
     }
 }
@@ -3694,11 +3449,17 @@ fn exec_rtrim(reg: &OwnedValue, pattern: Option<OwnedValue>) -> OwnedValue {
         (reg, Some(pattern)) => match reg {
             OwnedValue::Text(_) | OwnedValue::Integer(_) | OwnedValue::Float(_) => {
                 let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
-                OwnedValue::build_text(reg.to_string().trim_end_matches(&pattern_chars[..]))
+                OwnedValue::build_text(Rc::new(
+                    reg.to_string()
+                        .trim_end_matches(&pattern_chars[..])
+                        .to_string(),
+                ))
             }
             _ => reg.to_owned(),
         },
-        (OwnedValue::Text(t), None) => OwnedValue::build_text(t.as_str().trim_end()),
+        (OwnedValue::Text(t), None) => {
+            OwnedValue::build_text(Rc::new(t.value.trim_end().to_string()))
+        }
         (reg, _) => reg.to_owned(),
     }
 }
@@ -3707,18 +3468,22 @@ fn exec_zeroblob(req: &OwnedValue) -> OwnedValue {
     let length: i64 = match req {
         OwnedValue::Integer(i) => *i,
         OwnedValue::Float(f) => *f as i64,
-        OwnedValue::Text(s) => s.as_str().parse().unwrap_or(0),
+        OwnedValue::Text(s) => s.value.parse().unwrap_or(0),
         _ => 0,
     };
     OwnedValue::Blob(Rc::new(vec![0; length.max(0) as usize]))
 }
 
 // exec_if returns whether you should jump
-fn exec_if(reg: &OwnedValue, jump_if_null: bool, not: bool) -> bool {
+fn exec_if(reg: &OwnedValue, null_reg: &OwnedValue, not: bool) -> bool {
     match reg {
         OwnedValue::Integer(0) | OwnedValue::Float(0.0) => not,
         OwnedValue::Integer(_) | OwnedValue::Float(_) => !not,
-        OwnedValue::Null => jump_if_null,
+        OwnedValue::Null => match null_reg {
+            OwnedValue::Integer(0) | OwnedValue::Float(0.0) => false,
+            OwnedValue::Integer(_) | OwnedValue::Float(_) => true,
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -3741,7 +3506,7 @@ fn exec_cast(value: &OwnedValue, datatype: &str) -> OwnedValue {
         Affinity::Text => {
             // Convert everything to text representation
             // TODO: handle encoding and whatever sqlite3_snprintf does
-            OwnedValue::build_text(&value.to_string())
+            OwnedValue::build_text(Rc::new(value.to_string()))
         }
         Affinity::Real => match value {
             OwnedValue::Blob(b) => {
@@ -3749,7 +3514,7 @@ fn exec_cast(value: &OwnedValue, datatype: &str) -> OwnedValue {
                 let text = String::from_utf8_lossy(b);
                 cast_text_to_real(&text)
             }
-            OwnedValue::Text(t) => cast_text_to_real(t.as_str()),
+            OwnedValue::Text(t) => cast_text_to_real(&t.value),
             OwnedValue::Integer(i) => OwnedValue::Float(*i as f64),
             OwnedValue::Float(f) => OwnedValue::Float(*f),
             _ => OwnedValue::Float(0.0),
@@ -3760,14 +3525,14 @@ fn exec_cast(value: &OwnedValue, datatype: &str) -> OwnedValue {
                 let text = String::from_utf8_lossy(b);
                 cast_text_to_integer(&text)
             }
-            OwnedValue::Text(t) => cast_text_to_integer(t.as_str()),
+            OwnedValue::Text(t) => cast_text_to_integer(&t.value),
             OwnedValue::Integer(i) => OwnedValue::Integer(*i),
             // A cast of a REAL value into an INTEGER results in the integer between the REAL value and zero
             // that is closest to the REAL value. If a REAL is greater than the greatest possible signed integer (+9223372036854775807)
             // then the result is the greatest possible signed integer and if the REAL is less than the least possible signed integer (-9223372036854775808)
             // then the result is the least possible signed integer.
             OwnedValue::Float(f) => {
-                let i = f.trunc() as i128;
+                let i = f.floor() as i128;
                 if i > i64::MAX as i128 {
                     OwnedValue::Integer(i64::MAX)
                 } else if i < i64::MIN as i128 {
@@ -3783,7 +3548,7 @@ fn exec_cast(value: &OwnedValue, datatype: &str) -> OwnedValue {
                 let text = String::from_utf8_lossy(b);
                 cast_text_to_numeric(&text)
             }
-            OwnedValue::Text(t) => cast_text_to_numeric(t.as_str()),
+            OwnedValue::Text(t) => cast_text_to_numeric(&t.value),
             OwnedValue::Integer(i) => OwnedValue::Integer(*i),
             OwnedValue::Float(f) => OwnedValue::Float(*f),
             _ => value.clone(), // TODO probably wrong
@@ -3811,17 +3576,133 @@ fn exec_replace(source: &OwnedValue, pattern: &OwnedValue, replacement: &OwnedVa
     // If any of the casts failed, panic as text casting is not expected to fail.
     match (&source, &pattern, &replacement) {
         (OwnedValue::Text(source), OwnedValue::Text(pattern), OwnedValue::Text(replacement)) => {
-            if pattern.as_str().is_empty() {
-                return OwnedValue::Text(source.clone());
+            if pattern.value.is_empty() {
+                return OwnedValue::build_text(source.value.clone());
             }
 
             let result = source
-                .as_str()
-                .replace(pattern.as_str(), replacement.as_str());
-            OwnedValue::build_text(&result)
+                .value
+                .replace(pattern.value.as_str(), &replacement.value);
+            OwnedValue::build_text(Rc::new(result))
         }
         _ => unreachable!("text cast should never fail"),
     }
+}
+
+enum Affinity {
+    Integer,
+    Text,
+    Blob,
+    Real,
+    Numeric,
+}
+
+/// For tables not declared as STRICT, the affinity of a column is determined by the declared type of the column, according to the following rules in the order shown:
+/// If the declared type contains the string "INT" then it is assigned INTEGER affinity.
+/// If the declared type of the column contains any of the strings "CHAR", "CLOB", or "TEXT" then that column has TEXT affinity. Notice that the type VARCHAR contains the string "CHAR" and is thus assigned TEXT affinity.
+/// If the declared type for a column contains the string "BLOB" or if no type is specified then the column has affinity BLOB.
+/// If the declared type for a column contains any of the strings "REAL", "FLOA", or "DOUB" then the column has REAL affinity.
+/// Otherwise, the affinity is NUMERIC.
+/// Note that the order of the rules for determining column affinity is important. A column whose declared type is "CHARINT" will match both rules 1 and 2 but the first rule takes precedence and so the column affinity will be INTEGER.
+fn affinity(datatype: &str) -> Affinity {
+    // Note: callers of this function must ensure that the datatype is uppercase.
+    // Rule 1: INT -> INTEGER affinity
+    if datatype.contains("INT") {
+        return Affinity::Integer;
+    }
+
+    // Rule 2: CHAR/CLOB/TEXT -> TEXT affinity
+    if datatype.contains("CHAR") || datatype.contains("CLOB") || datatype.contains("TEXT") {
+        return Affinity::Text;
+    }
+
+    // Rule 3: BLOB or empty -> BLOB affinity (historically called NONE)
+    if datatype.contains("BLOB") || datatype.is_empty() {
+        return Affinity::Blob;
+    }
+
+    // Rule 4: REAL/FLOA/DOUB -> REAL affinity
+    if datatype.contains("REAL") || datatype.contains("FLOA") || datatype.contains("DOUB") {
+        return Affinity::Real;
+    }
+
+    // Rule 5: Otherwise -> NUMERIC affinity
+    Affinity::Numeric
+}
+
+/// When casting a TEXT value to INTEGER, the longest possible prefix of the value that can be interpreted as an integer number
+/// is extracted from the TEXT value and the remainder ignored. Any leading spaces in the TEXT value when converting from TEXT to INTEGER are ignored.
+/// If there is no prefix that can be interpreted as an integer number, the result of the conversion is 0.
+/// If the prefix integer is greater than +9223372036854775807 then the result of the cast is exactly +9223372036854775807.
+/// Similarly, if the prefix integer is less than -9223372036854775808 then the result of the cast is exactly -9223372036854775808.
+/// When casting to INTEGER, if the text looks like a floating point value with an exponent, the exponent will be ignored
+/// because it is no part of the integer prefix. For example, "CAST('123e+5' AS INTEGER)" results in 123, not in 12300000.
+/// The CAST operator understands decimal integers only — conversion of hexadecimal integers stops at the "x" in the "0x" prefix of the hexadecimal integer string and thus result of the CAST is always zero.
+fn cast_text_to_integer(text: &str) -> OwnedValue {
+    let text = text.trim();
+    if let Ok(i) = text.parse::<i64>() {
+        return OwnedValue::Integer(i);
+    }
+    // Try to find longest valid prefix that parses as an integer
+    // TODO: inefficient
+    let mut end_index = text.len() - 1;
+    while end_index > 0 {
+        if let Ok(i) = text[..=end_index].parse::<i64>() {
+            return OwnedValue::Integer(i);
+        }
+        end_index -= 1;
+    }
+    OwnedValue::Integer(0)
+}
+
+/// When casting a TEXT value to REAL, the longest possible prefix of the value that can be interpreted
+/// as a real number is extracted from the TEXT value and the remainder ignored. Any leading spaces in
+/// the TEXT value are ignored when converging from TEXT to REAL.
+/// If there is no prefix that can be interpreted as a real number, the result of the conversion is 0.0.
+fn cast_text_to_real(text: &str) -> OwnedValue {
+    let trimmed = text.trim_start();
+    if let Ok(num) = trimmed.parse::<f64>() {
+        return OwnedValue::Float(num);
+    }
+    // Try to find longest valid prefix that parses as a float
+    // TODO: inefficient
+    let mut end_index = trimmed.len() - 1;
+    while end_index > 0 {
+        if let Ok(num) = trimmed[..=end_index].parse::<f64>() {
+            return OwnedValue::Float(num);
+        }
+        end_index -= 1;
+    }
+    OwnedValue::Float(0.0)
+}
+
+/// NUMERIC Casting a TEXT or BLOB value into NUMERIC yields either an INTEGER or a REAL result.
+/// If the input text looks like an integer (there is no decimal point nor exponent) and the value
+/// is small enough to fit in a 64-bit signed integer, then the result will be INTEGER.
+/// Input text that looks like floating point (there is a decimal point and/or an exponent)
+/// and the text describes a value that can be losslessly converted back and forth between IEEE 754
+/// 64-bit float and a 51-bit signed integer, then the result is INTEGER. (In the previous sentence,
+/// a 51-bit integer is specified since that is one bit less than the length of the mantissa of an
+/// IEEE 754 64-bit float and thus provides a 1-bit of margin for the text-to-float conversion operation.)
+/// Any text input that describes a value outside the range of a 64-bit signed integer yields a REAL result.
+/// Casting a REAL or INTEGER value to NUMERIC is a no-op, even if a real value could be losslessly converted to an integer.
+fn cast_text_to_numeric(text: &str) -> OwnedValue {
+    if !text.contains('.') && !text.contains('e') && !text.contains('E') {
+        // Looks like an integer
+        if let Ok(i) = text.parse::<i64>() {
+            return OwnedValue::Integer(i);
+        }
+    }
+    // Try as float
+    if let Ok(f) = text.parse::<f64>() {
+        // Check if can be losslessly converted to 51-bit integer
+        let i = f as i64;
+        if f == i as f64 && i.abs() < (1i64 << 51) {
+            return OwnedValue::Integer(i);
+        }
+        return OwnedValue::Float(f);
+    }
+    OwnedValue::Integer(0)
 }
 
 fn execute_sqlite_version(version_integer: i64) -> String {
@@ -3836,7 +3717,7 @@ fn to_f64(reg: &OwnedValue) -> Option<f64> {
     match reg {
         OwnedValue::Integer(i) => Some(*i as f64),
         OwnedValue::Float(f) => Some(*f),
-        OwnedValue::Text(t) => t.as_str().parse::<f64>().ok(),
+        OwnedValue::Text(t) => t.value.parse::<f64>().ok(),
         OwnedValue::Agg(ctx) => to_f64(ctx.final_value()),
         _ => None,
     }
@@ -3937,20 +3818,181 @@ fn exec_math_log(arg: &OwnedValue, base: Option<&OwnedValue>) -> OwnedValue {
 
 #[cfg(test)]
 mod tests {
-    use crate::vdbe::exec_replace;
+
+    use crate::{
+        types::{SeekKey, SeekOp},
+        vdbe::exec_replace,
+    };
 
     use super::{
         exec_abs, exec_char, exec_hex, exec_if, exec_instr, exec_length, exec_like, exec_lower,
         exec_ltrim, exec_max, exec_min, exec_nullif, exec_quote, exec_random, exec_randomblob,
         exec_round, exec_rtrim, exec_sign, exec_soundex, exec_substring, exec_trim, exec_typeof,
-        exec_unhex, exec_unicode, exec_upper, exec_zeroblob, execute_sqlite_version, AggContext,
-        Bitfield, OwnedValue,
+        exec_unhex, exec_unicode, exec_upper, exec_zeroblob, execute_sqlite_version, get_new_rowid,
+        AggContext, Cursor, CursorResult, LimboError, OwnedRecord, OwnedValue, Result,
     };
-    use std::{collections::HashMap, rc::Rc};
+    use mockall::{mock, predicate};
+    use rand::{rngs::mock::StepRng, thread_rng};
+    use std::{cell::Ref, collections::HashMap, rc::Rc};
+
+    mock! {
+        Cursor {
+            fn seek_to_last(&mut self) -> Result<CursorResult<()>>;
+            fn seek<'a>(&mut self, key: SeekKey<'a>, op: SeekOp) -> Result<CursorResult<bool>>;
+            fn rowid(&self) -> Result<Option<u64>>;
+            fn seek_rowid(&mut self, rowid: u64) -> Result<CursorResult<bool>>;
+        }
+    }
+
+    impl Cursor for MockCursor {
+        fn root_page(&self) -> usize {
+            unreachable!()
+        }
+
+        fn seek_to_last(&mut self) -> Result<CursorResult<()>> {
+            self.seek_to_last()
+        }
+
+        fn rowid(&self) -> Result<Option<u64>> {
+            self.rowid()
+        }
+
+        fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<CursorResult<bool>> {
+            self.seek(key, op)
+        }
+
+        fn rewind(&mut self) -> Result<CursorResult<()>> {
+            unimplemented!()
+        }
+
+        fn next(&mut self) -> Result<CursorResult<()>> {
+            unimplemented!()
+        }
+
+        fn record(&self) -> Result<Ref<Option<OwnedRecord>>> {
+            unimplemented!()
+        }
+
+        fn is_empty(&self) -> bool {
+            unimplemented!()
+        }
+
+        fn set_null_flag(&mut self, _flag: bool) {
+            unimplemented!()
+        }
+
+        fn get_null_flag(&self) -> bool {
+            unimplemented!()
+        }
+
+        fn insert(
+            &mut self,
+            _key: &OwnedValue,
+            _record: &OwnedRecord,
+            _is_leaf: bool,
+        ) -> Result<CursorResult<()>> {
+            unimplemented!()
+        }
+
+        fn wait_for_completion(&mut self) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn exists(&mut self, _key: &OwnedValue) -> Result<CursorResult<bool>> {
+            unimplemented!()
+        }
+
+        fn btree_create(&mut self, _flags: usize) -> u32 {
+            unimplemented!()
+        }
+
+        fn last(&mut self) -> Result<CursorResult<()>> {
+            todo!()
+        }
+
+        fn prev(&mut self) -> Result<CursorResult<()>> {
+            todo!()
+        }
+    }
+
+    #[test]
+    fn test_get_new_rowid() -> Result<()> {
+        // Test case 0: Empty table
+        let mut mock = MockCursor::new();
+        mock.expect_seek_to_last()
+            .return_once(|| Ok(CursorResult::Ok(())));
+        mock.expect_rowid().return_once(|| Ok(None));
+
+        let result = get_new_rowid(&mut (Box::new(mock) as Box<dyn Cursor>), thread_rng())?;
+        assert_eq!(
+            result,
+            CursorResult::Ok(1),
+            "For an empty table, rowid should be 1"
+        );
+
+        // Test case 1: Normal case, rowid within i64::MAX
+        let mut mock = MockCursor::new();
+        mock.expect_seek_to_last()
+            .return_once(|| Ok(CursorResult::Ok(())));
+        mock.expect_rowid().return_once(|| Ok(Some(100)));
+
+        let result = get_new_rowid(&mut (Box::new(mock) as Box<dyn Cursor>), thread_rng())?;
+        assert_eq!(result, CursorResult::Ok(101));
+
+        // Test case 2: Rowid exceeds i64::MAX, need to generate random rowid
+        let mut mock = MockCursor::new();
+        mock.expect_seek_to_last()
+            .return_once(|| Ok(CursorResult::Ok(())));
+        mock.expect_rowid()
+            .return_once(|| Ok(Some(i64::MAX as u64)));
+        mock.expect_seek()
+            .with(predicate::always(), predicate::always())
+            .returning(|rowid, _| {
+                if rowid == SeekKey::TableRowId(50) {
+                    Ok(CursorResult::Ok(false))
+                } else {
+                    Ok(CursorResult::Ok(true))
+                }
+            });
+
+        // Mock the random number generation
+        let new_rowid =
+            get_new_rowid(&mut (Box::new(mock) as Box<dyn Cursor>), StepRng::new(1, 1))?;
+        assert_eq!(new_rowid, CursorResult::Ok(50));
+
+        // Test case 3: IO error
+        let mut mock = MockCursor::new();
+        mock.expect_seek_to_last()
+            .return_once(|| Ok(CursorResult::Ok(())));
+        mock.expect_rowid()
+            .return_once(|| Ok(Some(i64::MAX as u64)));
+        mock.expect_seek()
+            .with(predicate::always(), predicate::always())
+            .return_once(|_, _| Ok(CursorResult::IO));
+
+        let result = get_new_rowid(&mut (Box::new(mock) as Box<dyn Cursor>), thread_rng());
+        assert!(matches!(result, Ok(CursorResult::IO)));
+
+        // Test case 4: Failure to generate new rowid
+        let mut mock = MockCursor::new();
+        mock.expect_seek_to_last()
+            .return_once(|| Ok(CursorResult::Ok(())));
+        mock.expect_rowid()
+            .return_once(|| Ok(Some(i64::MAX as u64)));
+        mock.expect_seek()
+            .with(predicate::always(), predicate::always())
+            .returning(|_, _| Ok(CursorResult::Ok(true)));
+
+        // Mock the random number generation
+        let result = get_new_rowid(&mut (Box::new(mock) as Box<dyn Cursor>), StepRng::new(1, 1));
+        assert!(matches!(result, Err(LimboError::InternalError(_))));
+
+        Ok(())
+    }
 
     #[test]
     fn test_length() {
-        let input_str = OwnedValue::build_text("bob");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("bob")));
         let expected_len = OwnedValue::Integer(3);
         assert_eq!(exec_length(&input_str), expected_len);
 
@@ -3969,57 +4011,60 @@ mod tests {
 
     #[test]
     fn test_quote() {
-        let input = OwnedValue::build_text("abc\0edf");
-        let expected = OwnedValue::build_text("'abc'");
+        let input = OwnedValue::build_text(Rc::new(String::from("abc\0edf")));
+        let expected = OwnedValue::build_text(Rc::new(String::from("'abc'")));
         assert_eq!(exec_quote(&input), expected);
 
         let input = OwnedValue::Integer(123);
         let expected = OwnedValue::Integer(123);
         assert_eq!(exec_quote(&input), expected);
 
-        let input = OwnedValue::build_text("hello''world");
-        let expected = OwnedValue::build_text("'hello''''world'");
+        let input = OwnedValue::build_text(Rc::new(String::from("hello''world")));
+        let expected = OwnedValue::build_text(Rc::new(String::from("'hello''world'")));
         assert_eq!(exec_quote(&input), expected);
     }
 
     #[test]
     fn test_typeof() {
         let input = OwnedValue::Null;
-        let expected: OwnedValue = OwnedValue::build_text("null");
+        let expected: OwnedValue = OwnedValue::build_text(Rc::new("null".to_string()));
         assert_eq!(exec_typeof(&input), expected);
 
         let input = OwnedValue::Integer(123);
-        let expected: OwnedValue = OwnedValue::build_text("integer");
+        let expected: OwnedValue = OwnedValue::build_text(Rc::new("integer".to_string()));
         assert_eq!(exec_typeof(&input), expected);
 
         let input = OwnedValue::Float(123.456);
-        let expected: OwnedValue = OwnedValue::build_text("real");
+        let expected: OwnedValue = OwnedValue::build_text(Rc::new("real".to_string()));
         assert_eq!(exec_typeof(&input), expected);
 
-        let input = OwnedValue::build_text("hello");
-        let expected: OwnedValue = OwnedValue::build_text("text");
+        let input = OwnedValue::build_text(Rc::new("hello".to_string()));
+        let expected: OwnedValue = OwnedValue::build_text(Rc::new("text".to_string()));
         assert_eq!(exec_typeof(&input), expected);
 
         let input = OwnedValue::Blob(Rc::new("limbo".as_bytes().to_vec()));
-        let expected: OwnedValue = OwnedValue::build_text("blob");
+        let expected: OwnedValue = OwnedValue::build_text(Rc::new("blob".to_string()));
         assert_eq!(exec_typeof(&input), expected);
 
         let input = OwnedValue::Agg(Box::new(AggContext::Sum(OwnedValue::Integer(123))));
-        let expected = OwnedValue::build_text("integer");
+        let expected = OwnedValue::build_text(Rc::new("integer".to_string()));
         assert_eq!(exec_typeof(&input), expected);
     }
 
     #[test]
     fn test_unicode() {
         assert_eq!(
-            exec_unicode(&OwnedValue::build_text("a")),
+            exec_unicode(&OwnedValue::build_text(Rc::new("a".to_string()))),
             OwnedValue::Integer(97)
         );
         assert_eq!(
-            exec_unicode(&OwnedValue::build_text("😊")),
+            exec_unicode(&OwnedValue::build_text(Rc::new("😊".to_string()))),
             OwnedValue::Integer(128522)
         );
-        assert_eq!(exec_unicode(&OwnedValue::build_text("")), OwnedValue::Null);
+        assert_eq!(
+            exec_unicode(&OwnedValue::build_text(Rc::new("".to_string()))),
+            OwnedValue::Null
+        );
         assert_eq!(
             exec_unicode(&OwnedValue::Integer(23)),
             OwnedValue::Integer(50)
@@ -4049,11 +4094,17 @@ mod tests {
         assert_eq!(exec_min(input_int_vec.clone()), OwnedValue::Integer(-1));
         assert_eq!(exec_max(input_int_vec.clone()), OwnedValue::Integer(10));
 
-        let str1 = OwnedValue::build_text("A");
-        let str2 = OwnedValue::build_text("z");
+        let str1 = OwnedValue::build_text(Rc::new(String::from("A")));
+        let str2 = OwnedValue::build_text(Rc::new(String::from("z")));
         let input_str_vec = vec![&str2, &str1];
-        assert_eq!(exec_min(input_str_vec.clone()), OwnedValue::build_text("A"));
-        assert_eq!(exec_max(input_str_vec.clone()), OwnedValue::build_text("z"));
+        assert_eq!(
+            exec_min(input_str_vec.clone()),
+            OwnedValue::build_text(Rc::new(String::from("A")))
+        );
+        assert_eq!(
+            exec_max(input_str_vec.clone()),
+            OwnedValue::build_text(Rc::new(String::from("z")))
+        );
 
         let input_null_vec = vec![&OwnedValue::Null, &OwnedValue::Null];
         assert_eq!(exec_min(input_null_vec.clone()), OwnedValue::Null);
@@ -4063,102 +4114,102 @@ mod tests {
         assert_eq!(exec_min(input_mixed_vec.clone()), OwnedValue::Integer(10));
         assert_eq!(
             exec_max(input_mixed_vec.clone()),
-            OwnedValue::build_text("A")
+            OwnedValue::build_text(Rc::new(String::from("A")))
         );
     }
 
     #[test]
     fn test_trim() {
-        let input_str = OwnedValue::build_text("     Bob and Alice     ");
-        let expected_str = OwnedValue::build_text("Bob and Alice");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice     ")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("Bob and Alice")));
         assert_eq!(exec_trim(&input_str, None), expected_str);
 
-        let input_str = OwnedValue::build_text("     Bob and Alice     ");
-        let pattern_str = OwnedValue::build_text("Bob and");
-        let expected_str = OwnedValue::build_text("Alice");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice     ")));
+        let pattern_str = OwnedValue::build_text(Rc::new(String::from("Bob and")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("Alice")));
         assert_eq!(exec_trim(&input_str, Some(pattern_str)), expected_str);
     }
 
     #[test]
     fn test_ltrim() {
-        let input_str = OwnedValue::build_text("     Bob and Alice     ");
-        let expected_str = OwnedValue::build_text("Bob and Alice     ");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice     ")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("Bob and Alice     ")));
         assert_eq!(exec_ltrim(&input_str, None), expected_str);
 
-        let input_str = OwnedValue::build_text("     Bob and Alice     ");
-        let pattern_str = OwnedValue::build_text("Bob and");
-        let expected_str = OwnedValue::build_text("Alice     ");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice     ")));
+        let pattern_str = OwnedValue::build_text(Rc::new(String::from("Bob and")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("Alice     ")));
         assert_eq!(exec_ltrim(&input_str, Some(pattern_str)), expected_str);
     }
 
     #[test]
     fn test_rtrim() {
-        let input_str = OwnedValue::build_text("     Bob and Alice     ");
-        let expected_str = OwnedValue::build_text("     Bob and Alice");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice     ")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice")));
         assert_eq!(exec_rtrim(&input_str, None), expected_str);
 
-        let input_str = OwnedValue::build_text("     Bob and Alice     ");
-        let pattern_str = OwnedValue::build_text("Bob and");
-        let expected_str = OwnedValue::build_text("     Bob and Alice");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice     ")));
+        let pattern_str = OwnedValue::build_text(Rc::new(String::from("Bob and")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice")));
         assert_eq!(exec_rtrim(&input_str, Some(pattern_str)), expected_str);
 
-        let input_str = OwnedValue::build_text("     Bob and Alice     ");
-        let pattern_str = OwnedValue::build_text("and Alice");
-        let expected_str = OwnedValue::build_text("     Bob");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice     ")));
+        let pattern_str = OwnedValue::build_text(Rc::new(String::from("and Alice")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("     Bob")));
         assert_eq!(exec_rtrim(&input_str, Some(pattern_str)), expected_str);
     }
 
     #[test]
     fn test_soundex() {
-        let input_str = OwnedValue::build_text("Pfister");
-        let expected_str = OwnedValue::build_text("P236");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("Pfister")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("P236")));
         assert_eq!(exec_soundex(&input_str), expected_str);
 
-        let input_str = OwnedValue::build_text("husobee");
-        let expected_str = OwnedValue::build_text("H210");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("husobee")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("H210")));
         assert_eq!(exec_soundex(&input_str), expected_str);
 
-        let input_str = OwnedValue::build_text("Tymczak");
-        let expected_str = OwnedValue::build_text("T522");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("Tymczak")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("T522")));
         assert_eq!(exec_soundex(&input_str), expected_str);
 
-        let input_str = OwnedValue::build_text("Ashcraft");
-        let expected_str = OwnedValue::build_text("A261");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("Ashcraft")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("A261")));
         assert_eq!(exec_soundex(&input_str), expected_str);
 
-        let input_str = OwnedValue::build_text("Robert");
-        let expected_str = OwnedValue::build_text("R163");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("Robert")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("R163")));
         assert_eq!(exec_soundex(&input_str), expected_str);
 
-        let input_str = OwnedValue::build_text("Rupert");
-        let expected_str = OwnedValue::build_text("R163");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("Rupert")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("R163")));
         assert_eq!(exec_soundex(&input_str), expected_str);
 
-        let input_str = OwnedValue::build_text("Rubin");
-        let expected_str = OwnedValue::build_text("R150");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("Rubin")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("R150")));
         assert_eq!(exec_soundex(&input_str), expected_str);
 
-        let input_str = OwnedValue::build_text("Kant");
-        let expected_str = OwnedValue::build_text("K530");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("Kant")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("K530")));
         assert_eq!(exec_soundex(&input_str), expected_str);
 
-        let input_str = OwnedValue::build_text("Knuth");
-        let expected_str = OwnedValue::build_text("K530");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("Knuth")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("K530")));
         assert_eq!(exec_soundex(&input_str), expected_str);
 
-        let input_str = OwnedValue::build_text("x");
-        let expected_str = OwnedValue::build_text("X000");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("x")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("X000")));
         assert_eq!(exec_soundex(&input_str), expected_str);
 
-        let input_str = OwnedValue::build_text("闪电五连鞭");
-        let expected_str = OwnedValue::build_text("?000");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("闪电五连鞭")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("?000")));
         assert_eq!(exec_soundex(&input_str), expected_str);
     }
 
     #[test]
     fn test_upper_case() {
-        let input_str = OwnedValue::build_text("Limbo");
-        let expected_str = OwnedValue::build_text("LIMBO");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("Limbo")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("LIMBO")));
         assert_eq!(exec_upper(&input_str).unwrap(), expected_str);
 
         let input_int = OwnedValue::Integer(10);
@@ -4168,8 +4219,8 @@ mod tests {
 
     #[test]
     fn test_lower_case() {
-        let input_str = OwnedValue::build_text("Limbo");
-        let expected_str = OwnedValue::build_text("limbo");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("Limbo")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("limbo")));
         assert_eq!(exec_lower(&input_str).unwrap(), expected_str);
 
         let input_int = OwnedValue::Integer(10);
@@ -4179,38 +4230,38 @@ mod tests {
 
     #[test]
     fn test_hex() {
-        let input_str = OwnedValue::build_text("limbo");
-        let expected_val = OwnedValue::build_text("6C696D626F");
+        let input_str = OwnedValue::build_text(Rc::new("limbo".to_string()));
+        let expected_val = OwnedValue::build_text(Rc::new(String::from("6C696D626F")));
         assert_eq!(exec_hex(&input_str), expected_val);
 
         let input_int = OwnedValue::Integer(100);
-        let expected_val = OwnedValue::build_text("313030");
+        let expected_val = OwnedValue::build_text(Rc::new(String::from("313030")));
         assert_eq!(exec_hex(&input_int), expected_val);
 
         let input_float = OwnedValue::Float(12.34);
-        let expected_val = OwnedValue::build_text("31322E3334");
+        let expected_val = OwnedValue::build_text(Rc::new(String::from("31322E3334")));
         assert_eq!(exec_hex(&input_float), expected_val);
     }
 
     #[test]
     fn test_unhex() {
-        let input = OwnedValue::build_text("6f");
+        let input = OwnedValue::build_text(Rc::new(String::from("6F")));
         let expected = OwnedValue::Blob(Rc::new(vec![0x6f]));
         assert_eq!(exec_unhex(&input, None), expected);
 
-        let input = OwnedValue::build_text("6f");
+        let input = OwnedValue::build_text(Rc::new(String::from("6f")));
         let expected = OwnedValue::Blob(Rc::new(vec![0x6f]));
         assert_eq!(exec_unhex(&input, None), expected);
 
-        let input = OwnedValue::build_text("611");
+        let input = OwnedValue::build_text(Rc::new(String::from("611")));
         let expected = OwnedValue::Null;
         assert_eq!(exec_unhex(&input, None), expected);
 
-        let input = OwnedValue::build_text("");
+        let input = OwnedValue::build_text(Rc::new(String::from("")));
         let expected = OwnedValue::Blob(Rc::new(vec![]));
         assert_eq!(exec_unhex(&input, None), expected);
 
-        let input = OwnedValue::build_text("61x");
+        let input = OwnedValue::build_text(Rc::new(String::from("61x")));
         let expected = OwnedValue::Null;
         assert_eq!(exec_unhex(&input, None), expected);
 
@@ -4232,44 +4283,38 @@ mod tests {
         assert_eq!(exec_abs(&float_negative_reg).unwrap(), float_positive_reg);
 
         assert_eq!(
-            exec_abs(&OwnedValue::build_text("a")).unwrap(),
+            exec_abs(&OwnedValue::build_text(Rc::new(String::from("a")))).unwrap(),
             OwnedValue::Float(0.0)
         );
         assert_eq!(exec_abs(&OwnedValue::Null).unwrap(), OwnedValue::Null);
-
-        // ABS(i64::MIN) should return RuntimeError
-        assert!(exec_abs(&OwnedValue::Integer(i64::MIN)).is_err());
     }
 
     #[test]
     fn test_char() {
         assert_eq!(
             exec_char(vec![OwnedValue::Integer(108), OwnedValue::Integer(105)]),
-            OwnedValue::build_text("li")
+            OwnedValue::build_text(Rc::new("li".to_string()))
         );
-        assert_eq!(exec_char(vec![]), OwnedValue::build_text(""));
+        assert_eq!(
+            exec_char(vec![]),
+            OwnedValue::build_text(Rc::new("".to_string()))
+        );
         assert_eq!(
             exec_char(vec![OwnedValue::Null]),
-            OwnedValue::build_text("")
+            OwnedValue::build_text(Rc::new("".to_string()))
         );
         assert_eq!(
-            exec_char(vec![OwnedValue::build_text("a")]),
-            OwnedValue::build_text("")
+            exec_char(vec![OwnedValue::build_text(Rc::new("a".to_string()))]),
+            OwnedValue::build_text(Rc::new("".to_string()))
         );
-    }
-
-    #[test]
-    fn test_like_with_escape_or_regexmeta_chars() {
-        assert!(exec_like(None, r#"\%A"#, r#"\A"#));
-        assert!(exec_like(None, "%a%a", "aaaa"));
     }
 
     #[test]
     fn test_like_no_cache() {
         assert!(exec_like(None, "a%", "aaaa"));
         assert!(exec_like(None, "%a%a", "aaaa"));
-        assert!(!exec_like(None, "%a.a", "aaaa"));
-        assert!(!exec_like(None, "a.a%", "aaaa"));
+        assert!(exec_like(None, "%a.a", "aaaa"));
+        assert!(exec_like(None, "a.a%", "aaaa"));
         assert!(!exec_like(None, "%a.ab", "aaaa"));
     }
 
@@ -4278,15 +4323,15 @@ mod tests {
         let mut cache = HashMap::new();
         assert!(exec_like(Some(&mut cache), "a%", "aaaa"));
         assert!(exec_like(Some(&mut cache), "%a%a", "aaaa"));
-        assert!(!exec_like(Some(&mut cache), "%a.a", "aaaa"));
-        assert!(!exec_like(Some(&mut cache), "a.a%", "aaaa"));
+        assert!(exec_like(Some(&mut cache), "%a.a", "aaaa"));
+        assert!(exec_like(Some(&mut cache), "a.a%", "aaaa"));
         assert!(!exec_like(Some(&mut cache), "%a.ab", "aaaa"));
 
         // again after values have been cached
         assert!(exec_like(Some(&mut cache), "a%", "aaaa"));
         assert!(exec_like(Some(&mut cache), "%a%a", "aaaa"));
-        assert!(!exec_like(Some(&mut cache), "%a.a", "aaaa"));
-        assert!(!exec_like(Some(&mut cache), "a.a%", "aaaa"));
+        assert!(exec_like(Some(&mut cache), "%a.a", "aaaa"));
+        assert!(exec_like(Some(&mut cache), "a.a%", "aaaa"));
         assert!(!exec_like(Some(&mut cache), "%a.ab", "aaaa"));
     }
 
@@ -4325,19 +4370,19 @@ mod tests {
                 expected_len: 1,
             },
             TestCase {
-                input: OwnedValue::build_text(""),
+                input: OwnedValue::build_text(Rc::new(String::from(""))),
                 expected_len: 1,
             },
             TestCase {
-                input: OwnedValue::build_text("5"),
+                input: OwnedValue::build_text(Rc::new(String::from("5"))),
                 expected_len: 5,
             },
             TestCase {
-                input: OwnedValue::build_text("0"),
+                input: OwnedValue::build_text(Rc::new(String::from("0"))),
                 expected_len: 1,
             },
             TestCase {
-                input: OwnedValue::build_text("-1"),
+                input: OwnedValue::build_text(Rc::new(String::from("-1"))),
                 expected_len: 1,
             },
             TestCase {
@@ -4345,7 +4390,7 @@ mod tests {
                 expected_len: 2,
             },
             TestCase {
-                input: OwnedValue::Float(-3.15),
+                input: OwnedValue::Float(-3.14),
                 expected_len: 1,
             },
             TestCase {
@@ -4377,11 +4422,11 @@ mod tests {
         assert_eq!(exec_round(&input_val, Some(precision_val)), expected_val);
 
         let input_val = OwnedValue::Float(123.456);
-        let precision_val = OwnedValue::build_text("1");
+        let precision_val = OwnedValue::build_text(Rc::new(String::from("1")));
         let expected_val = OwnedValue::Float(123.5);
         assert_eq!(exec_round(&input_val, Some(precision_val)), expected_val);
 
-        let input_val = OwnedValue::build_text("123.456");
+        let input_val = OwnedValue::build_text(Rc::new(String::from("123.456")));
         let precision_val = OwnedValue::Integer(2);
         let expected_val = OwnedValue::Float(123.46);
         assert_eq!(exec_round(&input_val, Some(precision_val)), expected_val);
@@ -4403,24 +4448,29 @@ mod tests {
     #[test]
     fn test_exec_if() {
         let reg = OwnedValue::Integer(0);
-        assert!(!exec_if(&reg, false, false));
-        assert!(exec_if(&reg, false, true));
+        let null_reg = OwnedValue::Integer(0);
+        assert!(!exec_if(&reg, &null_reg, false));
+        assert!(exec_if(&reg, &null_reg, true));
 
         let reg = OwnedValue::Integer(1);
-        assert!(exec_if(&reg, false, false));
-        assert!(!exec_if(&reg, false, true));
+        let null_reg = OwnedValue::Integer(0);
+        assert!(exec_if(&reg, &null_reg, false));
+        assert!(!exec_if(&reg, &null_reg, true));
 
         let reg = OwnedValue::Null;
-        assert!(!exec_if(&reg, false, false));
-        assert!(!exec_if(&reg, false, true));
+        let null_reg = OwnedValue::Integer(0);
+        assert!(!exec_if(&reg, &null_reg, false));
+        assert!(!exec_if(&reg, &null_reg, true));
 
         let reg = OwnedValue::Null;
-        assert!(exec_if(&reg, true, false));
-        assert!(exec_if(&reg, true, true));
+        let null_reg = OwnedValue::Integer(1);
+        assert!(exec_if(&reg, &null_reg, false));
+        assert!(exec_if(&reg, &null_reg, true));
 
         let reg = OwnedValue::Null;
-        assert!(!exec_if(&reg, false, false));
-        assert!(!exec_if(&reg, false, true));
+        let null_reg = OwnedValue::Null;
+        assert!(!exec_if(&reg, &null_reg, false));
+        assert!(!exec_if(&reg, &null_reg, true));
     }
 
     #[test]
@@ -4435,8 +4485,8 @@ mod tests {
         );
         assert_eq!(
             exec_nullif(
-                &OwnedValue::build_text("limbo"),
-                &OwnedValue::build_text("limbo")
+                &OwnedValue::build_text(Rc::new("limbo".to_string())),
+                &OwnedValue::build_text(Rc::new("limbo".to_string()))
             ),
             OwnedValue::Null
         );
@@ -4451,100 +4501,100 @@ mod tests {
         );
         assert_eq!(
             exec_nullif(
-                &OwnedValue::build_text("limbo"),
-                &OwnedValue::build_text("limb")
+                &OwnedValue::build_text(Rc::new("limbo".to_string())),
+                &OwnedValue::build_text(Rc::new("limb".to_string()))
             ),
-            OwnedValue::build_text("limbo")
+            OwnedValue::build_text(Rc::new("limbo".to_string()))
         );
     }
 
     #[test]
     fn test_substring() {
-        let str_value = OwnedValue::build_text("limbo");
+        let str_value = OwnedValue::build_text(Rc::new("limbo".to_string()));
         let start_value = OwnedValue::Integer(1);
         let length_value = OwnedValue::Integer(3);
-        let expected_val = OwnedValue::build_text("lim");
+        let expected_val = OwnedValue::build_text(Rc::new(String::from("lim")));
         assert_eq!(
-            exec_substring(&str_value, &start_value, Some(&length_value)),
+            exec_substring(&str_value, &start_value, &length_value),
             expected_val
         );
 
-        let str_value = OwnedValue::build_text("limbo");
+        let str_value = OwnedValue::build_text(Rc::new("limbo".to_string()));
         let start_value = OwnedValue::Integer(1);
         let length_value = OwnedValue::Integer(10);
-        let expected_val = OwnedValue::build_text("limbo");
+        let expected_val = OwnedValue::build_text(Rc::new(String::from("limbo")));
         assert_eq!(
-            exec_substring(&str_value, &start_value, Some(&length_value)),
+            exec_substring(&str_value, &start_value, &length_value),
             expected_val
         );
 
-        let str_value = OwnedValue::build_text("limbo");
+        let str_value = OwnedValue::build_text(Rc::new("limbo".to_string()));
         let start_value = OwnedValue::Integer(10);
         let length_value = OwnedValue::Integer(3);
-        let expected_val = OwnedValue::build_text("");
+        let expected_val = OwnedValue::build_text(Rc::new(String::from("")));
         assert_eq!(
-            exec_substring(&str_value, &start_value, Some(&length_value)),
+            exec_substring(&str_value, &start_value, &length_value),
             expected_val
         );
 
-        let str_value = OwnedValue::build_text("limbo");
+        let str_value = OwnedValue::build_text(Rc::new("limbo".to_string()));
         let start_value = OwnedValue::Integer(3);
         let length_value = OwnedValue::Null;
-        let expected_val = OwnedValue::build_text("mbo");
+        let expected_val = OwnedValue::build_text(Rc::new(String::from("mbo")));
         assert_eq!(
-            exec_substring(&str_value, &start_value, Some(&length_value)),
+            exec_substring(&str_value, &start_value, &length_value),
             expected_val
         );
 
-        let str_value = OwnedValue::build_text("limbo");
+        let str_value = OwnedValue::build_text(Rc::new("limbo".to_string()));
         let start_value = OwnedValue::Integer(10);
         let length_value = OwnedValue::Null;
-        let expected_val = OwnedValue::build_text("");
+        let expected_val = OwnedValue::build_text(Rc::new(String::from("")));
         assert_eq!(
-            exec_substring(&str_value, &start_value, Some(&length_value)),
+            exec_substring(&str_value, &start_value, &length_value),
             expected_val
         );
     }
 
     #[test]
     fn test_exec_instr() {
-        let input = OwnedValue::build_text("limbo");
-        let pattern = OwnedValue::build_text("im");
+        let input = OwnedValue::build_text(Rc::new(String::from("limbo")));
+        let pattern = OwnedValue::build_text(Rc::new(String::from("im")));
         let expected = OwnedValue::Integer(2);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
-        let input = OwnedValue::build_text("limbo");
-        let pattern = OwnedValue::build_text("limbo");
+        let input = OwnedValue::build_text(Rc::new(String::from("limbo")));
+        let pattern = OwnedValue::build_text(Rc::new(String::from("limbo")));
         let expected = OwnedValue::Integer(1);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
-        let input = OwnedValue::build_text("limbo");
-        let pattern = OwnedValue::build_text("o");
+        let input = OwnedValue::build_text(Rc::new(String::from("limbo")));
+        let pattern = OwnedValue::build_text(Rc::new(String::from("o")));
         let expected = OwnedValue::Integer(5);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
-        let input = OwnedValue::build_text("liiiiimbo");
-        let pattern = OwnedValue::build_text("ii");
+        let input = OwnedValue::build_text(Rc::new(String::from("liiiiimbo")));
+        let pattern = OwnedValue::build_text(Rc::new(String::from("ii")));
         let expected = OwnedValue::Integer(2);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
-        let input = OwnedValue::build_text("limbo");
-        let pattern = OwnedValue::build_text("limboX");
+        let input = OwnedValue::build_text(Rc::new(String::from("limbo")));
+        let pattern = OwnedValue::build_text(Rc::new(String::from("limboX")));
         let expected = OwnedValue::Integer(0);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
-        let input = OwnedValue::build_text("limbo");
-        let pattern = OwnedValue::build_text("");
+        let input = OwnedValue::build_text(Rc::new(String::from("limbo")));
+        let pattern = OwnedValue::build_text(Rc::new(String::from("")));
         let expected = OwnedValue::Integer(1);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
-        let input = OwnedValue::build_text("");
-        let pattern = OwnedValue::build_text("limbo");
+        let input = OwnedValue::build_text(Rc::new(String::from("")));
+        let pattern = OwnedValue::build_text(Rc::new(String::from("limbo")));
         let expected = OwnedValue::Integer(0);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
-        let input = OwnedValue::build_text("");
-        let pattern = OwnedValue::build_text("");
+        let input = OwnedValue::build_text(Rc::new(String::from("")));
+        let pattern = OwnedValue::build_text(Rc::new(String::from("")));
         let expected = OwnedValue::Integer(1);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
@@ -4553,13 +4603,13 @@ mod tests {
         let expected = OwnedValue::Null;
         assert_eq!(exec_instr(&input, &pattern), expected);
 
-        let input = OwnedValue::build_text("limbo");
+        let input = OwnedValue::build_text(Rc::new(String::from("limbo")));
         let pattern = OwnedValue::Null;
         let expected = OwnedValue::Null;
         assert_eq!(exec_instr(&input, &pattern), expected);
 
         let input = OwnedValue::Null;
-        let pattern = OwnedValue::build_text("limbo");
+        let pattern = OwnedValue::build_text(Rc::new(String::from("limbo")));
         let expected = OwnedValue::Null;
         assert_eq!(exec_instr(&input, &pattern), expected);
 
@@ -4584,7 +4634,7 @@ mod tests {
         assert_eq!(exec_instr(&input, &pattern), expected);
 
         let input = OwnedValue::Float(12.34);
-        let pattern = OwnedValue::build_text(".");
+        let pattern = OwnedValue::build_text(Rc::new(String::from(".")));
         let expected = OwnedValue::Integer(3);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
@@ -4599,11 +4649,11 @@ mod tests {
         assert_eq!(exec_instr(&input, &pattern), expected);
 
         let input = OwnedValue::Blob(Rc::new(vec![0x61, 0x62, 0x63, 0x64, 0x65]));
-        let pattern = OwnedValue::build_text("cd");
+        let pattern = OwnedValue::build_text(Rc::new(String::from("cd")));
         let expected = OwnedValue::Integer(3);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
-        let input = OwnedValue::build_text("abcde");
+        let input = OwnedValue::build_text(Rc::new(String::from("abcde")));
         let pattern = OwnedValue::Blob(Rc::new(vec![0x63, 0x64]));
         let expected = OwnedValue::Integer(3);
         assert_eq!(exec_instr(&input, &pattern), expected);
@@ -4639,19 +4689,19 @@ mod tests {
         let expected = Some(OwnedValue::Integer(-1));
         assert_eq!(exec_sign(&input), expected);
 
-        let input = OwnedValue::build_text("abc");
+        let input = OwnedValue::build_text(Rc::new("abc".to_string()));
         let expected = Some(OwnedValue::Null);
         assert_eq!(exec_sign(&input), expected);
 
-        let input = OwnedValue::build_text("42");
+        let input = OwnedValue::build_text(Rc::new("42".to_string()));
         let expected = Some(OwnedValue::Integer(1));
         assert_eq!(exec_sign(&input), expected);
 
-        let input = OwnedValue::build_text("-42");
+        let input = OwnedValue::build_text(Rc::new("-42".to_string()));
         let expected = Some(OwnedValue::Integer(-1));
         assert_eq!(exec_sign(&input), expected);
 
-        let input = OwnedValue::build_text("0");
+        let input = OwnedValue::build_text(Rc::new("0".to_string()));
         let expected = Some(OwnedValue::Integer(0));
         assert_eq!(exec_sign(&input), expected);
 
@@ -4694,15 +4744,15 @@ mod tests {
         let expected = OwnedValue::Blob(Rc::new(vec![]));
         assert_eq!(exec_zeroblob(&input), expected);
 
-        let input = OwnedValue::build_text("5");
+        let input = OwnedValue::build_text(Rc::new("5".to_string()));
         let expected = OwnedValue::Blob(Rc::new(vec![0; 5]));
         assert_eq!(exec_zeroblob(&input), expected);
 
-        let input = OwnedValue::build_text("-5");
+        let input = OwnedValue::build_text(Rc::new("-5".to_string()));
         let expected = OwnedValue::Blob(Rc::new(vec![]));
         assert_eq!(exec_zeroblob(&input), expected);
 
-        let input = OwnedValue::build_text("text");
+        let input = OwnedValue::build_text(Rc::new("text".to_string()));
         let expected = OwnedValue::Blob(Rc::new(vec![]));
         assert_eq!(exec_zeroblob(&input), expected);
 
@@ -4724,123 +4774,104 @@ mod tests {
 
     #[test]
     fn test_replace() {
-        let input_str = OwnedValue::build_text("bob");
-        let pattern_str = OwnedValue::build_text("b");
-        let replace_str = OwnedValue::build_text("a");
-        let expected_str = OwnedValue::build_text("aoa");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("bob")));
+        let pattern_str = OwnedValue::build_text(Rc::new(String::from("b")));
+        let replace_str = OwnedValue::build_text(Rc::new(String::from("a")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("aoa")));
         assert_eq!(
             exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
 
-        let input_str = OwnedValue::build_text("bob");
-        let pattern_str = OwnedValue::build_text("b");
-        let replace_str = OwnedValue::build_text("");
-        let expected_str = OwnedValue::build_text("o");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("bob")));
+        let pattern_str = OwnedValue::build_text(Rc::new(String::from("b")));
+        let replace_str = OwnedValue::build_text(Rc::new(String::from("")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("o")));
         assert_eq!(
             exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
 
-        let input_str = OwnedValue::build_text("bob");
-        let pattern_str = OwnedValue::build_text("b");
-        let replace_str = OwnedValue::build_text("abc");
-        let expected_str = OwnedValue::build_text("abcoabc");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("bob")));
+        let pattern_str = OwnedValue::build_text(Rc::new(String::from("b")));
+        let replace_str = OwnedValue::build_text(Rc::new(String::from("abc")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("abcoabc")));
         assert_eq!(
             exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
 
-        let input_str = OwnedValue::build_text("bob");
-        let pattern_str = OwnedValue::build_text("a");
-        let replace_str = OwnedValue::build_text("b");
-        let expected_str = OwnedValue::build_text("bob");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("bob")));
+        let pattern_str = OwnedValue::build_text(Rc::new(String::from("a")));
+        let replace_str = OwnedValue::build_text(Rc::new(String::from("b")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("bob")));
         assert_eq!(
             exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
 
-        let input_str = OwnedValue::build_text("bob");
-        let pattern_str = OwnedValue::build_text("");
-        let replace_str = OwnedValue::build_text("a");
-        let expected_str = OwnedValue::build_text("bob");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("bob")));
+        let pattern_str = OwnedValue::build_text(Rc::new(String::from("")));
+        let replace_str = OwnedValue::build_text(Rc::new(String::from("a")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("bob")));
         assert_eq!(
             exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
 
-        let input_str = OwnedValue::build_text("bob");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("bob")));
         let pattern_str = OwnedValue::Null;
-        let replace_str = OwnedValue::build_text("a");
+        let replace_str = OwnedValue::build_text(Rc::new(String::from("a")));
         let expected_str = OwnedValue::Null;
         assert_eq!(
             exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
 
-        let input_str = OwnedValue::build_text("bo5");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("bo5")));
         let pattern_str = OwnedValue::Integer(5);
-        let replace_str = OwnedValue::build_text("a");
-        let expected_str = OwnedValue::build_text("boa");
+        let replace_str = OwnedValue::build_text(Rc::new(String::from("a")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("boa")));
         assert_eq!(
             exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
 
-        let input_str = OwnedValue::build_text("bo5.0");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("bo5.0")));
         let pattern_str = OwnedValue::Float(5.0);
-        let replace_str = OwnedValue::build_text("a");
-        let expected_str = OwnedValue::build_text("boa");
+        let replace_str = OwnedValue::build_text(Rc::new(String::from("a")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("boa")));
         assert_eq!(
             exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
 
-        let input_str = OwnedValue::build_text("bo5");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("bo5")));
         let pattern_str = OwnedValue::Float(5.0);
-        let replace_str = OwnedValue::build_text("a");
-        let expected_str = OwnedValue::build_text("bo5");
+        let replace_str = OwnedValue::build_text(Rc::new(String::from("a")));
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("bo5")));
         assert_eq!(
             exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
 
-        let input_str = OwnedValue::build_text("bo5.0");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("bo5.0")));
         let pattern_str = OwnedValue::Float(5.0);
         let replace_str = OwnedValue::Float(6.0);
-        let expected_str = OwnedValue::build_text("bo6.0");
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("bo6.0")));
         assert_eq!(
             exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
 
         // todo: change this test to use (0.1 + 0.2) instead of 0.3 when decimals are implemented.
-        let input_str = OwnedValue::build_text("tes3");
+        let input_str = OwnedValue::build_text(Rc::new(String::from("tes3")));
         let pattern_str = OwnedValue::Integer(3);
         let replace_str = OwnedValue::Agg(Box::new(AggContext::Sum(OwnedValue::Float(0.3))));
-        let expected_str = OwnedValue::build_text("tes0.3");
+        let expected_str = OwnedValue::build_text(Rc::new(String::from("tes0.3")));
         assert_eq!(
             exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
-    }
-
-    #[test]
-    fn test_bitfield() {
-        let mut bitfield = Bitfield::<4>::new();
-        for i in 0..256 {
-            bitfield.set(i);
-            assert!(bitfield.get(i));
-            for j in 0..i {
-                assert!(bitfield.get(j));
-            }
-            for j in i + 1..256 {
-                assert!(!bitfield.get(j));
-            }
-        }
-        for i in 0..256 {
-            bitfield.unset(i);
-            assert!(!bitfield.get(i));
-        }
     }
 }

@@ -43,7 +43,7 @@ impl From<pest::error::Error<Rule>> for Error {
             pest::error::LineColLocation::Pos((l, c)) => (l, c),
             pest::error::LineColLocation::Span((l, c), (_, _)) => (l, c),
         };
-        Self::Message {
+        Error::Message {
             msg: err.to_string(),
             location: Some(Location { line, column }),
         }
@@ -52,7 +52,7 @@ impl From<pest::error::Error<Rule>> for Error {
 
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
-        Self::Message {
+        Error::Message {
             msg: err.to_string(),
             location: None,
         }
@@ -61,7 +61,7 @@ impl From<std::io::Error> for Error {
 
 impl From<std::str::Utf8Error> for Error {
     fn from(err: std::str::Utf8Error) -> Self {
-        Self::Message {
+        Error::Message {
             msg: err.to_string(),
             location: None,
         }
@@ -70,7 +70,7 @@ impl From<std::str::Utf8Error> for Error {
 
 impl ser::Error for Error {
     fn custom<T: Display>(msg: T) -> Self {
-        Self::Message {
+        Error::Message {
             msg: msg.to_string(),
             location: None,
         }
@@ -79,7 +79,7 @@ impl ser::Error for Error {
 
 impl de::Error for Error {
     fn custom<T: Display>(msg: T) -> Self {
-        Self::Message {
+        Error::Message {
             msg: msg.to_string(),
             location: None,
         }
@@ -89,7 +89,7 @@ impl de::Error for Error {
 impl Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Message { ref msg, .. } => write!(formatter, "{}", msg),
+            Error::Message { ref msg, .. } => write!(formatter, "{}", msg),
         }
     }
 }
@@ -103,14 +103,6 @@ pub fn set_location<T>(res: &mut Result<T>, span: &Span<'_>) {
         if location.is_none() {
             let (line, column) = span.start_pos().line_col();
             *location = Some(Location { line, column });
-        }
-    }
-}
-
-impl From<Error> for crate::LimboError {
-    fn from(err: Error) -> Self {
-        match err {
-            Error::Message { msg, .. } => crate::LimboError::ParseError(msg),
         }
     }
 }
