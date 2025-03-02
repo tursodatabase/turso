@@ -356,8 +356,9 @@ pub fn derive_agg_func(input: TokenStream) -> TokenStream {
 ///            city TEXT
 ///        )"
 ///    }
-///    /// Open the virtual table and return a cursor
-///  fn open() -> Self::VCursor {
+///    /// Open the virtual table and return a cursor. Optionally, you can store
+///    /// a connection to the owning database in your cursor.
+///  fn open(&self, conn: Rc<Connection>) -> Self::VCursor {
 ///       let csv_content = fs::read_to_string("data.csv").unwrap_or_default();
 ///       let rows: Vec<Vec<String>> = csv_content
 ///           .lines()
@@ -471,6 +472,7 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 if ctx.is_null() || conn.is_null() {
                       return ::std::ptr::null();
                 }
+                let ctx = &*(ctx as *const #struct_name);
                 let conn = ::std::rc::Rc::new(::limbo_ext::Connection::new(conn));
                 if let Ok(cursor) = <#struct_name as ::limbo_ext::VTabModule>::open(ctx, conn) {
                     return ::std::boxed::Box::into_raw(::std::boxed::Box::new(cursor)) as *const ::std::ffi::c_void;
@@ -605,10 +607,8 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 let name = <#struct_name as ::limbo_ext::VTabModule>::NAME;
                 let name_c = ::std::ffi::CString::new(name).unwrap().into_raw() as *const ::std::ffi::c_char;
                 let table_instance = ::std::boxed::Box::into_raw(::std::boxed::Box::new(#struct_name::default()));
-                let conn = (api.connect)(api.ctx);
                 let module = ::limbo_ext::VTabModuleImpl {
                     ctx: table_instance as *const ::std::ffi::c_void,
-                    conn,
                     name: name_c,
                     conn: api.conn,
                     create_schema: Self::#create_schema_fn_name,
@@ -956,7 +956,6 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
 
             #[cfg(feature = "static")]
             pub unsafe extern "C" fn register_extension_static(api: &mut ::limbo_ext::ExtensionApi) -> ::limbo_ext::ResultCode {
-                let api = unsafe { &*api as *const ::limbo_ext::ExtensionApi } as *mut ::limbo_ext::ExtensionApi;
                 #(#static_scalars)*
 
                 #(#static_aggregates)*
@@ -972,14 +971,14 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
             #[cfg(not(feature = "static"))]
             #[no_mangle]
             pub unsafe extern "C" fn register_extension(api: &::limbo_ext::ExtensionApi) -> ::limbo_ext::ResultCode {
-                let api = unsafe { &*api as *const ::limbo_ext::ExtensionApi } as *mut ::limbo_ext::ExtensionApi;
                 #(#scalar_calls)*
 
                 #(#aggregate_calls)*
 
-                #(#vtab_calls)*
-
                 #(#vfs_calls)*
+
+                let api = unsafe { &*api as *const ::limbo_ext::ExtensionApi } as *mut ::limbo_ext::ExtensionApi;
+                #(#vtab_calls)*
 
                 ::limbo_ext::ResultCode::OK
             }

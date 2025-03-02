@@ -192,7 +192,9 @@ impl VTabModule for CsvVTable {
     }
 
     /// Open to return a new cursor: In this simple example, the CSV file is read completely into memory on connect.
-    fn open(&self) -> Result<Self::VCursor, Self::Error> {
+    /// You have the option of storing a connection to the database that opened the module, and you can query
+    /// tables accessible by the underlying connection.
+    fn open(&self, conn: Rc<Connection>) -> Result<Self::VCursor, Self::Error> {
         // Read CSV file contents from "data.csv"
         let csv_content = fs::read_to_string("data.csv").unwrap_or_default();
         // For simplicity, we'll ignore the header row.
