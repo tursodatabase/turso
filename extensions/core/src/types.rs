@@ -23,6 +23,10 @@ pub enum ResultCode {
     EOF = 15,
     ReadOnly = 16,
     RowID = 17,
+    Row = 18,
+    IO = 19,
+    Busy = 20,
+    Interrupt = 21,
 }
 
 impl ResultCode {
@@ -60,6 +64,10 @@ impl Display for ResultCode {
             ResultCode::EOF => write!(f, "EOF"),
             ResultCode::ReadOnly => write!(f, "Read Only"),
             ResultCode::RowID => write!(f, "RowID"),
+            ResultCode::Row => write!(f, "Row"),
+            ResultCode::IO => write!(f, "IO"),
+            ResultCode::Busy => write!(f, "Busy"),
+            ResultCode::Interrupt => write!(f, "Interrupt"),
         }
     }
 }
@@ -79,6 +87,12 @@ pub enum ValueType {
 pub struct Value {
     value_type: ValueType,
     value: ValueData,
+}
+
+impl Default for Value {
+    fn default() -> Self {
+        Self::null()
+    }
 }
 
 #[repr(C)]
