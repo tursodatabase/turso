@@ -1062,8 +1062,7 @@ impl Program {
                             let rowid = {
                                 let mut index_cursor = state.get_cursor(index_cursor_id);
                                 let index_cursor = index_cursor.as_btree_mut();
-                                let rowid = index_cursor.rowid()?;
-                                rowid
+                                index_cursor.rowid()?
                             };
                             let mut table_cursor = state.get_cursor(table_cursor_id);
                             let table_cursor = table_cursor.as_btree_mut();

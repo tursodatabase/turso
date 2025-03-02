@@ -1,6 +1,6 @@
 use std::{cell::RefCell, sync::Arc};
 
-use limbo_core::{File, Result};
+use limbo_core::{File, IOBuff, Result};
 pub(crate) struct SimulatorFile {
     pub(crate) inner: Arc<dyn File>,
     pub(crate) fault: RefCell<bool>,
@@ -88,12 +88,7 @@ impl File for SimulatorFile {
         self.inner.pread(pos, c)
     }
 
-    fn pwrite(
-        &self,
-        pos: usize,
-        buffer: Arc<RefCell<limbo_core::Buffer>>,
-        c: limbo_core::Completion,
-    ) -> Result<()> {
+    fn pwrite(&self, pos: usize, buffer: IOBuff, c: limbo_core::Completion) -> Result<()> {
         *self.nr_pwrite_calls.borrow_mut() += 1;
         if *self.fault.borrow() {
             *self.nr_pwrite_faults.borrow_mut() += 1;

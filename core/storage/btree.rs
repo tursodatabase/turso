@@ -2240,7 +2240,8 @@ impl PageStack {
     /// Get the top page on the stack.
     /// This is the page that is currently being traversed.
     fn top(&self) -> PageRef {
-        let page = self.stack.borrow()[self.current()]
+        let current = self.current_page.get();
+        let page = self.stack.borrow()[current as usize]
             .as_ref()
             .unwrap()
             .clone();
@@ -2622,55 +2623,59 @@ fn free_cell_range(
 /// Defragment a page. This means packing all the cells to the end of the page.
 fn defragment_page(page: &PageContent, usable_space: u16) {
     tracing::debug!("defragment_page");
-    let cloned_page = page.clone();
-    // TODO(pere): usable space should include offset probably
+
     let mut cbrk = usable_space;
+    let first_cell = page.unallocated_region_start() as u16;
+    let n_cell = page.cell_count();
 
-    // TODO: implement fast algorithm
+    if n_cell > 0 {
+        let (cell_offset, _) = page.cell_pointer_array_offset_and_size();
 
-    let last_cell = usable_space - 4;
-    let first_cell = cloned_page.unallocated_region_start() as u16;
+        // copy current page data into a temp buffer
+        let mut temp = vec![0u8; usable_space as usize];
+        temp.copy_from_slice(page.buffer.buf_mut().as_mut_slice());
 
-    if cloned_page.cell_count() > 0 {
-        let read_buf = cloned_page.as_ptr();
-        let write_buf = page.as_ptr();
+        // collect cell pointers and sizes
+        let mut cells: Vec<(usize, u16, usize)> = (0..n_cell)
+            .map(|i| {
+                let cell_idx = cell_offset + (i * 2);
+                let pc = page.read_u16_no_offset(cell_idx);
+                let (_, size) = page.cell_get_raw_region(
+                    i,
+                    payload_overflow_threshold_max(page.page_type(), usable_space),
+                    payload_overflow_threshold_min(page.page_type(), usable_space),
+                    usable_space as usize,
+                );
+                (i, pc, size)
+            })
+            .collect();
 
-        for i in 0..cloned_page.cell_count() {
-            let (cell_offset, _) = page.cell_pointer_array_offset_and_size();
+        // sort cells by original position to preserve order
+        cells.sort_by_key(|&(_, pc, _)| pc);
+
+        // move cells downward (from highest to lowest)
+        for &(i, pc, size) in &cells {
+            cbrk -= size as u16;
+            if cbrk < first_cell {
+                panic!("corrupt: cbrk < first_cell");
+            }
             let cell_idx = cell_offset + (i * 2);
-
-            let pc = cloned_page.read_u16_no_offset(cell_idx);
-            if pc > last_cell {
-                unimplemented!("corrupted page");
-            }
-
-            assert!(pc <= last_cell);
-
-            let (_, size) = cloned_page.cell_get_raw_region(
-                i,
-                payload_overflow_threshold_max(page.page_type(), usable_space),
-                payload_overflow_threshold_min(page.page_type(), usable_space),
-                usable_space as usize,
-            );
-            let size = size as u16;
-            cbrk -= size;
-            if cbrk < first_cell || pc + size > usable_space {
-                todo!("corrupt");
-            }
-            assert!(cbrk + size <= usable_space && cbrk >= first_cell);
-            // set new pointer
             page.write_u16_no_offset(cell_idx, cbrk);
-            // copy payload
-            write_buf[cbrk as usize..cbrk as usize + size as usize]
-                .copy_from_slice(&read_buf[pc as usize..pc as usize + size as usize]);
+
+            let write_start = cbrk as usize;
+            let write_end = cbrk as usize + size;
+
+            let temp_buf = &temp[pc as usize..(pc as usize + size)];
+            page.buffer.buf_mut().as_mut_slice()[write_start..write_end].copy_from_slice(temp_buf);
         }
     }
 
-    // assert!( nfree >= 0 );
-    // if( data[hdr+7]+cbrk-iCellFirst!=pPage->nFree ){
-    //   return SQLITE_CORRUPT_PAGE(pPage);
-    // }
-    assert!(cbrk >= first_cell);
+    // clear remaining free space (SQLite behavior)
+    let start = page.unallocated_region_start();
+    let end = cbrk as usize;
+    if start < end {
+        page.buffer.buf_mut().as_mut_slice()[start..end].fill(0);
+    }
 
     // set new first byte of cell content
     page.write_u16(PAGE_HEADER_OFFSET_CELL_CONTENT_AREA, cbrk);
@@ -3037,7 +3042,7 @@ mod tests {
 
     use super::*;
     use crate::fast_lock::SpinLock;
-    use crate::io::{Buffer, Completion, MemoryIO, OpenFlags, IO};
+    use crate::io::{Buffer, Completion, IOBuff, MemoryIO, OpenFlags, IO};
     use crate::storage::database::FileStorage;
     use crate::storage::page_cache::DumbLruPageCache;
     use crate::storage::sqlite3_ondisk;
@@ -3076,10 +3081,7 @@ mod tests {
         let drop_fn = Rc::new(|_| {});
         let inner = PageContent {
             offset: 0,
-            buffer: Arc::new(RefCell::new(Buffer::new(
-                BufferData::new(vec![0; 4096]),
-                drop_fn,
-            ))),
+            buffer: IOBuff::new(Buffer::new(BufferData::new(vec![0; 4096]), drop_fn)),
             overflow_cells: Vec::new(),
         };
         page.get().contents.replace(inner);
@@ -3584,11 +3586,10 @@ mod tests {
         ));
 
         let drop_fn = Rc::new(|_buf| {});
-        let buf = Arc::new(RefCell::new(Buffer::allocate(page_size as usize, drop_fn)));
+        let buf = IOBuff::new(Buffer::allocate(page_size as usize, drop_fn));
         {
-            let mut buf_mut = buf.borrow_mut();
-            let buf_slice = buf_mut.as_mut_slice();
-            sqlite3_ondisk::write_header_to_buf(buf_slice, &db_header.lock());
+            let buf_slice = buf.buf_mut().as_mut_slice();
+            sqlite3_ondisk::write_header_to_buf(buf_slice, &db_header.lock().unwrap());
         }
 
         let write_complete = Box::new(|_| {});
@@ -3637,10 +3638,10 @@ mod tests {
         while current_page <= 4 {
             let drop_fn = Rc::new(|_buf| {});
             #[allow(clippy::arc_with_non_send_sync)]
-            let buf = Arc::new(RefCell::new(Buffer::allocate(
-                db_header.lock().page_size as usize,
+            let buf = IOBuff::new(Buffer::allocate(
+                db_header.lock().unwrap().page_size as usize,
                 drop_fn,
-            )));
+            ));
             let write_complete = Box::new(|_| {});
             let c = Completion::Write(WriteCompletion::new(write_complete));
             pager
@@ -4105,6 +4106,74 @@ mod tests {
         );
         let buf = page.as_ptr();
         assert_eq!(&payload, &buf[start..start + len]);
+    }
+
+    #[test]
+    pub fn test_defragment_with_overflow() {
+        let db = get_database();
+        let page = get_page(2);
+        let page = page.get_contents();
+        let usable_space = 4096;
+
+        let record1 = Record::new([OwnedValue::Integer(1_i64)].to_vec());
+        let payload1 = add_record(1, 0, page, record1, &db);
+        assert_eq!(page.cell_count(), 1);
+
+        // insert second record (overflows)
+        let large_text = "A".repeat(8192); // exceeds 1 page
+        let record2 = Record::new([OwnedValue::build_text(&large_text)].to_vec());
+        let payload2 = add_record(2, 1, page, record2, &db);
+        assert_eq!(page.cell_count(), 2);
+
+        // 'fill_cell_payload' (called by add_record) writes to memory but doesn't modify the
+        // PageContent struct itself, so we cannot assert something like !page.overflow_cells.is_empty()
+
+        // check that an overflow page exists before defrag
+        let first_overflow_page = {
+            let (start, len) = page.cell_get_raw_region(
+                1,
+                payload_overflow_threshold_max(page.page_type(), 4096),
+                payload_overflow_threshold_min(page.page_type(), 4096),
+                usable_space as usize,
+            );
+            Some(page.read_u32(start + len - 4)) // read overflow pointer at end of the cell
+        };
+        assert!(
+            first_overflow_page.is_some_and(|c| c != 0),
+            "Expected valid overflow page pointer before defragmentation, but found 0!"
+        );
+
+        defragment_page(page, usable_space);
+
+        // ensure the same number of cells exist after defragmentation
+        assert_eq!(page.cell_count(), 2);
+
+        // ensure non-overflow cells were moved correctly
+        let (start1, len1) = page.cell_get_raw_region(
+            0,
+            payload_overflow_threshold_max(page.page_type(), 4096),
+            payload_overflow_threshold_min(page.page_type(), 4096),
+            usable_space as usize,
+        );
+        let buf = page.as_ptr();
+        assert_eq!(&payload1, &buf[start1..start1 + len1]);
+
+        // ensure overflow cell is still intact
+        let (start2, len2) = page.cell_get_raw_region(
+            1,
+            payload_overflow_threshold_max(page.page_type(), 4096),
+            payload_overflow_threshold_min(page.page_type(), 4096),
+            usable_space as usize,
+        );
+        assert_eq!(&payload2[..len2], &buf[start2..start2 + len2]);
+
+        // ensure the overflow pointer in the page still points to the correct overflow page
+        let recorded_overflow_page = page.read_u32(start2 + len2 - 4);
+        assert_eq!(
+            first_overflow_page.unwrap(),
+            recorded_overflow_page,
+            "Overflow pointer changed after defragmentation!"
+        );
     }
 
     #[test]

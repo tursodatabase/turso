@@ -1,12 +1,13 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use tracing::{debug, trace};
 
 use parking_lot::RwLock;
 use std::fmt::Formatter;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::{cell::RefCell, fmt, rc::Rc, sync::Arc};
+use std::{fmt, rc::Rc, sync::Arc};
 
-use crate::io::{File, SyncCompletion, IO};
+use crate::io::{File, IOBuff, SyncCompletion, IO};
 use crate::result::LimboResult;
 use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_write_wal_frame, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
@@ -26,7 +27,7 @@ pub const NO_LOCK: u32 = 0;
 pub const SHARED_LOCK: u32 = 1;
 pub const WRITE_LOCK: u32 = 2;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone, Default, Copy)]
 pub struct CheckpointResult {
     /// number of frames in WAL
     pub num_wal_frames: u64,
@@ -36,14 +37,11 @@ pub struct CheckpointResult {
 
 impl CheckpointResult {
     pub fn new() -> Self {
-        Self {
-            num_wal_frames: 0,
-            num_checkpointed_frames: 0,
-        }
+        Self::default()
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum CheckpointMode {
     Passive,
     Full,
@@ -165,14 +163,14 @@ pub trait Wal {
         &mut self,
         page: PageRef,
         db_size: u32,
-        write_counter: Rc<RefCell<usize>>,
+        write_counter: Rc<Cell<usize>>,
     ) -> Result<()>;
 
     fn should_checkpoint(&self) -> bool;
     fn checkpoint(
         &mut self,
         pager: &Pager,
-        write_counter: Rc<RefCell<usize>>,
+        write_counter: Rc<Cell<usize>>,
         mode: CheckpointMode,
     ) -> Result<CheckpointStatus>;
     fn sync(&mut self) -> Result<CheckpointStatus>;
@@ -237,8 +235,8 @@ pub struct WalFile {
     io: Arc<dyn IO>,
     buffer_pool: Rc<BufferPool>,
 
-    sync_state: RefCell<SyncState>,
-    syncing: Rc<RefCell<bool>>,
+    sync_state: SyncState,
+    syncing: Rc<Cell<bool>>,
     page_size: usize,
 
     shared: Arc<RwLock<WalFileShared>>,
@@ -436,7 +434,7 @@ impl Wal for WalFile {
         &mut self,
         page: PageRef,
         db_size: u32,
-        write_counter: Rc<RefCell<usize>>,
+        write_counter: Rc<Cell<usize>>,
     ) -> Result<()> {
         let page_id = page.get().id;
         let mut shared = self.shared.write();
@@ -488,7 +486,7 @@ impl Wal for WalFile {
     fn checkpoint(
         &mut self,
         pager: &Pager,
-        write_counter: Rc<RefCell<usize>>,
+        write_counter: Rc<Cell<usize>>,
         mode: CheckpointMode,
     ) -> Result<CheckpointStatus> {
         assert!(
@@ -587,7 +585,7 @@ impl Wal for WalFile {
                     self.ongoing_checkpoint.state = CheckpointState::WaitWritePage;
                 }
                 CheckpointState::WaitWritePage => {
-                    if *write_counter.borrow() > 0 {
+                    if write_counter.get() > 0 {
                         return Ok(CheckpointStatus::IO);
                     }
                     let shared = self.shared.read();
@@ -600,7 +598,7 @@ impl Wal for WalFile {
                     }
                 }
                 CheckpointState::Done => {
-                    if *write_counter.borrow() > 0 {
+                    if write_counter.get() > 0 {
                         return Ok(CheckpointStatus::IO);
                     }
                     let mut shared = self.shared.write();
@@ -632,30 +630,30 @@ impl Wal for WalFile {
     }
 
     fn sync(&mut self) -> Result<CheckpointStatus> {
-        let state = *self.sync_state.borrow();
+        let state = self.sync_state;
         match state {
             SyncState::NotSyncing => {
                 let shared = self.shared.write();
                 debug!("wal_sync");
                 {
+                    self.syncing.set(true);
                     let syncing = self.syncing.clone();
-                    *syncing.borrow_mut() = true;
                     let completion = Completion::Sync(SyncCompletion {
                         complete: Box::new(move |_| {
                             debug!("wal_sync finish");
-                            *syncing.borrow_mut() = false;
+                            syncing.set(false);
                         }),
                     });
                     shared.file.sync(completion)?;
                 }
-                self.sync_state.replace(SyncState::Syncing);
+                self.sync_state = SyncState::Syncing;
                 Ok(CheckpointStatus::IO)
             }
             SyncState::Syncing => {
-                if *self.syncing.borrow() {
+                if self.syncing.get() {
                     Ok(CheckpointStatus::IO)
                 } else {
-                    self.sync_state.replace(SyncState::NotSyncing);
+                    self.sync_state = SyncState::NotSyncing;
                     let checkpoint_result = CheckpointResult {
                         num_wal_frames: self.max_frame,
                         num_checkpointed_frames: self.ongoing_checkpoint.max_frame,
@@ -695,7 +693,7 @@ impl WalFile {
             });
             checkpoint_page.get().contents = Some(PageContent {
                 offset: 0,
-                buffer: Arc::new(RefCell::new(Buffer::new(buffer, drop_fn))),
+                buffer: IOBuff::new(Buffer::new(buffer, drop_fn)),
                 overflow_cells: Vec::new(),
             });
         }
@@ -709,11 +707,11 @@ impl WalFile {
                 max_frame: 0,
                 current_page: 0,
             },
-            syncing: Rc::new(RefCell::new(false)),
+            syncing: Rc::new(Cell::new(false)),
             checkpoint_threshold: 1000,
             page_size,
             buffer_pool,
-            sync_state: RefCell::new(SyncState::NotSyncing),
+            sync_state: SyncState::NotSyncing,
             max_frame: 0,
             min_frame: 0,
             max_frame_read_lock_index: 0,

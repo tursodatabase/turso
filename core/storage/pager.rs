@@ -1,4 +1,5 @@
 use crate::fast_lock::SpinLock;
+use crate::io::IOBuff;
 use crate::result::LimboResult;
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
@@ -6,7 +7,7 @@ use crate::storage::sqlite3_ondisk::{self, DatabaseHeader, PageContent, PageType
 use crate::storage::wal::{CheckpointResult, Wal};
 use crate::{Buffer, LimboError, Result};
 use parking_lot::RwLock;
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -145,7 +146,7 @@ enum CheckpointState {
 struct FlushInfo {
     state: FlushState,
     /// Number of writes taking place. When in_flight gets to 0 we can schedule a fsync.
-    in_flight_writes: Rc<RefCell<usize>>,
+    in_flight_writes: Rc<Cell<usize>>,
 }
 
 /// The pager interface implements the persistence layer by providing access
@@ -166,9 +167,9 @@ pub struct Pager {
     pub db_header: Arc<SpinLock<DatabaseHeader>>,
 
     flush_info: RefCell<FlushInfo>,
-    checkpoint_state: RefCell<CheckpointState>,
-    checkpoint_inflight: Rc<RefCell<usize>>,
-    syncing: Rc<RefCell<bool>>,
+    checkpoint_state: Cell<CheckpointState>,
+    checkpoint_inflight: Rc<Cell<usize>>,
+    syncing: Rc<Cell<bool>>,
 }
 
 impl Pager {
@@ -195,11 +196,11 @@ impl Pager {
             db_header: db_header_ref.clone(),
             flush_info: RefCell::new(FlushInfo {
                 state: FlushState::Start,
-                in_flight_writes: Rc::new(RefCell::new(0)),
+                in_flight_writes: Rc::new(Cell::new(0)),
             }),
-            syncing: Rc::new(RefCell::new(false)),
-            checkpoint_state: RefCell::new(CheckpointState::Checkpoint),
-            checkpoint_inflight: Rc::new(RefCell::new(0)),
+            syncing: Rc::new(Cell::new(false)),
+            checkpoint_state: Cell::new(CheckpointState::Checkpoint),
+            checkpoint_inflight: Rc::new(Cell::new(0)),
             buffer_pool,
         })
     }
@@ -375,7 +376,7 @@ impl Pager {
                     return Ok(CheckpointStatus::IO);
                 }
                 FlushState::WaitAppendFrames => {
-                    let in_flight = *self.flush_info.borrow().in_flight_writes.borrow();
+                    let in_flight = self.flush_info.borrow().in_flight_writes.get();
                     if in_flight == 0 {
                         self.flush_info.borrow_mut().state = FlushState::SyncWal;
                     } else {
@@ -411,7 +412,7 @@ impl Pager {
                     self.flush_info.borrow_mut().state = FlushState::WaitSyncDbFile;
                 }
                 FlushState::WaitSyncDbFile => {
-                    if *self.syncing.borrow() {
+                    if self.syncing.get() {
                         return Ok(CheckpointStatus::IO);
                     } else {
                         self.flush_info.borrow_mut().state = FlushState::Start;
@@ -426,7 +427,7 @@ impl Pager {
     pub fn checkpoint(&self) -> Result<CheckpointStatus> {
         let mut checkpoint_result = CheckpointResult::new();
         loop {
-            let state = *self.checkpoint_state.borrow();
+            let state = self.checkpoint_state.get();
             trace!("pager_checkpoint(state={:?})", state);
             match state {
                 CheckpointState::Checkpoint => {
@@ -449,7 +450,7 @@ impl Pager {
                         .replace(CheckpointState::WaitSyncDbFile);
                 }
                 CheckpointState::WaitSyncDbFile => {
-                    if *self.syncing.borrow() {
+                    if self.syncing.get() {
                         return Ok(CheckpointStatus::IO);
                     } else {
                         self.checkpoint_state
@@ -457,7 +458,8 @@ impl Pager {
                     }
                 }
                 CheckpointState::CheckpointDone => {
-                    return if *self.checkpoint_inflight.borrow() > 0 {
+                    let in_flight = self.checkpoint_inflight.clone();
+                    return if in_flight.get() > 0 {
                         Ok(CheckpointStatus::IO)
                     } else {
                         self.checkpoint_state.replace(CheckpointState::Checkpoint);
@@ -474,7 +476,7 @@ impl Pager {
         loop {
             match self.wal.borrow_mut().checkpoint(
                 self,
-                Rc::new(RefCell::new(0)),
+                Rc::new(Cell::new(0)),
                 CheckpointMode::Passive,
             ) {
                 Ok(CheckpointStatus::IO) => {
@@ -626,7 +628,7 @@ pub fn allocate_page(page_id: usize, buffer_pool: &Rc<BufferPool>, offset: usize
         let drop_fn = Rc::new(move |buf| {
             bp.put(buf);
         });
-        let buffer = Arc::new(RefCell::new(Buffer::new(buffer, drop_fn)));
+        let buffer = IOBuff::new(Buffer::new(buffer, drop_fn));
         page.set_loaded();
         page.get().contents = Some(PageContent {
             offset,

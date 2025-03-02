@@ -1,8 +1,8 @@
-use super::{Buffer, Completion, File, OpenFlags, IO};
+use super::{Completion, File, IOBuff, OpenFlags, IO};
 use crate::Result;
 
 use std::{
-    cell::{Cell, RefCell, UnsafeCell},
+    cell::{Cell, UnsafeCell},
     collections::BTreeMap,
     sync::Arc,
 };
@@ -84,7 +84,7 @@ impl File for MemoryFile {
 
         let read_len = buf_len.min(file_size - pos);
         {
-            let mut read_buf = r.buf_mut();
+            let read_buf = r.buf_mut();
             let mut offset = pos;
             let mut remaining = read_len;
             let mut buf_offset = 0;
@@ -109,8 +109,8 @@ impl File for MemoryFile {
         Ok(())
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<Buffer>>, c: Completion) -> Result<()> {
-        let buf = buffer.borrow();
+    fn pwrite(&self, pos: usize, buffer: IOBuff, c: Completion) -> Result<()> {
+        let buf = buffer.buf();
         let buf_len = buf.len();
         if buf_len == 0 {
             c.complete(0);
