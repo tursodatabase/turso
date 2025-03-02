@@ -41,7 +41,13 @@ def get_user_email(g, username):
         name = user.name if user.name else username
         if user.email:
             return f"{name} <{user.email}>"
-        return f"{name} (@{username})"
+        # If public email is not available, try to get from events
+        events = user.get_events()
+        for event in events:
+            if event.type == "PushEvent" and event.payload.get("commits"):
+                for commit in event.payload["commits"]:
+                    if commit.get("author") and commit["author"].get("email"):
+                        return f"{name} <{commit['author']['email']}>"
     except Exception as e:
         print(f"Error fetching email for user {username}: {str(e)}")
 

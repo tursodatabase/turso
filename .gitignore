@@ -26,10 +26,3 @@ dist/
 
 # OS
 .DS_Store
-
-# Javascript
-**/node_modules/
-
-# testing
-testing/limbo_output.txt
-**/limbo_output.txt

@@ -3,7 +3,7 @@ use fallible_iterator::FallibleIterator;
 use super::{Error, Parser};
 use crate::parser::ast::fmt::ToTokens;
 use crate::parser::{
-    ast::{Cmd, ParameterInfo, Stmt},
+    ast::{Cmd, Name, ParameterInfo, QualifiedName, Stmt},
     ParserError,
 };
 
@@ -73,12 +73,20 @@ fn vtab_args() -> Result<(), Error> {
   body TEXT CHECK(length(body)<10240)
 );";
     let r = parse_cmd(sql);
-    let Cmd::Stmt(Stmt::CreateVirtualTable(create_virtual_table)) = r else {
+    let Cmd::Stmt(Stmt::CreateVirtualTable {
+        tbl_name: QualifiedName {
+            name: Name(tbl_name),
+            ..
+        },
+        module_name: Name(module_name),
+        args: Some(args),
+        ..
+    }) = r
+    else {
         panic!("unexpected AST")
     };
-    assert_eq!(create_virtual_table.tbl_name.name, "mail");
-    assert_eq!(create_virtual_table.module_name.0, "fts3");
-    let args = create_virtual_table.args.as_ref().unwrap();
+    assert_eq!(tbl_name, "mail");
+    assert_eq!(module_name, "fts3");
     assert_eq!(args.len(), 2);
     assert_eq!(args[0], "subject VARCHAR(256) NOT NULL");
     assert_eq!(args[1], "body TEXT CHECK(length(body)<10240)");
@@ -331,21 +339,6 @@ fn qualified_table_name_within_triggers() {
 }
 
 #[test]
-fn select_from_error_stops_at_first_error() {
-    let mut parser = Parser::new(b"SELECT FROM foo;");
-
-    // First next() call should return the first syntax error
-    let err = parser.next().unwrap_err();
-    assert!(matches!(err, Error::ParserError(_, _, _)));
-
-    // Second next() call should return Ok(None) since parsing should have stopped
-    assert_eq!(parser.next().unwrap(), None);
-
-    // Third next() call should also return Ok(None)
-    assert_eq!(parser.next().unwrap(), None);
-}
-
-#[test]
 fn indexed_by_clause_within_triggers() {
     expect_parser_err_msg(
         b"CREATE TRIGGER main.t16err5 AFTER INSERT ON tA BEGIN
@@ -368,7 +361,7 @@ fn expect_parser_err_msg(input: &[u8], error_msg: &str) {
 }
 fn expect_parser_err(input: &[u8], err: ParserError) {
     let r = parse(input);
-    if let Error::ParserError(e, _, _) = r.unwrap_err() {
+    if let Error::ParserError(e, _) = r.unwrap_err() {
         assert_eq!(e, err);
     } else {
         panic!("unexpected error type")

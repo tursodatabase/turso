@@ -1,6 +1,4 @@
-#[cfg(feature = "fs")]
-use crate::error::LimboError;
-use crate::{io::Completion, Buffer, Result};
+use crate::{error::LimboError, io::Completion, Buffer, Result};
 use std::{cell::RefCell, rc::Rc};
 
 /// DatabaseStorage is an interface a database file that consists of pages.
@@ -9,10 +7,14 @@ use std::{cell::RefCell, rc::Rc};
 /// the storage medium. A database can either be a file on disk, like in SQLite,
 /// or something like a remote page server service.
 pub trait DatabaseStorage {
-    fn read_page(&self, page_idx: usize, c: Completion) -> Result<()>;
-    fn write_page(&self, page_idx: usize, buffer: Rc<RefCell<Buffer>>, c: Completion)
-        -> Result<()>;
-    fn sync(&self, c: Completion) -> Result<()>;
+    fn read_page(&self, page_idx: usize, c: Rc<Completion>) -> Result<()>;
+    fn write_page(
+        &self,
+        page_idx: usize,
+        buffer: Rc<RefCell<Buffer>>,
+        c: Rc<Completion>,
+    ) -> Result<()>;
+    fn sync(&self, c: Rc<Completion>) -> Result<()>;
 }
 
 #[cfg(feature = "fs")]
@@ -22,9 +24,9 @@ pub struct FileStorage {
 
 #[cfg(feature = "fs")]
 impl DatabaseStorage for FileStorage {
-    fn read_page(&self, page_idx: usize, c: Completion) -> Result<()> {
-        let r = match c {
-            Completion::Read(ref r) => r,
+    fn read_page(&self, page_idx: usize, c: Rc<Completion>) -> Result<()> {
+        let r = match c.as_ref() {
+            Completion::Read(r) => r,
             _ => unreachable!(),
         };
         let size = r.buf().len();
@@ -41,18 +43,18 @@ impl DatabaseStorage for FileStorage {
         &self,
         page_idx: usize,
         buffer: Rc<RefCell<Buffer>>,
-        c: Completion,
+        c: Rc<Completion>,
     ) -> Result<()> {
         let buffer_size = buffer.borrow().len();
         assert!(buffer_size >= 512);
         assert!(buffer_size <= 65536);
-        assert_eq!(buffer_size & (buffer_size - 1), 0);
+        assert!((buffer_size & (buffer_size - 1)) == 0);
         let pos = (page_idx - 1) * buffer_size;
         self.file.pwrite(pos, buffer, c)?;
         Ok(())
     }
 
-    fn sync(&self, c: Completion) -> Result<()> {
+    fn sync(&self, c: Rc<Completion>) -> Result<()> {
         self.file.sync(c)
     }
 }

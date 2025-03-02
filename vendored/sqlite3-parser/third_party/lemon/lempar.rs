@@ -285,7 +285,7 @@ impl yyParser<'_> {
             yyidx: 0,
             #[cfg(feature = "YYTRACKMAXSTACKDEPTH")]
             yyhwm: 0,
-            yystack: Vec::with_capacity(YYSTACKDEPTH),
+            yystack: Vec::new(),
             //#[cfg(not(feature = "YYNOERRORRECOVERY"))]
             yyerrcnt: -1,
 %%               /* Optional %extra_context store */
@@ -354,8 +354,8 @@ impl yyParser<'_> {
 ** is in state X and has a lookahead token Y.  In a well-tested
 ** systems, every element of this matrix should end up being set.
 */
-// #[cfg(feature = "YYCOVERAGE")]
-// static yycoverage: [[bool; YYNTOKEN]; YYNSTATE] = [];
+#[cfg(feature = "YYCOVERAGE")]
+static yycoverage: [[bool; YYNTOKEN]; YYNSTATE] = [];
 
 /*
 ** Write into out a description of every state/lookahead combination that
@@ -368,7 +368,7 @@ impl yyParser<'_> {
 #[cfg(feature = "YYCOVERAGE")]
 fn ParseCoverage(/*FILE *out*/) -> i32 {
     //int stateno, iLookAhead, i;
-    let nMissed = 0;
+    let mut nMissed = 0;
     /*for(stateno=0; stateno<YYNSTATE; stateno++){
       i = yy_shift_ofst[stateno];
       for(iLookAhead=0; iLookAhead<YYNTOKEN; iLookAhead++){

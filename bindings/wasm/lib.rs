@@ -1,4 +1,3 @@
-use js_sys::{Array, Object};
 use limbo_core::{
     maybe_init_database_file, BufferPool, OpenFlags, Pager, Result, WalFile, WalFileShared,
 };
@@ -6,7 +5,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
-#[allow(dead_code)]
+
 #[wasm_bindgen]
 pub struct Database {
     db: Arc<limbo_core::Database>,
@@ -47,48 +46,12 @@ impl Database {
     }
 
     #[wasm_bindgen]
-    pub fn exec(&self, _sql: &str) {
-        self.conn.execute(_sql).unwrap();
-    }
+    pub fn exec(&self, _sql: &str) {}
 
     #[wasm_bindgen]
     pub fn prepare(&self, _sql: &str) -> Statement {
         let stmt = self.conn.prepare(_sql).unwrap();
         Statement::new(RefCell::new(stmt), false)
-    }
-}
-
-#[wasm_bindgen]
-pub struct RowIterator {
-    inner: RefCell<limbo_core::Statement>,
-}
-
-#[wasm_bindgen]
-impl RowIterator {
-    fn new(inner: RefCell<limbo_core::Statement>) -> Self {
-        Self { inner }
-    }
-
-    #[wasm_bindgen]
-    pub fn next(&mut self) -> JsValue {
-        let mut stmt = self.inner.borrow_mut();
-        match stmt.step() {
-            Ok(limbo_core::StepResult::Row) => {
-                let row = stmt.row().unwrap();
-                let row_array = Array::new();
-                for value in row.get_values() {
-                    let value = to_js_value(value);
-                    row_array.push(&value);
-                }
-                JsValue::from(row_array)
-            }
-            Ok(limbo_core::StepResult::IO) => JsValue::UNDEFINED,
-            Ok(limbo_core::StepResult::Done) | Ok(limbo_core::StepResult::Interrupt) => {
-                JsValue::UNDEFINED
-            }
-            Ok(limbo_core::StepResult::Busy) => JsValue::UNDEFINED,
-            Err(e) => panic!("Error: {:?}", e),
-        }
     }
 }
 
@@ -101,7 +64,7 @@ pub struct Statement {
 #[wasm_bindgen]
 impl Statement {
     fn new(inner: RefCell<limbo_core::Statement>, raw: bool) -> Self {
-        Self { inner, raw }
+        Statement { inner, raw }
     }
 
     #[wasm_bindgen]
@@ -111,21 +74,18 @@ impl Statement {
     }
 
     pub fn get(&self) -> JsValue {
-        let mut stmt = self.inner.borrow_mut();
-        match stmt.step() {
-            Ok(limbo_core::StepResult::Row) => {
-                let row = stmt.row().unwrap();
+        match self.inner.borrow_mut().step() {
+            Ok(limbo_core::RowResult::Row(row)) => {
                 let row_array = js_sys::Array::new();
-                for value in row.get_values() {
+                for value in row.values {
                     let value = to_js_value(value);
                     row_array.push(&value);
                 }
                 JsValue::from(row_array)
             }
-            Ok(limbo_core::StepResult::IO)
-            | Ok(limbo_core::StepResult::Done)
-            | Ok(limbo_core::StepResult::Interrupt)
-            | Ok(limbo_core::StepResult::Busy) => JsValue::UNDEFINED,
+            Ok(limbo_core::RowResult::IO)
+            | Ok(limbo_core::RowResult::Done)
+            | Ok(limbo_core::RowResult::Interrupt) => JsValue::UNDEFINED,
             Err(e) => panic!("Error: {:?}", e),
         }
     }
@@ -133,74 +93,50 @@ impl Statement {
     pub fn all(&self) -> js_sys::Array {
         let array = js_sys::Array::new();
         loop {
-            let mut stmt = self.inner.borrow_mut();
-            match stmt.step() {
-                Ok(limbo_core::StepResult::Row) => {
-                    let row = stmt.row().unwrap();
+            match self.inner.borrow_mut().step() {
+                Ok(limbo_core::RowResult::Row(row)) => {
                     let row_array = js_sys::Array::new();
-                    for value in row.get_values() {
+                    for value in row.values {
                         let value = to_js_value(value);
                         row_array.push(&value);
                     }
                     array.push(&row_array);
                 }
-                Ok(limbo_core::StepResult::IO) => {}
-                Ok(limbo_core::StepResult::Interrupt) => break,
-                Ok(limbo_core::StepResult::Done) => break,
-                Ok(limbo_core::StepResult::Busy) => break,
+                Ok(limbo_core::RowResult::IO) => {}
+                Ok(limbo_core::RowResult::Interrupt) => break,
+                Ok(limbo_core::RowResult::Done) => break,
                 Err(e) => panic!("Error: {:?}", e),
             }
         }
         array
     }
 
-    #[wasm_bindgen]
-    pub fn iterate(self) -> JsValue {
-        let iterator = RowIterator::new(self.inner);
-        let iterator_obj = Object::new();
+    pub fn iterate(&self) -> JsValue {
+        let all = self.all();
+        let iterator_fn = js_sys::Reflect::get(&all, &js_sys::Symbol::iterator())
+            .expect("Failed to get iterator function")
+            .dyn_into::<js_sys::Function>()
+            .expect("Symbol.iterator is not a function");
 
-        // Define the next method that will be called by JavaScript
-        let next_fn = js_sys::Function::new_with_args(
-            "",
-            "const value = this.iterator.next();
-             const done = value === undefined;
-             return {
-                value,
-                done
-             };",
-        );
-
-        js_sys::Reflect::set(&iterator_obj, &JsValue::from_str("next"), &next_fn).unwrap();
-
-        js_sys::Reflect::set(
-            &iterator_obj,
-            &JsValue::from_str("iterator"),
-            &JsValue::from(iterator),
-        )
-        .unwrap();
-
-        let symbol_iterator = js_sys::Function::new_no_args("return this;");
-        js_sys::Reflect::set(&iterator_obj, &js_sys::Symbol::iterator(), &symbol_iterator).unwrap();
-
-        JsValue::from(iterator_obj)
+        iterator_fn
+            .call0(&all)
+            .expect("Failed to call iterator function")
     }
 }
 
-fn to_js_value(value: &limbo_core::OwnedValue) -> JsValue {
+fn to_js_value(value: limbo_core::Value) -> JsValue {
     match value {
-        limbo_core::OwnedValue::Null => JsValue::null(),
-        limbo_core::OwnedValue::Integer(i) => {
-            let i = *i;
+        limbo_core::Value::Null => JsValue::null(),
+        limbo_core::Value::Integer(i) => {
             if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
                 JsValue::from(i as i32)
             } else {
                 JsValue::from(i)
             }
         }
-        limbo_core::OwnedValue::Float(f) => JsValue::from(*f),
-        limbo_core::OwnedValue::Text(t) => JsValue::from_str(t.as_str()),
-        limbo_core::OwnedValue::Blob(b) => js_sys::Uint8Array::from(b.as_slice()).into(),
-        _ => unreachable!(),
+        limbo_core::Value::Float(f) => JsValue::from(f),
+        limbo_core::Value::Text(t) => JsValue::from_str(t),
+        limbo_core::Value::Blob(b) => js_sys::Uint8Array::from(b.as_slice()).into(),
     }
 }
 
@@ -212,7 +148,7 @@ pub struct File {
 #[allow(dead_code)]
 impl File {
     fn new(vfs: VFS, fd: i32) -> Self {
-        Self { vfs, fd }
+        File { vfs, fd }
     }
 }
 
@@ -227,9 +163,9 @@ impl limbo_core::File for File {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: limbo_core::Completion) -> Result<()> {
-        let r = match &c {
-            limbo_core::Completion::Read(ref r) => r,
+    fn pread(&self, pos: usize, c: Rc<limbo_core::Completion>) -> Result<()> {
+        let r = match &*c {
+            limbo_core::Completion::Read(r) => r,
             _ => unreachable!(),
         };
         {
@@ -246,10 +182,10 @@ impl limbo_core::File for File {
         &self,
         pos: usize,
         buffer: Rc<std::cell::RefCell<limbo_core::Buffer>>,
-        c: limbo_core::Completion,
+        c: Rc<limbo_core::Completion>,
     ) -> Result<()> {
-        let w = match &c {
-            limbo_core::Completion::Write(ref w) => w,
+        let w = match &*c {
+            limbo_core::Completion::Write(w) => w,
             _ => unreachable!(),
         };
         let buf = buffer.borrow();
@@ -259,7 +195,7 @@ impl limbo_core::File for File {
         Ok(())
     }
 
-    fn sync(&self, c: limbo_core::Completion) -> Result<()> {
+    fn sync(&self, c: Rc<limbo_core::Completion>) -> Result<()> {
         self.vfs.sync(self.fd);
         c.complete(0);
         Ok(())
@@ -325,14 +261,14 @@ pub struct DatabaseStorage {
 
 impl DatabaseStorage {
     pub fn new(file: Rc<dyn limbo_core::File>) -> Self {
-        Self { file }
+        DatabaseStorage { file }
     }
 }
 
 impl limbo_core::DatabaseStorage for DatabaseStorage {
-    fn read_page(&self, page_idx: usize, c: limbo_core::Completion) -> Result<()> {
-        let r = match c {
-            limbo_core::Completion::Read(ref r) => r,
+    fn read_page(&self, page_idx: usize, c: Rc<limbo_core::Completion>) -> Result<()> {
+        let r = match c.as_ref() {
+            limbo_core::Completion::Read(r) => r,
             _ => unreachable!(),
         };
         let size = r.buf().len();
@@ -349,7 +285,7 @@ impl limbo_core::DatabaseStorage for DatabaseStorage {
         &self,
         page_idx: usize,
         buffer: Rc<std::cell::RefCell<limbo_core::Buffer>>,
-        c: limbo_core::Completion,
+        c: Rc<limbo_core::Completion>,
     ) -> Result<()> {
         let size = buffer.borrow().len();
         let pos = (page_idx - 1) * size;
@@ -357,44 +293,15 @@ impl limbo_core::DatabaseStorage for DatabaseStorage {
         Ok(())
     }
 
-    fn sync(&self, _c: limbo_core::Completion) -> Result<()> {
+    fn sync(&self, _c: Rc<limbo_core::Completion>) -> Result<()> {
         todo!()
     }
 }
 
-#[cfg(all(feature = "web", feature = "nodejs"))]
-compile_error!("Features 'web' and 'nodejs' cannot be enabled at the same time");
-
-#[cfg(feature = "web")]
-#[wasm_bindgen(module = "/web/src/web-vfs.js")]
+#[wasm_bindgen(module = "/vfs.js")]
 extern "C" {
     type VFS;
-    #[wasm_bindgen(constructor)]
-    fn new() -> VFS;
 
-    #[wasm_bindgen(method)]
-    fn open(this: &VFS, path: &str, flags: &str) -> i32;
-
-    #[wasm_bindgen(method)]
-    fn close(this: &VFS, fd: i32) -> bool;
-
-    #[wasm_bindgen(method)]
-    fn pwrite(this: &VFS, fd: i32, buffer: &[u8], offset: usize) -> i32;
-
-    #[wasm_bindgen(method)]
-    fn pread(this: &VFS, fd: i32, buffer: &mut [u8], offset: usize) -> i32;
-
-    #[wasm_bindgen(method)]
-    fn size(this: &VFS, fd: i32) -> u64;
-
-    #[wasm_bindgen(method)]
-    fn sync(this: &VFS, fd: i32);
-}
-
-#[cfg(feature = "nodejs")]
-#[wasm_bindgen(module = "/node/src/vfs.cjs")]
-extern "C" {
-    type VFS;
     #[wasm_bindgen(constructor)]
     fn new() -> VFS;
 

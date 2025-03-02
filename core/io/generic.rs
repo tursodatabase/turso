@@ -1,14 +1,13 @@
 use crate::{Completion, File, LimboError, OpenFlags, Result, IO};
+use log::trace;
 use std::cell::RefCell;
 use std::io::{Read, Seek, Write};
 use std::rc::Rc;
-use tracing::{debug, trace};
 
 pub struct GenericIO {}
 
 impl GenericIO {
     pub fn new() -> Result<Self> {
-        debug!("Using IO backend 'generic'");
         Ok(Self {})
     }
 }
@@ -48,7 +47,7 @@ pub struct GenericFile {
 impl File for GenericFile {
     // Since we let the OS handle the locking, file locking is not supported on the generic IO implementation
     // No-op implementation allows compilation but provides no actual file locking.
-    fn lock_file(&self, _exclusive: bool) -> Result<()> {
+    fn lock_file(&self, exclusive: bool) -> Result<()> {
         Ok(())
     }
 
@@ -56,12 +55,12 @@ impl File for GenericFile {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: Completion) -> Result<()> {
+    fn pread(&self, pos: usize, c: Rc<Completion>) -> Result<()> {
         let mut file = self.file.borrow_mut();
         file.seek(std::io::SeekFrom::Start(pos as u64))?;
         {
-            let r = match c {
-                Completion::Read(ref r) => r,
+            let r = match c.as_ref() {
+                Completion::Read(r) => r,
                 _ => unreachable!(),
             };
             let mut buf = r.buf_mut();
@@ -72,7 +71,12 @@ impl File for GenericFile {
         Ok(())
     }
 
-    fn pwrite(&self, pos: usize, buffer: Rc<RefCell<crate::Buffer>>, c: Completion) -> Result<()> {
+    fn pwrite(
+        &self,
+        pos: usize,
+        buffer: Rc<RefCell<crate::Buffer>>,
+        c: Rc<Completion>,
+    ) -> Result<()> {
         let mut file = self.file.borrow_mut();
         file.seek(std::io::SeekFrom::Start(pos as u64))?;
         let buf = buffer.borrow();
@@ -82,7 +86,7 @@ impl File for GenericFile {
         Ok(())
     }
 
-    fn sync(&self, c: Completion) -> Result<()> {
+    fn sync(&self, c: Rc<Completion>) -> Result<()> {
         let mut file = self.file.borrow_mut();
         file.sync_all().map_err(|err| LimboError::IOError(err))?;
         c.complete(0);
