@@ -467,13 +467,14 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
             }
 
             #[no_mangle]
-            unsafe extern "C" fn #open_fn_name(ctx: *const ::std::ffi::c_void) -> *const ::std::ffi::c_void {
+            unsafe extern "C" fn #open_fn_name(ctx: *const ::std::ffi::c_void, conn: *mut ::limbo_ext::Conn) -> *const ::std::ffi::c_void {
                 if ctx.is_null() {
                     return ::std::ptr::null();
                 }
                 let ctx  = ctx as *const #struct_name;
                 let ctx: &#struct_name = &*ctx;
-                if let Ok(cursor) = <#struct_name as ::limbo_ext::VTabModule>::open(ctx) {
+                let conn = ::std::rc::Rc::new(::limbo_ext::Connection::new(conn));
+                if let Ok(cursor) = <#struct_name as ::limbo_ext::VTabModule>::open(ctx, conn) {
                     return ::std::boxed::Box::into_raw(::std::boxed::Box::new(cursor)) as *const ::std::ffi::c_void;
                 } else {
                     return ::std::ptr::null();
@@ -603,8 +604,10 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 let name = <#struct_name as ::limbo_ext::VTabModule>::NAME;
                 let name_c = ::std::ffi::CString::new(name).unwrap().into_raw() as *const ::std::ffi::c_char;
                 let table_instance = ::std::boxed::Box::into_raw(::std::boxed::Box::new(#struct_name::default()));
+                let conn = (api.connect)(api.ctx);
                 let module = ::limbo_ext::VTabModuleImpl {
                     ctx: table_instance as *const ::std::ffi::c_void,
+                    conn,
                     name: name_c,
                     create_schema: Self::#create_schema_fn_name,
                     open: Self::#open_fn_name,

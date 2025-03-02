@@ -1,5 +1,6 @@
 #[cfg(not(target_family = "wasm"))]
 mod dynamic;
+mod vtab_connect;
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
 use crate::UringIO;
 use crate::IO;
@@ -117,10 +118,12 @@ pub fn add_builtin_vfs_extensions(
     let mut api = match api {
         None => ExtensionApi {
             ctx: std::ptr::null_mut(),
+            conn: std::ptr::null_mut(),
             register_scalar_function,
             register_aggregate_function,
             register_vfs,
             register_module,
+            connect: vtab_connect::connect,
             builtin_vfs: vfslist.as_mut_ptr(),
             builtin_vfs_count: 0,
         },
@@ -233,19 +236,21 @@ impl Connection {
         ResultCode::OK
     }
 
-    pub fn build_limbo_ext(&self) -> ExtensionApi {
+    pub fn build_limbo_ext(self: &Rc<Connection>) -> ExtensionApi {
         ExtensionApi {
             ctx: self as *const _ as *mut c_void,
+            conn: std::ptr::null_mut(),
             register_scalar_function,
             register_aggregate_function,
             register_module,
             register_vfs,
             builtin_vfs: std::ptr::null_mut(),
             builtin_vfs_count: 0,
+            connect: vtab_connect::connect,
         }
     }
 
-    pub fn register_builtins(&self) -> Result<(), String> {
+    pub fn register_builtins(self: &Rc<Connection>) -> Result<(), String> {
         #[allow(unused_variables)]
         let mut ext_api = self.build_limbo_ext();
         #[cfg(feature = "uuid")]

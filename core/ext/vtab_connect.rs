@@ -1,4 +1,4 @@
-use crate::{types::OwnedValue, Connection, Database, Statement, StepResult};
+use crate::{types::OwnedValue, Connection, Statement, StepResult};
 use limbo_ext::{Conn as ExtConn, ResultCode, Stmt, Value};
 use std::{
     boxed::Box,
@@ -6,24 +6,18 @@ use std::{
     num::NonZeroUsize,
     ptr,
     rc::Rc,
-    sync::Arc,
 };
 
 pub unsafe extern "C" fn connect(ctx: *mut c_void) -> *mut ExtConn {
     if ctx.is_null() {
         return ptr::null_mut();
     }
-    Arc::increment_strong_count(ctx as *const Database);
-    //in order to call connect with self: Arc<Database> receiver
-    let db: Arc<Database> = Arc::from_raw(ctx as *const Database);
-    let conn = db.connect();
-    let conn = Rc::into_raw(conn) as *mut c_void;
-    let ext_conn = ExtConn::new(conn, prepare_stmt, close);
+    Rc::increment_strong_count(ctx as *const Connection);
+    let ext_conn = ExtConn::new(ctx, prepare_stmt, close);
     Box::into_raw(Box::new(ext_conn))
 }
 
 pub unsafe extern "C" fn close(ctx: *mut c_void) {
-    // don't decrement the strong count here, it will be decremented when the Arc<Database> is dropped
     let conn = Rc::from_raw(ctx as *const Connection);
     let _ = conn.close();
 }
@@ -78,9 +72,7 @@ pub unsafe extern "C" fn stmt_step(stmt: *mut Stmt) -> ResultCode {
     let Ok(stmt) = Stmt::from_ptr(stmt) else {
         return ResultCode::Error;
     };
-    if stmt._conn.is_null() {
-        return ResultCode::Error;
-    } else if stmt._ctx.is_null() {
+    if stmt._conn.is_null() || stmt._ctx.is_null() {
         return ResultCode::Error;
     }
     let conn: &Connection = unsafe { &*(stmt._conn as *const Connection) };
@@ -95,7 +87,7 @@ pub unsafe extern "C" fn stmt_step(stmt: *mut Stmt) -> ResultCode {
             }
             Ok(StepResult::Interrupt) => return ResultCode::Interrupt,
             Ok(StepResult::Busy) => return ResultCode::Busy,
-            Err(err) => {
+            _ => {
                 return ResultCode::Error;
             }
         }

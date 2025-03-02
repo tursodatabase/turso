@@ -1,26 +1,30 @@
 mod types;
 mod vfs_modules;
+mod vtab_connect;
 #[cfg(not(target_family = "wasm"))]
 pub use limbo_macros::VfsDerive;
 pub use limbo_macros::{register_extension, scalar, AggregateDerive, VTabModuleDerive};
 use std::{
     fmt::Display,
     os::raw::{c_char, c_void},
+    rc::Rc,
 };
 pub use types::{ResultCode, Value, ValueType};
-pub use vfs_modules::{RegisterVfsFn, VfsFileImpl, VfsImpl};
 #[cfg(not(target_family = "wasm"))]
-pub use vfs_modules::{VfsExtension, VfsFile};
+pub use vfs_modules::{RegisterVfsFn, VfsExtension, VfsFile, VfsFileImpl, VfsImpl};
+pub use vtab_connect::{Conn, ConnectFn, Connection, Stmt};
 
 pub type ExtResult<T> = std::result::Result<T, ResultCode>;
 
 #[repr(C)]
 pub struct ExtensionApi {
     pub ctx: *mut c_void,
+    pub conn: *mut Conn,
     pub register_scalar_function: RegisterScalarFn,
     pub register_aggregate_function: RegisterAggFn,
     pub register_module: RegisterModuleFn,
     pub register_vfs: RegisterVfsFn,
+    pub connect: ConnectFn,
     pub builtin_vfs: *mut *const VfsImpl,
     pub builtin_vfs_count: i32,
 }
@@ -98,6 +102,7 @@ pub trait AggFunc {
 #[derive(Clone, Debug)]
 pub struct VTabModuleImpl {
     pub ctx: *const c_void,
+    pub conn: *mut Conn,
     pub name: *const c_char,
     pub create_schema: VtabFnCreateSchema,
     pub open: VtabFnOpen,
@@ -126,7 +131,7 @@ impl VTabModuleImpl {
 
 pub type VtabFnCreateSchema = unsafe extern "C" fn(args: *const Value, argc: i32) -> *mut c_char;
 
-pub type VtabFnOpen = unsafe extern "C" fn(*const c_void) -> *const c_void;
+pub type VtabFnOpen = unsafe extern "C" fn(*const c_void, *mut Conn) -> *const c_void;
 
 pub type VtabFnFilter =
     unsafe extern "C" fn(cursor: *const c_void, argc: i32, argv: *const Value) -> ResultCode;
@@ -160,7 +165,7 @@ pub trait VTabModule: 'static {
     type Error: std::fmt::Display;
 
     fn create_schema(args: &[Value]) -> String;
-    fn open(&self) -> Result<Self::VCursor, Self::Error>;
+    fn open(&self, conn: Rc<Connection>) -> Result<Self::VCursor, Self::Error>;
     fn filter(cursor: &mut Self::VCursor, args: &[Value]) -> ResultCode;
     fn column(cursor: &Self::VCursor, idx: u32) -> Result<Value, Self::Error>;
     fn next(cursor: &mut Self::VCursor) -> ResultCode;

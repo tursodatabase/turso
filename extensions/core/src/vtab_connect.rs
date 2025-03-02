@@ -127,7 +127,7 @@ impl Statement<'_> {
 }
 
 /// Internal/core use _only_
-/// Extensions should not use this type directly
+/// Extensions should not import or use this type directly
 #[repr(C)]
 pub struct Stmt {
     // Rc::into_raw from core::Connection
@@ -205,12 +205,11 @@ impl Stmt {
             std::slice::from_raw_parts_mut(self.current_row, self.current_row_len as usize);
         for value in values.iter_mut() {
             let owned_value = std::mem::take(value);
-            owned_value.free();
+            owned_value.__free_internal_type();
         }
         let _ = Box::from_raw(self.current_row);
         self.current_row = std::ptr::null_mut();
         self.current_row_len = -1;
-        println!("freed current row");
     }
 
     pub fn get_row(&self) -> &[Value] {

@@ -1,7 +1,10 @@
 use crate::{Connection, LimboError};
 use libloading::{Library, Symbol};
 use limbo_ext::{ExtensionApi, ExtensionApiRef, ExtensionEntryPoint};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::{
+    rc::Rc,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 type ExtensionStore = Vec<(Arc<Library>, ExtensionApiRef)>;
 static EXTENSIONS: OnceLock<Arc<Mutex<ExtensionStore>>> = OnceLock::new();
@@ -12,9 +15,11 @@ pub fn get_extension_libraries() -> Arc<Mutex<ExtensionStore>> {
 }
 
 impl Connection {
-    pub fn load_extension<P: AsRef<std::ffi::OsStr>>(&self, path: P) -> crate::Result<()> {
+    pub fn load_extension<P: AsRef<std::ffi::OsStr>>(
+        self: &Rc<Connection>,
+        path: P,
+    ) -> crate::Result<()> {
         use limbo_ext::ExtensionApiRef;
-
         let api = Box::new(self.build_limbo_ext());
         let lib =
             unsafe { Library::new(path).map_err(|e| LimboError::ExtensionError(e.to_string()))? };

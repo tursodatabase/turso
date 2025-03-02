@@ -1,5 +1,8 @@
+use std::rc::Rc;
+
 use limbo_ext::{
-    register_extension, ResultCode, VTabCursor, VTabKind, VTabModule, VTabModuleDerive, Value,
+    register_extension, Connection, ResultCode, VTabCursor, VTabKind, VTabModule, VTabModuleDerive,
+    Value,
 };
 
 register_extension! {
@@ -36,7 +39,7 @@ impl VTabModule for GenerateSeriesVTab {
         .into()
     }
 
-    fn open(&self) -> Result<Self::VCursor, Self::Error> {
+    fn open(&self, _conn: Rc<Connection>) -> Result<Self::VCursor, Self::Error> {
         Ok(GenerateSeriesCursor {
             start: 0,
             stop: 0,
