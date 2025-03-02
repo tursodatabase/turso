@@ -40,7 +40,7 @@ impl VTabModule for KVStoreVTab {
         "CREATE TABLE x (key TEXT PRIMARY KEY, value TEXT);".to_string()
     }
 
-    fn open(&self, _conn: Rc<Connection>) -> Result<Self::VCursor, Self::Error> {
+    fn open(&self, _conn: Option<Rc<Connection>>) -> Result<Self::VCursor, Self::Error> {
         Ok(KVStoreCursor {
             rows: Vec::new(),
             index: None,

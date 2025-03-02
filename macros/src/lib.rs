@@ -472,9 +472,9 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 if ctx.is_null() || conn.is_null() {
                       return ::std::ptr::null();
                 }
-                let ctx = &*(ctx as *const #struct_name);
+                let ctx: &#struct_name = unsafe {&*(ctx as *const #struct_name)};
                 let conn = ::std::rc::Rc::new(::limbo_ext::Connection::new(conn));
-                if let Ok(cursor) = <#struct_name as ::limbo_ext::VTabModule>::open(ctx, conn) {
+                if let Ok(cursor) = <#struct_name as ::limbo_ext::VTabModule>::open(ctx, Some(conn)) {
                     return ::std::boxed::Box::into_raw(::std::boxed::Box::new(cursor)) as *const ::std::ffi::c_void;
                 } else {
                     return ::std::ptr::null();

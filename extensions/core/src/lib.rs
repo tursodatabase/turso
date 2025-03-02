@@ -165,7 +165,7 @@ pub trait VTabModule: 'static {
     type Error: std::fmt::Display;
 
     fn create_schema(args: &[Value]) -> String;
-    fn open(&self, conn: Rc<Connection>) -> Result<Self::VCursor, Self::Error>;
+    fn open(&self, conn: Option<Rc<Connection>>) -> Result<Self::VCursor, Self::Error>;
     fn filter(cursor: &mut Self::VCursor, args: &[Value]) -> ResultCode;
     fn column(cursor: &Self::VCursor, idx: u32) -> Result<Value, Self::Error>;
     fn next(cursor: &mut Self::VCursor) -> ResultCode;

@@ -79,7 +79,7 @@ impl VTabModule for CompletionVTab {
         .to_string()
     }
 
-    fn open(&self, _conn: Rc<Connection>) -> Result<Self::VCursor, Self::Error> {
+    fn open(&self, _conn: Option<Rc<Connection>>) -> Result<Self::VCursor, Self::Error> {
         Ok(CompletionCursor::default())
     }
 
