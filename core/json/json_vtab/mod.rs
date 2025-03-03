@@ -29,6 +29,8 @@ macro_rules! try_option {
     };
 }
 
+pub(super) use try_option;
+
 fn filter(args: &[Value]) -> Result<(Val, InPlaceJsonPath), ResultCode> {
     if args.len() != 1 && args.len() != 2 {
         return Err(ResultCode::InvalidArgs);
