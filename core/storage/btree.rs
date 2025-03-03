@@ -2623,60 +2623,58 @@ fn free_cell_range(
 /// Defragment a page. This means packing all the cells to the end of the page.
 fn defragment_page(page: &PageContent, usable_space: u16) {
     tracing::debug!("defragment_page");
-
+    // TODO(pere): usable space should include offset probably
     let mut cbrk = usable_space;
+
+    // TODO: implement fast algorithm
+
+    let last_cell = usable_space - 4;
     let first_cell = page.unallocated_region_start() as u16;
     let n_cell = page.cell_count();
-
     if n_cell > 0 {
+        let cloned_page = page.clone();
+        let read_buf = cloned_page.as_ptr();
+        let write_buf = page.as_ptr();
         let (cell_offset, _) = page.cell_pointer_array_offset_and_size();
 
-        // copy current page data into a temp buffer
-        let mut temp = vec![0u8; usable_space as usize];
-        temp.copy_from_slice(page.buffer.buf_mut().as_mut_slice());
-
-        // collect cell pointers and sizes
-        let mut cells: Vec<(usize, u16, usize)> = (0..n_cell)
-            .map(|i| {
-                let cell_idx = cell_offset + (i * 2);
-                let pc = page.read_u16_no_offset(cell_idx);
-                let (_, size) = page.cell_get_raw_region(
-                    i,
-                    payload_overflow_threshold_max(page.page_type(), usable_space),
-                    payload_overflow_threshold_min(page.page_type(), usable_space),
-                    usable_space as usize,
-                );
-                (i, pc, size)
-            })
-            .collect();
-
-        // sort cells by original position to preserve order
-        cells.sort_by_key(|&(_, pc, _)| pc);
-
-        // move cells downward (from highest to lowest)
-        for &(i, pc, size) in &cells {
-            cbrk -= size as u16;
-            if cbrk < first_cell {
-                panic!("corrupt: cbrk < first_cell");
-            }
+        for i in 0..n_cell {
             let cell_idx = cell_offset + (i * 2);
+
+            let pc = cloned_page.read_u16_no_offset(cell_idx);
+            if pc > last_cell {
+                unimplemented!("corrupted page");
+            }
+
+            assert!(pc <= last_cell);
+
+            let (_, size) = cloned_page.cell_get_raw_region(
+                i,
+                payload_overflow_threshold_max(page.page_type(), usable_space),
+                payload_overflow_threshold_min(page.page_type(), usable_space),
+                usable_space as usize,
+            );
+            let size = size as u16;
+            cbrk -= size;
+            if cbrk < first_cell || pc + size > usable_space {
+                todo!("corrupt");
+            }
+            assert!(cbrk + size <= usable_space && cbrk >= first_cell);
+            // set new pointer
             page.write_u16_no_offset(cell_idx, cbrk);
-
-            let write_start = cbrk as usize;
-            let write_end = cbrk as usize + size;
-
-            let temp_buf = &temp[pc as usize..(pc as usize + size)];
-            page.buffer.buf_mut().as_mut_slice()[write_start..write_end].copy_from_slice(temp_buf);
+            // copy payload
+            write_buf[cbrk as usize..cbrk as usize + size as usize]
+                .copy_from_slice(&read_buf[pc as usize..pc as usize + size as usize]);
         }
     }
 
-    // clear remaining free space (SQLite behavior)
-    let start = page.unallocated_region_start();
-    let end = cbrk as usize;
-    if start < end {
-        page.buffer.buf_mut().as_mut_slice()[start..end].fill(0);
+    // assert!( nfree >= 0 );
+    // if( data[hdr+7]+cbrk-iCellFirst!=pPage->nFree ){
+    //   return SQLITE_CORRUPT_PAGE(pPage);
+    // }
+    assert!(cbrk >= first_cell);
+    if first_cell < cbrk {
+        page.as_ptr()[first_cell as usize..cbrk as usize].fill(0);
     }
-
     // set new first byte of cell content
     page.write_u16(PAGE_HEADER_OFFSET_CELL_CONTENT_AREA, cbrk);
     // set free block to 0, unused spaced can be retrieved from gap between cell pointer end and content start
