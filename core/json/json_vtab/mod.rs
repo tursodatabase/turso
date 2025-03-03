@@ -294,6 +294,15 @@ impl InPlaceJsonPath {
         self.push(format!(".{}", key));
     }
 
+    fn last(&self) -> Option<&str> {
+        if let Some(len) = self.items_len.last() {
+            let path_len = self.path.len();
+            Some(&self.path[path_len - len..path_len])
+        } else {
+            None
+        }
+    }
+
     fn from_json_path(path: &str, j_path: &JsonPath<'_>) -> Self {
         Self {
             path: path.to_owned(),

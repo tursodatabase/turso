@@ -36,18 +36,14 @@ impl VTabModule for JsonEachVTab {
     }
 
     fn filter(cursor: &mut Self::VCursor, args: &[Value]) -> ResultCode {
-        let (json_val, mut path) = {
+        let (json_val, path) = {
             match filter(args) {
                 Ok(json_val) => json_val,
                 Err(rc) => return rc,
             }
         };
 
-        cursor.json_val = json_val;
-
-        path.push("".to_string()); // Add base case so that code is cleaner in next
-        cursor.path = path.path.clone();
-        cursor.curr_path = path;
+        cursor.init(path, json_val);
 
         cursor.next()
     }
@@ -94,6 +90,17 @@ impl Default for JsonEachCursor {
             path: "".to_string(),
             curr_path: InPlaceJsonPath::default(),
         }
+    }
+}
+
+impl JsonEachCursor {
+    /// Initializes the cursor and necessary base cases
+    fn init(&mut self, mut path: InPlaceJsonPath, json_val: Val) {
+        self.json_val = json_val;
+
+        path.push("".to_string()); // Add base case so that code is cleaner in next
+        self.path = path.path.clone();
+        self.curr_path = path;
     }
 }
 

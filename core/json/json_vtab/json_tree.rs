@@ -6,6 +6,12 @@ use crate::json::Val;
 
 use super::{filter, InPlaceJsonPath, ValExt as _, VecExt as _};
 
+macro_rules! is_json_container {
+    ($val:expr) => {
+        matches!($val, Val::Array(_) | Val::Object(_))
+    };
+}
+
 /// A virtual table that generates a sequence of integers
 #[derive(Debug, VTabModuleDerive, Default)]
 pub struct JsonTreeVTab;
@@ -38,22 +44,15 @@ impl VTabModule for JsonTreeVTab {
     }
 
     fn filter(cursor: &mut Self::VCursor, args: &[Value]) -> ResultCode {
-        let (json_val, mut path) = {
+        let (json_val, path) = {
             match filter(args) {
                 Ok(json_val) => json_val,
                 Err(rc) => return rc,
             }
         };
 
-        // TODO create a base case init function to have all basecases in one place
-
-        cursor.start = UnsafeCell::new(true);
-
-        cursor.val_stack = vec![json_val.clone(), Val::Null]; // Add Val::Null for base case for next
-        cursor.json_val = json_val;
-
-        path.push("".to_string()); // Add base case so that code is cleaner in next
-        cursor.full_key = path;
+        // Initialize the cursor and its base cases
+        cursor.init(path, json_val);
 
         cursor.next()
     }
@@ -83,6 +82,7 @@ pub struct JsonTreeCursor {
     eof: bool,
     array_idx_stack: Vec<isize>,
     full_key: InPlaceJsonPath, // Requested Path that reflects the path to the current container + the curr key
+    parent_path: InPlaceJsonPath,
     start: UnsafeCell<bool>,
     new_container: bool,
 }
@@ -99,13 +99,23 @@ impl Default for JsonTreeCursor {
             eof: false,
             array_idx_stack: Vec::new(),
             full_key: InPlaceJsonPath::default(),
-            start: UnsafeCell::new(false),
+            parent_path: InPlaceJsonPath::default(),
+            start: UnsafeCell::new(true),
             new_container: false,
         }
     }
 }
 
 impl JsonTreeCursor {
+    /// Initializes the cursor and necessary base cases
+    fn init(&mut self, path: InPlaceJsonPath, json_val: Val) {
+        self.val_stack = vec![json_val.clone(), Val::Null]; // Add Val::Null for base case for next
+        self.json_val = json_val;
+        self.new_container = is_json_container!(self.json_val);
+
+        self.full_key = path.clone();
+        self.parent_path = path;
+    }
     fn check_empty_container_or_atom(&mut self) {
         if let Some(v) = self.val_stack.last_mut() {
             let mut pop = false;
@@ -132,6 +142,12 @@ impl JsonTreeCursor {
             }
         }
     }
+
+    fn push_diff_in_paths(&mut self) {
+        if let Some(key) = self.full_key.last() {
+            self.parent_path.push(key.to_string());
+        };
+    }
 }
 
 impl VTabCursor for JsonTreeCursor {
@@ -145,9 +161,8 @@ impl VTabCursor for JsonTreeCursor {
         self.rowid += 1;
         self.id += 1;
         if unsafe { *self.start.get() } {
-            if !matches!(self.json_val, Val::Array(_) | Val::Object(_)) {
+            if !is_json_container!(self.json_val) {
                 self.eof = true;
-                let _ = self.full_key.pop();
             }
             return ResultCode::OK;
         }
@@ -156,6 +171,7 @@ impl VTabCursor for JsonTreeCursor {
 
         if self.new_container {
             self.parent_stack.push(self.id - 1);
+            self.push_diff_in_paths();
             self.new_container = false;
         }
 
@@ -187,9 +203,7 @@ impl VTabCursor for JsonTreeCursor {
                             // -1 here as the index is incremented in the later calls
                             self.array_idx_stack.push(-1);
                         }
-                        if matches!(val, Val::Array(_) | Val::Object(_)) {
-                            self.new_container = true;
-                        }
+                        self.new_container = is_json_container!(val);
 
                         self.full_key.push_array_locator(&self.key);
                         self.val_stack.push(val);
@@ -197,8 +211,9 @@ impl VTabCursor for JsonTreeCursor {
                     } else {
                         let _ = self.array_idx_stack.pop();
                         let _ = self.full_key.pop();
-                        let _ = self.val_stack.pop();
+                        let _ = self.parent_path.pop();
                         let _ = self.parent_stack.pop();
+                        let _ = self.val_stack.pop();
                     }
                 }
                 Val::Object(v) => {
@@ -206,9 +221,7 @@ impl VTabCursor for JsonTreeCursor {
                         if matches!(val, Val::Array(_)) {
                             self.array_idx_stack.push(-1);
                         }
-                        if matches!(val, Val::Array(_) | Val::Object(_)) {
-                            self.new_container = true;
-                        }
+                        self.new_container = is_json_container!(val);
 
                         self.key = key;
                         self.val_stack.push(val);
@@ -216,8 +229,9 @@ impl VTabCursor for JsonTreeCursor {
                         break;
                     } else {
                         let _ = self.full_key.pop();
-                        let _ = self.val_stack.pop();
+                        let _ = self.parent_path.pop();
                         let _ = self.parent_stack.pop();
+                        let _ = self.val_stack.pop();
                     }
                 }
                 Val::Removed => unreachable!(),
@@ -244,35 +258,24 @@ impl VTabCursor for JsonTreeCursor {
             }
         };
 
-        let parent = {
-            if *start {
-                Value::null()
-            } else {
-                Value::from_integer(self.parent_stack.last().unwrap().clone())
-            }
-        };
-
         let result = match idx {
             0 => Value::from_text(self.key.to_owned()), // Key
             1 => ret_val.to_value(),                    // Value
             2 => Value::from_text(ret_val.type_name()), // Type
             3 => ret_val.atom_value(),                  // Atom
             4 => Value::from_integer(self.id),          // Id
-            5 => parent,                                // Parent (null for json_each)
+            5 => {
+                // self.parent_stack.last().map(|i| Value::from_integer(i.clone())).unwrap_or(Value::null())
+                if *start {
+                    Value::null()
+                } else {
+                    Value::from_integer(self.parent_stack.last().unwrap().clone())
+                }
+            } // Parent (null for json_each)
             6 => Value::from_text(self.full_key.path.to_owned()), // FullKey
             7 => {
-                let mut path = self.full_key.clone();
-
-                let path = {
-                    if *start && matches!(ret_val, Val::Array(_) | Val::Object(_)) {
-                        path
-                    } else {
-                        let _ = path.pop();
-                        path
-                    }
-                };
                 *start = false;
-                Value::from_text(path.path)
+                Value::from_text(self.parent_path.path.clone())
             } // Path
             _ => Value::null(),
         };
