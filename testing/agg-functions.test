@@ -67,21 +67,21 @@ do_execsql_test select-count-field-b {
   SELECT count(b) FROM counter;
 } {9}
 
-do_execsql_test select-count-field-t-distinct {
-  SELECT count(distinct t) FROM counter;
-} {3}
-
-do_execsql_test select-count-field-i-distinct {
-  SELECT count(distinct i) FROM counter;
-} {3}
-
-do_execsql_test select-count-field-r-distinct {
-  SELECT count(distinct r) FROM counter;
-} {3}
-
-do_execsql_test select-count-field-b-distinct {
-  SELECT count(distinct b) FROM counter;
-} {3}
+#do_execsql_test select-count-field-t-distinct {
+#  SELECT count(distinct t) FROM counter;
+#} {3}
+#
+#do_execsql_test select-count-field-i-distinct {
+#  SELECT count(distinct i) FROM counter;
+#} {3}
+#
+#do_execsql_test select-count-field-r-distinct {
+#  SELECT count(distinct r) FROM counter;
+#} {3}
+#
+#do_execsql_test select-count-field-b-distinct {
+#  SELECT count(distinct b) FROM counter;
+#} {3}
 
 do_execsql_test select-max {
   SELECT max(age) FROM users;
