@@ -35,21 +35,29 @@ fn filter(args: &[Value]) -> Result<(Val, InPlaceJsonPath), ResultCode> {
     }
     // TODO: For now we are not dealing with JSONB
 
-    let json_val = try_option!(args[0].to_text(), Err(ResultCode::InvalidArgs));
+    // TODO include json subtype when it is merged to main
+    let json_val = match args[0].value_type() {
+        limbo_ext::ValueType::Null => OwnedValue::Null,
+        limbo_ext::ValueType::Text => OwnedValue::from_text(args[0].to_text().unwrap()),
+        limbo_ext::ValueType::Integer => OwnedValue::Integer(args[0].to_integer().unwrap()),
+        limbo_ext::ValueType::Float => OwnedValue::Float(args[0].to_float().unwrap()),
+        limbo_ext::ValueType::Blob => OwnedValue::from_blob(args[0].to_blob().unwrap()),
+        limbo_ext::ValueType::Error => return Err(ResultCode::InvalidArgs),
+    };
 
     let json_val = try_option!(
-        get_json_value(&OwnedValue::from_text(json_val)).ok(),
+        get_json_value(&json_val).ok(),
         Err(ResultCode::InvalidArgs) // Invalid Json
+                                     // TODO: see how to return a meaningful error message via ResultCode
     );
-    let path = args[1].to_text().unwrap_or("$");
+    let path = args
+        .get(1)
+        .map(|v| v.to_text().unwrap_or("$"))
+        .unwrap_or("$");
 
     let j_path = try_option!(json_path(path).ok(), Err(ResultCode::InvalidArgs));
 
-    // TODO Custom error message here for invalid path
-    let json_val = try_option!(
-        advance_path(json_val, &j_path),
-        Err(ResultCode::InvalidArgs)
-    );
+    let json_val = try_option!(advance_path(json_val, &j_path), Err(ResultCode::EOF));
 
     Ok((json_val, InPlaceJsonPath::from_json_path(path, &j_path)))
 }
