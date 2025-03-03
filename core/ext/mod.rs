@@ -1,4 +1,4 @@
-use crate::{function::ExternalFunc, Connection};
+use crate::{function::ExternalFunc, json::json_vtab, Connection};
 use limbo_ext::{
     ExtensionApi, InitAggFunction, ResultCode, ScalarFunction, VTabKind, VTabModuleImpl,
 };
@@ -157,6 +157,10 @@ impl Connection {
         #[cfg(feature = "completion")]
         if unsafe { !limbo_completion::register_extension_static(&ext_api).is_ok() } {
             return Err("Failed to register completion extension".to_string());
+        }
+        #[cfg(feature = "json")]
+        if unsafe { !json_vtab::register_extension_static(&ext_api).is_ok() } {
+            return Err("Failed to register json_each and json_tree".to_string());
         }
         Ok(())
     }

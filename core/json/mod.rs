@@ -2,6 +2,7 @@ mod de;
 mod error;
 mod json_operations;
 mod json_path;
+pub(crate) mod json_vtab;
 mod ser;
 
 pub use crate::json::de::from_str;
