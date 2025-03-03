@@ -57,7 +57,7 @@ def test_file_operations():
 def test_joins():
     shell = TestLimboShell()
     shell.run_test("open-file", ".open testing/testing.db", "")
-    shell.run_test("verify-tables", ".tables", "products users")
+    shell.run_test("verify-tables", ".tables", "counter products users")
     shell.run_test(
         "file-cross-join",
         "select * from users, products limit 1;",
