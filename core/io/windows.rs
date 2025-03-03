@@ -65,7 +65,7 @@ impl File for WindowsFile {
         file.seek(std::io::SeekFrom::Start(pos as u64))?;
         {
             let r = c.as_read();
-            let mut buf = r.buf_mut();
+            let buf = r.buf_mut();
             let buf = buf.as_mut_slice();
             file.read_exact(buf)?;
         }
@@ -79,7 +79,7 @@ impl File for WindowsFile {
         let buf = buffer.buf();
         let buf = buf.as_slice();
         file.write_all(buf)?;
-        c.complete(buffer.borrow().len() as i32);
+        c.complete(buffer.len() as i32);
         Ok(())
     }
 
