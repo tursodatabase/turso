@@ -36,14 +36,14 @@ impl VTabModule for JsonEachVTab {
     }
 
     fn filter(cursor: &mut Self::VCursor, args: &[Value]) -> ResultCode {
-        let (json_val, items_advanced, path) = {
+        let (json_val, path) = {
             match filter(args) {
                 Ok(json_val) => json_val,
                 Err(rc) => return rc,
             }
         };
 
-        cursor.init(path, json_val, items_advanced);
+        cursor.init(path, json_val);
 
         cursor.next()
     }
@@ -69,7 +69,6 @@ pub struct JsonEachCursor {
     key: String,    // Current key
     val: Val,       // Current Json Val
     id: i64,        // Arbitrary id of the value,
-    increment: i64, // Value to increment id
     eof: bool,
     array_idx_stack: Vec<usize>,
     path: String, // Requested Path
@@ -81,8 +80,7 @@ impl Default for JsonEachCursor {
         Self {
             rowid: i64::default(),
             json_val: Val::Null,
-            id: 0,
-            increment: 1,
+            id: -1,
             key: "".to_string(),
             val: Val::Null,
             eof: false,
@@ -95,21 +93,12 @@ impl Default for JsonEachCursor {
 
 impl JsonEachCursor {
     /// Initializes the cursor and necessary base cases
-    fn init(&mut self, mut path: InPlaceJsonPath, json_val: Val, items_advanced: usize) {
+    fn init(&mut self, mut path: InPlaceJsonPath, json_val: Val) {
         self.json_val = json_val;
 
         path.push("".to_string()); // Add base case so that code is cleaner in next
         self.path = path.path.clone();
         self.curr_path = path;
-
-        // This increment shenanigan is done to be compatible with the id assignment in sqlite
-        if matches!(self.json_val, Val::Array(_)) {
-            self.increment = 1 + items_advanced as i64;
-        } else if matches!(self.json_val, Val::Object(_)) {
-            self.increment = 2 + items_advanced as i64;
-        } else {
-            self.increment = 0 + items_advanced as i64;
-        }
     }
 }
 
@@ -119,13 +108,8 @@ impl JsonEachCursor {
         self.val = val;
         if !is_array_locator {
             self.curr_path.push_key(&self.key);
-            self.increment = self.val.key_value_count() as i64 + 1;
         } else {
             self.curr_path.push_array_locator(&self.key);
-            self.increment = self.val.key_value_count() as i64;
-            if matches!(self.val, Val::Object(_)) {
-                self.increment += 1;
-            }
         }
     }
 }
@@ -139,7 +123,7 @@ impl VTabCursor for JsonEachCursor {
         }
 
         self.rowid += 1;
-        self.id += self.increment;
+        self.id += 1;
         let _ = self.curr_path.pop(); // Pop to remove last element in path
 
         // TODO Improvement: see a way to first sort the elements so that we can pop from last instead of
@@ -175,7 +159,6 @@ impl VTabCursor for JsonEachCursor {
             _ => {
                 // This means to return the self.json_val in column()
                 // Doing this avoids a self.val = self.json_val.clone()
-                self.increment = self.val.key_value_count() as i64;
                 self.eof = true;
             }
         };

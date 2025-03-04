@@ -39,7 +39,7 @@ impl VTabModule for JsonTreeVTab {
     }
 
     fn filter(cursor: &mut Self::VCursor, args: &[Value]) -> ResultCode {
-        let (json_val, _,path) = {
+        let (json_val,path) = {
             match filter(args) {
                 Ok(json_val) => json_val,
                 Err(rc) => return rc,
