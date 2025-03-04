@@ -4,6 +4,8 @@ This document describes the compatibility of Limbo with SQLite.
 
 ## Table of contents
 
+- [Limbo compatibility with SQLite](#limbo-compatibility-with-sqlite)
+  - [Table of contents](#table-of-contents)
   - [Overview](#overview)
     - [Features](#features)
     - [Limitations](#limitations)
@@ -393,10 +395,9 @@ Modifiers:
 | jsonb_group_array(value)           |         |                                                                                                                                              |
 | json_group_object(label,value)     |         |                                                                                                                                              |
 | jsonb_group_object(name,value)     |         |                                                                                                                                              |
-| json_each(json)                    |         |                                                                                                                                              |
-| json_each(json,path)               |         |                                                                                                                                              |
-| json_tree(json)                    |         |                                                                                                                                              |
-| json_tree(json,path)               |         |                                                                                                                                              |
+| json_each(json)                    | Partial | No jsonb support                                                                                                                             |
+| json_each(json,path)               | Partial | No jsonb support                                                                                                                             |
+| json_tree(json)                    | Partial | No jsonb support                                                                                                                             |
 
 ## SQLite C API
 

@@ -36,14 +36,14 @@ impl VTabModule for JsonEachVTab {
     }
 
     fn filter(cursor: &mut Self::VCursor, args: &[Value]) -> ResultCode {
-        let (json_val, path) = {
+        let (json_val, items_advanced, path) = {
             match filter(args) {
                 Ok(json_val) => json_val,
                 Err(rc) => return rc,
             }
         };
 
-        cursor.init(path, json_val);
+        cursor.init(path, json_val, items_advanced);
 
         cursor.next()
     }
@@ -81,7 +81,7 @@ impl Default for JsonEachCursor {
         Self {
             rowid: i64::default(),
             json_val: Val::Null,
-            id: -1,
+            id: 0,
             increment: 1,
             key: "".to_string(),
             val: Val::Null,
@@ -95,12 +95,38 @@ impl Default for JsonEachCursor {
 
 impl JsonEachCursor {
     /// Initializes the cursor and necessary base cases
-    fn init(&mut self, mut path: InPlaceJsonPath, json_val: Val) {
+    fn init(&mut self, mut path: InPlaceJsonPath, json_val: Val, items_advanced: usize) {
         self.json_val = json_val;
 
         path.push("".to_string()); // Add base case so that code is cleaner in next
         self.path = path.path.clone();
         self.curr_path = path;
+
+        // This increment shenanigan is done to be compatible with the id assignment in sqlite
+        if matches!(self.json_val, Val::Array(_)) {
+            self.increment = 1 + items_advanced as i64;
+        } else if matches!(self.json_val, Val::Object(_)) {
+            self.increment = 2 + items_advanced as i64;
+        } else {
+            self.increment = 0 + items_advanced as i64;
+        }
+    }
+}
+
+impl JsonEachCursor {
+    fn push_new_val(&mut self, val: Val, key: String, is_array_locator: bool) {
+        self.key = key;
+        self.val = val;
+        if !is_array_locator {
+            self.curr_path.push_key(&self.key);
+            self.increment = self.val.key_value_count() as i64 + 1;
+        } else {
+            self.curr_path.push_array_locator(&self.key);
+            self.increment = self.val.key_value_count() as i64;
+            if matches!(self.val, Val::Object(_)) {
+                self.increment += 1;
+            }
+        }
     }
 }
 
@@ -121,7 +147,7 @@ impl VTabCursor for JsonEachCursor {
         match &mut self.json_val {
             Val::Array(v) => {
                 if let Some(val) = v.remove_first() {
-                    self.key = {
+                    let key = {
                         if let Some(idx) = self.array_idx_stack.last_mut() {
                             *idx += 1;
                             idx.to_string()
@@ -130,8 +156,7 @@ impl VTabCursor for JsonEachCursor {
                             0.to_string()
                         }
                     };
-                    self.val = val;
-                    self.curr_path.push_array_locator(&self.key);
+                    self.push_new_val(val, key, true);
                 } else {
                     let _ = self.array_idx_stack.pop();
                     self.eof = true;
@@ -140,9 +165,7 @@ impl VTabCursor for JsonEachCursor {
             }
             Val::Object(v) => {
                 if let Some((key, val)) = v.remove_first() {
-                    self.val = val;
-                    self.key = key;
-                    self.curr_path.push_key(&self.key);
+                    self.push_new_val(val, key, false);
                 } else {
                     self.eof = true;
                     return ResultCode::EOF;
@@ -152,10 +175,10 @@ impl VTabCursor for JsonEachCursor {
             _ => {
                 // This means to return the self.json_val in column()
                 // Doing this avoids a self.val = self.json_val.clone()
-                self.eof = true
+                self.increment = self.val.key_value_count() as i64;
+                self.eof = true;
             }
         };
-        self.increment = self.val.key_value_count() as i64;
 
         ResultCode::OK
     }

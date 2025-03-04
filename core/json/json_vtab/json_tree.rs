@@ -4,13 +4,8 @@ use limbo_ext::{ResultCode, VTabCursor, VTabKind, VTabModule, VTabModuleDerive, 
 
 use crate::json::Val;
 
-use super::{filter, try_option, InPlaceJsonPath, ValExt as _, VecExt as _};
+use super::{filter, is_json_container, try_option, InPlaceJsonPath, ValExt as _, VecExt as _};
 
-macro_rules! is_json_container {
-    ($val:expr) => {
-        matches!($val, Val::Array(_) | Val::Object(_))
-    };
-}
 
 /// A virtual table that generates a sequence of integers
 #[derive(Debug, VTabModuleDerive, Default)]
@@ -44,7 +39,7 @@ impl VTabModule for JsonTreeVTab {
     }
 
     fn filter(cursor: &mut Self::VCursor, args: &[Value]) -> ResultCode {
-        let (json_val, path) = {
+        let (json_val, _,path) = {
             match filter(args) {
                 Ok(json_val) => json_val,
                 Err(rc) => return rc,
@@ -193,7 +188,7 @@ impl VTabCursor for JsonTreeCursor {
 
         if unsafe { *self.start.get() } {
             if !is_json_container!(self.json_val) {
-                self.eof = true; // Signal for the next iteration that this is the last value of the vtable
+                self.eof = true; // Signal the next iteration that this is the last value of the vtable
             }
             return ResultCode::OK;
         }
@@ -204,6 +199,9 @@ impl VTabCursor for JsonTreeCursor {
             self.parent_stack.push(self.id - 1);
             self.push_diff_in_paths();
             self.new_container = false;
+            if matches!(self.val_stack.last(), Some(Val::Object(_))) {
+                self.id += 1;
+            }
         }
 
         loop {

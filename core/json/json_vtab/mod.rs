@@ -31,7 +31,19 @@ macro_rules! try_option {
 
 pub(super) use try_option;
 
-fn filter(args: &[Value]) -> Result<(Val, InPlaceJsonPath), ResultCode> {
+macro_rules! is_json_container {
+    ($val:expr) => {
+        matches!($val, Val::Array(_) | Val::Object(_))
+    };
+}
+
+pub(super) use is_json_container;
+
+fn filter(args: &[Value]) -> Result<(Val, usize, InPlaceJsonPath), ResultCode> {
+    if args.is_empty() {
+        return Err(ResultCode::EOF);
+    }
+
     if args.len() != 1 && args.len() != 2 {
         return Err(ResultCode::InvalidArgs);
     }
@@ -49,8 +61,8 @@ fn filter(args: &[Value]) -> Result<(Val, InPlaceJsonPath), ResultCode> {
 
     let json_val = try_option!(
         get_json_value(&json_val).ok(),
+        // TODO: see how to return a meaningful error message via ResultCode
         Err(ResultCode::InvalidArgs) // Invalid Json
-                                     // TODO: see how to return a meaningful error message via ResultCode
     );
     let path = args
         .get(1)
@@ -59,22 +71,39 @@ fn filter(args: &[Value]) -> Result<(Val, InPlaceJsonPath), ResultCode> {
 
     let j_path = try_option!(json_path(path).ok(), Err(ResultCode::InvalidArgs));
 
-    let json_val = try_option!(advance_path(json_val, &j_path), Err(ResultCode::EOF));
+    let (json_val, items_advanced) =
+        try_option!(advance_path(json_val, &j_path), Err(ResultCode::EOF));
 
-    Ok((json_val, InPlaceJsonPath::from_json_path(path, &j_path)))
+    Ok((
+        json_val,
+        items_advanced,
+        InPlaceJsonPath::from_json_path(path, &j_path),
+    ))
 }
 
 // Modified json_extract_single code
-fn advance_path(val: Val, path: &JsonPath) -> Option<Val> {
+fn advance_path(val: Val, path: &JsonPath) -> Option<(Val, usize)> {
     let mut current_element = val;
+    let mut items_advanced: usize = {
+        // Count the root if there are more than 1 elements
+        if path.elements.len() > 1 {
+            1
+        } else {
+            0
+        }
+    };
 
     for element in path.elements.iter() {
         match element {
             PathElement::Root() => continue,
             PathElement::Key(key, _) => match current_element {
                 Val::Object(map) => {
-                    if let Some((_, value)) = map.into_iter().find(|(k, _)| k == key) {
+                    if let Some((_, value)) = map.into_iter().find(|(k, value)| {
+                        items_advanced += value.key_value_count() + 1;
+                        k == key
+                    }) {
                         current_element = value;
+                        items_advanced += 2;
                     } else {
                         return None;
                     }
@@ -87,9 +116,13 @@ fn advance_path(val: Val, path: &JsonPath) -> Option<Val> {
                         if idx < 0 {
                             idx += array.len() as i32;
                         }
-
                         if idx < array.len() as i32 {
+                            let items = array[0..idx as usize]
+                                .iter()
+                                .map(|v| v.key_value_count())
+                                .sum::<usize>();
                             current_element = array.remove(idx as usize);
+                            items_advanced += items;
                         } else {
                             return None;
                         }
@@ -99,7 +132,7 @@ fn advance_path(val: Val, path: &JsonPath) -> Option<Val> {
             },
         }
     }
-    Some(current_element)
+    Some((current_element, items_advanced))
 }
 
 trait JsonPathExt {
@@ -195,7 +228,12 @@ impl ValExt for Val {
     fn key_value_count(&self) -> usize {
         match self {
             Val::Array(v) => v.iter().map(|val| val.key_value_count()).sum::<usize>() + 1,
-            Val::Object(v) => v.iter().map(|(_, val)| val.key_value_count() + 1).sum(),
+            Val::Object(v) => {
+                v.iter()
+                    .map(|(_, val)| val.key_value_count())
+                    .sum::<usize>()
+                    + 1
+            }
             Val::Removed => unreachable!(),
             _ => 1,
         }
@@ -236,7 +274,7 @@ impl Display for Val {
                     if comma {
                         write!(f, ",")?;
                     }
-                    write!(f, "\"{}\": {}", key, val.to_string())?; // Call format recursively
+                    write!(f, "\"{}\":{}", key, val.to_string())?; // Call format recursively
                     comma = true;
                 }
                 write!(f, "}}")

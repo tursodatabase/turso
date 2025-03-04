@@ -917,3 +917,68 @@ do_execsql_test json_quote_json_value {
 #   SELECT sum(json_valid(json_quote('a'||char(x)||'z'))) FROM c ORDER BY x;
 # } {31}
 
+do_execsql_test json_each_1 {
+    select * from json_each('1');
+} {|1|integer|1|0||$|$}
+
+do_execsql_test json_each_2 {
+    select * from json_each(1);
+} {|1|integer|1|0||$|$}
+
+do_execsql_test json_each_3 {
+    select * from json_each();
+} {}
+
+do_execsql_test json_each_4 {
+    select * from json_each(1.1);
+} {|1.1|real|1.1|0||$|$}
+
+do_execsql_test json_each_5 {
+    select * from json_each('{x: 1}');
+} {x|1|integer|1|2||$.x|$}
+
+do_execsql_test json_each_6 {
+    select * from json_each('{x: 1, y: 2}');
+} {x|1|integer|1|2||$.x|$
+y|2|integer|2|4||$.y|$}
+
+do_execsql_test json_each_7 {
+    select * from json_each('[1,2]');
+} {0|1|integer|1|1||$[0]|$
+1|2|integer|2|2||$[1]|$}
+
+do_execsql_test json_each_8 {
+    select * from json_each('{x: 1, y: 2, z: [1, 2]}');
+} {x|1|integer|1|2||$.x|$
+y|2|integer|2|4||$.y|$
+z|[1,2]|array||6||$.z|$}
+
+do_execsql_test json_each_8 {
+    select * from json_each('[1, 2, {x: 1}, "hi"]');
+} {0|1|integer|1|1||$[0]|$
+1|2|integer|2|2||$[1]|$
+2|{"x":1}|object||3||$[2]|$
+3|hi|text|hi|6||$[3]|$}
+
+do_execsql_test json_each_9 {
+    select * from json_each('[1, 2, {x: [1,2,3]}, "hi"]');
+} {0|1|integer|1|1||$[0]|$
+1|2|integer|2|2||$[1]|$
+2|{"x":[1,2,3]}|object||3||$[2]|$
+3|hi|text|hi|9||$[3]|$}
+
+do_execsql_test json_each_10 {
+    select * from json_each('hi');
+} {"Extension error: Invalid Argument"}
+
+do_execsql_test json_each_with_path {
+    select * from json_each('[1, 2, {x: [1,2,3]}, "hi"]', '$[0]');
+} {|1|integer|1|1||$[0]|$[0]}
+
+do_execsql_test json_each_with_path_2 {
+    select * from json_each('[1, 2, {x: [1,2,3]}, "hi"]', '$[2]');
+} {x|[1,2,3]|array||5||$[2].x|$[2]}
+
+do_execsql_test json_each_with_path_3 {
+    select * from json_each('[1, 2, {x: [1,2,3]}, "hi"]', '$[3]');
+} {|hi|text|hi|9||$[3]|$[3]}
