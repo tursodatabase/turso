@@ -6,9 +6,13 @@ mod opcodes_dictionary;
 
 use rustyline::{error::ReadlineError, DefaultEditor};
 use std::sync::atomic::Ordering;
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(EnvFilter::from_default_env())
+        .init();
     let mut rl = DefaultEditor::new()?;
     let mut app = app::Limbo::new(&mut rl)?;
     let home = dirs::home_dir().expect("Could not determine home directory");
