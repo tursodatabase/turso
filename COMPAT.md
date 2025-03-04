@@ -398,6 +398,7 @@ Modifiers:
 | json_each(json)                    | Partial | No jsonb support                                                                                                                             |
 | json_each(json,path)               | Partial | No jsonb support                                                                                                                             |
 | json_tree(json)                    | Partial | No jsonb support                                                                                                                             |
+| json_tree(json,path)               | Partial | No jsonb support                                                                                                                             |
 
 ## SQLite C API
 
