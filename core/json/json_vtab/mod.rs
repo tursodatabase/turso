@@ -201,20 +201,6 @@ impl ValExt for Val {
             _ => Value::null(),
         }
     }
-
-    fn key_value_count(&self) -> usize {
-        match self {
-            Val::Array(v) => v.iter().map(|val| val.key_value_count()).sum::<usize>() + 1,
-            Val::Object(v) => {
-                v.iter()
-                    .map(|(_, val)| val.key_value_count())
-                    .sum::<usize>()
-                    + 1
-            }
-            Val::Removed => unreachable!(),
-            _ => 1,
-        }
-    }
 }
 
 impl Display for Val {
