@@ -6,7 +6,6 @@ use crate::json::Val;
 
 use super::{filter, is_json_container, try_option, InPlaceJsonPath, ValExt as _, VecExt as _};
 
-
 /// A virtual table that generates a sequence of integers
 #[derive(Debug, VTabModuleDerive, Default)]
 pub struct JsonTreeVTab;
@@ -39,7 +38,7 @@ impl VTabModule for JsonTreeVTab {
     }
 
     fn filter(cursor: &mut Self::VCursor, args: &[Value]) -> ResultCode {
-        let (json_val,path) = {
+        let (json_val, path) = {
             match filter(args) {
                 Ok(json_val) => json_val,
                 Err(rc) => return rc,

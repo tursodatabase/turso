@@ -71,13 +71,9 @@ fn filter(args: &[Value]) -> Result<(Val, InPlaceJsonPath), ResultCode> {
 
     let j_path = try_option!(json_path(path).ok(), Err(ResultCode::InvalidArgs));
 
-    let json_val =
-        try_option!(advance_path(json_val, &j_path), Err(ResultCode::EOF));
+    let json_val = try_option!(advance_path(json_val, &j_path), Err(ResultCode::EOF));
 
-    Ok((
-        json_val,
-        InPlaceJsonPath::from_json_path(path, &j_path),
-    ))
+    Ok((json_val, InPlaceJsonPath::from_json_path(path, &j_path)))
 }
 
 // Modified json_extract_single code
@@ -146,7 +142,6 @@ trait ValExt {
     fn type_name(&self) -> String;
     fn to_value(&self) -> Value;
     fn atom_value(&self) -> Value;
-    fn key_value_count(&self) -> usize;
 }
 
 impl ValExt for Val {

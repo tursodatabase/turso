@@ -65,10 +65,10 @@ impl VTabModule for JsonEachVTab {
 #[derive(Debug)]
 pub struct JsonEachCursor {
     rowid: i64,
-    json_val: Val,  // Initial Val
-    key: String,    // Current key
-    val: Val,       // Current Json Val
-    id: i64,        // Arbitrary id of the value,
+    json_val: Val, // Initial Val
+    key: String,   // Current key
+    val: Val,      // Current Json Val
+    id: i64,       // Arbitrary id of the value,
     eof: bool,
     array_idx_stack: Vec<usize>,
     path: String, // Requested Path
