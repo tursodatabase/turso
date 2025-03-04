@@ -1,6 +1,6 @@
 use js_sys::{Array, Object};
 use limbo_core::{
-    maybe_init_database_file, BufferPool, OpenFlags, Pager, Result, WalFile, WalFileShared,
+    maybe_init_database_file, OpenFlags, Pager, Result, WalFileShared,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -23,26 +23,19 @@ impl Database {
             .open_file(path, limbo_core::OpenFlags::Create, false)
             .unwrap();
         maybe_init_database_file(&file, &io).unwrap();
-        let page_io = Rc::new(DatabaseStorage::new(file));
+        let page_io = Arc::new(DatabaseStorage::new(file));
         let db_header = Pager::begin_open(page_io.clone()).unwrap();
 
         // ensure db header is there
         io.run_once().unwrap();
 
-        let page_size = db_header.borrow().page_size;
+        let page_size = db_header.lock().unwrap().page_size;
 
         let wal_path = format!("{}-wal", path);
         let wal_shared = WalFileShared::open_shared(&io, wal_path.as_str(), page_size).unwrap();
-        let buffer_pool = Rc::new(BufferPool::new(page_size as usize));
-        let wal = Rc::new(RefCell::new(WalFile::new(
-            io.clone(),
-            db_header.borrow().page_size as usize,
-            wal_shared.clone(),
-            buffer_pool.clone(),
-        )));
 
-        let db = limbo_core::Database::open(io, page_io, wal, wal_shared, buffer_pool).unwrap();
-        let conn = db.connect();
+        let db = limbo_core::Database::open(io, page_io, wal_shared).unwrap();
+        let conn = db.connect().unwrap();
         Database { db, conn }
     }
 
@@ -209,6 +202,9 @@ pub struct File {
     fd: i32,
 }
 
+unsafe impl Send for File {}
+unsafe impl Sync for File {}
+
 #[allow(dead_code)]
 impl File {
     fn new(vfs: VFS, fd: i32) -> Self {
@@ -245,7 +241,7 @@ impl limbo_core::File for File {
     fn pwrite(
         &self,
         pos: usize,
-        buffer: Rc<std::cell::RefCell<limbo_core::Buffer>>,
+        buffer: Arc<std::cell::RefCell<limbo_core::Buffer>>,
         c: limbo_core::Completion,
     ) -> Result<()> {
         let w = match &c {
@@ -273,6 +269,8 @@ impl limbo_core::File for File {
 pub struct PlatformIO {
     vfs: VFS,
 }
+unsafe impl Send for PlatformIO {}
+unsafe impl Sync for PlatformIO {}
 
 impl limbo_core::IO for PlatformIO {
     fn open_file(
@@ -280,9 +278,9 @@ impl limbo_core::IO for PlatformIO {
         path: &str,
         _flags: OpenFlags,
         _direct: bool,
-    ) -> Result<Rc<dyn limbo_core::File>> {
+    ) -> Result<Arc<dyn limbo_core::File>> {
         let fd = self.vfs.open(path, "a+");
-        Ok(Rc::new(File {
+        Ok(Arc::new(File {
             vfs: VFS::new(),
             fd,
         }))
@@ -320,14 +318,17 @@ extern "C" {
 }
 
 pub struct DatabaseStorage {
-    file: Rc<dyn limbo_core::File>,
+    file: Arc<dyn limbo_core::File>,
 }
+unsafe impl Send for DatabaseStorage {}
+unsafe impl Sync for DatabaseStorage {}
 
 impl DatabaseStorage {
-    pub fn new(file: Rc<dyn limbo_core::File>) -> Self {
+    pub fn new(file: Arc<dyn limbo_core::File>) -> Self {
         Self { file }
     }
 }
+
 
 impl limbo_core::DatabaseStorage for DatabaseStorage {
     fn read_page(&self, page_idx: usize, c: limbo_core::Completion) -> Result<()> {
@@ -348,7 +349,7 @@ impl limbo_core::DatabaseStorage for DatabaseStorage {
     fn write_page(
         &self,
         page_idx: usize,
-        buffer: Rc<std::cell::RefCell<limbo_core::Buffer>>,
+        buffer: Arc<std::cell::RefCell<limbo_core::Buffer>>,
         c: limbo_core::Completion,
     ) -> Result<()> {
         let size = buffer.borrow().len();

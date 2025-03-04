@@ -1,4 +1,4 @@
-use std::{collections::HashMap, rc::Rc};
+use std::{collections::HashMap,  sync::Arc};
 
 use limbo_sqlite3_parser::ast;
 
@@ -76,7 +76,7 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
 fn query_is_already_ordered_by(
     table_references: &[TableReference],
     key: &mut ast::Expr,
-    available_indexes: &HashMap<String, Vec<Rc<Index>>>,
+    available_indexes: &HashMap<String, Vec<Arc<Index>>>,
 ) -> Result<bool> {
     let first_table = table_references.first();
     if first_table.is_none() {
@@ -91,7 +91,7 @@ fn query_is_already_ordered_by(
             Search::IndexSearch { index, .. } => {
                 let index_rc = key.check_index_scan(0, &table_reference, available_indexes)?;
                 let index_is_the_same =
-                    index_rc.map(|irc| Rc::ptr_eq(index, &irc)).unwrap_or(false);
+                    index_rc.map(|irc| Arc::ptr_eq(index, &irc)).unwrap_or(false);
                 Ok(index_is_the_same)
             }
         },
@@ -138,7 +138,7 @@ fn eliminate_unnecessary_orderby(plan: &mut SelectPlan, schema: &Schema) -> Resu
  */
 fn use_indexes(
     table_references: &mut [TableReference],
-    available_indexes: &HashMap<String, Vec<Rc<Index>>>,
+    available_indexes: &HashMap<String, Vec<Arc<Index>>>,
     where_clause: &mut Vec<WhereTerm>,
 ) -> Result<()> {
     if where_clause.is_empty() {
@@ -276,8 +276,8 @@ pub trait Optimizable {
         &mut self,
         table_index: usize,
         table_reference: &TableReference,
-        available_indexes: &HashMap<String, Vec<Rc<Index>>>,
-    ) -> Result<Option<Rc<Index>>>;
+        available_indexes: &HashMap<String, Vec<Arc<Index>>>,
+    ) -> Result<Option<Arc<Index>>>;
 }
 
 impl Optimizable for ast::Expr {
@@ -295,8 +295,8 @@ impl Optimizable for ast::Expr {
         &mut self,
         table_index: usize,
         table_reference: &TableReference,
-        available_indexes: &HashMap<String, Vec<Rc<Index>>>,
-    ) -> Result<Option<Rc<Index>>> {
+        available_indexes: &HashMap<String, Vec<Arc<Index>>>,
+    ) -> Result<Option<Arc<Index>>> {
         match self {
             Self::Column { table, column, .. } => {
                 if *table != table_index {
@@ -497,7 +497,7 @@ pub fn try_extract_index_search_expression(
     cond: &mut WhereTerm,
     table_index: usize,
     table_reference: &TableReference,
-    available_indexes: &HashMap<String, Vec<Rc<Index>>>,
+    available_indexes: &HashMap<String, Vec<Arc<Index>>>,
 ) -> Result<Option<Search>> {
     if !cond.should_eval_at_loop(table_index) {
         return Ok(None);

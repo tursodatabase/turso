@@ -76,7 +76,7 @@ unsafe extern "C" fn register_module(
 
 impl Database {
     fn register_scalar_function_impl(&self, name: &str, func: ScalarFunction) -> ResultCode {
-        self.syms.borrow_mut().functions.insert(
+        self.syms.lock().unwrap().functions.insert(
             name.to_string(),
             Rc::new(ExternalFunc::new_scalar(name.to_string(), func)),
         );
@@ -89,7 +89,7 @@ impl Database {
         args: i32,
         func: ExternAggFunc,
     ) -> ResultCode {
-        self.syms.borrow_mut().functions.insert(
+        self.syms.lock().unwrap().functions.insert(
             name.to_string(),
             Rc::new(ExternalFunc::new_aggregate(name.to_string(), args, func)),
         );
@@ -108,7 +108,8 @@ impl Database {
             implementation: module,
         };
         self.syms
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .vtab_modules
             .insert(name.to_string(), vmodule.into());
         ResultCode::OK

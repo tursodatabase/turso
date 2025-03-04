@@ -209,7 +209,7 @@ impl<'a> Limbo<'a> {
             }
         };
         let db = Database::open_file(io.clone(), &db_file)?;
-        let conn = db.connect();
+        let conn = db.connect().unwrap();
         let interrupt_count = Arc::new(AtomicUsize::new(0));
         {
             let interrupt_count: Arc<AtomicUsize> = Arc::clone(&interrupt_count);
@@ -400,7 +400,7 @@ impl<'a> Limbo<'a> {
         };
         self.io = Arc::clone(&io);
         let db = Database::open_file(self.io.clone(), path)?;
-        self.conn = db.connect();
+        self.conn = db.connect().unwrap();
         self.opts.db_file = path.to_string();
         Ok(())
     }

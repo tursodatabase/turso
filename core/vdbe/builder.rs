@@ -1,7 +1,7 @@
 use std::{
-    cell::{Cell, RefCell},
+    cell::Cell,
     collections::HashMap,
-    rc::{Rc, Weak},
+    rc::{Rc, Weak}, sync::{Arc, Mutex},
 };
 
 use crate::{
@@ -38,7 +38,7 @@ pub struct ProgramBuilder {
 #[derive(Debug, Clone)]
 pub enum CursorType {
     BTreeTable(Rc<BTreeTable>),
-    BTreeIndex(Rc<Index>),
+    BTreeIndex(Arc<Index>),
     Pseudo(Rc<PseudoTable>),
     Sorter,
     VirtualTable(Rc<VirtualTable>),
@@ -437,7 +437,7 @@ impl ProgramBuilder {
 
     pub fn build(
         mut self,
-        database_header: Rc<RefCell<DatabaseHeader>>,
+        database_header: Arc<Mutex<DatabaseHeader>>,
         connection: Weak<Connection>,
         change_cnt_on: bool,
     ) -> Program {

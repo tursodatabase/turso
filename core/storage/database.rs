@@ -1,24 +1,32 @@
 #[cfg(feature = "fs")]
 use crate::error::LimboError;
 use crate::{io::Completion, Buffer, Result};
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, sync::Arc};
 
 /// DatabaseStorage is an interface a database file that consists of pages.
 ///
 /// The purpose of this trait is to abstract the upper layers of Limbo from
 /// the storage medium. A database can either be a file on disk, like in SQLite,
 /// or something like a remote page server service.
-pub trait DatabaseStorage {
+pub trait DatabaseStorage: Send + Sync {
     fn read_page(&self, page_idx: usize, c: Completion) -> Result<()>;
-    fn write_page(&self, page_idx: usize, buffer: Rc<RefCell<Buffer>>, c: Completion)
-        -> Result<()>;
+    fn write_page(
+        &self,
+        page_idx: usize,
+        buffer: Arc<RefCell<Buffer>>,
+        c: Completion,
+    ) -> Result<()>;
     fn sync(&self, c: Completion) -> Result<()>;
 }
 
+
 #[cfg(feature = "fs")]
 pub struct FileStorage {
-    file: Rc<dyn crate::io::File>,
+    file: Arc<dyn crate::io::File>,
 }
+
+unsafe impl Send for FileStorage {}
+unsafe impl Sync for FileStorage {}
 
 #[cfg(feature = "fs")]
 impl DatabaseStorage for FileStorage {
@@ -40,7 +48,7 @@ impl DatabaseStorage for FileStorage {
     fn write_page(
         &self,
         page_idx: usize,
-        buffer: Rc<RefCell<Buffer>>,
+        buffer: Arc<RefCell<Buffer>>,
         c: Completion,
     ) -> Result<()> {
         let buffer_size = buffer.borrow().len();
@@ -59,7 +67,7 @@ impl DatabaseStorage for FileStorage {
 
 #[cfg(feature = "fs")]
 impl FileStorage {
-    pub fn new(file: Rc<dyn crate::io::File>) -> Self {
+    pub fn new(file: Arc<dyn crate::io::File>) -> Self {
         Self { file }
     }
 }

@@ -19,7 +19,7 @@ fn bench(criterion: &mut Criterion) {
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io.clone(), "../testing/testing.db").unwrap();
-    let limbo_conn = db.connect();
+    let limbo_conn = db.connect().unwrap();
 
     let queries = [
         "SELECT 1",

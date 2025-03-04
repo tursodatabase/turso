@@ -70,7 +70,7 @@ pub fn parse_schema_rows(
                             match row.get::<&str>(4) {
                                 Ok(sql) => {
                                     let index = schema::Index::from_sql(sql, root_page as usize)?;
-                                    schema.add_index(Rc::new(index));
+                                    schema.add_index(Arc::new(index));
                                 }
                                 _ => {
                                     // Automatic index on primary key, e.g.
@@ -105,7 +105,7 @@ pub fn parse_schema_rows(
             let table = schema.get_btree_table(&table_name).unwrap();
             let index =
                 schema::Index::automatic_from_primary_key(&table, &index_name, root_page as usize)?;
-            schema.add_index(Rc::new(index));
+            schema.add_index(Arc::new(index));
         }
     }
     Ok(())

@@ -8,8 +8,9 @@ use tempfile::TempDir;
 #[allow(dead_code)]
 pub struct TempDatabase {
     pub path: PathBuf,
-    pub io: Arc<dyn IO>,
+    pub io: Arc<dyn IO + Send>,
 }
+unsafe impl Send for TempDatabase {}
 
 #[allow(dead_code, clippy::arc_with_non_send_sync)]
 impl TempDatabase {
@@ -20,7 +21,7 @@ impl TempDatabase {
     pub fn new(db_name: &str) -> Self {
         let mut path = TempDir::new().unwrap().into_path();
         path.push(db_name);
-        let io: Arc<dyn IO> = Arc::new(limbo_core::PlatformIO::new().unwrap());
+        let io: Arc<dyn IO + Send> = Arc::new(limbo_core::PlatformIO::new().unwrap());
         Self { path, io }
     }
 
@@ -43,9 +44,14 @@ impl TempDatabase {
         log::debug!("conneting to limbo");
         let db = Database::open_file(self.io.clone(), self.path.to_str().unwrap()).unwrap();
 
-        let conn = db.connect();
+        let conn = db.connect().unwrap();
         log::debug!("connected to limbo");
         conn
+    }
+
+    pub fn limbo_database(&self) -> Arc<limbo_core::Database> {
+        log::debug!("conneting to limbo");
+        Database::open_file(self.io.clone(), self.path.to_str().unwrap()).unwrap()
     }
 }
 

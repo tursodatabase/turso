@@ -92,7 +92,7 @@ pub extern "system" fn Java_tech_turso_core_LimboDB_connect0<'local>(
         }
     };
 
-    let conn = LimboConnection::new(db.db.connect(), db.io.clone());
+    let conn = LimboConnection::new(db.db.connect().unwrap(), db.io.clone());
     conn.to_ptr()
 }
 

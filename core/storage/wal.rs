@@ -283,7 +283,7 @@ pub struct WalFileShared {
     // Another memory inefficient array made to just keep track of pages that are in frame_cache.
     pages_in_frames: Vec<u64>,
     last_checksum: (u32, u32), // Check of last frame in WAL, this is a cumulative checksum over all frames in the WAL
-    file: Rc<dyn File>,
+    file: Arc<dyn File>,
     /// read_locks is a list of read locks that can coexist with the max_frame number stored in
     /// value. There is a limited amount because and unbounded amount of connections could be
     /// fatal. Therefore, for now we copy how SQLite behaves with limited amounts of read max
@@ -675,7 +675,7 @@ impl WalFile {
             });
             checkpoint_page.get().contents = Some(PageContent {
                 offset: 0,
-                buffer: Rc::new(RefCell::new(Buffer::new(buffer, drop_fn))),
+                buffer: Arc::new(RefCell::new(Buffer::new(buffer, drop_fn))),
                 overflow_cells: Vec::new(),
             });
         }

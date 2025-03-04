@@ -120,7 +120,7 @@ pub fn get_writer(output: &str) -> Box<dyn Write> {
 
 pub fn get_io(db_location: DbLocation, io_choice: Io) -> anyhow::Result<Arc<dyn limbo_core::IO>> {
     Ok(match db_location {
-        DbLocation::Memory => Arc::new(limbo_core::MemoryIO::new()?),
+        DbLocation::Memory => Arc::new(limbo_core::MemoryIO::new()),
         DbLocation::Path => {
             match io_choice {
                 Io::Syscall => {

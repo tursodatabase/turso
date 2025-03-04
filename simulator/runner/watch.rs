@@ -98,7 +98,7 @@ fn execute_plan(
 
     if let SimConnection::Disconnected = connection {
         log::info!("connecting {}", connection_index);
-        env.connections[connection_index] = SimConnection::Connected(env.db.connect());
+        env.connections[connection_index] = SimConnection::Connected(env.db.connect().unwrap());
     } else {
         match execute_interaction(env, connection_index, interaction, &mut state.stack) {
             Ok(next_execution) => {

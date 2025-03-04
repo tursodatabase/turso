@@ -52,7 +52,7 @@ use parking_lot::RwLock;
 use std::cell::RefCell;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::trace;
 
 use super::pager::PageRef;
@@ -243,13 +243,13 @@ impl Default for DatabaseHeader {
 }
 
 pub fn begin_read_database_header(
-    page_io: Rc<dyn DatabaseStorage>,
-) -> Result<Rc<RefCell<DatabaseHeader>>> {
+    page_io: Arc<dyn DatabaseStorage>,
+) -> Result<Arc<Mutex<DatabaseHeader>>> {
     let drop_fn = Rc::new(|_buf| {});
-    let buf = Rc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
-    let result = Rc::new(RefCell::new(DatabaseHeader::default()));
+    let buf = Arc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
+    let result = Arc::new(Mutex::new(DatabaseHeader::default()));
     let header = result.clone();
-    let complete = Box::new(move |buf: Rc<RefCell<Buffer>>| {
+    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
         let header = header.clone();
         finish_read_database_header(buf, header).unwrap();
     });
@@ -259,12 +259,12 @@ pub fn begin_read_database_header(
 }
 
 fn finish_read_database_header(
-    buf: Rc<RefCell<Buffer>>,
-    header: Rc<RefCell<DatabaseHeader>>,
+    buf: Arc<RefCell<Buffer>>,
+    header: Arc<Mutex<DatabaseHeader>>,
 ) -> Result<()> {
     let buf = buf.borrow();
     let buf = buf.as_slice();
-    let mut header = RefCell::borrow_mut(&header);
+    let mut header = header.lock().unwrap();
     header.magic.copy_from_slice(&buf[0..16]);
     header.page_size = u16::from_be_bytes([buf[16], buf[17]]);
     header.write_version = buf[18];
@@ -299,10 +299,10 @@ pub fn begin_write_database_header(header: &DatabaseHeader, pager: &Pager) -> Re
     let page_source = pager.page_io.clone();
 
     let drop_fn = Rc::new(|_buf| {});
-    let buffer_to_copy = Rc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
+    let buffer_to_copy = Arc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
     let buffer_to_copy_in_cb = buffer_to_copy.clone();
 
-    let read_complete = Box::new(move |buffer: Rc<RefCell<Buffer>>| {
+    let read_complete = Box::new(move |buffer: Arc<RefCell<Buffer>>| {
         let buffer = buffer.borrow().clone();
         let buffer = Rc::new(RefCell::new(buffer));
         let mut buf_mut = buffer.borrow_mut();
@@ -312,7 +312,7 @@ pub fn begin_write_database_header(header: &DatabaseHeader, pager: &Pager) -> Re
     });
 
     let drop_fn = Rc::new(|_buf| {});
-    let buf = Rc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
+    let buf = Arc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
     let c = Completion::Read(ReadCompletion::new(buf, read_complete));
     page_source.read_page(1, c)?;
     // run get header block
@@ -393,7 +393,7 @@ pub struct OverflowCell {
 #[derive(Debug)]
 pub struct PageContent {
     pub offset: usize,
-    pub buffer: Rc<RefCell<Buffer>>,
+    pub buffer: Arc<RefCell<Buffer>>,
     pub overflow_cells: Vec<OverflowCell>,
 }
 
@@ -401,7 +401,7 @@ impl Clone for PageContent {
     fn clone(&self) -> Self {
         Self {
             offset: self.offset,
-            buffer: Rc::new(RefCell::new((*self.buffer.borrow()).clone())),
+            buffer: Arc::new(RefCell::new((*self.buffer.borrow()).clone())),
             overflow_cells: self.overflow_cells.clone(),
         }
     }
@@ -673,7 +673,7 @@ impl PageContent {
 }
 
 pub fn begin_read_page(
-    page_io: Rc<dyn DatabaseStorage>,
+    page_io: Arc<dyn DatabaseStorage>,
     buffer_pool: Rc<BufferPool>,
     page: PageRef,
     page_idx: usize,
@@ -684,8 +684,8 @@ pub fn begin_read_page(
         let buffer_pool = buffer_pool.clone();
         buffer_pool.put(buf);
     });
-    let buf = Rc::new(RefCell::new(Buffer::new(buf, drop_fn)));
-    let complete = Box::new(move |buf: Rc<RefCell<Buffer>>| {
+    let buf = Arc::new(RefCell::new(Buffer::new(buf, drop_fn)));
+    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
         let page = page.clone();
         if finish_read_page(page_idx, buf, page.clone()).is_err() {
             page.set_error();
@@ -696,7 +696,11 @@ pub fn begin_read_page(
     Ok(())
 }
 
-fn finish_read_page(page_idx: usize, buffer_ref: Rc<RefCell<Buffer>>, page: PageRef) -> Result<()> {
+fn finish_read_page(
+    page_idx: usize,
+    buffer_ref: Arc<RefCell<Buffer>>,
+    page: PageRef,
+) -> Result<()> {
     trace!("finish_read_btree_page(page_idx = {})", page_idx);
     let pos = if page_idx == 1 {
         DATABASE_HEADER_SIZE
@@ -754,7 +758,7 @@ pub fn begin_write_btree_page(
     Ok(())
 }
 
-pub fn begin_sync(page_io: Rc<dyn DatabaseStorage>, syncing: Rc<RefCell<bool>>) -> Result<()> {
+pub fn begin_sync(page_io: Arc<dyn DatabaseStorage>, syncing: Rc<RefCell<bool>>) -> Result<()> {
     assert!(!*syncing.borrow());
     *syncing.borrow_mut() = true;
     let completion = Completion::Sync(SyncCompletion {
@@ -1248,12 +1252,12 @@ pub fn write_varint_to_vec(value: u64, payload: &mut Vec<u8>) {
     payload.extend_from_slice(&varint[0..n]);
 }
 
-pub fn begin_read_wal_header(io: &Rc<dyn File>) -> Result<Arc<RwLock<WalHeader>>> {
+pub fn begin_read_wal_header(io: &Arc<dyn File>) -> Result<Arc<RwLock<WalHeader>>> {
     let drop_fn = Rc::new(|_buf| {});
-    let buf = Rc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
+    let buf = Arc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
     let result = Arc::new(RwLock::new(WalHeader::default()));
     let header = result.clone();
-    let complete = Box::new(move |buf: Rc<RefCell<Buffer>>| {
+    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
         let header = header.clone();
         finish_read_wal_header(buf, header).unwrap();
     });
@@ -1262,7 +1266,7 @@ pub fn begin_read_wal_header(io: &Rc<dyn File>) -> Result<Arc<RwLock<WalHeader>>
     Ok(result)
 }
 
-fn finish_read_wal_header(buf: Rc<RefCell<Buffer>>, header: Arc<RwLock<WalHeader>>) -> Result<()> {
+fn finish_read_wal_header(buf: Arc<RefCell<Buffer>>, header: Arc<RwLock<WalHeader>>) -> Result<()> {
     let buf = buf.borrow();
     let buf = buf.as_slice();
     let mut header = header.write();
@@ -1278,7 +1282,7 @@ fn finish_read_wal_header(buf: Rc<RefCell<Buffer>>, header: Arc<RwLock<WalHeader
 }
 
 pub fn begin_read_wal_frame(
-    io: &Rc<dyn File>,
+    io: &Arc<dyn File>,
     offset: usize,
     buffer_pool: Rc<BufferPool>,
     page: PageRef,
@@ -1293,9 +1297,9 @@ pub fn begin_read_wal_frame(
         let buffer_pool = buffer_pool.clone();
         buffer_pool.put(buf);
     });
-    let buf = Rc::new(RefCell::new(Buffer::new(buf, drop_fn)));
+    let buf = Arc::new(RefCell::new(Buffer::new(buf, drop_fn)));
     let frame = page.clone();
-    let complete = Box::new(move |buf: Rc<RefCell<Buffer>>| {
+    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
         let frame = frame.clone();
         finish_read_page(2, buf, frame).unwrap();
     });
@@ -1305,7 +1309,7 @@ pub fn begin_read_wal_frame(
 }
 
 pub fn begin_write_wal_frame(
-    io: &Rc<dyn File>,
+    io: &Arc<dyn File>,
     offset: usize,
     page: &PageRef,
     db_size: u32,
@@ -1357,7 +1361,7 @@ pub fn begin_write_wal_frame(
         buf[20..24].copy_from_slice(&header.checksum_2.to_be_bytes());
         buf[WAL_FRAME_HEADER_SIZE..].copy_from_slice(contents.as_ptr());
 
-        (Rc::new(RefCell::new(buffer)), checksums)
+        (Arc::new(RefCell::new(buffer)), checksums)
     };
 
     *write_counter.borrow_mut() += 1;
@@ -1379,7 +1383,7 @@ pub fn begin_write_wal_frame(
     Ok(checksums)
 }
 
-pub fn begin_write_wal_header(io: &Rc<dyn File>, header: &WalHeader) -> Result<()> {
+pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<()> {
     let buffer = {
         let drop_fn = Rc::new(|_buf| {});
 
@@ -1395,7 +1399,7 @@ pub fn begin_write_wal_header(io: &Rc<dyn File>, header: &WalHeader) -> Result<(
         buf[24..28].copy_from_slice(&header.checksum_1.to_be_bytes());
         buf[28..32].copy_from_slice(&header.checksum_2.to_be_bytes());
 
-        Rc::new(RefCell::new(buffer))
+        Arc::new(RefCell::new(buffer))
     };
 
     let write_complete = {

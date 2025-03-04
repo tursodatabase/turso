@@ -1,8 +1,8 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, sync::Arc};
 
 use limbo_core::{File, Result};
 pub(crate) struct SimulatorFile {
-    pub(crate) inner: Rc<dyn File>,
+    pub(crate) inner: Arc<dyn File>,
     pub(crate) fault: RefCell<bool>,
 
     /// Number of `pread` function calls (both success and failures).
@@ -22,6 +22,9 @@ pub(crate) struct SimulatorFile {
 
     pub(crate) page_size: usize,
 }
+
+unsafe impl Send for SimulatorFile {}
+unsafe impl Sync for SimulatorFile {}
 
 impl SimulatorFile {
     pub(crate) fn inject_fault(&self, fault: bool) {
@@ -88,7 +91,7 @@ impl File for SimulatorFile {
     fn pwrite(
         &self,
         pos: usize,
-        buffer: Rc<RefCell<limbo_core::Buffer>>,
+        buffer: Arc<RefCell<limbo_core::Buffer>>,
         c: limbo_core::Completion,
     ) -> Result<()> {
         *self.nr_pwrite_calls.borrow_mut() += 1;

@@ -72,6 +72,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::num::NonZero;
 use std::rc::{Rc, Weak};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// Represents a target for a jump instruction.
@@ -415,7 +416,7 @@ pub struct Program {
     pub max_registers: usize,
     pub insns: Vec<Insn>,
     pub cursor_ref: Vec<(Option<String>, CursorType)>,
-    pub database_header: Rc<RefCell<DatabaseHeader>>,
+    pub database_header: Arc<Mutex<DatabaseHeader>>,
     pub comments: Option<HashMap<InsnReference, &'static str>>,
     pub parameters: crate::parameters::Parameters,
     pub connection: Weak<Connection>,
@@ -908,15 +909,15 @@ impl Program {
                         Some(&table_name),
                         &module_name,
                         args,
-                        &conn.db.syms.borrow(),
+                        &conn.db.syms.lock().unwrap(),
                         limbo_ext::VTabKind::VirtualTable,
                         None,
                     )?;
                     {
                         conn.db
                             .syms
-                            .as_ref()
-                            .borrow_mut()
+                            .lock()
+                            .unwrap()
                             .vtabs
                             .insert(table_name, table.clone());
                     }
@@ -2900,7 +2901,7 @@ impl Program {
                     }
                     // SQLite returns "0" on an empty database, and 2 on the first insertion,
                     // so we'll mimic that behavior.
-                    let mut pages = pager.db_header.borrow().database_size.into();
+                    let mut pages = pager.db_header.lock().unwrap().database_size.into();
                     if pages == 1 {
                         pages = 0;
                     }
@@ -2917,13 +2918,13 @@ impl Program {
                         "SELECT * FROM  sqlite_schema WHERE {}",
                         where_clause
                     ))?;
-                    let mut schema = RefCell::borrow_mut(&conn.schema);
+                    let mut schema = conn.schema.lock().unwrap();
                     // TODO: This function below is synchronous, make it async
                     parse_schema_rows(
                         Some(stmt),
                         &mut schema,
                         conn.pager.io.clone(),
-                        &conn.db.syms.borrow(),
+                        &conn.db.syms.lock().unwrap()
                     )?;
                     state.pc += 1;
                 }
@@ -2933,7 +2934,7 @@ impl Program {
                         todo!("temp databases not implemented yet");
                     }
                     let cookie_value = match cookie {
-                        Cookie::UserVersion => pager.db_header.borrow().user_version.into(),
+                        Cookie::UserVersion => pager.db_header.lock().unwrap().user_version.into(),
                         cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
                     };
                     state.registers[*dest] = OwnedValue::Integer(cookie_value);

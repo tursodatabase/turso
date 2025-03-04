@@ -284,15 +284,15 @@ pub fn connect(path: &str) -> Result<Connection> {
 
     match path {
         ":memory:" => {
-            let io: Arc<dyn limbo_core::IO> = Arc::new(limbo_core::MemoryIO::new()?);
+            let io: Arc<dyn limbo_core::IO> = Arc::new(limbo_core::MemoryIO::new());
             let db = open_or(io.clone(), path)?;
-            let conn: Rc<limbo_core::Connection> = db.connect();
+            let conn: Rc<limbo_core::Connection> = db.connect().unwrap();
             Ok(Connection { conn, io })
         }
         path => {
             let io: Arc<dyn limbo_core::IO> = Arc::new(limbo_core::PlatformIO::new()?);
             let db = open_or(io.clone(), path)?;
-            let conn: Rc<limbo_core::Connection> = db.connect();
+            let conn: Rc<limbo_core::Connection> = db.connect().unwrap();
             Ok(Connection { conn, io })
         }
     }

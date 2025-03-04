@@ -41,7 +41,7 @@ impl Builder {
     pub async fn build(self) -> Result<Database> {
         match self.path.as_str() {
             ":memory:" => {
-                let io: Arc<dyn limbo_core::IO> = Arc::new(limbo_core::MemoryIO::new()?);
+                let io: Arc<dyn limbo_core::IO> = Arc::new(limbo_core::MemoryIO::new());
                 let db = limbo_core::Database::open_file(io, self.path.as_str())?;
                 Ok(Database { inner: db })
             }
@@ -59,7 +59,7 @@ unsafe impl Sync for Database {}
 
 impl Database {
     pub fn connect(&self) -> Result<Connection> {
-        let conn = self.inner.connect();
+        let conn = self.inner.connect().unwrap();
         #[allow(clippy::arc_with_non_send_sync)]
         let connection = Connection {
             inner: Arc::new(Mutex::new(conn)),

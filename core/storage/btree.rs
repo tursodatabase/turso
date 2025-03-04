@@ -1546,7 +1546,7 @@ impl BTreeCursor {
     /// The usable size of a page might be an odd number. However, the usable size is not allowed to be less than 480.
     /// In other words, if the page size is 512, then the reserved space size cannot exceed 32.
     fn usable_space(&self) -> usize {
-        let db_header = self.pager.db_header.borrow();
+        let db_header = self.pager.db_header.lock().unwrap();
         (db_header.page_size - db_header.reserved_space as u16) as usize
     }
 
@@ -1898,7 +1898,7 @@ impl BTreeCursor {
         let Some(first_page) = first_overflow_page else {
             return Ok(CursorResult::Ok(()));
         };
-        let page_count = self.pager.db_header.borrow().database_size as usize;
+        let page_count = self.pager.db_header.lock().unwrap().database_size as usize;
         let mut pages_left = n_overflow;
         let mut current_page = first_page;
         // Clear overflow pages
@@ -2779,12 +2779,14 @@ mod tests {
     use crate::storage::sqlite3_ondisk;
     use crate::storage::sqlite3_ondisk::DatabaseHeader;
     use crate::types::Text;
+    use crate::Connection;
     use crate::{BufferPool, DatabaseStorage, WalFile, WalFileShared, WriteCompletion};
     use std::cell::RefCell;
     use std::ops::Deref;
     use std::panic;
     use std::rc::Rc;
     use std::sync::Arc;
+    use std::sync::Mutex;
 
     use rand::{thread_rng, Rng};
     use tempfile::TempDir;
@@ -2812,7 +2814,7 @@ mod tests {
         let drop_fn = Rc::new(|_| {});
         let inner = PageContent {
             offset: 0,
-            buffer: Rc::new(RefCell::new(Buffer::new(
+            buffer: Arc::new(RefCell::new(Buffer::new(
                 BufferData::new(vec![0; 4096]),
                 drop_fn,
             ))),
@@ -2858,7 +2860,7 @@ mod tests {
         pos: usize,
         page: &mut PageContent,
         record: Record,
-        db: &Arc<Database>,
+        conn: &Rc<Connection>,
     ) -> Vec<u8> {
         let mut payload: Vec<u8> = Vec::new();
         fill_cell_payload(
@@ -2867,7 +2869,7 @@ mod tests {
             &mut payload,
             &record,
             4096,
-            db.pager.clone(),
+            conn.pager.clone(),
         );
         insert_into_cell(page, &payload, pos, 4096).unwrap();
         payload
@@ -2876,11 +2878,12 @@ mod tests {
     #[test]
     fn test_insert_cell() {
         let db = get_database();
+        let conn = db.connect().unwrap();
         let page = get_page(2);
         let page = page.get_contents();
         let header_size = 8;
         let record = Record::new([OwnedValue::Integer(1)].to_vec());
-        let payload = add_record(1, 0, page, record, &db);
+        let payload = add_record(1, 0, page, record, &conn);
         assert_eq!(page.cell_count(), 1);
         let free = compute_free_space(page, 4096);
         assert_eq!(free, 4096 - payload.len() as u16 - 2 - header_size);
@@ -2897,6 +2900,7 @@ mod tests {
     #[test]
     fn test_drop_1() {
         let db = get_database();
+        let conn = db.connect().unwrap();
 
         let page = get_page(2);
         let page = page.get_contents();
@@ -2907,7 +2911,7 @@ mod tests {
         let usable_space = 4096;
         for i in 0..3 {
             let record = Record::new([OwnedValue::Integer(i as i64)].to_vec());
-            let payload = add_record(i, i, page, record, &db);
+            let payload = add_record(i, i, page, record, &conn);
             assert_eq!(page.cell_count(), i + 1);
             let free = compute_free_space(page, usable_space);
             total_size += payload.len() as u16 + 2;
@@ -3054,9 +3058,9 @@ mod tests {
         let page_size = db_header.page_size as usize;
 
         #[allow(clippy::arc_with_non_send_sync)]
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new().unwrap());
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let io_file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
-        let page_io = Rc::new(FileStorage::new(io_file));
+        let page_io = Arc::new(FileStorage::new(io_file));
 
         let buffer_pool = Rc::new(BufferPool::new(db_header.page_size as usize));
         let wal_shared = WalFileShared::open_shared(&io, "test.wal", db_header.page_size).unwrap();
@@ -3065,7 +3069,7 @@ mod tests {
 
         let page_cache = Arc::new(parking_lot::RwLock::new(DumbLruPageCache::new(10)));
         let pager = {
-            let db_header = Rc::new(RefCell::new(db_header.clone()));
+            let db_header = Arc::new(Mutex::new(db_header.clone()));
             Pager::finish_open(db_header, page_io, wal, io, page_cache, buffer_pool).unwrap()
         };
         let pager = Rc::new(pager);
@@ -3224,6 +3228,7 @@ mod tests {
     #[test]
     pub fn test_drop_odd() {
         let db = get_database();
+        let conn= db.connect().unwrap();
 
         let page = get_page(2);
         let page = page.get_contents();
@@ -3235,7 +3240,7 @@ mod tests {
         let total_cells = 10;
         for i in 0..total_cells {
             let record = Record::new([OwnedValue::Integer(i as i64)].to_vec());
-            let payload = add_record(i, i, page, record, &db);
+            let payload = add_record(i, i, page, record, &conn);
             assert_eq!(page.cell_count(), i + 1);
             let free = compute_free_space(page, usable_space);
             total_size += payload.len() as u16 + 2;
@@ -3297,12 +3302,12 @@ mod tests {
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
-    fn setup_test_env(database_size: u32) -> (Rc<Pager>, Rc<RefCell<DatabaseHeader>>) {
+    fn setup_test_env(database_size: u32) -> (Rc<Pager>, Arc<Mutex<DatabaseHeader>>) {
         let page_size = 512;
         let mut db_header = DatabaseHeader::default();
         db_header.page_size = page_size;
         db_header.database_size = database_size;
-        let db_header = Rc::new(RefCell::new(db_header));
+        let db_header = Arc::new(Mutex::new(db_header));
 
         let buffer_pool = Rc::new(BufferPool::new(10));
 
@@ -3312,17 +3317,17 @@ mod tests {
             buffer_pool.put(Pin::new(vec));
         }
 
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new().unwrap());
-        let page_io = Rc::new(FileStorage::new(
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let page_io = Arc::new(FileStorage::new(
             io.open_file("test.db", OpenFlags::Create, false).unwrap(),
         ));
 
         let drop_fn = Rc::new(|_buf| {});
-        let buf = Rc::new(RefCell::new(Buffer::allocate(page_size as usize, drop_fn)));
+        let buf = Arc::new(RefCell::new(Buffer::allocate(page_size as usize, drop_fn)));
         {
             let mut buf_mut = buf.borrow_mut();
             let buf_slice = buf_mut.as_mut_slice();
-            sqlite3_ondisk::write_header_to_buf(buf_slice, &db_header.borrow());
+            sqlite3_ondisk::write_header_to_buf(buf_slice, &db_header.lock().unwrap());
         }
 
         let write_complete = Box::new(|_| {});
@@ -3370,8 +3375,8 @@ mod tests {
         let mut current_page = 2u32;
         while current_page <= 4 {
             let drop_fn = Rc::new(|_buf| {});
-            let buf = Rc::new(RefCell::new(Buffer::allocate(
-                db_header.borrow().page_size as usize,
+            let buf = Arc::new(RefCell::new(Buffer::allocate(
+                db_header.lock().unwrap().page_size as usize,
                 drop_fn,
             )));
             let write_complete = Box::new(|_| {});
@@ -3411,20 +3416,20 @@ mod tests {
             first_overflow_page: Some(2), // Point to first overflow page
         });
 
-        let initial_freelist_pages = db_header.borrow().freelist_pages;
+        let initial_freelist_pages = db_header.lock().unwrap().freelist_pages;
         // Clear overflow pages
         let clear_result = cursor.clear_overflow_pages(&leaf_cell)?;
         match clear_result {
             CursorResult::Ok(_) => {
                 // Verify proper number of pages were added to freelist
                 assert_eq!(
-                    db_header.borrow().freelist_pages,
+                    db_header.lock().unwrap().freelist_pages,
                     initial_freelist_pages + 3,
                     "Expected 3 pages to be added to freelist"
                 );
 
                 // If this is first trunk page
-                let trunk_page_id = db_header.borrow().freelist_trunk_page;
+                let trunk_page_id = db_header.lock().unwrap().freelist_trunk_page;
                 if trunk_page_id > 0 {
                     // Verify trunk page structure
                     let trunk_page = cursor.pager.read_page(trunk_page_id as usize)?;
@@ -3466,7 +3471,7 @@ mod tests {
             first_overflow_page: None,
         });
 
-        let initial_freelist_pages = db_header.borrow().freelist_pages;
+        let initial_freelist_pages = db_header.lock().unwrap().freelist_pages;
 
         // Try to clear non-existent overflow pages
         let clear_result = cursor.clear_overflow_pages(&leaf_cell)?;
@@ -3474,14 +3479,14 @@ mod tests {
             CursorResult::Ok(_) => {
                 // Verify freelist was not modified
                 assert_eq!(
-                    db_header.borrow().freelist_pages,
+                    db_header.lock().unwrap().freelist_pages,
                     initial_freelist_pages,
                     "Freelist should not change when no overflow pages exist"
                 );
 
                 // Verify trunk page wasn't created
                 assert_eq!(
-                    db_header.borrow().freelist_trunk_page,
+                    db_header.lock().unwrap().freelist_trunk_page,
                     0,
                     "No trunk page should be created when no overflow pages exist"
                 );
@@ -3496,6 +3501,7 @@ mod tests {
     #[test]
     pub fn test_defragment() {
         let db = get_database();
+        let conn = db.connect().unwrap();
 
         let page = get_page(2);
         let page = page.get_contents();
@@ -3506,7 +3512,7 @@ mod tests {
         let usable_space = 4096;
         for i in 0..3 {
             let record = Record::new([OwnedValue::Integer(i as i64)].to_vec());
-            let payload = add_record(i, i, page, record, &db);
+            let payload = add_record(i, i, page, record, &conn);
             assert_eq!(page.cell_count(), i + 1);
             let free = compute_free_space(page, usable_space);
             total_size += payload.len() as u16 + 2;
@@ -3534,6 +3540,7 @@ mod tests {
     #[test]
     pub fn test_drop_odd_with_defragment() {
         let db = get_database();
+        let conn = db.connect().unwrap();
 
         let page = get_page(2);
         let page = page.get_contents();
@@ -3545,7 +3552,7 @@ mod tests {
         let total_cells = 10;
         for i in 0..total_cells {
             let record = Record::new([OwnedValue::Integer(i as i64)].to_vec());
-            let payload = add_record(i, i, page, record, &db);
+            let payload = add_record(i, i, page, record, &conn);
             assert_eq!(page.cell_count(), i + 1);
             let free = compute_free_space(page, usable_space);
             total_size += payload.len() as u16 + 2;
@@ -3578,6 +3585,7 @@ mod tests {
     #[test]
     pub fn test_fuzz_drop_defragment_insert() {
         let db = get_database();
+        let conn = db.connect().unwrap();
 
         let page = get_page(2);
         let page = page.get_contents();
@@ -3604,7 +3612,7 @@ mod tests {
                         &mut payload,
                         &record,
                         4096,
-                        db.pager.clone(),
+                        conn.pager.clone(),
                     );
                     if (free as usize) < payload.len() - 2 {
                         // do not try to insert overflow pages because they require balancing
@@ -3643,13 +3651,14 @@ mod tests {
     #[test]
     pub fn test_free_space() {
         let db = get_database();
+        let conn = db.connect().unwrap();
         let page = get_page(2);
         let page = page.get_contents();
         let header_size = 8;
         let usable_space = 4096;
 
         let record = Record::new([OwnedValue::Integer(0)].to_vec());
-        let payload = add_record(0, 0, page, record, &db);
+        let payload = add_record(0, 0, page, record, &conn);
         let free = compute_free_space(page, usable_space);
         assert_eq!(free, 4096 - payload.len() as u16 - 2 - header_size);
     }
@@ -3657,13 +3666,14 @@ mod tests {
     #[test]
     pub fn test_defragment_1() {
         let db = get_database();
+        let conn = db.connect().unwrap();
 
         let page = get_page(2);
         let page = page.get_contents();
         let usable_space = 4096;
 
         let record = Record::new([OwnedValue::Integer(0 as i64)].to_vec());
-        let payload = add_record(0, 0, page, record, &db);
+        let payload = add_record(0, 0, page, record, &conn);
 
         assert_eq!(page.cell_count(), 1);
         defragment_page(page, usable_space);
@@ -3681,6 +3691,7 @@ mod tests {
     #[test]
     pub fn test_insert_drop_insert() {
         let db = get_database();
+        let conn = db.connect().unwrap();
 
         let page = get_page(2);
         let page = page.get_contents();
@@ -3693,14 +3704,14 @@ mod tests {
             ]
             .to_vec(),
         );
-        let _ = add_record(0, 0, page, record, &db);
+        let _ = add_record(0, 0, page, record, &conn);
 
         assert_eq!(page.cell_count(), 1);
         drop_cell(page, 0, usable_space).unwrap();
         assert_eq!(page.cell_count(), 0);
 
         let record = Record::new([OwnedValue::Integer(0 as i64)].to_vec());
-        let payload = add_record(0, 0, page, record, &db);
+        let payload = add_record(0, 0, page, record, &conn);
         assert_eq!(page.cell_count(), 1);
 
         let (start, len) = page.cell_get_raw_region(
@@ -3716,6 +3727,7 @@ mod tests {
     #[test]
     pub fn test_insert_drop_insert_multiple() {
         let db = get_database();
+        let conn = db.connect().unwrap();
 
         let page = get_page(2);
         let page = page.get_contents();
@@ -3728,7 +3740,7 @@ mod tests {
             ]
             .to_vec(),
         );
-        let _ = add_record(0, 0, page, record, &db);
+        let _ = add_record(0, 0, page, record, &conn);
 
         for _ in 0..100 {
             assert_eq!(page.cell_count(), 1);
@@ -3736,7 +3748,7 @@ mod tests {
             assert_eq!(page.cell_count(), 0);
 
             let record = Record::new([OwnedValue::Integer(0)].to_vec());
-            let payload = add_record(0, 0, page, record, &db);
+            let payload = add_record(0, 0, page, record, &conn);
             assert_eq!(page.cell_count(), 1);
 
             let (start, len) = page.cell_get_raw_region(
@@ -3753,17 +3765,18 @@ mod tests {
     #[test]
     pub fn test_drop_a_few_insert() {
         let db = get_database();
+        let conn = db.connect().unwrap();
 
         let page = get_page(2);
         let page = page.get_contents();
         let usable_space = 4096;
 
         let record = Record::new([OwnedValue::Integer(0)].to_vec());
-        let payload = add_record(0, 0, page, record, &db);
+        let payload = add_record(0, 0, page, record, &conn);
         let record = Record::new([OwnedValue::Integer(1)].to_vec());
-        let _ = add_record(1, 1, page, record, &db);
+        let _ = add_record(1, 1, page, record, &conn);
         let record = Record::new([OwnedValue::Integer(2)].to_vec());
-        let _ = add_record(2, 2, page, record, &db);
+        let _ = add_record(2, 2, page, record, &conn);
 
         drop_cell(page, 1, usable_space).unwrap();
         drop_cell(page, 1, usable_space).unwrap();
@@ -3774,38 +3787,40 @@ mod tests {
     #[test]
     pub fn test_fuzz_victim_1() {
         let db = get_database();
+        let conn = db.connect().unwrap();
 
         let page = get_page(2);
         let page = page.get_contents();
         let usable_space = 4096;
 
         let record = Record::new([OwnedValue::Integer(0)].to_vec());
-        let _ = add_record(0, 0, page, record, &db);
+        let _ = add_record(0, 0, page, record, &conn);
 
         let record = Record::new([OwnedValue::Integer(0)].to_vec());
-        let _ = add_record(0, 0, page, record, &db);
+        let _ = add_record(0, 0, page, record, &conn);
         drop_cell(page, 0, usable_space).unwrap();
 
         defragment_page(page, usable_space);
 
         let record = Record::new([OwnedValue::Integer(0)].to_vec());
-        let _ = add_record(0, 1, page, record, &db);
+        let _ = add_record(0, 1, page, record, &conn);
 
         drop_cell(page, 0, usable_space).unwrap();
 
         let record = Record::new([OwnedValue::Integer(0)].to_vec());
-        let _ = add_record(0, 1, page, record, &db);
+        let _ = add_record(0, 1, page, record, &conn);
     }
 
     #[test]
     pub fn test_fuzz_victim_2() {
         let db = get_database();
+        let conn = db.connect().unwrap();
 
         let page = get_page(2);
         let usable_space = 4096;
         let insert = |pos, page| {
             let record = Record::new([OwnedValue::Integer(0)].to_vec());
-            let _ = add_record(0, pos, page, record, &db);
+            let _ = add_record(0, pos, page, record, &conn);
         };
         let drop = |pos, page| {
             drop_cell(page, pos, usable_space).unwrap();
@@ -3838,12 +3853,13 @@ mod tests {
     #[test]
     pub fn test_fuzz_victim_3() {
         let db = get_database();
+        let conn = db.connect().unwrap();
 
         let page = get_page(2);
         let usable_space = 4096;
         let insert = |pos, page| {
             let record = Record::new([OwnedValue::Integer(0)].to_vec());
-            let _ = add_record(0, pos, page, record, &db);
+            let _ = add_record(0, pos, page, record, &conn);
         };
         let drop = |pos, page| {
             drop_cell(page, pos, usable_space).unwrap();
@@ -3859,7 +3875,7 @@ mod tests {
             &mut payload,
             &record,
             4096,
-            db.pager.clone(),
+        conn.pager.clone(),
         );
         insert(0, page.get_contents());
         defragment(page.get_contents());
@@ -3916,6 +3932,7 @@ mod tests {
     #[test]
     pub fn test_big_payload_compute_free() {
         let db = get_database();
+        let conn = db.connect().unwrap();
 
         let page = get_page(2);
         let usable_space = 4096;
@@ -3927,7 +3944,7 @@ mod tests {
             &mut payload,
             &record,
             4096,
-            db.pager.clone(),
+            conn.pager.clone(),
         );
         insert_into_cell(page.get_contents(), &payload, 0, 4096).unwrap();
         let free = compute_free_space(page.get_contents(), usable_space);

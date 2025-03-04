@@ -35,16 +35,16 @@ use crate::{bail_parse_error, Connection, LimboError, Result, SymbolTable};
 use insert::translate_insert;
 use limbo_sqlite3_parser::ast::{self, fmt::ToTokens, CreateVirtualTable, Delete, Insert};
 use select::translate_select;
-use std::cell::RefCell;
 use std::fmt::Display;
 use std::rc::{Rc, Weak};
+use std::sync::{Arc, Mutex};
 use transaction::{translate_tx_begin, translate_tx_commit};
 
 /// Translate SQL statement into bytecode program.
 pub fn translate(
     schema: &Schema,
     stmt: ast::Stmt,
-    database_header: Rc<RefCell<DatabaseHeader>>,
+    database_header: Arc<Mutex<DatabaseHeader>>,
     pager: Rc<Pager>,
     connection: Weak<Connection>,
     syms: &SymbolTable,

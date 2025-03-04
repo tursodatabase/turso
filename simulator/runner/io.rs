@@ -1,4 +1,4 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, sync::Arc};
 
 use limbo_core::{OpenFlags, PlatformIO, Result, IO};
 use rand::{RngCore, SeedableRng};
@@ -9,11 +9,14 @@ use crate::runner::file::SimulatorFile;
 pub(crate) struct SimulatorIO {
     pub(crate) inner: Box<dyn IO>,
     pub(crate) fault: RefCell<bool>,
-    pub(crate) files: RefCell<Vec<Rc<SimulatorFile>>>,
+    pub(crate) files: RefCell<Vec<Arc<SimulatorFile>>>,
     pub(crate) rng: RefCell<ChaCha8Rng>,
     pub(crate) nr_run_once_faults: RefCell<usize>,
     pub(crate) page_size: usize,
 }
+
+unsafe impl Send for SimulatorIO {}
+unsafe impl Sync for SimulatorIO {}
 
 impl SimulatorIO {
     pub(crate) fn new(seed: u64, page_size: usize) -> Result<Self> {
@@ -55,9 +58,9 @@ impl IO for SimulatorIO {
         path: &str,
         flags: OpenFlags,
         _direct: bool,
-    ) -> Result<Rc<dyn limbo_core::File>> {
+    ) -> Result<Arc<dyn limbo_core::File>> {
         let inner = self.inner.open_file(path, flags, false)?;
-        let file = Rc::new(SimulatorFile {
+        let file = Arc::new(SimulatorFile {
             inner,
             fault: RefCell::new(false),
             nr_pread_faults: RefCell::new(0),

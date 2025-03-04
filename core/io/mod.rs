@@ -1,6 +1,7 @@
 use crate::Result;
 use cfg_block::cfg_block;
 use std::fmt;
+use std::sync::Arc;
 use std::{
     cell::{Ref, RefCell, RefMut},
     fmt::Debug,
@@ -9,11 +10,11 @@ use std::{
     rc::Rc,
 };
 
-pub trait File {
+pub trait File: Send + Sync {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
     fn pread(&self, pos: usize, c: Completion) -> Result<()>;
-    fn pwrite(&self, pos: usize, buffer: Rc<RefCell<Buffer>>, c: Completion) -> Result<()>;
+    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<Buffer>>, c: Completion) -> Result<()>;
     fn sync(&self, c: Completion) -> Result<()>;
     fn size(&self) -> Result<u64>;
 }
@@ -23,8 +24,8 @@ pub enum OpenFlags {
     Create,
 }
 
-pub trait IO {
-    fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Rc<dyn File>>;
+pub trait IO: Send + Sync {
+    fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>>;
 
     fn run_once(&self) -> Result<()>;
 
@@ -33,7 +34,7 @@ pub trait IO {
     fn get_current_time(&self) -> String;
 }
 
-pub type Complete = dyn Fn(Rc<RefCell<Buffer>>);
+pub type Complete = dyn Fn(Arc<RefCell<Buffer>>);
 pub type WriteComplete = dyn Fn(i32);
 pub type SyncComplete = dyn Fn(i32);
 
@@ -44,7 +45,7 @@ pub enum Completion {
 }
 
 pub struct ReadCompletion {
-    pub buf: Rc<RefCell<Buffer>>,
+    pub buf: Arc<RefCell<Buffer>>,
     pub complete: Box<Complete>,
 }
 
@@ -76,7 +77,7 @@ pub struct SyncCompletion {
 }
 
 impl ReadCompletion {
-    pub fn new(buf: Rc<RefCell<Buffer>>, complete: Box<Complete>) -> Self {
+    pub fn new(buf: Arc<RefCell<Buffer>>, complete: Box<Complete>) -> Self {
         Self { buf, complete }
     }
 

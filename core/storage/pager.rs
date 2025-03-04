@@ -9,7 +9,7 @@ use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::trace;
 
 use super::page_cache::{DumbLruPageCache, PageCacheKey};
@@ -152,7 +152,7 @@ struct FlushInfo {
 /// transaction management.
 pub struct Pager {
     /// Source of the database pages.
-    pub page_io: Rc<dyn DatabaseStorage>,
+    pub page_io: Arc<dyn DatabaseStorage>,
     /// The write-ahead log (WAL) for the database.
     wal: Rc<RefCell<dyn Wal>>,
     /// A page cache for the database.
@@ -162,7 +162,7 @@ pub struct Pager {
     /// I/O interface for input/output operations.
     pub io: Arc<dyn crate::io::IO>,
     dirty_pages: Rc<RefCell<HashSet<usize>>>,
-    pub db_header: Rc<RefCell<DatabaseHeader>>,
+    pub db_header: Arc<Mutex<DatabaseHeader>>,
 
     flush_info: RefCell<FlushInfo>,
     checkpoint_state: RefCell<CheckpointState>,
@@ -172,14 +172,14 @@ pub struct Pager {
 
 impl Pager {
     /// Begins opening a database by reading the database header.
-    pub fn begin_open(page_io: Rc<dyn DatabaseStorage>) -> Result<Rc<RefCell<DatabaseHeader>>> {
+    pub fn begin_open(page_io: Arc<dyn DatabaseStorage>) -> Result<Arc<Mutex<DatabaseHeader>>> {
         sqlite3_ondisk::begin_read_database_header(page_io)
     }
 
     /// Completes opening a database by initializing the Pager with the database header.
     pub fn finish_open(
-        db_header_ref: Rc<RefCell<DatabaseHeader>>,
-        page_io: Rc<dyn DatabaseStorage>,
+        db_header_ref: Arc<Mutex<DatabaseHeader>>,
+        page_io: Arc<dyn DatabaseStorage>,
         wal: Rc<RefCell<dyn Wal>>,
         io: Arc<dyn crate::io::IO>,
         page_cache: Arc<RwLock<DumbLruPageCache>>,
@@ -318,7 +318,7 @@ impl Pager {
             let state = self.flush_info.borrow().state.clone();
             match state {
                 FlushState::Start => {
-                    let db_size = self.db_header.borrow().database_size;
+                    let db_size = self.db_header.lock().unwrap().database_size;
                     for page_id in self.dirty_pages.borrow().iter() {
                         let mut cache = self.page_cache.write();
                         let page_key =
@@ -465,7 +465,7 @@ impl Pager {
         const TRUNK_PAGE_NEXT_PAGE_OFFSET: usize = 0; // Offset to next trunk page pointer
         const TRUNK_PAGE_LEAF_COUNT_OFFSET: usize = 4; // Offset to leaf count
 
-        if page_id < 2 || page_id > self.db_header.borrow().database_size as usize {
+        if page_id < 2 || page_id > self.db_header.lock().unwrap().database_size as usize {
             return Err(LimboError::Corrupt(format!(
                 "Invalid page number {} for free operation",
                 page_id
@@ -480,9 +480,9 @@ impl Pager {
             None => self.read_page(page_id)?,
         };
 
-        self.db_header.borrow_mut().freelist_pages += 1;
+        self.db_header.lock().unwrap().freelist_pages += 1;
 
-        let trunk_page_id = self.db_header.borrow().freelist_trunk_page;
+        let trunk_page_id = self.db_header.lock().unwrap().freelist_trunk_page;
 
         if trunk_page_id != 0 {
             // Add as leaf to current trunk
@@ -520,7 +520,7 @@ impl Pager {
         // Zero leaf count
         contents.write_u32(TRUNK_PAGE_LEAF_COUNT_OFFSET, 0);
         // Update page 1 to point to new trunk
-        self.db_header.borrow_mut().freelist_trunk_page = page_id as u32;
+        self.db_header.lock().unwrap().freelist_trunk_page = page_id as u32;
         // Clear flags
         page.clear_uptodate();
         page.clear_loaded();
@@ -534,7 +534,7 @@ impl Pager {
     #[allow(clippy::readonly_write_lock)]
     pub fn allocate_page(&self) -> Result<PageRef> {
         let header = &self.db_header;
-        let mut header = RefCell::borrow_mut(header);
+        let mut header = header.lock().unwrap();
         header.database_size += 1;
         {
             // update database size
@@ -576,7 +576,7 @@ impl Pager {
     }
 
     pub fn usable_size(&self) -> usize {
-        let db_header = self.db_header.borrow();
+        let db_header = self.db_header.lock().unwrap();
         (db_header.page_size - db_header.reserved_space as u16) as usize
     }
 }
@@ -589,7 +589,7 @@ pub fn allocate_page(page_id: usize, buffer_pool: &Rc<BufferPool>, offset: usize
         let drop_fn = Rc::new(move |buf| {
             bp.put(buf);
         });
-        let buffer = Rc::new(RefCell::new(Buffer::new(buffer, drop_fn)));
+        let buffer = Arc::new(RefCell::new(Buffer::new(buffer, drop_fn)));
         page.set_loaded();
         page.get().contents = Some(PageContent {
             offset,

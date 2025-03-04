@@ -9,15 +9,20 @@ use rustix::{
     fs::{self, FlockOperation, OFlags, OpenOptionsExt},
     io::Errno,
 };
-use std::io::{ErrorKind, Read, Seek, Write};
-use std::rc::Rc;
-use tracing::{debug, trace};
 use std::{
     cell::{RefCell, UnsafeCell},
     mem::MaybeUninit,
 };
+use std::{
+    io::{ErrorKind, Read, Seek, Write},
+    sync::Arc,
+};
+use tracing::{debug, trace};
 
 struct OwnedCallbacks(UnsafeCell<Callbacks>);
+// We assume we locking on IO level is done by user.
+unsafe impl Send for OwnedCallbacks {}
+unsafe impl Sync for OwnedCallbacks {}
 struct BorrowedCallbacks<'io>(UnsafeCell<&'io mut Callbacks>);
 
 impl OwnedCallbacks {
@@ -163,6 +168,9 @@ pub struct UnixIO {
     callbacks: OwnedCallbacks,
 }
 
+unsafe impl Send for UnixIO {}
+unsafe impl Sync for UnixIO {}
+
 impl UnixIO {
     #[cfg(feature = "fs")]
     pub fn new() -> Result<Self> {
@@ -176,7 +184,7 @@ impl UnixIO {
 }
 
 impl IO for UnixIO {
-    fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Rc<dyn File>> {
+    fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         trace!("open_file(path = {})", path);
         let file = std::fs::File::options()
             .read(true)
@@ -185,8 +193,8 @@ impl IO for UnixIO {
             .create(matches!(flags, OpenFlags::Create))
             .open(path)?;
 
-        let unix_file = Rc::new(UnixFile {
-            file: Rc::new(RefCell::new(file)),
+        let unix_file = Arc::new(UnixFile {
+            file: Arc::new(RefCell::new(file)),
             poller: BorrowedPollHandler(self.poller.as_mut().into()),
             callbacks: BorrowedCallbacks(self.callbacks.as_mut().into()),
         });
@@ -245,20 +253,22 @@ impl IO for UnixIO {
 }
 
 enum CompletionCallback {
-    Read(Rc<RefCell<std::fs::File>>, Completion, usize),
+    Read(Arc<RefCell<std::fs::File>>, Completion, usize),
     Write(
-        Rc<RefCell<std::fs::File>>,
+        Arc<RefCell<std::fs::File>>,
         Completion,
-        Rc<RefCell<crate::Buffer>>,
+        Arc<RefCell<crate::Buffer>>,
         usize,
     ),
 }
 
 pub struct UnixFile<'io> {
-    file: Rc<RefCell<std::fs::File>>,
+    file: Arc<RefCell<std::fs::File>>,
     poller: BorrowedPollHandler<'io>,
     callbacks: BorrowedCallbacks<'io>,
 }
+unsafe impl Send for UnixFile<'_> {}
+unsafe impl Sync for UnixFile<'_> {}
 
 impl File for UnixFile<'_> {
     fn lock_file(&self, exclusive: bool) -> Result<()> {
@@ -332,7 +342,7 @@ impl File for UnixFile<'_> {
         }
     }
 
-    fn pwrite(&self, pos: usize, buffer: Rc<RefCell<crate::Buffer>>, c: Completion) -> Result<()> {
+    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<crate::Buffer>>, c: Completion) -> Result<()> {
         let file = self.file.borrow();
         let result = {
             let buf = buffer.borrow();

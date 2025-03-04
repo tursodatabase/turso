@@ -22,15 +22,13 @@ pub unsafe extern "C" fn db_open(path: *const c_char) -> *mut c_void {
     let path = unsafe { std::ffi::CStr::from_ptr(path) };
     let path = path.to_str().unwrap();
     let io: Arc<dyn IO> = match path {
-        p if p.contains(":memory:") => {
-            Arc::new(limbo_core::MemoryIO::new().expect("Failed to create IO"))
-        }
+        p if p.contains(":memory:") => Arc::new(limbo_core::MemoryIO::new()),
         _ => Arc::new(limbo_core::PlatformIO::new().expect("Failed to create IO")),
     };
     let db = Database::open_file(io.clone(), path);
     match db {
         Ok(db) => {
-            let conn = db.connect();
+            let conn = db.connect().unwrap();
             LimboConn::new(conn, io).to_ptr()
         }
         Err(e) => {
