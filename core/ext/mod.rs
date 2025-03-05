@@ -1,4 +1,6 @@
-use crate::{function::ExternalFunc, json::json_vtab, Connection};
+#[cfg(feature = "json")]
+use crate::json::json_vtab;
+use crate::{function::ExternalFunc, Connection};
 use limbo_ext::{
     ExtensionApi, InitAggFunction, ResultCode, ScalarFunction, VTabKind, VTabModuleImpl,
 };

@@ -2,7 +2,7 @@ use std::{fmt::Display, iter::successors};
 
 use limbo_ext::{register_extension, ResultCode, Value};
 
-use crate::OwnedValue;
+use crate::{types::Text, OwnedValue};
 
 use super::{
     get_json_value, json_path,
@@ -49,9 +49,11 @@ fn filter(args: &[Value]) -> Result<(Val, InPlaceJsonPath), ResultCode> {
     }
     // TODO: For now we are not dealing with JSONB
 
-    // TODO include json subtype when it is merged to main
     let json_val = match args[0].value_type() {
         limbo_ext::ValueType::Null => OwnedValue::Null,
+        limbo_ext::ValueType::Text if args[0].is_json() => {
+            OwnedValue::Text(Text::json(args[0].to_text().unwrap()))
+        }
         limbo_ext::ValueType::Text => OwnedValue::from_text(args[0].to_text().unwrap()),
         limbo_ext::ValueType::Integer => OwnedValue::Integer(args[0].to_integer().unwrap()),
         limbo_ext::ValueType::Float => OwnedValue::Float(args[0].to_float().unwrap()),
@@ -180,7 +182,7 @@ impl ValExt for Val {
             Val::String(v) => Value::from_text(v.clone()),
             Val::Removed => unreachable!(),
             // TODO: as we cannot declare a subtype for JSON I have to return text here
-            v => Value::from_text(v.to_string()),
+            v => Value::from_json(v.to_string()),
         }
     }
 
@@ -225,7 +227,7 @@ impl Display for Val {
                     if comma {
                         write!(f, ",")?;
                     }
-                    write!(f, "{}", val.to_string())?; // Call format recursively
+                    write!(f, "{}", val)?; // Call format for val recursively
                     comma = true;
                 }
                 write!(f, "]")
@@ -237,7 +239,7 @@ impl Display for Val {
                     if comma {
                         write!(f, ",")?;
                     }
-                    write!(f, "\"{}\":{}", key, val.to_string())?; // Call format recursively
+                    write!(f, "\"{}\":{}", key, val)?; // Call format for val recursively
                     comma = true;
                 }
                 write!(f, "}}")

@@ -198,9 +198,6 @@ impl VTabCursor for JsonTreeCursor {
             self.parent_stack.push(self.id - 1);
             self.push_diff_in_paths();
             self.new_container = false;
-            if matches!(self.val_stack.last(), Some(Val::Object(_))) {
-                self.id += 1;
-            }
         }
 
         loop {
