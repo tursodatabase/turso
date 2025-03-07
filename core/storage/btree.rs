@@ -4114,13 +4114,13 @@ mod tests {
         let usable_space = 4096;
 
         let record1 = Record::new([OwnedValue::Integer(1_i64)].to_vec());
-        let payload1 = add_record(1, 0, page, record1, &db);
+        let payload1 = add_record(1, 0, page, record1, &db.connect().unwrap());
         assert_eq!(page.cell_count(), 1);
 
         // insert second record (overflows)
         let large_text = "A".repeat(8192); // exceeds 1 page
         let record2 = Record::new([OwnedValue::build_text(&large_text)].to_vec());
-        let payload2 = add_record(2, 1, page, record2, &db);
+        let payload2 = add_record(2, 1, page, record2, &db.connect().unwrap());
         assert_eq!(page.cell_count(), 2);
 
         // 'fill_cell_payload' (called by add_record) writes to memory but doesn't modify the
