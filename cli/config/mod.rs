@@ -6,8 +6,9 @@ use palette::LimboColor;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::PathBuf;
+use tracing::error;
 
-#[derive(Deserialize, Clone, Default, JsonSchema)]
+#[derive(Debug, Deserialize, Clone, Default, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub table: TableConfig,
@@ -24,7 +25,9 @@ impl Config {
     }
 
     pub fn from_config_str(config: &str) -> Self {
-        toml::from_str(config).unwrap_or_default()
+        toml::from_str(config)
+            .inspect_err(|err| error!("{}", err))
+            .unwrap_or_default()
     }
 
     fn read_config_str(path: PathBuf) -> Option<String> {
@@ -36,7 +39,7 @@ impl Config {
     }
 }
 
-#[derive(Deserialize, Clone, JsonSchema)]
+#[derive(Debug, Deserialize, Clone, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct TableConfig {
     pub header_color: LimboColor,
@@ -46,7 +49,7 @@ pub struct TableConfig {
 impl Default for TableConfig {
     fn default() -> Self {
         Self {
-            header_color: LimboColor(Color::Green),
+            header_color: LimboColor(Color::White),
             column_colors: vec![
                 LimboColor(Color::Fixed(1)),
                 LimboColor(Color::Fixed(2)),
@@ -56,7 +59,7 @@ impl Default for TableConfig {
     }
 }
 
-#[derive(Deserialize, Clone, JsonSchema)]
+#[derive(Debug, Deserialize, Clone, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct SyntaxHighlightConfig {
     pub theme_name: String,

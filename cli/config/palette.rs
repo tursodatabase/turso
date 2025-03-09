@@ -164,7 +164,7 @@ impl<'de> Deserialize<'de> for LimboColor {
             }
         }
 
-        deserializer.deserialize_newtype_struct("LimboColor", LimboColorVisitor)
+        deserializer.deserialize_str(LimboColorVisitor)
     }
 }
 
@@ -204,9 +204,9 @@ impl LimboColor {
             Color::Green => comfy_table::Color::Green,
             Color::Yellow => comfy_table::Color::Yellow,
             Color::Blue => comfy_table::Color::Blue,
-            Color::Magenta => comfy_table::Color::Magenta,
+            Color::Magenta | Color::Purple => comfy_table::Color::Magenta,
             Color::Cyan => comfy_table::Color::Cyan,
-            Color::White => comfy_table::Color::White,
+            Color::White | Color::Default => comfy_table::Color::White,
             Color::Fixed(1) => comfy_table::Color::DarkRed,
             Color::Fixed(2) => comfy_table::Color::DarkGreen,
             Color::Fixed(3) => comfy_table::Color::DarkYellow,
@@ -215,16 +215,14 @@ impl LimboColor {
             Color::Fixed(6) => comfy_table::Color::DarkCyan,
             Color::Fixed(7) => comfy_table::Color::Grey,
             Color::Fixed(8) => comfy_table::Color::DarkGrey,
-            Color::Purple => comfy_table::Color::AnsiValue(35),
-            Color::DarkGray => comfy_table::Color::AnsiValue(90),
-            Color::LightRed => comfy_table::Color::AnsiValue(91),
-            Color::LightGreen => comfy_table::Color::AnsiValue(92),
-            Color::LightYellow => comfy_table::Color::AnsiValue(93),
-            Color::LightBlue => comfy_table::Color::AnsiValue(94),
-            Color::LightMagenta | Color::LightPurple => comfy_table::Color::AnsiValue(95),
-            Color::LightCyan => comfy_table::Color::AnsiValue(96),
-            Color::LightGray => comfy_table::Color::AnsiValue(97),
-            Color::Default => comfy_table::Color::AnsiValue(39),
+            Color::DarkGray => comfy_table::Color::AnsiValue(241),
+            Color::LightRed => comfy_table::Color::AnsiValue(09),
+            Color::LightGreen => comfy_table::Color::AnsiValue(10),
+            Color::LightYellow => comfy_table::Color::AnsiValue(11),
+            Color::LightBlue => comfy_table::Color::AnsiValue(12),
+            Color::LightMagenta | Color::LightPurple => comfy_table::Color::AnsiValue(13),
+            Color::LightCyan => comfy_table::Color::AnsiValue(14),
+            Color::LightGray => comfy_table::Color::AnsiValue(15),
             Color::Rgb(r, g, b) => comfy_table::Color::Rgb { r, g, b },
             Color::Fixed(ansi_color_num) => comfy_table::Color::AnsiValue(ansi_color_num),
         }

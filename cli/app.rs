@@ -722,9 +722,11 @@ impl<'a> Limbo<'a> {
                         let header = (0..rows.num_columns())
                             .map(|i| {
                                 let name = rows.get_column_name(i);
-                                Cell::new(name)
-                                    .add_attribute(Attribute::Bold)
-                                    .fg(Color::White)
+                                Cell::new(name).add_attribute(Attribute::Bold).fg(self
+                                    .config
+                                    .table
+                                    .header_color
+                                    .into_comfy_table_color())
                             })
                             .collect::<Vec<_>>();
                         table.set_header(header);
@@ -758,9 +760,12 @@ impl<'a> Limbo<'a> {
                                         }
                                     };
                                     row.add_cell(
-                                        Cell::new(content)
-                                            .set_alignment(alignment)
-                                            .fg(COLORS[idx % COLORS.len()]),
+                                        Cell::new(content).set_alignment(alignment).fg(self
+                                            .config
+                                            .table
+                                            .column_colors
+                                            [idx % self.config.table.column_colors.len()]
+                                        .into_comfy_table_color()),
                                     );
                                 }
                                 table.add_row(row);
