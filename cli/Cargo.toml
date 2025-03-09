@@ -42,9 +42,11 @@ tracing = "0.1.41"
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 toml = {version = "0.8.20", features = ["preserve_order"]}
-schemars = {version = "0.8.22", features = ["preserve_order"]}
+schemars = {version = "0.8.22", features = ["preserve_order", "indexmap2"]}
 serde = {version = "1.0.218", features = ["derive"]}
 indexmap = "2.7.1"
+validator = {version = "0.20.0", features = ["derive"]}
+strsim = "0.11.1"
 
 
 [features]
