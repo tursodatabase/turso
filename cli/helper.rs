@@ -13,6 +13,13 @@ use std::sync::Arc;
 use std::{ffi::OsString, path::PathBuf, str::FromStr as _};
 
 use crate::commands::CommandParser;
+use syntect::dumps::from_uncompressed_data;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::{Scope, SyntaxSet};
+use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
+
+use crate::config::{SyntaxHighlightConfig, CONFIG_DIR};
 
 macro_rules! try_result {
     ($expr:expr, $err:expr) => {
@@ -27,14 +34,37 @@ macro_rules! try_result {
 pub struct LimboHelper {
     #[rustyline(Completer)]
     completer: SqlCompleter<CommandParser>,
+    syntax_set: SyntaxSet,
+    theme_set: ThemeSet,
+    syntax_config: SyntaxHighlightConfig,
     #[rustyline(Hinter)]
     hinter: HistoryHinter,
 }
 
 impl LimboHelper {
-    pub fn new(conn: Rc<Connection>, io: Arc<dyn limbo_core::IO>) -> Self {
+    pub fn new(
+        conn: Rc<Connection>,
+        io: Arc<dyn limbo_core::IO>,
+        syntax_config: SyntaxHighlightConfig,
+    ) -> Self {
+        // Load only predefined syntax
+        let ps = from_uncompressed_data(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/SQL_syntax_set_dump.packdump"
+        )))
+        .unwrap();
+        let mut ts = ThemeSet::load_defaults();
+        let theme_dir = CONFIG_DIR.join("themes");
+        if theme_dir.exists() {
+            if let Err(err) = ts.add_from_folder(theme_dir) {
+                tracing::error!("{err}");
+            }
+        }
         LimboHelper {
             completer: SqlCompleter::new(conn, io),
+            syntax_set: ps,
+            theme_set: ts,
+            syntax_config,
             hinter: HistoryHinter::new(),
         }
     }
@@ -43,9 +73,30 @@ impl LimboHelper {
 impl Highlighter for LimboHelper {
     fn highlight<'l>(&self, line: &'l str, pos: usize) -> std::borrow::Cow<'l, str> {
         let _ = pos;
-        let style = Style::new().fg(Color::White); // Standard shell text color
-        let styled_str = style.paint(line);
-        std::borrow::Cow::Owned(styled_str.to_string())
+        // TODO use lifetimes to store highlight lines
+        let syntax = self
+            .syntax_set
+            .find_syntax_by_scope(Scope::new("source.sql").unwrap())
+            .unwrap();
+        let theme = self
+            .theme_set
+            .themes
+            .get(&self.syntax_config.theme_name)
+            .unwrap_or(&self.theme_set.themes["base16-ocean.dark"]);
+        let mut h = HighlightLines::new(syntax, theme);
+        let ranges = {
+            let mut ret_ranges = Vec::new();
+            for new_line in LinesWithEndings::from(line) {
+                let ranges: Vec<(syntect::highlighting::Style, &str)> =
+                    h.highlight_line(new_line, &self.syntax_set).unwrap();
+                ret_ranges.extend(ranges);
+            }
+            ret_ranges
+        };
+        let mut ret_line = as_24_bit_terminal_escaped(&ranges[..], false);
+        // Push this escape sequence to reset terminal color modes at the end of the string
+        ret_line.push_str("\x1b[0m");
+        std::borrow::Cow::Owned(ret_line)
     }
 
     fn highlight_prompt<'b, 's: 'b, 'p: 'b>(

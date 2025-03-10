@@ -1,13 +1,17 @@
 mod palette;
 
 use crate::utils::read_file;
+use crate::HOME_DIR;
 use nu_ansi_term::Color;
+use once_cell::sync::Lazy;
 use palette::LimboColor;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer};
 use std::fmt::Debug;
 use std::path::PathBuf;
 use validator::Validate;
+
+pub static CONFIG_DIR: Lazy<PathBuf> = Lazy::new(|| HOME_DIR.join(".config/limbo"));
 
 fn ok_or_default<'de, T, D>(deserializer: D) -> Result<T, D::Error>
 where
@@ -50,9 +54,7 @@ impl Config {
         }
     }
 
-    // TODO maybe actually print the error to the user in startup
     pub fn from_config_str(config: &str) -> Self {
-        // Self::load(config)
         toml::from_str(config)
             .inspect_err(|err| tracing::error!("{}", err))
             .unwrap_or_default()

@@ -47,6 +47,7 @@ serde = {version = "1.0.218", features = ["derive"]}
 indexmap = "2.7.1"
 validator = {version = "0.20.0", features = ["derive"]}
 toml_edit = {version = "0.22.24", features = ["serde"]}
+once_cell = "1.20.3"
 
 
 [features]
