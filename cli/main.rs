@@ -21,7 +21,9 @@ fn main() -> anyhow::Result<()> {
     
     let home = dirs::home_dir().expect("Could not determine home directory");
     let config_file = home.join(".config/limbo.toml");
+
     let config = config::Config::from_config_file(config_file);
+    tracing::info!("Configuration: {:?}", config);
 
     let mut app = app::Limbo::new(&mut rl, config)?;
 

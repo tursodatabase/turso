@@ -10,13 +10,14 @@ use nu_ansi_term::Color;
 use schemars::JsonSchema;
 use serde::{
     de::{self, Visitor},
-    Deserialize, Deserializer,
+    Deserialize, Deserializer, Serialize,
 };
 use tracing::{debug, trace, warn};
+use validator::Validate;
 
 pub type Palette = IndexMap<String, String>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct LimboColor(pub Color);
 
 impl TryFrom<&str> for LimboColor {
@@ -193,6 +194,12 @@ impl Deref for LimboColor {
 impl DerefMut for LimboColor {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+impl Validate for LimboColor {
+    fn validate(&self) -> Result<(), validator::ValidationErrors> {
+        Ok(())
     }
 }
 

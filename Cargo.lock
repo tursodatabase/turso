@@ -1778,6 +1778,7 @@ dependencies = [
  "strsim",
  "syntect",
  "toml",
+ "toml_edit",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
