@@ -62,7 +62,7 @@ limbo-wasm:
 	cargo build --package limbo-wasm --target wasm32-wasi
 .PHONY: limbo-wasm
 
-test: limbo test-compat test-vector test-sqlite3 test-shell test-extensions
+test: limbo test-compat test-vector test-sqlite3 test-shell test-extensions test-memory
 .PHONY: test
 
 test-extensions: limbo
@@ -93,6 +93,10 @@ test-sqlite3: limbo-c
 test-json:
 	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/json.test
 .PHONY: test-json
+
+test-memory:
+	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/cli_tests/memory.py
+.PHONY: test-memory
 
 clickbench:
 	./perf/clickbench/benchmark.sh
