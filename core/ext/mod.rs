@@ -238,7 +238,7 @@ impl Connection {
 
     pub fn build_limbo_ext(self: &Rc<Connection>) -> ExtensionApi {
         ExtensionApi {
-            ctx: self as *const _ as *mut c_void,
+            ctx: Rc::into_raw(self.clone()) as *const _ as *mut c_void,
             conn: std::ptr::null_mut(),
             register_scalar_function,
             register_aggregate_function,
