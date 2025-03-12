@@ -1,3 +1,15 @@
+#[cfg(target_family = "unix")]
+mod mmap_rustix;
+
+#[cfg(target_family = "unix")]
+use mmap_rustix::MemoryPages;
+
+#[cfg(not(target_family = "unix"))]
+mod btree;
+
+#[cfg(not(target_family = "unix"))]
+use btree::MemoryPages;
+
 use super::{Buffer, Completion, File, OpenFlags, IO};
 use crate::Result;
 
