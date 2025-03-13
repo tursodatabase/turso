@@ -46,6 +46,7 @@ pub unsafe extern "C" fn prepare_stmt(ctx: *mut ExtConn, sql: *const c_char) -> 
                 stmt_step,
                 stmt_get_row,
                 stmt_get_column_names,
+                stmt_free_current_row,
                 stmt_close,
             ))) as *const Stmt
         }
@@ -116,6 +117,21 @@ pub unsafe extern "C" fn stmt_get_row(ctx: *mut Stmt) {
         stmt.current_row_len = values.len() as i32;
     } else {
         stmt.current_row_len = 0;
+    }
+}
+
+pub unsafe extern "C" fn stmt_free_current_row(ctx: *mut Stmt) {
+    let Ok(stmt) = Stmt::from_ptr(ctx) else {
+        return;
+    };
+    if !stmt.current_row.is_null() {
+        let values: &mut [Value] =
+            std::slice::from_raw_parts_mut(stmt.current_row, stmt.current_row_len as usize);
+        for value in values.iter_mut() {
+            let owned_value = std::mem::take(value);
+            owned_value.__free_internal_type();
+        }
+        let _ = Box::from_raw(stmt.current_row);
     }
 }
 

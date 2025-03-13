@@ -13,6 +13,7 @@ pub type BindArgsFn =
     unsafe extern "C" fn(ctx: *mut Stmt, idx: i32, arg: *const Value) -> ResultCode;
 pub type StmtStepFn = unsafe extern "C" fn(ctx: *mut Stmt) -> ResultCode;
 pub type StmtGetRowValuesFn = unsafe extern "C" fn(ctx: *mut Stmt);
+pub type FreeCurrentRowFn = unsafe extern "C" fn(ctx: *mut Stmt);
 pub type CloseConnectionFn = unsafe extern "C" fn(ctx: *mut c_void);
 pub type CloseStmtFn = unsafe extern "C" fn(ctx: *mut Stmt);
 
@@ -54,47 +55,43 @@ impl Conn {
 /// Prepared statement for querying a core database connection
 /// public API with wrapper methods for extensions
 #[derive(Debug)]
-pub struct Statement<'conn> {
-    __ctx: *const Stmt,
-    _marker: std::marker::PhantomData<&'conn Connection>,
+pub struct Statement {
+    _ctx: *const Stmt,
 }
 
 /// The Database connection that opened the vtab:
 /// Public API to expose methods for extensions
 #[derive(Debug)]
 pub struct Connection {
-    __ctx: *const Conn,
+    _ctx: *const Conn,
 }
 
 impl Connection {
     pub fn new(ctx: *const Conn) -> Self {
-        Connection { __ctx: ctx }
+        Connection { _ctx: ctx }
     }
 
     pub fn prepare(self: &Rc<Self>, sql: &str) -> ExtResult<Statement> {
-        let stmt = unsafe { (*self.__ctx).prepare_stmt(sql) };
+        let stmt = unsafe { (*self._ctx).prepare_stmt(sql) };
         if stmt.is_null() {
             return Err(ResultCode::Error);
         }
-        Ok(Statement {
-            __ctx: stmt,
-            _marker: std::marker::PhantomData,
-        })
+        Ok(Statement { _ctx: stmt })
     }
 
     pub fn close(self) {
-        unsafe { ((*self.__ctx)._close)(self.__ctx as *mut c_void) };
+        unsafe { ((*self._ctx)._close)(self._ctx as *mut c_void) };
     }
 }
 
-impl Statement<'_> {
+impl Statement {
     /// Bind a value to a parameter in the prepared statement
     ///```ignore
     /// let stmt = conn.prepare_stmt("select * from users where name = ?");
     /// stmt.bind(1, Value::from_text("test".into()));
     pub fn bind(&self, idx: NonZeroUsize, arg: &Value) {
         let arg = arg as *const Value;
-        unsafe { (*self.__ctx).bind_args(idx, arg) }
+        unsafe { (*self._ctx).bind_args(idx, arg) }
     }
 
     /// Execute the statement and return the next row
@@ -105,7 +102,7 @@ impl Statement<'_> {
     /// }
     /// ```
     pub fn step(&self) -> ResultCode {
-        unsafe { (*self.__ctx).step() }
+        unsafe { (*self._ctx).step() }
     }
 
     // Get the current row values
@@ -115,17 +112,17 @@ impl Statement<'_> {
     ///    println!("row: {:?}", row);
     ///```
     pub fn get_row(&mut self) -> &[Value] {
-        unsafe { (*self.__ctx).get_row() }
+        unsafe { (*self._ctx).get_row() }
     }
 
     /// Get the result column names for the prepared statement
     pub fn get_column_names(&self) -> Vec<String> {
-        unsafe { (*self.__ctx).get_column_names() }
+        unsafe { (*self._ctx).get_column_names() }
     }
 
     /// Close the statement
     pub fn close(&self) {
-        unsafe { (*self.__ctx).close() }
+        unsafe { (*self._ctx).close() }
     }
 }
 
@@ -141,6 +138,7 @@ pub struct Stmt {
     pub _step: StmtStepFn,
     pub _get_row_values: StmtGetRowValuesFn,
     pub _get_column_names: GetColumnNamesFn,
+    pub _free_current_row: FreeCurrentRowFn,
     pub _close: CloseStmtFn,
     pub current_row: *mut Value,
     pub current_row_len: i32,
@@ -155,6 +153,7 @@ impl Stmt {
         step: StmtStepFn,
         rows: StmtGetRowValuesFn,
         names: GetColumnNamesFn,
+        free_row: FreeCurrentRowFn,
         close: CloseStmtFn,
     ) -> Self {
         Stmt {
@@ -164,6 +163,7 @@ impl Stmt {
             _step: step,
             _get_row_values: rows,
             _get_column_names: names,
+            _free_current_row: free_row,
             _close: close,
             current_row: std::ptr::null_mut(),
             current_row_len: -1,
@@ -204,13 +204,8 @@ impl Stmt {
         if self.current_row_len <= 0 {
             return;
         }
-        let values: &mut [Value] =
-            std::slice::from_raw_parts_mut(self.current_row, self.current_row_len as usize);
-        for value in values.iter_mut() {
-            let owned_value = std::mem::take(value);
-            owned_value.__free_internal_type();
-        }
-        let _ = Box::from_raw(self.current_row);
+        // free from the core side so we don't have to expose `__free_internal_type`
+        (self._free_current_row)(self.to_ptr() as *mut Stmt);
         self.current_row = std::ptr::null_mut();
         self.current_row_len = -1;
     }

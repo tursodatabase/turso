@@ -179,6 +179,7 @@ impl TextValue {
         })
     }
 
+    #[cfg(feature = "core_only")]
     fn free(self) {
         if !self.text.is_null() {
             let _ = unsafe { Box::from_raw(self.text as *mut u8) };
@@ -246,6 +247,7 @@ impl Blob {
         unsafe { std::slice::from_raw_parts(self.data, self.size as usize) }
     }
 
+    #[cfg(feature = "core_only")]
     fn free(self) {
         if !self.data.is_null() {
             let _ = unsafe { Box::from_raw(self.data as *mut u8) };
@@ -462,6 +464,7 @@ impl Value {
     /// consumes the value while freeing the underlying memory with null check.
     /// however this does assume that the type was properly constructed with
     /// the appropriate value_type and value.
+    #[cfg(feature = "core_only")]
     pub unsafe fn __free_internal_type(self) {
         match self.value_type {
             ValueType::Text => {

@@ -114,6 +114,7 @@ pub struct VTabModuleImpl {
     pub rowid: VtabRowIDFn,
 }
 
+#[cfg(feature = "core_only")]
 impl VTabModuleImpl {
     pub fn init_schema(&self, args: Vec<Value>) -> ExtResult<String> {
         let schema = unsafe { (self.create_schema)(args.as_ptr(), args.len() as i32) };

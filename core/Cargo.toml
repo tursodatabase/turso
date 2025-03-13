@@ -40,7 +40,7 @@ mimalloc = { version = "0.1", default-features = false }
 libloading = "0.8.6"
 
 [dependencies]
-limbo_ext = { workspace = true }
+limbo_ext = { workspace = true, features = ["core_only"] }
 cfg_block = "0.1.1"
 fallible-iterator = "0.3.0"
 hex = "0.4.3"
