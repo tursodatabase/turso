@@ -531,6 +531,43 @@ def test_sqlite_vfs_compat():
     sqlite.quit()
 
 
+# very stupid testing virtual table simply queries a (core/non-virtual) table
+# 'test' and returns the first 2 rows as a pair N times, just to demonstrate it can
+# TODO: figure out a good example extension or better way to test the functionality
+def test_vtab_connection():
+    limbo = TestLimboShell()
+    # create a regular table called test
+    limbo.execute_dot("CREATE TABLE test (value TEXT);")
+
+    # insert 2 rows
+    limbo.execute_dot("INSERT INTO test VALUES ('FIRST');")
+    limbo.execute_dot("INSERT INTO test VALUES ('SECOND');")
+
+    ext_path = "./target/debug/liblimbo_kv"
+    limbo.run_test_fn(
+        "CREATE VIRTUAL TABLE t using test;",
+        lambda res: "Virtual table module not found: test" in res,
+    )
+    limbo.execute_dot(f".load {ext_path}")
+    limbo.run_test_fn("CREATE VIRTUAL TABLE t using test;", null)
+    limbo.run_test_fn(
+        "SELECT * from t LIMIT 1;",
+        lambda res: "FIRST|SECOND" in res,
+        "querying another table in the connection from a vtab module",
+    )
+    limbo.run_test_fn(
+        "SELECT * from t LIMIT 2;",
+        lambda res: "FIRST|SECOND\nFIRST|SECOND" in res,
+        "querying another table in the connection from a vtab module",
+    )
+    limbo.run_test_fn(
+        "SELECT * from t LIMIT 3;",
+        lambda res: "FIRST|SECOND\nFIRST|SECOND\nFIRST|SECOND" in res,
+        "querying another table in the connection from a vtab module",
+    )
+    limbo.quit()
+
+
 def cleanup():
     if os.path.exists("testing/vfs.db"):
         os.remove("testing/vfs.db")
@@ -549,6 +586,7 @@ if __name__ == "__main__":
         test_ipaddr()
         test_vfs()
         test_sqlite_vfs_compat()
+        test_vtab_connection()
     except Exception as e:
         print(f"Test FAILED: {e}")
         cleanup()
