@@ -104,7 +104,7 @@ impl File for VfsFileImpl {
         let result = unsafe {
             (vfs.write)(
                 self.file,
-                buf.as_slice().as_ptr() as *mut u8,
+                buffer.buf_mut().as_ptr() as *mut u8,
                 count,
                 pos as i64,
             )

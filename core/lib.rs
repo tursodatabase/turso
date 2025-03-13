@@ -35,7 +35,9 @@ use crate::storage::wal::CheckpointResult;
 pub use io::UnixIO;
 #[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring"))]
 pub use io::UringIO;
-pub use io::{Buffer, Completion, File, MemoryIO, OpenFlags, PlatformIO, WriteCompletion, IO};
+pub use io::{
+    Buffer, Completion, File, IOBuff, MemoryIO, OpenFlags, PlatformIO, WriteCompletion, IO,
+};
 use limbo_ext::{ResultCode, VTabKind, VTabModuleImpl};
 use limbo_sqlite3_parser::{ast, ast::Cmd, lexer::sql::Parser};
 use parking_lot::RwLock;
