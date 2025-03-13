@@ -148,9 +148,9 @@ INSERT INTO t VALUES (zeroblob(1024 - 1), zeroblob(1024 - 2), zeroblob(1024 - 3)
     def run_test_fn(
         self, sql: str, validate: Callable[[str], bool], desc: str = ""
     ) -> None:
-        actual = self.shell.execute(sql)
         if desc:
             print(f"Testing: {desc}")
+        actual = self.shell.execute(sql)
         assert validate(actual), f"Test failed\nSQL: {sql}\nActual:\n{repr(actual)}"
 
     def execute_dot(self, dot_command: str) -> None:
