@@ -543,7 +543,7 @@ def test_vtab_connection():
     limbo.execute_dot("INSERT INTO test VALUES ('SECOND');")
     limbo.execute_dot("INSERT INTO test VALUES ('THIRD');")
     limbo.execute_dot("INSERT INTO test VALUES ('FOURTH');")
-    ext_path = "./target/debug/liblimbo_kv"
+    ext_path = "./target/debug/liblimbo_ext_tests"
     limbo.run_test_fn(
         "CREATE VIRTUAL TABLE t using test;",
         lambda res: "Virtual table module not found: test" in res,
