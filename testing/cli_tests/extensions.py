@@ -539,10 +539,10 @@ def test_vtab_connection():
     # create a regular table called test
     limbo.execute_dot("CREATE TABLE test (value TEXT);")
 
-    # insert 2 rows
     limbo.execute_dot("INSERT INTO test VALUES ('FIRST');")
     limbo.execute_dot("INSERT INTO test VALUES ('SECOND');")
-
+    limbo.execute_dot("INSERT INTO test VALUES ('THIRD');")
+    limbo.execute_dot("INSERT INTO test VALUES ('FOURTH');")
     ext_path = "./target/debug/liblimbo_kv"
     limbo.run_test_fn(
         "CREATE VIRTUAL TABLE t using test;",
@@ -557,12 +557,13 @@ def test_vtab_connection():
     )
     limbo.run_test_fn(
         "SELECT * from t LIMIT 2;",
-        lambda res: "FIRST|SECOND\nFIRST|SECOND" in res,
+        lambda res: "FIRST|SECOND|THIRD|FOURTH\nFIRST|SECOND|THIRD|FOURTH" in res,
         "querying another table in the connection from a vtab module",
     )
     limbo.run_test_fn(
         "SELECT * from t LIMIT 3;",
-        lambda res: "FIRST|SECOND\nFIRST|SECOND\nFIRST|SECOND" in res,
+        lambda res: "FIRST|SECOND|THIRD|FOURTH\nFIRST|SECOND|THIRD|FOURTH\nFIRST|SECOND|THIRD|FOURTH"
+        in res,
         "querying another table in the connection from a vtab module",
     )
     limbo.quit()

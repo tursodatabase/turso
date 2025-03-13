@@ -85,7 +85,7 @@ pub unsafe extern "C" fn stmt_step(stmt: *mut Stmt) -> ResultCode {
     loop {
         match stmt_ctx.step() {
             Ok(StepResult::Row) => return ResultCode::Row,
-            Ok(StepResult::Done) => return ResultCode::OK,
+            Ok(StepResult::Done) => return ResultCode::EOF,
             Ok(StepResult::IO) => {
                 let _ = conn.pager.io.run_once();
                 continue;

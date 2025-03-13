@@ -1,4 +1,4 @@
-use crate::{ExtResult, ResultCode, Value};
+use crate::{types::StepResult, ExtResult, ResultCode, Value};
 use std::{
     ffi::{c_char, c_void, CStr, CString},
     num::NonZeroUsize,
@@ -96,18 +96,18 @@ impl Statement {
 
     /// Execute the statement and return the next row
     ///```ignore
-    /// while stmt.step() == ResultCode::Row {
+    /// while stmt.step() == StepResult::Row {
     ///     let row = stmt.get_row();
     ///     println!("row: {:?}", row);
     /// }
     /// ```
-    pub fn step(&self) -> ResultCode {
+    pub fn step(&self) -> StepResult {
         unsafe { (*self._ctx).step() }
     }
 
     // Get the current row values
     ///```ignore
-    /// while stmt.step() == ResultCode::Row {
+    /// while stmt.step() == StepResult::Row {
     ///    let row = stmt.get_row();
     ///    println!("row: {:?}", row);
     ///```
@@ -191,8 +191,14 @@ impl Stmt {
         unsafe { (self._bind_args_fn)(self.to_ptr() as *mut Stmt, idx.get() as i32, arg) };
     }
 
-    fn step(&self) -> ResultCode {
-        unsafe { (self._step)(self.to_ptr() as *mut Stmt) }
+    fn step(&self) -> StepResult {
+        match unsafe { (self._step)(self.to_ptr() as *mut Stmt) } {
+            ResultCode::Row => StepResult::Row,
+            ResultCode::EOF => StepResult::Done,
+            ResultCode::Busy => StepResult::Busy,
+            ResultCode::Interrupt => StepResult::Interrupt,
+            _ => StepResult::Error,
+        }
     }
 
     /// # Safety

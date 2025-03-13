@@ -9,7 +9,7 @@ use std::{
     os::raw::{c_char, c_void},
     rc::Rc,
 };
-pub use types::{ResultCode, Value, ValueType};
+pub use types::{ResultCode, StepResult, Value, ValueType};
 #[cfg(not(target_family = "wasm"))]
 pub use vfs_modules::{RegisterVfsFn, VfsExtension, VfsFile, VfsFileImpl, VfsImpl};
 pub use vtab_connect::{Conn, ConnectFn, Connection, Stmt};

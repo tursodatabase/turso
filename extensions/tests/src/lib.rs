@@ -1,7 +1,7 @@
 use lazy_static::lazy_static;
 use limbo_ext::{
-    register_extension, scalar, Connection, ExtResult, ResultCode, VTabCursor, VTabKind,
-    VTabModule, VTabModuleDerive, Value,
+    register_extension, scalar, Connection, ExtResult, ResultCode, StepResult, VTabCursor,
+    VTabKind, VTabModule, VTabModuleDerive, Value,
 };
 #[cfg(not(target_family = "wasm"))]
 use limbo_ext::{VfsDerive, VfsExtension, VfsFile};
@@ -239,7 +239,7 @@ impl VTabModule for TestVTab {
     type Error = String;
 
     fn create_schema(_args: &[Value]) -> String {
-        "CREATE TABLE x (key TEXT PRIMARY KEY, value TEXT);".to_string()
+        "CREATE TABLE x (first TEXT, second TEXT, third TEXT, fourth TEXT);".to_string()
     }
 
     fn open(&self, conn: Option<Rc<Connection>>) -> Result<Self::VCursor, Self::Error> {
@@ -256,7 +256,7 @@ impl VTabModule for TestVTab {
         }
         if let Some(conn) = &cursor.conn {
             if let Ok(mut stmt) = conn.prepare("SELECT * FROM test;") {
-                while stmt.step() == ResultCode::Row {
+                while stmt.step() == StepResult::Row {
                     let row = stmt.get_row();
                     for val in row {
                         cursor.values.push(val.to_text().unwrap().to_string());
@@ -264,7 +264,6 @@ impl VTabModule for TestVTab {
                 }
             }
         }
-        cursor.pos += 1;
         ResultCode::OK
     }
 
