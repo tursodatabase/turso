@@ -90,7 +90,7 @@ class LimboShell:
 
     def quit(self) -> None:
         self._write_to_pipe(".quit")
-        sleep(0.3)
+        sleep(0.1)
         self.pipe.terminate()
         self.pipe.kill()
 

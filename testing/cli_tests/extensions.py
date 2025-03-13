@@ -549,7 +549,9 @@ def test_vtab_connection():
         lambda res: "Virtual table module not found: test" in res,
     )
     limbo.execute_dot(f".load {ext_path}")
+    # create virtual table using the demo module
     limbo.run_test_fn("CREATE VIRTUAL TABLE t using test;", null)
+    # virtual table extension should query and return the first 2 rows of the test table
     limbo.run_test_fn(
         "SELECT * from t LIMIT 1;",
         lambda res: "FIRST|SECOND" in res,
