@@ -210,6 +210,54 @@ impl OwnedValue {
         unsafe { v.__free_internal_type() };
         res
     }
+
+    /// creates a new OwnedValue without owning the underlying ffi value
+    ///
+    /// # Safety
+    /// This derefs a raw ptr after a null check, the caller still owns the ffi value
+    pub unsafe fn from_ffi_ptr(v: *const ExtValue) -> Result<Self> {
+        let v = unsafe { &*v };
+        match v.value_type() {
+            ExtValueType::Null => Ok(OwnedValue::Null),
+            ExtValueType::Integer => {
+                let Some(int) = v.to_integer() else {
+                    return Ok(OwnedValue::Null);
+                };
+                Ok(OwnedValue::Integer(int))
+            }
+            ExtValueType::Float => {
+                let Some(float) = v.to_float() else {
+                    return Ok(OwnedValue::Null);
+                };
+                Ok(OwnedValue::Float(float))
+            }
+            ExtValueType::Text => {
+                let Some(text) = v.to_text() else {
+                    return Ok(OwnedValue::Null);
+                };
+                if v.is_json() {
+                    Ok(OwnedValue::Text(Text::json(text)))
+                } else {
+                    Ok(OwnedValue::build_text(text))
+                }
+            }
+            ExtValueType::Blob => {
+                let Some(blob) = v.to_blob() else {
+                    return Ok(OwnedValue::Null);
+                };
+                Ok(OwnedValue::Blob(Rc::new(blob)))
+            }
+            ExtValueType::Error => {
+                let Some(err) = v.to_error_details() else {
+                    return Ok(OwnedValue::Null);
+                };
+                match err {
+                    (_, Some(msg)) => Err(LimboError::ExtensionError(msg)),
+                    (code, None) => Err(LimboError::ExtensionError(code.to_string())),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

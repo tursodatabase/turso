@@ -9,10 +9,11 @@ use limbo_ext::{
     ExtensionApi, InitAggFunction, ResultCode, ScalarFunction, VTabKind, VTabModuleImpl, VfsImpl,
 };
 pub use limbo_ext::{FinalizeFunction, StepFunction, Value as ExtValue, ValueType as ExtValueType};
+use std::sync::{Mutex, OnceLock};
 use std::{
     ffi::{c_char, c_void, CStr, CString},
     rc::Rc,
-    sync::{Arc, Mutex, OnceLock},
+    sync::Arc,
 };
 type ExternAggFunc = (InitAggFunction, StepFunction, FinalizeFunction);
 type Vfs = (String, Arc<VfsMod>);

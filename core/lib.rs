@@ -198,6 +198,8 @@ impl Database {
             syms: RefCell::new(SymbolTable::new()),
             total_changes: Cell::new(0),
         });
+        conn.register_builtins()
+            .map_err(LimboError::ExtensionError)?;
         Ok(conn)
     }
 

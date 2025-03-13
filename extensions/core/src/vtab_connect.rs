@@ -1,6 +1,7 @@
 use crate::{ExtResult, ResultCode, Value};
 use std::{
     ffi::{c_char, c_void, CStr, CString},
+    num::NonZeroUsize,
     rc::Rc,
 };
 
@@ -8,7 +9,8 @@ pub type ConnectFn = unsafe extern "C" fn(ctx: *mut c_void) -> *mut Conn;
 pub type PrepareStmtFn = unsafe extern "C" fn(api: *mut Conn, sql: *const c_char) -> *const Stmt;
 pub type GetColumnNamesFn =
     unsafe extern "C" fn(ctx: *mut Stmt, count: *mut i32) -> *mut *mut c_char;
-pub type BindArgsFn = unsafe extern "C" fn(ctx: *mut Stmt, idx: i32, arg: Value) -> ResultCode;
+pub type BindArgsFn =
+    unsafe extern "C" fn(ctx: *mut Stmt, idx: i32, arg: *const Value) -> ResultCode;
 pub type StmtStepFn = unsafe extern "C" fn(ctx: *mut Stmt) -> ResultCode;
 pub type StmtGetRowValuesFn = unsafe extern "C" fn(ctx: *mut Stmt);
 pub type CloseConnectionFn = unsafe extern "C" fn(ctx: *mut c_void);
@@ -90,7 +92,8 @@ impl Statement<'_> {
     ///```ignore
     /// let stmt = conn.prepare_stmt("select * from users where name = ?");
     /// stmt.bind(1, Value::from_text("test".into()));
-    pub fn bind(&self, idx: i32, arg: Value) {
+    pub fn bind(&self, idx: NonZeroUsize, arg: &Value) {
+        let arg = arg as *const Value;
         unsafe { (*self.__ctx).bind_args(idx, arg) }
     }
 
@@ -184,8 +187,8 @@ impl Stmt {
         self
     }
 
-    fn bind_args(&self, idx: i32, arg: Value) {
-        unsafe { (self._bind_args_fn)(self.to_ptr() as *mut Stmt, idx, arg) };
+    fn bind_args(&self, idx: NonZeroUsize, arg: *const Value) {
+        unsafe { (self._bind_args_fn)(self.to_ptr() as *mut Stmt, idx.get() as i32, arg) };
     }
 
     fn step(&self) -> ResultCode {
