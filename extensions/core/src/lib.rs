@@ -1,4 +1,5 @@
 mod types;
+#[cfg(not(target_family = "wasm"))]
 mod vfs_modules;
 mod vtab_connect;
 #[cfg(not(target_family = "wasm"))]
@@ -23,8 +24,10 @@ pub struct ExtensionApi {
     pub register_scalar_function: RegisterScalarFn,
     pub register_aggregate_function: RegisterAggFn,
     pub register_module: RegisterModuleFn,
-    pub register_vfs: RegisterVfsFn,
     pub connect: ConnectFn,
+    #[cfg(not(target_family = "wasm"))]
+    pub register_vfs: RegisterVfsFn,
+    #[cfg(not(target_family = "wasm"))]
     pub builtin_vfs: *mut *const VfsImpl,
     pub builtin_vfs_count: i32,
 }
@@ -36,6 +39,7 @@ pub struct ExtensionApiRef {
     pub api: *const ExtensionApi,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl ExtensionApi {
     /// Since we want the option to build in extensions at compile time as well,
     /// we add a slice of VfsImpls to the extension API, and this is called with any

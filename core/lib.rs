@@ -527,8 +527,8 @@ impl Connection {
             {
                 all_vfs.push("io_uring".to_string());
             }
+            all_vfs.extend(crate::list_vfs_modules());
         }
-        all_vfs.extend(list_vfs_modules());
         all_vfs
     }
 }

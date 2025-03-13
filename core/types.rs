@@ -236,7 +236,7 @@ impl OwnedValue {
                     return Ok(OwnedValue::Null);
                 };
                 if v.is_json() {
-                    Ok(OwnedValue::Text(Text::json(text)))
+                    Ok(OwnedValue::Text(Text::json(text.to_string())))
                 } else {
                     Ok(OwnedValue::build_text(text))
                 }
