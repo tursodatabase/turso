@@ -495,7 +495,9 @@ impl LazyRecord {
     fn parse_if_needed(&self) -> Result<()> {
         if self.parsed_record.get().is_none() {
             if let Some(data) = &self.raw_data {
-                let _ = self.parsed_record.set(read_record(data)?);
+                self.parsed_record
+                    .set(read_record(data)?)
+                    .expect("can't set parsed_record twice");
             } else {
                 unreachable!();
             }
