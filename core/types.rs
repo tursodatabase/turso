@@ -4,10 +4,11 @@ use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
 use crate::pseudo::PseudoCursor;
 use crate::storage::btree::BTreeCursor;
-use crate::storage::sqlite3_ondisk::write_varint;
+use crate::storage::sqlite3_ondisk::{read_record, write_varint};
 use crate::vdbe::sorter::Sorter;
 use crate::vdbe::VTabOpaqueCursor;
 use crate::Result;
+use std::cell::OnceCell;
 use std::fmt::Display;
 use std::rc::Rc;
 
@@ -485,6 +486,72 @@ impl Record {
 
     pub fn len(&self) -> usize {
         self.values.len()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LazyRecord {
+    parsed_record: OnceCell<Record>,
+    raw_data: Option<Vec<u8>>,
+}
+
+impl LazyRecord {
+    fn parse_if_needed(&self) -> Result<()> {
+        if self.parsed_record.get().is_none() {
+            if let Some(data) = &self.raw_data {
+                let _ = self.parsed_record.set(read_record(data)?);
+            } else {
+                unreachable!();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn get<'a, T: FromValue<'a> + 'a>(&'a self, idx: usize) -> Result<T> {
+        self.parse_if_needed()?;
+        self.parsed_record.get().unwrap().get::<T>(idx)
+    }
+
+    pub fn last_value(&self) -> Result<Option<&OwnedValue>> {
+        self.parse_if_needed()?;
+        Ok(self.parsed_record.get().unwrap().last_value())
+    }
+
+    pub fn get_values(&self) -> Result<&Vec<OwnedValue>> {
+        self.parse_if_needed()?;
+        Ok(&self.parsed_record.get().unwrap().get_values())
+    }
+
+    pub fn get_value(&self, idx: usize) -> Result<&OwnedValue> {
+        self.parse_if_needed()?;
+        Ok(&self.parsed_record.get().unwrap().get_value(idx))
+    }
+
+    pub fn len(&self) -> Result<usize> {
+        self.parse_if_needed()?;
+        Ok(self.parsed_record.get().unwrap().len())
+    }
+
+    pub fn new(record: Record) -> Self {
+        let parsed_cell = OnceCell::new();
+        let _ = parsed_cell.set(record);
+        Self {
+            parsed_record: parsed_cell,
+            raw_data: None,
+        }
+    }
+
+    pub fn new_lazy(data: Vec<u8>) -> Self {
+        Self {
+            parsed_record: OnceCell::new(),
+            raw_data: Some(data),
+        }
+    }
+
+    pub fn serialize(&self, buf: &mut Vec<u8>) -> Result<()> {
+        self.parse_if_needed()?;
+        self.parsed_record.get().unwrap().serialize(buf);
+        Ok(())
     }
 }
 
