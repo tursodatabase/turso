@@ -468,10 +468,6 @@ impl Record {
         T::from_value(value)
     }
 
-    pub fn count(&self) -> usize {
-        self.values.len()
-    }
-
     pub fn last_value(&self) -> Option<&OwnedValue> {
         self.values.last()
     }
