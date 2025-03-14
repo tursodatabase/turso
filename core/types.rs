@@ -507,11 +507,6 @@ impl LazyRecord {
         Ok(())
     }
 
-    pub fn get<'a, T: FromValue<'a> + 'a>(&'a self, idx: usize) -> Result<T> {
-        self.parse_if_needed()?;
-        self.parsed_record.get().unwrap().get::<T>(idx)
-    }
-
     pub fn last_value(&self) -> Result<Option<&OwnedValue>> {
         self.parse_if_needed()?;
         Ok(self.parsed_record.get().unwrap().last_value())
@@ -546,12 +541,6 @@ impl LazyRecord {
             parsed_record: OnceCell::new(),
             raw_data: Some(data),
         }
-    }
-
-    pub fn serialize(&self, buf: &mut Vec<u8>) -> Result<()> {
-        self.parse_if_needed()?;
-        self.parsed_record.get().unwrap().serialize(buf);
-        Ok(())
     }
 }
 
