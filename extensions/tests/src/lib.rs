@@ -1,6 +1,6 @@
 use lazy_static::lazy_static;
 use limbo_ext::{
-    register_extension, scalar, ExtResult, ResultCode, VTabCursor, VTabKind, VTabModule,
+    register_extension, scalar, BufferRef, ExtResult, ResultCode, VTabCursor, VTabKind, VTabModule,
     VTabModuleDerive, Value,
 };
 #[cfg(not(target_family = "wasm"))]
@@ -190,31 +190,43 @@ impl VfsExtension for TestFS {
 
 #[cfg(not(target_family = "wasm"))]
 impl VfsFile for TestFile {
-    fn read(&mut self, buf: &mut [u8], count: usize, offset: i64) -> ExtResult<i32> {
-        log::debug!("reading file with testing VFS: bytes: {count} offset: {offset}");
+    fn read<F: FnOnce(i32)>(&mut self, mut buf: BufferRef, offset: i64, cb: F) {
+        log::debug!("reading file with testing VFS: offset: {offset}");
         if self.file.seek(SeekFrom::Start(offset as u64)).is_err() {
-            return Err(ResultCode::Error);
+            cb(-1);
+            return;
         }
-        self.file
-            .read(&mut buf[..count])
+        let res = self
+            .file
+            .read(&mut buf)
             .map_err(|_| ResultCode::Error)
             .map(|n| n as i32)
+            .unwrap_or(-1);
+        cb(res);
     }
 
-    fn write(&mut self, buf: &[u8], count: usize, offset: i64) -> ExtResult<i32> {
-        log::debug!("writing to file with testing VFS: bytes: {count} offset: {offset}");
+    fn write<F: FnOnce(i32)>(&mut self, buf: BufferRef, offset: i64, cb: F) {
+        log::debug!(
+            "writing to file with testing VFS: {} offset: {offset}",
+            buf.len()
+        );
         if self.file.seek(SeekFrom::Start(offset as u64)).is_err() {
-            return Err(ResultCode::Error);
+            cb(-1);
+            return;
         }
-        self.file
-            .write(&buf[..count])
+        let res = self
+            .file
+            .write(&buf)
             .map_err(|_| ResultCode::Error)
             .map(|n| n as i32)
+            .unwrap_or(-1);
+        cb(res);
     }
 
-    fn sync(&self) -> ExtResult<()> {
+    fn sync<F: FnOnce()>(&self, cb: F) {
         log::debug!("syncing file with testing VFS");
-        self.file.sync_all().map_err(|_| ResultCode::Error)
+        let _ = self.file.sync_all();
+        cb();
     }
 
     fn size(&self) -> i64 {

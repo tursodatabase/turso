@@ -481,17 +481,32 @@ def test_vfs():
     limbo.execute_dot(".open testing/vfs.db testvfs")
     limbo.execute_dot("create table test (id integer primary key, value float);")
     limbo.execute_dot("create table vfs (id integer primary key, value blob);")
-    for i in range(50):
-        limbo.execute_dot("insert into test (value) values (randomblob(32*1024));")
+    for i in range(500):
+        limbo.execute_dot("insert into test (value) values (randomblob(1024));")
         limbo.execute_dot(f"insert into vfs (value) values ({i});")
     limbo.run_test_fn(
         "SELECT count(*) FROM test;",
-        lambda res: res == "50",
+        lambda res: res == "500",
         "Tested large write to testfs",
     )
     limbo.run_test_fn(
         "SELECT count(*) FROM vfs;",
-        lambda res: res == "50",
+        lambda res: res == "500",
+        "Tested large write to testfs",
+    )
+    limbo.execute_dot("create table test2 (id integer primary key, value float);")
+    limbo.execute_dot("create table vfs2 (id integer primary key, value blob);")
+    for i in range(500):
+        limbo.execute_dot("insert into test2 (value) values (randomblob(1024));")
+        limbo.execute_dot(f"insert into vfs2 (value) values ({i});")
+    limbo.run_test_fn(
+        "SELECT count(*) FROM test2;",
+        lambda res: res == "500",
+        "Tested large write to testfs",
+    )
+    limbo.run_test_fn(
+        "SELECT count(*) FROM vfs2;",
+        lambda res: res == "500",
         "Tested large write to testfs",
     )
     print("Tested large write to testfs")
@@ -520,13 +535,20 @@ def test_sqlite_vfs_compat():
     )
     sqlite.run_test_fn(
         "SELECT count(*) FROM test;",
-        lambda res: res == "50",
-        "Tested large write to testfs",
+        lambda res: res == "500",
     )
     sqlite.run_test_fn(
         "SELECT count(*) FROM vfs;",
-        lambda res: res == "50",
-        "Tested large write to testfs",
+        lambda res: res == "500",
+    )
+    sqlite.run_test_fn(
+        "SELECT count(*) FROM test2;",
+        lambda res: res == "500",
+        "Tested sqlite vfs compat",
+    )
+    sqlite.run_test_fn(
+        "SELECT count(*) FROM vfs2;",
+        lambda res: res == "500",
     )
     sqlite.quit()
 

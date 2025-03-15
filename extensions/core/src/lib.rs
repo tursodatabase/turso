@@ -8,7 +8,7 @@ use std::{
     os::raw::{c_char, c_void},
 };
 pub use types::{ResultCode, Value, ValueType};
-pub use vfs_modules::{RegisterVfsFn, VfsFileImpl, VfsImpl};
+pub use vfs_modules::{BufferRef, CallbackFn, IOCallback, RegisterVfsFn, VfsFileImpl, VfsImpl};
 #[cfg(not(target_family = "wasm"))]
 pub use vfs_modules::{VfsExtension, VfsFile};
 

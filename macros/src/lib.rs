@@ -729,17 +729,19 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
         }
 
         #[no_mangle]
-        pub unsafe extern "C" fn #read_fn_name(file_ptr: *const ::std::ffi::c_void, buf: *mut u8, count: usize, offset: i64) -> i32 {
+        pub unsafe extern "C" fn #read_fn_name(file_ptr: *const ::std::ffi::c_void, buf: *mut u8, count: usize, offset: i64, cb: ::limbo_ext::IOCallback) {
             if file_ptr.is_null() {
-                return -1;
+                (cb.callback)(-1, cb.ctx);
+                return;
             }
+            let callback = move | res: i32| {
+                (cb.callback)(res, cb.ctx);
+            };
             let vfs_file: &mut ::limbo_ext::VfsFileImpl = &mut *(file_ptr as *mut ::limbo_ext::VfsFileImpl);
+            let buff_ref = ::limbo_ext::BufferRef::new(buf, count);
             let file: &mut <#struct_name as ::limbo_ext::VfsExtension>::File =
                 &mut *(vfs_file.file as *mut <#struct_name as ::limbo_ext::VfsExtension>::File);
-            match <#struct_name as ::limbo_ext::VfsExtension>::File::read(file, ::std::slice::from_raw_parts_mut(buf, count), count, offset) {
-                Ok(n) => n,
-                Err(_) => -1,
-            }
+            <#struct_name as ::limbo_ext::VfsExtension>::File::read(file, buff_ref, offset, callback);
         }
 
         #[no_mangle]
@@ -755,17 +757,19 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
         }
 
         #[no_mangle]
-        pub unsafe extern "C" fn #write_fn_name(file_ptr: *const ::std::ffi::c_void, buf: *const u8, count: usize, offset: i64) -> i32 {
+        pub unsafe extern "C" fn #write_fn_name(file_ptr: *const ::std::ffi::c_void, buf: *const u8, count: usize, offset: i64, cb: ::limbo_ext::IOCallback) {
             if file_ptr.is_null() {
-                return -1;
+                (cb.callback)(-1, cb.ctx);
+                return;
             }
+            let callback = move | res: i32| {
+                (cb.callback)(res, cb.ctx);
+            };
             let vfs_file: &mut ::limbo_ext::VfsFileImpl = &mut *(file_ptr as *mut ::limbo_ext::VfsFileImpl);
+            let buff_ref = ::limbo_ext::BufferRef::new(buf as *mut u8, count);
             let file: &mut <#struct_name as ::limbo_ext::VfsExtension>::File =
                 &mut *(vfs_file.file as *mut <#struct_name as ::limbo_ext::VfsExtension>::File);
-            match <#struct_name as ::limbo_ext::VfsExtension>::File::write(file, ::std::slice::from_raw_parts(buf, count), count, offset) {
-                Ok(n) => n,
-                Err(_) => -1,
-            }
+            <#struct_name as ::limbo_ext::VfsExtension>::File::write(file, buff_ref, offset, callback);
         }
 
         #[no_mangle]
@@ -797,17 +801,18 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
         }
 
         #[no_mangle]
-        pub unsafe extern "C" fn #sync_fn_name(file_ptr: *const ::std::ffi::c_void) -> i32 {
+        pub unsafe extern "C" fn #sync_fn_name(file_ptr: *const ::std::ffi::c_void, cb: ::limbo_ext::IOCallback) {
             if file_ptr.is_null() {
-                return -1;
+                (cb.callback)(-1, cb.ctx);
+                return;
             }
+            let callback = move || {
+                (cb.callback)(0, cb.ctx);
+            };
             let vfs_file: &mut ::limbo_ext::VfsFileImpl = &mut *(file_ptr as *mut ::limbo_ext::VfsFileImpl);
             let file: &mut <#struct_name as ::limbo_ext::VfsExtension>::File =
                 &mut *(vfs_file.file as *mut <#struct_name as ::limbo_ext::VfsExtension>::File);
-            if <#struct_name as ::limbo_ext::VfsExtension>::File::sync(file).is_err() {
-                return -1;
-            }
-            0
+            <#struct_name as ::limbo_ext::VfsExtension>::File::sync(file, callback);
         }
 
         #[no_mangle]
