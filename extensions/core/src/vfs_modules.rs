@@ -40,7 +40,7 @@ pub trait VfsFile: Send + Sync {
     fn size(&self) -> i64;
 }
 
-/// a safe wrapper around the raw `*mut u8` buffer for extensions.
+/// a wrapper around the raw `*mut u8` buffer for extensions.
 /// core owns the underlying ManuallyDrop<Pin<Buffer>>
 #[derive(Debug)]
 #[repr(C)]
@@ -117,20 +117,19 @@ pub struct IOCallback {
     pub callback: CallbackFn,
     pub ctx: SendPtr,
 }
-
 unsafe impl Send for IOCallback {}
-unsafe impl Sync for IOCallback {}
 
 #[repr(transparent)]
+/// Wrapper type to support creating Box<dyn FnOnce()+Send> obj
+/// that needs to call a C function with an opaque pointer.
 pub struct SendPtr(*mut c_void);
+unsafe impl Send for SendPtr {}
 
 impl SendPtr {
     pub unsafe fn as_ptr(&self) -> *mut c_void {
         self.0
     }
 }
-unsafe impl Send for SendPtr {}
-unsafe impl Sync for SendPtr {}
 
 impl IOCallback {
     pub fn new(cb: CallbackFn, ctx: *mut c_void) -> Self {

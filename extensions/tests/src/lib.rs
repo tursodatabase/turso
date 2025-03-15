@@ -255,9 +255,9 @@ pub struct AsyncTestVFS;
 
 const PAGE_SIZE: usize = 4096;
 
-// This is just essentially the MemoryIO in core/io/memory.rs
-// with tokio + 'sleep's added to simulate async network IO
-// to ensure that we can support something like a S3 backend
+// NOTE: This dummy extension is just the MemoryIO in core/io/memory.rs
+// with tokio and 'sleep's added to simulate slow network IO
+// to ensure that we can truly support async IO with something like a S3 backend
 #[cfg(not(target_family = "wasm"))]
 #[derive(Default, VfsDerive)]
 pub struct AsyncTestVFS;
