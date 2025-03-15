@@ -556,6 +556,41 @@ def test_sqlite_vfs_compat():
     sqlite.quit()
 
 
+def test_async_vfs():
+    limbo = TestLimboShell()
+    ext_path = "target/debug/liblimbo_ext_tests"
+    limbo.run_test_fn(
+        ".vfslist", lambda x: "async_testvfs" not in x, "async_testvfs not loaded"
+    )
+    limbo.execute_dot(f".load {ext_path}")
+    limbo.run_test_fn(
+        ".vfslist", lambda res: "async_testvfs" in res, "async_testvfs extension loaded"
+    )
+    limbo.execute_dot(".open any.db async_testvfs")
+    limbo.execute_dot("create table test (id integer primary key, value text);")
+    limbo.execute_dot("create table vfs (id integer primary key, value int);")
+    for i in range(50):
+        limbo.execute_dot(f"insert into test (value) values ('strvalue{i}');")
+        limbo.execute_dot(f"insert into vfs (value) values ({i});")
+    limbo.run_test_fn(
+        "SELECT count(*) FROM test;",
+        lambda res: res == "50",
+        "Tested large write to testfs",
+    )
+    limbo.run_test_fn(
+        "SELECT count(*) FROM vfs;",
+        lambda res: res == "50",
+        "Tested large write to testfs",
+    )
+    for i in range(50):
+        limbo.run_test_fn(
+            f"SELECT value from test where id = {i + 1};",
+            lambda res: res == f"strvalue{i}",
+        )
+    print("Tested async test vfs extension")
+    limbo.quit()
+
+
 def cleanup():
     if os.path.exists("testing/vfs.db"):
         os.remove("testing/vfs.db")
@@ -574,6 +609,7 @@ if __name__ == "__main__":
         test_ipaddr()
         test_vfs()
         test_sqlite_vfs_compat()
+        test_async_vfs()
     except Exception as e:
         print(f"Test FAILED: {e}")
         cleanup()
