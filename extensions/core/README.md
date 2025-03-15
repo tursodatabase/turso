@@ -339,10 +339,13 @@ impl VfsExtension for ExampleFS {
 }
 
 impl VfsFile for ExampleFile {
-    fn read<F: FnOnce(i32)>(
+    /// A callback is provided to call with the eventual result of the bytes read/written
+    /// when your IO operation has completed.
+    fn read(
         &mut self,
         mut buf: BufferRef,
         offset: i64,
+        callback: Box<dyn FnOnce(i32) + Send>
     ) {
         if file.file.seek(SeekFrom::Start(offset as u64)).is_err() {
             callback(-1);
@@ -355,18 +358,17 @@ impl VfsFile for ExampleFile {
         callback(res);
     }
 
-    fn write<F: FnOnce(i32)>(&mut self, buf: &[u8], offset: i64, callback: F) {
+    fn write(&mut self, buf: &[u8], offset: i64, callback: Box<dyn FnOnce(i32) + Send>) {
         if self.file.seek(SeekFrom::Start(offset as u64)).is_err() {
             callback(-1);
             return;
         }
-        let res = self.file
+       callback(self.file
             .write(&buf)
-            .map(|n| n as i32).unwrap_or(-1);
-        callback(res);
+            .map(|n| n as i32).unwrap_or(-1));
     }
 
-    fn sync<F: FnOnce()>(&self, callback: F) {
+    fn sync(&self, callback: Box<dyn FnOnce() + Send>) {
         self.file.sync_all();
         callback();
     }
