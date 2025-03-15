@@ -729,19 +729,18 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
         }
 
         #[no_mangle]
-        pub unsafe extern "C" fn #read_fn_name(file_ptr: *const ::std::ffi::c_void, buf: *mut u8, count: usize, offset: i64, cb: ::limbo_ext::IOCallback) {
+        pub unsafe extern "C" fn #read_fn_name(file_ptr: *const ::std::ffi::c_void, buf: ::limbo_ext::BufferRef, offset: i64, cb: ::limbo_ext::IOCallback) {
             if file_ptr.is_null() {
-                (cb.callback)(-1, cb.ctx);
+                (cb.callback)(-1, cb.ctx.as_ptr());
                 return;
             }
-            let callback = move | res: i32| {
-                (cb.callback)(res, cb.ctx);
-            };
+            let callback: ::std::boxed::Box<dyn FnOnce(i32) + Send> = ::std::boxed::Box::new(move | res: i32| {
+                (cb.callback)(res, cb.ctx.as_ptr());
+            });
             let vfs_file: &mut ::limbo_ext::VfsFileImpl = &mut *(file_ptr as *mut ::limbo_ext::VfsFileImpl);
-            let buff_ref = ::limbo_ext::BufferRef::new(buf, count);
             let file: &mut <#struct_name as ::limbo_ext::VfsExtension>::File =
                 &mut *(vfs_file.file as *mut <#struct_name as ::limbo_ext::VfsExtension>::File);
-            <#struct_name as ::limbo_ext::VfsExtension>::File::read(file, buff_ref, offset, callback);
+            <#struct_name as ::limbo_ext::VfsExtension>::File::read(file, buf, offset, callback);
         }
 
         #[no_mangle]
@@ -757,19 +756,18 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
         }
 
         #[no_mangle]
-        pub unsafe extern "C" fn #write_fn_name(file_ptr: *const ::std::ffi::c_void, buf: *const u8, count: usize, offset: i64, cb: ::limbo_ext::IOCallback) {
+        pub unsafe extern "C" fn #write_fn_name(file_ptr: *const ::std::ffi::c_void, buf: ::limbo_ext::BufferRef, offset: i64, cb: ::limbo_ext::IOCallback) {
             if file_ptr.is_null() {
-                (cb.callback)(-1, cb.ctx);
+                (cb.callback)(-1, cb.ctx.as_ptr());
                 return;
             }
-            let callback = move | res: i32| {
-                (cb.callback)(res, cb.ctx);
-            };
+            let callback: ::std::boxed::Box<dyn FnOnce(i32) + Send> = ::std::boxed::Box::new(move | res: i32| {
+                (cb.callback)(res, cb.ctx.as_ptr());
+            });
             let vfs_file: &mut ::limbo_ext::VfsFileImpl = &mut *(file_ptr as *mut ::limbo_ext::VfsFileImpl);
-            let buff_ref = ::limbo_ext::BufferRef::new(buf as *mut u8, count);
             let file: &mut <#struct_name as ::limbo_ext::VfsExtension>::File =
                 &mut *(vfs_file.file as *mut <#struct_name as ::limbo_ext::VfsExtension>::File);
-            <#struct_name as ::limbo_ext::VfsExtension>::File::write(file, buff_ref, offset, callback);
+            <#struct_name as ::limbo_ext::VfsExtension>::File::write(file, buf, offset, callback);
         }
 
         #[no_mangle]
@@ -803,12 +801,12 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
         #[no_mangle]
         pub unsafe extern "C" fn #sync_fn_name(file_ptr: *const ::std::ffi::c_void, cb: ::limbo_ext::IOCallback) {
             if file_ptr.is_null() {
-                (cb.callback)(-1, cb.ctx);
+                (cb.callback)(-1, cb.ctx.as_ptr());
                 return;
             }
-            let callback = move || {
-                (cb.callback)(0, cb.ctx);
-            };
+            let callback: ::std::boxed::Box<dyn FnOnce() + Send> = ::std::boxed::Box::new(move || {
+               (cb.callback)(0, cb.ctx.as_ptr());
+            });
             let vfs_file: &mut ::limbo_ext::VfsFileImpl = &mut *(file_ptr as *mut ::limbo_ext::VfsFileImpl);
             let file: &mut <#struct_name as ::limbo_ext::VfsExtension>::File =
                 &mut *(vfs_file.file as *mut <#struct_name as ::limbo_ext::VfsExtension>::File);

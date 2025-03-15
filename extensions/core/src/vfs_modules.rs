@@ -34,20 +34,21 @@ pub trait VfsFile: Send + Sync {
     fn unlock(&self) -> ExtResult<()> {
         Ok(())
     }
-    fn read<F: FnOnce(i32)>(&mut self, buf: BufferRef, offset: i64, cb: F);
-    fn write<F: FnOnce(i32)>(&mut self, buf: BufferRef, offset: i64, cb: F);
-    fn sync<F: FnOnce()>(&self, cb: F);
+    fn read(&mut self, buf: BufferRef, offset: i64, cb: Box<dyn FnOnce(i32) + Send>);
+    fn write(&mut self, buf: BufferRef, offset: i64, cb: Box<dyn FnOnce(i32) + Send>);
+    fn sync(&self, cb: Box<dyn FnOnce() + Send>);
     fn size(&self) -> i64;
 }
 
 /// a safe wrapper around the raw `*mut u8` buffer for extensions.
 /// core owns the underlying ManuallyDrop<Pin<Buffer>>
 #[derive(Debug)]
+#[repr(C)]
 pub struct BufferRef {
-    ptr: NonNull<u8>,
+    _ptr: NonNull<u8>,
     len: usize,
 }
-
+unsafe impl Send for BufferRef {}
 impl BufferRef {
     /// create a new `BufferRef` from a raw pointer
     ///
@@ -56,19 +57,27 @@ impl BufferRef {
     /// should only be called on ptr to core's Buffer type
     pub unsafe fn new(ptr: *mut u8, len: usize) -> Self {
         Self {
-            ptr: NonNull::new(ptr).expect("Received null buffer pointer"),
+            _ptr: NonNull::new(ptr).expect("Received null buffer pointer"),
             len,
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// Get a safe slice reference to the buffer
     pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        unsafe { std::slice::from_raw_parts(self._ptr.as_ptr(), self.len) }
     }
 
     /// Get a safe mutable slice reference to the buffer
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        unsafe { std::slice::from_raw_parts_mut(self._ptr.as_ptr(), self.len) }
     }
 }
 
@@ -106,12 +115,29 @@ pub struct VfsImpl {
 #[repr(C)]
 pub struct IOCallback {
     pub callback: CallbackFn,
-    pub ctx: *mut c_void,
+    pub ctx: SendPtr,
 }
+
+unsafe impl Send for IOCallback {}
+unsafe impl Sync for IOCallback {}
+
+#[repr(transparent)]
+pub struct SendPtr(*mut c_void);
+
+impl SendPtr {
+    pub unsafe fn as_ptr(&self) -> *mut c_void {
+        self.0
+    }
+}
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {}
 
 impl IOCallback {
     pub fn new(cb: CallbackFn, ctx: *mut c_void) -> Self {
-        Self { callback: cb, ctx }
+        Self {
+            callback: cb,
+            ctx: SendPtr(ctx),
+        }
     }
 }
 
@@ -129,21 +155,11 @@ pub type VfsOpen = unsafe extern "C" fn(
 
 pub type VfsClose = unsafe extern "C" fn(file: *const c_void) -> ResultCode;
 
-pub type VfsRead = unsafe extern "C" fn(
-    file: *const c_void,
-    buf: *mut u8,
-    count: usize,
-    offset: i64,
-    callback: IOCallback,
-);
+pub type VfsRead =
+    unsafe extern "C" fn(file: *const c_void, buf: BufferRef, offset: i64, callback: IOCallback);
 
-pub type VfsWrite = unsafe extern "C" fn(
-    file: *const c_void,
-    buf: *const u8,
-    count: usize,
-    offset: i64,
-    callback: IOCallback,
-);
+pub type VfsWrite =
+    unsafe extern "C" fn(file: *const c_void, buf: BufferRef, offset: i64, callback: IOCallback);
 
 pub type VfsSync = unsafe extern "C" fn(file: *const c_void, callback: IOCallback);
 

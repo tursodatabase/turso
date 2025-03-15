@@ -54,8 +54,12 @@ impl IO for VfsMod {
     }
 }
 
-unsafe extern "C" fn callback(result: i32, user_data: *mut c_void) {
-    let completion = Box::from_raw(user_data as *mut Completion);
+unsafe extern "C" fn callback(result: i32, ctx: *mut c_void) {
+    if ctx.is_null() {
+        tracing::error!("IO completion callback context is null");
+        return;
+    }
+    let completion = Box::from_raw(ctx as *mut Completion);
     completion.complete(result);
 }
 
@@ -83,12 +87,13 @@ impl File for VfsFileImpl {
 
     fn pread(&self, pos: usize, c: Completion) -> Result<()> {
         let r = c.as_read();
+        let buff = r.buf_mut().as_mut_slice().as_ptr();
         let len = r.buf().len();
-        let buf = r.buf_mut().as_mut_slice().as_mut_ptr();
         let vfs = unsafe { &*self.vfs };
         let ctx = Box::into_raw(Box::new(c)) as *mut c_void;
         let cb = limbo_ext::IOCallback::new(callback, ctx);
-        unsafe { (vfs.read)(self.file, buf, len, pos as i64, cb) };
+        let buff_ref = unsafe { limbo_ext::BufferRef::new(buff as *mut u8, len) };
+        unsafe { (vfs.read)(self.file, buff_ref, pos as i64, cb) };
         Ok(())
     }
 
@@ -100,18 +105,11 @@ impl File for VfsFileImpl {
         }
         let vfs = unsafe { &*self.vfs };
         let ctx = Box::into_raw(Box::new(c)) as *mut c_void;
-        // buffer is ManuallyDrop so it's safe to pass a pointer to an extension
-        // without incrementing the strong count of our Arc
+        // buffer is ManuallyDrop/Pin so it's safe to pass a pointer to an extension
         let cb = limbo_ext::IOCallback::new(callback, ctx);
-        unsafe {
-            (vfs.write)(
-                self.file,
-                buf.as_slice().as_ptr() as *mut u8,
-                count,
-                pos as i64,
-                cb,
-            )
-        };
+        let buff_ref =
+            unsafe { limbo_ext::BufferRef::new(buf.as_slice().as_ptr() as *mut u8, count) };
+        unsafe { (vfs.write)(self.file, buff_ref, pos as i64, cb) };
         Ok(())
     }
 
