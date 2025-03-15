@@ -14,10 +14,11 @@ static= [ "limbo_ext/static" ]
 
 [dependencies]
 env_logger = "0.11.6"
+futures = "0.3.31"
 lazy_static = "1.5.0"
 limbo_ext = { workspace = true, features = ["static"] }
 log = "0.4.26"
-tokio = { version = "1.44.1", features = ["rt", "time"]}
+tokio = { version = "1.44.1", features = ["rt", "time", "macros"]}
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 mimalloc = { version = "0.1", default-features = false }

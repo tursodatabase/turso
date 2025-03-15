@@ -258,6 +258,9 @@ const PAGE_SIZE: usize = 4096;
 // NOTE: This dummy extension is just the MemoryIO in core/io/memory.rs
 // with tokio and 'sleep's added to simulate slow network IO
 // to ensure that we can truly support async IO with something like a S3 backend
+//
+// This is for testing purposes only and _not_ an example of how to structure or
+// implement async io in a vfs module
 #[cfg(not(target_family = "wasm"))]
 #[derive(Default, VfsDerive)]
 pub struct AsyncTestVFS;
@@ -296,9 +299,11 @@ impl VfsExtension for AsyncTestVFS {
     fn run_once(&self) -> ExtResult<()> {
         log::info!("run_once async test VFS");
         let mut task_queue = TASK_QUEUE.lock().unwrap();
-        while let Some(task) = task_queue.tasks.pop_front() {
-            let _ = RUNTIME.block_on(task);
-        }
+        let local = tokio::task::LocalSet::new();
+        let tasks = std::mem::take(&mut task_queue.tasks);
+        local.block_on(&RUNTIME, async {
+            let _ = futures::future::join_all(tasks).await;
+        });
         Ok(())
     }
 }

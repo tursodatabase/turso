@@ -1720,6 +1720,7 @@ name = "limbo_ext_tests"
 version = "0.0.16"
 dependencies = [
  "env_logger 0.11.6",
+ "futures",
  "lazy_static",
  "limbo_ext",
  "log",
