@@ -843,12 +843,12 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
 pub fn derive_type(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
     let struct_name = &ast.ident;
-    let generate_fn_name = format_ident!("generate_{}", struct_name);
+    let on_insert_fn_name = format_ident!("on_insert_{}", struct_name);
     let register_fn_name = format_ident!("register_{}", struct_name);
     let output = quote! {
         impl #struct_name {
        #[no_mangle]
-        pub unsafe extern "C" fn #generate_fn_name(
+        pub unsafe extern "C" fn #on_insert_fn_name(
             col_name: *const ::std::ffi::c_char,
             insert_val: *const ::limbo_ext::Value)
         ->  ::limbo_ext::Value {
@@ -858,11 +858,18 @@ pub fn derive_type(input: TokenStream) -> TokenStream {
                 ::std::ffi::CStr::from_ptr(col_name as *mut i8).to_str().map_or(None, |s| Some(s))
             };
             let val = if insert_val.is_null() {
-                &::limbo_ext::Value::null()
+            // the pointer is null
+                    None
             } else {
-                 &*(insert_val)
+              let val = &*(insert_val);
+              if val.is_null() {
+            // the value itself is null
+                    None
+                } else {
+                    Some(val)
+                }
             };
-            <#struct_name as ::limbo_ext::CustomType>::generate(col_name, val)
+            <#struct_name as ::limbo_ext::CustomType>::on_insert(col_name, val)
         }
 
         #[no_mangle]
@@ -872,11 +879,11 @@ pub fn derive_type(input: TokenStream) -> TokenStream {
             }
             let api = &*api;
             let name = <#struct_name as ::limbo_ext::CustomType>::NAME;
-            let name_c = std::ffi::CString::new(name).unwrap();
+            let name_c = std::ffi::CString::new(name).unwrap_or_default();
             let module = ::std::boxed::Box::into_raw(::std::boxed::Box::new(::limbo_ext::CustomTypeImpl {
                 name: name_c.as_ptr() as *const ::std::ffi::c_char,
                 type_of: Self::TYPE,
-                generate: Self::#generate_fn_name,
+                on_insert: Self::#on_insert_fn_name,
             }));
             (api.register_custom_type)(api.ctx, module as *const ::limbo_ext::CustomTypeImpl)
         }

@@ -15,7 +15,7 @@ impl ForeignTypeFunc {
     pub fn new_generate(ext_type: Rc<ForeignType>) -> Self {
         Self {
             ext_type,
-            op: ForeignTypeOp::Generate,
+            op: ForeignTypeOp::OnInsertHook,
         }
     }
 }
@@ -23,7 +23,7 @@ impl ForeignTypeFunc {
 impl Display for ForeignTypeFunc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let kind = match self.op {
-            ForeignTypeOp::Generate => "generate",
+            ForeignTypeOp::OnInsertHook => "on_insert",
         };
         write!(f, "{}: {}", self.ext_type.name, kind)
     }
@@ -31,8 +31,8 @@ impl Display for ForeignTypeFunc {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ForeignTypeOp {
-    Generate,
-    // TODO
+    OnInsertHook,
+    // TODO: Sorting, comparison
 }
 
 #[derive(Default)]
@@ -87,7 +87,7 @@ impl ForeignType {
             CString::new("").unwrap()
         };
         let val = insert_val.unwrap_or(OwnedValue::Null).to_ffi();
-        let value = unsafe { ((*ctx).generate)(col.as_ptr(), &val as *const limbo_ext::Value) };
+        let value = unsafe { ((*ctx).on_insert)(col.as_ptr(), &val as *const limbo_ext::Value) };
         unsafe {
             val.__free_internal_type();
         }

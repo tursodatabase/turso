@@ -2727,7 +2727,7 @@ impl Program {
                             _ => unreachable!("aggregate called in scalar context"),
                         },
                         crate::function::Func::ForeignType(ts) => match ts.op {
-                            ForeignTypeOp::Generate => {
+                            ForeignTypeOp::OnInsertHook => {
                                 let col_name = state.registers[*start_reg].to_text();
                                 let insert_val = &state.registers[*start_reg + 1];
                                 let insert_val = if let OwnedValue::Null = insert_val {

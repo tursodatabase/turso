@@ -195,14 +195,14 @@ pub trait VTabCursor: Sized {
 pub struct CustomTypeImpl {
     pub name: *const c_char,
     pub type_of: ValueType,
-    pub generate: CustomTypeGenerateFn,
+    pub on_insert: CustomTypeOnInsertFn,
 }
 
 pub trait CustomType: Default + Sized {
     const NAME: &'static str;
     const TYPE: ValueType;
-    fn generate(col_name: Option<&str>, insert_val: &Value) -> Value;
+    fn on_insert(col_name: Option<&str>, insert_val: Option<&Value>) -> Value;
 }
 
-pub type CustomTypeGenerateFn =
+pub type CustomTypeOnInsertFn =
     unsafe extern "C" fn(col_name: *const c_char, insert_val: *const Value) -> Value;

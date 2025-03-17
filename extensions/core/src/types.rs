@@ -249,6 +249,10 @@ impl Value {
         }
     }
 
+    pub fn is_null(&self) -> bool {
+        self.value_type == ValueType::Null
+    }
+
     /// Returns the value type of the Value
     pub fn value_type(&self) -> ValueType {
         self.value_type

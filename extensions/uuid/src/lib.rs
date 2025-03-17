@@ -144,18 +144,23 @@ impl CustomType for UUID {
     const NAME: &'static str = "UUID";
     const TYPE: ValueType = ValueType::Text;
 
-    fn generate(_col_name: Option<&str>, insert_val: &Value) -> Value {
-        // if value inserted is a unix timestamp, store a uuidv7. otherwise store a uuidv4
-        if let Some(val) = insert_val.to_integer() {
-            if val > 0 {
-                let ctx = uuid::ContextV7::new();
-                let ts = uuid::Timestamp::from_unix(ctx, val as u64, 0);
-                Value::from_text(uuid::Uuid::new_v7(ts).to_string())
-            } else {
-                Value::from_text(uuid::Uuid::new_v4().to_string())
+    fn on_insert(_col_name: Option<&str>, insert_val: Option<&Value>) -> Value {
+        // store a uuid7 using the timestamp if one is inserted, otherwise use 'now'
+        match insert_val {
+            Some(val) => {
+                if let Some(val) = val.to_integer() {
+                    let ctx = uuid::ContextV7::new();
+                    let ts = if val > 0 {
+                        uuid::Timestamp::from_unix(ctx, val as u64, 0)
+                    } else {
+                        uuid::Timestamp::now(ctx)
+                    };
+                    Value::from_text(uuid::Uuid::new_v7(ts).to_string())
+                } else {
+                    Value::error_with_message(String::from("Invalid timestamp"))
+                }
             }
-        } else {
-            Value::from_text(uuid::Uuid::new_v4().to_string())
+            None => Value::from_text(uuid::Uuid::now_v7().to_string()),
         }
     }
 }
