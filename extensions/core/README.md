@@ -301,27 +301,33 @@ impl VTabCursor for CsvCursor {
 
 ```rust
 
-#[derive(Default, CustomTypeDerive)]
+#[derive(CustomTypeDerive, Default)]
 pub struct UUID;
 
-/// Your type must implement the CustomType trait.
 impl CustomType for UUID {
-  const NAME: &'static str = "UUID";
-  const TYPE: ValueType = ValueType::Text;
+    const NAME: &'static str = "UUID";
+    const TYPE: ValueType = ValueType::Text;
 
-   /// Generate is called on any insert to a column of your declared type. 
-   /// 'insert_value' will be None if no value was inserted to the column for that row.
-  fn generate(col_name: Option<&str>, insert_value: Option<&Value>) -> Value {
-        // This example checks if the inserted value is a unix timestamp and generates a uuidv7.
-        // otherwise it stores a uuidv4.
-        if let Some(val) = insert_val {
-            let maybe_ts = val.to_integer().unwrap_or(0);
-            let ctx = uuid::ContextV7::new();
-            let ts = uuid::Timestamp::from_unix(ctx, maybe_ts as u64, 0);
-            return Value::from_text(uuid::Uuid::new_v7(ts).to_string());
+    fn on_insert(_col_name: Option<&str>, insert_val: Option<&Value>) -> Value {
+        // This example stores a uuid7 using a timestamp if one is inserted, otherwise it uses 'now'
+        match insert_val {
+            Some(val) => {
+                if let Some(val) = val.to_integer() {
+                    let ctx = uuid::ContextV7::new();
+                    let ts = if val > 0 {
+                        uuid::Timestamp::from_unix(ctx, val as u64, 0)
+                    } else {
+                        uuid::Timestamp::now(ctx)
+                    };
+                    Value::from_text(uuid::Uuid::new_v7(ts).to_string())
+                } else {
+                    // an error can be returned if the inserted value isn't a valid timestamp
+                    Value::error_with_message(String::from("Invalid timestamp"))
+                }
+            }
+            None => Value::from_text(uuid::Uuid::now_v7().to_string()),
         }
-        Value::from_text(uuid::Uuid::new_v4().to_string())
-  }
+    }
 }
 ```
 
