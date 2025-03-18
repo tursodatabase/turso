@@ -498,7 +498,7 @@ fn handle_inserted_external_value(
     // call the generate function
     program.emit_insn(Insn::Function {
         func: FuncCtx {
-            func: Func::ForeignType(ForeignTypeFunc::new_generate(ext_type.clone())),
+            func: Func::ForeignType(ForeignTypeFunc::new_insert_hook(ext_type.clone())),
             arg_count: 2,
         },
         dest: target_reg,

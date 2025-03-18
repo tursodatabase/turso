@@ -2735,7 +2735,8 @@ impl Program {
                                 } else {
                                     Some(insert_val)
                                 };
-                                let result = ts.ext_type.generate(col_name, insert_val.cloned())?;
+                                let result =
+                                    ts.ext_type.on_insert(col_name, insert_val.cloned())?;
                                 state.registers[*dest] = result;
                             }
                         },

@@ -12,7 +12,7 @@ pub struct ForeignTypeFunc {
 }
 
 impl ForeignTypeFunc {
-    pub fn new_generate(ext_type: Rc<ForeignType>) -> Self {
+    pub fn new_insert_hook(ext_type: Rc<ForeignType>) -> Self {
         Self {
             ext_type,
             op: ForeignTypeOp::OnInsertHook,
@@ -75,7 +75,7 @@ impl ForeignType {
         self._type
     }
 
-    pub fn generate(
+    pub fn on_insert(
         &self,
         column_name: Option<&str>,
         insert_val: Option<OwnedValue>,
