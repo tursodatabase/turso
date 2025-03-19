@@ -33,6 +33,8 @@ use crate::functions::printf::exec_printf;
 use crate::pseudo::PseudoCursor;
 use crate::result::LimboResult;
 use crate::schema::{affinity, Affinity};
+use crate::storage::database::FileStorage;
+use crate::storage::page_cache::DumbLruPageCache;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::CheckpointResult;
 use crate::storage::{btree::BTreeCursor, pager::Pager};
@@ -54,7 +56,9 @@ use crate::{
     json::json_error_position, json::json_extract, json::json_object, json::json_patch,
     json::json_quote, json::json_remove, json::json_set, json::json_type, json::jsonb,
 };
-use crate::{info, CheckpointStatus};
+use crate::{
+    info, BufferPool, CheckpointStatus, MemoryIO, OpenFlags, Wal, WalFile, WalFileShared, IO,
+};
 use crate::{
     resolve_ext_path, Connection, MvCursor, MvStore, Result, TransactionState, DATABASE_VERSION,
 };
@@ -64,6 +68,7 @@ use insn::{
     exec_subtract, Cookie,
 };
 use likeop::{construct_like_escape_arg, exec_glob, exec_like_with_escape};
+use parking_lot::RwLock;
 use rand::distributions::{Distribution, Uniform};
 use rand::{thread_rng, Rng};
 use regex::{Regex, RegexBuilder};
@@ -776,7 +781,8 @@ impl Program {
                         None => None,
                     };
                     let cursor = BTreeCursor::new(mv_cursor, pager.clone(), *root_page);
-                    let mut cursors = state.cursors.borrow_mut();
+                    let mut cursors: std::cell::RefMut<'_, Vec<Option<Cursor>>> =
+                        state.cursors.borrow_mut();
                     match cursor_type {
                         CursorType::BTreeTable(_) => {
                             cursors
@@ -3166,7 +3172,86 @@ impl Program {
                 Insn::Noop => {
                     // Do nothing
                     // Advance the program counter for the next opcode
-                    state.pc += 1
+                    state.pc += 1;
+                }
+                Insn::OpenEphemeral {
+                    cursor_id,
+                    is_btree,
+                    root_page,
+                } => {
+                    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+                    let file = io.open_file("", OpenFlags::Create, true)?;
+                    let page_io = Arc::new(FileStorage::new(file));
+
+                    let db_header = match Pager::begin_open(page_io.clone()) {
+                        Ok(header) => header,
+                        Err(e) => return Err(e), // look at this later
+                    };
+
+                    let buffer_pool = Rc::new(BufferPool::new(512));
+
+                    let page_size = db_header.lock().unwrap().page_size;
+
+                    let shared_wal =
+                        WalFileShared::open_shared(&io, "", db_header.lock().unwrap().page_size)?;
+
+                    let wal = Rc::new(RefCell::new(WalFile::new(
+                        io.clone(),
+                        page_size as usize,
+                        shared_wal.clone(),
+                        buffer_pool.clone(),
+                    )));
+
+                    let page_cache = Arc::new(RwLock::new(DumbLruPageCache::new(10)));
+
+                    let pager = Rc::new(Pager::finish_open(
+                        db_header,
+                        page_io,
+                        wal,
+                        io.clone(),
+                        page_cache,
+                        buffer_pool,
+                    )?);
+                    let (_, cursor_type) = self.cursor_ref.get(*cursor_id).unwrap();
+                    let mv_cursor = match state.mv_tx_id {
+                        Some(tx_id) => {
+                            let table_id = *root_page as u64;
+                            let mv_store = mv_store.as_ref().unwrap().clone();
+                            let mv_cursor = Rc::new(RefCell::new(
+                                MvCursor::new(mv_store, tx_id, table_id).unwrap(),
+                            ));
+                            Some(mv_cursor)
+                        }
+                        None => None,
+                    };
+
+                    let cursor = BTreeCursor::new(mv_cursor, pager.clone(), *root_page);
+                    let mut cursors: std::cell::RefMut<'_, Vec<Option<Cursor>>> =
+                        state.cursors.borrow_mut();
+                    match cursor_type {
+                        CursorType::BTreeTable(_) => {
+                            cursors
+                                .get_mut(*cursor_id)
+                                .unwrap()
+                                .replace(Cursor::new_btree(cursor));
+                        }
+                        CursorType::BTreeIndex(_) => {
+                            cursors
+                                .get_mut(*cursor_id)
+                                .unwrap()
+                                .replace(Cursor::new_btree(cursor));
+                        }
+                        CursorType::Pseudo(_) => {
+                            panic!("OpenReadAsync on pseudo cursor");
+                        }
+                        CursorType::Sorter => {
+                            panic!("OpenReadAsync on sorter cursor");
+                        }
+                        CursorType::VirtualTable(_) => {
+                            panic!("OpenReadAsync on virtual table cursor, use Insn::VOpenAsync instead");
+                        }
+                    }
+                    state.pc += 1;
                 }
             }
         }
