@@ -3587,7 +3587,7 @@ mod tests {
         let buf = IOBuff::new(Buffer::allocate(page_size as usize, drop_fn));
         {
             let buf_slice = buf.buf_mut().as_mut_slice();
-            sqlite3_ondisk::write_header_to_buf(buf_slice, &db_header.lock().unwrap());
+            sqlite3_ondisk::write_header_to_buf(buf_slice, &db_header.lock());
         }
 
         let write_complete = Box::new(|_| {});
@@ -3637,7 +3637,7 @@ mod tests {
             let drop_fn = Rc::new(|_buf| {});
             #[allow(clippy::arc_with_non_send_sync)]
             let buf = IOBuff::new(Buffer::allocate(
-                db_header.lock().unwrap().page_size as usize,
+                db_header.lock().page_size as usize,
                 drop_fn,
             ));
             let write_complete = Box::new(|_| {});
