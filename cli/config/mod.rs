@@ -24,7 +24,7 @@ where
             let validate = v.validate();
             if validate.is_err() {
                 tracing::error!(
-                    "Invalid value for {}.\nOriginal config value: {:?}",
+                    "Invalid value for {}.\n Original config value: {:?}",
                     validate.unwrap_err(),
                     v
                 );
@@ -107,12 +107,14 @@ impl TableConfig {
 #[derive(Debug, Deserialize, Clone, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct SyntaxHighlightConfig {
+    pub enable: bool,
     pub theme_name: String,
 }
 
 impl Default for SyntaxHighlightConfig {
     fn default() -> Self {
         Self {
+            enable: true,
             theme_name: "base16-ocean.dark".to_string(),
         }
     }

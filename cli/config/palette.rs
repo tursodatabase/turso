@@ -1,21 +1,17 @@
 use core::fmt;
 use std::{
-    collections::HashMap,
     fmt::Display,
     ops::{Deref, DerefMut},
 };
 
-use indexmap::IndexMap;
 use nu_ansi_term::Color;
 use schemars::JsonSchema;
 use serde::{
     de::{self, Visitor},
     Deserialize, Deserializer, Serialize,
 };
-use tracing::{debug, trace, warn};
+use tracing::trace;
 use validator::Validate;
-
-pub type Palette = IndexMap<String, String>;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LimboColor(pub Color);
@@ -233,50 +229,5 @@ impl LimboColor {
             Color::Rgb(r, g, b) => comfy_table::Color::Rgb { r, g, b },
             Color::Fixed(ansi_color_num) => comfy_table::Color::AnsiValue(ansi_color_num),
         }
-    }
-
-    // Function copied from Starship rs project
-    /** Parse a string that represents a color setting, returning None if this fails
-     There are three valid color formats:
-      - #RRGGBB      (a hash followed by an RGB hex)
-      - u8           (a number from 0-255, representing an ANSI color)
-      - colstring    (one of the 16 predefined color strings or a custom user-defined color)
-    */
-    fn parse_color_string(color_string: &str, palette: Option<&Palette>) -> Option<LimboColor> {
-        // Check palette for a matching user-defined color
-        if let Some(palette_color) = palette.as_ref().and_then(|x| x.get(color_string)) {
-            trace!(
-                "Read user-defined color string: {} defined as {}",
-                color_string,
-                palette_color
-            );
-            return Self::parse_color_string(palette_color, None);
-        } else {
-            match color_string.try_into() {
-                Ok(color) => Some(color),
-                Err(err) => {
-                    debug!(err);
-                    None
-                }
-            }
-        }
-    }
-}
-
-fn get_palette<'a>(
-    palettes: &'a HashMap<String, Palette>,
-    palette_name: Option<&str>,
-) -> Option<&'a Palette> {
-    if let Some(palette_name) = palette_name {
-        let palette = palettes.get(palette_name);
-        if palette.is_some() {
-            trace!("Found color palette: {}", palette_name);
-        } else {
-            warn!("Could not find color palette: {}", palette_name);
-        }
-        palette
-    } else {
-        trace!("No color palette specified, using defaults");
-        None
     }
 }
