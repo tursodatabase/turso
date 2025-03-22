@@ -89,15 +89,17 @@ impl Default for TableConfig {
 }
 
 impl TableConfig {
+    // Default colors for Pekka's tastes
     fn default_header_color() -> LimboColor {
-        LimboColor(Color::Green)
+        LimboColor(Color::White)
     }
 
     fn default_column_colors() -> Vec<LimboColor> {
         vec![
-            LimboColor(Color::Fixed(1)),
-            LimboColor(Color::Fixed(2)),
-            LimboColor(Color::Fixed(3)),
+            LimboColor(Color::Green),
+            LimboColor(Color::Black),
+            // Comfy Table Color::Grey
+            LimboColor(Color::Fixed(7)),
         ]
     }
 }
