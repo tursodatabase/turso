@@ -1,88 +1,73 @@
-name: Add Author Info to PR Description
+name: Update PR Description
+
 on:
   pull_request:
-    types: [opened]
-  push:
-    branches:
-      - '**'
-permissions:
-  pull-requests: write
-concurrency:
-  group: pr-description-updater-${{ github.event.pull_request.head.ref || github.ref }}
-  cancel-in-progress: false
+    types: 
+      - opened
+      - edited
+  pull_request_review:
+    types:
+      - submitted
+      - dismissed
+
 jobs:
-  add-author:
+  update-pr-description:
     runs-on: ubuntu-latest
     steps:
-      - name: Get PR number
-        id: prep
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            let prNumber;
-            if (context.eventName === 'push') {
-              const prs = await github.rest.pulls.list({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                head: `${context.repo.owner}:${context.ref.replace('refs/heads/', '')}`,
-                state: 'open'
-              });
-              if (prs.data.length === 0) {
-                console.log('No associated PR found for this push');
-                return;
-              }
-              prNumber = prs.data[0].number;
-            } else {
-              prNumber = context.issue.number;
-            }
-            core.setOutput('pr_number', prNumber);
-      
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Update PR Description
-        if: steps.prep.outputs.pr_number != ''
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const prNumber = parseInt('${{ steps.prep.outputs.pr_number }}');
-            
-            try {
-              // Fetch PR details
-              const pr = await github.rest.pulls.get({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: prNumber
-              });
-              
-              // Fetch complete user details
-              const userDetails = await github.rest.users.getByUsername({
-                username: pr.data.user.login
-              });
-              
-              // Prepare author info
-              const authorInfo = `
-            Author: ${userDetails.data.name || 'Name not provided'} (@${pr.data.user.login})
-              `;
-              
-              // Check if author info already exists
-              if (pr.data.body && pr.data.body.includes(authorInfo.trim())) {
-                console.log('Author info already present');
-                return;
-              }
-              
-              // Update PR body
-              const updatedBody = `${pr.data.body || ''}\n\n${authorInfo}`;
-              
-              // Update PR using github.rest method
-              await github.rest.pulls.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: prNumber,
-                body: updatedBody
-              });
-              
-              console.log('PR description updated successfully');
-            } catch (error) {
-              console.error('Error updating PR description:', error);
-              core.setFailed(error.message);
-            }
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Get author's username and full name
+          AUTHOR_USERNAME="${{ github.event.pull_request.user.login }}"
+          AUTHOR_FULL_NAME=$(gh api users/$AUTHOR_USERNAME | jq -r '.name // $AUTHOR_USERNAME')
+          
+          # Prepare author line
+          AUTHOR_LINE="Author: ${AUTHOR_FULL_NAME} (@${AUTHOR_USERNAME})"
+          
+          # Find reviewers
+          REVIEWERS=$(gh pr view $PR_NUMBER --json reviewRequests --jq '.reviewRequests[].login // empty')
+          
+          # If no reviewers from review requests, try to get reviewers from completed reviews
+          if [ -z "$REVIEWERS" ]; then
+            REVIEWERS=$(gh pr view $PR_NUMBER --json reviews --jq '.reviews[] | select(.state == "APPROVED") | .author.login' | head -n 1)
+          fi
+          
+          # Prepare reviewers line
+          REVIEWERS_LINE=""
+          if [ -n "$REVIEWERS" ]; then
+            REVIEWER_DETAILS=()
+            for reviewer in $REVIEWERS; do
+              # Get reviewer's full name
+              REVIEWER_FULL_NAME=$(gh api users/$reviewer | jq -r '.name // $reviewer')
+              REVIEWER_DETAILS+=("${REVIEWER_FULL_NAME} (@${reviewer})")
+            done
+            REVIEWERS_LINE="Reviewed-by: $(IFS=, ; echo "${REVIEWER_DETAILS[*]}")"
+          fi
+          
+          # Fetch current PR description
+          CURRENT_DESC=$(gh pr view $PR_NUMBER --json body --jq .body)
+          
+          # Remove existing Author and Reviewed-by lines
+          UPDATED_DESC=$(echo "$CURRENT_DESC" | sed -E '/^(Author:|Reviewed-by:)/d')
+          
+          # Combine description
+          UPDATED_DESC="${UPDATED_DESC}\n${AUTHOR_LINE}"
+          
+          # Add Reviewed-by line if reviewers exist
+          if [ -n "$REVIEWERS_LINE" ]; then
+            UPDATED_DESC="${UPDATED_DESC}\n${REVIEWERS_LINE}"
+          fi
+          
+          # Update the PR description
+          echo "$UPDATED_DESC" | gh pr edit $PR_NUMBER --body-file -
+
+      - name: Check for Errors
+        if: failure()
+        run: |
+          echo "Failed to update PR description"
+          exit 1
