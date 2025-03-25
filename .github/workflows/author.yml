@@ -21,10 +21,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          AUTHOR_USERNAME: ${{ github.event.pull_request.user.login }}
         run: |
-          # Get author's username and full name
-          AUTHOR_USERNAME="${{ github.event.pull_request.user.login }}"
-          AUTHOR_FULL_NAME=$(gh api users/$AUTHOR_USERNAME | jq -r '.name // $AUTHOR_USERNAME')
+          # Get author's full name
+          AUTHOR_FULL_NAME=$(gh api "users/${AUTHOR_USERNAME}" | jq -r '.name // "'"${AUTHOR_USERNAME}"'"')
           
           # Prepare author line
           AUTHOR_LINE="Author: ${AUTHOR_FULL_NAME} (@${AUTHOR_USERNAME})"
@@ -43,7 +43,7 @@ jobs:
             REVIEWER_DETAILS=()
             for reviewer in $REVIEWERS; do
               # Get reviewer's full name
-              REVIEWER_FULL_NAME=$(gh api users/$reviewer | jq -r '.name // $reviewer')
+              REVIEWER_FULL_NAME=$(gh api "users/${reviewer}" | jq -r '.name // "'"${reviewer}"'"')
               REVIEWER_DETAILS+=("${REVIEWER_FULL_NAME} (@${reviewer})")
             done
             REVIEWERS_LINE="Reviewed-by: $(IFS=, ; echo "${REVIEWER_DETAILS[*]}")"
@@ -56,11 +56,13 @@ jobs:
           UPDATED_DESC=$(echo "$CURRENT_DESC" | sed -E '/^(Author:|Reviewed-by:)/d')
           
           # Combine description
-          UPDATED_DESC="${UPDATED_DESC}\n${AUTHOR_LINE}"
+          UPDATED_DESC="${UPDATED_DESC}
+${AUTHOR_LINE}"
           
           # Add Reviewed-by line if reviewers exist
           if [ -n "$REVIEWERS_LINE" ]; then
-            UPDATED_DESC="${UPDATED_DESC}\n${REVIEWERS_LINE}"
+            UPDATED_DESC="${UPDATED_DESC}
+${REVIEWERS_LINE}"
           fi
           
           # Update the PR description
