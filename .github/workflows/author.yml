@@ -5,14 +5,11 @@ on:
   push:
     branches:
       - '**'
-
 permissions:
   pull-requests: write
-
 concurrency:
   group: pr-description-updater-${{ github.event.pull_request.head.ref || github.ref }}
   cancel-in-progress: false
-
 jobs:
   add-author:
     runs-on: ubuntu-latest
@@ -40,6 +37,7 @@ jobs:
               prNumber = context.issue.number;
             }
             core.setOutput('pr_number', prNumber);
+      
       - name: Update PR Description
         if: steps.prep.outputs.pr_number != ''
         uses: actions/github-script@v7
@@ -47,32 +45,44 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const prNumber = parseInt('${{ steps.prep.outputs.pr_number }}');
-            const pr = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: prNumber
-            });
-
-            // Fetch complete user details
-            const userDetails = await github.rest.users.getByUsername({
-              username: pr.data.user.login
-            });
-
-            const authorInfo = `
+            
+            try {
+              // Fetch PR details
+              const pr = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber
+              });
+              
+              // Fetch complete user details
+              const userDetails = await github.rest.users.getByUsername({
+                username: pr.data.user.login
+              });
+              
+              // Prepare author info
+              const authorInfo = `
             Author: ${userDetails.data.name || 'Name not provided'} (@${pr.data.user.login})
-            `;
-
-            // Check if author info already exists
-            if (pr.data.body && pr.data.body.includes(authorInfo.trim())) {
-              console.log('Author info already present');
-              return;
+              `;
+              
+              // Check if author info already exists
+              if (pr.data.body && pr.data.body.includes(authorInfo.trim())) {
+                console.log('Author info already present');
+                return;
+              }
+              
+              // Update PR body
+              const updatedBody = `${pr.data.body || ''}\n\n${authorInfo}`;
+              
+              // Update PR using github.rest method
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+                body: updatedBody
+              });
+              
+              console.log('PR description updated successfully');
+            } catch (error) {
+              console.error('Error updating PR description:', error);
+              core.setFailed(error.message);
             }
-
-            const updatedBody = `${pr.data.body || ''}\n\n${authorInfo}`;
-
-            await github.rest.pulls.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: prNumber,
-              body: updatedBody
-            });
