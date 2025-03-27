@@ -63,23 +63,23 @@ fn test_statement_bind() -> anyhow::Result<()> {
         match stmt.step()? {
             StepResult::Row => {
                 let row = stmt.row().unwrap();
-                if let limbo_core::OwnedValue::Text(s) = row.get_value(0) {
+                if let limbo_core::RefValue::Text(s) = row.get_value(0) {
                     assert_eq!(s.as_str(), "hello")
                 }
 
-                if let limbo_core::OwnedValue::Text(s) = row.get_value(1) {
+                if let limbo_core::RefValue::Text(s) = row.get_value(1) {
                     assert_eq!(s.as_str(), "hello")
                 }
 
-                if let limbo_core::OwnedValue::Integer(i) = row.get_value(2) {
+                if let limbo_core::RefValue::Integer(i) = row.get_value(2) {
                     assert_eq!(*i, 42)
                 }
 
-                if let limbo_core::OwnedValue::Blob(v) = row.get_value(3) {
-                    assert_eq!(v.as_ref(), &vec![0x1 as u8, 0x2, 0x3])
+                if let limbo_core::RefValue::Blob(v) = row.get_value(3) {
+                    assert_eq!(v.to_slice(), &vec![0x1 as u8, 0x2, 0x3])
                 }
 
-                if let limbo_core::OwnedValue::Float(f) = row.get_value(4) {
+                if let limbo_core::RefValue::Float(f) = row.get_value(4) {
                     assert_eq!(*f, 0.5)
                 }
             }

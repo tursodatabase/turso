@@ -40,7 +40,8 @@ use crate::storage::wal::CheckpointResult;
 use crate::storage::{btree::BTreeCursor, pager::Pager};
 use crate::translate::plan::{ResultSetColumn, TableReference};
 use crate::types::{
-    AggContext, Cursor, CursorResult, ExternalAggState, OwnedValue, Record, SeekKey, SeekOp,
+    AggContext, Cursor, CursorResult, ExternalAggState, ImmutableRecord, OwnedValue, SeekKey,
+    SeekOp,
 };
 use crate::util::{
     cast_real_to_integer, cast_text_to_integer, cast_text_to_numeric, cast_text_to_real,
@@ -235,7 +236,7 @@ enum HaltState {
 pub enum Register {
     OwnedValue(OwnedValue),
     Aggregate(AggContext),
-    Record(Record),
+    Record(ImmutableRecord),
 }
 
 /// The program state describes the environment in which the program executes.
@@ -243,7 +244,7 @@ pub struct ProgramState {
     pub pc: InsnReference,
     cursors: RefCell<Vec<Option<Cursor>>>,
     registers: Vec<Register>,
-    pub(crate) result_row: Option<Record>,
+    pub(crate) result_row: Option<ImmutableRecord>,
     last_compare: Option<std::cmp::Ordering>,
     deferred_seek: Option<(CursorID, CursorID)>,
     ended_coroutine: Bitfield<4>, // flag to indicate that a coroutine has ended (key is the yield register. currently we assume that the yield register is always between 0-255, YOLO)
@@ -1195,7 +1196,7 @@ impl Program {
                             };
                             if let Some(record) = record {
                                 state.registers[*dest] =
-                                    Register::OwnedValue(record.get_value(*column).clone());
+                                    Register::OwnedValue(record.get_value(*column).to_owned());
                             } else {
                                 state.registers[*dest] = Register::OwnedValue(OwnedValue::Null);
                             }
@@ -1205,7 +1206,7 @@ impl Program {
                                 let mut cursor = state.get_cursor(*cursor_id);
                                 let cursor = cursor.as_pseudo_mut();
                                 if let Some(record) = cursor.record() {
-                                    record.get_value(*column).clone()
+                                    record.get_value(*column).to_owned()
                                 } else {
                                     OwnedValue::Null
                                 }
@@ -1226,12 +1227,12 @@ impl Program {
                     count,
                     dest_reg,
                 } => {
-                    let record = make_owned_record(&state.registers, start_reg, count);
+                    let record = make_record(&state.registers, start_reg, count);
                     state.registers[*dest_reg] = Register::Record(record);
                     state.pc += 1;
                 }
                 Insn::ResultRow { start_reg, count } => {
-                    let record = make_owned_record(&state.registers, start_reg, count);
+                    let record = make_record(&state.registers, start_reg, count);
                     state.result_row = Some(record);
                     state.pc += 1;
                     return Ok(StepResult::Row);
@@ -1543,7 +1544,7 @@ impl Program {
                             let mut cursor = state.get_cursor(*cursor_id);
                             let cursor = cursor.as_btree_mut();
                             let record_from_regs =
-                                make_owned_record(&state.registers, start_reg, num_regs);
+                                make_record(&state.registers, start_reg, num_regs);
                             let found = return_if_io!(
                                 cursor.seek(SeekKey::IndexKey(&record_from_regs), SeekOp::GE)
                             );
@@ -1601,8 +1602,8 @@ impl Program {
                         let found = {
                             let mut cursor = state.get_cursor(*cursor_id);
                             let cursor = cursor.as_btree_mut();
-                            let record_from_regs: Record =
-                                make_owned_record(&state.registers, start_reg, num_regs);
+                            let record_from_regs =
+                                make_record(&state.registers, start_reg, num_regs);
                             let found = return_if_io!(
                                 cursor.seek(SeekKey::IndexKey(&record_from_regs), SeekOp::GT)
                             );
@@ -1659,8 +1660,7 @@ impl Program {
                     let pc = {
                         let mut cursor = state.get_cursor(*cursor_id);
                         let cursor = cursor.as_btree_mut();
-                        let record_from_regs: Record =
-                            make_owned_record(&state.registers, start_reg, num_regs);
+                        let record_from_regs = make_record(&state.registers, start_reg, num_regs);
                         let pc = if let Some(ref idx_record) = *cursor.record() {
                             // Compare against the same number of values
                             if idx_record.get_values()[..record_from_regs.len()]
@@ -1689,8 +1689,7 @@ impl Program {
                     let pc = {
                         let mut cursor = state.get_cursor(*cursor_id);
                         let cursor = cursor.as_btree_mut();
-                        let record_from_regs: Record =
-                            make_owned_record(&state.registers, start_reg, num_regs);
+                        let record_from_regs = make_record(&state.registers, start_reg, num_regs);
                         let pc = if let Some(ref idx_record) = *cursor.record() {
                             // Compare against the same number of values
                             if idx_record.get_values()[..record_from_regs.len()]
@@ -1719,8 +1718,7 @@ impl Program {
                     let pc = {
                         let mut cursor = state.get_cursor(*cursor_id);
                         let cursor = cursor.as_btree_mut();
-                        let record_from_regs: Record =
-                            make_owned_record(&state.registers, start_reg, num_regs);
+                        let record_from_regs = make_record(&state.registers, start_reg, num_regs);
                         let pc = if let Some(ref idx_record) = *cursor.record() {
                             // Compare against the same number of values
                             if idx_record.get_values()[..record_from_regs.len()]
@@ -1749,8 +1747,7 @@ impl Program {
                     let pc = {
                         let mut cursor = state.get_cursor(*cursor_id);
                         let cursor = cursor.as_btree_mut();
-                        let record_from_regs: Record =
-                            make_owned_record(&state.registers, start_reg, num_regs);
+                        let record_from_regs = make_record(&state.registers, start_reg, num_regs);
                         let pc = if let Some(ref idx_record) = *cursor.record() {
                             // Compare against the same number of values
                             if idx_record.get_values()[..record_from_regs.len()]
@@ -3602,12 +3599,8 @@ fn get_new_rowid<R: Rng>(cursor: &mut BTreeCursor, mut rng: R) -> Result<CursorR
     Ok(CursorResult::Ok(rowid.try_into().unwrap()))
 }
 
-fn make_owned_record(registers: &[Register], start_reg: &usize, count: &usize) -> Record {
-    let mut values = Vec::with_capacity(*count);
-    for r in registers.iter().skip(*start_reg).take(*count) {
-        values.push(r.get_owned_value().clone())
-    }
-    Record::new(values)
+fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> ImmutableRecord {
+    ImmutableRecord::from_registers(&registers[*start_reg..*start_reg + *count])
 }
 
 fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {

@@ -1,9 +1,9 @@
-use crate::types::Record;
+use crate::types::{ImmutableRecord, Record};
 use std::cmp::Ordering;
 
 pub struct Sorter {
-    records: Vec<Record>,
-    current: Option<Record>,
+    records: Vec<ImmutableRecord>,
+    current: Option<ImmutableRecord>,
     order: Vec<bool>,
 }
 
@@ -51,11 +51,11 @@ impl Sorter {
     pub fn next(&mut self) {
         self.current = self.records.pop();
     }
-    pub fn record(&self) -> Option<&Record> {
+    pub fn record(&self) -> Option<&ImmutableRecord> {
         self.current.as_ref()
     }
 
-    pub fn insert(&mut self, record: &Record) {
-        self.records.push(Record::new(record.get_values().to_vec()));
+    pub fn insert(&mut self, record: &ImmutableRecord) {
+        self.records.push(record.clone());
     }
 }

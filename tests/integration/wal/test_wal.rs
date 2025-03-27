@@ -1,5 +1,5 @@
 use crate::common::{do_flush, TempDatabase};
-use limbo_core::{Connection, LimboError, Result, StepResult};
+use limbo_core::{Connection, LimboError, RefValue, Result, StepResult};
 use std::cell::RefCell;
 use std::ops::Deref;
 use std::rc::Rc;
@@ -86,7 +86,7 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
                             let row = rows.row().unwrap();
                             let first_value = row.get_value(0);
                             let id = match first_value {
-                                limbo_core::OwnedValue::Integer(i) => *i as i32,
+                                RefValue::Integer(i) => *i as i32,
                                 _ => unreachable!(),
                             };
                             assert_eq!(id, i);
@@ -172,7 +172,7 @@ pub(crate) fn execute_and_get_ints(
                 let row = stmt.row().unwrap();
                 for value in row.get_values() {
                     let out = match value {
-                        limbo_core::OwnedValue::Integer(i) => i,
+                        limbo_core::RefValue::Integer(i) => i,
                         _ => {
                             return Err(LimboError::ConversionError(format!(
                                 "cannot convert {value} to int"

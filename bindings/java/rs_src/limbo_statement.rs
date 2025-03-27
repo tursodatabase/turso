@@ -107,15 +107,15 @@ fn row_to_obj_array<'local>(
 
     for (i, value) in row.get_values().iter().enumerate() {
         let obj = match value {
-            limbo_core::OwnedValue::Null => JObject::null(),
-            limbo_core::OwnedValue::Integer(i) => {
+            limbo_core::RefValue::Null => JObject::null(),
+            limbo_core::RefValue::Integer(i) => {
                 env.new_object("java/lang/Long", "(J)V", &[JValue::Long(*i)])?
             }
-            limbo_core::OwnedValue::Float(f) => {
+            limbo_core::RefValue::Float(f) => {
                 env.new_object("java/lang/Double", "(D)V", &[JValue::Double(*f)])?
             }
-            limbo_core::OwnedValue::Text(s) => env.new_string(s.as_str())?.into(),
-            limbo_core::OwnedValue::Blob(b) => env.byte_array_from_slice(&b)?.into(),
+            limbo_core::RefValue::Text(s) => env.new_string(s.as_str())?.into(),
+            limbo_core::RefValue::Blob(b) => env.byte_array_from_slice(&b.to_slice())?.into(),
         };
         if let Err(e) = env.set_object_array_element(&obj_array, i as i32, obj) {
             eprintln!("Error on parsing row: {:?}", e);

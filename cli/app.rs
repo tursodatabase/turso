@@ -5,7 +5,7 @@ use crate::{
     opcodes_dictionary::OPCODE_DESCRIPTIONS,
 };
 use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Row, Table};
-use limbo_core::{Database, LimboError, OwnedValue, Statement, StepResult};
+use limbo_core::{Database, LimboError, OwnedValue, RefValue, Statement, StepResult};
 
 use clap::{Parser, ValueEnum};
 use rustyline::{history::DefaultHistory, Editor};
@@ -710,12 +710,12 @@ impl<'a> Limbo<'a> {
                                 }
                                 let _ = self.writer.write(
                                     match value {
-                                        OwnedValue::Null => self.opts.null_value.clone(),
-                                        OwnedValue::Integer(i) => format!("{}", i),
-                                        OwnedValue::Float(f) => format!("{:?}", f),
-                                        OwnedValue::Text(s) => s.to_string(),
-                                        OwnedValue::Blob(b) => {
-                                            format!("{}", String::from_utf8_lossy(b))
+                                        RefValue::Null => self.opts.null_value.clone(),
+                                        RefValue::Integer(i) => format!("{}", i),
+                                        RefValue::Float(f) => format!("{:?}", f),
+                                        RefValue::Text(s) => s.to_string(),
+                                        RefValue::Blob(b) => {
+                                            format!("{}", String::from_utf8_lossy(b.to_slice()))
                                         }
                                     }
                                     .as_bytes(),
@@ -769,18 +769,16 @@ impl<'a> Limbo<'a> {
                                 row.max_height(1);
                                 for (idx, value) in record.get_values().iter().enumerate() {
                                     let (content, alignment) = match value {
-                                        OwnedValue::Null => {
+                                        RefValue::Null => {
                                             (self.opts.null_value.clone(), CellAlignment::Left)
                                         }
-                                        OwnedValue::Integer(i) => {
+                                        RefValue::Integer(i) => {
                                             (i.to_string(), CellAlignment::Right)
                                         }
-                                        OwnedValue::Float(f) => {
-                                            (f.to_string(), CellAlignment::Right)
-                                        }
-                                        OwnedValue::Text(s) => (s.to_string(), CellAlignment::Left),
-                                        OwnedValue::Blob(b) => (
-                                            String::from_utf8_lossy(b).to_string(),
+                                        RefValue::Float(f) => (f.to_string(), CellAlignment::Right),
+                                        RefValue::Text(s) => (s.to_string(), CellAlignment::Left),
+                                        RefValue::Blob(b) => (
+                                            String::from_utf8_lossy(b.to_slice()).to_string(),
                                             CellAlignment::Left,
                                         ),
                                     };
@@ -848,7 +846,7 @@ impl<'a> Limbo<'a> {
                     match rows.step()? {
                         StepResult::Row => {
                             let row = rows.row().unwrap();
-                            if let Some(OwnedValue::Text(schema)) = row.get_values().first() {
+                            if let Some(RefValue::Text(schema)) = row.get_values().first() {
                                 let _ = self.write_fmt(format_args!("{};", schema.as_str()));
                                 found = true;
                             }
@@ -906,7 +904,7 @@ impl<'a> Limbo<'a> {
                     match rows.step()? {
                         StepResult::Row => {
                             let row = rows.row().unwrap();
-                            if let Some(OwnedValue::Text(table)) = row.get_values().first() {
+                            if let Some(RefValue::Text(table)) = row.get_values().first() {
                                 tables.push_str(table.as_str());
                                 tables.push(' ');
                             }

@@ -143,23 +143,21 @@ impl LimboValue {
         Box::into_raw(Box::new(self)) as *const c_void
     }
 
-    pub fn from_value(value: &limbo_core::OwnedValue) -> Self {
+    pub fn from_value(value: &limbo_core::RefValue) -> Self {
         match value {
-            limbo_core::OwnedValue::Integer(i) => {
+            limbo_core::RefValue::Integer(i) => {
                 LimboValue::new(ValueType::Integer, ValueUnion::from_int(*i))
             }
-            limbo_core::OwnedValue::Float(r) => {
+            limbo_core::RefValue::Float(r) => {
                 LimboValue::new(ValueType::Real, ValueUnion::from_real(*r))
             }
-            limbo_core::OwnedValue::Text(s) => {
+            limbo_core::RefValue::Text(s) => {
                 LimboValue::new(ValueType::Text, ValueUnion::from_str(s.as_str()))
             }
-            limbo_core::OwnedValue::Blob(b) => {
-                LimboValue::new(ValueType::Blob, ValueUnion::from_bytes(b))
+            limbo_core::RefValue::Blob(b) => {
+                LimboValue::new(ValueType::Blob, ValueUnion::from_bytes(b.to_slice()))
             }
-            limbo_core::OwnedValue::Null => {
-                LimboValue::new(ValueType::Null, ValueUnion::from_null())
-            }
+            limbo_core::RefValue::Null => LimboValue::new(ValueType::Null, ValueUnion::from_null()),
         }
     }
 

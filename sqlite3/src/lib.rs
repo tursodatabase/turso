@@ -637,7 +637,7 @@ pub unsafe extern "C" fn sqlite3_column_text(
         None => return std::ptr::null(),
     };
     match row.get_values().get(idx as usize) {
-        Some(limbo_core::OwnedValue::Text(text)) => text.as_str().as_ptr(),
+        Some(limbo_core::RefValue::Text(text)) => text.as_str().as_ptr(),
         _ => std::ptr::null(),
     }
 }

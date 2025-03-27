@@ -177,10 +177,10 @@ impl Statement {
     }
 }
 
-fn to_js_value(value: &limbo_core::OwnedValue) -> JsValue {
+fn to_js_value(value: &limbo_core::RefValue) -> JsValue {
     match value {
-        limbo_core::OwnedValue::Null => JsValue::null(),
-        limbo_core::OwnedValue::Integer(i) => {
+        limbo_core::RefValue::Null => JsValue::null(),
+        limbo_core::RefValue::Integer(i) => {
             let i = *i;
             if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
                 JsValue::from(i as i32)
@@ -188,9 +188,9 @@ fn to_js_value(value: &limbo_core::OwnedValue) -> JsValue {
                 JsValue::from(i)
             }
         }
-        limbo_core::OwnedValue::Float(f) => JsValue::from(*f),
-        limbo_core::OwnedValue::Text(t) => JsValue::from_str(t.as_str()),
-        limbo_core::OwnedValue::Blob(b) => js_sys::Uint8Array::from(b.as_slice()).into(),
+        limbo_core::RefValue::Float(f) => JsValue::from(*f),
+        limbo_core::RefValue::Text(t) => JsValue::from_str(t.as_str()),
+        limbo_core::RefValue::Blob(b) => js_sys::Uint8Array::from(b.to_slice()).into(),
     }
 }
 

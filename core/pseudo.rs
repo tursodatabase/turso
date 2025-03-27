@@ -1,7 +1,7 @@
-use crate::types::Record;
+use crate::types::ImmutableRecord;
 
 pub struct PseudoCursor {
-    current: Option<Record>,
+    current: Option<ImmutableRecord>,
 }
 
 impl PseudoCursor {
@@ -9,11 +9,11 @@ impl PseudoCursor {
         Self { current: None }
     }
 
-    pub fn record(&self) -> Option<&Record> {
+    pub fn record(&self) -> Option<&ImmutableRecord> {
         self.current.as_ref()
     }
 
-    pub fn insert(&mut self, record: Record) {
+    pub fn insert(&mut self, record: ImmutableRecord) {
         self.current = Some(record);
     }
 }
