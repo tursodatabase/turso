@@ -326,11 +326,13 @@ fn row_to_py(py: Python, row: &limbo_core::Row) -> Result<PyObject> {
     let mut py_values = Vec::new();
     for value in row.get_values() {
         match value {
-            limbo_core::RefValue::Null => py_values.push(py.None()),
-            limbo_core::RefValue::Integer(i) => py_values.push(i.into_pyobject(py)?.into()),
-            limbo_core::RefValue::Float(f) => py_values.push(f.into_pyobject(py)?.into()),
-            limbo_core::RefValue::Text(s) => py_values.push(s.as_str().into_pyobject(py)?.into()),
-            limbo_core::RefValue::Blob(b) => py_values.push(PyBytes::new(py, b.to_slice()).into()),
+            limbo_core::OwnedValue::Null => py_values.push(py.None()),
+            limbo_core::OwnedValue::Integer(i) => py_values.push(i.into_pyobject(py)?.into()),
+            limbo_core::OwnedValue::Float(f) => py_values.push(f.into_pyobject(py)?.into()),
+            limbo_core::OwnedValue::Text(s) => py_values.push(s.as_str().into_pyobject(py)?.into()),
+            limbo_core::OwnedValue::Blob(b) => {
+                py_values.push(PyBytes::new(py, b.as_slice()).into())
+            }
         }
     }
     Ok(PyTuple::new(py, &py_values)

@@ -1,6 +1,7 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(non_camel_case_types)]
 
+use limbo_core::OwnedValue;
 use log::trace;
 use std::ffi::{self, CStr, CString};
 
@@ -636,8 +637,8 @@ pub unsafe extern "C" fn sqlite3_column_text(
         Some(row) => row,
         None => return std::ptr::null(),
     };
-    match row.get_values().get(idx as usize) {
-        Some(limbo_core::RefValue::Text(text)) => text.as_str().as_ptr(),
+    match row.get::<&OwnedValue>(idx as usize) {
+        Ok(limbo_core::OwnedValue::Text(text)) => text.as_str().as_ptr(),
         _ => std::ptr::null(),
     }
 }

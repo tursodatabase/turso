@@ -604,7 +604,7 @@ impl Statement {
     }
 }
 
-pub type Row = types::ImmutableRecord;
+pub type Row = vdbe::Row;
 
 pub type StepResult = vdbe::StepResult;
 

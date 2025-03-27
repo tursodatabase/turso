@@ -239,12 +239,19 @@ pub enum Register {
     Record(ImmutableRecord),
 }
 
+/// A row is a the list of registers that hold the values for a filtered row. This row is a pointer, therefore
+/// after stepping again, row will be invalidated to be sure it doesn't point to somewhere unexpected.
+pub struct Row {
+    values: *const Register,
+    count: usize,
+}
+
 /// The program state describes the environment in which the program executes.
 pub struct ProgramState {
     pub pc: InsnReference,
     cursors: RefCell<Vec<Option<Cursor>>>,
     registers: Vec<Register>,
-    pub(crate) result_row: Option<ImmutableRecord>,
+    pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
     deferred_seek: Option<(CursorID, CursorID)>,
     ended_coroutine: Bitfield<4>, // flag to indicate that a coroutine has ended (key is the yield register. currently we assume that the yield register is always between 0-255, YOLO)
@@ -399,6 +406,8 @@ impl Program {
             if state.is_interrupted() {
                 return Ok(StepResult::Interrupt);
             }
+            // invalidate row
+            let _ = state.result_row.take();
             let insn = &self.insns[state.pc as usize];
             trace_insn(self, state.pc as InsnReference, insn);
             match insn {
@@ -1253,8 +1262,12 @@ impl Program {
                     state.pc += 1;
                 }
                 Insn::ResultRow { start_reg, count } => {
-                    let record = make_record(&state.registers, start_reg, count);
-                    state.result_row = Some(record);
+                    let row = Row {
+                        values: &state.registers[*start_reg] as *const Register,
+                        count: *count,
+                    };
+
+                    state.result_row = Some(row);
                     state.pc += 1;
                     return Ok(StepResult::Row);
                 }
@@ -4480,6 +4493,67 @@ fn exec_math_log(arg: &OwnedValue, base: Option<&OwnedValue>) -> OwnedValue {
     OwnedValue::Float(f.log(base))
 }
 
+pub trait FromValueRow<'a> {
+    fn from_value(value: &'a OwnedValue) -> Result<Self>
+    where
+        Self: Sized + 'a;
+}
+
+impl<'a> FromValueRow<'a> for i64 {
+    fn from_value(value: &'a OwnedValue) -> Result<Self> {
+        match value {
+            OwnedValue::Integer(i) => Ok(*i),
+            _ => Err(LimboError::ConversionError("Expected integer value".into())),
+        }
+    }
+}
+
+impl<'a> FromValueRow<'a> for String {
+    fn from_value(value: &'a OwnedValue) -> Result<Self> {
+        match value {
+            OwnedValue::Text(s) => Ok(s.as_str().to_string()),
+            _ => Err(LimboError::ConversionError("Expected text value".into())),
+        }
+    }
+}
+
+impl<'a> FromValueRow<'a> for &'a str {
+    fn from_value(value: &'a OwnedValue) -> Result<Self> {
+        match value {
+            OwnedValue::Text(s) => Ok(s.as_str()),
+            _ => Err(LimboError::ConversionError("Expected text value".into())),
+        }
+    }
+}
+
+impl<'a> FromValueRow<'a> for &'a OwnedValue {
+    fn from_value(value: &'a OwnedValue) -> Result<Self> {
+        Ok(value)
+    }
+}
+
+impl Row {
+    pub fn get<'a, T: FromValueRow<'a> + 'a>(&'a self, idx: usize) -> Result<T> {
+        let value = unsafe { self.values.add(idx).as_ref().unwrap() };
+        let value = match value {
+            Register::OwnedValue(owned_value) => owned_value,
+            _ => unreachable!("a row should be formed of values only"),
+        };
+        T::from_value(value)
+    }
+
+    pub fn get_values(&self) -> impl Iterator<Item = &OwnedValue> {
+        let values = unsafe { std::slice::from_raw_parts(self.values, self.count) };
+        dbg!(&values);
+        // This should be ownedvalues
+        // TODO: add check for this
+        values.iter().map(|v| v.get_owned_value())
+    }
+
+    pub fn len(&self) -> usize {
+        self.count
+    }
+}
 #[cfg(test)]
 mod tests {
     use crate::vdbe::{exec_replace, Register};

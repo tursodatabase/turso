@@ -212,7 +212,7 @@ impl Rows {
             Ok(limbo_core::StepResult::Row) => {
                 let row = stmt.row().unwrap();
                 Ok(Some(Row {
-                    values: row.get_values().iter().map(|v| v.to_owned()).collect(),
+                    values: row.get_values().map(|v| v.to_owned()).collect(),
                 }))
             }
             _ => Ok(None),

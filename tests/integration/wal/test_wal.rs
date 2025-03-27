@@ -172,7 +172,7 @@ pub(crate) fn execute_and_get_ints(
                 let row = stmt.row().unwrap();
                 for value in row.get_values() {
                     let out = match value {
-                        limbo_core::RefValue::Integer(i) => i,
+                        limbo_core::OwnedValue::Integer(i) => i,
                         _ => {
                             return Err(LimboError::ConversionError(format!(
                                 "cannot convert {value} to int"

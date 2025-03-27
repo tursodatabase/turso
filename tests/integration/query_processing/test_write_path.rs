@@ -1,6 +1,6 @@
 use crate::common;
 use crate::common::{compare_string, do_flush, TempDatabase};
-use limbo_core::{Connection, RefValue, StepResult};
+use limbo_core::{Connection, OwnedValue, RefValue, StepResult};
 use log::debug;
 use std::rc::Rc;
 
@@ -192,10 +192,10 @@ fn test_sequential_write() -> anyhow::Result<()> {
                 match rows.step()? {
                     StepResult::Row => {
                         let row = rows.row().unwrap();
-                        let first_value = row.get_values().first().expect("missing id");
+                        let first_value = row.get::<&OwnedValue>(0).expect("missing id");
                         let id = match first_value {
-                            limbo_core::RefValue::Integer(i) => *i as i32,
-                            limbo_core::RefValue::Float(f) => *f as i32,
+                            limbo_core::OwnedValue::Integer(i) => *i as i32,
+                            limbo_core::OwnedValue::Float(f) => *f as i32,
                             _ => unreachable!(),
                         };
                         assert_eq!(current_read_index, id);
@@ -258,9 +258,9 @@ fn test_regression_multi_row_insert() -> anyhow::Result<()> {
             match rows.step()? {
                 StepResult::Row => {
                     let row = rows.row().unwrap();
-                    let first_value = row.get_values().first().expect("missing id");
+                    let first_value = row.get::<&OwnedValue>(0).expect("missing id");
                     let id = match first_value {
-                        RefValue::Float(f) => *f as i32,
+                        OwnedValue::Float(f) => *f as i32,
                         _ => panic!("expected float"),
                     };
                     actual_ids.push(id);
@@ -304,7 +304,10 @@ fn test_statement_reset() -> anyhow::Result<()> {
         match stmt.step()? {
             StepResult::Row => {
                 let row = stmt.row().unwrap();
-                assert_eq!(*row.get_value(0), limbo_core::OwnedValue::Integer(1));
+                assert_eq!(
+                    *row.get::<&OwnedValue>(0),
+                    limbo_core::OwnedValue::Integer(1)
+                );
                 break;
             }
             StepResult::IO => tmp_db.io.run_once()?,
@@ -318,7 +321,10 @@ fn test_statement_reset() -> anyhow::Result<()> {
         match stmt.step()? {
             StepResult::Row => {
                 let row = stmt.row().unwrap();
-                assert_eq!(*row.get_value(0), limbo_core::OwnedValue::Integer(1));
+                assert_eq!(
+                    *row.get::<&OwnedValue>(0),
+                    limbo_core::OwnedValue::Integer(1)
+                );
                 break;
             }
             StepResult::IO => tmp_db.io.run_once()?,

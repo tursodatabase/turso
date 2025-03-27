@@ -494,13 +494,13 @@ impl Interaction {
                         let mut r = Vec::new();
                         for v in row.get_values() {
                             let v = match v {
-                                limbo_core::RefValue::Null => Value::Null,
-                                limbo_core::RefValue::Integer(i) => Value::Integer(*i),
-                                limbo_core::RefValue::Float(f) => Value::Float(*f),
-                                limbo_core::RefValue::Text(t) => {
+                                limbo_core::OwnedValue::Null => Value::Null,
+                                limbo_core::OwnedValue::Integer(i) => Value::Integer(*i),
+                                limbo_core::OwnedValue::Float(f) => Value::Float(*f),
+                                limbo_core::OwnedValue::Text(t) => {
                                     Value::Text(t.as_str().to_string())
                                 }
-                                limbo_core::RefValue::Blob(b) => Value::Blob(b.to_slice().to_vec()),
+                                limbo_core::OwnedValue::Blob(b) => Value::Blob(b.to_vec()),
                             };
                             r.push(v);
                         }

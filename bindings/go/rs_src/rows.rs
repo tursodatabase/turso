@@ -2,7 +2,7 @@ use crate::{
     types::{LimboValue, ResultCode},
     LimboConn,
 };
-use limbo_core::{LimboError, Statement, StepResult};
+use limbo_core::{LimboError, OwnedValue, Statement, StepResult};
 use std::ffi::{c_char, c_void};
 
 pub struct LimboRows<'conn> {
@@ -75,8 +75,8 @@ pub extern "C" fn rows_get_value(ctx: *mut c_void, col_idx: usize) -> *const c_v
     let ctx = LimboRows::from_ptr(ctx);
 
     if let Some(row) = ctx.stmt.row() {
-        if let Some(value) = row.get_values().get(col_idx) {
-            return LimboValue::from_value(value).to_ptr();
+        if let Ok(value) = row.get::<&OwnedValue>(col_idx) {
+            return LimboValue::from_owned_value(value).to_ptr();
         }
     }
     std::ptr::null()

@@ -76,7 +76,7 @@ impl Statement {
                 let row = stmt.row().unwrap();
                 let mut obj = env.create_object()?;
 
-                for (idx, value) in row.get_values().iter().enumerate() {
+                for (idx, value) in row.get_values().enumerate() {
                     let key = (idx + 1).to_string();
                     let js_value = to_js_value(&env, value);
                     obj.set_named_property(&key, js_value)?;
@@ -92,14 +92,14 @@ impl Statement {
     }
 }
 
-fn to_js_value(env: &napi::Env, value: &limbo_core::RefValue) -> JsUnknown {
+fn to_js_value(env: &napi::Env, value: &limbo_core::OwnedValue) -> JsUnknown {
     match value {
-        limbo_core::RefValue::Null => env.get_null().unwrap().into_unknown(),
-        limbo_core::RefValue::Integer(i) => env.create_int64(*i).unwrap().into_unknown(),
-        limbo_core::RefValue::Float(f) => env.create_double(*f).unwrap().into_unknown(),
-        limbo_core::RefValue::Text(s) => env.create_string(s.as_str()).unwrap().into_unknown(),
-        limbo_core::RefValue::Blob(b) => {
-            env.create_buffer_copy(b.to_slice()).unwrap().into_unknown()
+        limbo_core::OwnedValue::Null => env.get_null().unwrap().into_unknown(),
+        limbo_core::OwnedValue::Integer(i) => env.create_int64(*i).unwrap().into_unknown(),
+        limbo_core::OwnedValue::Float(f) => env.create_double(*f).unwrap().into_unknown(),
+        limbo_core::OwnedValue::Text(s) => env.create_string(s.as_str()).unwrap().into_unknown(),
+        limbo_core::OwnedValue::Blob(b) => {
+            env.create_buffer_copy(b.as_slice()).unwrap().into_unknown()
         }
     }
 }
