@@ -555,6 +555,22 @@ impl Record {
         self.values.len()
     }
 }
+struct AppendWriter<'a> {
+    buf: &'a mut Vec<u8>,
+    pos: usize,
+}
+
+impl<'a> AppendWriter<'a> {
+    pub fn new(buf: &'a mut Vec<u8>, pos: usize) -> Self {
+        Self { buf, pos }
+    }
+
+    #[inline]
+    pub fn extend_from_slice(&mut self, slice: &[u8]) {
+        self.buf[self.pos..self.pos + slice.len()].copy_from_slice(slice);
+        self.pos += slice.len();
+    }
+}
 
 impl ImmutableRecord {
     pub fn get<'a, T: FromValue<'a> + 'a>(&'a self, idx: usize) -> Result<T> {
@@ -587,6 +603,7 @@ impl ImmutableRecord {
 
     pub fn from_registers(registers: &[Register]) -> Self {
         let mut values = Vec::with_capacity(registers.len());
+        let mut serials = Vec::with_capacity(registers.len());
         let mut size_header = 0;
         let mut size_values = 0;
 
@@ -596,6 +613,7 @@ impl ImmutableRecord {
             let value = value.get_owned_value();
             let serial_type = SerialType::from(value);
             let n = write_varint(&mut serial_type_buf[0..], serial_type.into());
+            serials.push(serial_type_buf.clone());
 
             let value_size = match serial_type {
                 SerialType::Null => 0,
@@ -625,50 +643,51 @@ impl ImmutableRecord {
             // if( nVarint<sqlite3VarintLen(nHdr) ) nHdr++;
         }
         // 1. write header size
-        let mut buf = Vec::with_capacity(header_size + size_values);
+        let mut buf = Vec::with_capacity((header_size + size_values) * 2);
         assert!(header_size <= 126);
         buf.extend(std::iter::repeat(0).take(9));
         let n = write_varint(buf.as_mut_slice(), header_size as u64);
         buf.truncate(n);
+
+        let start_pos = buf.len();
+        buf.resize(buf.capacity(), 0);
+        let mut writer = AppendWriter::new(&mut buf, start_pos);
+
         // 2. Write serial
-        for value in registers {
-            let value = value.get_owned_value();
-            let serial_type = SerialType::from(value);
-            let start_pos = buf.len();
-            buf.resize(buf.len() + 9, 0); // Ensure space for varint (1-9 bytes in length)
-            let len = buf.len();
-            let n = write_varint(&mut buf[start_pos..], serial_type.into());
-            buf.truncate(buf.len() - 9 + n); // Remove unused bytes
+        for value in serials {
+            writer.extend_from_slice(&value);
         }
 
         // write content
         for value in registers {
             let value = value.get_owned_value();
-            let start_offset = buf.len();
+            let start_offset = writer.pos;
             match value {
                 OwnedValue::Null => {}
                 OwnedValue::Integer(i) => {
                     values.push(RefValue::Integer(*i));
                     let serial_type = SerialType::from(value);
                     match serial_type {
-                        SerialType::I8 => buf.extend_from_slice(&(*i as i8).to_be_bytes()),
-                        SerialType::I16 => buf.extend_from_slice(&(*i as i16).to_be_bytes()),
-                        SerialType::I24 => buf.extend_from_slice(&(*i as i32).to_be_bytes()[1..]), // remove most significant byte
-                        SerialType::I32 => buf.extend_from_slice(&(*i as i32).to_be_bytes()),
-                        SerialType::I48 => buf.extend_from_slice(&i.to_be_bytes()[2..]), // remove 2 most significant bytes
-                        SerialType::I64 => buf.extend_from_slice(&i.to_be_bytes()),
+                        SerialType::I8 => writer.extend_from_slice(&(*i as i8).to_be_bytes()),
+                        SerialType::I16 => writer.extend_from_slice(&(*i as i16).to_be_bytes()),
+                        SerialType::I24 => {
+                            writer.extend_from_slice(&(*i as i32).to_be_bytes()[1..])
+                        } // remove most significant byte
+                        SerialType::I32 => writer.extend_from_slice(&(*i as i32).to_be_bytes()),
+                        SerialType::I48 => writer.extend_from_slice(&i.to_be_bytes()[2..]), // remove 2 most significant bytes
+                        SerialType::I64 => writer.extend_from_slice(&i.to_be_bytes()),
                         _ => unreachable!(),
                     }
                 }
                 OwnedValue::Float(f) => {
                     values.push(RefValue::Float(*f));
-                    buf.extend_from_slice(&f.to_be_bytes())
+                    writer.extend_from_slice(&f.to_be_bytes())
                 }
                 OwnedValue::Text(t) => {
-                    buf.extend_from_slice(&t.value);
-                    let end_offset = buf.len();
+                    writer.extend_from_slice(&t.value);
+                    let end_offset = writer.pos;
                     let len = end_offset - start_offset;
-                    let ptr = unsafe { buf.as_ptr().add(start_offset) };
+                    let ptr = unsafe { writer.buf.as_ptr().add(start_offset) };
                     let value = RefValue::Text(TextRef {
                         value: RawSlice::new(ptr, len),
                         subtype: t.subtype.clone(),
@@ -676,10 +695,10 @@ impl ImmutableRecord {
                     values.push(value);
                 }
                 OwnedValue::Blob(b) => {
-                    buf.extend_from_slice(b);
-                    let end_offset = buf.len();
+                    writer.extend_from_slice(b);
+                    let end_offset = writer.pos;
                     let len = end_offset - start_offset;
-                    let ptr = unsafe { buf.as_ptr().add(start_offset) };
+                    let ptr = unsafe { writer.buf.as_ptr().add(start_offset) };
                     values.push(RefValue::Blob(RawSlice::new(ptr, len)));
                 }
             };
