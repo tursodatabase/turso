@@ -5,7 +5,7 @@ use crate::{
     opcodes_dictionary::OPCODE_DESCRIPTIONS,
 };
 use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Row, Table};
-use limbo_core::{Database, LimboError, OwnedValue, RefValue, Statement, StepResult};
+use limbo_core::{Database, LimboError, RefValue, Statement, StepResult};
 
 use clap::{Parser, ValueEnum};
 use rustyline::{history::DefaultHistory, Editor};

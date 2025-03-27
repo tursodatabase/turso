@@ -32,7 +32,7 @@ pub enum TextSubtype {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Text {
-    pub value: Rc<Vec<u8>>,
+    pub value: Vec<u8>,
     pub subtype: TextSubtype,
 }
 
@@ -49,14 +49,14 @@ impl Text {
 
     pub fn new(value: &str) -> Self {
         Self {
-            value: Rc::new(value.as_bytes().to_vec()),
+            value: value.as_bytes().to_vec(),
             subtype: TextSubtype::Text,
         }
     }
 
     pub fn json(value: String) -> Self {
         Self {
-            value: Rc::new(value.into_bytes()),
+            value: value.into_bytes(),
             subtype: TextSubtype::Json,
         }
     }
@@ -86,7 +86,7 @@ pub enum OwnedValue {
     Integer(i64),
     Float(f64),
     Text(Text),
-    Blob(Rc<Vec<u8>>),
+    Blob(Vec<u8>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -95,7 +95,7 @@ pub struct RawSlice {
     len: usize,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum RefValue {
     Null,
     Integer(i64),
@@ -118,7 +118,7 @@ impl OwnedValue {
     }
 
     pub fn from_blob(data: Vec<u8>) -> Self {
-        OwnedValue::Blob(std::rc::Rc::new(data))
+        OwnedValue::Blob(data)
     }
 
     pub fn to_text(&self) -> Option<&str> {
@@ -231,7 +231,7 @@ impl OwnedValue {
                 let Some(blob) = v.to_blob() else {
                     return Ok(OwnedValue::Null);
                 };
-                Ok(OwnedValue::Blob(Rc::new(blob)))
+                Ok(OwnedValue::Blob(blob))
             }
             ExtValueType::Error => {
                 let Some(err) = v.to_error_details() else {
@@ -632,7 +632,6 @@ impl ImmutableRecord {
             size_values += value_size;
         }
         let mut header_size = size_header;
-        let mut header_bytes_buf: Vec<u8> = Vec::new();
         if header_size <= 126 {
             // common case
             header_size += 1;
@@ -769,10 +768,10 @@ impl RefValue {
             RefValue::Integer(i) => OwnedValue::Integer(*i),
             RefValue::Float(f) => OwnedValue::Float(*f),
             RefValue::Text(text_ref) => OwnedValue::Text(Text {
-                value: Rc::new(text_ref.value.to_slice().to_vec()),
+                value: text_ref.value.to_slice().to_vec(),
                 subtype: text_ref.subtype.clone(),
             }),
-            RefValue::Blob(b) => OwnedValue::Blob(Rc::new(b.to_slice().to_vec())),
+            RefValue::Blob(b) => OwnedValue::Blob(b.to_slice().to_vec()),
         }
     }
     pub fn to_blob(&self) -> Option<&[u8]> {
@@ -1347,7 +1346,7 @@ mod tests {
 
     #[test]
     fn test_serialize_blob() {
-        let blob = Rc::new(vec![1, 2, 3, 4, 5]);
+        let blob = vec![1, 2, 3, 4, 5];
         let record = Record::new(vec![OwnedValue::Blob(blob.clone())]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);

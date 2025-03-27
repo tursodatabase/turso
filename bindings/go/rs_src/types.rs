@@ -1,5 +1,4 @@
 use std::ffi::{c_char, c_void};
-use std::rc::Rc;
 
 #[allow(dead_code)]
 #[repr(C)]
@@ -196,7 +195,7 @@ impl LimboValue {
                     return limbo_core::OwnedValue::Null;
                 }
                 let bytes = self.value.to_bytes();
-                limbo_core::OwnedValue::Blob(Rc::new(bytes.to_vec()))
+                limbo_core::OwnedValue::Blob(bytes.to_vec())
             }
             ValueType::Null => limbo_core::OwnedValue::Null,
         }

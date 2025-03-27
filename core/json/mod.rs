@@ -73,7 +73,7 @@ pub fn get_json(json_value: &OwnedValue, indent: Option<&str>) -> crate::Result<
             let jsonbin = Jsonb::new(b.len(), Some(b));
             jsonbin.is_valid()?;
             Ok(OwnedValue::Text(Text {
-                value: Rc::new(jsonbin.to_string()?.into_bytes()),
+                value: jsonbin.to_string()?.into_bytes(),
                 subtype: TextSubtype::Json,
             }))
         }
@@ -95,7 +95,7 @@ pub fn jsonb(json_value: &OwnedValue, cache: &JsonCacheCell) -> crate::Result<Ow
 
     let jsonbin = cache.get_or_insert_with(json_value, json_conv_fn);
     match jsonbin {
-        Ok(jsonbin) => Ok(OwnedValue::Blob(Rc::new(jsonbin.data()))),
+        Ok(jsonbin) => Ok(OwnedValue::Blob(jsonbin.data())),
         Err(_) => {
             bail_parse_error!("malformed JSON")
         }
@@ -405,7 +405,7 @@ fn json_string_to_db_type(
 ) -> crate::Result<OwnedValue> {
     let mut json_string = json.to_string()?;
     if matches!(flag, OutputVariant::Binary) {
-        return Ok(OwnedValue::Blob(Rc::new(json.data())));
+        return Ok(OwnedValue::Blob(json.data()));
     }
     match element_type {
         ElementType::ARRAY | ElementType::OBJECT => Ok(OwnedValue::Text(Text::json(json_string))),
@@ -414,12 +414,12 @@ fn json_string_to_db_type(
                 json_string.remove(json_string.len() - 1);
                 json_string.remove(0);
                 Ok(OwnedValue::Text(Text {
-                    value: Rc::new(json_string.into_bytes()),
+                    value: json_string.into_bytes(),
                     subtype: TextSubtype::Json,
                 }))
             } else {
                 Ok(OwnedValue::Text(Text {
-                    value: Rc::new(json_string.into_bytes()),
+                    value: json_string.into_bytes(),
                     subtype: TextSubtype::Text,
                 }))
             }
@@ -764,7 +764,7 @@ mod tests {
     #[test]
     fn test_get_json_blob_valid_jsonb() {
         let binary_json = vec![124, 55, 104, 101, 121, 39, 121, 111];
-        let input = OwnedValue::Blob(Rc::new(binary_json));
+        let input = OwnedValue::Blob(binary_json);
         let result = get_json(&input, None).unwrap();
         if let OwnedValue::Text(result_str) = result {
             assert!(result_str.as_str().contains(r#"{"hey":"yo"}"#));
@@ -777,7 +777,7 @@ mod tests {
     #[test]
     fn test_get_json_blob_invalid_jsonb() {
         let binary_json: Vec<u8> = vec![0xA2, 0x62, 0x6B, 0x31, 0x62, 0x76]; // Incomplete binary JSON
-        let input = OwnedValue::Blob(Rc::new(binary_json));
+        let input = OwnedValue::Blob(binary_json);
         let result = get_json(&input, None);
         println!("{:?}", result);
         match result {
@@ -832,7 +832,7 @@ mod tests {
 
     #[test]
     fn test_json_array_blob_invalid() {
-        let blob = Register::OwnedValue(OwnedValue::Blob(Rc::new("1".as_bytes().to_vec())));
+        let blob = Register::OwnedValue(OwnedValue::Blob("1".as_bytes().to_vec()));
 
         let input = vec![blob];
 

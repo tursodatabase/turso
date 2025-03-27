@@ -50,7 +50,7 @@ use crate::util::{
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::Insn;
 use crate::vector::{vector32, vector64, vector_distance_cos, vector_extract};
-use crate::{bail_constraint_error, info, CheckpointStatus};
+use crate::{bail_constraint_error, info, CheckpointStatus, RefValue};
 #[cfg(feature = "json")]
 use crate::{
     function::JsonFunc, json::get_json, json::is_json_valid, json::json_array,
@@ -1176,17 +1176,38 @@ impl Program {
                                 );
                                 let cursor = cursor.as_btree_mut();
                                 let record = cursor.record();
-                                if let Some(record) = record.as_ref() {
+                                let value = if let Some(record) = record.as_ref() {
                                     if cursor.get_null_flag() {
-                                        OwnedValue::Null
+                                        RefValue::Null
                                     } else {
-                                        record.get_value(*column).to_owned()
+                                        record.get_value(*column).clone()
                                     }
                                 } else {
-                                    OwnedValue::Null
-                                }
+                                    RefValue::Null
+                                };
+                                value
                             };
-                            state.registers[*dest] = Register::OwnedValue(value);
+                            // If we are copying a text/blob, let's try to simply update size of text if we need to allocate more and reuse.
+                            match (&value, &mut state.registers[*dest]) {
+                                (
+                                    RefValue::Text(text_ref),
+                                    Register::OwnedValue(OwnedValue::Text(text_reg)),
+                                ) => {
+                                    text_reg.value.clear();
+                                    text_reg.value.extend_from_slice(text_ref.value.to_slice());
+                                }
+                                (
+                                    RefValue::Blob(raw_slice),
+                                    Register::OwnedValue(OwnedValue::Blob(blob_reg)),
+                                ) => {
+                                    blob_reg.clear();
+                                    blob_reg.extend_from_slice(raw_slice.to_slice());
+                                }
+                                _ => {
+                                    let reg = &mut state.registers[*dest];
+                                    *reg = Register::OwnedValue(value.to_owned());
+                                }
+                            }
                         }
                         CursorType::Sorter => {
                             let record = {
@@ -1432,8 +1453,7 @@ impl Program {
                     state.pc += 1;
                 }
                 Insn::Blob { value, dest } => {
-                    state.registers[*dest] =
-                        Register::OwnedValue(OwnedValue::Blob(Rc::new(value.clone())));
+                    state.registers[*dest] = Register::OwnedValue(OwnedValue::Blob(value.clone()));
                     state.pc += 1;
                 }
                 Insn::RowId { cursor_id, dest } => {
@@ -3904,7 +3924,7 @@ fn exec_randomblob(reg: &OwnedValue) -> OwnedValue {
 
     let mut blob: Vec<u8> = vec![0; length];
     getrandom::getrandom(&mut blob).expect("Failed to generate random blob");
-    OwnedValue::Blob(Rc::new(blob))
+    OwnedValue::Blob(blob)
 }
 
 fn exec_quote(value: &OwnedValue) -> OwnedValue {
@@ -4056,7 +4076,7 @@ fn exec_instr(reg: &OwnedValue, pattern: &OwnedValue) -> OwnedValue {
     if let (OwnedValue::Blob(reg), OwnedValue::Blob(pattern)) = (reg, pattern) {
         let result = reg
             .windows(pattern.len())
-            .position(|window| window == **pattern)
+            .position(|window| window == *pattern)
             .map_or(0, |i| i + 1);
         return OwnedValue::Integer(result as i64);
     }
@@ -4113,7 +4133,7 @@ fn exec_unhex(reg: &OwnedValue, ignored_chars: Option<&OwnedValue>) -> OwnedValu
         OwnedValue::Null => OwnedValue::Null,
         _ => match ignored_chars {
             None => match hex::decode(reg.to_string()) {
-                Ok(bytes) => OwnedValue::Blob(Rc::new(bytes)),
+                Ok(bytes) => OwnedValue::Blob(bytes),
                 Err(_) => OwnedValue::Null,
             },
             Some(ignore) => match ignore {
@@ -4125,7 +4145,7 @@ fn exec_unhex(reg: &OwnedValue, ignored_chars: Option<&OwnedValue>) -> OwnedValu
                         .trim_end_matches(|x| pat.contains(x))
                         .to_string();
                     match hex::decode(trimmed) {
-                        Ok(bytes) => OwnedValue::Blob(Rc::new(bytes)),
+                        Ok(bytes) => OwnedValue::Blob(bytes),
                         Err(_) => OwnedValue::Null,
                     }
                 }
@@ -4236,7 +4256,7 @@ fn exec_zeroblob(req: &OwnedValue) -> OwnedValue {
         OwnedValue::Text(s) => s.as_str().parse().unwrap_or(0),
         _ => 0,
     };
-    OwnedValue::Blob(Rc::new(vec![0; length.max(0) as usize]))
+    OwnedValue::Blob(vec![0; length.max(0) as usize])
 }
 
 // exec_if returns whether you should jump
@@ -4260,7 +4280,7 @@ fn exec_cast(value: &OwnedValue, datatype: &str) -> OwnedValue {
             // Convert to TEXT first, then interpret as BLOB
             // TODO: handle encoding
             let text = value.to_string();
-            OwnedValue::Blob(Rc::new(text.into_bytes()))
+            OwnedValue::Blob(text.into_bytes())
         }
         // TEXT To cast a BLOB value to TEXT, the sequence of bytes that make up the BLOB is interpreted as text encoded using the database encoding.
         // Casting an INTEGER or REAL value into TEXT renders the value as if via sqlite3_snprintf() except that the resulting TEXT uses the encoding of the database connection.
@@ -4487,7 +4507,7 @@ mod tests {
         let expected_len = OwnedValue::Integer(7);
         assert_eq!(exec_length(&input_float), expected_len);
 
-        let expected_blob = OwnedValue::Blob(Rc::new("example".as_bytes().to_vec()));
+        let expected_blob = OwnedValue::Blob("example".as_bytes().to_vec());
         let expected_len = OwnedValue::Integer(7);
         assert_eq!(exec_length(&expected_blob), expected_len);
     }
@@ -4525,7 +4545,7 @@ mod tests {
         let expected: OwnedValue = OwnedValue::build_text("text");
         assert_eq!(exec_typeof(&input), expected);
 
-        let input = OwnedValue::Blob(Rc::new("limbo".as_bytes().to_vec()));
+        let input = OwnedValue::Blob("limbo".as_bytes().to_vec());
         let expected: OwnedValue = OwnedValue::build_text("blob");
         assert_eq!(exec_typeof(&input), expected);
     }
@@ -4559,7 +4579,7 @@ mod tests {
         );
         assert_eq!(exec_unicode(&OwnedValue::Null), OwnedValue::Null);
         assert_eq!(
-            exec_unicode(&OwnedValue::Blob(Rc::new("example".as_bytes().to_vec()))),
+            exec_unicode(&OwnedValue::Blob("example".as_bytes().to_vec())),
             OwnedValue::Integer(101)
         );
     }
@@ -4719,11 +4739,11 @@ mod tests {
     #[test]
     fn test_unhex() {
         let input = OwnedValue::build_text("6f");
-        let expected = OwnedValue::Blob(Rc::new(vec![0x6f]));
+        let expected = OwnedValue::Blob(vec![0x6f]);
         assert_eq!(exec_unhex(&input, None), expected);
 
         let input = OwnedValue::build_text("6f");
-        let expected = OwnedValue::Blob(Rc::new(vec![0x6f]));
+        let expected = OwnedValue::Blob(vec![0x6f]);
         assert_eq!(exec_unhex(&input, None), expected);
 
         let input = OwnedValue::build_text("611");
@@ -4731,7 +4751,7 @@ mod tests {
         assert_eq!(exec_unhex(&input, None), expected);
 
         let input = OwnedValue::build_text("");
-        let expected = OwnedValue::Blob(Rc::new(vec![]));
+        let expected = OwnedValue::Blob(vec![]);
         assert_eq!(exec_unhex(&input, None), expected);
 
         let input = OwnedValue::build_text("61x");
@@ -5118,23 +5138,23 @@ mod tests {
         let expected = OwnedValue::Integer(3);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
-        let input = OwnedValue::Blob(Rc::new(vec![1, 2, 3, 4, 5]));
-        let pattern = OwnedValue::Blob(Rc::new(vec![3, 4]));
+        let input = OwnedValue::Blob(vec![1, 2, 3, 4, 5]);
+        let pattern = OwnedValue::Blob(vec![3, 4]);
         let expected = OwnedValue::Integer(3);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
-        let input = OwnedValue::Blob(Rc::new(vec![1, 2, 3, 4, 5]));
-        let pattern = OwnedValue::Blob(Rc::new(vec![3, 2]));
+        let input = OwnedValue::Blob(vec![1, 2, 3, 4, 5]);
+        let pattern = OwnedValue::Blob(vec![3, 2]);
         let expected = OwnedValue::Integer(0);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
-        let input = OwnedValue::Blob(Rc::new(vec![0x61, 0x62, 0x63, 0x64, 0x65]));
+        let input = OwnedValue::Blob(vec![0x61, 0x62, 0x63, 0x64, 0x65]);
         let pattern = OwnedValue::build_text("cd");
         let expected = OwnedValue::Integer(3);
         assert_eq!(exec_instr(&input, &pattern), expected);
 
         let input = OwnedValue::build_text("abcde");
-        let pattern = OwnedValue::Blob(Rc::new(vec![0x63, 0x64]));
+        let pattern = OwnedValue::Blob(vec![0x63, 0x64]);
         let expected = OwnedValue::Integer(3);
         assert_eq!(exec_instr(&input, &pattern), expected);
     }
@@ -5185,19 +5205,19 @@ mod tests {
         let expected = Some(OwnedValue::Integer(0));
         assert_eq!(exec_sign(&input), expected);
 
-        let input = OwnedValue::Blob(Rc::new(b"abc".to_vec()));
+        let input = OwnedValue::Blob(b"abc".to_vec());
         let expected = Some(OwnedValue::Null);
         assert_eq!(exec_sign(&input), expected);
 
-        let input = OwnedValue::Blob(Rc::new(b"42".to_vec()));
+        let input = OwnedValue::Blob(b"42".to_vec());
         let expected = Some(OwnedValue::Integer(1));
         assert_eq!(exec_sign(&input), expected);
 
-        let input = OwnedValue::Blob(Rc::new(b"-42".to_vec()));
+        let input = OwnedValue::Blob(b"-42".to_vec());
         let expected = Some(OwnedValue::Integer(-1));
         assert_eq!(exec_sign(&input), expected);
 
-        let input = OwnedValue::Blob(Rc::new(b"0".to_vec()));
+        let input = OwnedValue::Blob(b"0".to_vec());
         let expected = Some(OwnedValue::Integer(0));
         assert_eq!(exec_sign(&input), expected);
 
@@ -5209,39 +5229,39 @@ mod tests {
     #[test]
     fn test_exec_zeroblob() {
         let input = OwnedValue::Integer(0);
-        let expected = OwnedValue::Blob(Rc::new(vec![]));
+        let expected = OwnedValue::Blob(vec![]);
         assert_eq!(exec_zeroblob(&input), expected);
 
         let input = OwnedValue::Null;
-        let expected = OwnedValue::Blob(Rc::new(vec![]));
+        let expected = OwnedValue::Blob(vec![]);
         assert_eq!(exec_zeroblob(&input), expected);
 
         let input = OwnedValue::Integer(4);
-        let expected = OwnedValue::Blob(Rc::new(vec![0; 4]));
+        let expected = OwnedValue::Blob(vec![0; 4]);
         assert_eq!(exec_zeroblob(&input), expected);
 
         let input = OwnedValue::Integer(-1);
-        let expected = OwnedValue::Blob(Rc::new(vec![]));
+        let expected = OwnedValue::Blob(vec![]);
         assert_eq!(exec_zeroblob(&input), expected);
 
         let input = OwnedValue::build_text("5");
-        let expected = OwnedValue::Blob(Rc::new(vec![0; 5]));
+        let expected = OwnedValue::Blob(vec![0; 5]);
         assert_eq!(exec_zeroblob(&input), expected);
 
         let input = OwnedValue::build_text("-5");
-        let expected = OwnedValue::Blob(Rc::new(vec![]));
+        let expected = OwnedValue::Blob(vec![]);
         assert_eq!(exec_zeroblob(&input), expected);
 
         let input = OwnedValue::build_text("text");
-        let expected = OwnedValue::Blob(Rc::new(vec![]));
+        let expected = OwnedValue::Blob(vec![]);
         assert_eq!(exec_zeroblob(&input), expected);
 
         let input = OwnedValue::Float(2.6);
-        let expected = OwnedValue::Blob(Rc::new(vec![0; 2]));
+        let expected = OwnedValue::Blob(vec![0; 2]);
         assert_eq!(exec_zeroblob(&input), expected);
 
-        let input = OwnedValue::Blob(Rc::new(vec![1]));
-        let expected = OwnedValue::Blob(Rc::new(vec![]));
+        let input = OwnedValue::Blob(vec![1]);
+        let expected = OwnedValue::Blob(vec![]);
         assert_eq!(exec_zeroblob(&input), expected);
     }
 

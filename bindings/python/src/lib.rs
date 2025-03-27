@@ -350,7 +350,7 @@ fn py_to_owned_value(obj: &Bound<PyAny>) -> Result<limbo_core::OwnedValue> {
     } else if let Ok(string) = obj.extract::<String>() {
         return Ok(OwnedValue::Text(Text::from_str(string)));
     } else if let Ok(bytes) = obj.downcast::<PyBytes>() {
-        return Ok(OwnedValue::Blob(Rc::new(bytes.as_bytes().to_vec())));
+        return Ok(OwnedValue::Blob(bytes.as_bytes().to_vec()));
     } else {
         return Err(PyErr::new::<ProgrammingError, _>(format!(
             "Unsupported Python type: {}",

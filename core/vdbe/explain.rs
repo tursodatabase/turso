@@ -672,7 +672,7 @@ pub fn insn_to_str(
                 0,
                 *dest as i32,
                 0,
-                OwnedValue::Blob(Rc::new(value.clone())),
+                OwnedValue::Blob(value.clone()),
                 0,
                 format!(
                     "r[{}]={} (len={})",

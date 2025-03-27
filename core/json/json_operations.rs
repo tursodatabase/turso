@@ -185,7 +185,7 @@ pub fn jsonb_remove(args: &[Register], json_cache: &JsonCacheCell) -> crate::Res
         }
     }
 
-    Ok(OwnedValue::Blob(Rc::new(json.data())))
+    Ok(OwnedValue::Blob(json.data()))
 }
 
 pub fn json_replace(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<OwnedValue> {
@@ -554,7 +554,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "blob is not supported!")]
     fn test_blob_not_supported() {
-        let target = OwnedValue::Blob(Rc::new(vec![1, 2, 3]));
+        let target = OwnedValue::Blob(vec![1, 2, 3]);
         let patch = create_text("{}");
         json_patch(&target, &patch).unwrap();
     }
