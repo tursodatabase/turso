@@ -518,9 +518,13 @@ impl<'a> FromValue<'a> for &'a str {
 /// This struct serves the purpose of not allocating multiple vectors of bytes if not needed.
 /// A value in a record that has already been serialized can stay serialized and what this struct offsers
 /// is easy acces to each value which point to the payload.
+/// The name might be contradictory as it is immutable in the sense that you cannot modify the values without modifying the payload.
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ImmutableRecord {
-    pub payload: Pin<Vec<u8>>, // << point to this
+    // We have to be super careful with this buffer since we make values point to the payload we need to take care reallocations
+    // happen in a controlled manner. If we realocate with values that should be correct, they will now point to undefined data.
+    // We don't use pin here because it would make it imposible to reuse the buffer if we need to push a new record in the same struct.
+    pub payload: Vec<u8>,
     pub values: Vec<RefValue>,
 }
 
@@ -704,7 +708,7 @@ impl ImmutableRecord {
         }
 
         Self {
-            payload: Pin::new(buf),
+            payload: buf,
             values,
         }
     }

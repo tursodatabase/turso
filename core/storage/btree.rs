@@ -182,7 +182,6 @@ pub struct BTreeCursor {
     root_page: usize,
     /// Rowid and record are stored before being consumed.
     rowid: Cell<Option<u64>>,
-    record: RefCell<Option<ImmutableRecord>>,
     null_flag: bool,
     /// Index internal pages are consumed on the way up, so we store going upwards flag in case
     /// we just moved to a parent page and the parent page is an internal index page which requires
@@ -196,6 +195,9 @@ pub struct BTreeCursor {
     /// Page stack used to traverse the btree.
     /// Each cursor has a stack because each cursor traverses the btree independently.
     stack: PageStack,
+    /// Reusable immutable record, used to allow better allocation strategy.
+    reusable_immutable_record: RefCell<Option<ImmutableRecord>>,
+    empty_record: RefCell<bool>,
 }
 
 /// Stack of pages representing the tree traversal order.
@@ -233,7 +235,6 @@ impl BTreeCursor {
             pager,
             root_page,
             rowid: Cell::new(None),
-            record: RefCell::new(None),
             null_flag: false,
             going_upwards: false,
             state: CursorState::None,
@@ -243,6 +244,8 @@ impl BTreeCursor {
                 cell_indices: RefCell::new([0; BTCURSOR_MAX_DEPTH + 1]),
                 stack: RefCell::new([const { None }; BTCURSOR_MAX_DEPTH + 1]),
             },
+            reusable_immutable_record: RefCell::new(None),
+            empty_record: RefCell::new(true),
         }
     }
 
@@ -262,7 +265,7 @@ impl BTreeCursor {
 
     /// Move the cursor to the previous record and return it.
     /// Used in backwards iteration.
-    fn get_prev_record(&mut self) -> Result<CursorResult<(Option<u64>, Option<ImmutableRecord>)>> {
+    fn get_prev_record(&mut self) -> Result<CursorResult<(Option<u64>)>> {
         loop {
             let page = self.stack.top();
             let cell_idx = self.stack.current_cell_index();
@@ -279,7 +282,7 @@ impl BTreeCursor {
                         self.stack.pop();
                     } else {
                         // moved to begin of btree
-                        return Ok(CursorResult::Ok((None, None)));
+                        return Ok(CursorResult::Ok((None)));
                     }
                 }
                 // continue to next loop to get record from the new page
@@ -330,8 +333,11 @@ impl BTreeCursor {
                     _rowid, _payload, ..
                 }) => {
                     self.stack.retreat();
-                    let record = crate::storage::sqlite3_ondisk::read_record(&_payload)?;
-                    return Ok(CursorResult::Ok((Some(_rowid), Some(record))));
+                    crate::storage::sqlite3_ondisk::read_record(
+                        &_payload,
+                        self.get_lazy_immutable_record().as_mut().unwrap(),
+                    )?;
+                    return Ok(CursorResult::Ok(Some(_rowid)));
                 }
                 BTreeCell::IndexInteriorCell(_) => todo!(),
                 BTreeCell::IndexLeafCell(_) => todo!(),
@@ -344,18 +350,21 @@ impl BTreeCursor {
     fn get_next_record(
         &mut self,
         predicate: Option<(SeekKey<'_>, SeekOp)>,
-    ) -> Result<CursorResult<(Option<u64>, Option<ImmutableRecord>)>> {
+    ) -> Result<CursorResult<Option<u64>>> {
         if let Some(mv_cursor) = &self.mv_cursor {
             let mut mv_cursor = mv_cursor.borrow_mut();
             let rowid = mv_cursor.current_row_id();
             match rowid {
                 Some(rowid) => {
                     let record = mv_cursor.current_row().unwrap().unwrap();
-                    let record = crate::storage::sqlite3_ondisk::read_record(&record.data)?;
+                    crate::storage::sqlite3_ondisk::read_record(
+                        &record.data,
+                        self.get_lazy_immutable_record().as_mut().unwrap(),
+                    )?;
                     mv_cursor.forward();
-                    return Ok(CursorResult::Ok((Some(rowid.row_id), Some(record))));
+                    return Ok(CursorResult::Ok(Some(rowid.row_id)));
                 }
-                None => return Ok(CursorResult::Ok((None, None))),
+                None => return Ok(CursorResult::Ok(None)),
             }
         }
         loop {
@@ -389,7 +398,7 @@ impl BTreeCursor {
                             self.stack.pop();
                             continue;
                         } else {
-                            return Ok(CursorResult::Ok((None, None)));
+                            return Ok(CursorResult::Ok(None));
                         }
                     }
                 }
@@ -404,7 +413,7 @@ impl BTreeCursor {
                     self.stack.pop();
                     continue;
                 } else {
-                    return Ok(CursorResult::Ok((None, None)));
+                    return Ok(CursorResult::Ok(None));
                 }
             }
             assert!(cell_idx < contents.cell_count());
@@ -434,8 +443,11 @@ impl BTreeCursor {
                 }) => {
                     assert!(predicate.is_none());
                     self.stack.advance();
-                    let record = crate::storage::sqlite3_ondisk::read_record(_payload)?;
-                    return Ok(CursorResult::Ok((Some(*_rowid), Some(record))));
+                    let record = crate::storage::sqlite3_ondisk::read_record(
+                        _payload,
+                        self.get_lazy_immutable_record().as_mut().unwrap(),
+                    )?;
+                    return Ok(CursorResult::Ok(Some(*_rowid)));
                 }
                 BTreeCell::IndexInteriorCell(IndexInteriorCell {
                     payload,
@@ -451,61 +463,77 @@ impl BTreeCursor {
                     self.going_upwards = false;
                     self.stack.advance();
 
-                    let record = crate::storage::sqlite3_ondisk::read_record(payload)?;
+                    crate::storage::sqlite3_ondisk::read_record(
+                        payload,
+                        self.get_lazy_immutable_record().as_mut().unwrap(),
+                    )?;
                     if predicate.is_none() {
-                        let rowid = match record.last_value() {
+                        let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
+                        {
                             Some(RefValue::Integer(rowid)) => *rowid as u64,
                             _ => unreachable!("index cells should have an integer rowid"),
                         };
-                        return Ok(CursorResult::Ok((Some(rowid), Some(record))));
+                        return Ok(CursorResult::Ok(Some(rowid)));
                     }
 
                     let (key, op) = predicate.as_ref().unwrap();
                     let SeekKey::IndexKey(index_key) = key else {
                         unreachable!("index seek key should be a record");
                     };
-                    let order = compare_immutable(&record.get_values(), index_key.get_values());
+                    let order = compare_immutable(
+                        &self.get_immutable_record().as_ref().unwrap().get_values(),
+                        index_key.get_values(),
+                    );
                     let found = match op {
                         SeekOp::GT => order.is_gt(),
                         SeekOp::GE => order.is_ge(),
                         SeekOp::EQ => order.is_eq(),
                     };
                     if found {
-                        let rowid = match record.last_value() {
+                        let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
+                        {
                             Some(RefValue::Integer(rowid)) => *rowid as u64,
                             _ => unreachable!("index cells should have an integer rowid"),
                         };
-                        return Ok(CursorResult::Ok((Some(rowid), Some(record))));
+                        return Ok(CursorResult::Ok(Some(rowid)));
                     } else {
                         continue;
                     }
                 }
                 BTreeCell::IndexLeafCell(IndexLeafCell { payload, .. }) => {
                     self.stack.advance();
-                    let record = crate::storage::sqlite3_ondisk::read_record(payload)?;
+                    crate::storage::sqlite3_ondisk::read_record(
+                        payload,
+                        self.get_lazy_immutable_record().as_mut().unwrap(),
+                    )?;
                     if predicate.is_none() {
-                        let rowid = match record.last_value() {
+                        let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
+                        {
                             Some(RefValue::Integer(rowid)) => *rowid as u64,
                             _ => unreachable!("index cells should have an integer rowid"),
                         };
-                        return Ok(CursorResult::Ok((Some(rowid), Some(record))));
+                        return Ok(CursorResult::Ok(Some(rowid)));
                     }
                     let (key, op) = predicate.as_ref().unwrap();
                     let SeekKey::IndexKey(index_key) = key else {
                         unreachable!("index seek key should be a record");
                     };
-                    let order = compare_immutable(&record.get_values(), index_key.get_values());
+                    let order = compare_immutable(
+                        &self.get_immutable_record().as_ref().unwrap().get_values(),
+                        index_key.get_values(),
+                    );
                     let found = match op {
                         SeekOp::GT => order.is_lt(),
                         SeekOp::GE => order.is_le(),
                         SeekOp::EQ => order.is_le(),
                     };
                     if found {
-                        let rowid = match record.last_value() {
+                        let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
+                        {
                             Some(RefValue::Integer(rowid)) => *rowid as u64,
                             _ => unreachable!("index cells should have an integer rowid"),
                         };
-                        return Ok(CursorResult::Ok((Some(rowid), Some(record))));
+                        return Ok(CursorResult::Ok(Some(rowid)));
                     } else {
                         continue;
                     }
@@ -518,11 +546,7 @@ impl BTreeCursor {
     /// This may be used to seek to a specific record in a point query (e.g. SELECT * FROM table WHERE col = 10)
     /// or e.g. find the first record greater than the seek key in a range query (e.g. SELECT * FROM table WHERE col > 10).
     /// We don't include the rowid in the comparison and that's why the last value from the record is not included.
-    fn do_seek(
-        &mut self,
-        key: SeekKey<'_>,
-        op: SeekOp,
-    ) -> Result<CursorResult<(Option<u64>, Option<ImmutableRecord>)>> {
+    fn do_seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<CursorResult<Option<u64>>> {
         return_if_io!(self.move_to(key.clone(), op.clone()));
 
         {
@@ -561,15 +585,23 @@ impl BTreeCursor {
                         };
                         self.stack.advance();
                         if found {
-                            let record = crate::storage::sqlite3_ondisk::read_record(payload)?;
-                            return Ok(CursorResult::Ok((Some(*cell_rowid), Some(record))));
+                            let record = crate::storage::sqlite3_ondisk::read_record(
+                                payload,
+                                self.get_lazy_immutable_record().as_mut().unwrap(),
+                            )?;
+                            return Ok(CursorResult::Ok(Some(*cell_rowid)));
                         }
                     }
                     BTreeCell::IndexLeafCell(IndexLeafCell { payload, .. }) => {
                         let SeekKey::IndexKey(index_key) = key else {
                             unreachable!("index seek key should be a record");
                         };
-                        let record = crate::storage::sqlite3_ondisk::read_record(payload)?;
+                        let record = crate::storage::sqlite3_ondisk::read_record(
+                            payload,
+                            self.get_lazy_immutable_record().as_mut().unwrap(),
+                        )?;
+                        let record = self.get_immutable_record();
+                        let record = record.as_ref().unwrap();
                         let order = compare_immutable(
                             &record.get_values().as_slice()[..record.len() - 1],
                             &index_key.get_values().as_slice()[..],
@@ -585,7 +617,7 @@ impl BTreeCursor {
                                 Some(RefValue::Integer(rowid)) => *rowid as u64,
                                 _ => unreachable!("index cells should have an integer rowid"),
                             };
-                            return Ok(CursorResult::Ok((Some(rowid), Some(record))));
+                            return Ok(CursorResult::Ok(Some(rowid)));
                         }
                     }
                     cell_type => {
@@ -615,7 +647,7 @@ impl BTreeCursor {
             return self.get_next_record(Some((key, op)));
         }
 
-        Ok(CursorResult::Ok((None, None)))
+        Ok(CursorResult::Ok(None))
     }
 
     /// Move the cursor to the root page of the btree.
@@ -745,8 +777,14 @@ impl BTreeCursor {
                         let SeekKey::IndexKey(index_key) = key else {
                             unreachable!("index seek key should be a record");
                         };
-                        let record = crate::storage::sqlite3_ondisk::read_record(payload)?;
-                        let order = compare_immutable(index_key.get_values(), record.get_values());
+                        crate::storage::sqlite3_ondisk::read_record(
+                            payload,
+                            self.get_lazy_immutable_record().as_mut().unwrap(),
+                        )?;
+                        let order = compare_immutable(
+                            index_key.get_values(),
+                            self.get_immutable_record().as_ref().unwrap().get_values(),
+                        );
                         let target_leaf_page_is_in_the_left_subtree = match cmp {
                             SeekOp::GT => order.is_lt(),
                             SeekOp::GE => order.is_le(),
@@ -1662,19 +1700,18 @@ impl BTreeCursor {
 
     pub fn seek_to_last(&mut self) -> Result<CursorResult<()>> {
         return_if_io!(self.move_to_rightmost());
-        let (rowid, record) = return_if_io!(self.get_next_record(None));
+        let rowid = return_if_io!(self.get_next_record(None));
         if rowid.is_none() {
             let is_empty = return_if_io!(self.is_empty_table());
             assert!(is_empty);
             return Ok(CursorResult::Ok(()));
         }
         self.rowid.replace(rowid);
-        self.record.replace(record);
         Ok(CursorResult::Ok(()))
     }
 
     pub fn is_empty(&self) -> bool {
-        self.record.borrow().is_none()
+        *self.empty_record.borrow()
     }
 
     pub fn root_page(&self) -> usize {
@@ -1683,15 +1720,15 @@ impl BTreeCursor {
 
     pub fn rewind(&mut self) -> Result<CursorResult<()>> {
         if self.mv_cursor.is_some() {
-            let (rowid, record) = return_if_io!(self.get_next_record(None));
+            let rowid = return_if_io!(self.get_next_record(None));
             self.rowid.replace(rowid);
-            self.record.replace(record);
+            self.empty_record.replace(rowid.is_none());
         } else {
             self.move_to_root();
 
-            let (rowid, record) = return_if_io!(self.get_next_record(None));
+            let rowid = return_if_io!(self.get_next_record(None));
             self.rowid.replace(rowid);
-            self.record.replace(record);
+            self.empty_record.replace(rowid.is_none());
         }
         Ok(CursorResult::Ok(()))
     }
@@ -1705,18 +1742,18 @@ impl BTreeCursor {
     }
 
     pub fn next(&mut self) -> Result<CursorResult<()>> {
-        let (rowid, record) = return_if_io!(self.get_next_record(None));
+        let rowid = return_if_io!(self.get_next_record(None));
         self.rowid.replace(rowid);
-        self.record.replace(record);
+        self.empty_record.replace(rowid.is_none());
         Ok(CursorResult::Ok(()))
     }
 
     pub fn prev(&mut self) -> Result<CursorResult<()>> {
         assert!(self.mv_cursor.is_none());
         match self.get_prev_record()? {
-            CursorResult::Ok((rowid, record)) => {
+            CursorResult::Ok(rowid) => {
                 self.rowid.replace(rowid);
-                self.record.replace(record);
+                self.empty_record.replace(rowid.is_none());
                 Ok(CursorResult::Ok(()))
             }
             CursorResult::IO => Ok(CursorResult::IO),
@@ -1738,14 +1775,14 @@ impl BTreeCursor {
 
     pub fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<CursorResult<bool>> {
         assert!(self.mv_cursor.is_none());
-        let (rowid, record) = return_if_io!(self.do_seek(key, op));
+        let rowid = return_if_io!(self.do_seek(key, op));
         self.rowid.replace(rowid);
-        self.record.replace(record);
+        self.empty_record.replace(rowid.is_none());
         Ok(CursorResult::Ok(rowid.is_some()))
     }
 
     pub fn record(&self) -> Ref<Option<ImmutableRecord>> {
-        self.record.borrow()
+        self.reusable_immutable_record.borrow()
     }
 
     pub fn insert(
@@ -2325,6 +2362,21 @@ impl BTreeCursor {
             }
         }
         Ok(CursorResult::Ok(()))
+    }
+
+    fn get_lazy_immutable_record(&self) -> std::cell::RefMut<'_, Option<ImmutableRecord>> {
+        if self.reusable_immutable_record.borrow().is_none() {
+            let record = ImmutableRecord {
+                payload: Vec::with_capacity(4096),
+                values: Vec::with_capacity(10),
+            };
+            self.reusable_immutable_record.replace(Some(record));
+        }
+        self.reusable_immutable_record.borrow_mut()
+    }
+
+    fn get_immutable_record(&self) -> std::cell::RefMut<'_, Option<ImmutableRecord>> {
+        self.reusable_immutable_record.borrow_mut()
     }
 }
 
