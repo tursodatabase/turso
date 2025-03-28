@@ -1,18 +1,18 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{MvStore, Result, Row, RowID};
 use std::fmt::Debug;
-use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct ScanCursor<Clock: LogicalClock> {
-    pub db: Rc<MvStore<Clock>>,
+    pub db: Arc<MvStore<Clock>>,
     pub row_ids: Vec<RowID>,
     pub index: usize,
     tx_id: u64,
 }
 
 impl<Clock: LogicalClock> ScanCursor<Clock> {
-    pub fn new(db: Rc<MvStore<Clock>>, tx_id: u64, table_id: u64) -> Result<ScanCursor<Clock>> {
+    pub fn new(db: Arc<MvStore<Clock>>, tx_id: u64, table_id: u64) -> Result<ScanCursor<Clock>> {
         let row_ids = db.scan_row_ids_for_table(table_id)?;
         Ok(Self {
             db,
@@ -57,7 +57,7 @@ impl<Clock: LogicalClock> ScanCursor<Clock> {
 
 #[derive(Debug)]
 pub struct LazyScanCursor<Clock: LogicalClock> {
-    pub db: Rc<MvStore<Clock>>,
+    pub db: Arc<MvStore<Clock>>,
     pub current_pos: Option<RowID>,
     pub prev_pos: Option<RowID>,
     table_id: u64,
@@ -65,7 +65,11 @@ pub struct LazyScanCursor<Clock: LogicalClock> {
 }
 
 impl<Clock: LogicalClock> LazyScanCursor<Clock> {
-    pub fn new(db: Rc<MvStore<Clock>>, tx_id: u64, table_id: u64) -> Result<LazyScanCursor<Clock>> {
+    pub fn new(
+        db: Arc<MvStore<Clock>>,
+        tx_id: u64,
+        table_id: u64,
+    ) -> Result<LazyScanCursor<Clock>> {
         let current_pos = db.get_next_row_id_for_table(table_id, 0);
         Ok(Self {
             db,
@@ -115,7 +119,7 @@ impl<Clock: LogicalClock> LazyScanCursor<Clock> {
 
 #[derive(Debug)]
 pub struct BucketScanCursor<Clock: LogicalClock> {
-    pub db: Rc<MvStore<Clock>>,
+    pub db: Arc<MvStore<Clock>>,
     pub bucket: Vec<RowID>,
     bucket_size: u64,
     table_id: u64,
@@ -125,7 +129,7 @@ pub struct BucketScanCursor<Clock: LogicalClock> {
 
 impl<Clock: LogicalClock> BucketScanCursor<Clock> {
     pub fn new(
-        db: Rc<MvStore<Clock>>,
+        db: Arc<MvStore<Clock>>,
         tx_id: u64,
         table_id: u64,
         size: u64,

@@ -6,7 +6,6 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyTuple};
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
-use std::rc::Rc;
 use std::sync::Arc;
 
 mod errors;
@@ -62,7 +61,7 @@ pub struct Cursor {
     #[pyo3(get)]
     rowcount: i64,
 
-    smt: Option<Rc<RefCell<limbo_core::Statement>>>,
+    smt: Option<Arc<RefCell<limbo_core::Statement>>>,
 }
 
 #[allow(unused_variables, clippy::arc_with_non_send_sync)]
@@ -77,7 +76,7 @@ impl Cursor {
             PyErr::new::<ProgrammingError, _>(format!("Failed to prepare statement: {:?}", e))
         })?;
 
-        let stmt = Rc::new(RefCell::new(statement));
+        let stmt = Arc::new(RefCell::new(statement));
 
         Python::with_gil(|py| {
             if let Some(params) = parameters {
@@ -228,7 +227,7 @@ fn stmt_is_ddl(sql: &str) -> bool {
 #[pyclass(unsendable)]
 #[derive(Clone)]
 pub struct Connection {
-    conn: Rc<limbo_core::Connection>,
+    conn: Arc<limbo_core::Connection>,
     io: Arc<dyn limbo_core::IO>,
 }
 
@@ -310,13 +309,13 @@ pub fn connect(path: &str) -> Result<Connection> {
         ":memory:" => {
             let io: Arc<dyn limbo_core::IO> = Arc::new(limbo_core::MemoryIO::new());
             let db = open_or(io.clone(), path)?;
-            let conn: Rc<limbo_core::Connection> = db.connect().unwrap();
+            let conn: Arc<limbo_core::Connection> = db.connect().unwrap();
             Ok(Connection { conn, io })
         }
         path => {
             let io: Arc<dyn limbo_core::IO> = Arc::new(limbo_core::PlatformIO::new()?);
             let db = open_or(io.clone(), path)?;
-            let conn: Rc<limbo_core::Connection> = db.connect().unwrap();
+            let conn: Arc<limbo_core::Connection> = db.connect().unwrap();
             Ok(Connection { conn, io })
         }
     }
@@ -352,7 +351,7 @@ fn py_to_owned_value(obj: &Bound<PyAny>) -> Result<limbo_core::OwnedValue> {
     } else if let Ok(string) = obj.extract::<String>() {
         return Ok(OwnedValue::Text(Text::from_str(string)));
     } else if let Ok(bytes) = obj.downcast::<PyBytes>() {
-        return Ok(OwnedValue::Blob(Rc::new(bytes.as_bytes().to_vec())));
+        return Ok(OwnedValue::Blob(Arc::new(bytes.as_bytes().to_vec())));
     } else {
         return Err(PyErr::new::<ProgrammingError, _>(format!(
             "Unsupported Python type: {}",

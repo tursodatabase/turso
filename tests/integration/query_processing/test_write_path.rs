@@ -2,7 +2,7 @@ use crate::common;
 use crate::common::{compare_string, do_flush, TempDatabase};
 use limbo_core::{Connection, StepResult};
 use log::debug;
-use std::rc::Rc;
+use std::sync::Arc;
 
 #[test]
 #[ignore]
@@ -400,7 +400,7 @@ fn test_wal_restart() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY);");
     // threshold is 1000 by default
 
-    fn insert(i: usize, conn: &Rc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
+    fn insert(i: usize, conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
         debug!("inserting {}", i);
         let insert_query = format!("INSERT INTO test VALUES ({})", i);
         match conn.query(insert_query) {
@@ -423,7 +423,7 @@ fn test_wal_restart() -> anyhow::Result<()> {
         Ok(())
     }
 
-    fn count(conn: &Rc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<usize> {
+    fn count(conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<usize> {
         debug!("counting");
         let list_query = "SELECT count(x) FROM test";
         loop {

@@ -1,7 +1,6 @@
 use limbo_core::{CheckpointStatus, Connection, Database, IO};
 use rand::{rng, RngCore};
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -40,7 +39,7 @@ impl TempDatabase {
         Self { path, io }
     }
 
-    pub fn connect_limbo(&self) -> Rc<limbo_core::Connection> {
+    pub fn connect_limbo(&self) -> Arc<limbo_core::Connection> {
         log::debug!("conneting to limbo");
         let db = Database::open_file(self.io.clone(), self.path.to_str().unwrap(), false).unwrap();
 
@@ -55,7 +54,7 @@ impl TempDatabase {
     }
 }
 
-pub(crate) fn do_flush(conn: &Rc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
+pub(crate) fn do_flush(conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
     loop {
         match conn.cacheflush()? {
             CheckpointStatus::Done(_) => {

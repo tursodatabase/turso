@@ -1,4 +1,3 @@
-use std::rc::Rc;
 use std::sync::Arc;
 
 use limbo_core::{Connection, StepResult};
@@ -26,7 +25,7 @@ pub struct LimboHelper {
 }
 
 impl LimboHelper {
-    pub fn new(conn: Rc<Connection>, io: Arc<dyn limbo_core::IO>) -> Self {
+    pub fn new(conn: Arc<Connection>, io: Arc<dyn limbo_core::IO>) -> Self {
         LimboHelper {
             completer: SqlCompleter::new(conn, io),
             hinter: HistoryHinter::new(),
@@ -78,12 +77,12 @@ impl Highlighter for LimboHelper {
 }
 
 pub struct SqlCompleter {
-    conn: Rc<Connection>,
+    conn: Arc<Connection>,
     io: Arc<dyn limbo_core::IO>,
 }
 
 impl SqlCompleter {
-    pub fn new(conn: Rc<Connection>, io: Arc<dyn limbo_core::IO>) -> Self {
+    pub fn new(conn: Arc<Connection>, io: Arc<dyn limbo_core::IO>) -> Self {
         Self { conn, io }
     }
 }

@@ -8,7 +8,6 @@ use crate::{Buffer, LimboError, Result};
 use parking_lot::RwLock;
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashSet;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::trace;
@@ -145,7 +144,7 @@ enum CheckpointState {
 struct FlushInfo {
     state: FlushState,
     /// Number of writes taking place. When in_flight gets to 0 we can schedule a fsync.
-    in_flight_writes: Rc<RefCell<usize>>,
+    in_flight_writes: Arc<RefCell<usize>>,
 }
 
 /// The pager interface implements the persistence layer by providing access
@@ -155,20 +154,20 @@ pub struct Pager {
     /// Source of the database pages.
     pub db_file: Arc<dyn DatabaseStorage>,
     /// The write-ahead log (WAL) for the database.
-    wal: Rc<RefCell<dyn Wal>>,
+    wal: Arc<RefCell<dyn Wal>>,
     /// A page cache for the database.
     page_cache: Arc<RwLock<DumbLruPageCache>>,
     /// Buffer pool for temporary data storage.
-    buffer_pool: Rc<BufferPool>,
+    buffer_pool: Arc<BufferPool>,
     /// I/O interface for input/output operations.
     pub io: Arc<dyn crate::io::IO>,
-    dirty_pages: Rc<RefCell<HashSet<usize>>>,
+    dirty_pages: Arc<RefCell<HashSet<usize>>>,
     pub db_header: Arc<SpinLock<DatabaseHeader>>,
 
     flush_info: RefCell<FlushInfo>,
     checkpoint_state: RefCell<CheckpointState>,
-    checkpoint_inflight: Rc<RefCell<usize>>,
-    syncing: Rc<RefCell<bool>>,
+    checkpoint_inflight: Arc<RefCell<usize>>,
+    syncing: Arc<RefCell<bool>>,
 }
 
 impl Pager {
@@ -181,25 +180,25 @@ impl Pager {
     pub fn finish_open(
         db_header_ref: Arc<SpinLock<DatabaseHeader>>,
         db_file: Arc<dyn DatabaseStorage>,
-        wal: Rc<RefCell<dyn Wal>>,
+        wal: Arc<RefCell<dyn Wal>>,
         io: Arc<dyn crate::io::IO>,
         page_cache: Arc<RwLock<DumbLruPageCache>>,
-        buffer_pool: Rc<BufferPool>,
+        buffer_pool: Arc<BufferPool>,
     ) -> Result<Self> {
         Ok(Self {
             db_file,
             wal,
             page_cache,
             io,
-            dirty_pages: Rc::new(RefCell::new(HashSet::new())),
+            dirty_pages: Arc::new(RefCell::new(HashSet::new())),
             db_header: db_header_ref.clone(),
             flush_info: RefCell::new(FlushInfo {
                 state: FlushState::Start,
-                in_flight_writes: Rc::new(RefCell::new(0)),
+                in_flight_writes: Arc::new(RefCell::new(0)),
             }),
-            syncing: Rc::new(RefCell::new(false)),
+            syncing: Arc::new(RefCell::new(false)),
             checkpoint_state: RefCell::new(CheckpointState::Checkpoint),
-            checkpoint_inflight: Rc::new(RefCell::new(0)),
+            checkpoint_inflight: Arc::new(RefCell::new(0)),
             buffer_pool,
         })
     }
@@ -474,7 +473,7 @@ impl Pager {
         loop {
             match self.wal.borrow_mut().checkpoint(
                 self,
-                Rc::new(RefCell::new(0)),
+                Arc::new(RefCell::new(0)),
                 CheckpointMode::Passive,
             ) {
                 Ok(CheckpointStatus::IO) => {
@@ -618,12 +617,12 @@ impl Pager {
     }
 }
 
-pub fn allocate_page(page_id: usize, buffer_pool: &Rc<BufferPool>, offset: usize) -> PageRef {
+pub fn allocate_page(page_id: usize, buffer_pool: &Arc<BufferPool>, offset: usize) -> PageRef {
     let page = Arc::new(Page::new(page_id));
     {
         let buffer = buffer_pool.get();
         let bp = buffer_pool.clone();
-        let drop_fn = Rc::new(move |buf| {
+        let drop_fn = Arc::new(move |buf| {
             bp.put(buf);
         });
         let buffer = Arc::new(RefCell::new(Buffer::new(buffer, drop_fn)));

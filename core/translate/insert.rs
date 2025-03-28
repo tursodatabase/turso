@@ -1,5 +1,5 @@
 use std::ops::Deref;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use limbo_sqlite3_parser::ast::{
     DistinctNames, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, With,
@@ -446,7 +446,7 @@ fn populate_column_registers(
 
 fn translate_virtual_table_insert(
     program: &mut ProgramBuilder,
-    virtual_table: Rc<VirtualTable>,
+    virtual_table: Arc<VirtualTable>,
     columns: &Option<DistinctNames>,
     body: &InsertBody,
     on_conflict: &Option<ResolveType>,

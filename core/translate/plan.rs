@@ -3,7 +3,6 @@ use limbo_sqlite3_parser::ast;
 use std::{
     cmp::Ordering,
     fmt::{Display, Formatter},
-    rc::Rc,
     sync::Arc,
 };
 
@@ -267,13 +266,13 @@ pub enum Operation {
 
 impl TableReference {
     /// Returns the btree table for this table reference, if it is a BTreeTable.
-    pub fn btree(&self) -> Option<Rc<BTreeTable>> {
+    pub fn btree(&self) -> Option<Arc<BTreeTable>> {
         match &self.table {
             Table::BTree(_) => self.table.btree(),
             _ => None,
         }
     }
-    pub fn virtual_table(&self) -> Option<Rc<VirtualTable>> {
+    pub fn virtual_table(&self) -> Option<Arc<VirtualTable>> {
         match &self.table {
             Table::Virtual(_) => self.table.virtual_table(),
             _ => None,
@@ -282,7 +281,7 @@ impl TableReference {
 
     /// Creates a new TableReference for a subquery.
     pub fn new_subquery(identifier: String, plan: SelectPlan, join_info: Option<JoinInfo>) -> Self {
-        let table = Table::Pseudo(Rc::new(PseudoTable::new_with_columns(
+        let table = Table::Pseudo(Arc::new(PseudoTable::new_with_columns(
             plan.result_columns
                 .iter()
                 .map(|rc| Column {

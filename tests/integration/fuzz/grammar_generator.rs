@@ -14,7 +14,7 @@
 ///
 /// The idea behind this code is to provide a way to "build" grammar generator with all these rules and their dependencies and after that
 /// we can randomly sample strings from this generator easily.
-use std::{cell::RefCell, collections::HashMap, ops::Range, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, ops::Range, sync::Arc};
 
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
@@ -82,7 +82,7 @@ enum GrammarFrontierNode {
 }
 
 #[derive(Clone)]
-pub struct GrammarGenerator(Rc<RefCell<GrammarGeneratorInner>>);
+pub struct GrammarGenerator(Arc<RefCell<GrammarGeneratorInner>>);
 
 struct GrammarGeneratorInner {
     last_symbol_id: i32,
@@ -91,7 +91,7 @@ struct GrammarGeneratorInner {
 
 impl GrammarGenerator {
     pub fn new() -> Self {
-        GrammarGenerator(Rc::new(RefCell::new(GrammarGeneratorInner {
+        GrammarGenerator(Arc::new(RefCell::new(GrammarGeneratorInner {
             last_symbol_id: 0,
             symbols: HashMap::new(),
         })))

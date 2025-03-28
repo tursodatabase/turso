@@ -2,7 +2,6 @@ use crate::common::{do_flush, TempDatabase};
 use limbo_core::{Connection, LimboError, Result, StepResult};
 use std::cell::RefCell;
 use std::ops::Deref;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -130,11 +129,11 @@ fn maybe_setup_tracing() {
 /// Execute a statement and get strings result
 pub(crate) fn execute_and_get_strings(
     tmp_db: &TempDatabase,
-    conn: &Rc<Connection>,
+    conn: &Arc<Connection>,
     sql: &str,
 ) -> Result<Vec<String>> {
     let statement = conn.prepare(sql)?;
-    let stmt = Rc::new(RefCell::new(statement));
+    let stmt = Arc::new(RefCell::new(statement));
     let mut result = Vec::new();
 
     let mut stmt = stmt.borrow_mut();
@@ -158,11 +157,11 @@ pub(crate) fn execute_and_get_strings(
 /// Execute a statement and get integers
 pub(crate) fn execute_and_get_ints(
     tmp_db: &TempDatabase,
-    conn: &Rc<Connection>,
+    conn: &Arc<Connection>,
     sql: &str,
 ) -> Result<Vec<i64>> {
     let statement = conn.prepare(sql)?;
-    let stmt = Rc::new(RefCell::new(statement));
+    let stmt = Arc::new(RefCell::new(statement));
     let mut result = Vec::new();
 
     let mut stmt = stmt.borrow_mut();

@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use limbo_sqlite3_parser::ast;
 
@@ -179,7 +179,7 @@ pub fn emit_group_by<'a>(
         .collect::<Vec<_>>();
 
     // A pseudo table is a "fake" table to which we read one row at a time from the sorter
-    let pseudo_table = Rc::new(PseudoTable {
+    let pseudo_table = Arc::new(PseudoTable {
         columns: pseudo_columns,
     });
 

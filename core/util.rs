@@ -1,5 +1,5 @@
 use limbo_sqlite3_parser::ast::{self, CreateTableBody, Expr, FunctionTail, Literal};
-use std::{rc::Rc, sync::Arc};
+use std::sync::Arc;
 
 use crate::{
     schema::{self, Column, Schema, Type},
@@ -64,7 +64,7 @@ pub fn parse_schema_rows(
                                 schema.add_virtual_table(vtab);
                             } else {
                                 let table = schema::BTreeTable::from_sql(sql, root_page as usize)?;
-                                schema.add_btree_table(Rc::new(table));
+                                schema.add_btree_table(Arc::new(table));
                             }
                         }
                         "index" => {

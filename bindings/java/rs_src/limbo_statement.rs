@@ -7,7 +7,7 @@ use jni::sys::{jdouble, jint, jlong};
 use jni::JNIEnv;
 use limbo_core::{OwnedValue, Statement, StepResult};
 use std::num::NonZero;
-use std::rc::Rc;
+use std::sync::Arc;
 
 pub const STEP_RESULT_ID_ROW: i32 = 10;
 #[allow(dead_code)]
@@ -264,7 +264,7 @@ pub extern "system" fn Java_tech_turso_core_LimboStatement_bindBlob<'local>(
 
     stmt.stmt.bind_at(
         NonZero::new(position as usize).unwrap(),
-        OwnedValue::Blob(Rc::new(blob)),
+        OwnedValue::Blob(Arc::new(blob)),
     );
     SQLITE_OK
 }

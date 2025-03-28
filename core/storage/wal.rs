@@ -4,7 +4,7 @@ use tracing::{debug, trace};
 use parking_lot::RwLock;
 use std::fmt::Formatter;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::{cell::RefCell, fmt, rc::Rc, sync::Arc};
+use std::{cell::RefCell, fmt, sync::Arc};
 
 use crate::io::{File, SyncCompletion, IO};
 use crate::result::LimboResult;
@@ -164,21 +164,21 @@ pub trait Wal {
     fn find_frame(&self, page_id: u64) -> Result<Option<u64>>;
 
     /// Read a frame from the WAL.
-    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Rc<BufferPool>) -> Result<()>;
+    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Arc<BufferPool>) -> Result<()>;
 
     /// Write a frame to the WAL.
     fn append_frame(
         &mut self,
         page: PageRef,
         db_size: u32,
-        write_counter: Rc<RefCell<usize>>,
+        write_counter: Arc<RefCell<usize>>,
     ) -> Result<()>;
 
     fn should_checkpoint(&self) -> bool;
     fn checkpoint(
         &mut self,
         pager: &Pager,
-        write_counter: Rc<RefCell<usize>>,
+        write_counter: Arc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<CheckpointStatus>;
     fn sync(&mut self) -> Result<CheckpointStatus>;
@@ -241,10 +241,10 @@ impl fmt::Debug for OngoingCheckpoint {
 #[allow(dead_code)]
 pub struct WalFile {
     io: Arc<dyn IO>,
-    buffer_pool: Rc<BufferPool>,
+    buffer_pool: Arc<BufferPool>,
 
     sync_state: RefCell<SyncState>,
-    syncing: Rc<RefCell<bool>>,
+    syncing: Arc<RefCell<bool>>,
     page_size: usize,
 
     shared: Arc<RwLock<WalFileShared>>,
@@ -423,7 +423,7 @@ impl Wal for WalFile {
     }
 
     /// Read a frame from the WAL.
-    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Rc<BufferPool>) -> Result<()> {
+    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Arc<BufferPool>) -> Result<()> {
         debug!("read_frame({})", frame_id);
         let offset = self.frame_offset(frame_id);
         let shared = self.shared.read();
@@ -442,7 +442,7 @@ impl Wal for WalFile {
         &mut self,
         page: PageRef,
         db_size: u32,
-        write_counter: Rc<RefCell<usize>>,
+        write_counter: Arc<RefCell<usize>>,
     ) -> Result<()> {
         let page_id = page.get().id;
         let mut shared = self.shared.write();
@@ -494,7 +494,7 @@ impl Wal for WalFile {
     fn checkpoint(
         &mut self,
         pager: &Pager,
-        write_counter: Rc<RefCell<usize>>,
+        write_counter: Arc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<CheckpointStatus> {
         assert!(
@@ -690,13 +690,13 @@ impl WalFile {
         io: Arc<dyn IO>,
         page_size: usize,
         shared: Arc<RwLock<WalFileShared>>,
-        buffer_pool: Rc<BufferPool>,
+        buffer_pool: Arc<BufferPool>,
     ) -> Self {
         let checkpoint_page = Arc::new(Page::new(0));
         let buffer = buffer_pool.get();
         {
             let buffer_pool = buffer_pool.clone();
-            let drop_fn = Rc::new(move |buf| {
+            let drop_fn = Arc::new(move |buf| {
                 buffer_pool.put(buf);
             });
             checkpoint_page.get().contents = Some(PageContent {
@@ -715,7 +715,7 @@ impl WalFile {
                 max_frame: 0,
                 current_page: 0,
             },
-            syncing: Rc::new(RefCell::new(false)),
+            syncing: Arc::new(RefCell::new(false)),
             checkpoint_threshold: 1000,
             page_size,
             buffer_pool,

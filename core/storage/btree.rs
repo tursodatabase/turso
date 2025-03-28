@@ -14,7 +14,6 @@ use crate::{return_corrupt, LimboError, Result};
 
 use std::cell::{Cell, Ref, RefCell};
 use std::pin::Pin;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use super::pager::PageRef;
@@ -229,9 +228,9 @@ enum OverflowState {
 
 pub struct BTreeCursor {
     /// The multi-version cursor that is used to read and write to the database file.
-    mv_cursor: Option<Rc<RefCell<MvCursor>>>,
+    mv_cursor: Option<Arc<RefCell<MvCursor>>>,
     /// The pager that is used to read and write to the database file.
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     /// Page id of the root page used to go back up fast.
     root_page: usize,
     /// Rowid and record are stored before being consumed.
@@ -278,8 +277,8 @@ struct CellArray {
 
 impl BTreeCursor {
     pub fn new(
-        mv_cursor: Option<Rc<RefCell<MvCursor>>>,
-        pager: Rc<Pager>,
+        mv_cursor: Option<Arc<RefCell<MvCursor>>>,
+        pager: Arc<Pager>,
         root_page: usize,
     ) -> Self {
         Self {
@@ -2351,7 +2350,7 @@ impl BTreeCursor {
                     //  Get the current cell
                     let cell = contents.cell_get(
                         cell_idx as usize,
-                        Rc::clone(&self.pager),
+                        Arc::clone(&self.pager),
                         payload_overflow_threshold_max(
                             contents.page_type(),
                             self.usable_space() as u16,
@@ -3221,7 +3220,7 @@ fn fill_cell_payload(
     cell_payload: &mut Vec<u8>,
     record: &Record,
     usable_space: u16,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
 ) {
     assert!(matches!(
         page_type,
@@ -3306,7 +3305,7 @@ fn fill_cell_payload(
 
 /// Allocate a new overflow page.
 /// This is done when a cell overflows and new space is needed.
-fn allocate_overflow_page(pager: Rc<Pager>) -> PageRef {
+fn allocate_overflow_page(pager: Arc<Pager>) -> PageRef {
     let page = pager.allocate_page().unwrap();
 
     // setup overflow page
@@ -3406,7 +3405,6 @@ mod tests {
     use std::cell::RefCell;
     use std::ops::Deref;
     use std::panic;
-    use std::rc::Rc;
     use std::sync::Arc;
 
     use tempfile::TempDir;
@@ -3431,7 +3429,7 @@ mod tests {
     fn get_page(id: usize) -> PageRef {
         let page = Arc::new(Page::new(id));
 
-        let drop_fn = Rc::new(|_| {});
+        let drop_fn = Arc::new(|_| {});
         let inner = PageContent {
             offset: 0,
             buffer: Arc::new(RefCell::new(Buffer::new(
@@ -3480,7 +3478,7 @@ mod tests {
         pos: usize,
         page: &mut PageContent,
         record: Record,
-        conn: &Rc<Connection>,
+        conn: &Arc<Connection>,
     ) -> Vec<u8> {
         let mut payload: Vec<u8> = Vec::new();
         fill_cell_payload(
@@ -3550,7 +3548,7 @@ mod tests {
         }
     }
 
-    fn validate_btree(pager: Rc<Pager>, page_idx: usize) -> (usize, bool) {
+    fn validate_btree(pager: Arc<Pager>, page_idx: usize) -> (usize, bool) {
         let cursor = BTreeCursor::new(None, pager.clone(), page_idx);
         let page = pager.read_page(page_idx).unwrap();
         let page = page.get();
@@ -3614,7 +3612,7 @@ mod tests {
         (depth.unwrap(), valid)
     }
 
-    fn format_btree(pager: Rc<Pager>, page_idx: usize, depth: usize) -> String {
+    fn format_btree(pager: Arc<Pager>, page_idx: usize, depth: usize) -> String {
         let cursor = BTreeCursor::new(None, pager.clone(), page_idx);
         let page = pager.read_page(page_idx).unwrap();
         let page = page.get();
@@ -3673,7 +3671,7 @@ mod tests {
         }
     }
 
-    fn empty_btree() -> (Rc<Pager>, usize) {
+    fn empty_btree() -> (Arc<Pager>, usize) {
         let db_header = DatabaseHeader::default();
         let page_size = db_header.page_size as usize;
 
@@ -3682,17 +3680,17 @@ mod tests {
         let io_file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
         let db_file = Arc::new(DatabaseFile::new(io_file));
 
-        let buffer_pool = Rc::new(BufferPool::new(db_header.page_size as usize));
+        let buffer_pool = Arc::new(BufferPool::new(db_header.page_size as usize));
         let wal_shared = WalFileShared::open_shared(&io, "test.wal", db_header.page_size).unwrap();
         let wal_file = WalFile::new(io.clone(), page_size, wal_shared, buffer_pool.clone());
-        let wal = Rc::new(RefCell::new(wal_file));
+        let wal = Arc::new(RefCell::new(wal_file));
 
         let page_cache = Arc::new(parking_lot::RwLock::new(DumbLruPageCache::new(10)));
         let pager = {
             let db_header = Arc::new(SpinLock::new(db_header.clone()));
             Pager::finish_open(db_header, db_file, wal, io, page_cache, buffer_pool).unwrap()
         };
-        let pager = Rc::new(pager);
+        let pager = Arc::new(pager);
         let page1 = pager.allocate_page().unwrap();
         btree_init_page(&page1, PageType::TableLeaf, 0, 4096);
         (pager, page1.get().id)
@@ -3757,7 +3755,7 @@ mod tests {
                 )
                 .unwrap();
                 let key = OwnedValue::Integer(*key);
-                let value = Record::new(vec![OwnedValue::Blob(Rc::new(vec![0; *size]))]);
+                let value = Record::new(vec![OwnedValue::Blob(Arc::new(vec![0; *size]))]);
                 tracing::info!("insert key:{}", key);
                 run_until_done(|| cursor.insert(&key, &value, true), pager.deref()).unwrap();
                 tracing::info!(
@@ -3822,7 +3820,7 @@ mod tests {
                 .unwrap();
 
                 let key = OwnedValue::Integer(key);
-                let value = Record::new(vec![OwnedValue::Blob(Rc::new(vec![0; size]))]);
+                let value = Record::new(vec![OwnedValue::Blob(Arc::new(vec![0; size]))]);
                 run_until_done(|| cursor.insert(&key, &value, true), pager.deref()).unwrap();
             }
             tracing::info!(
@@ -3921,14 +3919,14 @@ mod tests {
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
-    fn setup_test_env(database_size: u32) -> (Rc<Pager>, Arc<SpinLock<DatabaseHeader>>) {
+    fn setup_test_env(database_size: u32) -> (Arc<Pager>, Arc<SpinLock<DatabaseHeader>>) {
         let page_size = 512;
         let mut db_header = DatabaseHeader::default();
         db_header.page_size = page_size;
         db_header.database_size = database_size;
         let db_header = Arc::new(SpinLock::new(db_header));
 
-        let buffer_pool = Rc::new(BufferPool::new(10));
+        let buffer_pool = Arc::new(BufferPool::new(10));
 
         // Initialize buffer pool with correctly sized buffers
         for _ in 0..10 {
@@ -3941,7 +3939,7 @@ mod tests {
             io.open_file("test.db", OpenFlags::Create, false).unwrap(),
         ));
 
-        let drop_fn = Rc::new(|_buf| {});
+        let drop_fn = Arc::new(|_buf| {});
         let buf = Arc::new(RefCell::new(Buffer::allocate(page_size as usize, drop_fn)));
         {
             let mut buf_mut = buf.borrow_mut();
@@ -3954,14 +3952,14 @@ mod tests {
         db_file.write_page(1, buf.clone(), c).unwrap();
 
         let wal_shared = WalFileShared::open_shared(&io, "test.wal", page_size).unwrap();
-        let wal = Rc::new(RefCell::new(WalFile::new(
+        let wal = Arc::new(RefCell::new(WalFile::new(
             io.clone(),
             page_size as usize,
             wal_shared,
             buffer_pool.clone(),
         )));
 
-        let pager = Rc::new(
+        let pager = Arc::new(
             Pager::finish_open(
                 db_header.clone(),
                 db_file,
@@ -3993,7 +3991,7 @@ mod tests {
         // Setup overflow pages (2, 3, 4) with linking
         let mut current_page = 2u32;
         while current_page <= 4 {
-            let drop_fn = Rc::new(|_buf| {});
+            let drop_fn = Arc::new(|_buf| {});
             #[allow(clippy::arc_with_non_send_sync)]
             let buf = Arc::new(RefCell::new(Buffer::allocate(
                 db_header.lock().page_size as usize,
@@ -4713,7 +4711,7 @@ mod tests {
 
         let page = get_page(2);
         let usable_space = 4096;
-        let record = Record::new([OwnedValue::Blob(Rc::new(vec![0; 3600]))].to_vec());
+        let record = Record::new([OwnedValue::Blob(Arc::new(vec![0; 3600]))].to_vec());
         let mut payload: Vec<u8> = Vec::new();
         fill_cell_payload(
             page.get_contents().page_type(),

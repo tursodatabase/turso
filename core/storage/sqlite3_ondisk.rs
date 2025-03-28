@@ -52,7 +52,6 @@ use crate::{File, Result};
 use parking_lot::RwLock;
 use std::cell::RefCell;
 use std::pin::Pin;
-use std::rc::Rc;
 use std::sync::Arc;
 use tracing::trace;
 
@@ -246,7 +245,7 @@ impl Default for DatabaseHeader {
 pub fn begin_read_database_header(
     db_file: Arc<dyn DatabaseStorage>,
 ) -> Result<Arc<SpinLock<DatabaseHeader>>> {
-    let drop_fn = Rc::new(|_buf| {});
+    let drop_fn = Arc::new(|_buf| {});
     #[allow(clippy::arc_with_non_send_sync)]
     let buf = Arc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
     let result = Arc::new(SpinLock::new(DatabaseHeader::default()));
@@ -298,23 +297,23 @@ fn finish_read_database_header(
 
 pub fn begin_write_database_header(header: &DatabaseHeader, pager: &Pager) -> Result<()> {
     let page_source = pager.db_file.clone();
-    let header = Rc::new(header.clone());
+    let header = Arc::new(header.clone());
 
-    let drop_fn = Rc::new(|_buf| {});
+    let drop_fn = Arc::new(|_buf| {});
     #[allow(clippy::arc_with_non_send_sync)]
     let buffer_to_copy = Arc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
     let buffer_to_copy_in_cb = buffer_to_copy.clone();
 
     let read_complete = Box::new(move |buffer: Arc<RefCell<Buffer>>| {
         let buffer = buffer.borrow().clone();
-        let buffer = Rc::new(RefCell::new(buffer));
+        let buffer = Arc::new(RefCell::new(buffer));
         let mut buf_mut = buffer.borrow_mut();
         write_header_to_buf(buf_mut.as_mut_slice(), &header);
         let mut dest_buf = buffer_to_copy_in_cb.borrow_mut();
         dest_buf.as_mut_slice().copy_from_slice(buf_mut.as_slice());
     });
 
-    let drop_fn = Rc::new(|_buf| {});
+    let drop_fn = Arc::new(|_buf| {});
     #[allow(clippy::arc_with_non_send_sync)]
     let buf = Arc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
     let c = Completion::Read(ReadCompletion::new(buf, read_complete));
@@ -558,7 +557,7 @@ impl PageContent {
     pub fn cell_get(
         &self,
         idx: usize,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         payload_overflow_threshold_max: usize,
         payload_overflow_threshold_min: usize,
         usable_size: usize,
@@ -701,13 +700,13 @@ impl PageContent {
 
 pub fn begin_read_page(
     db_file: Arc<dyn DatabaseStorage>,
-    buffer_pool: Rc<BufferPool>,
+    buffer_pool: Arc<BufferPool>,
     page: PageRef,
     page_idx: usize,
 ) -> Result<()> {
     trace!("begin_read_btree_page(page_idx = {})", page_idx);
     let buf = buffer_pool.get();
-    let drop_fn = Rc::new(move |buf| {
+    let drop_fn = Arc::new(move |buf| {
         let buffer_pool = buffer_pool.clone();
         buffer_pool.put(buf);
     });
@@ -752,7 +751,7 @@ fn finish_read_page(
 pub fn begin_write_btree_page(
     pager: &Pager,
     page: &PageRef,
-    write_counter: Rc<RefCell<usize>>,
+    write_counter: Arc<RefCell<usize>>,
 ) -> Result<()> {
     trace!("begin_write_btree_page(page={})", page.get().id);
     let page_source = &pager.db_file;
@@ -786,7 +785,7 @@ pub fn begin_write_btree_page(
     Ok(())
 }
 
-pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>, syncing: Rc<RefCell<bool>>) -> Result<()> {
+pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>, syncing: Arc<RefCell<bool>>) -> Result<()> {
     assert!(!*syncing.borrow());
     *syncing.borrow_mut() = true;
     let completion = Completion::Sync(SyncCompletion {
@@ -837,7 +836,7 @@ pub fn read_btree_cell(
     page: &[u8],
     page_type: &PageType,
     pos: usize,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     max_local: usize,
     min_local: usize,
     usable_size: usize,
@@ -915,7 +914,7 @@ pub fn read_btree_cell(
 /// read_payload takes in the unread bytearray with the payload size
 /// and returns the payload on the page, and optionally the first overflow page number.
 #[allow(clippy::readonly_write_lock)]
-fn read_payload(unread: &[u8], payload_size: usize, pager: Rc<Pager>) -> (Vec<u8>, Option<u32>) {
+fn read_payload(unread: &[u8], payload_size: usize, pager: Arc<Pager>) -> (Vec<u8>, Option<u32>) {
     let cell_len = unread.len();
     if payload_size <= cell_len {
         // fit within 1 page
@@ -1297,7 +1296,7 @@ pub fn write_varint_to_vec(value: u64, payload: &mut Vec<u8>) {
 }
 
 pub fn begin_read_wal_header(io: &Arc<dyn File>) -> Result<Arc<RwLock<WalHeader>>> {
-    let drop_fn = Rc::new(|_buf| {});
+    let drop_fn = Arc::new(|_buf| {});
     #[allow(clippy::arc_with_non_send_sync)]
     let buf = Arc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
     let result = Arc::new(RwLock::new(WalHeader::default()));
@@ -1329,7 +1328,7 @@ fn finish_read_wal_header(buf: Arc<RefCell<Buffer>>, header: Arc<RwLock<WalHeade
 pub fn begin_read_wal_frame(
     io: &Arc<dyn File>,
     offset: usize,
-    buffer_pool: Rc<BufferPool>,
+    buffer_pool: Arc<BufferPool>,
     page: PageRef,
 ) -> Result<()> {
     trace!(
@@ -1338,7 +1337,7 @@ pub fn begin_read_wal_frame(
         page.get().id
     );
     let buf = buffer_pool.get();
-    let drop_fn = Rc::new(move |buf| {
+    let drop_fn = Arc::new(move |buf| {
         let buffer_pool = buffer_pool.clone();
         buffer_pool.put(buf);
     });
@@ -1359,7 +1358,7 @@ pub fn begin_write_wal_frame(
     offset: usize,
     page: &PageRef,
     db_size: u32,
-    write_counter: Rc<RefCell<usize>>,
+    write_counter: Arc<RefCell<usize>>,
     wal_header: &WalHeader,
     checksums: (u32, u32),
 ) -> Result<(u32, u32)> {
@@ -1378,7 +1377,7 @@ pub fn begin_write_wal_frame(
     let (buffer, checksums) = {
         let page = page.get();
         let contents = page.contents.as_ref().unwrap();
-        let drop_fn = Rc::new(|_buf| {});
+        let drop_fn = Arc::new(|_buf| {});
 
         let mut buffer = Buffer::allocate(
             contents.buffer.borrow().len() + WAL_FRAME_HEADER_SIZE,
@@ -1439,7 +1438,7 @@ pub fn begin_write_wal_frame(
 
 pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<()> {
     let buffer = {
-        let drop_fn = Rc::new(|_buf| {});
+        let drop_fn = Arc::new(|_buf| {});
 
         let mut buffer = Buffer::allocate(512, drop_fn);
         let buf = buffer.as_mut_slice();

@@ -43,7 +43,6 @@ use std::{
     io::Write,
     num::NonZero,
     ops::Deref,
-    rc::Rc,
     sync::{Arc, OnceLock},
 };
 use storage::btree::btree_init_page;
@@ -81,7 +80,7 @@ pub(crate) type MvStore = crate::mvcc::MvStore<crate::mvcc::LocalClock>;
 pub(crate) type MvCursor = crate::mvcc::cursor::ScanCursor<crate::mvcc::LocalClock>;
 
 pub struct Database {
-    mv_store: Option<Rc<MvStore>>,
+    mv_store: Option<Arc<MvStore>>,
     schema: Arc<RwLock<Schema>>,
     // TODO: make header work without lock
     header: Arc<SpinLock<DatabaseHeader>>,
@@ -127,7 +126,7 @@ impl Database {
             version.to_string()
         });
         let mv_store = if enable_mvcc {
-            Some(Rc::new(MvStore::new(
+            Some(Arc::new(MvStore::new(
                 crate::mvcc::LocalClock::new(),
                 crate::mvcc::persistent_storage::Storage::new_noop(),
             )))
@@ -162,16 +161,16 @@ impl Database {
         Ok(db)
     }
 
-    pub fn connect(self: &Arc<Database>) -> Result<Rc<Connection>> {
-        let buffer_pool = Rc::new(BufferPool::new(self.page_size as usize));
+    pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
+        let buffer_pool = Arc::new(BufferPool::new(self.page_size as usize));
 
-        let wal = Rc::new(RefCell::new(WalFile::new(
+        let wal = Arc::new(RefCell::new(WalFile::new(
             self.io.clone(),
             self.page_size as usize,
             self.shared_wal.clone(),
             buffer_pool.clone(),
         )));
-        let pager = Rc::new(Pager::finish_open(
+        let pager = Arc::new(Pager::finish_open(
             self.header.clone(),
             self.db_file.clone(),
             wal,
@@ -179,7 +178,7 @@ impl Database {
             self.shared_page_cache.clone(),
             buffer_pool,
         )?);
-        let conn = Rc::new(Connection {
+        let conn = Arc::new(Connection {
             _db: self.clone(),
             pager: pager.clone(),
             schema: self.schema.clone(),
@@ -230,7 +229,7 @@ pub fn maybe_init_database_file(file: &Arc<dyn File>, io: &Arc<dyn IO>) -> Resul
         let db_header = DatabaseHeader::default();
         let page1 = allocate_page(
             1,
-            &Rc::new(BufferPool::new(db_header.page_size as usize)),
+            &Arc::new(BufferPool::new(db_header.page_size as usize)),
             DATABASE_HEADER_SIZE,
         );
         {
@@ -248,7 +247,7 @@ pub fn maybe_init_database_file(file: &Arc<dyn File>, io: &Arc<dyn IO>) -> Resul
             let contents = page1.get().contents.as_mut().unwrap();
             contents.write_database_header(&db_header);
             // write the first page to disk synchronously
-            let flag_complete = Rc::new(RefCell::new(false));
+            let flag_complete = Arc::new(RefCell::new(false));
             {
                 let flag_complete = flag_complete.clone();
                 let completion = Completion::Write(WriteCompletion::new(Box::new(move |_| {
@@ -274,7 +273,7 @@ pub fn maybe_init_database_file(file: &Arc<dyn File>, io: &Arc<dyn IO>) -> Resul
 
 pub struct Connection {
     _db: Arc<Database>,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     schema: Arc<RwLock<Schema>>,
     header: Arc<SpinLock<DatabaseHeader>>,
     auto_commit: RefCell<bool>,
@@ -287,7 +286,7 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub fn prepare(self: &Rc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
+    pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         let sql = sql.as_ref();
         tracing::trace!("Preparing: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
@@ -296,7 +295,7 @@ impl Connection {
         if let Some(cmd) = cmd {
             match cmd {
                 Cmd::Stmt(stmt) => {
-                    let program = Rc::new(translate::translate(
+                    let program = Arc::new(translate::translate(
                         self.schema
                             .try_read()
                             .ok_or(LimboError::SchemaLocked)?
@@ -304,7 +303,7 @@ impl Connection {
                         stmt,
                         self.header.clone(),
                         self.pager.clone(),
-                        Rc::downgrade(self),
+                        Arc::downgrade(self),
                         &syms,
                         QueryMode::Normal,
                     )?);
@@ -322,7 +321,7 @@ impl Connection {
         }
     }
 
-    pub fn query(self: &Rc<Connection>, sql: impl AsRef<str>) -> Result<Option<Statement>> {
+    pub fn query(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Option<Statement>> {
         let sql = sql.as_ref();
         tracing::trace!("Querying: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
@@ -333,7 +332,7 @@ impl Connection {
         }
     }
 
-    pub(crate) fn run_cmd(self: &Rc<Connection>, cmd: Cmd) -> Result<Option<Statement>> {
+    pub(crate) fn run_cmd(self: &Arc<Connection>, cmd: Cmd) -> Result<Option<Statement>> {
         let syms = self.syms.borrow();
         match cmd {
             Cmd::Stmt(ref stmt) | Cmd::Explain(ref stmt) => {
@@ -345,7 +344,7 @@ impl Connection {
                     stmt.clone(),
                     self.header.clone(),
                     self.pager.clone(),
-                    Rc::downgrade(self),
+                    Arc::downgrade(self),
                     &syms,
                     cmd.into(),
                 )?;
@@ -384,13 +383,13 @@ impl Connection {
         }
     }
 
-    pub fn query_runner<'a>(self: &'a Rc<Connection>, sql: &'a [u8]) -> QueryRunner<'a> {
+    pub fn query_runner<'a>(self: &'a Arc<Connection>, sql: &'a [u8]) -> QueryRunner<'a> {
         QueryRunner::new(self, sql)
     }
 
     /// Execute will run a query from start to finish taking ownership of I/O because it will run pending I/Os if it didn't finish.
     /// TODO: make this api async
-    pub fn execute(self: &Rc<Connection>, sql: impl AsRef<str>) -> Result<()> {
+    pub fn execute(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
         let sql = sql.as_ref();
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next()?;
@@ -406,7 +405,7 @@ impl Connection {
                         stmt,
                         self.header.clone(),
                         self.pager.clone(),
-                        Rc::downgrade(self),
+                        Arc::downgrade(self),
                         &syms,
                         QueryMode::Explain,
                     )?;
@@ -422,7 +421,7 @@ impl Connection {
                         stmt,
                         self.header.clone(),
                         self.pager.clone(),
-                        Rc::downgrade(self),
+                        Arc::downgrade(self),
                         &syms,
                         QueryMode::Normal,
                     )?;
@@ -521,17 +520,19 @@ impl Connection {
 }
 
 pub struct Statement {
-    program: Rc<vdbe::Program>,
+    program: Arc<vdbe::Program>,
     state: vdbe::ProgramState,
-    mv_store: Option<Rc<MvStore>>,
-    pager: Rc<Pager>,
+    mv_store: Option<Arc<MvStore>>,
+    pager: Arc<Pager>,
 }
+
+unsafe impl Send for Statement {}
 
 impl Statement {
     pub fn new(
-        program: Rc<vdbe::Program>,
-        mv_store: Option<Rc<MvStore>>,
-        pager: Rc<Pager>,
+        program: Arc<vdbe::Program>,
+        mv_store: Option<Arc<MvStore>>,
+        pager: Arc<Pager>,
     ) -> Self {
         let state = vdbe::ProgramState::new(program.max_registers, program.cursor_ref.len());
         Self {
@@ -604,7 +605,7 @@ pub type StepResult = vdbe::StepResult;
 pub struct VirtualTable {
     name: String,
     args: Option<Vec<ast::Expr>>,
-    pub implementation: Rc<VTabModuleImpl>,
+    pub implementation: Arc<VTabModuleImpl>,
     columns: Vec<Column>,
 }
 
@@ -620,7 +621,7 @@ impl VirtualTable {
         syms: &SymbolTable,
         kind: VTabKind,
         exprs: Option<Vec<ast::Expr>>,
-    ) -> Result<Rc<Self>> {
+    ) -> Result<Arc<Self>> {
         let module = syms
             .vtab_modules
             .get(module_name)
@@ -642,7 +643,7 @@ impl VirtualTable {
             LimboError::ParseError("Failed to parse schema from virtual table module".to_string()),
         )? {
             let columns = columns_from_create_table_body(&body)?;
-            let vtab = Rc::new(VirtualTable {
+            let vtab = Arc::new(VirtualTable {
                 name: tbl_name.unwrap_or(module_name).to_owned(),
                 implementation: module.implementation.clone(),
                 columns,
@@ -727,9 +728,9 @@ impl VirtualTable {
 }
 
 pub(crate) struct SymbolTable {
-    pub functions: HashMap<String, Rc<function::ExternalFunc>>,
-    pub vtabs: HashMap<String, Rc<VirtualTable>>,
-    pub vtab_modules: HashMap<String, Rc<crate::ext::VTabImpl>>,
+    pub functions: HashMap<String, Arc<function::ExternalFunc>>,
+    pub vtabs: HashMap<String, Arc<VirtualTable>>,
+    pub vtab_modules: HashMap<String, Arc<crate::ext::VTabImpl>>,
 }
 
 impl std::fmt::Debug for SymbolTable {
@@ -780,18 +781,18 @@ impl SymbolTable {
         &self,
         name: &str,
         _arg_count: usize,
-    ) -> Option<Rc<function::ExternalFunc>> {
+    ) -> Option<Arc<function::ExternalFunc>> {
         self.functions.get(name).cloned()
     }
 }
 
 pub struct QueryRunner<'a> {
     parser: Parser<'a>,
-    conn: &'a Rc<Connection>,
+    conn: &'a Arc<Connection>,
 }
 
 impl<'a> QueryRunner<'a> {
-    pub(crate) fn new(conn: &'a Rc<Connection>, statements: &'a [u8]) -> Self {
+    pub(crate) fn new(conn: &'a Arc<Connection>, statements: &'a [u8]) -> Self {
         Self {
             parser: Parser::new(statements),
             conn,

@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use limbo_core::{Connection, Database};
@@ -114,7 +113,7 @@ pub trait ConnectionTrait {
 
 #[derive(Clone)]
 pub(crate) enum SimConnection {
-    Connected(Rc<Connection>),
+    Connected(Arc<Connection>),
     Disconnected,
 }
 

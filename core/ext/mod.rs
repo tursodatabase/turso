@@ -11,7 +11,6 @@ use limbo_ext::{
 pub use limbo_ext::{FinalizeFunction, StepFunction, Value as ExtValue, ValueType as ExtValueType};
 use std::{
     ffi::{c_char, c_void, CStr, CString},
-    rc::Rc,
     sync::Arc,
 };
 type ExternAggFunc = (InitAggFunction, StepFunction, FinalizeFunction);
@@ -19,7 +18,7 @@ type ExternAggFunc = (InitAggFunction, StepFunction, FinalizeFunction);
 #[derive(Clone)]
 pub struct VTabImpl {
     pub module_kind: VTabKind,
-    pub implementation: Rc<VTabModuleImpl>,
+    pub implementation: Arc<VTabModuleImpl>,
 }
 
 pub(crate) unsafe extern "C" fn register_scalar_function(
@@ -116,7 +115,7 @@ impl Connection {
     fn register_scalar_function_impl(&self, name: &str, func: ScalarFunction) -> ResultCode {
         self.syms.borrow_mut().functions.insert(
             name.to_string(),
-            Rc::new(ExternalFunc::new_scalar(name.to_string(), func)),
+            Arc::new(ExternalFunc::new_scalar(name.to_string(), func)),
         );
         ResultCode::OK
     }
@@ -129,7 +128,7 @@ impl Connection {
     ) -> ResultCode {
         self.syms.borrow_mut().functions.insert(
             name.to_string(),
-            Rc::new(ExternalFunc::new_aggregate(name.to_string(), args, func)),
+            Arc::new(ExternalFunc::new_aggregate(name.to_string(), args, func)),
         );
         ResultCode::OK
     }
@@ -140,7 +139,7 @@ impl Connection {
         module: VTabModuleImpl,
         kind: VTabKind,
     ) -> ResultCode {
-        let module = Rc::new(module);
+        let module = Arc::new(module);
         let vmodule = VTabImpl {
             module_kind: kind,
             implementation: module,

@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, rc::Rc};
+use std::{collections::VecDeque, sync::Arc};
 
 use crate::{types::OwnedValue, vdbe::Register};
 
@@ -185,7 +185,7 @@ pub fn jsonb_remove(args: &[Register], json_cache: &JsonCacheCell) -> crate::Res
         }
     }
 
-    Ok(OwnedValue::Blob(Rc::new(json.data())))
+    Ok(OwnedValue::Blob(Arc::new(json.data())))
 }
 
 pub fn json_replace(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<OwnedValue> {
@@ -283,8 +283,6 @@ pub fn jsonb_insert(args: &[Register], json_cache: &JsonCacheCell) -> crate::Res
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
-
     use crate::types::Text;
 
     use super::*;
@@ -403,7 +401,6 @@ mod tests {
 
     #[test]
     fn test_deep_nested_patch() {
-        let mut patcher = JsonPatcher::new(10);
         let mut target = Val::Object(vec![(
             "level1".to_string(),
             Val::Object(vec![(
@@ -419,15 +416,19 @@ mod tests {
             )]),
         )]);
 
+        let mut patcher = JsonPatcher::new(10);
         patcher.apply_patch(&mut target, patch);
 
-        if let Val::Object(l1) = target {
-            if let Val::Object(l2) = &l1[0].1 {
-                if let Val::Object(l3) = &l2[0].1 {
-                    assert_eq!(l3[0].1, Val::String("new".to_string()));
-                }
-            }
-        }
+        assert_eq!(
+            target,
+            Val::Object(vec![(
+                "level1".to_string(),
+                Val::Object(vec![(
+                    "level2".to_string(),
+                    Val::Object(vec![("level3".to_string(), Val::String("new".to_string()))])
+                )])
+            )])
+        );
     }
 
     #[test]
@@ -554,7 +555,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "blob is not supported!")]
     fn test_blob_not_supported() {
-        let target = OwnedValue::Blob(Rc::new(vec![1, 2, 3]));
+        let target = OwnedValue::Blob(Arc::new(vec![1, 2, 3]));
         let patch = create_text("{}");
         json_patch(&target, &patch).unwrap();
     }

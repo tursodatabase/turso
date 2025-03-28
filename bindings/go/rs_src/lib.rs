@@ -5,7 +5,6 @@ mod types;
 use limbo_core::{Connection, Database, LimboError, IO};
 use std::{
     ffi::{c_char, c_void},
-    rc::Rc,
     sync::Arc,
 };
 
@@ -40,13 +39,13 @@ pub unsafe extern "C" fn db_open(path: *const c_char) -> *mut c_void {
 
 #[allow(dead_code)]
 struct LimboConn {
-    conn: Rc<Connection>,
+    conn: Arc<Connection>,
     io: Arc<dyn limbo_core::IO>,
     err: Option<LimboError>,
 }
 
 impl LimboConn {
-    fn new(conn: Rc<Connection>, io: Arc<dyn limbo_core::IO>) -> Self {
+    fn new(conn: Arc<Connection>, io: Arc<dyn limbo_core::IO>) -> Self {
         LimboConn {
             conn,
             io,

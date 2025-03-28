@@ -3,7 +3,6 @@
 
 use limbo_sqlite3_parser::ast;
 use limbo_sqlite3_parser::ast::PragmaName;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::fast_lock::SpinLock;
@@ -40,7 +39,7 @@ pub fn translate_pragma(
     name: &ast::QualifiedName,
     body: Option<ast::PragmaBody>,
     database_header: Arc<SpinLock<DatabaseHeader>>,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
 ) -> crate::Result<ProgramBuilder> {
     let mut program = ProgramBuilder::new(ProgramBuilderOpts {
         query_mode,
@@ -117,7 +116,7 @@ fn update_pragma(
     schema: &Schema,
     value: ast::Expr,
     header: Arc<SpinLock<DatabaseHeader>>,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
     match pragma {
@@ -262,7 +261,7 @@ fn query_pragma(
     Ok(())
 }
 
-fn update_cache_size(value: i64, header: Arc<SpinLock<DatabaseHeader>>, pager: Rc<Pager>) {
+fn update_cache_size(value: i64, header: Arc<SpinLock<DatabaseHeader>>, pager: Arc<Pager>) {
     let mut cache_size_unformatted: i64 = value;
     let mut cache_size = if cache_size_unformatted < 0 {
         let kb = cache_size_unformatted.abs() * 1024;

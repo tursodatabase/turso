@@ -1,8 +1,7 @@
 use std::{
     cell::Cell,
     collections::HashMap,
-    rc::{Rc, Weak},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 
 use limbo_sqlite3_parser::ast;
@@ -41,11 +40,11 @@ pub struct ProgramBuilder {
 
 #[derive(Debug, Clone)]
 pub enum CursorType {
-    BTreeTable(Rc<BTreeTable>),
+    BTreeTable(Arc<BTreeTable>),
     BTreeIndex(Arc<Index>),
-    Pseudo(Rc<PseudoTable>),
+    Pseudo(Arc<PseudoTable>),
     Sorter,
-    VirtualTable(Rc<VirtualTable>),
+    VirtualTable(Arc<VirtualTable>),
 }
 
 impl CursorType {

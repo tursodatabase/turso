@@ -168,7 +168,7 @@ pub struct Limbo<'a> {
     pub prompt: String,
     io: Arc<dyn limbo_core::IO>,
     writer: Box<dyn Write>,
-    conn: Rc<limbo_core::Connection>,
+    conn: Arc<limbo_core::Connection>,
     pub interrupt_count: Arc<AtomicUsize>,
     input_buff: String,
     opts: Settings,

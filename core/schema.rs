@@ -8,7 +8,6 @@ use limbo_sqlite3_parser::{
     lexer::sql::Parser,
 };
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::sync::Arc;
 use tracing::trace;
 
@@ -30,12 +29,12 @@ impl Schema {
         Self { tables, indexes }
     }
 
-    pub fn add_btree_table(&mut self, table: Rc<BTreeTable>) {
+    pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) {
         let name = normalize_ident(&table.name);
         self.tables.insert(name, Table::BTree(table).into());
     }
 
-    pub fn add_virtual_table(&mut self, table: Rc<VirtualTable>) {
+    pub fn add_virtual_table(&mut self, table: Arc<VirtualTable>) {
         let name = normalize_ident(&table.name);
         self.tables.insert(name, Table::Virtual(table).into());
     }
@@ -50,7 +49,7 @@ impl Schema {
         self.tables.remove(&name);
     }
 
-    pub fn get_btree_table(&self, name: &str) -> Option<Rc<BTreeTable>> {
+    pub fn get_btree_table(&self, name: &str) -> Option<Arc<BTreeTable>> {
         let name = normalize_ident(name);
         if let Some(table) = self.tables.get(&name) {
             table.btree()
@@ -82,9 +81,9 @@ impl Schema {
 
 #[derive(Clone, Debug)]
 pub enum Table {
-    BTree(Rc<BTreeTable>),
-    Pseudo(Rc<PseudoTable>),
-    Virtual(Rc<VirtualTable>),
+    BTree(Arc<BTreeTable>),
+    Pseudo(Arc<PseudoTable>),
+    Virtual(Arc<VirtualTable>),
 }
 
 impl Table {
@@ -120,7 +119,7 @@ impl Table {
         }
     }
 
-    pub fn btree(&self) -> Option<Rc<BTreeTable>> {
+    pub fn btree(&self) -> Option<Arc<BTreeTable>> {
         match self {
             Self::BTree(table) => Some(table.clone()),
             Self::Pseudo(_) => None,
@@ -128,7 +127,7 @@ impl Table {
         }
     }
 
-    pub fn virtual_table(&self) -> Option<Rc<VirtualTable>> {
+    pub fn virtual_table(&self) -> Option<Arc<VirtualTable>> {
         match self {
             Self::Virtual(table) => Some(table.clone()),
             _ => None,
@@ -139,9 +138,9 @@ impl Table {
 impl PartialEq for Table {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::BTree(a), Self::BTree(b)) => Rc::ptr_eq(a, b),
-            (Self::Pseudo(a), Self::Pseudo(b)) => Rc::ptr_eq(a, b),
-            (Self::Virtual(a), Self::Virtual(b)) => Rc::ptr_eq(a, b),
+            (Self::BTree(a), Self::BTree(b)) => Arc::ptr_eq(a, b),
+            (Self::Pseudo(a), Self::Pseudo(b)) => Arc::ptr_eq(a, b),
+            (Self::Virtual(a), Self::Virtual(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }

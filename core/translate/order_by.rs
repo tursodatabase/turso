@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use limbo_sqlite3_parser::ast;
 
@@ -105,7 +105,7 @@ pub fn emit_order_by(
             .map(|v| v.len())
             .unwrap_or(0);
 
-    let pseudo_table = Rc::new(PseudoTable {
+    let pseudo_table = Arc::new(PseudoTable {
         columns: pseudo_columns,
     });
     let pseudo_cursor = program.alloc_cursor_id(None, CursorType::Pseudo(pseudo_table.clone()));

@@ -621,8 +621,8 @@ use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{BucketScanCursor, LazyScanCursor, ScanCursor};
 use crate::mvcc::database::{MvStore, Row, RowID};
 use crate::mvcc::persistent_storage::Storage;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 // Simple atomic clock implementation for testing
 struct TestClock {
@@ -650,10 +650,10 @@ impl LogicalClock for TestClock {
     }
 }
 
-fn setup_test_db() -> (Rc<MvStore<TestClock>>, u64) {
+fn setup_test_db() -> (Arc<MvStore<TestClock>>, u64) {
     let clock = TestClock::new(1);
     let storage = Storage::new_noop();
-    let db = Rc::new(MvStore::new(clock, storage));
+    let db = Arc::new(MvStore::new(clock, storage));
     let tx_id = db.begin_tx();
 
     let table_id = 1;
@@ -677,10 +677,10 @@ fn setup_test_db() -> (Rc<MvStore<TestClock>>, u64) {
     (db, tx_id)
 }
 
-fn setup_sequential_db() -> (Rc<MvStore<TestClock>>, u64) {
+fn setup_sequential_db() -> (Arc<MvStore<TestClock>>, u64) {
     let clock = TestClock::new(1);
     let storage = Storage::new_noop();
-    let db = Rc::new(MvStore::new(clock, storage));
+    let db = Arc::new(MvStore::new(clock, storage));
     let tx_id = db.begin_tx();
 
     let table_id = 1;
@@ -848,7 +848,7 @@ fn test_scan_cursor_basic() {
 fn test_cursor_with_empty_table() {
     let clock = TestClock::new(1);
     let storage = Storage::new_noop();
-    let db = Rc::new(MvStore::new(clock, storage));
+    let db = Arc::new(MvStore::new(clock, storage));
     let tx_id = db.begin_tx();
     let table_id = 1; // Empty table
 

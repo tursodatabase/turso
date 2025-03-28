@@ -1,4 +1,4 @@
-use std::{fmt::Display, path::Path, rc::Rc, vec};
+use std::{fmt::Display, path::Path, sync::Arc, vec};
 
 use limbo_core::{Connection, Result, StepResult};
 use serde::{Deserialize, Serialize};
@@ -470,7 +470,7 @@ impl Interaction {
             Self::Assumption(_) | Self::Assertion(_) | Self::Fault(_) => vec![],
         }
     }
-    pub(crate) fn execute_query(&self, conn: &mut Rc<Connection>) -> ResultSet {
+    pub(crate) fn execute_query(&self, conn: &mut Arc<Connection>) -> ResultSet {
         if let Self::Query(query) = self {
             let query_str = query.to_string();
             let rows = conn.query(&query_str);

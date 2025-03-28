@@ -2,7 +2,7 @@ pub mod grammar_generator;
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
@@ -49,7 +49,7 @@ mod tests {
 
     fn limbo_exec_rows(
         db: &TempDatabase,
-        conn: &Rc<limbo_core::Connection>,
+        conn: &Arc<limbo_core::Connection>,
         query: &str,
     ) -> Vec<Vec<rusqlite::types::Value>> {
         let mut stmt = conn.prepare(query).unwrap();

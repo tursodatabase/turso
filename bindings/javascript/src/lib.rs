@@ -1,7 +1,6 @@
 #![deny(clippy::all)]
 
 use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use napi::{Env, JsObject, JsUnknown, Result as NapiResult};
@@ -12,7 +11,7 @@ pub struct Database {
     #[napi(writable = false)]
     pub memory: bool,
     _db: Arc<limbo_core::Database>,
-    conn: Rc<limbo_core::Connection>,
+    conn: Arc<limbo_core::Connection>,
 }
 
 #[napi]

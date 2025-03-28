@@ -2,7 +2,7 @@ use crate::vdbe::builder::CursorType;
 
 use super::{Insn, InsnReference, OwnedValue, Program};
 use crate::function::{Func, ScalarFunc};
-use std::rc::Rc;
+use std::sync::Arc;
 
 pub fn insn_to_str(
     program: &Program,
@@ -672,7 +672,7 @@ pub fn insn_to_str(
                 0,
                 *dest as i32,
                 0,
-                OwnedValue::Blob(Rc::new(value.clone())),
+                OwnedValue::Blob(Arc::new(value.clone())),
                 0,
                 format!(
                     "r[{}]={} (len={})",
@@ -1146,7 +1146,7 @@ pub fn insn_to_str(
                 *root as i32,
                 *former_root_reg as i32,
                 *is_temp as i32,
-                OwnedValue::build_text(&Rc::new("".to_string())),
+                OwnedValue::build_text(&Arc::new("".to_string())),
                 0,
                 format!(
                     "root iDb={} former_root={} is_temp={}",
@@ -1163,7 +1163,7 @@ pub fn insn_to_str(
                 *db as i32,
                 0,
                 0,
-                OwnedValue::build_text(&Rc::new(table_name.clone())),
+                OwnedValue::build_text(&Arc::new(table_name.clone())),
                 0,
                 format!("DROP TABLE {}", table_name),
             ),

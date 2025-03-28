@@ -32,14 +32,14 @@ pub struct ImportArgs {
 }
 
 pub struct ImportFile<'a> {
-    conn: Rc<Connection>,
+    conn: Arc<Connection>,
     io: Arc<dyn limbo_core::IO>,
     writer: &'a mut dyn Write,
 }
 
 impl<'a> ImportFile<'a> {
     pub fn new(
-        conn: Rc<Connection>,
+        conn: Arc<Connection>,
         io: Arc<dyn limbo_core::IO>,
         writer: &'a mut dyn Write,
     ) -> Self {
