@@ -1177,7 +1177,17 @@ impl BTreeCursor {
                         // check if we don't need to balance
                         // don't continue if there are no overflow cells
                         let page = current_page.get().contents.as_mut().unwrap();
-                        if page.overflow_cells.is_empty() {
+                        println!("pagetype in balance= {:?}", page.page_type());
+                        let free_space = compute_free_space(page, self.usable_space() as u16);
+                        println!(
+                            "freespace:  {}; usablespace: {}; comparison:{}",
+                            free_space,
+                            self.usable_space(),
+                            free_space as isize * 3 - self.usable_space() as isize * 2
+                        );
+                        if page.overflow_cells.is_empty()
+                            && free_space as usize * 3 <= self.usable_space() * 2
+                        {
                             let write_info = self.state.mut_write_info().unwrap();
                             write_info.state = WriteState::Finish;
                             return Ok(CursorResult::Ok(()));
