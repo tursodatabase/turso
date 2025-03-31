@@ -2295,46 +2295,59 @@ impl BTreeCursor {
                         delete_info.balance_write_info = Some(write_info);
                     }
 
-                    delete_info.state = DeleteState::WaitForBalancingToComplete { target_rowid }
+                    let write_info = delete_info.balance_write_info.take().unwrap();
+                    // First switch to Write state for balancing
+                    self.state = CursorState::Write(write_info);
+                    // Then immediately switch to WaitForBalancingToComplete to preserve target_rowid
+                    self.state = CursorState::Delete(DeleteInfo {
+                        state: DeleteState::WaitForBalancingToComplete { target_rowid },
+                        balance_write_info: match &self.state {
+                            CursorState::Write(wi) => Some(wi.clone()),
+                            _ => unreachable!("Just set the state to Write"),
+                        },
+                    });
                 }
 
                 DeleteState::WaitForBalancingToComplete { target_rowid } => {
                     let delete_info = self.state.mut_delete_info().unwrap();
+                    let write_info = delete_info.balance_write_info.as_ref().unwrap();
+                    println!(
+                        "WaitForBalancingToComplete: Current WriteState: {:?}",
+                        write_info.state
+                    );
+                    match write_info.state {
+                        WriteState::Start
+                        | WriteState::BalanceStart
+                        | WriteState::BalanceNonRoot
+                        | WriteState::BalanceNonRootWaitLoadPages => {
+                            // Still in balancing states, continue balancing
+                            println!(
+                                "Before balance() call - WriteState: {:?}",
+                                write_info.state.clone()
+                            );
+                            self.state = CursorState::Write(write_info.clone());
 
-                    // Switch the CursorState to Write state for balancing
-                    let write_info = delete_info.balance_write_info.take().unwrap();
-                    self.state = CursorState::Write(write_info);
+                            return_if_io!(self.balance());
 
-                    match self.balance()? {
-                        // TODO(Krishna): Add second balance in the case where deletion causes cursor to end up
-                        // a level deeper.
-                        CursorResult::Ok(()) => {
-                            let write_info = match &self.state {
-                                CursorState::Write(wi) => wi.clone(),
-                                _ => unreachable!("Balance operation changed cursor state"),
-                            };
-
-                            // Move to seek state
-                            self.state = CursorState::Delete(DeleteInfo {
-                                state: DeleteState::SeekAfterBalancing { target_rowid },
-                                balance_write_info: Some(write_info),
-                            });
+                            // After balance call, preserve the updated write info and target_rowid
+                            match &self.state {
+                                CursorState::Write(updated_write_info) => {
+                                    self.state = CursorState::Delete(DeleteInfo {
+                                        state: DeleteState::WaitForBalancingToComplete {
+                                            target_rowid,
+                                        },
+                                        balance_write_info: Some(updated_write_info.clone()),
+                                    });
+                                }
+                                _ => unreachable!("Balance call should maintain Write state"),
+                            }
+                            continue;
                         }
-
-                        CursorResult::IO => {
-                            // Save balance progress and return IO
-                            let write_info = match &self.state {
-                                CursorState::Write(wi) => wi.clone(),
-                                _ => unreachable!("Balance operation changed cursor state"),
-                            };
-
-                            self.state = CursorState::Delete(DeleteInfo {
-                                state: DeleteState::WaitForBalancingToComplete { target_rowid },
-                                balance_write_info: Some(write_info),
-                            });
-                            return Ok(CursorResult::IO);
+                        WriteState::Finish => {
+                            // Balancing complete, move to seek state
+                            delete_info.state = DeleteState::SeekAfterBalancing { target_rowid };
                         }
-                    }
+                    };
                 }
 
                 DeleteState::SeekAfterBalancing { target_rowid } => {
