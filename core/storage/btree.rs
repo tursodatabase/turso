@@ -1194,8 +1194,13 @@ impl BTreeCursor {
                         }
                     }
 
-                    if !self.stack.has_parent() {
+                    let page = current_page.get().contents.as_mut().unwrap();
+                    if !self.stack.has_parent() && !page.overflow_cells.is_empty() {
                         self.balance_root();
+                    } else {
+                        let write_info = self.state.mut_write_info().unwrap();
+                        write_info.state = WriteState::Finish;
+                        return Ok(CursorResult::Ok(()));
                     }
 
                     let write_info = self.state.mut_write_info().unwrap();
