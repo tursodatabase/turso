@@ -16,3 +16,454 @@ do_execsql_test_on_specific_db {:memory:} must-be-int-insert {
 2
 3
 4}
+
+
+do_execsql_test_on_specific_db {:memory:} affinity-test-setup {
+
+    CREATE TABLE affinity_test (
+        col_integer INTEGER,
+        col_int INT,
+        col_text TEXT,
+        col_varchar VARCHAR(10),
+        col_char CHAR(10),
+        col_clob CLOB,
+        col_real REAL,
+        col_float FLOAT,
+        col_double DOUBLE,
+        col_numeric NUMERIC,
+        col_decimal DECIMAL,
+        col_blob BLOB,
+        col_no_type
+    );
+    INSERT INTO affinity_test VALUES (
+        123, 123, 123, 123, 123, 123, 123, 123, 123, 123, 123, 123, 123
+    );
+    SELECT
+        typeof(col_integer),
+        typeof(col_int),
+        typeof(col_text),
+        typeof(col_varchar),
+        typeof(col_char),
+        typeof(col_clob),
+        typeof(col_real),
+        typeof(col_float),
+        typeof(col_double),
+        typeof(col_numeric),
+        typeof(col_decimal),
+        typeof(col_blob),
+        typeof(col_no_type)
+    FROM affinity_test;
+
+} {integer|integer|text|text|text|text|real|real|real|integer|integer|integer|integer}
+
+
+do_execsql_test_on_specific_db {:memory:} affinity-test-text-value {
+    CREATE TABLE affinity_test (
+        col_integer INTEGER,
+        col_int INT,
+        col_text TEXT,
+        col_varchar VARCHAR(10),
+        col_char CHAR(10),
+        col_clob CLOB,
+        col_real REAL,
+        col_float FLOAT,
+        col_double DOUBLE,
+        col_numeric NUMERIC,
+        col_decimal DECIMAL,
+        col_blob BLOB,
+        col_no_type
+    );
+
+
+    INSERT INTO affinity_test VALUES (
+        '456', '456', '456', '456', '456', '456', '456', '456', '456', '456', '456', '456', '456'
+    );
+
+
+    SELECT
+        typeof(col_integer),
+        typeof(col_int),
+        typeof(col_text),
+        typeof(col_varchar),
+        typeof(col_char),
+        typeof(col_clob),
+        typeof(col_real),
+        typeof(col_float),
+        typeof(col_double),
+        typeof(col_numeric),
+        typeof(col_decimal),
+        typeof(col_blob),
+        typeof(col_no_type)
+    FROM affinity_test;
+} {integer|integer|text|text|text|text|real|real|real|integer|integer|text|text}
+
+
+do_execsql_test_on_specific_db {:memory:} affinity-test-real-value {
+    CREATE TABLE affinity_test (
+        col_integer INTEGER,
+        col_int INT,
+        col_text TEXT,
+        col_varchar VARCHAR(10),
+        col_char CHAR(10),
+        col_clob CLOB,
+        col_real REAL,
+        col_float FLOAT,
+        col_double DOUBLE,
+        col_numeric NUMERIC,
+        col_decimal DECIMAL,
+        col_blob BLOB,
+        col_no_type
+    );
+
+    INSERT INTO affinity_test VALUES (
+        789.5, 789.5, 789.5, 789.5, 789.5, 789.5, 789.5, 789.5, 789.5, 789.5, 789.5, 789.5, 789.5
+    );
+
+
+    SELECT
+        typeof(col_integer),
+        typeof(col_int),
+        typeof(col_text),
+        typeof(col_varchar),
+        typeof(col_char),
+        typeof(col_clob),
+        typeof(col_real),
+        typeof(col_float),
+        typeof(col_double),
+        typeof(col_numeric),
+        typeof(col_decimal),
+        typeof(col_blob),
+        typeof(col_no_type)
+    FROM affinity_test;
+} {real|real|text|text|text|text|real|real|real|real|real|real|real}
+
+
+do_execsql_test_on_specific_db {:memory:} affinity-test-int-like-text {
+    CREATE TABLE affinity_test (
+        col_integer INTEGER,
+        col_int INT,
+        col_text TEXT,
+        col_varchar VARCHAR(10),
+        col_char CHAR(10),
+        col_clob CLOB,
+        col_real REAL,
+        col_float FLOAT,
+        col_double DOUBLE,
+        col_numeric NUMERIC,
+        col_decimal DECIMAL,
+        col_blob BLOB,
+        col_no_type
+    );
+
+
+    INSERT INTO affinity_test VALUES (
+        '3.0e+5', '3.0e+5', '3.0e+5', '3.0e+5', '3.0e+5', '3.0e+5',
+        '3.0e+5', '3.0e+5', '3.0e+5', '3.0e+5', '3.0e+5', '3.0e+5', '3.0e+5'
+    );
+
+
+    SELECT
+        typeof(col_integer),
+        typeof(col_int),
+        typeof(col_text),
+        typeof(col_varchar),
+        typeof(col_char),
+        typeof(col_clob),
+        typeof(col_real),
+        typeof(col_float),
+        typeof(col_double),
+        typeof(col_numeric),
+        typeof(col_decimal),
+        typeof(col_blob),
+        typeof(col_no_type),
+        col_integer,
+        col_numeric,
+        col_real
+    FROM affinity_test;
+} {integer|integer|text|text|text|text|real|real|real|integer|integer|text|text|300000|300000|300000.0}
+
+do_execsql_test_on_specific_db {:memory:} affinity-test-hex-integer {
+    CREATE TABLE affinity_test (
+        col_integer INTEGER,
+        col_int INT,
+        col_text TEXT,
+        col_varchar VARCHAR(10),
+        col_char CHAR(10),
+        col_clob CLOB,
+        col_real REAL,
+        col_float FLOAT,
+        col_double DOUBLE,
+        col_numeric NUMERIC,
+        col_decimal DECIMAL,
+        col_blob BLOB,
+        col_no_type
+    );
+
+    INSERT INTO affinity_test VALUES (
+        '0xFF', '0xFF', '0xFF', '0xFF', '0xFF', '0xFF',
+        '0xFF', '0xFF', '0xFF', '0xFF', '0xFF', '0xFF', '0xFF'
+    );
+
+    SELECT
+        typeof(col_integer),
+        typeof(col_int),
+        typeof(col_text),
+        typeof(col_varchar),
+        typeof(col_char),
+        typeof(col_clob),
+        typeof(col_real),
+        typeof(col_float),
+        typeof(col_double),
+        typeof(col_numeric),
+        typeof(col_decimal),
+        typeof(col_blob),
+        typeof(col_no_type),
+        col_integer,
+        col_numeric,
+        col_real
+    FROM affinity_test;
+} {text|text|text|text|text|text|text|text|text|text|text|text|text|0xFF|0xFF|0xFF}
+
+
+do_execsql_test_on_specific_db {:memory:} affinity-test-null-value {
+    CREATE TABLE affinity_test (
+        col_integer INTEGER,
+        col_int INT,
+        col_text TEXT,
+        col_varchar VARCHAR(10),
+        col_char CHAR(10),
+        col_clob CLOB,
+        col_real REAL,
+        col_float FLOAT,
+        col_double DOUBLE,
+        col_numeric NUMERIC,
+        col_decimal DECIMAL,
+        col_blob BLOB,
+        col_no_type
+    );
+
+    INSERT INTO affinity_test VALUES (
+        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+    );
+
+    SELECT
+        typeof(col_integer),
+        typeof(col_int),
+        typeof(col_text),
+        typeof(col_varchar),
+        typeof(col_char),
+        typeof(col_clob),
+        typeof(col_real),
+        typeof(col_float),
+        typeof(col_double),
+        typeof(col_numeric),
+        typeof(col_decimal),
+        typeof(col_blob),
+        typeof(col_no_type)
+    FROM affinity_test;
+} {null|null|null|null|null|null|null|null|null|null|null|null|null}
+
+do_execsql_test_on_specific_db {:memory:} affinity-test-blob-value {
+    CREATE TABLE affinity_test (
+        col_integer INTEGER,
+        col_int INT,
+        col_text TEXT,
+        col_varchar VARCHAR(10),
+        col_char CHAR(10),
+        col_clob CLOB,
+        col_real REAL,
+        col_float FLOAT,
+        col_double DOUBLE,
+        col_numeric NUMERIC,
+        col_decimal DECIMAL,
+        col_blob BLOB,
+        col_no_type
+    );
+
+
+    INSERT INTO affinity_test VALUES (
+        X'ABCD', X'ABCD', X'ABCD', X'ABCD', X'ABCD', X'ABCD',
+        X'ABCD', X'ABCD', X'ABCD', X'ABCD', X'ABCD', X'ABCD', X'ABCD'
+    );
+
+    SELECT
+        typeof(col_integer),
+        typeof(col_int),
+        typeof(col_text),
+        typeof(col_varchar),
+        typeof(col_char),
+        typeof(col_clob),
+        typeof(col_real),
+        typeof(col_float),
+        typeof(col_double),
+        typeof(col_numeric),
+        typeof(col_decimal),
+        typeof(col_blob),
+        typeof(col_no_type)
+    FROM affinity_test;
+} {blob|blob|blob|blob|blob|blob|blob|blob|blob|blob|blob|blob|blob}
+
+do_execsql_test_on_specific_db {:memory:} affinity-test-non-numeric-text {
+    CREATE TABLE affinity_test (
+        col_integer INTEGER,
+        col_int INT,
+        col_text TEXT,
+        col_varchar VARCHAR(10),
+        col_char CHAR(10),
+        col_clob CLOB,
+        col_real REAL,
+        col_float FLOAT,
+        col_double DOUBLE,
+        col_numeric NUMERIC,
+        col_decimal DECIMAL,
+        col_blob BLOB,
+        col_no_type
+    );
+
+    INSERT INTO affinity_test VALUES (
+        'abc', 'abc', 'abc', 'abc', 'abc', 'abc',
+        'abc', 'abc', 'abc', 'abc', 'abc', 'abc', 'abc'
+    );
+
+
+    SELECT
+        typeof(col_integer),
+        typeof(col_int),
+        typeof(col_text),
+        typeof(col_varchar),
+        typeof(col_char),
+        typeof(col_clob),
+        typeof(col_real),
+        typeof(col_float),
+        typeof(col_double),
+        typeof(col_numeric),
+        typeof(col_decimal),
+        typeof(col_blob),
+        typeof(col_no_type)
+    FROM affinity_test;
+} {text|text|text|text|text|text|text|text|text|text|text|text|text}
+
+do_execsql_test_on_specific_db {:memory:} affinity-test-large-int {
+    CREATE TABLE affinity_test (
+        col_integer INTEGER,
+        col_int INT,
+        col_text TEXT,
+        col_varchar VARCHAR(10),
+        col_char CHAR(10),
+        col_clob CLOB,
+        col_real REAL,
+        col_float FLOAT,
+        col_double DOUBLE,
+        col_numeric NUMERIC,
+        col_decimal DECIMAL,
+        col_blob BLOB,
+        col_no_type
+    );
+
+    INSERT INTO affinity_test VALUES (
+        '9223372036854775807', '9223372036854775807', '9223372036854775807', '9223372036854775807',
+        '9223372036854775807', '9223372036854775807', '9223372036854775807', '9223372036854775807',
+        '9223372036854775807', '9223372036854775807', '9223372036854775807', '9223372036854775807',
+        '9223372036854775807'
+    );
+
+
+    SELECT
+        typeof(col_integer),
+        typeof(col_int),
+        typeof(col_text),
+        typeof(col_varchar),
+        typeof(col_char),
+        typeof(col_clob),
+        typeof(col_real),
+        typeof(col_float),
+        typeof(col_double),
+        typeof(col_numeric),
+        typeof(col_decimal),
+        typeof(col_blob),
+        typeof(col_no_type)
+    FROM affinity_test;
+} {integer|integer|text|text|text|text|real|real|real|integer|integer|text|text}
+
+
+do_execsql_test_on_specific_db {:memory:} affinity-test-too-large-int {
+    CREATE TABLE affinity_test (
+        col_integer INTEGER,
+        col_int INT,
+        col_text TEXT,
+        col_varchar VARCHAR(10),
+        col_char CHAR(10),
+        col_clob CLOB,
+        col_real REAL,
+        col_float FLOAT,
+        col_double DOUBLE,
+        col_numeric NUMERIC,
+        col_decimal DECIMAL,
+        col_blob BLOB,
+        col_no_type
+    );
+
+    INSERT INTO affinity_test VALUES (
+        '9223372036854775808', '9223372036854775808', '9223372036854775808', '9223372036854775808',
+        '9223372036854775808', '9223372036854775808', '9223372036854775808', '9223372036854775808',
+        '9223372036854775808', '9223372036854775808', '9223372036854775808', '9223372036854775808',
+        '9223372036854775808'
+    );
+
+    SELECT
+        typeof(col_integer),
+        typeof(col_int),
+        typeof(col_text),
+        typeof(col_varchar),
+        typeof(col_char),
+        typeof(col_clob),
+        typeof(col_real),
+        typeof(col_float),
+        typeof(col_double),
+        typeof(col_numeric),
+        typeof(col_decimal),
+        typeof(col_blob),
+        typeof(col_no_type)
+    FROM affinity_test;
+} {real|real|text|text|text|text|real|real|real|real|real|text|text}
+
+
+do_execsql_test_on_specific_db {:memory:} affinity-test-int-as-real {
+    CREATE TABLE affinity_test (
+        col_integer INTEGER,
+        col_int INT,
+        col_text TEXT,
+        col_varchar VARCHAR(10),
+        col_char CHAR(10),
+        col_clob CLOB,
+        col_real REAL,
+        col_float FLOAT,
+        col_double DOUBLE,
+        col_numeric NUMERIC,
+        col_decimal DECIMAL,
+        col_blob BLOB,
+        col_no_type
+    );
+
+    INSERT INTO affinity_test VALUES (
+        4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0
+    );
+
+    SELECT
+        typeof(col_integer),
+        typeof(col_int),
+        typeof(col_text),
+        typeof(col_varchar),
+        typeof(col_char),
+        typeof(col_clob),
+        typeof(col_real),
+        typeof(col_float),
+        typeof(col_double),
+        typeof(col_numeric),
+        typeof(col_decimal),
+        typeof(col_blob),
+        typeof(col_no_type),
+        col_integer,
+        col_real
+    FROM affinity_test;
+} {integer|integer|text|text|text|text|real|real|real|integer|integer|real|real|4|4.0}
