@@ -249,12 +249,18 @@ pub fn translate_insert(
 
         program.resolve_label(make_record_label, program.offset());
     }
+    let affinity_string = btree_table
+        .columns
+        .iter()
+        .map(|col| col.affinity().aff_mask().to_ascii_uppercase())
+        .collect::<String>();
 
     // Create and insert the record
     program.emit_insn(Insn::MakeRecord {
         start_reg: column_registers_start,
         count: num_cols,
         dest_reg: record_register,
+        affinity_string: Some(affinity_string),
     });
 
     program.emit_insn(Insn::InsertAsync {

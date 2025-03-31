@@ -532,12 +532,13 @@ pub fn insn_to_str(
                 start_reg,
                 count,
                 dest_reg,
+                affinity_string,
             } => (
                 "MakeRecord",
                 *start_reg as i32,
                 *count as i32,
                 *dest_reg as i32,
-                OwnedValue::build_text(""),
+                OwnedValue::build_text(affinity_string.as_ref().unwrap_or(&String::new())),
                 0,
                 format!(
                     "r[{}]=mkrec(r[{}..{}])",

@@ -101,6 +101,11 @@ pub fn translate_create_table(
         Some(SQLITE_TABLEID.to_owned()),
         CursorType::BTreeTable(table.clone()),
     );
+    let affinity_string = table
+        .columns
+        .iter()
+        .map(|col| col.affinity().aff_mask().to_ascii_uppercase())
+        .collect::<String>();
     program.emit_insn(Insn::OpenWriteAsync {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1,
@@ -116,6 +121,7 @@ pub fn translate_create_table(
         &tbl_name.name.0,
         table_root_reg,
         Some(sql),
+        Some(affinity_string),
     );
 
     // If we need an automatic index, add its entry to sqlite_schema
@@ -131,6 +137,7 @@ pub fn translate_create_table(
             &index_name,
             &tbl_name.name.0,
             index_root_reg,
+            None,
             None,
         );
     }
@@ -179,6 +186,7 @@ fn emit_schema_entry(
     tbl_name: &str,
     root_page_reg: usize,
     sql: Option<String>,
+    affinity_string: Option<String>,
 ) {
     let rowid_reg = program.alloc_register();
     program.emit_insn(Insn::NewRowid {
@@ -217,6 +225,7 @@ fn emit_schema_entry(
         start_reg: type_reg,
         count: 5,
         dest_reg: record_reg,
+        affinity_string,
     });
 
     program.emit_insn(Insn::InsertAsync {
@@ -480,6 +489,7 @@ pub fn translate_create_virtual_table(
             start_reg: args_start,
             count: args_vec.len(),
             dest_reg: args_record_reg,
+            affinity_string: None,
         });
         Some(args_record_reg)
     } else {
@@ -512,6 +522,7 @@ pub fn translate_create_virtual_table(
         &tbl_name.name.0,
         0, // virtual tables dont have a root page
         Some(sql),
+        None,
     );
 
     let parse_schema_where_clause = format!("tbl_name = '{}' AND type != 'trigger'", table_name);

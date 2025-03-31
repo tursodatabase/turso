@@ -1266,8 +1266,24 @@ impl Program {
                     start_reg,
                     count,
                     dest_reg,
+                    affinity_string,
                 } => {
-                    let record = make_record(&state.registers, start_reg, count);
+                    let record = if let Some(af_str) = affinity_string {
+                        let registers_clone: Vec<_> = state.registers
+                            [*start_reg..*start_reg + *count]
+                            .into_iter()
+                            .cloned()
+                            .zip(af_str.bytes())
+                            .map(|(mut reg, ch)| {
+                                apply_affinity_string(&mut reg, ch);
+                                reg
+                            })
+                            .collect();
+
+                        make_record(&registers_clone, &0usize, count)
+                    } else {
+                        make_record(&state.registers, start_reg, count)
+                    };
                     state.registers[*dest_reg] = Register::Record(record);
                     state.pc += 1;
                 }
@@ -4414,6 +4430,54 @@ fn exec_if(reg: &OwnedValue, jump_if_null: bool, not: bool) -> bool {
         OwnedValue::Integer(_) | OwnedValue::Float(_) => !not,
         OwnedValue::Null => jump_if_null,
         _ => false,
+    }
+}
+
+fn apply_affinity_string(target: &mut Register, ch: u8) {
+    if let Register::OwnedValue(value) = target {
+        match ch {
+            /* BLOB */
+            0x41 => {
+                if matches!(value, OwnedValue::Blob(_)) {
+                    return;
+                }
+                let text = value.to_string();
+                *value = OwnedValue::Blob(text.into_bytes());
+            }
+            /* TEXT */
+            0x42 => {
+                if matches!(value, OwnedValue::Text(_)) {
+                    return;
+                }
+                let text = value.to_string();
+                *value = OwnedValue::from_text(&text);
+            }
+            /* NUMERIC & INTEGER */
+            0x43 | 0x44 => {
+                if !matches!(value, OwnedValue::Text(_)) {
+                    return;
+                }
+
+                if let Ok(num) = checked_cast_text_to_numeric(value.to_text().unwrap()) {
+                    *value = num;
+                } else {
+                    return;
+                }
+            }
+            /* REAL */
+            0x45 => {
+                if let OwnedValue::Integer(i) = value {
+                    *value = OwnedValue::Float(*i as f64);
+                } else if let OwnedValue::Text(t) = value {
+                    if let Ok(num) = checked_cast_text_to_numeric(t.as_str()) {
+                        *value = num;
+                    } else {
+                        return;
+                    }
+                }
+            }
+            _ => unreachable!(),
+        };
     }
 }
 

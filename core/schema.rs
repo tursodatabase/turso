@@ -507,8 +507,8 @@ pub enum Affinity {
     Numeric,
 }
 
-pub const SQLITE_AFF_TEXT: char = 'a';
-pub const SQLITE_AFF_NONE: char = 'b'; // Historically called NONE, but it's the same as BLOB
+pub const SQLITE_AFF_NONE: char = 'a'; // Historically called NONE, but it's the same as BLOB
+pub const SQLITE_AFF_TEXT: char = 'b';
 pub const SQLITE_AFF_NUMERIC: char = 'c';
 pub const SQLITE_AFF_INTEGER: char = 'd';
 pub const SQLITE_AFF_REAL: char = 'e';

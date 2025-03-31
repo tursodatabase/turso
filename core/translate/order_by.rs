@@ -245,6 +245,7 @@ pub fn sorter_insert(
         start_reg,
         count: column_count,
         dest_reg: record_reg,
+        affinity_string: None,
     });
     program.emit_insn(Insn::SorterInsert {
         cursor_id,

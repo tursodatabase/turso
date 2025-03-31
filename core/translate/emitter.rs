@@ -560,11 +560,17 @@ fn emit_update_insns(
             }
         }
     }
+    let affinity_string = table_ref
+        .columns()
+        .iter()
+        .map(|col| col.affinity().aff_mask())
+        .collect::<String>();
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg: first_col_reg,
         count: table_ref.columns().len(),
         dest_reg: record_reg,
+        affinity_string: Some(affinity_string),
     });
     program.emit_insn(Insn::InsertAsync {
         cursor: cursor_id,
