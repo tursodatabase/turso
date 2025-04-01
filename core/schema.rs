@@ -507,11 +507,11 @@ pub enum Affinity {
     Numeric,
 }
 
-pub const SQLITE_AFF_NONE: char = 'a'; // Historically called NONE, but it's the same as BLOB
-pub const SQLITE_AFF_TEXT: char = 'b';
-pub const SQLITE_AFF_NUMERIC: char = 'c';
-pub const SQLITE_AFF_INTEGER: char = 'd';
-pub const SQLITE_AFF_REAL: char = 'e';
+pub const SQLITE_AFF_NONE: char = 'A'; // Historically called NONE, but it's the same as BLOB
+pub const SQLITE_AFF_TEXT: char = 'B';
+pub const SQLITE_AFF_NUMERIC: char = 'C';
+pub const SQLITE_AFF_INTEGER: char = 'D';
+pub const SQLITE_AFF_REAL: char = 'E';
 
 impl Affinity {
     /// This is meant to be used in opcodes like Eq, which state:

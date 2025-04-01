@@ -104,7 +104,7 @@ pub fn translate_create_table(
     let affinity_string = table
         .columns
         .iter()
-        .map(|col| col.affinity().aff_mask().to_ascii_uppercase())
+        .map(|col| col.affinity().aff_mask())
         .collect::<String>();
     program.emit_insn(Insn::OpenWriteAsync {
         cursor_id: sqlite_schema_cursor_id,

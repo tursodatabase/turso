@@ -36,7 +36,10 @@ use crate::functions::printf::exec_printf;
 use crate::bail_constraint_error;
 use crate::pseudo::PseudoCursor;
 use crate::result::LimboResult;
-use crate::schema::{affinity, Affinity};
+use crate::schema::{
+    affinity, Affinity, SQLITE_AFF_INTEGER, SQLITE_AFF_NONE, SQLITE_AFF_NUMERIC, SQLITE_AFF_REAL,
+    SQLITE_AFF_TEXT,
+};
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::CheckpointResult;
 use crate::storage::{btree::BTreeCursor, pager::Pager};
@@ -1268,22 +1271,18 @@ impl Program {
                     dest_reg,
                     affinity_string,
                 } => {
-                    let record = if let Some(af_str) = affinity_string {
-                        let registers_clone: Vec<_> = state.registers
-                            [*start_reg..*start_reg + *count]
-                            .into_iter()
-                            .cloned()
-                            .zip(af_str.bytes())
-                            .map(|(mut reg, ch)| {
-                                apply_affinity_char(&mut reg, ch);
-                                reg
-                            })
-                            .collect();
-
-                        make_record(&registers_clone, &0usize, count)
-                    } else {
-                        make_record(&state.registers, start_reg, count)
+                    if let Some(af_str) = affinity_string {
+                        state.registers[*start_reg..*start_reg + *count]
+                            .iter_mut()
+                            .zip(af_str.chars())
+                            .for_each(|(reg, ch)| {
+                                let reg = reg.borrow_mut();
+                                apply_affinity_char(reg, ch);
+                            });
                     };
+
+                    let record = make_record(&state.registers, start_reg, count);
+
                     state.registers[*dest_reg] = Register::Record(record);
                     state.pc += 1;
                 }
@@ -4433,24 +4432,21 @@ fn exec_if(reg: &OwnedValue, jump_if_null: bool, not: bool) -> bool {
     }
 }
 
-fn apply_affinity_char(target: &mut Register, ch: u8) {
+fn apply_affinity_char(target: &mut Register, ch: char) {
     if let Register::OwnedValue(value) = target {
         if matches!(value, OwnedValue::Blob(_)) {
             return;
         }
         match ch {
-            /* BLOB */
-            0x41 => return,
-            /* TEXT */
-            0x42 => {
+            SQLITE_AFF_NONE => return,
+            SQLITE_AFF_TEXT => {
                 if matches!(value, OwnedValue::Text(_) | OwnedValue::Null) {
                     return;
                 }
                 let text = value.to_string();
-                *value = OwnedValue::from_text(&text);
+                *value = OwnedValue::Text(text.into());
             }
-            /* NUMERIC & INTEGER */
-            0x43 | 0x44 => {
+            SQLITE_AFF_INTEGER | SQLITE_AFF_NUMERIC => {
                 if !matches!(value, OwnedValue::Text(_) | OwnedValue::Float(_)) {
                     return;
                 }
@@ -4477,8 +4473,8 @@ fn apply_affinity_char(target: &mut Register, ch: u8) {
                     _ => num,
                 };
             }
-            /* REAL */
-            0x45 => {
+
+            SQLITE_AFF_REAL => {
                 if let OwnedValue::Integer(i) = value {
                     *value = OwnedValue::Float(*i as f64);
                 } else if let OwnedValue::Text(t) = value {

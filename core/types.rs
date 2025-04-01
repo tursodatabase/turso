@@ -41,6 +41,15 @@ pub struct TextRef {
     pub subtype: TextSubtype,
 }
 
+impl From<String> for Text {
+    fn from(value: String) -> Self {
+        Self {
+            value: value.into_bytes(),
+            subtype: TextSubtype::Text,
+        }
+    }
+}
+
 impl Text {
     pub fn from_str<S: Into<String>>(value: S) -> Self {
         Self::new(&value.into())

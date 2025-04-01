@@ -252,7 +252,7 @@ pub fn translate_insert(
     let affinity_string = btree_table
         .columns
         .iter()
-        .map(|col| col.affinity().aff_mask().to_ascii_uppercase())
+        .map(|col| col.affinity().aff_mask())
         .collect::<String>();
 
     // Create and insert the record
