@@ -12,7 +12,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, trace};
 
-const MAX_IOVECS: u32 = 128;
+const MAX_IOVECS: u32 = 1024;
 const SQPOLL_IDLE: u32 = 1000;
 
 #[derive(Debug, Error)]
