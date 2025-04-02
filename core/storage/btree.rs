@@ -1195,8 +1195,23 @@ impl BTreeCursor {
                     }
 
                     let page = current_page.get().contents.as_mut().unwrap();
-                    if !self.stack.has_parent() && !page.overflow_cells.is_empty() {
-                        self.balance_root();
+                    println!("cells in page: {}", page.cell_count());
+                    println!("root page id: {}", self.root_page);
+                    println!("current page on stack: {}", self.stack.current());
+                    println!("current page id: {}", current_page.get().id);
+                    println!("number of overflow cells: {}", page.overflow_cells.len());
+                    println!("page has parent: {}", !self.stack.has_parent());
+                    if !self.stack.has_parent() {
+                        if !page.overflow_cells.is_empty() {
+                            self.balance_root();
+                        } else if page.cell_count() == 0 {
+                            println!("root has no cells");
+                            self.balance_root_underflow()?;
+                        } else {
+                            let write_info = self.state.mut_write_info().unwrap();
+                            write_info.state = WriteState::Finish;
+                            return Ok(CursorResult::Ok(()));
+                        }
                     } else {
                         let write_info = self.state.mut_write_info().unwrap();
                         write_info.state = WriteState::Finish;
@@ -1911,6 +1926,28 @@ impl BTreeCursor {
         self.stack.push(root.clone());
         self.stack.advance();
         self.stack.push(child.clone());
+    }
+
+    fn balance_root_underflow(&mut self) -> Result<CursorResult<()>> {
+        println!("we are in balance root underflow");
+        let root = self.stack.top();
+        let root_contents = root.get().contents.as_mut().unwrap();
+        let child_page_id = root_contents.rightmost_pointer().unwrap();
+        let child = self.pager.read_page(child_page_id as usize)?;
+
+        return_if_locked!(child);
+
+        let child_contents = child.get().contents.as_mut().unwrap();
+        // Defragment child before inserting its cells into root, because root is smaller than child due to it
+        // containing header.
+        defragment_page(child_contents, self.usable_space() as u16);
+
+        self.pager.add_dirty(root.get().id);
+        self.pager.add_dirty(child.get().id);
+
+        self.copy_node_content(child.clone(), root.clone())?;
+        self.pager.free_page(Some(child), child_page_id as usize)?;
+        Ok(CursorResult::Ok(()))
     }
 
     fn usable_space(&self) -> usize {
@@ -2813,6 +2850,29 @@ impl BTreeCursor {
 
     fn get_immutable_record(&self) -> std::cell::RefMut<'_, Option<ImmutableRecord>> {
         self.reusable_immutable_record.borrow_mut()
+    }
+    fn copy_node_content(&self, src: PageRef, dst: PageRef) -> Result<()> {
+        let src_contents = src.get().contents.as_ref().unwrap();
+        let dst_contents = dst.get().contents.as_mut().unwrap();
+        let src_buf = src_contents.as_ptr();
+        let dst_buf = dst_contents.as_ptr();
+        let dst_header_offset = if dst.get().id == 1 {
+            DATABASE_HEADER_SIZE
+        } else {
+            0
+        };
+        // Copy content area
+        let content_start = src_contents.cell_content_area() as usize;
+        let content_size = self.usable_space() - content_start;
+        dst_buf[content_start..content_start + content_size]
+            .copy_from_slice(&src_buf[content_start..content_start + content_size]);
+        // Copy header and cell pointer array
+        let header_and_pointers_size =
+            src_contents.header_size() + src_contents.cell_pointer_array_size();
+        dst_buf[dst_header_offset..dst_header_offset + header_and_pointers_size].copy_from_slice(
+            &src_buf[src_contents.offset..src_contents.offset + header_and_pointers_size],
+        );
+        Ok(())
     }
 }
 
