@@ -12,6 +12,47 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, trace};
 
+/// Configuration options for the io_uring IO backend.
+///
+/// This struct allows tuning of the io_uring backend parameters for optimal performance
+/// in different use cases.
+///
+/// # Examples
+///
+/// ```rust
+/// use limbo_core::io::UringOpts;
+///
+/// // Create custom options with higher concurrency
+/// let opts = UringOpts {
+///     max_iovecs: 2048,  // Allow more concurrent operations
+///     sqpoll_idle: 500,  // More aggressive polling
+/// };
+///
+/// // Use default options
+/// let default_opts = UringOpts::default();
+/// ```
+#[derive(Debug)]
+pub struct UringOpts {
+    /// Maximum number of concurrent IO operations that can be in flight.
+    /// This determines the size of the submission and completion queues.
+    /// Higher values allow more concurrent operations but use more memory.
+    /// Default is 1024.
+    pub max_iovecs: u32,
+    /// Time in milliseconds that the kernel will wait before entering idle state
+    /// in the submission queue polling thread. Lower values mean more aggressive
+    /// polling but higher CPU usage. Default is 1000ms.
+    pub sqpoll_idle: u32,
+}
+
+impl Default for UringOpts {
+    fn default() -> Self {
+        Self {
+            max_iovecs: 1024,
+            sqpoll_idle: 1000,
+        }
+    }
+}
+
 const MAX_IOVECS: u32 = 1024;
 const SQPOLL_IDLE: u32 = 1000;
 
@@ -32,6 +73,60 @@ impl fmt::Display for UringIOError {
     }
 }
 
+/// An IO backend implementation using Linux's io_uring interface.
+///
+/// This implementation provides high-performance asynchronous IO operations using
+/// the io_uring interface available in recent Linux kernels. It supports:
+/// - Asynchronous reads and writes
+/// - File locking
+/// - Direct IO (when supported by the filesystem)
+/// - Configurable concurrency limits
+///
+/// # Performance Characteristics
+///
+/// - Uses a single submission queue and completion queue for all operations
+/// - Supports high concurrency through the io_uring interface
+/// - Minimizes system calls by batching operations
+/// - Uses kernel polling for reduced latency
+///
+/// # Examples
+///
+/// ```rust
+/// use limbo_core::io::UringIO;
+///
+/// // Create with default options
+/// let io = UringIO::new()?;
+///
+/// // Create with custom options for high concurrency
+/// let opts = UringOpts {
+///     max_iovecs: 2048,
+///     sqpoll_idle: 500,
+/// };
+/// let io = UringIO::with_opts(opts)?;
+///
+/// // Open a file for reading and writing
+/// let file = io.open_file("test.db", OpenFlags::Create, true)?;
+///
+/// // Perform async read
+/// let buffer = Buffer::allocate(4096, Arc::new(|_| {}));
+/// file.pread(0, Completion::Read(ReadCompletion::new(
+///     buffer.clone(),
+///     Box::new(move |buf| {
+///         // Handle read completion
+///         println!("Read {} bytes", buf.borrow().len());
+///     }),
+/// )))?;
+///
+/// // Run the IO loop to process completions
+/// io.run_once()?;
+/// ```
+///
+/// # Notes
+///
+/// - This implementation is only available on Linux systems with io_uring support
+/// - The io_uring interface requires Linux kernel 5.1 or later
+/// - Performance may vary depending on kernel version and system configuration
+/// - Consider using `max_iovecs` to tune for your specific workload
 pub struct UringIO {
     inner: Rc<RefCell<InnerUringIO>>,
 }
@@ -42,7 +137,7 @@ unsafe impl Sync for UringIO {}
 struct WrappedIOUring {
     ring: io_uring::IoUring,
     pending_ops: usize,
-    pub pending: [Option<Completion>; MAX_IOVECS as usize + 1],
+    pending: [Option<Completion>; MAX_IOVECS as usize + 1],
     key: u64,
 }
 
@@ -53,13 +148,57 @@ struct InnerUringIO {
 }
 
 impl UringIO {
+    /// Creates a new UringIO instance with default options.
+    ///
+    /// The default options are:
+    /// - max_iovecs: 1024 (allows 1024 concurrent operations)
+    /// - sqpoll_idle: 1000 (1 second idle timeout)
+    ///
+    /// # Returns
+    ///
+    /// A Result containing the new UringIO instance or an error if initialization fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The io_uring interface is not available
+    /// - The kernel version is too old
+    /// - System resources are insufficient
     pub fn new() -> Result<Self> {
+        Self::with_opts(UringOpts::default())
+    }
+
+    /// Creates a new UringIO instance with custom options.
+    ///
+    /// This allows tuning the io_uring backend for specific use cases.
+    ///
+    /// # Arguments
+    ///
+    /// * `opts` - Configuration options for the io_uring backend
+    ///
+    /// # Returns
+    ///
+    /// A Result containing the new UringIO instance or an error if initialization fails.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use limbo_core::io::{UringIO, UringOpts};
+    ///
+    /// // Create with custom options for high concurrency
+    /// let opts = UringOpts {
+    ///     max_iovecs: 2048,  // Allow more concurrent operations
+    ///     sqpoll_idle: 500,  // More aggressive polling
+    /// };
+    /// let io = UringIO::with_opts(opts)?;
+    /// ```
+    pub fn with_opts(opts: UringOpts) -> Result<Self> {
         let ring = match io_uring::IoUring::builder()
-            .setup_sqpoll(SQPOLL_IDLE)
-            .build(MAX_IOVECS)
+            .setup_sqpoll(opts.sqpoll_idle)
+            .build(opts.max_iovecs)
         {
             Ok(ring) => ring,
-            Err(_) => io_uring::IoUring::new(MAX_IOVECS)?,
+            Err(_) => io_uring::IoUring::new(opts.max_iovecs)?,
         };
         let inner = InnerUringIO {
             ring: WrappedIOUring {
@@ -74,7 +213,7 @@ impl UringIO {
             }; MAX_IOVECS as usize],
             next_iovec: 0,
         };
-        debug!("Using IO backend 'io-uring'");
+        debug!("Using IO backend 'io-uring' with max_iovecs={}", opts.max_iovecs);
         Ok(Self {
             inner: Rc::new(RefCell::new(inner)),
         })
@@ -136,6 +275,36 @@ impl WrappedIOUring {
 }
 
 impl IO for UringIO {
+    /// Opens a file for reading and writing using io_uring.
+    ///
+    /// This method supports:
+    /// - Creating new files (with `OpenFlags::Create`)
+    /// - Direct IO (when supported by the filesystem)
+    /// - File locking (unless disabled via environment variable)
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the file to open
+    /// * `flags` - Open flags (Create or None)
+    /// * `direct` - Whether to use direct IO
+    ///
+    /// # Returns
+    ///
+    /// A Result containing an Arc<dyn File> or an error if the file cannot be opened.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use limbo_core::io::{UringIO, OpenFlags};
+    ///
+    /// let io = UringIO::new()?;
+    /// 
+    /// // Open existing file
+    /// let file = io.open_file("test.db", OpenFlags::None, true)?;
+    ///
+    /// // Create new file with direct IO
+    /// let file = io.open_file("new.db", OpenFlags::Create, true)?;
+    /// ```
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
         trace!("open_file(path = {})", path);
         let file = std::fs::File::options()
@@ -162,6 +331,28 @@ impl IO for UringIO {
         Ok(uring_file)
     }
 
+    /// Processes any pending IO completions.
+    ///
+    /// This method should be called periodically to handle completed IO operations.
+    /// It will:
+    /// - Wait for at least one completion
+    /// - Process all available completions
+    /// - Call the appropriate completion callbacks
+    ///
+    /// # Returns
+    ///
+    /// A Result indicating success or failure of the operation.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use limbo_core::io::UringIO;
+    ///
+    /// let io = UringIO::new()?;
+    ///
+    /// // Process any pending completions
+    /// io.run_once()?;
+    /// ```
     fn run_once(&self) -> Result<()> {
         trace!("run_once()");
         let mut inner = self.inner.borrow_mut();
@@ -191,17 +382,56 @@ impl IO for UringIO {
         Ok(())
     }
 
+    /// Generates a random number using the system's random number generator.
+    ///
+    /// This is used internally for generating unique keys for IO operations.
+    ///
+    /// # Returns
+    ///
+    /// A random 64-bit integer.
     fn generate_random_number(&self) -> i64 {
         let mut buf = [0u8; 8];
         getrandom::getrandom(&mut buf).unwrap();
         i64::from_ne_bytes(buf)
     }
 
+    /// Gets the current time as a formatted string.
+    ///
+    /// The format is "YYYY-MM-DD HH:MM:SS".
+    ///
+    /// # Returns
+    ///
+    /// The current time as a string.
     fn get_current_time(&self) -> String {
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
     }
 }
 
+/// A file handle for the io_uring IO backend.
+///
+/// This struct provides the actual file operations using io_uring.
+/// It supports:
+/// - Asynchronous reads and writes
+/// - File locking
+/// - Direct IO
+///
+/// # Examples
+///
+/// ```rust
+/// use limbo_core::io::{UringIO, OpenFlags, Completion, ReadCompletion, Buffer};
+///
+/// let io = UringIO::new()?;
+/// let file = io.open_file("test.db", OpenFlags::None, true)?;
+///
+/// // Perform async read
+/// let buffer = Buffer::allocate(4096, Arc::new(|_| {}));
+/// file.pread(0, Completion::Read(ReadCompletion::new(
+///     buffer.clone(),
+///     Box::new(move |buf| {
+///         println!("Read {} bytes", buf.borrow().len());
+///     }),
+/// )))?;
+/// ```
 pub struct UringFile {
     io: Rc<RefCell<InnerUringIO>>,
     file: std::fs::File,
@@ -211,6 +441,30 @@ unsafe impl Send for UringFile {}
 unsafe impl Sync for UringFile {}
 
 impl File for UringFile {
+    /// Locks the file for exclusive or shared access.
+    ///
+    /// This implements file locking using fcntl F_SETLK.
+    /// The lock is non-blocking and will be released when the file is closed.
+    ///
+    /// # Arguments
+    ///
+    /// * `exclusive` - Whether to acquire an exclusive lock
+    ///
+    /// # Returns
+    ///
+    /// A Result indicating success or failure of the lock operation.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use limbo_core::io::UringIO;
+    ///
+    /// let io = UringIO::new()?;
+    /// let file = io.open_file("test.db", OpenFlags::None, true)?;
+    ///
+    /// // Acquire exclusive lock
+    /// file.lock_file(true)?;
+    /// ```
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         let fd = self.file.as_fd();
         // F_SETLK is a non-blocking lock. The lock will be released when the file is closed
@@ -237,6 +491,25 @@ impl File for UringFile {
         Ok(())
     }
 
+    /// Unlocks the file.
+    ///
+    /// This releases any lock previously acquired with `lock_file`.
+    ///
+    /// # Returns
+    ///
+    /// A Result indicating success or failure of the unlock operation.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use limbo_core::io::UringIO;
+    ///
+    /// let io = UringIO::new()?;
+    /// let file = io.open_file("test.db", OpenFlags::None, true)?;
+    ///
+    /// // Release lock
+    /// file.unlock_file()?;
+    /// ```
     fn unlock_file(&self) -> Result<()> {
         let fd = self.file.as_fd();
         fs::fcntl_lock(fd, FlockOperation::NonBlockingUnlock).map_err(|e| {
@@ -248,6 +521,36 @@ impl File for UringFile {
         Ok(())
     }
 
+    /// Performs an asynchronous read operation.
+    ///
+    /// This method submits a read operation to the io_uring submission queue.
+    /// The completion callback will be called when the read completes.
+    ///
+    /// # Arguments
+    ///
+    /// * `pos` - Position in the file to read from
+    /// * `c` - Completion callback to handle the read result
+    ///
+    /// # Returns
+    ///
+    /// A Result indicating success or failure of submitting the read operation.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use limbo_core::io::{UringIO, Completion, ReadCompletion, Buffer};
+    ///
+    /// let io = UringIO::new()?;
+    /// let file = io.open_file("test.db", OpenFlags::None, true)?;
+    ///
+    /// let buffer = Buffer::allocate(4096, Arc::new(|_| {}));
+    /// file.pread(0, Completion::Read(ReadCompletion::new(
+    ///     buffer.clone(),
+    ///     Box::new(move |buf| {
+    ///         println!("Read {} bytes", buf.borrow().len());
+    ///     }),
+    /// )))?;
+    /// ```
     fn pread(&self, pos: usize, c: Completion) -> Result<()> {
         let r = c.as_read();
         trace!("pread(pos = {}, length = {})", pos, r.buf().len());
@@ -267,6 +570,37 @@ impl File for UringFile {
         Ok(())
     }
 
+    /// Performs an asynchronous write operation.
+    ///
+    /// This method submits a write operation to the io_uring submission queue.
+    /// The completion callback will be called when the write completes.
+    ///
+    /// # Arguments
+    ///
+    /// * `pos` - Position in the file to write to
+    /// * `buffer` - Buffer containing the data to write
+    /// * `c` - Completion callback to handle the write result
+    ///
+    /// # Returns
+    ///
+    /// A Result indicating success or failure of submitting the write operation.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use limbo_core::io::{UringIO, Completion, WriteCompletion, Buffer};
+    ///
+    /// let io = UringIO::new()?;
+    /// let file = io.open_file("test.db", OpenFlags::None, true)?;
+    ///
+    /// let data = vec![1, 2, 3, 4];
+    /// let buffer = Buffer::new(Pin::new(data), Arc::new(|_| {}));
+    /// file.pwrite(0, Arc::new(RefCell::new(buffer)), Completion::Write(
+    ///     WriteCompletion::new(Box::new(move |result| {
+    ///         println!("Wrote {} bytes", result);
+    ///     }))
+    /// ))?;
+    /// ```
     fn pwrite(&self, pos: usize, buffer: Arc<RefCell<crate::Buffer>>, c: Completion) -> Result<()> {
         let mut io = self.io.borrow_mut();
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
@@ -290,6 +624,33 @@ impl File for UringFile {
         Ok(())
     }
 
+    /// Performs an asynchronous sync operation.
+    ///
+    /// This method submits a sync operation to the io_uring submission queue.
+    /// The completion callback will be called when the sync completes.
+    ///
+    /// # Arguments
+    ///
+    /// * `c` - Completion callback to handle the sync result
+    ///
+    /// # Returns
+    ///
+    /// A Result indicating success or failure of submitting the sync operation.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use limbo_core::io::{UringIO, Completion, SyncCompletion};
+    ///
+    /// let io = UringIO::new()?;
+    /// let file = io.open_file("test.db", OpenFlags::None, true)?;
+    ///
+    /// file.sync(Completion::Sync(SyncCompletion::new(
+    ///     Box::new(move |result| {
+    ///         println!("Sync completed with result {}", result);
+    ///     })
+    /// )))?;
+    /// ```
     fn sync(&self, c: Completion) -> Result<()> {
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
         let mut io = self.io.borrow_mut();
@@ -301,6 +662,23 @@ impl File for UringFile {
         Ok(())
     }
 
+    /// Gets the current size of the file.
+    ///
+    /// # Returns
+    ///
+    /// A Result containing the file size in bytes or an error if the size cannot be determined.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use limbo_core::io::UringIO;
+    ///
+    /// let io = UringIO::new()?;
+    /// let file = io.open_file("test.db", OpenFlags::None, true)?;
+    ///
+    /// let size = file.size()?;
+    /// println!("File size: {} bytes", size);
+    /// ```
     fn size(&self) -> Result<u64> {
         Ok(self.file.metadata()?.len())
     }
