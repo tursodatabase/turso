@@ -1,7 +1,10 @@
 require "minitest/autorun"
 require "limbo"
 
+puts "limbo version = #{Limbo::CORE_VERSION}"
+
 SQLite3 = Limbo::Compat::SQLite3
+
 
 describe Limbo::Compat::SQLite3 do
   before do

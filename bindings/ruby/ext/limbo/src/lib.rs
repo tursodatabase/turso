@@ -248,7 +248,7 @@ impl Row {
 #[magnus::init(name = "limbo")]
 fn init(ruby: &Ruby) -> std::result::Result<(), magnus::Error> {
     let module = ruby.define_module("Limbo")?;
-    module.const_set("CORE_VERSION", "0.0.14")?;
+    module.const_set("CORE_VERSION", env!("CARGO_PKG_VERSION"))?;
 
     let builder_class = module.define_class("Builder", ruby.class_object())?;
     builder_class.define_singleton_method("new", function!(Builder::new, 1))?;
