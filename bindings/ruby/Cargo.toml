@@ -12,7 +12,7 @@ path = "ext/limbo/src/lib.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-magnus = "0.7"
+magnus = "0.7.1"
 limbo_core = { workspace = true, features = ["io_uring"] }
 thiserror = "2.0.9"
 tokio = { version = "1.29.1", features = ["full"] }
