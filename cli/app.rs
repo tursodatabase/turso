@@ -136,7 +136,7 @@ impl<'a> Limbo<'a> {
             )
         };
         let conn = db.connect()?;
-        let h = LimboHelper::new(conn.clone(), io.clone(), config.syntax_highlight.clone());
+        let h = LimboHelper::new(conn.clone(), io.clone(), config.highlight.clone());
         rl.set_helper(Some(h));
         let interrupt_count = Arc::new(AtomicUsize::new(0));
         {

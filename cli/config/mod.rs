@@ -37,12 +37,12 @@ where
     Ok(x)
 }
 
-#[derive(Debug, Deserialize, Clone, Default, JsonSchema, Validate)]
+#[derive(Debug, Deserialize, Clone, Default, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     #[serde(deserialize_with = "ok_or_default")]
     pub table: TableConfig,
-    pub syntax_highlight: SyntaxHighlightConfig,
+    pub highlight: HighlightConfig,
 }
 
 impl Config {
@@ -106,16 +106,22 @@ impl TableConfig {
 
 #[derive(Debug, Deserialize, Clone, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
-pub struct SyntaxHighlightConfig {
+pub struct HighlightConfig {
     pub enable: bool,
-    pub theme_name: String,
+    pub theme: String,
+    pub prompt: LimboColor,
+    pub hint: LimboColor,
+    pub candidate: LimboColor,
 }
 
-impl Default for SyntaxHighlightConfig {
+impl Default for HighlightConfig {
     fn default() -> Self {
         Self {
             enable: true,
-            theme_name: "base16-ocean.dark".to_string(),
+            theme: "base16-ocean.dark".to_string(),
+            prompt: LimboColor(Color::Rgb(34u8, 197u8, 94u8)),
+            hint: LimboColor(Color::Rgb(107u8, 114u8, 128u8)),
+            candidate: LimboColor(Color::Green),
         }
     }
 }

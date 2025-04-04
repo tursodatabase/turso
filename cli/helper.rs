@@ -19,7 +19,7 @@ use syntect::highlighting::ThemeSet;
 use syntect::parsing::{Scope, SyntaxSet};
 use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
 
-use crate::config::{SyntaxHighlightConfig, CONFIG_DIR};
+use crate::config::{HighlightConfig, CONFIG_DIR};
 
 macro_rules! try_result {
     ($expr:expr, $err:expr) => {
@@ -36,7 +36,7 @@ pub struct LimboHelper {
     completer: SqlCompleter<CommandParser>,
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
-    syntax_config: SyntaxHighlightConfig,
+    syntax_config: HighlightConfig,
     #[rustyline(Hinter)]
     hinter: HistoryHinter,
 }
@@ -45,7 +45,7 @@ impl LimboHelper {
     pub fn new(
         conn: Rc<Connection>,
         io: Arc<dyn limbo_core::IO>,
-        syntax_config: SyntaxHighlightConfig,
+        syntax_config: HighlightConfig,
     ) -> Self {
         // Load only predefined syntax
         let ps = from_uncompressed_data(include_bytes!(concat!(
@@ -82,7 +82,7 @@ impl Highlighter for LimboHelper {
             let theme = self
                 .theme_set
                 .themes
-                .get(&self.syntax_config.theme_name)
+                .get(&self.syntax_config.theme)
                 .unwrap_or(&self.theme_set.themes["base16-ocean.dark"]);
             let mut h = HighlightLines::new(syntax, theme);
             let ranges = {
@@ -113,13 +113,13 @@ impl Highlighter for LimboHelper {
     ) -> std::borrow::Cow<'b, str> {
         let _ = default;
         // Dark emerald green for prompt
-        let style = Style::new().bold().fg(Color::Rgb(34u8, 197u8, 94u8));
+        let style = Style::new().bold().fg(self.syntax_config.prompt.0);
         let styled_str = style.paint(prompt);
         std::borrow::Cow::Owned(styled_str.to_string())
     }
 
     fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
-        let style = Style::new().bold().fg(Color::Rgb(107u8, 114u8, 128u8)); // Brighter dark grey for hints
+        let style = Style::new().bold().fg(self.syntax_config.hint.0); // Brighter dark grey for hints
         let styled_str = style.paint(hint);
         std::borrow::Cow::Owned(styled_str.to_string())
     }
@@ -130,7 +130,7 @@ impl Highlighter for LimboHelper {
         completion: rustyline::CompletionType,
     ) -> std::borrow::Cow<'c, str> {
         let _ = completion;
-        let style = Style::new().fg(Color::Green);
+        let style = Style::new().fg(self.syntax_config.candidate.0);
         let styled_str = style.paint(candidate);
         std::borrow::Cow::Owned(styled_str.to_string())
     }
