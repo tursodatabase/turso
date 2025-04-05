@@ -31,21 +31,21 @@ macro_rules! try_result {
 }
 
 #[derive(Helper, Completer, Hinter, Validator)]
-pub struct LimboHelper {
+pub struct LimboHelper<'a> {
     #[rustyline(Completer)]
     completer: SqlCompleter<CommandParser>,
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
-    syntax_config: HighlightConfig,
+    syntax_config: &'a HighlightConfig,
     #[rustyline(Hinter)]
     hinter: HistoryHinter,
 }
 
-impl LimboHelper {
+impl<'a> LimboHelper<'a> {
     pub fn new(
         conn: Rc<Connection>,
         io: Arc<dyn limbo_core::IO>,
-        syntax_config: HighlightConfig,
+        syntax_config: &'a HighlightConfig,
     ) -> Self {
         // Load only predefined syntax
         let ps = from_uncompressed_data(include_bytes!(concat!(
@@ -70,7 +70,7 @@ impl LimboHelper {
     }
 }
 
-impl Highlighter for LimboHelper {
+impl Highlighter for LimboHelper<'_> {
     fn highlight<'l>(&self, line: &'l str, pos: usize) -> std::borrow::Cow<'l, str> {
         let _ = pos;
         if self.syntax_config.enable {

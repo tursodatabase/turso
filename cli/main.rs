@@ -5,7 +5,6 @@ mod config;
 mod helper;
 mod input;
 mod opcodes_dictionary;
-mod utils;
 
 use config::CONFIG_DIR;
 use once_cell::sync::Lazy;
@@ -21,6 +20,8 @@ fn rustyline_config() -> Config {
 pub static HOME_DIR: Lazy<PathBuf> =
     Lazy::new(|| dirs::home_dir().expect("Could not determine home directory"));
 
+pub static HISTORY_FILE: Lazy<PathBuf> = Lazy::new(|| HOME_DIR.join(".limbo_history"));
+
 fn main() -> anyhow::Result<()> {
     let mut rl = Editor::with_config(rustyline_config())?;
     
@@ -30,12 +31,11 @@ fn main() -> anyhow::Result<()> {
     let config = config::Config::from_config_file(config_file);
     tracing::info!("Configuration: {:?}", config);
 
-    let mut app = app::Limbo::new(&mut rl, config)?;
+    let mut app = app::Limbo::new(&mut rl, &config)?;
 
     let _guard = app.init_tracing()?;
-    let history_file = HOME_DIR.join(".limbo_history");
-    if history_file.exists() {
-        app.rl.load_history(history_file.as_path())?;
+    if HISTORY_FILE.exists() {
+        app.rl.load_history(HISTORY_FILE.as_path())?;
     }
     loop {
         let readline = app.rl.readline(&app.prompt);
@@ -68,6 +68,6 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
-    rl.save_history(history_file.as_path())?;
+    app.rl.save_history(HISTORY_FILE.as_path())?;
     Ok(())
 }

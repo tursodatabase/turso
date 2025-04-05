@@ -1,6 +1,5 @@
 mod palette;
 
-use crate::utils::read_file;
 use crate::HOME_DIR;
 use nu_ansi_term::Color;
 use once_cell::sync::Lazy;
@@ -8,6 +7,7 @@ use palette::LimboColor;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer};
 use std::fmt::Debug;
+use std::fs::read_to_string;
 use std::path::PathBuf;
 use validator::Validate;
 
@@ -62,7 +62,17 @@ impl Config {
 
     fn read_config_str(path: PathBuf) -> Option<String> {
         if path.exists() {
-            read_file(path).ok()
+            tracing::trace!("Trying to read from {:?}", path);
+
+            let result = read_to_string(path);
+
+            if result.is_err() {
+                tracing::debug!("Error reading file: {:?}", result);
+            } else {
+                tracing::trace!("File read successfully");
+            };
+
+            result.ok()
         } else {
             None
         }

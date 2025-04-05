@@ -71,8 +71,8 @@ pub struct Limbo<'a> {
     pub interrupt_count: Arc<AtomicUsize>,
     input_buff: String,
     opts: Settings,
-    pub rl: &'a mut Editor<LimboHelper, DefaultHistory>,
-    config: Config,
+    pub rl: &'a mut Editor<LimboHelper<'a>, DefaultHistory>,
+    config: &'a Config,
 }
 
 struct QueryStatistics {
@@ -107,8 +107,8 @@ macro_rules! query_internal {
 
 impl<'a> Limbo<'a> {
     pub fn new(
-        rl: &'a mut rustyline::Editor<LimboHelper, DefaultHistory>,
-        config: Config,
+        rl: &'a mut rustyline::Editor<LimboHelper<'a>, DefaultHistory>,
+        config: &'a Config,
     ) -> anyhow::Result<Self> {
         let opts = Opts::parse();
         let db_file = opts
@@ -136,7 +136,7 @@ impl<'a> Limbo<'a> {
             )
         };
         let conn = db.connect()?;
-        let h = LimboHelper::new(conn.clone(), io.clone(), config.highlight.clone());
+        let h = LimboHelper::new(conn.clone(), io.clone(), &config.highlight);
         rl.set_helper(Some(h));
         let interrupt_count = Arc::new(AtomicUsize::new(0));
         {
@@ -158,7 +158,7 @@ impl<'a> Limbo<'a> {
             input_buff: String::new(),
             opts: Settings::from(opts),
             rl,
-            config,
+            config: &config,
         };
         app.first_run(sql, quiet)?;
         Ok(app)
