@@ -92,5 +92,19 @@ theme = "Amy"
 **Type**: `Color`\
 *Example*: `"yellow"`
 
+## Example `limbo.toml`
+
+```toml
+[table]
+column_colors = ["cyan", "black", "#010101"]
+header_color = "red"
+
+[highlight]
+enable = true
+prompt = "bright-blue"
+theme = "base16-ocean.light"
+hint = "123"
+candidate = "dark-yellow"
+```
 
 
