@@ -24,7 +24,7 @@ pub static HISTORY_FILE: Lazy<PathBuf> = Lazy::new(|| HOME_DIR.join(".limbo_hist
 
 fn main() -> anyhow::Result<()> {
     let mut rl = Editor::with_config(rustyline_config())?;
-    
+
     // let home = dirs::home_dir().expect("Could not determine home directory");
     let config_file = CONFIG_DIR.join("limbo.toml");
 

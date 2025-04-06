@@ -22,22 +22,50 @@ impl TryFrom<&str> for LimboColor {
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         // Parse RGB hex values
         trace!("Parsing color_string: {}", value);
-        if value.starts_with('#') {
-            trace!("Attempting to read hexadecimal color string: {}", value);
-            if value.len() != 7 {
-                return Err(format!("Could not parse hexadecimal string: {}", value));
-            }
-            let r: u8 = u8::from_str_radix(&value[1..3], 16).map_err(|e| e.to_string())?;
-            let g: u8 = u8::from_str_radix(&value[3..5], 16).map_err(|e| e.to_string())?;
-            let b: u8 = u8::from_str_radix(&value[5..7], 16).map_err(|e| e.to_string())?;
-            trace!("Read RGB color string: {},{},{}", r, g, b);
-            return Ok(LimboColor(Color::Rgb(r, g, b)));
-        }
 
-        // Parse a u8 (ansi color)
-        if let Result::Ok(ansi_color_num) = value.parse::<u8>() {
-            trace!("Read ANSI color string: {}", ansi_color_num);
-            return Ok(LimboColor(Color::Fixed(ansi_color_num)));
+        let color = match value.chars().collect::<Vec<_>>()[..] {
+            // #rrggbb hex color
+            ['#', r1, r2, g1, g2, b1, b2] => {
+                let r = u8::from_str_radix(&format!("{r1}{r2}"), 16).map_err(|e| e.to_string())?;
+                let g = u8::from_str_radix(&format!("{g1}{g2}"), 16).map_err(|e| e.to_string())?;
+                let b = u8::from_str_radix(&format!("{b1}{b2}"), 16).map_err(|e| e.to_string())?;
+                Some(Color::Rgb(r, g, b))
+            }
+            // #rgb shorthand hex color
+            ['#', r, g, b] => {
+                let r = u8::from_str_radix(&format!("{r}{r}"), 16).map_err(|e| e.to_string())?;
+                let g = u8::from_str_radix(&format!("{g}{g}"), 16).map_err(|e| e.to_string())?;
+                let b = u8::from_str_radix(&format!("{b}{b}"), 16).map_err(|e| e.to_string())?;
+                Some(Color::Rgb(r, g, b))
+            }
+            // 0-255 color code
+            [c1, c2, c3] => {
+                if let Ok(ansi_color_num) = str::parse::<u8>(&format!("{c1}{c2}{c3}")) {
+                    Some(Color::Fixed(ansi_color_num))
+                } else {
+                    None
+                }
+            }
+            [c1, c2] => {
+                if let Ok(ansi_color_num) = str::parse::<u8>(&format!("{c1}{c2}")) {
+                    Some(Color::Fixed(ansi_color_num))
+                } else {
+                    None
+                }
+            }
+            [c1] => {
+                if let Ok(ansi_color_num) = str::parse::<u8>(&format!("{c1}")) {
+                    Some(Color::Fixed(ansi_color_num))
+                } else {
+                    None
+                }
+            }
+            // unknown format
+            _ => None,
+        };
+
+        if let Some(color) = color {
+            return Ok(LimboColor(color));
         }
 
         // Check for any predefined color strings

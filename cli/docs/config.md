@@ -5,7 +5,8 @@ Config folder should be located at `$HOME/.config/limbo`. The config file inside
 Describes the Limbo Config file for the CLI\
 
 **Note**: Colors can be inputted as
-- Rgb string -> `"#010101"`
+- Rrggbb string -> `"#010101"`
+- Rgb string -> `"#A3F"`
 - 256 Ansi Color -> `"100"`
 - Predefined Color Names:
   - `"black"`
