@@ -467,7 +467,8 @@ impl<'a> Limbo<'a> {
         }
         match CommandParser::try_parse_from(args) {
             Err(err) => {
-                let _ = self.write_fmt(format_args!("{err}"));
+                // Let clap print with Styled Colors instead
+                let _ = err.print();
             }
             Ok(cmd) => match cmd.command {
                 Command::Exit(args) => {

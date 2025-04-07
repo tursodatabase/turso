@@ -188,6 +188,7 @@ impl DumbLruPageCache {
             // TODO: drop from another clean entry?
             return;
         }
+        tracing::debug!("pop_if_not_dirty(key={:?})", tail_entry.key);
         self.detach(tail, true);
         assert!(self.map.borrow_mut().remove(&tail_entry.key).is_some());
     }

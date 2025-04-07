@@ -27,6 +27,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use crate::{fast_lock::SpinLock, translate::optimizer::optimize_plan};
 pub use error::LimboError;
 use fallible_iterator::FallibleIterator;
+pub use io::clock::{Clock, Instant};
 #[cfg(all(feature = "fs", target_family = "unix"))]
 pub use io::UnixIO;
 #[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring"))]
@@ -38,7 +39,7 @@ use parking_lot::RwLock;
 use schema::{Column, Schema};
 use std::{
     borrow::Cow,
-    cell::{Cell, RefCell},
+    cell::{Cell, RefCell, UnsafeCell},
     collections::HashMap,
     io::Write,
     num::NonZero,
@@ -66,7 +67,6 @@ pub use types::OwnedValue;
 pub use types::RefValue;
 use util::{columns_from_create_table_body, parse_schema_rows};
 use vdbe::{builder::QueryMode, VTabOpaqueCursor};
-
 pub type Result<T, E = LimboError> = std::result::Result<T, E>;
 pub static DATABASE_VERSION: OnceLock<String> = OnceLock::new();
 
@@ -92,7 +92,7 @@ pub struct Database {
     // Shared structures of a Database are the parts that are common to multiple threads that might
     // create DB connections.
     shared_page_cache: Arc<RwLock<DumbLruPageCache>>,
-    shared_wal: Arc<RwLock<WalFileShared>>,
+    shared_wal: Arc<UnsafeCell<WalFileShared>>,
 }
 
 unsafe impl Send for Database {}
@@ -118,7 +118,7 @@ impl Database {
     pub fn open(
         io: Arc<dyn IO>,
         db_file: Arc<dyn DatabaseStorage>,
-        shared_wal: Arc<RwLock<WalFileShared>>,
+        shared_wal: Arc<UnsafeCell<WalFileShared>>,
         enable_mvcc: bool,
     ) -> Result<Arc<Database>> {
         let db_header = Pager::begin_open(db_file.clone())?;

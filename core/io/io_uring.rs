@@ -11,6 +11,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, trace};
+use crate::io::clock::{Clock, Instant};
 
 const MAX_IOVECS: u32 = 1024;
 const SQPOLL_IDLE: u32 = 1000;
@@ -196,9 +197,15 @@ impl IO for UringIO {
         getrandom::getrandom(&mut buf).unwrap();
         i64::from_ne_bytes(buf)
     }
+}
 
-    fn get_current_time(&self) -> String {
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+impl Clock for UringIO {
+    fn now(&self) -> Instant {
+        let now = chrono::Local::now();
+        Instant {
+            secs: now.timestamp(),
+            micros: now.timestamp_subsec_micros(),
+        }
     }
 }
 

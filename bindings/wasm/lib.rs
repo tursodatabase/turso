@@ -1,5 +1,7 @@
 use js_sys::{Array, Object};
-use limbo_core::{maybe_init_database_file, OpenFlags, Pager, Result, WalFileShared};
+use limbo_core::{
+    maybe_init_database_file, Clock, Instant, OpenFlags, Pager, Result, WalFileShared,
+};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -269,6 +271,18 @@ pub struct PlatformIO {
 unsafe impl Send for PlatformIO {}
 unsafe impl Sync for PlatformIO {}
 
+impl Clock for PlatformIO {
+    fn now(&self) -> Instant {
+        let date = Date::new();
+        let ms_since_epoch = date.getTime();
+
+        Instant {
+            secs: (ms_since_epoch / 1000.0) as i64,
+            micros: ((ms_since_epoch % 1000.0) * 1000.0) as u32,
+        }
+    }
+}
+
 impl limbo_core::IO for PlatformIO {
     fn open_file(
         &self,
@@ -291,11 +305,6 @@ impl limbo_core::IO for PlatformIO {
         let random_f64 = Math_random();
         (random_f64 * i64::MAX as f64) as i64
     }
-
-    fn get_current_time(&self) -> String {
-        let date = Date::new();
-        date.toISOString()
-    }
 }
 
 #[wasm_bindgen]
@@ -312,6 +321,9 @@ extern "C" {
 
     #[wasm_bindgen(method, getter)]
     fn toISOString(this: &Date) -> String;
+
+    #[wasm_bindgen(method)]
+    fn getTime(this: &Date) -> f64;
 }
 
 pub struct DatabaseFile {

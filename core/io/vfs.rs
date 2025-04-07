@@ -1,11 +1,21 @@
+use super::{Buffer, Completion, File, OpenFlags, IO};
 use crate::ext::VfsMod;
+use crate::io::clock::{Clock, Instant};
 use crate::{LimboError, Result};
 use limbo_ext::{VfsFileImpl, VfsImpl};
 use std::cell::RefCell;
 use std::ffi::{c_void, CString};
 use std::sync::Arc;
 
-use super::{Buffer, Completion, File, OpenFlags, IO};
+impl Clock for VfsMod {
+    fn now(&self) -> Instant {
+        let now = chrono::Local::now();
+        Instant {
+            secs: now.timestamp(),
+            micros: now.timestamp_subsec_micros(),
+        }
+    }
+}
 
 impl IO for VfsMod {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
@@ -40,7 +50,10 @@ impl IO for VfsMod {
         let vfs = unsafe { &*self.ctx };
         unsafe { (vfs.gen_random_number)() }
     }
+}
 
+impl VfsMod {
+    #[allow(dead_code)] // used in FFI call
     fn get_current_time(&self) -> String {
         if self.ctx.is_null() {
             return "".to_string();

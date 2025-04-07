@@ -264,6 +264,42 @@ def test_update_with_limit():
     limbo.quit()
 
 
+
+def test_update_with_limit_and_offset():
+    limbo = TestLimboShell(
+        "CREATE TABLE t (a,b,c); insert into t values (1,2,3), (4,5,6), (7,8,9), (1,2,3),(4,5,6), (7,8,9);"
+    )
+    limbo.run_test("update-limit-offset", "UPDATE t SET a = 10 LIMIT 1 OFFSET 3;", "")
+    limbo.run_test(
+        "update-limit-offset-result", "SELECT COUNT(*) from t WHERE a = 10;", "1"
+    )
+    limbo.run_test("update-limit-result", "SELECT a from t LIMIT 4;", "1\n4\n7\n10")
+    limbo.run_test(
+        "update-limit-offset-zero", "UPDATE t SET a = 100 LIMIT 0 OFFSET 0;", ""
+    )
+    limbo.run_test(
+        "update-limit-zero-result", "SELECT COUNT(*) from t WHERE a = 100;", "0"
+    )
+    limbo.run_test("update-limit-all", "UPDATE t SET a = 100 LIMIT -1 OFFSET 1;", "")
+    limbo.run_test("update-limit-result", "SELECT COUNT(*) from t WHERE a = 100;", "5")
+    limbo.run_test(
+        "udpate-limit-where", "UPDATE t SET a = 333 WHERE b = 5 LIMIT 1 OFFSET 2;", ""
+    )
+    limbo.run_test(
+        "update-limit-where-result", "SELECT COUNT(*) from t WHERE a = 333;", "0"
+    )
+    limbo.quit()
+    
+def test_insert_default_values():
+    limbo = TestLimboShell(
+        "CREATE TABLE t (a integer default(42),b integer default (43),c integer default(44));"
+    )
+    for _ in range(1, 10):
+        limbo.execute_dot("INSERT INTO t DEFAULT VALUES;")
+    limbo.run_test("insert-default-values", "SELECT * FROM t;", "42|43|44\n" * 9)
+    limbo.quit()
+
+
 if __name__ == "__main__":
     print("Running all Limbo CLI tests...")
     test_basic_queries()
@@ -282,4 +318,5 @@ if __name__ == "__main__":
     test_import_csv_skip()
     test_table_patterns()
     test_update_with_limit()
+    test_update_with_limit_and_offset()
     print("All tests have passed")

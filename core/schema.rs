@@ -2,7 +2,7 @@ use crate::VirtualTable;
 use crate::{util::normalize_ident, Result};
 use core::fmt;
 use fallible_iterator::FallibleIterator;
-use limbo_sqlite3_parser::ast::{Expr, Literal, TableOptions};
+use limbo_sqlite3_parser::ast::{Expr, Literal, SortOrder, TableOptions};
 use limbo_sqlite3_parser::{
     ast::{Cmd, CreateTableBody, QualifiedName, ResultColumn, Stmt},
     lexer::sql::Parser,
@@ -28,6 +28,13 @@ impl Schema {
             Arc::new(Table::BTree(sqlite_schema_table().into())),
         );
         Self { tables, indexes }
+    }
+
+    pub fn is_unique_idx_name(&self, name: &str) -> bool {
+        !self
+            .indexes
+            .iter()
+            .any(|idx| idx.1.iter().any(|i| i.name == name))
     }
 
     pub fn add_btree_table(&mut self, table: Rc<BTreeTable>) {
@@ -209,7 +216,7 @@ impl BTreeTable {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct PseudoTable {
     pub columns: Vec<Column>,
 }
@@ -242,12 +249,6 @@ impl PseudoTable {
             }
         }
         None
-    }
-}
-
-impl Default for PseudoTable {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -616,13 +617,7 @@ pub struct Index {
 #[derive(Debug, Clone)]
 pub struct IndexColumn {
     pub name: String,
-    pub order: Order,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Order {
-    Ascending,
-    Descending,
+    pub order: SortOrder,
 }
 
 impl Index {
@@ -642,11 +637,7 @@ impl Index {
                     .into_iter()
                     .map(|col| IndexColumn {
                         name: normalize_ident(&col.expr.to_string()),
-                        order: match col.order {
-                            Some(limbo_sqlite3_parser::ast::SortOrder::Asc) => Order::Ascending,
-                            Some(limbo_sqlite3_parser::ast::SortOrder::Desc) => Order::Descending,
-                            None => Order::Ascending,
-                        },
+                        order: col.order.unwrap_or(SortOrder::Asc),
                     })
                     .collect();
                 Ok(Index {
@@ -685,7 +676,7 @@ impl Index {
                 }
                 Ok(IndexColumn {
                     name: normalize_ident(col_name),
-                    order: Order::Ascending, // Primary key indexes are always ascending
+                    order: SortOrder::Asc, // Primary key indexes are always ascending
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1012,7 +1003,7 @@ mod tests {
         assert!(index.unique);
         assert_eq!(index.columns.len(), 1);
         assert_eq!(index.columns[0].name, "a");
-        assert!(matches!(index.columns[0].order, Order::Ascending));
+        assert!(matches!(index.columns[0].order, SortOrder::Asc));
         Ok(())
     }
 
@@ -1029,8 +1020,8 @@ mod tests {
         assert_eq!(index.columns.len(), 2);
         assert_eq!(index.columns[0].name, "a");
         assert_eq!(index.columns[1].name, "b");
-        assert!(matches!(index.columns[0].order, Order::Ascending));
-        assert!(matches!(index.columns[1].order, Order::Ascending));
+        assert!(matches!(index.columns[0].order, SortOrder::Asc));
+        assert!(matches!(index.columns[1].order, SortOrder::Asc));
         Ok(())
     }
 

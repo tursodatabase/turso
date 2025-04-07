@@ -99,6 +99,27 @@ do_execsql_test select-agg-binary-unary-positive {
   SELECT min(age) + +max(age) FROM users;
 } {101}
 
+do_execsql_test select-non-agg-cols-should-be-not-null {
+  SELECT id, first_name, sum(age) FROM users LIMIT 1;
+} {1|Jamie|503960}
+
+do_execsql_test select-with-group-by-and-agg-1 {
+  SELECT id, first_name, avg(age) FROM users group by last_name limit 1;
+} {274|Debra|66.25}
+
+do_execsql_test select-with-group-by-and-agg-2 {
+  select first_name, last_name from users where state = 'AL' group by last_name limit 10;
+} {Jay|Acosta
+Daniel|Adams
+Aaron|Baker
+Sharon|Becker
+Kim|Berg
+Donald|Bishop
+Brian|Bradford
+Jesus|Bradley
+John|Brown
+Hunter|Burke}
+
 do_execsql_test select-agg-json-array {
   SELECT json_group_array(name) FROM products;
 } {["hat","cap","shirt","sweater","sweatshirt","shorts","jeans","sneakers","boots","coat","accessories"]}

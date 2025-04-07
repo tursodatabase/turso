@@ -49,7 +49,6 @@ use crate::storage::database::DatabaseStorage;
 use crate::storage::pager::Pager;
 use crate::types::{ImmutableRecord, RawSlice, RefValue, TextRef, TextSubtype};
 use crate::{File, Result};
-use parking_lot::RwLock;
 use std::cell::RefCell;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
@@ -333,7 +332,7 @@ pub fn begin_write_database_header(header: &DatabaseHeader, pager: &Pager) -> Re
     });
 
     let c = Completion::Write(WriteCompletion::new(write_complete));
-    page_source.write_page(0, buffer_to_copy, c)?;
+    page_source.write_page(1, buffer_to_copy, c)?;
 
     Ok(())
 }
@@ -1329,11 +1328,11 @@ pub fn write_varint_to_vec(value: u64, payload: &mut Vec<u8>) {
     payload.extend_from_slice(&varint[0..n]);
 }
 
-pub fn begin_read_wal_header(io: &Arc<dyn File>) -> Result<Arc<RwLock<WalHeader>>> {
+pub fn begin_read_wal_header(io: &Arc<dyn File>) -> Result<Arc<SpinLock<WalHeader>>> {
     let drop_fn = Rc::new(|_buf| {});
     #[allow(clippy::arc_with_non_send_sync)]
     let buf = Arc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
-    let result = Arc::new(RwLock::new(WalHeader::default()));
+    let result = Arc::new(SpinLock::new(WalHeader::default()));
     let header = result.clone();
     let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
         let header = header.clone();
@@ -1344,10 +1343,13 @@ pub fn begin_read_wal_header(io: &Arc<dyn File>) -> Result<Arc<RwLock<WalHeader>
     Ok(result)
 }
 
-fn finish_read_wal_header(buf: Arc<RefCell<Buffer>>, header: Arc<RwLock<WalHeader>>) -> Result<()> {
+fn finish_read_wal_header(
+    buf: Arc<RefCell<Buffer>>,
+    header: Arc<SpinLock<WalHeader>>,
+) -> Result<()> {
     let buf = buf.borrow();
     let buf = buf.as_slice();
-    let mut header = header.write();
+    let mut header = header.lock();
     header.magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
     header.file_format = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
     header.page_size = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);

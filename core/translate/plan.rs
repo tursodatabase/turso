@@ -176,8 +176,8 @@ pub struct UpdatePlan {
     pub set_clauses: Vec<(usize, ast::Expr)>,
     pub where_clause: Vec<WhereTerm>,
     pub order_by: Option<Vec<(ast::Expr, Direction)>>,
-    // TODO: support OFFSET
     pub limit: Option<isize>,
+    pub offset: Option<isize>,
     // TODO: optional RETURNING clause
     pub returning: Option<Vec<ResultSetColumn>>,
     // whether the WHERE clause is always false

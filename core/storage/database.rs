@@ -50,6 +50,7 @@ impl DatabaseStorage for DatabaseFile {
         c: Completion,
     ) -> Result<()> {
         let buffer_size = buffer.borrow().len();
+        assert!(page_idx > 0);
         assert!(buffer_size >= 512);
         assert!(buffer_size <= 65536);
         assert_eq!(buffer_size & (buffer_size - 1), 0);

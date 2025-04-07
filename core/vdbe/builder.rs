@@ -16,14 +16,14 @@ use crate::{
     Connection, VirtualTable,
 };
 
-use super::{BranchOffset, CursorID, Insn, InsnReference, Program};
+use super::{BranchOffset, CursorID, Insn, InsnFunction, InsnReference, Program};
 #[allow(dead_code)]
 pub struct ProgramBuilder {
     next_free_register: usize,
     next_free_cursor_id: usize,
-    insns: Vec<Insn>,
+    insns: Vec<(Insn, InsnFunction)>,
     // for temporarily storing instructions that will be put after Transaction opcode
-    constant_insns: Vec<Insn>,
+    constant_insns: Vec<(Insn, InsnFunction)>,
     // Vector of labels which must be assigned to next emitted instruction
     next_insn_labels: Vec<BranchOffset>,
     // Cursors that are referenced by the program. Indexed by CursorID.
@@ -127,7 +127,14 @@ impl ProgramBuilder {
             self.label_to_resolved_offset[label.to_label_value() as usize] =
                 Some(self.insns.len() as InsnReference);
         }
-        self.insns.push(insn);
+        let function = insn.to_function();
+        self.insns.push((insn, function));
+    }
+
+    pub fn close_cursors(&mut self, cursors: &[CursorID]) {
+        for cursor in cursors {
+            self.emit_insn(Insn::Close { cursor_id: *cursor });
+        }
     }
 
     pub fn emit_string8(&mut self, value: String, dest: usize) {
@@ -253,7 +260,7 @@ impl ProgramBuilder {
                 );
             }
         };
-        for insn in self.insns.iter_mut() {
+        for (insn, _) in self.insns.iter_mut() {
             match insn {
                 Insn::Init { target_pc } => {
                     resolve(target_pc, "Init");

@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.0.18 - 2025-04-02
+
+### Added
+
+* Jsonb support update (Ihor Andrianov)
+* Add BTree balancing after `delete` (Krishna Vishal)
+* Introduce Register struct (Pere Diaz Bou)
+* Introduce immutable record (Pere Diaz Bou)
+* Introduce libFuzzer (Levy A.)
+* WAL frame checksum support (Daniel Boll)
+* Initial JavaScript bindings with napi-rs (Pekka Enberg)
+* Initial pass at `UPDATE` support (Preston Thorpe)
+* Add `commit()` and placeholding insert to Python binding (Diego Reis)
+
+### Updated
+
+* Create plan for Update queries (Preston Thorpe)
+* Validate cells inside a page after each operation (Pere Diaz Bou)
+* Refactor Cli Repl Commands to use clap (Pedro Muniz)
+* Allow balance_root to balance with interior pages (Pere Diaz Bou)
+* Let remainder (%) accept textual arguments (Anton Harniakou)
+* JSON code cleanups (Pekka Enberg)
+* Allocation improvements with ImmutableRecord, OwnedRecord and read_record (Pere Diaz Bou)
+* JavaScript binding improvements (Pekka Enberg)
+* Kill test environment (Pekka Enberg)
+* Remove public unlock method from `SpinLock` to prevent unsafe aliasing (Krishna Vishal)
+* Handle limit zero case in query plan emitter (Preston Thorpe)
+* Reduce MVCC cursor memory consumption (Ihor Andrianov)
+* Unary `+` is a noop (Levy A.)
+* JSON cache (Ihor Andrianov)
+* Bump `rusqlite` to 0.34 (Pere Diaz Bou)
+* core: Rename FileStorage to DatabaseFile (Pekka Enberg)
+* Improve Python bindings (Diego Reis)
+* Schema translation cleanups (Pekka Enberg)
+* Various JSON improvements (Ihor Andrianov)
+* Enable pretty mode in shell by default (Pekka Enberg)
+* Improve CLI color scheme (Pekka Enberg)
+* Impl Copy on some types in the pager to prevent explicit clones (Preston Thorpe)
+* Syntax highlighting and hinting (Pedro Muniz)
+* chore: gitignore files with an extension *.db (Anton Harniakou)
+* Organize extension library and feature gate VFS (Preston Thorpe)
+* fragment bench functions (Pere Diaz Bou)
+
+### Fixed
+
+* Remove unnecessary balance code that crashes (Pere Diaz Bou)
+* Fix propagation of divider cell balancing interior page (Pere Diaz Bou)
+* Fuzz test btree fix seeking. (Pere Diaz Bou)
+* Fix IdxCmp insn comparisons (Jussi Saurio)
+* Fixes probably all floating point math issues and floating point display issues. (Ihor Andrianov)
+* Make BTreeCell/read_payload  not allocate any data + overflow fixes (Pere Diaz Bou)
+* Fix `compute_shl` negate with overflow (Krishna Vishal)
+* Fix a typo in README.md (Tshepang Mbambo)
+* Fix platform specific FFI C pointer type casts (Preston Thorpe)
+* core: Fix Destroy opcode root page handling (Pekka Enberg)
+* Fix `SELECT 0.0 = 0` returning false (lgualtieri75)
+* bindings/python: Fix flaky tests (Diego Reis)
+* Fix io_uring WAL write corruption by ensuring buffer lifetime (Daniel Boll)
+
 ## 0.0.17 - 2025-03-19
 
 ### Added

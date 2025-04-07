@@ -6,6 +6,7 @@ pub use value::Value;
 pub use params::params_from_iter;
 
 use crate::params::*;
+use std::fmt::Debug;
 use std::num::NonZero;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -55,12 +56,19 @@ impl Builder {
     }
 }
 
+#[derive(Clone)]
 pub struct Database {
     inner: Arc<limbo_core::Database>,
 }
 
 unsafe impl Send for Database {}
 unsafe impl Sync for Database {}
+
+impl Debug for Database {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Database").finish()
+    }
+}
 
 impl Database {
     pub fn connect(&self) -> Result<Connection> {

@@ -4,6 +4,7 @@ use limbo_sqlite3_parser::ast;
 
 use crate::{
     schema::{Index, Schema},
+    util::exprs_are_equivalent,
     Result,
 };
 
@@ -42,6 +43,8 @@ fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
     )?;
 
     eliminate_unnecessary_orderby(plan, schema)?;
+
+    eliminate_orderby_like_groupby(plan)?;
 
     Ok(())
 }
@@ -117,11 +120,83 @@ fn query_is_already_ordered_by(
     }
 }
 
+fn eliminate_orderby_like_groupby(plan: &mut SelectPlan) -> Result<()> {
+    if plan.order_by.is_none() | plan.group_by.is_none() {
+        return Ok(());
+    }
+    if plan.table_references.len() == 0 {
+        return Ok(());
+    }
+
+    let order_by_clauses = plan.order_by.as_mut().unwrap();
+    let group_by_clauses = plan.group_by.as_mut().unwrap();
+
+    let mut group_by_insert_position = 0;
+    let mut order_index = 0;
+
+    // This function optimizes query execution by eliminating duplicate expressions between ORDER BY and GROUP BY clauses
+    // When the same column appears in both clauses, we can avoid redundant sorting operations
+    // The function reorders GROUP BY expressions and removes redundant ORDER BY expressions to ensure consistent ordering
+    while order_index < order_by_clauses.len() {
+        let (order_expr, direction) = &order_by_clauses[order_index];
+
+        // Skip descending orders as they require separate sorting
+        if matches!(direction, Direction::Descending) {
+            order_index += 1;
+            continue;
+        }
+
+        // Check if the current ORDER BY expression matches any expression in the GROUP BY clause
+        if let Some(group_expr_position) = group_by_clauses
+            .exprs
+            .iter()
+            .position(|expr| exprs_are_equivalent(expr, order_expr))
+        {
+            // If we found a matching expression in GROUP BY, we need to ensure it's in the correct position
+            // to preserve the ordering specified by ORDER BY clauses
+
+            // Move the matching GROUP BY expression to the current insertion position
+            // This effectively "bubbles up" the expression to maintain proper ordering
+            if group_expr_position != group_by_insert_position {
+                let mut current_position = group_expr_position;
+
+                // Swap expressions to move the matching one to the correct position
+                while current_position > group_by_insert_position {
+                    group_by_clauses
+                        .exprs
+                        .swap(current_position, current_position - 1);
+                    current_position -= 1;
+                }
+            }
+
+            group_by_insert_position += 1;
+
+            // Remove this expression from ORDER BY since it's now handled by GROUP BY
+            order_by_clauses.remove(order_index);
+            // Note: We don't increment order_index here because removal shifts all elements
+        } else {
+            // If not found in GROUP BY, move to next ORDER BY expression
+            order_index += 1;
+        }
+    }
+    if order_by_clauses.is_empty() {
+        plan.order_by = None
+    }
+    Ok(())
+}
+
 fn eliminate_unnecessary_orderby(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
     if plan.order_by.is_none() {
         return Ok(());
     }
     if plan.table_references.is_empty() {
+        return Ok(());
+    }
+
+    // If GROUP BY clause is present, we can't rely on already ordered columns because GROUP BY reorders the data
+    // This early return prevents the elimination of ORDER BY when GROUP BY exists, as sorting must be applied after grouping
+    // And if ORDER BY clause duplicates GROUP BY we handle it later in fn eliminate_orderby_like_groupby
+    if plan.group_by.is_some() {
         return Ok(());
     }
 

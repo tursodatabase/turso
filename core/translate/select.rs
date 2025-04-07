@@ -370,7 +370,7 @@ pub fn prepare_select_plan<'a>(
 
             // Parse the LIMIT/OFFSET clause
             (plan.limit, plan.offset) =
-                select.limit.map_or(Ok((None, None)), |l| parse_limit(*l))?;
+                select.limit.map_or(Ok((None, None)), |l| parse_limit(&l))?;
 
             // Return the unoptimized query plan
             Ok(Plan::Select(plan))

@@ -68,7 +68,7 @@ pub fn prepare_delete_plan(
     )?;
 
     // Parse the LIMIT/OFFSET clause
-    let (resolved_limit, resolved_offset) = limit.map_or(Ok((None, None)), |l| parse_limit(*l))?;
+    let (resolved_limit, resolved_offset) = limit.map_or(Ok((None, None)), |l| parse_limit(&l))?;
 
     let plan = DeletePlan {
         table_references,
@@ -86,7 +86,5 @@ pub fn prepare_delete_plan(
 fn estimate_num_instructions(plan: &DeletePlan) -> usize {
     let base = 20;
 
-    let num_instructions = base + plan.table_references.len() * 10;
-
-    num_instructions
+    base + plan.table_references.len() * 10
 }

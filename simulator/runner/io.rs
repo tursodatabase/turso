@@ -1,6 +1,6 @@
 use std::{cell::RefCell, sync::Arc};
 
-use limbo_core::{OpenFlags, PlatformIO, Result, IO};
+use limbo_core::{Clock, Instant, OpenFlags, PlatformIO, Result, IO};
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -52,6 +52,15 @@ impl SimulatorIO {
     }
 }
 
+impl Clock for SimulatorIO {
+    fn now(&self) -> Instant {
+        Instant {
+            secs: 1704067200, // 2024-01-01 00:00:00 UTC
+            micros: 0,
+        }
+    }
+}
+
 impl IO for SimulatorIO {
     fn open_file(
         &self,
@@ -87,9 +96,5 @@ impl IO for SimulatorIO {
 
     fn generate_random_number(&self) -> i64 {
         self.rng.borrow_mut().next_u64() as i64
-    }
-
-    fn get_current_time(&self) -> String {
-        "2024-01-01 00:00:00".to_string()
     }
 }

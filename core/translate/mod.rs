@@ -12,6 +12,7 @@ pub(crate) mod delete;
 pub(crate) mod emitter;
 pub(crate) mod expr;
 pub(crate) mod group_by;
+pub(crate) mod index;
 pub(crate) mod insert;
 pub(crate) mod main_loop;
 pub(crate) mod optimizer;
@@ -34,6 +35,7 @@ use crate::translate::delete::translate_delete;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::Program;
 use crate::{bail_parse_error, Connection, Result, SymbolTable};
+use index::translate_create_index;
 use insert::translate_insert;
 use limbo_sqlite3_parser::ast::{self, Delete, Insert};
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
@@ -61,7 +63,24 @@ pub fn translate(
         ast::Stmt::Attach { .. } => bail_parse_error!("ATTACH not supported yet"),
         ast::Stmt::Begin(tx_type, tx_name) => translate_tx_begin(tx_type, tx_name)?,
         ast::Stmt::Commit(tx_name) => translate_tx_commit(tx_name)?,
-        ast::Stmt::CreateIndex { .. } => bail_parse_error!("CREATE INDEX not supported yet"),
+        ast::Stmt::CreateIndex {
+            unique,
+            if_not_exists,
+            idx_name,
+            tbl_name,
+            columns,
+            ..
+        } => {
+            change_cnt_on = true;
+            translate_create_index(
+                query_mode,
+                (unique, if_not_exists),
+                &idx_name.name.0,
+                &tbl_name.0,
+                &columns,
+                schema,
+            )?
+        }
         ast::Stmt::CreateTable {
             temporary,
             if_not_exists,

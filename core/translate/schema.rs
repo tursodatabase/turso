@@ -103,7 +103,7 @@ pub fn translate_create_table(
     );
     program.emit_insn(Insn::OpenWriteAsync {
         cursor_id: sqlite_schema_cursor_id,
-        root_page: 1,
+        root_page: 1usize.into(),
     });
     program.emit_insn(Insn::OpenWriteAwait {});
 
@@ -155,8 +155,8 @@ pub fn translate_create_table(
     Ok(program)
 }
 
-#[derive(Debug)]
-enum SchemaEntryType {
+#[derive(Debug, Clone, Copy)]
+pub enum SchemaEntryType {
     Table,
     Index,
 }
@@ -169,9 +169,9 @@ impl SchemaEntryType {
         }
     }
 }
-const SQLITE_TABLEID: &str = "sqlite_schema";
+pub const SQLITE_TABLEID: &str = "sqlite_schema";
 
-fn emit_schema_entry(
+pub fn emit_schema_entry(
     program: &mut ProgramBuilder,
     sqlite_schema_cursor_id: usize,
     entry_type: SchemaEntryType,
@@ -462,7 +462,8 @@ pub fn translate_create_virtual_table(
         approx_num_insns: 40,
         approx_num_labels: 2,
     });
-
+    let init_label = program.emit_init();
+    let start_offset = program.offset();
     let module_name_reg = program.emit_string8_new_reg(module_name_str.clone());
     let table_name_reg = program.emit_string8_new_reg(table_name.clone());
 
@@ -499,7 +500,7 @@ pub fn translate_create_virtual_table(
     );
     program.emit_insn(Insn::OpenWriteAsync {
         cursor_id: sqlite_schema_cursor_id,
-        root_page: 1,
+        root_page: 1usize.into(),
     });
     program.emit_insn(Insn::OpenWriteAwait {});
 
@@ -520,8 +521,6 @@ pub fn translate_create_virtual_table(
         where_clause: parse_schema_where_clause,
     });
 
-    let init_label = program.emit_init();
-    let start_offset = program.offset();
     program.emit_halt();
     program.resolve_label(init_label, program.offset());
     program.emit_transaction(true);
@@ -573,14 +572,14 @@ pub fn translate_drop_table(
     let row_id_reg = program.alloc_register(); //  r5
 
     let table_name = "sqlite_schema";
-    let schema_table = schema.get_btree_table(&table_name).unwrap();
+    let schema_table = schema.get_btree_table(table_name).unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(
         Some(table_name.to_string()),
         CursorType::BTreeTable(schema_table.clone()),
     );
     program.emit_insn(Insn::OpenWriteAsync {
         cursor_id: sqlite_schema_cursor_id,
-        root_page: 1,
+        root_page: 1usize.into(),
     });
     program.emit_insn(Insn::OpenWriteAwait {});
 

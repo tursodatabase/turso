@@ -1,6 +1,7 @@
-use super::{Buffer, Completion, File, OpenFlags, IO};
+use super::{Buffer, Clock, Completion, File, OpenFlags, IO};
 use crate::Result;
 
+use crate::io::clock::Instant;
 use std::{
     cell::{Cell, RefCell, UnsafeCell},
     collections::BTreeMap,
@@ -29,6 +30,16 @@ impl Default for MemoryIO {
     }
 }
 
+impl Clock for MemoryIO {
+    fn now(&self) -> Instant {
+        let now = chrono::Local::now();
+        Instant {
+            secs: now.timestamp(),
+            micros: now.timestamp_subsec_micros(),
+        }
+    }
+}
+
 impl IO for MemoryIO {
     fn open_file(&self, _path: &str, _flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         Ok(Arc::new(MemoryFile {
@@ -46,10 +57,6 @@ impl IO for MemoryIO {
         let mut buf = [0u8; 8];
         getrandom::getrandom(&mut buf).unwrap();
         i64::from_ne_bytes(buf)
-    }
-
-    fn get_current_time(&self) -> String {
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
     }
 }
 

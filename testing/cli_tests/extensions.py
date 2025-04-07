@@ -339,16 +339,19 @@ def test_series():
 def test_kv():
     ext_path = "target/debug/liblimbo_ext_tests"
     limbo = TestLimboShell()
+    # first, create a normal table to ensure no issues
+    limbo.execute_dot("CREATE TABLE other (a,b,c);")
+    limbo.execute_dot("INSERT INTO other values (23,32,23);")
+    limbo = TestLimboShell()
     limbo.run_test_fn(
         "create virtual table t using kv_store;",
         lambda res: "Virtual table module not found: kv_store" in res,
     )
     limbo.execute_dot(f".load {ext_path}")
-    limbo.run_test_fn(
+    limbo.debug_print(
         "create virtual table t using kv_store;",
-        null,
-        "can create kv_store vtable",
     )
+    limbo.run_test_fn(".schema", lambda res: "CREATE VIRTUAL TABLE t" in res)
     limbo.run_test_fn(
         "insert into t values ('hello', 'world');",
         null,
@@ -495,12 +498,6 @@ def test_vfs():
         "Tested large write to testfs",
     )
     print("Tested large write to testfs")
-    # Pere: I commented this out because it added an extra row that made the test test_sqlite_vfs_compat fail
-    # it didn't segfault from my side so maybe this is necessary?
-    # # open regular db file to ensure we don't segfault when vfs file is dropped
-    # limbo.execute_dot(".open testing/vfs.db")
-    # limbo.execute_dot("create table test (id integer primary key, value float);")
-    # limbo.execute_dot("insert into test (value) values (1.0);")
     limbo.quit()
 
 
@@ -547,10 +544,10 @@ if __name__ == "__main__":
         test_aggregates()
         test_crypto()
         test_series()
-        test_kv()
         test_ipaddr()
         test_vfs()
         test_sqlite_vfs_compat()
+        test_kv()
     except Exception as e:
         print(f"Test FAILED: {e}")
         cleanup()
