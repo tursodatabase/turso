@@ -24,7 +24,7 @@ clear_caches() {
 
 # Clear caches once
 echo "The script might ask you to enter the password for sudo, in order to clear system caches."
-clear_caches
+#clear_caches
 count=1;
 
 # Run the queries, skipping any that are commented out
@@ -35,15 +35,15 @@ grep -v '^--' "$CLICKBENCH_DIR/queries.sql" | while read -r query; do
     ((echo "$count $query") 2>&1) | tee -a clickbench-limbo.txt > /dev/null
     ((echo "$count $query") 2>&1) | tee -a clickbench-sqlite3.txt >/dev/null
     for _ in $(seq 1 $TRIES); do
-        clear_caches
+        #clear_caches
         echo "----limbo syscall IO ----"
         ((time "$RELEASE_BUILD_DIR/limbo" --vfs syscall --quiet "$CLICKBENCH_DIR/mydb" <<< "${query}") 2>&1) | tee -a clickbench-limbo.txt
         clear_caches
         echo "----limbo io_uring IO ----"
-        clear_caches
+        #clear_caches
         ((time "$RELEASE_BUILD_DIR/limbo" --quiet "$CLICKBENCH_DIR/mydb" <<< "${query}") 2>&1) | tee -a clickbench-limbo.txt
         echo "----sqlite----"
-        clear_caches
+        #clear_caches
         ((time sqlite3 "$CLICKBENCH_DIR/mydb" <<< "${query}") 2>&1) | tee -a clickbench-sqlite3.txt
     done;
     count=$(($count+1))
