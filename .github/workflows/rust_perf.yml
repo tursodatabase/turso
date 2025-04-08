@@ -65,7 +65,7 @@ jobs:
           gh-repository: null
 
   clickbench:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v3
       - uses: actions/setup-node@v4
@@ -74,55 +74,3 @@ jobs:
 
       - name: Clickbench
         run: make clickbench
-
-      - name: Analyze LIMBO result with Nyrkiö
-        uses: nyrkio/github-action-benchmark@HEAD
-        with:
-          name: clickbench/limbo
-          tool: time
-          output-file-path: clickbench-limbo.txt
-          # What to do if a change is immediately detected by Nyrkiö.
-          # Note that smaller changes are only detected with delay, usually after a change
-          # persisted over 2-7 commits. Go to nyrkiö.com to view those or configure alerts.
-          # Note that Nyrkiö will find all changes, also improvements. This means fail-on-alert
-          # on pull events isn't compatible with this workflow being required to pass branch protection.
-          fail-on-alert: false
-          comment-on-alert: true
-          comment-always: false
-          # Nyrkiö configuration
-          nyrkio-enable: true
-          # Get yours from https://nyrkio.com/docs/getting-started
-          nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
-          # You may not want share the NYRKIO_JWT_TOKEN token with pull requests, for example.
-          # In that case this task would unnecessarily fail for random contributors. Don't want that:
-          never-fail: true
-          # Make results and change points public, so that any oss contributor can see them
-          nyrkio-public: true
-
-          nyrkio-api-root: https://nyrkio.com/api/v0
-          # Team support = results are visible and manageable to everyone in the same Github org
-          # nyrkio-org: tursodatabase
-
-          # Old way...
-          # Explicitly set this to null. We don't want threshold based alerts today.
-          external-data-json-path: null
-          gh-repository: null
-
-      - name: Analyze SQLITE3 result with Nyrkiö
-        uses: nyrkio/github-action-benchmark@HEAD
-        with:
-          name: clickbench/sqlite3
-          tool: time
-          output-file-path: clickbench-sqlite3.txt
-          fail-on-alert: false
-          comment-on-alert: true
-          comment-always: false
-          nyrkio-enable: true
-          nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
-          never-fail: true
-          nyrkio-public: true
-          nyrkio-api-root: https://nyrkio.com/api/v0
-          # nyrkio-org: tursodatabase
-
-          external-data-json-path: null
-          gh-repository: null
