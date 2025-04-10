@@ -104,12 +104,10 @@ impl TextRef {
 }
 
 #[derive(Debug, Clone)]
-pub enum OwnedValue {
-    Null,
-    Integer(i64),
-    Float(f64),
-    Text(Text),
-    Blob(Vec<u8>),
+pub struct OwnedValue {
+    buffer: Vec<u8>,
+    value_type: OwnedValueType,
+    text_subtype: Option<TextSubtype>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,61 +126,183 @@ pub enum RefValue {
 }
 
 impl OwnedValue {
-    // A helper function that makes building a text OwnedValue easier.
-    pub fn build_text(text: &str) -> Self {
-        Self::Text(Text::new(text))
+    pub fn null() -> Self {
+        Self {
+            buffer: Vec::new(),
+            value_type: OwnedValueType::Null,
+            text_subtype: None,
+        }
     }
 
-    pub fn to_blob(&self) -> Option<&[u8]> {
-        match self {
-            Self::Blob(blob) => Some(blob),
+    pub fn integer(value: i64) -> Self {
+        let mut buffer = Vec::with_capacity(8);
+        buffer.extend_from_slice(&value.to_ne_bytes());
+        Self {
+            buffer,
+            value_type: OwnedValueType::Integer,
+            text_subtype: None,
+        }
+    }
+
+    pub fn float(value: f64) -> Self {
+        let mut buffer = Vec::with_capacity(8);
+        buffer.extend_from_slice(&value.to_ne_bytes());
+        Self {
+            buffer,
+            value_type: OwnedValueType::Float,
+            text_subtype: None,
+        }
+    }
+
+    // Text creation with reuse of existing buffer
+    pub fn set_text(&mut self, value: &str) {
+        let bytes = value.as_bytes();
+        self.buffer.clear();
+        self.buffer.reserve(bytes.len());
+        self.buffer.extend_from_slice(bytes);
+        self.value_type = OwnedValueType::Text;
+        self.text_subtype = Some(TextSubtype::Text);
+    }
+
+    // Continue to support the old API
+    pub fn build_text(text: &str) -> Self {
+        let bytes = text.as_bytes();
+        Self {
+            buffer: bytes.to_vec(),
+            value_type: OwnedValueType::Text,
+            text_subtype: Some(TextSubtype::Text),
+        }
+    }
+
+    // Blob implementation
+    pub fn from_blob(data: Vec<u8>) -> Self {
+        Self {
+            buffer: data,
+            value_type: OwnedValueType::Blob,
+            text_subtype: None,
+        }
+    }
+
+    pub fn set_blob(&mut self, data: &[u8]) {
+        self.buffer.clear();
+        self.buffer.reserve(data.len());
+        self.buffer.extend_from_slice(data);
+        self.value_type = OwnedValueType::Blob;
+        self.text_subtype = None;
+    }
+
+    // Type conversion methods
+
+    pub fn as_integer(&self) -> Option<i64> {
+        match self.value_type {
+            OwnedValueType::Integer => {
+                if self.buffer.len() >= 8 {
+                    let mut bytes = [0u8; 8];
+                    bytes.copy_from_slice(&self.buffer[0..8]);
+                    Some(i64::from_ne_bytes(bytes))
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
 
-    pub fn from_blob(data: Vec<u8>) -> Self {
-        OwnedValue::Blob(data)
+    pub fn as_float(&self) -> Option<f64> {
+        match self.value_type {
+            OwnedValueType::Float => {
+                if self.buffer.len() >= 8 {
+                    let mut bytes = [0u8; 8];
+                    bytes.copy_from_slice(&self.buffer[0..8]);
+                    Some(f64::from_ne_bytes(bytes))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    pub fn as_text(&self) -> Option<&str> {
+        match self.value_type {
+            OwnedValueType::Text => std::str::from_utf8(&self.buffer).ok(),
+            _ => None,
+        }
     }
 
     pub fn to_text(&self) -> Option<&str> {
-        match self {
-            OwnedValue::Text(t) => Some(t.as_str()),
+        self.as_text()
+    }
+
+    pub fn to_blob(&self) -> Option<&[u8]> {
+        match self.value_type {
+            OwnedValueType::Blob => Some(&self.buffer),
             _ => None,
         }
     }
 
-    pub fn from_text(text: &str) -> Self {
-        OwnedValue::Text(Text::new(text))
+    // Type information
+    pub fn value_type(&self) -> OwnedValueType {
+        self.value_type
     }
 
-    pub fn value_type(&self) -> OwnedValueType {
-        match self {
-            OwnedValue::Null => OwnedValueType::Null,
-            OwnedValue::Integer(_) => OwnedValueType::Integer,
-            OwnedValue::Float(_) => OwnedValueType::Float,
-            OwnedValue::Text(_) => OwnedValueType::Text,
-            OwnedValue::Blob(_) => OwnedValueType::Blob,
-        }
+    // Conversion methods with optional buffer reuse
+    pub fn convert_to_integer(&mut self, value: i64) {
+        self.buffer.clear();
+        self.buffer.reserve(8);
+        self.buffer.extend_from_slice(&value.to_ne_bytes());
+        self.value_type = OwnedValueType::Integer;
+        self.text_subtype = None;
     }
+
+    pub fn convert_to_float(&mut self, value: f64) {
+        self.buffer.clear();
+        self.buffer.reserve(8);
+        self.buffer.extend_from_slice(&value.to_ne_bytes());
+        self.value_type = OwnedValueType::Float;
+        self.text_subtype = None;
+    }
+
+    pub fn convert_to_null(&mut self) {
+        self.buffer.clear();
+        self.value_type = OwnedValueType::Null;
+        self.text_subtype = None;
+    }
+
+    // Serialization for the database format
     pub fn serialize_serial(&self, out: &mut Vec<u8>) {
-        match self {
-            OwnedValue::Null => {}
-            OwnedValue::Integer(i) => {
+        match self.value_type {
+            OwnedValueType::Null => {}
+            OwnedValueType::Integer => {
+                let i = self.as_integer().unwrap();
                 let serial_type = SerialType::from(self);
+                // Same serialization logic as before
                 match serial_type {
-                    SerialType::I8 => out.extend_from_slice(&(*i as i8).to_be_bytes()),
-                    SerialType::I16 => out.extend_from_slice(&(*i as i16).to_be_bytes()),
-                    SerialType::I24 => out.extend_from_slice(&(*i as i32).to_be_bytes()[1..]), // remove most significant byte
-                    SerialType::I32 => out.extend_from_slice(&(*i as i32).to_be_bytes()),
-                    SerialType::I48 => out.extend_from_slice(&i.to_be_bytes()[2..]), // remove 2 most significant bytes
+                    SerialType::I8 => out.extend_from_slice(&(i as i8).to_be_bytes()),
+                    SerialType::I16 => out.extend_from_slice(&(i as i16).to_be_bytes()),
+                    SerialType::I24 => out.extend_from_slice(&(i as i32).to_be_bytes()[1..]),
+                    SerialType::I32 => out.extend_from_slice(&(i as i32).to_be_bytes()),
+                    SerialType::I48 => out.extend_from_slice(&i.to_be_bytes()[2..]),
                     SerialType::I64 => out.extend_from_slice(&i.to_be_bytes()),
                     _ => unreachable!(),
                 }
             }
-            OwnedValue::Float(f) => out.extend_from_slice(&f.to_be_bytes()),
-            OwnedValue::Text(t) => out.extend_from_slice(&t.value),
-            OwnedValue::Blob(b) => out.extend_from_slice(b),
-        };
+            OwnedValueType::Float => {
+                let f = self.as_float().unwrap();
+                out.extend_from_slice(&f.to_be_bytes());
+            }
+            OwnedValueType::Text => out.extend_from_slice(&self.buffer),
+            OwnedValueType::Blob => out.extend_from_slice(&self.buffer),
+            OwnedValueType::Error => todo!(),
+        }
+    }
+
+    pub fn from_text(text: &str) -> Self {
+        Self {
+            buffer: text.as_bytes().to_vec(),
+            value_type: OwnedValueType::Text,
+            text_subtype: Some(TextSubtype::Text),
+        }
     }
 }
 
@@ -214,165 +334,183 @@ impl ExternalAggState {
 /// }
 impl Display for OwnedValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Null => write!(f, ""),
-            Self::Integer(i) => {
-                write!(f, "{}", i)
+        match self.value_type {
+            OwnedValueType::Null => write!(f, ""),
+            OwnedValueType::Integer => {
+                if let Some(i) = self.as_integer() {
+                    write!(f, "{}", i)
+                } else {
+                    write!(f, "0")
+                }
             }
-            Self::Float(fl) => {
-                let fl = *fl;
-                if fl == f64::INFINITY {
-                    return write!(f, "Inf");
-                }
-                if fl == f64::NEG_INFINITY {
-                    return write!(f, "-Inf");
-                }
-                if fl.is_nan() {
-                    return write!(f, "");
-                }
-                // handle negative 0
-                if fl == -0.0 {
-                    return write!(f, "{:.1}", fl.abs());
-                }
+            OwnedValueType::Float => {
+                if let Some(fl) = self.as_float() {
+                    if fl == f64::INFINITY {
+                        return write!(f, "Inf");
+                    }
+                    if fl == f64::NEG_INFINITY {
+                        return write!(f, "-Inf");
+                    }
+                    if fl.is_nan() {
+                        return write!(f, "");
+                    }
+                    // handle negative 0
+                    if fl == -0.0 {
+                        return write!(f, "{:.1}", fl.abs());
+                    }
 
-                // handle scientific notation without trailing zeros
-                if (fl.abs() < 1e-4 || fl.abs() >= 1e15) && fl != 0.0 {
-                    let sci_notation = format!("{:.14e}", fl);
-                    let parts: Vec<&str> = sci_notation.split('e').collect();
+                    // handle scientific notation without trailing zeros
+                    if (fl.abs() < 1e-4 || fl.abs() >= 1e15) && fl != 0.0 {
+                        let sci_notation = format!("{:.14e}", fl);
+                        let parts: Vec<&str> = sci_notation.split('e').collect();
 
-                    if parts.len() == 2 {
-                        let mantissa = parts[0];
-                        let exponent = parts[1];
+                        if parts.len() == 2 {
+                            let mantissa = parts[0];
+                            let exponent = parts[1];
 
-                        let decimal_parts: Vec<&str> = mantissa.split('.').collect();
-                        if decimal_parts.len() == 2 {
-                            let whole = decimal_parts[0];
-                            // 1.{this part}
-                            let mut fraction = String::from(decimal_parts[1]);
+                            let decimal_parts: Vec<&str> = mantissa.split('.').collect();
+                            if decimal_parts.len() == 2 {
+                                let whole = decimal_parts[0];
+                                // 1.{this part}
+                                let mut fraction = String::from(decimal_parts[1]);
 
-                            //removing trailing 0 from fraction
-                            while fraction.ends_with('0') {
-                                fraction.pop();
+                                //removing trailing 0 from fraction
+                                while fraction.ends_with('0') {
+                                    fraction.pop();
+                                }
+
+                                let trimmed_mantissa = if fraction.is_empty() {
+                                    whole.to_string()
+                                } else {
+                                    format!("{}.{}", whole, fraction)
+                                };
+                                let (prefix, exponent) = if exponent.starts_with('-') {
+                                    ("-0", &exponent[1..])
+                                } else {
+                                    ("+", exponent)
+                                };
+                                return write!(f, "{}e{}{}", trimmed_mantissa, prefix, exponent);
                             }
+                        }
 
-                            let trimmed_mantissa = if fraction.is_empty() {
-                                whole.to_string()
-                            } else {
-                                format!("{}.{}", whole, fraction)
-                            };
-                            let (prefix, exponent) = if exponent.starts_with('-') {
-                                ("-0", &exponent[1..])
-                            } else {
-                                ("+", exponent)
-                            };
-                            return write!(f, "{}e{}{}", trimmed_mantissa, prefix, exponent);
+                        // fallback
+                        return write!(f, "{}", sci_notation);
+                    }
+
+                    // handle floating point max size is 15.
+                    // If left > right && right + left > 15 go to sci notation
+                    // If right > left && right + left > 15 truncate left so right + left == 15
+                    let rounded = fl.round();
+                    if (fl - rounded).abs() < 1e-14 {
+                        // if we very close to integer trim decimal part to 1 digit
+                        if rounded == rounded as i64 as f64 {
+                            return write!(f, "{:.1}", fl);
                         }
                     }
 
+                    let fl_str = format!("{}", fl);
+                    let splitted = fl_str.split('.').collect::<Vec<&str>>();
                     // fallback
-                    return write!(f, "{}", sci_notation);
-                }
-
-                // handle floating point max size is 15.
-                // If left > right && right + left > 15 go to sci notation
-                // If right > left && right + left > 15 truncate left so right + left == 15
-                let rounded = fl.round();
-                if (fl - rounded).abs() < 1e-14 {
-                    // if we very close to integer trim decimal part to 1 digit
-                    if rounded == rounded as i64 as f64 {
-                        return write!(f, "{:.1}", fl);
+                    if splitted.len() != 2 {
+                        return write!(f, "{:.14e}", fl);
                     }
-                }
 
-                let fl_str = format!("{}", fl);
-                let splitted = fl_str.split('.').collect::<Vec<&str>>();
-                // fallback
-                if splitted.len() != 2 {
-                    return write!(f, "{:.14e}", fl);
-                }
+                    let first_part = if fl < 0.0 {
+                        // remove -
+                        &splitted[0][1..]
+                    } else {
+                        splitted[0]
+                    };
 
-                let first_part = if fl < 0.0 {
-                    // remove -
-                    &splitted[0][1..]
+                    let second = splitted[1];
+
+                    // We want more precision for smaller numbers. in SQLite case we want 15 non zero digits in 0 < number < 1
+                    // leading zeroes added to max real size. But if float < 1e-4 we go to scientific notation
+                    let leading_zeros = second.chars().take_while(|c| c == &'0').count();
+                    let reminder = if first_part != "0" {
+                        MAX_REAL_SIZE as isize - first_part.len() as isize
+                    } else {
+                        MAX_REAL_SIZE as isize + leading_zeros as isize
+                    };
+                    // float that have integer part > 15 converted to sci notation
+                    if reminder < 0 {
+                        return write!(f, "{:.14e}", fl);
+                    }
+                    // trim decimal part to reminder or self len so total digits is 15;
+                    let mut fl = format!("{:.*}", second.len().min(reminder as usize), fl);
+                    // if decimal part ends with 0 we trim it
+                    while fl.ends_with('0') {
+                        fl.pop();
+                    }
+                    write!(f, "{}", fl)
                 } else {
-                    splitted[0]
-                };
-
-                let second = splitted[1];
-
-                // We want more precision for smaller numbers. in SQLite case we want 15 non zero digits in 0 < number < 1
-                // leading zeroes added to max real size. But if float < 1e-4 we go to scientific notation
-                let leading_zeros = second.chars().take_while(|c| c == &'0').count();
-                let reminder = if first_part != "0" {
-                    MAX_REAL_SIZE as isize - first_part.len() as isize
+                    write!(f, "0.0")
+                }
+            }
+            OwnedValueType::Text => {
+                if let Some(s) = self.as_text() {
+                    write!(f, "{}", s)
                 } else {
-                    MAX_REAL_SIZE as isize + leading_zeros as isize
-                };
-                // float that have integer part > 15 converted to sci notation
-                if reminder < 0 {
-                    return write!(f, "{:.14e}", fl);
+                    write!(f, "")
                 }
-                // trim decimal part to reminder or self len so total digits is 15;
-                let mut fl = format!("{:.*}", second.len().min(reminder as usize), fl);
-                // if decimal part ends with 0 we trim it
-                while fl.ends_with('0') {
-                    fl.pop();
-                }
-                write!(f, "{}", fl)
             }
-            Self::Text(s) => {
-                write!(f, "{}", s.as_str())
+
+            OwnedValueType::Blob => {
+                write!(f, "{}", String::from_utf8_lossy(&self.buffer))
             }
-            Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b)),
+            OwnedValueType::Error => todo!(),
         }
     }
 }
 
 impl OwnedValue {
     pub fn to_ffi(&self) -> ExtValue {
-        match self {
-            Self::Null => ExtValue::null(),
-            Self::Integer(i) => ExtValue::from_integer(*i),
-            Self::Float(fl) => ExtValue::from_float(*fl),
-            Self::Text(text) => ExtValue::from_text(text.as_str().to_string()),
-            Self::Blob(blob) => ExtValue::from_blob(blob.to_vec()),
+        match self.value_type {
+            OwnedValueType::Null => ExtValue::null(),
+            OwnedValueType::Integer => ExtValue::from_integer(self.as_integer().unwrap()),
+            OwnedValueType::Float => ExtValue::from_float(self.as_float().unwrap()),
+            OwnedValueType::Text => ExtValue::from_text(self.as_text().unwrap().to_string()),
+            OwnedValueType::Blob => ExtValue::from_blob(self.buffer.clone()),
+            OwnedValueType::Error => todo!(),
         }
     }
 
     pub fn from_ffi(v: ExtValue) -> Result<Self> {
         let res = match v.value_type() {
-            ExtValueType::Null => Ok(OwnedValue::Null),
+            ExtValueType::Null => Ok(Self::null()),
             ExtValueType::Integer => {
                 let Some(int) = v.to_integer() else {
-                    return Ok(OwnedValue::Null);
+                    return Ok(Self::null());
                 };
-                Ok(OwnedValue::Integer(int))
+                Ok(Self::integer(int))
             }
             ExtValueType::Float => {
                 let Some(float) = v.to_float() else {
-                    return Ok(OwnedValue::Null);
+                    return Ok(Self::null());
                 };
-                Ok(OwnedValue::Float(float))
+                Ok(Self::float(float))
             }
             ExtValueType::Text => {
                 let Some(text) = v.to_text() else {
-                    return Ok(OwnedValue::Null);
+                    return Ok(Self::null());
                 };
                 #[cfg(feature = "json")]
                 if v.is_json() {
-                    return Ok(OwnedValue::Text(Text::json(text.to_string())));
+                    let mut value = Self::from_text(text);
+                    value.text_subtype = Some(TextSubtype::Json);
+                    return Ok(value);
                 }
                 Ok(OwnedValue::build_text(text))
             }
             ExtValueType::Blob => {
                 let Some(blob) = v.to_blob() else {
-                    return Ok(OwnedValue::Null);
+                    return Ok(Self::null());
                 };
-                Ok(OwnedValue::Blob(blob))
+                Ok(Self::from_blob(blob))
             }
             ExtValueType::Error => {
                 let Some(err) = v.to_error_details() else {
-                    return Ok(OwnedValue::Null);
+                    return Ok(Self::null());
                 };
                 match err {
                     (_, Some(msg)) => Err(LimboError::ExtensionError(msg)),
@@ -396,7 +534,11 @@ pub enum AggContext {
     External(ExternalAggState),
 }
 
-const NULL: OwnedValue = OwnedValue::Null;
+const NULL: OwnedValue = OwnedValue {
+    buffer: Vec::new(),
+    value_type: OwnedValueType::Null,
+    text_subtype: None,
+};
 
 impl AggContext {
     pub fn compute_external(&mut self) -> Result<()> {
@@ -409,37 +551,48 @@ impl AggContext {
         Ok(())
     }
 
-    pub fn final_value(&self) -> &OwnedValue {
+    pub fn final_value(&self) -> OwnedValue {
         match self {
-            Self::Avg(acc, _count) => acc,
-            Self::Sum(acc) => acc,
-            Self::Count(count) => count,
-            Self::Max(max) => max.as_ref().unwrap_or(&NULL),
-            Self::Min(min) => min.as_ref().unwrap_or(&NULL),
-            Self::GroupConcat(s) => s,
-            Self::External(ext_state) => ext_state.finalized_value.as_ref().unwrap_or(&NULL),
+            Self::Avg(acc, _count) => acc.clone(),
+            Self::Sum(acc) => acc.clone(),
+            Self::Count(count) => count.clone(),
+            Self::Max(max) => max.clone().unwrap_or_else(|| OwnedValue::null()),
+            Self::Min(min) => min.clone().unwrap_or_else(|| OwnedValue::null()),
+            Self::GroupConcat(s) => s.clone(),
+            Self::External(ext_state) => ext_state
+                .finalized_value
+                .clone()
+                .unwrap_or_else(|| OwnedValue::null()),
         }
     }
 }
 
 impl PartialEq<OwnedValue> for OwnedValue {
     fn eq(&self, other: &OwnedValue) -> bool {
-        match (self, other) {
-            (Self::Integer(int_left), Self::Integer(int_right)) => int_left == int_right,
-            (Self::Integer(int_left), Self::Float(float_right)) => {
-                (*int_left as f64) == (*float_right)
+        match (self.value_type, other.value_type) {
+            (OwnedValueType::Integer, OwnedValueType::Integer) => {
+                self.as_integer() == other.as_integer()
             }
-            (Self::Float(float_left), Self::Integer(int_right)) => {
-                float_left == (&(*int_right as f64))
+            (OwnedValueType::Integer, OwnedValueType::Float) => {
+                (self.as_integer().unwrap() as f64) == (other.as_float().unwrap())
             }
-            (Self::Float(float_left), Self::Float(float_right)) => float_left == float_right,
-            (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => false,
-            (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => false,
-            (Self::Text(text_left), Self::Text(text_right)) => {
-                text_left.value.eq(&text_right.value)
+            (OwnedValueType::Float, OwnedValueType::Integer) => {
+                self.as_float().unwrap() == other.as_integer().unwrap() as f64
             }
-            (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.eq(blob_right),
-            (Self::Null, Self::Null) => true,
+            (OwnedValueType::Float, OwnedValueType::Float) => {
+                self.as_float().unwrap() == other.as_float().unwrap()
+            }
+            (
+                OwnedValueType::Integer | OwnedValueType::Float,
+                OwnedValueType::Text | OwnedValueType::Blob,
+            ) => false,
+            (
+                OwnedValueType::Text | OwnedValueType::Blob,
+                OwnedValueType::Integer | OwnedValueType::Float,
+            ) => false,
+            (OwnedValueType::Text, OwnedValueType::Text) => self.buffer == other.buffer,
+            (OwnedValueType::Blob, OwnedValueType::Blob) => self.buffer == other.buffer,
+            (OwnedValueType::Null, OwnedValueType::Null) => true,
             _ => false,
         }
     }
@@ -452,36 +605,40 @@ impl PartialEq<OwnedValue> for OwnedValue {
 #[allow(clippy::non_canonical_partial_ord_impl)]
 impl PartialOrd<OwnedValue> for OwnedValue {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        match (self, other) {
-            (Self::Integer(int_left), Self::Integer(int_right)) => int_left.partial_cmp(int_right),
-            (Self::Integer(int_left), Self::Float(float_right)) => {
-                (*int_left as f64).partial_cmp(float_right)
+        match (self.value_type, other.value_type) {
+            (OwnedValueType::Integer, OwnedValueType::Integer) => self
+                .as_integer()
+                .unwrap()
+                .partial_cmp(&other.as_integer().unwrap()),
+            (OwnedValueType::Integer, OwnedValueType::Float) => {
+                (self.as_integer().unwrap() as f64).partial_cmp(&other.as_float().unwrap())
             }
-            (Self::Float(float_left), Self::Integer(int_right)) => {
-                float_left.partial_cmp(&(*int_right as f64))
-            }
-            (Self::Float(float_left), Self::Float(float_right)) => {
-                float_left.partial_cmp(float_right)
-            }
-            // Numeric vs Text/Blob
-            (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => {
-                Some(std::cmp::Ordering::Less)
-            }
-            (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => {
-                Some(std::cmp::Ordering::Greater)
-            }
-
-            (Self::Text(text_left), Self::Text(text_right)) => {
-                text_left.value.partial_cmp(&text_right.value)
-            }
+            (OwnedValueType::Float, OwnedValueType::Integer) => self
+                .as_integer()
+                .unwrap()
+                .partial_cmp(&(other.as_float().unwrap() as i64)),
+            (OwnedValueType::Float, OwnedValueType::Float) => self
+                .as_float()
+                .unwrap()
+                .partial_cmp(&other.as_float().unwrap()),
+            (
+                OwnedValueType::Integer | OwnedValueType::Float,
+                OwnedValueType::Text | OwnedValueType::Blob,
+            ) => Some(std::cmp::Ordering::Less),
+            (
+                OwnedValueType::Text | OwnedValueType::Blob,
+                OwnedValueType::Integer | OwnedValueType::Float,
+            ) => Some(std::cmp::Ordering::Greater),
+            (OwnedValueType::Text, OwnedValueType::Text) => self.buffer.partial_cmp(&other.buffer),
             // Text vs Blob
-            (Self::Text(_), Self::Blob(_)) => Some(std::cmp::Ordering::Less),
-            (Self::Blob(_), Self::Text(_)) => Some(std::cmp::Ordering::Greater),
+            (OwnedValueType::Text, OwnedValueType::Blob) => Some(std::cmp::Ordering::Less),
+            (OwnedValueType::Blob, OwnedValueType::Text) => Some(std::cmp::Ordering::Greater),
 
-            (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.partial_cmp(blob_right),
-            (Self::Null, Self::Null) => Some(std::cmp::Ordering::Equal),
-            (Self::Null, _) => Some(std::cmp::Ordering::Less),
-            (_, Self::Null) => Some(std::cmp::Ordering::Greater),
+            (OwnedValueType::Blob, OwnedValueType::Blob) => self.buffer.partial_cmp(&other.buffer),
+            (OwnedValueType::Null, OwnedValueType::Null) => Some(std::cmp::Ordering::Equal),
+            (OwnedValueType::Null, _) => Some(std::cmp::Ordering::Less),
+            (_, OwnedValueType::Null) => Some(std::cmp::Ordering::Greater),
+            (_, _) => todo!(),
         }
     }
 }
@@ -512,39 +669,58 @@ impl std::ops::Add<OwnedValue> for OwnedValue {
     type Output = OwnedValue;
 
     fn add(self, rhs: Self) -> Self::Output {
-        match (self, rhs) {
-            (Self::Integer(int_left), Self::Integer(int_right)) => {
-                Self::Integer(int_left + int_right)
+        match (self.value_type, rhs.value_type) {
+            (OwnedValueType::Integer, OwnedValueType::Integer) => {
+                let lhs = self.as_integer().unwrap();
+                let rhs = rhs.as_integer().unwrap();
+                OwnedValue::integer(lhs + rhs)
             }
-            (Self::Integer(int_left), Self::Float(float_right)) => {
-                Self::Float(int_left as f64 + float_right)
+            (OwnedValueType::Integer, OwnedValueType::Float) => {
+                let lhs = self.as_integer().unwrap() as f64;
+                let rhs = rhs.as_float().unwrap();
+                OwnedValue::float(lhs + rhs)
             }
-            (Self::Float(float_left), Self::Integer(int_right)) => {
-                Self::Float(float_left + int_right as f64)
+            (OwnedValueType::Float, OwnedValueType::Integer) => {
+                let lhs = self.as_float().unwrap();
+                let rhs = rhs.as_integer().unwrap() as f64;
+                OwnedValue::float(lhs + rhs)
             }
-            (Self::Float(float_left), Self::Float(float_right)) => {
-                Self::Float(float_left + float_right)
+            (OwnedValueType::Float, OwnedValueType::Float) => {
+                let lhs = self.as_float().unwrap();
+                let rhs = rhs.as_float().unwrap();
+                OwnedValue::float(lhs + rhs)
             }
-            (Self::Text(string_left), Self::Text(string_right)) => {
-                Self::build_text(&(string_left.as_str().to_string() + string_right.as_str()))
+            (OwnedValueType::Text, OwnedValueType::Text) => {
+                let lhs = self.as_text().unwrap();
+                let rhs = rhs.as_text().unwrap();
+                OwnedValue::build_text(&(lhs.to_string() + rhs))
             }
-            (Self::Text(string_left), Self::Integer(int_right)) => {
-                Self::build_text(&(string_left.as_str().to_string() + &int_right.to_string()))
+            (OwnedValueType::Text, OwnedValueType::Integer) => {
+                let lhs = self.as_text().unwrap();
+                let rhs = rhs.as_integer().unwrap().to_string();
+                OwnedValue::build_text(&(lhs.to_string() + &rhs))
             }
-            (Self::Integer(int_left), Self::Text(string_right)) => {
-                Self::build_text(&(int_left.to_string() + string_right.as_str()))
+
+            (OwnedValueType::Integer, OwnedValueType::Text) => {
+                let lhs = self.as_integer().unwrap().to_string();
+                let rhs = rhs.as_text().unwrap();
+                OwnedValue::build_text(&(lhs + rhs))
             }
-            (Self::Text(string_left), Self::Float(float_right)) => {
-                let string_right = Self::Float(float_right).to_string();
-                Self::build_text(&(string_left.as_str().to_string() + &string_right))
+            (OwnedValueType::Text, OwnedValueType::Float) => {
+                let lhs = self.as_text().unwrap();
+                let rhs = rhs.as_float().unwrap();
+                let string_right = rhs.to_string();
+                OwnedValue::build_text(&(lhs.to_string() + &string_right))
             }
-            (Self::Float(float_left), Self::Text(string_right)) => {
-                let string_left = Self::Float(float_left).to_string();
-                Self::build_text(&(string_left + string_right.as_str()))
+            (OwnedValueType::Float, OwnedValueType::Text) => {
+                let lhs = self.as_float().unwrap();
+                let string_left = lhs.to_string();
+                let rhs = rhs.as_text().unwrap();
+                OwnedValue::build_text(&(string_left + rhs))
             }
-            (lhs, Self::Null) => lhs,
-            (Self::Null, rhs) => rhs,
-            _ => Self::Float(0.0),
+            (_, OwnedValueType::Null) => self,
+            (OwnedValueType::Null, _) => rhs,
+            _ => OwnedValue::float(0.0),
         }
     }
 }
@@ -553,9 +729,15 @@ impl std::ops::Add<f64> for OwnedValue {
     type Output = OwnedValue;
 
     fn add(self, rhs: f64) -> Self::Output {
-        match self {
-            Self::Integer(int_left) => Self::Float(int_left as f64 + rhs),
-            Self::Float(float_left) => Self::Float(float_left + rhs),
+        match self.value_type {
+            OwnedValueType::Integer => {
+                let int_left = self.as_integer().unwrap();
+                OwnedValue::float(int_left as f64 + rhs)
+            }
+            OwnedValueType::Float => {
+                let float_left = self.as_float().unwrap();
+                OwnedValue::float(float_left + rhs)
+            }
             _ => unreachable!(),
         }
     }
@@ -565,9 +747,15 @@ impl std::ops::Add<i64> for OwnedValue {
     type Output = OwnedValue;
 
     fn add(self, rhs: i64) -> Self::Output {
-        match self {
-            Self::Integer(int_left) => Self::Integer(int_left + rhs),
-            Self::Float(float_left) => Self::Float(float_left + rhs as f64),
+        match self.value_type {
+            OwnedValueType::Integer => {
+                let int_left = self.as_integer().unwrap();
+                OwnedValue::integer(int_left + rhs)
+            }
+            OwnedValueType::Float => {
+                let float_left = self.as_float().unwrap();
+                OwnedValue::float(float_left + rhs as f64)
+            }
             _ => unreachable!(),
         }
     }
@@ -595,20 +783,20 @@ impl std::ops::Div<OwnedValue> for OwnedValue {
     type Output = OwnedValue;
 
     fn div(self, rhs: OwnedValue) -> Self::Output {
-        match (self, rhs) {
-            (Self::Integer(int_left), Self::Integer(int_right)) => {
-                Self::Integer(int_left / int_right)
+        match (self.value_type, rhs.value_type) {
+            (OwnedValueType::Integer, OwnedValueType::Integer) => {
+                Self::integer(self.as_integer().unwrap() / rhs.as_integer().unwrap())
             }
-            (Self::Integer(int_left), Self::Float(float_right)) => {
-                Self::Float(int_left as f64 / float_right)
+            (OwnedValueType::Integer, OwnedValueType::Float) => {
+                Self::float(self.as_integer().unwrap() as f64 / rhs.as_float().unwrap())
             }
-            (Self::Float(float_left), Self::Integer(int_right)) => {
-                Self::Float(float_left / int_right as f64)
+            (OwnedValueType::Float, OwnedValueType::Integer) => {
+                Self::float(self.as_float().unwrap() / rhs.as_integer().unwrap() as f64)
             }
-            (Self::Float(float_left), Self::Float(float_right)) => {
-                Self::Float(float_left / float_right)
+            (OwnedValueType::Float, OwnedValueType::Float) => {
+                Self::float(self.as_float().unwrap() / self.as_float().unwrap())
             }
-            _ => Self::Float(0.0),
+            _ => Self::float(0.0),
         }
     }
 }
@@ -835,47 +1023,48 @@ impl ImmutableRecord {
         for value in registers {
             let value = value.get_owned_value();
             let start_offset = writer.pos;
-            match value {
-                OwnedValue::Null => {
+            match value.value_type {
+                OwnedValueType::Null => {
                     values.push(RefValue::Null);
                 }
-                OwnedValue::Integer(i) => {
-                    values.push(RefValue::Integer(*i));
+                OwnedValueType::Integer => {
+                    let i = value.as_integer().unwrap();
+                    values.push(RefValue::Integer(i));
                     let serial_type = SerialType::from(value);
                     match serial_type {
-                        SerialType::I8 => writer.extend_from_slice(&(*i as i8).to_be_bytes()),
-                        SerialType::I16 => writer.extend_from_slice(&(*i as i16).to_be_bytes()),
-                        SerialType::I24 => {
-                            writer.extend_from_slice(&(*i as i32).to_be_bytes()[1..])
-                        } // remove most significant byte
-                        SerialType::I32 => writer.extend_from_slice(&(*i as i32).to_be_bytes()),
+                        SerialType::I8 => writer.extend_from_slice(&(i as i8).to_be_bytes()),
+                        SerialType::I16 => writer.extend_from_slice(&(i as i16).to_be_bytes()),
+                        SerialType::I24 => writer.extend_from_slice(&(i as i32).to_be_bytes()[1..]), // remove most significant byte
+                        SerialType::I32 => writer.extend_from_slice(&(i as i32).to_be_bytes()),
                         SerialType::I48 => writer.extend_from_slice(&i.to_be_bytes()[2..]), // remove 2 most significant bytes
                         SerialType::I64 => writer.extend_from_slice(&i.to_be_bytes()),
                         _ => unreachable!(),
                     }
                 }
-                OwnedValue::Float(f) => {
-                    values.push(RefValue::Float(*f));
+                OwnedValueType::Float => {
+                    let f = value.as_float().unwrap();
+                    values.push(RefValue::Float(f));
                     writer.extend_from_slice(&f.to_be_bytes())
                 }
-                OwnedValue::Text(t) => {
-                    writer.extend_from_slice(&t.value);
+                OwnedValueType::Text => {
+                    writer.extend_from_slice(&value.buffer);
                     let end_offset = writer.pos;
                     let len = end_offset - start_offset;
                     let ptr = unsafe { writer.buf.as_ptr().add(start_offset) };
                     let value = RefValue::Text(TextRef {
                         value: RawSlice::new(ptr, len),
-                        subtype: t.subtype.clone(),
+                        subtype: value.text_subtype.clone().unwrap(),
                     });
                     values.push(value);
                 }
-                OwnedValue::Blob(b) => {
-                    writer.extend_from_slice(b);
+                OwnedValueType::Blob => {
+                    writer.extend_from_slice(&value.buffer.as_slice());
                     let end_offset = writer.pos;
                     let len = end_offset - start_offset;
                     let ptr = unsafe { writer.buf.as_ptr().add(start_offset) };
                     values.push(RefValue::Blob(RawSlice::new(ptr, len)));
                 }
+                _ => todo!(),
             };
         }
 
@@ -966,14 +1155,19 @@ impl RefValue {
 
     pub fn to_owned(&self) -> OwnedValue {
         match self {
-            RefValue::Null => OwnedValue::Null,
-            RefValue::Integer(i) => OwnedValue::Integer(*i),
-            RefValue::Float(f) => OwnedValue::Float(*f),
-            RefValue::Text(text_ref) => OwnedValue::Text(Text {
-                value: text_ref.value.to_slice().to_vec(),
-                subtype: text_ref.subtype.clone(),
-            }),
-            RefValue::Blob(b) => OwnedValue::Blob(b.to_slice().to_vec()),
+            RefValue::Null => OwnedValue::null(),
+            RefValue::Integer(i) => OwnedValue::integer(*i),
+            RefValue::Float(f) => OwnedValue::float(*f),
+            RefValue::Text(text_ref) => {
+                let bytes = text_ref.value.to_slice();
+                let mut value = OwnedValue {
+                    buffer: bytes.to_vec(),
+                    value_type: OwnedValueType::Text,
+                    text_subtype: Some(text_ref.subtype.clone()),
+                };
+                value
+            }
+            RefValue::Blob(b) => OwnedValue::from_blob(b.to_slice().to_vec()),
         }
     }
     pub fn to_blob(&self) -> Option<&[u8]> {
@@ -1076,23 +1270,27 @@ enum SerialType {
 
 impl From<&OwnedValue> for SerialType {
     fn from(value: &OwnedValue) -> Self {
-        match value {
-            OwnedValue::Null => SerialType::Null,
-            OwnedValue::Integer(i) => match i {
-                i if *i >= I8_LOW && *i <= I8_HIGH => SerialType::I8,
-                i if *i >= I16_LOW && *i <= I16_HIGH => SerialType::I16,
-                i if *i >= I24_LOW && *i <= I24_HIGH => SerialType::I24,
-                i if *i >= I32_LOW && *i <= I32_HIGH => SerialType::I32,
-                i if *i >= I48_LOW && *i <= I48_HIGH => SerialType::I48,
-                _ => SerialType::I64,
+        match value.value_type {
+            OwnedValueType::Null => SerialType::Null,
+            OwnedValueType::Integer => {
+                let i = value.as_integer().unwrap();
+                match i {
+                    i if i >= I8_LOW && i <= I8_HIGH => SerialType::I8,
+                    i if i >= I16_LOW && i <= I16_HIGH => SerialType::I16,
+                    i if i >= I24_LOW && i <= I24_HIGH => SerialType::I24,
+                    i if i >= I32_LOW && i <= I32_HIGH => SerialType::I32,
+                    i if i >= I48_LOW && i <= I48_HIGH => SerialType::I48,
+                    _ => SerialType::I64,
+                }
+            }
+            OwnedValueType::Float => SerialType::F64,
+            OwnedValueType::Text => SerialType::Text {
+                content_size: value.buffer.len(),
             },
-            OwnedValue::Float(_) => SerialType::F64,
-            OwnedValue::Text(t) => SerialType::Text {
-                content_size: t.value.len(),
+            OwnedValueType::Blob => SerialType::Blob {
+                content_size: value.buffer.len(),
             },
-            OwnedValue::Blob(b) => SerialType::Blob {
-                content_size: b.len(),
-            },
+            _ => todo!(),
         }
     }
 }
@@ -1134,23 +1332,32 @@ impl Record {
         let mut header_size = buf.len() - initial_i;
         // write content
         for value in &self.values {
-            match value {
-                OwnedValue::Null => {}
-                OwnedValue::Integer(i) => {
+            match value.value_type {
+                OwnedValueType::Null => {}
+                OwnedValueType::Integer => {
+                    let i = value.as_integer().unwrap();
                     let serial_type = SerialType::from(value);
                     match serial_type {
-                        SerialType::I8 => buf.extend_from_slice(&(*i as i8).to_be_bytes()),
-                        SerialType::I16 => buf.extend_from_slice(&(*i as i16).to_be_bytes()),
-                        SerialType::I24 => buf.extend_from_slice(&(*i as i32).to_be_bytes()[1..]), // remove most significant byte
-                        SerialType::I32 => buf.extend_from_slice(&(*i as i32).to_be_bytes()),
+                        SerialType::I8 => buf.extend_from_slice(&(i as i8).to_be_bytes()),
+                        SerialType::I16 => buf.extend_from_slice(&(i as i16).to_be_bytes()),
+                        SerialType::I24 => buf.extend_from_slice(&(i as i32).to_be_bytes()[1..]), // remove most significant byte
+                        SerialType::I32 => buf.extend_from_slice(&(i as i32).to_be_bytes()),
                         SerialType::I48 => buf.extend_from_slice(&i.to_be_bytes()[2..]), // remove 2 most significant bytes
                         SerialType::I64 => buf.extend_from_slice(&i.to_be_bytes()),
                         _ => unreachable!(),
                     }
                 }
-                OwnedValue::Float(f) => buf.extend_from_slice(&f.to_be_bytes()),
-                OwnedValue::Text(t) => buf.extend_from_slice(&t.value),
-                OwnedValue::Blob(b) => buf.extend_from_slice(b),
+                OwnedValueType::Float => {
+                    let f = value.as_float().unwrap();
+                    buf.extend_from_slice(&f.to_be_bytes())
+                }
+                OwnedValueType::Text => {
+                    buf.extend_from_slice(&value.buffer);
+                }
+                OwnedValueType::Blob => {
+                    buf.extend_from_slice(&value.buffer);
+                }
+                _ => todo!(),
             };
         }
 
@@ -1280,7 +1487,7 @@ mod tests {
 
     #[test]
     fn test_serialize_null() {
-        let record = Record::new(vec![OwnedValue::Null]);
+        let record = Record::new(vec![OwnedValue::null()]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
 
@@ -1297,12 +1504,12 @@ mod tests {
     #[test]
     fn test_serialize_integers() {
         let record = Record::new(vec![
-            OwnedValue::Integer(42),                // Should use SERIAL_TYPE_I8
-            OwnedValue::Integer(1000),              // Should use SERIAL_TYPE_I16
-            OwnedValue::Integer(1_000_000),         // Should use SERIAL_TYPE_I24
-            OwnedValue::Integer(1_000_000_000),     // Should use SERIAL_TYPE_I32
-            OwnedValue::Integer(1_000_000_000_000), // Should use SERIAL_TYPE_I48
-            OwnedValue::Integer(i64::MAX),          // Should use SERIAL_TYPE_I64
+            OwnedValue::integer(42),                // Should use SERIAL_TYPE_I8
+            OwnedValue::integer(1000),              // Should use SERIAL_TYPE_I16
+            OwnedValue::integer(1_000_000),         // Should use SERIAL_TYPE_I24
+            OwnedValue::integer(1_000_000_000),     // Should use SERIAL_TYPE_I32
+            OwnedValue::integer(1_000_000_000_000), // Should use SERIAL_TYPE_I48
+            OwnedValue::integer(i64::MAX),          // Should use SERIAL_TYPE_I64
         ]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
@@ -1372,7 +1579,7 @@ mod tests {
     #[test]
     fn test_serialize_float() {
         #[warn(clippy::approx_constant)]
-        let record = Record::new(vec![OwnedValue::Float(3.15555)]);
+        let record = Record::new(vec![OwnedValue::float(3.15555)]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
 
@@ -1393,7 +1600,11 @@ mod tests {
     #[test]
     fn test_serialize_text() {
         let text = "hello";
-        let record = Record::new(vec![OwnedValue::Text(Text::new(text))]);
+        let record = Record::new(vec![OwnedValue {
+            buffer: text.as_bytes().to_vec(),
+            value_type: OwnedValueType::Text,
+            text_subtype: Some(TextSubtype::Text),
+        }]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
 
@@ -1412,7 +1623,7 @@ mod tests {
     #[test]
     fn test_serialize_blob() {
         let blob = vec![1, 2, 3, 4, 5];
-        let record = Record::new(vec![OwnedValue::Blob(blob.clone())]);
+        let record = Record::new(vec![OwnedValue::from_blob(blob.clone())]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
 
@@ -1432,10 +1643,14 @@ mod tests {
     fn test_serialize_mixed_types() {
         let text = "test";
         let record = Record::new(vec![
-            OwnedValue::Null,
-            OwnedValue::Integer(42),
-            OwnedValue::Float(3.15),
-            OwnedValue::Text(Text::new(text)),
+            OwnedValue::null(),
+            OwnedValue::integer(42),
+            OwnedValue::float(3.15),
+            OwnedValue {
+                buffer: text.as_bytes().to_vec(),
+                value_type: OwnedValueType::Text,
+                text_subtype: Some(TextSubtype::Text),
+            },
         ]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
