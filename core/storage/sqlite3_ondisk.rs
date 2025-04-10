@@ -413,6 +413,15 @@ impl Clone for PageContent {
 }
 
 impl PageContent {
+    pub fn new(offset: usize, buffer: Arc<RefCell<Buffer>>) -> Self {
+        poison_buffer(&mut buffer.borrow_mut());
+        Self {
+            offset,
+            buffer,
+            overflow_cells: Vec::new(),
+        }
+    }
+
     pub fn page_type(&self) -> PageType {
         self.read_u8(0).try_into().unwrap()
     }
@@ -705,6 +714,18 @@ impl PageContent {
     }
 }
 
+#[cfg(debug_assertions)]
+fn poison_buffer(buffer: &mut Buffer) {
+    let buf = buffer.as_mut_slice();
+    for i in 0..buf.len() {
+        buf[i] = 0xDE;
+    }
+}
+
+#[cfg(not(debug_assertions))]
+#[inline(always)]
+fn poison_buffer(_buffer: &mut Buffer) {}
+
 pub fn begin_read_page(
     db_file: Arc<dyn DatabaseStorage>,
     buffer_pool: Rc<BufferPool>,
@@ -741,11 +762,7 @@ fn finish_read_page(
     } else {
         0
     };
-    let inner = PageContent {
-        offset: pos,
-        buffer: buffer_ref.clone(),
-        overflow_cells: Vec::new(),
-    };
+    let inner = PageContent::new(pos, buffer_ref.clone());
     {
         page.get().contents.replace(inner);
         page.set_uptodate();

@@ -698,11 +698,10 @@ impl WalFile {
             let drop_fn = Rc::new(move |buf| {
                 buffer_pool.put(buf);
             });
-            checkpoint_page.get().contents = Some(PageContent {
-                offset: 0,
-                buffer: Arc::new(RefCell::new(Buffer::new(buffer, drop_fn))),
-                overflow_cells: Vec::new(),
-            });
+            checkpoint_page.get().contents = Some(PageContent::new(
+                0,
+                Arc::new(RefCell::new(Buffer::new(buffer, drop_fn))),
+            ));
         }
         Self {
             io,

@@ -4893,14 +4893,13 @@ mod tests {
         let page = Arc::new(Page::new(id));
 
         let drop_fn = Rc::new(|_| {});
-        let inner = PageContent {
-            offset: 0,
-            buffer: Arc::new(RefCell::new(Buffer::new(
+        let inner = PageContent::new(
+            0,
+            Arc::new(RefCell::new(Buffer::new(
                 BufferData::new(vec![0; 4096]),
                 drop_fn,
             ))),
-            overflow_cells: Vec::new(),
-        };
+        );
         page.get().contents.replace(inner);
 
         btree_init_page(&page, PageType::TableLeaf, 0, 4096);
