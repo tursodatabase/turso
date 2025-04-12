@@ -6,6 +6,7 @@ use crate::{
     function::AggFunc,
     schema::{Column, PseudoTable},
     types::{OwnedValue, Record},
+    util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::Insn,
@@ -37,12 +38,15 @@ pub struct GroupByMetadata {
     pub reg_sorter_key: usize,
     // Register holding a flag to abort the grouping process if necessary
     pub reg_abort_flag: usize,
-    // Register holding the start of the accumulator group registers (i.e. the groups, not the aggregates)
-    pub reg_group_exprs_acc: usize,
+    // Register holding the start of the non aggregate query members (all columns except aggregate arguments)
+    pub reg_non_aggregate_exprs_acc: usize,
     // Starting index of the register(s) that hold the comparison result between the current row and the previous row
     // The comparison result is used to determine if the current row belongs to the same group as the previous row
     // Each group by expression has a corresponding register
     pub reg_group_exprs_cmp: usize,
+    // Columns that not part of GROUP BY clause and not arguments of Aggregation function.
+    // Heavy calculation and needed in different functions, so it is reasonable to do it once and save.
+    pub non_group_by_non_agg_column_count: Option<usize>,
 }
 
 /// Initialize resources needed for GROUP BY processing
@@ -50,15 +54,21 @@ pub fn init_group_by(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     group_by: &GroupBy,
-    aggregates: &[Aggregate],
+    plan: &SelectPlan,
 ) -> Result<()> {
-    let num_aggs = aggregates.len();
+    let num_aggs = plan.aggregates.len();
+
+    let non_aggregate_count = plan
+        .result_columns
+        .iter()
+        .filter(|rc| !rc.contains_aggregates)
+        .count();
 
     let sort_cursor = program.alloc_cursor_id(None, CursorType::Sorter);
 
     let reg_abort_flag = program.alloc_register();
     let reg_group_exprs_cmp = program.alloc_registers(group_by.exprs.len());
-    let reg_group_exprs_acc = program.alloc_registers(group_by.exprs.len());
+    let reg_non_aggregate_exprs_acc = program.alloc_registers(non_aggregate_count);
     let reg_agg_exprs_start = program.alloc_registers(num_aggs);
     let reg_sorter_key = program.alloc_register();
 
@@ -71,7 +81,7 @@ pub fn init_group_by(
     }
     program.emit_insn(Insn::SorterOpen {
         cursor_id: sort_cursor,
-        columns: aggregates.len() + group_by.exprs.len(),
+        columns: non_aggregate_count + plan.aggregates.len(),
         order: Record::new(order),
     });
 
@@ -110,9 +120,10 @@ pub fn init_group_by(
         label_acc_indicator_set_flag_true: program.allocate_label(),
         reg_subrtn_acc_clear_return_offset,
         reg_abort_flag,
-        reg_group_exprs_acc,
+        reg_non_aggregate_exprs_acc,
         reg_group_exprs_cmp,
         reg_sorter_key,
+        non_group_by_non_agg_column_count: None,
     });
     Ok(())
 }
@@ -146,25 +157,57 @@ pub fn emit_group_by<'a>(
         sort_cursor,
         reg_group_exprs_cmp,
         reg_subrtn_acc_clear_return_offset,
-        reg_group_exprs_acc,
+        reg_non_aggregate_exprs_acc,
         reg_abort_flag,
         reg_sorter_key,
         label_subrtn_acc_clear,
         label_acc_indicator_set_flag_true,
+        non_group_by_non_agg_column_count,
         ..
     } = *t_ctx.meta_group_by.as_mut().unwrap();
-
     let group_by = plan.group_by.as_ref().unwrap();
 
-    // all group by columns and all arguments of agg functions are in the sorter.
-    // the sort keys are the group by columns (the aggregation within groups is done based on how long the sort keys remain the same)
-    let sorter_column_count = group_by.exprs.len()
-        + plan
-            .aggregates
+    let agg_args_count = plan
+        .aggregates
+        .iter()
+        .map(|agg| agg.args.len())
+        .sum::<usize>();
+    let group_by_count = group_by.exprs.len();
+    let non_group_by_non_agg_column_count = non_group_by_non_agg_column_count.unwrap();
+
+    // We have to know which group by expr present in resulting set
+    let group_by_expr_in_res_cols = group_by.exprs.iter().map(|expr| {
+        plan.result_columns
             .iter()
-            .map(|agg| agg.args.len())
-            .sum::<usize>();
-    // sorter column names do not matter
+            .any(|e| exprs_are_equivalent(&e.expr, expr))
+    });
+
+    // Create a map from sorter column index to result register
+    // This helps track where each column from the sorter should be stored
+    let mut column_register_mapping =
+        vec![None; group_by_count + non_group_by_non_agg_column_count];
+    let mut next_reg = reg_non_aggregate_exprs_acc;
+
+    // Map GROUP BY columns that are in the result set to registers
+    for (i, is_in_result) in group_by_expr_in_res_cols.clone().enumerate() {
+        if is_in_result {
+            column_register_mapping[i] = Some(next_reg);
+            next_reg += 1;
+        }
+    }
+
+    // Handle other non-aggregate columns that aren't part of GROUP BY and not part of Aggregation function
+    for i in group_by_count..group_by_count + non_group_by_non_agg_column_count {
+        column_register_mapping[i] = Some(next_reg);
+        next_reg += 1;
+    }
+
+    // Calculate total number of columns in the sorter
+    // The sorter contains all GROUP BY columns, aggregate arguments, and other columns
+    let sorter_column_count = agg_args_count + group_by_count + non_group_by_non_agg_column_count;
+
+    // Create pseudo-columns for the pseudo-table
+    // (these are placeholders as we only care about structure, not semantics)
     let ty = crate::schema::Type::Null;
     let pseudo_columns = (0..sorter_column_count)
         .map(|_| Column {
@@ -178,7 +221,8 @@ pub fn emit_group_by<'a>(
         })
         .collect::<Vec<_>>();
 
-    // A pseudo table is a "fake" table to which we read one row at a time from the sorter
+    // Create a pseudo-table to read one row at a time from the sorter
+    // This allows us to use standard table access operations on the sorted data
     let pseudo_table = Rc::new(PseudoTable {
         columns: pseudo_columns,
     });
@@ -237,13 +281,6 @@ pub fn emit_group_by<'a>(
         target_pc_gt: program.offset().add(1u32),
     });
 
-    // New group, move current group by columns into the comparison register
-    program.emit_insn(Insn::Move {
-        source_reg: groups_start_reg,
-        dest_reg: reg_group_exprs_cmp,
-        count: group_by.exprs.len(),
-    });
-
     program.add_comment(
         program.offset(),
         "check if ended group had data, and output if so",
@@ -251,6 +288,13 @@ pub fn emit_group_by<'a>(
     program.emit_insn(Insn::Gosub {
         target_pc: label_subrtn_acc_output,
         return_reg: reg_subrtn_acc_output_return_offset,
+    });
+
+    // New group, move current group by columns into the comparison register
+    program.emit_insn(Insn::Move {
+        source_reg: groups_start_reg,
+        dest_reg: reg_group_exprs_cmp,
+        count: group_by.exprs.len(),
     });
 
     program.add_comment(program.offset(), "check abort flag");
@@ -266,10 +310,10 @@ pub fn emit_group_by<'a>(
         return_reg: reg_subrtn_acc_clear_return_offset,
     });
 
-    // Accumulate the values into the aggregations
+    // Process each aggregate function for the current row
     program.resolve_label(agg_step_label, program.offset());
     let start_reg = t_ctx.reg_agg_start.unwrap();
-    let mut cursor_index = group_by.exprs.len();
+    let mut cursor_index = group_by_count + non_group_by_non_agg_column_count; // Skipping all columns in sorter that not an aggregation arguments
     for (i, agg) in plan.aggregates.iter().enumerate() {
         let agg_result_reg = start_reg + i;
         translate_aggregation_step_groupby(
@@ -284,7 +328,8 @@ pub fn emit_group_by<'a>(
         cursor_index += agg.args.len();
     }
 
-    // We only emit the group by columns if we are going to start a new group (i.e. the prev group will not accumulate any more values into the aggregations)
+    // We only need to store non-aggregate columns once per group
+    // Skip if we've already stored them for this group
     program.add_comment(
         program.offset(),
         "don't emit group columns if continuing existing group",
@@ -295,17 +340,18 @@ pub fn emit_group_by<'a>(
         jump_if_null: false,
     });
 
-    // Read the group by columns for a finished group
-    for i in 0..group_by.exprs.len() {
-        let key_reg = reg_group_exprs_acc + i;
-        let sorter_column_index = i;
-        program.emit_insn(Insn::Column {
-            cursor_id: pseudo_cursor,
-            column: sorter_column_index,
-            dest: key_reg,
-        });
+    // Read non-aggregate columns from the current row
+    for (sorter_column_index, dest_reg) in column_register_mapping.iter().enumerate() {
+        if let Some(dest_reg) = dest_reg {
+            program.emit_insn(Insn::Column {
+                cursor_id: pseudo_cursor,
+                column: sorter_column_index,
+                dest: *dest_reg,
+            });
+        }
     }
 
+    // Mark that we've stored data for this group
     program.resolve_label(label_acc_indicator_set_flag_true, program.offset());
     program.add_comment(program.offset(), "indicate data in accumulator");
     program.emit_insn(Insn::Integer {
@@ -313,6 +359,7 @@ pub fn emit_group_by<'a>(
         dest: reg_data_in_acc_flag,
     });
 
+    // Continue to the next row in the sorter
     program.emit_insn(Insn::SorterNext {
         cursor_id: sort_cursor,
         pc_if_next: label_grouping_loop_start,
@@ -340,18 +387,22 @@ pub fn emit_group_by<'a>(
 
     program.resolve_label(label_subrtn_acc_output, program.offset());
 
+    // Only output a row if there's data in the accumulator
     program.add_comment(program.offset(), "output group by row subroutine start");
     program.emit_insn(Insn::IfPos {
         reg: reg_data_in_acc_flag,
         target_pc: label_agg_final,
         decrement_by: 0,
     });
+
+    // If no data, return without outputting a row
     let group_by_end_without_emitting_row_label = program.allocate_label();
     program.resolve_label(group_by_end_without_emitting_row_label, program.offset());
     program.emit_insn(Insn::Return {
         return_reg: reg_subrtn_acc_output_return_offset,
     });
 
+    // Finalize aggregate values for output
     let agg_start_reg = t_ctx.reg_agg_start.unwrap();
     // Resolve the label for the start of the group by output row subroutine
     program.resolve_label(label_agg_final, program.offset());
@@ -363,16 +414,34 @@ pub fn emit_group_by<'a>(
         });
     }
 
-    // we now have the group by columns in registers (group_exprs_start_register..group_exprs_start_register + group_by.len() - 1)
-    // and the agg results in (agg_start_reg..agg_start_reg + aggregates.len() - 1)
-    // we need to call translate_expr on each result column, but replace the expr with a register copy in case any part of the
-    // result column expression matches a) a group by column or b) an aggregation result.
-    for (i, expr) in group_by.exprs.iter().enumerate() {
-        t_ctx
-            .resolver
-            .expr_to_reg_cache
-            .push((expr, reg_group_exprs_acc + i));
+    // Map GROUP BY expressions to their registers in the result set
+    for (i, (expr, is_in_result)) in group_by
+        .exprs
+        .iter()
+        .zip(group_by_expr_in_res_cols)
+        .enumerate()
+    {
+        if is_in_result {
+            if let Some(reg) = &column_register_mapping.get(i).and_then(|opt| *opt) {
+                t_ctx.resolver.expr_to_reg_cache.push((expr, *reg));
+            }
+        }
     }
+
+    // Map non-aggregate, non-GROUP BY columns to their registers
+    let non_agg_cols = plan
+        .result_columns
+        .iter()
+        .filter(|rc| !rc.contains_aggregates && !is_column_in_group_by(&rc.expr, &group_by.exprs));
+
+    for (idx, rc) in non_agg_cols.enumerate() {
+        let sorter_idx = group_by_count + idx;
+        if let Some(reg) = column_register_mapping.get(sorter_idx).and_then(|opt| *opt) {
+            t_ctx.resolver.expr_to_reg_cache.push((&rc.expr, reg));
+        }
+    }
+
+    // Map aggregate expressions to their result registers
     for (i, agg) in plan.aggregates.iter().enumerate() {
         t_ctx
             .resolver
@@ -415,12 +484,18 @@ pub fn emit_group_by<'a>(
         return_reg: reg_subrtn_acc_output_return_offset,
     });
 
+    // Subroutine to clear accumulators for a new group
     program.add_comment(program.offset(), "clear accumulator subroutine start");
     program.resolve_label(label_subrtn_acc_clear, program.offset());
-    let start_reg = reg_group_exprs_acc;
+    let start_reg = reg_non_aggregate_exprs_acc;
+
+    // Reset all accumulator registers to NULL
     program.emit_insn(Insn::Null {
         dest: start_reg,
-        dest_end: Some(start_reg + group_by.exprs.len() + plan.aggregates.len() - 1),
+        dest_end: Some(
+            start_reg + non_group_by_non_agg_column_count + group_by_count + plan.aggregates.len()
+                - 1,
+        ),
     });
 
     program.emit_insn(Insn::Integer {
@@ -667,4 +742,10 @@ pub fn translate_aggregation_step_groupby(
         }
     };
     Ok(dest)
+}
+
+pub fn is_column_in_group_by(expr: &ast::Expr, group_by_exprs: &[ast::Expr]) -> bool {
+    group_by_exprs
+        .iter()
+        .any(|expr2| exprs_are_equivalent(expr, expr2))
 }

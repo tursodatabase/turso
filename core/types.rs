@@ -732,6 +732,10 @@ impl ImmutableRecord {
         &self.values[idx]
     }
 
+    pub fn get_value_opt(&self, idx: usize) -> Option<&RefValue> {
+        self.values.get(idx)
+    }
+
     pub fn len(&self) -> usize {
         self.values.len()
     }

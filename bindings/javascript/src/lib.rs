@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use limbo_core::{Clock, Instant};
 use napi::{Env, JsUnknown, Result as NapiResult};
 use napi_derive::napi;
 
@@ -152,6 +153,12 @@ impl limbo_core::DatabaseStorage for DatabaseFile {
 
 struct IO {}
 
+impl Clock for IO {
+    fn now(&self) -> Instant {
+        todo!()
+    }
+}
+
 impl limbo_core::IO for IO {
     fn open_file(
         &self,
@@ -167,10 +174,6 @@ impl limbo_core::IO for IO {
     }
 
     fn generate_random_number(&self) -> i64 {
-        todo!();
-    }
-
-    fn get_current_time(&self) -> String {
         todo!();
     }
 }

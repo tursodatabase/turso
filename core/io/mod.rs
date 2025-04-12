@@ -34,14 +34,12 @@ impl OpenFlags {
     }
 }
 
-pub trait IO: Send + Sync {
+pub trait IO: Clock + Send + Sync {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>>;
 
     fn run_once(&self) -> Result<()>;
 
     fn generate_random_number(&self) -> i64;
-
-    fn get_current_time(&self) -> String;
 }
 
 pub type Complete = dyn Fn(Arc<RefCell<Buffer>>);
@@ -216,4 +214,6 @@ mod memory;
 #[cfg(feature = "fs")]
 mod vfs;
 pub use memory::MemoryIO;
+pub mod clock;
 mod common;
+pub use clock::Clock;

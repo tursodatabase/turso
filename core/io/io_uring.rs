@@ -1,4 +1,5 @@
 use super::{common, Completion, File, OpenFlags, WriteCompletion, IO};
+use crate::io::clock::{Clock, Instant};
 use crate::{LimboError, Result};
 use rustix::fs::{self, FlockOperation, OFlags};
 use rustix::io_uring::iovec;
@@ -54,7 +55,6 @@ impl Default for UringOpts {
 }
 
 const MAX_IOVECS: u32 = 1024;
-const SQPOLL_IDLE: u32 = 1000;
 
 #[derive(Debug, Error)]
 enum UringIOError {
@@ -213,7 +213,10 @@ impl UringIO {
             }; MAX_IOVECS as usize],
             next_iovec: 0,
         };
-        debug!("Using IO backend 'io-uring' with max_iovecs={}", opts.max_iovecs);
+        debug!(
+            "Using IO backend 'io-uring' with max_iovecs={}",
+            opts.max_iovecs
+        );
         Ok(Self {
             inner: Rc::new(RefCell::new(inner)),
         })
@@ -298,7 +301,7 @@ impl IO for UringIO {
     /// use limbo_core::io::{UringIO, OpenFlags};
     ///
     /// let io = UringIO::new()?;
-    /// 
+    ///
     /// // Open existing file
     /// let file = io.open_file("test.db", OpenFlags::None, true)?;
     ///
@@ -394,16 +397,15 @@ impl IO for UringIO {
         getrandom::getrandom(&mut buf).unwrap();
         i64::from_ne_bytes(buf)
     }
+}
 
-    /// Gets the current time as a formatted string.
-    ///
-    /// The format is "YYYY-MM-DD HH:MM:SS".
-    ///
-    /// # Returns
-    ///
-    /// The current time as a string.
-    fn get_current_time(&self) -> String {
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+impl Clock for UringIO {
+    fn now(&self) -> Instant {
+        let now = chrono::Local::now();
+        Instant {
+            secs: now.timestamp(),
+            micros: now.timestamp_subsec_micros(),
+        }
     }
 }
 

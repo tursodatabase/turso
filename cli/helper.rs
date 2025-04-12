@@ -1,12 +1,18 @@
-use std::rc::Rc;
-use std::sync::Arc;
-
+use clap::Parser;
 use limbo_core::{Connection, StepResult};
 use nu_ansi_term::{Color, Style};
 use rustyline::completion::{extract_word, Completer, Pair};
 use rustyline::highlight::Highlighter;
 use rustyline::hint::HistoryHinter;
 use rustyline::{Completer, Helper, Hinter, Validator};
+use shlex::Shlex;
+use std::cell::RefCell;
+use std::marker::PhantomData;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::{ffi::OsString, path::PathBuf, str::FromStr as _};
+
+use crate::commands::CommandParser;
 
 macro_rules! try_result {
     ($expr:expr, $err:expr) => {
@@ -20,7 +26,7 @@ macro_rules! try_result {
 #[derive(Helper, Completer, Hinter, Validator)]
 pub struct LimboHelper {
     #[rustyline(Completer)]
-    completer: SqlCompleter,
+    completer: SqlCompleter<CommandParser>,
     #[rustyline(Hinter)]
     hinter: HistoryHinter,
 }
@@ -77,57 +83,70 @@ impl Highlighter for LimboHelper {
     }
 }
 
-pub struct SqlCompleter {
+pub struct SqlCompleter<C: Parser + Send + Sync + 'static> {
     conn: Rc<Connection>,
     io: Arc<dyn limbo_core::IO>,
+    // Has to be a ref cell as Rustyline takes immutable reference to self
+    // This problem would be solved with Reedline as it uses &mut self for completions
+    cmd: RefCell<clap::Command>,
+    _cmd_phantom: PhantomData<C>,
 }
 
-impl SqlCompleter {
+impl<C: Parser + Send + Sync + 'static> SqlCompleter<C> {
     pub fn new(conn: Rc<Connection>, io: Arc<dyn limbo_core::IO>) -> Self {
-        Self { conn, io }
-    }
-}
-
-// Got this from the FilenameCompleter.
-// TODO have to see what chars break words in Sqlite
-cfg_if::cfg_if! {
-    if #[cfg(unix)] {
-        // rl_basic_word_break_characters, rl_completer_word_break_characters
-        const fn default_break_chars(c : char) -> bool {
-            matches!(c, ' ' | '\t' | '\n' | '"' | '\\' | '\'' | '`' | '@' | '$' | '>' | '<' | '=' | ';' | '|' | '&' |
-            '{' | '(' | '\0')
+        Self {
+            conn,
+            io,
+            cmd: C::command().into(),
+            _cmd_phantom: PhantomData::default(),
         }
-        const ESCAPE_CHAR: Option<char> = Some('\\');
-        // In double quotes, not all break_chars need to be escaped
-        // https://www.gnu.org/software/bash/manual/html_node/Double-Quotes.html
-        #[allow(dead_code)]
-        const fn double_quotes_special_chars(c: char) -> bool { matches!(c, '"' | '$' | '\\' | '`') }
-    } else if #[cfg(windows)] {
-        // Remove \ to make file completion works on windows
-        const fn default_break_chars(c: char) -> bool {
-            matches!(c, ' ' | '\t' | '\n' | '"' | '\'' | '`' | '@' | '$' | '>' | '<' | '=' | ';' | '|' | '&' | '{' |
-            '(' | '\0')
-        }
-        const ESCAPE_CHAR: Option<char> = None;
-        #[allow(dead_code)]
-        const fn double_quotes_special_chars(c: char) -> bool { c == '"' } // TODO Validate: only '"' ?
-    } else if #[cfg(target_arch = "wasm32")] {
-        const fn default_break_chars(c: char) -> bool { false }
-        const ESCAPE_CHAR: Option<char> = None;
-        #[allow(dead_code)]
-        const fn double_quotes_special_chars(c: char) -> bool { false }
     }
-}
 
-impl Completer for SqlCompleter {
-    type Candidate = Pair;
-
-    fn complete(
+    fn dot_completion(
         &self,
-        line: &str,
-        pos: usize,
-        _ctx: &rustyline::Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
+        mut line: &str,
+        mut pos: usize,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        // TODO maybe check to see if the line is empty and then just output the command names
+        line = &line[1..];
+        pos = pos - 1;
+
+        let (prefix_pos, _) = extract_word(line, pos, ESCAPE_CHAR, default_break_chars);
+
+        let args = Shlex::new(line);
+        let mut args = std::iter::once("".to_owned())
+            .chain(args)
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        if line.ends_with(' ') {
+            args.push(OsString::new());
+        }
+        let arg_index = args.len() - 1;
+        // dbg!(&pos, line, &args, arg_index);
+
+        let mut cmd = self.cmd.borrow_mut();
+        match clap_complete::engine::complete(
+            &mut cmd,
+            args,
+            arg_index,
+            PathBuf::from_str(".").ok().as_deref(),
+        ) {
+            Ok(candidates) => {
+                let candidates = candidates
+                    .iter()
+                    .map(|candidate| Pair {
+                        display: candidate.get_value().to_string_lossy().into_owned(),
+                        replacement: candidate.get_value().to_string_lossy().into_owned(),
+                    })
+                    .collect::<Vec<Pair>>();
+
+                Ok((prefix_pos + 1, candidates))
+            }
+            Err(_) => Ok((prefix_pos + 1, Vec::new())),
+        }
+    }
+
+    fn sql_completion(&self, line: &str, pos: usize) -> rustyline::Result<(usize, Vec<Pair>)> {
         // TODO: have to differentiate words if they are enclosed in single of double quotes
         let (prefix_pos, prefix) = extract_word(line, pos, ESCAPE_CHAR, default_break_chars);
         let mut candidates = Vec::new();
@@ -165,5 +184,53 @@ impl Completer for SqlCompleter {
         }
 
         Ok((prefix_pos, candidates))
+    }
+}
+
+// Got this from the FilenameCompleter.
+// TODO have to see what chars break words in Sqlite
+cfg_if::cfg_if! {
+    if #[cfg(unix)] {
+        // rl_basic_word_break_characters, rl_completer_word_break_characters
+        const fn default_break_chars(c : char) -> bool {
+            matches!(c, ' ' | '\t' | '\n' | '"' | '\\' | '\'' | '`' | '@' | '$' | '>' | '<' | '=' | ';' | '|' | '&' |
+            '{' | '(' | '\0')
+        }
+        const ESCAPE_CHAR: Option<char> = Some('\\');
+        // In double quotes, not all break_chars need to be escaped
+        // https://www.gnu.org/software/bash/manual/html_node/Double-Quotes.html
+        #[allow(dead_code)]
+        const fn double_quotes_special_chars(c: char) -> bool { matches!(c, '"' | '$' | '\\' | '`') }
+    } else if #[cfg(windows)] {
+        // Remove \ to make file completion works on windows
+        const fn default_break_chars(c: char) -> bool {
+            matches!(c, ' ' | '\t' | '\n' | '"' | '\'' | '`' | '@' | '$' | '>' | '<' | '=' | ';' | '|' | '&' | '{' |
+            '(' | '\0')
+        }
+        const ESCAPE_CHAR: Option<char> = None;
+        #[allow(dead_code)]
+        const fn double_quotes_special_chars(c: char) -> bool { c == '"' } // TODO Validate: only '"' ?
+    } else if #[cfg(target_arch = "wasm32")] {
+        const fn default_break_chars(c: char) -> bool { false }
+        const ESCAPE_CHAR: Option<char> = None;
+        #[allow(dead_code)]
+        const fn double_quotes_special_chars(c: char) -> bool { false }
+    }
+}
+
+impl<C: Parser + Send + Sync + 'static> Completer for SqlCompleter<C> {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
+        if line.starts_with(".") {
+            self.dot_completion(line, pos)
+        } else {
+            self.sql_completion(line, pos)
+        }
     }
 }

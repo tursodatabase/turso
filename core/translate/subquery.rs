@@ -75,6 +75,7 @@ pub fn emit_subquery<'a>(
         meta_left_joins: (0..plan.table_references.len()).map(|_| None).collect(),
         meta_sort: None,
         reg_agg_start: None,
+        reg_nonagg_emit_once_flag: None,
         reg_result_cols_start: None,
         result_column_indexes_in_orderby_sorter: (0..plan.result_columns.len()).collect(),
         result_columns_to_skip_in_orderby_sorter: None,

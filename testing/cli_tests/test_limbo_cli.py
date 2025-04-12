@@ -111,7 +111,6 @@ class TestLimboShell:
         if init_commands is None:
             # Default initialization
             init_commands = """
-.open :memory:
 CREATE TABLE users (id INTEGER PRIMARY KEY, first_name TEXT, last_name TEXT, age INTEGER);
 CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price INTEGER);
 INSERT INTO users VALUES (1, 'Alice', 'Smith', 30), (2, 'Bob', 'Johnson', 25),

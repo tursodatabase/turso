@@ -398,6 +398,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.5.47"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c06f5378ea264ad4f82bbc826628b5aad714a75abf6ece087e923010eb937fb6"
+dependencies = [
+ "clap",
+ "clap_lex",
+ "is_executable",
+ "shlex",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.5.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -499,7 +511,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "core_tester"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1401,6 +1413,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7655c9839580ee829dfacba1d1278c2b7883e50a277ff7541299489d6bdfdc45"
 
 [[package]]
+name = "is_executable"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4a1b5bad6f9072935961dfbf1cced2f3d129963d091b6f69f007fe04e758ae2"
+dependencies = [
+ "winapi",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1601,7 +1622,7 @@ dependencies = [
 
 [[package]]
 name = "limbo"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "limbo_core",
  "thiserror 2.0.12",
@@ -1610,14 +1631,14 @@ dependencies = [
 
 [[package]]
 name = "limbo-go"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "limbo_core",
 ]
 
 [[package]]
 name = "limbo-java"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "jni",
  "limbo_core",
@@ -1626,7 +1647,7 @@ dependencies = [
 
 [[package]]
 name = "limbo-wasm"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "console_error_panic_hook",
  "getrandom 0.2.15",
@@ -1639,11 +1660,12 @@ dependencies = [
 
 [[package]]
 name = "limbo_cli"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "anyhow",
  "cfg-if",
  "clap",
+ "clap_complete",
  "comfy-table",
  "csv",
  "ctrlc",
@@ -1653,6 +1675,7 @@ dependencies = [
  "miette",
  "nu-ansi-term 0.50.1",
  "rustyline",
+ "shlex",
  "syntect",
  "tracing",
  "tracing-subscriber",
@@ -1660,7 +1683,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_completion"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "limbo_ext",
  "mimalloc",
@@ -1668,7 +1691,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_core"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "built",
  "cfg_block",
@@ -1721,7 +1744,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_crypto"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -1734,7 +1757,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_ext"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "chrono",
  "getrandom 0.3.2",
@@ -1743,7 +1766,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_ext_tests"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "env_logger 0.11.7",
  "lazy_static",
@@ -1754,7 +1777,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_ipaddr"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "ipnetwork",
  "limbo_ext",
@@ -1763,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_macros"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1772,7 +1795,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_node"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "limbo_core",
  "napi",
@@ -1782,7 +1805,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_percentile"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "limbo_ext",
  "mimalloc",
@@ -1790,7 +1813,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_regexp"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "limbo_ext",
  "mimalloc",
@@ -1799,7 +1822,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_series"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "limbo_ext",
  "mimalloc",
@@ -1809,7 +1832,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sim"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "anarchist-readable-name-generator-lib",
  "clap",
@@ -1829,7 +1852,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sqlite3"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "env_logger 0.11.7",
  "libc",
@@ -1839,7 +1862,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sqlite3_parser"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "bitflags 2.9.0",
  "cc",
@@ -1859,7 +1882,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_stress"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "antithesis_sdk",
  "clap",
@@ -1870,7 +1893,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_time"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "chrono",
  "limbo_ext",
@@ -1882,7 +1905,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_uuid"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "limbo_ext",
  "mimalloc",
@@ -2521,7 +2544,7 @@ dependencies = [
 
 [[package]]
 name = "py-limbo"
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 dependencies = [
  "anyhow",
  "limbo_core",

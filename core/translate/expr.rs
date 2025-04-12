@@ -494,241 +494,22 @@ pub fn translate_expr(
     match expr {
         ast::Expr::Between { .. } => todo!(),
         ast::Expr::Binary(e1, op, e2) => {
+            // Check if both sides of the expression are identical and reuse the same register if so
+            if e1 == e2 {
+                let shared_reg = program.alloc_register();
+                translate_expr(program, referenced_tables, e1, shared_reg, resolver)?;
+
+                emit_binary_insn(program, op, shared_reg, shared_reg, target_register)?;
+                return Ok(target_register);
+            }
+
             let e1_reg = program.alloc_registers(2);
             let e2_reg = e1_reg + 1;
 
             translate_expr(program, referenced_tables, e1, e1_reg, resolver)?;
             translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
 
-            match op {
-                ast::Operator::NotEquals => {
-                    let if_true_label = program.allocate_label();
-                    wrap_eval_jump_expr_zero_or_null(
-                        program,
-                        Insn::Ne {
-                            lhs: e1_reg,
-                            rhs: e2_reg,
-                            target_pc: if_true_label,
-                            flags: CmpInsFlags::default(),
-                        },
-                        target_register,
-                        if_true_label,
-                        e1_reg,
-                        e2_reg,
-                    );
-                }
-                ast::Operator::Equals => {
-                    let if_true_label = program.allocate_label();
-                    wrap_eval_jump_expr_zero_or_null(
-                        program,
-                        Insn::Eq {
-                            lhs: e1_reg,
-                            rhs: e2_reg,
-                            target_pc: if_true_label,
-                            flags: CmpInsFlags::default(),
-                        },
-                        target_register,
-                        if_true_label,
-                        e1_reg,
-                        e2_reg,
-                    );
-                }
-                ast::Operator::Less => {
-                    let if_true_label = program.allocate_label();
-                    wrap_eval_jump_expr_zero_or_null(
-                        program,
-                        Insn::Lt {
-                            lhs: e1_reg,
-                            rhs: e2_reg,
-                            target_pc: if_true_label,
-                            flags: CmpInsFlags::default(),
-                        },
-                        target_register,
-                        if_true_label,
-                        e1_reg,
-                        e2_reg,
-                    );
-                }
-                ast::Operator::LessEquals => {
-                    let if_true_label = program.allocate_label();
-                    wrap_eval_jump_expr_zero_or_null(
-                        program,
-                        Insn::Le {
-                            lhs: e1_reg,
-                            rhs: e2_reg,
-                            target_pc: if_true_label,
-                            flags: CmpInsFlags::default(),
-                        },
-                        target_register,
-                        if_true_label,
-                        e1_reg,
-                        e2_reg,
-                    );
-                }
-                ast::Operator::Greater => {
-                    let if_true_label = program.allocate_label();
-                    wrap_eval_jump_expr_zero_or_null(
-                        program,
-                        Insn::Gt {
-                            lhs: e1_reg,
-                            rhs: e2_reg,
-                            target_pc: if_true_label,
-                            flags: CmpInsFlags::default(),
-                        },
-                        target_register,
-                        if_true_label,
-                        e1_reg,
-                        e2_reg,
-                    );
-                }
-                ast::Operator::GreaterEquals => {
-                    let if_true_label = program.allocate_label();
-                    wrap_eval_jump_expr_zero_or_null(
-                        program,
-                        Insn::Ge {
-                            lhs: e1_reg,
-                            rhs: e2_reg,
-                            target_pc: if_true_label,
-                            flags: CmpInsFlags::default(),
-                        },
-                        target_register,
-                        if_true_label,
-                        e1_reg,
-                        e2_reg,
-                    );
-                }
-                ast::Operator::Add => {
-                    program.emit_insn(Insn::Add {
-                        lhs: e1_reg,
-                        rhs: e2_reg,
-                        dest: target_register,
-                    });
-                }
-                ast::Operator::Subtract => {
-                    program.emit_insn(Insn::Subtract {
-                        lhs: e1_reg,
-                        rhs: e2_reg,
-                        dest: target_register,
-                    });
-                }
-                ast::Operator::Multiply => {
-                    program.emit_insn(Insn::Multiply {
-                        lhs: e1_reg,
-                        rhs: e2_reg,
-                        dest: target_register,
-                    });
-                }
-                ast::Operator::Divide => {
-                    program.emit_insn(Insn::Divide {
-                        lhs: e1_reg,
-                        rhs: e2_reg,
-                        dest: target_register,
-                    });
-                }
-                ast::Operator::Modulus => {
-                    program.emit_insn(Insn::Remainder {
-                        lhs: e1_reg,
-                        rhs: e2_reg,
-                        dest: target_register,
-                    });
-                }
-                ast::Operator::And => {
-                    program.emit_insn(Insn::And {
-                        lhs: e1_reg,
-                        rhs: e2_reg,
-                        dest: target_register,
-                    });
-                }
-                ast::Operator::Or => {
-                    program.emit_insn(Insn::Or {
-                        lhs: e1_reg,
-                        rhs: e2_reg,
-                        dest: target_register,
-                    });
-                }
-                ast::Operator::BitwiseAnd => {
-                    program.emit_insn(Insn::BitAnd {
-                        lhs: e1_reg,
-                        rhs: e2_reg,
-                        dest: target_register,
-                    });
-                }
-                ast::Operator::BitwiseOr => {
-                    program.emit_insn(Insn::BitOr {
-                        lhs: e1_reg,
-                        rhs: e2_reg,
-                        dest: target_register,
-                    });
-                }
-                ast::Operator::RightShift => {
-                    program.emit_insn(Insn::ShiftRight {
-                        lhs: e1_reg,
-                        rhs: e2_reg,
-                        dest: target_register,
-                    });
-                }
-                ast::Operator::LeftShift => {
-                    program.emit_insn(Insn::ShiftLeft {
-                        lhs: e1_reg,
-                        rhs: e2_reg,
-                        dest: target_register,
-                    });
-                }
-                ast::Operator::Is => {
-                    let if_true_label = program.allocate_label();
-                    wrap_eval_jump_expr(
-                        program,
-                        Insn::Eq {
-                            lhs: e1_reg,
-                            rhs: e2_reg,
-                            target_pc: if_true_label,
-                            flags: CmpInsFlags::default().null_eq(),
-                        },
-                        target_register,
-                        if_true_label,
-                    );
-                }
-                ast::Operator::IsNot => {
-                    let if_true_label = program.allocate_label();
-                    wrap_eval_jump_expr(
-                        program,
-                        Insn::Ne {
-                            lhs: e1_reg,
-                            rhs: e2_reg,
-                            target_pc: if_true_label,
-                            flags: CmpInsFlags::default().null_eq(),
-                        },
-                        target_register,
-                        if_true_label,
-                    );
-                }
-                #[cfg(feature = "json")]
-                op @ (ast::Operator::ArrowRight | ast::Operator::ArrowRightShift) => {
-                    let json_func = match op {
-                        ast::Operator::ArrowRight => JsonFunc::JsonArrowExtract,
-                        ast::Operator::ArrowRightShift => JsonFunc::JsonArrowShiftExtract,
-                        _ => unreachable!(),
-                    };
-
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg: e1_reg,
-                        dest: target_register,
-                        func: FuncCtx {
-                            func: Func::Json(json_func),
-                            arg_count: 2,
-                        },
-                    })
-                }
-                ast::Operator::Concat => {
-                    program.emit_insn(Insn::Concat {
-                        lhs: e1_reg,
-                        rhs: e2_reg,
-                        dest: target_register,
-                    });
-                }
-                other_unimplemented => todo!("{:?}", other_unimplemented),
-            }
+            emit_binary_insn(program, op, e1_reg, e2_reg, target_register)?;
             Ok(target_register)
         }
         ast::Expr::Case {
@@ -2139,6 +1920,246 @@ pub fn translate_expr(
             Ok(target_register)
         }
     }
+}
+
+fn emit_binary_insn(
+    program: &mut ProgramBuilder,
+    op: &ast::Operator,
+    lhs: usize,
+    rhs: usize,
+    target_register: usize,
+) -> Result<()> {
+    match op {
+        ast::Operator::NotEquals => {
+            let if_true_label = program.allocate_label();
+            wrap_eval_jump_expr_zero_or_null(
+                program,
+                Insn::Ne {
+                    lhs,
+                    rhs,
+                    target_pc: if_true_label,
+                    flags: CmpInsFlags::default(),
+                },
+                target_register,
+                if_true_label,
+                lhs,
+                rhs,
+            );
+        }
+        ast::Operator::Equals => {
+            let if_true_label = program.allocate_label();
+            wrap_eval_jump_expr_zero_or_null(
+                program,
+                Insn::Eq {
+                    lhs,
+                    rhs,
+                    target_pc: if_true_label,
+                    flags: CmpInsFlags::default(),
+                },
+                target_register,
+                if_true_label,
+                lhs,
+                rhs,
+            );
+        }
+        ast::Operator::Less => {
+            let if_true_label = program.allocate_label();
+            wrap_eval_jump_expr_zero_or_null(
+                program,
+                Insn::Lt {
+                    lhs,
+                    rhs,
+                    target_pc: if_true_label,
+                    flags: CmpInsFlags::default(),
+                },
+                target_register,
+                if_true_label,
+                lhs,
+                rhs,
+            );
+        }
+        ast::Operator::LessEquals => {
+            let if_true_label = program.allocate_label();
+            wrap_eval_jump_expr_zero_or_null(
+                program,
+                Insn::Le {
+                    lhs,
+                    rhs,
+                    target_pc: if_true_label,
+                    flags: CmpInsFlags::default(),
+                },
+                target_register,
+                if_true_label,
+                lhs,
+                rhs,
+            );
+        }
+        ast::Operator::Greater => {
+            let if_true_label = program.allocate_label();
+            wrap_eval_jump_expr_zero_or_null(
+                program,
+                Insn::Gt {
+                    lhs,
+                    rhs,
+                    target_pc: if_true_label,
+                    flags: CmpInsFlags::default(),
+                },
+                target_register,
+                if_true_label,
+                lhs,
+                rhs,
+            );
+        }
+        ast::Operator::GreaterEquals => {
+            let if_true_label = program.allocate_label();
+            wrap_eval_jump_expr_zero_or_null(
+                program,
+                Insn::Ge {
+                    lhs,
+                    rhs,
+                    target_pc: if_true_label,
+                    flags: CmpInsFlags::default(),
+                },
+                target_register,
+                if_true_label,
+                lhs,
+                rhs,
+            );
+        }
+        ast::Operator::Add => {
+            program.emit_insn(Insn::Add {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+        }
+        ast::Operator::Subtract => {
+            program.emit_insn(Insn::Subtract {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+        }
+        ast::Operator::Multiply => {
+            program.emit_insn(Insn::Multiply {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+        }
+        ast::Operator::Divide => {
+            program.emit_insn(Insn::Divide {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+        }
+        ast::Operator::Modulus => {
+            program.emit_insn(Insn::Remainder {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+        }
+        ast::Operator::And => {
+            program.emit_insn(Insn::And {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+        }
+        ast::Operator::Or => {
+            program.emit_insn(Insn::Or {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+        }
+        ast::Operator::BitwiseAnd => {
+            program.emit_insn(Insn::BitAnd {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+        }
+        ast::Operator::BitwiseOr => {
+            program.emit_insn(Insn::BitOr {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+        }
+        ast::Operator::RightShift => {
+            program.emit_insn(Insn::ShiftRight {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+        }
+        ast::Operator::LeftShift => {
+            program.emit_insn(Insn::ShiftLeft {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+        }
+        ast::Operator::Is => {
+            let if_true_label = program.allocate_label();
+            wrap_eval_jump_expr(
+                program,
+                Insn::Eq {
+                    lhs,
+                    rhs,
+                    target_pc: if_true_label,
+                    flags: CmpInsFlags::default().null_eq(),
+                },
+                target_register,
+                if_true_label,
+            );
+        }
+        ast::Operator::IsNot => {
+            let if_true_label = program.allocate_label();
+            wrap_eval_jump_expr(
+                program,
+                Insn::Ne {
+                    lhs,
+                    rhs,
+                    target_pc: if_true_label,
+                    flags: CmpInsFlags::default().null_eq(),
+                },
+                target_register,
+                if_true_label,
+            );
+        }
+        #[cfg(feature = "json")]
+        op @ (ast::Operator::ArrowRight | ast::Operator::ArrowRightShift) => {
+            let json_func = match op {
+                ast::Operator::ArrowRight => JsonFunc::JsonArrowExtract,
+                ast::Operator::ArrowRightShift => JsonFunc::JsonArrowShiftExtract,
+                _ => unreachable!(),
+            };
+
+            program.emit_insn(Insn::Function {
+                constant_mask: 0,
+                start_reg: lhs,
+                dest: target_register,
+                func: FuncCtx {
+                    func: Func::Json(json_func),
+                    arg_count: 2,
+                },
+            })
+        }
+        ast::Operator::Concat => {
+            program.emit_insn(Insn::Concat {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+        }
+        other_unimplemented => todo!("{:?}", other_unimplemented),
+    }
+
+    Ok(())
 }
 
 /// The base logic for translating LIKE and GLOB expressions.

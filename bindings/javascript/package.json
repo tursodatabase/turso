@@ -1,6 +1,10 @@
 {
   "name": "@tursodatabase/limbo",
-  "version": "0.0.17",
+  "version": "0.0.19-pre.4",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tursodatabase/limbo"
+  },
   "description": "The Limbo database library",
   "main": "index.js",
   "types": "index.d.ts",
@@ -31,7 +35,6 @@
     "artifacts": "napi artifacts",
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
-    "prepublishOnly": "napi prepublish -t npm",
     "test": "ava",
     "universal": "napi universal",
     "version": "napi version"

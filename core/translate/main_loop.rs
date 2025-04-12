@@ -15,6 +15,7 @@ use super::{
     aggregation::translate_aggregation_step,
     emitter::{OperationMode, TranslateCtx},
     expr::{translate_condition_expr, translate_expr, ConditionMetadata},
+    group_by::is_column_in_group_by,
     order_by::{order_by_sorter_insert, sorter_insert},
     plan::{
         IterationDirection, Operation, Search, SelectPlan, SelectQueryType, TableReference,
@@ -37,11 +38,11 @@ pub struct LeftJoinMetadata {
 #[derive(Debug, Clone, Copy)]
 pub struct LoopLabels {
     /// jump to the start of the loop body
-    loop_start: BranchOffset,
+    pub loop_start: BranchOffset,
     /// jump to the NextAsync instruction (or equivalent)
-    next: BranchOffset,
+    pub next: BranchOffset,
     /// jump to the end of the loop, exiting it
-    loop_end: BranchOffset,
+    pub loop_end: BranchOffset,
 }
 
 impl LoopLabels {
@@ -102,7 +103,7 @@ pub fn init_loop(
                         let root_page = btree.root_page;
                         program.emit_insn(Insn::OpenWriteAsync {
                             cursor_id,
-                            root_page,
+                            root_page: root_page.into(),
                         });
                         program.emit_insn(Insn::OpenWriteAwait {});
                     }
@@ -110,7 +111,7 @@ pub fn init_loop(
                         let root_page = btree.root_page;
                         program.emit_insn(Insn::OpenWriteAsync {
                             cursor_id,
-                            root_page,
+                            root_page: root_page.into(),
                         });
                         program.emit_insn(Insn::OpenWriteAwait {});
                     }
@@ -144,14 +145,14 @@ pub fn init_loop(
                     OperationMode::DELETE => {
                         program.emit_insn(Insn::OpenWriteAsync {
                             cursor_id: table_cursor_id,
-                            root_page: table.table.get_root_page(),
+                            root_page: table.table.get_root_page().into(),
                         });
                         program.emit_insn(Insn::OpenWriteAwait {});
                     }
                     OperationMode::UPDATE => {
                         program.emit_insn(Insn::OpenWriteAsync {
                             cursor_id: table_cursor_id,
-                            root_page: table.table.get_root_page(),
+                            root_page: table.table.get_root_page().into(),
                         });
                         program.emit_insn(Insn::OpenWriteAwait {});
                     }
@@ -177,14 +178,14 @@ pub fn init_loop(
                         OperationMode::DELETE => {
                             program.emit_insn(Insn::OpenWriteAsync {
                                 cursor_id: index_cursor_id,
-                                root_page: index.root_page,
+                                root_page: index.root_page.into(),
                             });
                             program.emit_insn(Insn::OpenWriteAwait {});
                         }
                         OperationMode::UPDATE => {
                             program.emit_insn(Insn::OpenWriteAsync {
                                 cursor_id: index_cursor_id,
-                                root_page: index.root_page,
+                                root_page: index.root_page.into(),
                             });
                             program.emit_insn(Insn::OpenWriteAwait {});
                         }
@@ -597,19 +598,46 @@ fn emit_loop_source(
 ) -> Result<()> {
     match emit_target {
         LoopEmitTarget::GroupBySorter => {
+            // This function creates a sorter for GROUP BY operations by allocating registers and
+            // translating expressions for three types of columns:
+            // 1) GROUP BY columns (used as sorting keys)
+            // 2) non-aggregate, non-GROUP BY columns
+            // 3) aggregate function arguments
             let group_by = plan.group_by.as_ref().unwrap();
             let aggregates = &plan.aggregates;
-            let sort_keys_count = group_by.exprs.len();
+
+            // Identify columns in the result set that are neither in GROUP BY nor contain aggregates
+            let non_group_by_non_agg_expr = plan
+                .result_columns
+                .iter()
+                .filter(|rc| {
+                    !rc.contains_aggregates && !is_column_in_group_by(&rc.expr, &group_by.exprs)
+                })
+                .map(|rc| &rc.expr);
+            let non_agg_count = non_group_by_non_agg_expr.clone().count();
+            // Store the count of non-GROUP BY, non-aggregate columns in the metadata
+            // This will be used later during aggregation processing
+            t_ctx.meta_group_by.as_mut().map(|meta| {
+                meta.non_group_by_non_agg_column_count = Some(non_agg_count);
+                meta
+            });
+
+            // Calculate the total number of arguments used across all aggregate functions
             let aggregate_arguments_count = plan
                 .aggregates
                 .iter()
                 .map(|agg| agg.args.len())
                 .sum::<usize>();
-            let column_count = sort_keys_count + aggregate_arguments_count;
+
+            // Calculate total number of registers needed for all columns in the sorter
+            let column_count = group_by.exprs.len() + aggregate_arguments_count + non_agg_count;
+
+            // Allocate a contiguous block of registers for all columns
             let start_reg = program.alloc_registers(column_count);
             let mut cur_reg = start_reg;
 
-            // The group by sorter rows will contain the grouping keys first. They are also the sort keys.
+            // Step 1: Process GROUP BY columns first
+            // These will be the first columns in the sorter and serve as sort keys
             for expr in group_by.exprs.iter() {
                 let key_reg = cur_reg;
                 cur_reg += 1;
@@ -621,14 +649,28 @@ fn emit_loop_source(
                     &t_ctx.resolver,
                 )?;
             }
-            // Then we have the aggregate arguments.
+
+            // Step 2: Process columns that aren't part of GROUP BY and don't contain aggregates
+            // Example: SELECT col1, col2, SUM(col3) FROM table GROUP BY col1
+            // Here col2 would be processed in this loop if it's in the result set
+            for expr in non_group_by_non_agg_expr {
+                let key_reg = cur_reg;
+                cur_reg += 1;
+                translate_expr(
+                    program,
+                    Some(&plan.table_references),
+                    expr,
+                    key_reg,
+                    &t_ctx.resolver,
+                )?;
+            }
+
+            // Step 3: Process arguments for all aggregate functions
+            // For each aggregate, translate all its argument expressions
             for agg in aggregates.iter() {
-                // Here we are collecting scalars for the group by sorter, which will include
-                // both the group by expressions and the aggregate arguments.
-                // e.g. in `select u.first_name, sum(u.age) from users group by u.first_name`
-                // the sorter will have two scalars: u.first_name and u.age.
-                // these are then sorted by u.first_name, and for each u.first_name, we sum the u.age.
-                // the actual aggregation is done later.
+                // For a query like: SELECT group_col, SUM(val1), AVG(val2) FROM table GROUP BY group_col
+                // we'll process val1 and val2 here, storing them in the sorter so they're available
+                // when computing the aggregates after sorting by group_col
                 for expr in agg.args.iter() {
                     let agg_reg = cur_reg;
                     cur_reg += 1;
@@ -641,9 +683,6 @@ fn emit_loop_source(
                     )?;
                 }
             }
-
-            // TODO: although it's less often useful, SQLite does allow for expressions in the SELECT that are not part of a GROUP BY or aggregate.
-            // We currently ignore those and only emit the GROUP BY keys and aggregate arguments. This should be fixed.
 
             let group_by_metadata = t_ctx.meta_group_by.as_ref().unwrap();
 
@@ -677,14 +716,31 @@ fn emit_loop_source(
                     &t_ctx.resolver,
                 )?;
             }
-            for (i, rc) in plan.result_columns.iter().enumerate() {
-                if rc.contains_aggregates {
-                    // Do nothing, aggregates are computed above
-                    // if this result column is e.g. something like sum(x) + 1 or length(sum(x)), we do not want to translate that (+1) or length() yet,
-                    // it will be computed after the aggregations are finalized.
-                    continue;
-                }
-                let reg = start_reg + num_aggs + i;
+
+            let label_emit_nonagg_only_once = if let Some(flag) = t_ctx.reg_nonagg_emit_once_flag {
+                let if_label = program.allocate_label();
+                program.emit_insn(Insn::If {
+                    reg: flag,
+                    target_pc: if_label,
+                    jump_if_null: false,
+                });
+                Some(if_label)
+            } else {
+                None
+            };
+
+            let col_start = t_ctx.reg_result_cols_start.unwrap();
+
+            // Process only non-aggregate columns
+            let non_agg_columns = plan
+                .result_columns
+                .iter()
+                .enumerate()
+                .filter(|(_, rc)| !rc.contains_aggregates);
+
+            for (i, rc) in non_agg_columns {
+                let reg = col_start + i;
+
                 translate_expr(
                     program,
                     Some(&plan.table_references),
@@ -693,6 +749,12 @@ fn emit_loop_source(
                     &t_ctx.resolver,
                 )?;
             }
+            if let Some(label) = label_emit_nonagg_only_once {
+                program.resolve_label(label, program.offset());
+                let flag = t_ctx.reg_nonagg_emit_once_flag.unwrap();
+                program.emit_int(1, flag);
+            }
+
             Ok(())
         }
         LoopEmitTarget::QueryResult => {

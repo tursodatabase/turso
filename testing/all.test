@@ -28,3 +28,4 @@ source $testdir/scalar-functions-printf.test
 source $testdir/transactions.test
 source $testdir/update.test
 source $testdir/drop_table.test
+source $testdir/default_value.test

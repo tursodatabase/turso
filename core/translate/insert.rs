@@ -9,6 +9,7 @@ use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::Table;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode};
+use crate::vdbe::insn::RegisterOrLiteral;
 use crate::vdbe::BranchOffset;
 use crate::{
     schema::{Column, Schema},
@@ -84,11 +85,11 @@ pub fn translate_insert(
     );
     let root_page = btree_table.root_page;
     let values = match body {
-        InsertBody::Select(select, None) => match &select.body.select.deref() {
+        InsertBody::Select(select, _) => match &select.body.select.deref() {
             OneSelect::Values(values) => values,
             _ => todo!(),
         },
-        _ => todo!(),
+        InsertBody::DefaultValues => &vec![vec![]],
     };
 
     let column_mappings = resolve_columns_for_insert(&table, columns, values)?;
@@ -152,7 +153,7 @@ pub fn translate_insert(
 
         program.emit_insn(Insn::OpenWriteAsync {
             cursor_id,
-            root_page,
+            root_page: RegisterOrLiteral::Literal(root_page),
         });
         program.emit_insn(Insn::OpenWriteAwait {});
 
@@ -168,7 +169,7 @@ pub fn translate_insert(
         // Single row - populate registers directly
         program.emit_insn(Insn::OpenWriteAsync {
             cursor_id,
-            root_page,
+            root_page: RegisterOrLiteral::Literal(root_page),
         });
         program.emit_insn(Insn::OpenWriteAwait {});
 
@@ -297,6 +298,8 @@ struct ColumnMapping<'a> {
     /// If Some(i), use the i-th value from the VALUES tuple
     /// If None, use NULL (column was not specified in INSERT statement)
     value_index: Option<usize>,
+    /// The default value for the column, if defined
+    default_value: Option<&'a Expr>,
 }
 
 /// Resolves how each column in a table should be populated during an INSERT.
@@ -352,6 +355,7 @@ fn resolve_columns_for_insert<'a>(
             .map(|(i, col)| ColumnMapping {
                 column: col,
                 value_index: if i < num_values { Some(i) } else { None },
+                default_value: col.default.as_ref(),
             })
             .collect());
     }
@@ -362,6 +366,7 @@ fn resolve_columns_for_insert<'a>(
         .map(|col| ColumnMapping {
             column: col,
             value_index: None,
+            default_value: col.default.as_ref(),
         })
         .collect();
 
@@ -423,8 +428,10 @@ fn populate_column_registers(
             if write_directly_to_rowid_reg {
                 program.emit_insn(Insn::SoftNull { reg: target_reg });
             }
+        } else if let Some(default_expr) = mapping.default_value {
+            translate_expr(program, None, default_expr, target_reg, resolver)?;
         } else {
-            // Column was not specified - use NULL if it is nullable, otherwise error
+            // Column was not specified as has no DEFAULT - use NULL if it is nullable, otherwise error
             // Rowid alias columns can be NULL because we will autogenerate a rowid in that case.
             let is_nullable = !mapping.column.primary_key || mapping.column.is_rowid_alias;
             if is_nullable {

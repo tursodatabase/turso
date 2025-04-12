@@ -1,4 +1,5 @@
 use clap::Args;
+use clap_complete::{ArgValueCompleter, PathCompleter};
 use limbo_core::Connection;
 use std::{fs::File, io::Write, path::PathBuf, rc::Rc, sync::Arc};
 
@@ -13,6 +14,7 @@ pub struct ImportArgs {
     /// Skip the first N rows of input
     #[arg(long, default_value = "0")]
     skip: u64,
+    #[arg(add = ArgValueCompleter::new(PathCompleter::file()))]
     file: PathBuf,
     table: String,
 }

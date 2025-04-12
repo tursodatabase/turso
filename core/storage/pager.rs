@@ -102,10 +102,12 @@ impl Page {
     }
 
     pub fn set_dirty(&self) {
+        tracing::debug!("set_dirty(page={})", self.get().id);
         self.get().flags.fetch_or(PAGE_DIRTY, Ordering::SeqCst);
     }
 
     pub fn clear_dirty(&self) {
+        tracing::debug!("clear_dirty(page={})", self.get().id);
         self.get().flags.fetch_and(!PAGE_DIRTY, Ordering::SeqCst);
     }
 
@@ -240,10 +242,12 @@ impl Pager {
         (db_header.page_size - db_header.reserved_space as u16) as usize
     }
 
+    #[inline(always)]
     pub fn begin_read_tx(&self) -> Result<LimboResult> {
         self.wal.borrow_mut().begin_read_tx()
     }
 
+    #[inline(always)]
     pub fn begin_write_tx(&self) -> Result<LimboResult> {
         self.wal.borrow_mut().begin_write_tx()
     }

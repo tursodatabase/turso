@@ -58,7 +58,7 @@ pub fn parse_schema_rows(
                         "table" => {
                             let root_page: i64 = row.get::<i64>(3)?;
                             let sql: &str = row.get::<&str>(4)?;
-                            if root_page == 0 && sql.to_lowercase().contains("virtual") {
+                            if root_page == 0 && sql.to_lowercase().contains("create virtual") {
                                 let name: &str = row.get::<&str>(1)?;
                                 let vtab = syms.vtabs.get(name).unwrap().clone();
                                 schema.add_virtual_table(vtab);

@@ -35,9 +35,6 @@ pub enum Command {
     /// Open a database file
     #[command(display_name = ".open")]
     Open(OpenArgs),
-    /// Print this message or the help of the given subcommand(s)
-    // #[command(display_name = ".help")]
-    // Help,
     /// Display schema for a table
     #[command(display_name = ".schema")]
     Schema(SchemaArgs),

@@ -1,6 +1,6 @@
 //! Adaptation/port of [Go scanner](http://tip.golang.org/pkg/bufio/#Scanner).
 
-use log::debug;
+use log::trace;
 
 use std::error::Error;
 use std::fmt;
@@ -118,7 +118,7 @@ impl<S: Splitter> Scanner<S> {
         &mut self,
         input: &'input [u8],
     ) -> ScanResult<'input, S::TokenType, S::Error> {
-        debug!(target: "scanner", "scan(line: {}, column: {})", self.line, self.column);
+        trace!(target: "scanner", "scan(line: {}, column: {})", self.line, self.column);
         // Loop until we have a token.
         loop {
             // See if we can get a token with what we already have.
@@ -152,7 +152,7 @@ impl<S: Splitter> Scanner<S> {
 
     /// Consume `amt` bytes of the buffer.
     fn consume(&mut self, data: &[u8], amt: usize) {
-        debug!(target: "scanner", "consume({})", amt);
+        trace!(target: "scanner", "consume({})", amt);
         debug_assert!(amt <= data.len());
         for byte in &data[..amt] {
             if *byte == b'\n' {

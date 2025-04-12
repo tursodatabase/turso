@@ -29,52 +29,26 @@ members = [
 exclude = ["perf/latency/limbo"]
 
 [workspace.package]
-version = "0.0.18-pre.3"
+version = "0.0.19-pre.4"
 authors = ["the Limbo authors"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/tursodatabase/limbo"
 
 [workspace.dependencies]
-limbo_completion = { path = "extensions/completion", version = "0.0.18-pre.3" }
-limbo_core = { path = "core", version = "0.0.18-pre.3" }
-limbo_crypto = { path = "extensions/crypto", version = "0.0.18-pre.3" }
-limbo_ext = { path = "extensions/core", version = "0.0.18-pre.3" }
-limbo_ext_tests = { path = "extensions/tests", version = "0.0.18-pre.3" }
-limbo_ipaddr = { path = "extensions/ipaddr", version = "0.0.18-pre.3" }
-limbo_macros = { path = "macros", version = "0.0.18-pre.3" }
-limbo_percentile = { path = "extensions/percentile", version = "0.0.18-pre.3" }
-limbo_regexp = { path = "extensions/regexp", version = "0.0.18-pre.3" }
-limbo_series = { path = "extensions/series", version = "0.0.18-pre.3" }
-limbo_sqlite3_parser = { path = "vendored/sqlite3-parser", version = "0.0.18-pre.3" }
-limbo_time = { path = "extensions/time", version = "0.0.18-pre.3" }
-limbo_uuid = { path = "extensions/uuid", version = "0.0.18-pre.3" }
-
-# Config for 'cargo dist'
-[workspace.metadata.dist]
-# The preferred cargo-dist version to use in CI (Cargo.toml SemVer syntax)
-cargo-dist-version = "0.21.0"
-# CI backends to support
-ci = "github"
-# The installers to generate for each app
-installers = ["shell", "powershell"]
-# Target platforms to build apps for (Rust target-triple syntax)
-targets = [
-    "aarch64-apple-darwin",
-    "x86_64-apple-darwin",
-    "x86_64-unknown-linux-gnu",
-    "x86_64-pc-windows-msvc",
-]
-# Which actions to run on pull requests
-pr-run-mode = "plan"
-# Path that installers should place binaries in
-install-path = "~/.limbo"
-# Whether to install an updater program
-install-updater = true
-# Whether to consider the binaries in a package for distribution (defaults true)
-dist = false
-# Whether to enable GitHub Attestations
-github-attestations = true
+limbo_completion = { path = "extensions/completion", version = "0.0.19-pre.4" }
+limbo_core = { path = "core", version = "0.0.19-pre.4" }
+limbo_crypto = { path = "extensions/crypto", version = "0.0.19-pre.4" }
+limbo_ext = { path = "extensions/core", version = "0.0.19-pre.4" }
+limbo_ext_tests = { path = "extensions/tests", version = "0.0.19-pre.4" }
+limbo_ipaddr = { path = "extensions/ipaddr", version = "0.0.19-pre.4" }
+limbo_macros = { path = "macros", version = "0.0.19-pre.4" }
+limbo_percentile = { path = "extensions/percentile", version = "0.0.19-pre.4" }
+limbo_regexp = { path = "extensions/regexp", version = "0.0.19-pre.4" }
+limbo_series = { path = "extensions/series", version = "0.0.19-pre.4" }
+limbo_sqlite3_parser = { path = "vendored/sqlite3-parser", version = "0.0.19-pre.4" }
+limbo_time = { path = "extensions/time", version = "0.0.19-pre.4" }
+limbo_uuid = { path = "extensions/uuid", version = "0.0.19-pre.4" }
 
 [profile.release]
 debug = "line-tables-only"

@@ -20,24 +20,26 @@ path = "main.rs"
 
 [dependencies]
 anyhow = "1.0.75"
+cfg-if = "1.0.0"
 clap = { version = "4.5.31", features = ["derive"] }
+clap_complete = { version = "=4.5.47", features = ["unstable-dynamic"] }
 comfy-table = "7.1.4"
+csv = "1.3.1"
+ctrlc = "3.4.4"
 dirs = "5.0.1"
 env_logger = "0.10.1"
 limbo_core = { path = "../core", default-features = true, features = [
     "completion",
 ] }
+miette = { version = "7.4.0", features = ["fancy"] }
+nu-ansi-term = "0.50.1"
 rustyline = { version = "15.0.0", default-features = true, features = [
     "derive",
 ] }
-ctrlc = "3.4.4"
-csv = "1.3.1"
-miette = { version = "7.4.0", features = ["fancy"] }
-cfg-if = "1.0.0"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
-tracing = "0.1.41"
+shlex = "1.3.0"
 syntect = "5.2.0"
-nu-ansi-term = "0.50.1"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 
 
 [features]
@@ -46,4 +48,3 @@ io_uring = ["limbo_core/io_uring"]
 
 [build-dependencies]
 syntect = "5.2.0"
-

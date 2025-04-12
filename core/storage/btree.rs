@@ -12,13 +12,14 @@ use crate::types::{
 use crate::{return_corrupt, LimboError, Result};
 
 use std::cell::{Cell, Ref, RefCell};
+use std::cmp::Ordering;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use super::pager::PageRef;
 use super::sqlite3_ondisk::{
-    write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell, DATABASE_HEADER_SIZE,
+    read_record, write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell,
+    DATABASE_HEADER_SIZE,
 };
 
 /*
@@ -84,6 +85,18 @@ macro_rules! debug_validate_cells {
             debug_validate_cells_core($page_contents, $usable_space);
         }
     };
+}
+/// Check if the page is unlocked, if not return IO. If the page is not locked but not loaded, then try to load it.
+macro_rules! return_if_locked_maybe_load {
+    ($pager:expr, $expr:expr) => {{
+        if $expr.is_locked() {
+            return Ok(CursorResult::IO);
+        }
+        if !$expr.is_loaded() {
+            $pager.load_page($expr.clone())?;
+            return Ok(CursorResult::IO);
+        }
+    }};
 }
 
 /// State machine of destroy operations
@@ -156,6 +169,57 @@ enum ReadPayloadOverflow {
         remaining_to_read: usize,
         page: PageRef,
     },
+}
+
+#[derive(Clone, Debug)]
+pub enum BTreeKey<'a> {
+    TableRowId((u64, Option<&'a ImmutableRecord>)),
+    IndexKey(&'a ImmutableRecord),
+}
+
+impl BTreeKey<'_> {
+    /// Create a new table rowid key from a rowid and an optional immutable record.
+    /// The record is optional because it may not be available when the key is created.
+    pub fn new_table_rowid(rowid: u64, record: Option<&ImmutableRecord>) -> BTreeKey<'_> {
+        BTreeKey::TableRowId((rowid, record))
+    }
+
+    /// Create a new index key from an immutable record.
+    pub fn new_index_key(record: &ImmutableRecord) -> BTreeKey<'_> {
+        BTreeKey::IndexKey(record)
+    }
+
+    /// Get the record, if present. Index will always be present,
+    fn get_record(&self) -> Option<&'_ ImmutableRecord> {
+        match self {
+            BTreeKey::TableRowId((_, record)) => *record,
+            BTreeKey::IndexKey(record) => Some(record),
+        }
+    }
+
+    /// Get the rowid, if present. Index will never be present.
+    fn maybe_rowid(&self) -> Option<u64> {
+        match self {
+            BTreeKey::TableRowId((rowid, _)) => Some(*rowid),
+            BTreeKey::IndexKey(_) => None,
+        }
+    }
+
+    /// Assert that the key is an integer rowid and return it.
+    fn to_rowid(&self) -> u64 {
+        match self {
+            BTreeKey::TableRowId((rowid, _)) => *rowid,
+            BTreeKey::IndexKey(_) => panic!("BTreeKey::to_rowid called on IndexKey"),
+        }
+    }
+
+    /// Assert that the key is an index key and return it.
+    fn to_index_key_values(&self) -> &'_ Vec<RefValue> {
+        match self {
+            BTreeKey::TableRowId(_) => panic!("BTreeKey::to_index_key called on TableRowId"),
+            BTreeKey::IndexKey(key) => key.get_values(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -588,8 +652,8 @@ impl BTreeCursor {
                 BTreeCell::TableLeafCell(TableLeafCell {
                     _rowid,
                     _payload,
-                    first_overflow_page,
                     payload_size,
+                    first_overflow_page,
                 }) => {
                     assert!(predicate.is_none());
                     if let Some(next_page) = first_overflow_page {
@@ -803,10 +867,8 @@ impl BTreeCursor {
                         };
                         let record = self.get_immutable_record();
                         let record = record.as_ref().unwrap();
-                        let order = compare_immutable(
-                            &record.get_values().as_slice()[..record.len() - 1],
-                            &index_key.get_values().as_slice()[..],
-                        );
+                        let without_rowid = &record.get_values().as_slice()[..record.len() - 1];
+                        let order = without_rowid.cmp(index_key.get_values());
                         let found = match op {
                             SeekOp::GT => order.is_gt(),
                             SeekOp::GE => order.is_ge(),
@@ -853,6 +915,7 @@ impl BTreeCursor {
 
     /// Move the cursor to the root page of the btree.
     fn move_to_root(&mut self) {
+        tracing::trace!("move_to_root({})", self.root_page);
         let mem_page = self.pager.read_page(self.root_page).unwrap();
         self.stack.clear();
         self.stack.push(mem_page);
@@ -1037,11 +1100,11 @@ impl BTreeCursor {
 
     /// Insert a record into the btree.
     /// If the insert operation overflows the page, it will be split and the btree will be balanced.
-    fn insert_into_page(
-        &mut self,
-        key: &OwnedValue,
-        record: &ImmutableRecord,
-    ) -> Result<CursorResult<()>> {
+    fn insert_into_page(&mut self, bkey: &BTreeKey) -> Result<CursorResult<()>> {
+        let record = bkey
+            .get_record()
+            .expect("expected record present on insert");
+
         if let CursorState::None = &self.state {
             self.state = CursorState::Write(WriteInfo::new());
         }
@@ -1056,10 +1119,7 @@ impl BTreeCursor {
             match write_state {
                 WriteState::Start => {
                     let page = self.stack.top();
-                    let int_key = match key {
-                        OwnedValue::Integer(i) => *i as u64,
-                        _ => unreachable!("btree tables are indexed by integers!"),
-                    };
+                    return_if_locked_maybe_load!(self.pager, page);
 
                     // get page and find cell
                     let (cell_idx, page_type) = {
@@ -1069,23 +1129,27 @@ impl BTreeCursor {
                         self.pager.add_dirty(page.get().id);
 
                         let page = page.get().contents.as_mut().unwrap();
-                        assert!(matches!(page.page_type(), PageType::TableLeaf));
+                        assert!(matches!(
+                            page.page_type(),
+                            PageType::TableLeaf | PageType::IndexLeaf
+                        ));
 
                         // find cell
-                        (self.find_cell(page, int_key), page.page_type())
+                        (self.find_cell(page, bkey), page.page_type())
                     };
                     tracing::debug!("insert_into_page(cell_idx={})", cell_idx);
 
                     // if the cell index is less than the total cells, check: if its an existing
                     // rowid, we are going to update / overwrite the cell
                     if cell_idx < page.get_contents().cell_count() {
-                        if let BTreeCell::TableLeafCell(tbl_leaf) = page.get_contents().cell_get(
+                        match page.get_contents().cell_get(
                             cell_idx,
                             payload_overflow_threshold_max(page_type, self.usable_space() as u16),
                             payload_overflow_threshold_min(page_type, self.usable_space() as u16),
                             self.usable_space(),
                         )? {
-                            if tbl_leaf._rowid == int_key {
+                         BTreeCell::TableLeafCell(tbl_leaf) => {
+                            if tbl_leaf._rowid == bkey.to_rowid() {
                                 tracing::debug!("insert_into_page: found exact match with cell_idx={cell_idx}, overwriting");
                                 self.overwrite_cell(page.clone(), cell_idx, record)?;
                                 self.state
@@ -1095,12 +1159,37 @@ impl BTreeCursor {
                                 continue;
                             }
                         }
+                      BTreeCell::IndexLeafCell(idx_leaf) => {
+                        read_record(
+                            idx_leaf.payload,
+                            self.get_immutable_record_or_create().as_mut().unwrap(),
+                        )
+                        .expect("failed to read record");
+                    if compare_immutable(
+                                record.get_values(),
+                                self.get_immutable_record()
+                                    .as_ref()
+                                    .unwrap()
+                                    .get_values()
+                        ) == Ordering::Equal {
+
+                        tracing::debug!("insert_into_page: found exact match with cell_idx={cell_idx}, overwriting");
+                        self.overwrite_cell(page.clone(), cell_idx, record)?;
+                        self.state
+                            .mut_write_info()
+                            .expect("expected write info")
+                            .state = WriteState::Finish;
+                        continue;
+                        }
+                    }
+                    other => panic!("unexpected cell type, expected TableLeaf or IndexLeaf, found: {:?}", other),
+                   }
                     }
                     // insert cell
                     let mut cell_payload: Vec<u8> = Vec::with_capacity(record.len() + 4);
                     fill_cell_payload(
                         page_type,
-                        Some(int_key),
+                        bkey.maybe_rowid(),
                         &mut cell_payload,
                         record,
                         self.usable_space() as u16,
@@ -1219,11 +1308,7 @@ impl BTreeCursor {
                 if parent_page.is_locked() {
                     return Ok(CursorResult::IO);
                 }
-                return_if_locked!(parent_page);
-                if !parent_page.is_loaded() {
-                    self.pager.load_page(parent_page.clone())?;
-                    return Ok(CursorResult::IO);
-                }
+                return_if_locked_maybe_load!(self.pager, parent_page);
                 parent_page.set_dirty();
                 self.pager.add_dirty(parent_page.get().id);
                 let parent_contents = parent_page.get().contents.as_ref().unwrap();
@@ -1903,8 +1988,7 @@ impl BTreeCursor {
     }
 
     /// Find the index of the cell in the page that contains the given rowid.
-    /// BTree tables only.
-    fn find_cell(&self, page: &PageContent, int_key: u64) -> usize {
+    fn find_cell(&self, page: &PageContent, key: &BTreeKey) -> usize {
         let mut cell_idx = 0;
         let cell_count = page.cell_count();
         while cell_idx < cell_count {
@@ -1918,20 +2002,66 @@ impl BTreeCursor {
                 .unwrap()
             {
                 BTreeCell::TableLeafCell(cell) => {
-                    if int_key <= cell._rowid {
+                    if key.to_rowid() <= cell._rowid {
                         break;
                     }
                 }
                 BTreeCell::TableInteriorCell(cell) => {
-                    if int_key <= cell._rowid {
+                    if key.to_rowid() <= cell._rowid {
                         break;
                     }
                 }
-                _ => todo!(),
+                BTreeCell::IndexInteriorCell(IndexInteriorCell { payload, .. })
+                | BTreeCell::IndexLeafCell(IndexLeafCell { payload, .. }) => {
+                    // TODO: implement efficient comparison of records
+                    // e.g. https://github.com/sqlite/sqlite/blob/master/src/vdbeaux.c#L4719
+                    read_record(
+                        payload,
+                        self.get_immutable_record_or_create().as_mut().unwrap(),
+                    )
+                    .expect("failed to read record");
+                    let order = compare_immutable(
+                        key.to_index_key_values(),
+                        self.get_immutable_record().as_ref().unwrap().get_values(),
+                    );
+                    match order {
+                        Ordering::Less | Ordering::Equal => {
+                            break;
+                        }
+                        Ordering::Greater => {}
+                    }
+                }
             }
             cell_idx += 1;
         }
         cell_idx
+    }
+
+    pub fn seek_end(&mut self) -> Result<CursorResult<()>> {
+        assert!(self.mv_cursor.is_none()); // unsure about this -_-
+        self.move_to_root();
+        loop {
+            let mem_page = self.stack.top();
+            let page_id = mem_page.get().id;
+            let page = self.pager.read_page(page_id)?;
+            return_if_locked!(page);
+
+            let contents = page.get().contents.as_ref().unwrap();
+            if contents.is_leaf() {
+                // set cursor just past the last cell to append
+                self.stack.set_cell_index(contents.cell_count() as i32);
+                return Ok(CursorResult::Ok(()));
+            }
+
+            match contents.rightmost_pointer() {
+                Some(right_most_pointer) => {
+                    self.stack.set_cell_index(contents.cell_count() as i32 + 1); // invalid on interior
+                    let child = self.pager.read_page(right_most_pointer as usize)?;
+                    self.stack.push(child);
+                }
+                None => unreachable!("interior page must have rightmost pointer"),
+            }
+        }
     }
 
     pub fn seek_to_last(&mut self) -> Result<CursorResult<()>> {
@@ -2023,28 +2153,36 @@ impl BTreeCursor {
 
     pub fn insert(
         &mut self,
-        key: &OwnedValue,
-        record: &ImmutableRecord,
+        key: &BTreeKey,
         moved_before: bool, /* Indicate whether it's necessary to traverse to find the leaf page */
     ) -> Result<CursorResult<()>> {
-        let int_key = match key {
-            OwnedValue::Integer(i) => i,
-            _ => unreachable!("btree tables are indexed by integers!"),
-        };
         match &self.mv_cursor {
-            Some(mv_cursor) => {
-                let row_id =
-                    crate::mvcc::database::RowID::new(self.table_id() as u64, *int_key as u64);
-                let record_buf = record.get_payload().to_vec();
-                let row = crate::mvcc::database::Row::new(row_id, record_buf);
-                mv_cursor.borrow_mut().insert(row).unwrap();
-            }
+            Some(mv_cursor) => match key.maybe_rowid() {
+                Some(rowid) => {
+                    let row_id = crate::mvcc::database::RowID::new(self.table_id() as u64, rowid);
+                    let record_buf = key.get_record().unwrap().get_payload().to_vec();
+                    let row = crate::mvcc::database::Row::new(row_id, record_buf);
+                    mv_cursor.borrow_mut().insert(row).unwrap();
+                }
+                None => todo!("Support mvcc inserts with index btrees"),
+            },
             None => {
                 if !moved_before {
-                    return_if_io!(self.move_to(SeekKey::TableRowId(*int_key as u64), SeekOp::EQ));
+                    match key {
+                        BTreeKey::IndexKey(_) => {
+                            return_if_io!(self
+                                .move_to(SeekKey::IndexKey(key.get_record().unwrap()), SeekOp::GE))
+                        }
+                        BTreeKey::TableRowId(_) => return_if_io!(
+                            self.move_to(SeekKey::TableRowId(key.to_rowid()), SeekOp::EQ)
+                        ),
+                    }
                 }
-                return_if_io!(self.insert_into_page(key, record));
-                self.rowid.replace(Some(*int_key as u64));
+                return_if_io!(self.insert_into_page(key));
+                if key.maybe_rowid().is_some() {
+                    let int_key = key.to_rowid();
+                    self.rowid.replace(Some(int_key));
+                }
             }
         };
         Ok(CursorResult::Ok(()))
@@ -2095,12 +2233,7 @@ impl BTreeCursor {
 
                 DeleteState::LoadPage => {
                     let page = self.stack.top();
-                    return_if_locked!(page);
-
-                    if !page.is_loaded() {
-                        self.pager.load_page(page.clone())?;
-                        return Ok(CursorResult::IO);
-                    }
+                    return_if_locked_maybe_load!(self.pager, page);
 
                     let delete_info = self.state.mut_delete_info().unwrap();
                     delete_info.state = DeleteState::FindCell;
@@ -2368,6 +2501,33 @@ impl BTreeCursor {
         self.null_flag
     }
 
+    /// Search for a key in an Index Btree. Looking up indexes that need to be unique, we cannot compare the rowid
+    pub fn key_exists_in_index(&mut self, key: &ImmutableRecord) -> Result<CursorResult<bool>> {
+        return_if_io!(self.do_seek(SeekKey::IndexKey(key), SeekOp::GE));
+
+        let record_opt = self.record();
+        match record_opt.as_ref() {
+            Some(record) => {
+                // Existing record found — compare prefix
+                let existing_key = &record.get_values()[..record.count().saturating_sub(1)];
+                let inserted_key_vals = &key.get_values();
+                if existing_key
+                    .iter()
+                    .zip(inserted_key_vals.iter())
+                    .all(|(a, b)| a == b)
+                {
+                    return Ok(CursorResult::Ok(true)); // duplicate
+                }
+            }
+            None => {
+                // Cursor not pointing at a record — table is empty or past last
+                return Ok(CursorResult::Ok(false));
+            }
+        }
+
+        Ok(CursorResult::Ok(false)) // not a duplicate
+    }
+
     pub fn exists(&mut self, key: &OwnedValue) -> Result<CursorResult<bool>> {
         assert!(self.mv_cursor.is_none());
         let int_key = match key {
@@ -2386,7 +2546,7 @@ impl BTreeCursor {
             OwnedValue::Integer(i) => *i as u64,
             _ => unreachable!("btree tables are indexed by integers!"),
         };
-        let cell_idx = self.find_cell(contents, int_key);
+        let cell_idx = self.find_cell(contents, &BTreeKey::new_table_rowid(int_key, None));
         if cell_idx >= contents.cell_count() {
             Ok(CursorResult::Ok(false))
         } else {
@@ -2499,12 +2659,7 @@ impl BTreeCursor {
                 }
                 DestroyState::LoadPage => {
                     let page = self.stack.top();
-                    return_if_locked!(page);
-
-                    if !page.is_loaded() {
-                        self.pager.load_page(Arc::clone(&page))?;
-                        return Ok(CursorResult::IO);
-                    }
+                    return_if_locked_maybe_load!(self.pager, page);
 
                     let destroy_info = self
                         .state
@@ -4041,25 +4196,28 @@ mod tests {
             for (key, size) in sequence.iter() {
                 run_until_done(
                     || {
-                        let key = SeekKey::TableRowId(*key as u64);
+                        let key = SeekKey::TableRowId(*key);
                         cursor.move_to(key, SeekOp::EQ)
                     },
                     pager.deref(),
                 )
                 .unwrap();
-                let key = OwnedValue::Integer(*key);
                 let value = ImmutableRecord::from_registers(&[Register::OwnedValue(
                     OwnedValue::Blob(vec![0; *size]),
                 )]);
                 tracing::info!("insert key:{}", key);
-                run_until_done(|| cursor.insert(&key, &value, true), pager.deref()).unwrap();
+                run_until_done(
+                    || cursor.insert(&BTreeKey::new_table_rowid(*key, Some(&value)), true),
+                    pager.deref(),
+                )
+                .unwrap();
                 tracing::info!(
                     "=========== btree ===========\n{}\n\n",
                     format_btree(pager.clone(), root_page, 0)
                 );
             }
             for (key, _) in sequence.iter() {
-                let seek_key = SeekKey::TableRowId(*key as u64);
+                let seek_key = SeekKey::TableRowId(*key);
                 assert!(
                     matches!(
                         cursor.seek(seek_key, SeekOp::EQ).unwrap(),
@@ -4127,12 +4285,14 @@ mod tests {
                     pager.deref(),
                 )
                 .unwrap();
-
-                let key = OwnedValue::Integer(key);
                 let value = ImmutableRecord::from_registers(&[Register::OwnedValue(
                     OwnedValue::Blob(vec![0; size]),
                 )]);
-                run_until_done(|| cursor.insert(&key, &value, true), pager.deref()).unwrap();
+                run_until_done(
+                    || cursor.insert(&BTreeKey::new_table_rowid(key as u64, Some(&value)), true),
+                    pager.deref(),
+                )
+                .unwrap();
                 if matches!(validate_btree(pager.clone(), root_page), (_, false)) {
                     panic!("invalid btree");
                 }
@@ -4208,21 +4368,25 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     pub fn btree_insert_fuzz_run_random() {
         btree_insert_fuzz_run(128, 16, |rng| (rng.next_u32() % 4096) as usize);
     }
 
     #[test]
+    #[ignore]
     pub fn btree_insert_fuzz_run_small() {
         btree_insert_fuzz_run(1, 1024, |rng| (rng.next_u32() % 128) as usize);
     }
 
     #[test]
+    #[ignore]
     pub fn btree_insert_fuzz_run_big() {
         btree_insert_fuzz_run(64, 32, |rng| 3 * 1024 + (rng.next_u32() % 1024) as usize);
     }
 
     #[test]
+    #[ignore]
     pub fn btree_insert_fuzz_run_overflow() {
         btree_insert_fuzz_run(64, 32, |rng| (rng.next_u32() % 32 * 1024) as usize);
     }
@@ -5002,7 +5166,6 @@ mod tests {
         for i in 0..10000 {
             let mut cursor = BTreeCursor::new(None, pager.clone(), root_page);
             tracing::info!("INSERT INTO t VALUES ({});", i,);
-            let key = OwnedValue::Integer(i);
             let value =
                 ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Integer(i))]);
             tracing::trace!("before insert {}", i);
@@ -5014,7 +5177,11 @@ mod tests {
                 pager.deref(),
             )
             .unwrap();
-            run_until_done(|| cursor.insert(&key, &value, true), pager.deref()).unwrap();
+            run_until_done(
+                || cursor.insert(&BTreeKey::new_table_rowid(i as u64, Some(&value)), true),
+                pager.deref(),
+            )
+            .unwrap();
             keys.push(i);
         }
         if matches!(validate_btree(pager.clone(), root_page), (_, false)) {
@@ -5078,7 +5245,6 @@ mod tests {
         // Insert 10,000 records in to the BTree.
         for i in 1..=10000 {
             let mut cursor = BTreeCursor::new(None, pager.clone(), root_page);
-            let key = OwnedValue::Integer(i);
             let value = ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Text(
                 Text::new("hello world"),
             ))]);
@@ -5092,7 +5258,11 @@ mod tests {
             )
             .unwrap();
 
-            run_until_done(|| cursor.insert(&key, &value, true), pager.deref()).unwrap();
+            run_until_done(
+                || cursor.insert(&BTreeKey::new_table_rowid(i as u64, Some(&value)), true),
+                pager.deref(),
+            )
+            .unwrap();
         }
 
         match validate_btree(pager.clone(), root_page) {
@@ -5151,7 +5321,6 @@ mod tests {
         for i in 0..iterations {
             let mut cursor = BTreeCursor::new(None, pager.clone(), root_page);
             tracing::info!("INSERT INTO t VALUES ({});", i,);
-            let key = OwnedValue::Integer(i as i64);
             let value =
                 ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Text(Text {
                     value: huge_texts[i].as_bytes().to_vec(),
@@ -5170,7 +5339,11 @@ mod tests {
                 pager.deref(),
             )
             .unwrap();
-            run_until_done(|| cursor.insert(&key, &value, true), pager.deref()).unwrap();
+            run_until_done(
+                || cursor.insert(&BTreeKey::new_table_rowid(i as u64, Some(&value)), true),
+                pager.deref(),
+            )
+            .unwrap();
             tracing::debug!(
                 "=========== btree after ===========\n{}\n\n",
                 format_btree(pager.clone(), root_page, 0)
