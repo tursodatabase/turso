@@ -795,41 +795,56 @@ pub fn decode_percent(uri: &str) -> String {
 /// When casting to INTEGER, if the text looks like a floating point value with an exponent, the exponent will be ignored
 /// because it is no part of the integer prefix. For example, "CAST('123e+5' AS INTEGER)" results in 123, not in 12300000.
 /// The CAST operator understands decimal integers only — conversion of hexadecimal integers stops at the "x" in the "0x" prefix of the hexadecimal integer string and thus result of the CAST is always zero.
-pub fn cast_text_to_integer(text: &str) -> OwnedValue {
-    let text = text.trim();
-    if text.is_empty() {
-        return OwnedValue::Integer(0);
+pub fn cast_text_to_integer(value: &mut OwnedValue) {
+    if let Some(text) = value.as_text() {
+        let text = text.trim();
+        if text.is_empty() {
+            value.convert_to_integer(0);
+            return;
+        }
+        if let Ok(i) = text.parse::<i64>() {
+            value.convert_to_integer(i);
+            return;
+        }
+        let bytes = text.as_bytes();
+        let mut end = 0;
+        if bytes[0] == b'-' {
+            end = 1;
+        }
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if let Ok(i) = text[..end].parse::<i64>() {
+            value.convert_to_integer(i);
+        } else {
+            value.convert_to_integer(0);
+        }
+    } else {
+        value.convert_to_integer(0);
     }
-    if let Ok(i) = text.parse::<i64>() {
-        return OwnedValue::Integer(i);
-    }
-    let bytes = text.as_bytes();
-    let mut end = 0;
-    if bytes[0] == b'-' {
-        end = 1;
-    }
-    while end < bytes.len() && bytes[end].is_ascii_digit() {
-        end += 1;
-    }
-    text[..end]
-        .parse::<i64>()
-        .map_or(OwnedValue::Integer(0), OwnedValue::Integer)
 }
 
 /// When casting a TEXT value to REAL, the longest possible prefix of the value that can be interpreted
 /// as a real number is extracted from the TEXT value and the remainder ignored. Any leading spaces in
 /// the TEXT value are ignored when converging from TEXT to REAL.
 /// If there is no prefix that can be interpreted as a real number, the result of the conversion is 0.0.
-pub fn cast_text_to_real(text: &str) -> OwnedValue {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return OwnedValue::Float(0.0);
+pub fn cast_text_to_real(value: &mut OwnedValue) {
+    if let Some(text) = value.as_text() {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            value.convert_to_float(0.0);
+            return;
+        }
+        if let Ok((_, text)) = parse_numeric_str(trimmed) {
+            if let Ok(f) = text.parse::<f64>() {
+                value.convert_to_float(f);
+                return;
+            }
+        }
+        value.convert_to_float(0.0);
+    } else {
+        value.convert_to_float(0.0);
     }
-    let Ok((_, text)) = parse_numeric_str(trimmed) else {
-        return OwnedValue::Float(0.0);
-    };
-    text.parse::<f64>()
-        .map_or(OwnedValue::Float(0.0), OwnedValue::Float)
 }
 
 /// NUMERIC Casting a TEXT or BLOB value into NUMERIC yields either an INTEGER or a REAL result.
@@ -842,35 +857,43 @@ pub fn cast_text_to_real(text: &str) -> OwnedValue {
 /// IEEE 754 64-bit float and thus provides a 1-bit of margin for the text-to-float conversion operation.)
 /// Any text input that describes a value outside the range of a 64-bit signed integer yields a REAL result.
 /// Casting a REAL or INTEGER value to NUMERIC is a no-op, even if a real value could be losslessly converted to an integer.
-pub fn checked_cast_text_to_numeric(text: &str) -> std::result::Result<OwnedValue, ()> {
-    // sqlite will parse the first N digits of a string to numeric value, then determine
-    // whether _that_ value is more likely a real or integer value. e.g.
-    // '-100234-2344.23e14' evaluates to -100234 instead of -100234.0
-    let (kind, text) = parse_numeric_str(text)?;
-    match kind {
-        OwnedValueType::Integer => {
-            match text.parse::<i64>() {
-                Ok(i) => Ok(OwnedValue::Integer(i)),
-                Err(e) => {
-                    if matches!(
-                        e.kind(),
-                        std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow
-                    ) {
-                        // if overflow, we return the representation as a real:
-                        // we have to match sqlite exactly here, so we match sqlite3AtoF
-                        let value = text.parse::<f64>().unwrap_or_default();
-                        let factor = 10f64.powi(15 - value.abs().log10().ceil() as i32);
-                        Ok(OwnedValue::Float((value * factor).round() / factor))
-                    } else {
-                        Err(())
+fn checked_cast_text_to_numeric(value: &mut OwnedValue) -> std::result::Result<(), ()> {
+    if let Some(text) = value.as_text() {
+        let (kind, text) = parse_numeric_str(text)?;
+        match kind {
+            OwnedValueType::Integer => {
+                match text.parse::<i64>() {
+                    Ok(i) => {
+                        value.convert_to_integer(i);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        if matches!(
+                            e.kind(),
+                            std::num::IntErrorKind::PosOverflow
+                                | std::num::IntErrorKind::NegOverflow
+                        ) {
+                            // if overflow, we return the representation as a real:
+                            // we have to match sqlite exactly here, so we match sqlite3AtoF
+                            let float_val = text.parse::<f64>().unwrap_or_default();
+                            let factor = 10f64.powi(15 - float_val.abs().log10().ceil() as i32);
+                            value.convert_to_float((float_val * factor).round() / factor);
+                            Ok(())
+                        } else {
+                            Err(())
+                        }
                     }
                 }
             }
+            OwnedValueType::Float => {
+                let float_val = text.parse::<f64>().unwrap_or(0.0);
+                value.convert_to_float(float_val);
+                Ok(())
+            }
+            _ => unreachable!(),
         }
-        OwnedValueType::Float => Ok(text
-            .parse::<f64>()
-            .map_or(OwnedValue::Float(0.0), OwnedValue::Float)),
-        _ => unreachable!(),
+    } else {
+        Err(())
     }
 }
 
@@ -931,15 +954,20 @@ fn parse_numeric_str(text: &str) -> Result<(OwnedValueType, &str), ()> {
     ))
 }
 
-pub fn cast_text_to_numeric(txt: &str) -> OwnedValue {
-    checked_cast_text_to_numeric(txt).unwrap_or(OwnedValue::Integer(0))
+pub fn cast_text_to_numeric(value: &mut OwnedValue) {
+    if let Err(_) = checked_cast_text_to_numeric(value) {
+        value.convert_to_integer(0);
+    }
 }
 
 // Check if float can be losslessly converted to 51-bit integer
-pub fn cast_real_to_integer(float: f64) -> std::result::Result<i64, ()> {
-    let i = float as i64;
-    if float == i as f64 && i.abs() < (1i64 << 51) {
-        return Ok(i);
+pub fn cast_real_to_integer(value: &mut OwnedValue) -> std::result::Result<(), ()> {
+    if let Some(float) = value.as_float() {
+        let i = float as i64;
+        if float == i as f64 && i.abs() < (1i64 << 51) {
+            value.convert_to_integer(i);
+            return Ok(());
+        }
     }
     Err(())
 }
@@ -1544,163 +1572,144 @@ pub mod tests {
 
     #[test]
     fn test_text_to_integer() {
-        assert_eq!(cast_text_to_integer("1"), OwnedValue::Integer(1),);
-        assert_eq!(cast_text_to_integer("-1"), OwnedValue::Integer(-1),);
-        assert_eq!(
-            cast_text_to_integer("1823400-00000"),
-            OwnedValue::Integer(1823400),
-        );
-        assert_eq!(
-            cast_text_to_integer("-10000000"),
-            OwnedValue::Integer(-10000000),
-        );
-        assert_eq!(cast_text_to_integer("123xxx"), OwnedValue::Integer(123),);
-        assert_eq!(
-            cast_text_to_integer("9223372036854775807"),
-            OwnedValue::Integer(i64::MAX),
-        );
-        assert_eq!(
-            cast_text_to_integer("9223372036854775808"),
-            OwnedValue::Integer(0),
-        );
-        assert_eq!(
-            cast_text_to_integer("-9223372036854775808"),
-            OwnedValue::Integer(i64::MIN),
-        );
-        assert_eq!(
-            cast_text_to_integer("-9223372036854775809"),
-            OwnedValue::Integer(0),
-        );
-        assert_eq!(cast_text_to_integer("-"), OwnedValue::Integer(0),);
+        let test_cases = [
+            ("1", 1),
+            ("-1", -1),
+            ("1823400-00000", 1823400),
+            ("-10000000", -10000000),
+            ("123xxx", 123),
+            ("9223372036854775807", i64::MAX),
+            ("9223372036854775808", 0),
+            ("-9223372036854775808", i64::MIN),
+            ("-9223372036854775809", 0),
+            ("-", 0),
+        ];
+
+        for (input, expected) in test_cases {
+            let mut value = OwnedValue::from_text(input);
+            cast_text_to_integer(&mut value);
+            assert_eq!(value.as_integer().unwrap(), expected);
+        }
     }
 
     #[test]
     fn test_text_to_real() {
-        assert_eq!(cast_text_to_real("1"), OwnedValue::Float(1.0));
-        assert_eq!(cast_text_to_real("-1"), OwnedValue::Float(-1.0));
-        assert_eq!(cast_text_to_real("1.0"), OwnedValue::Float(1.0));
-        assert_eq!(cast_text_to_real("-1.0"), OwnedValue::Float(-1.0));
-        assert_eq!(cast_text_to_real("1e10"), OwnedValue::Float(1e10));
-        assert_eq!(cast_text_to_real("-1e10"), OwnedValue::Float(-1e10));
-        assert_eq!(cast_text_to_real("1e-10"), OwnedValue::Float(1e-10));
-        assert_eq!(cast_text_to_real("-1e-10"), OwnedValue::Float(-1e-10));
-        assert_eq!(cast_text_to_real("1.123e10"), OwnedValue::Float(1.123e10));
-        assert_eq!(cast_text_to_real("-1.123e10"), OwnedValue::Float(-1.123e10));
-        assert_eq!(cast_text_to_real("1.123e-10"), OwnedValue::Float(1.123e-10));
-        assert_eq!(cast_text_to_real("-1.123-e-10"), OwnedValue::Float(-1.123));
-        assert_eq!(cast_text_to_real("1-282584294928"), OwnedValue::Float(1.0));
-        assert_eq!(
-            cast_text_to_real("1.7976931348623157e309"),
-            OwnedValue::Float(f64::INFINITY),
-        );
-        assert_eq!(
-            cast_text_to_real("-1.7976931348623157e308"),
-            OwnedValue::Float(f64::MIN),
-        );
-        assert_eq!(
-            cast_text_to_real("-1.7976931348623157e309"),
-            OwnedValue::Float(f64::NEG_INFINITY),
-        );
-        assert_eq!(cast_text_to_real("1E"), OwnedValue::Float(1.0));
-        assert_eq!(cast_text_to_real("1EE"), OwnedValue::Float(1.0));
-        assert_eq!(cast_text_to_real("-1E"), OwnedValue::Float(-1.0));
-        assert_eq!(cast_text_to_real("1."), OwnedValue::Float(1.0));
-        assert_eq!(cast_text_to_real("-1."), OwnedValue::Float(-1.0));
-        assert_eq!(cast_text_to_real("1.23E"), OwnedValue::Float(1.23));
-        assert_eq!(cast_text_to_real(".1.23E-"), OwnedValue::Float(0.1));
-        assert_eq!(cast_text_to_real("0"), OwnedValue::Float(0.0));
-        assert_eq!(cast_text_to_real("-0"), OwnedValue::Float(0.0));
-        assert_eq!(cast_text_to_real("-0"), OwnedValue::Float(0.0));
-        assert_eq!(cast_text_to_real("-0.0"), OwnedValue::Float(0.0));
-        assert_eq!(cast_text_to_real("0.0"), OwnedValue::Float(0.0));
-        assert_eq!(cast_text_to_real("-"), OwnedValue::Float(0.0));
+        let test_cases = [
+            ("1", 1.0),
+            ("-1", -1.0),
+            ("1.0", 1.0),
+            ("-1.0", -1.0),
+            ("1e10", 1e10),
+            ("-1e10", -1e10),
+            ("1e-10", 1e-10),
+            ("-1e-10", -1e-10),
+            ("1.123e10", 1.123e10),
+            ("-1.123e10", -1.123e10),
+            ("1.123e-10", 1.123e-10),
+            ("-1.123-e-10", -1.123),
+            ("1-282584294928", 1.0),
+            ("1.7976931348623157e309", f64::INFINITY),
+            ("-1.7976931348623157e308", f64::MIN),
+            ("-1.7976931348623157e309", f64::NEG_INFINITY),
+            ("1E", 1.0),
+            ("1EE", 1.0),
+            ("-1E", -1.0),
+            ("1.", 1.0),
+            ("-1.", -1.0),
+            ("1.23E", 1.23),
+            (".1.23E-", 0.1),
+            ("0", 0.0),
+            ("-0", 0.0),
+            ("-0.0", 0.0),
+            ("0.0", 0.0),
+            ("-", 0.0),
+        ];
+
+        for (input, expected) in test_cases {
+            let mut value = OwnedValue::from_text(input);
+            cast_text_to_real(&mut value);
+            assert_eq!(value.as_float().unwrap(), expected);
+        }
     }
 
     #[test]
     fn test_text_to_numeric() {
-        assert_eq!(cast_text_to_numeric("1"), OwnedValue::Integer(1));
-        assert_eq!(cast_text_to_numeric("-1"), OwnedValue::Integer(-1));
-        assert_eq!(
-            cast_text_to_numeric("1823400-00000"),
-            OwnedValue::Integer(1823400)
-        );
-        assert_eq!(
-            cast_text_to_numeric("-10000000"),
-            OwnedValue::Integer(-10000000)
-        );
-        assert_eq!(cast_text_to_numeric("123xxx"), OwnedValue::Integer(123));
-        assert_eq!(
-            cast_text_to_numeric("9223372036854775807"),
-            OwnedValue::Integer(i64::MAX)
-        );
-        assert_eq!(
-            cast_text_to_numeric("9223372036854775808"),
-            OwnedValue::Float(9.22337203685478e18)
-        ); // Exceeds i64, becomes float
-        assert_eq!(
-            cast_text_to_numeric("-9223372036854775808"),
-            OwnedValue::Integer(i64::MIN)
-        );
-        assert_eq!(
-            cast_text_to_numeric("-9223372036854775809"),
-            OwnedValue::Float(-9.22337203685478e18)
-        ); // Exceeds i64, becomes float
+        let integer_cases = [
+            ("1", 1),
+            ("-1", -1),
+            ("1823400-00000", 1823400),
+            ("-10000000", -10000000),
+            ("123xxx", 123),
+            ("9223372036854775807", i64::MAX),
+            ("1-282584294928", 1),
+            ("0", 0),
+            ("-0", 0),
+            ("-", 0),
+            ("-e", 0),
+            ("-E", 0),
+            ("xxx", 0),
+        ];
 
-        assert_eq!(cast_text_to_numeric("1.0"), OwnedValue::Float(1.0));
-        assert_eq!(cast_text_to_numeric("-1.0"), OwnedValue::Float(-1.0));
-        assert_eq!(cast_text_to_numeric("1e10"), OwnedValue::Float(1e10));
-        assert_eq!(cast_text_to_numeric("-1e10"), OwnedValue::Float(-1e10));
-        assert_eq!(cast_text_to_numeric("1e-10"), OwnedValue::Float(1e-10));
-        assert_eq!(cast_text_to_numeric("-1e-10"), OwnedValue::Float(-1e-10));
-        assert_eq!(
-            cast_text_to_numeric("1.123e10"),
-            OwnedValue::Float(1.123e10)
-        );
-        assert_eq!(
-            cast_text_to_numeric("-1.123e10"),
-            OwnedValue::Float(-1.123e10)
-        );
-        assert_eq!(
-            cast_text_to_numeric("1.123e-10"),
-            OwnedValue::Float(1.123e-10)
-        );
-        assert_eq!(
-            cast_text_to_numeric("-1.123-e-10"),
-            OwnedValue::Float(-1.123)
-        );
-        assert_eq!(
-            cast_text_to_numeric("1-282584294928"),
-            OwnedValue::Integer(1)
-        );
-        assert_eq!(cast_text_to_numeric("xxx"), OwnedValue::Integer(0));
-        assert_eq!(
-            cast_text_to_numeric("1.7976931348623157e309"),
-            OwnedValue::Float(f64::INFINITY)
-        );
-        assert_eq!(
-            cast_text_to_numeric("-1.7976931348623157e308"),
-            OwnedValue::Float(f64::MIN)
-        );
-        assert_eq!(
-            cast_text_to_numeric("-1.7976931348623157e309"),
-            OwnedValue::Float(f64::NEG_INFINITY)
-        );
+        for (input, expected) in integer_cases {
+            let mut value = OwnedValue::from_text(input);
+            cast_text_to_numeric(&mut value);
+            assert_eq!(
+                value.value_type(),
+                OwnedValueType::Integer,
+                "Testing input: {}",
+                input
+            );
+            assert_eq!(
+                value.as_integer().unwrap(),
+                expected,
+                "Testing input: {}",
+                input
+            );
+        }
 
-        assert_eq!(cast_text_to_numeric("1E"), OwnedValue::Float(1.0));
-        assert_eq!(cast_text_to_numeric("1EE"), OwnedValue::Float(1.0));
-        assert_eq!(cast_text_to_numeric("-1E"), OwnedValue::Float(-1.0));
-        assert_eq!(cast_text_to_numeric("1."), OwnedValue::Float(1.0));
-        assert_eq!(cast_text_to_numeric("-1."), OwnedValue::Float(-1.0));
-        assert_eq!(cast_text_to_numeric("1.23E"), OwnedValue::Float(1.23));
-        assert_eq!(cast_text_to_numeric("1.23E-"), OwnedValue::Float(1.23));
+        let float_cases = [
+            ("9223372036854775808", 9.22337203685478e18),
+            ("-9223372036854775809", -9.22337203685478e18),
+            ("1.0", 1.0),
+            ("-1.0", -1.0),
+            ("1e10", 1e10),
+            ("-1e10", -1e10),
+            ("1e-10", 1e-10),
+            ("-1e-10", -1e-10),
+            ("1.123e10", 1.123e10),
+            ("-1.123e10", -1.123e10),
+            ("1.123e-10", 1.123e-10),
+            ("-1.123-e-10", -1.123),
+            ("1.7976931348623157e309", f64::INFINITY),
+            ("-1.7976931348623157e308", f64::MIN),
+            ("-1.7976931348623157e309", f64::NEG_INFINITY),
+            ("1E", 1.0),
+            ("1EE", 1.0),
+            ("-1E", -1.0),
+            ("1.", 1.0),
+            ("-1.", -1.0),
+            ("1.23E", 1.23),
+            ("1.23E-", 1.23),
+            ("-0.0", 0.0),
+            ("0.0", 0.0),
+        ];
 
-        assert_eq!(cast_text_to_numeric("0"), OwnedValue::Integer(0));
-        assert_eq!(cast_text_to_numeric("-0"), OwnedValue::Integer(0));
-        assert_eq!(cast_text_to_numeric("-0.0"), OwnedValue::Float(0.0));
-        assert_eq!(cast_text_to_numeric("0.0"), OwnedValue::Float(0.0));
-        assert_eq!(cast_text_to_numeric("-"), OwnedValue::Integer(0));
-        assert_eq!(cast_text_to_numeric("-e"), OwnedValue::Integer(0));
-        assert_eq!(cast_text_to_numeric("-E"), OwnedValue::Integer(0));
+        for (input, expected) in float_cases {
+            let mut value = OwnedValue::from_text(input);
+            cast_text_to_numeric(&mut value);
+            assert_eq!(
+                value.value_type(),
+                OwnedValueType::Float,
+                "Testing input: {}",
+                input
+            );
+            assert_eq!(
+                value.as_float().unwrap(),
+                expected,
+                "Testing input: {}",
+                input
+            );
+        }
     }
 
     #[test]
