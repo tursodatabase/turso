@@ -1,4 +1,4 @@
-use crate::types::OwnedValue;
+use crate::types::{OwnedValue, OwnedValueType};
 use crate::vdbe::Register;
 use crate::LimboError;
 use crate::Result;
@@ -14,8 +14,9 @@ pub fn vector32(args: &[Register]) -> Result<OwnedValue> {
     }
     let x = parse_vector(&args[0], Some(VectorType::Float32))?;
     // Extract the Vec<u8> from OwnedValue
-    if let OwnedValue::Blob(data) = vector_serialize_f32(x) {
-        Ok(OwnedValue::Blob(data))
+    let serialized_vector = vector_serialize_f32(x);
+    if OwnedValueType::Blob == serialized_vector.value_type() {
+        Ok(serialized_vector)
     } else {
         Err(LimboError::ConversionError(
             "Failed to serialize vector".to_string(),
@@ -31,8 +32,9 @@ pub fn vector64(args: &[Register]) -> Result<OwnedValue> {
     }
     let x = parse_vector(&args[0], Some(VectorType::Float64))?;
     // Extract the Vec<u8> from OwnedValue
-    if let OwnedValue::Blob(data) = vector_serialize_f64(x) {
-        Ok(OwnedValue::Blob(data))
+    let serialized_vector = vector_serialize_f64(x);
+    if OwnedValueType::Blob == serialized_vector.value_type() {
+        Ok(serialized_vector)
     } else {
         Err(LimboError::ConversionError(
             "Failed to serialize vector".to_string(),
@@ -47,9 +49,9 @@ pub fn vector_extract(args: &[Register]) -> Result<OwnedValue> {
         ));
     }
 
-    let blob = match &args[0].get_owned_value() {
-        OwnedValue::Blob(b) => b,
-        _ => {
+    let blob = match args[0].get_owned_value().to_blob() {
+        Some(b) => b,
+        None => {
             return Err(LimboError::ConversionError(
                 "Expected blob value".to_string(),
             ))
@@ -75,5 +77,5 @@ pub fn vector_distance_cos(args: &[Register]) -> Result<OwnedValue> {
     let x = parse_vector(&args[0], None)?;
     let y = parse_vector(&args[1], None)?;
     let dist = do_vector_distance_cos(&x, &y)?;
-    Ok(OwnedValue::Float(dist))
+    Ok(OwnedValue::float(dist))
 }
