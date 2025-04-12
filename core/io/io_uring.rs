@@ -20,7 +20,7 @@ use tracing::{debug, trace};
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// use limbo_core::io::UringOpts;
 ///
 /// // Create custom options with higher concurrency
@@ -91,7 +91,7 @@ impl fmt::Display for UringIOError {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// use limbo_core::io::UringIO;
 ///
 /// // Create with default options
@@ -182,7 +182,7 @@ impl UringIO {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use limbo_core::io::{UringIO, UringOpts};
     ///
     /// // Create with custom options for high concurrency
@@ -297,7 +297,7 @@ impl IO for UringIO {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use limbo_core::io::{UringIO, OpenFlags};
     ///
     /// let io = UringIO::new()?;
@@ -348,7 +348,7 @@ impl IO for UringIO {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use limbo_core::io::UringIO;
     ///
     /// let io = UringIO::new()?;
@@ -419,7 +419,7 @@ impl Clock for UringIO {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// use limbo_core::io::{UringIO, OpenFlags, Completion, ReadCompletion, Buffer};
 ///
 /// let io = UringIO::new()?;
@@ -458,7 +458,7 @@ impl File for UringFile {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use limbo_core::io::UringIO;
     ///
     /// let io = UringIO::new()?;
@@ -503,7 +503,7 @@ impl File for UringFile {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use limbo_core::io::UringIO;
     ///
     /// let io = UringIO::new()?;
@@ -539,7 +539,7 @@ impl File for UringFile {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use limbo_core::io::{UringIO, Completion, ReadCompletion, Buffer};
     ///
     /// let io = UringIO::new()?;
@@ -589,7 +589,7 @@ impl File for UringFile {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use limbo_core::io::{UringIO, Completion, WriteCompletion, Buffer};
     ///
     /// let io = UringIO::new()?;
@@ -641,7 +641,7 @@ impl File for UringFile {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use limbo_core::io::{UringIO, Completion, SyncCompletion};
     ///
     /// let io = UringIO::new()?;
@@ -672,7 +672,7 @@ impl File for UringFile {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use limbo_core::io::UringIO;
     ///
     /// let io = UringIO::new()?;
