@@ -345,10 +345,10 @@ def test_kv():
     limbo = TestLimboShell()
     limbo.run_test_fn(
         "create virtual table t using kv_store;",
-        lambda res: "Virtual table module not found: kv_store" in res,
+        lambda res: "Module kv_store not found" in res,
     )
     limbo.execute_dot(f".load {ext_path}")
-    limbo.debug_print(
+    limbo.execute_dot(
         "create virtual table t using kv_store;",
     )
     limbo.run_test_fn(".schema", lambda res: "CREATE VIRTUAL TABLE t" in res)
@@ -398,9 +398,34 @@ def test_kv():
     limbo.run_test_fn(
         "select count(*) from t;", lambda res: "100" == res, "can insert 100 rows"
     )
+    limbo.run_test_fn("update t set value = 'updated' where key = 'key33';", null)
+    limbo.run_test_fn(
+        "select * from t where key = 'key33';",
+        lambda res: res == "key33|updated",
+        "can update single row",
+    )
+    limbo.run_test_fn(
+        "select COUNT(*) from t where value = 'updated';",
+        lambda res: res == "1",
+        "only updated a single row",
+    )
+    limbo.run_test_fn("update t set value = 'updated2';", null)
+    limbo.run_test_fn(
+        "select COUNT(*) from t where value = 'updated2';",
+        lambda res: res == "100",
+        "can update all rows",
+    )
     limbo.run_test_fn("delete from t limit 96;", null, "can delete 96 rows")
     limbo.run_test_fn(
         "select count(*) from t;", lambda res: "4" == res, "four rows remain"
+    )
+    limbo.run_test_fn(
+        "update t set key = '100' where 1;", null, "where clause evaluates properly"
+    )
+    limbo.run_test_fn(
+        "select * from t where key = '100';",
+        lambda res: res == "100|updated2",
+        "there is only 1 key remaining after setting all keys to same value",
     )
     limbo.quit()
 

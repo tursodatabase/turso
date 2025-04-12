@@ -1,3 +1,8 @@
 #!/bin/bash
 
-target/debug/limbo -m list "$@"
+# if RUST_LOG is non-empty, enable tracing output
+if [ -n "$RUST_LOG" ]; then
+   target/debug/limbo -m list -t testing/test.log "$@"
+else
+   target/debug/limbo -m list "$@"
+fi

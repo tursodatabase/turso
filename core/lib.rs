@@ -32,7 +32,9 @@ pub use io::clock::{Clock, Instant};
 pub use io::UnixIO;
 #[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring"))]
 pub use io::UringIO;
-pub use io::{Buffer, Completion, File, MemoryIO, OpenFlags, PlatformIO, WriteCompletion, IO};
+pub use io::{
+    Buffer, Completion, File, MemoryIO, OpenFlags, PlatformIO, SyscallIO, WriteCompletion, IO,
+};
 use limbo_ext::{ResultCode, VTabKind, VTabModuleImpl};
 use limbo_sqlite3_parser::{ast, ast::Cmd, lexer::sql::Parser};
 use parking_lot::RwLock;
@@ -70,7 +72,7 @@ use vdbe::{builder::QueryMode, VTabOpaqueCursor};
 pub type Result<T, E = LimboError> = std::result::Result<T, E>;
 pub static DATABASE_VERSION: OnceLock<String> = OnceLock::new();
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum TransactionState {
     Write,
     Read,
@@ -158,7 +160,13 @@ impl Database {
                 .try_write()
                 .expect("lock on schema should succeed first try");
             let syms = conn.syms.borrow();
-            parse_schema_rows(rows, &mut schema, io, syms.deref(), None)?;
+            if let Err(LimboError::ExtensionError(e)) =
+                parse_schema_rows(rows, &mut schema, io, &syms, None)
+            {
+                // this means that a vtab exists and we no longer have the module loaded. we print
+                // a warning to the user to load the module
+                eprintln!("Warning: {}", e);
+            }
         }
         Ok(db)
     }
@@ -186,9 +194,9 @@ impl Database {
             schema: self.schema.clone(),
             header: self.header.clone(),
             last_insert_rowid: Cell::new(0),
-            auto_commit: RefCell::new(true),
+            auto_commit: Cell::new(true),
             mv_transactions: RefCell::new(Vec::new()),
-            transaction_state: RefCell::new(TransactionState::None),
+            transaction_state: Cell::new(TransactionState::None),
             last_change: Cell::new(0),
             syms: RefCell::new(SymbolTable::new()),
             total_changes: Cell::new(0),
@@ -209,7 +217,7 @@ impl Database {
             Some(vfs) => vfs,
             None => match vfs.trim() {
                 "memory" => Arc::new(MemoryIO::new()),
-                "syscall" => Arc::new(PlatformIO::new()?),
+                "syscall" => Arc::new(SyscallIO::new()?),
                 #[cfg(all(target_os = "linux", feature = "io_uring"))]
                 "io_uring" => Arc::new(UringIO::new()?),
                 other => {
@@ -278,9 +286,9 @@ pub struct Connection {
     pager: Rc<Pager>,
     schema: Arc<RwLock<Schema>>,
     header: Arc<SpinLock<DatabaseHeader>>,
-    auto_commit: RefCell<bool>,
+    auto_commit: Cell<bool>,
     mv_transactions: RefCell<Vec<crate::mvcc::database::TxID>>,
-    transaction_state: RefCell<TransactionState>,
+    transaction_state: Cell<TransactionState>,
     last_insert_rowid: Cell<u64>,
     last_change: Cell<i64>,
     total_changes: Cell<i64>,
@@ -517,7 +525,26 @@ impl Connection {
     }
 
     pub fn get_auto_commit(&self) -> bool {
-        *self.auto_commit.borrow()
+        self.auto_commit.get()
+    }
+
+    pub fn parse_schema_rows(self: &Rc<Connection>) -> Result<()> {
+        let rows = self.query("SELECT * FROM sqlite_schema")?;
+        let mut schema = self
+            .schema
+            .try_write()
+            .expect("lock on schema should succeed first try");
+        {
+            let syms = self.syms.borrow();
+            if let Err(LimboError::ExtensionError(e)) =
+                parse_schema_rows(rows, &mut schema, self.pager.io.clone(), &syms, None)
+            {
+                // this means that a vtab exists and we no longer have the module loaded. we print
+                // a warning to the user to load the module
+                eprintln!("Warning: {}", e);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -630,7 +657,7 @@ impl VirtualTable {
                 module_name
             )))?;
         if let VTabKind::VirtualTable = kind {
-            if module.module_kind != VTabKind::VirtualTable {
+            if module.module_kind == VTabKind::TableValuedFunction {
                 return Err(LimboError::ExtensionError(format!(
                     "{} is not a virtual table module",
                     module_name

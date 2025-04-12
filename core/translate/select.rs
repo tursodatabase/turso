@@ -411,8 +411,8 @@ fn count_plan_required_cursors(plan: &SelectPlan) -> usize {
         .map(|t| match &t.op {
             Operation::Scan { .. } => 1,
             Operation::Search(search) => match search {
-                Search::RowidEq { .. } | Search::RowidSearch { .. } => 1,
-                Search::IndexSearch { .. } => 2, // btree cursor and index cursor
+                Search::RowidEq { .. } => 1,
+                Search::Seek { index, .. } => 1 + index.is_some() as usize,
             },
             Operation::Subquery { plan, .. } => count_plan_required_cursors(plan),
         })

@@ -190,3 +190,11 @@ terms or conditions.
 
 [contribution guide]: https://github.com/tursodatabase/limbo/blob/main/CONTRIBUTING.md
 [MIT license]: https://github.com/tursodatabase/limbo/blob/main/LICENSE.md
+
+## Contributors
+
+Thanks to all the contributors to Limbo!
+
+<a href="https://github.com/tursodatabase/limbo/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=tursodatabase/limbo" />
+</a>

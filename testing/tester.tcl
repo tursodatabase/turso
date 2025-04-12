@@ -97,3 +97,124 @@ proc do_execsql_test_tolerance {test_name sql_statements expected_outputs tolera
         }
     }
 }
+# This procedure passes the test if the output contains error messages
+proc run_test_expecting_any_error {sqlite_exec db_name sql} {
+    # Execute the SQL command and capture output
+    set command [list $sqlite_exec $db_name $sql]
+
+    # Use catch to handle both successful and error cases
+    catch {exec {*}$command} result options
+
+    # Check if the output contains error indicators (×, error, syntax error, etc.)
+    if {[regexp {(error|ERROR|Error|×|syntax error|failed)} $result]} {
+        # Error found in output - test passed
+        puts "Test PASSED: Got expected error"
+        return 1
+    }
+
+    # No error indicators in output
+    puts "Test FAILED: '$sql'"
+    puts "Expected an error but command output didn't indicate any error: '$result'"
+    exit 1
+}
+
+# This procedure passes if error matches a specific pattern
+proc run_test_expecting_error {sqlite_exec db_name sql expected_error_pattern} {
+    # Execute the SQL command and capture output
+    set command [list $sqlite_exec $db_name $sql]
+
+    # Capture output whether command succeeds or fails
+    catch {exec {*}$command} result options
+
+    # Check if the output contains error indicators first
+    if {![regexp {(error|ERROR|Error|×|syntax error|failed)} $result]} {
+        puts "Test FAILED: '$sql'"
+        puts "Expected an error matching '$expected_error_pattern'"
+        puts "But command output didn't indicate any error: '$result'"
+        exit 1
+    }
+
+    # Now check if the error message matches the expected pattern
+    if {![regexp $expected_error_pattern $result]} {
+        puts "Test FAILED: '$sql'"
+        puts "Error occurred but didn't match expected pattern."
+        puts "Output was: '$result'"
+        puts "Expected pattern: '$expected_error_pattern'"
+        exit 1
+    }
+
+    # If we get here, the test passed - got expected error matching pattern
+    return 1
+}
+
+# This version accepts exact error text, ignoring formatting
+proc run_test_expecting_error_content {sqlite_exec db_name sql expected_error_text} {
+    # Execute the SQL command and capture output
+    set command [list $sqlite_exec $db_name $sql]
+
+    # Capture output whether command succeeds or fails
+    catch {exec {*}$command} result options
+
+    # Check if the output contains error indicators first
+    if {![regexp {(error|ERROR|Error|×|syntax error|failed)} $result]} {
+        puts "Test FAILED: '$sql'"
+        puts "Expected an error with text: '$expected_error_text'"
+        puts "But command output didn't indicate any error: '$result'"
+        exit 1
+    }
+
+    # Normalize both the actual and expected error messages
+    # Remove all whitespace, newlines, and special characters for comparison
+    set normalized_actual [regsub -all {[[:space:]]|[[:punct:]]} $result ""]
+    set normalized_expected [regsub -all {[[:space:]]|[[:punct:]]} $expected_error_text ""]
+
+    # Convert to lowercase for case-insensitive comparison
+    set normalized_actual [string tolower $normalized_actual]
+    set normalized_expected [string tolower $normalized_expected]
+
+    # Check if the normalized strings contain the same text
+    if {[string first $normalized_expected $normalized_actual] == -1} {
+        puts "Test FAILED: '$sql'"
+        puts "Error occurred but content didn't match."
+        puts "Output was: '$result'"
+        puts "Expected text: '$expected_error_text'"
+        exit 1
+    }
+
+    # If we get here, the test passed - got error with expected content
+    return 1
+}
+
+proc do_execsql_test_error {test_name sql_statements expected_error_pattern} {
+    foreach db $::test_dbs {
+        puts [format "(%s) %s Running error test: %s" $db [string repeat " " [expr {40 - [string length $db]}]] $test_name]
+        set combined_sql [string trim $sql_statements]
+        run_test_expecting_error $::sqlite_exec $db $combined_sql $expected_error_pattern
+    }
+}
+
+proc do_execsql_test_error_content {test_name sql_statements expected_error_text} {
+    foreach db $::test_dbs {
+        puts [format "(%s) %s Running error content test: %s" $db [string repeat " " [expr {40 - [string length $db]}]] $test_name]
+        set combined_sql [string trim $sql_statements]
+        run_test_expecting_error_content $::sqlite_exec $db $combined_sql $expected_error_text
+    }
+}
+
+proc do_execsql_test_any_error {test_name sql_statements} {
+    foreach db $::test_dbs {
+        puts [format "(%s) %s Running any-error test: %s" $db [string repeat " " [expr {40 - [string length $db]}]] $test_name]
+        set combined_sql [string trim $sql_statements]
+        run_test_expecting_any_error $::sqlite_exec $db $combined_sql
+    }
+}
+
+proc do_execsql_test_in_memory_any_error {test_name sql_statements} {
+    puts [format "(in-memory) %s Running any-error test: %s" [string repeat " " 31] $test_name]
+
+    # Use ":memory:" special filename for in-memory database
+    set db_name ":memory:"
+
+    set combined_sql [string trim $sql_statements]
+    run_test_expecting_any_error $::sqlite_exec $db_name $combined_sql
+}

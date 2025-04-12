@@ -1,11 +1,17 @@
 use crate::{
-    commands::{args::EchoMode, import::ImportFile, Command, CommandParser},
+    commands::{
+        args::{EchoMode, TimerMode},
+        import::ImportFile,
+        Command, CommandParser,
+    },
     helper::LimboHelper,
     input::{get_io, get_writer, DbLocation, OutputMode, Settings},
     opcodes_dictionary::OPCODE_DESCRIPTIONS,
 };
 use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Row, Table};
 use limbo_core::{Database, LimboError, OwnedValue, Statement, StepResult};
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use clap::Parser;
 use rustyline::{history::DefaultHistory, Editor};
@@ -18,6 +24,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    time::{Duration, Instant},
 };
 
 #[derive(Parser)]
@@ -49,6 +56,8 @@ pub struct Opts {
     pub vfs: Option<String>,
     #[clap(long, help = "Enable experimental MVCC feature")]
     pub experimental_mvcc: bool,
+    #[clap(short = 't', long, help = "specify output file for log traces")]
+    pub tracing_output: Option<String>,
 }
 
 const PROMPT: &str = "limbo> ";
@@ -62,6 +71,11 @@ pub struct Limbo<'a> {
     input_buff: String,
     opts: Settings,
     pub rl: &'a mut Editor<LimboHelper, DefaultHistory>,
+}
+
+struct QueryStatistics {
+    io_time_elapsed_samples: Vec<Duration>,
+    execute_time_elapsed_samples: Vec<Duration>,
 }
 
 macro_rules! query_internal {
@@ -130,6 +144,8 @@ impl<'a> Limbo<'a> {
             })
             .expect("Error setting Ctrl-C handler");
         }
+        let sql = opts.sql.clone();
+        let quiet = opts.quiet;
         let mut app = Self {
             prompt: PROMPT.to_string(),
             io,
@@ -137,19 +153,23 @@ impl<'a> Limbo<'a> {
             conn,
             interrupt_count,
             input_buff: String::new(),
-            opts: Settings::from(&opts),
+            opts: Settings::from(opts),
             rl,
         };
-
-        if opts.sql.is_some() {
-            app.handle_first_input(opts.sql.as_ref().unwrap());
-        }
-        if !opts.quiet {
-            app.write_fmt(format_args!("Limbo v{}", env!("CARGO_PKG_VERSION")))?;
-            app.writeln("Enter \".help\" for usage hints.")?;
-            app.display_in_memory()?;
-        }
+        app.first_run(sql, quiet)?;
         Ok(app)
+    }
+
+    fn first_run(&mut self, sql: Option<String>, quiet: bool) -> io::Result<()> {
+        if let Some(sql) = sql {
+            self.handle_first_input(&sql);
+        }
+        if !quiet {
+            self.write_fmt(format_args!("Limbo v{}", env!("CARGO_PKG_VERSION")))?;
+            self.writeln("Enter \".help\" for usage hints.")?;
+            self.display_in_memory()?;
+        }
+        Ok(())
     }
 
     fn handle_first_input(&mut self, cmd: &str) {
@@ -381,7 +401,15 @@ impl<'a> Limbo<'a> {
             let _ = self.writeln(input);
         }
 
-        if input.trim_start().starts_with("explain") {
+        let start = Instant::now();
+        let mut stats = QueryStatistics {
+            io_time_elapsed_samples: vec![],
+            execute_time_elapsed_samples: vec![],
+        };
+        // TODO this is a quickfix. Some ideas to do case insensitive comparisons is to use
+        // Uncased or Unicase.
+        let temp = input.to_lowercase();
+        if temp.trim_start().starts_with("explain") {
             if let Ok(Some(stmt)) = self.conn.query(input) {
                 let _ = self.writeln(stmt.explain().as_bytes());
             }
@@ -389,12 +417,57 @@ impl<'a> Limbo<'a> {
             let conn = self.conn.clone();
             let runner = conn.query_runner(input.as_bytes());
             for output in runner {
-                if self.print_query_result(input, output).is_err() {
+                if self
+                    .print_query_result(input, output, Some(&mut stats))
+                    .is_err()
+                {
                     break;
                 }
             }
         }
+        self.print_query_performance_stats(start, stats);
         self.reset_input();
+    }
+
+    fn print_query_performance_stats(&mut self, start: Instant, stats: QueryStatistics) {
+        let elapsed_as_str = |duration: Duration| {
+            if duration.as_secs() >= 1 {
+                format!("{} s", duration.as_secs_f64())
+            } else if duration.as_millis() >= 1 {
+                format!("{} ms", duration.as_millis() as f64)
+            } else if duration.as_micros() >= 1 {
+                format!("{} us", duration.as_micros() as f64)
+            } else {
+                format!("{} ns", duration.as_nanos())
+            }
+        };
+        let sample_stats_as_str = |name: &str, samples: Vec<Duration>| {
+            if samples.is_empty() {
+                return format!("{}: No samples available", name);
+            }
+            let avg_time_spent = samples.iter().sum::<Duration>() / samples.len() as u32;
+            let total_time = samples.iter().fold(Duration::ZERO, |acc, x| acc + *x);
+            format!(
+                "{}: avg={}, total={}",
+                name,
+                elapsed_as_str(avg_time_spent),
+                elapsed_as_str(total_time),
+            )
+        };
+        if self.opts.timer {
+            let _ = self.writeln("Command stats:\n----------------------------");
+            let _ = self.writeln(format!(
+                "total: {} (this includes parsing/coloring of cli app)\n",
+                elapsed_as_str(start.elapsed())
+            ));
+
+            let _ = self.writeln("query execution stats:\n----------------------------");
+            let _ = self.writeln(sample_stats_as_str(
+                "Execution",
+                stats.execute_time_elapsed_samples,
+            ));
+            let _ = self.writeln(sample_stats_as_str("I/O", stats.io_time_elapsed_samples));
+        }
     }
 
     fn reset_line(&mut self, line: &str) -> rustyline::Result<()> {
@@ -426,7 +499,7 @@ impl<'a> Limbo<'a> {
                         let conn = self.conn.clone();
                         let runner = conn.query_runner(after_comment.as_bytes());
                         for output in runner {
-                            if let Err(e) = self.print_query_result(after_comment, output) {
+                            if let Err(e) = self.print_query_result(after_comment, output, None) {
                                 let _ = self.writeln(e.to_string());
                             }
                         }
@@ -555,6 +628,12 @@ impl<'a> Limbo<'a> {
                         let _ = self.writeln(v);
                     });
                 }
+                Command::Timer(timer_mode) => {
+                    self.opts.timer = match timer_mode.mode {
+                        TimerMode::On => true,
+                        TimerMode::Off => false,
+                    };
+                }
             },
         }
     }
@@ -563,6 +642,7 @@ impl<'a> Limbo<'a> {
         &mut self,
         sql: &str,
         mut output: Result<Option<Statement>, LimboError>,
+        mut statistics: Option<&mut QueryStatistics>,
     ) -> anyhow::Result<()> {
         match output {
             Ok(Some(ref mut rows)) => match self.opts.output_mode {
@@ -572,8 +652,13 @@ impl<'a> Limbo<'a> {
                         return Ok(());
                     }
 
+                    let start = Instant::now();
+
                     match rows.step() {
                         Ok(StepResult::Row) => {
+                            if let Some(ref mut stats) = statistics {
+                                stats.execute_time_elapsed_samples.push(start.elapsed());
+                            }
                             let row = rows.row().unwrap();
                             for (i, value) in row.get_values().enumerate() {
                                 if i > 0 {
@@ -588,17 +673,30 @@ impl<'a> Limbo<'a> {
                             let _ = self.writeln("");
                         }
                         Ok(StepResult::IO) => {
+                            let start = Instant::now();
                             self.io.run_once()?;
+                            if let Some(ref mut stats) = statistics {
+                                stats.io_time_elapsed_samples.push(start.elapsed());
+                            }
                         }
                         Ok(StepResult::Interrupt) => break,
                         Ok(StepResult::Done) => {
+                            if let Some(ref mut stats) = statistics {
+                                stats.execute_time_elapsed_samples.push(start.elapsed());
+                            }
                             break;
                         }
                         Ok(StepResult::Busy) => {
+                            if let Some(ref mut stats) = statistics {
+                                stats.execute_time_elapsed_samples.push(start.elapsed());
+                            }
                             let _ = self.writeln("database is busy");
                             break;
                         }
                         Err(err) => {
+                            if let Some(ref mut stats) = statistics {
+                                stats.execute_time_elapsed_samples.push(start.elapsed());
+                            }
                             let _ = self.writeln(err.to_string());
                             break;
                         }
@@ -626,8 +724,12 @@ impl<'a> Limbo<'a> {
                         table.set_header(header);
                     }
                     loop {
+                        let start = Instant::now();
                         match rows.step() {
                             Ok(StepResult::Row) => {
+                                if let Some(ref mut stats) = statistics {
+                                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                                }
                                 let record = rows.row().unwrap();
                                 let mut row = Row::new();
                                 row.max_height(1);
@@ -658,19 +760,38 @@ impl<'a> Limbo<'a> {
                                 table.add_row(row);
                             }
                             Ok(StepResult::IO) => {
+                                let start = Instant::now();
                                 self.io.run_once()?;
+                                if let Some(ref mut stats) = statistics {
+                                    stats.io_time_elapsed_samples.push(start.elapsed());
+                                }
                             }
-                            Ok(StepResult::Interrupt) => break,
-                            Ok(StepResult::Done) => break,
+                            Ok(StepResult::Interrupt) => {
+                                if let Some(ref mut stats) = statistics {
+                                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                                }
+                                break;
+                            }
+                            Ok(StepResult::Done) => {
+                                if let Some(ref mut stats) = statistics {
+                                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                                }
+                                break;
+                            }
                             Ok(StepResult::Busy) => {
+                                if let Some(ref mut stats) = statistics {
+                                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                                }
                                 let _ = self.writeln("database is busy");
                                 break;
                             }
                             Err(err) => {
-                                let _ = self.write_fmt(format_args!(
-                                    "{:?}",
-                                    miette::Error::from(err).with_source_code(sql.to_owned())
-                                ));
+                                if let Some(ref mut stats) = statistics {
+                                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                                }
+                                let report =
+                                    miette::Error::from(err).with_source_code(sql.to_owned());
+                                let _ = self.write_fmt(format_args!("{:?}", report));
                                 break;
                             }
                         }
@@ -683,16 +804,45 @@ impl<'a> Limbo<'a> {
             },
             Ok(None) => {}
             Err(err) => {
-                let _ = self.write_fmt(format_args!(
-                    "{:?}",
-                    miette::Error::from(err).with_source_code(sql.to_owned())
-                ));
+                let report = miette::Error::from(err).with_source_code(sql.to_owned());
+                let _ = self.write_fmt(format_args!("{:?}", report));
                 anyhow::bail!("We have to throw here, even if we printed error");
             }
         }
         // for now let's cache flush always
         self.conn.cacheflush()?;
         Ok(())
+    }
+
+    pub fn init_tracing(&mut self) -> Result<WorkerGuard, std::io::Error> {
+        let ((non_blocking, guard), should_emit_ansi) =
+            if let Some(file) = &self.opts.tracing_output {
+                (
+                    tracing_appender::non_blocking(
+                        std::fs::File::options()
+                            .append(true)
+                            .create(true)
+                            .open(file)?,
+                    ),
+                    false,
+                )
+            } else {
+                (tracing_appender::non_blocking(std::io::stderr()), true)
+            };
+        if let Err(e) = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(non_blocking)
+                    .with_line_number(true)
+                    .with_thread_ids(true)
+                    .with_ansi(should_emit_ansi),
+            )
+            .with(EnvFilter::from_default_env())
+            .try_init()
+        {
+            println!("Unable to setup tracing appender: {:?}", e);
+        }
+        Ok(guard)
     }
 
     fn display_schema(&mut self, table: Option<&str>) -> anyhow::Result<()> {

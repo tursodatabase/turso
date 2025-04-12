@@ -41,7 +41,6 @@ Limbo aims to be fully compatible with SQLite, with opt-in features not supporte
 * ⛔️ Concurrent access from multiple processes is not supported.
 * ⛔️ Savepoints are not supported.
 * ⛔️ Triggers are not supported.
-* ⛔️ Indexes are not supported.
 * ⛔️ Views are not supported.
 * ⛔️ Vacuum is not supported.
 
@@ -58,13 +57,14 @@ Limbo aims to be fully compatible with SQLite, with opt-in features not supporte
 | COMMIT TRANSACTION        | Partial | Transaction names are not supported.                                              |
 | CREATE INDEX              | Yes     |                                                                                   |
 | CREATE TABLE              | Partial |                                                                                   |
+| CREATE TABLE ... STRICT   | Yes     |                                                                                   |
 | CREATE TRIGGER            | No      |                                                                                   |
 | CREATE VIEW               | No      |                                                                                   |
-| CREATE VIRTUAL TABLE      | No      |                                                                                   |
+| CREATE VIRTUAL TABLE      | Yes     |                                                                                   |
 | DELETE                    | Yes     |                                                                                   |
 | DETACH DATABASE           | No      |                                                                                   |
 | DROP INDEX                | No      |                                                                                   |
-| DROP TABLE                | No      |                                                                                   |
+| DROP TABLE                | Yes     |                                                                                   |
 | DROP TRIGGER              | No      |                                                                                   |
 | DROP VIEW                 | No      |                                                                                   |
 | END TRANSACTION           | Partial | Alias for `COMMIT TRANSACTION`                                                    |
@@ -226,8 +226,8 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | length(X)                    | Yes     |                                                      |
 | like(X,Y)                    | Yes     |                                                      |
 | like(X,Y,Z)                  | Yes     |                                                      |
-| likelihood(X,Y)              | No      |                                                      |
-| likely(X)                    | No      |                                                      |
+| likelihood(X,Y)              | Yes     |                                                      |
+| likely(X)                    | Yes     |                                                      |
 | load_extension(X)            | Yes     | sqlite3 extensions not yet supported                 |
 | load_extension(X,Y)          | No      |                                                      |
 | lower(X)                     | Yes     |                                                      |
@@ -328,7 +328,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | julianday() | Partial | does not support modifiers   |
 | unixepoch() | Partial | does not support modifiers   |
 | strftime()  | Yes     | partially supports modifiers |
-| timediff()  | No      |                              |
+| timediff()  | Yes     | partially supports modifiers |
 
 Modifiers:
 

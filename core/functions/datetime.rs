@@ -656,6 +656,61 @@ fn parse_modifier(modifier: &str) -> Result<Modifier> {
     }
 }
 
+pub fn exec_timediff(values: &[Register]) -> OwnedValue {
+    if values.len() < 2 {
+        return OwnedValue::Null;
+    }
+
+    let start = parse_naive_date_time(values[0].get_owned_value());
+    let end = parse_naive_date_time(values[1].get_owned_value());
+
+    match (start, end) {
+        (Some(start), Some(end)) => {
+            let duration = start.signed_duration_since(end);
+            format_time_duration(&duration)
+        }
+        _ => OwnedValue::Null,
+    }
+}
+
+/// Format the time duration as +/-YYYY-MM-DD HH:MM:SS.SSS as per SQLite's timediff() function
+fn format_time_duration(duration: &chrono::Duration) -> OwnedValue {
+    let is_negative = duration.num_seconds() < 0;
+
+    let abs_duration = if is_negative {
+        -duration.clone()
+    } else {
+        duration.clone()
+    };
+
+    let total_seconds = abs_duration.num_seconds();
+    let hours = (total_seconds % 86400) / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+
+    let days = total_seconds / 86400;
+    let years = days / 365;
+    let remaining_days = days % 365;
+    let months = 0;
+
+    let total_millis = abs_duration.num_milliseconds();
+    let millis = total_millis % 1000;
+
+    let result = format!(
+        "{}{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        if is_negative { "-" } else { "+" },
+        years,
+        months,
+        remaining_days,
+        hours,
+        minutes,
+        seconds,
+        millis
+    );
+
+    OwnedValue::build_text(&result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1642,4 +1697,67 @@ mod tests {
 
     #[test]
     fn test_strftime() {}
+
+    #[test]
+    fn test_exec_timediff() {
+        let start = OwnedValue::build_text("12:00:00");
+        let end = OwnedValue::build_text("14:30:45");
+        let expected = OwnedValue::build_text("-0000-00-00 02:30:45.000");
+        assert_eq!(
+            exec_timediff(&[Register::OwnedValue(start), Register::OwnedValue(end)]),
+            expected
+        );
+
+        let start = OwnedValue::build_text("14:30:45");
+        let end = OwnedValue::build_text("12:00:00");
+        let expected = OwnedValue::build_text("+0000-00-00 02:30:45.000");
+        assert_eq!(
+            exec_timediff(&[Register::OwnedValue(start), Register::OwnedValue(end)]),
+            expected
+        );
+
+        let start = OwnedValue::build_text("12:00:01.300");
+        let end = OwnedValue::build_text("12:00:00.500");
+        let expected = OwnedValue::build_text("+0000-00-00 00:00:00.800");
+        assert_eq!(
+            exec_timediff(&[Register::OwnedValue(start), Register::OwnedValue(end)]),
+            expected
+        );
+
+        let start = OwnedValue::build_text("13:30:00");
+        let end = OwnedValue::build_text("16:45:30");
+        let expected = OwnedValue::build_text("-0000-00-00 03:15:30.000");
+        assert_eq!(
+            exec_timediff(&[Register::OwnedValue(start), Register::OwnedValue(end)]),
+            expected
+        );
+
+        let start = OwnedValue::build_text("2023-05-10 23:30:00");
+        let end = OwnedValue::build_text("2023-05-11 01:15:00");
+        let expected = OwnedValue::build_text("-0000-00-00 01:45:00.000");
+        assert_eq!(
+            exec_timediff(&[Register::OwnedValue(start), Register::OwnedValue(end)]),
+            expected
+        );
+
+        let start = OwnedValue::Null;
+        let end = OwnedValue::build_text("12:00:00");
+        let expected = OwnedValue::Null;
+        assert_eq!(
+            exec_timediff(&[Register::OwnedValue(start), Register::OwnedValue(end)]),
+            expected
+        );
+
+        let start = OwnedValue::build_text("not a time");
+        let end = OwnedValue::build_text("12:00:00");
+        let expected = OwnedValue::Null;
+        assert_eq!(
+            exec_timediff(&[Register::OwnedValue(start), Register::OwnedValue(end)]),
+            expected
+        );
+
+        let start = OwnedValue::build_text("12:00:00");
+        let expected = OwnedValue::Null;
+        assert_eq!(exec_timediff(&[Register::OwnedValue(start)]), expected);
+    }
 }

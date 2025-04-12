@@ -1,53 +1,82 @@
-use tracing::debug;
-
-use crate::storage::pager::Pager;
-use crate::storage::sqlite3_ondisk::{
-    read_u32, read_varint, BTreeCell, PageContent, PageType, TableInteriorCell, TableLeafCell,
-};
-use crate::MvCursor;
-
-use crate::types::{
-    compare_immutable, CursorResult, ImmutableRecord, OwnedValue, RefValue, SeekKey, SeekOp,
-};
-use crate::{return_corrupt, LimboError, Result};
-
-use std::cell::{Cell, Ref, RefCell};
-use std::cmp::Ordering;
-use std::pin::Pin;
-use std::rc::Rc;
-
-use super::pager::PageRef;
-use super::sqlite3_ondisk::{
-    read_record, write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell,
-    DATABASE_HEADER_SIZE,
+use crate::{
+    storage::{
+        pager::Pager,
+        sqlite3_ondisk::{
+            read_u32, read_varint, BTreeCell, PageContent, PageType, TableInteriorCell,
+            TableLeafCell,
+        },
+    },
+    translate::plan::IterationDirection,
+    MvCursor,
 };
 
-/*
-    These are offsets of fields in the header of a b-tree page.
-*/
+use crate::{
+    return_corrupt,
+    types::{
+        compare_immutable, CursorResult, ImmutableRecord, OwnedValue, RefValue, SeekKey, SeekOp,
+    },
+    LimboError, Result,
+};
 
-/// type of btree page -> u8
-const PAGE_HEADER_OFFSET_PAGE_TYPE: usize = 0;
-/// pointer to first freeblock -> u16
-/// The second field of the b-tree page header is the offset of the first freeblock, or zero if there are no freeblocks on the page.
-/// A freeblock is a structure used to identify unallocated space within a b-tree page.
-/// Freeblocks are organized as a chain.
+#[cfg(debug_assertions)]
+use std::collections::HashSet;
+use std::{
+    cell::{Cell, Ref, RefCell},
+    cmp::Ordering,
+    pin::Pin,
+    rc::Rc,
+};
+
+use super::{
+    pager::PageRef,
+    sqlite3_ondisk::{
+        read_record, write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell,
+        DATABASE_HEADER_SIZE,
+    },
+};
+
+/// The B-Tree page header is 12 bytes for interior pages and 8 bytes for leaf pages.
 ///
-/// To be clear, freeblocks do not mean the regular unallocated free space to the left of the cell content area pointer, but instead
-/// blocks of at least 4 bytes WITHIN the cell content area that are not in use due to e.g. deletions.
-const PAGE_HEADER_OFFSET_FIRST_FREEBLOCK: usize = 1;
-/// number of cells in the page -> u16
-const PAGE_HEADER_OFFSET_CELL_COUNT: usize = 3;
-/// pointer to first byte of cell allocated content from top -> u16
-/// SQLite strives to place cells as far toward the end of the b-tree page as it can,
-/// in order to leave space for future growth of the cell pointer array.
-/// = the cell content area pointer moves leftward as cells are added to the page
-const PAGE_HEADER_OFFSET_CELL_CONTENT_AREA: usize = 5;
-/// number of fragmented bytes -> u8
-/// Fragments are isolated groups of 1, 2, or 3 unused bytes within the cell content area.
-const PAGE_HEADER_OFFSET_FRAGMENTED_BYTES_COUNT: usize = 7;
-/// if internalnode, pointer right most pointer (saved separately from cells) -> u32
-const PAGE_HEADER_OFFSET_RIGHTMOST_PTR: usize = 8;
+/// +--------+-----------------+-----------------+-----------------+--------+----- ..... ----+
+/// | Page   | First Freeblock | Cell Count      | Cell Content    | Frag.  | Right-most     |
+/// | Type   | Offset          |                 | Area Start      | Bytes  | pointer        |
+/// +--------+-----------------+-----------------+-----------------+--------+----- ..... ----+
+///     0        1        2        3        4        5        6        7        8       11
+///
+pub mod offset {
+    /// Type of the B-Tree page (u8).
+    pub const BTREE_PAGE_TYPE: usize = 0;
+
+    /// A pointer to the first freeblock (u16).
+    ///
+    /// This field of the B-Tree page header is an offset to the first freeblock, or zero if
+    /// there are no freeblocks on the page.  A freeblock is a structure used to identify
+    /// unallocated space within a B-Tree page, organized as a chain.
+    ///
+    /// Please note that freeblocks do not mean the regular unallocated free space to the left
+    /// of the cell content area pointer, but instead blocks of at least 4
+    /// bytes WITHIN the cell content area that are not in use due to e.g.
+    /// deletions.
+    pub const BTREE_FIRST_FREEBLOCK: usize = 1;
+
+    /// The number of cells in the page (u16).
+    pub const BTREE_CELL_COUNT: usize = 3;
+
+    /// A pointer to first byte of cell allocated content from top (u16).
+    ///
+    /// SQLite strives to place cells as far toward the end of the b-tree page as it can, in
+    /// order to leave space for future growth of the cell pointer array. This means that the
+    /// cell content area pointer moves leftward as cells are added to the page.
+    pub const BTREE_CELL_CONTENT_AREA: usize = 5;
+
+    /// The number of fragmented bytes (u8).
+    ///
+    /// Fragments are isolated groups of 1, 2, or 3 unused bytes within the cell content area.
+    pub const BTREE_FRAGMENTED_BYTES_COUNT: usize = 7;
+
+    /// The right-most pointer (saved separately from cells) (u32)
+    pub const BTREE_RIGHTMOST_PTR: usize = 8;
+}
 
 /// Maximum depth of an SQLite B-Tree structure. Any B-Tree deeper than
 /// this will be declared corrupt. This value is calculated based on a
@@ -226,7 +255,7 @@ impl BTreeKey<'_> {
 struct BalanceInfo {
     /// Old pages being balanced.
     pages_to_balance: Vec<PageRef>,
-    /// Bookkeeping of the rightmost pointer so the PAGE_HEADER_OFFSET_RIGHTMOST_PTR can be updated.
+    /// Bookkeeping of the rightmost pointer so the offset::BTREE_RIGHTMOST_PTR can be updated.
     rightmost_pointer: *mut u8,
     /// Divider cells of old pages
     divider_cells: Vec<Vec<u8>>,
@@ -402,7 +431,10 @@ impl BTreeCursor {
 
     /// Move the cursor to the previous record and return it.
     /// Used in backwards iteration.
-    fn get_prev_record(&mut self) -> Result<CursorResult<Option<u64>>> {
+    fn get_prev_record(
+        &mut self,
+        predicate: Option<(SeekKey<'_>, SeekOp)>,
+    ) -> Result<CursorResult<Option<u64>>> {
         loop {
             let page = self.stack.top();
             let cell_idx = self.stack.current_cell_index();
@@ -411,11 +443,11 @@ impl BTreeCursor {
             // todo: find a better way to flag moved to end or begin of page
             if self.stack.current_cell_index_less_than_min() {
                 loop {
-                    if self.stack.current_cell_index() > 0 {
-                        self.stack.retreat();
+                    if self.stack.current_cell_index() >= 0 {
                         break;
                     }
                     if self.stack.has_parent() {
+                        self.going_upwards = true;
                         self.stack.pop();
                     } else {
                         // moved to begin of btree
@@ -427,11 +459,6 @@ impl BTreeCursor {
             }
 
             let cell_idx = cell_idx as usize;
-            tracing::trace!(
-                "get_prev_record current id={} cell={}",
-                page.get().id,
-                cell_idx
-            );
             return_if_locked!(page);
             if !page.is_loaded() {
                 self.pager.load_page(page.clone())?;
@@ -440,13 +467,24 @@ impl BTreeCursor {
             let contents = page.get().contents.as_ref().unwrap();
 
             let cell_count = contents.cell_count();
+
+            // If we are at the end of the page and we haven't just come back from the right child,
+            // we now need to move to the rightmost child.
+            if cell_idx as i32 == i32::MAX && !self.going_upwards {
+                let rightmost_pointer = contents.rightmost_pointer();
+                if let Some(rightmost_pointer) = rightmost_pointer {
+                    self.stack
+                        .push_backwards(self.pager.read_page(rightmost_pointer as usize)?);
+                    continue;
+                }
+            }
+
             let cell_idx = if cell_idx >= cell_count {
                 self.stack.set_cell_index(cell_count as i32 - 1);
                 cell_count - 1
             } else {
                 cell_idx
             };
-
             let cell = contents.cell_get(
                 cell_idx,
                 payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
@@ -460,9 +498,7 @@ impl BTreeCursor {
                     _rowid,
                 }) => {
                     let mem_page = self.pager.read_page(_left_child_page as usize)?;
-                    self.stack.push(mem_page);
-                    // use cell_index = i32::MAX to tell next loop to go to the end of the current page
-                    self.stack.set_cell_index(i32::MAX);
+                    self.stack.push_backwards(mem_page);
                     continue;
                 }
                 BTreeCell::TableLeafCell(TableLeafCell {
@@ -482,8 +518,135 @@ impl BTreeCursor {
                     self.stack.retreat();
                     return Ok(CursorResult::Ok(Some(_rowid)));
                 }
-                BTreeCell::IndexInteriorCell(_) => todo!(),
-                BTreeCell::IndexLeafCell(_) => todo!(),
+                BTreeCell::IndexInteriorCell(IndexInteriorCell {
+                    payload,
+                    left_child_page,
+                    first_overflow_page,
+                    payload_size,
+                }) => {
+                    if !self.going_upwards {
+                        // In backwards iteration, if we haven't just moved to this interior node from the
+                        // right child, but instead are about to move to the left child, we need to retreat
+                        // so that we don't come back to this node again.
+                        // For example:
+                        // this parent: key 666
+                        // left child has: key 663, key 664, key 665
+                        // we need to move to the previous parent (with e.g. key 662) when iterating backwards.
+                        self.stack.retreat();
+                        let mem_page = self.pager.read_page(left_child_page as usize)?;
+                        self.stack.push(mem_page);
+                        // use cell_index = i32::MAX to tell next loop to go to the end of the current page
+                        self.stack.set_cell_index(i32::MAX);
+                        continue;
+                    }
+                    if let Some(next_page) = first_overflow_page {
+                        return_if_io!(self.process_overflow_read(payload, next_page, payload_size))
+                    } else {
+                        crate::storage::sqlite3_ondisk::read_record(
+                            payload,
+                            self.get_immutable_record_or_create().as_mut().unwrap(),
+                        )?
+                    };
+
+                    // Going upwards = we just moved to an interior cell from the right child.
+                    // On the first pass we must take the record from the interior cell (since unlike table btrees, index interior cells have payloads)
+                    // We then mark going_upwards=false so that we go back down the tree on the next invocation.
+                    self.going_upwards = false;
+                    if predicate.is_none() {
+                        let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
+                        {
+                            Some(RefValue::Integer(rowid)) => *rowid as u64,
+                            _ => unreachable!("index cells should have an integer rowid"),
+                        };
+                        return Ok(CursorResult::Ok(Some(rowid)));
+                    }
+
+                    let (key, op) = predicate.as_ref().unwrap();
+                    let SeekKey::IndexKey(index_key) = key else {
+                        unreachable!("index seek key should be a record");
+                    };
+                    let order = {
+                        let record = self.get_immutable_record();
+                        let record = record.as_ref().unwrap();
+                        let record_values = record.get_values();
+                        let record_slice_same_num_cols =
+                            &record_values[..index_key.get_values().len()];
+                        let order =
+                            compare_immutable(record_slice_same_num_cols, index_key.get_values());
+                        order
+                    };
+
+                    let found = match op {
+                        SeekOp::EQ => order.is_eq(),
+                        SeekOp::LE => order.is_le(),
+                        SeekOp::LT => order.is_lt(),
+                        _ => unreachable!("Seek GT/GE should not happen in get_prev_record() because we are iterating backwards"),
+                    };
+                    if found {
+                        let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
+                        {
+                            Some(RefValue::Integer(rowid)) => *rowid as u64,
+                            _ => unreachable!("index cells should have an integer rowid"),
+                        };
+                        return Ok(CursorResult::Ok(Some(rowid)));
+                    } else {
+                        continue;
+                    }
+                }
+                BTreeCell::IndexLeafCell(IndexLeafCell {
+                    payload,
+                    first_overflow_page,
+                    payload_size,
+                }) => {
+                    if let Some(next_page) = first_overflow_page {
+                        return_if_io!(self.process_overflow_read(payload, next_page, payload_size))
+                    } else {
+                        crate::storage::sqlite3_ondisk::read_record(
+                            payload,
+                            self.get_immutable_record_or_create().as_mut().unwrap(),
+                        )?
+                    };
+
+                    self.stack.retreat();
+                    if predicate.is_none() {
+                        let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
+                        {
+                            Some(RefValue::Integer(rowid)) => *rowid as u64,
+                            _ => unreachable!("index cells should have an integer rowid"),
+                        };
+                        return Ok(CursorResult::Ok(Some(rowid)));
+                    }
+                    let (key, op) = predicate.as_ref().unwrap();
+                    let SeekKey::IndexKey(index_key) = key else {
+                        unreachable!("index seek key should be a record");
+                    };
+                    let order = {
+                        let record = self.get_immutable_record();
+                        let record = record.as_ref().unwrap();
+                        let record_values = record.get_values();
+                        let record_slice_same_num_cols =
+                            &record_values[..index_key.get_values().len()];
+                        let order =
+                            compare_immutable(record_slice_same_num_cols, index_key.get_values());
+                        order
+                    };
+                    let found = match op {
+                        SeekOp::EQ => order.is_eq(),
+                        SeekOp::LE => order.is_le(),
+                        SeekOp::LT => order.is_lt(),
+                        _ => unreachable!("Seek GT/GE should not happen in get_prev_record() because we are iterating backwards"),
+                    };
+                    if found {
+                        let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
+                        {
+                            Some(RefValue::Integer(rowid)) => *rowid as u64,
+                            _ => unreachable!("index cells should have an integer rowid"),
+                        };
+                        return Ok(CursorResult::Ok(Some(rowid)));
+                    } else {
+                        continue;
+                    }
+                }
             }
         }
     }
@@ -607,7 +770,7 @@ impl BTreeCursor {
                     }
                     None => {
                         if has_parent {
-                            debug!("moving simple upwards");
+                            tracing::trace!("moving simple upwards");
                             self.going_upwards = true;
                             self.stack.pop();
                             continue;
@@ -622,7 +785,7 @@ impl BTreeCursor {
                 // end
                 let has_parent = self.stack.current() > 0;
                 if has_parent {
-                    debug!("moving upwards");
+                    tracing::debug!("moving upwards");
                     self.going_upwards = true;
                     self.stack.pop();
                     continue;
@@ -718,6 +881,7 @@ impl BTreeCursor {
                         SeekOp::GT => order.is_gt(),
                         SeekOp::GE => order.is_ge(),
                         SeekOp::EQ => order.is_eq(),
+                        _ => unreachable!("Seek LE/LT should not happen in get_next_record() because we are iterating forwards"),
                     };
                     if found {
                         let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
@@ -769,6 +933,7 @@ impl BTreeCursor {
                         SeekOp::GT => order.is_lt(),
                         SeekOp::GE => order.is_le(),
                         SeekOp::EQ => order.is_le(),
+                        _ => todo!("not implemented: {:?}", op),
                     };
                     if found {
                         let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
@@ -790,6 +955,7 @@ impl BTreeCursor {
     /// or e.g. find the first record greater than the seek key in a range query (e.g. SELECT * FROM table WHERE col > 10).
     /// We don't include the rowid in the comparison and that's why the last value from the record is not included.
     fn do_seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<CursorResult<Option<u64>>> {
+        let cell_iter_dir = op.iteration_direction();
         return_if_io!(self.move_to(key.clone(), op.clone()));
 
         {
@@ -798,9 +964,27 @@ impl BTreeCursor {
 
             let contents = page.get().contents.as_ref().unwrap();
 
-            for cell_idx in 0..contents.cell_count() {
+            let cell_count = contents.cell_count();
+            let mut cell_idx: isize = if cell_iter_dir == IterationDirection::Forwards {
+                0
+            } else {
+                cell_count as isize - 1
+            };
+            let end = if cell_iter_dir == IterationDirection::Forwards {
+                cell_count as isize - 1
+            } else {
+                0
+            };
+            self.stack.set_cell_index(cell_idx as i32);
+            while cell_count > 0
+                && (if cell_iter_dir == IterationDirection::Forwards {
+                    cell_idx <= end
+                } else {
+                    cell_idx >= end
+                })
+            {
                 let cell = contents.cell_get(
-                    cell_idx,
+                    cell_idx as usize,
                     payload_overflow_threshold_max(
                         contents.page_type(),
                         self.usable_space() as u16,
@@ -825,6 +1009,8 @@ impl BTreeCursor {
                             SeekOp::GT => *cell_rowid > rowid_key,
                             SeekOp::GE => *cell_rowid >= rowid_key,
                             SeekOp::EQ => *cell_rowid == rowid_key,
+                            SeekOp::LE => *cell_rowid <= rowid_key,
+                            SeekOp::LT => *cell_rowid < rowid_key,
                         };
                         if found {
                             if let Some(next_page) = first_overflow_page {
@@ -839,10 +1025,10 @@ impl BTreeCursor {
                                     self.get_immutable_record_or_create().as_mut().unwrap(),
                                 )?
                             };
-                            self.stack.advance();
+                            self.stack.next_cell_in_direction(cell_iter_dir);
                             return Ok(CursorResult::Ok(Some(*cell_rowid)));
                         } else {
-                            self.stack.advance();
+                            self.stack.next_cell_in_direction(cell_iter_dir);
                         }
                     }
                     BTreeCell::IndexLeafCell(IndexLeafCell {
@@ -867,14 +1053,17 @@ impl BTreeCursor {
                         };
                         let record = self.get_immutable_record();
                         let record = record.as_ref().unwrap();
-                        let without_rowid = &record.get_values().as_slice()[..record.len() - 1];
-                        let order = without_rowid.cmp(index_key.get_values());
+                        let record_slice_equal_number_of_cols =
+                            &record.get_values().as_slice()[..index_key.get_values().len()];
+                        let order = record_slice_equal_number_of_cols.cmp(index_key.get_values());
                         let found = match op {
                             SeekOp::GT => order.is_gt(),
                             SeekOp::GE => order.is_ge(),
                             SeekOp::EQ => order.is_eq(),
+                            SeekOp::LE => order.is_le(),
+                            SeekOp::LT => order.is_lt(),
                         };
-                        self.stack.advance();
+                        self.stack.next_cell_in_direction(cell_iter_dir);
                         if found {
                             let rowid = match record.last_value() {
                                 Some(RefValue::Integer(rowid)) => *rowid as u64,
@@ -886,6 +1075,11 @@ impl BTreeCursor {
                     cell_type => {
                         unreachable!("unexpected cell type: {:?}", cell_type);
                     }
+                }
+                if cell_iter_dir == IterationDirection::Forwards {
+                    cell_idx += 1;
+                } else {
+                    cell_idx -= 1;
                 }
             }
         }
@@ -907,7 +1101,14 @@ impl BTreeCursor {
             // if we were to return Ok(CursorResult::Ok((None, None))), self.record would be None, which is incorrect, because we already know
             // that there is a record with a key greater than K (K' = K+2) in the parent interior cell. Hence, we need to move back up the tree
             // and get the next matching record from there.
-            return self.get_next_record(Some((key, op)));
+            match op.iteration_direction() {
+                IterationDirection::Forwards => {
+                    return self.get_next_record(Some((key, op)));
+                }
+                IterationDirection::Backwards => {
+                    return self.get_prev_record(Some((key, op)));
+                }
+            }
         }
 
         Ok(CursorResult::Ok(None))
@@ -955,7 +1156,8 @@ impl BTreeCursor {
 
     pub fn move_to(&mut self, key: SeekKey<'_>, cmp: SeekOp) -> Result<CursorResult<()>> {
         assert!(self.mv_cursor.is_none());
-        tracing::debug!("move_to(key={:?} cmp={:?})", key, cmp);
+        tracing::trace!("move_to(key={:?} cmp={:?})", key, cmp);
+        tracing::trace!("backtrace: {}", std::backtrace::Backtrace::force_capture());
         // For a table with N rows, we can find any row by row id in O(log(N)) time by starting at the root page and following the B-tree pointers.
         // B-trees consist of interior pages and leaf pages. Interior pages contain pointers to other pages, while leaf pages contain the actual row data.
         //
@@ -981,6 +1183,8 @@ impl BTreeCursor {
         // 6. If we find the cell, we return the record. Otherwise, we return an empty result.
         self.move_to_root();
 
+        let iter_dir = cmp.iteration_direction();
+
         loop {
             let page = self.stack.top();
             return_if_locked!(page);
@@ -992,7 +1196,7 @@ impl BTreeCursor {
 
             let mut found_cell = false;
             for cell_idx in 0..contents.cell_count() {
-                match &contents.cell_get(
+                let cell = contents.cell_get(
                     cell_idx,
                     payload_overflow_threshold_max(
                         contents.page_type(),
@@ -1003,25 +1207,61 @@ impl BTreeCursor {
                         self.usable_space() as u16,
                     ),
                     self.usable_space(),
-                )? {
+                )?;
+                match &cell {
                     BTreeCell::TableInteriorCell(TableInteriorCell {
                         _left_child_page,
-                        _rowid,
+                        _rowid: cell_rowid,
                     }) => {
                         let SeekKey::TableRowId(rowid_key) = key else {
                             unreachable!("table seek key should be a rowid");
                         };
+                        // in sqlite btrees left child pages have <= keys.
+                        // table btrees can have a duplicate rowid in the interior cell, so for example if we are looking for rowid=10,
+                        // and we find an interior cell with rowid=10, we need to move to the left page since (due to the <= rule of sqlite btrees)
+                        // the left page may have a rowid=10.
+                        // Logic table for determining if target leaf page is in left subtree
+                        //
+                        // Forwards iteration (looking for first match in tree):
+                        // OP  | Current Cell vs Seek Key   | Action?  | Explanation
+                        // GT  | >                          | go left  | First > key is in left subtree
+                        // GT  | = or <                     | go right | First > key is in right subtree
+                        // GE  | > or =                     | go left  | First >= key is in left subtree
+                        // GE  | <                          | go right | First >= key is in right subtree
+                        //
+                        // Backwards iteration (looking for last match in tree):
+                        // OP  | Current Cell vs Seek Key   | Action?  | Explanation
+                        // LE  | > or =                     | go left  | Last <= key is in left subtree
+                        // LE  | <                          | go right | Last <= key is in right subtree
+                        // LT  | > or =                     | go left  | Last < key is in left subtree
+                        // LT  | <                          | go right?| Last < key is in right subtree, except if cell rowid is exactly 1 less
+                        //
+                        // No iteration (point query):
+                        // EQ  | > or =                     | go left  | Last = key is in left subtree
+                        // EQ  | <                          | go right | Last = key is in right subtree
                         let target_leaf_page_is_in_left_subtree = match cmp {
-                            SeekOp::GT => rowid_key < *_rowid,
-                            SeekOp::GE => rowid_key <= *_rowid,
-                            SeekOp::EQ => rowid_key <= *_rowid,
+                            SeekOp::GT => *cell_rowid > rowid_key,
+                            SeekOp::GE => *cell_rowid >= rowid_key,
+                            SeekOp::LE => *cell_rowid >= rowid_key,
+                            SeekOp::LT => *cell_rowid + 1 >= rowid_key,
+                            SeekOp::EQ => *cell_rowid >= rowid_key,
                         };
-                        self.stack.advance();
                         if target_leaf_page_is_in_left_subtree {
+                            // If we found our target rowid in the left subtree,
+                            // we need to move the parent cell pointer forwards or backwards depending on the iteration direction.
+                            // For example: since the internal node contains the max rowid of the left subtree, we need to move the
+                            // parent pointer backwards in backwards iteration so that we don't come back to the parent again.
+                            // E.g.
+                            // this parent: rowid 666
+                            // left child has: 664,665,666
+                            // we need to move to the previous parent (with e.g. rowid 663) when iterating backwards.
+                            self.stack.next_cell_in_direction(iter_dir);
                             let mem_page = self.pager.read_page(*_left_child_page as usize)?;
                             self.stack.push(mem_page);
                             found_cell = true;
                             break;
+                        } else {
+                            self.stack.advance();
                         }
                     }
                     BTreeCell::TableLeafCell(TableLeafCell {
@@ -1055,17 +1295,61 @@ impl BTreeCursor {
                                 self.get_immutable_record_or_create().as_mut().unwrap(),
                             )?
                         };
-                        let order = compare_immutable(
+                        let record = self.get_immutable_record();
+                        let record = record.as_ref().unwrap();
+                        let record_slice_equal_number_of_cols =
+                            &record.get_values().as_slice()[..index_key.get_values().len()];
+                        let interior_cell_vs_index_key = compare_immutable(
+                            record_slice_equal_number_of_cols,
                             index_key.get_values(),
-                            self.get_immutable_record().as_ref().unwrap().get_values(),
                         );
-                        let target_leaf_page_is_in_the_left_subtree = match cmp {
-                            SeekOp::GT => order.is_lt(),
-                            SeekOp::GE => order.is_le(),
-                            SeekOp::EQ => order.is_le(),
+                        // in sqlite btrees left child pages have <= keys.
+                        // in general, in forwards iteration we want to find the first key that matches the seek condition.
+                        // in backwards iteration we want to find the last key that matches the seek condition.
+                        //
+                        // Logic table for determining if target leaf page is in left subtree.
+                        // For index b-trees this is a bit more complicated since the interior cells contain payloads (the key is the payload).
+                        // and for non-unique indexes there might be several cells with the same key.
+                        //
+                        // Forwards iteration (looking for first match in tree):
+                        // OP  | Current Cell vs Seek Key  | Action?  | Explanation
+                        // GT  | >                         | go left  | First > key could be exactly this one, or in left subtree
+                        // GT  | = or <                    | go right | First > key must be in right subtree
+                        // GE  | >                         | go left  | First >= key could be exactly this one, or in left subtree
+                        // GE  | =                         | go left  | First >= key could be exactly this one, or in left subtree
+                        // GE  | <                         | go right | First >= key must be in right subtree
+                        //
+                        // Backwards iteration (looking for last match in tree):
+                        // OP  | Current Cell vs Seek Key  | Action?  | Explanation
+                        // LE  | >                         | go left  | Last <= key must be in left subtree
+                        // LE  | =                         | go right | Last <= key is either this one, or somewhere to the right of this one. So we need to go right to make sure
+                        // LE  | <                         | go right | Last <= key must be in right subtree
+                        // LT  | >                         | go left  | Last < key must be in left subtree
+                        // LT  | =                         | go left  | Last < key must be in left subtree since we want strictly less than
+                        // LT  | <                         | go right | Last < key could be exactly this one, or in right subtree
+                        //
+                        // No iteration (point query):
+                        // EQ  | >                         | go left  | First = key must be in left subtree
+                        // EQ  | =                         | go left  | First = key could be exactly this one, or in left subtree
+                        // EQ  | <                         | go right | First = key must be in right subtree
+
+                        let target_leaf_page_is_in_left_subtree = match cmp {
+                            SeekOp::GT => interior_cell_vs_index_key.is_gt(),
+                            SeekOp::GE => interior_cell_vs_index_key.is_ge(),
+                            SeekOp::EQ => interior_cell_vs_index_key.is_ge(),
+                            SeekOp::LE => interior_cell_vs_index_key.is_gt(),
+                            SeekOp::LT => interior_cell_vs_index_key.is_ge(),
                         };
-                        if target_leaf_page_is_in_the_left_subtree {
-                            // we don't advance in case of index tree internal nodes because we will visit this node going up
+                        if target_leaf_page_is_in_left_subtree {
+                            // we don't advance in case of forward iteration and index tree internal nodes because we will visit this node going up.
+                            // in backwards iteration, we must retreat because otherwise we would unnecessarily visit this node again.
+                            // Example:
+                            // this parent: key 666, and we found the target key in the left child.
+                            // left child has: key 663, key 664, key 665
+                            // we need to move to the previous parent (with e.g. key 662) when iterating backwards so that we don't end up back here again.
+                            if iter_dir == IterationDirection::Backwards {
+                                self.stack.retreat();
+                            }
                             let mem_page = self.pager.read_page(*left_child_page as usize)?;
                             self.stack.push(mem_page);
                             found_cell = true;
@@ -1199,7 +1483,7 @@ impl BTreeCursor {
                     // insert
                     let overflow = {
                         let contents = page.get().contents.as_mut().unwrap();
-                        debug!(
+                        tracing::debug!(
                             "insert_into_page(overflow, cell_count={})",
                             contents.cell_count()
                         );
@@ -1280,7 +1564,6 @@ impl BTreeCursor {
                     let write_info = self.state.mut_write_info().unwrap();
                     write_info.state = WriteState::BalanceNonRoot;
                     self.stack.pop();
-                    self.stack.retreat();
                     return_if_io!(self.balance_non_root());
                 }
                 WriteState::BalanceNonRoot | WriteState::BalanceNonRootWaitLoadPages => {
@@ -1305,16 +1588,20 @@ impl BTreeCursor {
             WriteState::BalanceStart => todo!(),
             WriteState::BalanceNonRoot => {
                 let parent_page = self.stack.top();
-                if parent_page.is_locked() {
-                    return Ok(CursorResult::IO);
-                }
                 return_if_locked_maybe_load!(self.pager, parent_page);
+                // If `move_to` moved to rightmost page, cell index will be out of bounds. Meaning cell_count+1.
+                // In any other case, `move_to` will stay in the correct index.
+                if self.stack.current_cell_index() as usize
+                    == parent_page.get_contents().cell_count() + 1
+                {
+                    self.stack.retreat();
+                }
                 parent_page.set_dirty();
                 self.pager.add_dirty(parent_page.get().id);
                 let parent_contents = parent_page.get().contents.as_ref().unwrap();
                 let page_to_balance_idx = self.stack.current_cell_index() as usize;
 
-                debug!(
+                tracing::debug!(
                     "balance_non_root(parent_id={} page_to_balance_idx={})",
                     parent_page.get().id,
                     page_to_balance_idx
@@ -1332,7 +1619,12 @@ impl BTreeCursor {
                     parent_contents.overflow_cells.is_empty(),
                     "balancing child page with overflowed parent not yet implemented"
                 );
-                assert!(page_to_balance_idx <= parent_contents.cell_count());
+                assert!(
+                    page_to_balance_idx <= parent_contents.cell_count(),
+                    "page_to_balance_idx={} is out of bounds for parent cell count {}",
+                    page_to_balance_idx,
+                    number_of_cells_in_parent
+                );
                 // As there will be at maximum 3 pages used to balance:
                 // sibling_pointer is the index represeneting one of those 3 pages, and we initialize it to the last possible page.
                 // next_divider is the first divider that contains the first page of the 3 pages.
@@ -1463,12 +1755,13 @@ impl BTreeCursor {
                 // Now do real balancing
                 let parent_page = self.stack.top();
                 let parent_contents = parent_page.get_contents();
+
                 assert!(
                     parent_contents.overflow_cells.is_empty(),
                     "overflow parent not yet implemented"
                 );
 
-                // Get divider cells and max_cells
+                /* 1. Get divider cells and max_cells */
                 let mut max_cells = 0;
                 let mut pages_to_balance_new = Vec::new();
                 for i in (0..balance_info.sibling_count).rev() {
@@ -1478,12 +1771,14 @@ impl BTreeCursor {
                     self.pager.add_dirty(sibling_page.get().id);
                     max_cells += sibling_contents.cell_count();
                     max_cells += sibling_contents.overflow_cells.len();
-                    if i == 0 {
-                        // we don't have left sibling from this one so we break
-                        break;
+
+                    // Right pointer is not dropped, we simply update it at the end. This could be a divider cell that points
+                    // to the last page in the list of pages to balance or this could be the rightmost pointer that points to a page.
+                    if i == balance_info.sibling_count - 1 {
+                        continue;
                     }
                     // Since we know we have a left sibling, take the divider that points to left sibling of this page
-                    let cell_idx = balance_info.first_divider_cell + i - 1;
+                    let cell_idx = balance_info.first_divider_cell + i;
                     let (cell_start, cell_len) = parent_contents.cell_get_raw_region(
                         cell_idx,
                         payload_overflow_threshold_max(
@@ -1499,6 +1794,13 @@ impl BTreeCursor {
                     let buf = parent_contents.as_ptr();
                     let cell_buf = &buf[cell_start..cell_start + cell_len];
                     max_cells += 1;
+
+                    tracing::debug!(
+                        "balance_non_root(drop_divider_cell, first_divider_cell={}, divider_cell={}, left_pointer={})",
+                        balance_info.first_divider_cell,
+                        i,
+                        read_u32(cell_buf, 0)
+                    );
 
                     // TODO(pere): make this reference and not copy
                     balance_info.divider_cells.push(cell_buf.to_vec());
@@ -1517,6 +1819,7 @@ impl BTreeCursor {
                 // Reverse divider cells to be in order
                 balance_info.divider_cells.reverse();
 
+                /* 2. Initialize CellArray with all the cells used for distribution, this includes divider cells if !leaf. */
                 let mut cell_array = CellArray {
                     cells: Vec::with_capacity(max_cells),
                     number_of_cells_per_page: Vec::new(),
@@ -1528,6 +1831,7 @@ impl BTreeCursor {
                 let mut count_cells_in_old_pages = Vec::new();
 
                 let page_type = balance_info.pages_to_balance[0].get_contents().page_type();
+                tracing::debug!("balance_non_root(page_type={:?})", page_type);
                 let leaf_data = matches!(page_type, PageType::TableLeaf);
                 let leaf = matches!(page_type, PageType::TableLeaf | PageType::IndexLeaf);
                 for (i, old_page) in balance_info.pages_to_balance.iter().enumerate() {
@@ -1553,10 +1857,6 @@ impl BTreeCursor {
                     }
                     // Insert overflow cells into correct place
                     let offset = total_cells_inserted;
-                    assert!(
-                        old_page_contents.overflow_cells.len() <= 1,
-                        "todo: check this works for more than one overflow cell"
-                    );
                     for overflow_cell in old_page_contents.overflow_cells.iter_mut() {
                         cell_array.cells.insert(
                             offset + overflow_cell.index,
@@ -1572,11 +1872,21 @@ impl BTreeCursor {
                     if i < balance_info.pages_to_balance.len() - 1 && !leaf_data {
                         // If we are a index page or a interior table page we need to take the divider cell too.
                         // But we don't need the last divider as it will remain the same.
-                        let divider_cell = &mut balance_info.divider_cells[i];
+                        let mut divider_cell = balance_info.divider_cells[i].as_mut_slice();
                         // TODO(pere): in case of old pages are leaf pages, so index leaf page, we need to strip page pointers
                         // from divider cells in index interior pages (parent) because those should not be included.
                         cells_inserted += 1;
-                        cell_array.cells.push(to_static_buf(divider_cell.as_mut()));
+                        if !leaf {
+                            // This divider cell needs to be updated with new left pointer,
+                            let right_pointer = old_page_contents.rightmost_pointer().unwrap();
+                            divider_cell[..4].copy_from_slice(&right_pointer.to_be_bytes());
+                        } else {
+                            // index leaf
+                            assert!(divider_cell.len() >= 4);
+                            // let's strip the page pointer
+                            divider_cell = &mut divider_cell[4..];
+                        }
+                        cell_array.cells.push(to_static_buf(divider_cell));
                     }
                     total_cells_inserted += cells_inserted;
                 }
@@ -1586,20 +1896,27 @@ impl BTreeCursor {
                     cells_capacity_start,
                     "calculation of max cells was wrong"
                 );
+
+                // Let's copy all cells for later checks
+                #[cfg(debug_assertions)]
+                let mut cells_debug = Vec::new();
                 #[cfg(debug_assertions)]
                 {
                     for cell in &cell_array.cells {
-                        assert!(cell.len() >= 4);
-
-                        if leaf_data {
-                            assert!(cell[0] != 0, "payload is {:?}", cell);
+                        cells_debug.push(cell.to_vec());
+                        if leaf {
+                            assert!(cell[0] != 0)
                         }
                     }
                 }
-                // calculate how many pages to allocate
-                let mut new_page_sizes = Vec::new();
+
+                #[cfg(debug_assertions)]
+                validate_cells_after_insertion(&cell_array, leaf_data);
+
+                /* 3. Initiliaze current size of every page including overflow cells and divider cells that might be included. */
+                let mut new_page_sizes: Vec<i64> = Vec::new();
                 let leaf_correction = if leaf { 4 } else { 0 };
-                // number of bytes beyond header, different from global usableSapce which inccludes
+                // number of bytes beyond header, different from global usableSapce which includes
                 // header
                 let usable_space = self.usable_space() - 12 + leaf_correction;
                 for i in 0..balance_info.sibling_count {
@@ -1610,20 +1927,34 @@ impl BTreeCursor {
                     let page_contents = page.get_contents();
                     let free_space = compute_free_space(page_contents, self.usable_space() as u16);
 
-                    new_page_sizes.push(usable_space as u16 - free_space);
+                    new_page_sizes.push(usable_space as i64 - free_space as i64);
                     for overflow in &page_contents.overflow_cells {
                         let size = new_page_sizes.last_mut().unwrap();
                         // 2 to account of pointer
-                        *size += 2 + overflow.payload.len() as u16;
+                        *size += 2 + overflow.payload.len() as i64;
+                    }
+                    if !leaf && i < balance_info.sibling_count - 1 {
+                        // Account for divider cell which is included in this page.
+                        let size = new_page_sizes.last_mut().unwrap();
+                        *size += cell_array.cells[cell_array.cell_count(i)].len() as i64;
                     }
                 }
 
+                /* 4. Now let's try to move cells to the left trying to stack them without exceeding the maximum size of a page.
+                     There are two cases:
+                       * If current page has too many cells, it will move them to the next page.
+                       * If it still has space, and it can take a cell from the right it will take them.
+                         Here there is a caveat. Taking a cell from the right might take cells from page i+1, i+2, i+3, so not necessarily
+                         adjacent. But we decrease the size of the adjacent page if we move from the right. This might cause a intermitent state
+                         where page can have size <0.
+                    This will also calculate how many pages are required to balance the cells and store in sibling_count_new.
+                */
                 // Try to pack as many cells to the left
                 let mut sibling_count_new = balance_info.sibling_count;
                 let mut i = 0;
                 while i < sibling_count_new {
                     // First try to move cells to the right if they do not fit
-                    while new_page_sizes[i] > usable_space as u16 {
+                    while new_page_sizes[i] > usable_space as i64 {
                         let needs_new_page = i + 1 >= sibling_count_new;
                         if needs_new_page {
                             sibling_count_new += 1;
@@ -1637,7 +1968,7 @@ impl BTreeCursor {
                             );
                         }
                         let size_of_cell_to_remove_from_left =
-                            2 + cell_array.cells[cell_array.cell_count(i) - 1].len() as u16;
+                            2 + cell_array.cells[cell_array.cell_count(i) - 1].len() as i64;
                         new_page_sizes[i] -= size_of_cell_to_remove_from_left;
                         let size_of_cell_to_move_right = if !leaf_data {
                             if cell_array.number_of_cells_per_page[i]
@@ -1645,23 +1976,23 @@ impl BTreeCursor {
                             {
                                 // This means we move to the right page the divider cell and we
                                 // promote left cell to divider
-                                2 + cell_array.cells[cell_array.cell_count(i)].len() as u16
+                                2 + cell_array.cells[cell_array.cell_count(i)].len() as i64
                             } else {
                                 0
                             }
                         } else {
                             size_of_cell_to_remove_from_left
                         };
-                        new_page_sizes[i + 1] += size_of_cell_to_move_right;
+                        new_page_sizes[i + 1] += size_of_cell_to_move_right as i64;
                         cell_array.number_of_cells_per_page[i] -= 1;
                     }
 
                     // Now try to take from the right if we didn't have enough
                     while cell_array.number_of_cells_per_page[i] < cell_array.cells.len() as u16 {
                         let size_of_cell_to_remove_from_right =
-                            2 + cell_array.cells[cell_array.cell_count(i)].len() as u16;
+                            2 + cell_array.cells[cell_array.cell_count(i)].len() as i64;
                         let can_take = new_page_sizes[i] + size_of_cell_to_remove_from_right
-                            > usable_space as u16;
+                            > usable_space as i64;
                         if can_take {
                             break;
                         }
@@ -1672,7 +2003,7 @@ impl BTreeCursor {
                             if cell_array.number_of_cells_per_page[i]
                                 < cell_array.cells.len() as u16
                             {
-                                2 + cell_array.cells[cell_array.cell_count(i)].len() as u16
+                                2 + cell_array.cells[cell_array.cell_count(i)].len() as i64
                             } else {
                                 0
                             }
@@ -1683,16 +2014,24 @@ impl BTreeCursor {
                         new_page_sizes[i + 1] -= size_of_cell_to_remove_from_right;
                     }
 
-                    let we_still_need_another_page =
+                    // Check if this page contains up to the last cell. If this happens it means we really just need up to this page.
+                    // Let's update the number of new pages to be up to this page (i+1)
+                    let page_completes_all_cells =
                         cell_array.number_of_cells_per_page[i] >= cell_array.cells.len() as u16;
-                    if we_still_need_another_page {
+                    if page_completes_all_cells {
                         sibling_count_new = i + 1;
+                        break;
                     }
                     i += 1;
                     if i >= sibling_count_new {
                         break;
                     }
                 }
+                new_page_sizes.truncate(sibling_count_new);
+                cell_array
+                    .number_of_cells_per_page
+                    .truncate(sibling_count_new);
+
                 tracing::debug!(
                     "balance_non_root(sibling_count={}, sibling_count_new={}, cells={})",
                     balance_info.sibling_count,
@@ -1700,6 +2039,10 @@ impl BTreeCursor {
                     cell_array.cells.len()
                 );
 
+                /* 5. Balance pages starting from a left stacked cell state and move them to right trying to maintain a balanced state
+                where we only move from left to right if it will not unbalance both pages, meaning moving left to right won't make
+                right page bigger than left page.
+                */
                 // Comment borrowed from SQLite src/btree.c
                 // The packing computed by the previous block is biased toward the siblings
                 // on the left side (siblings with smaller keys). The left siblings are
@@ -1718,8 +2061,8 @@ impl BTreeCursor {
                     // the same we add to right (we don't add divider to right).
                     let mut cell_right = cell_left + 1 - leaf_data as u16;
                     loop {
-                        let cell_left_size = cell_array.cell_size(cell_left as usize);
-                        let cell_right_size = cell_array.cell_size(cell_right as usize);
+                        let cell_left_size = cell_array.cell_size(cell_left as usize) as i64;
+                        let cell_right_size = cell_array.cell_size(cell_right as usize) as i64;
                         // TODO: add assert nMaxCells
 
                         let pointer_size = if i == sibling_count_new - 1 { 0 } else { 2 };
@@ -1779,13 +2122,36 @@ impl BTreeCursor {
                     }
                 }
 
-                // Write right pointer in parent page to point to new rightmost page
+                #[cfg(debug_assertions)]
+                {
+                    tracing::debug!("balance_non_root(parent page_id={})", parent_page.get().id);
+                    for page in &pages_to_balance_new {
+                        tracing::debug!("balance_non_root(new_sibling page_id={})", page.get().id);
+                    }
+                }
+
+                // pages_pointed_to helps us debug we did in fact create divider cells to all the new pages and the rightmost pointer,
+                // also points to the last page.
+                #[cfg(debug_assertions)]
+                let mut pages_pointed_to = HashSet::new();
+
+                // Write right pointer in parent page to point to new rightmost page. keep in mind
+                // we update rightmost pointer first because inserting cells could defragment parent page,
+                // therfore invalidating the pointer.
                 let right_page_id = pages_to_balance_new.last().unwrap().get().id as u32;
                 let rightmost_pointer = balance_info.rightmost_pointer;
                 let rightmost_pointer =
                     unsafe { std::slice::from_raw_parts_mut(rightmost_pointer, 4) };
                 rightmost_pointer[0..4].copy_from_slice(&right_page_id.to_be_bytes());
 
+                #[cfg(debug_assertions)]
+                pages_pointed_to.insert(right_page_id);
+                tracing::debug!(
+                    "balance_non_root(rightmost_pointer_update, rightmost_pointer={})",
+                    right_page_id
+                );
+
+                /* 6. Update parent pointers. Update right pointer and insert divider cells with newly created distribution of cells */
                 // Ensure right-child pointer of the right-most new sibling pge points to the page
                 // that was originally on that place.
                 let is_leaf_page = matches!(page_type, PageType::TableLeaf | PageType::IndexLeaf);
@@ -1795,7 +2161,7 @@ impl BTreeCursor {
                     let new_last_page = pages_to_balance_new.last().unwrap();
                     new_last_page
                         .get_contents()
-                        .write_u32(PAGE_HEADER_OFFSET_RIGHTMOST_PTR, right_pointer);
+                        .write_u32(offset::BTREE_RIGHTMOST_PTR, right_pointer);
                 }
                 // TODO: pointer map update (vacuum support)
                 // Update divider cells in parent
@@ -1814,10 +2180,17 @@ impl BTreeCursor {
                         // Make this page's rightmost pointer point to pointer of divider cell before modification
                         let previous_pointer_divider = read_u32(&divider_cell, 0);
                         page.get_contents()
-                            .write_u32(PAGE_HEADER_OFFSET_RIGHTMOST_PTR, previous_pointer_divider);
+                            .write_u32(offset::BTREE_RIGHTMOST_PTR, previous_pointer_divider);
                         // divider cell now points to this page
-                        divider_cell[0..4].copy_from_slice(&(page.get().id as u32).to_be_bytes());
-                        new_divider_cell.extend_from_slice(divider_cell);
+                        new_divider_cell.extend_from_slice(&(page.get().id as u32).to_be_bytes());
+                        // now copy the rest of the divider cell:
+                        // Table Interior page:
+                        //   * varint rowid
+                        // Index Interior page:
+                        //   * varint payload size
+                        //   * payload
+                        //   * first overflow page (u32 optional)
+                        new_divider_cell.extend_from_slice(&divider_cell[4..]);
                     } else if leaf_data {
                         // Leaf table
                         // FIXME: not needed conversion
@@ -1830,10 +2203,29 @@ impl BTreeCursor {
                         write_varint_to_vec(rowid, &mut new_divider_cell);
                     } else {
                         // Leaf index
+                        new_divider_cell.extend_from_slice(&(page.get().id as u32).to_be_bytes());
                         new_divider_cell.extend_from_slice(divider_cell);
                     }
+
+                    let left_pointer = read_u32(&new_divider_cell[..4], 0);
+                    assert!(left_pointer != parent_page.get().id as u32);
+                    #[cfg(debug_assertions)]
+                    pages_pointed_to.insert(left_pointer);
+                    tracing::debug!(
+                        "balance_non_root(insert_divider_cell, first_divider_cell={}, divider_cell={}, left_pointer={})",
+                        balance_info.first_divider_cell,
+                        i,
+                        left_pointer
+                    );
+                    assert_eq!(left_pointer, page.get().id as u32);
+                    // FIXME: remove this lock
+                    assert!(
+                        left_pointer <= self.pager.db_header.lock().database_size,
+                        "invalid page number divider left pointer {} > database number of pages",
+                        left_pointer,
+                    );
                     // FIXME: defragment shouldn't be needed
-                    defragment_page(parent_contents, self.usable_space() as u16);
+                    // defragment_page(parent_contents, self.usable_space() as u16);
                     insert_into_cell(
                         parent_contents,
                         &new_divider_cell,
@@ -1841,8 +2233,53 @@ impl BTreeCursor {
                         self.usable_space() as u16,
                     )
                     .unwrap();
+                    #[cfg(debug_assertions)]
+                    self.validate_balance_non_root_divider_cell_insertion(
+                        balance_info,
+                        parent_contents,
+                        i,
+                        page,
+                    );
                 }
-                // TODO: update pages
+                tracing::debug!(
+                    "balance_non_root(parent_overflow={})",
+                    parent_contents.overflow_cells.len()
+                );
+
+                #[cfg(debug_assertions)]
+                {
+                    // Let's ensure every page is pointed to by the divider cell or the rightmost pointer.
+                    for page in &pages_to_balance_new {
+                        assert!(
+                            pages_pointed_to.contains(&(page.get().id as u32)),
+                            "page {} not pointed to by divider cell or rightmost pointer",
+                            page.get().id
+                        );
+                    }
+                }
+                /* 7. Start real movement of cells. Next comment is borrowed from SQLite: */
+                /* Now update the actual sibling pages. The order in which they are updated
+                 ** is important, as this code needs to avoid disrupting any page from which
+                 ** cells may still to be read. In practice, this means:
+                 **
+                 **  (1) If cells are moving left (from apNew[iPg] to apNew[iPg-1])
+                 **      then it is not safe to update page apNew[iPg] until after
+                 **      the left-hand sibling apNew[iPg-1] has been updated.
+                 **
+                 **  (2) If cells are moving right (from apNew[iPg] to apNew[iPg+1])
+                 **      then it is not safe to update page apNew[iPg] until after
+                 **      the right-hand sibling apNew[iPg+1] has been updated.
+                 **
+                 ** If neither of the above apply, the page is safe to update.
+                 **
+                 ** The iPg value in the following loop starts at nNew-1 goes down
+                 ** to 0, then back up to nNew-1 again, thus making two passes over
+                 ** the pages.  On the initial downward pass, only condition (1) above
+                 ** needs to be tested because (2) will always be true from the previous
+                 ** step.  On the upward pass, both conditions are always true, so the
+                 ** upwards pass simply processes pages that were missed on the downward
+                 ** pass.
+                 */
                 let mut done = vec![false; sibling_count_new];
                 for i in (1 - sibling_count_new as i64)..sibling_count_new as i64 {
                     let page_idx = i.unsigned_abs() as usize;
@@ -1858,6 +2295,7 @@ impl BTreeCursor {
                             (0, 0, cell_array.cell_count(0))
                         } else {
                             let this_was_old_page = page_idx < balance_info.sibling_count;
+                            // We add !leaf_data because we want to skip 1 in case of divider cell which is encountared between pages assigned
                             let start_old_cells = if this_was_old_page {
                                 count_cells_in_old_pages[page_idx - 1] as usize
                                     + (!leaf_data) as usize
@@ -1894,8 +2332,25 @@ impl BTreeCursor {
                         done[page_idx] = true;
                     }
                 }
+
+                #[cfg(debug_assertions)]
+                self.post_balance_non_root_validation(
+                    &parent_page,
+                    balance_info,
+                    parent_contents,
+                    pages_to_balance_new,
+                    page_type,
+                    leaf_data,
+                    cells_debug,
+                    sibling_count_new,
+                    rightmost_pointer,
+                );
                 // TODO: balance root
-                // TODO: free pages
+                // We have to free pages that are not used anymore
+                for i in sibling_count_new..balance_info.sibling_count {
+                    let page = &balance_info.pages_to_balance[i];
+                    self.pager.free_page(Some(page.clone()), page.get().id)?;
+                }
                 (WriteState::BalanceStart, Ok(CursorResult::Ok(())))
             }
             WriteState::Finish => todo!(),
@@ -1907,6 +2362,396 @@ impl BTreeCursor {
         let write_info = self.state.mut_write_info().unwrap();
         write_info.state = next_write_state;
         result
+    }
+
+    #[cfg(debug_assertions)]
+    fn validate_balance_non_root_divider_cell_insertion(
+        &self,
+        balance_info: &mut BalanceInfo,
+        parent_contents: &mut PageContent,
+        i: usize,
+        page: &std::sync::Arc<crate::Page>,
+    ) {
+        let left_pointer = if parent_contents.overflow_cells.len() == 0 {
+            let (cell_start, cell_len) = parent_contents.cell_get_raw_region(
+                balance_info.first_divider_cell + i,
+                payload_overflow_threshold_max(
+                    parent_contents.page_type(),
+                    self.usable_space() as u16,
+                ),
+                payload_overflow_threshold_min(
+                    parent_contents.page_type(),
+                    self.usable_space() as u16,
+                ),
+                self.usable_space(),
+            );
+            tracing::debug!(
+                "balance_non_root(cell_start={}, cell_len={})",
+                cell_start,
+                cell_len
+            );
+
+            let left_pointer = read_u32(
+                &parent_contents.as_ptr()[cell_start..cell_start + cell_len],
+                0,
+            );
+            left_pointer
+        } else {
+            let mut left_pointer = None;
+            for cell in parent_contents.overflow_cells.iter() {
+                if cell.index == balance_info.first_divider_cell + i {
+                    left_pointer = Some(read_u32(&cell.payload, 0))
+                }
+            }
+            left_pointer.expect("overflow cell with divider cell was not found")
+        };
+        assert_eq!(left_pointer, page.get().id as u32, "the cell we just inserted doesn't point to the correct page. points to {}, should point to {}",
+           left_pointer,
+            page.get().id as u32
+         );
+    }
+
+    #[cfg(debug_assertions)]
+    fn post_balance_non_root_validation(
+        &self,
+        parent_page: &PageRef,
+        balance_info: &mut BalanceInfo,
+        parent_contents: &mut PageContent,
+        pages_to_balance_new: Vec<std::sync::Arc<crate::Page>>,
+        page_type: PageType,
+        leaf_data: bool,
+        mut cells_debug: Vec<Vec<u8>>,
+        sibling_count_new: usize,
+        rightmost_pointer: &mut [u8],
+    ) {
+        let mut valid = true;
+        let mut current_index_cell = 0;
+        for cell_idx in 0..parent_contents.cell_count() {
+            let cell = parent_contents
+                .cell_get(
+                    cell_idx,
+                    payload_overflow_threshold_max(
+                        parent_contents.page_type(),
+                        self.usable_space() as u16,
+                    ),
+                    payload_overflow_threshold_min(
+                        parent_contents.page_type(),
+                        self.usable_space() as u16,
+                    ),
+                    self.usable_space(),
+                )
+                .unwrap();
+            match cell {
+                BTreeCell::TableInteriorCell(table_interior_cell) => {
+                    let left_child_page = table_interior_cell._left_child_page;
+                    if left_child_page == parent_page.get().id as u32 {
+                        tracing::error!("balance_non_root(parent_divider_points_to_same_page, page_id={}, cell_left_child_page={})",
+                                parent_page.get().id,
+                                left_child_page,
+                            );
+                        valid = false;
+                    }
+                }
+                BTreeCell::IndexInteriorCell(index_interior_cell) => {
+                    let left_child_page = index_interior_cell.left_child_page;
+                    if left_child_page == parent_page.get().id as u32 {
+                        tracing::error!("balance_non_root(parent_divider_points_to_same_page, page_id={}, cell_left_child_page={})",
+                                parent_page.get().id,
+                                left_child_page,
+                            );
+                        valid = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Let's now make a in depth check that we in fact added all possible cells somewhere and they are not lost
+        for (page_idx, page) in pages_to_balance_new.iter().enumerate() {
+            let contents = page.get_contents();
+            debug_validate_cells!(contents, self.usable_space() as u16);
+            // Cells are distributed in order
+            for cell_idx in 0..contents.cell_count() {
+                let (cell_start, cell_len) = contents.cell_get_raw_region(
+                    cell_idx,
+                    payload_overflow_threshold_max(
+                        contents.page_type(),
+                        self.usable_space() as u16,
+                    ),
+                    payload_overflow_threshold_min(
+                        contents.page_type(),
+                        self.usable_space() as u16,
+                    ),
+                    self.usable_space(),
+                );
+                let buf = contents.as_ptr();
+                let cell_buf = to_static_buf(&mut buf[cell_start..cell_start + cell_len]);
+                let cell_buf_in_array = &cells_debug[current_index_cell];
+                if cell_buf != cell_buf_in_array {
+                    tracing::error!("balance_non_root(cell_not_found_debug, page_id={}, cell_in_cell_array_idx={})",
+                        page.get().id,
+                        current_index_cell,
+                    );
+                    valid = false;
+                }
+
+                let cell = crate::storage::sqlite3_ondisk::read_btree_cell(
+                    cell_buf,
+                    &page_type,
+                    0,
+                    payload_overflow_threshold_max(
+                        parent_contents.page_type(),
+                        self.usable_space() as u16,
+                    ),
+                    payload_overflow_threshold_min(
+                        parent_contents.page_type(),
+                        self.usable_space() as u16,
+                    ),
+                    self.usable_space(),
+                )
+                .unwrap();
+                match &cell {
+                    BTreeCell::TableInteriorCell(table_interior_cell) => {
+                        let left_child_page = table_interior_cell._left_child_page;
+                        if left_child_page == page.get().id as u32 {
+                            tracing::error!("balance_non_root(child_page_points_same_page, page_id={}, cell_left_child_page={}, page_idx={})",
+                                page.get().id,
+                                left_child_page,
+                                page_idx
+                            );
+                            valid = false;
+                        }
+                        if left_child_page == parent_page.get().id as u32 {
+                            tracing::error!("balance_non_root(child_page_points_parent_of_child, page_id={}, cell_left_child_page={}, page_idx={})",
+                                page.get().id,
+                                left_child_page,
+                                page_idx
+                            );
+                            valid = false;
+                        }
+                    }
+                    BTreeCell::IndexInteriorCell(index_interior_cell) => {
+                        let left_child_page = index_interior_cell.left_child_page;
+                        if left_child_page == page.get().id as u32 {
+                            tracing::error!("balance_non_root(child_page_points_same_page, page_id={}, cell_left_child_page={}, page_idx={})",
+                                page.get().id,
+                                left_child_page,
+                                page_idx
+                            );
+                            valid = false;
+                        }
+                        if left_child_page == parent_page.get().id as u32 {
+                            tracing::error!("balance_non_root(child_page_points_parent_of_child, page_id={}, cell_left_child_page={}, page_idx={})",
+                                page.get().id,
+                                left_child_page,
+                                page_idx
+                            );
+                            valid = false;
+                        }
+                    }
+                    _ => {}
+                }
+                current_index_cell += 1;
+            }
+            // Now check divider cells and their pointers.
+            let parent_buf = parent_contents.as_ptr();
+            let cell_divider_idx = balance_info.first_divider_cell + page_idx;
+            if page_idx == sibling_count_new - 1 {
+                // We will only validate rightmost pointer of parent page, we will not validate rightmost if it's a cell and not the last pointer because,
+                // insert cell could've defragmented the page and invalidated the pointer.
+                // right pointer, we just check right pointer points to this page.
+                if cell_divider_idx == parent_contents.cell_count() {
+                    let rightmost = read_u32(rightmost_pointer, 0);
+                    if rightmost != page.get().id as u32 {
+                        tracing::error!("balance_non_root(cell_divider_right_pointer, should point to {}, but points to {})",
+                        page.get().id,
+                        rightmost
+                    );
+                        valid = false;
+                    }
+                }
+            } else {
+                // divider cell might be an overflow cell
+                let mut was_overflow = false;
+                for overflow_cell in &parent_contents.overflow_cells {
+                    if overflow_cell.index == cell_divider_idx {
+                        let left_pointer = read_u32(&overflow_cell.payload, 0);
+                        if left_pointer != page.get().id as u32 {
+                            tracing::error!("balance_non_root(cell_divider_left_pointer_overflow, should point to page_id={}, but points to {}, divider_cell={}, overflow_cells_parent={})",
+                        page.get().id,
+                        left_pointer,
+                        page_idx,
+                        parent_contents.overflow_cells.len()
+                    );
+                            valid = false;
+                        }
+                        was_overflow = true;
+                        break;
+                    }
+                }
+                if was_overflow {
+                    continue;
+                }
+                // check if overflow
+                // check if right pointer, this is the last page. Do we update rightmost pointer and defragment moves it?
+                let (cell_start, cell_len) = parent_contents.cell_get_raw_region(
+                    cell_divider_idx,
+                    payload_overflow_threshold_max(
+                        parent_contents.page_type(),
+                        self.usable_space() as u16,
+                    ),
+                    payload_overflow_threshold_min(
+                        parent_contents.page_type(),
+                        self.usable_space() as u16,
+                    ),
+                    self.usable_space(),
+                );
+                let cell_left_pointer = read_u32(&parent_buf[cell_start..cell_start + cell_len], 0);
+                if cell_left_pointer != page.get().id as u32 {
+                    tracing::error!("balance_non_root(cell_divider_left_pointer, should point to page_id={}, but points to {}, divider_cell={}, overflow_cells_parent={})",
+                        page.get().id,
+                        cell_left_pointer,
+                        page_idx,
+                        parent_contents.overflow_cells.len()
+                    );
+                    valid = false;
+                }
+                if leaf_data {
+                    // If we are in a table leaf page, we just need to check that this cell that should be a divider cell is in the parent
+                    // This means we already check cell in leaf pages but not on parent so we don't advance current_index_cell
+                    if page_idx >= balance_info.sibling_count - 1 {
+                        // This means we are in the last page and we don't need to check anything
+                        continue;
+                    }
+                    let cell_buf: &'static mut [u8] =
+                        to_static_buf(&mut cells_debug[current_index_cell - 1]);
+                    let cell = crate::storage::sqlite3_ondisk::read_btree_cell(
+                        cell_buf,
+                        &page_type,
+                        0,
+                        payload_overflow_threshold_max(
+                            parent_contents.page_type(),
+                            self.usable_space() as u16,
+                        ),
+                        payload_overflow_threshold_min(
+                            parent_contents.page_type(),
+                            self.usable_space() as u16,
+                        ),
+                        self.usable_space(),
+                    )
+                    .unwrap();
+                    let parent_cell = parent_contents
+                        .cell_get(
+                            cell_divider_idx,
+                            payload_overflow_threshold_max(
+                                parent_contents.page_type(),
+                                self.usable_space() as u16,
+                            ),
+                            payload_overflow_threshold_min(
+                                parent_contents.page_type(),
+                                self.usable_space() as u16,
+                            ),
+                            self.usable_space(),
+                        )
+                        .unwrap();
+                    let rowid = match cell {
+                        BTreeCell::TableLeafCell(table_leaf_cell) => table_leaf_cell._rowid,
+                        _ => unreachable!(),
+                    };
+                    let rowid_parent = match parent_cell {
+                        BTreeCell::TableInteriorCell(table_interior_cell) => {
+                            table_interior_cell._rowid
+                        }
+                        _ => unreachable!(),
+                    };
+                    if rowid_parent != rowid {
+                        tracing::error!("balance_non_root(cell_divider_rowid, page_id={}, cell_divider_idx={}, rowid_parent={}, rowid={})",
+                            page.get().id,
+                            cell_divider_idx,
+                            rowid_parent,
+                            rowid
+                        );
+                        valid = false;
+                    }
+                } else {
+                    // In any other case, we need to check that this cell was moved to parent as divider cell
+                    let mut was_overflow = false;
+                    for overflow_cell in &parent_contents.overflow_cells {
+                        if overflow_cell.index == cell_divider_idx {
+                            let left_pointer = read_u32(&overflow_cell.payload, 0);
+                            if left_pointer != page.get().id as u32 {
+                                tracing::error!("balance_non_root(cell_divider_divider_cell_overflow should point to page_id={}, but points to {}, divider_cell={}, overflow_cells_parent={})",
+                                    page.get().id,
+                                    left_pointer,
+                                    page_idx,
+                                    parent_contents.overflow_cells.len()
+                                );
+                                valid = false;
+                            }
+                            was_overflow = true;
+                            break;
+                        }
+                    }
+                    if was_overflow {
+                        continue;
+                    }
+                    let (parent_cell_start, parent_cell_len) = parent_contents.cell_get_raw_region(
+                        cell_divider_idx,
+                        payload_overflow_threshold_max(
+                            parent_contents.page_type(),
+                            self.usable_space() as u16,
+                        ),
+                        payload_overflow_threshold_min(
+                            parent_contents.page_type(),
+                            self.usable_space() as u16,
+                        ),
+                        self.usable_space(),
+                    );
+                    let cell_buf_in_array = &cells_debug[current_index_cell];
+                    let left_pointer = read_u32(
+                        &parent_buf[parent_cell_start..parent_cell_start + parent_cell_len],
+                        0,
+                    );
+                    if left_pointer != page.get().id as u32 {
+                        tracing::error!("balance_non_root(divider_cell_left_pointer_interior should point to page_id={}, but points to {}, divider_cell={}, overflow_cells_parent={})",
+                                    page.get().id,
+                                    left_pointer,
+                                    page_idx,
+                                    parent_contents.overflow_cells.len()
+                                );
+                        valid = false;
+                    }
+                    match page_type {
+                        PageType::TableInterior | PageType::IndexInterior => {
+                            let parent_cell_buf =
+                                &parent_buf[parent_cell_start..parent_cell_start + parent_cell_len];
+                            if parent_cell_buf[4..] != cell_buf_in_array[4..] {
+                                tracing::error!("balance_non_root(cell_divider_cell, page_id={}, cell_divider_idx={})",
+                                    page.get().id,
+                                    cell_divider_idx,
+                                );
+                                valid = false;
+                            }
+                        }
+                        PageType::IndexLeaf => {
+                            let parent_cell_buf =
+                                &parent_buf[parent_cell_start..parent_cell_start + parent_cell_len];
+                            if parent_cell_buf[4..] != cell_buf_in_array[..] {
+                                tracing::error!("balance_non_root(cell_divider_cell_index_leaf, page_id={}, cell_divider_idx={})",
+                                    page.get().id,
+                                    cell_divider_idx,
+                                );
+                                valid = false;
+                            }
+                        }
+                        _ => {
+                            unreachable!()
+                        }
+                    }
+                    current_index_cell += 1;
+                }
+            }
+        }
+        assert!(valid, "corrupted database, cells were to balanced properly");
     }
 
     /// Balance the root page.
@@ -1956,7 +2801,11 @@ impl BTreeCursor {
         child_buf[0..root_contents.header_size()]
             .copy_from_slice(&root_buf[offset..offset + root_contents.header_size()]);
         // Copy overflow cells
-        child_contents.overflow_cells = root_contents.overflow_cells.clone();
+        std::mem::swap(
+            &mut child_contents.overflow_cells,
+            &mut root_contents.overflow_cells,
+        );
+        root_contents.overflow_cells.clear();
 
         // 2. Modify root
         let new_root_page_type = match root_contents.page_type() {
@@ -1965,21 +2814,17 @@ impl BTreeCursor {
             other => other,
         } as u8;
         // set new page type
-        root_contents.write_u8(PAGE_HEADER_OFFSET_PAGE_TYPE, new_root_page_type);
-        root_contents.write_u32(PAGE_HEADER_OFFSET_RIGHTMOST_PTR, child.get().id as u32);
-        root_contents.write_u16(
-            PAGE_HEADER_OFFSET_CELL_CONTENT_AREA,
-            self.usable_space() as u16,
-        );
-        root_contents.write_u16(PAGE_HEADER_OFFSET_CELL_COUNT, 0);
-        root_contents.write_u16(PAGE_HEADER_OFFSET_FIRST_FREEBLOCK, 0);
+        root_contents.write_u8(offset::BTREE_PAGE_TYPE, new_root_page_type);
+        root_contents.write_u32(offset::BTREE_RIGHTMOST_PTR, child.get().id as u32);
+        root_contents.write_u16(offset::BTREE_CELL_CONTENT_AREA, self.usable_space() as u16);
+        root_contents.write_u16(offset::BTREE_CELL_COUNT, 0);
+        root_contents.write_u16(offset::BTREE_FIRST_FREEBLOCK, 0);
 
-        root_contents.write_u8(PAGE_HEADER_OFFSET_FRAGMENTED_BYTES_COUNT, 0);
+        root_contents.write_u8(offset::BTREE_FRAGMENTED_BYTES_COUNT, 0);
         root_contents.overflow_cells.clear();
         self.root_page = root.get().id;
         self.stack.clear();
         self.stack.push(root.clone());
-        self.stack.advance();
         self.stack.push(child.clone());
     }
 
@@ -2034,6 +2879,7 @@ impl BTreeCursor {
             }
             cell_idx += 1;
         }
+        assert!(cell_idx <= cell_count);
         cell_idx
     }
 
@@ -2116,7 +2962,7 @@ impl BTreeCursor {
 
     pub fn prev(&mut self) -> Result<CursorResult<()>> {
         assert!(self.mv_cursor.is_none());
-        match self.get_prev_record()? {
+        match self.get_prev_record(None)? {
             CursorResult::Ok(rowid) => {
                 self.rowid.replace(rowid);
                 self.empty_record.replace(rowid.is_none());
@@ -2156,6 +3002,7 @@ impl BTreeCursor {
         key: &BTreeKey,
         moved_before: bool, /* Indicate whether it's necessary to traverse to find the leaf page */
     ) -> Result<CursorResult<()>> {
+        tracing::trace!("insert");
         match &self.mv_cursor {
             Some(mv_cursor) => match key.maybe_rowid() {
                 Some(rowid) => {
@@ -2167,6 +3014,7 @@ impl BTreeCursor {
                 None => todo!("Support mvcc inserts with index btrees"),
             },
             None => {
+                tracing::trace!("moved {}", moved_before);
                 if !moved_before {
                     match key {
                         BTreeKey::IndexKey(_) => {
@@ -2503,7 +3351,7 @@ impl BTreeCursor {
 
     /// Search for a key in an Index Btree. Looking up indexes that need to be unique, we cannot compare the rowid
     pub fn key_exists_in_index(&mut self, key: &ImmutableRecord) -> Result<CursorResult<bool>> {
-        return_if_io!(self.do_seek(SeekKey::IndexKey(key), SeekOp::GE));
+        return_if_io!(self.seek(SeekKey::IndexKey(key), SeekOp::GE));
 
         let record_opt = self.record();
         match record_opt.as_ref() {
@@ -2534,7 +3382,7 @@ impl BTreeCursor {
             OwnedValue::Integer(i) => i,
             _ => unreachable!("btree tables are indexed by integers!"),
         };
-        return_if_io!(self.move_to(SeekKey::TableRowId(*int_key as u64), SeekOp::EQ));
+        let _ = return_if_io!(self.move_to(SeekKey::TableRowId(*int_key as u64), SeekOp::EQ));
         let page = self.stack.top();
         // TODO(pere): request load
         return_if_locked!(page);
@@ -2855,25 +3703,8 @@ impl BTreeCursor {
         };
 
         // if it all fits in local space and old_local_size is enough, do an in-place overwrite
-        if new_payload.len() <= old_local_size {
-            self.overwrite_content(
-                page_ref.clone(),
-                old_offset,
-                &new_payload,
-                0,
-                new_payload.len(),
-            )?;
-            let remaining = old_local_size - new_payload.len();
-            if remaining > 0 {
-                // fill the rest with zeros
-                self.overwrite_content(
-                    page_ref.clone(),
-                    old_offset + new_payload.len(),
-                    &[0; 1],
-                    0,
-                    remaining,
-                )?;
-            }
+        if new_payload.len() == old_local_size {
+            self.overwrite_content(page_ref.clone(), old_offset, &new_payload)?;
             Ok(CursorResult::Ok(()))
         } else {
             // doesn't fit, drop it and insert a new one
@@ -2897,36 +3728,11 @@ impl BTreeCursor {
         page_ref: PageRef,
         dest_offset: usize,
         new_payload: &[u8],
-        src_offset: usize,
-        amount: usize,
     ) -> Result<CursorResult<()>> {
         return_if_locked!(page_ref);
-        page_ref.set_dirty();
-        self.pager.add_dirty(page_ref.get().id);
         let buf = page_ref.get().contents.as_mut().unwrap().as_ptr();
+        buf[dest_offset..dest_offset + new_payload.len()].copy_from_slice(&new_payload);
 
-        // if new_payload doesn't have enough data, we fill with zeros
-        let n_data = new_payload.len().saturating_sub(src_offset);
-        if n_data == 0 {
-            // everything is zeros
-            for i in 0..amount {
-                if buf[dest_offset + i] != 0 {
-                    buf[dest_offset + i] = 0;
-                }
-            }
-        } else {
-            let copy_len = n_data.min(amount);
-            // copy the overlapping portion
-            buf[dest_offset..dest_offset + copy_len]
-                .copy_from_slice(&new_payload[src_offset..src_offset + copy_len]);
-
-            // if copy_len < amount => fill remainder with 0
-            if copy_len < amount {
-                for i in copy_len..amount {
-                    buf[dest_offset + i] = 0;
-                }
-            }
-        }
         Ok(CursorResult::Ok(()))
     }
 
@@ -2941,6 +3747,24 @@ impl BTreeCursor {
     fn get_immutable_record(&self) -> std::cell::RefMut<'_, Option<ImmutableRecord>> {
         self.reusable_immutable_record.borrow_mut()
     }
+
+    pub fn is_write_in_progress(&self) -> bool {
+        match self.state {
+            CursorState::Write(_) => true,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn validate_cells_after_insertion(cell_array: &CellArray, leaf_data: bool) {
+    for cell in &cell_array.cells {
+        assert!(cell.len() >= 4);
+
+        if leaf_data {
+            assert!(cell[0] != 0, "payload is {:?}", cell);
+        }
+    }
 }
 
 impl PageStack {
@@ -2952,7 +3776,7 @@ impl PageStack {
     }
     /// Push a new page onto the stack.
     /// This effectively means traversing to a child page.
-    fn push(&self, page: PageRef) {
+    fn _push(&self, page: PageRef, starting_cell_idx: i32) {
         tracing::trace!(
             "pagestack::push(current={}, new_page_id={})",
             self.current_page.get(),
@@ -2965,7 +3789,15 @@ impl PageStack {
             "corrupted database, stack is bigger than expected"
         );
         self.stack.borrow_mut()[current as usize] = Some(page);
-        self.cell_indices.borrow_mut()[current as usize] = 0;
+        self.cell_indices.borrow_mut()[current as usize] = starting_cell_idx;
+    }
+
+    fn push(&self, page: PageRef) {
+        self._push(page, 0);
+    }
+
+    fn push_backwards(&self, page: PageRef) {
+        self._push(page, i32::MAX);
     }
 
     /// Pop a page off the stack.
@@ -3025,6 +3857,18 @@ impl PageStack {
         self.cell_indices.borrow_mut()[current] -= 1;
     }
 
+    /// Move the cursor to the next cell in the current page according to the iteration direction.
+    fn next_cell_in_direction(&self, iteration_direction: IterationDirection) {
+        match iteration_direction {
+            IterationDirection::Forwards => {
+                self.advance();
+            }
+            IterationDirection::Backwards => {
+                self.retreat();
+            }
+        }
+    }
+
     fn set_cell_index(&self, idx: i32) {
         let current = self.current();
         self.cell_indices.borrow_mut()[current] = idx
@@ -3053,7 +3897,7 @@ impl CellArray {
 fn find_free_cell(page_ref: &PageContent, usable_space: u16, amount: usize) -> Result<usize> {
     // NOTE: freelist is in ascending order of keys and pc
     // unuse_space is reserved bytes at the end of page, therefore we must substract from maxpc
-    let mut prev_pc = page_ref.offset + PAGE_HEADER_OFFSET_FIRST_FREEBLOCK;
+    let mut prev_pc = page_ref.offset + offset::BTREE_FIRST_FREEBLOCK;
     let mut pc = page_ref.first_freeblock() as usize;
     let maxpc = usable_space as usize - amount;
 
@@ -3075,16 +3919,16 @@ fn find_free_cell(page_ref: &PageContent, usable_space: u16, amount: usize) -> R
                     return Ok(0);
                 }
                 // Delete the slot from freelist and update the page's fragment count.
-                page_ref.write_u16(prev_pc, next);
+                page_ref.write_u16_no_offset(prev_pc, next);
                 let frag = page_ref.num_frag_free_bytes() + new_size as u8;
-                page_ref.write_u8(PAGE_HEADER_OFFSET_FRAGMENTED_BYTES_COUNT, frag);
+                page_ref.write_u8(offset::BTREE_FRAGMENTED_BYTES_COUNT, frag);
                 return Ok(pc);
             } else if new_size + pc > maxpc {
                 return_corrupt!("Free block extends beyond page end");
             } else {
                 // Requested amount fits inside the current free slot so we reduce its size
                 // to account for newly allocated space.
-                page_ref.write_u16(pc + 2, new_size as u16);
+                page_ref.write_u16_no_offset(pc + 2, new_size as u16);
                 return Ok(pc + new_size);
             }
         }
@@ -3107,18 +3951,18 @@ fn find_free_cell(page_ref: &PageContent, usable_space: u16, amount: usize) -> R
 pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usable_space: u16) {
     // setup btree page
     let contents = page.get();
-    debug!("btree_init_page(id={}, offset={})", contents.id, offset);
+    tracing::debug!("btree_init_page(id={}, offset={})", contents.id, offset);
     let contents = contents.contents.as_mut().unwrap();
     contents.offset = offset;
     let id = page_type as u8;
-    contents.write_u8(PAGE_HEADER_OFFSET_PAGE_TYPE, id);
-    contents.write_u16(PAGE_HEADER_OFFSET_FIRST_FREEBLOCK, 0);
-    contents.write_u16(PAGE_HEADER_OFFSET_CELL_COUNT, 0);
+    contents.write_u8(offset::BTREE_PAGE_TYPE, id);
+    contents.write_u16(offset::BTREE_FIRST_FREEBLOCK, 0);
+    contents.write_u16(offset::BTREE_CELL_COUNT, 0);
 
-    contents.write_u16(PAGE_HEADER_OFFSET_CELL_CONTENT_AREA, usable_space);
+    contents.write_u16(offset::BTREE_CELL_CONTENT_AREA, usable_space);
 
-    contents.write_u8(PAGE_HEADER_OFFSET_FRAGMENTED_BYTES_COUNT, 0);
-    contents.write_u32(PAGE_HEADER_OFFSET_RIGHTMOST_PTR, 0);
+    contents.write_u8(offset::BTREE_FRAGMENTED_BYTES_COUNT, 0);
+    contents.write_u32(offset::BTREE_RIGHTMOST_PTR, 0);
 }
 
 fn to_static_buf(buf: &mut [u8]) -> &'static mut [u8] {
@@ -3133,7 +3977,7 @@ fn edit_page(
     cell_array: &CellArray,
     usable_space: u16,
 ) -> Result<()> {
-    tracing::trace!(
+    tracing::debug!(
         "edit_page start_old_cells={} start_new_cells={} number_new_cells={} cell_array={}",
         start_old_cells,
         start_new_cells,
@@ -3215,7 +4059,7 @@ fn edit_page(
     )?;
     debug_validate_cells!(page, usable_space);
     // TODO: noverflow
-    page.write_u16(PAGE_HEADER_OFFSET_CELL_COUNT, number_new_cells as u16);
+    page.write_u16(offset::BTREE_CELL_COUNT, number_new_cells as u16);
     Ok(())
 }
 
@@ -3245,7 +4089,7 @@ fn page_free_array(
             let offset = (cell_pointer.start as usize - buf_range.start as usize) as u16;
             let len = (cell_pointer.end as usize - cell_pointer.start as usize) as u16;
             free_cell_range(page, offset, len, usable_space)?;
-            page.write_u16(PAGE_HEADER_OFFSET_CELL_COUNT, page.cell_count() as u16 - 1);
+            page.write_u16(offset::BTREE_CELL_COUNT, page.cell_count() as u16 - 1);
             number_of_cells_removed += 1;
         }
     }
@@ -3352,10 +4196,14 @@ fn free_cell_range(
             }
         }
         if removed_fragmentation > page.num_frag_free_bytes() {
-            return_corrupt!("Invalid fragmentation count");
+            return_corrupt!(format!(
+                "Invalid fragmentation count. Had {} and removed {}",
+                page.num_frag_free_bytes(),
+                removed_fragmentation
+            ));
         }
         let frag = page.num_frag_free_bytes() - removed_fragmentation;
-        page.write_u8(PAGE_HEADER_OFFSET_FRAGMENTED_BYTES_COUNT, frag);
+        page.write_u8(offset::BTREE_FRAGMENTED_BYTES_COUNT, frag);
         pc
     };
 
@@ -3363,11 +4211,11 @@ fn free_cell_range(
         if offset < page.cell_content_area() {
             return_corrupt!("Free block before content area");
         }
-        if pointer_to_pc != page.offset as u16 + PAGE_HEADER_OFFSET_FIRST_FREEBLOCK as u16 {
+        if pointer_to_pc != page.offset as u16 + offset::BTREE_FIRST_FREEBLOCK as u16 {
             return_corrupt!("Invalid content area merge");
         }
-        page.write_u16(PAGE_HEADER_OFFSET_FIRST_FREEBLOCK, pc);
-        page.write_u16(PAGE_HEADER_OFFSET_CELL_CONTENT_AREA, end);
+        page.write_u16(offset::BTREE_FIRST_FREEBLOCK, pc);
+        page.write_u16(offset::BTREE_CELL_CONTENT_AREA, end);
     } else {
         page.write_u16_no_offset(pointer_to_pc as usize, offset);
         page.write_u16_no_offset(offset as usize, pc);
@@ -3432,10 +4280,10 @@ fn defragment_page(page: &PageContent, usable_space: u16) {
     assert!(cbrk >= first_cell);
 
     // set new first byte of cell content
-    page.write_u16(PAGE_HEADER_OFFSET_CELL_CONTENT_AREA, cbrk);
+    page.write_u16(offset::BTREE_CELL_CONTENT_AREA, cbrk);
     // set free block to 0, unused spaced can be retrieved from gap between cell pointer end and content start
-    page.write_u16(PAGE_HEADER_OFFSET_FIRST_FREEBLOCK, 0);
-    page.write_u8(PAGE_HEADER_OFFSET_FRAGMENTED_BYTES_COUNT, 0);
+    page.write_u16(offset::BTREE_FIRST_FREEBLOCK, 0);
+    page.write_u8(offset::BTREE_FRAGMENTED_BYTES_COUNT, 0);
     debug_validate_cells!(page, usable_space);
 }
 
@@ -3443,17 +4291,27 @@ fn defragment_page(page: &PageContent, usable_space: u16) {
 /// Only enabled in debug mode, where we ensure that all cells are valid.
 fn debug_validate_cells_core(page: &PageContent, usable_space: u16) {
     for i in 0..page.cell_count() {
-        // println!("Debug function: i={}", i);
         let (offset, size) = page.cell_get_raw_region(
             i,
             payload_overflow_threshold_max(page.page_type(), usable_space),
             payload_overflow_threshold_min(page.page_type(), usable_space),
             usable_space as usize,
         );
+        let buf = &page.as_ptr()[offset..offset + size];
+        assert!(
+            size >= 4,
+            "cell size should be at least 4 bytes idx={}, cell={:?}, offset={}",
+            i,
+            buf,
+            offset
+        );
         if page.is_leaf() {
             assert!(page.as_ptr()[offset] != 0);
         }
-        assert!(size >= 4, "cell size should be at least 4 bytes idx={}", i);
+        assert!(
+            offset + size <= usable_space as usize,
+            "cell spans out of usable space"
+        );
     }
 }
 
@@ -3468,8 +4326,9 @@ fn insert_into_cell(
     cell_idx: usize,
     usable_space: u16,
 ) -> Result<()> {
+    debug_validate_cells!(page, usable_space);
     assert!(
-        cell_idx <= page.cell_count(),
+        cell_idx <= page.cell_count() + page.overflow_cells.len(),
         "attempting to add cell to an incorrect place cell_idx={} cell_count={}",
         cell_idx,
         page.cell_count()
@@ -3487,11 +4346,13 @@ fn insert_into_cell(
     }
 
     let new_cell_data_pointer = allocate_cell_space(page, payload.len() as u16, usable_space)?;
-    tracing::trace!(
-        "insert_into_cell(idx={}, pc={})",
+    tracing::debug!(
+        "insert_into_cell(idx={}, pc={}, size={})",
         cell_idx,
-        new_cell_data_pointer
+        new_cell_data_pointer,
+        payload.len()
     );
+    assert!(new_cell_data_pointer + payload.len() as u16 <= usable_space);
     let buf = page.as_ptr();
 
     // copy data
@@ -3515,7 +4376,7 @@ fn insert_into_cell(
 
     // update cell count
     let new_n_cells = (page.cell_count() + 1) as u16;
-    page.write_u16(PAGE_HEADER_OFFSET_CELL_COUNT, new_n_cells);
+    page.write_u16(offset::BTREE_CELL_COUNT, new_n_cells);
     debug_validate_cells!(page, usable_space);
     Ok(())
 }
@@ -3627,12 +4488,12 @@ fn allocate_cell_space(page_ref: &PageContent, amount: u16, usable_space: u16) -
     if gap + 2 + amount > top {
         // defragment
         defragment_page(page_ref, usable_space);
-        top = page_ref.read_u16(PAGE_HEADER_OFFSET_CELL_CONTENT_AREA) as usize;
+        top = page_ref.read_u16(offset::BTREE_CELL_CONTENT_AREA) as usize;
     }
 
     top -= amount;
 
-    page_ref.write_u16(PAGE_HEADER_OFFSET_CELL_CONTENT_AREA, top as u16);
+    page_ref.write_u16(offset::BTREE_CELL_CONTENT_AREA, top as u16);
 
     assert!(top + amount <= usable_space as usize);
     Ok(top as u16)
@@ -3665,7 +4526,7 @@ fn fill_cell_payload(
     }
 
     let payload_overflow_threshold_max = payload_overflow_threshold_max(page_type, usable_space);
-    debug!(
+    tracing::debug!(
         "fill_cell_payload(record_size={}, payload_overflow_threshold_max={})",
         record_buf.len(),
         payload_overflow_threshold_max
@@ -3791,11 +4652,11 @@ fn drop_cell(page: &mut PageContent, cell_idx: usize, usable_space: u16) -> Resu
     if page.cell_count() > 1 {
         shift_pointers_left(page, cell_idx);
     } else {
-        page.write_u16(PAGE_HEADER_OFFSET_CELL_CONTENT_AREA, usable_space);
-        page.write_u16(PAGE_HEADER_OFFSET_FIRST_FREEBLOCK, 0);
-        page.write_u8(PAGE_HEADER_OFFSET_FRAGMENTED_BYTES_COUNT, 0);
+        page.write_u16(offset::BTREE_CELL_CONTENT_AREA, usable_space);
+        page.write_u16(offset::BTREE_FIRST_FREEBLOCK, 0);
+        page.write_u8(offset::BTREE_FRAGMENTED_BYTES_COUNT, 0);
     }
-    page.write_u16(PAGE_HEADER_OFFSET_CELL_COUNT, page.cell_count() as u16 - 1);
+    page.write_u16(offset::BTREE_CELL_COUNT, page.cell_count() as u16 - 1);
     debug_validate_cells!(page, usable_space);
     Ok(())
 }
@@ -3815,29 +4676,28 @@ fn shift_pointers_left(page: &mut PageContent, cell_idx: usize) {
 
 #[cfg(test)]
 mod tests {
-    use rand_chacha::rand_core::RngCore;
-    use rand_chacha::rand_core::SeedableRng;
-    use rand_chacha::ChaCha8Rng;
+    use rand::{thread_rng, Rng};
+    use rand_chacha::{
+        rand_core::{RngCore, SeedableRng},
+        ChaCha8Rng,
+    };
     use test_log::test;
 
     use super::*;
-    use crate::fast_lock::SpinLock;
-    use crate::io::{Buffer, Completion, MemoryIO, OpenFlags, IO};
-    use crate::storage::database::DatabaseFile;
-    use crate::storage::page_cache::DumbLruPageCache;
-    use crate::storage::sqlite3_ondisk;
-    use crate::storage::sqlite3_ondisk::DatabaseHeader;
-    use crate::types::Text;
-    use crate::vdbe::Register;
-    use crate::Connection;
-    use crate::{BufferPool, DatabaseStorage, WalFile, WalFileShared, WriteCompletion};
-    use std::cell::RefCell;
-    use std::collections::HashSet;
-    use std::mem::transmute;
-    use std::ops::Deref;
-    use std::panic;
-    use std::rc::Rc;
-    use std::sync::Arc;
+    use crate::{
+        fast_lock::SpinLock,
+        io::{Buffer, Completion, MemoryIO, OpenFlags, IO},
+        storage::{
+            database::DatabaseFile, page_cache::DumbLruPageCache, sqlite3_ondisk,
+            sqlite3_ondisk::DatabaseHeader,
+        },
+        types::Text,
+        vdbe::Register,
+        BufferPool, Connection, DatabaseStorage, WalFile, WalFileShared, WriteCompletion,
+    };
+    use std::{
+        cell::RefCell, collections::HashSet, mem::transmute, ops::Deref, panic, rc::Rc, sync::Arc,
+    };
 
     use tempfile::TempDir;
 
@@ -3862,14 +4722,13 @@ mod tests {
         let page = Arc::new(Page::new(id));
 
         let drop_fn = Rc::new(|_| {});
-        let inner = PageContent {
-            offset: 0,
-            buffer: Arc::new(RefCell::new(Buffer::new(
+        let inner = PageContent::new(
+            0,
+            Arc::new(RefCell::new(Buffer::new(
                 BufferData::new(vec![0; 4096]),
                 drop_fn,
             ))),
-            overflow_cells: Vec::new(),
-        };
+        );
         page.get().contents.replace(inner);
 
         btree_init_page(&page, PageType::TableLeaf, 0, 4096);
@@ -4009,6 +4868,14 @@ mod tests {
                     _left_child_page, ..
                 }) => {
                     child_pages.push(pager.read_page(_left_child_page as usize).unwrap());
+                    if _left_child_page == page.id as u32 {
+                        valid = false;
+                        tracing::error!(
+                            "left child page is the same as parent {}",
+                            _left_child_page
+                        );
+                        continue;
+                    }
                     let (child_depth, child_valid) =
                         validate_btree(pager.clone(), _left_child_page as usize);
                     valid &= child_valid;
@@ -4016,6 +4883,10 @@ mod tests {
                 }
                 _ => panic!("unsupported btree cell: {:?}", cell),
             };
+            if current_depth >= 100 {
+                tracing::error!("depth is too big");
+                return (100, false);
+            }
             depth = Some(depth.unwrap_or(current_depth + 1));
             if depth != Some(current_depth + 1) {
                 tracing::error!("depth is different for child of page {}", page_idx);
@@ -4251,9 +5122,7 @@ mod tests {
             let (pager, root_page) = empty_btree();
             let mut cursor = BTreeCursor::new(None, pager.clone(), root_page);
             let mut keys = Vec::new();
-            let seed = rng.next_u64();
             tracing::info!("seed: {}", seed);
-            let mut rng = ChaCha8Rng::seed_from_u64(seed);
             for insert_id in 0..inserts {
                 let size = size(&mut rng);
                 let key = {
@@ -4288,12 +5157,31 @@ mod tests {
                 let value = ImmutableRecord::from_registers(&[Register::OwnedValue(
                     OwnedValue::Blob(vec![0; size]),
                 )]);
+                let btree_before = format_btree(pager.clone(), root_page, 0);
                 run_until_done(
                     || cursor.insert(&BTreeKey::new_table_rowid(key as u64, Some(&value)), true),
                     pager.deref(),
                 )
                 .unwrap();
-                if matches!(validate_btree(pager.clone(), root_page), (_, false)) {
+                // FIXME: add sorted vector instead, should be okay for small amounts of keys for now :P, too lazy to fix right now
+                keys.sort();
+                cursor.move_to_root();
+                let mut valid = true;
+                for key in keys.iter() {
+                    tracing::trace!("seeking key: {}", key);
+                    run_until_done(|| cursor.next(), pager.deref()).unwrap();
+                    let cursor_rowid = cursor.rowid().unwrap().unwrap();
+                    if *key as u64 != cursor_rowid {
+                        valid = false;
+                        println!("key {} is not found, got {}", key, cursor_rowid);
+                        break;
+                    }
+                }
+                // let's validate btree too so that we undertsand where the btree failed
+                if matches!(validate_btree(pager.clone(), root_page), (_, false)) || !valid {
+                    let btree_after = format_btree(pager.clone(), root_page, 0);
+                    println!("btree before:\n{}", btree_before);
+                    println!("btree after:\n{}", btree_after);
                     panic!("invalid btree");
                 }
             }
@@ -4304,13 +5192,17 @@ mod tests {
             if matches!(validate_btree(pager.clone(), root_page), (_, false)) {
                 panic!("invalid btree");
             }
+            keys.sort();
+            cursor.move_to_root();
             for key in keys.iter() {
-                let seek_key = SeekKey::TableRowId(*key as u64);
-                tracing::debug!("seeking key: {}", key);
-                let found =
-                    run_until_done(|| cursor.seek(seek_key.clone(), SeekOp::EQ), pager.deref())
-                        .unwrap();
-                assert!(found, "key {} is not found", key);
+                tracing::trace!("seeking key: {}", key);
+                run_until_done(|| cursor.next(), pager.deref()).unwrap();
+                let cursor_rowid = cursor.rowid().unwrap().unwrap();
+                assert_eq!(
+                    *key as u64, cursor_rowid,
+                    "key {} is not found, got {}",
+                    key, cursor_rowid
+                );
             }
         }
     }
@@ -4368,25 +5260,21 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     pub fn btree_insert_fuzz_run_random() {
         btree_insert_fuzz_run(128, 16, |rng| (rng.next_u32() % 4096) as usize);
     }
 
     #[test]
-    #[ignore]
     pub fn btree_insert_fuzz_run_small() {
-        btree_insert_fuzz_run(1, 1024, |rng| (rng.next_u32() % 128) as usize);
+        btree_insert_fuzz_run(1, 100, |rng| (rng.next_u32() % 128) as usize);
     }
 
     #[test]
-    #[ignore]
     pub fn btree_insert_fuzz_run_big() {
         btree_insert_fuzz_run(64, 32, |rng| 3 * 1024 + (rng.next_u32() % 1024) as usize);
     }
 
     #[test]
-    #[ignore]
     pub fn btree_insert_fuzz_run_overflow() {
         btree_insert_fuzz_run(64, 32, |rng| (rng.next_u32() % 32 * 1024) as usize);
     }
@@ -4621,7 +5509,7 @@ mod tests {
             let contents = root_page.get().contents.as_mut().unwrap();
 
             // Set rightmost pointer to page4
-            contents.write_u32(PAGE_HEADER_OFFSET_RIGHTMOST_PTR, page4.get().id as u32);
+            contents.write_u32(offset::BTREE_RIGHTMOST_PTR, page4.get().id as u32);
 
             // Create a cell with pointer to page3
             let cell_content = vec![
@@ -4775,15 +5663,13 @@ mod tests {
         let mut total_size = 0;
         let mut cells = Vec::new();
         let usable_space = 4096;
-        let mut i = 1000;
-        // let seed = thread_rng().gen();
-        // let seed = 15292777653676891381;
-        let seed = 9261043168681395159;
+        let mut i = 100000;
+        let seed = thread_rng().gen();
         tracing::info!("seed {}", seed);
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         while i > 0 {
             i -= 1;
-            match rng.next_u64() % 3 {
+            match rng.next_u64() % 4 {
                 0 => {
                     // allow appends with extra place to insert
                     let cell_idx = rng.next_u64() as usize % (page.cell_count() + 1);
@@ -4800,14 +5686,14 @@ mod tests {
                         4096,
                         conn.pager.clone(),
                     );
-                    if (free as usize) < payload.len() - 2 {
+                    if (free as usize) < payload.len() + 2 {
                         // do not try to insert overflow pages because they require balancing
                         continue;
                     }
                     insert_into_cell(page, &payload, cell_idx, 4096).unwrap();
                     assert!(page.overflow_cells.is_empty());
                     total_size += payload.len() as u16 + 2;
-                    cells.push(Cell { pos: i, payload });
+                    cells.insert(cell_idx, Cell { pos: i, payload });
                 }
                 1 => {
                     if page.cell_count() == 0 {
@@ -4826,6 +5712,13 @@ mod tests {
                 }
                 2 => {
                     defragment_page(page, usable_space);
+                }
+                3 => {
+                    // check cells
+                    for (i, cell) in cells.iter().enumerate() {
+                        ensure_cell(page, i, &cell.payload);
+                    }
+                    assert_eq!(page.cell_count(), cells.len());
                 }
                 _ => unreachable!(),
             }

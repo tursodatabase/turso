@@ -7,7 +7,7 @@ use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::{schema::Schema, Result, SymbolTable};
 use limbo_sqlite3_parser::ast::{Expr, Limit, QualifiedName};
 
-use super::plan::TableReference;
+use super::plan::{IterationDirection, TableReference};
 
 pub fn translate_delete(
     query_mode: QueryMode,
@@ -53,7 +53,10 @@ pub fn prepare_delete_plan(
     let table_references = vec![TableReference {
         table,
         identifier: name,
-        op: Operation::Scan { iter_dir: None },
+        op: Operation::Scan {
+            iter_dir: IterationDirection::Forwards,
+            index: None,
+        },
         join_info: None,
     }];
 

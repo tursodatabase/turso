@@ -9,7 +9,7 @@
     "dev": "vite"
   },
   "devDependencies": {
-    "vite": "^6.0.7",
+    "vite": "^6.2.6",
     "vite-plugin-wasm": "^3.4.1"
   }
 }

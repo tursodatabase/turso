@@ -6,10 +6,10 @@ use limbo_sqlite3_parser::ast::{
 };
 
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
-use crate::schema::Table;
+use crate::schema::{IndexColumn, Table};
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode};
-use crate::vdbe::insn::RegisterOrLiteral;
+use crate::vdbe::insn::{IdxInsertFlags, RegisterOrLiteral};
 use crate::vdbe::BranchOffset;
 use crate::{
     schema::{Column, Schema},
@@ -83,6 +83,22 @@ pub fn translate_insert(
         Some(table_name.0.clone()),
         CursorType::BTreeTable(btree_table.clone()),
     );
+    // allocate cursor id's for each btree index cursor we'll need to populate the indexes
+    // (idx name, root_page, idx cursor id)
+    let idx_cursors = schema
+        .get_indices(&table_name.0)
+        .iter()
+        .map(|idx| {
+            (
+                &idx.name,
+                idx.root_page,
+                program.alloc_cursor_id(
+                    Some(table_name.0.clone()),
+                    CursorType::BTreeIndex(idx.clone()),
+                ),
+            )
+        })
+        .collect::<Vec<(&String, usize, usize)>>();
     let root_page = btree_table.root_page;
     let values = match body {
         InsertBody::Select(select, _) => match &select.body.select.deref() {
@@ -93,6 +109,7 @@ pub fn translate_insert(
     };
 
     let column_mappings = resolve_columns_for_insert(&table, columns, values)?;
+    let index_col_mappings = resolve_indicies_for_insert(schema, table.as_ref(), &column_mappings)?;
     // Check if rowid was provided (through INTEGER PRIMARY KEY as a rowid alias)
     let rowid_alias_index = btree_table.columns.iter().position(|c| c.is_rowid_alias);
     let has_user_provided_rowid = {
@@ -183,7 +200,14 @@ pub fn translate_insert(
             &resolver,
         )?;
     }
-
+    // Open all the index btrees for writing
+    for idx_cursor in idx_cursors.iter() {
+        program.emit_insn(Insn::OpenWriteAsync {
+            cursor_id: idx_cursor.2,
+            root_page: idx_cursor.1.into(),
+        });
+        program.emit_insn(Insn::OpenWriteAwait {});
+    }
     // Common record insertion logic for both single and multiple rows
     let check_rowid_is_integer_label = rowid_alias_reg.and(Some(program.allocate_label()));
     if let Some(reg) = rowid_alias_reg {
@@ -251,6 +275,17 @@ pub fn translate_insert(
         program.resolve_label(make_record_label, program.offset());
     }
 
+    match table.btree() {
+        Some(t) if t.is_strict => {
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: column_registers_start,
+                count: num_cols,
+                check_generated: true,
+                table_reference: Rc::clone(&t),
+            });
+        }
+        _ => (),
+    }
     // Create and insert the record
     program.emit_insn(Insn::MakeRecord {
         start_reg: column_registers_start,
@@ -265,7 +300,55 @@ pub fn translate_insert(
         flag: 0,
     });
     program.emit_insn(Insn::InsertAwait { cursor_id });
+    for index_col_mapping in index_col_mappings.iter() {
+        // find which cursor we opened earlier for this index
+        let idx_cursor_id = idx_cursors
+            .iter()
+            .find(|(name, _, _)| *name == &index_col_mapping.idx_name)
+            .map(|(_, _, c_id)| *c_id)
+            .expect("no cursor found for index");
 
+        let num_cols = index_col_mapping.columns.len();
+        // allocate scratch registers for the index columns plus rowid
+        let idx_start_reg = program.alloc_registers(num_cols + 1);
+
+        // copy each index column from the table's column registers into these scratch regs
+        for (i, col) in index_col_mapping.columns.iter().enumerate() {
+            // copy from the table's column register over to the index's scratch register
+
+            program.emit_insn(Insn::Copy {
+                src_reg: column_registers_start + col.0,
+                dst_reg: idx_start_reg + i,
+                amount: 0,
+            });
+        }
+        // last register is the rowid
+        program.emit_insn(Insn::Copy {
+            src_reg: rowid_reg,
+            dst_reg: idx_start_reg + num_cols,
+            amount: 0,
+        });
+
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: idx_start_reg,
+            count: num_cols + 1,
+            dest_reg: record_reg,
+        });
+
+        // now do the actual index insertion using the unpacked registers
+        program.emit_insn(Insn::IdxInsertAsync {
+            cursor_id: idx_cursor_id,
+            record_reg,
+            unpacked_start: Some(idx_start_reg), // TODO: enable optimization
+            unpacked_count: Some((num_cols + 1) as u16),
+            // TODO: figure out how to determine whether or not we need to seek prior to insert.
+            flags: IdxInsertFlags::new(),
+        });
+        program.emit_insn(Insn::IdxInsertAwait {
+            cursor_id: idx_cursor_id,
+        });
+    }
     if inserting_multiple_rows {
         // For multiple rows, loop back
         program.emit_insn(Insn::Goto {
@@ -391,6 +474,69 @@ fn resolve_columns_for_insert<'a>(
     }
 
     Ok(mappings)
+}
+
+/// Represents how a column in an index should be populated during an INSERT.
+/// Similar to ColumnMapping above but includes the index name, as well as multiple
+/// possible value indices for each.
+#[derive(Default)]
+struct IndexColMapping {
+    idx_name: String,
+    columns: Vec<(usize, IndexColumn)>,
+    value_indicies: Vec<Option<usize>>,
+}
+
+impl IndexColMapping {
+    fn new(name: String) -> Self {
+        IndexColMapping {
+            idx_name: name,
+            ..Default::default()
+        }
+    }
+}
+
+/// Example:
+/// Table 'test': (a, b, c);
+/// Index 'idx': test(a, b);
+///________________________________
+/// Insert (a, c): (2, 3)
+/// Record: (2, NULL, 3)
+/// IndexColMapping: (a, b) = (2, NULL)
+fn resolve_indicies_for_insert(
+    schema: &Schema,
+    table: &Table,
+    columns: &[ColumnMapping<'_>],
+) -> Result<Vec<IndexColMapping>> {
+    let mut index_col_mappings = Vec::new();
+    // Iterate over all indices for this table
+    for index in schema.get_indices(table.get_name()) {
+        let mut idx_map = IndexColMapping::new(index.name.clone());
+        // For each column in the index (in the order defined by the index),
+        // try to find the corresponding column in the insert’s column mapping.
+        for idx_col in &index.columns {
+            let target_name = normalize_ident(idx_col.name.as_str());
+            if let Some((i, col_mapping)) = columns.iter().enumerate().find(|(_, mapping)| {
+                mapping
+                    .column
+                    .name
+                    .as_ref()
+                    .map_or(false, |name| name.eq_ignore_ascii_case(&target_name))
+            }) {
+                idx_map.columns.push((i, idx_col.clone()));
+                idx_map.value_indicies.push(col_mapping.value_index);
+            } else {
+                return Err(crate::LimboError::ParseError(format!(
+                    "Column {} not found in index {}",
+                    target_name, index.name
+                )));
+            }
+        }
+        // Add the mapping if at least one column was found.
+        if !idx_map.columns.is_empty() {
+            index_col_mappings.push(idx_map);
+        }
+    }
+    Ok(index_col_mappings)
 }
 
 /// Populates the column registers with values for a single row

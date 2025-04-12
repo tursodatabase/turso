@@ -528,6 +528,20 @@ pub fn insn_to_str(
                     ),
                 )
             }
+            Insn::TypeCheck {
+                start_reg,
+                count,
+                check_generated,
+                ..
+            } => (
+                "TypeCheck",
+                *start_reg as i32,
+                *count as i32,
+                *check_generated as i32,
+                OwnedValue::build_text(""),
+                0,
+                String::from(""),
+            ),
             Insn::MakeRecord {
                 start_reg,
                 count,
@@ -734,31 +748,43 @@ pub fn insn_to_str(
                 is_index: _,
                 cursor_id,
                 start_reg,
-                num_regs: _,
+                num_regs,
                 target_pc,
-            } => (
-                "SeekGT",
-                *cursor_id as i32,
-                target_pc.to_debug_int(),
-                *start_reg as i32,
-                OwnedValue::build_text(""),
-                0,
-                "".to_string(),
-            ),
-            Insn::SeekGE {
+            }
+            | Insn::SeekGE {
                 is_index: _,
                 cursor_id,
                 start_reg,
-                num_regs: _,
+                num_regs,
+                target_pc,
+            }
+            | Insn::SeekLE {
+                is_index: _,
+                cursor_id,
+                start_reg,
+                num_regs,
+                target_pc,
+            }
+            | Insn::SeekLT {
+                is_index: _,
+                cursor_id,
+                start_reg,
+                num_regs,
                 target_pc,
             } => (
-                "SeekGE",
+                match insn {
+                    Insn::SeekGT { .. } => "SeekGT",
+                    Insn::SeekGE { .. } => "SeekGE",
+                    Insn::SeekLE { .. } => "SeekLE",
+                    Insn::SeekLT { .. } => "SeekLT",
+                    _ => unreachable!(),
+                },
                 *cursor_id as i32,
                 target_pc.to_debug_int(),
                 *start_reg as i32,
                 OwnedValue::build_text(""),
                 0,
-                "".to_string(),
+                format!("key=[{}..{}]", start_reg, start_reg + num_regs - 1),
             ),
             Insn::SeekEnd { cursor_id } => (
                 "SeekEnd",
@@ -796,58 +822,40 @@ pub fn insn_to_str(
             Insn::IdxGT {
                 cursor_id,
                 start_reg,
-                num_regs: _,
+                num_regs,
                 target_pc,
-            } => (
-                "IdxGT",
-                *cursor_id as i32,
-                target_pc.to_debug_int(),
-                *start_reg as i32,
-                OwnedValue::build_text(""),
-                0,
-                "".to_string(),
-            ),
-            Insn::IdxGE {
+            }
+            | Insn::IdxGE {
                 cursor_id,
                 start_reg,
-                num_regs: _,
+                num_regs,
                 target_pc,
-            } => (
-                "IdxGE",
-                *cursor_id as i32,
-                target_pc.to_debug_int(),
-                *start_reg as i32,
-                OwnedValue::build_text(""),
-                0,
-                "".to_string(),
-            ),
-            Insn::IdxLT {
+            }
+            | Insn::IdxLE {
                 cursor_id,
                 start_reg,
-                num_regs: _,
+                num_regs,
                 target_pc,
-            } => (
-                "IdxLT",
-                *cursor_id as i32,
-                target_pc.to_debug_int(),
-                *start_reg as i32,
-                OwnedValue::build_text(""),
-                0,
-                "".to_string(),
-            ),
-            Insn::IdxLE {
+            }
+            | Insn::IdxLT {
                 cursor_id,
                 start_reg,
-                num_regs: _,
+                num_regs,
                 target_pc,
             } => (
-                "IdxLE",
+                match insn {
+                    Insn::IdxGT { .. } => "IdxGT",
+                    Insn::IdxGE { .. } => "IdxGE",
+                    Insn::IdxLE { .. } => "IdxLE",
+                    Insn::IdxLT { .. } => "IdxLT",
+                    _ => unreachable!(),
+                },
                 *cursor_id as i32,
                 target_pc.to_debug_int(),
                 *start_reg as i32,
                 OwnedValue::build_text(""),
                 0,
-                "".to_string(),
+                format!("key=[{}..{}]", start_reg, start_reg + num_regs - 1),
             ),
             Insn::DecrJumpZero { reg, target_pc } => (
                 "DecrJumpZero",
@@ -1213,9 +1221,9 @@ pub fn insn_to_str(
                 0,
                 "".to_string(),
             ),
-            Insn::LastAsync { .. } => (
+            Insn::LastAsync { cursor_id } => (
                 "LastAsync",
-                0,
+                *cursor_id as i32,
                 0,
                 0,
                 OwnedValue::build_text(""),
@@ -1240,27 +1248,27 @@ pub fn insn_to_str(
                 0,
                 where_clause.clone(),
             ),
-            Insn::LastAwait { .. } => (
+            Insn::LastAwait { cursor_id, .. } => (
                 "LastAwait",
-                0,
+                *cursor_id as i32,
                 0,
                 0,
                 OwnedValue::build_text(""),
                 0,
                 "".to_string(),
             ),
-            Insn::PrevAsync { .. } => (
+            Insn::PrevAsync { cursor_id } => (
                 "PrevAsync",
-                0,
+                *cursor_id as i32,
                 0,
                 0,
                 OwnedValue::build_text(""),
                 0,
                 "".to_string(),
             ),
-            Insn::PrevAwait { .. } => (
+            Insn::PrevAwait { cursor_id, .. } => (
                 "PrevAwait",
-                0,
+                *cursor_id as i32,
                 0,
                 0,
                 OwnedValue::build_text(""),

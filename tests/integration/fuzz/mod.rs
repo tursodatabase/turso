@@ -2,9 +2,9 @@ pub mod grammar_generator;
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
+    use std::{collections::HashSet, rc::Rc};
 
-    use rand::SeedableRng;
+    use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
     use rusqlite::params;
 
@@ -104,6 +104,248 @@ mod tests {
                 "query: {}, limbo: {:?}, sqlite: {:?}",
                 query, limbo, sqlite
             );
+        }
+    }
+
+    #[test]
+    pub fn rowid_seek_fuzz() {
+        let db = TempDatabase::new_with_rusqlite("CREATE TABLE t(x INTEGER PRIMARY KEY)"); // INTEGER PRIMARY KEY is a rowid alias, so an index is not created
+        let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
+
+        let insert = format!(
+            "INSERT INTO t VALUES {}",
+            (1..10000)
+                .map(|x| format!("({})", x))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        sqlite_conn.execute(&insert, params![]).unwrap();
+        sqlite_conn.close().unwrap();
+        let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
+        let limbo_conn = db.connect_limbo();
+
+        const COMPARISONS: [&str; 4] = ["<", "<=", ">", ">="];
+        const ORDER_BY: [Option<&str>; 4] = [
+            None,
+            Some("ORDER BY x"),
+            Some("ORDER BY x DESC"),
+            Some("ORDER BY x ASC"),
+        ];
+
+        for comp in COMPARISONS.iter() {
+            for order_by in ORDER_BY.iter() {
+                for max in 0..=10000 {
+                    let query = format!(
+                        "SELECT * FROM t WHERE x {} {} {} LIMIT 3",
+                        comp,
+                        max,
+                        order_by.unwrap_or("")
+                    );
+                    log::trace!("query: {}", query);
+                    let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
+                    let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
+                    assert_eq!(
+                        limbo, sqlite,
+                        "query: {}, limbo: {:?}, sqlite: {:?}",
+                        query, limbo, sqlite
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    pub fn index_scan_fuzz() {
+        let db = TempDatabase::new_with_rusqlite("CREATE TABLE t(x PRIMARY KEY)");
+        let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
+
+        let insert = format!(
+            "INSERT INTO t VALUES {}",
+            (0..10000)
+                .map(|x| format!("({})", x))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        sqlite_conn.execute(&insert, params![]).unwrap();
+        sqlite_conn.close().unwrap();
+        let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
+        let limbo_conn = db.connect_limbo();
+
+        const COMPARISONS: [&str; 5] = ["=", "<", "<=", ">", ">="];
+
+        const ORDER_BY: [Option<&str>; 4] = [
+            None,
+            Some("ORDER BY x"),
+            Some("ORDER BY x DESC"),
+            Some("ORDER BY x ASC"),
+        ];
+
+        for comp in COMPARISONS.iter() {
+            for order_by in ORDER_BY.iter() {
+                for max in 0..=10000 {
+                    let query = format!(
+                        "SELECT * FROM t WHERE x {} {} {} LIMIT 3",
+                        comp,
+                        max,
+                        order_by.unwrap_or(""),
+                    );
+                    let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
+                    let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
+                    assert_eq!(
+                        limbo, sqlite,
+                        "query: {}, limbo: {:?}, sqlite: {:?}",
+                        query, limbo, sqlite
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    pub fn index_scan_compound_key_fuzz() {
+        let (mut rng, seed) = if std::env::var("SEED").is_ok() {
+            let seed = std::env::var("SEED").unwrap().parse::<u64>().unwrap();
+            (ChaCha8Rng::seed_from_u64(seed), seed)
+        } else {
+            rng_from_time()
+        };
+        let db = TempDatabase::new_with_rusqlite("CREATE TABLE t(x, y, z, PRIMARY KEY (x, y))");
+        let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
+        let mut pk_tuples = HashSet::new();
+        while pk_tuples.len() < 100000 {
+            pk_tuples.insert((rng.random_range(0..3000), rng.random_range(0..3000)));
+        }
+        let mut tuples = Vec::new();
+        for pk_tuple in pk_tuples {
+            tuples.push(format!(
+                "({}, {}, {})",
+                pk_tuple.0,
+                pk_tuple.1,
+                rng.random_range(0..2000)
+            ));
+        }
+        let insert = format!("INSERT INTO t VALUES {}", tuples.join(", "));
+        sqlite_conn.execute(&insert, params![]).unwrap();
+        sqlite_conn.close().unwrap();
+        let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
+        let limbo_conn = db.connect_limbo();
+
+        const COMPARISONS: [&str; 5] = ["=", "<", "<=", ">", ">="];
+
+        const ORDER_BY: [Option<&str>; 3] = [None, Some("ORDER BY x DESC"), Some("ORDER BY x ASC")];
+        const SECONDARY_ORDER_BY: [Option<&str>; 3] = [None, Some(", y DESC"), Some(", y ASC")];
+
+        let print_dump_on_fail = |insert: &str, seed: u64| {
+            let comment = format!("-- seed: {}; dump for manual debugging:", seed);
+            let pragma_journal_mode = "PRAGMA journal_mode = wal;";
+            let create_table = "CREATE TABLE t(x, y, z, PRIMARY KEY (x, y));";
+            let dump = format!(
+                "{}\n{}\n{}\n{}\n{}",
+                comment, pragma_journal_mode, create_table, comment, insert
+            );
+            println!("{}", dump);
+        };
+
+        for comp in COMPARISONS.iter() {
+            for order_by in ORDER_BY.iter() {
+                // make it more likely that the full 2-column index is utilized for seeking
+                let iter_count_per_permutation = if *comp == "=" { 2000 } else { 500 };
+                println!(
+                    "fuzzing {} iterations with comp: {:?}, order_by: {:?}",
+                    iter_count_per_permutation, comp, order_by
+                );
+                for _ in 0..iter_count_per_permutation {
+                    let first_col_val = rng.random_range(0..=3000);
+                    let mut limit = "LIMIT 5";
+                    let mut second_idx_col_cond = "".to_string();
+                    let mut second_idx_col_comp = "".to_string();
+
+                    // somtetimes include the second index column in the where clause.
+                    // make it more probable when first column has '=' constraint since those queries are usually faster to run
+                    let second_col_prob = if *comp == "=" { 0.7 } else { 0.02 };
+                    if rng.random_bool(second_col_prob) {
+                        let second_idx_col = rng.random_range(0..3000);
+
+                        second_idx_col_comp =
+                            COMPARISONS[rng.random_range(0..COMPARISONS.len())].to_string();
+                        second_idx_col_cond =
+                            format!(" AND y {} {}", second_idx_col_comp, second_idx_col);
+                    }
+
+                    // if the first constraint is =, then half the time, use the second index column in the ORDER BY too
+                    let mut secondary_order_by = None;
+                    let use_secondary_order_by = order_by.is_some()
+                        && *comp == "="
+                        && second_idx_col_comp != ""
+                        && rng.random_bool(0.5);
+                    let full_order_by = if use_secondary_order_by {
+                        secondary_order_by =
+                            SECONDARY_ORDER_BY[rng.random_range(0..SECONDARY_ORDER_BY.len())];
+                        if let Some(secondary) = secondary_order_by {
+                            format!("{}{}", order_by.unwrap_or(""), secondary,)
+                        } else {
+                            order_by.unwrap_or("").to_string()
+                        }
+                    } else {
+                        order_by.unwrap_or("").to_string()
+                    };
+
+                    // There are certain cases where SQLite does not bother iterating in reverse order despite the ORDER BY.
+                    // These cases include e.g.
+                    // SELECT * FROM t WHERE x = 3 ORDER BY x DESC
+                    // SELECT * FROM t WHERE x = 3 and y < 100 ORDER BY x DESC
+                    //
+                    // The common thread being that the ORDER BY column is also constrained by an equality predicate, meaning
+                    // that it doesn't semantically matter what the ordering is.
+                    //
+                    // We do not currently replicate this "lazy" behavior, so in these cases we want the full result set and ensure
+                    // that if the result is not exactly equal, then the ordering must be the exact reverse.
+                    let allow_reverse_ordering = {
+                        if *comp != "=" {
+                            false
+                        } else if secondary_order_by.is_some() {
+                            second_idx_col_comp == "="
+                        } else {
+                            true
+                        }
+                    };
+                    if allow_reverse_ordering {
+                        // see comment above about ordering and the '=' comparison operator; omitting LIMIT for that reason
+                        // we mainly have LIMIT here for performance reasons but for = we want to get all the rows to ensure
+                        // correctness in the = case
+                        limit = "";
+                    }
+                    let query = format!(
+                        // e.g. SELECT * FROM t WHERE x = 1 AND y > 2 ORDER BY x DESC LIMIT 5
+                        "SELECT * FROM t WHERE x {} {} {} {} {}",
+                        comp, first_col_val, second_idx_col_cond, full_order_by, limit,
+                    );
+                    log::debug!("query: {}", query);
+                    let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
+                    let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
+                    let is_equal = limbo == sqlite;
+                    if !is_equal {
+                        if allow_reverse_ordering {
+                            let limbo_row_count = limbo.len();
+                            let sqlite_row_count = sqlite.len();
+                            if limbo_row_count == sqlite_row_count {
+                                let limbo_rev = limbo.iter().cloned().rev().collect::<Vec<_>>();
+                                assert_eq!(limbo_rev, sqlite, "query: {}, limbo: {:?}, sqlite: {:?}, seed: {}, allow_reverse_ordering: {}", query, limbo, sqlite, seed, allow_reverse_ordering);
+                            } else {
+                                print_dump_on_fail(&insert, seed);
+                                let error_msg = format!("row count mismatch (limbo row count: {}, sqlite row count: {}): query: {}, limbo: {:?}, sqlite: {:?}, seed: {}, allow_reverse_ordering: {}", limbo_row_count, sqlite_row_count, query, limbo, sqlite, seed, allow_reverse_ordering);
+                                panic!("{}", error_msg);
+                            }
+                        } else {
+                            print_dump_on_fail(&insert, seed);
+                            panic!(
+                                "query: {}, limbo row count: {}, limbo: {:?}, sqlite row count: {}, sqlite: {:?}, seed: {}, allow_reverse_ordering: {}",
+                                query, limbo.len(), limbo, sqlite.len(), sqlite, seed, allow_reverse_ordering
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

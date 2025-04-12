@@ -1309,53 +1309,74 @@ do_execsql_test log-int-null {
   SELECT log(5, null)
 } {}
 
-do_execsql_test mod-int-null {
+do_execsql_test remainder-int-null {
   SELECT 183 % null
 } {}
 
-do_execsql_test mod-int-0 {
+do_execsql_test remainder-int-0 {
   SELECT 183 % 0
 } {}
 
-do_execsql_test mod-int-int {
+do_execsql_test remainder-int-int {
   SELECT 183 % 10
 } { 3 }
 
-do_execsql_test mod-int-float {
+do_execsql_test remainder-int-float {
   SELECT 38 % 10.35
 } { 8.0 }
 
-do_execsql_test mod-float-int {
+do_execsql_test remainder-float-int {
   SELECT 38.43 % 13
 } { 12.0 }
 
-do_execsql_test mod-0-float {
+do_execsql_test remainder-0-float {
   SELECT 0 % 12.0
 } { 0.0 }
 
-do_execsql_test mod-float-0 {
+do_execsql_test remainder-float-0 {
   SELECT 23.14 % 0
 } {}
 
-do_execsql_test mod-float-float {
+do_execsql_test remainder-float-float {
   SELECT 23.14 % 12.0
 } { 11.0 }
 
-do_execsql_test mod-float-agg {
+do_execsql_test remainder-float-agg {
     SELECT 23.14 % sum(id) from products
 } { 23.0 }
 
-do_execsql_test mod-int-agg {
+do_execsql_test remainder-int-agg {
     SELECT 17 % sum(id) from users
 } { 17 }
 
-do_execsql_test mod-agg-int {
+do_execsql_test remainder-agg-int {
     SELECT count(*) % 17 from users
 } { 4 }
 
-do_execsql_test mod-agg-float {
+do_execsql_test remainder-agg-float {
     SELECT count(*) % 2.43 from users
 } { 0.0 }
+
+foreach {testnum lhs rhs ans} {
+   1   'a'    'a'   {}
+   2   'a'    10    0
+   3   10     'a'   {}
+   4   'a'    11.0  0.0
+   5   11.0   'a'   {}
+   7   '10'   '3'   1
+   8   '10.0' '3'   1.0
+   9   '10.0' -3    1.0
+} {
+  do_execsql_test remainder-text-$testnum "SELECT $lhs % $rhs" $::ans
+}
+
+foreach {testnum lhs rhs ans} {
+   1   '-9223372036854775808'  '-1'  0 
+   2   -9223372036854775808     -1   0
+   3   -9223372036854775809     -1   0.0
+} {
+  do_execsql_test remainder-overflow-$testnum "SELECT $lhs % $rhs" $::ans
+}
 
 do_execsql_test comp-float-float {
     SELECT 0.0 = 0.0

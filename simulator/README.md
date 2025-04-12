@@ -15,19 +15,17 @@ Based on these parameters, we randomly generate **interaction plans**. Interacti
 
 An example of a property is the following:
 
-```json
-{
-  "name": "Read your own writes",
-  "queries": [
-    "INSERT INTO t1 (id) VALUES (1)",
-    "SELECT * FROM t1 WHERE id = 1"
-  ],
-  "assertions": [
-    "result.rows.length == 1",
-    "result.rows[0].id == 1"
-  ]
-}
+```sql
+-- begin testing 'Select-Select-Optimizer'
+-- ASSUME table marvelous_ideal exists;
+SELECT ((devoted_ahmed = -9142609771.541502 AND loving_wicker = -1246708244.164486)) FROM marvelous_ideal WHERE TRUE;
+SELECT * FROM marvelous_ideal WHERE (devoted_ahmed = -9142609771.541502 AND loving_wicker = -1246708244.164486);
+-- ASSERT select queries should return the same amount of results;
+-- end testing 'Select-Select-Optimizer'
 ```
+
+The simulator starts from an initially empty database, adding random interactions based on the workload distribution. It can
+add random queries unrelated to the properties without breaking the property invariants to reach more diverse states and respect the configured workload distribution.
 
 The simulator executes the interaction plans in a loop, and checks the assertions. It can add random queries unrelated to the properties without
 breaking the property invariants to reach more diverse states and respect the configured workload distribution.
@@ -44,36 +42,72 @@ The simulator code is broken into 4 main parts:
 To run the simulator, you can use the following command:
 
 ```bash
-cargo run
+RUST_LOG=limbo_sim=debug cargo run --bin limbo_sim
 ```
 
-This prompt (in the future) will invoke a clap command line interface to configure the simulator. For now, the simulator runs with the default configurations changing the `main.rs` file. If you want to see the logs, you can change the `RUST_LOG` environment variable.
+The simulator CLI has a few configuration options that you can explore via `--help` flag.
 
-```bash
-RUST_LOG=info cargo run --bin limbo_sim
+```txt
+The Limbo deterministic simulator
+
+Usage: limbo_sim [OPTIONS]
+
+Options:
+  -s, --seed <SEED>                  set seed for reproducible runs
+  -d, --doublecheck                  enable doublechecking, run the simulator with the plan twice and check output equality
+  -n, --maximum-size <MAXIMUM_SIZE>  change the maximum size of the randomly generated sequence of interactions [default: 5000]
+  -k, --minimum-size <MINIMUM_SIZE>  change the minimum size of the randomly generated sequence of interactions [default: 1000]
+  -t, --maximum-time <MAXIMUM_TIME>  change the maximum time of the simulation(in seconds) [default: 3600]
+  -l, --load <LOAD>                  load plan from the bug base
+  -w, --watch                        enable watch mode that reruns the simulation on file changes
+      --differential                 run differential testing between sqlite and Limbo
+  -h, --help                         Print help
+  -V, --version                      Print version
 ```
 
 ## Adding new properties
 
-Todo
+The properties are defined in `simulator/generation/property.rs` in the `Property` enum. Each property is documented with
+inline doc comments, an example is given below:
 
-## Adding new generation functions
+```rust
+/// Insert-Select is a property in which the inserted row
+/// must be in the resulting rows of a select query that has a
+/// where clause that matches the inserted row.
+/// The execution of the property is as follows
+///     INSERT INTO <t> VALUES (...)
+///     I_0
+///     I_1
+///     ...
+///     I_n
+///     SELECT * FROM <t> WHERE <predicate>
+/// The interactions in the middle has the following constraints;
+/// - There will be no errors in the middle interactions.
+/// - The inserted row will not be deleted.
+/// - The inserted row will not be updated.
+/// - The table `t` will not be renamed, dropped, or altered.
+InsertValuesSelect {
+    /// The insert query
+    insert: Insert,
+    /// Selected row index
+    row_index: usize,
+    /// Additional interactions in the middle of the property
+    queries: Vec<Query>,
+    /// The select query
+    select: Select,
+},
+```
 
-Todo
-
-## Adding new models
-
-Todo
-
-## Coverage with Limbo
-
-Todo
+If you would like to add a new property, you can add a new variant to the `Property` enum, and the corresponding
+generation function in `simulator/generation/property.rs`. The generation function should return a `Property` instance, and
+it should generate the necessary queries and assertions for the property.
 
 ## Automatic Compatibility Testing with SQLite
 
-Todo
+You can use the `--differential` flag to run the simulator in differential testing mode. This mode will run the same interaction plan on both Limbo and SQLite, and compare the results. It will also check for any panics or errors in either database.
 
 ## Resources
+
 - [(reading) TigerBeetle Deterministic Simulation Testing](https://docs.tigerbeetle.com/about/vopr/)
 - [(reading) sled simulation guide (jepsen-proof engineering)](https://sled.rs/simulation.html)
 - [(video) "Testing Distributed Systems w/ Deterministic Simulation" by Will Wilson](https://www.youtube.com/watch?v=4fFDFbi3toc)

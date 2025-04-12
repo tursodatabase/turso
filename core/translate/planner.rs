@@ -1,7 +1,7 @@
 use super::{
     plan::{
-        Aggregate, EvalAt, JoinInfo, Operation, Plan, ResultSetColumn, SelectPlan, SelectQueryType,
-        TableReference, WhereTerm,
+        Aggregate, EvalAt, IterationDirection, JoinInfo, Operation, Plan, ResultSetColumn,
+        SelectPlan, SelectQueryType, TableReference, WhereTerm,
     },
     select::prepare_select_plan,
     SymbolTable,
@@ -320,7 +320,10 @@ fn parse_from_clause_table<'a>(
                     ));
                 };
                 scope.tables.push(TableReference {
-                    op: Operation::Scan { iter_dir: None },
+                    op: Operation::Scan {
+                        iter_dir: IterationDirection::Forwards,
+                        index: None,
+                    },
                     table: tbl_ref,
                     identifier: alias.unwrap_or(normalized_qualified_name),
                     join_info: None,
@@ -399,7 +402,10 @@ fn parse_from_clause_table<'a>(
                 .unwrap_or(normalized_name.to_string());
 
             scope.tables.push(TableReference {
-                op: Operation::Scan { iter_dir: None },
+                op: Operation::Scan {
+                    iter_dir: IterationDirection::Forwards,
+                    index: None,
+                },
                 join_info: None,
                 table: Table::Virtual(vtab),
                 identifier: alias,

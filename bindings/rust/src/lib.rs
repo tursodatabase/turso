@@ -17,11 +17,13 @@ pub enum Error {
     ToSqlConversionFailure(BoxError),
     #[error("Mutex lock error: {0}")]
     MutexError(String),
+    #[error("SQL execution failure: `{0}`")]
+    SqlExecutionFailure(String),
 }
 
 impl From<limbo_core::LimboError> for Error {
-    fn from(_err: limbo_core::LimboError) -> Self {
-        todo!();
+    fn from(err: limbo_core::LimboError) -> Self {
+        Error::SqlExecutionFailure(err.to_string())
     }
 }
 

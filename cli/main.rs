@@ -7,7 +7,6 @@ mod opcodes_dictionary;
 
 use rustyline::{error::ReadlineError, Config, Editor};
 use std::sync::atomic::Ordering;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 fn rustyline_config() -> Config {
     Config::builder()
@@ -17,15 +16,8 @@ fn rustyline_config() -> Config {
 
 fn main() -> anyhow::Result<()> {
     let mut rl = Editor::with_config(rustyline_config())?;
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_line_number(true)
-                .with_thread_ids(true),
-        )
-        .with(EnvFilter::from_default_env())
-        .init();
     let mut app = app::Limbo::new(&mut rl)?;
+    let _guard = app.init_tracing()?;
     let home = dirs::home_dir().expect("Could not determine home directory");
     let history_file = home.join(".limbo_history");
     if history_file.exists() {

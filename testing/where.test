@@ -572,3 +572,7 @@ do_execsql_test where-constant-condition-no-tables {
 do_execsql_test where-constant-condition-no-tables-2 {
     select 1 where 1 IS NOT NULL;
 } {1}
+
+do_execsql_test where-null-comparison-index-seek-regression-test {
+    select age from users where age > NULL;
+} {}

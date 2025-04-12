@@ -34,3 +34,5 @@ dist/
 # testing
 testing/limbo_output.txt
 **/limbo_output.txt
+testing/test.log
+.bugbase

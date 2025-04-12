@@ -161,6 +161,7 @@ pub struct BTreeTable {
     pub primary_key_column_names: Vec<String>,
     pub columns: Vec<Column>,
     pub has_rowid: bool,
+    pub is_strict: bool,
 }
 
 impl BTreeTable {
@@ -262,12 +263,14 @@ fn create_table(
     let mut has_rowid = true;
     let mut primary_key_column_names = vec![];
     let mut cols = vec![];
+    let is_strict: bool;
     match body {
         CreateTableBody::ColumnsAndConstraints {
             columns,
             constraints,
             options,
         } => {
+            is_strict = options.contains(TableOptions::STRICT);
             if let Some(constraints) = constraints {
                 for c in constraints {
                     if let limbo_sqlite3_parser::ast::TableConstraint::PrimaryKey {
@@ -390,6 +393,7 @@ fn create_table(
         has_rowid,
         primary_key_column_names,
         columns: cols,
+        is_strict,
     })
 }
 
@@ -456,7 +460,7 @@ pub fn affinity(datatype: &str) -> Affinity {
     }
 
     // Rule 3: BLOB or empty -> BLOB affinity (historically called NONE)
-    if datatype.contains("BLOB") || datatype.is_empty() {
+    if datatype.contains("BLOB") || datatype.is_empty() || datatype.contains("ANY") {
         return Affinity::Blob;
     }
 
@@ -508,11 +512,11 @@ pub enum Affinity {
     Numeric,
 }
 
-pub const SQLITE_AFF_TEXT: char = 'a';
-pub const SQLITE_AFF_NONE: char = 'b'; // Historically called NONE, but it's the same as BLOB
-pub const SQLITE_AFF_NUMERIC: char = 'c';
-pub const SQLITE_AFF_INTEGER: char = 'd';
-pub const SQLITE_AFF_REAL: char = 'e';
+pub const SQLITE_AFF_NONE: char = 'A'; // Historically called NONE, but it's the same as BLOB
+pub const SQLITE_AFF_TEXT: char = 'B';
+pub const SQLITE_AFF_NUMERIC: char = 'C';
+pub const SQLITE_AFF_INTEGER: char = 'D';
+pub const SQLITE_AFF_REAL: char = 'E';
 
 impl Affinity {
     /// This is meant to be used in opcodes like Eq, which state:
@@ -552,6 +556,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
         root_page: 1,
         name: "sqlite_schema".to_string(),
         has_rowid: true,
+        is_strict: false,
         primary_key_column_names: vec![],
         columns: vec![
             Column {
@@ -1046,6 +1051,7 @@ mod tests {
             root_page: 0,
             name: "t1".to_string(),
             has_rowid: true,
+            is_strict: false,
             primary_key_column_names: vec!["nonexistent".to_string()],
             columns: vec![Column {
                 name: Some("a".to_string()),

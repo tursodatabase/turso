@@ -172,7 +172,7 @@ macro_rules! try_with_position {
             Ok(val) => val,
             Err(err) => {
                 let mut err = Error::from(err);
-                err.position($scanner.line(), $scanner.column());
+                err.position($scanner.line(), $scanner.column(), $scanner.offset() - 1);
                 return Err(err);
             }
         }
@@ -596,7 +596,9 @@ fn number(data: &[u8]) -> Result<(Option<Token<'_>>, usize), Error> {
         } else if b == b'e' || b == b'E' {
             return exponential_part(data, i);
         } else if is_identifier_start(b) {
-            return Err(Error::BadNumber(None, None));
+            return Err(Error::BadNumber(None, None, Some(i + 1), unsafe {
+                String::from_utf8_unchecked(data[..i + 1].to_vec())
+            }));
         }
         Ok((Some((&data[..i], TK_INTEGER)), i))
     } else {
@@ -610,13 +612,28 @@ fn hex_integer(data: &[u8]) -> Result<(Option<Token<'_>>, usize), Error> {
     if let Some((i, b)) = find_end_of_number(data, 2, u8::is_ascii_hexdigit)? {
         // Must not be empty (Ox is invalid)
         if i == 2 || is_identifier_start(b) {
-            return Err(Error::MalformedHexInteger(None, None));
+            let (len, help) = if i == 2 && !is_identifier_start(b) {
+                (i, "Did you forget to add digits after '0x' or '0X'?")
+            } else {
+                (i + 1, "There are some invalid digits after '0x' or '0X'")
+            };
+            return Err(Error::MalformedHexInteger(
+                None,
+                None,
+                Some(len),  // Length of the malformed hex
+                Some(help), // Help Message
+            ));
         }
         Ok((Some((&data[..i], TK_INTEGER)), i))
     } else {
         // Must not be empty (Ox is invalid)
         if data.len() == 2 {
-            return Err(Error::MalformedHexInteger(None, None));
+            return Err(Error::MalformedHexInteger(
+                None,
+                None,
+                Some(2), // Length of the malformed hex
+                Some("Did you forget to add digits after '0x' or '0X'?"), // Help Message
+            ));
         }
         Ok((Some((data, TK_INTEGER)), data.len()))
     }
@@ -628,7 +645,9 @@ fn fractional_part(data: &[u8], i: usize) -> Result<(Option<Token<'_>>, usize), 
         if b == b'e' || b == b'E' {
             return exponential_part(data, i);
         } else if is_identifier_start(b) {
-            return Err(Error::BadNumber(None, None));
+            return Err(Error::BadNumber(None, None, Some(i + 1), unsafe {
+                String::from_utf8_unchecked(data[..i + 1].to_vec())
+            }));
         }
         Ok((Some((&data[..i], TK_FLOAT)), i))
     } else {
@@ -643,17 +662,24 @@ fn exponential_part(data: &[u8], i: usize) -> Result<(Option<Token<'_>>, usize),
         let i = if *b == b'+' || *b == b'-' { i + 1 } else { i };
         if let Some((j, b)) = find_end_of_number(data, i + 1, u8::is_ascii_digit)? {
             if j == i + 1 || is_identifier_start(b) {
-                return Err(Error::BadNumber(None, None));
+                let len = if is_identifier_start(b) { j + 1 } else { j };
+                return Err(Error::BadNumber(None, None, Some(len), unsafe {
+                    String::from_utf8_unchecked(data[..len].to_vec())
+                }));
             }
             Ok((Some((&data[..j], TK_FLOAT)), j))
         } else {
             if data.len() == i + 1 {
-                return Err(Error::BadNumber(None, None));
+                return Err(Error::BadNumber(None, None, Some(i + 1), unsafe {
+                    String::from_utf8_unchecked(data[..i + 1].to_vec())
+                }));
             }
             Ok((Some((data, TK_FLOAT)), data.len()))
         }
     } else {
-        Err(Error::BadNumber(None, None))
+        Err(Error::BadNumber(None, None, Some(data.len()), unsafe {
+            String::from_utf8_unchecked(data.to_vec())
+        }))
     }
 }
 
@@ -670,7 +696,9 @@ fn find_end_of_number(
             {
                 continue;
             }
-            return Err(Error::BadNumber(None, None));
+            return Err(Error::BadNumber(None, None, Some(j), unsafe {
+                String::from_utf8_unchecked(data[..j].to_vec())
+            }));
         } else {
             return Ok(Some((j, b)));
         }
@@ -724,7 +752,7 @@ mod tests {
         let mut s = Scanner::new(tokenizer);
         expect_token(&mut s, input, b"SELECT", TokenType::TK_SELECT)?;
         let err = s.scan(input).unwrap_err();
-        assert!(matches!(err, Error::BadNumber(_, _)));
+        assert!(matches!(err, Error::BadNumber(_, _, _, _)));
         Ok(())
     }
 

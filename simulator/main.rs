@@ -2,11 +2,11 @@
 use clap::Parser;
 use generation::plan::{Interaction, InteractionPlan, InteractionPlanState};
 use generation::ArbitraryFrom;
-use limbo_core::Database;
 use notify::event::{DataChange, ModifyKind};
 use notify::{EventKind, RecursiveMode, Watcher};
 use rand::prelude::*;
-use runner::cli::SimulatorCLI;
+use runner::bugbase::{Bug, BugBase, LoadedBug};
+use runner::cli::{SimulatorCLI, SimulatorCommand};
 use runner::env::SimulatorEnv;
 use runner::execution::{execute_plans, Execution, ExecutionHistory, ExecutionResult};
 use runner::{differential, watch};
@@ -15,101 +15,159 @@ use std::backtrace::Backtrace;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
-use tempfile::TempDir;
 
 mod generation;
 mod model;
 mod runner;
 mod shrink;
 struct Paths {
+    base: PathBuf,
     db: PathBuf,
     plan: PathBuf,
     shrunk_plan: PathBuf,
     history: PathBuf,
     doublecheck_db: PathBuf,
     shrunk_db: PathBuf,
+    diff_db: PathBuf,
 }
 
 impl Paths {
-    fn new(output_dir: &Path, shrink: bool, doublecheck: bool) -> Self {
-        let paths = Paths {
-            db: PathBuf::from(output_dir).join("simulator.db"),
-            plan: PathBuf::from(output_dir).join("simulator.plan"),
-            shrunk_plan: PathBuf::from(output_dir).join("simulator_shrunk.plan"),
-            history: PathBuf::from(output_dir).join("simulator.history"),
-            doublecheck_db: PathBuf::from(output_dir).join("simulator_double.db"),
-            shrunk_db: PathBuf::from(output_dir).join("simulator_shrunk.db"),
-        };
-
-        // Print the seed, the locations of the database and the plan file
-        log::info!("database path: {:?}", paths.db);
-        if doublecheck {
-            log::info!("doublecheck database path: {:?}", paths.doublecheck_db);
-        } else if shrink {
-            log::info!("shrunk database path: {:?}", paths.shrunk_db);
+    fn new(output_dir: &Path) -> Self {
+        Paths {
+            base: output_dir.to_path_buf(),
+            db: PathBuf::from(output_dir).join("test.db"),
+            plan: PathBuf::from(output_dir).join("plan.sql"),
+            shrunk_plan: PathBuf::from(output_dir).join("shrunk.sql"),
+            history: PathBuf::from(output_dir).join("history.txt"),
+            doublecheck_db: PathBuf::from(output_dir).join("double.db"),
+            shrunk_db: PathBuf::from(output_dir).join("shrunk.db"),
+            diff_db: PathBuf::from(output_dir).join("diff.db"),
         }
-        log::info!("simulator plan path: {:?}", paths.plan);
-        log::info!(
-            "simulator plan serialized path: {:?}",
-            paths.plan.with_extension("plan.json")
-        );
-        if shrink {
-            log::info!("shrunk plan path: {:?}", paths.shrunk_plan);
-        }
-        log::info!("simulator history path: {:?}", paths.history);
-
-        paths
     }
 }
 
 fn main() -> Result<(), String> {
     init_logger();
-
-    let cli_opts = SimulatorCLI::parse();
+    let mut cli_opts = SimulatorCLI::parse();
     cli_opts.validate()?;
 
-    let seed = cli_opts.seed.unwrap_or_else(|| thread_rng().next_u64());
+    match cli_opts.subcommand {
+        Some(SimulatorCommand::List) => {
+            let mut bugbase = BugBase::load().map_err(|e| format!("{:?}", e))?;
+            bugbase.list_bugs()
+        }
+        Some(SimulatorCommand::Loop { n, short_circuit }) => {
+            banner();
+            for i in 0..n {
+                println!("iteration {}", i);
+                let result = testing_main(&cli_opts);
+                if result.is_err() && short_circuit {
+                    println!("short circuiting after {} iterations", i);
+                    return result;
+                } else if result.is_err() {
+                    println!("iteration {} failed", i);
+                } else {
+                    println!("iteration {} succeeded", i);
+                }
+            }
+            Ok(())
+        }
+        Some(SimulatorCommand::Test { filter }) => {
+            let mut bugbase = BugBase::load().map_err(|e| format!("{:?}", e))?;
+            let bugs = bugbase.load_bugs()?;
+            let mut bugs = bugs
+                .into_iter()
+                .flat_map(|bug| {
+                    let runs = bug
+                        .runs
+                        .into_iter()
+                        .filter_map(|run| run.error.clone().map(|_| run))
+                        .filter(|run| run.error.as_ref().unwrap().contains(&filter))
+                        .map(|run| run.cli_options)
+                        .collect::<Vec<_>>();
 
-    let output_dir = match &cli_opts.output_dir {
-        Some(dir) => Path::new(dir).to_path_buf(),
-        None => TempDir::new().map_err(|e| format!("{:?}", e))?.into_path(),
-    };
+                    runs.into_iter()
+                        .map(|mut cli_opts| {
+                            cli_opts.seed = Some(bug.seed);
+                            cli_opts.load = None;
+                            cli_opts
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
 
-    banner();
-    let paths = Paths::new(&output_dir, cli_opts.shrink, cli_opts.doublecheck);
+            bugs.sort();
+            bugs.dedup_by(|a, b| a == b);
 
-    log::info!("seed: {}", seed);
+            println!(
+                "found {} previously triggered configurations with {}",
+                bugs.len(),
+                filter
+            );
+
+            let results = bugs
+                .into_iter()
+                .map(|cli_opts| testing_main(&cli_opts))
+                .collect::<Vec<_>>();
+
+            let (successes, failures): (Vec<_>, Vec<_>) =
+                results.into_iter().partition(|result| result.is_ok());
+            println!("the results of the change are:");
+            println!("\t{} successful runs", successes.len());
+            println!("\t{} failed runs", failures.len());
+            Ok(())
+        }
+        None => {
+            banner();
+            testing_main(&cli_opts)
+        }
+    }
+}
+
+fn testing_main(cli_opts: &SimulatorCLI) -> Result<(), String> {
+    let mut bugbase = BugBase::load().map_err(|e| format!("{:?}", e))?;
 
     let last_execution = Arc::new(Mutex::new(Execution::new(0, 0, 0)));
-    let (env, plans) = setup_simulation(seed, &cli_opts, &paths.db, &paths.plan);
+    let (seed, env, plans) = setup_simulation(&mut bugbase, cli_opts, |p| &p.plan, |p| &p.db);
+
+    let paths = bugbase.paths(seed);
+
+    // Create the output directory if it doesn't exist
+    if !paths.base.exists() {
+        std::fs::create_dir_all(&paths.base).map_err(|e| format!("{:?}", e))?;
+    }
 
     if cli_opts.watch {
-        watch_mode(seed, &cli_opts, &paths, last_execution.clone()).unwrap();
-    } else if cli_opts.differential {
-        differential_testing(env, plans, last_execution.clone())
-    } else {
-        run_simulator(&cli_opts, &paths, env, plans, last_execution.clone());
+        watch_mode(seed, cli_opts, &paths, last_execution.clone()).unwrap();
+        return Ok(());
     }
+
+    let result = if cli_opts.differential {
+        differential_testing(
+            seed,
+            &mut bugbase,
+            cli_opts,
+            &paths,
+            plans,
+            last_execution.clone(),
+        )
+    } else {
+        run_simulator(
+            seed,
+            &mut bugbase,
+            cli_opts,
+            &paths,
+            env,
+            plans,
+            last_execution.clone(),
+        )
+    };
 
     // Print the seed, the locations of the database and the plan file at the end again for easily accessing them.
-    println!("database path: {:?}", paths.db);
-    if cli_opts.doublecheck {
-        println!("doublecheck database path: {:?}", paths.doublecheck_db);
-    } else if cli_opts.shrink {
-        println!("shrunk database path: {:?}", paths.shrunk_db);
-    }
-    println!("simulator plan path: {:?}", paths.plan);
-    println!(
-        "simulator plan serialized path: {:?}",
-        paths.plan.with_extension("plan.json")
-    );
-    if cli_opts.shrink {
-        println!("shrunk plan path: {:?}", paths.shrunk_plan);
-    }
-    println!("simulator history path: {:?}", paths.history);
     println!("seed: {}", seed);
+    println!("path: {}", paths.base.display());
 
-    Ok(())
+    result
 }
 
 fn watch_mode(
@@ -140,14 +198,13 @@ fn watch_mode(
                         std::panic::catch_unwind(|| {
                             let plan: Vec<Vec<Interaction>> =
                                 InteractionPlan::compute_via_diff(&paths.plan);
-
                             let mut env = SimulatorEnv::new(seed, cli_opts, &paths.db);
                             plan.iter().for_each(|is| {
                                 is.iter().for_each(|i| {
                                     i.shadow(&mut env);
                                 });
                             });
-                            let env = Arc::new(Mutex::new(env.clone()));
+                            let env = Arc::new(Mutex::new(env.clone_without_connections()));
                             watch::run_simulation(env, &mut [plan], last_execution.clone())
                         }),
                         last_execution.clone(),
@@ -160,7 +217,6 @@ fn watch_mode(
                         SandboxedResult::Panicked { error, .. }
                         | SandboxedResult::FoundBug { error, .. } => {
                             log::error!("simulation failed: '{}'", error);
-                            println!("simulation failed: '{}'", error);
                         }
                     }
                 }
@@ -173,12 +229,14 @@ fn watch_mode(
 }
 
 fn run_simulator(
+    seed: u64,
+    bugbase: &mut BugBase,
     cli_opts: &SimulatorCLI,
     paths: &Paths,
     env: SimulatorEnv,
     plans: Vec<InteractionPlan>,
     last_execution: Arc<Mutex<Execution>>,
-) {
+) -> Result<(), String> {
     std::panic::set_hook(Box::new(move |info| {
         log::error!("panic occurred");
 
@@ -204,13 +262,23 @@ fn run_simulator(
     );
 
     if cli_opts.doublecheck {
-        doublecheck(env.clone(), paths, &plans, last_execution.clone(), result);
+        doublecheck(
+            seed,
+            bugbase,
+            cli_opts,
+            paths,
+            &plans,
+            last_execution.clone(),
+            result,
+        )
     } else {
         // No doublecheck, run shrinking if panicking or found a bug.
         match &result {
             SandboxedResult::Correct => {
                 log::info!("simulation succeeded");
                 println!("simulation succeeded");
+                bugbase.mark_successful_run(seed, cli_opts).unwrap();
+                Ok(())
             }
             SandboxedResult::Panicked {
                 error,
@@ -238,60 +306,73 @@ fn run_simulator(
                 }
 
                 log::error!("simulation failed: '{}'", error);
-                println!("simulation failed: '{}'", error);
+                log::info!("Starting to shrink");
 
-                if cli_opts.shrink {
-                    log::info!("Starting to shrink");
+                let shrunk_plans = plans
+                    .iter()
+                    .map(|plan| {
+                        let shrunk = plan.shrink_interaction_plan(last_execution);
+                        log::info!("{}", shrunk.stats());
+                        shrunk
+                    })
+                    .collect::<Vec<_>>();
 
-                    let shrunk_plans = plans
-                        .iter()
-                        .map(|plan| {
-                            let shrunk = plan.shrink_interaction_plan(last_execution);
-                            log::info!("{}", shrunk.stats());
-                            shrunk
-                        })
-                        .collect::<Vec<_>>();
+                // Write the shrunk plan to a file
+                let mut f = std::fs::File::create(&paths.shrunk_plan).unwrap();
+                f.write_all(shrunk_plans[0].to_string().as_bytes()).unwrap();
 
-                    // Write the shrunk plan to a file
-                    let mut f = std::fs::File::create(&paths.shrunk_plan).unwrap();
-                    f.write_all(shrunk_plans[0].to_string().as_bytes()).unwrap();
+                let last_execution = Arc::new(Mutex::new(*last_execution));
+                let env = SimulatorEnv::new(seed, cli_opts, &paths.shrunk_db);
 
-                    let last_execution = Arc::new(Mutex::new(*last_execution));
-
-                    let shrunk = SandboxedResult::from(
-                        std::panic::catch_unwind(|| {
-                            run_simulation(
-                                env.clone(),
-                                &mut shrunk_plans.clone(),
-                                last_execution.clone(),
-                            )
-                        }),
-                        last_execution,
-                    );
-
-                    match (&shrunk, &result) {
-                        (
-                            SandboxedResult::Panicked { error: e1, .. },
-                            SandboxedResult::Panicked { error: e2, .. },
+                let env = Arc::new(Mutex::new(env));
+                let shrunk = SandboxedResult::from(
+                    std::panic::catch_unwind(|| {
+                        run_simulation(
+                            env.clone(),
+                            &mut shrunk_plans.clone(),
+                            last_execution.clone(),
                         )
-                        | (
-                            SandboxedResult::FoundBug { error: e1, .. },
-                            SandboxedResult::FoundBug { error: e2, .. },
-                        ) => {
-                            if e1 != e2 {
-                                log::error!(
-                                    "shrinking failed, the error was not properly reproduced"
-                                );
-                            } else {
-                                log::info!("shrinking succeeded");
-                            }
-                        }
-                        (_, SandboxedResult::Correct) => {
-                            unreachable!("shrinking should never be called on a correct simulation")
-                        }
-                        _ => {
+                    }),
+                    last_execution,
+                );
+
+                match (&shrunk, &result) {
+                    (
+                        SandboxedResult::Panicked { error: e1, .. },
+                        SandboxedResult::Panicked { error: e2, .. },
+                    )
+                    | (
+                        SandboxedResult::FoundBug { error: e1, .. },
+                        SandboxedResult::FoundBug { error: e2, .. },
+                    ) => {
+                        if e1 != e2 {
                             log::error!("shrinking failed, the error was not properly reproduced");
+                            bugbase
+                                .add_bug(seed, plans[0].clone(), Some(error.clone()), cli_opts)
+                                .unwrap();
+                            Err(format!("failed with error: '{}'", error))
+                        } else {
+                            log::info!(
+                                "shrinking succeeded, reduced the plan from {} to {}",
+                                plans[0].plan.len(),
+                                shrunk_plans[0].plan.len()
+                            );
+                            // Save the shrunk database
+                            bugbase
+                                .add_bug(seed, shrunk_plans[0].clone(), Some(e1.clone()), cli_opts)
+                                .unwrap();
+                            Err(format!("failed with error: '{}'", e1))
                         }
+                    }
+                    (_, SandboxedResult::Correct) => {
+                        unreachable!("shrinking should never be called on a correct simulation")
+                    }
+                    _ => {
+                        log::error!("shrinking failed, the error was not properly reproduced");
+                        bugbase
+                            .add_bug(seed, plans[0].clone(), Some(error.clone()), cli_opts)
+                            .unwrap();
+                        Err(format!("failed with error: '{}'", error))
                     }
                 }
             }
@@ -300,21 +381,16 @@ fn run_simulator(
 }
 
 fn doublecheck(
-    env: Arc<Mutex<SimulatorEnv>>,
+    seed: u64,
+    bugbase: &mut BugBase,
+    cli_opts: &SimulatorCLI,
     paths: &Paths,
     plans: &[InteractionPlan],
     last_execution: Arc<Mutex<Execution>>,
     result: SandboxedResult,
-) {
-    {
-        let mut env_ = env.lock().unwrap();
-        env_.db = Database::open_file(
-            env_.io.clone(),
-            paths.doublecheck_db.to_str().unwrap(),
-            false,
-        )
-        .unwrap();
-    }
+) -> Result<(), String> {
+    let env = SimulatorEnv::new(seed, cli_opts, &paths.doublecheck_db);
+    let env = Arc::new(Mutex::new(env));
 
     // Run the simulation again
     let result2 = SandboxedResult::from(
@@ -324,32 +400,24 @@ fn doublecheck(
         last_execution.clone(),
     );
 
-    match (result, result2) {
+    let doublecheck_result = match (result, result2) {
         (SandboxedResult::Correct, SandboxedResult::Panicked { .. }) => {
-            log::error!("doublecheck failed! first run succeeded, but second run panicked.");
+            Err("first run succeeded, but second run panicked.".to_string())
         }
         (SandboxedResult::FoundBug { .. }, SandboxedResult::Panicked { .. }) => {
-            log::error!(
-                "doublecheck failed! first run failed an assertion, but second run panicked."
-            );
+            Err("first run failed an assertion, but second run panicked.".to_string())
         }
         (SandboxedResult::Panicked { .. }, SandboxedResult::Correct) => {
-            log::error!("doublecheck failed! first run panicked, but second run succeeded.");
+            Err("first run panicked, but second run succeeded.".to_string())
         }
         (SandboxedResult::Panicked { .. }, SandboxedResult::FoundBug { .. }) => {
-            log::error!(
-                "doublecheck failed! first run panicked, but second run failed an assertion."
-            );
+            Err("first run panicked, but second run failed an assertion.".to_string())
         }
         (SandboxedResult::Correct, SandboxedResult::FoundBug { .. }) => {
-            log::error!(
-                "doublecheck failed! first run succeeded, but second run failed an assertion."
-            );
+            Err("first run succeeded, but second run failed an assertion.".to_string())
         }
         (SandboxedResult::FoundBug { .. }, SandboxedResult::Correct) => {
-            log::error!(
-                "doublecheck failed! first run failed an assertion, but second run succeeded."
-            );
+            Err("first run failed an assertion, but second run succeeded.".to_string())
         }
         (SandboxedResult::Correct, SandboxedResult::Correct)
         | (SandboxedResult::FoundBug { .. }, SandboxedResult::FoundBug { .. })
@@ -358,34 +426,76 @@ fn doublecheck(
             let db_bytes = std::fs::read(&paths.db).unwrap();
             let doublecheck_db_bytes = std::fs::read(&paths.doublecheck_db).unwrap();
             if db_bytes != doublecheck_db_bytes {
-                log::error!("doublecheck failed! database files are different.");
+                Err(
+                    "database files are different, check binary diffs for more details."
+                        .to_string(),
+                )
             } else {
-                log::info!("doublecheck succeeded! database files are the same.");
+                Ok(())
             }
+        }
+    };
+
+    match doublecheck_result {
+        Ok(_) => {
+            log::info!("doublecheck succeeded");
+            println!("doublecheck succeeded");
+            bugbase.mark_successful_run(seed, cli_opts)?;
+            Ok(())
+        }
+        Err(e) => {
+            log::error!("doublecheck failed: '{}'", e);
+            bugbase
+                .add_bug(seed, plans[0].clone(), Some(e.clone()), cli_opts)
+                .unwrap();
+            Err(format!("doublecheck failed: '{}'", e))
         }
     }
 }
 
 fn differential_testing(
-    env: SimulatorEnv,
+    seed: u64,
+    bugbase: &mut BugBase,
+    cli_opts: &SimulatorCLI,
+    paths: &Paths,
     plans: Vec<InteractionPlan>,
     last_execution: Arc<Mutex<Execution>>,
-) {
-    let env = Arc::new(Mutex::new(env));
+) -> Result<(), String> {
+    let env = Arc::new(Mutex::new(SimulatorEnv::new(seed, cli_opts, &paths.db)));
+    let rusqlite_env = Arc::new(Mutex::new(SimulatorEnv::new(
+        seed,
+        cli_opts,
+        &paths.diff_db,
+    )));
+
     let result = SandboxedResult::from(
         std::panic::catch_unwind(|| {
             let plan = plans[0].clone();
-            differential::run_simulation(env, &mut [plan], last_execution.clone())
+            differential::run_simulation(
+                env,
+                rusqlite_env,
+                &|| rusqlite::Connection::open(paths.diff_db.clone()).unwrap(),
+                &mut [plan],
+                last_execution.clone(),
+            )
         }),
         last_execution.clone(),
     );
 
-    if let SandboxedResult::Correct = result {
-        log::info!("simulation succeeded");
-        println!("simulation succeeded");
-    } else {
-        log::error!("simulation failed");
-        println!("simulation failed");
+    match result {
+        SandboxedResult::Correct => {
+            log::info!("simulation succeeded, output of Limbo conforms to SQLite");
+            println!("simulation succeeded, output of Limbo conforms to SQLite");
+            bugbase.mark_successful_run(seed, cli_opts).unwrap();
+            Ok(())
+        }
+        SandboxedResult::Panicked { error, .. } | SandboxedResult::FoundBug { error, .. } => {
+            log::error!("simulation failed: '{}'", error);
+            bugbase
+                .add_bug(seed, plans[0].clone(), Some(error.clone()), cli_opts)
+                .unwrap();
+            Err(format!("simulation failed: '{}'", error))
+        }
     }
 }
 
@@ -443,54 +553,73 @@ impl SandboxedResult {
 }
 
 fn setup_simulation(
-    mut seed: u64,
+    bugbase: &mut BugBase,
     cli_opts: &SimulatorCLI,
-    db_path: &Path,
-    plan_path: &Path,
-) -> (SimulatorEnv, Vec<InteractionPlan>) {
-    if let Some(load) = &cli_opts.load {
-        let seed_path = PathBuf::from(load).with_extension("seed");
-        let seed_str = std::fs::read_to_string(&seed_path).unwrap();
-        seed = seed_str.parse().unwrap();
-    }
+    plan_path: fn(&Paths) -> &Path,
+    db_path: fn(&Paths) -> &Path,
+) -> (u64, SimulatorEnv, Vec<InteractionPlan>) {
+    if let Some(seed) = &cli_opts.load {
+        let seed = seed.parse::<u64>().expect("seed should be a number");
+        let bug = bugbase
+            .get_bug(seed)
+            .unwrap_or_else(|| panic!("bug '{}' not found in bug base", seed));
 
-    let mut env = SimulatorEnv::new(seed, cli_opts, db_path);
+        let paths = bugbase.paths(seed);
+        if !paths.base.exists() {
+            std::fs::create_dir_all(&paths.base).unwrap();
+        }
+        let env = SimulatorEnv::new(bug.seed(), cli_opts, db_path(&paths));
 
-    // todo: the loading works correctly because of a hacky decision
-    // Right now, the plan generation is the only point we use the rng, so the environment doesn't
-    // even need it. In the future, especially with multi-connections and multi-threading, we might
-    // use the RNG for more things such as scheduling, so this assumption will fail.  When that happens,
-    // we'll need to reachitect this logic by saving and loading RNG state.
-    let plans = if let Some(load) = &cli_opts.load {
-        log::info!("Loading database interaction plan...");
-        let plan = std::fs::read_to_string(load).unwrap();
-        let plan: InteractionPlan = serde_json::from_str(&plan).unwrap();
-        vec![plan]
+        let plan = match bug {
+            Bug::Loaded(LoadedBug { plan, .. }) => plan.clone(),
+            Bug::Unloaded { seed } => {
+                let seed = *seed;
+                bugbase
+                    .load_bug(seed)
+                    .unwrap_or_else(|_| panic!("could not load bug '{}' in bug base", seed))
+                    .plan
+                    .clone()
+            }
+        };
+
+        std::fs::write(plan_path(&paths), plan.to_string()).unwrap();
+        std::fs::write(
+            plan_path(&paths).with_extension("json"),
+            serde_json::to_string_pretty(&plan).unwrap(),
+        )
+        .unwrap();
+        let plans = vec![plan];
+        (seed, env, plans)
     } else {
+        let seed = cli_opts.seed.unwrap_or_else(|| {
+            let mut rng = rand::thread_rng();
+            rng.next_u64()
+        });
+
+        let paths = bugbase.paths(seed);
+        if !paths.base.exists() {
+            std::fs::create_dir_all(&paths.base).unwrap();
+        }
+        let mut env = SimulatorEnv::new(seed, cli_opts, &paths.db);
+
         log::info!("Generating database interaction plan...");
-        (1..=env.opts.max_connections)
+
+        let plans = (1..=env.opts.max_connections)
             .map(|_| InteractionPlan::arbitrary_from(&mut env.rng.clone(), &mut env))
-            .collect::<Vec<_>>()
-    };
+            .collect::<Vec<_>>();
 
-    // todo: for now, we only use 1 connection, so it's safe to use the first plan.
-    let plan = plans[0].clone();
-
-    let mut f = std::fs::File::create(plan_path).unwrap();
-    // todo: create a detailed plan file with all the plans. for now, we only use 1 connection, so it's safe to use the first plan.
-    f.write_all(plan.to_string().as_bytes()).unwrap();
-
-    let serialized_plan_path = plan_path.with_extension("plan.json");
-    let mut f = std::fs::File::create(&serialized_plan_path).unwrap();
-    f.write_all(serde_json::to_string(&plan).unwrap().as_bytes())
+        // todo: for now, we only use 1 connection, so it's safe to use the first plan.
+        let plan = &plans[0];
+        log::info!("{}", plan.stats());
+        std::fs::write(plan_path(&paths), plan.to_string()).unwrap();
+        std::fs::write(
+            plan_path(&paths).with_extension("json"),
+            serde_json::to_string_pretty(&plan).unwrap(),
+        )
         .unwrap();
 
-    let seed_path = plan_path.with_extension("seed");
-    let mut f = std::fs::File::create(&seed_path).unwrap();
-    f.write_all(seed.to_string().as_bytes()).unwrap();
-
-    log::info!("{}", plan.stats());
-    (env, plans)
+        (seed, env, plans)
+    }
 }
 
 fn run_simulation(

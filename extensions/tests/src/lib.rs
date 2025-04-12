@@ -112,11 +112,14 @@ impl VTabModule for KVStoreVTab {
         if cursor.index.is_some_and(|c| c >= cursor.rows.len()) {
             return Err("cursor out of range".into());
         }
-        let (_, ref key, ref val) = cursor.rows[cursor.index.unwrap_or(0)];
-        match idx {
-            0 => Ok(Value::from_text(key.clone())), // key
-            1 => Ok(Value::from_text(val.clone())), // value
-            _ => Err("Invalid column".into()),
+        if let Some((_, ref key, ref val)) = cursor.rows.get(cursor.index.unwrap_or(0)) {
+            match idx {
+                0 => Ok(Value::from_text(key.clone())), // key
+                1 => Ok(Value::from_text(val.clone())), // value
+                _ => Err("Invalid column".into()),
+            }
+        } else {
+            Err("cursor out of range".into())
         }
     }
 }

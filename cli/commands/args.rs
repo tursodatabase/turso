@@ -106,3 +106,15 @@ pub struct LoadExtensionArgs {
     #[arg(add = ArgValueCompleter::new(PathCompleter::file()))]
     pub path: String,
 }
+
+#[derive(Debug, ValueEnum, Clone)]
+pub enum TimerMode {
+    On,
+    Off,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TimerArgs {
+    #[arg(value_enum)]
+    pub mode: TimerMode,
+}

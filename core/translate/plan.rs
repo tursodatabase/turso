@@ -7,12 +7,15 @@ use std::{
     sync::Arc,
 };
 
-use crate::schema::{PseudoTable, Type};
 use crate::{
     function::AggFunc,
     schema::{BTreeTable, Column, Index, Table},
     vdbe::BranchOffset,
     VirtualTable,
+};
+use crate::{
+    schema::{PseudoTable, Type},
+    types::SeekOp,
 };
 
 #[derive(Debug, Clone)]
@@ -259,12 +262,11 @@ pub struct TableReference {
 pub enum Operation {
     // Scan operation
     // This operation is used to scan a table.
-    // The iter_dir are uset to indicate the direction of the iterator.
-    // The use of Option for iter_dir is aimed at implementing a conservative optimization strategy: it only pushes
-    // iter_dir down to Scan when iter_dir is None, to prevent potential result set errors caused by multiple
-    // assignments. for more detailed discussions, please refer to https://github.com/tursodatabase/limbo/pull/376
+    // The iter_dir is used to indicate the direction of the iterator.
     Scan {
-        iter_dir: Option<IterationDirection>,
+        iter_dir: IterationDirection,
+        /// The index that we are using to scan the table, if any.
+        index: Option<Arc<Index>>,
     },
     // Search operation
     // This operation is used to search for a row in a table using an index
@@ -326,6 +328,68 @@ impl TableReference {
     }
 }
 
+/// A definition of a rowid/index search.
+///
+/// [SeekKey] is the condition that is used to seek to a specific row in a table/index.
+/// [TerminationKey] is the condition that is used to terminate the search after a seek.
+#[derive(Debug, Clone)]
+pub struct SeekDef {
+    /// The key to use when seeking and when terminating the scan that follows the seek.
+    /// For example, given:
+    /// - CREATE INDEX i ON t (x, y)
+    /// - SELECT * FROM t WHERE x = 1 AND y >= 30
+    /// The key is [1, 30]
+    pub key: Vec<ast::Expr>,
+    /// The condition to use when seeking. See [SeekKey] for more details.
+    pub seek: Option<SeekKey>,
+    /// The condition to use when terminating the scan that follows the seek. See [TerminationKey] for more details.
+    pub termination: Option<TerminationKey>,
+    /// The direction of the scan that follows the seek.
+    pub iter_dir: IterationDirection,
+}
+
+impl SeekDef {
+    /// Whether we should null pad unset columns when seeking.
+    /// This is only done for forward seeks.
+    /// The reason it is done is that sometimes our full index key is not used in seeking.
+    /// See [SeekKey] for more details.
+    ///
+    /// For example, given:
+    /// - CREATE INDEX i ON t (x, y)
+    /// - SELECT * FROM t WHERE x = 1 AND y < 30
+    /// We want to seek to the first row where x = 1, and then iterate forwards.
+    /// In this case, the seek key is GT(1, NULL) since '30' cannot be used to seek (since we want y < 30),
+    /// and any value of y will be greater than NULL.
+    ///
+    /// In backwards iteration direction, we do not null pad because we want to seek to the last row that matches the seek key.
+    /// For example, given:
+    /// - CREATE INDEX i ON t (x, y)
+    /// - SELECT * FROM t WHERE x = 1 AND y > 30 ORDER BY y
+    /// We want to seek to the last row where x = 1, and then iterate backwards.
+    /// In this case, the seek key is just LE(1) so any row with x = 1 will be a match.
+    pub fn null_pad_unset_cols(&self) -> bool {
+        self.iter_dir == IterationDirection::Forwards
+    }
+}
+
+/// A condition to use when seeking.
+#[derive(Debug, Clone)]
+pub struct SeekKey {
+    /// How many columns from [SeekDef::key] are used in seeking.
+    pub len: usize,
+    /// The comparison operator to use when seeking.
+    pub op: SeekOp,
+}
+
+#[derive(Debug, Clone)]
+/// A condition to use when terminating the scan that follows a seek.
+pub struct TerminationKey {
+    /// How many columns from [SeekDef::key] are used in terminating the scan that follows the seek.
+    pub len: usize,
+    /// The comparison operator to use when terminating the scan that follows the seek.
+    pub op: SeekOp,
+}
+
 /// An enum that represents a search operation that can be used to search for a row in a table using an index
 /// (i.e. a primary key or a secondary index)
 #[allow(clippy::enum_variant_names)]
@@ -333,16 +397,10 @@ impl TableReference {
 pub enum Search {
     /// A rowid equality point lookup. This is a special case that uses the SeekRowid bytecode instruction and does not loop.
     RowidEq { cmp_expr: WhereTerm },
-    /// A rowid search. Uses bytecode instructions like SeekGT, SeekGE etc.
-    RowidSearch {
-        cmp_op: ast::Operator,
-        cmp_expr: WhereTerm,
-    },
-    /// A secondary index search. Uses bytecode instructions like SeekGE, SeekGT etc.
-    IndexSearch {
-        index: Arc<Index>,
-        cmp_op: ast::Operator,
-        cmp_expr: WhereTerm,
+    /// A search on a table btree (via `rowid`) or a secondary index search. Uses bytecode instructions like SeekGE, SeekGT etc.
+    Seek {
+        index: Option<Arc<Index>>,
+        seek_def: SeekDef,
     },
 }
 
@@ -419,14 +477,16 @@ impl Display for SelectPlan {
                     writeln!(f, "{}SCAN {}", indent, table_name)?;
                 }
                 Operation::Search(search) => match search {
-                    Search::RowidEq { .. } | Search::RowidSearch { .. } => {
+                    Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
                         writeln!(
                             f,
                             "{}SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
                             indent, reference.identifier
                         )?;
                     }
-                    Search::IndexSearch { index, .. } => {
+                    Search::Seek {
+                        index: Some(index), ..
+                    } => {
                         writeln!(
                             f,
                             "{}SEARCH {} USING INDEX {}",
@@ -508,14 +568,16 @@ impl fmt::Display for UpdatePlan {
                     }
                 }
                 Operation::Search(search) => match search {
-                    Search::RowidEq { .. } | Search::RowidSearch { .. } => {
+                    Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
                         writeln!(
                             f,
                             "{}SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
                             indent, reference.identifier
                         )?;
                     }
-                    Search::IndexSearch { index, .. } => {
+                    Search::Seek {
+                        index: Some(index), ..
+                    } => {
                         writeln!(
                             f,
                             "{}SEARCH {} USING INDEX {}",

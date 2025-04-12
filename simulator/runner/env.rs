@@ -1,8 +1,10 @@
+use std::fmt::Display;
+use std::mem;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use limbo_core::{Connection, Database};
+use limbo_core::Database;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -12,12 +14,6 @@ use crate::runner::io::SimulatorIO;
 
 use super::cli::SimulatorCLI;
 
-pub trait SimulatorEnvTrait {
-    fn tables(&self) -> &Vec<Table>;
-    fn tables_mut(&mut self) -> &mut Vec<Table>;
-}
-
-#[derive(Clone)]
 pub(crate) struct SimulatorEnv {
     pub(crate) opts: SimulatorOpts,
     pub(crate) tables: Vec<Table>,
@@ -27,13 +23,18 @@ pub(crate) struct SimulatorEnv {
     pub(crate) rng: ChaCha8Rng,
 }
 
-impl SimulatorEnvTrait for SimulatorEnv {
-    fn tables(&self) -> &Vec<Table> {
-        &self.tables
-    }
-
-    fn tables_mut(&mut self) -> &mut Vec<Table> {
-        &mut self.tables
+impl SimulatorEnv {
+    pub(crate) fn clone_without_connections(&self) -> Self {
+        SimulatorEnv {
+            opts: self.opts.clone(),
+            tables: self.tables.clone(),
+            connections: (0..self.connections.len())
+                .map(|_| SimConnection::Disconnected)
+                .collect(),
+            io: self.io.clone(),
+            db: self.db.clone(),
+            rng: self.rng.clone(),
+        }
     }
 }
 
@@ -66,7 +67,7 @@ impl SimulatorEnv {
         };
 
         let opts = SimulatorOpts {
-            ticks: rng.gen_range(cli_opts.minimum_size..=cli_opts.maximum_size),
+            ticks: rng.gen_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
             max_connections: 1, // TODO: for now let's use one connection as we didn't implement
             // correct transactions processing
             max_tables: rng.gen_range(0..128),
@@ -76,7 +77,7 @@ impl SimulatorEnv {
             delete_percent,
             drop_percent,
             page_size: 4096, // TODO: randomize this too
-            max_interactions: rng.gen_range(cli_opts.minimum_size..=cli_opts.maximum_size),
+            max_interactions: rng.gen_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
             max_time_simulation: cli_opts.maximum_time,
         };
 
@@ -87,6 +88,11 @@ impl SimulatorEnv {
             std::fs::remove_file(db_path).unwrap();
         }
 
+        let wal_path = db_path.with_extension("db-wal");
+        if wal_path.exists() {
+            std::fs::remove_file(wal_path).unwrap();
+        }
+
         let db = match Database::open_file(io.clone(), db_path.to_str().unwrap(), false) {
             Ok(db) => db,
             Err(e) => {
@@ -94,7 +100,9 @@ impl SimulatorEnv {
             }
         };
 
-        let connections = vec![SimConnection::Disconnected; opts.max_connections];
+        let connections = (0..opts.max_connections)
+            .map(|_| SimConnection::Disconnected)
+            .collect::<Vec<_>>();
 
         SimulatorEnv {
             opts,
@@ -107,27 +115,55 @@ impl SimulatorEnv {
     }
 }
 
-pub trait ConnectionTrait {
+pub trait ConnectionTrait
+where
+    Self: std::marker::Sized + Clone,
+{
     fn is_connected(&self) -> bool;
     fn disconnect(&mut self);
 }
 
-#[derive(Clone)]
 pub(crate) enum SimConnection {
-    Connected(Rc<Connection>),
+    LimboConnection(Rc<limbo_core::Connection>),
+    SQLiteConnection(rusqlite::Connection),
     Disconnected,
 }
 
-impl ConnectionTrait for SimConnection {
-    fn is_connected(&self) -> bool {
+impl SimConnection {
+    pub(crate) fn is_connected(&self) -> bool {
         match self {
-            SimConnection::Connected(_) => true,
+            SimConnection::LimboConnection(_) | SimConnection::SQLiteConnection(_) => true,
             SimConnection::Disconnected => false,
         }
     }
+    pub(crate) fn disconnect(&mut self) {
+        let conn = mem::replace(self, SimConnection::Disconnected);
 
-    fn disconnect(&mut self) {
-        *self = SimConnection::Disconnected;
+        match conn {
+            SimConnection::LimboConnection(conn) => {
+                conn.close().unwrap();
+            }
+            SimConnection::SQLiteConnection(conn) => {
+                conn.close().unwrap();
+            }
+            SimConnection::Disconnected => {}
+        }
+    }
+}
+
+impl Display for SimConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SimConnection::LimboConnection(_) => {
+                write!(f, "LimboConnection")
+            }
+            SimConnection::SQLiteConnection(_) => {
+                write!(f, "SQLiteConnection")
+            }
+            SimConnection::Disconnected => {
+                write!(f, "Disconnected")
+            }
+        }
     }
 }
 

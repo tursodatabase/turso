@@ -141,3 +141,62 @@ Collin|15}
 do_execsql_test case-insensitive-alias {
     select u.first_name as fF, count(1) > 0 as cC from users u where fF = 'Jamie' group by fF order by cC;
 } {Jamie|1}
+
+do_execsql_test age_idx_order_desc {
+    select first_name from users order by age desc limit 3;
+} {Robert
+Sydney
+Matthew}
+
+do_execsql_test rowid_or_integer_pk_desc {
+    select first_name from users order by id desc limit 3;
+} {Nicole
+Gina
+Dorothy}
+
+# These two following tests may seem dumb but they verify that index scanning by age_idx doesn't drop any rows due to BTree bugs
+do_execsql_test orderby_asc_verify_rows {
+    select count(1) from (select * from users order by age desc)
+} {10000}
+
+do_execsql_test orderby_desc_verify_rows {
+    select count(1) from (select * from users order by age desc)
+} {10000}
+
+do_execsql_test orderby_desc_with_offset {
+    select first_name, age from users order by age desc limit 3 offset 666;
+} {Francis|94
+Matthew|94
+Theresa|94}
+
+do_execsql_test orderby_desc_with_filter {
+    select first_name, age from users where age <= 50 order by age desc limit 5;
+} {Gerald|50
+Nicole|50
+Tammy|50
+Marissa|50
+Daniel|50}
+
+do_execsql_test orderby_asc_with_filter_range {
+    select first_name, age from users where age <= 50 and age >= 49 order by age asc limit 5;
+} {William|49
+Jennifer|49
+Robert|49
+David|49
+Stephanie|49}
+
+do_execsql_test orderby_desc_with_filter_id_lt {
+    select id from users where id < 6666 order by id desc limit 5;
+} {6665
+6664
+6663
+6662
+6661}
+
+do_execsql_test orderby_desc_with_filter_id_le {
+    select id from users where id <= 6666 order by id desc limit 5;
+} {6666
+6665
+6664
+6663
+6662}

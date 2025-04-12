@@ -9,7 +9,7 @@ use std::io;
 /// Error with position
 pub trait ScanError: Error + From<io::Error> + Sized {
     /// Update the position where the error occurs
-    fn position(&mut self, line: u64, column: usize);
+    fn position(&mut self, line: u64, column: usize, offset: usize);
 }
 
 /// The `(&[u8], TokenType)` is the token.
@@ -126,7 +126,7 @@ impl<S: Splitter> Scanner<S> {
                 let data = &input[self.offset..];
                 match self.splitter.split(data) {
                     Err(mut e) => {
-                        e.position(self.line, self.column);
+                        e.position(self.line, self.column, self.offset);
                         return Err(e);
                     }
                     Ok((None, 0)) => {

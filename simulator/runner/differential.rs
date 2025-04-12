@@ -5,54 +5,20 @@ use crate::{
         pick_index,
         plan::{Interaction, InteractionPlanState, ResultSet},
     },
-    model::{
-        query::Query,
-        table::{Table, Value},
-    },
+    model::{query::Query, table::Value},
     runner::execution::ExecutionContinuation,
     InteractionPlan,
 };
 
 use super::{
-    env::{ConnectionTrait, SimConnection, SimulatorEnv, SimulatorEnvTrait},
+    env::{SimConnection, SimulatorEnv},
     execution::{execute_interaction, Execution, ExecutionHistory, ExecutionResult},
 };
 
-pub(crate) struct SimulatorEnvRusqlite {
-    pub(crate) tables: Vec<Table>,
-    pub(crate) connections: Vec<RusqliteConnection>,
-}
-
-pub(crate) enum RusqliteConnection {
-    Connected(rusqlite::Connection),
-    Disconnected,
-}
-
-impl ConnectionTrait for RusqliteConnection {
-    fn is_connected(&self) -> bool {
-        match self {
-            RusqliteConnection::Connected(_) => true,
-            RusqliteConnection::Disconnected => false,
-        }
-    }
-
-    fn disconnect(&mut self) {
-        *self = RusqliteConnection::Disconnected;
-    }
-}
-
-impl SimulatorEnvTrait for SimulatorEnvRusqlite {
-    fn tables(&self) -> &Vec<Table> {
-        &self.tables
-    }
-
-    fn tables_mut(&mut self) -> &mut Vec<Table> {
-        &mut self.tables
-    }
-}
-
 pub(crate) fn run_simulation(
     env: Arc<Mutex<SimulatorEnv>>,
+    rusqlite_env: Arc<Mutex<SimulatorEnv>>,
+    rusqlite_conn: &dyn Fn() -> rusqlite::Connection,
     plans: &mut [InteractionPlan],
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
@@ -66,14 +32,7 @@ pub(crate) fn run_simulation(
             secondary_pointer: 0,
         })
         .collect::<Vec<_>>();
-    let env = env.lock().unwrap();
 
-    let rusqlite_env = SimulatorEnvRusqlite {
-        tables: env.tables.clone(),
-        connections: (0..env.connections.len())
-            .map(|_| RusqliteConnection::Connected(rusqlite::Connection::open_in_memory().unwrap()))
-            .collect::<Vec<_>>(),
-    };
     let mut rusqlite_states = plans
         .iter()
         .map(|_| InteractionPlanState {
@@ -84,15 +43,14 @@ pub(crate) fn run_simulation(
         .collect::<Vec<_>>();
 
     let result = execute_plans(
-        Arc::new(Mutex::new(env.clone())),
+        env,
         rusqlite_env,
+        rusqlite_conn,
         plans,
         &mut states,
         &mut rusqlite_states,
         last_execution,
     );
-
-    env.io.print_stats();
 
     log::info!("Simulation completed");
 
@@ -148,7 +106,8 @@ fn execute_query_rusqlite(
 
 pub(crate) fn execute_plans(
     env: Arc<Mutex<SimulatorEnv>>,
-    mut rusqlite_env: SimulatorEnvRusqlite,
+    rusqlite_env: Arc<Mutex<SimulatorEnv>>,
+    rusqlite_conn: &dyn Fn() -> rusqlite::Connection,
     plans: &mut [InteractionPlan],
     states: &mut [InteractionPlanState],
     rusqlite_states: &mut [InteractionPlanState],
@@ -158,6 +117,8 @@ pub(crate) fn execute_plans(
     let now = std::time::Instant::now();
 
     let mut env = env.lock().unwrap();
+    let mut rusqlite_env = rusqlite_env.lock().unwrap();
+
     for _tick in 0..env.opts.ticks {
         // Pick the connection to interact with
         let connection_index = pick_index(env.connections.len(), &mut env.rng);
@@ -176,6 +137,7 @@ pub(crate) fn execute_plans(
         match execute_plan(
             &mut env,
             &mut rusqlite_env,
+            rusqlite_conn,
             connection_index,
             plans,
             states,
@@ -202,13 +164,15 @@ pub(crate) fn execute_plans(
 
 fn execute_plan(
     env: &mut SimulatorEnv,
-    rusqlite_env: &mut SimulatorEnvRusqlite,
+    rusqlite_env: &mut SimulatorEnv,
+    rusqlite_conn: &dyn Fn() -> rusqlite::Connection,
     connection_index: usize,
     plans: &mut [InteractionPlan],
     states: &mut [InteractionPlanState],
     rusqlite_states: &mut [InteractionPlanState],
 ) -> limbo_core::Result<()> {
     let connection = &env.connections[connection_index];
+    let rusqlite_connection = &rusqlite_env.connections[connection_index];
     let plan = &mut plans[connection_index];
     let state = &mut states[connection_index];
     let rusqlite_state = &mut rusqlite_states[connection_index];
@@ -218,83 +182,141 @@ fn execute_plan(
 
     let interaction = &plan.plan[state.interaction_pointer].interactions()[state.secondary_pointer];
 
-    if let SimConnection::Disconnected = connection {
-        log::debug!("connecting {}", connection_index);
-        env.connections[connection_index] = SimConnection::Connected(env.db.connect().unwrap());
-    } else {
-        let limbo_result =
-            execute_interaction(env, connection_index, interaction, &mut state.stack);
-        let ruqlite_result = execute_interaction_rusqlite(
-            rusqlite_env,
-            connection_index,
-            interaction,
-            &mut rusqlite_state.stack,
-        );
+    match (connection, rusqlite_connection) {
+        (SimConnection::Disconnected, SimConnection::Disconnected) => {
+            log::debug!("connecting {}", connection_index);
+            env.connections[connection_index] =
+                SimConnection::LimboConnection(env.db.connect().unwrap());
+            rusqlite_env.connections[connection_index] =
+                SimConnection::SQLiteConnection(rusqlite_conn());
+        }
+        (SimConnection::LimboConnection(_), SimConnection::SQLiteConnection(_)) => {
+            let limbo_result =
+                execute_interaction(env, connection_index, interaction, &mut state.stack);
+            let ruqlite_result = execute_interaction_rusqlite(
+                rusqlite_env,
+                connection_index,
+                interaction,
+                &mut rusqlite_state.stack,
+            );
+            match (limbo_result, ruqlite_result) {
+                (Ok(next_execution), Ok(next_execution_rusqlite)) => {
+                    if next_execution != next_execution_rusqlite {
+                        log::error!("limbo and rusqlite results do not match");
+                        return Err(limbo_core::LimboError::InternalError(
+                            "limbo and rusqlite results do not match".into(),
+                        ));
+                    }
 
-        match (limbo_result, ruqlite_result) {
-            (Ok(next_execution), Ok(next_execution_rusqlite)) => {
-                if next_execution != next_execution_rusqlite {
-                    log::error!("limbo and rusqlite results do not match");
-                    return Err(limbo_core::LimboError::InternalError(
-                        "limbo and rusqlite results do not match".into(),
-                    ));
-                }
-                log::debug!("connection {} processed", connection_index);
-                // Move to the next interaction or property
-                match next_execution {
-                    ExecutionContinuation::NextInteraction => {
-                        if state.secondary_pointer + 1
-                            >= plan.plan[state.interaction_pointer].interactions().len()
-                        {
-                            // If we have reached the end of the interactions for this property, move to the next property
-                            state.interaction_pointer += 1;
-                            state.secondary_pointer = 0;
-                        } else {
-                            // Otherwise, move to the next interaction
-                            state.secondary_pointer += 1;
+                    let limbo_values = state.stack.last();
+                    let rusqlite_values = rusqlite_state.stack.last();
+                    match (limbo_values, rusqlite_values) {
+                        (Some(limbo_values), Some(rusqlite_values)) => {
+                            match (limbo_values, rusqlite_values) {
+                                (Ok(limbo_values), Ok(rusqlite_values)) => {
+                                    if limbo_values != rusqlite_values {
+                                        log::error!("limbo and rusqlite results do not match");
+                                        return Err(limbo_core::LimboError::InternalError(
+                                            "limbo and rusqlite results do not match".into(),
+                                        ));
+                                    }
+                                }
+                                (Err(limbo_err), Err(rusqlite_err)) => {
+                                    log::warn!(
+                                        "limbo and rusqlite both fail, requires manual check"
+                                    );
+                                    log::warn!("limbo error {}", limbo_err);
+                                    log::warn!("rusqlite error {}", rusqlite_err);
+                                }
+                                (Ok(limbo_result), Err(rusqlite_err)) => {
+                                    log::error!("limbo and rusqlite results do not match");
+                                    log::error!("limbo values {:?}", limbo_result);
+                                    log::error!("rusqlite error {}", rusqlite_err);
+                                    return Err(limbo_core::LimboError::InternalError(
+                                        "limbo and rusqlite results do not match".into(),
+                                    ));
+                                }
+                                (Err(limbo_err), Ok(_)) => {
+                                    log::error!("limbo and rusqlite results do not match");
+                                    log::error!("limbo error {}", limbo_err);
+                                    return Err(limbo_core::LimboError::InternalError(
+                                        "limbo and rusqlite results do not match".into(),
+                                    ));
+                                }
+                            }
+                        }
+                        (None, None) => {}
+                        _ => {
+                            log::error!("limbo and rusqlite results do not match");
+                            return Err(limbo_core::LimboError::InternalError(
+                                "limbo and rusqlite results do not match".into(),
+                            ));
                         }
                     }
-                    ExecutionContinuation::NextProperty => {
-                        // Skip to the next property
-                        state.interaction_pointer += 1;
-                        state.secondary_pointer = 0;
+
+                    // Move to the next interaction or property
+                    match next_execution {
+                        ExecutionContinuation::NextInteraction => {
+                            if state.secondary_pointer + 1
+                                >= plan.plan[state.interaction_pointer].interactions().len()
+                            {
+                                // If we have reached the end of the interactions for this property, move to the next property
+                                state.interaction_pointer += 1;
+                                state.secondary_pointer = 0;
+                            } else {
+                                // Otherwise, move to the next interaction
+                                state.secondary_pointer += 1;
+                            }
+                        }
+                        ExecutionContinuation::NextProperty => {
+                            // Skip to the next property
+                            state.interaction_pointer += 1;
+                            state.secondary_pointer = 0;
+                        }
                     }
                 }
-            }
-            (Err(err), Ok(_)) => {
-                log::error!("limbo and rusqlite results do not match");
-                log::error!("limbo error {}", err);
-                return Err(err);
-            }
-            (Ok(_), Err(err)) => {
-                log::error!("limbo and rusqlite results do not match");
-                log::error!("rusqlite error {}", err);
-                return Err(err);
-            }
-            (Err(err), Err(err_rusqlite)) => {
-                log::error!("limbo and rusqlite both fail, requires manual check");
-                log::error!("limbo error {}", err);
-                log::error!("rusqlite error {}", err_rusqlite);
-                return Err(err);
+                (Err(err), Ok(_)) => {
+                    log::error!("limbo and rusqlite results do not match");
+                    log::error!("limbo error {}", err);
+                    return Err(err);
+                }
+                (Ok(val), Err(err)) => {
+                    log::error!("limbo and rusqlite results do not match");
+                    log::error!("limbo {:?}", val);
+                    log::error!("rusqlite error {}", err);
+                    return Err(err);
+                }
+                (Err(err), Err(err_rusqlite)) => {
+                    log::error!("limbo and rusqlite both fail, requires manual check");
+                    log::error!("limbo error {}", err);
+                    log::error!("rusqlite error {}", err_rusqlite);
+                    return Err(err);
+                }
             }
         }
+        _ => unreachable!("{} vs {}", connection, rusqlite_connection),
     }
 
     Ok(())
 }
 
 fn execute_interaction_rusqlite(
-    env: &mut SimulatorEnvRusqlite,
+    env: &mut SimulatorEnv,
     connection_index: usize,
     interaction: &Interaction,
     stack: &mut Vec<ResultSet>,
 ) -> limbo_core::Result<ExecutionContinuation> {
-    log::info!("executing in rusqlite: {}", interaction);
+    log::trace!(
+        "execute_interaction_rusqlite(connection_index={}, interaction={})",
+        connection_index,
+        interaction
+    );
     match interaction {
         Interaction::Query(query) => {
             let conn = match &mut env.connections[connection_index] {
-                RusqliteConnection::Connected(conn) => conn,
-                RusqliteConnection::Disconnected => unreachable!(),
+                SimConnection::SQLiteConnection(conn) => conn,
+                SimConnection::LimboConnection(_) => unreachable!(),
+                SimConnection::Disconnected => unreachable!(),
             };
 
             log::debug!("{}", interaction);
@@ -318,7 +340,7 @@ fn execute_interaction_rusqlite(
             }
         }
         Interaction::Fault(_) => {
-            log::debug!("faults are not supported in differential testing mode");
+            interaction.execute_fault(env, connection_index)?;
         }
     }
 

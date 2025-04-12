@@ -1,3 +1,4 @@
+pub mod bugbase;
 pub mod cli;
 pub mod differential;
 pub mod env;

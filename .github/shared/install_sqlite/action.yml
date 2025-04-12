@@ -6,10 +6,10 @@ runs:
   steps:
     - name: Install SQLite
       env:
-        SQLITE_VERSION: "3470200"
-        YEAR: 2024
+        SQLITE_VERSION: "3490100"
+        YEAR: 2025
       run: |
-        curl -o /tmp/sqlite.zip https://www.sqlite.org/$YEAR/sqlite-tools-linux-x64-$SQLITE_VERSION.zip > /dev/null
+        curl -o /tmp/sqlite.zip https://sqlite.org/$YEAR/sqlite-tools-linux-x64-$SQLITE_VERSION.zip > /dev/null
         unzip -j /tmp/sqlite.zip sqlite3 -d /usr/local/bin/
         sqlite3 --version
       shell: bash

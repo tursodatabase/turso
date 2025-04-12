@@ -5,6 +5,7 @@ use crate::ext::{ExtValue, ExtValueType};
 use crate::pseudo::PseudoCursor;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::sqlite3_ondisk::write_varint;
+use crate::translate::plan::IterationDirection;
 use crate::vdbe::sorter::Sorter;
 use crate::vdbe::{Register, VTabOpaqueCursor};
 use crate::Result;
@@ -20,6 +21,20 @@ pub enum OwnedValueType {
     Text,
     Blob,
     Error,
+}
+
+impl Display for OwnedValueType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Null => "NULL",
+            Self::Integer => "INT",
+            Self::Float => "REAL",
+            Self::Blob => "BLOB",
+            Self::Text => "TEXT",
+            Self::Error => "ERROR",
+        };
+        write!(f, "{}", value)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +81,15 @@ impl Text {
 
     pub fn as_str(&self) -> &str {
         unsafe { std::str::from_utf8_unchecked(self.value.as_ref()) }
+    }
+}
+
+impl From<String> for Text {
+    fn from(value: String) -> Self {
+        Text {
+            value: value.into_bytes(),
+            subtype: TextSubtype::Text,
+        }
     }
 }
 
@@ -197,6 +221,12 @@ impl Display for OwnedValue {
             }
             Self::Float(fl) => {
                 let fl = *fl;
+                if fl == f64::INFINITY {
+                    return write!(f, "Inf");
+                }
+                if fl == f64::NEG_INFINITY {
+                    return write!(f, "-Inf");
+                }
                 if fl.is_nan() {
                     return write!(f, "");
                 }
@@ -1197,11 +1227,32 @@ pub enum CursorResult<T> {
     IO,
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// The match condition of a table/index seek.
 pub enum SeekOp {
     EQ,
     GE,
     GT,
+    LE,
+    LT,
+}
+
+impl SeekOp {
+    /// A given seek op implies an iteration direction.
+    ///
+    /// For example, a seek with SeekOp::GT implies:
+    /// Find the first table/index key that compares greater than the seek key
+    /// -> used in forwards iteration.
+    ///
+    /// A seek with SeekOp::LE implies:
+    /// Find the last table/index key that compares less than or equal to the seek key
+    /// -> used in backwards iteration.
+    pub fn iteration_direction(&self) -> IterationDirection {
+        match self {
+            SeekOp::EQ | SeekOp::GE | SeekOp::GT => IterationDirection::Forwards,
+            SeekOp::LE | SeekOp::LT => IterationDirection::Backwards,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Debug)]

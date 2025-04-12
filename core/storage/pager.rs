@@ -637,11 +637,7 @@ pub fn allocate_page(page_id: usize, buffer_pool: &Rc<BufferPool>, offset: usize
         });
         let buffer = Arc::new(RefCell::new(Buffer::new(buffer, drop_fn)));
         page.set_loaded();
-        page.get().contents = Some(PageContent {
-            offset,
-            buffer,
-            overflow_cells: Vec::new(),
-        });
+        page.get().contents = Some(PageContent::new(offset, buffer));
     }
     page
 }

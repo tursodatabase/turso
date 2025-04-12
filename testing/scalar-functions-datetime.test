@@ -589,3 +589,70 @@ set FMT [list %S.%3f %C %y %b %B %h %a %A %D %x %v %.f %.3f %.6f %.9f %3f %6f %9
 foreach i $FMT {
   do_execsql_test strftime-invalid-$i "SELECT strftime('$i','2025-01-23T13:14:30.567');" {}
 }
+
+
+# Tests for the TIMEDIFF function
+
+do_execsql_test timediff-basic-positive {
+  SELECT timediff('14:30:45', '12:00:00');
+} {"+0000-00-00 02:30:45.000"}
+
+do_execsql_test timediff-basic-negative {
+  SELECT timediff('12:00:00', '14:30:45');
+} {"-0000-00-00 02:30:45.000"}
+
+do_execsql_test timediff-with-milliseconds-positive {
+  SELECT timediff('12:00:01.300', '12:00:00.500');
+} {"+0000-00-00 00:00:00.800"}
+
+do_execsql_test timediff-same-time {
+  SELECT timediff('12:00:00', '12:00:00');
+} {"+0000-00-00 00:00:00.000"}
+
+do_execsql_test timediff-across-dates {
+  SELECT timediff('2023-05-11 01:15:00', '2023-05-10 23:30:00');
+} {"+0000-00-00 01:45:00.000"}
+
+do_execsql_test timediff-across-dates-negative {
+  SELECT timediff('2023-05-10 23:30:00', '2023-05-11 01:15:00');
+} {"-0000-00-00 01:45:00.000"}
+
+do_execsql_test timediff-different-formats {
+  SELECT timediff('2023-05-10T23:30:00', '2023-05-10 14:15:00');
+} {"+0000-00-00 09:15:00.000"}
+
+do_execsql_test timediff-with-timezone {
+  SELECT timediff('2023-05-10 23:30:00+02:00', '2023-05-10 18:30:00Z');
+} {"+0000-00-00 03:00:00.000"}
+
+do_execsql_test timediff-large-difference {
+  SELECT timediff('2023-05-12 10:00:00', '2023-05-10 08:00:00');
+} {"+0000-00-02 02:00:00.000"}
+
+do_execsql_test timediff-with-seconds-precision {
+  SELECT timediff('12:30:45.123', '12:30:44.987');
+} {"+0000-00-00 00:00:00.136"}
+
+do_execsql_test timediff-null-first-arg {
+  SELECT timediff(NULL, '12:00:00');
+} {{}}
+
+do_execsql_test timediff-null-second-arg {
+  SELECT timediff('12:00:00', NULL);
+} {{}}
+
+do_execsql_test timediff-invalid-first-arg {
+  SELECT timediff('not-a-time', '12:00:00');
+} {{}}
+
+do_execsql_test timediff-invalid-second-arg {
+  SELECT timediff('12:00:00', 'not-a-time');
+} {{}}
+
+do_execsql_test timediff-julian-day {
+  SELECT timediff(2460000, 2460000.5);
+} {"-0000-00-00 12:00:00.000"}
+
+do_execsql_test timediff-different-time-formats {
+  SELECT timediff('23:59:59', '00:00:00');
+} {"+0000-00-00 23:59:59.000"}

@@ -3,7 +3,7 @@ pub mod import;
 
 use args::{
     CwdArgs, EchoArgs, ExitArgs, LoadExtensionArgs, NullValueArgs, OpcodesArgs, OpenArgs,
-    OutputModeArgs, SchemaArgs, SetOutputArgs, TablesArgs,
+    OutputModeArgs, SchemaArgs, SetOutputArgs, TablesArgs, TimerArgs,
 };
 use clap::Parser;
 use import::ImportArgs;
@@ -72,6 +72,8 @@ pub enum Command {
     /// List vfs modules available
     #[command(name = "vfslist", display_name = ".vfslist")]
     ListVfs,
+    #[command(name = "timer", display_name = ".timer")]
+    Timer(TimerArgs),
 }
 
 const _HELP_TEMPLATE: &str = "{before-help}{name}

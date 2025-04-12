@@ -14,6 +14,7 @@ COPY ./Cargo.lock ./Cargo.lock
 COPY ./Cargo.toml ./Cargo.toml
 COPY ./bindings/go ./bindings/go/
 COPY ./bindings/java ./bindings/java/
+COPY ./bindings/javascript ./bindings/javascript/
 COPY ./bindings/python ./bindings/python/
 COPY ./bindings/rust ./bindings/rust/
 COPY ./bindings/wasm ./bindings/wasm/

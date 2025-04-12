@@ -89,12 +89,12 @@ impl Database {
         path: &str,
         vfs: &str,
     ) -> crate::Result<(Arc<dyn IO>, Arc<Database>)> {
-        use crate::{MemoryIO, PlatformIO};
+        use crate::{MemoryIO, SyscallIO};
         use dynamic::get_vfs_modules;
 
         let io: Arc<dyn IO> = match vfs {
             "memory" => Arc::new(MemoryIO::new()),
-            "syscall" => Arc::new(PlatformIO::new()?),
+            "syscall" => Arc::new(SyscallIO::new()?),
             #[cfg(all(target_os = "linux", feature = "io_uring"))]
             "io_uring" => Arc::new(UringIO::new()?),
             other => match get_vfs_modules().iter().find(|v| v.0 == vfs) {

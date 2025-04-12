@@ -195,6 +195,54 @@ do_execsql_test hex-null {
   select hex(null)
 } {}
 
+do_execsql_test likely {
+    select likely('limbo')
+} {limbo}
+
+do_execsql_test likely-int {
+    select likely(100)
+} {100}
+
+do_execsql_test likely-decimal {
+    select likely(12.34)
+} {12.34}
+
+do_execsql_test likely-null {
+    select likely(NULL)
+} {}
+
+do_execsql_test likelihood-string {
+  SELECT likelihood('limbo', 0.5);
+} {limbo}
+
+do_execsql_test likelihood-string-high-probability {
+  SELECT likelihood('database', 0.9375);
+} {database}
+
+do_execsql_test likelihood-integer {
+  SELECT likelihood(100, 0.0625);
+} {100}
+
+do_execsql_test likelihood-integer-probability-1 {
+  SELECT likelihood(42, 1.0);
+} {42}
+
+do_execsql_test likelihood-decimal {
+  SELECT likelihood(12.34, 0.5);
+} {12.34}
+
+do_execsql_test likelihood-null {
+  SELECT likelihood(NULL, 0.5);
+} {}
+
+do_execsql_test likelihood-blob {
+  SELECT hex(likelihood(x'01020304', 0.5));
+} {01020304}
+
+do_execsql_test likelihood-zero-probability {
+  SELECT likelihood(999, 0.0);
+} {999}
+
 do_execsql_test unhex-str-ab {
   SELECT unhex('6162');
 } {ab}

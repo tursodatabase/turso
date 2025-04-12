@@ -413,6 +413,12 @@ impl ProgramBuilder {
                 Insn::SeekGT { target_pc, .. } => {
                     resolve(target_pc, "SeekGT");
                 }
+                Insn::SeekLE { target_pc, .. } => {
+                    resolve(target_pc, "SeekLE");
+                }
+                Insn::SeekLT { target_pc, .. } => {
+                    resolve(target_pc, "SeekLT");
+                }
                 Insn::IdxGE { target_pc, .. } => {
                     resolve(target_pc, "IdxGE");
                 }

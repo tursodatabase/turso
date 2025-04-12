@@ -166,6 +166,14 @@ do_execsql_test select-like-expression {
     select 2 % 0.5
 } {}
 
+do_execsql_test select_positive_infinite_float {
+  SELECT 1.7976931348623157E+308 + 1e308; -- f64::MAX + 1e308
+} {Inf}
+
+do_execsql_test select_negative_infinite_float {
+  SELECT -1.7976931348623157E+308 - 1e308 -- f64::MIN - 1e308
+} {-Inf}
+
 do_execsql_test select_shl_large_negative_float {
     SELECT 1 << -1e19;
     SELECT 1 << -9223372036854775808;  -- i64::MIN
