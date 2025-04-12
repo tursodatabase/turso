@@ -42,7 +42,7 @@ pub fn init_order_by(
     });
     let mut order = Vec::new();
     for (_, direction) in order_by.iter() {
-        order.push(OwnedValue::Integer(*direction as i64));
+        order.push(OwnedValue::integer(*direction as i64));
     }
     program.emit_insn(Insn::SorterOpen {
         cursor_id: sort_cursor,

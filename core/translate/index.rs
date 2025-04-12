@@ -117,7 +117,7 @@ pub fn translate_create_index(
         .columns
         .iter()
         .map(|c| {
-            OwnedValue::Integer(match c.order {
+            OwnedValue::integer(match c.order {
                 SortOrder::Asc => 0,
                 SortOrder::Desc => 1,
             })

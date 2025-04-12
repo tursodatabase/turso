@@ -77,7 +77,7 @@ pub fn init_group_by(
     let mut order = Vec::new();
     const ASCENDING: i64 = 0;
     for _ in group_by.exprs.iter() {
-        order.push(OwnedValue::Integer(ASCENDING));
+        order.push(OwnedValue::integer(ASCENDING));
     }
     program.emit_insn(Insn::SorterOpen {
         cursor_id: sort_cursor,
