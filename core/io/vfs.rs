@@ -1,4 +1,4 @@
-use super::{Buffer, Completion, File, OpenFlags, IO};
+use super::{Buffer, Completion, File, MemoryIO, OpenFlags, IO};
 use crate::ext::VfsMod;
 use crate::io::clock::{Clock, Instant};
 use crate::{LimboError, Result};
@@ -49,6 +49,10 @@ impl IO for VfsMod {
         }
         let vfs = unsafe { &*self.ctx };
         unsafe { (vfs.gen_random_number)() }
+    }
+
+    fn get_memory_io(&self) -> Arc<MemoryIO> {
+        Arc::new(MemoryIO::new())
     }
 }
 

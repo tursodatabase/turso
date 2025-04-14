@@ -1,9 +1,9 @@
+use super::MemoryIO;
 use crate::{Clock, Completion, File, Instant, LimboError, OpenFlags, Result, IO};
 use std::cell::RefCell;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
 use tracing::{debug, trace};
-
 pub struct WindowsIO {}
 
 impl WindowsIO {
@@ -37,6 +37,10 @@ impl IO for WindowsIO {
         let mut buf = [0u8; 8];
         getrandom::getrandom(&mut buf).unwrap();
         i64::from_ne_bytes(buf)
+    }
+
+    fn get_memory_io(&self) -> Arc<MemoryIO> {
+        Arc::new(MemoryIO::new())
     }
 }
 

@@ -2,7 +2,7 @@ use crate::error::LimboError;
 use crate::io::common;
 use crate::Result;
 
-use super::{Completion, File, OpenFlags, IO};
+use super::{Completion, File, MemoryIO, OpenFlags, IO};
 use polling::{Event, Events, Poller};
 use rustix::{
     fd::{AsFd, AsRawFd},
@@ -257,6 +257,10 @@ impl IO for UnixIO {
         let mut buf = [0u8; 8];
         getrandom::getrandom(&mut buf).unwrap();
         i64::from_ne_bytes(buf)
+    }
+    
+    fn get_memory_io(&self) -> Arc<MemoryIO> {
+        Arc::new(MemoryIO::new())
     }
 }
 

@@ -39,7 +39,7 @@ pub struct LeftJoinMetadata {
 pub struct LoopLabels {
     /// jump to the start of the loop body
     pub loop_start: BranchOffset,
-    /// jump to the NextAsync instruction (or equivalent)
+    /// jump to the Next instruction (or equivalent)
     pub next: BranchOffset,
     /// jump to the end of the loop, exiting it
     pub loop_end: BranchOffset,
@@ -96,44 +96,39 @@ pub fn init_loop(
                 match (mode, &table.table) {
                     (OperationMode::SELECT, Table::BTree(btree)) => {
                         let root_page = btree.root_page;
-                        program.emit_insn(Insn::OpenReadAsync {
+                        program.emit_insn(Insn::OpenRead {
                             cursor_id,
                             root_page,
                         });
-                        program.emit_insn(Insn::OpenReadAwait {});
                         if let Some(index_cursor_id) = index_cursor_id {
-                            program.emit_insn(Insn::OpenReadAsync {
+                            program.emit_insn(Insn::OpenRead {
                                 cursor_id: index_cursor_id,
                                 root_page: index.as_ref().unwrap().root_page,
                             });
-                            program.emit_insn(Insn::OpenReadAwait {});
                         }
                     }
                     (OperationMode::DELETE, Table::BTree(btree)) => {
                         let root_page = btree.root_page;
-                        program.emit_insn(Insn::OpenWriteAsync {
+                        program.emit_insn(Insn::OpenWrite {
                             cursor_id,
                             root_page: root_page.into(),
                         });
-                        program.emit_insn(Insn::OpenWriteAwait {});
                     }
                     (OperationMode::UPDATE, Table::BTree(btree)) => {
                         let root_page = btree.root_page;
-                        program.emit_insn(Insn::OpenWriteAsync {
+                        program.emit_insn(Insn::OpenWrite {
                             cursor_id,
                             root_page: root_page.into(),
                         });
                         if let Some(index_cursor_id) = index_cursor_id {
-                            program.emit_insn(Insn::OpenWriteAsync {
+                            program.emit_insn(Insn::OpenWrite {
                                 cursor_id: index_cursor_id,
                                 root_page: index.as_ref().unwrap().root_page.into(),
                             });
                         }
-                        program.emit_insn(Insn::OpenWriteAwait {});
                     }
                     (_, Table::Virtual(_)) => {
-                        program.emit_insn(Insn::VOpenAsync { cursor_id });
-                        program.emit_insn(Insn::VOpenAwait {});
+                        program.emit_insn(Insn::VOpen { cursor_id });
                     }
                     _ => {
                         unimplemented!()
@@ -148,18 +143,16 @@ pub fn init_loop(
 
                 match mode {
                     OperationMode::SELECT => {
-                        program.emit_insn(Insn::OpenReadAsync {
+                        program.emit_insn(Insn::OpenRead {
                             cursor_id: table_cursor_id,
                             root_page: table.table.get_root_page(),
                         });
-                        program.emit_insn(Insn::OpenReadAwait {});
                     }
                     OperationMode::DELETE | OperationMode::UPDATE => {
-                        program.emit_insn(Insn::OpenWriteAsync {
+                        program.emit_insn(Insn::OpenWrite {
                             cursor_id: table_cursor_id,
                             root_page: table.table.get_root_page().into(),
                         });
-                        program.emit_insn(Insn::OpenWriteAwait {});
                     }
                     _ => {
                         unimplemented!()
@@ -177,18 +170,16 @@ pub fn init_loop(
 
                     match mode {
                         OperationMode::SELECT => {
-                            program.emit_insn(Insn::OpenReadAsync {
+                            program.emit_insn(Insn::OpenRead {
                                 cursor_id: index_cursor_id,
                                 root_page: index.root_page,
                             });
-                            program.emit_insn(Insn::OpenReadAwait);
                         }
                         OperationMode::UPDATE | OperationMode::DELETE => {
-                            program.emit_insn(Insn::OpenWriteAsync {
+                            program.emit_insn(Insn::OpenWrite {
                                 cursor_id: index_cursor_id,
                                 root_page: index.root_page.into(),
                             });
-                            program.emit_insn(Insn::OpenWriteAwait {});
                         }
                         _ => {
                             unimplemented!()
@@ -204,7 +195,7 @@ pub fn init_loop(
 }
 
 /// Set up the main query execution loop
-/// For example in the case of a nested table scan, this means emitting the RewindAsync instruction
+/// For example in the case of a nested table scan, this means emitting the Rewind instruction
 /// for all tables involved, outermost first.
 pub fn open_loop(
     program: &mut ProgramBuilder,
@@ -289,51 +280,36 @@ pub fn open_loop(
                 let iteration_cursor_id = index_cursor_id.unwrap_or(cursor_id);
                 if !matches!(&table.table, Table::Virtual(_)) {
                     if *iter_dir == IterationDirection::Backwards {
-                        program.emit_insn(Insn::LastAsync {
+                        program.emit_insn(Insn::Last {
                             cursor_id: iteration_cursor_id,
+                            pc_if_empty: loop_end,
                         });
                     } else {
-                        program.emit_insn(Insn::RewindAsync {
+                        program.emit_insn(Insn::Rewind {
                             cursor_id: iteration_cursor_id,
+                            pc_if_empty: loop_end,
                         });
                     }
                 }
-                match &table.table {
-                    Table::BTree(_) => {
-                        program.emit_insn(if *iter_dir == IterationDirection::Backwards {
-                            Insn::LastAwait {
-                                cursor_id: iteration_cursor_id,
-                                pc_if_empty: loop_end,
-                            }
-                        } else {
-                            Insn::RewindAwait {
-                                cursor_id: iteration_cursor_id,
-                                pc_if_empty: loop_end,
-                            }
-                        })
+                if let Table::Virtual(ref table) = table.table {
+                    let start_reg =
+                        program.alloc_registers(table.args.as_ref().map(|a| a.len()).unwrap_or(0));
+                    let mut cur_reg = start_reg;
+                    let args = match table.args.as_ref() {
+                        Some(args) => args,
+                        None => &vec![],
+                    };
+                    for arg in args {
+                        let reg = cur_reg;
+                        cur_reg += 1;
+                        let _ = translate_expr(program, Some(tables), arg, reg, &t_ctx.resolver)?;
                     }
-                    Table::Virtual(ref table) => {
-                        let start_reg = program
-                            .alloc_registers(table.args.as_ref().map(|a| a.len()).unwrap_or(0));
-                        let mut cur_reg = start_reg;
-                        let args = match table.args.as_ref() {
-                            Some(args) => args,
-                            None => &vec![],
-                        };
-                        for arg in args {
-                            let reg = cur_reg;
-                            cur_reg += 1;
-                            let _ =
-                                translate_expr(program, Some(tables), arg, reg, &t_ctx.resolver)?;
-                        }
-                        program.emit_insn(Insn::VFilter {
-                            cursor_id,
-                            pc_if_empty: loop_end,
-                            arg_count: table.args.as_ref().map_or(0, |args| args.len()),
-                            args_reg: start_reg,
-                        });
-                    }
-                    other => panic!("Unsupported table reference type: {:?}", other),
+                    program.emit_insn(Insn::VFilter {
+                        cursor_id,
+                        pc_if_empty: loop_end,
+                        arg_count: table.args.as_ref().map_or(0, |args| args.len()),
+                        args_reg: start_reg,
+                    });
                 }
                 program.resolve_label(loop_start, program.offset());
 
@@ -702,7 +678,7 @@ fn emit_loop_source(
 }
 
 /// Closes the loop for a given source operator.
-/// For example in the case of a nested table scan, this means emitting the NextAsync instruction
+/// For example in the case of a nested table scan, this means emitting the Next instruction
 /// for all tables involved, innermost first.
 pub fn close_loop(
     program: &mut ProgramBuilder,
@@ -727,7 +703,7 @@ pub fn close_loop(
         match &table.op {
             Operation::Subquery { .. } => {
                 program.resolve_label(loop_labels.next, program.offset());
-                // A subquery has no cursor to call NextAsync on, so it just emits a Goto
+                // A subquery has no cursor to call Next on, so it just emits a Goto
                 // to the Yield instruction, which in turn jumps back to the main loop of the subquery,
                 // so that the next row from the subquery can be read.
                 program.emit_insn(Insn::Goto {
@@ -745,21 +721,12 @@ pub fn close_loop(
                 match &table.table {
                     Table::BTree(_) => {
                         if *iter_dir == IterationDirection::Backwards {
-                            program.emit_insn(Insn::PrevAsync {
+                            program.emit_insn(Insn::Prev {
                                 cursor_id: iteration_cursor_id,
+                                pc_if_prev: loop_labels.loop_start,
                             });
                         } else {
-                            program.emit_insn(Insn::NextAsync {
-                                cursor_id: iteration_cursor_id,
-                            });
-                        }
-                        if *iter_dir == IterationDirection::Backwards {
-                            program.emit_insn(Insn::PrevAwait {
-                                cursor_id: iteration_cursor_id,
-                                pc_if_next: loop_labels.loop_start,
-                            });
-                        } else {
-                            program.emit_insn(Insn::NextAwait {
+                            program.emit_insn(Insn::Next {
                                 cursor_id: iteration_cursor_id,
                                 pc_if_next: loop_labels.loop_start,
                             });
@@ -776,7 +743,7 @@ pub fn close_loop(
             }
             Operation::Search(search) => {
                 program.resolve_label(loop_labels.next, program.offset());
-                // Rowid equality point lookups are handled with a SeekRowid instruction which does not loop, so there is no need to emit a NextAsync instruction.
+                // Rowid equality point lookups are handled with a SeekRowid instruction which does not loop, so there is no need to emit a Next instruction.
                 if !matches!(search, Search::RowidEq { .. }) {
                     let (cursor_id, iter_dir) = match search {
                         Search::Seek {
@@ -796,14 +763,12 @@ pub fn close_loop(
                     };
 
                     if iter_dir == IterationDirection::Backwards {
-                        program.emit_insn(Insn::PrevAsync { cursor_id });
-                        program.emit_insn(Insn::PrevAwait {
+                        program.emit_insn(Insn::Prev {
                             cursor_id,
-                            pc_if_next: loop_labels.loop_start,
+                            pc_if_prev: loop_labels.loop_start,
                         });
                     } else {
-                        program.emit_insn(Insn::NextAsync { cursor_id });
-                        program.emit_insn(Insn::NextAwait {
+                        program.emit_insn(Insn::Next {
                             cursor_id,
                             pc_if_next: loop_labels.loop_start,
                         });
@@ -881,10 +846,7 @@ fn emit_seek(
 ) -> Result<()> {
     let Some(seek) = seek_def.seek.as_ref() else {
         assert!(seek_def.iter_dir == IterationDirection::Backwards, "A SeekDef without a seek operation should only be used in backwards iteration direction");
-        program.emit_insn(Insn::LastAsync {
-            cursor_id: seek_cursor_id,
-        });
-        program.emit_insn(Insn::LastAwait {
+        program.emit_insn(Insn::Last {
             cursor_id: seek_cursor_id,
             pc_if_empty: loop_end,
         });

@@ -8,16 +8,29 @@ do_execsql_test fuzz-test-failure {
   SELECT mod(atanh(tanh(-1.0)), ((1.0))) / ((asinh(-1.0) / 2.0 * 1.0) + pow(0.0, 1.0) + 0.5);
 } {-16.8596516555675}
 
-do_execsql_test add-int {
+do_execsql_test add-int-1 {
   SELECT 10 + 1
 } {11}
+
+do_execsql_test add-int-2 {
+  SELECT 0xA + 0xFF
+} {265}
+
+do_execsql_test add-int-3 {
+  SELECT 0xA + 1
+} {11}
+
 
 do_execsql_test add-float {
   SELECT 10.1 + 0.3
 } {10.4}
 
-do_execsql_test add-int-float {
+do_execsql_test add-int-float-1 {
   SELECT 10 + 0.1
+} {10.1}
+
+do_execsql_test add-int-float-2 {
+  SELECT 0xa + 0.1
 } {10.1}
 
 do_execsql_test add-agg-int-agg-int {
@@ -626,6 +639,38 @@ do_execsql_test bitwise-not-agg-int {
 do_execsql_test bitwise-not-zero {
 	SELECT ~0
 } {-1}
+
+do_execsql_test bitwise-not-empty-blob {
+	SELECT ~x''
+} {-1}
+
+do_execsql_test bitwise-not-cast-blob {
+	SELECT ~ CAST ('af' AS BLOB);
+} {-1}
+
+do_execsql_test bitwise-not-blob {
+	SELECT ~ x'0000';
+} {-1}
+
+do_execsql_test bitwise-not-blob-2 {
+	SELECT ~ x'0001';
+} {-1}
+
+do_execsql_test boolean-not-empty-blob {
+	SELECT NOT x''
+} {1}
+
+do_execsql_test boolean-not-cast-blob {
+	SELECT NOT CAST ('af' AS BLOB);
+} {1}
+
+do_execsql_test boolean-not-blob {
+	SELECT NOT x'0000';
+} {1}
+
+do_execsql_test boolean-not-blob-2 {
+	SELECT NOT x'0001';
+} {1}
 
 foreach {testname lhs ans} {
   int-1           1        0

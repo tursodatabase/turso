@@ -305,6 +305,10 @@ impl limbo_core::IO for PlatformIO {
         let random_f64 = Math_random();
         (random_f64 * i64::MAX as f64) as i64
     }
+
+    fn get_memory_io(&self) -> Arc<limbo_core::MemoryIO> {
+        Arc::new(limbo_core::MemoryIO::new())
+    }
 }
 
 #[wasm_bindgen]

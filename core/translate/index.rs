@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     schema::{BTreeTable, Column, Index, IndexColumn, PseudoTable, Schema},
+    storage::pager::CreateBTreeFlags,
     types::Record,
     util::normalize_ident,
     vdbe::{
@@ -91,15 +92,14 @@ pub fn translate_create_index(
     program.emit_insn(Insn::CreateBtree {
         db: 0,
         root: root_page_reg,
-        flags: 2, // index leaf
+        flags: CreateBTreeFlags::new_index(),
     });
 
     // open the sqlite schema table for writing and create a new entry for the index
-    program.emit_insn(Insn::OpenWriteAsync {
+    program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
     });
-    program.emit_insn(Insn::OpenWriteAwait {});
     let sql = create_idx_stmt_to_sql(&tbl_name, &idx_name, unique_if_not_exists, &columns);
     emit_schema_entry(
         &mut program,
@@ -136,18 +136,14 @@ pub fn translate_create_index(
     });
 
     // open the table we are creating the index on for reading
-    program.emit_insn(Insn::OpenReadAsync {
+    program.emit_insn(Insn::OpenRead {
         cursor_id: table_cursor_id,
         root_page: tbl.root_page,
     });
-    program.emit_insn(Insn::OpenReadAwait {});
 
-    program.emit_insn(Insn::RewindAsync {
-        cursor_id: table_cursor_id,
-    });
     let loop_start_label = program.allocate_label();
     let loop_end_label = program.allocate_label();
-    program.emit_insn(Insn::RewindAwait {
+    program.emit_insn(Insn::Rewind {
         cursor_id: table_cursor_id,
         pc_if_empty: loop_end_label,
     });
@@ -183,10 +179,7 @@ pub fn translate_create_index(
         record_reg,
     });
 
-    program.emit_insn(Insn::NextAsync {
-        cursor_id: table_cursor_id,
-    });
-    program.emit_insn(Insn::NextAwait {
+    program.emit_insn(Insn::Next {
         cursor_id: table_cursor_id,
         pc_if_next: loop_start_label,
     });
@@ -194,11 +187,10 @@ pub fn translate_create_index(
 
     // Open the index btree we created for writing to insert the
     // newly sorted index records.
-    program.emit_insn(Insn::OpenWriteAsync {
+    program.emit_insn(Insn::OpenWrite {
         cursor_id: btree_cursor_id,
         root_page: RegisterOrLiteral::Register(root_page_reg),
     });
-    program.emit_insn(Insn::OpenWriteAwait {});
 
     let sorted_loop_start = program.allocate_label();
     let sorted_loop_end = program.allocate_label();
@@ -221,15 +213,12 @@ pub fn translate_create_index(
         cursor_id: btree_cursor_id,
     });
     // insert new index record
-    program.emit_insn(Insn::IdxInsertAsync {
+    program.emit_insn(Insn::IdxInsert {
         cursor_id: btree_cursor_id,
         record_reg: sorted_record_reg,
         unpacked_start: None, // TODO: optimize with these to avoid decoding record twice
         unpacked_count: None,
         flags: IdxInsertFlags::new().use_seek(false),
-    });
-    program.emit_insn(Insn::IdxInsertAwait {
-        cursor_id: btree_cursor_id,
     });
     program.emit_insn(Insn::SorterNext {
         cursor_id: sorter_cursor_id,

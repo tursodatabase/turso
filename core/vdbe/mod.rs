@@ -28,6 +28,7 @@ use crate::{
     error::LimboError,
     fast_lock::SpinLock,
     function::{AggFunc, FuncCtx},
+    storage::sqlite3_ondisk::SmallVec,
 };
 
 use crate::{
@@ -232,6 +233,8 @@ pub struct ProgramState {
     last_compare: Option<std::cmp::Ordering>,
     deferred_seek: Option<(CursorID, CursorID)>,
     ended_coroutine: Bitfield<4>, // flag to indicate that a coroutine has ended (key is the yield register. currently we assume that the yield register is always between 0-255, YOLO)
+    /// Indicate whether an [Insn::Once] instruction at a given program counter position has already been executed, well, once.
+    once: SmallVec<u32, 4>,
     regex_cache: RegexCache,
     pub(crate) mv_tx_id: Option<crate::mvcc::database::TxID>,
     interrupted: bool,
@@ -254,6 +257,7 @@ impl ProgramState {
             last_compare: None,
             deferred_seek: None,
             ended_coroutine: Bitfield::new(),
+            once: SmallVec::<u32, 4>::new(),
             regex_cache: RegexCache::new(),
             mv_tx_id: None,
             interrupted: false,
@@ -284,8 +288,11 @@ impl ProgramState {
         self.parameters.insert(index, value);
     }
 
-    pub fn get_parameter(&self, index: NonZero<usize>) -> Option<&OwnedValue> {
-        self.parameters.get(&index)
+    pub fn get_parameter(&self, index: NonZero<usize>) -> OwnedValue {
+        self.parameters
+            .get(&index)
+            .cloned()
+            .unwrap_or(OwnedValue::Null)
     }
 
     pub fn reset(&mut self) {
@@ -560,8 +567,8 @@ fn print_insn(program: &Program, addr: InsnReference, insn: &Insn, indent: Strin
 fn get_indent_count(indent_count: usize, curr_insn: &Insn, prev_insn: Option<&Insn>) -> usize {
     let indent_count = if let Some(insn) = prev_insn {
         match insn {
-            Insn::RewindAwait { .. }
-            | Insn::LastAwait { .. }
+            Insn::Rewind { .. }
+            | Insn::Last { .. }
             | Insn::SorterSort { .. }
             | Insn::SeekGE { .. }
             | Insn::SeekGT { .. }
@@ -575,9 +582,7 @@ fn get_indent_count(indent_count: usize, curr_insn: &Insn, prev_insn: Option<&In
     };
 
     match curr_insn {
-        Insn::NextAsync { .. } | Insn::SorterNext { .. } | Insn::PrevAsync { .. } => {
-            indent_count - 1
-        }
+        Insn::Next { .. } | Insn::SorterNext { .. } | Insn::Prev { .. } => indent_count - 1,
         _ => indent_count,
     }
 }

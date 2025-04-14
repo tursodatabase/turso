@@ -168,11 +168,10 @@ pub fn translate_insert(
         program.emit_insn(Insn::EndCoroutine { yield_reg });
         program.resolve_label(jump_on_definition_label, program.offset());
 
-        program.emit_insn(Insn::OpenWriteAsync {
+        program.emit_insn(Insn::OpenWrite {
             cursor_id,
             root_page: RegisterOrLiteral::Literal(root_page),
         });
-        program.emit_insn(Insn::OpenWriteAwait {});
 
         // Main loop
         // FIXME: rollback is not implemented. E.g. if you insert 2 rows and one fails to unique constraint violation,
@@ -184,11 +183,10 @@ pub fn translate_insert(
         });
     } else {
         // Single row - populate registers directly
-        program.emit_insn(Insn::OpenWriteAsync {
+        program.emit_insn(Insn::OpenWrite {
             cursor_id,
             root_page: RegisterOrLiteral::Literal(root_page),
         });
-        program.emit_insn(Insn::OpenWriteAwait {});
 
         populate_column_registers(
             &mut program,
@@ -202,11 +200,10 @@ pub fn translate_insert(
     }
     // Open all the index btrees for writing
     for idx_cursor in idx_cursors.iter() {
-        program.emit_insn(Insn::OpenWriteAsync {
+        program.emit_insn(Insn::OpenWrite {
             cursor_id: idx_cursor.2,
             root_page: idx_cursor.1.into(),
         });
-        program.emit_insn(Insn::OpenWriteAwait {});
     }
     // Common record insertion logic for both single and multiple rows
     let check_rowid_is_integer_label = rowid_alias_reg.and(Some(program.allocate_label()));
@@ -293,13 +290,12 @@ pub fn translate_insert(
         dest_reg: record_register,
     });
 
-    program.emit_insn(Insn::InsertAsync {
+    program.emit_insn(Insn::Insert {
         cursor: cursor_id,
         key_reg: rowid_reg,
         record_reg: record_register,
         flag: 0,
     });
-    program.emit_insn(Insn::InsertAwait { cursor_id });
     for index_col_mapping in index_col_mappings.iter() {
         // find which cursor we opened earlier for this index
         let idx_cursor_id = idx_cursors
@@ -337,16 +333,13 @@ pub fn translate_insert(
         });
 
         // now do the actual index insertion using the unpacked registers
-        program.emit_insn(Insn::IdxInsertAsync {
+        program.emit_insn(Insn::IdxInsert {
             cursor_id: idx_cursor_id,
             record_reg,
             unpacked_start: Some(idx_start_reg), // TODO: enable optimization
             unpacked_count: Some((num_cols + 1) as u16),
             // TODO: figure out how to determine whether or not we need to seek prior to insert.
             flags: IdxInsertFlags::new(),
-        });
-        program.emit_insn(Insn::IdxInsertAwait {
-            cursor_id: idx_cursor_id,
         });
     }
     if inserting_multiple_rows {

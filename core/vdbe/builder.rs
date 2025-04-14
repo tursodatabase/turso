@@ -327,17 +327,11 @@ impl ProgramBuilder {
                 } => {
                     resolve(target_pc, "IfNot");
                 }
-                Insn::RewindAwait {
-                    cursor_id: _cursor_id,
-                    pc_if_empty,
-                } => {
-                    resolve(pc_if_empty, "RewindAwait");
+                Insn::Rewind { pc_if_empty, .. } => {
+                    resolve(pc_if_empty, "Rewind");
                 }
-                Insn::LastAwait {
-                    cursor_id: _cursor_id,
-                    pc_if_empty,
-                } => {
-                    resolve(pc_if_empty, "LastAwait");
+                Insn::Last { pc_if_empty, .. } => {
+                    resolve(pc_if_empty, "Last");
                 }
                 Insn::Goto { target_pc } => {
                     resolve(target_pc, "Goto");
@@ -366,11 +360,11 @@ impl ProgramBuilder {
                 Insn::IfPos { target_pc, .. } => {
                     resolve(target_pc, "IfPos");
                 }
-                Insn::NextAwait { pc_if_next, .. } => {
-                    resolve(pc_if_next, "NextAwait");
+                Insn::Next { pc_if_next, .. } => {
+                    resolve(pc_if_next, "Next");
                 }
-                Insn::PrevAwait { pc_if_next, .. } => {
-                    resolve(pc_if_next, "PrevAwait");
+                Insn::Prev { pc_if_prev, .. } => {
+                    resolve(pc_if_prev, "Prev");
                 }
                 Insn::InitCoroutine {
                     yield_reg: _,

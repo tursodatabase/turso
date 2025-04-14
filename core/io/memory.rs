@@ -58,6 +58,10 @@ impl IO for MemoryIO {
         getrandom::getrandom(&mut buf).unwrap();
         i64::from_ne_bytes(buf)
     }
+
+    fn get_memory_io(&self) -> Arc<MemoryIO> {
+        Arc::new(MemoryIO::new())
+    }
 }
 
 pub struct MemoryFile {

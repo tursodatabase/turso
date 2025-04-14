@@ -2,6 +2,7 @@ use std::fmt::Display;
 
 use crate::ast;
 use crate::schema::Schema;
+use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::ProgramBuilder;
 use crate::translate::ProgramBuilderOpts;
 use crate::translate::QueryMode;
@@ -60,7 +61,7 @@ pub fn translate_create_table(
     program.emit_insn(Insn::CreateBtree {
         db: 0,
         root: table_root_reg,
-        flags: 1, // Table leaf page
+        flags: CreateBTreeFlags::new_table(),
     });
 
     // Create an automatic index B-tree if needed
@@ -92,7 +93,7 @@ pub fn translate_create_table(
         program.emit_insn(Insn::CreateBtree {
             db: 0,
             root: index_root_reg,
-            flags: 2, // Index leaf page
+            flags: CreateBTreeFlags::new_index(),
         });
     }
 
@@ -101,11 +102,10 @@ pub fn translate_create_table(
         Some(SQLITE_TABLEID.to_owned()),
         CursorType::BTreeTable(table.clone()),
     );
-    program.emit_insn(Insn::OpenWriteAsync {
+    program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1usize.into(),
     });
-    program.emit_insn(Insn::OpenWriteAwait {});
 
     // Add the table entry to sqlite_schema
     emit_schema_entry(
@@ -219,14 +219,11 @@ pub fn emit_schema_entry(
         dest_reg: record_reg,
     });
 
-    program.emit_insn(Insn::InsertAsync {
+    program.emit_insn(Insn::Insert {
         cursor: sqlite_schema_cursor_id,
         key_reg: rowid_reg,
         record_reg,
         flag: 0,
-    });
-    program.emit_insn(Insn::InsertAwait {
-        cursor_id: sqlite_schema_cursor_id,
     });
 }
 
@@ -498,11 +495,10 @@ pub fn translate_create_virtual_table(
         Some(SQLITE_TABLEID.to_owned()),
         CursorType::BTreeTable(table.clone()),
     );
-    program.emit_insn(Insn::OpenWriteAsync {
+    program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1usize.into(),
     });
-    program.emit_insn(Insn::OpenWriteAwait {});
 
     let sql = create_vtable_body_to_str(&vtab);
     emit_schema_entry(
@@ -577,19 +573,15 @@ pub fn translate_drop_table(
         Some(table_name.to_string()),
         CursorType::BTreeTable(schema_table.clone()),
     );
-    program.emit_insn(Insn::OpenWriteAsync {
+    program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1usize.into(),
     });
-    program.emit_insn(Insn::OpenWriteAwait {});
 
     //  1. Remove all entries from the schema table related to the table we are dropping, except for triggers
     //  loop to beginning of schema table
-    program.emit_insn(Insn::RewindAsync {
-        cursor_id: sqlite_schema_cursor_id,
-    });
     let end_metadata_label = program.allocate_label();
-    program.emit_insn(Insn::RewindAwait {
+    program.emit_insn(Insn::Rewind {
         cursor_id: sqlite_schema_cursor_id,
         pc_if_empty: end_metadata_label,
     });
@@ -624,18 +616,12 @@ pub fn translate_drop_table(
         cursor_id: sqlite_schema_cursor_id,
         dest: row_id_reg,
     });
-    program.emit_insn(Insn::DeleteAsync {
-        cursor_id: sqlite_schema_cursor_id,
-    });
-    program.emit_insn(Insn::DeleteAwait {
+    program.emit_insn(Insn::Delete {
         cursor_id: sqlite_schema_cursor_id,
     });
 
     program.resolve_label(next_label, program.offset());
-    program.emit_insn(Insn::NextAsync {
-        cursor_id: sqlite_schema_cursor_id,
-    });
-    program.emit_insn(Insn::NextAwait {
+    program.emit_insn(Insn::Next {
         cursor_id: sqlite_schema_cursor_id,
         pc_if_next: metadata_loop,
     });

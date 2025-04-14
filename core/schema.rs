@@ -483,26 +483,72 @@ pub enum Type {
     Blob,
 }
 
+/// # SQLite Column Type Affinities
+///
 /// Each column in an SQLite 3 database is assigned one of the following type affinities:
 ///
-/// TEXT
-/// NUMERIC
-/// INTEGER
-/// REAL
-/// BLOB
-/// (Historical note: The "BLOB" type affinity used to be called "NONE". But that term was easy to confuse with "no affinity" and so it was renamed.)
+/// - **TEXT**
+/// - **NUMERIC**
+/// - **INTEGER**
+/// - **REAL**
+/// - **BLOB**
 ///
-/// A column with TEXT affinity stores all data using storage classes NULL, TEXT or BLOB. If numerical data is inserted into a column with TEXT affinity it is converted into text form before being stored.
+/// > **Note:** Historically, the "BLOB" type affinity was called "NONE". However, this term was renamed to avoid confusion with "no affinity".
 ///
-/// A column with NUMERIC affinity may contain values using all five storage classes. When text data is inserted into a NUMERIC column, the storage class of the text is converted to INTEGER or REAL (in order of preference) if the text is a well-formed integer or real literal, respectively. If the TEXT value is a well-formed integer literal that is too large to fit in a 64-bit signed integer, it is converted to REAL. For conversions between TEXT and REAL storage classes, only the first 15 significant decimal digits of the number are preserved. If the TEXT value is not a well-formed integer or real literal, then the value is stored as TEXT. For the purposes of this paragraph, hexadecimal integer literals are not considered well-formed and are stored as TEXT. (This is done for historical compatibility with versions of SQLite prior to version 3.8.6 2014-08-15 where hexadecimal integer literals were first introduced into SQLite.) If a floating point value that can be represented exactly as an integer is inserted into a column with NUMERIC affinity, the value is converted into an integer. No attempt is made to convert NULL or BLOB values.
+/// ## Affinity Descriptions
 ///
-/// A string might look like a floating-point literal with a decimal point and/or exponent notation but as long as the value can be expressed as an integer, the NUMERIC affinity will convert it into an integer. Hence, the string '3.0e+5' is stored in a column with NUMERIC affinity as the integer 300000, not as the floating point value 300000.0.
+/// ### **TEXT**
+/// - Stores data using the NULL, TEXT, or BLOB storage classes.
+/// - Numerical data inserted into a column with TEXT affinity is converted into text form before being stored.
+/// - **Example:**
+///   ```sql
+///   CREATE TABLE example (col TEXT);
+///   INSERT INTO example (col) VALUES (123); -- Stored as '123' (text)
+///   SELECT typeof(col) FROM example; -- Returns 'text'
+///   ```
 ///
-/// A column that uses INTEGER affinity behaves the same as a column with NUMERIC affinity. The difference between INTEGER and NUMERIC affinity is only evident in a CAST expression: The expression "CAST(4.0 AS INT)" returns an integer 4, whereas "CAST(4.0 AS NUMERIC)" leaves the value as a floating-point 4.0.
+/// ### **NUMERIC**
+/// - Can store values using all five storage classes.
+/// - Text data is converted to INTEGER or REAL (in that order of preference) if it is a well-formed integer or real literal.
+/// - If the text represents an integer too large for a 64-bit signed integer, it is converted to REAL.
+/// - If the text is not a well-formed literal, it is stored as TEXT.
+/// - Hexadecimal integer literals are stored as TEXT for historical compatibility.
+/// - Floating-point values that can be exactly represented as integers are converted to integers.
+/// - **Example:**
+///   ```sql
+///   CREATE TABLE example (col NUMERIC);
+///   INSERT INTO example (col) VALUES ('3.0e+5'); -- Stored as 300000 (integer)
+///   SELECT typeof(col) FROM example; -- Returns 'integer'
+///   ```
 ///
-/// A column with REAL affinity behaves like a column with NUMERIC affinity except that it forces integer values into floating point representation. (As an internal optimization, small floating point values with no fractional component and stored in columns with REAL affinity are written to disk as integers in order to take up less space and are automatically converted back into floating point as the value is read out. This optimization is completely invisible at the SQL level and can only be detected by examining the raw bits of the database file.)
+/// ### **INTEGER**
+/// - Behaves like NUMERIC affinity but differs in `CAST` expressions.
+/// - **Example:**
+///   ```sql
+///   CREATE TABLE example (col INTEGER);
+///   INSERT INTO example (col) VALUES (4.0); -- Stored as 4 (integer)
+///   SELECT typeof(col) FROM example; -- Returns 'integer'
+///   ```
 ///
-/// A column with affinity BLOB does not prefer one storage class over another and no attempt is made to coerce data from one storage class into another.
+/// ### **REAL**
+/// - Similar to NUMERIC affinity but forces integer values into floating-point representation.
+/// - **Optimization:** Small floating-point values with no fractional component may be stored as integers on disk to save space. This is invisible at the SQL level.
+/// - **Example:**
+///   ```sql
+///   CREATE TABLE example (col REAL);
+///   INSERT INTO example (col) VALUES (4); -- Stored as 4.0 (real)
+///   SELECT typeof(col) FROM example; -- Returns 'real'
+///   ```
+///
+/// ### **BLOB**
+/// - Does not prefer any storage class.
+/// - No coercion is performed between storage classes.
+/// - **Example:**
+///   ```sql
+///   CREATE TABLE example (col BLOB);
+///   INSERT INTO example (col) VALUES (x'1234'); -- Stored as a binary blob
+///   SELECT typeof(col) FROM example; -- Returns 'blob'
+///   ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Affinity {
     Integer,

@@ -431,8 +431,7 @@ fn emit_delete_insns(
             conflict_action,
         });
     } else {
-        program.emit_insn(Insn::DeleteAsync { cursor_id });
-        program.emit_insn(Insn::DeleteAwait { cursor_id });
+        program.emit_insn(Insn::Delete { cursor_id });
     }
     if let Some(limit) = limit {
         let limit_reg = program.alloc_register();
@@ -683,13 +682,12 @@ fn emit_update_insns(
             count: table_ref.columns().len(),
             dest_reg: record_reg,
         });
-        program.emit_insn(Insn::InsertAsync {
+        program.emit_insn(Insn::Insert {
             cursor: cursor_id,
             key_reg: beg,
             record_reg,
             flag: 0,
         });
-        program.emit_insn(Insn::InsertAwait { cursor_id });
     } else if let Some(vtab) = table_ref.virtual_table() {
         let arg_count = table_ref.columns().len() + 2;
         program.emit_insn(Insn::VUpdate {

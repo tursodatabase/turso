@@ -325,7 +325,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | date()      | Yes     | partially supports modifiers |
 | time()      | Yes     | partially supports modifiers |
 | datetime()  | Yes     | partially supports modifiers |
-| julianday() | Partial | does not support modifiers   |
+| julianday() | Yes     | partially support modifiers  |
 | unixepoch() | Partial | does not support modifiers   |
 | strftime()  | Yes     | partially supports modifiers |
 | timediff()  | Yes     | partially supports modifiers |
@@ -460,9 +460,7 @@ Modifiers:
 | HaltIfNull     | No     |         |
 | IdxDelete      | No     |         |
 | IdxGE          | Yes    |         |
-| IdxInsert      | No     |         |
-| IdxInsertAsync | Yes    |         |
-| IdxInsertAwait | Yes    |         |
+| IdxInsert      | Yes     |         |
 | IdxLE          | Yes    |         |
 | IdxLT          | Yes    |         |
 | IdxRowid       | No     |         |
@@ -474,9 +472,7 @@ Modifiers:
 | IncrVacuum     | No     |         |
 | Init           | Yes    |         |
 | InitCoroutine  | Yes    |         |
-| Insert         | No     |         |
-| InsertAsync    | Yes    |         |
-| InsertAwait    | Yes    |         |
+| Insert         | Yes     |         |
 | InsertInt      | No     |         |
 | Int64          | No     |         |
 | Integer        | Yes    |         |
@@ -497,9 +493,7 @@ Modifiers:
 | MustBeInt      | Yes    |         |
 | Ne             | Yes    |         |
 | NewRowid       | Yes    |         |
-| Next           | No     |         |
-| NextAsync      | Yes    |         |
-| NextAwait      | Yes    |         |
+| Next           | Yes     |         |
 | Noop           | Yes     |         |
 | Not            | Yes    |         |
 | NotExists      | Yes    |         |
@@ -507,23 +501,18 @@ Modifiers:
 | NotNull        | Yes    |         |
 | Null           | Yes    |         |
 | NullRow        | Yes    |         |
-| Once           | No     |         |
-| OpenAutoindex  | No     |         |
-| OpenEphemeral  | No     |         |
+| Once           | Yes     |         |
+| OpenAutoindex  | Yes     |         |
+| OpenEphemeral  | Yes     |         |
 | OpenPseudo     | Yes    |         |
 | OpenRead       | Yes    |         |
-| OpenReadAsync  | Yes    |         |
-| OpenWrite      | No     |         |
-| OpenWriteAsync | Yes    |         |
-| OpenWriteAwait | Yes    |         |
+| OpenWrite      | Yes     |         |
 | Or             | Yes    |         |
 | Pagecount      | Partial| no temp databases |
 | Param          | No     |         |
 | ParseSchema    | No     |         |
 | Permutation    | No     |         |
-| Prev           | No     |         |
-| PrevAsync      | Yes    |         |
-| PrevAwait      | Yes    |         |
+| Prev           | Yes     |         |
 | Program        | No     |         |
 | ReadCookie     | Partial| no temp databases, only user_version supported |
 | Real           | Yes    |         |
@@ -533,8 +522,6 @@ Modifiers:
 | ResultRow      | Yes    |         |
 | Return         | Yes    |         |
 | Rewind         | Yes    |         |
-| RewindAsync    | Yes    |         |
-| RewindAwait    | Yes    |         |
 | RowData        | No     |         |
 | RowId          | Yes    |         |
 | RowKey         | No     |         |
@@ -580,7 +567,7 @@ Modifiers:
 | VDestroy       | No     |         |
 | VFilter        | Yes    |         |
 | VNext          | Yes    |         |
-| VOpen          | Yes    |VOpenAsync|
+| VOpen          | Yes    |         |
 | VRename        | No     |         |
 | VUpdate        | Yes    |         |
 | Vacuum         | No     |         |

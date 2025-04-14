@@ -183,7 +183,7 @@ impl Database {
         let pager = Rc::new(Pager::finish_open(
             self.header.clone(),
             self.db_file.clone(),
-            wal,
+            Some(wal),
             self.io.clone(),
             self.shared_page_cache.clone(),
             buffer_pool,

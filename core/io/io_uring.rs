@@ -1,6 +1,6 @@
 use super::{common, Completion, File, OpenFlags, WriteCompletion, IO};
 use crate::io::clock::{Clock, Instant};
-use crate::{LimboError, Result};
+use crate::{LimboError, MemoryIO, Result};
 use rustix::fs::{self, FlockOperation, OFlags};
 use rustix::io_uring::iovec;
 use std::cell::RefCell;
@@ -396,6 +396,10 @@ impl IO for UringIO {
         let mut buf = [0u8; 8];
         getrandom::getrandom(&mut buf).unwrap();
         i64::from_ne_bytes(buf)
+    }
+
+    fn get_memory_io(&self) -> Arc<MemoryIO> {
+        Arc::new(MemoryIO::new())
     }
 }
 

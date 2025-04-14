@@ -399,7 +399,11 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
         (Expr::Unary(op1, expr1), Expr::Unary(op2, expr2)) => {
             op1 == op2 && exprs_are_equivalent(expr1, expr2)
         }
-        (Expr::Variable(var1), Expr::Variable(var2)) => var1 == var2,
+        // Variables that are not bound to a specific value, are treated as NULL
+        // https://sqlite.org/lang_expr.html#varparam
+        (Expr::Variable(var), Expr::Variable(var2)) if var == "" && var2 == "" => false,
+        // Named variables can be compared by their name
+        (Expr::Variable(val), Expr::Variable(val2)) => val == val2,
         (Expr::Parenthesized(exprs1), Expr::Parenthesized(exprs2)) => {
             exprs1.len() == exprs2.len()
                 && exprs1
@@ -943,6 +947,24 @@ pub mod tests {
         assert_eq!(normalize_ident("`foo`"), "foo");
         assert_eq!(normalize_ident("[foo]"), "foo");
         assert_eq!(normalize_ident("\"foo\""), "foo");
+    }
+
+    #[test]
+    fn test_anonymous_variable_comparison() {
+        let expr1 = Expr::Variable("".to_string());
+        let expr2 = Expr::Variable("".to_string());
+        assert!(!exprs_are_equivalent(&expr1, &expr2));
+    }
+
+    #[test]
+    fn test_named_variable_comparison() {
+        let expr1 = Expr::Variable("1".to_string());
+        let expr2 = Expr::Variable("1".to_string());
+        assert!(exprs_are_equivalent(&expr1, &expr2));
+
+        let expr1 = Expr::Variable("1".to_string());
+        let expr2 = Expr::Variable("2".to_string());
+        assert!(!exprs_are_equivalent(&expr1, &expr2));
     }
 
     #[test]

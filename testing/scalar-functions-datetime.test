@@ -423,26 +423,33 @@ do_execsql_test julianday-time-only {
     SELECT julianday('15:30:45');
 } {2451545.14635417}
 
-#
-# TODO: fix precision issue
-#
-#do_execsql_test julianday-midnight {
-#    SELECT julianday('2023-05-18 00:00:00');
-#} {2460082.5}
+do_execsql_test julianday-midnight {
+    SELECT julianday('2023-05-18 00:00:00');
+} {2460082.5}
 
-#do_execsql_test julianday-noon {
-#    SELECT julianday('2023-05-18 12:00:00');
-#} {2460083.0}
+do_execsql_test julianday-noon {
+    SELECT julianday('2023-05-18 12:00:00');
+} {2460083.0}
 
-#do_execsql_test julianday-fractional-zero {
-#    SELECT julianday('2023-05-18 00:00:00.000');
-#} {2460082.5}
+do_execsql_test julianday-fractional-zero {
+    SELECT julianday('2023-05-18 00:00:00.000');
+} {2460082.5}
 
-# same issue as above, we return .5000000 because we are using fmt precision
-#do_execsql_test julianday-date-only {
-#    SELECT julianday('2023-05-18');
-#} {2460082.5}
+do_execsql_test julianday-date-only {
+    SELECT julianday('2023-05-18');
+} {2460082.5}
 
+do_execsql_test julianday-with-modifier-day {
+    SELECT julianday(2454832.5,'+1 day');
+} {2454833.5}
+
+do_execsql_test julianday-with-modifier-hour {
+    SELECT julianday(2454832.5,'-3 hours');
+} {2454832.375}
+
+do_execsql_test julianday-max-day {
+  SELECT julianday('9999-12-31 23:59:59');
+} {5373484.49998843}
 
 
 

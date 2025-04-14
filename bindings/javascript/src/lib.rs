@@ -176,4 +176,8 @@ impl limbo_core::IO for IO {
     fn generate_random_number(&self) -> i64 {
         todo!();
     }
+
+    fn get_memory_io(&self) -> Arc<limbo_core::MemoryIO> {
+        Arc::new(limbo_core::MemoryIO::new())
+    }
 }

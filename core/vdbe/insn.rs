@@ -1,7 +1,11 @@
 use std::{num::NonZero, rc::Rc};
 
 use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
-use crate::{schema::BTreeTable, storage::wal::CheckpointMode, types::Record};
+use crate::{
+    schema::BTreeTable,
+    storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
+    types::Record,
+};
 use limbo_macros::Description;
 
 /// Flags provided to comparison instructions (e.g. Eq, Ne) which determine behavior related to NULL values.
@@ -253,21 +257,15 @@ pub enum Insn {
         jump_if_null: bool,
     },
     /// Open a cursor for reading.
-    OpenReadAsync {
+    OpenRead {
         cursor_id: CursorID,
         root_page: PageIdx,
     },
 
-    /// Await for the completion of open cursor.
-    OpenReadAwait,
-
     /// Open a cursor for a virtual table.
-    VOpenAsync {
+    VOpen {
         cursor_id: CursorID,
     },
-
-    /// Await for the completion of open cursor for a virtual table.
-    VOpenAwait,
 
     /// Create a new virtual table.
     VCreate {
@@ -315,21 +313,12 @@ pub enum Insn {
     },
 
     /// Rewind the cursor to the beginning of the B-Tree.
-    RewindAsync {
-        cursor_id: CursorID,
-    },
-
-    /// Await for the completion of cursor rewind.
-    RewindAwait {
+    Rewind {
         cursor_id: CursorID,
         pc_if_empty: BranchOffset,
     },
 
-    LastAsync {
-        cursor_id: CursorID,
-    },
-
-    LastAwait {
+    Last {
         cursor_id: CursorID,
         pc_if_empty: BranchOffset,
     },
@@ -364,23 +353,14 @@ pub enum Insn {
     },
 
     /// Advance the cursor to the next row.
-    NextAsync {
-        cursor_id: CursorID,
-    },
-
-    /// Await for the completion of cursor advance.
-    NextAwait {
+    Next {
         cursor_id: CursorID,
         pc_if_next: BranchOffset,
     },
 
-    PrevAsync {
+    Prev {
         cursor_id: CursorID,
-    },
-
-    PrevAwait {
-        cursor_id: CursorID,
-        pc_if_next: BranchOffset,
+        pc_if_prev: BranchOffset,
     },
 
     /// Halt the program.
@@ -494,15 +474,12 @@ pub enum Insn {
     /// P3 + P4 are for the original column values that make up that key in unpacked (pre-serialized) form.
     /// If P5 has the OPFLAG_APPEND bit set, that is a hint to the b-tree layer that this insert is likely to be an append.
     /// OPFLAG_NCHANGE bit set, then the change counter is incremented by this instruction. If the OPFLAG_NCHANGE bit is clear, then the change counter is unchanged
-    IdxInsertAsync {
+    IdxInsert {
         cursor_id: CursorID,
         record_reg: usize, // P2 the register containing the record to insert
         unpacked_start: Option<usize>, // P3 the index of the first register for the unpacked key
         unpacked_count: Option<u16>, // P4 # of unpacked values in the key in P2
         flags: IdxInsertFlags, // TODO: optimization
-    },
-    IdxInsertAwait {
-        cursor_id: CursorID,
     },
 
     /// The P4 register values beginning with P3 form an unpacked index key that omits the PRIMARY KEY. Compare this key value against the index that P1 is currently pointing to, ignoring the PRIMARY KEY or ROWID fields at the end.
@@ -638,22 +615,14 @@ pub enum Insn {
         end_offset: BranchOffset,
     },
 
-    InsertAsync {
+    Insert {
         cursor: CursorID,
         key_reg: usize,    // Must be int.
         record_reg: usize, // Blob of record data.
         flag: usize,       // Flags used by insert, for now not used.
     },
 
-    InsertAwait {
-        cursor_id: usize,
-    },
-
-    DeleteAsync {
-        cursor_id: CursorID,
-    },
-
-    DeleteAwait {
+    Delete {
         cursor_id: CursorID,
     },
 
@@ -683,12 +652,10 @@ pub enum Insn {
         offset_reg: usize,
     },
 
-    OpenWriteAsync {
+    OpenWrite {
         cursor_id: CursorID,
         root_page: RegisterOrLiteral<PageIdx>,
     },
-
-    OpenWriteAwait {},
 
     Copy {
         src_reg: usize,
@@ -703,7 +670,7 @@ pub enum Insn {
         /// The root page of the new b-tree (P2).
         root: usize,
         /// Flags (P3).
-        flags: usize,
+        flags: CreateBTreeFlags,
     },
 
     /// Deletes an entire database table or index whose root page in the database file is given by P1.
@@ -808,40 +775,41 @@ pub enum Insn {
         dest: usize,
         cookie: Cookie,
     },
+    /// Open a new cursor P1 to a transient table.
+    OpenEphemeral {
+        cursor_id: usize,
+        is_table: bool,
+    },
+    /// Works the same as OpenEphemeral, name just distinguishes its use; used for transient indexes in joins.
+    OpenAutoindex {
+        cursor_id: usize,
+    },
+    /// Fall through to the next instruction on the first invocation, otherwise jump to target_pc
+    Once {
+        target_pc_when_reentered: BranchOffset,
+    },
 }
 
 impl Insn {
     pub fn to_function(&self) -> InsnFunction {
         match self {
             Insn::Init { .. } => execute::op_init,
-
             Insn::Null { .. } => execute::op_null,
-
             Insn::NullRow { .. } => execute::op_null_row,
-
             Insn::Add { .. } => execute::op_add,
-
             Insn::Subtract { .. } => execute::op_subtract,
-
             Insn::Multiply { .. } => execute::op_multiply,
-
             Insn::Divide { .. } => execute::op_divide,
-
             Insn::Compare { .. } => execute::op_compare,
             Insn::BitAnd { .. } => execute::op_bit_and,
-
             Insn::BitOr { .. } => execute::op_bit_or,
-
             Insn::BitNot { .. } => execute::op_bit_not,
-
             Insn::Checkpoint { .. } => execute::op_checkpoint,
             Insn::Remainder { .. } => execute::op_remainder,
-
             Insn::Jump { .. } => execute::op_jump,
             Insn::Move { .. } => execute::op_move,
             Insn::IfPos { .. } => execute::op_if_pos,
             Insn::NotNull { .. } => execute::op_not_null,
-
             Insn::Eq { .. } => execute::op_eq,
             Insn::Ne { .. } => execute::op_ne,
             Insn::Lt { .. } => execute::op_lt,
@@ -850,57 +818,34 @@ impl Insn {
             Insn::Ge { .. } => execute::op_ge,
             Insn::If { .. } => execute::op_if,
             Insn::IfNot { .. } => execute::op_if_not,
-            Insn::OpenReadAsync { .. } => execute::op_open_read_async,
-            Insn::OpenReadAwait => execute::op_open_read_await,
-
-            Insn::VOpenAsync { .. } => execute::op_vopen_async,
-
-            Insn::VOpenAwait => execute::op_vopen_await,
-
+            Insn::OpenRead { .. } => execute::op_open_read,
+            Insn::VOpen { .. } => execute::op_vopen,
             Insn::VCreate { .. } => execute::op_vcreate,
             Insn::VFilter { .. } => execute::op_vfilter,
             Insn::VColumn { .. } => execute::op_vcolumn,
             Insn::VUpdate { .. } => execute::op_vupdate,
             Insn::VNext { .. } => execute::op_vnext,
             Insn::OpenPseudo { .. } => execute::op_open_pseudo,
-            Insn::RewindAsync { .. } => execute::op_rewind_async,
-
-            Insn::RewindAwait { .. } => execute::op_rewind_await,
-            Insn::LastAsync { .. } => execute::op_last_async,
-
-            Insn::LastAwait { .. } => execute::op_last_await,
+            Insn::Rewind { .. } => execute::op_rewind,
+            Insn::Last { .. } => execute::op_last,
             Insn::Column { .. } => execute::op_column,
             Insn::TypeCheck { .. } => execute::op_type_check,
             Insn::MakeRecord { .. } => execute::op_make_record,
             Insn::ResultRow { .. } => execute::op_result_row,
-
-            Insn::NextAsync { .. } => execute::op_next_async,
-
-            Insn::NextAwait { .. } => execute::op_next_await,
-            Insn::PrevAsync { .. } => execute::op_prev_async,
-
-            Insn::PrevAwait { .. } => execute::op_prev_await,
+            Insn::Next { .. } => execute::op_next,
+            Insn::Prev { .. } => execute::op_prev,
             Insn::Halt { .. } => execute::op_halt,
             Insn::Transaction { .. } => execute::op_transaction,
-
             Insn::AutoCommit { .. } => execute::op_auto_commit,
             Insn::Goto { .. } => execute::op_goto,
-
             Insn::Gosub { .. } => execute::op_gosub,
             Insn::Return { .. } => execute::op_return,
-
             Insn::Integer { .. } => execute::op_integer,
-
             Insn::Real { .. } => execute::op_real,
-
             Insn::RealAffinity { .. } => execute::op_real_affinity,
-
             Insn::String8 { .. } => execute::op_string8,
-
             Insn::Blob { .. } => execute::op_blob,
-
             Insn::RowId { .. } => execute::op_row_id,
-
             Insn::SeekRowid { .. } => execute::op_seek_rowid,
             Insn::DeferredSeek { .. } => execute::op_deferred_seek,
             Insn::SeekGE { .. } => execute::op_seek,
@@ -913,10 +858,8 @@ impl Insn {
             Insn::IdxLE { .. } => execute::op_idx_le,
             Insn::IdxLT { .. } => execute::op_idx_lt,
             Insn::DecrJumpZero { .. } => execute::op_decr_jump_zero,
-
             Insn::AggStep { .. } => execute::op_agg_step,
             Insn::AggFinal { .. } => execute::op_agg_final,
-
             Insn::SorterOpen { .. } => execute::op_sorter_open,
             Insn::SorterInsert { .. } => execute::op_sorter_insert,
             Insn::SorterSort { .. } => execute::op_sorter_sort,
@@ -925,57 +868,36 @@ impl Insn {
             Insn::Function { .. } => execute::op_function,
             Insn::InitCoroutine { .. } => execute::op_init_coroutine,
             Insn::EndCoroutine { .. } => execute::op_end_coroutine,
-
             Insn::Yield { .. } => execute::op_yield,
-            Insn::InsertAsync { .. } => execute::op_insert_async,
-            Insn::InsertAwait { .. } => execute::op_insert_await,
-            Insn::IdxInsertAsync { .. } => execute::op_idx_insert_async,
-            Insn::IdxInsertAwait { .. } => execute::op_idx_insert_await,
-            Insn::DeleteAsync { .. } => execute::op_delete_async,
-
-            Insn::DeleteAwait { .. } => execute::op_delete_await,
-
+            Insn::Insert { .. } => execute::op_insert,
+            Insn::IdxInsert { .. } => execute::op_idx_insert,
+            Insn::Delete { .. } => execute::op_delete,
             Insn::NewRowid { .. } => execute::op_new_rowid,
             Insn::MustBeInt { .. } => execute::op_must_be_int,
-
             Insn::SoftNull { .. } => execute::op_soft_null,
-
             Insn::NotExists { .. } => execute::op_not_exists,
             Insn::OffsetLimit { .. } => execute::op_offset_limit,
-            Insn::OpenWriteAsync { .. } => execute::op_open_write_async,
-            Insn::OpenWriteAwait { .. } => execute::op_open_write_await,
-
+            Insn::OpenWrite { .. } => execute::op_open_write,
             Insn::Copy { .. } => execute::op_copy,
             Insn::CreateBtree { .. } => execute::op_create_btree,
-
             Insn::Destroy { .. } => execute::op_destroy,
             Insn::DropTable { .. } => execute::op_drop_table,
             Insn::Close { .. } => execute::op_close,
-
             Insn::IsNull { .. } => execute::op_is_null,
-
             Insn::ParseSchema { .. } => execute::op_parse_schema,
-
             Insn::ShiftRight { .. } => execute::op_shift_right,
-
             Insn::ShiftLeft { .. } => execute::op_shift_left,
-
             Insn::Variable { .. } => execute::op_variable,
-
             Insn::ZeroOrNull { .. } => execute::op_zero_or_null,
-
             Insn::Not { .. } => execute::op_not,
-
             Insn::Concat { .. } => execute::op_concat,
-
             Insn::And { .. } => execute::op_and,
-
             Insn::Or { .. } => execute::op_or,
-
             Insn::Noop => execute::op_noop,
             Insn::PageCount { .. } => execute::op_page_count,
-
             Insn::ReadCookie { .. } => execute::op_read_cookie,
+            Insn::OpenEphemeral { .. } | Insn::OpenAutoindex { .. } => execute::op_open_ephemeral,
+            Insn::Once { .. } => execute::op_once,
         }
     }
 }

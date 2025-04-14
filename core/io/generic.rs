@@ -1,3 +1,4 @@
+use super::MemoryIO;
 use crate::{Clock, Completion, File, Instant, LimboError, OpenFlags, Result, IO};
 use std::cell::RefCell;
 use std::io::{Read, Seek, Write};
@@ -26,6 +27,7 @@ impl IO for GenericIO {
             .open(path)?;
         Ok(Arc::new(GenericFile {
             file: RefCell::new(file),
+            memory_io: Arc::new(MemoryIO::new()),
         }))
     }
 
@@ -37,6 +39,10 @@ impl IO for GenericIO {
         let mut buf = [0u8; 8];
         getrandom::getrandom(&mut buf).unwrap();
         i64::from_ne_bytes(buf)
+    }
+
+    fn get_memory_io(&self) -> Arc<MemoryIO> {
+        Arc::new(MemoryIO::new())
     }
 }
 
@@ -52,6 +58,7 @@ impl Clock for GenericIO {
 
 pub struct GenericFile {
     file: RefCell<std::fs::File>,
+    memory_io: Arc<MemoryIO>,
 }
 
 unsafe impl Send for GenericFile {}

@@ -46,21 +46,13 @@ enum DateTimeOutput {
     DateTime,
     // Holds the format string
     StrfTime(String),
+    JuliaDay,
 }
 
 fn exec_datetime(values: &[Register], output_type: DateTimeOutput) -> OwnedValue {
     if values.is_empty() {
         let now = parse_naive_date_time(&OwnedValue::build_text("now")).unwrap();
-
-        let formatted_str = match output_type {
-            DateTimeOutput::DateTime => now.format("%Y-%m-%d %H:%M:%S").to_string(),
-            DateTimeOutput::Time => now.format("%H:%M:%S").to_string(),
-            DateTimeOutput::Date => now.format("%Y-%m-%d").to_string(),
-            DateTimeOutput::StrfTime(ref format_str) => strftime_format(&now, format_str),
-        };
-
-        // Parse here
-        return OwnedValue::build_text(&formatted_str);
+        return format_dt(now, output_type, false);
     }
     if let Some(mut dt) = parse_naive_date_time(values[0].get_owned_value()) {
         // if successful, treat subsequent entries as modifiers
@@ -91,28 +83,32 @@ fn modify_dt(dt: &mut NaiveDateTime, mods: &[Register], output_type: DateTimeOut
     if is_leap_second(dt) || *dt > get_max_datetime_exclusive() {
         return OwnedValue::build_text("");
     }
-    let formatted = format_dt(*dt, output_type, subsec_requested);
-    OwnedValue::build_text(&formatted)
+    format_dt(*dt, output_type, subsec_requested)
 }
 
-fn format_dt(dt: NaiveDateTime, output_type: DateTimeOutput, subsec: bool) -> String {
+fn format_dt(dt: NaiveDateTime, output_type: DateTimeOutput, subsec: bool) -> OwnedValue {
     match output_type {
-        DateTimeOutput::Date => dt.format("%Y-%m-%d").to_string(),
+        DateTimeOutput::Date => OwnedValue::from_text(dt.format("%Y-%m-%d").to_string().as_str()),
         DateTimeOutput::Time => {
-            if subsec {
+            let t = if subsec {
                 dt.format("%H:%M:%S%.3f").to_string()
             } else {
                 dt.format("%H:%M:%S").to_string()
-            }
+            };
+            OwnedValue::from_text(t.as_str())
         }
         DateTimeOutput::DateTime => {
-            if subsec {
+            let t = if subsec {
                 dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
             } else {
                 dt.format("%Y-%m-%d %H:%M:%S").to_string()
-            }
+            };
+            OwnedValue::from_text(t.as_str())
         }
-        DateTimeOutput::StrfTime(format_str) => strftime_format(&dt, &format_str),
+        DateTimeOutput::StrfTime(format_str) => {
+            OwnedValue::from_text(strftime_format(&dt, &format_str).as_str())
+        }
+        DateTimeOutput::JuliaDay => OwnedValue::Float(to_julian_day_exact(&dt)),
     }
 }
 
@@ -325,14 +321,8 @@ fn last_day_in_month(year: i32, month: u32) -> u32 {
     28
 }
 
-pub fn exec_julianday(time_value: &OwnedValue) -> Result<String> {
-    let dt = parse_naive_date_time(time_value);
-    match dt {
-        // if we did something heinous like: parse::<f64>().unwrap().to_string()
-        // that would solve the precision issue, but dear lord...
-        Some(dt) => Ok(format!("{:.1$}", to_julian_day_exact(&dt), 8)),
-        None => Ok(String::new()),
-    }
+pub fn exec_julianday(values: &[Register]) -> OwnedValue {
+    exec_datetime(values, DateTimeOutput::JuliaDay)
 }
 
 fn to_julian_day_exact(dt: &NaiveDateTime) -> f64 {

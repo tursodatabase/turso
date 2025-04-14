@@ -4,7 +4,7 @@ use limbo_sqlite3_parser::ast::{self, UnaryOperator};
 use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::schema::{Table, Type};
-use crate::util::normalize_ident;
+use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::{
     builder::ProgramBuilder,
     insn::{CmpInsFlags, Insn},
@@ -494,8 +494,8 @@ pub fn translate_expr(
     match expr {
         ast::Expr::Between { .. } => todo!(),
         ast::Expr::Binary(e1, op, e2) => {
-            // Check if both sides of the expression are identical and reuse the same register if so
-            if e1 == e2 {
+            // Check if both sides of the expression are equivalent and reuse the same register if so
+            if exprs_are_equivalent(e1, e2) {
                 let shared_reg = program.alloc_register();
                 translate_expr(program, referenced_tables, e1, shared_reg, resolver)?;
 
@@ -1159,7 +1159,7 @@ pub fn translate_expr(
                             });
                             Ok(target_register)
                         }
-                        ScalarFunc::Date | ScalarFunc::DateTime => {
+                        ScalarFunc::Date | ScalarFunc::DateTime | ScalarFunc::JulianDay => {
                             let start_reg = program
                                 .alloc_registers(args.as_ref().map(|x| x.len()).unwrap_or(1));
                             if let Some(args) = args {
@@ -1259,11 +1259,11 @@ pub fn translate_expr(
                             });
                             Ok(target_register)
                         }
-                        ScalarFunc::UnixEpoch | ScalarFunc::JulianDay => {
+                        ScalarFunc::UnixEpoch => {
                             let mut start_reg = 0;
                             match args {
                                 Some(args) if args.len() > 1 => {
-                                    crate::bail_parse_error!("epoch or julianday function with > 1 arguments. Modifiers are not yet supported.");
+                                    crate::bail_parse_error!("epoch function with > 1 arguments. Modifiers are not yet supported.");
                                 }
                                 Some(args) if args.len() == 1 => {
                                     let arg_reg = program.alloc_register();
@@ -1850,8 +1850,14 @@ pub fn translate_expr(
         }
         ast::Expr::Literal(lit) => match lit {
             ast::Literal::Numeric(val) => {
-                let maybe_int = val.parse::<i64>();
-                if let Ok(int_value) = maybe_int {
+                if val.starts_with("0x") {
+                    // must be a hex decimal
+                    let int_value = i64::from_str_radix(&val[2..], 16)?;
+                    program.emit_insn(Insn::Integer {
+                        value: int_value,
+                        dest: target_register,
+                    });
+                } else if let Ok(int_value) = val.parse::<i64>() {
                     program.emit_insn(Insn::Integer {
                         value: int_value,
                         dest: target_register,

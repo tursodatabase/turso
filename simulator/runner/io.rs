@@ -97,4 +97,8 @@ impl IO for SimulatorIO {
     fn generate_random_number(&self) -> i64 {
         self.rng.borrow_mut().next_u64() as i64
     }
+
+    fn get_memory_io(&self) -> Arc<limbo_core::MemoryIO> {
+        todo!()
+    }
 }
