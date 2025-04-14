@@ -74,7 +74,7 @@ impl DumbLruPageCache {
 
         self.map.borrow_mut().insert(key, ptr);
         if self.len() > self.capacity {
-            self.pop_if_not_dirty();
+            self.pop_if_not_dirty_or_locked();
         }
     }
 
@@ -177,15 +177,15 @@ impl DumbLruPageCache {
         self.head.borrow_mut().replace(entry);
     }
 
-    fn pop_if_not_dirty(&mut self) {
+    fn pop_if_not_dirty_or_locked(&mut self) {
         let tail = *self.tail.borrow();
         if tail.is_none() {
             return;
         }
         let mut tail = tail.unwrap();
         let tail_entry = unsafe { tail.as_mut() };
-        if tail_entry.page.is_dirty() {
-            // TODO: drop from another clean entry?
+        if tail_entry.page.is_dirty() || tail_entry.page.is_locked() {
+            // TODO: drop another clean and unlocked entry
             return;
         }
         tracing::debug!("pop_if_not_dirty(key={:?})", tail_entry.key);
