@@ -208,11 +208,141 @@ impl DumbLruPageCache {
     pub fn len(&self) -> usize {
         self.map.borrow().len()
     }
+
+    #[cfg(test)]
+    fn get_entry_ptr(&self, key: &PageCacheKey) -> Option<NonNull<PageCacheEntry>> {
+        self.map.borrow().get(key).copied()
+    }
+
+    #[cfg(test)]
+    fn verify_list_integrity(&self) {
+        let map_len = self.map.borrow().len();
+        let head_ptr = *self.head.borrow();
+        let tail_ptr = *self.tail.borrow();
+
+        if map_len == 0 {
+            assert!(head_ptr.is_none(), "Head should be None when map is empty");
+            assert!(tail_ptr.is_none(), "Tail should be None when map is empty");
+            return;
+        }
+
+        assert!(
+            head_ptr.is_some(),
+            "Head should be Some when map is not empty"
+        );
+        assert!(
+            tail_ptr.is_some(),
+            "Tail should be Some when map is not empty"
+        );
+
+        unsafe {
+            assert!(
+                head_ptr.unwrap().as_ref().prev.is_none(),
+                "Head's prev pointer mismatch"
+            );
+        }
+
+        unsafe {
+            assert!(
+                tail_ptr.unwrap().as_ref().next.is_none(),
+                "Tail's next pointer mismatch"
+            );
+        }
+
+        // Forward traversal
+        let mut forward_count = 0;
+        let mut current = head_ptr;
+        let mut last_ptr: Option<NonNull<PageCacheEntry>> = None;
+        while let Some(node) = current {
+            forward_count += 1;
+            unsafe {
+                let node_ref = node.as_ref();
+                assert_eq!(
+                    node_ref.prev, last_ptr,
+                    "Backward pointer mismatch during forward traversal for key {:?}",
+                    node_ref.key
+                );
+                assert!(
+                    self.map.borrow().contains_key(&node_ref.key),
+                    "Node key {:?} not found in map during forward traversal",
+                    node_ref.key
+                );
+                assert_eq!(
+                    self.map.borrow().get(&node_ref.key).copied(),
+                    Some(node),
+                    "Map pointer mismatch for key {:?}",
+                    node_ref.key
+                );
+
+                last_ptr = Some(node);
+                current = node_ref.next;
+            }
+
+            if forward_count > map_len + 5 {
+                panic!(
+                    "Infinite loop suspected in forward integrity check. Size {}, count {}",
+                    map_len, forward_count
+                );
+            }
+        }
+        assert_eq!(
+            forward_count, map_len,
+            "Forward count mismatch (counted {}, map has {})",
+            forward_count, map_len
+        );
+        assert_eq!(
+            tail_ptr, last_ptr,
+            "Tail pointer mismatch after forward traversal"
+        );
+
+        // Backward traversal
+        let mut backward_count = 0;
+        current = tail_ptr;
+        last_ptr = None;
+        while let Some(node) = current {
+            backward_count += 1;
+            unsafe {
+                let node_ref = node.as_ref();
+                assert_eq!(
+                    node_ref.next, last_ptr,
+                    "Forward pointer mismatch during backward traversal for key {:?}",
+                    node_ref.key
+                );
+                assert!(
+                    self.map.borrow().contains_key(&node_ref.key),
+                    "Node key {:?} not found in map during backward traversal",
+                    node_ref.key
+                );
+
+                last_ptr = Some(node);
+                current = node_ref.prev;
+            }
+            if backward_count > map_len + 5 {
+                panic!(
+                    "Infinite loop suspected in backward integrity check. Size {}, count {}",
+                    map_len, backward_count
+                );
+            }
+        }
+        assert_eq!(
+            backward_count, map_len,
+            "Backward count mismatch (counted {}, map has {})",
+            backward_count, map_len
+        );
+        assert_eq!(
+            head_ptr, last_ptr,
+            "Head pointer mismatch after backward traversal"
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{num::NonZeroUsize, sync::Arc};
+    use super::*;
+    use crate::io::{Buffer, BufferData};
+    use crate::storage::pager::{Page, PageRef};
+    use crate::storage::sqlite3_ondisk::PageContent;
+    use std::{cell::RefCell, num::NonZeroUsize, pin::Pin, rc::Rc, sync::Arc};
 
     use lru::LruCache;
     use rand_chacha::{
@@ -220,16 +350,275 @@ mod tests {
         ChaCha8Rng,
     };
 
-    use crate::{storage::page_cache::DumbLruPageCache, Page};
+    fn create_key(id: usize) -> PageCacheKey {
+        PageCacheKey::new(id, Some(id as u64))
+    }
 
-    use super::PageCacheKey;
+    pub fn page_with_content(page_id: usize) -> PageRef {
+        let page = Arc::new(Page::new(page_id));
+        {
+            let buffer_drop_fn = Rc::new(|_data: BufferData| {});
+            let buffer = Buffer::new(Pin::new(vec![0; 4096]), buffer_drop_fn);
+            let page_content = PageContent {
+                offset: 0,
+                buffer: Arc::new(RefCell::new(buffer)),
+                overflow_cells: Vec::new(),
+            };
+            page.get().contents = Some(page_content);
+            page.set_loaded();
+        }
+        page
+    }
 
     fn insert_page(cache: &mut DumbLruPageCache, id: usize) -> PageCacheKey {
-        let key = PageCacheKey::new(id, None);
-        #[allow(clippy::arc_with_non_send_sync)]
-        let page = Arc::new(Page::new(id));
-        cache.insert(key.clone(), page.clone());
+        let key = create_key(id);
+        let page = page_with_content(id);
+        cache.insert(key.clone(), page);
         key
+    }
+
+    fn page_has_content(page: &PageRef) -> bool {
+        page.is_loaded() && page.get().contents.is_some()
+    }
+
+    #[test]
+    fn test_detach_only_element() {
+        let mut cache = DumbLruPageCache::new(5);
+        let key1 = insert_page(&mut cache, 1);
+        cache.verify_list_integrity();
+        assert_eq!(cache.len(), 1);
+        assert!(cache.head.borrow().is_some());
+        assert!(cache.tail.borrow().is_some());
+        assert_eq!(*cache.head.borrow(), *cache.tail.borrow());
+
+        cache.delete(key1.clone());
+
+        assert_eq!(
+            cache.len(),
+            0,
+            "Length should be 0 after deleting only element"
+        );
+        assert!(
+            cache.map.borrow().get(&key1).is_none(),
+            "Map should not contain key after delete"
+        );
+        assert!(cache.head.borrow().is_none(), "Head should be None");
+        assert!(cache.tail.borrow().is_none(), "Tail should be None");
+        cache.verify_list_integrity();
+    }
+
+    #[test]
+    fn test_detach_head() {
+        let mut cache = DumbLruPageCache::new(5);
+        let _key1 = insert_page(&mut cache, 1); // Tail
+        let key2 = insert_page(&mut cache, 2); // Middle
+        let key3 = insert_page(&mut cache, 3); // Head
+        cache.verify_list_integrity();
+        assert_eq!(cache.len(), 3);
+
+        let head_ptr_before = cache.head.borrow().unwrap();
+        assert_eq!(
+            unsafe { &head_ptr_before.as_ref().key },
+            &key3,
+            "Initial head check"
+        );
+
+        cache.delete(key3.clone());
+
+        assert_eq!(cache.len(), 2, "Length should be 2 after deleting head");
+        assert!(
+            cache.map.borrow().get(&key3).is_none(),
+            "Map should not contain deleted head key"
+        );
+        cache.verify_list_integrity();
+
+        let new_head_ptr = cache.head.borrow().unwrap();
+        assert_eq!(
+            unsafe { &new_head_ptr.as_ref().key },
+            &key2,
+            "New head should be key2"
+        );
+        assert!(
+            unsafe { new_head_ptr.as_ref().prev.is_none() },
+            "New head's prev should be None"
+        );
+
+        let tail_ptr = cache.tail.borrow().unwrap();
+        assert_eq!(
+            unsafe { new_head_ptr.as_ref().next },
+            Some(tail_ptr),
+            "New head's next should point to tail (key1)"
+        );
+    }
+
+    #[test]
+    fn test_detach_tail() {
+        let mut cache = DumbLruPageCache::new(5);
+        let key1 = insert_page(&mut cache, 1); // Tail
+        let key2 = insert_page(&mut cache, 2); // Middle
+        let _key3 = insert_page(&mut cache, 3); // Head
+        cache.verify_list_integrity();
+        assert_eq!(cache.len(), 3);
+
+        let tail_ptr_before = cache.tail.borrow().unwrap();
+        assert_eq!(
+            unsafe { &tail_ptr_before.as_ref().key },
+            &key1,
+            "Initial tail check"
+        );
+
+        cache.delete(key1.clone()); // Delete tail
+
+        assert_eq!(cache.len(), 2, "Length should be 2 after deleting tail");
+        assert!(
+            cache.map.borrow().get(&key1).is_none(),
+            "Map should not contain deleted tail key"
+        );
+        cache.verify_list_integrity();
+
+        let new_tail_ptr = cache.tail.borrow().unwrap();
+        assert_eq!(
+            unsafe { &new_tail_ptr.as_ref().key },
+            &key2,
+            "New tail should be key2"
+        );
+        assert!(
+            unsafe { new_tail_ptr.as_ref().next.is_none() },
+            "New tail's next should be None"
+        );
+
+        let head_ptr = cache.head.borrow().unwrap();
+        assert_eq!(
+            unsafe { head_ptr.as_ref().prev },
+            None,
+            "Head's prev should point to new tail (key2)"
+        );
+        assert_eq!(
+            unsafe { head_ptr.as_ref().next },
+            Some(new_tail_ptr),
+            "Head's next should point to new tail (key2)"
+        );
+        assert_eq!(
+            unsafe { new_tail_ptr.as_ref().next },
+            None,
+            "Double check new tail's next is None"
+        );
+    }
+
+    #[test]
+    fn test_detach_middle() {
+        let mut cache = DumbLruPageCache::new(5);
+        let key1 = insert_page(&mut cache, 1); // Tail
+        let key2 = insert_page(&mut cache, 2); // Middle
+        let key3 = insert_page(&mut cache, 3); // Middle
+        let _key4 = insert_page(&mut cache, 4); // Head
+        cache.verify_list_integrity();
+        assert_eq!(cache.len(), 4);
+
+        let head_ptr_before = cache.head.borrow().unwrap();
+        let tail_ptr_before = cache.tail.borrow().unwrap();
+
+        cache.delete(key2.clone()); // Detach a middle element (key2)
+
+        assert_eq!(cache.len(), 3, "Length should be 3 after deleting middle");
+        assert!(
+            cache.map.borrow().get(&key2).is_none(),
+            "Map should not contain deleted middle key2"
+        );
+        cache.verify_list_integrity();
+
+        // Check neighbors
+        let key1_ptr = cache.get_entry_ptr(&key1).expect("Key1 should still exist");
+        let key3_ptr = cache.get_entry_ptr(&key3).expect("Key3 should still exist");
+        assert_eq!(
+            unsafe { key3_ptr.as_ref().next },
+            Some(key1_ptr),
+            "Key3's next should point to key1"
+        );
+        assert_eq!(
+            unsafe { key1_ptr.as_ref().prev },
+            Some(key3_ptr),
+            "Key1's prev should point to key2"
+        );
+
+        assert_eq!(
+            cache.head.borrow().unwrap(),
+            head_ptr_before,
+            "Head should remain key4"
+        );
+        assert_eq!(
+            cache.tail.borrow().unwrap(),
+            tail_ptr_before,
+            "Tail should remain key1"
+        );
+    }
+
+    #[test]
+    fn test_detach_via_delete() {
+        let mut cache = DumbLruPageCache::new(5);
+        let key1 = create_key(1);
+        let page1 = page_with_content(1);
+        cache.insert(key1.clone(), page1.clone());
+        assert!(
+            page_has_content(&page1),
+            "Page content should exist before delete"
+        );
+        cache.verify_list_integrity();
+
+        cache.delete(key1.clone());
+        assert_eq!(cache.len(), 0);
+        assert!(
+            !page_has_content(&page1),
+            "Page content should be removed after delete"
+        );
+        cache.verify_list_integrity();
+    }
+
+    #[test]
+    fn test_detach_via_insert() {
+        let mut cache = DumbLruPageCache::new(5);
+        let key1 = create_key(1);
+        let page1_v1 = page_with_content(1);
+        let page1_v2 = page_with_content(1);
+
+        cache.insert(key1.clone(), page1_v1.clone());
+        assert!(
+            page_has_content(&page1_v1),
+            "Page1 V1 content should exist initially"
+        );
+        cache.verify_list_integrity();
+
+        cache.insert(key1.clone(), page1_v2.clone()); // Trigger delete page1_v1
+
+        assert_eq!(
+            cache.len(),
+            1,
+            "Cache length should still be 1 after replace"
+        );
+        assert!(
+            !page_has_content(&page1_v1),
+            "Page1 V1 content should be cleaned after being replaced in cache"
+        );
+        assert!(
+            page_has_content(&page1_v2),
+            "Page1 V2 content should exist after insert"
+        );
+
+        let current_page = cache.get(&key1).unwrap();
+        assert!(
+            Arc::ptr_eq(&current_page, &page1_v2),
+            "Cache should now hold page1 V2"
+        );
+
+        cache.verify_list_integrity();
+    }
+
+    #[test]
+    fn test_detach_nonexistent_key() {
+        let mut cache = DumbLruPageCache::new(5);
+        let key_nonexist = create_key(99);
+
+        cache.delete(key_nonexist.clone()); // no-op
     }
 
     #[test]
