@@ -224,6 +224,14 @@ mod tests {
 
     use super::PageCacheKey;
 
+    fn insert_page(cache: &mut DumbLruPageCache, id: usize) -> PageCacheKey {
+        let key = PageCacheKey::new(id, None);
+        #[allow(clippy::arc_with_non_send_sync)]
+        let page = Arc::new(Page::new(id));
+        cache.insert(key.clone(), page.clone());
+        key
+    }
+
     #[test]
     fn test_page_cache_evict() {
         let mut cache = DumbLruPageCache::new(1);
@@ -325,14 +333,6 @@ mod tests {
         cache.clear();
         assert!(cache.get(&key1).is_none());
         assert!(cache.get(&key2).is_none());
-    }
-
-    fn insert_page(cache: &mut DumbLruPageCache, id: usize) -> PageCacheKey {
-        let key = PageCacheKey::new(id, None);
-        #[allow(clippy::arc_with_non_send_sync)]
-        let page = Arc::new(Page::new(id));
-        cache.insert(key.clone(), page.clone());
-        key
     }
 
     #[test]
