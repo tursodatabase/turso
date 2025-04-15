@@ -34,7 +34,10 @@ use crate::{
 use crate::{
     storage::{btree::BTreeCursor, pager::Pager, sqlite3_ondisk::DatabaseHeader},
     translate::plan::{ResultSetColumn, TableReference},
-    types::{AggContext, Cursor, CursorResult, ImmutableRecord, OwnedValue, SeekKey, SeekOp},
+    types::{
+        AggContext, Cursor, CursorResult, ImmutableRecord, OwnedValue, OwnedValueType, SeekKey,
+        SeekOp,
+    },
     vdbe::{builder::CursorType, insn::Insn},
 };
 
@@ -248,7 +251,7 @@ impl ProgramState {
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {
         let cursors: RefCell<Vec<Option<Cursor>>> =
             RefCell::new((0..max_cursors).map(|_| None).collect());
-        let registers = vec![Register::OwnedValue(OwnedValue::Null); max_registers];
+        let registers = vec![Register::OwnedValue(OwnedValue::null()); max_registers];
         Self {
             pc: 0,
             cursors,
@@ -300,7 +303,7 @@ impl ProgramState {
         self.cursors.borrow_mut().iter_mut().for_each(|c| *c = None);
         self.registers
             .iter_mut()
-            .for_each(|r| *r = Register::OwnedValue(OwnedValue::Null));
+            .for_each(|r| *r = Register::OwnedValue(OwnedValue::null()));
         self.last_compare = None;
         self.deferred_seek = None;
         self.ended_coroutine.0 = [0; 4];
@@ -324,6 +327,13 @@ impl ProgramState {
 
 impl Register {
     pub fn get_owned_value(&self) -> &OwnedValue {
+        match self {
+            Register::OwnedValue(v) => v,
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn get_owned_value_mut(&mut self) -> &mut OwnedValue {
         match self {
             Register::OwnedValue(v) => v,
             _ => unreachable!(),
@@ -595,8 +605,8 @@ pub trait FromValueRow<'a> {
 
 impl<'a> FromValueRow<'a> for i64 {
     fn from_value(value: &'a OwnedValue) -> Result<Self> {
-        match value {
-            OwnedValue::Integer(i) => Ok(*i),
+        match value.value_type() {
+            OwnedValueType::Integer => Ok(value.as_integer().unwrap()),
             _ => Err(LimboError::ConversionError("Expected integer value".into())),
         }
     }
@@ -604,8 +614,8 @@ impl<'a> FromValueRow<'a> for i64 {
 
 impl<'a> FromValueRow<'a> for String {
     fn from_value(value: &'a OwnedValue) -> Result<Self> {
-        match value {
-            OwnedValue::Text(s) => Ok(s.as_str().to_string()),
+        match value.value_type() {
+            OwnedValueType::Text => Ok(value.to_text().unwrap().to_string()),
             _ => Err(LimboError::ConversionError("Expected text value".into())),
         }
     }
@@ -613,8 +623,8 @@ impl<'a> FromValueRow<'a> for String {
 
 impl<'a> FromValueRow<'a> for &'a str {
     fn from_value(value: &'a OwnedValue) -> Result<Self> {
-        match value {
-            OwnedValue::Text(s) => Ok(s.as_str()),
+        match value.value_type() {
+            OwnedValueType::Text => Ok(value.to_text().unwrap()),
             _ => Err(LimboError::ConversionError("Expected text value".into())),
         }
     }

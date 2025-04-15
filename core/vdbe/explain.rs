@@ -1,4 +1,7 @@
-use crate::vdbe::{builder::CursorType, insn::RegisterOrLiteral};
+use crate::{
+    types::OwnedValueType,
+    vdbe::{builder::CursorType, insn::RegisterOrLiteral},
+};
 
 use super::{Insn, InsnReference, OwnedValue, Program};
 use crate::function::{Func, ScalarFunc};
@@ -632,7 +635,7 @@ pub fn insn_to_str(
                 0,
                 *dest as i32,
                 0,
-                OwnedValue::Float(*value),
+                OwnedValue::float(*value),
                 0,
                 format!("r[{}]={}", dest, value),
             ),
@@ -659,7 +662,7 @@ pub fn insn_to_str(
                 0,
                 *dest as i32,
                 0,
-                OwnedValue::Blob(value.clone()),
+                OwnedValue::from_blob(value.clone()),
                 0,
                 format!(
                     "r[{}]={} (len={})",
@@ -878,9 +881,9 @@ pub fn insn_to_str(
                 let to_print: Vec<String> = order
                     .get_values()
                     .iter()
-                    .map(|v| match v {
-                        OwnedValue::Integer(i) => {
-                            if *i == 0 {
+                    .map(|v| match v.value_type() {
+                        OwnedValueType::Integer => {
+                            if v.as_integer().unwrap() == 0 {
                                 "B".to_string()
                             } else {
                                 "-B".to_string()
@@ -920,7 +923,7 @@ pub fn insn_to_str(
                 *cursor_id as i32,
                 *record_reg as i32,
                 0,
-                OwnedValue::Integer(0),
+                OwnedValue::integer(0),
                 0,
                 format!("key=r[{}]", record_reg),
             ),
