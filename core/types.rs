@@ -154,7 +154,6 @@ impl OwnedValue {
         }
     }
 
-    // Text creation with reuse of existing buffer
     pub fn set_text(&mut self, value: &str) {
         let bytes = value.as_bytes();
         self.buffer.clear();
@@ -164,7 +163,6 @@ impl OwnedValue {
         self.text_subtype = Some(TextSubtype::Text);
     }
 
-    // Continue to support the old API
     pub fn build_text(text: &str) -> Self {
         let bytes = text.as_bytes();
         Self {
@@ -174,7 +172,6 @@ impl OwnedValue {
         }
     }
 
-    // Blob implementation
     pub fn from_blob(data: Vec<u8>) -> Self {
         Self {
             buffer: data,
@@ -192,7 +189,6 @@ impl OwnedValue {
     }
 
     // Type conversion methods
-
     pub fn as_integer(&self) -> Option<i64> {
         match self.value_type {
             OwnedValueType::Integer => {
@@ -241,12 +237,10 @@ impl OwnedValue {
         }
     }
 
-    // Type information
     pub fn value_type(&self) -> OwnedValueType {
         self.value_type
     }
 
-    // Conversion methods with optional buffer reuse
     pub fn convert_to_integer(&mut self, value: i64) {
         self.buffer.clear();
         self.buffer.reserve(8);
@@ -269,14 +263,12 @@ impl OwnedValue {
         self.text_subtype = None;
     }
 
-    // Serialization for the database format
     pub fn serialize_serial(&self, out: &mut Vec<u8>) {
         match self.value_type {
             OwnedValueType::Null => {}
             OwnedValueType::Integer => {
                 let i = self.as_integer().unwrap();
                 let serial_type = SerialType::from(self);
-                // Same serialization logic as before
                 match serial_type {
                     SerialType::I8 => out.extend_from_slice(&(i as i8).to_be_bytes()),
                     SerialType::I16 => out.extend_from_slice(&(i as i16).to_be_bytes()),
