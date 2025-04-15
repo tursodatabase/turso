@@ -223,6 +223,7 @@ mod tests {
     use crate::{storage::page_cache::DumbLruPageCache, Page};
 
     use super::PageCacheKey;
+    use super::PageRef;
 
     #[test]
     fn test_page_cache_evict() {
@@ -331,6 +332,40 @@ mod tests {
         let key = PageCacheKey::new(id, None);
         #[allow(clippy::arc_with_non_send_sync)]
         let page = Arc::new(Page::new(id));
+        cache.insert(key.clone(), page.clone());
+        key
+    }
+
+    #[test]
+    fn test_page_cache_insert_existing() {
+        let mut cache = DumbLruPageCache::new(1);
+        #[allow(clippy::arc_with_non_send_sync)]
+        let page1 = Arc::new(Page::new(1));
+        assert_eq!(Arc::strong_count(&page1), 1);
+        let _ = insert_page_provided(&mut cache, 1, page1.clone());
+        assert_eq!(Arc::strong_count(&page1), 2); // Should be another ref at page cache
+    }
+
+    #[test]
+    fn test_page_cache_insert_duplicate_key() {
+        let mut cache = DumbLruPageCache::new(1);
+        #[allow(clippy::arc_with_non_send_sync)]
+        let page1 = Arc::new(Page::new(1));
+        assert_eq!(Arc::strong_count(&page1), 1);
+        let _ = insert_page_provided(&mut cache, 1, page1.clone());
+        #[allow(clippy::arc_with_non_send_sync)]
+        let page2 = Arc::new(Page::new(1));
+        let _ = insert_page_provided(&mut cache, 1, page2.clone()); // This should fail
+        assert_eq!(Arc::strong_count(&page1), 2); // first page should stay (referenced) in cache
+        assert_eq!(Arc::strong_count(&page2), 1);
+    }
+
+    fn insert_page_provided(
+        cache: &mut DumbLruPageCache,
+        id: usize,
+        page: PageRef,
+    ) -> PageCacheKey {
+        let key = PageCacheKey::new(id, None);
         cache.insert(key.clone(), page.clone());
         key
     }
