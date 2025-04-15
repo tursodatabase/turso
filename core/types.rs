@@ -296,6 +296,14 @@ impl OwnedValue {
             text_subtype: Some(TextSubtype::Text),
         }
     }
+
+    pub fn blob_buffer_mut(&mut self) -> Option<&mut Vec<u8>> {
+        if self.value_type == OwnedValueType::Blob {
+            Some(&mut self.buffer)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

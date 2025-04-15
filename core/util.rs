@@ -857,7 +857,7 @@ pub fn cast_text_to_real(value: &mut OwnedValue) {
 /// IEEE 754 64-bit float and thus provides a 1-bit of margin for the text-to-float conversion operation.)
 /// Any text input that describes a value outside the range of a 64-bit signed integer yields a REAL result.
 /// Casting a REAL or INTEGER value to NUMERIC is a no-op, even if a real value could be losslessly converted to an integer.
-fn checked_cast_text_to_numeric(value: &mut OwnedValue) -> std::result::Result<(), ()> {
+pub fn checked_cast_text_to_numeric(value: &mut OwnedValue) -> std::result::Result<(), ()> {
     if let Some(text) = value.as_text() {
         let (kind, text) = parse_numeric_str(text)?;
         match kind {
