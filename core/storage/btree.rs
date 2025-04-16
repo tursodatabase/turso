@@ -4848,8 +4848,10 @@ mod tests {
         fast_lock::SpinLock,
         io::{Buffer, Completion, MemoryIO, OpenFlags, IO},
         storage::{
-            database::DatabaseFile, page_cache::DumbLruPageCache, sqlite3_ondisk,
-            sqlite3_ondisk::DatabaseHeader,
+            database::DatabaseFile,
+            page_cache::DumbLruPageCache,
+            pager::CreateBTreeFlags,
+            sqlite3_ondisk::{self, DatabaseHeader},
         },
         types::Text,
         vdbe::Register,
@@ -5367,6 +5369,81 @@ mod tests {
             }
         }
     }
+
+    fn btree_index_insert_fuzz_run(attempts: usize, inserts: usize) {
+        let (mut rng, seed) = if std::env::var("SEED").is_ok() {
+            let seed = std::env::var("SEED").unwrap();
+            let seed = seed.parse::<u64>().unwrap();
+            let rng = ChaCha8Rng::seed_from_u64(seed);
+            (rng, seed)
+        } else {
+            rng_from_time()
+        };
+        let mut seen = HashSet::new();
+        tracing::info!("super seed: {}", seed);
+        for _ in 0..attempts {
+            let (pager, _) = empty_btree();
+            let index_root_page = pager.btree_create(&CreateBTreeFlags::new_index());
+            let index_root_page = index_root_page as usize;
+            let mut cursor = BTreeCursor::new(None, pager.clone(), index_root_page);
+            let mut keys = Vec::new();
+            tracing::info!("seed: {}", seed);
+            for _ in 0..inserts {
+                let key = {
+                    let result;
+                    loop {
+                        let cols = (0..10)
+                            .map(|_| (rng.next_u64() % (1 << 30)) as i64)
+                            .collect::<Vec<_>>();
+                        if seen.contains(&cols) {
+                            continue;
+                        } else {
+                            seen.insert(cols.clone());
+                        }
+                        result = cols;
+                        break;
+                    }
+                    result
+                };
+                keys.push(key.clone());
+                let value = ImmutableRecord::from_registers(
+                    &key.iter()
+                        .map(|col| Register::OwnedValue(OwnedValue::Integer(*col)))
+                        .collect::<Vec<_>>(),
+                );
+                run_until_done(
+                    || {
+                        cursor.insert(
+                            &BTreeKey::new_index_key(&value),
+                            cursor.is_write_in_progress(),
+                        )
+                    },
+                    pager.deref(),
+                )
+                .unwrap();
+                keys.sort();
+                cursor.move_to_root();
+            }
+            keys.sort();
+            cursor.move_to_root();
+            for key in keys.iter() {
+                tracing::trace!("seeking key: {:?}", key);
+                run_until_done(|| cursor.next(), pager.deref()).unwrap();
+                let record = cursor.record();
+                let record = record.as_ref().unwrap();
+                let cursor_key = record.get_values();
+                assert_eq!(
+                    cursor_key,
+                    &key.iter()
+                        .map(|col| RefValue::Integer(*col))
+                        .collect::<Vec<_>>(),
+                    "key {:?} is not found",
+                    key
+                );
+            }
+        }
+    }
+
     #[test]
     pub fn test_drop_odd() {
         let db = get_database();
@@ -5418,6 +5495,11 @@ mod tests {
             tracing::info!("======= size:{} =======", size);
             btree_insert_fuzz_run(2, 1024, |_| size);
         }
+    }
+
+    #[test]
+    pub fn btree_index_insert_fuzz_run_equal_size() {
+        btree_index_insert_fuzz_run(2, 1024 * 32);
     }
 
     #[test]
