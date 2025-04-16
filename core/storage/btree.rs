@@ -2468,7 +2468,37 @@ impl BTreeCursor {
         sibling_count_new: usize,
         rightmost_pointer: &mut [u8],
     ) {
-        let mut valid = true;
+        #[derive(Debug, PartialEq, Eq)]
+        enum PostBalanceNonRootValidation {
+            Valid,
+            Invalid(String),
+        }
+
+        impl PostBalanceNonRootValidation {
+            fn invalidate(self, other: PostBalanceNonRootValidation) -> Self {
+                match (self, other) {
+                    (PostBalanceNonRootValidation::Valid, PostBalanceNonRootValidation::Valid) => {
+                        PostBalanceNonRootValidation::Valid
+                    }
+                    (
+                        PostBalanceNonRootValidation::Valid,
+                        PostBalanceNonRootValidation::Invalid(reason),
+                    ) => PostBalanceNonRootValidation::Invalid(reason),
+                    (
+                        PostBalanceNonRootValidation::Invalid(reason),
+                        PostBalanceNonRootValidation::Valid,
+                    ) => PostBalanceNonRootValidation::Invalid(reason),
+                    (
+                        PostBalanceNonRootValidation::Invalid(reason1),
+                        PostBalanceNonRootValidation::Invalid(reason2),
+                    ) => PostBalanceNonRootValidation::Invalid(format!(
+                        "{} and {}",
+                        reason1, reason2
+                    )),
+                }
+            }
+        }
+        let mut valid = PostBalanceNonRootValidation::Valid;
         let mut current_index_cell = 0;
         for cell_idx in 0..parent_contents.cell_count() {
             let cell = parent_contents
@@ -2493,7 +2523,10 @@ impl BTreeCursor {
                                 parent_page.get().id,
                                 left_child_page,
                             );
-                        valid = false;
+                        valid = valid.invalidate(PostBalanceNonRootValidation::Invalid(format!("parent_divider_points_to_same_page, page_id={}, cell_left_child_page={}",
+                                parent_page.get().id,
+                                left_child_page,
+                            )));
                     }
                 }
                 BTreeCell::IndexInteriorCell(index_interior_cell) => {
@@ -2503,7 +2536,10 @@ impl BTreeCursor {
                                 parent_page.get().id,
                                 left_child_page,
                             );
-                        valid = false;
+                        valid = valid.invalidate(PostBalanceNonRootValidation::Invalid(format!("parent_divider_points_to_same_page, page_id={}, cell_left_child_page={}",
+                                parent_page.get().id,
+                                left_child_page,
+                            )));
                     }
                 }
                 _ => {}
@@ -2535,7 +2571,11 @@ impl BTreeCursor {
                         page.get().id,
                         current_index_cell,
                     );
-                    valid = false;
+                    valid = valid.invalidate(PostBalanceNonRootValidation::Invalid(format!(
+                        "cell_not_found_debug, page_id={}, cell_in_cell_array_idx={}",
+                        page.get().id,
+                        current_index_cell,
+                    )));
                 }
 
                 let cell = crate::storage::sqlite3_ondisk::read_btree_cell(
@@ -2562,7 +2602,11 @@ impl BTreeCursor {
                                 left_child_page,
                                 page_idx
                             );
-                            valid = false;
+                            valid = valid.invalidate(PostBalanceNonRootValidation::Invalid(format!("child_page_points_same_page, page_id={}, cell_left_child_page={}, page_idx={}",
+                                page.get().id,
+                                left_child_page,
+                                page_idx
+                            )));
                         }
                         if left_child_page == parent_page.get().id as u32 {
                             tracing::error!("balance_non_root(child_page_points_parent_of_child, page_id={}, cell_left_child_page={}, page_idx={})",
@@ -2570,7 +2614,11 @@ impl BTreeCursor {
                                 left_child_page,
                                 page_idx
                             );
-                            valid = false;
+                            valid = valid.invalidate(PostBalanceNonRootValidation::Invalid(format!("child_page_points_parent_of_child, page_id={}, cell_left_child_page={}, page_idx={}",
+                                page.get().id,
+                                left_child_page,
+                                page_idx
+                            )));
                         }
                     }
                     BTreeCell::IndexInteriorCell(index_interior_cell) => {
@@ -2581,7 +2629,11 @@ impl BTreeCursor {
                                 left_child_page,
                                 page_idx
                             );
-                            valid = false;
+                            valid = valid.invalidate(PostBalanceNonRootValidation::Invalid(format!("child_page_points_same_page, page_id={}, cell_left_child_page={}, page_idx={}",
+                                page.get().id,
+                                left_child_page,
+                                page_idx
+                            )));
                         }
                         if left_child_page == parent_page.get().id as u32 {
                             tracing::error!("balance_non_root(child_page_points_parent_of_child, page_id={}, cell_left_child_page={}, page_idx={})",
@@ -2589,7 +2641,11 @@ impl BTreeCursor {
                                 left_child_page,
                                 page_idx
                             );
-                            valid = false;
+                            valid = valid.invalidate(PostBalanceNonRootValidation::Invalid(format!("child_page_points_parent_of_child, page_id={}, cell_left_child_page={}, page_idx={}",
+                                page.get().id,
+                                left_child_page,
+                                page_idx
+                            )));
                         }
                     }
                     _ => {}
@@ -2609,7 +2665,9 @@ impl BTreeCursor {
                     tracing::error!("balance_non_root(balance_shallower_incorrect_pages_to_balance_new_len, pages_to_balance_new={})",
                         pages_to_balance_new.len()
                     );
-                    valid = false;
+                    valid = valid.invalidate(PostBalanceNonRootValidation::Invalid(format!("balance_shallower_incorrect_pages_to_balance_new_len, pages_to_balance_new={}",
+                        pages_to_balance_new.len()
+                    )));
                 }
 
                 if current_index_cell != cells_debug.len()
@@ -2622,7 +2680,12 @@ impl BTreeCursor {
                         contents.cell_count(),
                         parent_contents.cell_count()
                     );
-                    valid = false;
+                    valid = valid.invalidate(PostBalanceNonRootValidation::Invalid(format!("balance_shallower_incorrect_cell_count, current_index_cell={}, cells_debug={}, cell_count={}, parent_cell_count={}",
+                        current_index_cell,
+                        cells_debug.len(),
+                        contents.cell_count(),
+                        parent_contents.cell_count()
+                    )));
                 }
 
                 if rightmost == page.get().id as u32 || rightmost == parent_page.get().id as u32 {
@@ -2631,7 +2694,11 @@ impl BTreeCursor {
                         parent_page.get().id,
                         rightmost,
                     );
-                    valid = false;
+                    valid = valid.invalidate(PostBalanceNonRootValidation::Invalid(format!("balance_shallower_rightmost_pointer, page_id={}, parent_page_id={}, rightmost={}",
+                        page.get().id,
+                        parent_page.get().id,
+                        rightmost,
+                    )));
                 }
 
                 if let Some(rm) = contents.rightmost_pointer() {
@@ -2640,7 +2707,10 @@ impl BTreeCursor {
                             rm,
                             rightmost,
                         );
-                        valid = false;
+                        valid = valid.invalidate(PostBalanceNonRootValidation::Invalid(format!(
+                            "balance_shallower_rightmost_pointer, page_rightmost={}, rightmost={}",
+                            rm, rightmost,
+                        )));
                     }
                 }
 
@@ -2650,7 +2720,10 @@ impl BTreeCursor {
                             rm,
                             rightmost,
                         );
-                        valid = false;
+                        valid = valid.invalidate(PostBalanceNonRootValidation::Invalid(format!("balance_shallower_rightmost_pointer, parent_rightmost={}, rightmost={}",
+                            rm,
+                            rightmost,
+                        )));
                     }
                 }
 
@@ -2659,7 +2732,11 @@ impl BTreeCursor {
                         page_type,
                         parent_contents.page_type()
                     );
-                    valid = false
+                    valid = valid.invalidate(PostBalanceNonRootValidation::Invalid(format!(
+                        "balance_shallower_parent_page_type, page_type={:?}, parent_page_type={:?}",
+                        page_type,
+                        parent_contents.page_type()
+                    )));
                 }
 
                 for parent_cell_idx in 0..contents.cell_count() {
@@ -2701,7 +2778,10 @@ impl BTreeCursor {
                             page.get().id,
                             parent_cell_idx,
                         );
-                        valid = false;
+                        valid = valid.invalidate(PostBalanceNonRootValidation::Invalid(format!("balance_shallower_cell_not_found_debug, page_id={}, cell_in_cell_array_idx={}",
+                            page.get().id,
+                            parent_cell_idx,
+                        )));
                     }
                 }
             } else if page_idx == sibling_count_new - 1 {
@@ -2715,7 +2795,10 @@ impl BTreeCursor {
                         page.get().id,
                         rightmost
                     );
-                        valid = false;
+                        valid = valid.invalidate(PostBalanceNonRootValidation::Invalid(format!("balance_shallower_cell_divider_right_pointer, page_id={}, rightmost={}",
+                            page.get().id,
+                            rightmost
+                        )));
                     }
                 }
             } else {
@@ -2731,7 +2814,12 @@ impl BTreeCursor {
                         page_idx,
                         parent_contents.overflow_cells.len()
                     );
-                            valid = false;
+                            valid = valid.invalidate(PostBalanceNonRootValidation::Invalid(format!("balance_shallower_cell_divider_left_pointer_overflow, page_id={}, left_pointer={}, divider_cell={}, overflow_cells_parent={}",
+                                page.get().id,
+                                left_pointer,
+                                page_idx,
+                                parent_contents.overflow_cells.len()
+                            )));
                         }
                         was_overflow = true;
                         break;
@@ -2762,7 +2850,12 @@ impl BTreeCursor {
                         page_idx,
                         parent_contents.overflow_cells.len()
                     );
-                    valid = false;
+                    valid = valid.invalidate(PostBalanceNonRootValidation::Invalid(format!("balance_shallower_cell_divider_left_pointer, page_id={}, cell_left_pointer={}, divider_cell={}, overflow_cells_parent={}",
+                        page.get().id,
+                        cell_left_pointer,
+                        page_idx,
+                        parent_contents.overflow_cells.len()
+                    )));
                 }
                 if leaf_data {
                     // If we are in a table leaf page, we just need to check that this cell that should be a divider cell is in the parent
@@ -2819,7 +2912,12 @@ impl BTreeCursor {
                             rowid_parent,
                             rowid
                         );
-                        valid = false;
+                        valid = valid.invalidate(PostBalanceNonRootValidation::Invalid(format!("balance_shallower_cell_divider_rowid, page_id={}, cell_divider_idx={}, rowid_parent={}, rowid={}",
+                            page.get().id,
+                            cell_divider_idx,
+                            rowid_parent,
+                            rowid
+                        )));
                     }
                 } else {
                     // In any other case, we need to check that this cell was moved to parent as divider cell
@@ -2834,7 +2932,12 @@ impl BTreeCursor {
                                     page_idx,
                                     parent_contents.overflow_cells.len()
                                 );
-                                valid = false;
+                                valid = valid.invalidate(PostBalanceNonRootValidation::Invalid(format!("balance_shallower_cell_divider_divider_cell_overflow, page_id={}, left_pointer={}, divider_cell={}, overflow_cells_parent={}",
+                                    page.get().id,
+                                    left_pointer,
+                                    page_idx,
+                                    parent_contents.overflow_cells.len()
+                                )));
                             }
                             was_overflow = true;
                             break;
@@ -2867,7 +2970,12 @@ impl BTreeCursor {
                                     page_idx,
                                     parent_contents.overflow_cells.len()
                                 );
-                        valid = false;
+                        valid = valid.invalidate(PostBalanceNonRootValidation::Invalid(format!("balance_shallower_cell_divider_divider_cell_overflow, page_id={}, left_pointer={}, divider_cell={}, overflow_cells_parent={}",
+                            page.get().id,
+                            left_pointer,
+                            page_idx,
+                            parent_contents.overflow_cells.len()
+                        )));
                     }
                     match page_type {
                         PageType::TableInterior | PageType::IndexInterior => {
@@ -2878,7 +2986,10 @@ impl BTreeCursor {
                                     page.get().id,
                                     cell_divider_idx,
                                 );
-                                valid = false;
+                                valid = valid.invalidate(PostBalanceNonRootValidation::Invalid(format!("balance_shallower_cell_divider_cell, page_id={}, cell_divider_idx={}",
+                                    page.get().id,
+                                    cell_divider_idx,
+                                )));
                             }
                         }
                         PageType::IndexLeaf => {
@@ -2889,7 +3000,10 @@ impl BTreeCursor {
                                     page.get().id,
                                     cell_divider_idx,
                                 );
-                                valid = false;
+                                valid = valid.invalidate(PostBalanceNonRootValidation::Invalid(format!("balance_shallower_cell_divider_cell, page_id={}, cell_divider_idx={}",
+                                    page.get().id,
+                                    cell_divider_idx,
+                                )));
                             }
                         }
                         _ => {
@@ -2900,7 +3014,11 @@ impl BTreeCursor {
                 }
             }
         }
-        assert!(valid, "corrupted database, cells were to balanced properly");
+        assert!(
+            valid == PostBalanceNonRootValidation::Valid,
+            "corrupted database, cells were to balanced properly: {:?}",
+            valid
+        );
     }
 
     /// Balance the root page.
