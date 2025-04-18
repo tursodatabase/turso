@@ -42,7 +42,7 @@ publishing {
     publications {
         create<MavenPublication>("mavenJava") {
             from(components["java"])
-            groupId = "tech.turso"
+            groupId = properties["projectGroup"]!!.toString().replace("\"", "")
             artifactId = "limbo"
             version = properties["projectVersion"]!!.toString()
 
