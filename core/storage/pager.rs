@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::trace;
 
-use super::page_cache::{DumbLruPageCache, PageCacheKey};
+use super::page_cache::{CacheError, DumbLruPageCache, PageCacheKey};
 use super::wal::{CheckpointMode, CheckpointStatus};
 
 pub struct PageInner {
@@ -22,6 +22,7 @@ pub struct PageInner {
     pub id: usize,
 }
 
+#[derive(Debug)]
 pub struct Page {
     pub inner: UnsafeCell<PageInner>,
 }
@@ -213,6 +214,7 @@ impl Pager {
         })
     }
 
+    // FIXME: handle no room in page cache
     pub fn btree_create(&self, flags: &CreateBTreeFlags) -> u32 {
         let page_type = match flags {
             _ if flags.is_table() => PageType::TableLeaf,
@@ -226,6 +228,7 @@ impl Pager {
 
     /// Allocate a new overflow page.
     /// This is done when a cell overflows and new space is needed.
+    // FIXME: handle no room in page cache
     pub fn allocate_overflow_page(&self) -> PageRef {
         let page = self.allocate_page().unwrap();
         tracing::debug!("Pager::allocate_overflow_page(id={})", page.get().id);
@@ -240,6 +243,7 @@ impl Pager {
 
     /// Allocate a new page to the btree via the pager.
     /// This marks the page as dirty and writes the page header.
+    // FIXME: handle no room in page cache
     pub fn do_allocate_page(&self, page_type: PageType, offset: usize) -> PageRef {
         let page = self.allocate_page().unwrap();
         crate::btree_init_page(&page, page_type, offset, self.usable_space() as u16);
@@ -387,6 +391,7 @@ impl Pager {
     }
 
     /// Changes the size of the page cache.
+    // FIXME: handle no room in page cache
     pub fn change_page_cache_size(&self, capacity: usize) {
         let mut page_cache = self.page_cache.write();
         page_cache.resize(capacity);
@@ -631,6 +636,7 @@ impl Pager {
         Gets a new page that increasing the size of the page or uses a free page.
         Currently free list pages are not yet supported.
     */
+    // FIXME: handle no room in page cache
     #[allow(clippy::readonly_write_lock)]
     pub fn allocate_page(&self) -> Result<PageRef> {
         let header = &self.db_header;
@@ -654,21 +660,29 @@ impl Pager {
             }
         }
 
+        // FIXME: should reserve page cache entry before modifying the database
         let page = allocate_page(header.database_size as usize, &self.buffer_pool, 0);
         {
             // setup page and add to cache
             page.set_dirty();
             self.add_dirty(page.get().id);
-            let mut cache = self.page_cache.write();
             let max_frame = match &self.wal {
                 Some(wal) => wal.borrow().get_max_frame(),
                 None => 0,
             };
 
             let page_key = PageCacheKey::new(page.get().id, Some(max_frame));
-            cache.insert(page_key, page.clone());
+            let mut cache = self.page_cache.write();
+            match cache.insert(page_key, page.clone()) {
+                Err(CacheError::Full) => return Err(LimboError::CacheFull),
+                Err(_) => {
+                    return Err(LimboError::InternalError(
+                        "Unknown error inserting page to cache".into(),
+                    ))
+                }
+                Ok(_) => return Ok(page),
+            }
         }
-        Ok(page)
     }
 
     pub fn put_loaded_page(&self, id: usize, page: PageRef) {

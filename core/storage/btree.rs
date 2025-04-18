@@ -2365,6 +2365,7 @@ impl BTreeCursor {
                         balance_info.pages_to_balance[i].set_dirty();
                         pages_to_balance_new.push(balance_info.pages_to_balance[i].clone());
                     } else {
+                        // FIXME: handle page cache is full
                         let page = self.pager.do_allocate_page(page_type, 0);
                         pages_to_balance_new.push(page);
                         // Since this page didn't exist before, we can set it to cells length as it
@@ -3203,6 +3204,7 @@ impl BTreeCursor {
 
         let root = self.stack.top();
         let root_contents = root.get_contents();
+        // FIXME: handle page cache is full
         let child = self.pager.do_allocate_page(root_contents.page_type(), 0);
 
         tracing::debug!(
@@ -5065,6 +5067,7 @@ fn fill_cell_payload(
         }
 
         // we still have bytes to add, we will need to allocate new overflow page
+        // FIXME: handle page cache is full
         let overflow_page = pager.allocate_overflow_page();
         overflow_pages.push(overflow_page.clone());
         {
@@ -5496,6 +5499,7 @@ mod tests {
             Pager::finish_open(db_header, db_file, Some(wal), io, page_cache, buffer_pool).unwrap()
         };
         let pager = Rc::new(pager);
+        // FIXME: handle page cache is full
         let page1 = pager.allocate_page().unwrap();
         btree_init_page(&page1, PageType::TableLeaf, 0, 4096);
         (pager, page1.get().id)
@@ -5984,9 +5988,11 @@ mod tests {
         }
 
         // Allocate two leaf pages
+        // FIXME: handle page cache is full
         let page3 = cursor.pager.allocate_page()?;
         btree_init_page(&page3, PageType::TableLeaf, 0, 512);
 
+        // FIXME: handle page cache is full
         let page4 = cursor.pager.allocate_page()?;
         btree_init_page(&page4, PageType::TableLeaf, 0, 512);
 

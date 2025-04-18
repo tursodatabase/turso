@@ -43,9 +43,12 @@ unsafe impl Sync for DumbLruPageCache {}
 
 #[derive(Debug, PartialEq)]
 pub enum CacheError {
+    InternalError(String),
     Locked,
     Dirty,
     ActiveRefs,
+    Full,
+    KeyExists,
 }
 
 impl PageCacheKey {
@@ -68,12 +71,16 @@ impl DumbLruPageCache {
     }
 
     pub fn insert(&mut self, key: PageCacheKey, value: PageRef) -> Result<(), CacheError> {
-        trace!("cache_insert(key={:?})", key);
-        self._delete(key.clone(), false)?;
-        if self.len() >= self.capacity {
-            // Make room before trying to insert
-            self.pop_if_not_dirty()?;
+        trace!("insert(key={:?})", key);
+        // Check first if page already exists in cache
+        if let Some(existing_page_ref) = self.get(&key) {
+            assert!(
+                Arc::ptr_eq(&value, &existing_page_ref),
+                "Attempted to insert different page with same key"
+            );
+            return Err(CacheError::KeyExists);
         }
+        self.make_room_for(1)?;
         let entry = Box::new(PageCacheEntry {
             key: key.clone(),
             next: None,
@@ -81,7 +88,7 @@ impl DumbLruPageCache {
             page: value,
         });
         let ptr_raw = Box::into_raw(entry);
-        let ptr = unsafe { ptr_raw.as_mut().unwrap().as_non_null() };
+        let ptr = unsafe { NonNull::new_unchecked(ptr_raw) };
         self.touch(ptr);
 
         self.map.borrow_mut().insert(key, ptr);
@@ -213,22 +220,44 @@ impl DumbLruPageCache {
         self.head.borrow_mut().replace(entry);
     }
 
-    fn pop_if_not_dirty(&mut self) -> Result<(), CacheError> {
-        let tail = *self.tail.borrow();
-        if tail.is_none() {
+    pub fn make_room_for(&mut self, n: usize) -> Result<(), CacheError> {
+        if n > self.capacity {
+            return Err(CacheError::Full);
+        }
+
+        let len = self.len();
+        let available = self.capacity.saturating_sub(len);
+        if n <= available && len <= self.capacity {
             return Ok(());
         }
 
-        let mut tail = tail.unwrap();
-        let tail_entry = unsafe { tail.as_mut() };
-        tracing::debug!("pop_if_not_dirty(key={:?})", tail_entry.key);
-        let key = tail_entry.key.clone();
+        let tail = self.tail.borrow().ok_or_else(|| {
+            CacheError::InternalError(format!(
+                "Page cache of len {} expected to have a tail pointer",
+                self.len()
+            ))
+        })?;
 
-        // TODO: drop from another clean entry?
-        self.detach(tail, true)?;
+        // Handle len > capacity, too
+        let available = self.capacity.saturating_sub(len);
+        let x = n.saturating_sub(available);
+        let mut need_to_evict = x.saturating_add(len.saturating_sub(self.capacity));
 
-        assert!(self.map.borrow_mut().remove(&key).is_some());
-        Ok(())
+        let mut current_opt = Some(tail);
+        while need_to_evict > 0 && current_opt.is_some() {
+            let current = current_opt.unwrap();
+            let entry = unsafe { current.as_ref() };
+            current_opt = entry.prev; // Pick prev before modifying entry
+            match self.delete(entry.key.clone()) {
+                Err(_) => {}
+                Ok(_) => need_to_evict -= 1,
+            }
+        }
+
+        match need_to_evict > 0 {
+            true => Err(CacheError::Full),
+            false => Ok(()),
+        }
     }
 
     pub fn clear(&mut self) -> Result<(), CacheError> {
@@ -629,35 +658,30 @@ mod tests {
     }
 
     #[test]
-    fn test_detach_via_insert() {
+    fn test_insert_same_id_different_frame() {
+        let mut cache = DumbLruPageCache::new(5);
+        let key1_1 = PageCacheKey::new(1, Some(1 as u64));
+        let key1_2 = PageCacheKey::new(1, Some(2 as u64));
+        let page1_1 = page_with_content(1);
+        let page1_2 = page_with_content(1);
+
+        assert!(cache.insert(key1_1.clone(), page1_1.clone()).is_ok());
+        assert!(cache.insert(key1_2.clone(), page1_2.clone()).is_ok());
+        assert_eq!(cache.len(), 2);
+        cache.verify_list_integrity();
+    }
+
+    #[test]
+    #[should_panic(expected = "Attempted to insert different page with same key")]
+    fn test_insert_existing_key_fail() {
         let mut cache = DumbLruPageCache::new(5);
         let key1 = create_key(1);
         let page1_v1 = page_with_content(1);
         let page1_v2 = page_with_content(1);
-
         assert!(cache.insert(key1.clone(), page1_v1.clone()).is_ok());
         assert_eq!(cache.len(), 1);
         cache.verify_list_integrity();
-
-        // Fail to insert v2 as v1 is still referenced
-        let result = cache.insert(key1.clone(), page1_v2.clone());
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), CacheError::ActiveRefs);
-        assert_eq!(cache.len(), 1); // Page v1 should remain in cache
-        assert!(page_has_content(&page1_v1));
-
-        drop(page1_v1);
-        assert!(cache.insert(key1.clone(), page1_v2.clone()).is_ok());
-        assert_eq!(cache.len(), 1);
-        assert!(page_has_content(&page1_v2));
-
-        let current_page = cache.get(&key1).unwrap();
-        assert!(
-            Arc::ptr_eq(&current_page, &page1_v2),
-            "Cache should now hold page1 V2"
-        );
-
-        cache.verify_list_integrity();
+        let _ = cache.insert(key1.clone(), page1_v2.clone()); // Panic
     }
 
     #[test]
@@ -806,9 +830,20 @@ mod tests {
                     let key = PageCacheKey::new(id_page as usize, Some(id_frame));
                     #[allow(clippy::arc_with_non_send_sync)]
                     let page = Arc::new(Page::new(id_page as usize));
-                    lru.push(key.clone(), page.clone());
+                    if let Some(_) = cache.get(&key) {
+                        continue; // skip duplicate page ids
+                    }
                     // println!("inserting page {:?}", key);
-                    cache.insert(key.clone(), page); // move page so there's no reference left here
+                    match cache.insert(key.clone(), page.clone()) {
+                        Err(CacheError::Full | CacheError::ActiveRefs) => {} // Ignore
+                        Err(err) => {
+                            // Any other error should fail the test
+                            panic!("Cache insertion failed: {:?}", err);
+                        }
+                        Ok(_) => {
+                            lru.push(key, page);
+                        }
+                    }
                     assert!(cache.len() <= 10);
                 }
                 1 => {
@@ -826,7 +861,7 @@ mod tests {
                     };
                     // println!("removing page {:?}", key);
                     lru.pop(&key);
-                    cache.delete(key);
+                    assert!(cache.delete(key).is_ok());
                 }
                 2 => {
                     // test contents
@@ -839,6 +874,7 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+        assert!(lru.len() > 0); // Check it inserted some
     }
 
     #[test]

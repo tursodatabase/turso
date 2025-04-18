@@ -8,6 +8,8 @@ pub enum LimboError {
     NotADB,
     #[error("Internal error: {0}")]
     InternalError(String),
+    #[error("Page cache is full")]
+    CacheFull,
     #[error("Parse error: {0}")]
     ParseError(String),
     #[error(transparent)]
