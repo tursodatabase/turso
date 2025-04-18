@@ -1,0 +1,66 @@
+name: Publish to Maven Central
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (e.g., 0.1.0)'
+        required: true
+        default: ''
+
+env:
+  working-directory: bindings/java
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up JDK
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '8'
+          cache: 'gradle'
+
+      - name: Update version if manually triggered
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          sed -i "s/projectVersion=.*/projectVersion=${{ github.event.inputs.version }}/" gradle.properties
+          
+      - name: Update version if triggered by release
+        if: github.event_name == 'release'
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          # Remove 'v' prefix if present
+          VERSION="${VERSION#v}"
+          sed -i "s/projectVersion=.*/projectVersion=${VERSION}/" gradle.properties
+
+      - name: Build with Gradle
+        run: |
+          # Build for all supported platforms
+          make macos_x86
+          make macos_arm64
+          make windows
+
+      - name: Publish to Maven Central
+        env:
+          MAVEN_UPLOAD_USERNAME: ${{ secrets.MAVEN_UPLOAD_USERNAME }}
+          MAVEN_UPLOAD_PASSWORD: ${{ secrets.MAVEN_UPLOAD_PASSWORD }}
+          MAVEN_SIGNING_KEY: ${{ secrets.MAVEN_SIGNING_KEY }}
+          MAVEN_SIGNING_PASSPHRASE: ${{ secrets.MAVEN_SIGNING_PASSPHRASE }}
+        run: |
+          ./gradlew publishToMavenCentral

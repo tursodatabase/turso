@@ -12,7 +12,7 @@ To view related works, visit this [issue](https://github.com/tursodatabase/limbo
 
 ### Maven Central (WIP)
 
-The Limbo JDBC driver is available on Maven Central. You can add it to your project using the following dependency:
+The Limbo JDBC driver is available on Maven Central. The library is automatically deployed to Maven Central when a new release is created. You can add it to your project using the following dependency:
 
 #### Maven
 ```xml
