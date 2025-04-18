@@ -1,6 +1,10 @@
 name: Publish to Maven Central
 
 on:
+  push:
+    # TODO: remove this
+    branches:
+      - java-bindings-maven-central  # Allow running on your feature branch
   release:
     types: [created]
   workflow_dispatch:
@@ -45,8 +49,7 @@ jobs:
         if: github.event_name == 'release'
         run: |
           VERSION="${{ github.event.release.tag_name }}"
-          # Remove 'v' prefix if present
-          VERSION="${VERSION#v}"
+          VERSION="${VERSION#v}" # Remove 'v' prefix
           sed -i "s/projectVersion=.*/projectVersion=${VERSION}/" gradle.properties
 
       - name: Build with Gradle
