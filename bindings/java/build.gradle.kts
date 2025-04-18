@@ -8,6 +8,7 @@ plugins {
     application
     `java-library`
     `maven-publish`
+    signing
     id("net.ltgt.errorprone") version "3.1.0"
 
     // If you're stuck on JRE 8, use id 'com.diffplug.spotless' version '6.13.0' or older.
@@ -17,9 +18,24 @@ plugins {
 group = properties["projectGroup"]!!
 version = properties["projectVersion"]!!
 
+signing {
+    val signingKey = System.getenv("MAVEN_SIGNING_KEY")
+    val signingPassword = System.getenv("MAVEN_SIGNING_PASSPHRASE")
+
+    if (signingKey != null && signingPassword != null) {
+        useInMemoryPgpKeys(signingKey, signingPassword)
+        sign(publishing.publications["mavenJava"])
+    } else {
+        logger.warn("Signing key or passphrase not found. Artifact signing is disabled.")
+    }
+}
+
 java {
     sourceCompatibility = JavaVersion.VERSION_1_8
     targetCompatibility = JavaVersion.VERSION_1_8
+
+    withJavadocJar()
+    withSourcesJar()
 }
 
 publishing {
@@ -28,7 +44,48 @@ publishing {
             from(components["java"])
             groupId = "tech.turso"
             artifactId = "limbo"
-            version = "0.0.1-SNAPSHOT"
+            version = properties["projectVersion"]!!.toString()
+
+            pom {
+                name.set("Limbo")
+                description.set("Java bindings for Limbo database")
+                url.set("https://github.com/tursodatabase/limbo")
+
+                licenses {
+                    license {
+                        name.set("MIT License")
+                        url.set("https://opensource.org/licenses/MIT")
+                    }
+                }
+
+                developers {
+                    developer {
+                        id.set("tursodatabase")
+                        name.set("Turso Database Team")
+                        email.set("support@turso.tech")
+                    }
+                }
+
+                scm {
+                    connection.set("scm:git:git://github.com/tursodatabase/limbo.git")
+                    developerConnection.set("scm:git:ssh://github.com:tursodatabase/limbo.git")
+                    url.set("https://github.com/tursodatabase/limbo")
+                }
+            }
+        }
+    }
+
+    repositories {
+        maven {
+            name = "OSSRH"
+            val releasesRepoUrl = "https://s01.oss.sonatype.org/service/local/staging/deploy/maven2/"
+            val snapshotsRepoUrl = "https://s01.oss.sonatype.org/content/repositories/snapshots/"
+            url = uri(if (version.toString().endsWith("SNAPSHOT")) snapshotsRepoUrl else releasesRepoUrl)
+
+            credentials {
+                username = System.getenv("MAVEN_UPLOAD_USERNAME") ?: ""
+                password = System.getenv("MAVEN_UPLOAD_PASSWORD") ?: ""
+            }
         }
     }
 }
@@ -146,4 +203,13 @@ spotless {
         removeUnusedImports()
         googleJavaFormat("1.7") // or use eclipse().configFile("path/to/eclipse-format.xml")
     }
+}
+
+// Task to publish to Maven Central
+tasks.register("publishToMavenCentral") {
+    group = "publishing"
+    description = "Publishes all Maven publications to Maven Central"
+    dependsOn(tasks.withType<PublishToMavenRepository>().matching {
+        it.repository == publishing.repositories.getByName("OSSRH")
+    })
 }

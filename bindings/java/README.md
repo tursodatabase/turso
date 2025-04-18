@@ -10,10 +10,36 @@ To view related works, visit this [issue](https://github.com/tursodatabase/limbo
 
 ## How to use
 
-Currently, we have not published to the maven central. Instead, you can locally build the jar and deploy it to
-maven local to use it.
+### Maven Central (WIP)
+
+The Limbo JDBC driver is available on Maven Central. You can add it to your project using the following dependency:
+
+#### Maven
+```xml
+<dependency>
+    <groupId>tech.turso</groupId>
+    <artifactId>limbo</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+</dependency>
+```
+
+#### Gradle (Kotlin DSL)
+```kotlin
+dependencies {
+    implementation("tech.turso:limbo:0.0.1-SNAPSHOT")
+}
+```
+
+#### Gradle (Groovy DSL)
+```groovy
+dependencies {
+    implementation 'tech.turso:limbo:0.0.1-SNAPSHOT'
+}
+```
 
 ### Build jar and publish to maven local
+
+If you want to build the library locally, you can use the following commands:
 
 ```shell
 $ cd bindings/java 
@@ -23,14 +49,6 @@ $ make macos_x86
 
 # deploy to maven local 
 $ make publish_local
-```
-
-Now you can use the dependency as follows:
-
-```kotlin
-dependencies {
-    implementation("tech.turso:limbo:0.0.1-SNAPSHOT")
-}
 ```
 
 ## Code style
