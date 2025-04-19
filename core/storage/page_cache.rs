@@ -51,6 +51,12 @@ pub enum CacheError {
     KeyExists,
 }
 
+#[derive(Debug, PartialEq)]
+pub enum CacheResizeResult {
+    Done,
+    PendingEvictions,
+}
+
 impl PageCacheKey {
     pub fn new(pgno: usize, max_frame: Option<u64>) -> Self {
         Self { pgno, max_frame }
@@ -136,9 +142,14 @@ impl DumbLruPageCache {
         Some(page)
     }
 
-    pub fn resize(&mut self, capacity: usize) {
-        let _ = capacity;
-        todo!();
+    // To match SQLite behavior, just set capacity and try to shrink as much as possible.
+    // In case of failure, the caller should request further evictions (e.g. after I/O).
+    pub fn resize(&mut self, capacity: usize) -> CacheResizeResult {
+        self.capacity = capacity;
+        match self.make_room_for(0) {
+            Ok(_) => CacheResizeResult::Done,
+            Err(_) => CacheResizeResult::PendingEvictions,
+        }
     }
 
     fn detach(
@@ -922,5 +933,90 @@ mod tests {
             let key = insert_page(&mut cache, i);
             assert_eq!(cache.peek(&key, false).unwrap().get().id, i);
         }
+    }
+
+    #[test]
+    fn test_resize_smaller_success() {
+        let mut cache = DumbLruPageCache::new(5);
+        for i in 1..=5 {
+            let _ = insert_page(&mut cache, i);
+        }
+        assert_eq!(cache.len(), 5);
+        let result = cache.resize(3);
+        assert_eq!(result, CacheResizeResult::Done);
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.capacity, 3);
+        assert!(cache.insert(create_key(6), page_with_content(6)).is_ok());
+    }
+
+    #[test]
+    fn test_resize_larger() {
+        let mut cache = DumbLruPageCache::new(2);
+        let _ = insert_page(&mut cache, 1);
+        let _ = insert_page(&mut cache, 2);
+        assert_eq!(cache.len(), 2);
+        let result = cache.resize(5);
+        assert_eq!(result, CacheResizeResult::Done);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.capacity, 5);
+        assert!(cache.get(&create_key(1)).is_some());
+        assert!(cache.get(&create_key(2)).is_some());
+        for i in 3..=5 {
+            let _ = insert_page(&mut cache, i);
+        }
+        assert_eq!(cache.len(), 5);
+        assert!(cache.insert(create_key(4), page_with_content(4)).is_err());
+        cache.verify_list_integrity();
+    }
+
+    #[test]
+    fn test_resize_with_active_references() {
+        let mut cache = DumbLruPageCache::new(5);
+        let page1 = page_with_content(1);
+        let page2 = page_with_content(2);
+        let page3 = page_with_content(3);
+        assert!(cache.insert(create_key(1), page1.clone()).is_ok());
+        assert!(cache.insert(create_key(2), page2.clone()).is_ok());
+        assert!(cache.insert(create_key(3), page3.clone()).is_ok());
+        assert_eq!(cache.len(), 3);
+        cache.verify_list_integrity();
+        assert_eq!(cache.resize(2), CacheResizeResult::PendingEvictions);
+        assert_eq!(cache.capacity, 2);
+        assert_eq!(cache.len(), 3);
+        drop(page2);
+        drop(page3);
+        assert_eq!(cache.resize(1), CacheResizeResult::Done); // Evicted 2 and 3
+        assert_eq!(cache.len(), 1);
+        assert!(cache.insert(create_key(4), page_with_content(4)).is_err());
+        cache.verify_list_integrity();
+    }
+
+    #[test]
+    fn test_resize_to_zero() {
+        let mut cache = DumbLruPageCache::new(5);
+        for i in 1..=3 {
+            let _ = insert_page(&mut cache, i);
+        }
+        assert_eq!(cache.len(), 3);
+        let result = cache.resize(0);
+        assert_eq!(result, CacheResizeResult::Done); // removed all 3
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.capacity, 0);
+        cache.verify_list_integrity();
+        assert!(cache.insert(create_key(4), page_with_content(4)).is_err());
+    }
+
+    #[test]
+    fn test_resize_same_capacity() {
+        let mut cache = DumbLruPageCache::new(3);
+        for i in 1..=3 {
+            let _ = insert_page(&mut cache, i);
+        }
+        let result = cache.resize(3);
+        assert_eq!(result, CacheResizeResult::Done); // no-op
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.capacity, 3);
+        cache.verify_list_integrity();
+        assert!(cache.insert(create_key(4), page_with_content(4)).is_ok());
     }
 }

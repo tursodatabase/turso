@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::trace;
 
-use super::page_cache::{CacheError, DumbLruPageCache, PageCacheKey};
+use super::page_cache::{CacheError, DumbLruPageCache, PageCacheKey, CacheResizeResult};
 use super::wal::{CheckpointMode, CheckpointStatus};
 
 pub struct PageInner {
@@ -405,10 +405,9 @@ impl Pager {
     }
 
     /// Changes the size of the page cache.
-    // FIXME: handle no room in page cache
-    pub fn change_page_cache_size(&self, capacity: usize) {
+    pub fn change_page_cache_size(&self, capacity: usize) -> Result<CacheResizeResult> {
         let mut page_cache = self.page_cache.write();
-        page_cache.resize(capacity)
+        Ok(page_cache.resize(capacity))
     }
 
     pub fn add_dirty(&self, page_id: usize) {
