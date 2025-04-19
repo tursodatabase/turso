@@ -34,7 +34,7 @@ io-uring = { version = "0.6.1", optional = true }
 
 [target.'cfg(target_family = "unix")'.dependencies]
 polling = "3.7.2"
-rustix = "0.38.34"
+rustix = { version = "0.38.34", features = ["mm", "fs"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 mimalloc = { version = "0.1", default-features = false }
@@ -73,6 +73,13 @@ parking_lot = "0.12.3"
 crossbeam-skiplist = "0.1.3"
 tracing = "0.1.41"
 ryu = "1.0.19"
+crossbeam = "0.8.4" 
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_System_Memory",
+    "Win32_Foundation",
+]}
 
 [build-dependencies]
 chrono = { version = "0.4.38", default-features = false }
