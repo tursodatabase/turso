@@ -2383,10 +2383,11 @@ impl BTreeCursor {
                 for (page, new_id) in pages_to_balance_new.iter().zip(page_numbers) {
                     if new_id != page.get().id {
                         page.get().id = new_id;
-                        self.pager.put_loaded_page(new_id, page.clone());
+                        // FIXME: why would there be another page at this id/frame?
+                        self.pager.put_loaded_page(new_id, page.clone())
+                            .expect("put_loaded_page should not fail here");
                     }
                 }
-
                 #[cfg(debug_assertions)]
                 {
                     tracing::debug!("balance_non_root(parent page_id={})", parent_page.get().id);
