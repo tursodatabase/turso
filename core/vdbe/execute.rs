@@ -4473,11 +4473,11 @@ pub fn op_open_ephemeral(
     let io = conn.pager.io.get_memory_io();
 
     let file = io.open_file("", OpenFlags::Create, true)?;
-    maybe_init_database_file(&file, &(io.clone() as Arc<dyn IO>))?;
+    let buffer_pool = Rc::new(BufferPool::new(io.clone(), 4096));
+    maybe_init_database_file(&file, &(io.clone() as Arc<dyn IO>), buffer_pool.clone())?;
     let db_file = Arc::new(FileMemoryStorage::new(file));
 
     let db_header = Pager::begin_open(db_file.clone())?;
-    let buffer_pool = Rc::new(BufferPool::new(db_header.lock().page_size as usize));
     let page_cache = Arc::new(RwLock::new(DumbLruPageCache::new(10)));
 
     let pager = Rc::new(Pager::finish_open(

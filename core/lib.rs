@@ -53,11 +53,14 @@ use std::{
     num::NonZero,
     ops::Deref,
     rc::Rc,
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    },
 };
-use storage::btree::btree_init_page;
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
+use storage::{btree::btree_init_page, pager::allocate_page};
 pub use storage::{
     buffer_pool::BufferPool,
     database::DatabaseStorage,
@@ -67,7 +70,6 @@ pub use storage::{
 };
 use storage::{
     page_cache::DumbLruPageCache,
-    pager::allocate_page,
     sqlite3_ondisk::{DatabaseHeader, DATABASE_HEADER_SIZE},
 };
 use translate::select::prepare_select_plan;
@@ -76,7 +78,9 @@ pub use types::RefValue;
 use util::{columns_from_create_table_body, parse_schema_rows};
 use vdbe::{builder::QueryMode, VTabOpaqueCursor};
 pub type Result<T, E = LimboError> = std::result::Result<T, E>;
+
 pub static DATABASE_VERSION: OnceLock<String> = OnceLock::new();
+pub const DEFAULT_PAGE_SIZE: usize = 4096;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TransactionState {
@@ -96,6 +100,7 @@ pub struct Database {
     header: Arc<SpinLock<DatabaseHeader>>,
     db_file: Arc<dyn DatabaseStorage>,
     io: Arc<dyn IO>,
+    buffer_pool: Rc<BufferPool>,
     page_size: u16,
     // Shared structures of a Database are the parts that are common to multiple threads that might
     // create DB connections.
@@ -110,9 +115,10 @@ impl Database {
     #[cfg(feature = "fs")]
     pub fn open_file(io: Arc<dyn IO>, path: &str, enable_mvcc: bool) -> Result<Arc<Database>> {
         let file = io.open_file(path, OpenFlags::Create, true)?;
-        maybe_init_database_file(&file, &io)?;
+        let buffer_pool = Rc::new(BufferPool::new(io.clone(), DEFAULT_PAGE_SIZE));
+        maybe_init_database_file(&file, &io, buffer_pool.clone())?;
         let db_file = Arc::new(DatabaseFile::new(file));
-        Self::open(io, path, db_file, enable_mvcc)
+        Self::open(io, path, db_file, buffer_pool.clone(), enable_mvcc)
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -120,6 +126,7 @@ impl Database {
         io: Arc<dyn IO>,
         path: &str,
         db_file: Arc<dyn DatabaseStorage>,
+        buffer_pool: Rc<BufferPool>,
         enable_mvcc: bool,
     ) -> Result<Arc<Database>> {
         let db_header = Pager::begin_open(db_file.clone())?;
@@ -153,6 +160,7 @@ impl Database {
             shared_page_cache: shared_page_cache.clone(),
             shared_wal: shared_wal.clone(),
             db_file,
+            buffer_pool,
             io: io.clone(),
             page_size,
         };
@@ -177,13 +185,11 @@ impl Database {
     }
 
     pub fn connect(self: &Arc<Database>) -> Result<Rc<Connection>> {
-        let buffer_pool = Rc::new(BufferPool::new(self.page_size as usize));
-
         let wal = Rc::new(RefCell::new(WalFile::new(
             self.io.clone(),
             self.page_size as usize,
             self.shared_wal.clone(),
-            buffer_pool.clone(),
+            self.buffer_pool.clone(),
         )));
         let pager = Rc::new(Pager::finish_open(
             self.header.clone(),
@@ -191,7 +197,7 @@ impl Database {
             Some(wal),
             self.io.clone(),
             self.shared_page_cache.clone(),
-            buffer_pool,
+            self.buffer_pool.clone(),
         )?);
         let conn = Rc::new(Connection {
             _db: self.clone(),
@@ -238,15 +244,15 @@ impl Database {
     }
 }
 
-pub fn maybe_init_database_file(file: &Arc<dyn File>, io: &Arc<dyn IO>) -> Result<()> {
+pub fn maybe_init_database_file(
+    file: &Arc<dyn File>,
+    io: &Arc<dyn IO>,
+    pool: Rc<BufferPool>,
+) -> Result<()> {
     if file.size()? == 0 {
         // init db
         let db_header = DatabaseHeader::default();
-        let page1 = allocate_page(
-            1,
-            &Rc::new(BufferPool::new(db_header.page_size as usize)),
-            DATABASE_HEADER_SIZE,
-        );
+        let page1 = allocate_page(1, db_header.page_size.into(), &pool, DATABASE_HEADER_SIZE);
         {
             // Create the sqlite_schema table, for this we just need to create the btree page
             // for the first page of the database which is basically like any other btree page
@@ -262,18 +268,18 @@ pub fn maybe_init_database_file(file: &Arc<dyn File>, io: &Arc<dyn IO>) -> Resul
             let contents = page1.get().contents.as_mut().unwrap();
             contents.write_database_header(&db_header);
             // write the first page to disk synchronously
-            let flag_complete = Rc::new(RefCell::new(false));
+            let flag_complete = Arc::new(AtomicBool::new(false));
             {
                 let flag_complete = flag_complete.clone();
-                let completion = Completion::Write(WriteCompletion::new(Box::new(move |_| {
-                    *flag_complete.borrow_mut() = true;
-                })));
+                let completion = Completion::new_write(move |_| {
+                    flag_complete.store(true, Ordering::SeqCst);
+                });
                 file.pwrite(0, contents.buffer.clone(), completion)?;
             }
             let mut limit = 100;
             loop {
                 io.run_once()?;
-                if *flag_complete.borrow() {
+                if flag_complete.load(Ordering::SeqCst) {
                     break;
                 }
                 limit -= 1;

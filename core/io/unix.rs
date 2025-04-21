@@ -3,6 +3,7 @@ use crate::io::common;
 use crate::Result;
 
 use super::{Completion, File, MemoryIO, OpenFlags, IO};
+use crate::io::clock::{Clock, Instant};
 use polling::{Event, Events, Poller};
 use rustix::{
     fd::{AsFd, AsRawFd},
@@ -18,7 +19,6 @@ use std::{
     sync::Arc,
 };
 use tracing::{debug, trace};
-use crate::io::clock::{Clock, Instant};
 
 struct OwnedCallbacks(UnsafeCell<Callbacks>);
 // We assume we locking on IO level is done by user.
@@ -230,15 +230,14 @@ impl IO for UnixIO {
                     CompletionCallback::Read(ref file, ref c, pos) => {
                         let mut file = file.borrow_mut();
                         let r = c.as_read();
-                        let mut buf = r.buf_mut();
+                        let buf = r.buf.slice_mut();
                         file.seek(std::io::SeekFrom::Start(pos as u64))?;
-                        file.read(buf.as_mut_slice())
+                        file.read(buf)
                     }
                     CompletionCallback::Write(ref file, _, ref buf, pos) => {
                         let mut file = file.borrow_mut();
-                        let buf = buf.borrow();
                         file.seek(std::io::SeekFrom::Start(pos as u64))?;
-                        file.write(buf.as_slice())
+                        file.write(buf.slice())
                     }
                 };
                 match result {
@@ -258,7 +257,7 @@ impl IO for UnixIO {
         getrandom::getrandom(&mut buf).unwrap();
         i64::from_ne_bytes(buf)
     }
-    
+
     fn get_memory_io(&self) -> Arc<MemoryIO> {
         Arc::new(MemoryIO::new())
     }
@@ -269,7 +268,7 @@ enum CompletionCallback {
     Write(
         Arc<RefCell<std::fs::File>>,
         Completion,
-        Arc<RefCell<crate::Buffer>>,
+        Arc<crate::Buffer>,
         usize,
     ),
 }
@@ -327,8 +326,8 @@ impl File for UnixFile<'_> {
         let file = self.file.borrow();
         let result = {
             let r = c.as_read();
-            let mut buf = r.buf_mut();
-            rustix::io::pread(file.as_fd(), buf.as_mut_slice(), pos as u64)
+            let buf = r.buf.slice_mut();
+            rustix::io::pread(file.as_fd(), buf, pos as u64)
         };
         match result {
             Ok(n) => {
@@ -355,12 +354,9 @@ impl File for UnixFile<'_> {
         }
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<crate::Buffer>>, c: Completion) -> Result<()> {
+    fn pwrite(&self, pos: usize, buffer: Arc<crate::Buffer>, c: Completion) -> Result<()> {
         let file = self.file.borrow();
-        let result = {
-            let buf = buffer.borrow();
-            rustix::io::pwrite(file.as_fd(), buf.as_slice(), pos as u64)
-        };
+        let result = { rustix::io::pwrite(file.as_fd(), buffer.slice(), pos as u64) };
         match result {
             Ok(n) => {
                 trace!("pwrite n: {}", n);

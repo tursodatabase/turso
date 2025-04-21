@@ -1,20 +1,13 @@
+use crate::storage::buffer_pool::ArenaBuffer;
 use crate::Result;
 use cfg_block::cfg_block;
-use std::fmt;
-use std::sync::Arc;
-use std::{
-    cell::{Ref, RefCell, RefMut},
-    fmt::Debug,
-    mem::ManuallyDrop,
-    pin::Pin,
-    rc::Rc,
-};
+use std::{cell::UnsafeCell, fmt::Debug, pin::Pin, sync::Arc};
 
 pub trait File: Send + Sync {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
     fn pread(&self, pos: usize, c: Completion) -> Result<()>;
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<Buffer>>, c: Completion) -> Result<()>;
+    fn pwrite(&self, pos: usize, buffer: Arc<Buffer>, c: Completion) -> Result<()>;
     fn sync(&self, c: Completion) -> Result<()>;
     fn size(&self) -> Result<u64>;
 }
@@ -42,9 +35,14 @@ pub trait IO: Clock + Send + Sync {
     fn generate_random_number(&self) -> i64;
 
     fn get_memory_io(&self) -> Arc<MemoryIO>;
+
+    /// IO_URING only. noop for other implementations.
+    fn register_buffer(&self, _arena_id: u32, _iovec: (*const u8, usize)) -> Result<()> {
+        Ok(())
+    }
 }
 
-pub type Complete = dyn Fn(Arc<RefCell<Buffer>>);
+pub type Complete = dyn Fn(Arc<Buffer>);
 pub type WriteComplete = dyn Fn(i32);
 pub type SyncComplete = dyn Fn(i32);
 
@@ -55,7 +53,7 @@ pub enum Completion {
 }
 
 pub struct ReadCompletion {
-    pub buf: Arc<RefCell<Buffer>>,
+    pub buf: Arc<Buffer>,
     pub complete: Box<Complete>,
 }
 
@@ -66,6 +64,18 @@ impl Completion {
             Self::Write(w) => w.complete(result),
             Self::Sync(s) => s.complete(result), // fix
         }
+    }
+    pub fn new_write<F>(complete: F) -> Self
+    where
+        F: Fn(i32) + 'static,
+    {
+        Self::Write(WriteCompletion::new(Box::new(complete)))
+    }
+    pub fn new_read<F>(buf: Arc<Buffer>, complete: F) -> Self
+    where
+        F: Fn(Arc<Buffer>) + 'static,
+    {
+        Self::Read(ReadCompletion::new(buf, Box::new(complete)))
     }
 
     /// only call this method if you are sure that the completion is
@@ -87,16 +97,16 @@ pub struct SyncCompletion {
 }
 
 impl ReadCompletion {
-    pub fn new(buf: Arc<RefCell<Buffer>>, complete: Box<Complete>) -> Self {
+    pub fn new(buf: Arc<Buffer>, complete: Box<Complete>) -> Self {
         Self { buf, complete }
     }
 
-    pub fn buf(&self) -> Ref<'_, Buffer> {
-        self.buf.borrow()
+    pub fn buf(&self) -> Arc<Buffer> {
+        self.buf.clone()
     }
 
-    pub fn buf_mut(&self) -> RefMut<'_, Buffer> {
-        self.buf.borrow_mut()
+    pub fn buf_mut(&self) -> &mut [u8] {
+        self.buf.slice_mut()
     }
 
     pub fn complete(&self) {
@@ -123,63 +133,86 @@ impl SyncCompletion {
         (self.complete)(res);
     }
 }
+type BuffData = Pin<Box<[u8]>>;
 
-pub type BufferData = Pin<Vec<u8>>;
-
-pub type BufferDropFn = Rc<dyn Fn(BufferData)>;
-
-#[derive(Clone)]
-pub struct Buffer {
-    data: ManuallyDrop<BufferData>,
-    drop: BufferDropFn,
-}
-
-impl Debug for Buffer {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self.data)
-    }
+#[derive(Debug)]
+pub enum Buffer {
+    Heap(UnsafeCell<BuffData>),
+    Pooled(UnsafeCell<ArenaBuffer>),
 }
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        let data = unsafe { ManuallyDrop::take(&mut self.data) };
-        (self.drop)(data);
+        if let Self::Pooled(slice) = self {
+            unsafe { &*slice.get() }.mark_free();
+        }
     }
 }
 
 impl Buffer {
-    pub fn allocate(size: usize, drop: BufferDropFn) -> Self {
-        let data = ManuallyDrop::new(Pin::new(vec![0; size]));
-        Self { data, drop }
+    pub fn new_heap(len: usize) -> Arc<Self> {
+        let out = Pin::new(vec![0u8; len].into_boxed_slice());
+        tracing::trace!("new_heap buffer: len: {}", len);
+        Buffer::Heap(UnsafeCell::new(out)).into()
     }
 
-    pub fn new(data: BufferData, drop: BufferDropFn) -> Self {
-        let data = ManuallyDrop::new(data);
-        Self { data, drop }
+    pub fn new_pooled(page: ArenaBuffer) -> Arc<Self> {
+        tracing::trace!("new_pooled: page: {:?}, len: {}", page, page.len());
+        Buffer::Pooled(UnsafeCell::new(page)).into()
     }
 
-    pub fn len(&self) -> usize {
-        self.data.len()
+    pub fn arena_id(&self) -> Option<u32> {
+        match self {
+            Self::Heap(_) => None,
+            Self::Pooled(slice) => Some(unsafe { &*slice.get() }.io_id()),
+        }
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        &self.data
-    }
-
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.data
-    }
-
     pub fn as_ptr(&self) -> *const u8 {
-        self.data.as_ptr()
+        match self {
+            Self::Heap(data) => unsafe { &*data.get() }.as_ptr(),
+            Self::Pooled(slice) => unsafe { &*slice.get() }.as_ptr(),
+        }
     }
 
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.data.as_mut_ptr()
+        match self {
+            Self::Heap(data) => unsafe { &mut *data.get() }.as_mut_ptr(),
+            Self::Pooled(slice) => unsafe { &mut *slice.get() }.as_mut_ptr(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Heap(data) => unsafe { &*data.get() }.len(),
+            Self::Pooled(slice) => unsafe { &*slice.get() }.len(),
+        }
+    }
+
+    #[inline]
+    pub fn slice(&self) -> &[u8] {
+        unsafe {
+            match self {
+                Self::Heap(b) => &(*b.get()),
+                Self::Pooled(s) => &(*s.get())[..(*s.get()).len()],
+            }
+        }
+    }
+
+    /// Mutable view – caller must guarantee exclusivity!
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    pub fn slice_mut(&self) -> &mut [u8] {
+        match self {
+            Self::Heap(b) => unsafe { &mut (*b.get()) },
+            Self::Pooled(s) => unsafe { &mut (*s.get())[..(*s.get()).len()] },
+        }
+    }
+
+    /// Deep copy of underyling data. avoid using this if possible.
+    pub fn deep_clone(&self) -> Self {
+        let mut out = Pin::new(vec![0u8; self.len()].into_boxed_slice());
+        out.as_mut().copy_from_slice(self.slice());
+        Buffer::Heap(UnsafeCell::new(out))
     }
 }
 

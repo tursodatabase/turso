@@ -4,7 +4,7 @@ use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::sqlite3_ondisk::{self, DatabaseHeader, PageContent, PageType};
 use crate::storage::wal::{CheckpointResult, Wal};
-use crate::{Buffer, LimboError, Result};
+use crate::{LimboError, Result};
 use parking_lot::RwLock;
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashSet;
@@ -654,7 +654,12 @@ impl Pager {
             }
         }
 
-        let page = allocate_page(header.database_size as usize, &self.buffer_pool, 0);
+        let page = allocate_page(
+            header.database_size as usize,
+            header.page_size.into(),
+            &self.buffer_pool,
+            0,
+        );
         {
             // setup page and add to cache
             page.set_dirty();
@@ -689,18 +694,16 @@ impl Pager {
     }
 }
 
-pub fn allocate_page(page_id: usize, buffer_pool: &Rc<BufferPool>, offset: usize) -> PageRef {
+pub fn allocate_page(
+    page_id: usize,
+    size: usize,
+    buffer_pool: &Rc<BufferPool>,
+    offset: usize,
+) -> PageRef {
     let page = Arc::new(Page::new(page_id));
-    {
-        let buffer = buffer_pool.get();
-        let bp = buffer_pool.clone();
-        let drop_fn = Rc::new(move |buf| {
-            bp.put(buf);
-        });
-        let buffer = Arc::new(RefCell::new(Buffer::new(buffer, drop_fn)));
-        page.set_loaded();
-        page.get().contents = Some(PageContent::new(offset, buffer));
-    }
+    let buffer = buffer_pool.get_page(Some(size));
+    page.set_loaded();
+    page.get().contents = Some(PageContent::new(offset, buffer));
     page
 }
 

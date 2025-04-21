@@ -3904,7 +3904,7 @@ impl BTreeCursor {
             OwnedValue::Integer(i) => i,
             _ => unreachable!("btree tables are indexed by integers!"),
         };
-        let _ = return_if_io!(self.move_to(SeekKey::TableRowId(*int_key as u64), SeekOp::EQ));
+        return_if_io!(self.move_to(SeekKey::TableRowId(*int_key as u64), SeekOp::EQ));
         let page = self.stack.top();
         // TODO(pere): request load
         return_if_locked!(page);
@@ -4253,7 +4253,7 @@ impl BTreeCursor {
     ) -> Result<CursorResult<()>> {
         return_if_locked!(page_ref);
         let buf = page_ref.get().contents.as_mut().unwrap().as_ptr();
-        buf[dest_offset..dest_offset + new_payload.len()].copy_from_slice(&new_payload);
+        buf[dest_offset..dest_offset + new_payload.len()].copy_from_slice(new_payload);
 
         Ok(CursorResult::Ok(()))
     }
@@ -5253,7 +5253,6 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::{
-        io::BufferData,
         storage::{
             btree::{
                 compute_free_space, fill_cell_payload, payload_overflow_threshold_max,
@@ -5272,16 +5271,8 @@ mod tests {
     fn get_page(id: usize) -> PageRef {
         let page = Arc::new(Page::new(id));
 
-        let drop_fn = Rc::new(|_| {});
-        let inner = PageContent::new(
-            0,
-            Arc::new(RefCell::new(Buffer::new(
-                BufferData::new(vec![0; 4096]),
-                drop_fn,
-            ))),
-        );
+        let inner = PageContent::new(0, Buffer::new_heap(4096));
         page.get().contents.replace(inner);
-
         btree_init_page(&page, PageType::TableLeaf, 0, 4096);
         page
     }
@@ -5550,7 +5541,7 @@ mod tests {
         let io_file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
         let db_file = Arc::new(DatabaseFile::new(io_file));
 
-        let buffer_pool = Rc::new(BufferPool::new(db_header.page_size as usize));
+        let buffer_pool = Rc::new(BufferPool::new(io.clone(), db_header.page_size as usize));
         let wal_shared = WalFileShared::open_shared(&io, "test.wal", db_header.page_size).unwrap();
         let wal_file = WalFile::new(io.clone(), page_size, wal_shared, buffer_pool.clone());
         let wal = Rc::new(RefCell::new(wal_file));
@@ -5838,24 +5829,15 @@ mod tests {
         db_header.database_size = database_size;
         let db_header = Arc::new(SpinLock::new(db_header));
 
-        let buffer_pool = Rc::new(BufferPool::new(10));
-
-        // Initialize buffer pool with correctly sized buffers
-        for _ in 0..10 {
-            let vec = vec![0; page_size as usize]; // Initialize with correct length, not just capacity
-            buffer_pool.put(Pin::new(vec));
-        }
-
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let buffer_pool = Rc::new(BufferPool::new(io.clone(), page_size.into()));
+
         let db_file = Arc::new(DatabaseFile::new(
             io.open_file("test.db", OpenFlags::Create, false).unwrap(),
         ));
-
-        let drop_fn = Rc::new(|_buf| {});
-        let buf = Arc::new(RefCell::new(Buffer::allocate(page_size as usize, drop_fn)));
+        let buf = buffer_pool.get_page(Some(page_size as usize));
         {
-            let mut buf_mut = buf.borrow_mut();
-            let buf_slice = buf_mut.as_mut_slice();
+            let buf_slice = buf.slice_mut();
             sqlite3_ondisk::write_header_to_buf(buf_slice, &db_header.lock());
         }
 
@@ -5903,14 +5885,10 @@ mod tests {
         // Setup overflow pages (2, 3, 4) with linking
         let mut current_page = 2u32;
         while current_page <= 4 {
-            let drop_fn = Rc::new(|_buf| {});
             #[allow(clippy::arc_with_non_send_sync)]
-            let buf = Arc::new(RefCell::new(Buffer::allocate(
-                db_header.lock().page_size as usize,
-                drop_fn,
-            )));
+            let buf = Buffer::new_heap(db_header.lock().page_size as usize);
             let write_complete = Box::new(|_| {});
-            let c = Completion::Write(WriteCompletion::new(write_complete));
+            let c = Completion::new_write(write_complete);
             pager
                 .db_file
                 .write_page(current_page as usize, buf.clone(), c)?;

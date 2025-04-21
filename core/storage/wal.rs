@@ -12,8 +12,7 @@ use crate::result::LimboResult;
 use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_write_wal_frame, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
 };
-use crate::{Buffer, LimboError, Result};
-use crate::{Completion, Page};
+use crate::{Completion, LimboError, Page, Result};
 
 use self::sqlite3_ondisk::{checksum_wal, PageContent, WAL_MAGIC_BE, WAL_MAGIC_LE};
 
@@ -430,6 +429,7 @@ impl Wal for WalFile {
         page.set_locked();
         begin_read_wal_frame(
             &self.get_shared().file,
+            self.page_size,
             offset + WAL_FRAME_HEADER_SIZE,
             buffer_pool,
             page,
@@ -693,17 +693,9 @@ impl WalFile {
         buffer_pool: Rc<BufferPool>,
     ) -> Self {
         let checkpoint_page = Arc::new(Page::new(0));
-        let buffer = buffer_pool.get();
-        {
-            let buffer_pool = buffer_pool.clone();
-            let drop_fn = Rc::new(move |buf| {
-                buffer_pool.put(buf);
-            });
-            checkpoint_page.get().contents = Some(PageContent::new(
-                0,
-                Arc::new(RefCell::new(Buffer::new(buffer, drop_fn))),
-            ));
-        }
+        let buffer = buffer_pool.get_page(Some(page_size + WAL_FRAME_HEADER_SIZE));
+        let buffer_pool = buffer_pool.clone();
+        checkpoint_page.get().contents = Some(PageContent::new(0, buffer));
         Self {
             io,
             shared,

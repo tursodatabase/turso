@@ -30,7 +30,7 @@ testvfs = ["limbo_ext_tests/static"]
 fuzz = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
-io-uring = { version = "0.6.1", optional = true }
+io-uring = { version = "0.7.4", optional = true }
 
 [target.'cfg(target_family = "unix")'.dependencies]
 polling = "3.7.2"

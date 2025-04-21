@@ -3,7 +3,7 @@ use crate::Result;
 
 use crate::io::clock::Instant;
 use std::{
-    cell::{Cell, RefCell, UnsafeCell},
+    cell::{Cell, UnsafeCell},
     collections::BTreeMap,
     sync::Arc,
 };
@@ -81,7 +81,7 @@ impl File for MemoryFile {
 
     fn pread(&self, pos: usize, c: Completion) -> Result<()> {
         let r = c.as_read();
-        let buf_len = r.buf().len();
+        let buf_len = r.buf.len();
         if buf_len == 0 {
             c.complete(0);
             return Ok(());
@@ -95,7 +95,7 @@ impl File for MemoryFile {
 
         let read_len = buf_len.min(file_size - pos);
         {
-            let mut read_buf = r.buf_mut();
+            let read_buf = r.buf.slice_mut();
             let mut offset = pos;
             let mut remaining = read_len;
             let mut buf_offset = 0;
@@ -105,10 +105,10 @@ impl File for MemoryFile {
                 let page_offset = offset % PAGE_SIZE;
                 let bytes_to_read = remaining.min(PAGE_SIZE - page_offset);
                 if let Some(page) = self.get_page(page_no) {
-                    read_buf.as_mut_slice()[buf_offset..buf_offset + bytes_to_read]
+                    read_buf[buf_offset..buf_offset + bytes_to_read]
                         .copy_from_slice(&page[page_offset..page_offset + bytes_to_read]);
                 } else {
-                    read_buf.as_mut_slice()[buf_offset..buf_offset + bytes_to_read].fill(0);
+                    read_buf[buf_offset..buf_offset + bytes_to_read].fill(0);
                 }
 
                 offset += bytes_to_read;
@@ -120,9 +120,8 @@ impl File for MemoryFile {
         Ok(())
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<Buffer>>, c: Completion) -> Result<()> {
-        let buf = buffer.borrow();
-        let buf_len = buf.len();
+    fn pwrite(&self, pos: usize, buffer: Arc<Buffer>, c: Completion) -> Result<()> {
+        let buf_len = buffer.len();
         if buf_len == 0 {
             c.complete(0);
             return Ok(());
@@ -131,7 +130,7 @@ impl File for MemoryFile {
         let mut offset = pos;
         let mut remaining = buf_len;
         let mut buf_offset = 0;
-        let data = &buf.as_slice();
+        let data = &buffer.slice();
 
         while remaining > 0 {
             let page_no = offset / PAGE_SIZE;
