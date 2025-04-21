@@ -13,7 +13,7 @@ use crate::vdbe::{Register, VTabOpaqueCursor};
 use crate::Result;
 use std::fmt::Display;
 
-const MAX_REAL_SIZE: u8 = 15;
+pub const MAX_REAL_SIZE: u8 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OwnedValueType {
