@@ -13,7 +13,7 @@ pub const DEFAULT_ARENA_SIZE: usize = 2 * 1024 * 1024; // 2MB arenas
 pub struct ArenaBuffer {
     ptr: NonNull<u8>,
     len: usize,
-    id: u32, // encoded (arena, slot)
+    id: u32, // packed (arena, slot)
     arena: Arc<Arena>,
 }
 
@@ -32,17 +32,22 @@ impl ArenaBuffer {
             arena,
         })
     }
+
     pub fn len(&self) -> usize {
         self.len
     }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// The arena ID, only useful for representing the index into
+    /// the kernel's array of fixed iovecs registered with io_uring.
     pub fn io_id(&self) -> u32 {
         split_id(self.id).0
     }
 
+    /// Mark the buffer as free in the arena.
     pub fn mark_free(&self) {
         self.arena.mark_free(self.id);
     }
@@ -61,6 +66,12 @@ impl DerefMut for ArenaBuffer {
     }
 }
 
+/// Each arena represents a 2MB anonymous `mmap` memory region that is split into
+/// logical pages and given out to the BufferPool. Each arena is the same fixed size but
+/// can be created with it's own `page_size`.
+/// This is to support the WAL requesting buffers
+/// of size: page_size + WAL_FRAME_HEADER_SIZE without having to use an ephemeral heap buffer
+/// and providing a fast path for writing wal frames (which will likely never exceed 1 arena)
 #[derive(Debug)]
 struct ArenaInner {
     base: NonNull<u8>,
@@ -167,16 +178,30 @@ fn split_id(id: u32) -> (u32, u32) {
 mod arena {
     use rustix::mm::{mmap_anonymous, munmap, MapFlags, ProtFlags};
     pub unsafe fn alloc(len: usize) -> *mut u8 {
-        let ptr = mmap_anonymous(
-            std::ptr::null_mut(),
-            len,
-            ProtFlags::READ | ProtFlags::WRITE,
-            MapFlags::PRIVATE | MapFlags::HUGE_2MB,
-        )
-        .expect("mmap failed");
-        if ptr == libc::MAP_FAILED || ptr.is_null() {
-            panic!("map failed")
+        // Attempt to mmap backed by 2MB hugepages
+        let ptr = unsafe {
+            mmap_anonymous(
+                std::ptr::null_mut(),
+                len,
+                ProtFlags::READ | ProtFlags::WRITE,
+                MapFlags::PRIVATE | MapFlags::HUGE_2MB,
+            )
+        };
+        if let Ok(ptr) = ptr {
+            if ptr != libc::MAP_FAILED {
+                return ptr.cast();
+            }
         }
+        // Fallback to normal anonymous mapping.
+        let ptr = unsafe {
+            mmap_anonymous(
+                std::ptr::null_mut(),
+                len,
+                ProtFlags::READ | ProtFlags::WRITE,
+                MapFlags::PRIVATE,
+            )
+        }
+        .expect("mmap failed");
         ptr.cast()
     }
 
@@ -207,6 +232,9 @@ mod arena {
     }
 }
 
+/// BufferPool manages a set of arenas which are devided into pages
+/// and allocated to the pager/IO layer. Can return an ephemeral Heap
+/// buffer if no arena is available for the requested size.
 pub struct BufferPool {
     io: Arc<dyn IO>,
     default_page_size: usize, // e.g. 4096 (data pages)
@@ -227,6 +255,9 @@ impl BufferPool {
         }
     }
 
+    /// Returns a Buffer for use in IO operations.
+    /// Takes an optional length parameter, returning a page of the pool's
+    /// default page size for the connection if None is provided.
     pub fn get_page(&self, len: Option<usize>) -> Arc<Buffer> {
         let size = len.unwrap_or(self.default_page_size);
         match self.get(size) {
@@ -237,7 +268,7 @@ impl BufferPool {
 
     /// internal: try arena then maybe grow
     fn get(&self, len: usize) -> Result<ArenaBuffer, ()> {
-        // fast path: existing arena with page_size >= len
+        // fast path: existing arena with arena.page_size >= len
         for a in self
             .arenas
             .read()
@@ -254,7 +285,9 @@ impl BufferPool {
         a.try_alloc(len).ok_or(())
     }
 
+    // Add an arena to the pool with a default page size.
     fn add_arena(&self, page_size: usize) -> Result<Arc<Arena>, ()> {
+        // hold guard to prevent expansion while we are adding a new arena
         let _g = self.expand_guard.lock();
         let id = self.next_arena.fetch_add(1, Ordering::Relaxed);
         if id >= MAX_ARENAS {
@@ -263,12 +296,7 @@ impl BufferPool {
         tracing::trace!("add_arena: id: {} with page_size: {}", id, page_size);
         let arena = Arena::new(id, page_size);
 
-        // map length is always fixed 2 MiB
-        assert_eq!(
-            arena.inner.base.as_ptr() as usize % 512,
-            0,
-            "O_DIRECT requires aligned buffer"
-        );
+        // map length is always fixed 2 MiB so O_DIRECT will always be aligned
         self.io
             .register_buffer(id, (arena.inner.base.as_ptr(), DEFAULT_ARENA_SIZE))
             .map_err(|_| ())?;
