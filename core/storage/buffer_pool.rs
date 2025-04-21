@@ -177,31 +177,41 @@ fn split_id(id: u32) -> (u32, u32) {
 #[cfg(unix)]
 mod arena {
     use rustix::mm::{mmap_anonymous, munmap, MapFlags, ProtFlags};
+    /// On Linux we first try a 2 MiB hugetlb mapping and fall back
+    /// to a normal mapping if that fails or if huge pages are
+    /// unavailable.
     pub unsafe fn alloc(len: usize) -> *mut u8 {
-        // Attempt to mmap backed by 2MB hugepages
-        let ptr = unsafe {
-            mmap_anonymous(
+        #[cfg(target_os = "linux")]
+        {
+            // try explicit 2 MiB hugetlb page
+            if let Ok(ptr) = mmap_anonymous(
                 std::ptr::null_mut(),
                 len,
                 ProtFlags::READ | ProtFlags::WRITE,
-                MapFlags::PRIVATE | MapFlags::HUGE_2MB,
-            )
-        };
-        if let Ok(ptr) = ptr {
-            if ptr != libc::MAP_FAILED {
-                return ptr.cast();
+                MapFlags::PRIVATE | MapFlags::HUGETLB | MapFlags::HUGE_2MB,
+            ) {
+                // check for MAP_FAILED
+                if ptr != !0 as *mut std::ffi::c_void {
+                    return ptr.cast();
+                }
             }
         }
-        // Fallback to normal anonymous mapping.
-        let ptr = unsafe {
-            mmap_anonymous(
-                std::ptr::null_mut(),
-                len,
-                ProtFlags::READ | ProtFlags::WRITE,
-                MapFlags::PRIVATE,
-            )
-        }
+
+        // Darwin and fallback: normal anonymous mapping
+        let ptr = mmap_anonymous(
+            std::ptr::null_mut(),
+            len,
+            ProtFlags::READ | ProtFlags::WRITE,
+            MapFlags::PRIVATE,
+        )
         .expect("mmap failed");
+
+        #[cfg(target_os = "linux")]
+        {
+            // Advise kernel to use transparent hugepages for this mapping since hugetlb is not available.
+            // This is advise only so errors aren’t fatal, we can ignore ENOSYS / EINVAL / ENOMEM.
+            let _ = rustix::mm::madvise(ptr, len, rustix::mm::Advice::LinuxHugepage);
+        }
         ptr.cast()
     }
 
