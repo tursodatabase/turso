@@ -18,7 +18,7 @@ use clap::Parser;
 use rustyline::{error::ReadlineError, history::DefaultHistory, Editor};
 use std::{
     fmt,
-    io::{self, BufRead as _, Write},
+    io::{self, BufRead as _, IsTerminal, Write},
     path::PathBuf,
     rc::Rc,
     sync::{
@@ -840,7 +840,10 @@ impl Limbo {
                     false,
                 )
             } else {
-                (tracing_appender::non_blocking(std::io::stderr()), true)
+                (
+                    tracing_appender::non_blocking(std::io::stderr()),
+                    IsTerminal::is_terminal(&std::io::stderr()),
+                )
             };
         if let Err(e) = tracing_subscriber::registry()
             .with(
