@@ -306,6 +306,14 @@ pub struct Connection {
     syms: RefCell<SymbolTable>,
 }
 
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if let Err(e) = self.close() {
+            tracing::error!("Error closing connection: {}", e);
+        }
+    }
+}
+
 impl Connection {
     pub fn prepare(self: &Rc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         let sql = sql.as_ref();
