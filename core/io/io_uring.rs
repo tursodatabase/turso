@@ -60,6 +60,7 @@ impl UringIO {
         let ring = match io_uring::IoUring::builder()
             .setup_sqpoll(SQPOLL_IDLE)
             .setup_single_issuer()
+            .setup_coop_taskrun()
             .build(ENTRIES)
         {
             Ok(ring) => ring,
@@ -120,6 +121,10 @@ impl WrappedIOUring {
                 .expect("submission queue is full");
         }
         self.pending_ops += 1;
+        if self.pending_ops % 3 == 0 {
+            // submit every 16 entries
+            self.ring.submit().expect("submit failed");
+        }
     }
 
     fn wait_for_completion(&mut self) -> Result<()> {
