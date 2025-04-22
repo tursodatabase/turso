@@ -149,14 +149,13 @@ impl ArenaInner {
 
 impl Drop for ArenaInner {
     fn drop(&mut self) {
-        if cfg!(debug_assertions) || self.page_count as usize != self.freelist.len() {
-            eprintln!(
-                "buffer pool leak: {}/{} pages still in use when Arena dropped",
-                self.freelist.len(),
-                self.page_count
-            );
-            std::process::exit(1);
-        }
+        assert_eq!(
+            self.page_count as usize,
+            self.freelist.len(),
+            "buffer pool leak: {}/{} pages still in use when Arena dropped",
+            self.freelist.len(),
+            self.page_count
+        );
         unsafe { arena::dealloc(self.base.as_ptr(), DEFAULT_ARENA_SIZE) };
     }
 }
