@@ -122,7 +122,7 @@ impl WrappedIOUring {
         }
         self.pending_ops += 1;
         if self.pending_ops % 3 == 0 {
-            // submit every 16 entries
+            // periodically submit to avoid filling up the submission queue
             self.ring.submit().expect("submit failed");
         }
     }
@@ -131,6 +131,7 @@ impl WrappedIOUring {
         self.ring.submit_and_wait(1)?;
         Ok(())
     }
+
     fn get_completion(&mut self) -> Option<io_uring::cqueue::Entry> {
         // NOTE: This works because CompletionQueue's next function pops the head of the queue. This is not normal behaviour of iterators
         let entry = self.ring.completion().next();
