@@ -15,6 +15,8 @@ use crate::{
     },
     types::compare_immutable,
 };
+use std::future::Future;
+use std::pin::Pin;
 use std::{borrow::BorrowMut, rc::Rc, sync::Arc};
 
 use crate::{pseudo::PseudoCursor, result::LimboResult};
@@ -71,7 +73,7 @@ use crate::{
     json::jsonb_patch, json::jsonb_remove, json::jsonb_replace, json::jsonb_set,
 };
 
-use super::{get_new_rowid, make_record, Program, ProgramState, Register};
+use super::{get_new_rowid, make_record, BranchOffset, Program, ProgramState, Register};
 use crate::{
     bail_constraint_error, must_be_btree_cursor, resolve_ext_path, MvStore, Pager, Result,
     DATABASE_VERSION,
@@ -1469,20 +1471,32 @@ pub fn op_next(
         unreachable!("unexpected Insn {:?}", insn)
     };
     assert!(pc_if_next.is_offset());
-    let is_empty = {
-        let mut cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Next");
-        let cursor = cursor.as_btree_mut();
-        cursor.set_null_flag(false);
-        return_if_io!(cursor.next());
+    let state_ptr = state as *mut ProgramState;
+    let mut cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Next");
+    let cursor = cursor.as_btree_mut();
+    let cursor_static = cursor as *mut BTreeCursor;
+    cursor.set_null_flag(false);
+    let func = Box::pin(op_next_async(state_ptr, cursor, *pc_if_next));
+    (unsafe { &mut *state_ptr }).func = Some((cursor_static, func));
 
-        cursor.is_empty()
-    };
-    if !is_empty {
-        state.pc = pc_if_next.to_offset_int();
-    } else {
-        state.pc += 1;
-    }
     Ok(InsnFunctionStepResult::Step)
+}
+
+async fn op_next_async(
+    state: *mut ProgramState,
+    cursor: *mut BTreeCursor,
+    pc_if_next: BranchOffset,
+) -> Result<CursorResult<()>> {
+    unsafe {
+        (&mut *cursor).next_async().await;
+        let is_empty = { (&mut *cursor).is_empty() };
+        if !is_empty {
+            (*state).pc = pc_if_next.to_offset_int();
+        } else {
+            (*state).pc += 1;
+        }
+    }
+    Ok(CursorResult::Ok(()))
 }
 
 pub fn op_prev(

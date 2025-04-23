@@ -25,6 +25,7 @@ use std::collections::HashSet;
 use std::{
     cell::{Cell, Ref, RefCell},
     cmp::Ordering,
+    future::Future,
     pin::Pin,
     rc::Rc,
 };
@@ -206,6 +207,29 @@ enum ReadPayloadOverflow {
         remaining_to_read: usize,
         page: PageRef,
     },
+}
+
+struct LoadPageFuture {
+    page: PageRef,
+    pager: Rc<Pager>,
+}
+
+impl Future for LoadPageFuture {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if self.page.is_locked() {
+            std::task::Poll::Pending
+        } else if !self.page.is_loaded() {
+            self.pager.load_page(self.page.clone());
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -758,6 +782,249 @@ impl BTreeCursor {
                 self.pager.load_page(mem_page_rc.clone())?;
                 return Ok(CursorResult::IO);
             }
+            let mem_page = mem_page_rc.get();
+
+            let contents = mem_page.contents.as_ref().unwrap();
+
+            if cell_idx == contents.cell_count() {
+                // do rightmost
+                let has_parent = self.stack.has_parent();
+                match contents.rightmost_pointer() {
+                    Some(right_most_pointer) => {
+                        self.stack.advance();
+                        let mem_page = self.pager.read_page(right_most_pointer as usize)?;
+                        self.stack.push(mem_page);
+                        continue;
+                    }
+                    None => {
+                        if has_parent {
+                            tracing::trace!("moving simple upwards");
+                            self.going_upwards = true;
+                            self.stack.pop();
+                            continue;
+                        } else {
+                            return Ok(CursorResult::Ok(None));
+                        }
+                    }
+                }
+            }
+
+            if cell_idx > contents.cell_count() {
+                // end
+                let has_parent = self.stack.current() > 0;
+                if has_parent {
+                    tracing::debug!("moving upwards");
+                    self.going_upwards = true;
+                    self.stack.pop();
+                    continue;
+                } else {
+                    return Ok(CursorResult::Ok(None));
+                }
+            }
+            assert!(cell_idx < contents.cell_count());
+
+            let cell = contents.cell_get(
+                cell_idx,
+                payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
+                payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
+                self.usable_space(),
+            )?;
+            match &cell {
+                BTreeCell::TableInteriorCell(TableInteriorCell {
+                    _left_child_page,
+                    _rowid,
+                }) => {
+                    assert!(predicate.is_none());
+                    self.stack.advance();
+                    let mem_page = self.pager.read_page(*_left_child_page as usize)?;
+                    self.stack.push(mem_page);
+                    continue;
+                }
+                BTreeCell::TableLeafCell(TableLeafCell {
+                    _rowid,
+                    _payload,
+                    payload_size,
+                    first_overflow_page,
+                }) => {
+                    assert!(predicate.is_none());
+                    if let Some(next_page) = first_overflow_page {
+                        return_if_io!(self.process_overflow_read(
+                            _payload,
+                            *next_page,
+                            *payload_size
+                        ))
+                    } else {
+                        crate::storage::sqlite3_ondisk::read_record(
+                            _payload,
+                            self.get_immutable_record_or_create().as_mut().unwrap(),
+                        )?
+                    };
+                    self.stack.advance();
+                    return Ok(CursorResult::Ok(Some(*_rowid)));
+                }
+                BTreeCell::IndexInteriorCell(IndexInteriorCell {
+                    payload,
+                    left_child_page,
+                    first_overflow_page,
+                    payload_size,
+                }) => {
+                    if !self.going_upwards {
+                        let mem_page = self.pager.read_page(*left_child_page as usize)?;
+                        self.stack.push(mem_page);
+                        continue;
+                    }
+                    if let Some(next_page) = first_overflow_page {
+                        return_if_io!(self.process_overflow_read(
+                            payload,
+                            *next_page,
+                            *payload_size
+                        ))
+                    } else {
+                        crate::storage::sqlite3_ondisk::read_record(
+                            payload,
+                            self.get_immutable_record_or_create().as_mut().unwrap(),
+                        )?
+                    };
+
+                    self.going_upwards = false;
+                    self.stack.advance();
+                    if predicate.is_none() {
+                        let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
+                        {
+                            Some(RefValue::Integer(rowid)) => *rowid as u64,
+                            _ => unreachable!("index cells should have an integer rowid"),
+                        };
+                        return Ok(CursorResult::Ok(Some(rowid)));
+                    }
+
+                    let (key, op) = predicate.as_ref().unwrap();
+                    let SeekKey::IndexKey(index_key) = key else {
+                        unreachable!("index seek key should be a record");
+                    };
+                    let order = {
+                        let record = self.get_immutable_record();
+                        let record = record.as_ref().unwrap();
+                        let record_slice_same_num_cols =
+                            &record.get_values()[..index_key.get_values().len()];
+                        let order = compare_immutable(
+                            record_slice_same_num_cols,
+                            index_key.get_values(),
+                            self.index_key_sort_order,
+                        );
+                        order
+                    };
+                    let found = match op {
+                        SeekOp::GT => order.is_gt(),
+                        SeekOp::GE => order.is_ge(),
+                        SeekOp::EQ => order.is_eq(),
+                        _ => unreachable!("Seek LE/LT should not happen in get_next_record() because we are iterating forwards"),
+                    };
+                    if found {
+                        let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
+                        {
+                            Some(RefValue::Integer(rowid)) => *rowid as u64,
+                            _ => unreachable!("index cells should have an integer rowid"),
+                        };
+                        return Ok(CursorResult::Ok(Some(rowid)));
+                    } else {
+                        continue;
+                    }
+                }
+                BTreeCell::IndexLeafCell(IndexLeafCell {
+                    payload,
+                    first_overflow_page,
+                    payload_size,
+                }) => {
+                    if let Some(next_page) = first_overflow_page {
+                        return_if_io!(self.process_overflow_read(
+                            payload,
+                            *next_page,
+                            *payload_size
+                        ))
+                    } else {
+                        crate::storage::sqlite3_ondisk::read_record(
+                            payload,
+                            self.get_immutable_record_or_create().as_mut().unwrap(),
+                        )?
+                    };
+
+                    self.stack.advance();
+                    if predicate.is_none() {
+                        let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
+                        {
+                            Some(RefValue::Integer(rowid)) => *rowid as u64,
+                            _ => unreachable!("index cells should have an integer rowid"),
+                        };
+                        return Ok(CursorResult::Ok(Some(rowid)));
+                    }
+                    let (key, op) = predicate.as_ref().unwrap();
+                    let SeekKey::IndexKey(index_key) = key else {
+                        unreachable!("index seek key should be a record");
+                    };
+                    let order = {
+                        let record = self.get_immutable_record();
+                        let record = record.as_ref().unwrap();
+                        let record_slice_same_num_cols =
+                            &record.get_values()[..index_key.get_values().len()];
+                        let order = compare_immutable(
+                            record_slice_same_num_cols,
+                            index_key.get_values(),
+                            self.index_key_sort_order,
+                        );
+                        order
+                    };
+                    let found = match op {
+                        SeekOp::GT => order.is_lt(),
+                        SeekOp::GE => order.is_le(),
+                        SeekOp::EQ => order.is_le(),
+                        _ => todo!("not implemented: {:?}", op),
+                    };
+                    if found {
+                        let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
+                        {
+                            Some(RefValue::Integer(rowid)) => *rowid as u64,
+                            _ => unreachable!("index cells should have an integer rowid"),
+                        };
+                        return Ok(CursorResult::Ok(Some(rowid)));
+                    } else {
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Move the cursor to the next record and return it.
+    /// Used in forwards iteration, which is the default.
+    async fn get_next_record_async(
+        &mut self,
+        predicate: Option<(SeekKey<'_>, SeekOp)>,
+    ) -> Result<CursorResult<Option<u64>>> {
+        if let Some(mv_cursor) = &self.mv_cursor {
+            let mut mv_cursor = mv_cursor.borrow_mut();
+            let rowid = mv_cursor.current_row_id();
+            match rowid {
+                Some(rowid) => {
+                    let record = mv_cursor.current_row().unwrap().unwrap();
+                    crate::storage::sqlite3_ondisk::read_record(
+                        &record.data,
+                        self.get_immutable_record_or_create().as_mut().unwrap(),
+                    )?;
+                    mv_cursor.forward();
+                    return Ok(CursorResult::Ok(Some(rowid.row_id)));
+                }
+                None => return Ok(CursorResult::Ok(None)),
+            }
+        }
+        loop {
+            let mem_page_rc = self.stack.top();
+            let cell_idx = self.stack.current_cell_index() as usize;
+            LoadPageFuture {
+                page: mem_page_rc.clone(),
+                pager: self.pager.clone(),
+            }
+            .await;
+            tracing::trace!("current id={} cell={}", mem_page_rc.get().id, cell_idx);
             let mem_page = mem_page_rc.get();
 
             let contents = mem_page.contents.as_ref().unwrap();
@@ -3375,6 +3642,13 @@ impl BTreeCursor {
 
     pub fn next(&mut self) -> Result<CursorResult<()>> {
         let rowid = return_if_io!(self.get_next_record(None));
+        self.rowid.replace(rowid);
+        self.empty_record.replace(rowid.is_none());
+        Ok(CursorResult::Ok(()))
+    }
+
+    pub async fn next_async(&mut self) -> Result<CursorResult<()>> {
+        let rowid = return_if_io!(self.get_next_record_async(None).await);
         self.rowid.replace(rowid);
         self.empty_record.replace(rowid.is_none());
         Ok(CursorResult::Ok(()))

@@ -54,10 +54,13 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     ffi::c_void,
+    future::Future,
     num::NonZero,
     ops::Deref,
+    pin::Pin,
     rc::{Rc, Weak},
     sync::Arc,
+    task::{Context, Poll, Wake, Waker},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -242,6 +245,11 @@ pub struct ProgramState {
     halt_state: Option<HaltState>,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
+    func: Option<(
+        *mut BTreeCursor,
+        Pin<Box<dyn Future<Output = Result<CursorResult<()>>>>>,
+    )>,
+    waker: Waker,
 }
 
 impl ProgramState {
@@ -265,6 +273,8 @@ impl ProgramState {
             halt_state: None,
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
+            func: None,
+            waker: Waker::from(Arc::new(MyWaker {})),
         }
     }
 
@@ -360,7 +370,10 @@ pub struct Program {
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: Vec<TableReference>,
 }
-
+struct MyWaker {}
+impl Wake for MyWaker {
+    fn wake(self: Arc<Self>) {}
+}
 impl Program {
     pub fn step(
         &self,
@@ -376,6 +389,17 @@ impl Program {
             let _ = state.result_row.take();
             let (insn, insn_function) = &self.insns[state.pc as usize];
             trace_insn(self, state.pc as InsnReference, insn);
+            if let Some((cursor, func)) = &mut state.func {
+                let mut cx = Context::from_waker(&state.waker);
+                match func.as_mut().poll(&mut cx) {
+                    Poll::Ready(_) => {
+                        let _ = state.func.take();
+                    }
+                    Poll::Pending => {
+                        return Ok(StepResult::IO);
+                    }
+                }
+            }
             let res = insn_function(self, state, insn, &pager, mv_store.as_ref())?;
             match res {
                 InsnFunctionStepResult::Step => {}
