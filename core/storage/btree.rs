@@ -1,4 +1,5 @@
 use crate::{
+    continuation::{self, Continuation},
     schema::Index,
     storage::{
         pager::Pager,
@@ -25,8 +26,10 @@ use std::collections::HashSet;
 use std::{
     cell::{Cell, Ref, RefCell},
     cmp::Ordering,
+    mem::swap,
     pin::Pin,
     rc::Rc,
+    sync::Arc,
 };
 
 use super::{
@@ -726,6 +729,91 @@ impl BTreeCursor {
         }
     }
 
+    /// Reads the record of a cell that has overflow pages. This is a state machine that requires to be called until completion so everything /// that calls this function should be reentrant.
+    fn process_overflow_read_continuation(
+        &mut self,
+        payload: &'static [u8],
+        start_next_page: u32,
+        payload_size: u64,
+        callback: impl FnOnce(&mut Continuation, &mut BTreeCursor) + 'static,
+        continuation: &mut Continuation,
+    ) -> Result<()> {
+        tracing::debug!("start reading overflow page payload_size={}", payload_size);
+        let page = self.pager.read_page(start_next_page as usize)?;
+        self.process_overflow_read_continuation_core(
+            Rc::new(RefCell::new(payload.to_vec())),
+            start_next_page,
+            payload_size as usize - payload.len(),
+            page,
+            callback,
+            continuation,
+        )?;
+        Ok(())
+    }
+
+    fn process_overflow_read_continuation_core(
+        &mut self,
+        payload: Rc<RefCell<Vec<u8>>>,
+        mut start_next_page: u32,
+        mut remaining_to_read: usize,
+        mut page: PageRef,
+        callback: impl FnOnce(&mut Continuation, &mut BTreeCursor) + 'static,
+        continuation: &mut Continuation,
+    ) -> Result<()> {
+        loop {
+            if page.is_locked() {
+                let page = page.clone();
+                let payload = payload.clone();
+                continuation.replace(
+                    move |continuation, cursor| {
+                        cursor.process_overflow_read_continuation_core(
+                            payload.clone(),
+                            start_next_page,
+                            remaining_to_read,
+                            page.clone(),
+                            callback,
+                            continuation,
+                        );
+                    },
+                    self,
+                );
+                return Ok(());
+            }
+            tracing::debug!(
+                "reading overflow page {} {}",
+                start_next_page,
+                remaining_to_read
+            );
+            let contents = page.get_contents();
+            // The first four bytes of each overflow page are a big-endian integer which is the page number of the next page in the chain, or zero for the final page in the chain.
+            let next = contents.read_u32_no_offset(0);
+            let buf = contents.as_ptr();
+            let usable_space = self.pager.usable_space();
+            let to_read = remaining_to_read.min(usable_space - 4);
+            payload.borrow_mut().extend_from_slice(&buf[4..4 + to_read]);
+            remaining_to_read -= to_read;
+            if remaining_to_read == 0 || next == 0 {
+                assert!(
+                    remaining_to_read == 0 && next == 0,
+                    "we can't have more pages to read while also have read everything"
+                );
+                {
+                    let mut reuse_immutable = self.get_immutable_record_or_create();
+                    crate::storage::sqlite3_ondisk::read_record(
+                        &payload.borrow(),
+                        reuse_immutable.as_mut().unwrap(),
+                    )?;
+                }
+                callback(continuation, self);
+                return Ok(());
+            } else {
+                let new_page = self.pager.read_page(next as usize)?;
+                page = new_page;
+                start_next_page = next;
+            }
+        }
+    }
+
     /// Move the cursor to the next record and return it.
     /// Used in forwards iteration, which is the default.
     fn get_next_record(
@@ -962,6 +1050,344 @@ impl BTreeCursor {
                             _ => unreachable!("index cells should have an integer rowid"),
                         };
                         return Ok(CursorResult::Ok(Some(rowid)));
+                    } else {
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Move the cursor to the next record and return it.
+    /// Used in forwards iteration, which is the default.
+    fn get_next_record_continuation(
+        &mut self,
+        predicate: Option<(SeekKey<'static>, SeekOp)>,
+        continuation: &mut Continuation,
+        callback: impl FnOnce(&mut BTreeCursor, Option<u64>) + 'static + Copy,
+    ) -> Result<()> {
+        if let Some(mv_cursor) = self.mv_cursor.clone() {
+            let mut mv_cursor = mv_cursor.borrow_mut();
+            let rowid = mv_cursor.current_row_id().clone();
+            match rowid {
+                Some(rowid) => {
+                    let record = mv_cursor.current_row().unwrap().unwrap();
+                    crate::storage::sqlite3_ondisk::read_record(
+                        &record.data,
+                        self.get_immutable_record_or_create().as_mut().unwrap(),
+                    )?;
+                    mv_cursor.forward();
+                    callback(self, Some(rowid.row_id));
+                    Ok(())
+                }
+                None => {
+                    callback(self, None);
+                    Ok(())
+                }
+            }
+        } else {
+            self.get_next_record_continuation_core(predicate, continuation, callback)
+        }
+    }
+
+    /// Move the cursor to the next record and return it.
+    /// Used in forwards iteration, which is the default.
+    fn get_next_record_continuation_core(
+        &mut self,
+        predicate: Option<(SeekKey<'static>, SeekOp)>,
+        continuation: &mut Continuation,
+        callback: impl FnOnce(&mut BTreeCursor, Option<u64>) + 'static + Copy,
+    ) -> Result<()> {
+        loop {
+            let mem_page_rc = self.stack.top();
+            let cell_idx = self.stack.current_cell_index() as usize;
+
+            tracing::trace!("current id={} cell={}", mem_page_rc.get().id, cell_idx);
+            if mem_page_rc.is_locked() {
+                continuation.replace(
+                    move |continuation, cursor| {
+                        cursor.get_next_record_continuation_core(predicate, continuation, callback);
+                    },
+                    self,
+                );
+                return Ok(());
+            }
+            if !mem_page_rc.is_loaded() {
+                self.pager.load_page(mem_page_rc.clone())?;
+                continuation.replace(
+                    move |continuation, cursor| {
+                        cursor.get_next_record_continuation_core(predicate, continuation, callback);
+                    },
+                    self,
+                );
+                return Ok(());
+            }
+            let mem_page = mem_page_rc.get();
+
+            let contents = mem_page.contents.as_ref().unwrap();
+
+            if cell_idx == contents.cell_count() {
+                // do rightmost
+                let has_parent = self.stack.has_parent();
+                match contents.rightmost_pointer() {
+                    Some(right_most_pointer) => {
+                        self.stack.advance();
+                        let mem_page = self.pager.read_page(right_most_pointer as usize)?;
+                        self.stack.push(mem_page);
+                        continue;
+                    }
+                    None => {
+                        if has_parent {
+                            tracing::trace!("moving simple upwards");
+                            self.going_upwards = true;
+                            self.stack.pop();
+                            continue;
+                        } else {
+                            callback(self, None);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
+            if cell_idx > contents.cell_count() {
+                // end
+                let has_parent = self.stack.current() > 0;
+                if has_parent {
+                    tracing::debug!("moving upwards");
+                    self.going_upwards = true;
+                    self.stack.pop();
+                    continue;
+                } else {
+                    callback(self, None);
+                    return Ok(());
+                }
+            }
+            assert!(cell_idx < contents.cell_count());
+
+            let cell = contents.cell_get(
+                cell_idx,
+                payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
+                payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
+                self.usable_space(),
+            )?;
+            match &cell {
+                BTreeCell::TableInteriorCell(TableInteriorCell {
+                    _left_child_page,
+                    _rowid,
+                }) => {
+                    assert!(predicate.is_none());
+                    self.stack.advance();
+                    let mem_page = self.pager.read_page(*_left_child_page as usize)?;
+                    self.stack.push(mem_page);
+                    continue;
+                }
+                BTreeCell::TableLeafCell(TableLeafCell {
+                    _rowid,
+                    _payload,
+                    payload_size,
+                    first_overflow_page,
+                }) => {
+                    assert!(predicate.is_none());
+                    if let Some(next_page) = first_overflow_page {
+                        let rowid = *_rowid;
+                        self.process_overflow_read_continuation(
+                            _payload,
+                            *next_page,
+                            *payload_size,
+                            move |continuation, cursor| {
+                                cursor.stack.advance();
+                                callback(cursor, Some(rowid));
+                            },
+                            continuation,
+                        );
+                    } else {
+                        crate::storage::sqlite3_ondisk::read_record(
+                            _payload,
+                            self.get_immutable_record_or_create().as_mut().unwrap(),
+                        )?;
+                        self.stack.advance();
+                        callback(self, Some(*_rowid));
+                    };
+                    return Ok(());
+                }
+                BTreeCell::IndexInteriorCell(IndexInteriorCell {
+                    payload,
+                    left_child_page,
+                    first_overflow_page,
+                    payload_size,
+                }) => {
+                    if !self.going_upwards {
+                        let mem_page = self.pager.read_page(*left_child_page as usize)?;
+                        self.stack.push(mem_page);
+                        continue;
+                    }
+                    if let Some(next_page) = first_overflow_page {
+                        self.process_overflow_read_continuation(
+                            payload,
+                            *next_page,
+                            *payload_size,
+                            move |continuation, cursor| {
+                                cursor.going_upwards = false;
+                                cursor.stack.advance();
+                                if predicate.is_none() {
+                                    let rowid = match cursor.get_immutable_record().as_ref().unwrap().last_value()
+                                    {
+                                        Some(RefValue::Integer(rowid)) => *rowid as u64,
+                                        _ => unreachable!("index cells should have an integer rowid"),
+                                    };
+                                    callback(cursor, Some(rowid));
+                                    return;
+                                }
+
+                                let (key, op) = predicate.as_ref().unwrap();
+                                let SeekKey::IndexKey(index_key) = key else {
+                                    unreachable!("index seek key should be a record");
+                                };
+                                let order = {
+                                    let record = cursor.get_immutable_record();
+                                    let record = record.as_ref().unwrap();
+                                    let record_slice_same_num_cols =
+                                        &record.get_values()[..index_key.get_values().len()];
+                                    let order = compare_immutable(
+                                        record_slice_same_num_cols,
+                                        index_key.get_values(),
+                                        cursor.index_key_sort_order,
+                                    );
+                                    order
+                                };
+                                let found = match op {
+                                    SeekOp::GT => order.is_gt(),
+                                    SeekOp::GE => order.is_ge(),
+                                    SeekOp::EQ => order.is_eq(),
+                                    _ => unreachable!("Seek LE/LT should not happen in get_next_record() because we are iterating forwards"),
+                                };
+                                if found {
+                                    let rowid = match cursor.get_immutable_record().as_ref().unwrap().last_value()
+                                    {
+                                        Some(RefValue::Integer(rowid)) => *rowid as u64,
+                                        _ => unreachable!("index cells should have an integer rowid"),
+                                    };
+                                    callback(cursor, Some(rowid));
+                                    return;
+                                } else {
+                                    cursor.get_next_record_continuation_core(predicate, continuation, callback);
+                                }
+                            },
+                            continuation,
+                        );
+                    } else {
+                        crate::storage::sqlite3_ondisk::read_record(
+                            payload,
+                            self.get_immutable_record_or_create().as_mut().unwrap(),
+                        )?;
+                        self.going_upwards = false;
+                        self.stack.advance();
+                        if predicate.is_none() {
+                            let rowid =
+                                match self.get_immutable_record().as_ref().unwrap().last_value() {
+                                    Some(RefValue::Integer(rowid)) => *rowid as u64,
+                                    _ => unreachable!("index cells should have an integer rowid"),
+                                };
+                            callback(self, Some(rowid));
+                            return Ok(());
+                        }
+
+                        let (key, op) = predicate.as_ref().unwrap();
+                        let SeekKey::IndexKey(index_key) = key else {
+                        unreachable!("index seek key should be a record");
+                    };
+                        let order = {
+                            let record = self.get_immutable_record();
+                            let record = record.as_ref().unwrap();
+                            let record_slice_same_num_cols =
+                                &record.get_values()[..index_key.get_values().len()];
+                            let order = compare_immutable(
+                                record_slice_same_num_cols,
+                                index_key.get_values(),
+                                self.index_key_sort_order,
+                            );
+                            order
+                        };
+                        let found = match op {
+                        SeekOp::GT => order.is_gt(),
+                        SeekOp::GE => order.is_ge(),
+                        SeekOp::EQ => order.is_eq(),
+                        _ => unreachable!("Seek LE/LT should not happen in get_next_record() because we are iterating forwards"),
+                    };
+                        if found {
+                            let rowid =
+                                match self.get_immutable_record().as_ref().unwrap().last_value() {
+                                    Some(RefValue::Integer(rowid)) => *rowid as u64,
+                                    _ => unreachable!("index cells should have an integer rowid"),
+                                };
+                            callback(self, Some(rowid));
+                            return Ok(());
+                        } else {
+                            continue;
+                        }
+                    };
+                }
+                BTreeCell::IndexLeafCell(IndexLeafCell {
+                    payload,
+                    first_overflow_page,
+                    payload_size,
+                }) => {
+                    if let Some(next_page) = first_overflow_page {
+                        self.process_overflow_read_continuation(
+                            payload,
+                            *next_page,
+                            *payload_size,
+                            move |_, _| {},
+                            continuation,
+                        );
+                    } else {
+                        crate::storage::sqlite3_ondisk::read_record(
+                            payload,
+                            self.get_immutable_record_or_create().as_mut().unwrap(),
+                        )?
+                    };
+
+                    self.stack.advance();
+                    if predicate.is_none() {
+                        let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
+                        {
+                            Some(RefValue::Integer(rowid)) => *rowid as u64,
+                            _ => unreachable!("index cells should have an integer rowid"),
+                        };
+                        callback(self, Some(rowid));
+                        return Ok(());
+                    }
+                    let (key, op) = predicate.as_ref().unwrap();
+                    let SeekKey::IndexKey(index_key) = key else {
+                        unreachable!("index seek key should be a record");
+                    };
+                    let order = {
+                        let record = self.get_immutable_record();
+                        let record = record.as_ref().unwrap();
+                        let record_slice_same_num_cols =
+                            &record.get_values()[..index_key.get_values().len()];
+                        let order = compare_immutable(
+                            record_slice_same_num_cols,
+                            index_key.get_values(),
+                            self.index_key_sort_order,
+                        );
+                        order
+                    };
+                    let found = match op {
+                        SeekOp::GT => order.is_lt(),
+                        SeekOp::GE => order.is_le(),
+                        SeekOp::EQ => order.is_le(),
+                        _ => todo!("not implemented: {:?}", op),
+                    };
+                    if found {
+                        let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
+                        {
+                            Some(RefValue::Integer(rowid)) => *rowid as u64,
+                            _ => unreachable!("index cells should have an integer rowid"),
+                        };
+                        callback(self, Some(rowid));
+                        return Ok(());
                     } else {
                         continue;
                     }
@@ -3380,6 +3806,23 @@ impl BTreeCursor {
         Ok(CursorResult::Ok(()))
     }
 
+    pub fn next_continuation(
+        &mut self,
+        continuation: &mut Continuation,
+        callback: impl FnOnce() + 'static + Copy,
+    ) -> Result<CursorResult<()>> {
+        self.get_next_record_continuation(
+            None,
+            continuation,
+            move |cursor: &mut BTreeCursor, rowid: Option<u64>| {
+                cursor.rowid.replace(rowid);
+                cursor.empty_record.replace(rowid.is_none());
+                callback();
+            },
+        );
+        Ok(CursorResult::Ok(()))
+    }
+
     pub fn prev(&mut self) -> Result<CursorResult<()>> {
         assert!(self.mv_cursor.is_none());
         match self.get_prev_record(None)? {
@@ -5145,6 +5588,15 @@ fn shift_pointers_left(page: &mut PageContent, cell_idx: usize) {
     buf.copy_within(start..start + amount_to_shift, start - 2);
 }
 
+pub fn to_unsafe_ptr<T>(t_ref: &mut T) -> *mut T {
+    let state_addr = t_ref as *const _ as usize;
+    let unsafe_ptr = state_addr as *mut T;
+    unsafe_ptr
+}
+
+pub fn from_unsafe_ptr<'a, T>(t_ref: *mut T) -> &'a mut T {
+    unsafe { &mut *t_ref }
+}
 #[cfg(test)]
 mod tests {
     use rand::{thread_rng, Rng};

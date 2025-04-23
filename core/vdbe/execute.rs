@@ -1463,24 +1463,31 @@ pub fn op_next(
     let Insn::Next {
         cursor_id,
         pc_if_next,
-    } = insn
+    } = *insn
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
     assert!(pc_if_next.is_offset());
-    let is_empty = {
-        let mut cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Next");
-        let cursor = cursor.as_btree_mut();
-        cursor.set_null_flag(false);
-        return_if_io!(cursor.next());
+    let state_ptr: *mut ProgramState = state as *mut _;
+    let mut cursor = must_be_btree_cursor!(cursor_id, program.cursor_ref, state, "Next");
+    let cursor = cursor.as_btree_mut();
+    cursor.set_null_flag(false);
+    let program_ptr: *const Program = program as *const _;
+    cursor.next_continuation(&mut state.continuation.borrow_mut(), move || {
+        let state = unsafe { &mut *state_ptr };
+        let program = unsafe { &*program_ptr };
+        let is_empty = {
+            let mut cursor = must_be_btree_cursor!(cursor_id, program.cursor_ref, state, "Next");
+            let cursor = cursor.as_btree_mut();
+            cursor.is_empty()
+        };
+        if is_empty {
+            state.pc += 1;
+        } else {
+            state.pc = pc_if_next.to_offset_int();
+        }
+    });
 
-        cursor.is_empty()
-    };
-    if !is_empty {
-        state.pc = pc_if_next.to_offset_int();
-    } else {
-        state.pc += 1;
-    }
     Ok(InsnFunctionStepResult::Step)
 }
 

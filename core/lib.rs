@@ -1,3 +1,4 @@
+mod continuation;
 mod error;
 mod ext;
 mod fast_lock;

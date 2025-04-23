@@ -25,6 +25,7 @@ pub mod likeop;
 pub mod sorter;
 
 use crate::{
+    continuation::Continuation,
     error::LimboError,
     fast_lock::SpinLock,
     function::{AggFunc, FuncCtx},
@@ -242,6 +243,7 @@ pub struct ProgramState {
     halt_state: Option<HaltState>,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
+    continuation: RefCell<Continuation>,
 }
 
 impl ProgramState {
@@ -265,6 +267,7 @@ impl ProgramState {
             halt_state: None,
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
+            continuation: RefCell::new(Continuation::new()),
         }
     }
 
@@ -376,6 +379,9 @@ impl Program {
             let _ = state.result_row.take();
             let (insn, insn_function) = &self.insns[state.pc as usize];
             trace_insn(self, state.pc as InsnReference, insn);
+            if state.continuation.borrow().is_initialized() {
+                state.continuation.borrow_mut().call();
+            }
             let res = insn_function(self, state, insn, &pager, mv_store.as_ref())?;
             match res {
                 InsnFunctionStepResult::Step => {}
