@@ -25,6 +25,7 @@ members = [
     "sqlite3",
     "stress",
     "tests",
+    "tests_macros",
     "vendored/sqlite3-parser/sqlparser_bench",
 ]
 exclude = ["perf/latency/limbo"]

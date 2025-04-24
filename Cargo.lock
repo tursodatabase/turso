@@ -1932,6 +1932,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "limbo_tests_macros"
+version = "0.0.19"
+
+[[package]]
 name = "limbo_time"
 version = "0.0.19"
 dependencies = [
