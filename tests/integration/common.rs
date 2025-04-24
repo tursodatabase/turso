@@ -2,7 +2,7 @@ use limbo_core::{CheckpointStatus, Connection, Database, IO};
 use rand::{rng, RngCore};
 use rusqlite::params;
 use rusqlite::types::Value;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -30,12 +30,9 @@ impl TempDatabase {
         Self { path, io }
     }
 
-    pub fn new_with_existent(db_path: &Path) -> Self {
+    pub fn new_existent(db_path: PathBuf) -> Self {
         let io: Arc<dyn IO + Send> = Arc::new(limbo_core::PlatformIO::new().unwrap());
-        Self {
-            path: db_path.to_path_buf(),
-            io,
-        }
+        Self { path: db_path, io }
     }
 
     pub fn new_with_rusqlite(table_sql: &str) -> Self {
@@ -127,6 +124,7 @@ pub fn maybe_setup_tracing() {
         .with(EnvFilter::from_default_env())
         .try_init();
 }
+
 pub(crate) fn limbo_exec_rows_error(
     db: &TempDatabase,
     conn: &Rc<limbo_core::Connection>,
@@ -146,9 +144,8 @@ pub(crate) fn limbo_exec_rows_error(
     }
 }
 
-
-pub(crate) fn exec_sql(sql: &str, values: Vec<Vec<Value>>) {
-    let db = TempDatabase::new_empty();
+pub(crate) fn exec_sql(db: PathBuf, sql: &str, values: Vec<Vec<Value>>) {
+    let db = TempDatabase::new_existent(db);
     let limbo_conn = db.connect_limbo();
     let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
     let limbo = limbo_exec_rows(&db, &limbo_conn, sql);
@@ -165,7 +162,6 @@ pub(crate) fn exec_sql(sql: &str, values: Vec<Vec<Value>>) {
         sql, values, sqlite
     );
 }
-
 pub(crate) fn sqlite_exec_rows(
     conn: &rusqlite::Connection,
     query: &str,
@@ -279,7 +275,7 @@ mod tests {
     #[test]
     fn test_limbo_open_read_only() -> anyhow::Result<()> {
         let path = TempDir::new().unwrap().into_path().join("temp_read_only");
-        let db = TempDatabase::new_with_existent(&path);
+        let db = TempDatabase::new_existent(path.clone());
         {
             let conn = db.connect_limbo();
             let ret = limbo_exec_rows(&db, &conn, "CREATE table t(a)");
