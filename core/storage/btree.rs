@@ -209,21 +209,19 @@ enum ReadPayloadOverflow {
     },
 }
 
-struct LoadPageFuture {
-    page: PageRef,
-    pager: Rc<Pager>,
+struct LoadPageFuture<'a> {
+    page: &'a PageRef,
+    pager: &'a Rc<Pager>,
 }
 
-impl Future for LoadPageFuture {
+impl<'a> Future for LoadPageFuture<'a> {
     type Output = ();
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        if self.page.is_locked() {
-            std::task::Poll::Pending
-        } else if !self.page.is_loaded() {
+        if !self.page.is_loaded() {
             self.pager.load_page(self.page.clone());
             std::task::Poll::Pending
         } else {
@@ -1020,8 +1018,8 @@ impl BTreeCursor {
             let mem_page_rc = self.stack.top();
             let cell_idx = self.stack.current_cell_index() as usize;
             LoadPageFuture {
-                page: mem_page_rc.clone(),
-                pager: self.pager.clone(),
+                page: &mem_page_rc,
+                pager: &self.pager,
             }
             .await;
             tracing::trace!("current id={} cell={}", mem_page_rc.get().id, cell_idx);
