@@ -3,7 +3,8 @@ use limbo_core::{Database, PlatformIO, IO};
 
 
 use pprof::criterion::{Output, PProfProfiler};
-use std::sync::Arc;
+use tempfile::TempDir;
+use std::{fs::File, path::PathBuf, rc::Rc, sync::Arc};
 
 pub struct TempDatabase {
     _dir: TempDir,
@@ -18,11 +19,16 @@ impl TempDatabase {
         TempDatabase { _dir: dir, path }
     }
 
-    pub fn connect_limbo(&self) -> limbo_core::Connection {
+    pub fn connect_limbo(&self) -> Rc<limbo_core::Connection> {
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, &self.path, false)
+        if let Some(db_path) = self.path.to_str() {
+            let db = Database::open_file(io, db_path, false)
             .expect("opening limbo database failed");
-        db.connect().expect("limbo connect failed")
+            db.connect().expect("limbo connect failed")
+        }
+        else {
+            panic!("DB path not provided")
+        }
     }
 
     pub fn connect_rusqlite(&self) -> rusqlite::Connection {
