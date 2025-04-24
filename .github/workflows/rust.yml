@@ -29,18 +29,29 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
-    - name: Set up Python 3.10
-      uses: actions/setup-python@v5
+    - name: Install latest nextest release
+      uses: taiki-e/install-action@nextest
+      if: runner.os != 'Windows'
+
+    - name: Test with latest nextest release
+      uses: actions-rs/cargo@v1
+      if: runner.os != 'Windows'
+      env:
+        RUST_LOG: ${{ runner.debug && 'limbo_core::storage=trace' || '' }}
       with:
-        python-version: "3.10"
+        command: nextest
+        args: run --profile ci --verbose
+      timeout-minutes: 10
+
     - name: Build
+      if: runner.os == 'Windows'
       run: cargo build --verbose
     - name: Test
+      if: runner.os == 'Windows'
       env:
         RUST_LOG: ${{ runner.debug && 'limbo_core::storage=trace' || '' }}
       run: cargo test --verbose
       timeout-minutes: 10
-
 
   clippy:
     runs-on: ubuntu-latest
