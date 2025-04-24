@@ -55,13 +55,13 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     ffi::c_void,
-    future::Future,
+    future::{Future, IntoFuture},
     num::NonZero,
     ops::Deref,
     pin::Pin,
     rc::{Rc, Weak},
     sync::Arc,
-    task::{Context, Poll, Wake, Waker},
+    task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -249,9 +249,8 @@ pub struct ProgramState {
     func: Option<(
         bool,
         *mut BTreeCursor,
-        ReusableBoxFuture<Result<CursorResult<()>>>,
+        Pin<Box<dyn Future<Output = Result<CursorResult<()>>>>>,
     )>,
-    waker: Waker,
 }
 
 impl ProgramState {
@@ -276,7 +275,6 @@ impl ProgramState {
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
             func: None,
-            waker: Waker::from(Arc::new(MyWaker {})),
         }
     }
 
@@ -372,10 +370,26 @@ pub struct Program {
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: Vec<TableReference>,
 }
-struct MyWaker {}
-impl Wake for MyWaker {
-    fn wake(self: Arc<Self>) {}
+
+pub fn create_waker() -> Waker {
+    // Safety: The waker points to a vtable with functions that do nothing. Doing
+    // nothing is memory-safe.
+    unsafe { Waker::from_raw(RAW_WAKER) }
 }
+
+const RAW_WAKER: RawWaker = RawWaker::new(std::ptr::null(), &VTABLE);
+const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+
+unsafe fn clone(_: *const ()) -> RawWaker {
+    RAW_WAKER
+}
+
+unsafe fn wake(_: *const ()) {}
+
+unsafe fn wake_by_ref(_: *const ()) {}
+
+unsafe fn drop(_: *const ()) {}
+
 impl Program {
     pub fn step(
         &self,
@@ -391,19 +405,6 @@ impl Program {
             let _ = state.result_row.take();
             let (insn, insn_function) = &self.insns[state.pc as usize];
             trace_insn(self, state.pc as InsnReference, insn);
-            if let Some((finished, _, func)) = &mut state.func {
-                if !*finished {
-                    let mut cx = Context::from_waker(&state.waker);
-                    match func.poll(&mut cx) {
-                        Poll::Ready(_) => {
-                            *finished = true;
-                        }
-                        Poll::Pending => {
-                            return Ok(StepResult::IO);
-                        }
-                    }
-                }
-            }
             let res = insn_function(self, state, insn, &pager, mv_store.as_ref())?;
             match res {
                 InsnFunctionStepResult::Step => {}

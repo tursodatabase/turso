@@ -217,6 +217,7 @@ struct LoadPageFuture<'a> {
 impl<'a> Future for LoadPageFuture<'a> {
     type Output = ();
 
+    #[inline(always)]
     fn poll(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -377,7 +378,7 @@ pub struct BTreeCursor {
     /// Page id of the root page used to go back up fast.
     root_page: usize,
     /// Rowid and record are stored before being consumed.
-    rowid: Cell<Option<u64>>,
+    pub rowid: Cell<Option<u64>>,
     null_flag: bool,
     /// Index internal pages are consumed on the way up, so we store going upwards flag in case
     /// we just moved to a parent page and the parent page is an internal index page which requires
@@ -393,7 +394,7 @@ pub struct BTreeCursor {
     stack: PageStack,
     /// Reusable immutable record, used to allow better allocation strategy.
     reusable_immutable_record: RefCell<Option<ImmutableRecord>>,
-    empty_record: Cell<bool>,
+    pub empty_record: Cell<bool>,
     pub index_key_sort_order: IndexKeySortOrder,
 }
 
@@ -994,7 +995,7 @@ impl BTreeCursor {
 
     /// Move the cursor to the next record and return it.
     /// Used in forwards iteration, which is the default.
-    async fn get_next_record_async(
+    pub async fn get_next_record_async(
         &mut self,
         predicate: Option<(SeekKey<'_>, SeekOp)>,
     ) -> Result<CursorResult<Option<u64>>> {

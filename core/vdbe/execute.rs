@@ -1,9 +1,11 @@
 #![allow(unused_variables)]
 use crate::numeric::{NullableInteger, Numeric};
 use crate::reusable_future_box::ReusableBoxFuture;
+use crate::storage::btree;
 use crate::storage::database::FileMemoryStorage;
 use crate::storage::page_cache::DumbLruPageCache;
 use crate::storage::pager::CreateBTreeFlags;
+use crate::vdbe::create_waker;
 use crate::{
     error::{LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_PRIMARYKEY},
     ext::ExtValue,
@@ -18,6 +20,7 @@ use crate::{
 };
 use std::future::Future;
 use std::pin::Pin;
+use std::task::Context;
 use std::{borrow::BorrowMut, rc::Rc, sync::Arc};
 
 use crate::{pseudo::PseudoCursor, result::LimboResult};
@@ -45,8 +48,8 @@ use crate::{
 };
 
 use crate::{
-    info, maybe_init_database_file, BufferPool, MvCursor, OpenFlags, RefValue, Row, StepResult,
-    TransactionState, IO,
+    info, maybe_init_database_file, return_if_io, BufferPool, MvCursor, OpenFlags, RefValue, Row,
+    StepResult, TransactionState, IO,
 };
 
 use super::{
@@ -1464,38 +1467,59 @@ pub fn op_next(
     pager: &Rc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    let Insn::Next {
-        cursor_id,
-        pc_if_next,
-    } = insn
-    else {
-        unreachable!("unexpected Insn {:?}", insn)
-    };
-    assert!(pc_if_next.is_offset());
     let state_ptr = state as *mut ProgramState;
-    let mut cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Next");
-    let cursor = cursor.as_btree_mut();
-    let cursor_static = cursor as *mut BTreeCursor;
-    cursor.set_null_flag(false);
-    let future = op_next_async(state_ptr, cursor, *pc_if_next);
-    if let Some((fininised, c, func)) = &mut (unsafe { &mut *state_ptr }).func {
-        *fininised = false;
-        func.set(future);
+    if let Some((_, _, future)) = &mut (unsafe { &mut *state_ptr }).func {
+        let waker = create_waker();
+        let mut cx = Context::from_waker(&waker);
+        match future.as_mut().poll(&mut cx) {
+            std::task::Poll::Pending => {
+                return Ok(InsnFunctionStepResult::Step);
+            }
+            std::task::Poll::Ready(_) => {}
+        }
+        (unsafe { &mut *state_ptr }).func.take();
+        return Ok(InsnFunctionStepResult::Step);
     } else {
-        (unsafe { &mut *state_ptr }).func =
-            Some((false, cursor_static, ReusableBoxFuture::new(future)));
+        let Insn::Next {
+            cursor_id,
+            pc_if_next,
+        } = insn
+        else {
+            unreachable!("unexpected Insn {:?}", insn)
+        };
+        assert!(pc_if_next.is_offset());
+        let mut cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Next");
+        let cursor = cursor.as_btree_mut();
+        let cursor_static = cursor as *mut BTreeCursor;
+        cursor.set_null_flag(false);
+        let mut future = Box::pin(op_next_async(state_ptr, cursor, *pc_if_next));
+        let waker = create_waker();
+        let mut cx = Context::from_waker(&waker);
+        match future.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(value) => match value? {
+                CursorResult::Ok(()) => return Ok(InsnFunctionStepResult::Step),
+                CursorResult::IO => {}
+            },
+            std::task::Poll::Pending => {}
+        }
+        (unsafe { &mut *state_ptr }).func = Some((false, cursor_static, future));
+        Ok(InsnFunctionStepResult::IO)
     }
-
-    Ok(InsnFunctionStepResult::Step)
 }
 
+#[inline(always)]
 async fn op_next_async(
     state: *mut ProgramState,
     cursor: *mut BTreeCursor,
     pc_if_next: BranchOffset,
 ) -> Result<CursorResult<()>> {
     unsafe {
-        (&mut *cursor).next_async().await;
+        let rowid = match (&mut *cursor).get_next_record_async(None).await.unwrap() {
+            CursorResult::Ok(v) => v,
+            CursorResult::IO => panic!("WTF"),
+        };
+        (&mut *cursor).rowid.replace(rowid);
+        (&mut *cursor).empty_record.replace(rowid.is_none());
         let is_empty = { (&mut *cursor).is_empty() };
         if !is_empty {
             (*state).pc = pc_if_next.to_offset_int();
