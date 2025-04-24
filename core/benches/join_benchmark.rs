@@ -1,44 +1,9 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use limbo_core::{Database, PlatformIO, IO};
-
+use limbo_core::{Database, PlatformIO};
 
 use pprof::criterion::{Output, PProfProfiler};
-use tempfile::TempDir;
-use std::{fs::File, path::PathBuf, rc::Rc, sync::Arc};
-
-pub struct TempDatabase {
-    _dir: TempDir,
-    path: PathBuf,
-}
-
-impl TempDatabase {
-    pub fn new_empty() -> Self {
-        let dir = TempDir::new().expect("failed to create tempdir");
-        let path = dir.path().join("database.db");
-        File::create(&path).expect("failed to create temp db file");
-        TempDatabase { _dir: dir, path }
-    }
-
-    pub fn connect_limbo(&self) -> Rc<limbo_core::Connection> {
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        if let Some(db_path) = self.path.to_str() {
-            let db = Database::open_file(io, db_path, false)
-            .expect("opening limbo database failed");
-            db.connect().expect("limbo connect failed")
-        }
-        else {
-            panic!("DB path not provided")
-        }
-    }
-
-    pub fn connect_rusqlite(&self) -> rusqlite::Connection {
-        let conn = rusqlite::Connection::open(&self.path).unwrap();
-        conn.pragma_update(None, "locking_mode", "EXCLUSIVE").unwrap();
-        conn
-    }
-}
-
-
+use std::sync::Arc;
+use limbo_core::IO;
 
 fn rusqlite_open() -> rusqlite::Connection {
     let sqlite_conn = rusqlite::Connection::open("../testing/database.db").unwrap();
@@ -75,24 +40,14 @@ fn bench_join_query(criterion: &mut Criterion) {
 
     let mut group = criterion.benchmark_group("join_query");
 
-    group.bench_with_input(
-        BenchmarkId::new("limbo_prepare_join", query),
-        &query,
-        |b, query| {
-            b.iter(|| {
-                limbo_conn.prepare(query).unwrap();
-            });
-        },
-    );
-
     // Benchmark Limbo execution
     group.bench_with_input(
         BenchmarkId::new("limbo_execute", query),
         &query,
         |b, query| {
-            let mut stmt = limbo_conn.prepare(query).unwrap();
             let io = io.clone();
             b.iter(|| {
+                let mut stmt = limbo_conn.prepare(query).unwrap();
                 loop {
                     match stmt.step().unwrap() {
                         limbo_core::StepResult::Row => {
@@ -109,7 +64,7 @@ fn bench_join_query(criterion: &mut Criterion) {
                         }
                     }
                 }
-                stmt.reset();
+                // stmt.reset();
             });
         },
     );
@@ -118,22 +73,12 @@ fn bench_join_query(criterion: &mut Criterion) {
         let sqlite_conn = rusqlite_open();
 
         group.bench_with_input(
-            BenchmarkId::new("sqlite_prepare_join", query),
-            &query,
-            |b, query| {
-                b.iter(|| {
-                    sqlite_conn.prepare(query).unwrap();
-                });
-            },
-        );
-
-        group.bench_with_input(
             BenchmarkId::new("sqlite_execute", query),
             &query,
             |b, query| {
-                let mut stmt = sqlite_conn.prepare(query).unwrap();
-                let mut rows = stmt.query([]).unwrap();
                 b.iter(|| {
+                    let mut stmt = sqlite_conn.prepare(query).unwrap();
+                    let mut rows = stmt.query([]).unwrap();
                     while let Some(row) = rows.next().unwrap() {
                         black_box(row);
                     }
