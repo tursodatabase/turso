@@ -11,6 +11,7 @@ pub mod mvcc;
 mod parameters;
 mod pseudo;
 pub mod result;
+mod reusable_future_box;
 mod schema;
 mod storage;
 mod translate;

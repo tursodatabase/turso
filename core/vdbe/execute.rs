@@ -1,5 +1,6 @@
 #![allow(unused_variables)]
 use crate::numeric::{NullableInteger, Numeric};
+use crate::reusable_future_box::ReusableBoxFuture;
 use crate::storage::database::FileMemoryStorage;
 use crate::storage::page_cache::DumbLruPageCache;
 use crate::storage::pager::CreateBTreeFlags;
@@ -1476,8 +1477,14 @@ pub fn op_next(
     let cursor = cursor.as_btree_mut();
     let cursor_static = cursor as *mut BTreeCursor;
     cursor.set_null_flag(false);
-    let func = Box::pin(op_next_async(state_ptr, cursor, *pc_if_next));
-    (unsafe { &mut *state_ptr }).func = Some((cursor_static, func));
+    let future = op_next_async(state_ptr, cursor, *pc_if_next);
+    if let Some((fininised, c, func)) = &mut (unsafe { &mut *state_ptr }).func {
+        *fininised = false;
+        func.set(future);
+    } else {
+        (unsafe { &mut *state_ptr }).func =
+            Some((false, cursor_static, ReusableBoxFuture::new(future)));
+    }
 
     Ok(InsnFunctionStepResult::Step)
 }

@@ -28,6 +28,7 @@ use crate::{
     error::LimboError,
     fast_lock::SpinLock,
     function::{AggFunc, FuncCtx},
+    reusable_future_box::ReusableBoxFuture,
     storage::sqlite3_ondisk::SmallVec,
 };
 
@@ -246,8 +247,9 @@ pub struct ProgramState {
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
     func: Option<(
+        bool,
         *mut BTreeCursor,
-        Pin<Box<dyn Future<Output = Result<CursorResult<()>>>>>,
+        ReusableBoxFuture<Result<CursorResult<()>>>,
     )>,
     waker: Waker,
 }
@@ -389,14 +391,16 @@ impl Program {
             let _ = state.result_row.take();
             let (insn, insn_function) = &self.insns[state.pc as usize];
             trace_insn(self, state.pc as InsnReference, insn);
-            if let Some((cursor, func)) = &mut state.func {
-                let mut cx = Context::from_waker(&state.waker);
-                match func.as_mut().poll(&mut cx) {
-                    Poll::Ready(_) => {
-                        let _ = state.func.take();
-                    }
-                    Poll::Pending => {
-                        return Ok(StepResult::IO);
+            if let Some((finished, _, func)) = &mut state.func {
+                if !*finished {
+                    let mut cx = Context::from_waker(&state.waker);
+                    match func.poll(&mut cx) {
+                        Poll::Ready(_) => {
+                            *finished = true;
+                        }
+                        Poll::Pending => {
+                            return Ok(StepResult::IO);
+                        }
                     }
                 }
             }
