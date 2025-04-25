@@ -805,7 +805,7 @@ impl<'a> Limbo<'a> {
                                     row.get_value(4).to_string(),
                                     row.get_value(5).to_string(),
                                     row.get_value(6).to_string(),
-                                    row.get_value(7).to_string(),
+                                    row.get_value(7),
                                 ));
                                 prev_insn = insn;
                                 Ok(())
