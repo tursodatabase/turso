@@ -550,6 +550,7 @@ dependencies = [
  "assert_cmd",
  "cargo_metadata",
  "env_logger 0.10.2",
+ "hex",
  "limbo_core",
  "limbo_tests_macros",
  "log",

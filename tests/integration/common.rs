@@ -205,9 +205,6 @@ pub(crate) fn exec_many_sql<I, V>(
     I: Iterator<Item = V>,
     V: Into<Value>,
 {
-    // let x = vec![vec![vec![2]]];
-    // let y = x.into_iter().map(|v| v.into_iter().flatten());
-
     for (sql, curr_value) in zip(sql_queries, values) {
         let values: Vec<Value> = curr_value.map(|v| v.into()).collect();
         // Blocks here to drop db connections
