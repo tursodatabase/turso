@@ -4,13 +4,14 @@ use super::{Insn, InsnReference, OwnedValue, Program};
 use crate::function::{Func, ScalarFunc};
 use std::rc::Rc;
 
-pub fn insn_to_str(
+pub const EXPLAIN_COLUMNS: [&str; 8] = ["addr", "opcode", "p1", "p2", "p3", "p4", "p5", "comment"];
+pub const EXPLAIN_QUERY_PLAN_COLUMNS: [&str; 4] = ["id", "parent", "notused", "detail"];
+
+pub fn insn_to_values(
     program: &Program,
-    addr: InsnReference,
     insn: &Insn,
-    indent: String,
     manual_comment: Option<&'static str>,
-) -> String {
+) -> (String, i32, i32, i32, OwnedValue, u16, String) {
     let (opcode, p1, p2, p3, p4, p5, comment): (&str, i32, i32, i32, OwnedValue, u16, String) =
         match insn {
             Insn::Init { target_pc } => (
@@ -1418,15 +1419,35 @@ pub fn insn_to_str(
                 ),
             ),
         };
+
+    (
+        opcode.to_string(),
+        p1,
+        p2,
+        p3,
+        p4,
+        p5,
+        manual_comment.map_or(comment.to_string(), |mc| format!("{}; {}", comment, mc)),
+    )
+}
+
+pub fn insn_to_str(
+    program: &Program,
+    addr: InsnReference,
+    insn: &Insn,
+    indent: String,
+    manual_comment: Option<&'static str>,
+) -> String {
+    let (opcode, p1, p2, p3, p4, p5, comment) = insn_to_values(program, insn, manual_comment);
     format!(
         "{:<4}  {:<17}  {:<4}  {:<4}  {:<4}  {:<13}  {:<2}  {}",
         addr,
-        &(indent + opcode),
+        &(indent + &opcode),
         p1,
         p2,
         p3,
         p4.to_string(),
         p5,
-        manual_comment.map_or(comment.to_string(), |mc| format!("{}; {}", comment, mc))
+        comment,
     )
 }

@@ -35,7 +35,10 @@ use crate::{
     storage::{btree::BTreeCursor, pager::Pager, sqlite3_ondisk::DatabaseHeader},
     translate::plan::{ResultSetColumn, TableReference},
     types::{AggContext, Cursor, CursorResult, ImmutableRecord, OwnedValue, SeekKey, SeekOp},
-    vdbe::{builder::CursorType, insn::Insn},
+    vdbe::{
+        builder::{CursorType, QueryMode},
+        insn::Insn,
+    },
 };
 
 use crate::CheckpointStatus;
@@ -367,6 +370,21 @@ impl Program {
         state: &mut ProgramState,
         mv_store: Option<Rc<MvStore>>,
         pager: Rc<Pager>,
+        query_mode: QueryMode,
+    ) -> Result<StepResult> {
+        match query_mode {
+            QueryMode::Normal => self.normal_step(state, mv_store, pager),
+            QueryMode::Explain | QueryMode::ExplainQueryPlan => {
+                self.explain_step(state, query_mode)
+            }
+        }
+    }
+
+    fn normal_step(
+        &self,
+        state: &mut ProgramState,
+        mv_store: Option<Rc<MvStore>>,
+        pager: Rc<Pager>,
     ) -> Result<StepResult> {
         loop {
             if state.is_interrupted() {
@@ -385,6 +403,50 @@ impl Program {
                 InsnFunctionStepResult::Interrupt => return Ok(StepResult::Interrupt),
                 InsnFunctionStepResult::Busy => return Ok(StepResult::Busy),
             }
+        }
+    }
+
+    fn explain_step(&self, state: &mut ProgramState, query_mode: QueryMode) -> Result<StepResult> {
+        assert!(!matches!(query_mode, QueryMode::Normal));
+        assert!(matches!(query_mode, QueryMode::ExplainQueryPlan) || state.column_count() >= 8);
+        assert!(matches!(query_mode, QueryMode::Explain) || state.column_count() >= 4);
+
+        if state.is_interrupted() {
+            return Ok(StepResult::Interrupt);
+        }
+
+        match query_mode {
+            QueryMode::Explain => {
+                if state.pc as usize >= self.insns.len() {
+                    return Ok(StepResult::Done);
+                }
+
+                let (current_insn, _) = &self.insns[state.pc as usize];
+                let (opcode, p1, p2, p3, p4, p5, comment) = explain::insn_to_values(
+                    self,
+                    current_insn,
+                    self.comments
+                        .as_ref()
+                        .and_then(|comments| comments.get(&{ state.pc }).copied()),
+                );
+
+                state.registers[0] = Register::OwnedValue(OwnedValue::Integer(state.pc as i64));
+                state.registers[1] = Register::OwnedValue(OwnedValue::from_text(&opcode));
+                state.registers[2] = Register::OwnedValue(OwnedValue::Integer(p1 as i64));
+                state.registers[3] = Register::OwnedValue(OwnedValue::Integer(p2 as i64));
+                state.registers[4] = Register::OwnedValue(OwnedValue::Integer(p3 as i64));
+                state.registers[5] = Register::OwnedValue(p4);
+                state.registers[6] = Register::OwnedValue(OwnedValue::Integer(p5 as i64));
+                state.registers[7] = Register::OwnedValue(OwnedValue::from_text(&comment));
+                state.result_row = Some(Row {
+                    values: &state.registers[0] as *const Register,
+                    count: explain::EXPLAIN_COLUMNS.len(),
+                });
+                state.pc += 1;
+                Ok(StepResult::Row)
+            }
+            QueryMode::ExplainQueryPlan => todo!(),
+            _ => unreachable!(),
         }
     }
 

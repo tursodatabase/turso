@@ -58,12 +58,14 @@ impl CursorType {
 pub enum QueryMode {
     Normal,
     Explain,
+    ExplainQueryPlan,
 }
 
 impl From<ast::Cmd> for QueryMode {
     fn from(stmt: ast::Cmd) -> Self {
         match stmt {
-            ast::Cmd::ExplainQueryPlan(_) | ast::Cmd::Explain(_) => QueryMode::Explain,
+            ast::Cmd::Explain(_) => QueryMode::Explain,
+            ast::Cmd::ExplainQueryPlan(_) => QueryMode::ExplainQueryPlan,
             _ => QueryMode::Normal,
         }
     }
@@ -87,10 +89,9 @@ impl ProgramBuilder {
             constant_insns: Vec::new(),
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
             seekrowid_emitted_bitmask: 0,
-            comments: if opts.query_mode == QueryMode::Explain {
-                Some(HashMap::new())
-            } else {
-                None
+            comments: match opts.query_mode {
+                QueryMode::Explain | QueryMode::ExplainQueryPlan => Some(HashMap::new()),
+                QueryMode::Normal => None,
             },
             parameters: Parameters::new(),
             result_columns: Vec::new(),
