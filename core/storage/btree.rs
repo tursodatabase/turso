@@ -5244,7 +5244,6 @@ mod tests {
         types::Text,
         vdbe::Register,
         BufferPool, Connection, DatabaseStorage, StepResult, WalFile, WalFileShared,
-        WriteCompletion,
     };
     use std::{
         cell::RefCell, collections::HashSet, mem::transmute, ops::Deref, panic, rc::Rc, sync::Arc,
@@ -5542,7 +5541,9 @@ mod tests {
         let db_file = Arc::new(DatabaseFile::new(io_file));
 
         let buffer_pool = Rc::new(BufferPool::new(io.clone(), db_header.page_size as usize));
-        let wal_shared = WalFileShared::open_shared(&io, "test.wal", db_header.page_size).unwrap();
+        let wal_shared =
+            WalFileShared::open_shared(&io, buffer_pool.clone(), "test.wal", db_header.page_size)
+                .unwrap();
         let wal_file = WalFile::new(io.clone(), page_size, wal_shared, buffer_pool.clone());
         let wal = Rc::new(RefCell::new(wal_file));
 
@@ -5841,11 +5842,11 @@ mod tests {
             sqlite3_ondisk::write_header_to_buf(buf_slice, &db_header.lock());
         }
 
-        let write_complete = Box::new(|_| {});
-        let c = Completion::Write(WriteCompletion::new(write_complete));
+        let c = Completion::new_write(|_| {});
         db_file.write_page(1, buf.clone(), c).unwrap();
 
-        let wal_shared = WalFileShared::open_shared(&io, "test.wal", page_size).unwrap();
+        let wal_shared =
+            WalFileShared::open_shared(&io, buffer_pool.clone(), "test.wal", page_size).unwrap();
         let wal = Rc::new(RefCell::new(WalFile::new(
             io.clone(),
             page_size as usize,
@@ -5887,8 +5888,7 @@ mod tests {
         while current_page <= 4 {
             #[allow(clippy::arc_with_non_send_sync)]
             let buf = Buffer::new_heap(db_header.lock().page_size as usize);
-            let write_complete = Box::new(|_| {});
-            let c = Completion::new_write(write_complete);
+            let c = Completion::new_write(move |_| {});
             pager
                 .db_file
                 .write_page(current_page as usize, buf.clone(), c)?;

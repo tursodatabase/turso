@@ -253,11 +253,10 @@ pub fn begin_read_database_header(
     let buffer = Buffer::new_heap(512);
     let result = Arc::new(SpinLock::new(DatabaseHeader::default()));
     let header = result.clone();
-    let complete = Box::new(move |buf: Arc<Buffer>| {
+    let c = Completion::new_read(buffer, move |buf: Arc<Buffer>| {
         let header = header.clone();
         finish_read_database_header(buf.clone(), header).unwrap();
     });
-    let c = Completion::new_read(buffer, complete);
     db_file.read_page(1, c)?;
     Ok(result)
 }
@@ -785,11 +784,11 @@ pub fn begin_write_btree_page(
 
     *write_counter.borrow_mut() += 1;
     let c = {
+        let buf_len = buffer.len();
         let buf_ = buffer.clone();
         Completion::new_write(move |bytes_written: i32| {
+            let _ = buf_.clone();
             trace!("finish_write_btree_page");
-            let buf_copy = buf_.clone();
-            let buf_len = buf_copy.len();
             *write_counter.borrow_mut() -= 1;
 
             page_finish.clear_dirty();
@@ -1321,17 +1320,19 @@ pub fn begin_read_wal_frame(
     let frame = page.clone();
     let complete = Completion::new_read(buf, move |buf: Arc<Buffer>| {
         let frame = frame.clone();
-        finish_read_page(page.get().id, buf, frame).unwrap();
+        finish_read_page(page.get().id, buf.clone(), frame).unwrap();
     });
     io.pread(offset, complete)?;
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn begin_write_wal_frame(
     io: &Arc<dyn File>,
     offset: usize,
     page: &PageRef,
     page_size: u16,
+    buffer_pool: Rc<BufferPool>,
     db_size: u32,
     write_counter: Rc<RefCell<usize>>,
     wal_header: &WalHeader,
@@ -1352,7 +1353,7 @@ pub fn begin_write_wal_frame(
     let (buffer, checksums) = {
         let page = page.get();
         let contents = page.contents.as_ref().unwrap();
-        let buffer = Buffer::new_heap(contents.buffer.len() + WAL_FRAME_HEADER_SIZE);
+        let buffer = buffer_pool.get_page(Some(contents.buffer.len() + WAL_FRAME_HEADER_SIZE));
         let buf = buffer.slice_mut();
         buf[0..4].copy_from_slice(&header.page_number.to_be_bytes());
         buf[4..8].copy_from_slice(&header.db_size.to_be_bytes());
@@ -1389,8 +1390,8 @@ pub fn begin_write_wal_frame(
     *write_counter.borrow_mut() += 1;
     let buf_copy = buffer.clone();
     let c = Completion::new_write(move |bytes_written: i32| {
-        let buf_copy = buf_copy.clone();
         let buf_len = buf_copy.len();
+        let _ = buf_copy.clone();
         *write_counter.borrow_mut() -= 1;
 
         page_finish.clear_dirty();
@@ -1403,9 +1404,13 @@ pub fn begin_write_wal_frame(
     Ok(checksums)
 }
 
-pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<()> {
+pub fn begin_write_wal_header(
+    io: &Arc<dyn File>,
+    pool: Rc<BufferPool>,
+    header: &WalHeader,
+) -> Result<()> {
     let buffer = {
-        let buffer = Buffer::new_heap(512);
+        let buffer = pool.get_page(Some(512));
         let buf = buffer.slice_mut();
 
         buf[0..4].copy_from_slice(&header.magic.to_be_bytes());

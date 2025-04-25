@@ -463,6 +463,7 @@ impl Wal for WalFile {
             offset,
             &page,
             self.page_size as u16,
+            self.buffer_pool.clone(),
             db_size,
             write_counter,
             &header,
@@ -734,6 +735,7 @@ impl WalFile {
 impl WalFileShared {
     pub fn open_shared(
         io: &Arc<dyn IO>,
+        buffer_pool: Rc<BufferPool>,
         path: &str,
         page_size: u16,
     ) -> Result<Arc<UnsafeCell<WalFileShared>>> {
@@ -776,7 +778,7 @@ impl WalFileShared {
             );
             wal_header.checksum_1 = checksums.0;
             wal_header.checksum_2 = checksums.1;
-            sqlite3_ondisk::begin_write_wal_header(&file, &wal_header)?;
+            sqlite3_ondisk::begin_write_wal_header(&file, buffer_pool.clone(), &wal_header)?;
             Arc::new(SpinLock::new(wal_header))
         };
         let checksum = {

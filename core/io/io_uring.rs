@@ -1,4 +1,4 @@
-use super::{common, Completion, File, OpenFlags, WriteCompletion, IO};
+use super::{common, Completion, File, OpenFlags, IO};
 use crate::io::clock::{Clock, Instant};
 use crate::storage::buffer_pool::MAX_ARENA_PAGES;
 use crate::{LimboError, MemoryIO, Result};
@@ -14,7 +14,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, trace};
 
-const ENTRIES: u32 = 512;
+const ENTRIES: u32 = 2048;
 const SQPOLL_IDLE: u32 = 500;
 const ACTIVE_FILES: u32 = 2;
 
@@ -121,9 +121,9 @@ impl WrappedIOUring {
                 .expect("submission queue is full");
         }
         self.pending_ops += 1;
-        if self.pending_ops % 3 == 0 {
-            // periodically submit to avoid filling up the submission queue
-            self.ring.submit().expect("submit failed");
+        if self.pending_ops % 32 == 0 {
+            // We need to wait for at least one completion before we can submit more.
+            self.ring.submit().expect("failed to submit");
         }
     }
 
@@ -148,13 +148,13 @@ impl WrappedIOUring {
     }
 
     fn get_key(&mut self) -> u64 {
-        self.key += 1;
-        if self.key == ENTRIES as u64 {
-            let key = self.key;
+        let key = self.key;
+        if key == ENTRIES.into() {
             self.key = 0;
-            return key;
+        } else {
+            self.key += 1;
         }
-        self.key
+        key
     }
 }
 
@@ -215,7 +215,7 @@ impl IO for UringIO {
     fn register_buffer(&self, arena_id: u32, iovec: (*const u8, usize)) -> Result<()> {
         let inner = unsafe { &*self.inner.get() };
         let mut offset = inner.buffers.fetch_add(1, Ordering::SeqCst);
-        tracing::trace!("register_buffer: arena_id: {arena_id}, offset: {offset}");
+        println!("register_buffer: arena_id = {arena_id}, offset = {offset}");
         if arena_id != offset {
             // this means that a new connection + buffer pool is reusing the IO, so we can overwrite
             // the earlier buffers by calling update on previously registered indexes.
@@ -357,14 +357,7 @@ impl File for UringFile {
                     .user_data(io.ring.get_key())
             }
         };
-        io.ring.submit_entry(
-            &write,
-            Completion::Write(WriteCompletion::new(Box::new(move |result| {
-                c.complete(result);
-                // NOTE: Explicitly reference buffer to ensure it lives until here
-                let _ = buffer.clone();
-            }))),
-        );
+        io.ring.submit_entry(&write, c);
         Ok(())
     }
 

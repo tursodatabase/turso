@@ -135,7 +135,8 @@ impl Database {
 
         let page_size = db_header.lock().page_size;
         let wal_path = format!("{}-wal", path);
-        let shared_wal = WalFileShared::open_shared(&io, wal_path.as_str(), page_size)?;
+        let shared_wal =
+            WalFileShared::open_shared(&io, buffer_pool.clone(), wal_path.as_str(), page_size)?;
 
         DATABASE_VERSION.get_or_init(|| {
             let version = db_header.lock().version_number;
@@ -304,14 +305,6 @@ pub struct Connection {
     last_change: Cell<i64>,
     total_changes: Cell<i64>,
     syms: RefCell<SymbolTable>,
-}
-
-impl Drop for Connection {
-    fn drop(&mut self) {
-        if let Err(e) = self.close() {
-            tracing::error!("Error closing connection: {}", e);
-        }
-    }
 }
 
 impl Connection {

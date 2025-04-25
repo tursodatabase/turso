@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const MAX_ARENA_PAGES: u32 = 256; // 512MB total max buffer pool size
-pub const DEFAULT_ARENA_SIZE: usize = 2 * 1024 * 1024; // 2MB arenas
+pub const DEFAULT_ARENA_SIZE: usize = 4 * 1024 * 1024; // 2MB arenas
 
 #[derive(Debug, Clone)]
 pub struct ArenaBuffer {
@@ -270,26 +270,31 @@ impl BufferPool {
     pub fn get_page(&self, len: Option<usize>) -> Arc<Buffer> {
         let size = len.unwrap_or(self.default_page_size);
         match self.get(size) {
-            Ok(buf) => Buffer::new_pooled(buf),
-            Err(_) => Buffer::new_heap(size),
+            Ok(buf) => {
+                tracing::trace!("BufferPool: get_page: id: {}", buf.io_id());
+                Buffer::new_pooled(buf)
+            }
+            Err(_) => {
+                tracing::trace!("BufferPool: get_page: pool unavailable, using heap buffer");
+                Buffer::new_heap(size)
+            }
         }
     }
 
     /// internal: try arena then maybe grow
     fn get(&self, len: usize) -> Result<ArenaBuffer, ()> {
         // fast path: existing arena with arena.page_size >= len
-        for a in self
-            .arenas
-            .read()
-            .iter()
-            .filter(|a| a.inner.page_size >= len)
         {
-            if let Some(b) = a.try_alloc(len) {
-                return Ok(b);
+            let arenas = self.arenas.read();
+            for a in arenas.iter().filter(|a| a.inner.page_size >= len) {
+                if let Some(b) = a.try_alloc(len) {
+                    return Ok(b);
+                }
             }
         }
-        // need a new arena whose page >= len but <= 2 MiB
-        let psize = len.min(self.default_page_size.max(len));
+        let psize = len
+            .max(self.default_page_size) // anything smaller gets rounded up to default
+            .min(DEFAULT_ARENA_SIZE);
         let a = self.add_arena(psize)?;
         a.try_alloc(len).ok_or(())
     }
@@ -297,7 +302,9 @@ impl BufferPool {
     // Add an arena to the pool with a default page size.
     fn add_arena(&self, page_size: usize) -> Result<Arc<Arena>, ()> {
         // hold guard to prevent expansion while we are adding a new arena
-        let _g = self.expand_guard.lock();
+        let Ok(_g) = self.expand_guard.lock() else {
+            return Err(());
+        };
         let id = self.next_arena.fetch_add(1, Ordering::Relaxed);
         if id >= MAX_ARENAS {
             return Err(());
