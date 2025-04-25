@@ -17,7 +17,31 @@ mod tests {
 
     #[macro_export]
     macro_rules! db_test {
-        ($name:ident, [$($db_path:literal),*], $statement:literal, $expected:expr) => {
+        ([$($db_path:literal),*], $name:ident, $statement:literal, $expected:literal) => {
+            #[test]
+                fn $name() {
+                $(
+                    $crate::common::exec_sql(
+                        $crate::tcl_port::tests::WORKSPACE_ROOT.join($db_path),
+                        $statement,
+                        vec![vec![$expected]].into_iter().flatten(),
+                    );
+                )*
+            }
+        };
+        ($name:ident, $statement:literal, $expected:literal) => {
+            #[test]
+            fn $name() {
+                for db_path in $crate::tcl_port::tests::TEST_DBS {
+                    $crate::common::exec_sql(
+                        $crate::tcl_port::tests::WORKSPACE_ROOT.join(db_path),
+                        $statement,
+                        vec![vec![$expected]].into_iter().flatten(),
+                    );
+                }
+            }
+        };
+        ([$($db_path:literal),*], $name:ident, $statement:literal, $expected:expr) => {
             #[test]
                 fn $name() {
                 $(
@@ -37,6 +61,22 @@ mod tests {
                         $crate::tcl_port::tests::WORKSPACE_ROOT.join(db_path),
                         $statement,
                         ($expected).into_iter().flatten(),
+                    );
+                }
+            }
+        };
+        ($name:ident, [$($statement:literal),*], [$($expected:expr), *]) => {
+            #[test]
+            fn $name() {
+                for db_path in $crate::tcl_port::tests::TEST_DBS {
+                    let queries = vec![$($statement),*];
+                    let expected_vals = vec![$($expected), *];
+                    assert_eq!(queries.len(), expected_vals.len(), "you did not provide the number of arguments for queries and expected values");
+
+                    $crate::common::exec_many_sql(
+                        $crate::tcl_port::tests::WORKSPACE_ROOT.join(db_path),
+                        queries.iter().map(|s| s.to_string()),
+                        expected_vals.into_iter().map(|v| v.into_iter().flatten()),
                     );
                 }
             }

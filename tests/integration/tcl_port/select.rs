@@ -13,5 +13,9 @@ mod tests {
     //     );
     // }
 
-    db_test!(select_const_1, "SELECT 1", vec![vec![1]]);
+    db_test!(select_const_1, "SELECT 1", 1);
+
+    db_test!(select_const_2, "SELECT 2", 2);
+
+    db_test!(select_const_3, ["SELECT 2", "SELECT 2"], [vec![vec![2]]]);
 }
