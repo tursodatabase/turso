@@ -5,7 +5,6 @@ mod tests {
     use cargo_metadata::MetadataCommand;
     use std::path::PathBuf;
     use std::sync::LazyLock;
-    
 
     pub const TEST_DBS: [&str; 2] = ["testing/testing.db", "testing/testing_norowidalias.db"];
 
@@ -85,6 +84,18 @@ mod tests {
                         $crate::tcl_port::tests::WORKSPACE_ROOT.join(db_path),
                         queries.iter().map(|s| s.to_string()),
                         expected_vals.into_iter().map(|v| v.into_iter().flatten().map(|v| v.to_owned())),
+                    );
+                }
+            }
+        };
+        ($name:ident, $statement:literal) => {
+            #[test]
+            fn $name() {
+                for db_path in $crate::tcl_port::tests::TEST_DBS {
+                    $crate::common::exec_sql(
+                        $crate::tcl_port::tests::WORKSPACE_ROOT.join(db_path),
+                        $statement,
+                        std::iter::empty::<rusqlite::types::Value>(),
                     );
                 }
             }
