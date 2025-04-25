@@ -18,7 +18,7 @@ path = "integration/mod.rs"
 anyhow = "1.0.75"
 env_logger = "0.10.1"
 limbo_core = { path = "../core" }
-rusqlite = { version = "0.34", features = ["bundled"] }
+rusqlite = { workspace = true }
 tempfile = "3.0.7"
 log = "0.4.22"
 assert_cmd = "^2"

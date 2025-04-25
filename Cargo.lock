@@ -1970,8 +1970,10 @@ dependencies = [
 name = "limbo_tests_macros"
 version = "0.0.19"
 dependencies = [
+ "hex",
  "proc-macro2",
  "quote",
+ "rusqlite",
  "syn 2.0.100",
 ]
 

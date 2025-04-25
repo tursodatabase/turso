@@ -10,6 +10,8 @@ repository.workspace = true
 proc-macro = true
 
 [dependencies]
+hex = "0.4.3"
 proc-macro2 = "1.0.95"
 quote = "1.0.40"
+rusqlite = { workspace = true }
 syn = "2.0.100"
