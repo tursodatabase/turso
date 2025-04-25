@@ -16,38 +16,7 @@ mod tests {
     }
 
     #[macro_export]
-    macro_rules! sqlite_blob {
-        ($value:literal) => {
-            [vec![hex::decode($value.as_bytes()).unwrap()]]
-        };
-    }
-
-    #[macro_export]
     macro_rules! db_test {
-        ([$($db_path:literal),*], $name:ident, $statement:literal, $expected:literal) => {
-            #[test]
-                fn $name() {
-                $(
-                    $crate::common::exec_sql(
-                        $crate::tcl_port::tests::WORKSPACE_ROOT.join($db_path),
-                        $statement,
-                        vec![vec![$expected]].into_iter().flatten().map(|v| v.to_owned()),
-                    );
-                )*
-            }
-        };
-        ($name:ident, $statement:literal, $expected:literal) => {
-            #[test]
-            fn $name() {
-                for db_path in $crate::tcl_port::tests::TEST_DBS {
-                    $crate::common::exec_sql(
-                        $crate::tcl_port::tests::WORKSPACE_ROOT.join(db_path),
-                        $statement,
-                        vec![vec![$expected]].into_iter().flatten().map(|v| v.to_owned()),
-                    );
-                }
-            }
-        };
         ([$($db_path:literal),*], $name:ident, $statement:literal, $expected:expr) => {
             #[test]
                 fn $name() {
@@ -55,7 +24,7 @@ mod tests {
                     $crate::common::exec_sql(
                         $crate::tcl_port::tests::WORKSPACE_ROOT.join($db_path),
                         $statement,
-                        ($expected).into_iter().flatten().map(|v| v.to_owned()),
+                        ::limbo_tests_macros::sqlite_values!($expected),
                     );
                 )*
             }
@@ -67,12 +36,12 @@ mod tests {
                     $crate::common::exec_sql(
                         $crate::tcl_port::tests::WORKSPACE_ROOT.join(db_path),
                         $statement,
-                        ($expected).into_iter().flatten().map(|v| v.to_owned()),
+                        ::limbo_tests_macros::sqlite_values!($expected),
                     );
                 }
             }
         };
-        ($name:ident, [$($statement:literal),*], [$($expected:expr), *]) => {
+        ($name:ident, [$($statement:literal),*], [$($expected:expr),*]) => {
             #[test]
             fn $name() {
                 for db_path in $crate::tcl_port::tests::TEST_DBS {
@@ -95,7 +64,7 @@ mod tests {
                     $crate::common::exec_sql(
                         $crate::tcl_port::tests::WORKSPACE_ROOT.join(db_path),
                         $statement,
-                        std::iter::empty::<rusqlite::types::Value>(),
+                        ::limbo_tests_macros::sqlite_values!(None),
                     );
                 }
             }

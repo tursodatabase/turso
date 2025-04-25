@@ -149,12 +149,7 @@ pub(crate) fn limbo_exec_rows_error(
 }
 
 
-pub(crate) fn exec_sql<I, V>(db_path: PathBuf, sql: &str, values: I)
-where
-    I: Iterator<Item = V>,
-    V: Into<Value>,
-{
-    let values: Vec<Value> = values.map(|v| v.into()).collect();
+pub(crate) fn exec_sql(db_path: PathBuf, sql: &str, values: Vec<Vec<Value>>) {
     // Blocks here to drop db connections
     {
         let sqlite_conn = rusqlite::Connection::open_with_flags(
@@ -162,10 +157,7 @@ where
             OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .unwrap();
-        let sqlite: Vec<Value> = sqlite_exec_rows(&sqlite_conn, sql)
-            .into_iter()
-            .flatten()
-            .collect();
+        let sqlite = sqlite_exec_rows(&sqlite_conn, sql);
 
         assert_eq!(
             sqlite,
@@ -181,10 +173,8 @@ where
     {
         let db = TempDatabase::new_existent(&db_path);
         let limbo_conn = db.connect_limbo();
-        let limbo: Vec<Value> = limbo_exec_rows(&db, &limbo_conn, sql)
-            .into_iter()
-            .flatten()
-            .collect();
+        let limbo = limbo_exec_rows(&db, &limbo_conn, sql);
+
         assert_eq!(
             limbo,
             values,
