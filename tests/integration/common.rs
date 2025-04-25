@@ -1,8 +1,8 @@
 use limbo_core::{CheckpointStatus, Connection, Database, IO};
 use rand::{rng, RngCore};
-use rusqlite::params;
 use rusqlite::types::Value;
-use std::path::PathBuf;
+use rusqlite::{params, OpenFlags};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -30,9 +30,12 @@ impl TempDatabase {
         Self { path, io }
     }
 
-    pub fn new_existent(db_path: PathBuf) -> Self {
+    pub fn new_existent(db_path: &Path) -> Self {
         let io: Arc<dyn IO + Send> = Arc::new(limbo_core::PlatformIO::new().unwrap());
-        Self { path: db_path, io }
+        Self {
+            path: db_path.to_path_buf(),
+            io,
+        }
     }
 
     pub fn new_with_rusqlite(table_sql: &str) -> Self {
@@ -144,23 +147,53 @@ pub(crate) fn limbo_exec_rows_error(
     }
 }
 
-pub(crate) fn exec_sql(db: PathBuf, sql: &str, values: Vec<Vec<Value>>) {
-    let db = TempDatabase::new_existent(db);
-    let limbo_conn = db.connect_limbo();
-    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
-    let limbo = limbo_exec_rows(&db, &limbo_conn, sql);
-    let sqlite = sqlite_exec_rows(&sqlite_conn, sql);
 
-    assert_eq!(
-        limbo, values,
-        "query: {}, values: {:#?}, limbo: {:#?}",
-        sql, values, limbo
-    );
-    assert_eq!(
-        sqlite, values,
-        "query: {}, values: {:#?}, sqlite: {:#?}",
-        sql, values, sqlite
-    );
+pub(crate) fn exec_sql<I, V>(db_path: PathBuf, sql: &str, values: I)
+where
+    I: Iterator<Item = V>,
+    V: Into<Value>,
+{
+    let values: Vec<Value> = values.map(|v| v.into()).collect();
+    // Blocks here to drop db connections
+    {
+        let sqlite_conn = rusqlite::Connection::open_with_flags(
+            db_path.clone(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let sqlite: Vec<Value> = sqlite_exec_rows(&sqlite_conn, sql)
+            .into_iter()
+            .flatten()
+            .collect();
+
+        assert_eq!(
+            sqlite,
+            values,
+            "query: {}, values: {:?}, sqlite: {:?}, db: {}",
+            sql,
+            values,
+            sqlite,
+            db_path.to_string_lossy()
+        );
+    }
+
+    {
+        let db = TempDatabase::new_existent(&db_path);
+        let limbo_conn = db.connect_limbo();
+        let limbo: Vec<Value> = limbo_exec_rows(&db, &limbo_conn, sql)
+            .into_iter()
+            .flatten()
+            .collect();
+        assert_eq!(
+            limbo,
+            values,
+            "query: {}, values: {:?}, limbo: {:?}, db: {}",
+            sql,
+            values,
+            limbo,
+            db_path.to_string_lossy()
+        );
+    }
 }
 pub(crate) fn sqlite_exec_rows(
     conn: &rusqlite::Connection,
@@ -275,7 +308,7 @@ mod tests {
     #[test]
     fn test_limbo_open_read_only() -> anyhow::Result<()> {
         let path = TempDir::new().unwrap().into_path().join("temp_read_only");
-        let db = TempDatabase::new_existent(path.clone());
+        let db = TempDatabase::new_existent(&path);
         {
             let conn = db.connect_limbo();
             let ret = limbo_exec_rows(&db, &conn, "CREATE table t(a)");

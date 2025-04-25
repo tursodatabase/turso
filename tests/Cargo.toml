@@ -30,6 +30,7 @@ cargo_metadata = "0.19.2"
 test-log = { version = "0.2.17", features = ["trace"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 tracing = "0.1.41"
+limbo_tests_macros = { version = "0.0.19", path = "../tests_macros" }
 
 # rexpect does not support windows.
 [target.'cfg(not(windows))'.dependencies]
