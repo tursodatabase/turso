@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use limbo_core::{Clock, Instant};
+use limbo_core::{maybe_init_database_file, Clock, Instant};
 use napi::{Env, JsUnknown, Result as NapiResult};
 use napi_derive::napi;
 
@@ -29,20 +29,9 @@ impl Database {
         let file = io
             .open_file(&path, limbo_core::OpenFlags::Create, false)
             .unwrap();
-        limbo_core::maybe_init_database_file(&file, &io).unwrap();
+        maybe_init_database_file(&file, &io).unwrap();
         let db_file = Arc::new(DatabaseFile::new(file));
-        let db_header = limbo_core::Pager::begin_open(db_file.clone()).unwrap();
-
-        // ensure db header is there
-        io.run_once().unwrap();
-
-        let page_size = db_header.lock().page_size;
-
-        let wal_path = format!("{}-wal", path);
-        let wal_shared =
-            limbo_core::WalFileShared::open_shared(&io, wal_path.as_str(), page_size).unwrap();
-
-        let db = limbo_core::Database::open(io, db_file, wal_shared, false).unwrap();
+        let db = limbo_core::Database::open(io, &path, db_file, false).unwrap();
         let conn = db.connect().unwrap();
         Self {
             memory,

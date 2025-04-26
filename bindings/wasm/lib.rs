@@ -1,7 +1,5 @@
 use js_sys::{Array, Object};
-use limbo_core::{
-    maybe_init_database_file, Clock, Instant, OpenFlags, Pager, Result, WalFileShared,
-};
+use limbo_core::{maybe_init_database_file, Clock, Instant, OpenFlags, Result};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -19,22 +17,10 @@ impl Database {
     #[wasm_bindgen(constructor)]
     pub fn new(path: &str) -> Database {
         let io: Arc<dyn limbo_core::IO> = Arc::new(PlatformIO { vfs: VFS::new() });
-        let file = io
-            .open_file(path, limbo_core::OpenFlags::Create, false)
-            .unwrap();
+        let file = io.open_file(path, OpenFlags::Create, false).unwrap();
         maybe_init_database_file(&file, &io).unwrap();
         let db_file = Arc::new(DatabaseFile::new(file));
-        let db_header = Pager::begin_open(db_file.clone()).unwrap();
-
-        // ensure db header is there
-        io.run_once().unwrap();
-
-        let page_size = db_header.lock().page_size;
-
-        let wal_path = format!("{}-wal", path);
-        let wal_shared = WalFileShared::open_shared(&io, wal_path.as_str(), page_size).unwrap();
-
-        let db = limbo_core::Database::open(io, db_file, wal_shared, false).unwrap();
+        let db = limbo_core::Database::open(io, path, db_file, false).unwrap();
         let conn = db.connect().unwrap();
         Database { db, conn }
     }

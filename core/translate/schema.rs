@@ -37,7 +37,7 @@ pub fn translate_create_table(
             let init_label = program.emit_init();
             let start_offset = program.offset();
             program.emit_halt();
-            program.resolve_label(init_label, program.offset());
+            program.preassign_label_to_next_insn(init_label);
             program.emit_transaction(true);
             program.emit_constant_insns();
             program.emit_goto(start_offset);
@@ -148,7 +148,7 @@ pub fn translate_create_table(
 
     // TODO: SqlExec
     program.emit_halt();
-    program.resolve_label(init_label, program.offset());
+    program.preassign_label_to_next_insn(init_label);
     program.emit_transaction(true);
     program.emit_constant_insns();
     program.emit_goto(start_offset);
@@ -448,7 +448,7 @@ pub fn translate_create_virtual_table(
         });
         let init_label = program.emit_init();
         program.emit_halt();
-        program.resolve_label(init_label, program.offset());
+        program.preassign_label_to_next_insn(init_label);
         program.emit_transaction(true);
         program.emit_constant_insns();
         return Ok(program);
@@ -519,7 +519,7 @@ pub fn translate_create_virtual_table(
     });
 
     program.emit_halt();
-    program.resolve_label(init_label, program.offset());
+    program.preassign_label_to_next_insn(init_label);
     program.emit_transaction(true);
     program.emit_constant_insns();
     program.emit_goto(start_offset);
@@ -545,7 +545,7 @@ pub fn translate_drop_table(
             let init_label = program.emit_init();
             let start_offset = program.offset();
             program.emit_halt();
-            program.resolve_label(init_label, program.offset());
+            program.preassign_label_to_next_insn(init_label);
             program.emit_transaction(true);
             program.emit_constant_insns();
             program.emit_goto(start_offset);
@@ -583,14 +583,14 @@ pub fn translate_drop_table(
     //  1. Remove all entries from the schema table related to the table we are dropping, except for triggers
     //  loop to beginning of schema table
     let end_metadata_label = program.allocate_label();
+    let metadata_loop = program.allocate_label();
     program.emit_insn(Insn::Rewind {
         cursor_id: sqlite_schema_cursor_id,
         pc_if_empty: end_metadata_label,
     });
+    program.preassign_label_to_next_insn(metadata_loop);
 
     //  start loop on schema table
-    let metadata_loop = program.allocate_label();
-    program.resolve_label(metadata_loop, program.offset());
     program.emit_insn(Insn::Column {
         cursor_id: sqlite_schema_cursor_id,
         column: 2,
@@ -627,7 +627,7 @@ pub fn translate_drop_table(
         cursor_id: sqlite_schema_cursor_id,
         pc_if_next: metadata_loop,
     });
-    program.resolve_label(end_metadata_label, program.offset());
+    program.preassign_label_to_next_insn(end_metadata_label);
     //  end of loop on schema table
 
     //  2. Destroy the indices within a loop
@@ -696,7 +696,7 @@ pub fn translate_drop_table(
 
     //  end of the program
     program.emit_halt();
-    program.resolve_label(init_label, program.offset());
+    program.preassign_label_to_next_insn(init_label);
     program.emit_transaction(true);
     program.emit_constant_insns();
 

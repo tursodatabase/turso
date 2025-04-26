@@ -149,8 +149,7 @@ pub fn translate_create_index(
         cursor_id: table_cursor_id,
         pc_if_empty: loop_end_label,
     });
-
-    program.resolve_label(loop_start_label, program.offset());
+    program.preassign_label_to_next_insn(loop_start_label);
 
     // Loop start:
     // Collect index values into start_reg..rowid_reg
@@ -185,7 +184,7 @@ pub fn translate_create_index(
         cursor_id: table_cursor_id,
         pc_if_next: loop_start_label,
     });
-    program.resolve_label(loop_end_label, program.offset());
+    program.preassign_label_to_next_insn(loop_end_label);
 
     // Open the index btree we created for writing to insert the
     // newly sorted index records.
@@ -202,7 +201,7 @@ pub fn translate_create_index(
         cursor_id: sorter_cursor_id,
         pc_if_empty: sorted_loop_end,
     });
-    program.resolve_label(sorted_loop_start, program.offset());
+    program.preassign_label_to_next_insn(sorted_loop_start);
     let sorted_record_reg = program.alloc_register();
     program.emit_insn(Insn::SorterData {
         pseudo_cursor: pseudo_cursor_id,
@@ -226,7 +225,7 @@ pub fn translate_create_index(
         cursor_id: sorter_cursor_id,
         pc_if_next: sorted_loop_start,
     });
-    program.resolve_label(sorted_loop_end, program.offset());
+    program.preassign_label_to_next_insn(sorted_loop_end);
 
     // End of the outer loop
     //
@@ -248,7 +247,7 @@ pub fn translate_create_index(
 
     // Epilogue:
     program.emit_halt();
-    program.resolve_label(init_label, program.offset());
+    program.preassign_label_to_next_insn(init_label);
     program.emit_transaction(true);
     program.emit_constant_insns();
     program.emit_goto(start_offset);

@@ -124,8 +124,8 @@ pub fn emit_order_by(
         cursor_id: sort_cursor,
         pc_if_empty: sort_loop_end_label,
     });
+    program.preassign_label_to_next_insn(sort_loop_start_label);
 
-    program.resolve_label(sort_loop_start_label, program.offset());
     emit_offset(program, t_ctx, plan, sort_loop_next_label)?;
 
     program.emit_insn(Insn::SorterData {
@@ -154,8 +154,7 @@ pub fn emit_order_by(
         cursor_id: sort_cursor,
         pc_if_next: sort_loop_start_label,
     });
-
-    program.resolve_label(sort_loop_end_label, program.offset());
+    program.preassign_label_to_next_insn(sort_loop_end_label);
 
     Ok(())
 }

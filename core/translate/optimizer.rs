@@ -11,6 +11,7 @@ use crate::{
 };
 
 use super::{
+    emitter::Resolver,
     plan::{
         DeletePlan, Direction, EvalAt, GroupBy, IterationDirection, Operation, Plan, Search,
         SeekDef, SeekKey, SelectPlan, TableReference, UpdatePlan, WhereTerm,
@@ -479,7 +480,7 @@ fn rewrite_exprs_update(plan: &mut UpdatePlan) -> Result<()> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConstantPredicate {
+pub enum AlwaysTrueOrFalse {
     AlwaysTrue,
     AlwaysFalse,
 }
@@ -489,18 +490,20 @@ pub enum ConstantPredicate {
   Implemented for ast::Expr
 */
 pub trait Optimizable {
-    // if the expression is a constant expression e.g. '1', returns the constant condition
-    fn check_constant(&self) -> Result<Option<ConstantPredicate>>;
+    // if the expression is a constant expression that, when evaluated as a condition, is always true or false
+    // return a [ConstantPredicate].
+    fn check_always_true_or_false(&self) -> Result<Option<AlwaysTrueOrFalse>>;
     fn is_always_true(&self) -> Result<bool> {
         Ok(self
-            .check_constant()?
-            .map_or(false, |c| c == ConstantPredicate::AlwaysTrue))
+            .check_always_true_or_false()?
+            .map_or(false, |c| c == AlwaysTrueOrFalse::AlwaysTrue))
     }
     fn is_always_false(&self) -> Result<bool> {
         Ok(self
-            .check_constant()?
-            .map_or(false, |c| c == ConstantPredicate::AlwaysFalse))
+            .check_always_true_or_false()?
+            .map_or(false, |c| c == AlwaysTrueOrFalse::AlwaysFalse))
     }
+    fn is_constant(&self, resolver: &Resolver<'_>) -> bool;
     fn is_rowid_alias_of(&self, table_index: usize) -> bool;
     fn is_nonnull(&self, tables: &[TableReference]) -> bool;
 }
@@ -599,22 +602,106 @@ impl Optimizable for ast::Expr {
             Expr::Variable(..) => false,
         }
     }
-    fn check_constant(&self) -> Result<Option<ConstantPredicate>> {
+    /// Returns true if the expression is a constant i.e. does not depend on variables or columns etc.
+    fn is_constant(&self, resolver: &Resolver<'_>) -> bool {
+        match self {
+            Expr::Between {
+                lhs, start, end, ..
+            } => {
+                lhs.is_constant(resolver)
+                    && start.is_constant(resolver)
+                    && end.is_constant(resolver)
+            }
+            Expr::Binary(expr, _, expr1) => {
+                expr.is_constant(resolver) && expr1.is_constant(resolver)
+            }
+            Expr::Case {
+                base,
+                when_then_pairs,
+                else_expr,
+            } => {
+                base.as_ref()
+                    .map_or(true, |base| base.is_constant(resolver))
+                    && when_then_pairs.iter().all(|(when, then)| {
+                        when.is_constant(resolver) && then.is_constant(resolver)
+                    })
+                    && else_expr
+                        .as_ref()
+                        .map_or(true, |else_expr| else_expr.is_constant(resolver))
+            }
+            Expr::Cast { expr, .. } => expr.is_constant(resolver),
+            Expr::Collate(expr, _) => expr.is_constant(resolver),
+            Expr::DoublyQualified(_, _, _) => {
+                panic!("DoublyQualified should have been rewritten as Column")
+            }
+            Expr::Exists(_) => false,
+            Expr::FunctionCall { args, name, .. } => {
+                let Some(func) =
+                    resolver.resolve_function(&name.0, args.as_ref().map_or(0, |args| args.len()))
+                else {
+                    return false;
+                };
+                func.is_deterministic()
+                    && args.as_ref().map_or(true, |args| {
+                        args.iter().all(|arg| arg.is_constant(resolver))
+                    })
+            }
+            Expr::FunctionCallStar { .. } => false,
+            Expr::Id(_) => panic!("Id should have been rewritten as Column"),
+            Expr::Column { .. } => false,
+            Expr::RowId { .. } => false,
+            Expr::InList { lhs, rhs, .. } => {
+                lhs.is_constant(resolver)
+                    && rhs
+                        .as_ref()
+                        .map_or(true, |rhs| rhs.iter().all(|rhs| rhs.is_constant(resolver)))
+            }
+            Expr::InSelect { .. } => {
+                false // might be constant, too annoying to check subqueries etc. implement later
+            }
+            Expr::InTable { .. } => false,
+            Expr::IsNull(expr) => expr.is_constant(resolver),
+            Expr::Like {
+                lhs, rhs, escape, ..
+            } => {
+                lhs.is_constant(resolver)
+                    && rhs.is_constant(resolver)
+                    && escape
+                        .as_ref()
+                        .map_or(true, |escape| escape.is_constant(resolver))
+            }
+            Expr::Literal(_) => true,
+            Expr::Name(_) => false,
+            Expr::NotNull(expr) => expr.is_constant(resolver),
+            Expr::Parenthesized(exprs) => exprs.iter().all(|expr| expr.is_constant(resolver)),
+            Expr::Qualified(_, _) => {
+                panic!("Qualified should have been rewritten as Column")
+            }
+            Expr::Raise(_, expr) => expr
+                .as_ref()
+                .map_or(true, |expr| expr.is_constant(resolver)),
+            Expr::Subquery(_) => false,
+            Expr::Unary(_, expr) => expr.is_constant(resolver),
+            Expr::Variable(_) => false,
+        }
+    }
+    /// Returns true if the expression is a constant expression that, when evaluated as a condition, is always true or false
+    fn check_always_true_or_false(&self) -> Result<Option<AlwaysTrueOrFalse>> {
         match self {
             Self::Literal(lit) => match lit {
                 ast::Literal::Numeric(b) => {
                     if let Ok(int_value) = b.parse::<i64>() {
                         return Ok(Some(if int_value == 0 {
-                            ConstantPredicate::AlwaysFalse
+                            AlwaysTrueOrFalse::AlwaysFalse
                         } else {
-                            ConstantPredicate::AlwaysTrue
+                            AlwaysTrueOrFalse::AlwaysTrue
                         }));
                     }
                     if let Ok(float_value) = b.parse::<f64>() {
                         return Ok(Some(if float_value == 0.0 {
-                            ConstantPredicate::AlwaysFalse
+                            AlwaysTrueOrFalse::AlwaysFalse
                         } else {
-                            ConstantPredicate::AlwaysTrue
+                            AlwaysTrueOrFalse::AlwaysTrue
                         }));
                     }
 
@@ -624,35 +711,35 @@ impl Optimizable for ast::Expr {
                     let without_quotes = s.trim_matches('\'');
                     if let Ok(int_value) = without_quotes.parse::<i64>() {
                         return Ok(Some(if int_value == 0 {
-                            ConstantPredicate::AlwaysFalse
+                            AlwaysTrueOrFalse::AlwaysFalse
                         } else {
-                            ConstantPredicate::AlwaysTrue
+                            AlwaysTrueOrFalse::AlwaysTrue
                         }));
                     }
 
                     if let Ok(float_value) = without_quotes.parse::<f64>() {
                         return Ok(Some(if float_value == 0.0 {
-                            ConstantPredicate::AlwaysFalse
+                            AlwaysTrueOrFalse::AlwaysFalse
                         } else {
-                            ConstantPredicate::AlwaysTrue
+                            AlwaysTrueOrFalse::AlwaysTrue
                         }));
                     }
 
-                    Ok(Some(ConstantPredicate::AlwaysFalse))
+                    Ok(Some(AlwaysTrueOrFalse::AlwaysFalse))
                 }
                 _ => Ok(None),
             },
             Self::Unary(op, expr) => {
                 if *op == ast::UnaryOperator::Not {
-                    let trivial = expr.check_constant()?;
+                    let trivial = expr.check_always_true_or_false()?;
                     return Ok(trivial.map(|t| match t {
-                        ConstantPredicate::AlwaysTrue => ConstantPredicate::AlwaysFalse,
-                        ConstantPredicate::AlwaysFalse => ConstantPredicate::AlwaysTrue,
+                        AlwaysTrueOrFalse::AlwaysTrue => AlwaysTrueOrFalse::AlwaysFalse,
+                        AlwaysTrueOrFalse::AlwaysFalse => AlwaysTrueOrFalse::AlwaysTrue,
                     }));
                 }
 
                 if *op == ast::UnaryOperator::Negative {
-                    let trivial = expr.check_constant()?;
+                    let trivial = expr.check_always_true_or_false()?;
                     return Ok(trivial);
                 }
 
@@ -661,50 +748,50 @@ impl Optimizable for ast::Expr {
             Self::InList { lhs: _, not, rhs } => {
                 if rhs.is_none() {
                     return Ok(Some(if *not {
-                        ConstantPredicate::AlwaysTrue
+                        AlwaysTrueOrFalse::AlwaysTrue
                     } else {
-                        ConstantPredicate::AlwaysFalse
+                        AlwaysTrueOrFalse::AlwaysFalse
                     }));
                 }
                 let rhs = rhs.as_ref().unwrap();
                 if rhs.is_empty() {
                     return Ok(Some(if *not {
-                        ConstantPredicate::AlwaysTrue
+                        AlwaysTrueOrFalse::AlwaysTrue
                     } else {
-                        ConstantPredicate::AlwaysFalse
+                        AlwaysTrueOrFalse::AlwaysFalse
                     }));
                 }
 
                 Ok(None)
             }
             Self::Binary(lhs, op, rhs) => {
-                let lhs_trivial = lhs.check_constant()?;
-                let rhs_trivial = rhs.check_constant()?;
+                let lhs_trivial = lhs.check_always_true_or_false()?;
+                let rhs_trivial = rhs.check_always_true_or_false()?;
                 match op {
                     ast::Operator::And => {
-                        if lhs_trivial == Some(ConstantPredicate::AlwaysFalse)
-                            || rhs_trivial == Some(ConstantPredicate::AlwaysFalse)
+                        if lhs_trivial == Some(AlwaysTrueOrFalse::AlwaysFalse)
+                            || rhs_trivial == Some(AlwaysTrueOrFalse::AlwaysFalse)
                         {
-                            return Ok(Some(ConstantPredicate::AlwaysFalse));
+                            return Ok(Some(AlwaysTrueOrFalse::AlwaysFalse));
                         }
-                        if lhs_trivial == Some(ConstantPredicate::AlwaysTrue)
-                            && rhs_trivial == Some(ConstantPredicate::AlwaysTrue)
+                        if lhs_trivial == Some(AlwaysTrueOrFalse::AlwaysTrue)
+                            && rhs_trivial == Some(AlwaysTrueOrFalse::AlwaysTrue)
                         {
-                            return Ok(Some(ConstantPredicate::AlwaysTrue));
+                            return Ok(Some(AlwaysTrueOrFalse::AlwaysTrue));
                         }
 
                         Ok(None)
                     }
                     ast::Operator::Or => {
-                        if lhs_trivial == Some(ConstantPredicate::AlwaysTrue)
-                            || rhs_trivial == Some(ConstantPredicate::AlwaysTrue)
+                        if lhs_trivial == Some(AlwaysTrueOrFalse::AlwaysTrue)
+                            || rhs_trivial == Some(AlwaysTrueOrFalse::AlwaysTrue)
                         {
-                            return Ok(Some(ConstantPredicate::AlwaysTrue));
+                            return Ok(Some(AlwaysTrueOrFalse::AlwaysTrue));
                         }
-                        if lhs_trivial == Some(ConstantPredicate::AlwaysFalse)
-                            && rhs_trivial == Some(ConstantPredicate::AlwaysFalse)
+                        if lhs_trivial == Some(AlwaysTrueOrFalse::AlwaysFalse)
+                            && rhs_trivial == Some(AlwaysTrueOrFalse::AlwaysFalse)
                         {
-                            return Ok(Some(ConstantPredicate::AlwaysFalse));
+                            return Ok(Some(AlwaysTrueOrFalse::AlwaysFalse));
                         }
 
                         Ok(None)

@@ -33,7 +33,7 @@ pub fn translate_tx_begin(
         }
     }
     program.emit_halt();
-    program.resolve_label(init_label, program.offset());
+    program.preassign_label_to_next_insn(init_label);
     program.emit_goto(start_offset);
     Ok(program)
 }
@@ -52,7 +52,7 @@ pub fn translate_tx_commit(_tx_name: Option<Name>) -> Result<ProgramBuilder> {
         rollback: false,
     });
     program.emit_halt();
-    program.resolve_label(init_label, program.offset());
+    program.preassign_label_to_next_insn(init_label);
     program.emit_goto(start_offset);
     Ok(program)
 }

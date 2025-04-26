@@ -28,6 +28,7 @@ csv = "1.3.1"
 ctrlc = "3.4.4"
 dirs = "5.0.1"
 env_logger = "0.10.1"
+libc = "0.2.172"
 limbo_core = { path = "../core", default-features = true, features = [
     "completion",
 ] }
@@ -41,7 +42,6 @@ syntect = "5.2.0"
 tracing = "0.1.41"
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
-
 
 [features]
 default = ["io_uring"]

@@ -275,16 +275,18 @@ pub fn emit_group_by<'a>(
         "start new group if comparison is not equal",
     );
     // If we are at a new group, continue. If we are at the same group, jump to the aggregation step (i.e. accumulate more values into the aggregations)
+    let label_jump_after_comparison = program.allocate_label();
     program.emit_insn(Insn::Jump {
-        target_pc_lt: program.offset().add(1u32),
+        target_pc_lt: label_jump_after_comparison,
         target_pc_eq: agg_step_label,
-        target_pc_gt: program.offset().add(1u32),
+        target_pc_gt: label_jump_after_comparison,
     });
 
     program.add_comment(
         program.offset(),
         "check if ended group had data, and output if so",
     );
+    program.resolve_label(label_jump_after_comparison, program.offset());
     program.emit_insn(Insn::Gosub {
         target_pc: label_subrtn_acc_output,
         return_reg: reg_subrtn_acc_output_return_offset,
@@ -364,8 +366,7 @@ pub fn emit_group_by<'a>(
         cursor_id: sort_cursor,
         pc_if_next: label_grouping_loop_start,
     });
-
-    program.resolve_label(label_grouping_loop_end, program.offset());
+    program.preassign_label_to_next_insn(label_grouping_loop_end);
 
     program.add_comment(program.offset(), "emit row for final group");
     program.emit_insn(Insn::Gosub {
@@ -505,8 +506,7 @@ pub fn emit_group_by<'a>(
     program.emit_insn(Insn::Return {
         return_reg: reg_subrtn_acc_clear_return_offset,
     });
-
-    program.resolve_label(label_group_by_end, program.offset());
+    program.preassign_label_to_next_insn(label_group_by_end);
 
     Ok(())
 }

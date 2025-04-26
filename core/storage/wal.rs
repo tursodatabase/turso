@@ -462,6 +462,7 @@ impl Wal for WalFile {
             &shared.file,
             offset,
             &page,
+            self.page_size as u16,
             db_size,
             write_counter,
             &header,

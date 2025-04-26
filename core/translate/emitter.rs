@@ -159,8 +159,7 @@ fn epilogue(
         err_code: 0,
         description: String::new(),
     });
-
-    program.resolve_label(init_label, program.offset());
+    program.preassign_label_to_next_insn(init_label);
 
     match txn_mode {
         TransactionMode::Read => program.emit_insn(Insn::Transaction { write: false }),
@@ -297,7 +296,7 @@ pub fn emit_query<'a>(
             condition_metadata,
             &t_ctx.resolver,
         )?;
-        program.resolve_label(jump_target_when_true, program.offset());
+        program.preassign_label_to_next_insn(jump_target_when_true);
     }
 
     // Set up main query execution loop
@@ -308,8 +307,7 @@ pub fn emit_query<'a>(
 
     // Clean up and close the main execution loop
     close_loop(program, t_ctx, &plan.table_references)?;
-
-    program.resolve_label(after_main_loop_label, program.offset());
+    program.preassign_label_to_next_insn(after_main_loop_label);
 
     let mut order_by_necessary = plan.order_by.is_some() && !plan.contains_constant_false_condition;
     let order_by = plan.order_by.as_ref();
@@ -379,8 +377,7 @@ fn emit_program_for_delete(
 
     // Clean up and close the main execution loop
     close_loop(program, &mut t_ctx, &plan.table_references)?;
-
-    program.resolve_label(after_main_loop_label, program.offset());
+    program.preassign_label_to_next_insn(after_main_loop_label);
 
     // Finalize program
     epilogue(program, init_label, start_offset, TransactionMode::Write)?;
@@ -516,8 +513,7 @@ fn emit_program_for_update(
     )?;
     emit_update_insns(&plan, &t_ctx, program)?;
     close_loop(program, &mut t_ctx, &plan.table_references)?;
-
-    program.resolve_label(after_main_loop_label, program.offset());
+    program.preassign_label_to_next_insn(after_main_loop_label);
 
     // Finalize program
     epilogue(program, init_label, start_offset, TransactionMode::Write)?;
@@ -570,7 +566,7 @@ fn emit_update_insns(
             meta,
             &t_ctx.resolver,
         )?;
-        program.resolve_label(jump_target, program.offset());
+        program.preassign_label_to_next_insn(jump_target);
     }
     let beg = program.alloc_registers(
         table_ref.table.columns().len()

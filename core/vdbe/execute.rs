@@ -3894,6 +3894,60 @@ pub fn op_soft_null(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_no_conflict(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Rc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    let Insn::NoConflict {
+        cursor_id,
+        target_pc,
+        record_reg,
+        num_regs,
+    } = insn
+    else {
+        unreachable!("unexpected Insn {:?}", insn)
+    };
+    let mut cursor_ref = state.get_cursor(*cursor_id);
+    let cursor = cursor_ref.as_btree_mut();
+
+    let record = if *num_regs == 0 {
+        let record = match &state.registers[*record_reg] {
+            Register::Record(r) => r,
+            _ => {
+                return Err(LimboError::InternalError(
+                    "NoConflict: exepected a record in the register".into(),
+                ));
+            }
+        };
+        record
+    } else {
+        &make_record(&state.registers, record_reg, num_regs)
+    };
+    // If there is at least one NULL in the index record, there cannot be a conflict so we can immediately jump.
+    let contains_nulls = record
+        .get_values()
+        .iter()
+        .any(|val| matches!(val, RefValue::Null));
+
+    if contains_nulls {
+        drop(cursor_ref);
+        state.pc = target_pc.to_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    let conflict = return_if_io!(cursor.seek(SeekKey::IndexKey(record), SeekOp::EQ));
+    drop(cursor_ref);
+    if !conflict {
+        state.pc = target_pc.to_offset_int();
+    } else {
+        state.pc += 1;
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_not_exists(
     program: &Program,
     state: &mut ProgramState,

@@ -13,6 +13,7 @@ use crate::vdbe::{
 use crate::Result;
 
 use super::emitter::Resolver;
+use super::optimizer::Optimizable;
 use super::plan::{Operation, TableReference};
 
 #[derive(Debug, Clone, Copy)]
@@ -205,7 +206,7 @@ pub fn translate_condition_expr(
                 },
                 resolver,
             )?;
-            program.resolve_label(jump_target_when_true, program.offset());
+            program.preassign_label_to_next_insn(jump_target_when_true);
             translate_condition_expr(
                 program,
                 referenced_tables,
@@ -230,7 +231,7 @@ pub fn translate_condition_expr(
                 },
                 resolver,
             )?;
-            program.resolve_label(jump_target_when_false, program.offset());
+            program.preassign_label_to_next_insn(jump_target_when_false);
             translate_condition_expr(
                 program,
                 referenced_tables,
@@ -254,8 +255,8 @@ pub fn translate_condition_expr(
         {
             let lhs_reg = program.alloc_register();
             let rhs_reg = program.alloc_register();
-            translate_and_mark(program, Some(referenced_tables), lhs, lhs_reg, resolver)?;
-            translate_and_mark(program, Some(referenced_tables), rhs, rhs_reg, resolver)?;
+            translate_expr(program, Some(referenced_tables), lhs, lhs_reg, resolver)?;
+            translate_expr(program, Some(referenced_tables), rhs, rhs_reg, resolver)?;
             match op {
                 ast::Operator::Greater => {
                     emit_cmp_insn!(program, condition_metadata, Gt, Le, lhs_reg, rhs_reg)
@@ -410,7 +411,7 @@ pub fn translate_condition_expr(
             }
 
             if !condition_metadata.jump_if_condition_is_true {
-                program.resolve_label(jump_target_when_true, program.offset());
+                program.preassign_label_to_next_insn(jump_target_when_true);
             }
         }
         ast::Expr::Like { not, .. } => {
@@ -478,6 +479,38 @@ pub fn translate_condition_expr(
     Ok(())
 }
 
+/// Reason why [translate_expr_no_constant_opt()] was called.
+#[derive(Debug)]
+pub enum NoConstantOptReason {
+    /// The expression translation involves reusing register(s),
+    /// so hoisting those register assignments is not safe.
+    /// e.g. SELECT COALESCE(1, t.x, NULL) would overwrite 1 with NULL, which is invalid.
+    RegisterReuse,
+}
+
+/// Translate an expression into bytecode via [translate_expr()], and forbid any constant values from being hoisted
+/// into the beginning of the program. This is a good idea in most cases where
+/// a register will end up being reused e.g. in a coroutine.
+pub fn translate_expr_no_constant_opt(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&[TableReference]>,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+    deopt_reason: NoConstantOptReason,
+) -> Result<usize> {
+    tracing::debug!(
+        "translate_expr_no_constant_opt: expr={:?}, deopt_reason={:?}",
+        expr,
+        deopt_reason
+    );
+    let next_span_idx = program.constant_spans_next_idx();
+    let translated = translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+    program.constant_spans_invalidate_after(next_span_idx);
+    Ok(translated)
+}
+
+/// Translate an expression into bytecode.
 pub fn translate_expr(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&[TableReference]>,
@@ -485,14 +518,29 @@ pub fn translate_expr(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
+    let constant_span = if expr.is_constant(resolver) {
+        if !program.constant_span_is_open() {
+            Some(program.constant_span_start())
+        } else {
+            None
+        }
+    } else {
+        program.constant_span_end_all();
+        None
+    };
+
     if let Some(reg) = resolver.resolve_cached_expr_reg(expr) {
         program.emit_insn(Insn::Copy {
             src_reg: reg,
             dst_reg: target_register,
             amount: 0,
         });
+        if let Some(span) = constant_span {
+            program.constant_span_end(span);
+        }
         return Ok(target_register);
     }
+
     match expr {
         ast::Expr::Between { .. } => {
             unreachable!("expression should have been rewritten in optmizer")
@@ -504,17 +552,17 @@ pub fn translate_expr(
                 translate_expr(program, referenced_tables, e1, shared_reg, resolver)?;
 
                 emit_binary_insn(program, op, shared_reg, shared_reg, target_register)?;
-                return Ok(target_register);
+                Ok(target_register)
+            } else {
+                let e1_reg = program.alloc_registers(2);
+                let e2_reg = e1_reg + 1;
+
+                translate_expr(program, referenced_tables, e1, e1_reg, resolver)?;
+                translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
+
+                emit_binary_insn(program, op, e1_reg, e2_reg, target_register)?;
+                Ok(target_register)
             }
-
-            let e1_reg = program.alloc_registers(2);
-            let e2_reg = e1_reg + 1;
-
-            translate_expr(program, referenced_tables, e1, e1_reg, resolver)?;
-            translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
-
-            emit_binary_insn(program, op, e1_reg, e2_reg, target_register)?;
-            Ok(target_register)
         }
         ast::Expr::Case {
             base,
@@ -545,7 +593,14 @@ pub fn translate_expr(
                 )?;
             };
             for (when_expr, then_expr) in when_then_pairs {
-                translate_expr(program, referenced_tables, when_expr, expr_reg, resolver)?;
+                translate_expr_no_constant_opt(
+                    program,
+                    referenced_tables,
+                    when_expr,
+                    expr_reg,
+                    resolver,
+                    NoConstantOptReason::RegisterReuse,
+                )?;
                 match base_reg {
                     // CASE 1 WHEN 0 THEN 0 ELSE 1 becomes 1==0, Ne branch to next clause
                     Some(base_reg) => program.emit_insn(Insn::Ne {
@@ -563,12 +618,13 @@ pub fn translate_expr(
                     }),
                 };
                 // THEN...
-                translate_expr(
+                translate_expr_no_constant_opt(
                     program,
                     referenced_tables,
                     then_expr,
                     target_register,
                     resolver,
+                    NoConstantOptReason::RegisterReuse,
                 )?;
                 program.emit_insn(Insn::Goto {
                     target_pc: return_label,
@@ -580,7 +636,14 @@ pub fn translate_expr(
             }
             match else_expr {
                 Some(expr) => {
-                    translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+                    translate_expr_no_constant_opt(
+                        program,
+                        referenced_tables,
+                        expr,
+                        target_register,
+                        resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )?;
                 }
                 // If ELSE isn't specified, it means ELSE null.
                 None => {
@@ -590,7 +653,7 @@ pub fn translate_expr(
                     });
                 }
             };
-            program.resolve_label(return_label, program.offset());
+            program.preassign_label_to_next_insn(return_label);
             Ok(target_register)
         }
         ast::Expr::Cast { expr, type_name } => {
@@ -776,7 +839,7 @@ pub fn translate_expr(
                         if let Some(args) = args {
                             for (i, arg) in args.iter().enumerate() {
                                 // register containing result of each argument expression
-                                translate_and_mark(
+                                translate_expr(
                                     program,
                                     referenced_tables,
                                     arg,
@@ -904,12 +967,13 @@ pub fn translate_expr(
                             // whenever a not null check succeeds, we jump to the end of the series
                             let label_coalesce_end = program.allocate_label();
                             for (index, arg) in args.iter().enumerate() {
-                                let reg = translate_expr(
+                                let reg = translate_expr_no_constant_opt(
                                     program,
                                     referenced_tables,
                                     arg,
                                     target_register,
                                     resolver,
+                                    NoConstantOptReason::RegisterReuse,
                                 )?;
                                 if index < args.len() - 1 {
                                     program.emit_insn(Insn::NotNull {
@@ -991,12 +1055,13 @@ pub fn translate_expr(
                             };
 
                             let temp_reg = program.alloc_register();
-                            translate_expr(
+                            translate_expr_no_constant_opt(
                                 program,
                                 referenced_tables,
                                 &args[0],
                                 temp_reg,
                                 resolver,
+                                NoConstantOptReason::RegisterReuse,
                             )?;
                             let before_copy_label = program.allocate_label();
                             program.emit_insn(Insn::NotNull {
@@ -1004,12 +1069,13 @@ pub fn translate_expr(
                                 target_pc: before_copy_label,
                             });
 
-                            translate_expr(
+                            translate_expr_no_constant_opt(
                                 program,
                                 referenced_tables,
                                 &args[1],
                                 temp_reg,
                                 resolver,
+                                NoConstantOptReason::RegisterReuse,
                             )?;
                             program.resolve_label(before_copy_label, program.offset());
                             program.emit_insn(Insn::Copy {
@@ -1029,12 +1095,13 @@ pub fn translate_expr(
                                 ),
                             };
                             let temp_reg = program.alloc_register();
-                            translate_expr(
+                            translate_expr_no_constant_opt(
                                 program,
                                 referenced_tables,
                                 &args[0],
                                 temp_reg,
                                 resolver,
+                                NoConstantOptReason::RegisterReuse,
                             )?;
                             let jump_target_when_false = program.allocate_label();
                             program.emit_insn(Insn::IfNot {
@@ -1042,26 +1109,28 @@ pub fn translate_expr(
                                 target_pc: jump_target_when_false,
                                 jump_if_null: true,
                             });
-                            translate_expr(
+                            translate_expr_no_constant_opt(
                                 program,
                                 referenced_tables,
                                 &args[1],
                                 target_register,
                                 resolver,
+                                NoConstantOptReason::RegisterReuse,
                             )?;
                             let jump_target_result = program.allocate_label();
                             program.emit_insn(Insn::Goto {
                                 target_pc: jump_target_result,
                             });
-                            program.resolve_label(jump_target_when_false, program.offset());
-                            translate_expr(
+                            program.preassign_label_to_next_insn(jump_target_when_false);
+                            translate_expr_no_constant_opt(
                                 program,
                                 referenced_tables,
                                 &args[2],
                                 target_register,
                                 resolver,
+                                NoConstantOptReason::RegisterReuse,
                             )?;
-                            program.resolve_label(jump_target_result, program.offset());
+                            program.preassign_label_to_next_insn(jump_target_result);
                             Ok(target_register)
                         }
                         ScalarFunc::Glob | ScalarFunc::Like => {
@@ -1113,7 +1182,7 @@ pub fn translate_expr(
                         | ScalarFunc::ZeroBlob => {
                             let args = expect_arguments_exact!(args, 1, srf);
                             let start_reg = program.alloc_register();
-                            translate_and_mark(
+                            translate_expr(
                                 program,
                                 referenced_tables,
                                 &args[0],
@@ -1132,7 +1201,7 @@ pub fn translate_expr(
                         ScalarFunc::LoadExtension => {
                             let args = expect_arguments_exact!(args, 1, srf);
                             let start_reg = program.alloc_register();
-                            translate_and_mark(
+                            translate_expr(
                                 program,
                                 referenced_tables,
                                 &args[0],
@@ -1169,7 +1238,7 @@ pub fn translate_expr(
                             if let Some(args) = args {
                                 for (i, arg) in args.iter().enumerate() {
                                     // register containing result of each argument expression
-                                    translate_and_mark(
+                                    translate_expr(
                                         program,
                                         referenced_tables,
                                         arg,
@@ -1248,7 +1317,7 @@ pub fn translate_expr(
                                 crate::bail_parse_error!("hex function with no arguments",);
                             };
                             let start_reg = program.alloc_register();
-                            translate_and_mark(
+                            translate_expr(
                                 program,
                                 referenced_tables,
                                 &args[0],
@@ -1296,7 +1365,7 @@ pub fn translate_expr(
                             if let Some(args) = args {
                                 for (i, arg) in args.iter().enumerate() {
                                     // register containing result of each argument expression
-                                    translate_and_mark(
+                                    translate_expr(
                                         program,
                                         referenced_tables,
                                         arg,
@@ -1365,7 +1434,7 @@ pub fn translate_expr(
 
                             let start_reg = program.alloc_registers(args.len());
                             for (i, arg) in args.iter().enumerate() {
-                                translate_and_mark(
+                                translate_expr(
                                     program,
                                     referenced_tables,
                                     arg,
@@ -1394,7 +1463,7 @@ pub fn translate_expr(
                             };
                             let start_reg = program.alloc_registers(args.len());
                             for (i, arg) in args.iter().enumerate() {
-                                translate_and_mark(
+                                translate_expr(
                                     program,
                                     referenced_tables,
                                     arg,
@@ -1424,7 +1493,7 @@ pub fn translate_expr(
                             };
                             let start_reg = program.alloc_registers(args.len());
                             for (i, arg) in args.iter().enumerate() {
-                                translate_and_mark(
+                                translate_expr(
                                     program,
                                     referenced_tables,
                                     arg,
@@ -1577,7 +1646,7 @@ pub fn translate_expr(
                             if let Some(args) = args {
                                 for (i, arg) in args.iter().enumerate() {
                                     // register containing result of each argument expression
-                                    translate_and_mark(
+                                    translate_expr(
                                         program,
                                         referenced_tables,
                                         arg,
@@ -1614,7 +1683,7 @@ pub fn translate_expr(
                                 crate::bail_parse_error!("likely function with no arguments",);
                             };
                             let start_reg = program.alloc_register();
-                            translate_and_mark(
+                            translate_expr(
                                 program,
                                 referenced_tables,
                                 &args[0],
@@ -1665,7 +1734,7 @@ pub fn translate_expr(
                             }
 
                             let start_reg = program.alloc_register();
-                            translate_and_mark(
+                            translate_expr(
                                 program,
                                 referenced_tables,
                                 &args[0],
@@ -1701,13 +1770,7 @@ pub fn translate_expr(
                     MathFuncArity::Unary => {
                         let args = expect_arguments_exact!(args, 1, math_func);
                         let start_reg = program.alloc_register();
-                        translate_and_mark(
-                            program,
-                            referenced_tables,
-                            &args[0],
-                            start_reg,
-                            resolver,
-                        )?;
+                        translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
                         program.emit_insn(Insn::Function {
                             constant_mask: 0,
                             start_reg,
@@ -2098,7 +2161,13 @@ pub fn translate_expr(
             });
             Ok(target_register)
         }
+    }?;
+
+    if let Some(span) = constant_span {
+        program.constant_span_end(span);
     }
+
+    Ok(target_register)
 }
 
 fn emit_binary_insn(
@@ -2367,17 +2436,11 @@ fn translate_like_base(
             let arg_count = if matches!(escape, Some(_)) { 3 } else { 2 };
             let start_reg = program.alloc_registers(arg_count);
             let mut constant_mask = 0;
-            translate_and_mark(program, referenced_tables, lhs, start_reg + 1, resolver)?;
+            translate_expr(program, referenced_tables, lhs, start_reg + 1, resolver)?;
             let _ = translate_expr(program, referenced_tables, rhs, start_reg, resolver)?;
             if arg_count == 3 {
                 if let Some(escape) = escape {
-                    translate_and_mark(
-                        program,
-                        referenced_tables,
-                        escape,
-                        start_reg + 2,
-                        resolver,
-                    )?;
+                    translate_expr(program, referenced_tables, escape, start_reg + 2, resolver)?;
                 }
             }
             if matches!(rhs.as_ref(), ast::Expr::Literal(_)) {
@@ -2480,20 +2543,6 @@ pub fn maybe_apply_affinity(col_type: Type, target_register: usize, program: &mu
             register: target_register,
         })
     }
-}
-
-pub fn translate_and_mark(
-    program: &mut ProgramBuilder,
-    referenced_tables: Option<&[TableReference]>,
-    expr: &ast::Expr,
-    target_register: usize,
-    resolver: &Resolver,
-) -> Result<()> {
-    translate_expr(program, referenced_tables, expr, target_register, resolver)?;
-    if matches!(expr, ast::Expr::Literal(_)) {
-        program.mark_last_insn_constant();
-    }
-    Ok(())
 }
 
 /// Sanitaizes a string literal by removing single quote at front and back

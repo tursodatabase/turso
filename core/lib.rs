@@ -85,9 +85,9 @@ enum TransactionState {
     None,
 }
 
-pub(crate) type MvStore = crate::mvcc::MvStore<crate::mvcc::LocalClock>;
+pub(crate) type MvStore = mvcc::MvStore<mvcc::LocalClock>;
 
-pub(crate) type MvCursor = crate::mvcc::cursor::ScanCursor<crate::mvcc::LocalClock>;
+pub(crate) type MvCursor = mvcc::cursor::ScanCursor<mvcc::LocalClock>;
 
 pub struct Database {
     mv_store: Option<Rc<MvStore>>,
@@ -109,48 +109,47 @@ unsafe impl Sync for Database {}
 impl Database {
     #[cfg(feature = "fs")]
     pub fn open_file(io: Arc<dyn IO>, path: &str, enable_mvcc: bool) -> Result<Arc<Database>> {
-        use storage::wal::WalFileShared;
-
         let file = io.open_file(path, OpenFlags::Create, true)?;
         maybe_init_database_file(&file, &io)?;
         let db_file = Arc::new(DatabaseFile::new(file));
-        let wal_path = format!("{}-wal", path);
-        let db_header = Pager::begin_open(db_file.clone())?;
-        io.run_once()?;
-        let page_size = db_header.lock().page_size;
-        let wal_shared = WalFileShared::open_shared(&io, wal_path.as_str(), page_size)?;
-        Self::open(io, db_file, wal_shared, enable_mvcc)
+        Self::open(io, path, db_file, enable_mvcc)
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn open(
         io: Arc<dyn IO>,
+        path: &str,
         db_file: Arc<dyn DatabaseStorage>,
-        shared_wal: Arc<UnsafeCell<WalFileShared>>,
         enable_mvcc: bool,
     ) -> Result<Arc<Database>> {
         let db_header = Pager::begin_open(db_file.clone())?;
+        // ensure db header is there
         io.run_once()?;
+
+        let page_size = db_header.lock().page_size;
+        let wal_path = format!("{}-wal", path);
+        let shared_wal = WalFileShared::open_shared(&io, wal_path.as_str(), page_size)?;
+
         DATABASE_VERSION.get_or_init(|| {
             let version = db_header.lock().version_number;
             version.to_string()
         });
+
         let mv_store = if enable_mvcc {
             Some(Rc::new(MvStore::new(
-                crate::mvcc::LocalClock::new(),
-                crate::mvcc::persistent_storage::Storage::new_noop(),
+                mvcc::LocalClock::new(),
+                mvcc::persistent_storage::Storage::new_noop(),
             )))
         } else {
             None
         };
+
         let shared_page_cache = Arc::new(RwLock::new(DumbLruPageCache::new(10)));
-        let page_size = db_header.lock().page_size;
-        let header = db_header;
         let schema = Arc::new(RwLock::new(Schema::new()));
         let db = Database {
             mv_store,
             schema: schema.clone(),
-            header: header.clone(),
+            header: db_header.clone(),
             shared_page_cache: shared_page_cache.clone(),
             shared_wal: shared_wal.clone(),
             db_file,
@@ -218,7 +217,7 @@ impl Database {
     #[cfg(feature = "fs")]
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn open_new(path: &str, vfs: &str) -> Result<(Arc<dyn IO>, Arc<Database>)> {
-        let vfsmods = crate::ext::add_builtin_vfs_extensions(None)?;
+        let vfsmods = ext::add_builtin_vfs_extensions(None)?;
         let io: Arc<dyn IO> = match vfsmods.iter().find(|v| v.0 == vfs).map(|v| v.1.clone()) {
             Some(vfs) => vfs,
             None => match vfs.trim() {

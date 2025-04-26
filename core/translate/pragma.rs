@@ -29,7 +29,7 @@ fn list_pragmas(
     }
 
     program.emit_halt();
-    program.resolve_label(init_label, program.offset());
+    program.preassign_label_to_next_insn(init_label);
     program.emit_constant_insns();
     program.emit_goto(start_offset);
 }
@@ -104,7 +104,7 @@ pub fn translate_pragma(
         },
     };
     program.emit_halt();
-    program.resolve_label(init_label, program.offset());
+    program.preassign_label_to_next_insn(init_label);
     program.emit_transaction(write);
     program.emit_constant_insns();
     program.emit_goto(start_offset);

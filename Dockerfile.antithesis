@@ -52,7 +52,7 @@ COPY --from=planner /app/vendored ./vendored/
 RUN if [ "$antithesis" = "true" ]; then \
         cp /opt/antithesis/libvoidstar.so /usr/lib/libvoidstar.so && \
         export RUSTFLAGS="-Ccodegen-units=1 -Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=3 -Cllvm-args=-sanitizer-coverage-trace-pc-guard -Clink-args=-Wl,--build-id -L/usr/lib/ -lvoidstar" && \
-        cargo build --bin limbo_stress --release; \
+        cargo build --bin limbo_stress; \
     else \
         cargo build --bin limbo_stress --release; \
     fi
@@ -62,7 +62,8 @@ RUN if [ "$antithesis" = "true" ]; then \
 #
 
 FROM debian:bullseye-slim AS runtime
-RUN apt-get update && apt-get install -y bash && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y bash curl xz-utils python3 sqlite3 bc binutils pip && rm -rf /var/lib/apt/lists/*
+RUN pip install antithesis pylimbo
 
 WORKDIR /app
 EXPOSE 8080
@@ -70,6 +71,13 @@ COPY --from=builder /usr/lib/libvoidstar.so* /usr/lib/
 COPY --from=builder /app/target/release/limbo_stress /bin/limbo_stress
 COPY stress/docker-entrypoint.sh /bin
 RUN chmod +x /bin/docker-entrypoint.sh
+
+COPY ./antithesis-tests/bank-test/*.py /opt/antithesis/test/v1/bank-test/
+COPY ./antithesis-tests/stress-composer/*.py /opt/antithesis/test/v1/stress-composer/
+COPY ./antithesis-tests/stress /opt/antithesis/test/v1/stress
+RUN chmod 777 -R /opt/antithesis/test/v1
+
+RUN mkdir /opt/antithesis/catalog
+RUN ln -s /opt/antithesis/test/v1/bank-test/*.py /opt/antithesis/catalog
+
 ENTRYPOINT ["/bin/docker-entrypoint.sh"]
-ENV RUST_BACKTRACE=1
-CMD ["/bin/limbo_stress"]

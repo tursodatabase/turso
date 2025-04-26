@@ -1,4 +1,6 @@
 services:
-  workload:
+  limbo:
     image: us-central1-docker.pkg.dev/molten-verve-216720/turso-repository/limbo-workload:antithesis-latest
-    command: [ "/bin/limbo_stress" ]
+    environment:
+      SANDBOX: "composed"
+    command: ["sleep", "infinity"]

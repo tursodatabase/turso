@@ -8,7 +8,6 @@ use core::panic;
 use hex;
 use limbo::Builder;
 use opts::Opts;
-use serde_json::json;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -321,7 +320,7 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
         let mut queries = vec![];
         for _ in 0..opts.nr_iterations {
             let sql = generate_random_statement(&schema);
-            writeln!(log_file, "{}", sql)?;
+            // writeln!(log_file, "{}", sql)?;
             queries.push(sql);
         }
         plan.queries_per_thread.push(queries);
@@ -391,12 +390,6 @@ pub fn init_tracing() -> Result<WorkerGuard, std::io::Error> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _g = init_tracing()?;
-    let (num_nodes, main_id) = (1, "n-001");
-    let startup_data = json!({
-        "num_nodes": num_nodes,
-        "main_node_id": main_id,
-    });
-    lifecycle::setup_complete(&startup_data);
     antithesis_init();
 
     let mut opts = Opts::parse();

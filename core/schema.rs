@@ -81,6 +81,14 @@ impl Schema {
             .map_or_else(|| &[] as &[Arc<Index>], |v| v.as_slice())
     }
 
+    pub fn get_index(&self, table_name: &str, index_name: &str) -> Option<&Arc<Index>> {
+        let name = normalize_ident(table_name);
+        self.indexes
+            .get(&name)?
+            .iter()
+            .find(|index| index.name == index_name)
+    }
+
     pub fn remove_indices_for_table(&mut self, table_name: &str) {
         let name = normalize_ident(table_name);
         self.indexes.remove(&name);

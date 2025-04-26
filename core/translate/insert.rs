@@ -13,16 +13,15 @@ use crate::vdbe::insn::{IdxInsertFlags, RegisterOrLiteral};
 use crate::vdbe::BranchOffset;
 use crate::{
     schema::{Column, Schema},
-    translate::expr::translate_expr,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::Insn,
     },
-    SymbolTable,
 };
-use crate::{Result, VirtualTable};
+use crate::{Result, SymbolTable, VirtualTable};
 
 use super::emitter::Resolver;
+use super::expr::{translate_expr_no_constant_opt, NoConstantOptReason};
 
 #[allow(clippy::too_many_arguments)]
 pub fn translate_insert(
@@ -144,11 +143,14 @@ pub fn translate_insert(
     if inserting_multiple_rows {
         let yield_reg = program.alloc_register();
         let jump_on_definition_label = program.allocate_label();
+        let start_offset_label = program.allocate_label();
         program.emit_insn(Insn::InitCoroutine {
             yield_reg,
             jump_on_definition: jump_on_definition_label,
-            start_offset: program.offset().add(1u32),
+            start_offset: start_offset_label,
         });
+
+        program.resolve_label(start_offset_label, program.offset());
 
         for value in values {
             populate_column_registers(
@@ -166,7 +168,7 @@ pub fn translate_insert(
             });
         }
         program.emit_insn(Insn::EndCoroutine { yield_reg });
-        program.resolve_label(jump_on_definition_label, program.offset());
+        program.preassign_label_to_next_insn(jump_on_definition_label);
 
         program.emit_insn(Insn::OpenWrite {
             cursor_id,
@@ -268,8 +270,7 @@ pub fn translate_insert(
             err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
             description: format!("{}.{}", table_name.0, rowid_column_name),
         });
-
-        program.resolve_label(make_record_label, program.offset());
+        program.preassign_label_to_next_insn(make_record_label);
     }
 
     match table.btree() {
@@ -283,19 +284,7 @@ pub fn translate_insert(
         }
         _ => (),
     }
-    // Create and insert the record
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: column_registers_start,
-        count: num_cols,
-        dest_reg: record_register,
-    });
 
-    program.emit_insn(Insn::Insert {
-        cursor: cursor_id,
-        key_reg: rowid_reg,
-        record_reg: record_register,
-        flag: 0,
-    });
     for index_col_mapping in index_col_mappings.iter() {
         // find which cursor we opened earlier for this index
         let idx_cursor_id = idx_cursors
@@ -332,6 +321,49 @@ pub fn translate_insert(
             dest_reg: record_reg,
         });
 
+        let index = schema
+            .get_index(&table_name.0, &index_col_mapping.idx_name)
+            .expect("index should be present");
+
+        if index.unique {
+            let label_idx_insert = program.allocate_label();
+            program.emit_insn(Insn::NoConflict {
+                cursor_id: idx_cursor_id,
+                target_pc: label_idx_insert,
+                record_reg: idx_start_reg,
+                num_regs: num_cols,
+            });
+            let column_names = index_col_mapping.columns.iter().enumerate().fold(
+                String::with_capacity(50),
+                |mut accum, (idx, (index, _))| {
+                    if idx > 0 {
+                        accum.push_str(", ");
+                    }
+
+                    accum.push_str(&btree_table.name);
+                    accum.push('.');
+
+                    let name = btree_table
+                        .columns
+                        .get(*index)
+                        .unwrap()
+                        .name
+                        .as_ref()
+                        .expect("column name is None");
+                    accum.push_str(name);
+
+                    accum
+                },
+            );
+
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                description: column_names,
+            });
+
+            program.resolve_label(label_idx_insert, program.offset());
+        }
+
         // now do the actual index insertion using the unpacked registers
         program.emit_insn(Insn::IdxInsert {
             cursor_id: idx_cursor_id,
@@ -342,6 +374,21 @@ pub fn translate_insert(
             flags: IdxInsertFlags::new(),
         });
     }
+
+    // Create and insert the record
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: column_registers_start,
+        count: num_cols,
+        dest_reg: record_register,
+    });
+
+    program.emit_insn(Insn::Insert {
+        cursor: cursor_id,
+        key_reg: rowid_reg,
+        record_reg: record_register,
+        flag: 0,
+    });
+
     if inserting_multiple_rows {
         // For multiple rows, loop back
         program.emit_insn(Insn::Goto {
@@ -354,8 +401,8 @@ pub fn translate_insert(
         err_code: 0,
         description: String::new(),
     });
+    program.preassign_label_to_next_insn(init_label);
 
-    program.resolve_label(init_label, program.offset());
     program.emit_insn(Insn::Transaction { write: true });
     program.emit_constant_insns();
     program.emit_insn(Insn::Goto {
@@ -472,7 +519,7 @@ fn resolve_columns_for_insert<'a>(
 /// Represents how a column in an index should be populated during an INSERT.
 /// Similar to ColumnMapping above but includes the index name, as well as multiple
 /// possible value indices for each.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct IndexColMapping {
     idx_name: String,
     columns: Vec<(usize, IndexColumn)>,
@@ -557,18 +604,26 @@ fn populate_column_registers(
             } else {
                 target_reg
             };
-            translate_expr(
+            translate_expr_no_constant_opt(
                 program,
                 None,
                 value.get(value_index).expect("value index out of bounds"),
                 reg,
                 resolver,
+                NoConstantOptReason::RegisterReuse,
             )?;
             if write_directly_to_rowid_reg {
                 program.emit_insn(Insn::SoftNull { reg: target_reg });
             }
         } else if let Some(default_expr) = mapping.default_value {
-            translate_expr(program, None, default_expr, target_reg, resolver)?;
+            translate_expr_no_constant_opt(
+                program,
+                None,
+                default_expr,
+                target_reg,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
         } else {
             // Column was not specified as has no DEFAULT - use NULL if it is nullable, otherwise error
             // Rowid alias columns can be NULL because we will autogenerate a rowid in that case.
@@ -618,7 +673,14 @@ fn translate_virtual_table_insert(
 
     let value_registers_start = program.alloc_registers(values[0].len());
     for (i, expr) in values[0].iter().enumerate() {
-        translate_expr(program, None, expr, value_registers_start + i, resolver)?;
+        translate_expr_no_constant_opt(
+            program,
+            None,
+            expr,
+            value_registers_start + i,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
     }
     /* *
      * Inserts for virtual tables are done in a single step.
@@ -672,12 +734,12 @@ fn translate_virtual_table_insert(
     });
 
     let halt_label = program.allocate_label();
+    program.resolve_label(halt_label, program.offset());
     program.emit_insn(Insn::Halt {
         err_code: 0,
         description: String::new(),
     });
 
-    program.resolve_label(halt_label, program.offset());
     program.resolve_label(init_label, program.offset());
 
     program.emit_insn(Insn::Goto {

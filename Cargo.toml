@@ -57,6 +57,13 @@ codegen-units = 1
 panic = "abort"
 lto = true
 
+[profile.antithesis]
+inherits = "release"
+debug = true
+codegen-units = 1
+panic = "abort"
+lto = true
+
 [profile.bench-profile]
 inherits = "release"
 debug = true

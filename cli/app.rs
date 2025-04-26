@@ -7,6 +7,7 @@ use crate::{
     helper::LimboHelper,
     input::{get_io, get_writer, DbLocation, OutputMode, Settings},
     opcodes_dictionary::OPCODE_DESCRIPTIONS,
+    HISTORY_FILE,
 };
 use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Row as CFRow, Table};
 use limbo_core::{Database, LimboError, OwnedValue, QueryMode, Row, Statement, StepResult};
@@ -14,10 +15,10 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use clap::Parser;
-use rustyline::{history::DefaultHistory, Editor};
+use rustyline::{error::ReadlineError, history::DefaultHistory, Editor};
 use std::{
     fmt,
-    io::{self, Write},
+    io::{self, BufRead as _, Write},
     path::PathBuf,
     rc::Rc,
     sync::{
@@ -62,7 +63,7 @@ pub struct Opts {
 
 const PROMPT: &str = "limbo> ";
 
-pub struct Limbo<'a> {
+pub struct Limbo {
     pub prompt: String,
     io: Arc<dyn limbo_core::IO>,
     writer: Box<dyn Write>,
@@ -70,7 +71,7 @@ pub struct Limbo<'a> {
     pub interrupt_count: Arc<AtomicUsize>,
     input_buff: String,
     opts: Settings,
-    pub rl: &'a mut Editor<LimboHelper, DefaultHistory>,
+    pub rl: Option<Editor<LimboHelper, DefaultHistory>>,
 }
 
 struct QueryStatistics {
@@ -160,8 +161,8 @@ macro_rules! step_handle {
 
 static COLORS: &[Color] = &[Color::Green, Color::Black, Color::Grey];
 
-impl<'a> Limbo<'a> {
-    pub fn new(rl: &'a mut rustyline::Editor<LimboHelper, DefaultHistory>) -> anyhow::Result<Self> {
+impl Limbo {
+    pub fn new() -> anyhow::Result<Self> {
         let opts = Opts::parse();
         let db_file = opts
             .database
@@ -188,8 +189,6 @@ impl<'a> Limbo<'a> {
             )
         };
         let conn = db.connect()?;
-        let h = LimboHelper::new(conn.clone(), io.clone());
-        rl.set_helper(Some(h));
         let interrupt_count = Arc::new(AtomicUsize::new(0));
         {
             let interrupt_count: Arc<AtomicUsize> = Arc::clone(&interrupt_count);
@@ -209,10 +208,17 @@ impl<'a> Limbo<'a> {
             interrupt_count,
             input_buff: String::new(),
             opts: Settings::from(opts),
-            rl,
+            rl: None,
         };
         app.first_run(sql, quiet)?;
         Ok(app)
+    }
+
+    pub fn with_readline(mut self, mut rl: Editor<LimboHelper, DefaultHistory>) -> Self {
+        let h = LimboHelper::new(self.conn.clone(), self.io.clone());
+        rl.set_helper(Some(h));
+        self.rl = Some(rl);
+        self
     }
 
     fn first_run(&mut self, sql: Option<String>, quiet: bool) -> io::Result<()> {
@@ -517,8 +523,9 @@ impl<'a> Limbo<'a> {
         }
     }
 
-    fn reset_line(&mut self, line: &str) -> rustyline::Result<()> {
-        self.rl.add_history_entry(line.to_owned())?;
+    fn reset_line(&mut self, _line: &str) -> rustyline::Result<()> {
+        // Entry is auto added to history
+        // self.rl.add_history_entry(line.to_owned())?;
         self.interrupt_count.store(0, Ordering::SeqCst);
         Ok(())
     }
@@ -985,6 +992,36 @@ impl<'a> Limbo<'a> {
         let buff = self.input_buff.clone();
         self.run_query(buff.as_str());
         self.reset_input();
+    }
+
+    pub fn readline(&mut self) -> Result<String, ReadlineError> {
+        if let Some(rl) = &mut self.rl {
+            Ok(rl.readline(&self.prompt)?)
+        } else {
+            let mut input = String::new();
+            println!("");
+            let mut reader = std::io::stdin().lock();
+            if reader.read_line(&mut input)? == 0 {
+                return Err(ReadlineError::Eof.into());
+            }
+            // Remove trailing newline
+            if input.ends_with('\n') {
+                input.pop();
+                if input.ends_with('\r') {
+                    input.pop();
+                }
+            }
+
+            Ok(input)
+        }
+    }
+}
+
+impl Drop for Limbo {
+    fn drop(&mut self) {
+        if let Some(rl) = &mut self.rl {
+            let _ = rl.save_history(HISTORY_FILE.as_path());
+        }
     }
 }
 
