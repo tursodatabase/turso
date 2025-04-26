@@ -440,9 +440,13 @@ impl Program {
                 let (opcode, p1, p2, p3, p4, p5, comment) = explain::insn_to_values(
                     self,
                     current_insn,
-                    self.comments
-                        .as_ref()
-                        .and_then(|comments| comments.get(&{ state.pc }).copied()),
+                    self.comments.as_ref().and_then(|comments| {
+                        comments
+                            .iter()
+                            .find(|(offset, _)| *offset == state.pc)
+                            .map(|(_, comment)| comment)
+                            .copied()
+                    }),
                 );
 
                 state.registers[0] = Register::OwnedValue(OwnedValue::Integer(state.pc as i64));

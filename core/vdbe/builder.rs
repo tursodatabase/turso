@@ -90,7 +90,7 @@ impl ProgramBuilder {
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
             seekrowid_emitted_bitmask: 0,
             comments: match opts.query_mode {
-                QueryMode::Explain | QueryMode::ExplainQueryPlan => Some(HashMap::new()),
+                QueryMode::Explain | QueryMode::ExplainQueryPlan => Some(Vec::new()),
                 QueryMode::Normal => None,
             },
             parameters: Parameters::new(),
