@@ -2,6 +2,7 @@ mod agg_functions;
 mod boolean;
 mod changes;
 mod coalesce;
+mod compare;
 mod select;
 
 #[cfg(test)]

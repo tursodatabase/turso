@@ -1,0 +1,181 @@
+#[cfg(test)]
+mod tests {
+    use crate::db_test;
+
+    db_test!(compare_eq_int_int_1, "SELECT 8 = 1", 0);
+
+    db_test!(compare_eq_int_int_2, "SELECT 8 = 8", 1);
+
+    db_test!(compare_eq_int_null, "SELECT 8 = NULL", [Null]);
+
+    db_test!(compare_eq_float_float_1, "SELECT 8.0 = 1.0", 0);
+
+    db_test!(compare_eq_float_float_2, "SELECT 8.0 = 8.0", 1);
+
+    db_test!(compare_eq_float_null, "SELECT 8.0 = NULL", [Null]);
+
+    db_test!(compare_eq_text_text_1, "SELECT 'a' = 'b'", 0);
+    db_test!(compare_eq_text_text_2, "SELECT 'a' = 'a'", 1);
+
+    db_test!(compare_eq_text_null, "SELECT 'a' = NULL", [Null]);
+
+    db_test!(compare_eq_null_int, "SELECT NULL = 1", [Null]);
+
+    db_test!(compare_eq_null_float, "SELECT NULL = 1.0", [Null]);
+
+    db_test!(compare_eq_null_text, "SELECT NULL = 'a'", [Null]);
+
+    db_test!(compare_eq_null_null, "SELECT NULL = NULL", [Null]);
+
+    db_test!(compare_neq_int_int_1, "SELECT 8 <> 1", 1);
+
+    db_test!(compare_neq_int_int_2, "SELECT 8 <> 8", 0);
+
+    db_test!(compare_neq_int_null, "SELECT 8 <> NULL", [Null]);
+
+    db_test!(compare_neq_float_float_1, "SELECT 8.0 <> 1.0", 1);
+
+    db_test!(compare_neq_float_float_2, "SELECT 8.0 <> 8.0", 0);
+
+    db_test!(compare_neq_float_null, "SELECT 8.0 <> NULL", [Null]);
+
+    db_test!(compare_neq_text_text_1, "SELECT 'a' <> 'b'", 1);
+
+    db_test!(compare_neq_text_text_2, "SELECT 'a' <> 'a'", 0);
+
+    db_test!(compare_neq_text_null, "SELECT 'a' <> NULL", [Null]);
+
+    db_test!(compare_neq_null_int, "SELECT NULL <> 1", [Null]);
+
+    db_test!(compare_neq_null_float, "SELECT NULL <> 1.0", [Null]);
+
+    db_test!(compare_neq_null_text, "SELECT NULL <> 'a'", [Null]);
+
+    db_test!(compare_neq_null_null, "SELECT NULL <> NULL", [Null]);
+
+    db_test!(compare_gt_int_int_1, "SELECT 1 > 8", 0);
+
+    db_test!(compare_gt_int_int_2, "SELECT 1 > 1", 0);
+
+    db_test!(compare_gt_int_int_3, "SELECT 8 > 0", 1);
+
+    db_test!(compare_gt_int_null, "SELECT 8 > NULL", [Null]);
+
+    db_test!(compare_gt_float_float_1, "SELECT 1.0 > 2.0", 0);
+
+    db_test!(compare_gt_float_float_2, "SELECT 1.0 > 1.0", 0);
+
+    db_test!(compare_gt_float_float_3, "SELECT 7.0 > 6.0", 1);
+
+    db_test!(compare_gt_float_null, "SELECT 8.0 > NULL", [Null]);
+
+    db_test!(compare_gt_text_text_1, "SELECT 'b' > 'c'", 0);
+
+    db_test!(compare_gt_text_text_2, "SELECT 'b' > 'b'", 0);
+
+    db_test!(compare_gt_text_text_3, "SELECT 'b' > 'a'", 1);
+
+    db_test!(compare_gt_text_null, "SELECT 'a' > NULL", [Null]);
+
+    db_test!(compare_gt_null_int, "SELECT NULL > 1", [Null]);
+
+    db_test!(compare_gt_null_float, "SELECT NULL > 1.0", [Null]);
+
+    db_test!(compare_gt_null_text, "SELECT NULL > 'a'", [Null]);
+
+    db_test!(compare_gt_null_null, "SELECT NULL > NULL", [Null]);
+
+    db_test!(compare_gte_int_int_1, "SELECT 1 >= 8", 0);
+
+    db_test!(compare_gte_int_int_2, "SELECT 1 >= 1", 1);
+
+    db_test!(compare_gte_int_int_3, "SELECT 8 >= 0", 1);
+
+    db_test!(compare_gte_int_null, "SELECT 8 >= NULL", [Null]);
+
+    db_test!(compare_gte_float_float_1, "SELECT 1.0 >= 2.0", 0);
+
+    db_test!(compare_gte_float_float_2, "SELECT 1.0 >= 1.0", 1);
+
+    db_test!(compare_gte_float_float_3, "SELECT 7.0 >= 6.0", 1);
+
+    db_test!(compare_gte_float_null, "SELECT 8.0 >= NULL", [Null]);
+
+    db_test!(compare_gte_text_text_1, "SELECT 'b' >= 'c'", 0);
+
+    db_test!(compare_gte_text_text_2, "SELECT 'b' >= 'b'", 1);
+
+    db_test!(compare_gte_text_text_3, "SELECT 'b' >= 'a'", 1);
+
+    db_test!(compare_gte_text_null, "SELECT 'a' >= NULL", [Null]);
+
+    db_test!(compare_gte_null_int, "SELECT NULL >= 1", [Null]);
+
+    db_test!(compare_gte_null_float, "SELECT NULL >= 1.0", [Null]);
+
+    db_test!(compare_gte_null_text, "SELECT NULL >= 'a'", [Null]);
+
+    db_test!(compare_gte_null_null, "SELECT NULL >= NULL", [Null]);
+
+    // Less than (<) tests
+    db_test!(compare_lt_int_int_1, "SELECT 1 < 8", 1);
+    db_test!(compare_lt_int_int_2, "SELECT 1 < 1", 0);
+    db_test!(compare_lt_int_int_3, "SELECT 8 < 0", 0);
+    db_test!(compare_lt_int_null, "SELECT 8 < NULL", [Null]);
+
+    db_test!(compare_lt_float_float_1, "SELECT 1.0 < 2.0", 1);
+    db_test!(compare_lt_float_float_2, "SELECT 1.0 < 1.0", 0);
+    db_test!(compare_lt_float_float_3, "SELECT 7.0 < 6.0", 0);
+    db_test!(compare_lt_float_null, "SELECT 8.0 < NULL", [Null]);
+
+    db_test!(compare_lt_text_text_1, "SELECT 'b' < 'c'", 1);
+    db_test!(compare_lt_text_text_2, "SELECT 'b' < 'b'", 0);
+    db_test!(compare_lt_text_text_3, "SELECT 'b' < 'a'", 0);
+    db_test!(compare_lt_text_null, "SELECT 'a' < NULL", [Null]);
+
+    db_test!(compare_lt_null_int, "SELECT NULL < 1", [Null]);
+    db_test!(compare_lt_null_float, "SELECT NULL < 1.0", [Null]);
+    db_test!(compare_lt_null_text, "SELECT NULL < 'a'", [Null]);
+    db_test!(compare_lt_null_null, "SELECT NULL < NULL", [Null]);
+
+    // Less than or equal (<=) tests
+    db_test!(compare_lte_int_int_1, "SELECT 1 <= 8", 1);
+    db_test!(compare_lte_int_int_2, "SELECT 1 <= 1", 1);
+    db_test!(compare_lte_int_int_3, "SELECT 8 <= 0", 0);
+    db_test!(compare_lte_int_null, "SELECT 8 <= NULL", [Null]);
+
+    db_test!(compare_lte_float_float_1, "SELECT 1.0 <= 2.0", 1);
+    db_test!(compare_lte_float_float_2, "SELECT 1.0 <= 1.0", 1);
+    db_test!(compare_lte_float_float_3, "SELECT 7.0 <= 6.0", 0);
+    db_test!(compare_lte_float_null, "SELECT 8.0 <= NULL", [Null]);
+
+    db_test!(compare_lte_text_text_1, "SELECT 'b' <= 'c'", 1);
+    db_test!(compare_lte_text_text_2, "SELECT 'b' <= 'b'", 1);
+    db_test!(compare_lte_text_text_3, "SELECT 'b' <= 'a'", 0);
+    db_test!(compare_lte_text_null, "SELECT 'a' <= NULL", [Null]);
+
+    db_test!(compare_lte_null_int, "SELECT NULL <= 1", [Null]);
+    db_test!(compare_lte_null_float, "SELECT NULL <= 1.0", [Null]);
+    db_test!(compare_lte_null_text, "SELECT NULL <= 'a'", [Null]);
+    db_test!(compare_lte_null_null, "SELECT NULL <= NULL", [Null]);
+
+    // IS tests
+    db_test!(compare_is_int_int_1, "SELECT 8 is 1", 0);
+    db_test!(compare_is_int_int_2, "SELECT 8 is 8", 1);
+
+    db_test!(compare_is_float_float_1, "SELECT 8.0 is 1.0", 0);
+    db_test!(compare_is_float_float_2, "SELECT 8.0 is 8.0", 1);
+
+    db_test!(compare_is_text_text_1, "SELECT 'a' is 'b'", 0);
+    db_test!(compare_is_text_text_2, "SELECT 'a' is 'a'", 1);
+
+    // IS NOT tests
+    db_test!(compare_is_not_int_int_1, "SELECT 8 is not 1", 1);
+    db_test!(compare_is_not_int_int_2, "SELECT 8 is not 8", 0);
+
+    db_test!(compare_is_not_float_float_1, "SELECT 8.0 is not 1.0", 1);
+    db_test!(compare_is_not_float_float_2, "SELECT 8.0 is not 8.0", 0);
+
+    db_test!(compare_is_not_text_text_1, "SELECT 'a' is not 'b'", 1);
+    db_test!(compare_is_not_text_text_2, "SELECT 'a' is not 'a'", 0);
+}
