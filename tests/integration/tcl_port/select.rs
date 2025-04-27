@@ -6,7 +6,7 @@ mod tests {
 
     // #[test]
     // fn select_const_x() {
-    //     exec_sql("".into(), "SELECT 1", sqlite_values!(-1));
+    //     exec_sql("".into(), "SELECT 1", sqlite_values!([inf]));
     // }
 
     // db_test!(select_const_1, "SELECT 1", 1);
@@ -200,4 +200,40 @@ mod tests {
     //         [-997623670, -498811835, -974242, -1]
     //     ]
     // );
+
+    // TODO: there is a rust-analyzer bug that incorrectly expands negative integers in proc_macros
+    // Waiting for this to be fixed here: https://github.com/rust-lang/rust-analyzer/pull/19434
+    // db_test!(
+    //     select_bin_shl,
+    //     [
+    //         "select 997623670 << 0, 997623670 << 1, 997623670 << 10, 997623670 << 30",
+    //         "select -997623670 << 0, -997623670 << 1, -997623670 << 10, -997623670 << 30",
+    //         "select 997623670 >> 0, 997623670 >> -1, 997623670 >> -10, 997623670 >> -30",
+    //         "select -997623670 >> 0, -997623670 >> -1, -997623670 >> -10, -997623670 >> -30"
+    //     ],
+    //     [
+    //         [997623670, 1995247340, 1021566638080, 1071190259091374080],
+    //         [-997623670, -1995247340, -1021566638080, -1071190259091374080],
+    //         [997623670, 1995247340, 1021566638080, 1071190259091374080],
+    //         [-997623670, -1995247340, -1021566638080, -1071190259091374080]
+    //     ]
+    // );
+
+    // Test LIKE in SELECT position
+    db_test!(select_like_expression, "select 'bar' like 'bar%'", 1);
+
+    db_test!(
+        select_not_like_expression,
+        "select 'bar' not like 'bar%'",
+        0
+    );
+
+    // regression test for float divisor being cast to zero int and panicking
+    db_test!(select_like_expression_2, "select 2 % 0.5", [Null]);
+
+    db_test!(
+        select_positive_infinite_float,
+        "SELECT 1.7976931348623157E+308 + 1e308; -- f64::MAX + 1e308",
+        [Inf]
+    );
 }

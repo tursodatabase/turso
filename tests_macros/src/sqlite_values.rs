@@ -19,6 +19,10 @@ impl syn::parse::Parse for NewValue {
             let name = ident.to_string();
             match name.as_str() {
                 null if null.eq_ignore_ascii_case("null") => Value::Null,
+                inf if inf.eq_ignore_ascii_case("inf") => Value::Real(std::f64::INFINITY),
+                neg_inf if neg_inf.eq_ignore_ascii_case("NegInf") => {
+                    Value::Real(std::f64::NEG_INFINITY)
+                }
                 _ => {
                     return Err(syn::Error::new(ident.span(), "expected NULL identifier"));
                 }
@@ -85,9 +89,23 @@ impl quote::ToTokens for ValueList {
             Value::Integer(i) => quote! {
                 ::rusqlite::types::Value::Integer(#i)
             },
-            Value::Real(f) => quote! {
-                ::rusqlite::types::Value::Real(#f)
-            },
+            Value::Real(f) => {
+                if f.is_infinite() {
+                    if f.is_sign_negative() {
+                        quote! {
+                            ::rusqlite::types::Value::Real(std::f64::NEG_INFINITY)
+                        }
+                    } else {
+                        quote! {
+                            ::rusqlite::types::Value::Real(std::f64::INFINITY)
+                        }
+                    }
+                } else {
+                    quote! {
+                        ::rusqlite::types::Value::Real(#f)
+                    }
+                }
+            }
             Value::Text(t) => quote! {
                 ::rusqlite::types::Value::Text(#t.to_string())
             },
