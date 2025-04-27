@@ -4,6 +4,7 @@ mod changes;
 mod coalesce;
 mod compare;
 mod concat;
+mod default_value;
 mod select;
 
 #[cfg(test)]
