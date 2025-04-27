@@ -2,7 +2,6 @@ mod select;
 
 #[cfg(test)]
 mod tests {
-    use cargo_metadata::MetadataCommand;
     use std::path::PathBuf;
     use std::sync::LazyLock;
 
@@ -10,9 +9,13 @@ mod tests {
 
     pub(crate) static WORKSPACE_ROOT: LazyLock<PathBuf> = LazyLock::new(get_workspace_root);
 
+    // hack to get workspace root
     pub(crate) fn get_workspace_root() -> PathBuf {
-        let metadata = MetadataCommand::new().exec().unwrap();
-        metadata.workspace_root.into_std_path_buf()
+        // ATTENTION: THIS IS NOT PORTABLE. IF THE FILE STRUCTURE CHANGES OF WHERE THE CARGO.toml FOR THIS
+        // CRATE CHANGES THIS WILL BREAK. THE TESTS WILL FAIL.
+        // To make this more portable we could colocate the databases inside this crate
+        let root: PathBuf = std::env!("CARGO_MANIFEST_DIR").into();
+        root.parent().unwrap().into()
     }
 
     #[macro_export]
