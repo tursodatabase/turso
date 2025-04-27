@@ -6,12 +6,7 @@ mod tests {
 
     // #[test]
     // fn select_const_x() {
-
-    //     exec_sql(
-    //         "".into(),
-    //         "SELECT 1",
-    //         sqlite_values!(""),
-    //     );
+    //     exec_sql("".into(), "SELECT 1", sqlite_values!(-1));
     // }
 
     // db_test!(select_const_1, "SELECT 1", 1);
@@ -154,13 +149,55 @@ mod tests {
     //     "one"
     // );
 
+    // db_test!(
+    //     select_base_case_null_result,
+    //     [
+    //         "select case NULL when 0 then 'first' else 'second' end",
+    //         "select case NULL when NULL then 'first' else 'second' end",
+    //         "select case 0 when 0 then 'first' else 'second' end"
+    //     ],
+    //     ["second", "second", "first"]
+    // );
+
     db_test!(
-        select_base_case_null_result,
-        [
-            "select case NULL when 0 then 'first' else 'second' end",
-            "select case NULL when NULL then 'first' else 'second' end",
-            "select case 0 when 0 then 'first' else 'second' end"
-        ],
-        ["second", "second", "first"]
+        select_base_case_noelse_null,
+        "select case 'null else' when 0 then 0 when 1 then 1 end",
+        [Null]
     );
+
+    db_test!(
+        select_is_null,
+        [
+            "select null is null, (1 / 0) is null, null is (1 / 0), (1 / 0) is (1 / 0)",
+            "select 4 is null, '4' is null, 0 is null, (1 / 2) is null"
+        ],
+        [[1, 1, 1, 1], [0, 0, 0, 0]]
+    );
+
+    db_test!(
+        select_is_not_null,
+        [
+            "select null is not null, (1 / 0) is not null, null is not (1 / 0), (1 / 0) is not (1 / 0)",
+            "select 4 is not null, '4' is not null, 0 is not null, (1 / 2) is not null"
+        ],
+        [[0, 0, 0, 0], [1, 1, 1, 1]]
+    );
+
+    // TODO: there is a rust-analyzer bug that incorrectly expands negative integers in proc_macros
+    // Waiting for this to be fixed here: https://github.com/rust-lang/rust-analyzer/pull/19434
+    // db_test!(
+    //     select_bin_shr,
+    //     [
+    //         "select 997623670 >> 0, 997623670 >> 1, 997623670 >> 10, 997623670 >> 30",
+    //         "select -997623670 >> 0, -997623670 >> 1, -997623670 >> 10, -997623670 >> 30",
+    //         "select 997623670 << 0, 997623670 << -1, 997623670 << -10, 997623670 << -30",
+    //         "select -997623670 << 0, -997623670 << -1, -997623670 << -10, -997623670 << -30"
+    //     ],
+    //     [
+    //         [997623670, 498811835, 974241, 0],
+    //         [-997623670, -498811835, -974242, -1],
+    //         [997623670, 498811835, 974241, 0],
+    //         [-997623670, -498811835, -974242, -1]
+    //     ]
+    // );
 }

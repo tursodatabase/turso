@@ -2,7 +2,6 @@ use limbo_core::{CheckpointStatus, Connection, Database, IO};
 use rand::{rng, RngCore};
 use rusqlite::types::Value;
 use rusqlite::{params, OpenFlags};
-use std::iter::zip;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;

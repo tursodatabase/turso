@@ -25,7 +25,7 @@ impl syn::parse::Parse for NewValue {
             }
         } else {
             let curr: Lit = input.parse()?;
-            let value = match curr {
+            match curr {
                 Lit::Bool(bool) => bool.value().into(),
                 Lit::Str(s) => s.value().into(),
                 Lit::Int(i) => i.base10_parse::<i64>()?.into(),
@@ -38,8 +38,7 @@ impl syn::parse::Parse for NewValue {
                 lit => {
                     return Err(syn::Error::new(lit.span(), "unexpected literal type"));
                 }
-            };
-            value
+            }
         };
         Ok(Self(value))
     }
@@ -110,7 +109,7 @@ impl syn::parse::Parse for ValueList2D {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         if input.peek(Ident) {
             let ident: Ident = input.parse()?;
-            if ident.to_string() != "None" {
+            if ident != "None" {
                 return Err(syn::Error::new(
                     ident.span(),
                     "expected None identifier for empty sqlite values",
