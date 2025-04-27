@@ -1,5 +1,6 @@
 mod agg_functions;
 mod boolean;
+mod changes;
 mod select;
 
 #[cfg(test)]
@@ -34,6 +35,15 @@ mod tests {
                 )*
             }
         };
+        (memory, $name:ident, $statement:literal, $expected:expr) => {
+            #[test]
+            fn $name() {
+                $crate::common::exec_sql_memory(
+                    $statement,
+                    ::limbo_tests_macros::sqlite_values!($expected),
+                );
+            }
+        };
         ($name:ident, $statement:literal, $expected:expr) => {
             #[test]
             fn $name() {
@@ -59,6 +69,18 @@ mod tests {
                         expected_vals,
                     );
                 }
+            }
+        };
+        (memory, $name:ident, [$($statement:literal),*], [$($expected:expr),*]) => {
+            #[test]
+            fn $name() {
+                let queries = vec![$($statement),*];
+                let expected_vals = ::limbo_tests_macros::sqlite_values!($($expected), *);
+
+                $crate::common::exec_many_sql_memory(
+                    queries,
+                    expected_vals,
+                );
             }
         };
         ($name:ident, $statement:literal) => {

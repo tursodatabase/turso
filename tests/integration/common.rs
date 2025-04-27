@@ -38,6 +38,15 @@ impl TempDatabase {
         }
     }
 
+    pub fn new_in_memory() -> Self {
+        let io: Arc<dyn IO + Send> = Arc::new(limbo_core::MemoryIO::new());
+        // No path for Memory IO
+        Self {
+            path: "".into(),
+            io,
+        }
+    }
+
     pub fn new_with_rusqlite(table_sql: &str) -> Self {
         let mut path = TempDir::new().unwrap().into_path();
         path.push("test.db");
@@ -186,6 +195,33 @@ pub(crate) fn exec_sql(db_path: PathBuf, sql: &str, values: Vec<Vec<Value>>) {
     }
 }
 
+#[allow(dead_code)]
+pub(crate) fn exec_sql_memory(sql: &str, values: Vec<Vec<Value>>) {
+    // Blocks here to drop db connections
+    {
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+        let sqlite = sqlite_exec_rows(&sqlite_conn, sql);
+
+        assert_eq!(
+            sqlite, values,
+            "query: {}, values: {:?}, sqlite: {:?}",
+            sql, values, sqlite,
+        );
+    }
+
+    {
+        let db = TempDatabase::new_in_memory();
+        let limbo_conn = db.connect_limbo();
+        let limbo = limbo_exec_rows(&db, &limbo_conn, sql);
+
+        assert_eq!(
+            limbo, values,
+            "query: {}, values: {:?}, limbo: {:?}",
+            sql, values, limbo,
+        );
+    }
+}
+
 pub(crate) fn exec_many_sql(db_path: PathBuf, sql_queries: Vec<&str>, values: Vec<Vec<Value>>) {
     {
         let sqlite_conn = rusqlite::Connection::open_with_flags(
@@ -226,6 +262,39 @@ pub(crate) fn exec_many_sql(db_path: PathBuf, sql_queries: Vec<&str>, values: Ve
             values,
             limbo_values,
             db_path.to_string_lossy()
+        );
+    }
+}
+
+// TODO: see a better way later to avoid having different functions for in-memory and disk exec
+pub(crate) fn exec_many_sql_memory(sql_queries: Vec<&str>, values: Vec<Vec<Value>>) {
+    {
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mut sqlite_values = Vec::with_capacity(sql_queries.len());
+        for sql in sql_queries.iter() {
+            let sqlite = sqlite_exec_rows(&sqlite_conn, &sql);
+            sqlite_values.extend(sqlite);
+        }
+        assert_eq!(
+            sqlite_values, values,
+            "query: {:#?}, values: {:?}, sqlite: {:?}",
+            sql_queries, values, sqlite_values,
+        );
+    }
+
+    {
+        let db = TempDatabase::new_in_memory();
+        let limbo_conn = db.connect_limbo();
+        let mut limbo_values = Vec::with_capacity(sql_queries.len());
+        for sql in sql_queries.iter() {
+            let limbo = limbo_exec_rows(&db, &limbo_conn, &sql);
+            limbo_values.extend(limbo);
+        }
+
+        assert_eq!(
+            limbo_values, values,
+            "query: {:#?}, values: {:?}, limbo: {:?}",
+            sql_queries, values, limbo_values,
         );
     }
 }
