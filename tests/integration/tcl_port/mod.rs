@@ -1,4 +1,5 @@
 mod agg_functions;
+mod boolean;
 mod select;
 
 #[cfg(test)]
