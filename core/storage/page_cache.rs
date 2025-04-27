@@ -1,6 +1,8 @@
-use std::{cell::RefCell, collections::HashMap, ptr::NonNull};
+use std::{cell::RefCell, collections::HashMap, ptr::NonNull, sync::Arc};
 
 use tracing::{debug, trace};
+
+use crate::Page;
 
 use super::pager::PageRef;
 
@@ -11,7 +13,7 @@ use super::pager::PageRef;
 //
 // WAL was introduced after Shared cache in SQLite, so this is why these two features don't work
 // well together because pages with different snapshots may collide.
-#[derive(Debug, Eq, Hash, PartialEq, Clone)]
+#[derive(Debug, Eq, Hash, PartialEq, Copy, Clone)]
 pub struct PageCacheKey {
     pgno: usize,
     max_frame: Option<u64>,
@@ -20,7 +22,8 @@ pub struct PageCacheKey {
 #[allow(dead_code)]
 struct PageCacheEntry {
     key: PageCacheKey,
-    page: PageRef,
+    // store Arc<Page> instead of PageRef to keep the page alive w/o being included in the pin count
+    page: Arc<Page>,
     prev: Option<NonNull<PageCacheEntry>>,
     next: Option<NonNull<PageCacheEntry>>,
 }
@@ -59,14 +62,14 @@ impl DumbLruPageCache {
         self.map.borrow().contains_key(key)
     }
 
-    pub fn insert(&mut self, key: PageCacheKey, value: PageRef) {
-        self._delete(key.clone(), false);
+    pub fn insert(&mut self, key: PageCacheKey, value: &PageRef) {
+        self._delete(key, false);
         trace!("cache_insert(key={:?})", key);
         let entry = Box::new(PageCacheEntry {
-            key: key.clone(),
+            key,
             next: None,
             prev: None,
-            page: value,
+            page: value.get_ref(),
         });
         let ptr_raw = Box::into_raw(entry);
         let ptr = unsafe { ptr_raw.as_mut().unwrap().as_non_null() };
@@ -89,6 +92,14 @@ impl DumbLruPageCache {
             return;
         }
         let ptr = ptr.unwrap();
+        if clean_page {
+            let page = unsafe { &ptr.as_ref().page };
+            if page.pinned() || page.is_dirty() {
+                // put it back: we cannot evict a pinned page
+                self.map.borrow_mut().insert(key, ptr);
+                return;
+            }
+        }
         self.detach(ptr, clean_page);
         unsafe { std::ptr::drop_in_place(ptr.as_ptr()) };
     }
@@ -112,7 +123,8 @@ impl DumbLruPageCache {
             self.detach(ptr, false);
             self.touch(ptr);
         }
-        Some(page)
+        // when we hand out pages, re-wrap in PageRef to increment the pin count
+        Some(PageRef::new(page))
     }
 
     pub fn resize(&mut self, capacity: usize) {
@@ -125,6 +137,7 @@ impl DumbLruPageCache {
             // evict buffer
             let page = unsafe { &entry.as_mut().page };
             page.clear_loaded();
+            assert!(!page.pinned());
             debug!("cleaning up page {}", page.get().id);
             let _ = page.get().contents.take();
         }
@@ -150,7 +163,7 @@ impl DumbLruPageCache {
             }
             (Some(mut p), None) => {
                 unsafe { p.as_mut().next = None };
-                self.tail = RefCell::new(Some(p));
+                self.tail.borrow_mut().replace(p);
             }
             (Some(mut p), Some(mut n)) => unsafe {
                 let p_mut = p.as_mut();
@@ -165,6 +178,7 @@ impl DumbLruPageCache {
     fn touch(&mut self, mut entry: NonNull<PageCacheEntry>) {
         if let Some(mut head) = *self.head.borrow_mut() {
             unsafe {
+                entry.as_mut().prev = None;
                 entry.as_mut().next.replace(head);
                 let head = head.as_mut();
                 head.prev = Some(entry);
@@ -184,7 +198,7 @@ impl DumbLruPageCache {
         }
         let mut tail = tail.unwrap();
         let tail_entry = unsafe { tail.as_mut() };
-        if tail_entry.page.is_dirty() {
+        if tail_entry.page.is_dirty() || tail_entry.page.pinned() {
             // TODO: drop from another clean entry?
             return;
         }
@@ -194,7 +208,7 @@ impl DumbLruPageCache {
     }
 
     pub fn clear(&mut self) {
-        let to_remove: Vec<PageCacheKey> = self.map.borrow().iter().map(|v| v.0.clone()).collect();
+        let to_remove: Vec<PageCacheKey> = self.map.borrow().iter().map(|v| *v.0).collect();
         for key in to_remove {
             self.delete(key);
         }
@@ -220,7 +234,7 @@ mod tests {
         ChaCha8Rng,
     };
 
-    use crate::{storage::page_cache::DumbLruPageCache, Page};
+    use crate::{storage::page_cache::DumbLruPageCache, Page, PageRef};
 
     use super::PageCacheKey;
 
@@ -253,9 +267,9 @@ mod tests {
                     let id_frame = rng.next_u64() % max_pages;
                     let key = PageCacheKey::new(id_page as usize, Some(id_frame));
                     #[allow(clippy::arc_with_non_send_sync)]
-                    let page = Arc::new(Page::new(id_page as usize));
+                    let page = PageRef::new(Arc::new(Page::new(id_page as usize)));
                     // println!("inserting page {:?}", key);
-                    cache.insert(key.clone(), page.clone());
+                    cache.insert(key, &page);
                     lru.push(key, page);
                     assert!(cache.len() <= 10);
                 }
@@ -265,12 +279,10 @@ mod tests {
                     let key = if random || lru.is_empty() {
                         let id_page = rng.next_u64() % max_pages;
                         let id_frame = rng.next_u64() % max_pages;
-                        let key = PageCacheKey::new(id_page as usize, Some(id_frame));
-                        key
+                        PageCacheKey::new(id_page as usize, Some(id_frame))
                     } else {
                         let i = rng.next_u64() as usize % lru.len();
-                        let key = lru.iter().skip(i).next().unwrap().0.clone();
-                        key
+                        *lru.iter().nth(i).unwrap().0
                     };
                     // println!("removing page {:?}", key);
                     lru.pop(&key);
@@ -280,7 +292,7 @@ mod tests {
                     // test contents
                     for (key, page) in &lru {
                         // println!("getting page {:?}", key);
-                        cache.peek(&key, false).unwrap();
+                        cache.peek(key, false).unwrap();
                         assert_eq!(page.get().id, key.pgno);
                     }
                 }
@@ -313,7 +325,7 @@ mod tests {
     fn test_page_cache_delete() {
         let mut cache = DumbLruPageCache::new(2);
         let key1 = insert_page(&mut cache, 1);
-        cache.delete(key1.clone());
+        cache.delete(key1);
         assert!(cache.get(&key1).is_none());
     }
 
@@ -330,8 +342,8 @@ mod tests {
     fn insert_page(cache: &mut DumbLruPageCache, id: usize) -> PageCacheKey {
         let key = PageCacheKey::new(id, None);
         #[allow(clippy::arc_with_non_send_sync)]
-        let page = Arc::new(Page::new(id));
-        cache.insert(key.clone(), page.clone());
+        let page = PageRef::new(Arc::new(Page::new(id)));
+        cache.insert(key, &page);
         key
     }
 

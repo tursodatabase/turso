@@ -8,6 +8,7 @@ use crate::{LimboError, Result};
 use parking_lot::RwLock;
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashSet;
+use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -24,11 +25,41 @@ pub struct PageInner {
 
 pub struct Page {
     pub inner: UnsafeCell<PageInner>,
+    pub pin: AtomicUsize,
 }
 
 // Concurrency control of pages will be handled by the pager, we won't wrap Page with RwLock
-// because that is bad bad.
-pub type PageRef = Arc<Page>;
+// because that is bad bad. However, we do our own reference counting to prevent the page cache
+// from dropping the page while it's still in use by a cursor.
+pub struct PageRef(Arc<Page>);
+impl PageRef {
+    pub fn new(page: Arc<Page>) -> Self {
+        page.pin();
+        Self(page.clone())
+    }
+    pub fn get_ref(&self) -> Arc<Page> {
+        Arc::clone(&self.0)
+    }
+}
+impl Deref for PageRef {
+    type Target = Page;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Clone for PageRef {
+    fn clone(&self) -> Self {
+        self.0.pin();
+        Self(self.0.clone())
+    }
+}
+
+impl Drop for PageRef {
+    fn drop(&mut self) {
+        self.0.unpin()
+    }
+}
 
 /// Page is up-to-date.
 const PAGE_UPTODATE: usize = 0b001;
@@ -49,12 +80,25 @@ impl Page {
                 contents: None,
                 id,
             }),
+            pin: AtomicUsize::new(0),
         }
     }
 
     #[allow(clippy::mut_from_ref)]
     pub fn get(&self) -> &mut PageInner {
         unsafe { &mut *self.inner.get() }
+    }
+
+    pub fn pin(&self) {
+        self.pin.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn unpin(&self) {
+        self.pin.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    pub fn pinned(&self) -> bool {
+        self.pin.load(Ordering::Acquire) != 0
     }
 
     pub fn get_contents(&self) -> &mut PageContent {
@@ -168,7 +212,7 @@ pub struct Pager {
     /// A page cache for the database.
     page_cache: Arc<RwLock<DumbLruPageCache>>,
     /// Buffer pool for temporary data storage.
-    buffer_pool: Rc<BufferPool>,
+    buffer_pool: Arc<BufferPool>,
     /// I/O interface for input/output operations.
     pub io: Arc<dyn crate::io::IO>,
     dirty_pages: Rc<RefCell<HashSet<usize>>>,
@@ -193,7 +237,7 @@ impl Pager {
         wal: Option<Rc<RefCell<dyn Wal>>>,
         io: Arc<dyn crate::io::IO>,
         page_cache: Arc<RwLock<DumbLruPageCache>>,
-        buffer_pool: Rc<BufferPool>,
+        buffer_pool: Arc<BufferPool>,
     ) -> Result<Self> {
         Ok(Self {
             db_file,
@@ -314,7 +358,7 @@ impl Pager {
             tracing::trace!("read_page(page_idx = {}) = cached", page_idx);
             return Ok(page.clone());
         }
-        let page = Arc::new(Page::new(page_idx));
+        let page = PageRef::new(Arc::new(Page::new(page_idx)));
         page.set_locked();
 
         if let Some(wal) = &self.wal {
@@ -326,7 +370,7 @@ impl Pager {
                 }
                 // TODO(pere) ensure page is inserted, we should probably first insert to page cache
                 // and if successful, read frame or page
-                page_cache.insert(page_key, page.clone());
+                page_cache.insert(page_key, &page);
                 return Ok(page);
             }
         }
@@ -337,7 +381,7 @@ impl Pager {
             page_idx,
         )?;
         // TODO(pere) ensure page is inserted
-        page_cache.insert(page_key, page.clone());
+        page_cache.insert(page_key, &page);
         Ok(page)
     }
 
@@ -345,31 +389,33 @@ impl Pager {
     pub fn load_page(&self, page: PageRef) -> Result<()> {
         let id = page.get().id;
         trace!("load_page(page_idx = {})", id);
-        let mut page_cache = self.page_cache.write();
         page.set_locked();
         let max_frame = match &self.wal {
             Some(wal) => wal.borrow().get_max_frame(),
             None => 0,
         };
         let page_key = PageCacheKey::new(id, Some(max_frame));
-        if let Some(wal) = &self.wal {
-            if let Some(frame_id) = wal.borrow().find_frame(id as u64)? {
-                wal.borrow()
-                    .read_frame(frame_id, page.clone(), self.buffer_pool.clone())?;
-                {
-                    page.set_uptodate();
+        {
+            let mut page_cache = self.page_cache.write();
+            if let Some(wal) = &self.wal {
+                if let Some(frame_id) = wal.borrow().find_frame(id as u64)? {
+                    wal.borrow()
+                        .read_frame(frame_id, page.clone(), self.buffer_pool.clone())?;
+                    {
+                        page.set_uptodate();
+                    }
+                    // TODO(pere) ensure page is inserted
+                    if !page_cache.contains_key(&page_key) {
+                        page_cache.insert(page_key, &page);
+                    }
+                    return Ok(());
                 }
-                // TODO(pere) ensure page is inserted
-                if !page_cache.contains_key(&page_key) {
-                    page_cache.insert(page_key, page.clone());
-                }
-                return Ok(());
             }
-        }
 
-        // TODO(pere) ensure page is inserted
-        if !page_cache.contains_key(&page_key) {
-            page_cache.insert(page_key, page.clone());
+            // TODO(pere) ensure page is inserted
+            if !page_cache.contains_key(&page_key) {
+                page_cache.insert(page_key, &page);
+            }
         }
         sqlite3_ondisk::begin_read_page(
             self.db_file.clone(),
@@ -671,7 +717,7 @@ impl Pager {
             };
 
             let page_key = PageCacheKey::new(page.get().id, Some(max_frame));
-            cache.insert(page_key, page.clone());
+            cache.insert(page_key, &page);
         }
         Ok(page)
     }
@@ -684,7 +730,7 @@ impl Pager {
             None => 0,
         };
         let page_key = PageCacheKey::new(id, Some(max_frame));
-        cache.insert(page_key, page.clone());
+        cache.insert(page_key, &page);
         page.set_loaded();
     }
 
@@ -697,14 +743,14 @@ impl Pager {
 pub fn allocate_page(
     page_id: usize,
     size: usize,
-    buffer_pool: &Rc<BufferPool>,
+    buffer_pool: &Arc<BufferPool>,
     offset: usize,
 ) -> PageRef {
     let page = Arc::new(Page::new(page_id));
     let buffer = buffer_pool.get_page(Some(size));
     page.set_loaded();
     page.get().contents = Some(PageContent::new(offset, buffer));
-    page
+    PageRef::new(page)
 }
 
 #[derive(Debug)]
@@ -740,7 +786,10 @@ mod tests {
 
     use parking_lot::RwLock;
 
-    use crate::storage::page_cache::{DumbLruPageCache, PageCacheKey};
+    use crate::{
+        storage::page_cache::{DumbLruPageCache, PageCacheKey},
+        PageRef,
+    };
 
     use super::Page;
 
@@ -754,7 +803,7 @@ mod tests {
             std::thread::spawn(move || {
                 let mut cache = cache.write();
                 let page_key = PageCacheKey::new(1, None);
-                cache.insert(page_key, Arc::new(Page::new(1)));
+                cache.insert(page_key, &PageRef::new(Arc::new(Page::new(1))));
             })
         };
         let _ = thread.join();

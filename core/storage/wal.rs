@@ -164,7 +164,7 @@ pub trait Wal {
     fn find_frame(&self, page_id: u64) -> Result<Option<u64>>;
 
     /// Read a frame from the WAL.
-    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Rc<BufferPool>) -> Result<()>;
+    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Arc<BufferPool>) -> Result<()>;
 
     /// Write a frame to the WAL.
     fn append_frame(
@@ -241,7 +241,7 @@ impl fmt::Debug for OngoingCheckpoint {
 #[allow(dead_code)]
 pub struct WalFile {
     io: Arc<dyn IO>,
-    buffer_pool: Rc<BufferPool>,
+    buffer_pool: Arc<BufferPool>,
 
     sync_state: RefCell<SyncState>,
     syncing: Rc<RefCell<bool>>,
@@ -423,7 +423,7 @@ impl Wal for WalFile {
     }
 
     /// Read a frame from the WAL.
-    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Rc<BufferPool>) -> Result<()> {
+    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Arc<BufferPool>) -> Result<()> {
         debug!("read_frame({})", frame_id);
         let offset = self.frame_offset(frame_id);
         page.set_locked();
@@ -462,8 +462,8 @@ impl Wal for WalFile {
             &shared.file,
             offset,
             &page,
-            self.page_size as u16,
             self.buffer_pool.clone(),
+            header.page_size,
             db_size,
             write_counter,
             &header,
@@ -562,7 +562,10 @@ impl Wal for WalFile {
                                 state, page, *frame
                             );
                             self.ongoing_checkpoint.page.get().id = page as usize;
-
+                            if *write_counter.borrow() > 0 {
+                                // we cannot checkpoint if there are writes in progress
+                                return Ok(CheckpointStatus::IO);
+                            }
                             self.read_frame(
                                 *frame,
                                 self.ongoing_checkpoint.page.clone(),
@@ -691,7 +694,7 @@ impl WalFile {
         io: Arc<dyn IO>,
         page_size: usize,
         shared: Arc<UnsafeCell<WalFileShared>>,
-        buffer_pool: Rc<BufferPool>,
+        buffer_pool: Arc<BufferPool>,
     ) -> Self {
         let checkpoint_page = Arc::new(Page::new(0));
         let buffer = buffer_pool.get_page(Some(page_size + WAL_FRAME_HEADER_SIZE));
@@ -701,7 +704,7 @@ impl WalFile {
             io,
             shared,
             ongoing_checkpoint: OngoingCheckpoint {
-                page: checkpoint_page,
+                page: PageRef::new(checkpoint_page),
                 state: CheckpointState::Start,
                 min_frame: 0,
                 max_frame: 0,
@@ -735,7 +738,7 @@ impl WalFile {
 impl WalFileShared {
     pub fn open_shared(
         io: &Arc<dyn IO>,
-        buffer_pool: Rc<BufferPool>,
+        buffer_pool: Arc<BufferPool>,
         path: &str,
         page_size: u16,
     ) -> Result<Arc<UnsafeCell<WalFileShared>>> {
