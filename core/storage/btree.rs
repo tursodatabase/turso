@@ -438,7 +438,7 @@ impl BTreeCursor {
             let cell_idx = self.stack.current_cell_index();
 
             // moved to beginning of current page
-            // todo: find a better way to flag moved to end or begin of page
+            // todo: find a better way to flag moved to end or beginning of page
             if self.stack.current_cell_index_less_than_min() {
                 loop {
                     if self.stack.current_cell_index() >= 0 {
@@ -448,7 +448,7 @@ impl BTreeCursor {
                         self.going_upwards = true;
                         self.stack.pop();
                     } else {
-                        // moved to begin of btree
+                        // moved to beginning of btree
                         return Ok(CursorResult::Ok(None));
                     }
                 }
@@ -457,11 +457,7 @@ impl BTreeCursor {
             }
 
             let cell_idx = cell_idx as usize;
-            return_if_locked!(page);
-            if !page.is_loaded() {
-                self.pager.load_page(page.clone())?;
-                return Ok(CursorResult::IO);
-            }
+            return_if_locked_maybe_load!(self.pager, page);
             let contents = page.get().contents.as_ref().unwrap();
 
             let cell_count = contents.cell_count();
@@ -753,11 +749,7 @@ impl BTreeCursor {
             let cell_idx = self.stack.current_cell_index() as usize;
 
             tracing::trace!("current id={} cell={}", mem_page_rc.get().id, cell_idx);
-            return_if_locked!(mem_page_rc);
-            if !mem_page_rc.is_loaded() {
-                self.pager.load_page(mem_page_rc.clone())?;
-                return Ok(CursorResult::IO);
-            }
+            return_if_locked_maybe_load!(self.pager, mem_page_rc);
             let mem_page = mem_page_rc.get();
 
             let contents = mem_page.contents.as_ref().unwrap();
@@ -976,12 +968,8 @@ impl BTreeCursor {
     /// We don't include the rowid in the comparison and that's why the last value from the record is not included.
     fn do_seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<CursorResult<Option<u64>>> {
         match key {
-            SeekKey::TableRowId(rowid) => {
-                return self.tablebtree_seek(rowid, op);
-            }
-            SeekKey::IndexKey(index_key) => {
-                return self.indexbtree_seek(index_key, op);
-            }
+            SeekKey::TableRowId(rowid) => self.tablebtree_seek(rowid, op),
+            SeekKey::IndexKey(index_key) => self.indexbtree_seek(index_key, op),
         }
     }
 
@@ -1484,7 +1472,7 @@ impl BTreeCursor {
                     }
                 };
                 let cell = contents.cell_get(
-                    nearest_matching_cell as usize,
+                    nearest_matching_cell,
                     payload_overflow_threshold_max(
                         contents.page_type(),
                         self.usable_space() as u16,
@@ -1642,12 +1630,8 @@ impl BTreeCursor {
         self.move_to_root();
 
         match key {
-            SeekKey::TableRowId(rowid_key) => {
-                return self.tablebtree_move_to(rowid_key, cmp);
-            }
-            SeekKey::IndexKey(index_key) => {
-                return self.indexbtree_move_to(index_key, cmp);
-            }
+            SeekKey::TableRowId(rowid_key) => self.tablebtree_move_to(rowid_key, cmp),
+            SeekKey::IndexKey(index_key) => self.indexbtree_move_to(index_key, cmp),
         }
     }
 
@@ -1816,6 +1800,7 @@ impl BTreeCursor {
                         "BalanceInfo should be empty on start"
                     );
                     let current_page = self.stack.top();
+                    return_if_locked_maybe_load!(self.pager, current_page);
                     {
                         // check if we don't need to balance
                         // don't continue if:
@@ -1839,7 +1824,7 @@ impl BTreeCursor {
                     }
 
                     if !self.stack.has_parent() {
-                        self.balance_root();
+                        return_if_io!(self.balance_root());
                     }
 
                     let write_info = self.state.mut_write_info().unwrap();
@@ -2038,6 +2023,7 @@ impl BTreeCursor {
                 }
                 // Now do real balancing
                 let parent_page = self.stack.top();
+                return_if_locked!(parent_page);
                 let parent_contents = parent_page.get_contents();
                 let parent_is_root = !self.stack.has_parent();
 
@@ -2271,7 +2257,7 @@ impl BTreeCursor {
                         } else {
                             size_of_cell_to_remove_from_left
                         };
-                        new_page_sizes[i + 1] += size_of_cell_to_move_right as i64;
+                        new_page_sizes[i + 1] += size_of_cell_to_move_right;
                         cell_array.number_of_cells_per_page[i] -= 1;
                     }
 
@@ -2490,7 +2476,7 @@ impl BTreeCursor {
                     if !is_leaf_page {
                         // Interior
                         // Make this page's rightmost pointer point to pointer of divider cell before modification
-                        let previous_pointer_divider = read_u32(&divider_cell, 0);
+                        let previous_pointer_divider = read_u32(divider_cell, 0);
                         page.get_contents()
                             .write_u32(offset::BTREE_RIGHTMOST_PTR, previous_pointer_divider);
                         // divider cell now points to this page
@@ -2550,7 +2536,7 @@ impl BTreeCursor {
                         balance_info,
                         parent_contents,
                         i,
-                        page,
+                        page.clone(),
                     );
                 }
                 tracing::debug!(
@@ -2704,7 +2690,7 @@ impl BTreeCursor {
 
                 #[cfg(debug_assertions)]
                 self.post_balance_non_root_validation(
-                    &parent_page,
+                    parent_page.clone(),
                     balance_info,
                     parent_contents,
                     pages_to_balance_new,
@@ -2739,9 +2725,9 @@ impl BTreeCursor {
         balance_info: &mut BalanceInfo,
         parent_contents: &mut PageContent,
         i: usize,
-        page: &std::sync::Arc<crate::Page>,
+        page: PageRef,
     ) {
-        let left_pointer = if parent_contents.overflow_cells.len() == 0 {
+        let left_pointer = if parent_contents.overflow_cells.is_empty() {
             let (cell_start, cell_len) = parent_contents.cell_get_raw_region(
                 balance_info.first_divider_cell + i,
                 payload_overflow_threshold_max(
@@ -2783,10 +2769,10 @@ impl BTreeCursor {
     #[cfg(debug_assertions)]
     fn post_balance_non_root_validation(
         &self,
-        parent_page: &PageRef,
+        parent_page: PageRef,
         balance_info: &mut BalanceInfo,
         parent_contents: &mut PageContent,
-        pages_to_balance_new: [Option<std::sync::Arc<crate::Page>>; 5],
+        pages_to_balance_new: [Option<PageRef>; 5],
         page_type: PageType,
         leaf_data: bool,
         mut cells_debug: Vec<Vec<u8>>,
@@ -2935,7 +2921,7 @@ impl BTreeCursor {
                 let rightmost = read_u32(rightmost_pointer, 0);
                 debug_validate_cells!(parent_contents, self.usable_space() as u16);
 
-                if !pages_to_balance_new[0].is_some() {
+                if pages_to_balance_new[0].is_none() {
                     tracing::error!(
                         "balance_non_root(balance_shallower_incorrect_page, page_idx={})",
                         0
@@ -3255,7 +3241,7 @@ impl BTreeCursor {
     /// Balance the root page.
     /// This is done when the root page overflows, and we need to create a new root page.
     /// See e.g. https://en.wikipedia.org/wiki/B-tree
-    fn balance_root(&mut self) {
+    fn balance_root(&mut self) -> Result<CursorResult<()>> {
         /* todo: balance deeper, create child and copy contents of root there. Then split root */
         /* if we are in root page then we just need to create a new root and push key there */
 
@@ -3267,6 +3253,8 @@ impl BTreeCursor {
         let offset = if is_page_1 { DATABASE_HEADER_SIZE } else { 0 };
 
         let root = self.stack.top();
+        // page still may be locked because we push pages from read_page directly to the stack
+        return_if_locked_maybe_load!(self.pager, root);
         let root_contents = root.get_contents();
         let child = self.pager.do_allocate_page(root_contents.page_type(), 0);
 
@@ -3324,6 +3312,7 @@ impl BTreeCursor {
         self.stack.clear();
         self.stack.push(root.clone());
         self.stack.push(child.clone());
+        Ok(CursorResult::Ok(()))
     }
 
     fn usable_space(&self) -> usize {
@@ -3566,6 +3555,7 @@ impl BTreeCursor {
             match delete_state {
                 DeleteState::Start => {
                     let page = self.stack.top();
+                    return_if_locked!(page);
                     if matches!(
                         page.get_contents().page_type(),
                         PageType::TableLeaf | PageType::TableInterior
@@ -3577,11 +3567,9 @@ impl BTreeCursor {
                                 return Ok(CursorResult::Ok(()));
                             }
                         };
-                    } else {
-                        if self.reusable_immutable_record.borrow().is_none() {
-                            self.state = CursorState::None;
-                            return Ok(CursorResult::Ok(()));
-                        }
+                    } else if self.reusable_immutable_record.borrow().is_none() {
+                        self.state = CursorState::None;
+                        return Ok(CursorResult::Ok(()));
                     }
 
                     let delete_info = self.state.mut_delete_info().unwrap();
@@ -3598,6 +3586,7 @@ impl BTreeCursor {
 
                 DeleteState::FindCell => {
                     let page = self.stack.top();
+                    return_if_locked!(page);
                     let mut cell_idx = self.stack.current_cell_index() as usize;
                     cell_idx -= 1;
 
@@ -3645,6 +3634,7 @@ impl BTreeCursor {
                     return_if_io!(self.clear_overflow_pages(&cell));
 
                     let page = self.stack.top();
+                    return_if_locked!(page);
                     let contents = page.get().contents.as_ref().unwrap();
 
                     let delete_info = self.state.mut_delete_info().unwrap();
@@ -4330,7 +4320,7 @@ impl PageStack {
             "corrupted database, stack is bigger than expected"
         );
         assert!(current >= 0);
-        self.stack.borrow_mut()[current as usize] = Some(page);
+        self.stack.borrow_mut()[current as usize] = Some(page.clone());
         self.cell_indices.borrow_mut()[current as usize] = starting_cell_idx;
     }
 
@@ -5540,7 +5530,7 @@ mod tests {
         let io_file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
         let db_file = Arc::new(DatabaseFile::new(io_file));
 
-        let buffer_pool = Rc::new(BufferPool::new(io.clone(), db_header.page_size as usize));
+        let buffer_pool = BufferPool::new(io.clone(), db_header.page_size as usize);
         let wal_shared =
             WalFileShared::open_shared(&io, buffer_pool.clone(), "test.wal", db_header.page_size)
                 .unwrap();
@@ -5831,7 +5821,7 @@ mod tests {
         let db_header = Arc::new(SpinLock::new(db_header));
 
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let buffer_pool = Rc::new(BufferPool::new(io.clone(), page_size.into()));
+        let buffer_pool = BufferPool::new(io.clone(), page_size.into());
 
         let db_file = Arc::new(DatabaseFile::new(
             io.open_file("test.db", OpenFlags::Create, false).unwrap(),
