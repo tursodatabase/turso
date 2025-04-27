@@ -90,7 +90,7 @@ impl quote::ToTokens for ValueList {
                 ::rusqlite::types::Value::Real(#f)
             },
             Value::Text(t) => quote! {
-                ::rusqlite::types::Value::Text(#t)
+                ::rusqlite::types::Value::Text(#t.to_string())
             },
             Value::Blob(b) => {
                 quote! {
@@ -111,10 +111,13 @@ impl syn::parse::Parse for ValueList2D {
         if input.peek(Ident) {
             let ident: Ident = input.parse()?;
             if ident.to_string() != "None" {
-                return Err(syn::Error::new(ident.span(), "expected None identifier for empty sqlite values"));
+                return Err(syn::Error::new(
+                    ident.span(),
+                    "expected None identifier for empty sqlite values",
+                ));
             }
             let punctuated = Punctuated::new();
-            return Ok(Self { inner: punctuated })
+            return Ok(Self { inner: punctuated });
         }
 
         if input.peek(Bracket) {

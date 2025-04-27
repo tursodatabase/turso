@@ -187,56 +187,47 @@ pub(crate) fn exec_sql(db_path: PathBuf, sql: &str, values: Vec<Vec<Value>>) {
     }
 }
 
-pub(crate) fn exec_many_sql<I, V>(
-    db_path: PathBuf,
-    sql_queries: impl Iterator<Item = String>,
-    values: impl Iterator<Item = I>,
-) where
-    I: Iterator<Item = V>,
-    V: Into<Value>,
-{
-    for (sql, curr_value) in zip(sql_queries, values) {
-        let values: Vec<Value> = curr_value.map(|v| v.into()).collect();
-        // Blocks here to drop db connections
-        {
-            let sqlite_conn = rusqlite::Connection::open_with_flags(
-                db_path.clone(),
-                OpenFlags::SQLITE_OPEN_READ_ONLY,
-            )
-            .unwrap();
-            let sqlite: Vec<Value> = sqlite_exec_rows(&sqlite_conn, &sql)
-                .into_iter()
-                .flatten()
-                .collect();
+pub(crate) fn exec_many_sql(db_path: PathBuf, sql_queries: Vec<&str>, values: Vec<Vec<Value>>) {
+    {
+        let sqlite_conn = rusqlite::Connection::open_with_flags(
+            db_path.clone(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut sqlite_values = Vec::with_capacity(sql_queries.len());
+        for sql in sql_queries.iter() {
+            let sqlite = sqlite_exec_rows(&sqlite_conn, &sql);
+            sqlite_values.extend(sqlite);
+        }
+        assert_eq!(
+            sqlite_values,
+            values,
+            "query: {:#?}, values: {:?}, sqlite: {:?}, db: {}",
+            sql_queries,
+            values,
+            sqlite_values,
+            db_path.to_string_lossy()
+        );
+    }
 
-            assert_eq!(
-                sqlite,
-                values,
-                "query: {}, values: {:?}, sqlite: {:?}, db: {}",
-                sql,
-                values,
-                sqlite,
-                db_path.to_string_lossy()
-            );
+    {
+        let db = TempDatabase::new_existent(&db_path);
+        let limbo_conn = db.connect_limbo();
+        let mut limbo_values = Vec::with_capacity(sql_queries.len());
+        for sql in sql_queries.iter() {
+            let limbo = limbo_exec_rows(&db, &limbo_conn, &sql);
+            limbo_values.extend(limbo);
         }
 
-        {
-            let db = TempDatabase::new_existent(&db_path);
-            let limbo_conn = db.connect_limbo();
-            let limbo: Vec<Value> = limbo_exec_rows(&db, &limbo_conn, &sql)
-                .into_iter()
-                .flatten()
-                .collect();
-            assert_eq!(
-                limbo,
-                values,
-                "query: {}, values: {:?}, limbo: {:?}, db: {}",
-                sql,
-                values,
-                limbo,
-                db_path.to_string_lossy()
-            );
-        }
+        assert_eq!(
+            limbo_values,
+            values,
+            "query: {:#?}, values: {:?}, limbo: {:?}, db: {}",
+            sql_queries,
+            values,
+            limbo_values,
+            db_path.to_string_lossy()
+        );
     }
 }
 

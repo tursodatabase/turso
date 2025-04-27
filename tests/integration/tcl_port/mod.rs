@@ -46,13 +46,12 @@ mod tests {
             fn $name() {
                 for db_path in $crate::tcl_port::tests::TEST_DBS {
                     let queries = vec![$($statement),*];
-                    let expected_vals = vec![$($expected), *];
-                    assert_eq!(queries.len(), expected_vals.len(), "you did not provide the number of arguments for queries and expected values");
+                    let expected_vals = ::limbo_tests_macros::sqlite_values!($($expected), *);
 
                     $crate::common::exec_many_sql(
                         $crate::tcl_port::tests::WORKSPACE_ROOT.join(db_path),
-                        queries.iter().map(|s| s.to_string()),
-                        expected_vals.into_iter().map(|v| v.into_iter().flatten().map(|v| v.to_owned())),
+                        queries,
+                        expected_vals,
                     );
                 }
             }
