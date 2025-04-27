@@ -73,7 +73,6 @@ parking_lot = "0.12.3"
 crossbeam-skiplist = "0.1.3"
 tracing = "0.1.41"
 ryu = "1.0.19"
-crossbeam = "0.8.4" 
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
