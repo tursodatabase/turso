@@ -121,8 +121,7 @@ impl WrappedIOUring {
                 .expect("submission queue is full");
         }
         self.pending_ops += 1;
-        if self.pending_ops % 32 == 0 {
-            // We need to wait for at least one completion before we can submit more.
+        if self.pending_ops == ENTRIES as usize {
             self.ring.submit().expect("failed to submit");
         }
     }
@@ -311,6 +310,7 @@ impl File for UringFile {
         let read_e = {
             let len = r.buf.len();
             let ptr = r.buf.as_ptr() as *mut u8;
+            assert!(!ptr.is_null());
             if let Some(id) = r.buf.arena_id() {
                 trace!("pread_fixed(pos = {}, length = {})", pos, r.buf.len());
                 io_uring::opcode::ReadFixed::new(
@@ -335,6 +335,7 @@ impl File for UringFile {
     }
 
     fn pwrite(&self, pos: usize, buffer: Arc<crate::Buffer>, c: Completion) -> Result<()> {
+        assert!(!buffer.as_ptr().is_null());
         let io = unsafe { &mut *self.io.get() };
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
         let write = {

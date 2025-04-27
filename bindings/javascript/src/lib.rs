@@ -29,7 +29,7 @@ impl Database {
         let file = io
             .open_file(&path, limbo_core::OpenFlags::Create, false)
             .unwrap();
-        let pool = Rc::new(BufferPool::new(DEFAULT_PAGE_SIZE));
+        let pool = BufferPool::new(io.clone(), DEFAULT_PAGE_SIZE);
         maybe_init_database_file(&file, &io, pool.clone()).unwrap();
         let db_file = Arc::new(DatabaseFile::new(file));
         let db = limbo_core::Database::open(io, &path, db_file, pool.clone(), false).unwrap();

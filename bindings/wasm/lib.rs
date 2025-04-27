@@ -18,7 +18,7 @@ impl Database {
     pub fn new(path: &str) -> Database {
         let io: Arc<dyn limbo_core::IO> = Arc::new(PlatformIO { vfs: VFS::new() });
         let file = io.open_file(path, OpenFlags::Create, false).unwrap();
-        let pool = Rc::new(limbo_core::BufferPool::new(DEFAULT_PAGE_SIZE));
+        let pool = limbo_core::BufferPool::new(io.clone(), DEFAULT_PAGE_SIZE);
         maybe_init_database_file(&file, &io, pool.clone()).unwrap();
         let db_file = Arc::new(DatabaseFile::new(file));
         let db = limbo_core::Database::open(io, path, db_file, pool.clone(), false).unwrap();
@@ -214,12 +214,11 @@ impl limbo_core::File for File {
             limbo_core::Completion::Read(ref r) => r,
             _ => unreachable!(),
         };
-        {
+        let nr = {
             let buf = r.buf.slice_mut();
-            let nr = self.vfs.pread(self.fd, buf, pos);
-            assert!(nr >= 0);
-        }
-        r.complete();
+            self.vfs.pread(self.fd, buf, pos)
+        };
+        r.complete(nr);
         Ok(())
     }
 

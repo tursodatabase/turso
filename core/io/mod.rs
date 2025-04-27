@@ -42,7 +42,7 @@ pub trait IO: Clock + Send + Sync {
     }
 }
 
-pub type Complete = dyn Fn(Arc<Buffer>);
+pub type Complete = dyn Fn(Arc<Buffer>, i32);
 pub type WriteComplete = dyn Fn(i32);
 pub type SyncComplete = dyn Fn(i32);
 
@@ -60,7 +60,7 @@ pub struct ReadCompletion {
 impl Completion {
     pub fn complete(&self, result: i32) {
         match self {
-            Self::Read(r) => r.complete(),
+            Self::Read(r) => r.complete(result),
             Self::Write(w) => w.complete(result),
             Self::Sync(s) => s.complete(result), // fix
         }
@@ -73,7 +73,7 @@ impl Completion {
     }
     pub fn new_read<F>(buf: Arc<Buffer>, complete: F) -> Self
     where
-        F: Fn(Arc<Buffer>) + 'static,
+        F: Fn(Arc<Buffer>, i32) + 'static,
     {
         Self::Read(ReadCompletion::new(buf, Box::new(complete)))
     }
@@ -109,8 +109,8 @@ impl ReadCompletion {
         self.buf.slice_mut()
     }
 
-    pub fn complete(&self) {
-        (self.complete)(self.buf.clone());
+    pub fn complete(&self, res: i32) {
+        (self.complete)(self.buf.clone(), res);
     }
 }
 

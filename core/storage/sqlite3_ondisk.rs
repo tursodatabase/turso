@@ -253,7 +253,7 @@ pub fn begin_read_database_header(
     let buffer = Buffer::new_heap(512);
     let result = Arc::new(SpinLock::new(DatabaseHeader::default()));
     let header = result.clone();
-    let c = Completion::new_read(buffer, move |buf: Arc<Buffer>| {
+    let c = Completion::new_read(buffer, move |buf: Arc<Buffer>, _: i32| {
         let header = header.clone();
         finish_read_database_header(buf.clone(), header).unwrap();
     });
@@ -304,7 +304,8 @@ pub fn begin_write_database_header(header: &DatabaseHeader, pager: &Pager) -> Re
     let buffer_to_copy_in_cb = buffer_to_copy.clone();
 
     let buf = Buffer::new_heap(512);
-    let c = Completion::new_read(buf, move |buffer: Arc<Buffer>| {
+    let c = Completion::new_read(buf, move |buffer: Arc<Buffer>, res: i32| {
+        assert_eq!(res, 512);
         let buffer = buffer.clone();
         let buf_mut = buffer.slice_mut();
         write_header_to_buf(buf_mut, &header);
@@ -732,15 +733,15 @@ impl PageContent {
 
 pub fn begin_read_page(
     db_file: Arc<dyn DatabaseStorage>,
-    buffer_pool: Rc<BufferPool>,
+    buffer_pool: Arc<BufferPool>,
     page: PageRef,
     page_idx: usize,
 ) -> Result<()> {
     trace!("begin_read_btree_page(page_idx = {})", page_idx);
     let buf = buffer_pool.get_page(None);
-    let c = Completion::new_read(buf, move |buf: Arc<Buffer>| {
+    let c = Completion::new_read(buf, move |buf: Arc<Buffer>, res: i32| {
         let page = page.clone();
-        if finish_read_page(page_idx, buf, page.clone()).is_err() {
+        if finish_read_page(page_idx, buf, page.clone()).is_err() || res < 0 {
             page.set_error();
         }
     });
@@ -1281,11 +1282,11 @@ pub fn begin_read_wal_header(io: &Arc<dyn File>) -> Result<Arc<SpinLock<WalHeade
     let buf = Buffer::new_heap(512);
     let result = Arc::new(SpinLock::new(WalHeader::default()));
     let header = result.clone();
-    let complete = Box::new(move |buf: Arc<Buffer>| {
+    let c = Completion::new_read(buf, move |buf: Arc<Buffer>, res: i32| {
+        tracing::trace!("read wal header({res} bytes)");
         let header = header.clone();
         finish_read_wal_header(buf, header).unwrap();
     });
-    let c = Completion::new_read(buf, complete);
     io.pread(0, c)?;
     Ok(result)
 }
@@ -1308,7 +1309,7 @@ pub fn begin_read_wal_frame(
     io: &Arc<dyn File>,
     frame_size: usize,
     offset: usize,
-    buffer_pool: Rc<BufferPool>,
+    buffer_pool: Arc<BufferPool>,
     page: PageRef,
 ) -> Result<()> {
     trace!(
@@ -1318,7 +1319,8 @@ pub fn begin_read_wal_frame(
     );
     let buf = buffer_pool.get_page(Some(frame_size));
     let frame = page.clone();
-    let complete = Completion::new_read(buf, move |buf: Arc<Buffer>| {
+    let complete = Completion::new_read(buf, move |buf: Arc<Buffer>, res: i32| {
+        tracing::trace!("read wal frame({res} bytes)");
         let frame = frame.clone();
         finish_read_page(page.get().id, buf.clone(), frame).unwrap();
     });
@@ -1331,8 +1333,8 @@ pub fn begin_write_wal_frame(
     io: &Arc<dyn File>,
     offset: usize,
     page: &PageRef,
-    page_size: u16,
-    buffer_pool: Rc<BufferPool>,
+    buffer_pool: Arc<BufferPool>,
+    page_size: u32,
     db_size: u32,
     write_counter: Rc<RefCell<usize>>,
     wal_header: &WalHeader,
@@ -1393,7 +1395,10 @@ pub fn begin_write_wal_frame(
         let buf_len = buf_copy.len();
         let _ = buf_copy.clone();
         *write_counter.borrow_mut() -= 1;
-
+        tracing::debug!(
+            "wrote({bytes_written} to buffer {:?} with length: {buf_len})",
+            buf_copy.arena_id()
+        );
         page_finish.clear_dirty();
         if bytes_written < buf_len as i32 {
             tracing::error!("wrote({bytes_written}) less than expected({buf_len})");
@@ -1406,7 +1411,7 @@ pub fn begin_write_wal_frame(
 
 pub fn begin_write_wal_header(
     io: &Arc<dyn File>,
-    pool: Rc<BufferPool>,
+    pool: Arc<BufferPool>,
     header: &WalHeader,
 ) -> Result<()> {
     let buffer = {
