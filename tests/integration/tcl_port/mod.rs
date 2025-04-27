@@ -3,6 +3,7 @@ mod boolean;
 mod changes;
 mod coalesce;
 mod compare;
+mod concat;
 mod select;
 
 #[cfg(test)]
