@@ -4473,7 +4473,7 @@ pub fn op_open_ephemeral(
     let io = conn.pager.io.get_memory_io();
 
     let file = io.open_file("", OpenFlags::Create, true)?;
-    let buffer_pool = Rc::new(BufferPool::new(io.clone(), 4096));
+    let buffer_pool = BufferPool::new(io.clone(), 4096);
     maybe_init_database_file(&file, &(io.clone() as Arc<dyn IO>), buffer_pool.clone())?;
     let db_file = Arc::new(FileMemoryStorage::new(file));
 

@@ -100,7 +100,7 @@ pub struct Database {
     header: Arc<SpinLock<DatabaseHeader>>,
     db_file: Arc<dyn DatabaseStorage>,
     io: Arc<dyn IO>,
-    buffer_pool: Rc<BufferPool>,
+    buffer_pool: Arc<BufferPool>,
     page_size: u16,
     // Shared structures of a Database are the parts that are common to multiple threads that might
     // create DB connections.
@@ -115,7 +115,7 @@ impl Database {
     #[cfg(feature = "fs")]
     pub fn open_file(io: Arc<dyn IO>, path: &str, enable_mvcc: bool) -> Result<Arc<Database>> {
         let file = io.open_file(path, OpenFlags::Create, true)?;
-        let buffer_pool = Rc::new(BufferPool::new(io.clone(), DEFAULT_PAGE_SIZE));
+        let buffer_pool = BufferPool::new(io.clone(), DEFAULT_PAGE_SIZE);
         maybe_init_database_file(&file, &io, buffer_pool.clone())?;
         let db_file = Arc::new(DatabaseFile::new(file));
         Self::open(io, path, db_file, buffer_pool.clone(), enable_mvcc)
@@ -126,7 +126,7 @@ impl Database {
         io: Arc<dyn IO>,
         path: &str,
         db_file: Arc<dyn DatabaseStorage>,
-        buffer_pool: Rc<BufferPool>,
+        buffer_pool: Arc<BufferPool>,
         enable_mvcc: bool,
     ) -> Result<Arc<Database>> {
         let db_header = Pager::begin_open(db_file.clone())?;
@@ -248,7 +248,7 @@ impl Database {
 pub fn maybe_init_database_file(
     file: &Arc<dyn File>,
     io: &Arc<dyn IO>,
-    pool: Rc<BufferPool>,
+    pool: Arc<BufferPool>,
 ) -> Result<()> {
     if file.size()? == 0 {
         // init db
