@@ -5262,6 +5262,7 @@ mod tests {
 
         let inner = PageContent::new(0, Buffer::new_heap(4096));
         page.get().contents.replace(inner);
+        let page = PageRef::new(page);
         btree_init_page(&page, PageType::TableLeaf, 0, 4096);
         page
     }
