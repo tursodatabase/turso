@@ -5,6 +5,7 @@ mod coalesce;
 mod compare;
 mod concat;
 mod default_value;
+mod delete;
 mod select;
 
 #[cfg(test)]
