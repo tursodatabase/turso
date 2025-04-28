@@ -15,6 +15,7 @@ mod json;
 mod like;
 mod math;
 mod offset;
+mod orderby;
 mod select;
 
 #[cfg(test)]
