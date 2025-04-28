@@ -11,6 +11,7 @@ mod glob;
 mod groupby;
 mod insert;
 mod join;
+mod json;
 mod select;
 
 #[cfg(test)]
