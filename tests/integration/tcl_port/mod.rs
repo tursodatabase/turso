@@ -17,6 +17,7 @@ mod math;
 mod offset;
 mod orderby;
 mod pragma;
+mod scalar_functions_datetime;
 mod select;
 
 #[cfg(test)]
