@@ -13,6 +13,7 @@ mod insert;
 mod join;
 mod json;
 mod like;
+mod math;
 mod select;
 
 #[cfg(test)]
