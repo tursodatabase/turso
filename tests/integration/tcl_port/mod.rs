@@ -9,6 +9,7 @@ mod delete;
 mod drop_table;
 mod glob;
 mod groupby;
+mod insert;
 mod select;
 
 #[cfg(test)]
@@ -64,12 +65,12 @@ mod tests {
                 }
             }
         };
-        ($name:ident, [$($statement:literal),*], [$($expected:expr),*]) => {
+        ($name:ident, [$($statement:literal),*], $expected:expr) => {
             #[test]
             fn $name() {
                 for db_path in $crate::tcl_port::tests::TEST_DBS {
                     let queries = vec![$($statement),*];
-                    let expected_vals = ::limbo_tests_macros::sqlite_values!($($expected), *);
+                    let expected_vals = ::limbo_tests_macros::sqlite_values!($expected);
 
                     $crate::common::exec_many_sql(
                         $crate::tcl_port::tests::WORKSPACE_ROOT.join(db_path),
@@ -79,11 +80,11 @@ mod tests {
                 }
             }
         };
-        (memory, $name:ident, [$($statement:literal),*], [$($expected:expr),*]) => {
+        (memory, $name:ident, [$($statement:literal),*], $expected:expr) => {
             #[test]
             fn $name() {
                 let queries = vec![$($statement),*];
-                let expected_vals = ::limbo_tests_macros::sqlite_values!($($expected), *);
+                let expected_vals = ::limbo_tests_macros::sqlite_values!($expected);
 
                 $crate::common::exec_many_sql_memory(
                     queries,
@@ -101,6 +102,14 @@ mod tests {
                         ::limbo_tests_macros::sqlite_values!(None),
                     );
                 }
+            }
+        };
+        (memory_expect_error, $name:ident, [$($statement:literal),*]) => {
+            #[test]
+            fn $name() {
+                let queries = vec![$($statement),*];
+
+                $crate::common::expect_memory_error(queries);
             }
         };
     }

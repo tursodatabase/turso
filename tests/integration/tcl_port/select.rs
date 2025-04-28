@@ -142,7 +142,7 @@ mod tests {
             "select case NULL when NULL then 'first' else 'second' end",
             "select case 0 when 0 then 'first' else 'second' end"
         ],
-        ["second", "second", "first"]
+        [["second"], ["second"], ["first"]]
     );
 
     db_test!(
@@ -246,7 +246,7 @@ mod tests {
             "SELECT 1 << -9223372036854775808;  -- i64::MIN",
             "SELECT 1 << 9223372036854775807;   -- i64::MAX"
         ],
-        [0, 0, 0]
+        [[0], [0], [0]]
     );
 
     db_test!(
@@ -299,13 +299,13 @@ mod tests {
             "SELECT '8' << '-2'",
             "SELECT '-4' << '2'"
         ],
-        [4, 2, -16]
+        [[4], [2], [-16]]
     );
 
     db_test!(
         select_shl_chained,
         ["SELECT (1 << 2) << 3", "SELECT (2 << 1) << (1 << 1)"],
-        [32, 16]
+        [[32], [16]]
     );
 
     db_test!(
@@ -315,7 +315,7 @@ mod tests {
             "SELECT 1.0 << 2",
             "SELECT 1.5 << 2"
         ],
-        [4, 4, 4]
+        [[4], [4], [4]]
     );
 
     // TODO: rust-analyzer bug

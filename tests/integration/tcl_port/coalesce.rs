@@ -19,7 +19,7 @@ mod tests {
             " select coalesce(NULL, coalesce(1, 2))",
             "select coalesce(0, coalesce(1, 2))"
         ],
-        [2, 1, 0]
+        [[2], [1], [0]]
     );
 
     db_test!(coaslesce_null, "select coalesce(NULL, NULL, NULL)", [Null]);

@@ -14,7 +14,7 @@ mod tests {
             "DELETE FROM t1 WHERE x = 2",
             "SELECT * FROM t1 ORDER BY x"
         ],
-        [1, 3]
+        [[1], [3]]
     );
 
     // Test alternating delete-insert pattern to stress freelist
@@ -32,7 +32,7 @@ mod tests {
             "INSERT INTO t4 VALUES (5)",
             "SELECT * FROM t4 ORDER BY x"
         ],
-        [3, 4, 5]
+        [[3], [4], [5]]
     );
 
     // Test deleting from both ends
@@ -51,7 +51,7 @@ mod tests {
             "DELETE FROM t5 WHERE x = 5",
             "SELECT * FROM t5 ORDER BY x"
         ],
-        [2, 3, 4]
+        [[2], [3], [4]]
     );
 
     // Test delete-insert cycles with value reuse
@@ -67,6 +67,6 @@ mod tests {
             "INSERT INTO t6 VALUES (2)", // Reuse same value
             "SELECT * FROM t6 ORDER BY x"
         ],
-        [1, 2, 3]
+        [[1], [2], [3]]
     );
 }

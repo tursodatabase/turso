@@ -305,6 +305,27 @@ pub(crate) fn exec_many_sql_memory(sql_queries: Vec<&str>, values: Vec<Vec<Value
     }
 }
 
+pub(crate) fn expect_memory_error(sql_queries: Vec<&str>) {
+    {
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+        let contains_error = sql_queries
+            .iter()
+            .map(|sql| sqlite_exec_rows_error(&sqlite_conn, &sql))
+            .any(|res| res.is_err());
+        assert!(contains_error, "no error thrown in SQLite");
+    }
+
+    {
+        let db = TempDatabase::new_in_memory();
+        let limbo_conn = db.connect_limbo();
+        let contains_error = sql_queries
+            .iter()
+            .map(|sql| limbo_exec_rows_error(&db, &limbo_conn, &sql))
+            .any(|res| res.is_err());
+        assert!(contains_error, "no error thrown in Limbo");
+    }
+}
+
 pub(crate) fn sqlite_exec_rows(
     conn: &rusqlite::Connection,
     query: &str,
@@ -326,6 +347,21 @@ pub(crate) fn sqlite_exec_rows(
     }
 
     results
+}
+
+/// Exec sqlite and expect errors
+pub(crate) fn sqlite_exec_rows_error(
+    conn: &rusqlite::Connection,
+    query: &str,
+) -> anyhow::Result<()> {
+    let mut stmt = conn.prepare(&query)?;
+    let mut rows = stmt.query(params![])?;
+    while let Some(row) = rows.next()? {
+        for i in 0.. {
+            let _: rusqlite::types::Value = row.get(i)?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn limbo_exec_rows(
@@ -366,6 +402,31 @@ pub(crate) fn limbo_exec_rows(
         rows.push(row);
     }
     rows
+}
+
+/// Exec Limbo and expect errors
+pub(crate) fn limbo_exec_rows_error(
+    db: &TempDatabase,
+    conn: &Rc<limbo_core::Connection>,
+    query: &str,
+) -> anyhow::Result<()> {
+    let mut stmt = conn.prepare(query)?;
+    loop {
+        let result = stmt.step()?;
+        match result {
+            limbo_core::StepResult::Row => {
+                let _row = stmt.row();
+                continue;
+            }
+            limbo_core::StepResult::IO => {
+                db.io.run_once()?;
+                continue;
+            }
+            limbo_core::StepResult::Done => break,
+            r => panic!("unexpected result {:?}: expecting single row", r),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
