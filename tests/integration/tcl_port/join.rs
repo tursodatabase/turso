@@ -1,0 +1,584 @@
+#[cfg(test)]
+mod tests {
+    use crate::db_test;
+
+    db_test!(
+        cross_join,
+        "select * from users, products limit 1",
+        [
+            1,
+            "Jamie",
+            "Foster",
+            "dylan00@example.com",
+            "496-522-9493",
+            "62375 Johnson Rest Suite 322",
+            "West Lauriestad",
+            "IL",
+            "35865",
+            94,
+            1,
+            "hat",
+            79.0
+        ]
+    );
+
+    db_test!(
+        cross_join_specific_columns,
+        "select first_name, price from users, products limit 1",
+        ["Jamie", 79.0]
+    );
+
+    db_test!(
+        cross_join_where_right_tbl,
+        "select users.first_name, products.name from users join products where products.id = 1 limit 2",
+        [["Jamie", "hat"], ["Cindy", "hat"]]
+    );
+
+    db_test!(
+        cross_join_where_left_tbl,
+        "select users.first_name, products.name from users join products where users.id = 1 limit 2",
+        [["Jamie", "hat"], ["Jamie", "cap"]]
+    );
+
+    db_test!(
+        inner_join_pk,
+        "select users.first_name as user_name, products.name as product_name from users join products on users.id = products.id",
+        [
+            ["Jamie", "hat"],
+            ["Cindy", "cap"],
+            ["Tommy", "shirt"],
+            ["Jennifer", "sweater"],
+            ["Edward", "sweatshirt"],
+            ["Nicholas", "shorts"],
+            ["Aimee", "jeans"],
+            ["Rachel", "sneakers"],
+            ["Matthew", "boots"],
+            ["Daniel", "coat"],
+            ["Travis", "accessories"]
+        ]
+    );
+
+    db_test!(
+        inner_join_non_pk_unqualified,
+        "select first_name, name from users join products on first_name != name limit 1",
+        ["Jamie", "hat"]
+    );
+
+    db_test!(
+        inner_join_non_pk_qualified,
+        "select users.first_name as user_name, products.name as product_name from users join products on users.first_name = products.name"
+    );
+
+    db_test!(
+        inner_join_self,
+        "select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 join users as u2 on u1.id = u2.id + 1 limit 1",
+        ["Cindy", "Jamie"]
+    );
+
+    db_test!(
+        inner_join_self_with_where,
+        "select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 join users as u2 on u1.id = u2.id + 1 where u1.id = 5 limit 1",
+        ["Edward", "Jennifer"]
+    );
+
+    // Uncomment this test when it works. Sqlite3 returns 'Aaron' due to the way it reorders tables in the join based on the where clause.
+    // db_test!(
+    //     inner_join_with_where_2,
+    //     "select u.first_name from users u join products as p on u.first_name != p.name where u.last_name = 'Williams' limit 1",
+    //     ["Laura"] // <-- sqlite3 returns 'Aaron'
+    // );
+
+    db_test!(
+        inner_join_constant_condition_true,
+        "select u.first_name, p.name from users u join products as p where 1 limit 5",
+        [
+            ["Jamie", "hat"],
+            ["Jamie", "cap"],
+            ["Jamie", "shirt"],
+            ["Jamie", "sweater"],
+            ["Jamie", "sweatshirt"]
+        ]
+    );
+
+    db_test!(
+        inner_join_constant_condition_false,
+        "select u.first_name from users u join products as p where 0 limit 5"
+    );
+
+    db_test!(
+        left_join_pk,
+        "select users.first_name as user_name, products.name as product_name from users left join products on users.id = products.id limit 12",
+        [
+            ["Jamie", "hat"],
+            ["Cindy", "cap"],
+            ["Tommy", "shirt"],
+            ["Jennifer", "sweater"],
+            ["Edward", "sweatshirt"],
+            ["Nicholas", "shorts"],
+            ["Aimee", "jeans"],
+            ["Rachel", "sneakers"],
+            ["Matthew", "boots"],
+            ["Daniel", "coat"],
+            ["Travis", "accessories"],
+            ["Alan", Null]
+        ]
+    );
+
+    db_test!(
+        left_join_with_where,
+        "select u.first_name, p.name from users u left join products as p on u.id = p.id where u.id >= 10 limit 5",
+        [
+            ["Daniel", "coat"],
+            ["Travis", "accessories"],
+            ["Alan", Null],
+            ["Michael", Null],
+            ["Brianna", Null]
+        ]
+    );
+
+    db_test!(
+        left_join_with_where_2,
+        "select users.first_name, products.name from users left join products on users.id < 2 where users.id < 3",
+        [
+            ["Jamie", "hat"],
+            ["Jamie", "cap"],
+            ["Jamie", "shirt"],
+            ["Jamie", "sweater"],
+            ["Jamie", "sweatshirt"],
+            ["Jamie", "shorts"],
+            ["Jamie", "jeans"],
+            ["Jamie", "sneakers"],
+            ["Jamie", "boots"],
+            ["Jamie", "coat"],
+            ["Jamie", "accessories"],
+            ["Cindy", Null]
+        ]
+    );
+
+    db_test!(
+        left_join_row_id,
+        "select u.rowid, p.rowid from users u left join products as p on u.rowid = p.rowid where u.rowid >= 10 limit 5",
+        [
+            [10, 10],
+            [11, 11],
+            [12, Null],
+            [13, Null],
+            [14, Null]
+        ]
+    );
+
+    db_test!(
+        left_join_constant_condition_true_1,
+        "select u.first_name, p.name from users u left join products as p on true limit 1",
+        ["Jamie", "hat"]
+    );
+
+    db_test!(
+        left_join_constant_condition_false_1,
+        "select u.first_name, p.name from users u left join products as p on false limit 1",
+        ["Jamie", Null]
+    );
+
+    db_test!(
+        left_join_constant_condition_where_false,
+        "select u.first_name, p.name from users u left join products as p where false limit 1"
+    );
+
+    db_test!(
+        left_join_non_pk,
+        "select users.first_name as user_name, products.name as product_name from users left join products on users.first_name = products.name limit 3",
+        [
+            ["Jamie", Null],
+            ["Cindy", Null],
+            ["Tommy", Null]
+        ]
+    );
+
+    db_test!(
+        left_join_self,
+        "select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 left join users as u2 on u1.id = u2.id + 1 limit 2",
+        [
+            ["Jamie", Null],
+            ["Cindy", "Jamie"]
+        ]
+    );
+
+    db_test!(
+        left_join_self_2,
+        "select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 left join users as u2 on u2.id = u1.id + 1 limit 2",
+        [
+            ["Jamie", "Cindy"],
+            ["Cindy", "Tommy"]
+        ]
+    );
+
+    db_test!(
+        left_join_self_with_where,
+        "select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 left join users as u2 on u1.id = u2.id + 1 where u1.id = 5 limit 2",
+        ["Edward", "Jennifer"]
+    );
+
+    db_test!(
+        left_join_multiple_cond_and,
+        "select u.first_name, p.name from users u left join products as p on u.id = p.id and u.first_name = p.name limit 2",
+        [
+            ["Jamie", Null],
+            ["Cindy", Null]
+        ]
+    );
+
+    db_test!(
+        left_join_multiple_cond_or,
+        "select u.first_name, p.name from users u left join products as p on u.id = p.id or u.first_name = p.name limit 2",
+        [
+            ["Jamie", "hat"],
+            ["Cindy", "cap"]
+        ]
+    );
+
+    db_test!(
+        left_join_no_join_conditions_but_multiple_where,
+        "select u.first_name, p.name from users u left join products as p where u.id = p.id or u.first_name = p.name limit 2",
+        [
+            ["Jamie", "hat"],
+            ["Cindy", "cap"]
+        ]
+    );
+
+    db_test!(
+        left_join_order_by_qualified,
+        "select users.first_name, products.name from users left join products on users.id = products.id where users.first_name like 'Jam%' order by null limit 2",
+        [
+            ["Jamie", "hat"],
+            ["James", Null]
+        ]
+    );
+
+    db_test!(
+        left_join_order_by_qualified_nullable_sorting_col,
+        "select users.first_name, products.name from users left join products on users.id = products.id order by products.name limit 1",
+        ["Alan", Null]
+    );
+
+    db_test!(
+        left_join_constant_condition_true_2,
+        "select u.first_name, p.name from users u left join products as p on 1 limit 5",
+        [
+            ["Jamie", "hat"],
+            ["Jamie", "cap"],
+            ["Jamie", "shirt"],
+            ["Jamie", "sweater"],
+            ["Jamie", "sweatshirt"]
+        ]
+    );
+
+    db_test!(
+        left_join_constant_condition_false_2,
+        "select u.first_name, p.name from users u left join products as p on 0 limit 5",
+        [
+            ["Jamie", Null],
+            ["Cindy", Null],
+            ["Tommy", Null],
+            ["Jennifer", Null],
+            ["Edward", Null]
+        ]
+    );
+
+    db_test!(
+        four_way_inner_join,
+        "select u1.first_name, u2.first_name, u3.first_name, u4.first_name from users u1 join users u2 on u1.id = u2.id join users u3 on u2.id = u3.id + 1 join users u4 on u3.id = u4.id + 1 limit 1",
+        ["Tommy", "Tommy", "Cindy", "Jamie"]
+    );
+
+    db_test!(
+        three_way_inner_join_with_two_seeks,
+        "select * from users u join users u2 on u.id=u2.id join products p on u2.id = p.id limit 3",
+        [
+            [
+                1,
+                "Jamie",
+                "Foster",
+                "dylan00@example.com",
+                "496-522-9493",
+                "62375 Johnson Rest Suite 322",
+                "West Lauriestad",
+                "IL",
+                "35865",
+                94,
+                1,
+                "Jamie",
+                "Foster",
+                "dylan00@example.com",
+                "496-522-9493",
+                "62375 Johnson Rest Suite 322",
+                "West Lauriestad",
+                "IL",
+                "35865",
+                94,
+                1,
+                "hat",
+                79.0
+            ],
+            [
+                2,
+                "Cindy",
+                "Salazar",
+                "williamsrebecca@example.com",
+                "287-934-1135",
+                "75615 Stacey Shore",
+                "South Stephanie",
+                "NC",
+                "85181",
+                37,
+                2,
+                "Cindy",
+                "Salazar",
+                "williamsrebecca@example.com",
+                "287-934-1135",
+                "75615 Stacey Shore",
+                "South Stephanie",
+                "NC",
+                "85181",
+                37,
+                2,
+                "cap",
+                82.0
+            ],
+            [
+                3,
+                "Tommy",
+                "Perry",
+                "warechristopher@example.org",
+                "001-288-554-8139x0276",
+                "2896 Paul Fall Apt. 972",
+                "Michaelborough",
+                "VA",
+                "15691",
+                18,
+                3,
+                "Tommy",
+                "Perry",
+                "warechristopher@example.org",
+                "001-288-554-8139x0276",
+                "2896 Paul Fall Apt. 972",
+                "Michaelborough",
+                "VA",
+                "15691",
+                18,
+                3,
+                "shirt",
+                18.0
+            ]
+        ]
+    );
+
+    db_test!(
+        leftjoin_innerjoin_where,
+        "select u.first_name, p.name, p2.name from users u left join products p on p.name = u.first_name join products p2 on length(p2.name) > 8 where u.first_name = 'Franklin'",
+        [
+            ["Franklin", Null, "sweatshirt"],
+            ["Franklin", Null, "accessories"]
+        ]
+    );
+
+    db_test!(
+        leftjoin_leftjoin_where,
+        "select u.first_name, p.name, p2.name from users u left join products p on p.name = u.first_name join products p2 on length(p2.name) > 8 where u.first_name = 'Franklin'",
+        [
+            ["Franklin", Null, "sweatshirt"],
+            ["Franklin", Null, "accessories"]
+        ]
+    );
+
+    db_test!(
+        innerjoin_leftjoin_where,
+        "select u.first_name, u2.first_name, p.name from users u join users u2 on u.id = u2.id + 1 left join products p on p.name = u.first_name where u.first_name = 'Franklin'",
+        ["Franklin", "Cynthia", Null]
+    );
+
+    db_test!(
+        innerjoin_leftjoin_with_or_terms,
+        "select u.first_name, u2.first_name, p.name from users u join users u2 on u.id = u2.id + 1 left join products p on p.name = u.first_name or p.name like 'sweat%' where u.first_name = 'Franklin'",
+        [
+            ["Franklin", "Cynthia", "sweater"],
+            ["Franklin", "Cynthia", "sweatshirt"]
+        ]
+    );
+
+    db_test!(
+        left_join_constant_condition_false_inner_join_constant_condition_true,
+        "select u.first_name, p.name, u2.first_name from users u left join products as p on 0 join users u2 on 1 limit 5",
+        [
+            ["Jamie", Null, "Jamie"],
+            ["Jamie", Null, "Cindy"],
+            ["Jamie", Null, "Tommy"],
+            ["Jamie", Null, "Jennifer"],
+            ["Jamie", Null, "Edward"]
+        ]
+    );
+
+    db_test!(
+        left_join_constant_condition_true_inner_join_constant_condition_false,
+        "select u.first_name, p.name, u2.first_name from users u left join products as p on 1 join users u2 on 0 limit 5"
+    );
+
+    db_test!(
+        join_utilizing_both_seekrowid_and_secondary_index,
+        "select u.first_name, p.name from users u join products p on u.id = p.id and u.age > 70",
+        [
+            ["Matthew", "boots"],
+            ["Nicholas", "shorts"],
+            ["Jamie", "hat"]
+        ]
+    );
+
+    db_test!(
+        join_using,
+        "select * from users join products using (id) limit 3",
+        [
+            [
+                1,
+                "Jamie",
+                "Foster",
+                "dylan00@example.com",
+                "496-522-9493",
+                "62375 Johnson Rest Suite 322",
+                "West Lauriestad",
+                "IL",
+                "35865",
+                94,
+                "hat",
+                79.0
+            ],
+            [
+                2,
+                "Cindy",
+                "Salazar",
+                "williamsrebecca@example.com",
+                "287-934-1135",
+                "75615 Stacey Shore",
+                "South Stephanie",
+                "NC",
+                "85181",
+                37,
+                "cap",
+                82.0
+            ],
+            [
+                3,
+                "Tommy",
+                "Perry",
+                "warechristopher@example.org",
+                "001-288-554-8139x0276",
+                "2896 Paul Fall Apt. 972",
+                "Michaelborough",
+                "VA",
+                "15691",
+                18,
+                "shirt",
+                18.0
+            ]
+        ]
+    );
+
+    db_test!(
+        join_using_multiple,
+        "select u.first_name, u.last_name, p.name from users u join users u2 using(id) join products p using(id) limit 3",
+        [
+            ["Jamie", "Foster", "hat"],
+            ["Cindy", "Salazar", "cap"],
+            ["Tommy", "Perry", "shirt"]
+        ]
+    );
+
+    db_test!(
+        join_using_multiple_with_quoting,
+        "select u.first_name, u.last_name, p.name from users u join users u2 using(id) join [products] p using(`id`) limit 3",
+        [
+            ["Jamie", "Foster", "hat"],
+            ["Cindy", "Salazar", "cap"],
+            ["Tommy", "Perry", "shirt"]
+        ]
+    );
+
+    db_test!(
+        join_using_natural,
+        "select * from users natural join products limit 3",
+        [
+            [
+                1,
+                "Jamie",
+                "Foster",
+                "dylan00@example.com",
+                "496-522-9493",
+                "62375 Johnson Rest Suite 322",
+                "West Lauriestad",
+                "IL",
+                "35865",
+                94,
+                "hat",
+                79.0
+            ],
+            [
+                2,
+                "Cindy",
+                "Salazar",
+                "williamsrebecca@example.com",
+                "287-934-1135",
+                "75615 Stacey Shore",
+                "South Stephanie",
+                "NC",
+                "85181",
+                37,
+                "cap",
+                82.0
+            ],
+            [
+                3,
+                "Tommy",
+                "Perry",
+                "warechristopher@example.org",
+                "001-288-554-8139x0276",
+                "2896 Paul Fall Apt. 972",
+                "Michaelborough",
+                "VA",
+                "15691",
+                18,
+                "shirt",
+                18.0
+            ]
+        ]
+    );
+
+    db_test!(
+        natural_join_multiple,
+        "select u.first_name, u2.last_name, p.name from users u natural join users u2 natural join products p limit 3",
+        [
+            ["Jamie", "Foster", "hat"],
+            ["Cindy", "Salazar", "cap"],
+            ["Tommy", "Perry", "shirt"]
+        ]
+    );
+
+    db_test!(
+        natural_join_and_using_join,
+        "select u.id, u2.id, p.id from users u natural join products p join users u2 using (first_name) limit 3",
+        [
+            [1, 1, 1],
+            [1, 1204, 1],
+            [1, 1261, 1]
+        ]
+    );
+
+    db_test!(
+        left_join_backwards_iteration,
+        "select users.id, users.first_name as user_name, products.name as product_name 
+        from users left join products on users.id = products.id 
+        where users.id < 13 order by users.id desc limit 3",
+        [
+            [12, "Alan", Null],
+            [11, "Travis", "accessories"],
+            [10, "Daniel", "coat"]
+        ]
+    );
+}

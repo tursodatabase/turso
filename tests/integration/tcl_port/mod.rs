@@ -10,6 +10,7 @@ mod drop_table;
 mod glob;
 mod groupby;
 mod insert;
+mod join;
 mod select;
 
 #[cfg(test)]

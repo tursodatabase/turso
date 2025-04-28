@@ -7,6 +7,7 @@ You are tasked with converting TCL tests involving sql statements to Rust. Below
 - Preserve comments from TCL and from the SQL statements
 - If a test is commented out, still port it, but leave it commented in the Rust version as well.
 - Columns outputs are separated by a `|` and rows are separated by a newline
+- Sometimes the output of certain test cases are encapsulated with "". You should consider the value inside of those quotes and interpret them normally. Like: "1|Jamie|Foster|dylan00@example.com|496-522-9493|62375 Johnson Rest Suite 322|West Lauriestad|IL|35865|94|hat|79.0" could be interpreted as: [1, "Jamie", "Foster", "dylan00@example.com", "496-522-9493", "62375 Johnson Rest Suite 322", "West Lauriestad", "IL", "35865", 94, "Jamie", "Foster", "dylan00@example.com", "496-522-9493", "62375 Johnson Rest Suite 322", "West Lauriestad", "IL", "35865", 94, "hat", 79.0]
 
 ## Context
 
