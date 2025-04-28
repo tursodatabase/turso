@@ -170,7 +170,10 @@ pub(crate) fn exec_sql(db_path: PathBuf, sql: &str, values: Vec<Vec<Value>>) {
         assert_eq!(
             sqlite,
             values,
-            "query: {}, values: {:?}, sqlite: {:?}, db: {}",
+            "query: {}, 
+            values: {:?}, 
+            sqlite: {:?}, 
+            db: {}",
             sql,
             values,
             sqlite,
@@ -186,7 +189,10 @@ pub(crate) fn exec_sql(db_path: PathBuf, sql: &str, values: Vec<Vec<Value>>) {
         assert_eq!(
             limbo,
             values,
-            "query: {}, values: {:?}, limbo: {:?}, db: {}",
+            "query: {}, 
+            values: {:?}, 
+            limbo: {:?}, 
+            db: {}",
             sql,
             values,
             limbo,

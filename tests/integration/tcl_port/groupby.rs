@@ -1,0 +1,257 @@
+#[cfg(test)]
+mod tests {
+    use crate::db_test;
+
+    db_test!(
+        group_by,
+        "select u.first_name, sum(u.age) from users u group by u.first_name limit 10;",
+        [
+            ["Aaron", 2271],
+            ["Abigail", 890],
+            ["Adam", 1642],
+            ["Adrian", 439],
+            ["Adriana", 83],
+            ["Adrienne", 318],
+            ["Aimee", 33],
+            ["Alan", 551],
+            ["Albert", 369],
+            ["Alec", 247]
+        ]
+    );
+
+    db_test!(
+        group_by_without_aggs,
+        "select u.first_name from users u group by u.first_name limit 10;",
+        [
+            ["Aaron"],
+            ["Abigail"],
+            ["Adam"],
+            ["Adrian"],
+            ["Adriana"],
+            ["Adrienne"],
+            ["Aimee"],
+            ["Alan"],
+            ["Albert"],
+            ["Alec"]
+        ]
+    );
+
+    db_test!(
+        group_by_two_joined_columns,
+        "select u.first_name, p.name, sum(u.age) from users u join products p on u.id = p.id group by u.first_name, p.name limit 10;",
+        [
+            ["Aimee", "jeans", 24],
+            ["Cindy", "cap", 37],
+            ["Daniel", "coat", 13],
+            ["Edward", "sweatshirt", 15],
+            ["Jamie", "hat", 94],
+            ["Jennifer", "sweater", 33],
+            ["Matthew", "boots", 77],
+            ["Nicholas", "shorts", 89],
+            ["Rachel", "sneakers", 63],
+            ["Tommy", "shirt", 18]
+        ]
+    );
+
+    db_test!(
+        group_by_order_by,
+        "select u.first_name, p.name, sum(u.age) from users u join products p on u.id = p.id group by u.first_name, p.name order by p.name limit 10;",
+        [
+            ["Travis", "accessories", 22],
+            ["Matthew", "boots", 77],
+            ["Cindy", "cap", 37],
+            ["Daniel", "coat", 13],
+            ["Jamie", "hat", 94],
+            ["Aimee", "jeans", 24],
+            ["Tommy", "shirt", 18],
+            ["Nicholas", "shorts", 89],
+            ["Rachel", "sneakers", 63],
+            ["Jennifer", "sweater", 33]
+        ]
+    );
+
+    db_test!(
+        group_by_order_by_aggregate,
+        "select u.first_name, p.name, sum(u.age) from users u join products p on u.id = p.id group by u.first_name, p.name order by sum(u.age) limit 10;",
+        [
+            ["Daniel", "coat", 13],
+            ["Edward", "sweatshirt", 15],
+            ["Tommy", "shirt", 18],
+            ["Travis", "accessories", 22],
+            ["Aimee", "jeans", 24],
+            ["Jennifer", "sweater", 33],
+            ["Cindy", "cap", 37],
+            ["Rachel", "sneakers", 63],
+            ["Matthew", "boots", 77],
+            ["Nicholas", "shorts", 89]
+        ]
+    );
+
+    db_test!(
+        group_by_multiple_aggregates,
+        "select u.first_name, sum(u.age), count(u.age) from users u group by u.first_name order by sum(u.age) limit 10;",
+        [
+            ["Jaclyn", 1, 1],
+            ["Mia", 1, 1],
+            ["Kirsten", 7, 1],
+            ["Kellie", 8, 1],
+            ["Makayla", 8, 1],
+            ["Yvette", 9, 1],
+            ["Mckenzie", 12, 1],
+            ["Grant", 14, 1],
+            ["Mackenzie", 15, 1],
+            ["Cesar", 17, 1]
+        ]
+    );
+
+    // TODO: bug found here
+    // ["Adriana", 83, "83"] -> Limbo is outputing the last 83 as an Integer instead of Text
+    // db_test!(
+    //     group_by_multiple_aggregates_2,
+    //     "select u.first_name, sum(u.age), group_concat(u.age) from users u group by u.first_name order by u.first_name limit 10;",
+    //     [
+    //         ["Aaron", 2271, "52,46,17,69,71,91,34,30,97,81,47,98,45,69,97,18,38,26,98,60,33,97,42,43,43,22,18,75,56,67,83,58,82,28,22,72,5,58,96,32,55"],
+    //         ["Abigail", 890, "17,82,62,57,55,5,9,83,93,22,23,57,56,100,74,95"],
+    //         ["Adam", 1642, "34,23,10,11,46,40,2,57,51,80,65,24,15,84,59,6,34,100,32,79,57,5,77,34,30,19,54,74,89,98,72,91,90"],
+    //         ["Adrian", 439, "37,28,94,76,69,60,34,41"],
+    //         ["Adriana", 83, "83"],
+    //         ["Adrienne", 318, "79,74,82,33,50"],
+    //         ["Aimee", 33, "24,9"],
+    //         ["Alan", 551, "18,52,30,62,96,13,85,97,98"],
+    //         ["Albert", 369, "99,80,41,7,64,7,26,41,4"],
+    //         ["Alec", 247, "55,48,53,91"]
+    //     ]
+    // );
+
+    db_test!(
+        group_by_complex_order_by,
+        "select u.first_name, group_concat(u.last_name) from users u group by u.first_name order by -1 * length(group_concat(u.last_name)) limit 1;",
+        [["Michael", "Love,Finley,Hurst,Molina,Williams,Brown,King,Whitehead,Ochoa,Davis,Rhodes,Mcknight,Reyes,Johnston,Smith,Young,Lopez,Roberts,Green,Cole,Lane,Wagner,Allen,Simpson,Schultz,Perry,Mendez,Gibson,Hale,Williams,Bradford,Johnson,Weber,Nunez,Walls,Gonzalez,Park,Blake,Vazquez,Garcia,Mathews,Pacheco,Johnson,Perez,Gibson,Sparks,Chapman,Tate,Dudley,Miller,Alvarado,Ward,Nguyen,Rosales,Flynn,Ball,Jones,Hoffman,Clarke,Rivera,Moore,Hardin,Dillon,Montgomery,Rodgers,Payne,Williams,Mueller,Hernandez,Ware,Yates,Grimes,Gilmore,Johnson,Clark,Rodriguez,Walters,Powell,Colon,Mccoy,Allen,Quinn,Dunn,Wilson,Thompson,Bradford,Hunter,Gilmore,Woods,Bennett,Collier,Ali,Herrera,Lawson,Garner,Perez,Brown,Pena,Allen,Davis,Washington,Jackson,Khan,Martinez,Blackwell,Lee,Parker,Lynn,Johnson,Benton,Leonard,Munoz,Alvarado,Mathews,Salazar,Nelson,Jones,Carpenter,Walter,Young,Coleman,Berry,Clark,Powers,Meyer,Lewis,Barton,Guzman,Schneider,Hernandez,Mclaughlin,Allen,Atkinson,Woods,Rivera,Jones,Gordon,Dennis,Yoder,Hunt,Vance,Nelson,Park,Barnes,Lang,Williams,Cervantes,Tran,Anderson,Todd,Gonzalez,Lowery,Sanders,Mccullough,Haley,Rogers,Perez,Watson,Weaver,Wise,Walter,Summers,Long,Chan,Williams,Mccoy,Duncan,Roy,West,Christensen,Cuevas,Garcia,Williams,Butler,Anderson,Armstrong,Villarreal,Boyer,Johnson,Dyer,Hurst,Wilkins,Mercer,Taylor,Montes,Mccarty,Gill,Rodriguez,Williams,Copeland,Hansen,Palmer,Alexander,White,Taylor,Bowers,Hughes,Gibbs,Myers,Kennedy,Sanchez,Bell,Wilson,Berry,Spears,Patton,Rose,Smith,Bowen,Nicholson,Stewart,Quinn,Powell,Delgado,Mills,Duncan,Phillips,Grant,Hatfield,Russell,Anderson,Reed,Mahoney,Mcguire,Ortega,Logan,Schmitt,Walker"]]
+    );
+
+    db_test!(
+        group_by_complex_order_by_2,
+        "select u.first_name, sum(u.age) from users u group by u.first_name order by -1 * sum(u.age) limit 10;",
+        [
+            ["Michael", 11204],
+            ["David", 8758],
+            ["Robert", 8109],
+            ["Jennifer", 7700],
+            ["John", 7299],
+            ["Christopher", 6397],
+            ["James", 5921],
+            ["Joseph", 5711],
+            ["Brian", 5059],
+            ["William", 5047]
+        ]
+    );
+
+    db_test!(
+        group_by_and_binary_expression_that_depends_on_two_aggregates,
+        "select u.first_name, sum(u.age) + count(1) from users u group by u.first_name limit 5;",
+        [
+            ["Aaron", 2312],
+            ["Abigail", 906],
+            ["Adam", 1675],
+            ["Adrian", 447],
+            ["Adriana", 84]
+        ]
+    );
+
+    db_test!(
+        group_by_function_expression,
+        "select length(phone_number), count(1) from users group by length(phone_number) order by count(1);",
+        [
+            [15, 392],
+            [22, 416],
+            [13, 762],
+            [20, 791],
+            [10, 793],
+            [19, 816],
+            [21, 821],
+            [17, 1184],
+            [18, 1211],
+            [16, 1231],
+            [12, 1583]
+        ]
+    );
+
+    db_test!(
+        group_by_function_expression_ridiculous,
+        "select upper(substr(phone_number, 1,3)), count(1) from users group by upper(substr(phone_number, 1,3)) order by -1 * count(1) limit 5;",
+        [
+            ["001", 1677],
+            ["+1-", 1606],
+            ["(97", 36],
+            ["(20", 35],
+            ["(31", 35]
+        ]
+    );
+
+    db_test!(
+        group_by_count_star,
+        "select u.first_name, count(*) from users u group by u.first_name limit 1;",
+        [["Aaron", 41]]
+    );
+
+    db_test!(
+        having,
+        "select u.first_name, round(avg(u.age)) from users u group by u.first_name having avg(u.age) > 97 order by avg(u.age) desc limit 5;",
+        [
+            ["Nina", 100.0],
+            ["Kurt", 99.0],
+            ["Selena", 98.0]
+        ]
+    );
+
+    db_test!(
+        having_with_binary_cond,
+        "select u.first_name, sum(u.age) from users u group by u.first_name having sum(u.age) + 1000 = 9109;",
+        [["Robert", 8109]]
+    );
+
+    db_test!(
+        having_with_scalar_fn_over_aggregate,
+        "select u.first_name, concat(count(1), ' people with this name') from users u group by u.first_name having count(1) > 50 order by count(1) asc limit 5;",
+        [
+            ["Angela", "51 people with this name"],
+            ["Justin", "51 people with this name"],
+            ["Rachel", "52 people with this name"],
+            ["Susan", "52 people with this name"],
+            ["Jeffrey", "54 people with this name"]
+        ]
+    );
+
+    db_test!(
+        having_with_multiple_conditions,
+        "select u.first_name, count(*), round(avg(u.age)) as avg_age 
+        from users u 
+        group by u.first_name 
+        having count(*) > 40 and avg(u.age) > 40
+        order by count(*) desc, avg(u.age) desc
+        limit 5;",
+        [
+            ["Michael", 228, 49.0],
+            ["David", 165, 53.0],
+            ["Robert", 159, 51.0],
+            ["Jennifer", 151, 51.0],
+            ["John", 145, 50.0]
+        ]
+    );
+
+    // Wanda = 9, Whitney = 11, William = 111
+    db_test!(
+        column_alias_in_group_by_order_by_having,
+        "select first_name as fn, count(1) as fn_count from users where fn in ('Wanda', 'Whitney', 'William') group by fn having fn_count > 10 order by fn_count;",
+        [
+            ["Whitney", 11],
+            ["William", 111]
+        ]
+    );
+
+    db_test!(
+        group_by_column_number,
+        "select u.first_name, count(1) from users u group by 1 limit 1;",
+        [["Aaron", 41]]
+    );
+}

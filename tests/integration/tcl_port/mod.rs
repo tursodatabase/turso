@@ -8,6 +8,7 @@ mod default_value;
 mod delete;
 mod drop_table;
 mod glob;
+mod groupby;
 mod select;
 
 #[cfg(test)]
