@@ -16,6 +16,7 @@ mod like;
 mod math;
 mod offset;
 mod orderby;
+mod pragma;
 mod select;
 
 #[cfg(test)]
