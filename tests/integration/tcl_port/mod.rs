@@ -18,6 +18,7 @@ mod offset;
 mod orderby;
 mod pragma;
 mod scalar_functions_datetime;
+mod scalar_functions_printf;
 mod select;
 
 #[cfg(test)]
