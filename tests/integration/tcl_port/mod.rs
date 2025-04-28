@@ -12,6 +12,7 @@ mod groupby;
 mod insert;
 mod join;
 mod json;
+mod like;
 mod select;
 
 #[cfg(test)]
