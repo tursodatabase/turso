@@ -23,6 +23,7 @@ mod scalar_functions_printf;
 mod select;
 mod subquery;
 mod total_changes;
+mod transactions;
 
 #[cfg(test)]
 mod tests {
