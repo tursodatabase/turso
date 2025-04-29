@@ -25,6 +25,7 @@ mod subquery;
 mod total_changes;
 mod transactions;
 mod update;
+mod where_test; // cannot name the file where as where is a rust keyword
 
 #[cfg(test)]
 mod tests {
