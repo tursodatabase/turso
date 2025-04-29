@@ -49,8 +49,9 @@ mod tests {
     macro_rules! db_test {
         ([$($db_path:literal),*], $name:ident, $statement:literal, $expected:expr) => {
             #[test]
-                fn $name() {
-                    let tester = crate::common::SqlTester::single($statement, ::limbo_tests_macros::sqlite_values!($expected));
+            #[allow(clippy::approx_constant)]
+            fn $name() {
+                    let tester = $crate::common::SqlTester::single($statement, ::limbo_tests_macros::sqlite_values!($expected));
                 $(
                     tester.exec_sql(Some($crate::tcl_port::tests::WORKSPACE_ROOT.join($db_path)));
                 )*
@@ -58,15 +59,17 @@ mod tests {
         };
         (memory, $name:ident, $statement:literal, $expected:expr) => {
             #[test]
+            #[allow(clippy::approx_constant)]
             fn $name() {
-                let tester = crate::common::SqlTester::single($statement, ::limbo_tests_macros::sqlite_values!($expected));
+                let tester = $crate::common::SqlTester::single($statement, ::limbo_tests_macros::sqlite_values!($expected));
                 tester.exec_sql(None);
             }
         };
         ($name:ident, $statement:literal, $expected:expr) => {
             #[test]
+            #[allow(clippy::approx_constant)]
             fn $name() {
-                let tester = crate::common::SqlTester::single($statement, ::limbo_tests_macros::sqlite_values!($expected));
+                let tester = $crate::common::SqlTester::single($statement, ::limbo_tests_macros::sqlite_values!($expected));
                 for db_path in $crate::tcl_port::tests::TEST_DBS {
                     tester.exec_sql(Some($crate::tcl_port::tests::WORKSPACE_ROOT.join(db_path)));
                 }
@@ -74,43 +77,48 @@ mod tests {
         };
         ($name:ident, [$($statement:literal),*], $expected:expr) => {
             #[test]
+            #[allow(clippy::approx_constant)]
             fn $name() {
                 for db_path in $crate::tcl_port::tests::TEST_DBS {
                     let queries = vec![$($statement),*];
-                    let tester = crate::common::SqlTester::many(queries, ::limbo_tests_macros::sqlite_values!($expected));
+                    let tester = $crate::common::SqlTester::many(queries, ::limbo_tests_macros::sqlite_values!($expected));
                     tester.exec_sql(Some($crate::tcl_port::tests::WORKSPACE_ROOT.join(db_path)));
                 }
             }
         };
         (memory, $name:ident, [$($statement:literal),*], $expected:expr) => {
             #[test]
+            #[allow(clippy::approx_constant)]
             fn $name() {
                 let queries = vec![$($statement),*];
-                let tester = crate::common::SqlTester::many(queries, ::limbo_tests_macros::sqlite_values!($expected));
+                let tester = $crate::common::SqlTester::many(queries, ::limbo_tests_macros::sqlite_values!($expected));
                 tester.exec_sql(None);
             }
         };
         ($name:ident, $statement:literal) => {
             #[test]
+            #[allow(clippy::approx_constant)]
             fn $name() {
                 for db_path in $crate::tcl_port::tests::TEST_DBS {
-                    let tester = crate::common::SqlTester::single($statement, ::limbo_tests_macros::sqlite_values!(None));
+                    let tester = $crate::common::SqlTester::single($statement, ::limbo_tests_macros::sqlite_values!(None));
                     tester.exec_sql(Some($crate::tcl_port::tests::WORKSPACE_ROOT.join(db_path)));
                 }
             }
         };
         (memory_expect_error, $name:ident, [$($statement:literal),*]) => {
             #[test]
+            #[allow(clippy::approx_constant)]
             fn $name() {
                 let queries = vec![$($statement),*];
-                let tester = crate::common::SqlTester::memory_error(queries);
+                let tester = $crate::common::SqlTester::memory_error(queries);
                 tester.exec_sql(None);
             }
         };
         (regex, $name:ident, $statement:literal, $expected:expr) => {
             #[test]
+            #[allow(clippy::approx_constant)]
             fn $name() {
-                let tester = crate::common::SqlTester::regex($statement, ::regex::Regex::new($expected).unwrap());
+                let tester = $crate::common::SqlTester::regex($statement, ::regex::Regex::new($expected).unwrap());
                 tester.exec_sql(None);
             }
         };

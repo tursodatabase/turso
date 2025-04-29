@@ -24,8 +24,6 @@ log = "0.4.22"
 assert_cmd = "^2"
 rand_chacha = "0.9.0"
 rand = "0.9.0"
-cargo_metadata = "0.19.2"
-hex = "0.4.3"
 regex = "1.11.1"
 
 [dev-dependencies]
