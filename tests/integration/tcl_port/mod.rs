@@ -17,6 +17,7 @@ mod math;
 mod offset;
 mod orderby;
 mod pragma;
+mod scalar_functions;
 mod scalar_functions_datetime;
 mod scalar_functions_printf;
 mod select;
@@ -44,33 +45,25 @@ mod tests {
         ([$($db_path:literal),*], $name:ident, $statement:literal, $expected:expr) => {
             #[test]
                 fn $name() {
+                    let tester = crate::common::SqlTester::single($statement, ::limbo_tests_macros::sqlite_values!($expected));
                 $(
-                    $crate::common::exec_sql(
-                        $crate::tcl_port::tests::WORKSPACE_ROOT.join($db_path),
-                        $statement,
-                        ::limbo_tests_macros::sqlite_values!($expected),
-                    );
+                    tester.exec_sql(Some($crate::tcl_port::tests::WORKSPACE_ROOT.join($db_path)));
                 )*
             }
         };
         (memory, $name:ident, $statement:literal, $expected:expr) => {
             #[test]
             fn $name() {
-                $crate::common::exec_sql_memory(
-                    $statement,
-                    ::limbo_tests_macros::sqlite_values!($expected),
-                );
+                let tester = crate::common::SqlTester::single($statement, ::limbo_tests_macros::sqlite_values!($expected));
+                tester.exec_sql(None);
             }
         };
         ($name:ident, $statement:literal, $expected:expr) => {
             #[test]
             fn $name() {
+                let tester = crate::common::SqlTester::single($statement, ::limbo_tests_macros::sqlite_values!($expected));
                 for db_path in $crate::tcl_port::tests::TEST_DBS {
-                    $crate::common::exec_sql(
-                        $crate::tcl_port::tests::WORKSPACE_ROOT.join(db_path),
-                        $statement,
-                        ::limbo_tests_macros::sqlite_values!($expected),
-                    );
+                    tester.exec_sql(Some($crate::tcl_port::tests::WORKSPACE_ROOT.join(db_path)));
                 }
             }
         };
@@ -79,13 +72,8 @@ mod tests {
             fn $name() {
                 for db_path in $crate::tcl_port::tests::TEST_DBS {
                     let queries = vec![$($statement),*];
-                    let expected_vals = ::limbo_tests_macros::sqlite_values!($expected);
-
-                    $crate::common::exec_many_sql(
-                        $crate::tcl_port::tests::WORKSPACE_ROOT.join(db_path),
-                        queries,
-                        expected_vals,
-                    );
+                    let tester = crate::common::SqlTester::many(queries, ::limbo_tests_macros::sqlite_values!($expected));
+                    tester.exec_sql(Some($crate::tcl_port::tests::WORKSPACE_ROOT.join(db_path)));
                 }
             }
         };
@@ -93,23 +81,16 @@ mod tests {
             #[test]
             fn $name() {
                 let queries = vec![$($statement),*];
-                let expected_vals = ::limbo_tests_macros::sqlite_values!($expected);
-
-                $crate::common::exec_many_sql_memory(
-                    queries,
-                    expected_vals,
-                );
+                let tester = crate::common::SqlTester::many(queries, ::limbo_tests_macros::sqlite_values!($expected));
+                tester.exec_sql(None);
             }
         };
         ($name:ident, $statement:literal) => {
             #[test]
             fn $name() {
                 for db_path in $crate::tcl_port::tests::TEST_DBS {
-                    $crate::common::exec_sql(
-                        $crate::tcl_port::tests::WORKSPACE_ROOT.join(db_path),
-                        $statement,
-                        ::limbo_tests_macros::sqlite_values!(None),
-                    );
+                    let tester = crate::common::SqlTester::single($statement, ::limbo_tests_macros::sqlite_values!(None));
+                    tester.exec_sql(Some($crate::tcl_port::tests::WORKSPACE_ROOT.join(db_path)));
                 }
             }
         };
@@ -117,8 +98,15 @@ mod tests {
             #[test]
             fn $name() {
                 let queries = vec![$($statement),*];
-
-                $crate::common::expect_memory_error(queries);
+                let tester = crate::common::SqlTester::memory_error(queries);
+                tester.exec_sql(None);
+            }
+        };
+        (regex, $name:ident, $statement:literal, $expected:expr) => {
+            #[test]
+            fn $name() {
+                let tester = crate::common::SqlTester::regex($statement, ::regex::Regex::new($expected).unwrap());
+                tester.exec_sql(None);
             }
         };
     }

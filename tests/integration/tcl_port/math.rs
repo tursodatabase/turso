@@ -1023,9 +1023,17 @@ mod tests {
 
     db_test!(atan2_int_int, "SELECT atan2(5, -1)", [1.7681918866447774]);
 
-    db_test!(atan2_int_float, "SELECT atan2(5, -1.5)", [1.8622531212727638]);
+    db_test!(
+        atan2_int_float,
+        "SELECT atan2(5, -1.5)",
+        [1.8622531212727638]
+    );
 
-    db_test!(atan2_int_str, "SELECT atan2(5, '-1.5')", [1.8622531212727638]);
+    db_test!(
+        atan2_int_str,
+        "SELECT atan2(5, '-1.5')",
+        [1.8622531212727638]
+    );
 
     // TODO: Limbo outputs 0.5028432109278609
     // db_test!(
