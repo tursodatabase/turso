@@ -24,6 +24,7 @@ mod select;
 mod subquery;
 mod total_changes;
 mod transactions;
+mod update;
 
 #[cfg(test)]
 mod tests {
