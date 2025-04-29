@@ -21,6 +21,7 @@ mod scalar_functions;
 mod scalar_functions_datetime;
 mod scalar_functions_printf;
 mod select;
+mod subquery;
 
 #[cfg(test)]
 mod tests {
