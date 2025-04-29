@@ -1,0 +1,38 @@
+#[cfg(test)]
+mod tests {
+    use crate::db_test;
+
+    db_test!(
+        memory,
+        total_changes_on_basic_insert,
+        [
+            "CREATE TABLE temp (t1 INTEGER, PRIMARY KEY (t1))",
+            "INSERT INTO temp VALUES (1)",
+            "SELECT total_changes()"
+        ],
+        1
+    );
+
+    db_test!(
+        memory,
+        total_changes_on_multiple_row_insert,
+        [
+            "CREATE TABLE temp (t1 INTEGER, PRIMARY KEY (t1))",
+            "INSERT INTO temp VALUES (1), (2), (3)",
+            "SELECT total_changes()"
+        ],
+        3
+    );
+
+    db_test!(
+        memory,
+        total_changes_on_multiple_inserts,
+        [
+            "CREATE TABLE temp (t1 INTEGER, PRIMARY KEY (t1))",
+            "INSERT INTO temp VALUES (1), (2), (3)",
+            "INSERT INTO temp VALUES (4), (5), (6), (7)",
+            "SELECT total_changes()"
+        ],
+        7
+    );
+}
