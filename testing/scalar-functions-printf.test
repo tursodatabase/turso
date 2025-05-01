@@ -109,7 +109,7 @@ do_execsql_test printf-sqlite-q {
   SELECT printf('%q', 'hello'),
          printf('%q', 'it''s'),
          printf('%q', NULL);
-} {{hello|it''s|}}
+} {{hello|it''s|(NULL)}}
 
 do_execsql_test printf-sqlite-Q {
   SELECT printf('%Q', 'hello'),
@@ -121,7 +121,7 @@ do_execsql_test printf-sqlite-w {
   SELECT printf('%w', 'table'),
          printf('%w', 'my "table"'),
          printf('%w', NULL);
-} {{table|my ""table""|}}
+} {{table|my ""table""|(NULL)}}
 
 # ============================================================
 # Multiple format specifiers

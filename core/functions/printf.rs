@@ -686,6 +686,16 @@ pub fn format_value(
                     let _ = write!(output, "NULL");
                     return;
                 }
+                PrintfArg::Null
+                    if matches!(
+                        spec.specifier,
+                        FormatSpecifierType::SqlEscapedString
+                            | FormatSpecifierType::SqlEscapedIdentifier
+                    ) =>
+                {
+                    let _ = write!(output, "(NULL)");
+                    return;
+                }
                 other => {
                     let _ = write!(buffer, "{}", other);
                     buffer.as_str()
@@ -1091,14 +1101,28 @@ fn determine_numeric_properties<'a>(
 ) -> Result<(bool, bool, &'static str, u64, u32, bool), LimboError> {
     let (is_signed, num_i64, num_u64) = match arg {
         PrintfArg::Int(i) => {
-            if spec.specifier == FormatSpecifierType::UnsignedDecimal {
+            if matches!(
+                spec.specifier,
+                FormatSpecifierType::UnsignedDecimal
+                    | FormatSpecifierType::Pointer
+                    | FormatSpecifierType::HexLower
+                    | FormatSpecifierType::HexUpper
+                    | FormatSpecifierType::Octal
+            ) {
                 (i != 0, Some(i.wrapping_abs() as i64), Some(i as u64))
             } else {
                 (i != 0, Some(i), Some(i.unsigned_abs()))
             }
         }
         PrintfArg::Float(f) => {
-            if spec.specifier == FormatSpecifierType::UnsignedDecimal {
+            if matches!(
+                spec.specifier,
+                FormatSpecifierType::UnsignedDecimal
+                    | FormatSpecifierType::Pointer
+                    | FormatSpecifierType::HexLower
+                    | FormatSpecifierType::HexUpper
+                    | FormatSpecifierType::Octal
+            ) {
                 (f != 0., Some((f as u64) as i64), Some(f as u64))
             } else {
                 (f != 0., Some(f as i64), Some((f as i64).unsigned_abs()))
@@ -1175,10 +1199,7 @@ fn format_core_number(
     Ok(())
 }
 
-/// Inserts thousands-separating commas into the decimal digits already
-/// present in `buf`.  O(n) time, O(1) extra memory.
 fn apply_commas(buf: &mut String) {
-    // Ignore sign; remember where the digits start.
     let digits = if buf.starts_with('-') {
         &buf[1..]
     } else {
@@ -1191,15 +1212,15 @@ fn apply_commas(buf: &mut String) {
 
     let commas = (len - 1) / 3;
     let new_len = buf.len() + commas;
-    buf.reserve(commas); // one reallocation at most
+    buf.reserve(commas); 
 
-    // SAFETY: we just reserved enough space; we'll fill every byte we set.
+
     unsafe {
         // Save original length *before* we enlarge the buffer.
         let orig_len = buf.len();
         let bytes = buf.as_mut_vec();
         bytes.set_len(new_len);
-
+        assert!(bytes.len() >= orig_len);
         // read = index of last digit in the *original* buffer
         let mut read = (orig_len as isize) - 1;
 
@@ -1374,7 +1395,6 @@ mod tests {
         String::from_utf8(result_bytes).expect("printf produced invalid UTF-8")
     }
 
-    // === Tests for exec_printf ===
 
     #[test]
     fn test_exec_printf_basic() {
@@ -1804,7 +1824,7 @@ mod tests {
         assert_eq!(run_printf("%q", vec![PrintfArg::Str("it's")]), "it''s"); // Quotes doubled
         assert_eq!(run_printf("%q", vec![PrintfArg::Str("'")]), "''");
         assert_eq!(run_printf("%q", vec![PrintfArg::Str("")]), "");
-        assert_eq!(run_printf("%q", vec![PrintfArg::Null]), ""); // Null -> empty string
+        assert_eq!(run_printf("%q", vec![PrintfArg::Null]), "(NULL)"); // Null -> empty string
         assert_eq!(
             run_printf("%10q", vec![PrintfArg::Str("it's")]),
             "     it''s"
@@ -1834,7 +1854,7 @@ mod tests {
             "my \"\"table\"\""
         );
         assert_eq!(run_printf("%w", vec![PrintfArg::Str("\"")]), "\"\"");
-        assert_eq!(run_printf("%w", vec![PrintfArg::Null]), ""); // Null -> empty string
+        assert_eq!(run_printf("%w", vec![PrintfArg::Null]), "(NULL)");
         assert_eq!(
             run_printf("%15w", vec![PrintfArg::Str("col\"umn")]),
             "       col\"\"umn"
