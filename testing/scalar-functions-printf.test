@@ -3,7 +3,10 @@
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 
-# Basic string formatting
+# ============================================================
+# Basic formatting tests
+# ============================================================
+
 do_execsql_test printf-basic-string {
   SELECT printf('Hello World!');
 } {{Hello World!}}
@@ -15,3 +18,163 @@ do_execsql_test printf-string-replacement {
 do_execsql_test printf-numeric-replacement {
   SELECT printf('My number is: %d', 42);
 } {{My number is: 42}}
+
+# ============================================================
+# Integer formatting tests
+# ============================================================
+
+do_execsql_test printf-integer-formats {
+  SELECT printf('%d', 123),
+         printf('%i', 123),
+         printf('%u', 123),
+         printf('%x', 123),
+         printf('%X', 123),
+         printf('%o', 123);
+} {{123} {123} {123} {7b} {7B} {173}}
+
+do_execsql_test printf-integer-negative {
+  SELECT printf('%d', -123),
+         printf('%i', -123),
+         printf('%u', -123),
+         printf('%x', -123),
+         printf('%X', -123),
+         printf('%o', -123);
+} {{-123} {-123} {18446744073709551493} {ffffff85} {FFFFFF85} {1777777777777777777605}}
+
+do_execsql_test printf-integer-width {
+  SELECT printf('%5d', 42),
+         printf('%05d', 42),
+         printf('%-5d', 42);
+} {{   42} {00042} {42   }}
+
+# ============================================================
+# Float formatting tests
+# ============================================================
+
+do_execsql_test printf-float-basic {
+  SELECT printf('%f', 123.456),
+         printf('%e', 123.456),
+         printf('%E', 123.456),
+         printf('%g', 123.456),
+         printf('%G', 123.456);
+} {{123.456000} {1.234560e+02} {1.234560E+02} {123.456} {123.456}}
+
+do_execsql_test printf-float-precision {
+  SELECT printf('%.2f', 123.456),
+         printf('%.0f', 123.456),
+         printf('%.10f', 123.456);
+} {{123.46} {123} {123.4560000000}}
+
+do_execsql_test printf-float-special {
+  SELECT printf('%f', 0.0),
+         printf('%.3f', 0.0009),
+         printf('%g', 0.0009),
+         printf('%.2g', 123.456);
+} {{0.000000} {0.001} {0.0009} {1.2e+02}}
+
+do_execsql_test printf-float-width-align {
+  SELECT printf('%10.2f', 123.45),
+         printf('%-10.2f', 123.45),
+         printf('%010.2f', 123.45);
+} {{    123.45} {123.45    } {0000123.45}}
+
+do_execsql_test printf-float-signs {
+  SELECT printf('%f', -123.45),
+         printf('%+f', 123.45),
+         printf('% f', 123.45);
+} {{-123.450000} {+123.450000} { 123.450000}}
+
+# ============================================================
+# String formatting tests
+# ============================================================
+
+do_execsql_test printf-string-width-precision {
+  SELECT printf('%10s', 'hello'),
+         printf('%-10s', 'hello'),
+         printf('%.3s', 'hello'),
+         printf('%10.3s', 'hello');
+} {{     hello} {hello     } {hel} {       hel}}
+
+do_execsql_test printf-string-null {
+  SELECT printf('%s', NULL),
+         printf('%10s', NULL),
+         printf('%.3s', NULL);
+} {{} {          } {}}
+
+# ============================================================
+# SQLite-specific format specifiers
+# ============================================================
+
+do_execsql_test printf-sqlite-q {
+  SELECT printf('%q', 'hello'),
+         printf('%q', 'it''s'),
+         printf('%q', NULL);
+} {{hello} {it''s} {}}
+
+do_execsql_test printf-sqlite-Q {
+  SELECT printf('%Q', 'hello'),
+         printf('%Q', 'it''s'),
+         printf('%Q', NULL);
+} {{'hello'} {'it''s'} {NULL}}
+
+do_execsql_test printf-sqlite-w {
+  SELECT printf('%w', 'table'),
+         printf('%w', 'my "table"'),
+         printf('%w', NULL);
+} {{table} {my ""table""} {}}
+
+# ============================================================
+# Multiple format specifiers
+# ============================================================
+
+do_execsql_test printf-multiple-specifiers {
+  SELECT printf('Name: %s, Age: %d, Salary: $%.2f', 'Bob', 42, 75000.50);
+} {{Name: Bob, Age: 42, Salary: $75000.50}}
+
+do_execsql_test printf-mixed-types {
+  SELECT printf('%s = %d (0x%x), %f%%', 'value', 255, 255, 99.9);
+} {{value = 255 (0xff), 99.900000%}}
+
+# ============================================================
+# Dynamic width and precision tests
+# ============================================================
+
+do_execsql_test printf-dynamic-width {
+  SELECT printf('%*d', 5, 42),
+         printf('%*s', 10, 'hello');
+} {{   42} {     hello}}
+
+do_execsql_test printf-dynamic-precision {
+  SELECT printf('%.*f', 2, 123.456),
+         printf('%.*s', 3, 'hello');
+} {{123.46} {hel}}
+
+do_execsql_test printf-dynamic-both {
+  SELECT printf('%*.*f', 10, 2, 123.456);
+} {{    123.46}}
+
+# ============================================================
+# Edge cases
+# ============================================================
+
+do_execsql_test printf-edge-empty-format {
+  SELECT printf('');
+} {{}}
+
+do_execsql_test printf-edge-percent {
+  SELECT printf('%%'),
+         printf('100%%');
+} {{%} {100%}}
+
+do_execsql_test printf-edge-large-numbers {
+  SELECT printf('%d', 9223372036854775807),
+         printf('%d', -9223372036854775808);
+} {{9223372036854775807} {-9223372036854775808}}
+
+do_execsql_test printf-edge-too-few-args {
+  SELECT printf('%d %s', 42);
+} {{42 }}
+
+do_execsql_test printf-edge-too-many-args {
+  SELECT printf('%d', 42, 'extra', 123);
+} {{42}}
