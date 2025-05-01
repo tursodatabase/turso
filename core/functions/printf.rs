@@ -1212,8 +1212,7 @@ fn apply_commas(buf: &mut String) {
 
     let commas = (len - 1) / 3;
     let new_len = buf.len() + commas;
-    buf.reserve(commas); 
-
+    buf.reserve(commas);
 
     unsafe {
         // Save original length *before* we enlarge the buffer.
@@ -1394,7 +1393,6 @@ mod tests {
         let result_bytes = printf(format, mapped_args);
         String::from_utf8(result_bytes).expect("printf produced invalid UTF-8")
     }
-
 
     #[test]
     fn test_exec_printf_basic() {
