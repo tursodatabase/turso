@@ -2,7 +2,6 @@ use std::fmt::Display;
 use std::iter::Map;
 use std::num::FpCategory;
 use std::slice::Iter;
-use std::str::from_utf8_unchecked;
 
 use crate::types::{OwnedValue, MAX_REAL_SIZE};
 use crate::vdbe::Register;
