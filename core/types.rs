@@ -146,6 +146,14 @@ impl OwnedValue {
         OwnedValue::Blob(data)
     }
 
+    // caller is responsible for calling with a valid utf-8 string
+    pub fn from_raw_text(text: Vec<u8>) -> Self {
+        Self::Text(Text {
+            value: text,
+            subtype: TextSubtype::Text,
+        })
+    }
+
     pub fn to_text(&self) -> Option<&str> {
         match self {
             OwnedValue::Text(t) => Some(t.as_str()),

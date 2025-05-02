@@ -56,8 +56,7 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<OwnedValue> {
     let args: Map<Iter<'_, Register>, fn(&Register) -> PrintfArg> =
         values[1..].iter().map(|reg| reg.get_owned_value().into());
     let result = printf(format_str, args);
-    let text = unsafe { from_utf8_unchecked(result.as_slice()) };
-    Ok(OwnedValue::from_text(text))
+    Ok(OwnedValue::from_raw_text(result))
 }
 
 #[derive(Debug, Clone, PartialEq)] // Add Clone derive
@@ -602,6 +601,7 @@ pub fn format_value(
     spec: &mut FormatSpec,
     arg: Option<PrintfArg>,
 ) -> () {
+    buffer.clear();
     let Some(arg) = arg else {
         match spec.specifier {
             FormatSpecifierType::String => {
@@ -641,7 +641,7 @@ pub fn format_value(
             }
 
             FormatSpecifierType::Character => {
-                let _ = write!(output, " ");
+                let _ = write!(output, "");
                 return;
             }
             FormatSpecifierType::None => {
@@ -653,7 +653,7 @@ pub fn format_value(
     if matches!(spec.precision, SpecArg::IsSet(x) if x > PRINTF_PRECISION_LIMIT) {
         return;
     }
-    buffer.clear();
+
     match spec.specifier {
         FormatSpecifierType::SignedDecimal
         | FormatSpecifierType::UnsignedDecimal
@@ -913,15 +913,15 @@ fn choose_format_and_precision(
 /// Manually builds the core formatted string (no prefix/padding) from components.
 /// Applies rounding, precision, places decimal/exponent, handles '#' / '!' effects.
 fn build_core_string(
-    exponent: i32,                       // From extraction
-    effective_spec: FormatSpecifierType, // From choose_format_and_precision
-    effective_precision: usize,          // From choose_format_and_precision
+    exponent: i32,
+    effective_spec: FormatSpecifierType,
+    effective_precision: usize,
     spec: &FormatSpec,
     buffer: &mut String,
 ) -> Result<(), LimboError> {
     let mut current_pos = buffer.len();
     // I assume we are working with ascii digit only
-    // TODO: replace buffer.as_mut_vec().extend_from_within with same string method when 1.87.0 arrives.
+    // TODO: replace buffer.as_mut_vec().extend_from_within() with same string method when 1.87.0 arrives.
     unsafe {
         assert!(buffer.as_mut_vec().len() == buffer.len());
     }
