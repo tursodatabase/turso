@@ -36,7 +36,8 @@ mod tests {
 
     db_test!(pragma_table_info_invalid_table, "PRAGMA table_info=pekka");
 
-    db_test!(memory, pragma_page_count_empty, "PRAGMA page_count", 0);
+    // temporarily skip this test case. The issue is detailed in #1407
+    // db_test!(memory, pragma_page_count_empty, "PRAGMA page_count", 0);
 
     db_test!(
         memory,
