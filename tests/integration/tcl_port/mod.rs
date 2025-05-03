@@ -122,5 +122,18 @@ mod tests {
                 tester.exec_sql(None);
             }
         };
+        (random-db, $name:ident, $statement:literal, $expected:expr) => {
+            #[test]
+            #[allow(clippy::approx_constant)]
+            fn $name() {
+                use rand::{rng, RngCore};
+                let mut path = ::tempfile::TempDir::new().unwrap().into_path();
+                let db_name = format!("test-{}.db", rng().next_u32());
+                path.push(db_name);
+                let mut tester = $crate::common::SqlTester::single($statement, ::limbo_tests_macros::sqlite_values!($expected));
+                tester.with_is_random_db(true);
+                tester.exec_sql(Some(path));
+            }
+        };
     }
 }

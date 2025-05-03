@@ -5,6 +5,7 @@ mod tests {
     db_test!(pragma_cache_size, "PRAGMA cache_size", -2000);
 
     db_test!(
+        random - db,
         pragma_update_journal_mode_wal,
         "PRAGMA journal_mode=WAL",
         "wal"

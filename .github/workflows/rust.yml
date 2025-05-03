@@ -124,8 +124,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
-      - name: Build
-        run: cargo build --verbose
       - name: Test
         env:
           RUST_LOG: ${{ runner.debug && 'limbo_core::storage=trace' || '' }}

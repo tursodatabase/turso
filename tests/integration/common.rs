@@ -157,6 +157,7 @@ pub(crate) fn limbo_exec_rows_error(
     }
 }
 
+#[derive(Debug)]
 enum TestMode {
     Single { sql: &'static str },
     Many { sql_queries: Vec<&'static str> },
@@ -164,9 +165,11 @@ enum TestMode {
     Regex { sql: &'static str, regex: Regex },
 }
 
+#[derive(Debug)]
 pub(crate) struct SqlTester {
     mode: TestMode,
     values: Vec<Vec<Value>>,
+    is_random_db: bool,
 }
 
 impl SqlTester {
@@ -174,6 +177,7 @@ impl SqlTester {
         Self {
             mode: TestMode::Single { sql },
             values,
+            is_random_db: false,
         }
     }
 
@@ -181,6 +185,7 @@ impl SqlTester {
         Self {
             mode: TestMode::Many { sql_queries },
             values,
+            is_random_db: false,
         }
     }
 
@@ -188,6 +193,7 @@ impl SqlTester {
         Self {
             mode: TestMode::MemoryError { sql_queries },
             values: Vec::new(),
+            is_random_db: false,
         }
     }
 
@@ -195,17 +201,28 @@ impl SqlTester {
         Self {
             mode: TestMode::Regex { sql, regex },
             values: Vec::new(),
+            is_random_db: false,
         }
+    }
+
+    pub(crate) fn with_is_random_db(&mut self, is_random_db: bool) -> &mut Self {
+        self.is_random_db = is_random_db;
+        return self;
     }
 
     pub(crate) fn exec_sql(&self, db_path: Option<PathBuf>) {
         {
             let sqlite_conn = if let Some(ref db_path) = db_path {
-                rusqlite::Connection::open_with_flags(
-                    db_path.clone(),
-                    OpenFlags::SQLITE_OPEN_READ_ONLY,
-                )
-                .unwrap()
+                if !self.is_random_db {
+                    rusqlite::Connection::open_with_flags(
+                        db_path.clone(),
+                        OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )
+                    .unwrap()
+                } else {
+                    // This can be a random db_path that was not created yet
+                    rusqlite::Connection::open(db_path.clone()).unwrap()
+                }
             } else {
                 rusqlite::Connection::open_in_memory().unwrap()
             };
@@ -218,7 +235,13 @@ impl SqlTester {
             } else {
                 TempDatabase::new_in_memory()
             };
-            let limbo_conn = db.connect_limbo();
+            let limbo_conn = if self.is_random_db || db_path.is_none() {
+                db.connect_limbo()
+            } else {
+                db.connect_limbo_with_flags(
+                    limbo_core::OpenFlags::default() | limbo_core::OpenFlags::ReadOnly,
+                )
+            };
             self.exec_sql_limbo(db, limbo_conn, &db_path);
         }
     }
@@ -509,6 +532,12 @@ mod tests {
 
             let err = limbo_exec_rows_error(&db, &conn, "INSERT INTO t values (1)").unwrap_err();
             assert!(matches!(err, limbo_core::LimboError::ReadOnly), "{:?}", err);
+
+            let conn_2 = db.connect_limbo_with_flags(
+                limbo_core::OpenFlags::default() | limbo_core::OpenFlags::ReadOnly,
+            );
+            let ret = limbo_exec_rows(&db, &conn_2, "SELECT * from t");
+            assert_eq!(ret, vec![vec![Value::Integer(1)]]);
         }
         Ok(())
     }
