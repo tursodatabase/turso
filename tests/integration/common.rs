@@ -157,7 +157,6 @@ pub(crate) fn limbo_exec_rows_error(
     }
 }
 
-
 enum TestMode {
     Single { sql: &'static str },
     Many { sql_queries: Vec<&'static str> },

@@ -37,7 +37,6 @@ mod tests {
     );
 
     // Test dropping table with index
-    /*
     db_test!(
         memory,
         drop_table_with_index_1,
@@ -50,10 +49,8 @@ mod tests {
         ],
         [0]
     );
-    */
 
     // Test dropping table cleans up related schema entries
-    /*
     db_test!(
         memory,
         drop_table_schema_cleanup_1,
@@ -67,7 +64,6 @@ mod tests {
         ],
         [0]
     );
-    */
 
     // Test dropping table after multiple inserts and deletes
     db_test!(

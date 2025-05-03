@@ -254,4 +254,16 @@ mod tests {
         "select u.first_name, count(1) from users u group by 1 limit 1;",
         [["Aaron", 41]]
     );
+
+    // There was a regression where we incorrectly removed SOME order by terms and left others in place,
+    // which is invalid and results in wrong rows being returned.
+    db_test!(
+        groupby_orderby_removal_regression_test,
+        "select id, last_name, count(1) from users GROUP BY 1,2 order by id, last_name desc limit 3",
+        [
+            [1, "Foster", 1],
+            [2, "Salazar", 1],
+            [3, "Perry", 1],
+        ]
+    );
 }
