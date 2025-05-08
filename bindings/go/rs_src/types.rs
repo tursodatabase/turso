@@ -174,64 +174,62 @@ impl LimboValue {
         Box::into_raw(Box::new(self)) as *const c_void
     }
 
-    pub fn from_owned_value(value: &limbo_core::OwnedValue) -> Self {
+    pub fn from_owned_value(value: &limbo_core::Value) -> Self {
         match value {
-            limbo_core::OwnedValue::Integer(i) => {
+            limbo_core::Value::Integer(i) => {
                 LimboValue::new(ValueType::Integer, ValueUnion::from_int(*i))
             }
-            limbo_core::OwnedValue::Float(r) => {
+            limbo_core::Value::Float(r) => {
                 LimboValue::new(ValueType::Real, ValueUnion::from_real(*r))
             }
-            limbo_core::OwnedValue::Text(s) => {
+            limbo_core::Value::Text(s) => {
                 LimboValue::new(ValueType::Text, ValueUnion::from_str(s.as_str()))
             }
-            limbo_core::OwnedValue::Blob(b) => {
+            limbo_core::Value::Blob(b) => {
                 LimboValue::new(ValueType::Blob, ValueUnion::from_bytes(b.as_slice()))
             }
-            limbo_core::OwnedValue::Null => {
-                LimboValue::new(ValueType::Null, ValueUnion::from_null())
-            }
+            limbo_core::Value::Null => LimboValue::new(ValueType::Null, ValueUnion::from_null()),
         }
     }
 
     // The values we get from Go need to be temporarily owned by the statement until they are bound
     // then they can be cleaned up immediately afterwards
-    pub fn to_value(&self, pool: &mut AllocPool) -> limbo_core::OwnedValue {
+    pub fn to_value(&self, pool: &mut AllocPool) -> limbo_core::Value {
         match self.value_type {
             ValueType::Integer => {
                 if unsafe { self.value.int_val == 0 } {
-                    return limbo_core::OwnedValue::Null;
+                    return limbo_core::Value::Null;
                 }
-                limbo_core::OwnedValue::Integer(unsafe { self.value.int_val })
+                limbo_core::Value::Integer(unsafe { self.value.int_val })
             }
             ValueType::Real => {
                 if unsafe { self.value.real_val == 0.0 } {
-                    return limbo_core::OwnedValue::Null;
+                    return limbo_core::Value::Null;
                 }
-                limbo_core::OwnedValue::Float(unsafe { self.value.real_val })
+                limbo_core::Value::Float(unsafe { self.value.real_val })
             }
             ValueType::Text => {
                 if unsafe { self.value.text_ptr.is_null() } {
-                    return limbo_core::OwnedValue::Null;
+                    return limbo_core::Value::Null;
                 }
                 let cstr = unsafe { std::ffi::CStr::from_ptr(self.value.text_ptr) };
                 match cstr.to_str() {
                     Ok(utf8_str) => {
                         let owned = utf8_str.to_owned();
                         let borrowed = pool.add_string(owned);
-                        limbo_core::OwnedValue::build_text(borrowed)
+                        limbo_core::Value::build_text(borrowed)
                     }
-                    Err(_) => limbo_core::OwnedValue::Null,
+                    Err(_) => limbo_core::Value::Null,
                 }
             }
             ValueType::Blob => {
                 if unsafe { self.value.blob_ptr.is_null() } {
-                    return limbo_core::OwnedValue::Null;
+                    return limbo_core::Value::Null;
                 }
                 let bytes = self.value.to_bytes();
-                limbo_core::OwnedValue::Blob(bytes.to_vec())
+                limbo_core::Value::Blob(bytes.to_vec())
             }
-            ValueType::Null => limbo_core::OwnedValue::Null,
+            ValueType::Null => limbo_core::Value::Null,
         }
     }
 }

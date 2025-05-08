@@ -1,7 +1,7 @@
 use anyhow::Result;
 use errors::*;
 use limbo_core::types::Text;
-use limbo_core::OwnedValue;
+use limbo_core::Value;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyTuple};
 use std::cell::RefCell;
@@ -326,13 +326,11 @@ fn row_to_py(py: Python, row: &limbo_core::Row) -> Result<PyObject> {
     let mut py_values = Vec::new();
     for value in row.get_values() {
         match value {
-            limbo_core::OwnedValue::Null => py_values.push(py.None()),
-            limbo_core::OwnedValue::Integer(i) => py_values.push(i.into_pyobject(py)?.into()),
-            limbo_core::OwnedValue::Float(f) => py_values.push(f.into_pyobject(py)?.into()),
-            limbo_core::OwnedValue::Text(s) => py_values.push(s.as_str().into_pyobject(py)?.into()),
-            limbo_core::OwnedValue::Blob(b) => {
-                py_values.push(PyBytes::new(py, b.as_slice()).into())
-            }
+            limbo_core::Value::Null => py_values.push(py.None()),
+            limbo_core::Value::Integer(i) => py_values.push(i.into_pyobject(py)?.into()),
+            limbo_core::Value::Float(f) => py_values.push(f.into_pyobject(py)?.into()),
+            limbo_core::Value::Text(s) => py_values.push(s.as_str().into_pyobject(py)?.into()),
+            limbo_core::Value::Blob(b) => py_values.push(PyBytes::new(py, b.as_slice()).into()),
         }
     }
     Ok(PyTuple::new(py, &py_values)
@@ -341,18 +339,18 @@ fn row_to_py(py: Python, row: &limbo_core::Row) -> Result<PyObject> {
         .into())
 }
 
-/// Converts a Python object to a Limbo OwnedValue
-fn py_to_owned_value(obj: &Bound<PyAny>) -> Result<limbo_core::OwnedValue> {
+/// Converts a Python object to a Limbo Value
+fn py_to_owned_value(obj: &Bound<PyAny>) -> Result<limbo_core::Value> {
     if obj.is_none() {
-        return Ok(OwnedValue::Null);
+        return Ok(Value::Null);
     } else if let Ok(integer) = obj.extract::<i64>() {
-        return Ok(OwnedValue::Integer(integer));
+        return Ok(Value::Integer(integer));
     } else if let Ok(float) = obj.extract::<f64>() {
-        return Ok(OwnedValue::Float(float));
+        return Ok(Value::Float(float));
     } else if let Ok(string) = obj.extract::<String>() {
-        return Ok(OwnedValue::Text(Text::from_str(string)));
+        return Ok(Value::Text(Text::from_str(string)));
     } else if let Ok(bytes) = obj.downcast::<PyBytes>() {
-        return Ok(OwnedValue::Blob(bytes.as_bytes().to_vec()));
+        return Ok(Value::Blob(bytes.as_bytes().to_vec()));
     } else {
         return Err(PyErr::new::<ProgrammingError, _>(format!(
             "Unsupported Python type: {}",

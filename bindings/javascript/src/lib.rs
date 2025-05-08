@@ -266,36 +266,36 @@ impl Statement {
     }
 }
 
-fn to_js_value(env: &napi::Env, value: &limbo_core::OwnedValue) -> napi::Result<JsUnknown> {
+fn to_js_value(env: &napi::Env, value: &limbo_core::Value) -> napi::Result<JsUnknown> {
     match value {
-        limbo_core::OwnedValue::Null => Ok(env.get_null()?.into_unknown()),
-        limbo_core::OwnedValue::Integer(i) => Ok(env.create_int64(*i)?.into_unknown()),
-        limbo_core::OwnedValue::Float(f) => Ok(env.create_double(*f)?.into_unknown()),
-        limbo_core::OwnedValue::Text(s) => Ok(env.create_string(s.as_str())?.into_unknown()),
-        limbo_core::OwnedValue::Blob(b) => Ok(env.create_buffer_copy(b.as_slice())?.into_unknown()),
+        limbo_core::Value::Null => Ok(env.get_null()?.into_unknown()),
+        limbo_core::Value::Integer(i) => Ok(env.create_int64(*i)?.into_unknown()),
+        limbo_core::Value::Float(f) => Ok(env.create_double(*f)?.into_unknown()),
+        limbo_core::Value::Text(s) => Ok(env.create_string(s.as_str())?.into_unknown()),
+        limbo_core::Value::Blob(b) => Ok(env.create_buffer_copy(b.as_slice())?.into_unknown()),
     }
 }
 
-fn from_js_value(value: JsUnknown) -> napi::Result<limbo_core::OwnedValue> {
+fn from_js_value(value: JsUnknown) -> napi::Result<limbo_core::Value> {
     match value.get_type()? {
         napi::ValueType::Undefined | napi::ValueType::Null | napi::ValueType::Unknown => {
-            Ok(limbo_core::OwnedValue::Null)
+            Ok(limbo_core::Value::Null)
         }
         napi::ValueType::Boolean => {
             let b = value.coerce_to_bool()?.get_value()?;
-            Ok(limbo_core::OwnedValue::Integer(b as i64))
+            Ok(limbo_core::Value::Integer(b as i64))
         }
         napi::ValueType::Number => {
             let num = value.coerce_to_number()?.get_double()?;
             if num.fract() == 0.0 {
-                Ok(limbo_core::OwnedValue::Integer(num as i64))
+                Ok(limbo_core::Value::Integer(num as i64))
             } else {
-                Ok(limbo_core::OwnedValue::Float(num))
+                Ok(limbo_core::Value::Float(num))
             }
         }
         napi::ValueType::String => {
             let s = value.coerce_to_string()?;
-            Ok(limbo_core::OwnedValue::Text(Text::from_str(
+            Ok(limbo_core::Value::Text(Text::from_str(
                 s.into_utf8()?.as_str()?,
             )))
         }

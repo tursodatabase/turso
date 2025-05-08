@@ -145,7 +145,7 @@ fn to_ext_constraint_op(op: &Operator) -> Option<ConstraintOp> {
 /// back to it as arguments for the VFilter operation.
 /// is going to be filtered against: e.g:
 /// 'SELECT key, value FROM vtab WHERE key = 'some_key';
-/// we need to send the OwnedValue('some_key') as an argument to VFilter, and possibly omit it from
+/// we need to send the Value('some_key') as an argument to VFilter, and possibly omit it from
 /// the filtration in the vdbe layer.
 pub fn convert_where_to_vtab_constraint(
     term: &WhereTerm,

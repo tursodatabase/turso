@@ -1,6 +1,6 @@
 use crate::common::{self, maybe_setup_tracing};
 use crate::common::{compare_string, do_flush, TempDatabase};
-use limbo_core::{Connection, OwnedValue, Row, StepResult};
+use limbo_core::{Connection, Row, StepResult, Value};
 use log::debug;
 use std::rc::Rc;
 
@@ -157,10 +157,10 @@ fn test_sequential_write() -> anyhow::Result<()> {
 
         let mut current_read_index = 0;
         run_query_on_row(&tmp_db, &conn, &list_query, |row: &Row| {
-            let first_value = row.get::<&OwnedValue>(0).expect("missing id");
+            let first_value = row.get::<&Value>(0).expect("missing id");
             let id = match first_value {
-                limbo_core::OwnedValue::Integer(i) => *i as i32,
-                limbo_core::OwnedValue::Float(f) => *f as i32,
+                limbo_core::Value::Integer(i) => *i as i32,
+                limbo_core::Value::Float(f) => *f as i32,
                 _ => unreachable!(),
             };
             assert_eq!(current_read_index, id);
@@ -190,9 +190,9 @@ fn test_regression_multi_row_insert() -> anyhow::Result<()> {
     let expected_ids = vec![-3, -2, -1];
     let mut actual_ids = Vec::new();
     run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
-        let first_value = row.get::<&OwnedValue>(0).expect("missing id");
+        let first_value = row.get::<&Value>(0).expect("missing id");
         let id = match first_value {
-            OwnedValue::Float(f) => *f as i32,
+            Value::Float(f) => *f as i32,
             _ => panic!("expected float"),
         };
         actual_ids.push(id);
@@ -222,8 +222,8 @@ fn test_statement_reset() -> anyhow::Result<()> {
             StepResult::Row => {
                 let row = stmt.row().unwrap();
                 assert_eq!(
-                    *row.get::<&OwnedValue>(0).unwrap(),
-                    limbo_core::OwnedValue::Integer(1)
+                    *row.get::<&Value>(0).unwrap(),
+                    limbo_core::Value::Integer(1)
                 );
                 break;
             }
@@ -239,8 +239,8 @@ fn test_statement_reset() -> anyhow::Result<()> {
             StepResult::Row => {
                 let row = stmt.row().unwrap();
                 assert_eq!(
-                    *row.get::<&OwnedValue>(0).unwrap(),
-                    limbo_core::OwnedValue::Integer(1)
+                    *row.get::<&Value>(0).unwrap(),
+                    limbo_core::Value::Integer(1)
                 );
                 break;
             }
@@ -362,10 +362,10 @@ fn test_write_delete_with_index() -> anyhow::Result<()> {
         println!("listing after deleting {} ", i);
         let mut current_read_index = i + 1;
         run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
-            let first_value = row.get::<&OwnedValue>(0).expect("missing id");
+            let first_value = row.get::<&Value>(0).expect("missing id");
             let id = match first_value {
-                limbo_core::OwnedValue::Integer(i) => *i as i32,
-                limbo_core::OwnedValue::Float(f) => *f as i32,
+                limbo_core::Value::Integer(i) => *i as i32,
+                limbo_core::Value::Float(f) => *f as i32,
                 _ => unreachable!(),
             };
             assert_eq!(current_read_index, id);
@@ -378,10 +378,10 @@ fn test_write_delete_with_index() -> anyhow::Result<()> {
                 &conn,
                 &format!("select * from test where x = {}", i),
                 |row| {
-                    let first_value = row.get::<&OwnedValue>(0).expect("missing id");
+                    let first_value = row.get::<&Value>(0).expect("missing id");
                     let id = match first_value {
-                        limbo_core::OwnedValue::Integer(i) => *i as i32,
-                        limbo_core::OwnedValue::Float(f) => *f as i32,
+                        limbo_core::Value::Integer(i) => *i as i32,
+                        limbo_core::Value::Float(f) => *f as i32,
                         _ => unreachable!(),
                     };
                     assert_eq!(i, id);

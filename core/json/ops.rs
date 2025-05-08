@@ -1,4 +1,4 @@
-use crate::{types::OwnedValue, vdbe::Register};
+use crate::{types::Value, vdbe::Register};
 
 use super::{
     convert_dbtype_to_jsonb, curry_convert_dbtype_to_jsonb, json_path_from_owned_value,
@@ -12,13 +12,9 @@ use super::{
 /// * If the patch contains a scalar value, the target is replaced with that value
 /// * If both target and patch are objects, the patch is recursively applied
 /// * null values in the patch result in property removal from the target
-pub fn json_patch(
-    target: &OwnedValue,
-    patch: &OwnedValue,
-    cache: &JsonCacheCell,
-) -> crate::Result<OwnedValue> {
+pub fn json_patch(target: &Value, patch: &Value, cache: &JsonCacheCell) -> crate::Result<Value> {
     match (target, patch) {
-        (OwnedValue::Blob(_), _) | (_, OwnedValue::Blob(_)) => {
+        (Value::Blob(_), _) | (_, Value::Blob(_)) => {
             crate::bail_constraint_error!("blob is not supported!");
         }
         _ => (),
@@ -34,13 +30,9 @@ pub fn json_patch(
     json_string_to_db_type(target, element_type, OutputVariant::ElementType)
 }
 
-pub fn jsonb_patch(
-    target: &OwnedValue,
-    patch: &OwnedValue,
-    cache: &JsonCacheCell,
-) -> crate::Result<OwnedValue> {
+pub fn jsonb_patch(target: &Value, patch: &Value, cache: &JsonCacheCell) -> crate::Result<Value> {
     match (target, patch) {
-        (OwnedValue::Blob(_), _) | (_, OwnedValue::Blob(_)) => {
+        (Value::Blob(_), _) | (_, Value::Blob(_)) => {
             crate::bail_constraint_error!("blob is not supported!");
         }
         _ => (),
@@ -56,9 +48,9 @@ pub fn jsonb_patch(
     json_string_to_db_type(target, element_type, OutputVariant::Binary)
 }
 
-pub fn json_remove(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<OwnedValue> {
+pub fn json_remove(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<Value> {
     if args.is_empty() {
-        return Ok(OwnedValue::Null);
+        return Ok(Value::Null);
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
@@ -75,9 +67,9 @@ pub fn json_remove(args: &[Register], json_cache: &JsonCacheCell) -> crate::Resu
     json_string_to_db_type(json, el_type, OutputVariant::String)
 }
 
-pub fn jsonb_remove(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<OwnedValue> {
+pub fn jsonb_remove(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<Value> {
     if args.is_empty() {
-        return Ok(OwnedValue::Null);
+        return Ok(Value::Null);
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
@@ -89,12 +81,12 @@ pub fn jsonb_remove(args: &[Register], json_cache: &JsonCacheCell) -> crate::Res
         }
     }
 
-    Ok(OwnedValue::Blob(json.data()))
+    Ok(Value::Blob(json.data()))
 }
 
-pub fn json_replace(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<OwnedValue> {
+pub fn json_replace(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<Value> {
     if args.is_empty() {
-        return Ok(OwnedValue::Null);
+        return Ok(Value::Null);
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
@@ -116,9 +108,9 @@ pub fn json_replace(args: &[Register], json_cache: &JsonCacheCell) -> crate::Res
     json_string_to_db_type(json, el_type, super::OutputVariant::String)
 }
 
-pub fn jsonb_replace(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<OwnedValue> {
+pub fn jsonb_replace(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<Value> {
     if args.is_empty() {
-        return Ok(OwnedValue::Null);
+        return Ok(Value::Null);
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
@@ -139,9 +131,9 @@ pub fn jsonb_replace(args: &[Register], json_cache: &JsonCacheCell) -> crate::Re
     json_string_to_db_type(json, el_type, OutputVariant::Binary)
 }
 
-pub fn json_insert(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<OwnedValue> {
+pub fn json_insert(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<Value> {
     if args.is_empty() {
-        return Ok(OwnedValue::Null);
+        return Ok(Value::Null);
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
@@ -162,9 +154,9 @@ pub fn json_insert(args: &[Register], json_cache: &JsonCacheCell) -> crate::Resu
     json_string_to_db_type(json, el_type, OutputVariant::String)
 }
 
-pub fn jsonb_insert(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<OwnedValue> {
+pub fn jsonb_insert(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<Value> {
     if args.is_empty() {
-        return Ok(OwnedValue::Null);
+        return Ok(Value::Null);
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
@@ -191,12 +183,12 @@ mod tests {
 
     use super::*;
 
-    fn create_text(s: &str) -> OwnedValue {
-        OwnedValue::Text(Text::from_str(s))
+    fn create_text(s: &str) -> Value {
+        Value::Text(Text::from_str(s))
     }
 
-    fn create_json(s: &str) -> OwnedValue {
-        OwnedValue::Text(Text::json(s.to_string()))
+    fn create_json(s: &str) -> Value {
+        Value::Text(Text::json(s.to_string()))
     }
 
     #[test]
@@ -237,7 +229,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "blob is not supported!")]
     fn test_blob_not_supported() {
-        let target = OwnedValue::Blob(vec![1, 2, 3]);
+        let target = Value::Blob(vec![1, 2, 3]);
         let patch = create_text("{}");
         let cache = JsonCacheCell::new();
 
@@ -292,20 +284,20 @@ mod tests {
     fn test_json_remove_empty_args() {
         let args = vec![];
         let json_cache = JsonCacheCell::new();
-        assert_eq!(json_remove(&args, &json_cache).unwrap(), OwnedValue::Null);
+        assert_eq!(json_remove(&args, &json_cache).unwrap(), Value::Null);
     }
 
     #[test]
     fn test_json_remove_array_element() {
         let args = vec![
-            Register::OwnedValue(create_json(r#"[1,2,3,4,5]"#)),
-            Register::OwnedValue(create_text("$[2]")),
+            Register::Value(create_json(r#"[1,2,3,4,5]"#)),
+            Register::Value(create_text("$[2]")),
         ];
 
         let json_cache = JsonCacheCell::new();
         let result = json_remove(&args, &json_cache).unwrap();
         match result {
-            OwnedValue::Text(t) => assert_eq!(t.as_str(), "[1,2,4,5]"),
+            Value::Text(t) => assert_eq!(t.as_str(), "[1,2,4,5]"),
             _ => panic!("Expected Text value"),
         }
     }
@@ -313,15 +305,15 @@ mod tests {
     #[test]
     fn test_json_remove_multiple_paths() {
         let args = vec![
-            Register::OwnedValue(create_json(r#"{"a": 1, "b": 2, "c": 3}"#)),
-            Register::OwnedValue(create_text("$.a")),
-            Register::OwnedValue(create_text("$.c")),
+            Register::Value(create_json(r#"{"a": 1, "b": 2, "c": 3}"#)),
+            Register::Value(create_text("$.a")),
+            Register::Value(create_text("$.c")),
         ];
 
         let json_cache = JsonCacheCell::new();
         let result = json_remove(&args, &json_cache).unwrap();
         match result {
-            OwnedValue::Text(t) => assert_eq!(t.as_str(), r#"{"b":2}"#),
+            Value::Text(t) => assert_eq!(t.as_str(), r#"{"b":2}"#),
             _ => panic!("Expected Text value"),
         }
     }
@@ -329,14 +321,14 @@ mod tests {
     #[test]
     fn test_json_remove_nested_paths() {
         let args = vec![
-            Register::OwnedValue(create_json(r#"{"a": {"b": {"c": 1, "d": 2}}}"#)),
-            Register::OwnedValue(create_text("$.a.b.c")),
+            Register::Value(create_json(r#"{"a": {"b": {"c": 1, "d": 2}}}"#)),
+            Register::Value(create_text("$.a.b.c")),
         ];
 
         let json_cache = JsonCacheCell::new();
         let result = json_remove(&args, &json_cache).unwrap();
         match result {
-            OwnedValue::Text(t) => assert_eq!(t.as_str(), r#"{"a":{"b":{"d":2}}}"#),
+            Value::Text(t) => assert_eq!(t.as_str(), r#"{"a":{"b":{"d":2}}}"#),
             _ => panic!("Expected Text value"),
         }
     }
@@ -344,14 +336,14 @@ mod tests {
     #[test]
     fn test_json_remove_duplicate_keys() {
         let args = vec![
-            Register::OwnedValue(create_json(r#"{"a": 1, "a": 2, "a": 3}"#)),
-            Register::OwnedValue(create_text("$.a")),
+            Register::Value(create_json(r#"{"a": 1, "a": 2, "a": 3}"#)),
+            Register::Value(create_text("$.a")),
         ];
 
         let json_cache = JsonCacheCell::new();
         let result = json_remove(&args, &json_cache).unwrap();
         match result {
-            OwnedValue::Text(t) => assert_eq!(t.as_str(), r#"{"a":2,"a":3}"#),
+            Value::Text(t) => assert_eq!(t.as_str(), r#"{"a":2,"a":3}"#),
             _ => panic!("Expected Text value"),
         }
     }
@@ -359,8 +351,8 @@ mod tests {
     #[test]
     fn test_json_remove_invalid_path() {
         let args = vec![
-            Register::OwnedValue(create_json(r#"{"a": 1}"#)),
-            Register::OwnedValue(OwnedValue::Integer(42)), // Invalid path type
+            Register::Value(create_json(r#"{"a": 1}"#)),
+            Register::Value(Value::Integer(42)), // Invalid path type
         ];
 
         let json_cache = JsonCacheCell::new();
@@ -370,18 +362,18 @@ mod tests {
     #[test]
     fn test_json_remove_complex_case() {
         let args = vec![
-            Register::OwnedValue(create_json(
+            Register::Value(create_json(
                 r#"{"a":[1,2,3],"b":{"x":1,"x":2},"c":[{"y":1},{"y":2}]}"#,
             )),
-            Register::OwnedValue(create_text("$.a[1]")),
-            Register::OwnedValue(create_text("$.b.x")),
-            Register::OwnedValue(create_text("$.c[0].y")),
+            Register::Value(create_text("$.a[1]")),
+            Register::Value(create_text("$.b.x")),
+            Register::Value(create_text("$.c[0].y")),
         ];
 
         let json_cache = JsonCacheCell::new();
         let result = json_remove(&args, &json_cache).unwrap();
         match result {
-            OwnedValue::Text(t) => {
+            Value::Text(t) => {
                 let value = t.as_str();
                 assert!(value.contains(r#"[1,3]"#));
                 assert!(value.contains(r#"{"x":2}"#));

@@ -1,16 +1,16 @@
-use crate::types::OwnedValue;
+use crate::types::Value;
 use crate::vdbe::Register;
 use crate::LimboError;
 
 // TODO: Support %!.3s %i, %x, %X, %o, %e, %E, %c. flags: - + 0 ! ,
 #[inline(always)]
-pub fn exec_printf(values: &[Register]) -> crate::Result<OwnedValue> {
+pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
     if values.is_empty() {
-        return Ok(OwnedValue::Null);
+        return Ok(Value::Null);
     }
     let format_str = match &values[0].get_owned_value() {
-        OwnedValue::Text(t) => t.as_str(),
-        _ => return Ok(OwnedValue::Null),
+        Value::Text(t) => t.as_str(),
+        _ => return Ok(Value::Null),
     };
 
     let mut result = String::new();
@@ -34,8 +34,8 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<OwnedValue> {
                 }
                 let value = &values[args_index].get_owned_value();
                 match value {
-                    OwnedValue::Integer(_) => result.push_str(&format!("{}", value)),
-                    OwnedValue::Float(_) => result.push_str(&format!("{}", value)),
+                    Value::Integer(_) => result.push_str(&format!("{}", value)),
+                    Value::Float(_) => result.push_str(&format!("{}", value)),
                     _ => result.push_str("0".into()),
                 }
                 args_index += 1;
@@ -45,8 +45,8 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<OwnedValue> {
                     return Err(LimboError::InvalidArgument("not enough arguments".into()));
                 }
                 match &values[args_index].get_owned_value() {
-                    OwnedValue::Text(t) => result.push_str(t.as_str()),
-                    OwnedValue::Null => result.push_str("(null)"),
+                    Value::Text(t) => result.push_str(t.as_str()),
+                    Value::Null => result.push_str("(null)"),
                     v => result.push_str(&format!("{}", v)),
                 }
                 args_index += 1;
@@ -57,8 +57,8 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<OwnedValue> {
                 }
                 let value = &values[args_index].get_owned_value();
                 match value {
-                    OwnedValue::Float(f) => result.push_str(&format!("{:.6}", f)),
-                    OwnedValue::Integer(i) => result.push_str(&format!("{:.6}", *i as f64)),
+                    Value::Float(f) => result.push_str(&format!("{:.6}", f)),
+                    Value::Integer(i) => result.push_str(&format!("{:.6}", *i as f64)),
                     _ => result.push_str("0.0".into()),
                 }
                 args_index += 1;
@@ -75,7 +75,7 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<OwnedValue> {
             }
         }
     }
-    Ok(OwnedValue::build_text(&result))
+    Ok(Value::build_text(&result))
 }
 
 #[cfg(test)]
@@ -83,20 +83,20 @@ mod tests {
     use super::*;
 
     fn text(value: &str) -> Register {
-        Register::OwnedValue(OwnedValue::build_text(value))
+        Register::Value(Value::build_text(value))
     }
 
     fn integer(value: i64) -> Register {
-        Register::OwnedValue(OwnedValue::Integer(value))
+        Register::Value(Value::Integer(value))
     }
 
     fn float(value: f64) -> Register {
-        Register::OwnedValue(OwnedValue::Float(value))
+        Register::Value(Value::Float(value))
     }
 
     #[test]
     fn test_printf_no_args() {
-        assert_eq!(exec_printf(&[]).unwrap(), OwnedValue::Null);
+        assert_eq!(exec_printf(&[]).unwrap(), Value::Null);
     }
 
     #[test]
@@ -122,7 +122,7 @@ mod tests {
             ),
             // String with null value
             (
-                vec![text("Hello, %s!"), Register::OwnedValue(OwnedValue::Null)],
+                vec![text("Hello, %s!"), Register::Value(Value::Null)],
                 text("Hello, (null)!"),
             ),
             // String with number conversion

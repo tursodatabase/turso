@@ -285,7 +285,7 @@ impl Rows {
 
 #[derive(Debug)]
 pub struct Row {
-    values: Vec<limbo_core::OwnedValue>,
+    values: Vec<limbo_core::Value>,
 }
 
 unsafe impl Send for Row {}
@@ -295,11 +295,11 @@ impl Row {
     pub fn get_value(&self, index: usize) -> Result<Value> {
         let value = &self.values[index];
         match value {
-            limbo_core::OwnedValue::Integer(i) => Ok(Value::Integer(*i)),
-            limbo_core::OwnedValue::Null => Ok(Value::Null),
-            limbo_core::OwnedValue::Float(f) => Ok(Value::Real(*f)),
-            limbo_core::OwnedValue::Text(text) => Ok(Value::Text(text.to_string())),
-            limbo_core::OwnedValue::Blob(items) => Ok(Value::Blob(items.to_vec())),
+            limbo_core::Value::Integer(i) => Ok(Value::Integer(*i)),
+            limbo_core::Value::Null => Ok(Value::Null),
+            limbo_core::Value::Float(f) => Ok(Value::Real(*f)),
+            limbo_core::Value::Text(text) => Ok(Value::Text(text.to_string())),
+            limbo_core::Value::Blob(items) => Ok(Value::Blob(items.to_vec())),
         }
     }
 

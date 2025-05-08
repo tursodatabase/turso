@@ -48,7 +48,7 @@ use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::pager::Pager;
 use crate::types::{
-    ImmutableRecord, RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype,
+    ImmutableRecord, RawSlice, SerialType, SerialTypeKind, TextRef, TextSubtype, ValueRef,
 };
 use crate::{File, Result};
 use std::cell::RefCell;
@@ -1123,7 +1123,7 @@ impl<'a, T: Default + Copy, const N: usize> Iterator for SmallVecIter<'a, T, N> 
 pub fn read_record(payload: &[u8], reuse_immutable: &mut ImmutableRecord) -> Result<()> {
     // Let's clear previous use
     reuse_immutable.invalidate();
-    // Copy payload to ImmutableRecord in order to make RefValue that point to this new buffer.
+    // Copy payload to ImmutableRecord in order to make ValueRef that point to this new buffer.
     // By reusing this immutable record we make it less allocation expensive.
     reuse_immutable.start_serialization(payload);
 
@@ -1164,25 +1164,25 @@ pub fn read_record(payload: &[u8], reuse_immutable: &mut ImmutableRecord) -> Res
     Ok(())
 }
 
-/// Reads a value that might reference the buffer it is reading from. Be sure to store RefValue with the buffer
+/// Reads a value that might reference the buffer it is reading from. Be sure to store ValueRef with the buffer
 /// always.
 #[inline(always)]
-pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usize)> {
+pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(ValueRef, usize)> {
     match serial_type.kind() {
-        SerialTypeKind::Null => Ok((RefValue::Null, 0)),
+        SerialTypeKind::Null => Ok((ValueRef::Null, 0)),
         SerialTypeKind::I8 => {
             if buf.is_empty() {
                 crate::bail_corrupt_error!("Invalid UInt8 value");
             }
             let val = buf[0] as i8;
-            Ok((RefValue::Integer(val as i64), 1))
+            Ok((ValueRef::Integer(val as i64), 1))
         }
         SerialTypeKind::I16 => {
             if buf.len() < 2 {
                 crate::bail_corrupt_error!("Invalid BEInt16 value");
             }
             Ok((
-                RefValue::Integer(i16::from_be_bytes([buf[0], buf[1]]) as i64),
+                ValueRef::Integer(i16::from_be_bytes([buf[0], buf[1]]) as i64),
                 2,
             ))
         }
@@ -1192,7 +1192,7 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
             }
             let sign_extension = if buf[0] <= 127 { 0 } else { 255 };
             Ok((
-                RefValue::Integer(
+                ValueRef::Integer(
                     i32::from_be_bytes([sign_extension, buf[0], buf[1], buf[2]]) as i64
                 ),
                 3,
@@ -1203,7 +1203,7 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
                 crate::bail_corrupt_error!("Invalid BEInt32 value");
             }
             Ok((
-                RefValue::Integer(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64),
+                ValueRef::Integer(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64),
                 4,
             ))
         }
@@ -1213,7 +1213,7 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
             }
             let sign_extension = if buf[0] <= 127 { 0 } else { 255 };
             Ok((
-                RefValue::Integer(i64::from_be_bytes([
+                ValueRef::Integer(i64::from_be_bytes([
                     sign_extension,
                     sign_extension,
                     buf[0],
@@ -1231,7 +1231,7 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
                 crate::bail_corrupt_error!("Invalid BEInt64 value");
             }
             Ok((
-                RefValue::Integer(i64::from_be_bytes([
+                ValueRef::Integer(i64::from_be_bytes([
                     buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
                 ])),
                 8,
@@ -1242,25 +1242,25 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
                 crate::bail_corrupt_error!("Invalid BEFloat64 value");
             }
             Ok((
-                RefValue::Float(f64::from_be_bytes([
+                ValueRef::Float(f64::from_be_bytes([
                     buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
                 ])),
                 8,
             ))
         }
-        SerialTypeKind::ConstInt0 => Ok((RefValue::Integer(0), 0)),
-        SerialTypeKind::ConstInt1 => Ok((RefValue::Integer(1), 0)),
+        SerialTypeKind::ConstInt0 => Ok((ValueRef::Integer(0), 0)),
+        SerialTypeKind::ConstInt1 => Ok((ValueRef::Integer(1), 0)),
         SerialTypeKind::Blob => {
             let content_size = serial_type.size();
             if buf.len() < content_size {
                 crate::bail_corrupt_error!("Invalid Blob value");
             }
             if content_size == 0 {
-                Ok((RefValue::Blob(RawSlice::new(std::ptr::null(), 0)), 0))
+                Ok((ValueRef::Blob(RawSlice::new(std::ptr::null(), 0)), 0))
             } else {
                 let ptr = &buf[0] as *const u8;
                 let slice = RawSlice::new(ptr, content_size);
-                Ok((RefValue::Blob(slice), content_size))
+                Ok((ValueRef::Blob(slice), content_size))
             }
         }
         SerialTypeKind::Text => {
@@ -1279,7 +1279,7 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
                 RawSlice::new(ptr, content_size)
             };
             Ok((
-                RefValue::Text(TextRef {
+                ValueRef::Text(TextRef {
                     value: slice,
                     subtype: TextSubtype::Text,
                 }),
@@ -1616,42 +1616,42 @@ pub fn read_u32(buf: &[u8], pos: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use crate::OwnedValue;
+    use crate::Value;
 
     use super::*;
     use rstest::rstest;
 
     #[rstest]
-    #[case(&[], SerialType::null(), OwnedValue::Null)]
-    #[case(&[255], SerialType::i8(), OwnedValue::Integer(-1))]
-    #[case(&[0x12, 0x34], SerialType::i16(), OwnedValue::Integer(0x1234))]
-    #[case(&[0xFE], SerialType::i8(), OwnedValue::Integer(-2))]
-    #[case(&[0x12, 0x34, 0x56], SerialType::i24(), OwnedValue::Integer(0x123456))]
-    #[case(&[0x12, 0x34, 0x56, 0x78], SerialType::i32(), OwnedValue::Integer(0x12345678))]
-    #[case(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC], SerialType::i48(), OwnedValue::Integer(0x123456789ABC))]
-    #[case(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xFF], SerialType::i64(), OwnedValue::Integer(0x123456789ABCDEFF))]
-    #[case(&[0x40, 0x09, 0x21, 0xFB, 0x54, 0x44, 0x2D, 0x18], SerialType::f64(), OwnedValue::Float(std::f64::consts::PI))]
-    #[case(&[1, 2], SerialType::const_int0(), OwnedValue::Integer(0))]
-    #[case(&[65, 66], SerialType::const_int1(), OwnedValue::Integer(1))]
-    #[case(&[1, 2, 3], SerialType::blob(3), OwnedValue::Blob(vec![1, 2, 3].into()))]
-    #[case(&[], SerialType::blob(0), OwnedValue::Blob(vec![].into()))] // empty blob
-    #[case(&[65, 66, 67], SerialType::text(3), OwnedValue::build_text("ABC"))]
-    #[case(&[0x80], SerialType::i8(), OwnedValue::Integer(-128))]
-    #[case(&[0x80, 0], SerialType::i16(), OwnedValue::Integer(-32768))]
-    #[case(&[0x80, 0, 0], SerialType::i24(), OwnedValue::Integer(-8388608))]
-    #[case(&[0x80, 0, 0, 0], SerialType::i32(), OwnedValue::Integer(-2147483648))]
-    #[case(&[0x80, 0, 0, 0, 0, 0], SerialType::i48(), OwnedValue::Integer(-140737488355328))]
-    #[case(&[0x80, 0, 0, 0, 0, 0, 0, 0], SerialType::i64(), OwnedValue::Integer(-9223372036854775808))]
-    #[case(&[0x7f], SerialType::i8(), OwnedValue::Integer(127))]
-    #[case(&[0x7f, 0xff], SerialType::i16(), OwnedValue::Integer(32767))]
-    #[case(&[0x7f, 0xff, 0xff], SerialType::i24(), OwnedValue::Integer(8388607))]
-    #[case(&[0x7f, 0xff, 0xff, 0xff], SerialType::i32(), OwnedValue::Integer(2147483647))]
-    #[case(&[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff], SerialType::i48(), OwnedValue::Integer(140737488355327))]
-    #[case(&[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], SerialType::i64(), OwnedValue::Integer(9223372036854775807))]
+    #[case(&[], SerialType::null(), Value::Null)]
+    #[case(&[255], SerialType::i8(), Value::Integer(-1))]
+    #[case(&[0x12, 0x34], SerialType::i16(), Value::Integer(0x1234))]
+    #[case(&[0xFE], SerialType::i8(), Value::Integer(-2))]
+    #[case(&[0x12, 0x34, 0x56], SerialType::i24(), Value::Integer(0x123456))]
+    #[case(&[0x12, 0x34, 0x56, 0x78], SerialType::i32(), Value::Integer(0x12345678))]
+    #[case(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC], SerialType::i48(), Value::Integer(0x123456789ABC))]
+    #[case(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xFF], SerialType::i64(), Value::Integer(0x123456789ABCDEFF))]
+    #[case(&[0x40, 0x09, 0x21, 0xFB, 0x54, 0x44, 0x2D, 0x18], SerialType::f64(), Value::Float(std::f64::consts::PI))]
+    #[case(&[1, 2], SerialType::const_int0(), Value::Integer(0))]
+    #[case(&[65, 66], SerialType::const_int1(), Value::Integer(1))]
+    #[case(&[1, 2, 3], SerialType::blob(3), Value::Blob(vec![1, 2, 3].into()))]
+    #[case(&[], SerialType::blob(0), Value::Blob(vec![].into()))] // empty blob
+    #[case(&[65, 66, 67], SerialType::text(3), Value::build_text("ABC"))]
+    #[case(&[0x80], SerialType::i8(), Value::Integer(-128))]
+    #[case(&[0x80, 0], SerialType::i16(), Value::Integer(-32768))]
+    #[case(&[0x80, 0, 0], SerialType::i24(), Value::Integer(-8388608))]
+    #[case(&[0x80, 0, 0, 0], SerialType::i32(), Value::Integer(-2147483648))]
+    #[case(&[0x80, 0, 0, 0, 0, 0], SerialType::i48(), Value::Integer(-140737488355328))]
+    #[case(&[0x80, 0, 0, 0, 0, 0, 0, 0], SerialType::i64(), Value::Integer(-9223372036854775808))]
+    #[case(&[0x7f], SerialType::i8(), Value::Integer(127))]
+    #[case(&[0x7f, 0xff], SerialType::i16(), Value::Integer(32767))]
+    #[case(&[0x7f, 0xff, 0xff], SerialType::i24(), Value::Integer(8388607))]
+    #[case(&[0x7f, 0xff, 0xff, 0xff], SerialType::i32(), Value::Integer(2147483647))]
+    #[case(&[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff], SerialType::i48(), Value::Integer(140737488355327))]
+    #[case(&[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], SerialType::i64(), Value::Integer(9223372036854775807))]
     fn test_read_value(
         #[case] buf: &[u8],
         #[case] serial_type: SerialType,
-        #[case] expected: OwnedValue,
+        #[case] expected: Value,
     ) {
         let result = read_value(buf, serial_type).unwrap();
         assert_eq!(result.0.to_owned(), expected);

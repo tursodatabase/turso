@@ -5,7 +5,7 @@ use crate::utils::set_err_msg_and_throw_exception;
 use jni::objects::{JByteArray, JObject, JObjectArray, JString, JValue};
 use jni::sys::{jdouble, jint, jlong};
 use jni::JNIEnv;
-use limbo_core::{OwnedValue, Statement, StepResult};
+use limbo_core::{Statement, StepResult, Value};
 use std::num::NonZero;
 
 pub const STEP_RESULT_ID_ROW: i32 = 10;
@@ -106,15 +106,15 @@ fn row_to_obj_array<'local>(
 
     for (i, value) in row.get_values().enumerate() {
         let obj = match value {
-            limbo_core::OwnedValue::Null => JObject::null(),
-            limbo_core::OwnedValue::Integer(i) => {
+            limbo_core::Value::Null => JObject::null(),
+            limbo_core::Value::Integer(i) => {
                 env.new_object("java/lang/Long", "(J)V", &[JValue::Long(*i)])?
             }
-            limbo_core::OwnedValue::Float(f) => {
+            limbo_core::Value::Float(f) => {
                 env.new_object("java/lang/Double", "(D)V", &[JValue::Double(*f)])?
             }
-            limbo_core::OwnedValue::Text(s) => env.new_string(s.as_str())?.into(),
-            limbo_core::OwnedValue::Blob(b) => env.byte_array_from_slice(&b.as_slice())?.into(),
+            limbo_core::Value::Text(s) => env.new_string(s.as_str())?.into(),
+            limbo_core::Value::Blob(b) => env.byte_array_from_slice(&b.as_slice())?.into(),
         };
         if let Err(e) = env.set_object_array_element(&obj_array, i as i32, obj) {
             eprintln!("Error on parsing row: {:?}", e);
@@ -162,7 +162,7 @@ pub extern "system" fn Java_tech_turso_core_LimboStatement_bindNull<'local>(
     };
 
     stmt.stmt
-        .bind_at(NonZero::new(position as usize).unwrap(), OwnedValue::Null);
+        .bind_at(NonZero::new(position as usize).unwrap(), Value::Null);
     SQLITE_OK
 }
 
@@ -184,7 +184,7 @@ pub extern "system" fn Java_tech_turso_core_LimboStatement_bindLong<'local>(
 
     stmt.stmt.bind_at(
         NonZero::new(position as usize).unwrap(),
-        OwnedValue::Integer(value),
+        Value::Integer(value),
     );
     SQLITE_OK
 }
@@ -207,7 +207,7 @@ pub extern "system" fn Java_tech_turso_core_LimboStatement_bindDouble<'local>(
 
     stmt.stmt.bind_at(
         NonZero::new(position as usize).unwrap(),
-        OwnedValue::Float(value),
+        Value::Float(value),
     );
     SQLITE_OK
 }
@@ -235,7 +235,7 @@ pub extern "system" fn Java_tech_turso_core_LimboStatement_bindText<'local>(
 
     stmt.stmt.bind_at(
         NonZero::new(position as usize).unwrap(),
-        OwnedValue::build_text(text.as_str()),
+        Value::build_text(text.as_str()),
     );
     SQLITE_OK
 }
@@ -261,10 +261,8 @@ pub extern "system" fn Java_tech_turso_core_LimboStatement_bindBlob<'local>(
         Err(_) => return SQLITE_ERROR,
     };
 
-    stmt.stmt.bind_at(
-        NonZero::new(position as usize).unwrap(),
-        OwnedValue::Blob(blob),
-    );
+    stmt.stmt
+        .bind_at(NonZero::new(position as usize).unwrap(), Value::Blob(blob));
     SQLITE_OK
 }
 

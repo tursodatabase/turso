@@ -1,6 +1,6 @@
 use std::cell::{Cell, UnsafeCell};
 
-use crate::OwnedValue;
+use crate::Value;
 
 use super::jsonb::Jsonb;
 
@@ -8,7 +8,7 @@ const JSON_CACHE_SIZE: usize = 4;
 
 #[derive(Debug)]
 pub struct JsonCache {
-    entries: [Option<(OwnedValue, Jsonb)>; JSON_CACHE_SIZE],
+    entries: [Option<(Value, Jsonb)>; JSON_CACHE_SIZE],
     age: [usize; JSON_CACHE_SIZE],
     used: usize,
     counter: usize,
@@ -38,7 +38,7 @@ impl JsonCache {
         oldest_idx
     }
 
-    pub fn insert(&mut self, key: &OwnedValue, value: &Jsonb) {
+    pub fn insert(&mut self, key: &Value, value: &Jsonb) {
         if self.used < JSON_CACHE_SIZE {
             self.entries[self.used] = Some((key.clone(), value.clone()));
             self.age[self.used] = self.counter;
@@ -53,7 +53,7 @@ impl JsonCache {
         }
     }
 
-    pub fn lookup(&mut self, key: &OwnedValue) -> Option<Jsonb> {
+    pub fn lookup(&mut self, key: &Value) -> Option<Jsonb> {
         for i in (0..self.used).rev() {
             if let Some((stored_key, value)) = &self.entries[i] {
                 if key == stored_key {
@@ -89,7 +89,7 @@ impl JsonCacheCell {
     }
 
     #[cfg(test)]
-    pub fn lookup(&self, key: &OwnedValue) -> Option<Jsonb> {
+    pub fn lookup(&self, key: &Value) -> Option<Jsonb> {
         assert_eq!(self.accessed.get(), false);
 
         self.accessed.set(true);
@@ -113,8 +113,8 @@ impl JsonCacheCell {
 
     pub fn get_or_insert_with(
         &self,
-        key: &OwnedValue,
-        value: impl Fn(&OwnedValue) -> crate::Result<Jsonb>,
+        key: &Value,
+        value: impl Fn(&Value) -> crate::Result<Jsonb>,
     ) -> crate::Result<Jsonb> {
         assert_eq!(self.accessed.get(), false);
 
@@ -171,10 +171,10 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
-    // Helper function to create test OwnedValue and Jsonb from JSON string
-    fn create_test_pair(json_str: &str) -> (OwnedValue, Jsonb) {
-        // Create OwnedValue as text representation of JSON
-        let key = OwnedValue::build_text(json_str);
+    // Helper function to create test Value and Jsonb from JSON string
+    fn create_test_pair(json_str: &str) -> (Value, Jsonb) {
+        // Create Value as text representation of JSON
+        let key = Value::build_text(json_str);
 
         // Create Jsonb from the same JSON string
         let value = Jsonb::from_str(json_str).unwrap();

@@ -112,7 +112,6 @@ pub fn translate_create_index(
         Some(sql),
     );
 
-    // determine the order of the columns in the index for the sorter
     let order = idx.columns.iter().map(|c| c.order.clone()).collect();
     // open the sorter and the pseudo table
     program.emit_insn(Insn::SorterOpen {

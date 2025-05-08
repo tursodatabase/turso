@@ -14,9 +14,7 @@ use crate::{
 
 use crate::{
     return_corrupt,
-    types::{
-        compare_immutable, CursorResult, ImmutableRecord, OwnedValue, RefValue, SeekKey, SeekOp,
-    },
+    types::{compare_immutable, CursorResult, ImmutableRecord, SeekKey, SeekOp, Value, ValueRef},
     LimboError, Result,
 };
 
@@ -243,7 +241,7 @@ impl BTreeKey<'_> {
     }
 
     /// Assert that the key is an index key and return it.
-    fn to_index_key_values(&self) -> &'_ Vec<RefValue> {
+    fn to_index_key_values(&self) -> &'_ Vec<ValueRef> {
         match self {
             BTreeKey::TableRowId(_) => panic!("BTreeKey::to_index_key called on TableRowId"),
             BTreeKey::IndexKey(key) => key.get_values(),
@@ -548,7 +546,7 @@ impl BTreeCursor {
                     if predicate.is_none() {
                         let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
                         {
-                            Some(RefValue::Integer(rowid)) => *rowid as u64,
+                            Some(ValueRef::Integer(rowid)) => *rowid as u64,
                             _ => unreachable!("index cells should have an integer rowid"),
                         };
                         return Ok(CursorResult::Ok(Some(rowid)));
@@ -581,7 +579,7 @@ impl BTreeCursor {
                     if found {
                         let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
                         {
-                            Some(RefValue::Integer(rowid)) => *rowid as u64,
+                            Some(ValueRef::Integer(rowid)) => *rowid as u64,
                             _ => unreachable!("index cells should have an integer rowid"),
                         };
                         return Ok(CursorResult::Ok(Some(rowid)));
@@ -607,7 +605,7 @@ impl BTreeCursor {
                     if predicate.is_none() {
                         let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
                         {
-                            Some(RefValue::Integer(rowid)) => *rowid as u64,
+                            Some(ValueRef::Integer(rowid)) => *rowid as u64,
                             _ => unreachable!("index cells should have an integer rowid"),
                         };
                         return Ok(CursorResult::Ok(Some(rowid)));
@@ -638,7 +636,7 @@ impl BTreeCursor {
                     if found {
                         let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
                         {
-                            Some(RefValue::Integer(rowid)) => *rowid as u64,
+                            Some(ValueRef::Integer(rowid)) => *rowid as u64,
                             _ => unreachable!("index cells should have an integer rowid"),
                         };
                         return Ok(CursorResult::Ok(Some(rowid)));
@@ -862,7 +860,7 @@ impl BTreeCursor {
                     if predicate.is_none() {
                         let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
                         {
-                            Some(RefValue::Integer(rowid)) => *rowid as u64,
+                            Some(ValueRef::Integer(rowid)) => *rowid as u64,
                             _ => unreachable!("index cells should have an integer rowid"),
                         };
                         return Ok(CursorResult::Ok(Some(rowid)));
@@ -893,7 +891,7 @@ impl BTreeCursor {
                     if found {
                         let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
                         {
-                            Some(RefValue::Integer(rowid)) => *rowid as u64,
+                            Some(ValueRef::Integer(rowid)) => *rowid as u64,
                             _ => unreachable!("index cells should have an integer rowid"),
                         };
                         return Ok(CursorResult::Ok(Some(rowid)));
@@ -923,7 +921,7 @@ impl BTreeCursor {
                     if predicate.is_none() {
                         let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
                         {
-                            Some(RefValue::Integer(rowid)) => *rowid as u64,
+                            Some(ValueRef::Integer(rowid)) => *rowid as u64,
                             _ => unreachable!("index cells should have an integer rowid"),
                         };
                         return Ok(CursorResult::Ok(Some(rowid)));
@@ -953,7 +951,7 @@ impl BTreeCursor {
                     if found {
                         let rowid = match self.get_immutable_record().as_ref().unwrap().last_value()
                         {
-                            Some(RefValue::Integer(rowid)) => *rowid as u64,
+                            Some(ValueRef::Integer(rowid)) => *rowid as u64,
                             _ => unreachable!("index cells should have an integer rowid"),
                         };
                         return Ok(CursorResult::Ok(Some(rowid)));
@@ -1503,7 +1501,7 @@ impl BTreeCursor {
                 let record = self.get_immutable_record();
                 let record = record.as_ref().unwrap();
                 let rowid = match record.last_value() {
-                    Some(RefValue::Integer(rowid)) => *rowid as u64,
+                    Some(ValueRef::Integer(rowid)) => *rowid as u64,
                     _ => unreachable!("index cells should have an integer rowid"),
                 };
                 self.stack.set_cell_index(nearest_matching_cell as i32);
@@ -3853,10 +3851,10 @@ impl BTreeCursor {
         Ok(CursorResult::Ok(false)) // not a duplicate
     }
 
-    pub fn exists(&mut self, key: &OwnedValue) -> Result<CursorResult<bool>> {
+    pub fn exists(&mut self, key: &Value) -> Result<CursorResult<bool>> {
         assert!(self.mv_cursor.is_none());
         let int_key = match key {
-            OwnedValue::Integer(i) => i,
+            Value::Integer(i) => i,
             _ => unreachable!("btree tables are indexed by integers!"),
         };
         let _ = return_if_io!(self.move_to(SeekKey::TableRowId(*int_key as u64), SeekOp::EQ));
@@ -3868,7 +3866,7 @@ impl BTreeCursor {
 
         // find cell
         let int_key = match key {
-            OwnedValue::Integer(i) => *i as u64,
+            Value::Integer(i) => *i as u64,
             _ => unreachable!("btree tables are indexed by integers!"),
         };
         let cell_idx = self.find_cell(contents, &BTreeKey::new_table_rowid(int_key, None));
@@ -5376,7 +5374,7 @@ mod tests {
             pager::PageRef,
             sqlite3_ondisk::{BTreeCell, PageContent, PageType},
         },
-        types::OwnedValue,
+        types::Value,
         Database, Page, Pager, PlatformIO,
     };
 
@@ -5456,8 +5454,7 @@ mod tests {
         let page = get_page(2);
         let page = page.get_contents();
         let header_size = 8;
-        let record =
-            ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Integer(1))]);
+        let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(1))]);
         let payload = add_record(1, 0, page, record, &conn);
         assert_eq!(page.cell_count(), 1);
         let free = compute_free_space(page, 4096);
@@ -5485,9 +5482,8 @@ mod tests {
         let mut cells = Vec::new();
         let usable_space = 4096;
         for i in 0..3 {
-            let record = ImmutableRecord::from_registers(&[Register::OwnedValue(
-                OwnedValue::Integer(i as i64),
-            )]);
+            let record =
+                ImmutableRecord::from_registers(&[Register::Value(Value::Integer(i as i64))]);
             let payload = add_record(i, i, page, record, &conn);
             assert_eq!(page.cell_count(), i + 1);
             let free = compute_free_space(page, usable_space);
@@ -5738,9 +5734,10 @@ mod tests {
                     pager.deref(),
                 )
                 .unwrap();
-                let value = ImmutableRecord::from_registers(&[Register::OwnedValue(
-                    OwnedValue::Blob(vec![0; *size]),
-                )]);
+                let value = ImmutableRecord::from_registers(&[Register::Value(Value::Blob(vec![
+                        0;
+                        *size
+                    ]))]);
                 tracing::info!("insert key:{}", key);
                 run_until_done(
                     || cursor.insert(&BTreeKey::new_table_rowid(*key, Some(&value)), true),
@@ -5819,9 +5816,8 @@ mod tests {
                     pager.deref(),
                 )
                 .unwrap();
-                let value = ImmutableRecord::from_registers(&[Register::OwnedValue(
-                    OwnedValue::Blob(vec![0; size]),
-                )]);
+                let value =
+                    ImmutableRecord::from_registers(&[Register::Value(Value::Blob(vec![0; size]))]);
                 let btree_before = format_btree(pager.clone(), root_page, 0);
                 run_until_done(
                     || cursor.insert(&BTreeKey::new_table_rowid(key as u64, Some(&value)), true),
@@ -5910,7 +5906,7 @@ mod tests {
                 keys.push(key.clone());
                 let value = ImmutableRecord::from_registers(
                     &key.iter()
-                        .map(|col| Register::OwnedValue(OwnedValue::Integer(*col)))
+                        .map(|col| Register::Value(Value::Integer(*col)))
                         .collect::<Vec<_>>(),
                 );
                 run_until_done(
@@ -5937,7 +5933,7 @@ mod tests {
                 assert_eq!(
                     cursor_key,
                     &key.iter()
-                        .map(|col| RefValue::Integer(*col))
+                        .map(|col| ValueRef::Integer(*col))
                         .collect::<Vec<_>>(),
                     "key {:?} is not found",
                     key
@@ -5960,9 +5956,8 @@ mod tests {
         let usable_space = 4096;
         let total_cells = 10;
         for i in 0..total_cells {
-            let record = ImmutableRecord::from_registers(&[Register::OwnedValue(
-                OwnedValue::Integer(i as i64),
-            )]);
+            let record =
+                ImmutableRecord::from_registers(&[Register::Value(Value::Integer(i as i64))]);
             let payload = add_record(i, i, page, record, &conn);
             assert_eq!(page.cell_count(), i + 1);
             let free = compute_free_space(page, usable_space);
@@ -6321,9 +6316,8 @@ mod tests {
         let mut cells = Vec::new();
         let usable_space = 4096;
         for i in 0..3 {
-            let record = ImmutableRecord::from_registers(&[Register::OwnedValue(
-                OwnedValue::Integer(i as i64),
-            )]);
+            let record =
+                ImmutableRecord::from_registers(&[Register::Value(Value::Integer(i as i64))]);
             let payload = add_record(i, i, page, record, &conn);
             assert_eq!(page.cell_count(), i + 1);
             let free = compute_free_space(page, usable_space);
@@ -6363,9 +6357,8 @@ mod tests {
         let usable_space = 4096;
         let total_cells = 10;
         for i in 0..total_cells {
-            let record = ImmutableRecord::from_registers(&[Register::OwnedValue(
-                OwnedValue::Integer(i as i64),
-            )]);
+            let record =
+                ImmutableRecord::from_registers(&[Register::Value(Value::Integer(i as i64))]);
             let payload = add_record(i, i, page, record, &conn);
             assert_eq!(page.cell_count(), i + 1);
             let free = compute_free_space(page, usable_space);
@@ -6419,8 +6412,8 @@ mod tests {
                     // allow appends with extra place to insert
                     let cell_idx = rng.next_u64() as usize % (page.cell_count() + 1);
                     let free = compute_free_space(page, usable_space);
-                    let record = ImmutableRecord::from_registers(&[Register::OwnedValue(
-                        OwnedValue::Integer(i as i64),
+                    let record = ImmutableRecord::from_registers(&[Register::Value(
+                        Value::Integer(i as i64),
                     )]);
                     let mut payload: Vec<u8> = Vec::new();
                     fill_cell_payload(
@@ -6497,8 +6490,8 @@ mod tests {
                         // allow appends with extra place to insert
                         let cell_idx = rng.next_u64() as usize % (page.cell_count() + 1);
                         let free = compute_free_space(page, usable_space);
-                        let record = ImmutableRecord::from_registers(&[Register::OwnedValue(
-                            OwnedValue::Integer(i as i64),
+                        let record = ImmutableRecord::from_registers(&[Register::Value(
+                            Value::Integer(i as i64),
                         )]);
                         let mut payload: Vec<u8> = Vec::new();
                         fill_cell_payload(
@@ -6653,8 +6646,7 @@ mod tests {
         let header_size = 8;
         let usable_space = 4096;
 
-        let record =
-            ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Integer(0))]);
+        let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(0))]);
         let payload = add_record(0, 0, page, record, &conn);
         let free = compute_free_space(page, usable_space);
         assert_eq!(free, 4096 - payload.len() as u16 - 2 - header_size);
@@ -6669,8 +6661,7 @@ mod tests {
         let page = page.get_contents();
         let usable_space = 4096;
 
-        let record =
-            ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Integer(0))]);
+        let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(0))]);
         let payload = add_record(0, 0, page, record, &conn);
 
         assert_eq!(page.cell_count(), 1);
@@ -6696,8 +6687,8 @@ mod tests {
         let usable_space = 4096;
 
         let record = ImmutableRecord::from_registers(&[
-            Register::OwnedValue(OwnedValue::Integer(0)),
-            Register::OwnedValue(OwnedValue::Text(Text::new("aaaaaaaa"))),
+            Register::Value(Value::Integer(0)),
+            Register::Value(Value::Text(Text::new("aaaaaaaa"))),
         ]);
         let _ = add_record(0, 0, page, record, &conn);
 
@@ -6705,8 +6696,7 @@ mod tests {
         drop_cell(page, 0, usable_space).unwrap();
         assert_eq!(page.cell_count(), 0);
 
-        let record =
-            ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Integer(0))]);
+        let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(0))]);
         let payload = add_record(0, 0, page, record, &conn);
         assert_eq!(page.cell_count(), 1);
 
@@ -6730,8 +6720,8 @@ mod tests {
         let usable_space = 4096;
 
         let record = ImmutableRecord::from_registers(&[
-            Register::OwnedValue(OwnedValue::Integer(0)),
-            Register::OwnedValue(OwnedValue::Text(Text::new("aaaaaaaa"))),
+            Register::Value(Value::Integer(0)),
+            Register::Value(Value::Text(Text::new("aaaaaaaa"))),
         ]);
         let _ = add_record(0, 0, page, record, &conn);
 
@@ -6740,8 +6730,7 @@ mod tests {
             drop_cell(page, 0, usable_space).unwrap();
             assert_eq!(page.cell_count(), 0);
 
-            let record =
-                ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Integer(0))]);
+            let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(0))]);
             let payload = add_record(0, 0, page, record, &conn);
             assert_eq!(page.cell_count(), 1);
 
@@ -6765,14 +6754,11 @@ mod tests {
         let page = page.get_contents();
         let usable_space = 4096;
 
-        let record =
-            ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Integer(0))]);
+        let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(0))]);
         let payload = add_record(0, 0, page, record, &conn);
-        let record =
-            ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Integer(1))]);
+        let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(1))]);
         let _ = add_record(1, 1, page, record, &conn);
-        let record =
-            ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Integer(2))]);
+        let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(2))]);
         let _ = add_record(2, 2, page, record, &conn);
 
         drop_cell(page, 1, usable_space).unwrap();
@@ -6790,25 +6776,21 @@ mod tests {
         let page = page.get_contents();
         let usable_space = 4096;
 
-        let record =
-            ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Integer(0))]);
+        let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(0))]);
         let _ = add_record(0, 0, page, record, &conn);
 
-        let record =
-            ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Integer(0))]);
+        let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(0))]);
         let _ = add_record(0, 0, page, record, &conn);
         drop_cell(page, 0, usable_space).unwrap();
 
         defragment_page(page, usable_space);
 
-        let record =
-            ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Integer(0))]);
+        let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(0))]);
         let _ = add_record(0, 1, page, record, &conn);
 
         drop_cell(page, 0, usable_space).unwrap();
 
-        let record =
-            ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Integer(0))]);
+        let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(0))]);
         let _ = add_record(0, 1, page, record, &conn);
     }
 
@@ -6820,8 +6802,7 @@ mod tests {
         let page = get_page(2);
         let usable_space = 4096;
         let insert = |pos, page| {
-            let record =
-                ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Integer(0))]);
+            let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(0))]);
             let _ = add_record(0, pos, page, record, &conn);
         };
         let drop = |pos, page| {
@@ -6860,8 +6841,7 @@ mod tests {
         let page = get_page(2);
         let usable_space = 4096;
         let insert = |pos, page| {
-            let record =
-                ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Integer(0))]);
+            let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(0))]);
             let _ = add_record(0, pos, page, record, &conn);
         };
         let drop = |pos, page| {
@@ -6870,8 +6850,7 @@ mod tests {
         let defragment = |page| {
             defragment_page(page, usable_space);
         };
-        let record =
-            ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Integer(0))]);
+        let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(0))]);
         let mut payload: Vec<u8> = Vec::new();
         fill_cell_payload(
             page.get_contents().page_type(),
@@ -6904,8 +6883,7 @@ mod tests {
         for i in 0..10000 {
             let mut cursor = BTreeCursor::new(None, pager.clone(), root_page);
             tracing::info!("INSERT INTO t VALUES ({});", i,);
-            let value =
-                ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Integer(i))]);
+            let value = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(i))]);
             tracing::trace!("before insert {}", i);
             run_until_done(
                 || {
@@ -6931,7 +6909,7 @@ mod tests {
         );
         for key in keys.iter() {
             let mut cursor = BTreeCursor::new(None, pager.clone(), root_page);
-            let key = OwnedValue::Integer(*key);
+            let key = Value::Integer(*key);
             let exists = run_until_done(|| cursor.exists(&key), pager.deref()).unwrap();
             assert!(exists, "key not found {}", key);
         }
@@ -6945,10 +6923,7 @@ mod tests {
         let page = get_page(2);
         let usable_space = 4096;
         let record =
-            ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Blob(vec![
-                0;
-                3600
-            ]))]);
+            ImmutableRecord::from_registers(&[Register::Value(Value::Blob(vec![0; 3600]))]);
         let mut payload: Vec<u8> = Vec::new();
         fill_cell_payload(
             page.get_contents().page_type(),
@@ -6983,7 +6958,7 @@ mod tests {
         // Insert 10,000 records in to the BTree.
         for i in 1..=10000 {
             let mut cursor = BTreeCursor::new(None, pager.clone(), root_page);
-            let value = ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Text(
+            let value = ImmutableRecord::from_registers(&[Register::Value(Value::Text(
                 Text::new("hello world"),
             ))]);
 
@@ -7028,7 +7003,7 @@ mod tests {
             }
 
             let mut cursor = BTreeCursor::new(None, pager.clone(), root_page);
-            let key = OwnedValue::Integer(i);
+            let key = Value::Integer(i);
             let exists = run_until_done(|| cursor.exists(&key), pager.deref()).unwrap();
             assert!(exists, "Key {} should exist but doesn't", i);
         }
@@ -7036,7 +7011,7 @@ mod tests {
         // Verify the deleted records don't exist.
         for i in 500..=3500 {
             let mut cursor = BTreeCursor::new(None, pager.clone(), root_page);
-            let key = OwnedValue::Integer(i);
+            let key = Value::Integer(i);
             let exists = run_until_done(|| cursor.exists(&key), pager.deref()).unwrap();
             assert!(!exists, "Deleted key {} still exists", i);
         }
@@ -7059,11 +7034,10 @@ mod tests {
         for i in 0..iterations {
             let mut cursor = BTreeCursor::new(None, pager.clone(), root_page);
             tracing::info!("INSERT INTO t VALUES ({});", i,);
-            let value =
-                ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Text(Text {
-                    value: huge_texts[i].as_bytes().to_vec(),
-                    subtype: crate::types::TextSubtype::Text,
-                }))]);
+            let value = ImmutableRecord::from_registers(&[Register::Value(Value::Text(Text {
+                value: huge_texts[i].as_bytes().to_vec(),
+                subtype: crate::types::TextSubtype::Text,
+            }))]);
             tracing::trace!("before insert {}", i);
             tracing::debug!(
                 "=========== btree before ===========\n{}\n\n",

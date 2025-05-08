@@ -1,4 +1,4 @@
-use crate::types::{OwnedValue, OwnedValueType};
+use crate::types::{Value, ValueType};
 use crate::vdbe::Register;
 use crate::{LimboError, Result};
 
@@ -41,7 +41,7 @@ impl Vector {
 /// ```console
 /// [1.0, 2.0, 3.0]
 /// ```
-pub fn parse_string_vector(vector_type: VectorType, value: &OwnedValue) -> Result<Vector> {
+pub fn parse_string_vector(vector_type: VectorType, value: &Value) -> Result<Vector> {
     let Some(text) = value.to_text() else {
         return Err(LimboError::ConversionError(
             "Invalid vector value".to_string(),
@@ -106,11 +106,11 @@ pub fn parse_string_vector(vector_type: VectorType, value: &OwnedValue) -> Resul
 
 pub fn parse_vector(value: &Register, vec_ty: Option<VectorType>) -> Result<Vector> {
     match value.get_owned_value().value_type() {
-        OwnedValueType::Text => parse_string_vector(
+        ValueType::Text => parse_string_vector(
             vec_ty.unwrap_or(VectorType::Float32),
             value.get_owned_value(),
         ),
-        OwnedValueType::Blob => {
+        ValueType::Blob => {
             let Some(blob) = value.get_owned_value().to_blob() else {
                 return Err(LimboError::ConversionError(
                     "Invalid vector value".to_string(),
@@ -166,11 +166,11 @@ pub fn vector_deserialize(vector_type: VectorType, blob: &[u8]) -> Result<Vector
     }
 }
 
-pub fn vector_serialize_f64(x: Vector) -> OwnedValue {
+pub fn vector_serialize_f64(x: Vector) -> Value {
     let mut blob = Vec::with_capacity(x.dims * 8 + 1);
     blob.extend_from_slice(&x.data);
     blob.push(2);
-    OwnedValue::from_blob(blob)
+    Value::from_blob(blob)
 }
 
 pub fn vector_deserialize_f64(blob: &[u8]) -> Result<Vector> {
@@ -181,8 +181,8 @@ pub fn vector_deserialize_f64(blob: &[u8]) -> Result<Vector> {
     })
 }
 
-pub fn vector_serialize_f32(x: Vector) -> OwnedValue {
-    OwnedValue::from_blob(x.data)
+pub fn vector_serialize_f32(x: Vector) -> Value {
+    Value::from_blob(x.data)
 }
 
 pub fn vector_deserialize_f32(blob: &[u8]) -> Result<Vector> {
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn parse_string_vector_zero_length() {
-        let value = OwnedValue::from_text("[]");
+        let value = Value::from_text("[]");
         let vector = parse_string_vector(VectorType::Float32, &value).unwrap();
         assert_eq!(vector.dims, 0);
         assert_eq!(vector.vector_type, VectorType::Float32);
@@ -574,7 +574,7 @@ mod tests {
 
     #[test]
     fn test_parse_string_vector_valid_whitespace() {
-        let value = OwnedValue::from_text("  [  1.0  ,  2.0  ,  3.0  ]  ");
+        let value = Value::from_text("  [  1.0  ,  2.0  ,  3.0  ]  ");
         let vector = parse_string_vector(VectorType::Float32, &value).unwrap();
         assert_eq!(vector.dims, 3);
         assert_eq!(vector.vector_type, VectorType::Float32);
@@ -582,7 +582,7 @@ mod tests {
 
     #[test]
     fn test_parse_string_vector_valid() {
-        let value = OwnedValue::from_text("[1.0, 2.0, 3.0]");
+        let value = Value::from_text("[1.0, 2.0, 3.0]");
         let vector = parse_string_vector(VectorType::Float32, &value).unwrap();
         assert_eq!(vector.dims, 3);
         assert_eq!(vector.vector_type, VectorType::Float32);
@@ -619,7 +619,7 @@ mod tests {
         let text = vector_to_text(&v);
 
         // Parse back from text
-        let value = OwnedValue::from_text(&text);
+        let value = Value::from_text(&text);
         let parsed = parse_string_vector(v.vector_type.clone(), &value);
 
         match parsed {

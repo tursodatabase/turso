@@ -34,7 +34,7 @@ use crate::{
 use crate::{
     storage::{btree::BTreeCursor, pager::Pager, sqlite3_ondisk::DatabaseHeader},
     translate::plan::{ResultSetColumn, TableReference},
-    types::{AggContext, Cursor, CursorResult, ImmutableRecord, OwnedValue, SeekKey, SeekOp},
+    types::{AggContext, Cursor, CursorResult, ImmutableRecord, SeekKey, SeekOp, Value},
     vdbe::{builder::CursorType, insn::Insn},
 };
 
@@ -241,7 +241,7 @@ enum HaltState {
 
 #[derive(Debug, Clone)]
 pub enum Register {
-    OwnedValue(OwnedValue),
+    Value(Value),
     Aggregate(AggContext),
     Record(ImmutableRecord),
 }
@@ -267,7 +267,7 @@ pub struct ProgramState {
     regex_cache: RegexCache,
     pub(crate) mv_tx_id: Option<crate::mvcc::database::TxID>,
     interrupted: bool,
-    parameters: HashMap<NonZero<usize>, OwnedValue>,
+    parameters: HashMap<NonZero<usize>, Value>,
     halt_state: Option<HaltState>,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
@@ -278,7 +278,7 @@ impl ProgramState {
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {
         let cursors: RefCell<Vec<Option<Cursor>>> =
             RefCell::new((0..max_cursors).map(|_| None).collect());
-        let registers = vec![Register::OwnedValue(OwnedValue::Null); max_registers];
+        let registers = vec![Register::Value(Value::Null); max_registers];
         Self {
             pc: 0,
             cursors,
@@ -315,15 +315,12 @@ impl ProgramState {
         self.interrupted
     }
 
-    pub fn bind_at(&mut self, index: NonZero<usize>, value: OwnedValue) {
+    pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) {
         self.parameters.insert(index, value);
     }
 
-    pub fn get_parameter(&self, index: NonZero<usize>) -> OwnedValue {
-        self.parameters
-            .get(&index)
-            .cloned()
-            .unwrap_or(OwnedValue::Null)
+    pub fn get_parameter(&self, index: NonZero<usize>) -> Value {
+        self.parameters.get(&index).cloned().unwrap_or(Value::Null)
     }
 
     pub fn reset(&mut self) {
@@ -331,7 +328,7 @@ impl ProgramState {
         self.cursors.borrow_mut().iter_mut().for_each(|c| *c = None);
         self.registers
             .iter_mut()
-            .for_each(|r| *r = Register::OwnedValue(OwnedValue::Null));
+            .for_each(|r| *r = Register::Value(Value::Null));
         self.last_compare = None;
         self.deferred_seek = None;
         self.ended_coroutine.0 = [0; 4];
@@ -354,9 +351,9 @@ impl ProgramState {
 }
 
 impl Register {
-    pub fn get_owned_value(&self) -> &OwnedValue {
+    pub fn get_owned_value(&self) -> &Value {
         match self {
-            Register::OwnedValue(v) => v,
+            Register::Value(v) => v,
             _ => unreachable!(),
         }
     }
@@ -623,49 +620,49 @@ fn get_indent_count(indent_count: usize, curr_insn: &Insn, prev_insn: Option<&In
 }
 
 pub trait FromValueRow<'a> {
-    fn from_value(value: &'a OwnedValue) -> Result<Self>
+    fn from_value(value: &'a Value) -> Result<Self>
     where
         Self: Sized + 'a;
 }
 
 impl<'a> FromValueRow<'a> for i64 {
-    fn from_value(value: &'a OwnedValue) -> Result<Self> {
+    fn from_value(value: &'a Value) -> Result<Self> {
         match value {
-            OwnedValue::Integer(i) => Ok(*i),
+            Value::Integer(i) => Ok(*i),
             _ => Err(LimboError::ConversionError("Expected integer value".into())),
         }
     }
 }
 
 impl<'a> FromValueRow<'a> for f64 {
-    fn from_value(value: &'a OwnedValue) -> Result<Self> {
+    fn from_value(value: &'a Value) -> Result<Self> {
         match value {
-            OwnedValue::Float(f) => Ok(*f),
+            Value::Float(f) => Ok(*f),
             _ => Err(LimboError::ConversionError("Expected integer value".into())),
         }
     }
 }
 
 impl<'a> FromValueRow<'a> for String {
-    fn from_value(value: &'a OwnedValue) -> Result<Self> {
+    fn from_value(value: &'a Value) -> Result<Self> {
         match value {
-            OwnedValue::Text(s) => Ok(s.as_str().to_string()),
+            Value::Text(s) => Ok(s.as_str().to_string()),
             _ => Err(LimboError::ConversionError("Expected text value".into())),
         }
     }
 }
 
 impl<'a> FromValueRow<'a> for &'a str {
-    fn from_value(value: &'a OwnedValue) -> Result<Self> {
+    fn from_value(value: &'a Value) -> Result<Self> {
         match value {
-            OwnedValue::Text(s) => Ok(s.as_str()),
+            Value::Text(s) => Ok(s.as_str()),
             _ => Err(LimboError::ConversionError("Expected text value".into())),
         }
     }
 }
 
-impl<'a> FromValueRow<'a> for &'a OwnedValue {
-    fn from_value(value: &'a OwnedValue) -> Result<Self> {
+impl<'a> FromValueRow<'a> for &'a Value {
+    fn from_value(value: &'a Value) -> Result<Self> {
         Ok(value)
     }
 }
@@ -674,21 +671,21 @@ impl Row {
     pub fn get<'a, T: FromValueRow<'a> + 'a>(&'a self, idx: usize) -> Result<T> {
         let value = unsafe { self.values.add(idx).as_ref().unwrap() };
         let value = match value {
-            Register::OwnedValue(owned_value) => owned_value,
+            Register::Value(owned_value) => owned_value,
             _ => unreachable!("a row should be formed of values only"),
         };
         T::from_value(value)
     }
 
-    pub fn get_value<'a>(&'a self, idx: usize) -> &'a OwnedValue {
+    pub fn get_value<'a>(&'a self, idx: usize) -> &'a Value {
         let value = unsafe { self.values.add(idx).as_ref().unwrap() };
         match value {
-            Register::OwnedValue(owned_value) => owned_value,
+            Register::Value(owned_value) => owned_value,
             _ => unreachable!("a row should be formed of values only"),
         }
     }
 
-    pub fn get_values(&self) -> impl Iterator<Item = &OwnedValue> {
+    pub fn get_values(&self) -> impl Iterator<Item = &Value> {
         let values = unsafe { std::slice::from_raw_parts(self.values, self.count) };
         // This should be ownedvalues
         // TODO: add check for this

@@ -14,7 +14,7 @@ use crate::vdbe::{
     insn::{CmpInsFlags, Insn},
     BranchOffset,
 };
-use crate::{OwnedValue, Result};
+use crate::{Result, Value};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ConditionMetadata {
@@ -1983,13 +1983,13 @@ pub fn translate_expr(
         ast::Expr::Literal(lit) => match lit {
             ast::Literal::Numeric(val) => {
                 match parse_numeric_literal(val)? {
-                    OwnedValue::Integer(int_value) => {
+                    Value::Integer(int_value) => {
                         program.emit_insn(Insn::Integer {
                             value: int_value,
                             dest: target_register,
                         });
                     }
-                    OwnedValue::Float(real_value) => {
+                    Value::Float(real_value) => {
                         program.emit_insn(Insn::Real {
                             value: real_value,
                             dest: target_register,
@@ -2104,13 +2104,13 @@ pub fn translate_expr(
             (UnaryOperator::Negative, ast::Expr::Literal(ast::Literal::Numeric(numeric_value))) => {
                 let numeric_value = "-".to_owned() + numeric_value;
                 match parse_numeric_literal(&numeric_value)? {
-                    OwnedValue::Integer(int_value) => {
+                    Value::Integer(int_value) => {
                         program.emit_insn(Insn::Integer {
                             value: int_value,
                             dest: target_register,
                         });
                     }
-                    OwnedValue::Float(real_value) => {
+                    Value::Float(real_value) => {
                         program.emit_insn(Insn::Real {
                             value: real_value,
                             dest: target_register,
@@ -2140,13 +2140,13 @@ pub fn translate_expr(
             }
             (UnaryOperator::BitwiseNot, ast::Expr::Literal(ast::Literal::Numeric(num_val))) => {
                 match parse_numeric_literal(num_val)? {
-                    OwnedValue::Integer(int_value) => {
+                    Value::Integer(int_value) => {
                         program.emit_insn(Insn::Integer {
                             value: !int_value,
                             dest: target_register,
                         });
                     }
-                    OwnedValue::Float(real_value) => {
+                    Value::Float(real_value) => {
                         program.emit_insn(Insn::Integer {
                             value: !(real_value as i64),
                             dest: target_register,

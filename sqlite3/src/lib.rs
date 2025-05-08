@@ -1,7 +1,7 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(non_camel_case_types)]
 
-use limbo_core::OwnedValue;
+use limbo_core::Value;
 use log::trace;
 use std::ffi::{self, CStr, CString};
 
@@ -565,63 +565,63 @@ pub unsafe extern "C" fn sqlite3_column_bytes(
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_type(value: *mut ffi::c_void) -> ffi::c_int {
-    let value = value as *mut limbo_core::OwnedValue;
+    let value = value as *mut limbo_core::Value;
     let value = &*value;
     match value {
-        limbo_core::OwnedValue::Null => 0,
-        limbo_core::OwnedValue::Integer(_) => 1,
-        limbo_core::OwnedValue::Float(_) => 2,
-        limbo_core::OwnedValue::Text(_) => 3,
-        limbo_core::OwnedValue::Blob(_) => 4,
+        limbo_core::Value::Null => 0,
+        limbo_core::Value::Integer(_) => 1,
+        limbo_core::Value::Float(_) => 2,
+        limbo_core::Value::Text(_) => 3,
+        limbo_core::Value::Blob(_) => 4,
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_int64(value: *mut ffi::c_void) -> i64 {
-    let value = value as *mut limbo_core::OwnedValue;
+    let value = value as *mut limbo_core::Value;
     let value = &*value;
     match value {
-        limbo_core::OwnedValue::Integer(i) => *i,
+        limbo_core::Value::Integer(i) => *i,
         _ => 0,
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_double(value: *mut ffi::c_void) -> f64 {
-    let value = value as *mut limbo_core::OwnedValue;
+    let value = value as *mut limbo_core::Value;
     let value = &*value;
     match value {
-        limbo_core::OwnedValue::Float(f) => *f,
+        limbo_core::Value::Float(f) => *f,
         _ => 0.0,
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_text(value: *mut ffi::c_void) -> *const ffi::c_uchar {
-    let value = value as *mut limbo_core::OwnedValue;
+    let value = value as *mut limbo_core::Value;
     let value = &*value;
     match value {
-        limbo_core::OwnedValue::Text(text) => text.as_str().as_ptr(),
+        limbo_core::Value::Text(text) => text.as_str().as_ptr(),
         _ => std::ptr::null(),
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_blob(value: *mut ffi::c_void) -> *const ffi::c_void {
-    let value = value as *mut limbo_core::OwnedValue;
+    let value = value as *mut limbo_core::Value;
     let value = &*value;
     match value {
-        limbo_core::OwnedValue::Blob(blob) => blob.as_ptr() as *const ffi::c_void,
+        limbo_core::Value::Blob(blob) => blob.as_ptr() as *const ffi::c_void,
         _ => std::ptr::null(),
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_bytes(value: *mut ffi::c_void) -> ffi::c_int {
-    let value = value as *mut limbo_core::OwnedValue;
+    let value = value as *mut limbo_core::Value;
     let value = &*value;
     match value {
-        limbo_core::OwnedValue::Blob(blob) => blob.len() as ffi::c_int,
+        limbo_core::Value::Blob(blob) => blob.len() as ffi::c_int,
         _ => 0,
     }
 }
@@ -637,8 +637,8 @@ pub unsafe extern "C" fn sqlite3_column_text(
         Some(row) => row,
         None => return std::ptr::null(),
     };
-    match row.get::<&OwnedValue>(idx as usize) {
-        Ok(limbo_core::OwnedValue::Text(text)) => text.as_str().as_ptr(),
+    match row.get::<&Value>(idx as usize) {
+        Ok(limbo_core::Value::Text(text)) => text.as_str().as_ptr(),
         _ => std::ptr::null(),
     }
 }

@@ -1,4 +1,4 @@
-use crate::OwnedValue;
+use crate::Value;
 
 mod nonnan;
 
@@ -66,12 +66,12 @@ impl From<Numeric> for NullableInteger {
     }
 }
 
-impl From<Numeric> for OwnedValue {
+impl From<Numeric> for Value {
     fn from(value: Numeric) -> Self {
         match value {
-            Numeric::Null => OwnedValue::Null,
-            Numeric::Integer(v) => OwnedValue::Integer(v),
-            Numeric::Float(v) => OwnedValue::Float(v.into()),
+            Numeric::Null => Value::Null,
+            Numeric::Integer(v) => Value::Integer(v),
+            Numeric::Float(v) => Value::Float(v.into()),
         }
     }
 }
@@ -96,22 +96,22 @@ impl<T: AsRef<str>> From<T> for Numeric {
     }
 }
 
-impl From<OwnedValue> for Numeric {
-    fn from(value: OwnedValue) -> Self {
+impl From<Value> for Numeric {
+    fn from(value: Value) -> Self {
         Self::from(&value)
     }
 }
-impl From<&OwnedValue> for Numeric {
-    fn from(value: &OwnedValue) -> Self {
+impl From<&Value> for Numeric {
+    fn from(value: &Value) -> Self {
         match value {
-            OwnedValue::Null => Self::Null,
-            OwnedValue::Integer(v) => Self::Integer(*v),
-            OwnedValue::Float(v) => match NonNan::new(*v) {
+            Value::Null => Self::Null,
+            Value::Integer(v) => Self::Integer(*v),
+            Value::Float(v) => match NonNan::new(*v) {
                 Some(v) => Self::Float(v),
                 None => Self::Null,
             },
-            OwnedValue::Text(text) => Numeric::from(text.as_str()),
-            OwnedValue::Blob(blob) => {
+            Value::Text(text) => Numeric::from(text.as_str()),
+            Value::Blob(blob) => {
                 let text = String::from_utf8_lossy(blob.as_slice());
                 Numeric::from(&text)
             }
@@ -220,11 +220,11 @@ pub enum NullableInteger {
     Integer(i64),
 }
 
-impl From<NullableInteger> for OwnedValue {
+impl From<NullableInteger> for Value {
     fn from(value: NullableInteger) -> Self {
         match value {
-            NullableInteger::Null => OwnedValue::Null,
-            NullableInteger::Integer(v) => OwnedValue::Integer(v),
+            NullableInteger::Null => Value::Null,
+            NullableInteger::Integer(v) => Value::Integer(v),
         }
     }
 }
@@ -235,20 +235,20 @@ impl<T: AsRef<str>> From<T> for NullableInteger {
     }
 }
 
-impl From<OwnedValue> for NullableInteger {
-    fn from(value: OwnedValue) -> Self {
+impl From<Value> for NullableInteger {
+    fn from(value: Value) -> Self {
         Self::from(&value)
     }
 }
 
-impl From<&OwnedValue> for NullableInteger {
-    fn from(value: &OwnedValue) -> Self {
+impl From<&Value> for NullableInteger {
+    fn from(value: &Value) -> Self {
         match value {
-            OwnedValue::Null => Self::Null,
-            OwnedValue::Integer(v) => Self::Integer(*v),
-            OwnedValue::Float(v) => Self::Integer(*v as i64),
-            OwnedValue::Text(text) => Self::from(text.as_str()),
-            OwnedValue::Blob(blob) => {
+            Value::Null => Self::Null,
+            Value::Integer(v) => Self::Integer(*v),
+            Value::Float(v) => Self::Integer(*v as i64),
+            Value::Text(text) => Self::from(text.as_str()),
+            Value::Blob(blob) => {
                 let text = String::from_utf8_lossy(blob.as_slice());
                 Self::from(text)
             }

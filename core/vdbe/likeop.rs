@@ -2,11 +2,11 @@ use std::collections::HashMap;
 
 use regex::{Regex, RegexBuilder};
 
-use crate::{types::OwnedValue, LimboError};
+use crate::{types::Value, LimboError};
 
-pub fn construct_like_escape_arg(escape_value: &OwnedValue) -> Result<char, LimboError> {
+pub fn construct_like_escape_arg(escape_value: &Value) -> Result<char, LimboError> {
     match escape_value {
-        OwnedValue::Text(text) => {
+        Value::Text(text) => {
             let mut escape_chars = text.as_str().chars();
             match (escape_chars.next(), escape_chars.next()) {
                 (Some(escape), None) => Ok(escape),

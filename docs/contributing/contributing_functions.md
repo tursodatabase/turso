@@ -179,7 +179,7 @@ Note that for other functions it might be implemented in other location in vdbe 
 ```diff
 // file vdbe/datetime.rs
 // ...
-+ pub fn exec_date(values: &[OwnedValue]) -> OwnedValue {
++ pub fn exec_date(values: &[Value]) -> Value {
 +   // ... implementation
 + }
 

@@ -10,7 +10,7 @@ use crate::{
     HISTORY_FILE,
 };
 use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Row, Table};
-use limbo_core::{Database, LimboError, OwnedValue, Statement, StepResult};
+use limbo_core::{Database, LimboError, Statement, StepResult, Value};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -684,7 +684,7 @@ impl Limbo {
                                 if i > 0 {
                                     let _ = self.writer.write(b"|");
                                 }
-                                if matches!(value, OwnedValue::Null) {
+                                if matches!(value, Value::Null) {
                                     let _ = self.writer.write(self.opts.null_value.as_bytes())?;
                                 } else {
                                     let _ = self.writer.write(format!("{}", value).as_bytes())?;
@@ -755,19 +755,19 @@ impl Limbo {
                                 row.max_height(1);
                                 for (idx, value) in record.get_values().enumerate() {
                                     let (content, alignment) = match value {
-                                        OwnedValue::Null => {
+                                        Value::Null => {
                                             (self.opts.null_value.clone(), CellAlignment::Left)
                                         }
-                                        OwnedValue::Integer(_) => {
+                                        Value::Integer(_) => {
                                             (format!("{}", value), CellAlignment::Right)
                                         }
-                                        OwnedValue::Float(_) => {
+                                        Value::Float(_) => {
                                             (format!("{}", value), CellAlignment::Right)
                                         }
-                                        OwnedValue::Text(_) => {
+                                        Value::Text(_) => {
                                             (format!("{}", value), CellAlignment::Left)
                                         }
-                                        OwnedValue::Blob(_) => {
+                                        Value::Blob(_) => {
                                             (format!("{}", value), CellAlignment::Left)
                                         }
                                     };
@@ -883,7 +883,7 @@ impl Limbo {
                     match rows.step()? {
                         StepResult::Row => {
                             let row = rows.row().unwrap();
-                            if let Ok(OwnedValue::Text(schema)) = row.get::<&OwnedValue>(0) {
+                            if let Ok(Value::Text(schema)) = row.get::<&Value>(0) {
                                 let _ = self.write_fmt(format_args!("{};", schema.as_str()));
                                 found = true;
                             }
@@ -939,7 +939,7 @@ impl Limbo {
                     match rows.step()? {
                         StepResult::Row => {
                             let row = rows.row().unwrap();
-                            if let Ok(OwnedValue::Text(idx)) = row.get::<&OwnedValue>(0) {
+                            if let Ok(Value::Text(idx)) = row.get::<&Value>(0) {
                                 indexes.push_str(idx.as_str());
                                 indexes.push(' ');
                             }
@@ -990,7 +990,7 @@ impl Limbo {
                     match rows.step()? {
                         StepResult::Row => {
                             let row = rows.row().unwrap();
-                            if let Ok(OwnedValue::Text(table)) = row.get::<&OwnedValue>(0) {
+                            if let Ok(Value::Text(table)) = row.get::<&Value>(0) {
                                 tables.push_str(table.as_str());
                                 tables.push(' ');
                             }

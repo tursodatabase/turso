@@ -4,7 +4,7 @@ use std::{error::Error, num::NonZero, sync::Arc};
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::{fuzz_target, Corpus};
-use limbo_core::{OwnedValue, IO as _};
+use limbo_core::{Value, IO as _};
 
 macro_rules! str_enum {
     ($vis:vis enum $name:ident { $($variant:ident => $value:literal),*, }) => {
@@ -72,20 +72,20 @@ enum Value {
     Blob(Vec<u8>),
 }
 
-impl From<Value> for limbo_core::OwnedValue {
-    fn from(value: Value) -> limbo_core::OwnedValue {
+impl From<Value> for limbo_core::Value {
+    fn from(value: Value) -> limbo_core::Value {
         match value {
-            Value::Null => limbo_core::OwnedValue::Null,
-            Value::Integer(v) => limbo_core::OwnedValue::Integer(v),
+            Value::Null => limbo_core::Value::Null,
+            Value::Integer(v) => limbo_core::Value::Integer(v),
             Value::Real(v) => {
                 if v.is_nan() {
-                    limbo_core::OwnedValue::Null
+                    limbo_core::Value::Null
                 } else {
-                    limbo_core::OwnedValue::Float(v)
+                    limbo_core::Value::Float(v)
                 }
             }
-            Value::Text(v) => limbo_core::OwnedValue::from_text(&v),
-            Value::Blob(v) => limbo_core::OwnedValue::from_blob(v.to_owned()),
+            Value::Text(v) => limbo_core::Value::from_text(&v),
+            Value::Blob(v) => limbo_core::Value::from_blob(v.to_owned()),
         }
     }
 }
@@ -206,7 +206,7 @@ fn do_fuzz(expr: Expr) -> Result<Corpus, Box<dyn Error>> {
     };
 
     assert_eq!(
-        OwnedValue::from(expected.clone()),
+        Value::from(expected.clone()),
         found.clone(),
         "with expression {:?}",
         expr,

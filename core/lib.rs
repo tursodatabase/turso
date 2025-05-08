@@ -71,8 +71,8 @@ use storage::{
     sqlite3_ondisk::{DatabaseHeader, DATABASE_HEADER_SIZE},
 };
 use translate::select::prepare_select_plan;
-pub use types::OwnedValue;
-pub use types::RefValue;
+pub use types::Value;
+pub use types::ValueRef;
 use util::{columns_from_create_table_body, parse_schema_rows};
 use vdbe::{builder::QueryMode, VTabOpaqueCursor};
 pub type Result<T, E = LimboError> = std::result::Result<T, E>;
@@ -635,7 +635,7 @@ impl Statement {
         self.program.parameters.count()
     }
 
-    pub fn bind_at(&mut self, index: NonZero<usize>, value: OwnedValue) {
+    pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) {
         self.state.bind_at(index, value);
     }
 
@@ -768,9 +768,9 @@ impl VirtualTable {
         }
     }
 
-    pub fn column(&self, cursor: &VTabOpaqueCursor, column: usize) -> Result<OwnedValue> {
+    pub fn column(&self, cursor: &VTabOpaqueCursor, column: usize) -> Result<Value> {
         let val = unsafe { (self.implementation.column)(cursor.as_ptr(), column as u32) };
-        OwnedValue::from_ffi(val)
+        Value::from_ffi(val)
     }
 
     pub fn next(&self, cursor: &VTabOpaqueCursor) -> Result<bool> {
@@ -782,7 +782,7 @@ impl VirtualTable {
         }
     }
 
-    pub fn update(&self, args: &[OwnedValue]) -> Result<Option<i64>> {
+    pub fn update(&self, args: &[Value]) -> Result<Option<i64>> {
         let arg_count = args.len();
         let ext_args = args.iter().map(|arg| arg.to_ffi()).collect::<Vec<_>>();
         let newrowid = 0i64;
