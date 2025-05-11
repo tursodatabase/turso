@@ -7,6 +7,7 @@ pub(super) fn integer<'src>() -> impl Parser<'src, &'src str, i64, extra::Err<Ri
         .then(text::int(10))
         .to_slice()
         .map(|s: &str| s.parse().unwrap())
+        .labelled("integer")
         .boxed();
     number
 }
@@ -34,6 +35,7 @@ pub(super) fn real<'src>() -> impl Parser<'src, &'src str, f64, extra::Err<Rich<
         just("Inf").to(core::f64::INFINITY),
         just("-Inf").to(core::f64::NEG_INFINITY),
     ))
+    .labelled("real")
 }
 
 pub(super) fn text<'src>() -> impl Parser<'src, &'src str, String, extra::Err<Rich<'src, char>>> {
@@ -58,6 +60,15 @@ pub(super) fn text<'src>() -> impl Parser<'src, &'src str, String, extra::Err<Ri
         .to_slice()
         .map(ToString::to_string)
         .delimited_by(just('"'), just('"'))
+        .labelled("text")
+}
+
+pub(super) fn blob<'src>() -> impl Parser<'src, &'src str, Vec<u8>, extra::Err<Rich<'src, char>>> {
+    text::digits(16)
+        .to_slice()
+        .try_map(|b, span| hex::decode(b).map_err(|e| Rich::custom(span, e)))
+        .delimited_by(just("b\""), just('"'))
+        .labelled("blob")
 }
 
 pub(super) fn value_parser<'src>(
@@ -66,6 +77,7 @@ pub(super) fn value_parser<'src>(
         just("true").to(Value::Integer(1)),
         just("false").to(Value::Integer(0)),
     ))
+    .labelled("boolean")
     .boxed();
 
     choice((
@@ -74,6 +86,7 @@ pub(super) fn value_parser<'src>(
         integer().map(|i| Value::Integer(i)),
         just("Null").to(Value::Null),
         text().map(|s| Value::Text(s)),
+        blob().map(|b| Value::Blob(b)),
     ))
 }
 
@@ -228,5 +241,25 @@ mod tests {
         let input = "\"test\n\"";
         let val = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, val);
+
+        let input = r#"test\n""#;
+        let _ = parser.parse(input).into_result().unwrap_err();
+    }
+
+    #[test]
+    fn test_blob_value() {
+        let parser = value_parser();
+        let input = r#"b"1240""#;
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let parser = value_parser();
+        // Odd number of digits
+        let input = r#"b"124""#;
+        let _ = parser.parse(input).into_result().unwrap_err();
+
+        // Not Hex Digit
+        let input = r#"b"12LKOPK""#;
+        let _ = parser.parse(input).into_result().unwrap_err();
     }
 }

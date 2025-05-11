@@ -817,6 +817,7 @@ name = "dsl_parser"
 version = "0.0.20"
 dependencies = [
  "chumsky",
+ "hex",
  "insta",
  "rusqlite",
 ]
