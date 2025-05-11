@@ -36,6 +36,30 @@ pub(super) fn real<'src>() -> impl Parser<'src, &'src str, f64, extra::Err<Rich<
     ))
 }
 
+pub(super) fn text<'src>() -> impl Parser<'src, &'src str, String, extra::Err<Rich<'src, char>>> {
+    let escape = just('\\')
+        .then(choice((
+            just('\\'),
+            just('/'),
+            just('"'),
+            just('b').to('\x08'),
+            just('f').to('\x0C'),
+            just('n').to('\n'),
+            just('r').to('\r'),
+            just('t').to('\t'),
+        )))
+        .ignored()
+        .boxed();
+
+    none_of("\\\"")
+        .ignored()
+        .or(escape)
+        .repeated()
+        .to_slice()
+        .map(ToString::to_string)
+        .delimited_by(just('"'), just('"'))
+}
+
 pub(super) fn value_parser<'src>(
 ) -> impl Parser<'src, &'src str, Value, extra::Err<Rich<'src, char>>> {
     let boolean = choice((
@@ -49,6 +73,7 @@ pub(super) fn value_parser<'src>(
         real().map(|f| Value::Real(f)),
         integer().map(|i| Value::Integer(i)),
         just("Null").to(Value::Null),
+        text().map(|s| Value::Text(s)),
     ))
 }
 
@@ -181,6 +206,26 @@ mod tests {
         assert_debug_snapshot_with_input!(input, val);
 
         let input = "-Inf";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+    }
+
+    #[test]
+    fn test_text_value() {
+        let parser = value_parser();
+        let input = r#""true""#;
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let input = r#""test""#;
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let input = r#""test\n""#;
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let input = "\"test\n\"";
         let val = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, val);
     }

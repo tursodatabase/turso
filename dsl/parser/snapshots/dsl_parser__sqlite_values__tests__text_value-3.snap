@@ -1,0 +1,8 @@
+---
+source: dsl/parser/sqlite_values.rs
+description: "input: \"test\\n\""
+expression: val
+---
+Text(
+    "test\\n",
+)
