@@ -1,13 +1,14 @@
-use std::{borrow::Cow, marker::PhantomData};
+use std::borrow::Cow;
 
 use chumsky::prelude::*;
 use rusqlite::types::Value;
 
-#[derive(Debug)]
-struct Test<'a> {
+#[derive(Debug, PartialEq)]
+pub struct Test<'a> {
     /// List of databases to test on
     databases: Option<Vec<&'a str>>,
     /// Test Name
+    // Idea of a Cow<'a, str> is that you can manipulate the ident if needed and still use this struct
     ident: Cow<'a, str>,
     /// Sql Statement(s) to run
     statement: Statement<'a>,
@@ -16,13 +17,14 @@ struct Test<'a> {
 }
 
 /// Sql Statement(s)
-#[derive(Debug)]
-enum Statement<'a> {
+#[derive(Debug, PartialEq, Eq)]
+pub enum Statement<'a> {
     Single(&'a str),
     Many(Vec<&'a str>),
 }
 
-fn parser_test<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Err<Rich<'src, char>>> {
+pub fn parser_test<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Err<Rich<'src, char>>>
+{
     let test_keyword = text::keyword("test");
 
     let ident: Boxed<'_, '_, &'src str, &'src str, extra::Full<Rich<'src, char>, (), ()>> =
@@ -56,7 +58,7 @@ fn parser_test<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Err<Ri
     test_keyword.ignore_then(contents).boxed()
 }
 
-fn parser_test_many<'src>(
+pub fn parser_test_many<'src>(
 ) -> impl Parser<'src, &'src str, Vec<Test<'src>>, extra::Err<Rich<'src, char>>> {
     parser_test()
         .padded()
@@ -65,17 +67,91 @@ fn parser_test_many<'src>(
         .boxed()
 }
 
+// TODO: use INSTA for snapshot testing output of parser, instead of writing by hand
 #[cfg(test)]
 mod tests {
     use chumsky::Parser;
 
-    use crate::parser_test_many;
+    use crate::{parser_test, parser_test_many, Test};
 
     #[test]
-    fn test_basic() {
+    fn test_single_statement() {
+        let parser = parser_test();
+        let res = parser.parse("test(test_single, SELECT)").unwrap();
+        assert_eq!(
+            res,
+            Test {
+                databases: None,
+                ident: "test_single".into(),
+                statement: crate::Statement::Single("SELECT"),
+                values: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn test_many_statements_1() {
+        let parser = parser_test();
+        let res = parser.parse("test(test_many, [SELECT,])").unwrap();
+        assert_eq!(
+            res,
+            Test {
+                databases: None,
+                ident: "test_many".into(),
+                statement: crate::Statement::Many(vec!["SELECT"]),
+                values: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn test_many_statements_2() {
+        let parser = parser_test();
+        let res = parser
+            .parse("test(test_many, [SELECT, INSERT, DELETE])")
+            .unwrap();
+        assert_eq!(
+            res,
+            Test {
+                databases: None,
+                ident: "test_many".into(),
+                statement: crate::Statement::Many(vec!["SELECT", "INSERT", "DELETE"]),
+                values: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn test_many_tests() {
         let parser = parser_test_many();
-        let x = parser.parse("test(hi, [SELECT ])\n test(second, [SELECT ])");
-        dbg!(&x);
-        x.unwrap();
+        let input = r#"
+            test(test_many, [SELECT, INSERT, DELETE])
+            test(test_many_2, [SELECT,])
+            test(test_single, SELECT)
+        "#;
+        let res = parser.parse(input).unwrap();
+        let expected = vec![
+            Test {
+                databases: None,
+                ident: "test_many".into(),
+                statement: crate::Statement::Many(vec!["SELECT", "INSERT", "DELETE"]),
+                values: vec![],
+            },
+            Test {
+                databases: None,
+                ident: "test_many_2".into(),
+                statement: crate::Statement::Many(vec!["SELECT"]),
+                values: vec![],
+            },
+            Test {
+                databases: None,
+                ident: "test_single".into(),
+                statement: crate::Statement::Single("SELECT"),
+                values: vec![],
+            },
+        ];
+        res.into_iter()
+            .zip(expected.into_iter())
+            .for_each(|(got, expected)| assert_eq!(got, expected));
     }
 }
