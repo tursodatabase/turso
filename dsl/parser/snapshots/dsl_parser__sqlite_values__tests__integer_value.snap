@@ -1,0 +1,8 @@
+---
+source: dsl/parser/sqlite_values.rs
+description: "input: 1"
+expression: val
+---
+Integer(
+    1,
+)
