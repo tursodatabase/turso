@@ -1,0 +1,8 @@
+---
+source: dsl/parser/sqlite_values.rs
+description: "input: -1.0"
+expression: val
+---
+Real(
+    -1.0,
+)

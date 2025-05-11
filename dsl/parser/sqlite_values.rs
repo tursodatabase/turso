@@ -11,6 +11,27 @@ pub(super) fn integer<'src>() -> impl Parser<'src, &'src str, i64, extra::Err<Ri
     number
 }
 
+pub(super) fn real<'src>() -> impl Parser<'src, &'src str, f64, extra::Err<Rich<'src, char>>> {
+    let digits = text::digits(10).to_slice();
+
+    let frac = just('.').then(digits);
+
+    let exp = just('e')
+        .or(just('E'))
+        .then(one_of("+-").or_not())
+        .then(digits);
+
+    let number = just('-')
+        .or_not()
+        .then(text::int(10))
+        .then(frac)
+        .then(exp.or_not())
+        .to_slice()
+        .map(|s: &str| s.parse().unwrap())
+        .boxed();
+    number
+}
+
 pub(super) fn value_parser<'src>(
 ) -> impl Parser<'src, &'src str, Value, extra::Err<Rich<'src, char>>> {
     let boolean = choice((
@@ -19,9 +40,11 @@ pub(super) fn value_parser<'src>(
     ))
     .boxed();
 
-    // let real = text::digits(radix);
-
-    choice((boolean, integer().map(|i| Value::Integer(i))))
+    choice((
+        boolean,
+        real().map(|f| Value::Real(f)),
+        integer().map(|i| Value::Integer(i)),
+    ))
 }
 
 pub(super) fn sqlite_values_parser<'src>(
@@ -83,6 +106,46 @@ mod tests {
         assert_debug_snapshot_with_input!(input, val);
 
         let input = "112343543009010293";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+    }
+
+    #[test]
+    fn test_real_value() {
+        let parser = value_parser();
+        let input = "1.0";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let input = "0.0";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let input = "-1.0";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let input = "-1000021900.0";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let input = "112343543009010293.0";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let input = "123.3489534";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let input = "-123.3489534";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let input = "-123.3489534E5";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let input = "-123.3489534E-5";
         let val = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, val);
     }
