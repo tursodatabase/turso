@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, marker::PhantomData};
 
 use chumsky::prelude::*;
 use rusqlite::types::Value;
@@ -22,7 +22,7 @@ enum Statement<'a> {
     Many(Vec<&'a str>),
 }
 
-fn parser<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Err<Rich<'src, char>>> {
+fn parser_test<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Err<Rich<'src, char>>> {
     let test_keyword = text::keyword("test");
 
     let ident: Boxed<'_, '_, &'src str, &'src str, extra::Full<Rich<'src, char>, (), ()>> =
@@ -56,16 +56,25 @@ fn parser<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Err<Rich<'s
     test_keyword.ignore_then(contents).boxed()
 }
 
+fn parser_test_many<'src>(
+) -> impl Parser<'src, &'src str, Vec<Test<'src>>, extra::Err<Rich<'src, char>>> {
+    parser_test()
+        .padded()
+        .repeated()
+        .collect::<Vec<_>>()
+        .boxed()
+}
+
 #[cfg(test)]
 mod tests {
     use chumsky::Parser;
 
-    use crate::parser;
+    use crate::parser_test_many;
 
     #[test]
     fn test_basic() {
-        let parser = parser();
-        let x = parser.parse("test(hi, [SELECT ])");
+        let parser = parser_test_many();
+        let x = parser.parse("test(hi, [SELECT ])\n test(second, [SELECT ])");
         dbg!(&x);
         x.unwrap();
     }
