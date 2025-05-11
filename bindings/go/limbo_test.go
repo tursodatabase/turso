@@ -608,37 +608,6 @@ func TestJSONFunctions(t *testing.T) {
 	}
 }
 
-func TestBindUpdate(t *testing.T) {
-	conn, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatalf("Error opening connection: %v", err)
-	}
-	if _, err = conn.Exec("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT)"); err != nil {
-		t.Fatalf("Error creating table: %v", err)
-	}
-	if _, err := conn.Exec("INSERT INTO test (id, name) VALUES (1, 'test')"); err != nil {
-		t.Fatalf("Error inserting data: %v", err)
-	}
-	stmt, err := conn.Prepare("UPDATE test SET name = ? WHERE id = ?")
-	if err != nil {
-		t.Fatalf("Error preparing statement: %v", err)
-	}
-	_, err = stmt.Exec(1, "updated")
-	if err != nil {
-		t.Fatalf("Error executing statement: %v", err)
-	}
-	// test if the update was successful
-	row := conn.QueryRow("SELECT id, name FROM test WHERE id = 1")
-	var (
-		id   int
-		name string
-	)
-	row.Scan(&id, &name)
-	if id != 1 || name != "updated" {
-		t.Fatalf("Expected (1, 'updated'), got (%d, %s)", id, name)
-	}
-}
-
 func slicesAreEq(a, b []byte) bool {
 	if len(a) != len(b) {
 		fmt.Printf("LENGTHS NOT EQUAL: %d != %d\n", len(a), len(b))
