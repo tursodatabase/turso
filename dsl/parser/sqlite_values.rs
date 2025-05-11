@@ -35,17 +35,18 @@ pub(super) fn sqlite_values_parser<'src>(
 #[cfg(test)]
 mod tests {
     use chumsky::Parser;
-    use rusqlite::types::Value;
 
-    use crate::sqlite_values::value_parser;
+    use crate::{assert_debug_snapshot_with_input, sqlite_values::value_parser};
 
     #[test]
     fn test_boolean_value() {
         let parser = value_parser();
-        let val = parser.parse("true").unwrap();
-        assert_eq!(val, Value::Integer(1));
+        let input = "true";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
 
-        let val = parser.parse("false").unwrap();
-        assert_eq!(val, Value::Integer(0));
+        let input = "false";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
     }
 }

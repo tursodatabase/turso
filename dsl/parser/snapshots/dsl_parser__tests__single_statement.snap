@@ -1,0 +1,13 @@
+---
+source: dsl/parser/lib.rs
+description: "input: test(test_single, SELECT)"
+expression: res
+---
+Test {
+    databases: None,
+    ident: "test_single",
+    statement: Single(
+        "SELECT",
+    ),
+    values: [],
+}

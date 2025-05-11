@@ -1,0 +1,16 @@
+---
+source: dsl/parser/lib.rs
+expression: res
+---
+Test {
+    databases: None,
+    ident: "test_many",
+    statement: Many(
+        [
+            "SELECT",
+            "INSERT",
+            "DELETE",
+        ],
+    ),
+    values: [],
+}

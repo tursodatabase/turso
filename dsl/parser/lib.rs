@@ -69,58 +69,45 @@ pub fn test_parser_many<'src>(
         .boxed()
 }
 
-// TODO: use INSTA for snapshot testing output of parser, instead of writing by hand
 #[cfg(test)]
 mod tests {
     use chumsky::Parser;
 
-    use crate::{test_parser, test_parser_many, Test};
+    use crate::{test_parser, test_parser_many};
+
+    #[macro_export]
+    macro_rules! assert_debug_snapshot_with_input {
+        ($input:expr, $result:expr) => {
+            ::insta::with_settings!({
+                description => &format!("input: {}", $input)
+            }, {
+                ::insta::assert_debug_snapshot!($result);
+            });
+        };
+    }
 
     #[test]
     fn test_single_statement() {
         let parser = test_parser();
-        let res = parser.parse("test(test_single, SELECT)").unwrap();
-        assert_eq!(
-            res,
-            Test {
-                databases: None,
-                ident: "test_single".into(),
-                statement: crate::Statement::Single("SELECT"),
-                values: vec![]
-            }
-        );
+        let input = "test(test_single, SELECT)";
+        let res = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, res);
     }
 
     #[test]
     fn test_many_statements_1() {
         let parser = test_parser();
-        let res = parser.parse("test(test_many, [SELECT,])").unwrap();
-        assert_eq!(
-            res,
-            Test {
-                databases: None,
-                ident: "test_many".into(),
-                statement: crate::Statement::Many(vec!["SELECT"]),
-                values: vec![]
-            }
-        );
+        let input = "test(test_many, [SELECT,])";
+        let res = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, res);
     }
 
     #[test]
     fn test_many_statements_2() {
         let parser = test_parser();
-        let res = parser
-            .parse("test(test_many, [SELECT, INSERT, DELETE])")
-            .unwrap();
-        assert_eq!(
-            res,
-            Test {
-                databases: None,
-                ident: "test_many".into(),
-                statement: crate::Statement::Many(vec!["SELECT", "INSERT", "DELETE"]),
-                values: vec![]
-            }
-        );
+        let input = "test(test_many, [SELECT, INSERT, DELETE])";
+        let res = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, res);
     }
 
     #[test]
@@ -132,28 +119,6 @@ mod tests {
             test(test_single, SELECT)
         "#;
         let res = parser.parse(input).unwrap();
-        let expected = vec![
-            Test {
-                databases: None,
-                ident: "test_many".into(),
-                statement: crate::Statement::Many(vec!["SELECT", "INSERT", "DELETE"]),
-                values: vec![],
-            },
-            Test {
-                databases: None,
-                ident: "test_many_2".into(),
-                statement: crate::Statement::Many(vec!["SELECT"]),
-                values: vec![],
-            },
-            Test {
-                databases: None,
-                ident: "test_single".into(),
-                statement: crate::Statement::Single("SELECT"),
-                values: vec![],
-            },
-        ];
-        res.into_iter()
-            .zip(expected.into_iter())
-            .for_each(|(got, expected)| assert_eq!(got, expected));
+        assert_debug_snapshot_with_input!(input, res);
     }
 }
