@@ -1,3 +1,5 @@
+mod sqlite_values;
+
 use std::borrow::Cow;
 
 use chumsky::prelude::*;
@@ -23,7 +25,7 @@ pub enum Statement<'a> {
     Many(Vec<&'a str>),
 }
 
-pub fn parser_test<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Err<Rich<'src, char>>>
+pub fn test_parser<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Err<Rich<'src, char>>>
 {
     let test_keyword = text::keyword("test");
 
@@ -58,9 +60,9 @@ pub fn parser_test<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Er
     test_keyword.ignore_then(contents).boxed()
 }
 
-pub fn parser_test_many<'src>(
+pub fn test_parser_many<'src>(
 ) -> impl Parser<'src, &'src str, Vec<Test<'src>>, extra::Err<Rich<'src, char>>> {
-    parser_test()
+    test_parser()
         .padded()
         .repeated()
         .collect::<Vec<_>>()
@@ -72,11 +74,11 @@ pub fn parser_test_many<'src>(
 mod tests {
     use chumsky::Parser;
 
-    use crate::{parser_test, parser_test_many, Test};
+    use crate::{test_parser, test_parser_many, Test};
 
     #[test]
     fn test_single_statement() {
-        let parser = parser_test();
+        let parser = test_parser();
         let res = parser.parse("test(test_single, SELECT)").unwrap();
         assert_eq!(
             res,
@@ -91,7 +93,7 @@ mod tests {
 
     #[test]
     fn test_many_statements_1() {
-        let parser = parser_test();
+        let parser = test_parser();
         let res = parser.parse("test(test_many, [SELECT,])").unwrap();
         assert_eq!(
             res,
@@ -106,7 +108,7 @@ mod tests {
 
     #[test]
     fn test_many_statements_2() {
-        let parser = parser_test();
+        let parser = test_parser();
         let res = parser
             .parse("test(test_many, [SELECT, INSERT, DELETE])")
             .unwrap();
@@ -123,7 +125,7 @@ mod tests {
 
     #[test]
     fn test_many_tests() {
-        let parser = parser_test_many();
+        let parser = test_parser_many();
         let input = r#"
             test(test_many, [SELECT, INSERT, DELETE])
             test(test_many_2, [SELECT,])
