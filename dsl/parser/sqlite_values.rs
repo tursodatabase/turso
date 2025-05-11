@@ -29,7 +29,11 @@ pub(super) fn real<'src>() -> impl Parser<'src, &'src str, f64, extra::Err<Rich<
         .to_slice()
         .map(|s: &str| s.parse().unwrap())
         .boxed();
-    number
+    choice((
+        number,
+        just("Inf").to(core::f64::INFINITY),
+        just("-Inf").to(core::f64::NEG_INFINITY),
+    ))
 }
 
 pub(super) fn value_parser<'src>(
@@ -158,6 +162,14 @@ mod tests {
         assert_debug_snapshot_with_input!(input, val);
 
         let input = "-123.3489534E-5";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let input = "Inf";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let input = "-Inf";
         let val = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, val);
     }
