@@ -44,6 +44,7 @@ pub(super) fn value_parser<'src>(
         boolean,
         real().map(|f| Value::Real(f)),
         integer().map(|i| Value::Integer(i)),
+        just("Null").to(Value::Null),
     ))
 }
 
@@ -73,6 +74,17 @@ mod tests {
     use chumsky::Parser;
 
     use crate::{assert_debug_snapshot_with_input, sqlite_values::value_parser};
+
+    #[test]
+    fn test_null_value() {
+        let parser = value_parser();
+        let input = "Null";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let input = "null";
+        let _ = parser.parse(input).into_result().unwrap_err();
+    }
 
     #[test]
     fn test_boolean_value() {

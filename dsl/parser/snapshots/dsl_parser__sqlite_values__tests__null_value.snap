@@ -1,0 +1,6 @@
+---
+source: dsl/parser/sqlite_values.rs
+description: "input: Null"
+expression: val
+---
+Null
