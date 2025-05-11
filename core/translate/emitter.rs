@@ -7,6 +7,7 @@ use std::sync::Arc;
 use limbo_sqlite3_parser::ast::{self};
 
 use crate::function::Func;
+use crate::parameters::UpdatePos;
 use crate::schema::Index;
 use crate::translate::plan::{DeletePlan, Plan, Search};
 use crate::util::exprs_are_equivalent;
@@ -672,6 +673,7 @@ fn emit_update_insns(
             jump_target_when_true: jump_target,
             jump_target_when_false: t_ctx.label_main_loop_end.unwrap(),
         };
+        program.parameters.set_update_position(UpdatePos::Where);
         translate_condition_expr(
             program,
             &plan.table_references,
@@ -724,6 +726,7 @@ fn emit_update_insns(
             jump_target_when_true: BranchOffset::Placeholder,
             jump_target_when_false: loop_labels.next,
         };
+        program.parameters.set_update_position(UpdatePos::Where);
         translate_condition_expr(
             program,
             &plan.table_references,
@@ -733,6 +736,9 @@ fn emit_update_insns(
         )?;
     }
 
+    // can we cache the translated expressions by saving their register values so we can copy them
+    // to the result registers later instead of re-evaluating them every time?
+    let mut new_value_registers = Vec::with_capacity(plan.set_clauses.len());
     // Update indexes first. Columns that are updated will be translated from an expression and those who aren't modified will be
     // read from table. Mutiple value index key could be updated partially.
     for (index, index_cursor) in plan.indexes_to_update.iter().zip(index_cursors) {
@@ -740,23 +746,23 @@ fn emit_update_insns(
         let index_record_reg_start = program.alloc_registers(index_record_reg_count);
         for (idx, column) in index.columns.iter().enumerate() {
             if let Some((_, expr)) = plan.set_clauses.iter().find(|(i, _)| *i == idx) {
-                translate_expr(
+                new_value_registers.push(translate_expr(
                     program,
                     Some(&plan.table_references),
                     expr,
                     index_record_reg_start + idx,
                     &t_ctx.resolver,
-                )?;
+                )?);
             } else {
                 program.emit_insn(Insn::Column {
-                    cursor_id: cursor_id,
+                    cursor_id,
                     column: column.pos_in_table,
                     dest: index_record_reg_start + idx,
                 });
             }
         }
         program.emit_insn(Insn::RowId {
-            cursor_id: cursor_id,
+            cursor_id,
             dest: index_record_reg_start + index.columns.len(),
         });
         let index_record_reg = program.alloc_register();
@@ -778,7 +784,14 @@ fn emit_update_insns(
     let start = if is_virtual { beg + 2 } else { beg + 1 };
     for idx in 0..table_ref.columns().len() {
         let target_reg = start + idx;
-        if let Some((_, expr)) = plan.set_clauses.iter().find(|(i, _)| *i == idx) {
+        if let Some((idx, (_, expr))) = plan
+            .set_clauses
+            .iter()
+            .enumerate()
+            .find(|(_, (i, _))| *i == idx)
+        {
+            // set the parameter's update context so it can map it to the proper param index
+            program.parameters.set_update_position(UpdatePos::Set(idx));
             translate_expr(
                 program,
                 Some(&plan.table_references),

@@ -4,6 +4,7 @@ use limbo_sqlite3_parser::ast;
 use std::sync::Arc;
 
 use crate::{
+    parameters::UpdatePos,
     schema::{Index, Table},
     translate::result_row::emit_select_result,
     types::SeekOp,
@@ -264,6 +265,7 @@ pub fn open_loop(
                         jump_target_when_true,
                         jump_target_when_false: next,
                     };
+                    program.parameters.set_update_position(UpdatePos::Where);
                     translate_condition_expr(
                         program,
                         tables,
@@ -420,6 +422,7 @@ pub fn open_loop(
                         jump_target_when_true,
                         jump_target_when_false: next,
                     };
+                    program.parameters.set_update_position(UpdatePos::Where);
                     translate_condition_expr(
                         program,
                         tables,
@@ -528,6 +531,8 @@ pub fn open_loop(
                         jump_target_when_true,
                         jump_target_when_false: next,
                     };
+                    // optionally set the parameter position in case we are in an update stmt.
+                    program.parameters.set_update_position(UpdatePos::Where);
                     translate_condition_expr(
                         program,
                         tables,

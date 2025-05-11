@@ -62,6 +62,9 @@ pub fn translate_update(
         approx_num_insns: 20,
         approx_num_labels: 4,
     });
+    // initialize context for translating an update statement to keep track
+    // of variable/parameter positioning
+    program.parameters.init_update_context(body);
     emit_program(&mut program, plan, syms)?;
     Ok(program)
 }
