@@ -70,14 +70,25 @@ pub(super) fn sqlite_values_parser<'src>(
         .delimited_by(just('[').padded(), just(']').padded())
         .boxed();
 
-    value_list_2d
+    choice((just("None").to(vec![vec![]]), value_list_2d))
 }
 
 #[cfg(test)]
 mod tests {
     use chumsky::Parser;
 
-    use crate::{assert_debug_snapshot_with_input, sqlite_values::value_parser};
+    use crate::{
+        assert_debug_snapshot_with_input,
+        sqlite_values::{sqlite_values_parser, value_parser},
+    };
+
+    #[test]
+    fn test_none_values() {
+        let parser = sqlite_values_parser();
+        let input = "None";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+    }
 
     #[test]
     fn test_null_value() {
