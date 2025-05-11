@@ -99,3 +99,104 @@ fn test_statement_bind() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn test_bind_parameters_update_query() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_rusqlite("create table test (a integer, b text);");
+    let conn = tmp_db.connect_limbo();
+    let mut ins = conn.prepare("insert into test (a, b) values (3, 'test1');")?;
+    loop {
+        match ins.step()? {
+            StepResult::IO => tmp_db.io.run_once()?,
+            StepResult::Done | StepResult::Interrupt => break,
+            StepResult::Busy => panic!("database busy"),
+            _ => {}
+        }
+    }
+    let mut ins = conn.prepare("update test set a = ? where b = ?;")?;
+    ins.bind_at(1.try_into()?, OwnedValue::Integer(222));
+    ins.bind_at(2.try_into()?, OwnedValue::build_text("test1"));
+    loop {
+        match ins.step()? {
+            StepResult::IO => tmp_db.io.run_once()?,
+            StepResult::Done | StepResult::Interrupt => break,
+            StepResult::Busy => panic!("database busy"),
+            _ => {}
+        }
+    }
+
+    let mut sel = conn.prepare("select a, b from test;")?;
+    loop {
+        match sel.step()? {
+            StepResult::Row => {
+                let row = sel.row().unwrap();
+                assert_eq!(
+                    row.get::<&OwnedValue>(0).unwrap(),
+                    &OwnedValue::Integer(222)
+                );
+                assert_eq!(
+                    row.get::<&OwnedValue>(1).unwrap(),
+                    &OwnedValue::build_text("test1"),
+                );
+            }
+            StepResult::IO => tmp_db.io.run_once()?,
+            StepResult::Done | StepResult::Interrupt => break,
+            StepResult::Busy => panic!("database busy"),
+        }
+    }
+    assert_eq!(ins.parameters().count(), 2);
+    Ok(())
+}
+
+#[test]
+fn test_bind_parameters_update_query_multiple_where() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_rusqlite(
+        "create table test (a integer, b text, c integer, d integer);",
+    );
+    let conn = tmp_db.connect_limbo();
+    let mut ins = conn.prepare("insert into test (a, b, c, d) values (3, 'test1', 4, 5);")?;
+    loop {
+        match ins.step()? {
+            StepResult::IO => tmp_db.io.run_once()?,
+            StepResult::Done | StepResult::Interrupt => break,
+            StepResult::Busy => panic!("database busy"),
+            _ => {}
+        }
+    }
+    let mut ins = conn.prepare("update test set a = ? where b = ? and c = 4 and d = ?;")?;
+    ins.bind_at(1.try_into()?, OwnedValue::Integer(222));
+    ins.bind_at(2.try_into()?, OwnedValue::build_text("test1"));
+    ins.bind_at(3.try_into()?, OwnedValue::Integer(5));
+    loop {
+        match ins.step()? {
+            StepResult::IO => tmp_db.io.run_once()?,
+            StepResult::Done | StepResult::Interrupt => break,
+            StepResult::Busy => panic!("database busy"),
+            _ => {}
+        }
+    }
+
+    let mut sel = conn.prepare("select a, b, c, d from test;")?;
+    loop {
+        match sel.step()? {
+            StepResult::Row => {
+                let row = sel.row().unwrap();
+                assert_eq!(
+                    row.get::<&OwnedValue>(0).unwrap(),
+                    &OwnedValue::Integer(222)
+                );
+                assert_eq!(
+                    row.get::<&OwnedValue>(1).unwrap(),
+                    &OwnedValue::build_text("test1"),
+                );
+                assert_eq!(row.get::<&OwnedValue>(2).unwrap(), &OwnedValue::Integer(4));
+                assert_eq!(row.get::<&OwnedValue>(3).unwrap(), &OwnedValue::Integer(5));
+            }
+            StepResult::IO => tmp_db.io.run_once()?,
+            StepResult::Done | StepResult::Interrupt => break,
+            StepResult::Busy => panic!("database busy"),
+        }
+    }
+    assert_eq!(ins.parameters().count(), 3);
+    Ok(())
+}
