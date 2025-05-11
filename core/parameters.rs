@@ -1,4 +1,4 @@
-use std::{cell::Cell, num::NonZero};
+use std::num::NonZero;
 
 use limbo_sqlite3_parser::ast::{Expr, Update};
 
@@ -57,7 +57,7 @@ impl Parameters {
         if let Some(ref mut ctx) = self.update_ctx {
             if let UpdatePos::Where = pos {
                 if ctx.where_pos.is_none() {
-                    ctx.where_pos = Some(Cell::new(0));
+                    ctx.where_pos = Some(0);
                 }
             }
             ctx.current_position = pos;
@@ -100,7 +100,7 @@ impl Parameters {
             "" => {
                 let index = self.next_index();
                 self.list.push(Parameter::Anonymous(index));
-                if let Some(ctx) = &self.update_ctx {
+                if let Some(ctx) = &mut self.update_ctx {
                     return ctx.get_index().unwrap_or(index);
                 };
                 tracing::trace!("anonymous parameter at {index}");
@@ -149,7 +149,7 @@ pub struct UpdateContext {
     // so we store the index of the overall parameter # and then keep track of the
     // current index into the where clause
     where_clause: Vec<usize>,
-    where_pos: Option<Cell<usize>>,
+    where_pos: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -161,7 +161,7 @@ pub enum UpdatePos {
 impl UpdateContext {
     fn new() -> Self {
         UpdateContext {
-            current_position: UpdatePos::Set(0),
+            current_position: UpdatePos::Where,
             set_clause: vec![],
             where_clause: vec![],
             where_pos: None,
@@ -172,13 +172,17 @@ impl UpdateContext {
     /// in the clause, we can look it up here because we have the current translation position.
     /// For 'set' clauses, it's passed in from the translator, for 'where' clauses it's initialized
     /// in the translator and then kept track of internally.
-    fn get_index(&self) -> Option<NonZero<usize>> {
+    fn get_index(&mut self) -> Option<NonZero<usize>> {
         match self.current_position {
             UpdatePos::Set(idx) => self.set_clause.iter().find(|s| s.1 == idx).map(|s| s.0),
             UpdatePos::Where => {
-                let pos = self.where_pos.as_ref().unwrap();
-                let res = self.where_clause.get(pos.get()).copied();
-                pos.set(pos.get() + 1); // increment position for next parameter
+                if self.where_pos.is_none() {
+                    self.where_pos = Some(0);
+                }
+                let res = self.where_clause.get(self.where_pos.unwrap()).copied();
+                if let Some(pos) = self.where_pos.as_mut() {
+                    *pos += 1; // increment position for next parameter
+                }
                 res
             }
         }
