@@ -1,4 +1,6 @@
-use std::num::NonZero;
+use std::{cell::Cell, num::NonZero};
+
+use limbo_sqlite3_parser::ast::{Expr, Update};
 
 #[derive(Clone, Debug)]
 pub enum Parameter {
@@ -27,6 +29,7 @@ impl Parameter {
 pub struct Parameters {
     index: NonZero<usize>,
     pub list: Vec<Parameter>,
+    update_ctx: Option<UpdateContext>,
 }
 
 impl Default for Parameters {
@@ -40,6 +43,24 @@ impl Parameters {
         Self {
             index: 1.try_into().unwrap(),
             list: vec![],
+            update_ctx: None,
+        }
+    }
+
+    /// Initialize the context for an update query
+    pub fn init_update_context(&mut self, body: &mut Update) {
+        self.update_ctx = Some(gather_parameter_count(body));
+    }
+
+    /// Set the location and position of the tranlsator in the update stmt.
+    pub fn set_update_position(&mut self, pos: UpdatePos) {
+        if let Some(ref mut ctx) = self.update_ctx {
+            if let UpdatePos::Where = pos {
+                if ctx.where_pos.is_none() {
+                    ctx.where_pos = Some(Cell::new(0));
+                }
+            }
+            ctx.current_position = pos;
         }
     }
 
@@ -79,6 +100,9 @@ impl Parameters {
             "" => {
                 let index = self.next_index();
                 self.list.push(Parameter::Anonymous(index));
+                if let Some(ctx) = &self.update_ctx {
+                    return ctx.get_index().unwrap_or(index);
+                };
                 tracing::trace!("anonymous parameter at {index}");
                 index
             }
@@ -113,5 +137,115 @@ impl Parameters {
                 index
             }
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct UpdateContext {
+    current_position: UpdatePos,
+    // overall parameter index, index into set clause
+    set_clause: Vec<(usize, usize)>,
+    // there is only one where clause, but can contain multiple variables
+    // so we store the index of the overall parameter # and then keep track of the
+    // current index into the where clause
+    where_clause: Vec<usize>,
+    where_pos: Option<Cell<usize>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum UpdatePos {
+    Where,
+    Set(usize),
+}
+
+impl UpdateContext {
+    fn new() -> Self {
+        UpdateContext {
+            current_position: UpdatePos::Set(0),
+            set_clause: vec![],
+            where_clause: vec![],
+            where_pos: None,
+        }
+    }
+
+    /// Since we stored the index of the overall parameter # associated with the position
+    /// in the clause, we can look it up here because we have the current translation position.
+    /// For 'set' clauses, it's passed in from the translator, for 'where' clauses it's initialized
+    /// in the translator and then kept track of internally.
+    fn get_index(&self) -> Option<NonZero<usize>> {
+        match self.current_position {
+            UpdatePos::Set(idx) => self.set_clause.iter().find(|s| s.1 == idx).map(|s| s.0),
+            UpdatePos::Where => {
+                let pos = self.where_pos.as_ref().unwrap();
+                let res = self.where_clause.get(pos.get()).copied();
+                pos.set(pos.get() + 1); // increment position for next parameter
+                res
+            }
+        }
+        .and_then(NonZero::new)
+    }
+}
+
+fn gather_parameter_count(body: &mut Update) -> UpdateContext {
+    let mut params = UpdateContext::new();
+    let mut idx = 1;
+    body.sets.iter().enumerate().for_each(|(i, set)| {
+        if let Expr::Variable(_) = set.expr {
+            params.set_clause.push((idx, i));
+            idx += 1;
+        }
+    });
+    if let Some(where_clause) = &body.where_clause {
+        traverse_expr_counting_variables(&mut params.where_clause, &mut idx, where_clause);
+    }
+    params
+}
+
+fn traverse_expr_counting_variables(params: &mut Vec<usize>, pos: &mut usize, expr: &Expr) {
+    match expr {
+        Expr::Variable(s) => {
+            // only count anonymous variables
+            if s.is_empty() {
+                params.push(*pos);
+                *pos += 1;
+            }
+        }
+        Expr::Binary(lhs, _, rhs) => {
+            traverse_expr_counting_variables(params, pos, lhs);
+            traverse_expr_counting_variables(params, pos, rhs);
+        }
+        Expr::Unary(_, expr) => {
+            traverse_expr_counting_variables(params, pos, expr);
+        }
+        Expr::Parenthesized(expr) => {
+            traverse_expr_counting_variables(params, pos, &expr[0]);
+        }
+        Expr::InList { lhs, rhs, .. } => {
+            traverse_expr_counting_variables(params, pos, lhs);
+            if let Some(rhs) = rhs {
+                for expr in rhs.iter() {
+                    traverse_expr_counting_variables(params, pos, expr);
+                }
+            }
+        }
+        Expr::FunctionCall {
+            args: Some(args), ..
+        } => {
+            for expr in args.iter() {
+                traverse_expr_counting_variables(params, pos, expr);
+            }
+        }
+        Expr::Between {
+            lhs, start, end, ..
+        } => {
+            traverse_expr_counting_variables(params, pos, lhs);
+            traverse_expr_counting_variables(params, pos, start);
+            traverse_expr_counting_variables(params, pos, end);
+        }
+        Expr::Like { lhs, rhs, .. } => {
+            traverse_expr_counting_variables(params, pos, lhs);
+            traverse_expr_counting_variables(params, pos, rhs);
+        }
+        _ => {}
     }
 }
