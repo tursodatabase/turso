@@ -1,6 +1,6 @@
 ---
 source: dsl/parser/lib.rs
-description: "input: \n            test(test_many, [SELECT, INSERT, DELETE], [Null, 1])\n            test(test_many_2, [SELECT,], [[Null, 1], [\"hi\"]])\n            test(test_single, SELECT, 1.234)\n        "
+description: "input: \n            test(test_many, [\"SELECT\", \"INSERT\", \"DELETE\"], [Null, 1])\n            test(test_many_2, [\"SELECT\",], [[Null, 1], [\"hi\"]])\n            test(test_single, \"SELECT\", 1.234)\n        "
 expression: res
 ---
 [
@@ -10,9 +10,9 @@ expression: res
         ident: "test_many",
         statement: Many(
             [
-                "SELECT",
-                "INSERT",
-                "DELETE",
+                "\"SELECT\"",
+                "\"INSERT\"",
+                "\"DELETE\"",
             ],
         ),
         values: [
@@ -30,7 +30,7 @@ expression: res
         ident: "test_many_2",
         statement: Many(
             [
-                "SELECT",
+                "\"SELECT\"",
             ],
         ),
         values: [
@@ -52,7 +52,7 @@ expression: res
         mode: Normal,
         ident: "test_single",
         statement: Single(
-            "SELECT",
+            "\"SELECT\"",
         ),
         values: [
             [

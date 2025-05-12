@@ -3,6 +3,7 @@ mod sqlite_values;
 use std::borrow::Cow;
 
 use chumsky::prelude::*;
+pub use chumsky::Parser;
 use regex::Regex;
 use rusqlite::types::Value;
 use sqlite_values::sqlite_values_parser;
@@ -61,8 +62,14 @@ pub enum Statement<'a> {
     Many(Vec<&'a str>),
 }
 
-fn kind<'src>() -> impl Parser<'src, &'src str, TestKind<'src>, extra::Err<Rich<'src, char>>> {
+fn escape<'src>() -> impl Parser<'src, &'src str, (), extra::Err<Rich<'src, char>>> + Copy {
     let escape = just('\\').then(any()).ignored();
+
+    escape
+}
+
+fn kind<'src>() -> impl Parser<'src, &'src str, TestKind<'src>, extra::Err<Rich<'src, char>>> {
+    let escape = escape();
 
     let db_path = none_of("\\\"")
         .ignored()
@@ -97,18 +104,16 @@ fn kind<'src>() -> impl Parser<'src, &'src str, TestKind<'src>, extra::Err<Rich<
     kind
 }
 
-pub fn test_contents_without_values<'src>() -> impl Parser<
-    'src,
-    &'src str,
-    (Option<TestKind<'src>>, &'src str, Statement<'src>),
-    extra::Err<Rich<'src, char>>,
-> {
-    let ident = text::unicode::ident().padded();
-
-    let sql_query = text::unicode::ident();
+fn statement<'src>() -> impl Parser<'src, &'src str, Statement<'src>, extra::Err<Rich<'src, char>>>
+{
+    let sql_query = none_of('"')
+        .repeated()
+        .at_least(1)
+        .delimited_by(just('"'), just('"'))
+        .to_slice();
 
     let statement = choice((
-        sql_query.map(|s: &'src str| Statement::Single(s)),
+        sql_query.map(|s| Statement::Single(s)),
         sql_query
             .separated_by(just(',').padded())
             .allow_trailing()
@@ -118,13 +123,23 @@ pub fn test_contents_without_values<'src>() -> impl Parser<
             .map(|s: Vec<&str>| Statement::Many(s)),
     ))
     .boxed();
+    statement
+}
+
+pub fn contents_without_values<'src>() -> impl Parser<
+    'src,
+    &'src str,
+    (Option<TestKind<'src>>, &'src str, Statement<'src>),
+    extra::Err<Rich<'src, char>>,
+> {
+    let ident = text::unicode::ident().padded();
 
     let contents = kind()
         .then_ignore(just(',').padded())
         .or_not()
         .then(ident)
         .then_ignore(just(',').padded())
-        .then(statement)
+        .then(statement())
         .map(|((kind, ident), statement)| (kind, ident, statement))
         .boxed();
     contents
@@ -135,7 +150,7 @@ pub fn test_parser<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Er
     let test_keyword = text::keyword("test");
     let test_error_keyword = text::keyword("test_error");
 
-    let contents_with_value = test_contents_without_values()
+    let contents_with_value = contents_without_values()
         .then(
             just(',')
                 .padded()
@@ -163,7 +178,7 @@ pub fn test_parser<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Er
         .delimited_by(just('(').padded(), just(')').padded())
         .boxed();
 
-    let contents_no_value = test_contents_without_values()
+    let contents_no_value = contents_without_values()
         .map(|(kind, ident, statement)| Test {
             kind: kind.unwrap_or_default(),
             mode: TestMode::Error,
@@ -180,8 +195,8 @@ pub fn test_parser<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Er
     ))
 }
 
-pub fn test_parser_many<'src>(
-) -> impl Parser<'src, &'src str, Vec<Test<'src>>, extra::Err<Rich<'src, char>>> {
+pub fn parser_dsl<'src>(
+) -> impl Parser<'src, &'src str, Vec<Test<'src>>, extra::Err<Rich<'src, char>>> + Clone {
     test_parser()
         .padded()
         .repeated()
@@ -193,7 +208,7 @@ pub fn test_parser_many<'src>(
 mod tests {
     use chumsky::Parser;
 
-    use crate::{test_parser, test_parser_many};
+    use crate::{parser_dsl, test_parser};
 
     #[macro_export]
     macro_rules! assert_debug_snapshot_with_input {
@@ -209,7 +224,7 @@ mod tests {
     #[test]
     fn test_single_statement() {
         let parser = test_parser();
-        let input = "test(test_single, SELECT)";
+        let input = r#"test(test_single, "SELECT 1")"#;
         let res = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, res);
     }
@@ -217,7 +232,7 @@ mod tests {
     #[test]
     fn test_many_statements_1() {
         let parser = test_parser();
-        let input = "test(test_many, [SELECT,])";
+        let input = r#"test(test_many, ["SELECT",])"#;
         let res = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, res);
     }
@@ -225,18 +240,18 @@ mod tests {
     #[test]
     fn test_many_statements_2() {
         let parser = test_parser();
-        let input = "test(test_many, [SELECT, INSERT, DELETE])";
+        let input = r#"test(test_many, ["SELECT", "INSERT", "DELETE"])"#;
         let res = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, res);
     }
 
     #[test]
     fn test_many_tests() {
-        let parser = test_parser_many();
+        let parser = parser_dsl();
         let input = r#"
-            test(test_many, [SELECT, INSERT, DELETE])
-            test(test_many_2, [SELECT,])
-            test(test_single, SELECT)
+            test(test_many, ["SELECT", "INSERT", "DELETE"])
+            test(test_many_2, ["SELECT",])
+            test(test_single, "SELECT")
         "#;
         let res = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, res);
@@ -245,18 +260,18 @@ mod tests {
     #[test]
     fn test_single_statement_with_value() {
         let parser = test_parser();
-        let input = "test(test_single, SELECT, [Null, 1])";
+        let input = r#"test(test_single, "SELECT", [Null, 1])"#;
         let res = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, res);
     }
 
     #[test]
     fn test_many_tests_with_value() {
-        let parser = test_parser_many();
+        let parser = parser_dsl();
         let input = r#"
-            test(test_many, [SELECT, INSERT, DELETE], [Null, 1])
-            test(test_many_2, [SELECT,], [[Null, 1], ["hi"]])
-            test(test_single, SELECT, 1.234)
+            test(test_many, ["SELECT", "INSERT", "DELETE"], [Null, 1])
+            test(test_many_2, ["SELECT",], [[Null, 1], ["hi"]])
+            test(test_single, "SELECT", 1.234)
         "#;
         let res = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, res);
@@ -265,11 +280,11 @@ mod tests {
     #[test]
     fn test_error() {
         let parser = test_parser();
-        let input = r#"test_error(test_error, SELECT)"#;
+        let input = r#"test_error(test_error, "SELECT")"#;
         let res = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, res);
 
-        let input = r#"test_error(test_error, [SELECT, INSERT, DELETE])"#;
+        let input = r#"test_error(test_error, ["SELECT", "INSERT", "DELETE"])"#;
         let res = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, res);
     }
@@ -277,25 +292,25 @@ mod tests {
     #[test]
     fn test_with_kind() {
         let parser = test_parser();
-        let input = r#"test(["testing/users.db"],test_single, SELECT, [Null, 1])"#;
+        let input = r#"test(["testing/users.db"],test_single, "SELECT", [Null, 1])"#;
         let res = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, res);
 
         let parser = test_parser();
-        let input = r#"test(["testing/users.db", "anything"],test_single, SELECT, [Null, 1])"#;
+        let input = r#"test(["testing/users.db", "anything"],test_single, "SELECT", [Null, 1])"#;
         let res = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, res);
 
         let parser = test_parser();
-        let input = r#"test(memory,test_single, SELECT, [Null, 1])"#;
+        let input = r#"test(memory,test_single, "SELECT", [Null, 1])"#;
         let res = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, res);
 
-        let input = r#"test(r"\d+\.\d+\.\d+", test_single, SELECT)"#;
+        let input = r#"test(r"\d+\.\d+\.\d+", test_single, "SELECT")"#;
         let res = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, res);
 
-        let input = r#"test(r"\d+\.\d+\.\d+", test_single, SELECT, [Null, 1])"#;
+        let input = r#"test(r"\d+\.\d+\.\d+", test_single, "SELECT", [Null, 1])"#;
         let res = parser.parse(input).has_errors();
         assert!(res);
     }

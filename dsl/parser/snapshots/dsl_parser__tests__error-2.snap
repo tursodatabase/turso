@@ -1,6 +1,6 @@
 ---
 source: dsl/parser/lib.rs
-description: "input: test_error(test_error, [SELECT, INSERT, DELETE])"
+description: "input: test_error(test_error, [\"SELECT\", \"INSERT\", \"DELETE\"])"
 expression: res
 ---
 Test {
@@ -9,9 +9,9 @@ Test {
     ident: "test_error",
     statement: Many(
         [
-            "SELECT",
-            "INSERT",
-            "DELETE",
+            "\"SELECT\"",
+            "\"INSERT\"",
+            "\"DELETE\"",
         ],
     ),
     values: [

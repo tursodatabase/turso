@@ -6,8 +6,14 @@ name = "dsl_test_runner"
 repository.workspace = true
 version.workspace = true
 
-[lib]
-path = "lib.rs"
+[[bin]]
+name = "dsl_runner"
+path = "main.rs"
 
 [dependencies]
+ariadne = { version = "0.5.1", features = ["concolor", "auto-color"] }
+clap = { version = "4.5.38", features = ["derive"] }
 dsl_parser = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = "2.0.12"
+walkdir = "2.5.0"

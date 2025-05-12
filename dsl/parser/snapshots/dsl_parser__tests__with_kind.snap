@@ -1,6 +1,6 @@
 ---
 source: dsl/parser/lib.rs
-description: "input: test([\"testing/users.db\"],test_single, SELECT, [Null, 1])"
+description: "input: test([\"testing/users.db\"],test_single, \"SELECT\", [Null, 1])"
 expression: res
 ---
 Test {
@@ -12,7 +12,7 @@ Test {
     mode: Normal,
     ident: "test_single",
     statement: Single(
-        "SELECT",
+        "\"SELECT\"",
     ),
     values: [
         [

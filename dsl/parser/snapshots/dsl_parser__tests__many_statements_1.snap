@@ -1,6 +1,6 @@
 ---
 source: dsl/parser/lib.rs
-description: "input: test(test_many, [SELECT,])"
+description: "input: test(test_many, [\"SELECT\",])"
 expression: res
 ---
 Test {
@@ -9,7 +9,7 @@ Test {
     ident: "test_many",
     statement: Many(
         [
-            "SELECT",
+            "\"SELECT\"",
         ],
     ),
     values: [

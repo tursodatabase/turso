@@ -1,6 +1,6 @@
 ---
 source: dsl/parser/lib.rs
-description: "input: test_error(test_error, SELECT)"
+description: "input: test_error(test_error, \"SELECT\")"
 expression: res
 ---
 Test {
@@ -8,7 +8,7 @@ Test {
     mode: Error,
     ident: "test_error",
     statement: Single(
-        "SELECT",
+        "\"SELECT\"",
     ),
     values: [
         [],
