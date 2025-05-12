@@ -16,7 +16,7 @@ regex = "1.11.1"
 rusqlite = { workspace = true }
 
 [dev-dependencies]
-insta = { version = "1.43.1", features = ["serde"] }
+insta = "1.43.1"
 
 [profile.dev.package]
 insta.opt-level = 3
