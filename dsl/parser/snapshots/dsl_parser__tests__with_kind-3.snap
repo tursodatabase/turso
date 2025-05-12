@@ -1,0 +1,21 @@
+---
+source: dsl/parser/lib.rs
+description: "input: test(memory,test_single, SELECT, [Null, 1])"
+expression: res
+---
+Test {
+    kind: Memory,
+    mode: Normal,
+    ident: "test_single",
+    statement: Single(
+        "SELECT",
+    ),
+    values: [
+        [
+            Null,
+            Integer(
+                1,
+            ),
+        ],
+    ],
+}

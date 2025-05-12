@@ -3,6 +3,7 @@ mod sqlite_values;
 use std::borrow::Cow;
 
 use chumsky::prelude::*;
+use regex::Regex;
 use rusqlite::types::Value;
 use sqlite_values::sqlite_values_parser;
 
@@ -22,16 +23,26 @@ pub struct Test<'a> {
     values: Vec<Vec<Value>>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone)]
+pub struct WrappedRegex(pub Regex);
+
+impl PartialEq for WrappedRegex {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_str().eq(other.0.as_str())
+    }
+}
+
+#[derive(Debug, PartialEq, Clone, Default)]
 pub enum TestKind<'a> {
     /// Default Databases
+    #[default]
     Default,
     /// Specific Databases
     Databases(Vec<&'a str>),
     /// In-memory Database
     Memory,
     /// In-memory Regex test
-    Regex,
+    Regex(WrappedRegex),
 }
 
 #[derive(Debug, PartialEq, Clone, Copy, Default)]
@@ -50,8 +61,48 @@ pub enum Statement<'a> {
     Many(Vec<&'a str>),
 }
 
-pub fn test_contents_without_values<'src>(
-) -> impl Parser<'src, &'src str, (&'src str, Statement<'src>), extra::Err<Rich<'src, char>>> {
+fn kind<'src>() -> impl Parser<'src, &'src str, TestKind<'src>, extra::Err<Rich<'src, char>>> {
+    let escape = just('\\').then(any()).ignored();
+
+    let db_path = none_of("\\\"")
+        .ignored()
+        .or(escape)
+        .repeated()
+        .to_slice()
+        .delimited_by(just('"'), just('"'));
+
+    let kind = choice((
+        just("memory").to(TestKind::Memory),
+        none_of("\\\"")
+            .ignored()
+            .or(escape)
+            .repeated()
+            .to_slice()
+            .delimited_by(just("r\""), just('"'))
+            .try_map(|re, span| {
+                let regex = Regex::new(re).map_err(|err| Rich::custom(span, err))?;
+                Ok(TestKind::Regex(WrappedRegex(regex)))
+            })
+            .boxed()
+            .labelled("regex"),
+        db_path
+            .separated_by(just(',').padded())
+            .allow_trailing()
+            .at_least(1)
+            .collect::<Vec<_>>()
+            .map(|dbs| TestKind::Databases(dbs))
+            .delimited_by(just('[').padded(), just(']').padded()),
+    ))
+    .boxed();
+    kind
+}
+
+pub fn test_contents_without_values<'src>() -> impl Parser<
+    'src,
+    &'src str,
+    (Option<TestKind<'src>>, &'src str, Statement<'src>),
+    extra::Err<Rich<'src, char>>,
+> {
     let ident = text::unicode::ident().padded();
 
     let sql_query = text::unicode::ident();
@@ -61,15 +112,20 @@ pub fn test_contents_without_values<'src>(
         sql_query
             .separated_by(just(',').padded())
             .allow_trailing()
+            .at_least(1)
             .collect::<Vec<_>>()
             .delimited_by(just('[').padded(), just(']').padded())
             .map(|s: Vec<&str>| Statement::Many(s)),
     ))
     .boxed();
 
-    let contents = ident
+    let contents = kind()
+        .then_ignore(just(',').padded())
+        .or_not()
+        .then(ident)
         .then_ignore(just(',').padded())
         .then(statement)
+        .map(|((kind, ident), statement)| (kind, ident, statement))
         .boxed();
     contents
 }
@@ -86,19 +142,30 @@ pub fn test_parser<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Er
                 .ignore_then(sqlite_values_parser())
                 .or_not(),
         )
-        .map(|((ident, statement), values)| Test {
-            kind: TestKind::Default,
-            mode: TestMode::Normal,
-            ident: ident.into(),
-            statement,
-            values: values.unwrap_or(vec![vec![]]),
+        .try_map(|((kind, ident, statement), values), span| {
+            let kind = kind.unwrap_or_default();
+            if matches!(kind, TestKind::Regex(..)) && values.is_some() {
+                return Err(Rich::custom(
+                    span,
+                    "regex text cannot have expected values declared",
+                ));
+            }
+            let values = values.unwrap_or(vec![vec![]]);
+
+            Ok(Test {
+                kind,
+                mode: TestMode::Normal,
+                ident: ident.into(),
+                statement,
+                values,
+            })
         })
         .delimited_by(just('(').padded(), just(')').padded())
         .boxed();
 
     let contents_no_value = test_contents_without_values()
-        .map(|(ident, statement)| Test {
-            kind: TestKind::Default,
+        .map(|(kind, ident, statement)| Test {
+            kind: kind.unwrap_or_default(),
             mode: TestMode::Error,
             ident: ident.into(),
             statement,
@@ -205,5 +272,31 @@ mod tests {
         let input = r#"test_error(test_error, [SELECT, INSERT, DELETE])"#;
         let res = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, res);
+    }
+
+    #[test]
+    fn test_with_kind() {
+        let parser = test_parser();
+        let input = r#"test(["testing/users.db"],test_single, SELECT, [Null, 1])"#;
+        let res = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, res);
+
+        let parser = test_parser();
+        let input = r#"test(["testing/users.db", "anything"],test_single, SELECT, [Null, 1])"#;
+        let res = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, res);
+
+        let parser = test_parser();
+        let input = r#"test(memory,test_single, SELECT, [Null, 1])"#;
+        let res = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, res);
+
+        let input = r#"test(r"\d+\.\d+\.\d+", test_single, SELECT)"#;
+        let res = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, res);
+
+        let input = r#"test(r"\d+\.\d+\.\d+", test_single, SELECT, [Null, 1])"#;
+        let res = parser.parse(input).has_errors();
+        assert!(res);
     }
 }

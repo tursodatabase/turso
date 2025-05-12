@@ -819,6 +819,7 @@ dependencies = [
  "chumsky",
  "hex",
  "insta",
+ "regex",
  "rusqlite",
 ]
 

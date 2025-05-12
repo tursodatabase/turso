@@ -12,6 +12,7 @@ path = "lib.rs"
 [dependencies]
 chumsky = "0.10.1"
 hex = "0.4.3"
+regex = "1.11.1"
 rusqlite = { workspace = true }
 
 [dev-dependencies]

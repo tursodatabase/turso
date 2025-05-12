@@ -1,0 +1,26 @@
+---
+source: dsl/parser/lib.rs
+description: "input: test([\"testing/users.db\", \"anything\"],test_single, SELECT, [Null, 1])"
+expression: res
+---
+Test {
+    kind: Databases(
+        [
+            "testing/users.db",
+            "anything",
+        ],
+    ),
+    mode: Normal,
+    ident: "test_single",
+    statement: Single(
+        "SELECT",
+    ),
+    values: [
+        [
+            Null,
+            Integer(
+                1,
+            ),
+        ],
+    ],
+}

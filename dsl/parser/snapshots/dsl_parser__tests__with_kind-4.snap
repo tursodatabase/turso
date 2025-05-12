@@ -1,0 +1,22 @@
+---
+source: dsl/parser/lib.rs
+description: "input: test(r\"\\d+\\.\\d+\\.\\d+\", test_single, SELECT)"
+expression: res
+---
+Test {
+    kind: Regex(
+        WrappedRegex(
+            Regex(
+                "\\d+\\.\\d+\\.\\d+",
+            ),
+        ),
+    ),
+    mode: Normal,
+    ident: "test_single",
+    statement: Single(
+        "SELECT",
+    ),
+    values: [
+        [],
+    ],
+}
