@@ -4,6 +4,7 @@ use std::borrow::Cow;
 
 use chumsky::prelude::*;
 use rusqlite::types::Value;
+use sqlite_values::sqlite_values_parser;
 
 #[derive(Debug, PartialEq)]
 pub struct Test<'a> {
@@ -48,11 +49,17 @@ pub fn test_parser<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Er
     let contents = ident
         .then_ignore(just(',').padded())
         .then(statement)
-        .map(|(ident, statement)| Test {
+        .then(
+            just(',')
+                .padded()
+                .ignore_then(sqlite_values_parser())
+                .or_not(),
+        )
+        .map(|((ident, statement), values)| Test {
             databases: None,
             ident: ident.into(),
             statement,
-            values: vec![],
+            values: values.unwrap_or(vec![vec![]]),
         })
         .delimited_by(just('(').padded(), just(')').padded())
         .boxed();
@@ -117,6 +124,26 @@ mod tests {
             test(test_many, [SELECT, INSERT, DELETE])
             test(test_many_2, [SELECT,])
             test(test_single, SELECT)
+        "#;
+        let res = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, res);
+    }
+
+    #[test]
+    fn test_single_statement_with_value() {
+        let parser = test_parser();
+        let input = "test(test_single, SELECT, [Null, 1])";
+        let res = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, res);
+    }
+
+    #[test]
+    fn test_many_tests_with_value() {
+        let parser = test_parser_many();
+        let input = r#"
+            test(test_many, [SELECT, INSERT, DELETE], [Null, 1])
+            test(test_many_2, [SELECT,], [[Null, 1], ["hi"]])
+            test(test_single, SELECT, 1.234)
         "#;
         let res = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, res);

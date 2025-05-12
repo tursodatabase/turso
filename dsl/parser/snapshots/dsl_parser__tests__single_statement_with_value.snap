@@ -1,6 +1,6 @@
 ---
 source: dsl/parser/lib.rs
-description: "input: test(test_single, SELECT)"
+description: "input: test(test_single, SELECT, [Null, 1])"
 expression: res
 ---
 Test {
@@ -10,6 +10,11 @@ Test {
         "SELECT",
     ),
     values: [
-        [],
+        [
+            Null,
+            Integer(
+                1,
+            ),
+        ],
     ],
 }

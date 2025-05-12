@@ -1,6 +1,6 @@
 ---
 source: dsl/parser/lib.rs
-description: "input: \n            test(test_many, [SELECT, INSERT, DELETE])\n            test(test_many_2, [SELECT,])\n            test(test_single, SELECT)\n        "
+description: "input: \n            test(test_many, [SELECT, INSERT, DELETE], [Null, 1])\n            test(test_many_2, [SELECT,], [[Null, 1], [\"hi\"]])\n            test(test_single, SELECT, 1.234)\n        "
 expression: res
 ---
 [
@@ -15,7 +15,12 @@ expression: res
             ],
         ),
         values: [
-            [],
+            [
+                Null,
+                Integer(
+                    1,
+                ),
+            ],
         ],
     },
     Test {
@@ -27,7 +32,17 @@ expression: res
             ],
         ),
         values: [
-            [],
+            [
+                Null,
+                Integer(
+                    1,
+                ),
+            ],
+            [
+                Text(
+                    "hi",
+                ),
+            ],
         ],
     },
     Test {
@@ -37,7 +52,11 @@ expression: res
             "SELECT",
         ),
         values: [
-            [],
+            [
+                Real(
+                    1.234,
+                ),
+            ],
         ],
     },
 ]
