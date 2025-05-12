@@ -5,7 +5,8 @@ expression: res
 ---
 [
     Test {
-        databases: None,
+        kind: Default,
+        mode: Normal,
         ident: "test_many",
         statement: Many(
             [
@@ -24,7 +25,8 @@ expression: res
         ],
     },
     Test {
-        databases: None,
+        kind: Default,
+        mode: Normal,
         ident: "test_many_2",
         statement: Many(
             [
@@ -46,7 +48,8 @@ expression: res
         ],
     },
     Test {
-        databases: None,
+        kind: Default,
+        mode: Normal,
         ident: "test_single",
         statement: Single(
             "SELECT",

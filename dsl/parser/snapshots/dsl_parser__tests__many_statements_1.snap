@@ -4,7 +4,8 @@ description: "input: test(test_many, [SELECT,])"
 expression: res
 ---
 Test {
-    databases: None,
+    kind: Default,
+    mode: Normal,
     ident: "test_many",
     statement: Many(
         [

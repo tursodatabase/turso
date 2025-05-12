@@ -9,14 +9,38 @@ use sqlite_values::sqlite_values_parser;
 #[derive(Debug, PartialEq)]
 pub struct Test<'a> {
     /// List of databases to test on
-    databases: Option<Vec<&'a str>>,
+    kind: TestKind<'a>,
+    /// Test mode
+    mode: TestMode,
     /// Test Name
-    // Idea of a Cow<'a, str> is that you can manipulate the ident if needed and still use this struct
+    // Idea of a Cow<'a, str> is that you can manipulate the ident with format! and still use this struct
+    // e.g converting the ident to snake_case
     ident: Cow<'a, str>,
     /// Sql Statement(s) to run
     statement: Statement<'a>,
     /// Expected Output Value from test
     values: Vec<Vec<Value>>,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum TestKind<'a> {
+    /// Default Databases
+    Default,
+    /// Specific Databases
+    Databases(Vec<&'a str>),
+    /// In-memory Database
+    Memory,
+    /// In-memory Regex test
+    Regex,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy, Default)]
+pub enum TestMode {
+    /// Follow normal execution
+    #[default]
+    Normal,
+    /// Expect an Error to occur
+    Error,
 }
 
 /// Sql Statement(s)
@@ -26,12 +50,9 @@ pub enum Statement<'a> {
     Many(Vec<&'a str>),
 }
 
-pub fn test_parser<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Err<Rich<'src, char>>>
-{
-    let test_keyword = text::keyword("test");
-
-    let ident: Boxed<'_, '_, &'src str, &'src str, extra::Full<Rich<'src, char>, (), ()>> =
-        text::unicode::ident().padded().boxed();
+pub fn test_contents_without_values<'src>(
+) -> impl Parser<'src, &'src str, (&'src str, Statement<'src>), extra::Err<Rich<'src, char>>> {
+    let ident = text::unicode::ident().padded();
 
     let sql_query = text::unicode::ident();
 
@@ -49,6 +70,16 @@ pub fn test_parser<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Er
     let contents = ident
         .then_ignore(just(',').padded())
         .then(statement)
+        .boxed();
+    contents
+}
+
+pub fn test_parser<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Err<Rich<'src, char>>>
+{
+    let test_keyword = text::keyword("test");
+    let test_error_keyword = text::keyword("test_error");
+
+    let contents_with_value = test_contents_without_values()
         .then(
             just(',')
                 .padded()
@@ -56,7 +87,8 @@ pub fn test_parser<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Er
                 .or_not(),
         )
         .map(|((ident, statement), values)| Test {
-            databases: None,
+            kind: TestKind::Default,
+            mode: TestMode::Normal,
             ident: ident.into(),
             statement,
             values: values.unwrap_or(vec![vec![]]),
@@ -64,7 +96,21 @@ pub fn test_parser<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Er
         .delimited_by(just('(').padded(), just(')').padded())
         .boxed();
 
-    test_keyword.ignore_then(contents).boxed()
+    let contents_no_value = test_contents_without_values()
+        .map(|(ident, statement)| Test {
+            kind: TestKind::Default,
+            mode: TestMode::Error,
+            ident: ident.into(),
+            statement,
+            values: vec![vec![]],
+        })
+        .delimited_by(just('(').padded(), just(')').padded())
+        .boxed();
+
+    choice((
+        test_keyword.ignore_then(contents_with_value),
+        test_error_keyword.ignore_then(contents_no_value),
+    ))
 }
 
 pub fn test_parser_many<'src>(
@@ -145,6 +191,18 @@ mod tests {
             test(test_many_2, [SELECT,], [[Null, 1], ["hi"]])
             test(test_single, SELECT, 1.234)
         "#;
+        let res = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, res);
+    }
+
+    #[test]
+    fn test_error() {
+        let parser = test_parser();
+        let input = r#"test_error(test_error, SELECT)"#;
+        let res = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, res);
+
+        let input = r#"test_error(test_error, [SELECT, INSERT, DELETE])"#;
         let res = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, res);
     }

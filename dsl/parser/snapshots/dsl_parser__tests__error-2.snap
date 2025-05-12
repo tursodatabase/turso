@@ -1,12 +1,12 @@
 ---
 source: dsl/parser/lib.rs
-description: "input: test(test_many, [SELECT, INSERT, DELETE])"
+description: "input: test_error(test_error, [SELECT, INSERT, DELETE])"
 expression: res
 ---
 Test {
     kind: Default,
-    mode: Normal,
-    ident: "test_many",
+    mode: Error,
+    ident: "test_error",
     statement: Many(
         [
             "SELECT",
