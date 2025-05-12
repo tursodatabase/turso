@@ -1,0 +1,13 @@
+---
+source: dsl/parser/sqlite_values.rs
+description: "input: [Null, 1]"
+expression: val
+---
+[
+    [
+        Null,
+        Integer(
+            1,
+        ),
+    ],
+]

@@ -1,0 +1,12 @@
+---
+source: dsl/parser/sqlite_values.rs
+description: "input: \"test\""
+expression: val
+---
+[
+    [
+        Text(
+            "test",
+        ),
+    ],
+]

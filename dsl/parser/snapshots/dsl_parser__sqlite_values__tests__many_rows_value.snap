@@ -1,0 +1,43 @@
+---
+source: dsl/parser/sqlite_values.rs
+description: "input: [[Null, 1], [true, \"hi\"], [1, \"hi\", 1.0, x\"1240\"], [1]]"
+expression: val
+---
+[
+    [
+        Null,
+        Integer(
+            1,
+        ),
+    ],
+    [
+        Integer(
+            1,
+        ),
+        Text(
+            "hi",
+        ),
+    ],
+    [
+        Integer(
+            1,
+        ),
+        Text(
+            "hi",
+        ),
+        Real(
+            1.0,
+        ),
+        Blob(
+            [
+                18,
+                64,
+            ],
+        ),
+    ],
+    [
+        Integer(
+            1,
+        ),
+    ],
+]

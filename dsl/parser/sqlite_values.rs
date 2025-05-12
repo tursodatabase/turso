@@ -36,6 +36,7 @@ pub(super) fn real<'src>() -> impl Parser<'src, &'src str, f64, extra::Err<Rich<
         just("-Inf").to(core::f64::NEG_INFINITY),
     ))
     .labelled("real")
+    .boxed()
 }
 
 pub(super) fn text<'src>() -> impl Parser<'src, &'src str, String, extra::Err<Rich<'src, char>>> {
@@ -61,14 +62,16 @@ pub(super) fn text<'src>() -> impl Parser<'src, &'src str, String, extra::Err<Ri
         .map(ToString::to_string)
         .delimited_by(just('"'), just('"'))
         .labelled("text")
+        .boxed()
 }
 
 pub(super) fn blob<'src>() -> impl Parser<'src, &'src str, Vec<u8>, extra::Err<Rich<'src, char>>> {
     text::digits(16)
         .to_slice()
         .try_map(|b, span| hex::decode(b).map_err(|e| Rich::custom(span, e)))
-        .delimited_by(just("b\""), just('"'))
+        .delimited_by(just("x\""), just('"'))
         .labelled("blob")
+        .boxed()
 }
 
 pub(super) fn value_parser<'src>(
@@ -88,13 +91,14 @@ pub(super) fn value_parser<'src>(
         text().map(|s| Value::Text(s)),
         blob().map(|b| Value::Blob(b)),
     ))
+    .boxed()
 }
 
 pub(super) fn sqlite_values_parser<'src>(
 ) -> impl Parser<'src, &'src str, Vec<Vec<Value>>, extra::Err<Rich<'src, char>>> {
-    let value_parser = value_parser();
+    let value = value_parser();
 
-    let value_list = value_parser
+    let value_list = value
         .separated_by(just(',').padded())
         .allow_trailing()
         .collect::<Vec<_>>()
@@ -102,13 +106,19 @@ pub(super) fn sqlite_values_parser<'src>(
         .boxed();
 
     let value_list_2d = value_list
+        .clone()
         .separated_by(just(',').padded())
         .allow_trailing()
         .collect::<Vec<_>>()
         .delimited_by(just('[').padded(), just(']').padded())
         .boxed();
 
-    choice((just("None").to(vec![vec![]]), value_list_2d))
+    choice((
+        just("None").to(vec![vec![]]),
+        value_parser().map(|v| vec![vec![v]]),
+        value_list.map(|v_list| vec![v_list]),
+        value_list_2d,
+    ))
 }
 
 #[cfg(test)]
@@ -124,6 +134,65 @@ mod tests {
     fn test_none_values() {
         let parser = sqlite_values_parser();
         let input = "None";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+    }
+
+    #[test]
+    fn test_single_value() {
+        let parser = sqlite_values_parser();
+        let input = "Null";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let input = "true";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let input = "1";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let input = "1.0";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let input = r#""test""#;
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let input = r#"x"1240""#;
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+    }
+
+    #[test]
+    fn test_single_row_value() {
+        let parser = sqlite_values_parser();
+        let input = "[Null, 1]";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let input = "[true, \"hi\"]";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let input = "[1, \"hi\", 1.0, x\"1240\"]";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+
+        let input = "[1]";
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
+    }
+
+    #[test]
+    fn test_many_rows_value() {
+        let parser = sqlite_values_parser();
+        // Notice that it will parse the values here but it will not assert if the length
+        // of each row is the same. This is possible to happen if we have to do different queries
+        // that returns different number of cols.
+        let input = "[[Null, 1], [true, \"hi\"], [1, \"hi\", 1.0, x\"1240\"], [1]]";
         let val = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, val);
     }
@@ -249,17 +318,17 @@ mod tests {
     #[test]
     fn test_blob_value() {
         let parser = value_parser();
-        let input = r#"b"1240""#;
+        let input = r#"x"1240""#;
         let val = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, val);
 
         let parser = value_parser();
         // Odd number of digits
-        let input = r#"b"124""#;
+        let input = r#"x"124""#;
         let _ = parser.parse(input).into_result().unwrap_err();
 
         // Not Hex Digit
-        let input = r#"b"12LKOPK""#;
+        let input = r#"x"12LKOPK""#;
         let _ = parser.parse(input).into_result().unwrap_err();
     }
 }

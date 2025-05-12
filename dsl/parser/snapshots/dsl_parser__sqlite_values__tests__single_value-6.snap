@@ -1,0 +1,15 @@
+---
+source: dsl/parser/sqlite_values.rs
+description: "input: x\"1240\""
+expression: val
+---
+[
+    [
+        Blob(
+            [
+                18,
+                64,
+            ],
+        ),
+    ],
+]
