@@ -11,7 +11,7 @@ members = [
     "bindings/wasm",
     "cli",
     "core",
-    "dsl/parser", 
+    "dsl/parser", "dsl/test_runner", 
     "extensions/completion",
     "extensions/core",
     "extensions/crypto", 
@@ -52,6 +52,7 @@ limbo_sqlite3_parser = { path = "vendored/sqlite3-parser", version = "0.0.20" }
 limbo_time = { path = "extensions/time", version = "0.0.20" }
 limbo_uuid = { path = "extensions/uuid", version = "0.0.20" }
 rusqlite = { version = "0.34", features = ["bundled"] }
+dsl_parser = { path = "dsl/parser" }
 
 [profile.release]
 debug = "line-tables-only"

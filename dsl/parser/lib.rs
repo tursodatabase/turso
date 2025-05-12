@@ -10,17 +10,17 @@ use sqlite_values::sqlite_values_parser;
 #[derive(Debug, PartialEq)]
 pub struct Test<'a> {
     /// List of databases to test on
-    kind: TestKind<'a>,
+    pub kind: TestKind<'a>,
     /// Test mode
-    mode: TestMode,
+    pub mode: TestMode,
     /// Test Name
     // Idea of a Cow<'a, str> is that you can manipulate the ident with format! and still use this struct
     // e.g converting the ident to snake_case
-    ident: Cow<'a, str>,
+    pub ident: Cow<'a, str>,
     /// Sql Statement(s) to run
-    statement: Statement<'a>,
+    pub statement: Statement<'a>,
     /// Expected Output Value from test
-    values: Vec<Vec<Value>>,
+    pub values: Vec<Vec<Value>>,
 }
 
 #[derive(Debug, Clone)]

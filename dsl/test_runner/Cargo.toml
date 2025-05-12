@@ -1,0 +1,13 @@
+[package]
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+name = "dsl_test_runner"
+repository.workspace = true
+version.workspace = true
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+dsl_parser = { workspace = true }

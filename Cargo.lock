@@ -824,6 +824,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsl_test_runner"
+version = "0.0.19"
+dependencies = [
+ "dsl_parser",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
