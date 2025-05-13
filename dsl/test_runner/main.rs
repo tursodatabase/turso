@@ -17,7 +17,8 @@ fn main() {
         .filter(|e| is_test_file(e))
         .map(|entry| {
             println!("{}", entry.path().display());
-            fs::read_to_string(entry.path()).unwrap()
+            // TODO: see a way to determine the 
+           ( entry.path().display().to_string(), fs::read_to_string(entry.path()).unwrap())
         })
         .collect::<Vec<_>>();
 

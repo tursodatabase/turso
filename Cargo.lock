@@ -864,6 +864,7 @@ dependencies = [
  "dsl_parser",
  "gag",
  "limbo_core",
+ "owo-colors",
  "regex",
  "rusqlite",
  "tempfile",
