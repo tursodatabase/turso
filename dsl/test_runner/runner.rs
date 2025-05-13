@@ -76,5 +76,20 @@ impl<'src> Runner<'src> {
         }
     }
 
-    pub fn run(&self) {}
+    pub fn run(&self, default_dbs: Option<Vec<PathBuf>>) {
+        assert!(!self.has_errors());
+        let default_dbs = default_dbs;
+        for file_test in self.inner.iter() {
+            for test in file_test.tests.iter() {
+                // TODO: remove unwrap later
+                if let Some(default_dbs) = default_dbs.as_ref() {
+                    for db_path in default_dbs {
+                        test.exec_sql(Some(db_path)).unwrap()
+                    }
+                } else {
+                    test.exec_sql(None).unwrap();
+                }
+            }
+        }
+    }
 }

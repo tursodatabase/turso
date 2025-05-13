@@ -39,7 +39,8 @@ pub(super) fn real<'src>() -> impl Parser<'src, &'src str, f64, extra::Err<Rich<
     .boxed()
 }
 
-pub(super) fn text<'src>() -> impl Parser<'src, &'src str, String, extra::Err<Rich<'src, char>>> {
+pub(super) fn text<'src>(
+) -> impl Parser<'src, &'src str, &'src str, extra::Err<Rich<'src, char>>> + Clone {
     let escape = just('\\')
         .then(choice((
             just('\\'),
@@ -59,7 +60,6 @@ pub(super) fn text<'src>() -> impl Parser<'src, &'src str, String, extra::Err<Ri
         .or(escape)
         .repeated()
         .to_slice()
-        .map(ToString::to_string)
         .delimited_by(just('"'), just('"'))
         .labelled("text")
         .boxed()
@@ -88,7 +88,7 @@ pub(super) fn value_parser<'src>(
         real().map(|f| Value::Real(f)),
         integer().map(|i| Value::Integer(i)),
         just("Null").to(Value::Null),
-        text().map(|s| Value::Text(s)),
+        text().map(|s| Value::Text(s.to_string())),
         blob().map(|b| Value::Blob(b)),
     ))
     .boxed()

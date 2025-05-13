@@ -28,7 +28,8 @@ fn main() {
         runner.print_errors();
         return;
     }
-    runner.run();
+    // TODO: later pass default databases from Args
+    runner.run(None);
 }
 
 fn is_hidden(entry: &DirEntry) -> bool {

@@ -10,9 +10,9 @@ expression: res
         ident: "test_many",
         statement: Many(
             [
-                "\"SELECT\"",
-                "\"INSERT\"",
-                "\"DELETE\"",
+                "SELECT",
+                "INSERT",
+                "DELETE",
             ],
         ),
         values: [
@@ -30,7 +30,7 @@ expression: res
         ident: "test_many_2",
         statement: Many(
             [
-                "\"SELECT\"",
+                "SELECT",
             ],
         ),
         values: [
@@ -52,7 +52,7 @@ expression: res
         mode: Normal,
         ident: "test_single",
         statement: Single(
-            "\"SELECT\"",
+            "SELECT",
         ),
         values: [
             [

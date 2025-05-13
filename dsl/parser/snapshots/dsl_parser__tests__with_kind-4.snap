@@ -14,7 +14,7 @@ Test {
     mode: Normal,
     ident: "test_single",
     statement: Single(
-        "\"SELECT\"",
+        "SELECT",
     ),
     values: [
         [],

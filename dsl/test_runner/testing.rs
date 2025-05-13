@@ -13,6 +13,7 @@ use tempfile::TempDir;
 #[derive(Debug)]
 pub(crate) enum AssertKind {
     Eq,
+    #[allow(dead_code)]
     Ne,
 }
 
@@ -56,7 +57,7 @@ macro_rules! return_if_neq {
                     // The reborrows below are intentional. Without them, the stack slot for the
                     // borrow is initialized even before the values are compared, leading to a
                     // noticeable slow down.
-                    $crate::testing::assert_failed(kind, &*left_val, &*right_val, $crate::option::Option::None);
+                    return Err($crate::testing::assert_failed(kind, &*left_val, &*right_val, $crate::option::Option::None));
                 }
             }
         }
@@ -69,14 +70,14 @@ macro_rules! return_if_neq {
                     // The reborrows below are intentional. Without them, the stack slot for the
                     // borrow is initialized even before the values are compared, leading to a
                     // noticeable slow down.
-                    $crate::testing::assert_failed(kind, &*left_val, &*right_val, Option::Some(format_args!($($arg)+)));
+                    return Err($crate::testing::assert_failed(kind, &*left_val, &*right_val, Option::Some(format_args!($($arg)+))));
                 }
             }
         }
     };
 }
 
-/// Copy of assert_eq! but returns instead
+/// Copy of assert! but returns instead
 macro_rules! return_if_false {
     ($val:expr $(,)?) => {
         if !($val) {
@@ -84,7 +85,7 @@ macro_rules! return_if_false {
             // The reborrows below are intentional. Without them, the stack slot for the
             // borrow is initialized even before the values are compared, leading to a
             // noticeable slow down.
-            $crate::testing::assert_failed(kind, &val, &true, $crate::option::Option::None);
+            return Err($crate::testing::assert_failed(kind, &$val, &true, Option::None));
         }
     };
     ($val:expr, $($arg:tt)+) => {
@@ -93,7 +94,7 @@ macro_rules! return_if_false {
             // The reborrows below are intentional. Without them, the stack slot for the
             // borrow is initialized even before the values are compared, leading to a
             // noticeable slow down.
-            $crate::testing::assert_failed(kind, &$val, &true, Option::Some(format_args!($($arg)+)));
+            return Err($crate::testing::assert_failed(kind, &$val, &true, Option::Some(format_args!($($arg)+))));
         }
     };
 }
@@ -107,6 +108,7 @@ unsafe impl Send for TempDatabase {}
 
 #[allow(clippy::arc_with_non_send_sync)]
 impl TempDatabase {
+    #[allow(dead_code)]
     pub fn new(db_name: &str) -> Self {
         let mut path = TempDir::new().unwrap().keep();
         path.push(db_name);
@@ -173,27 +175,24 @@ impl<'a> DslTest<'a> {
         }
     }
 
-    pub(crate) fn exec_sql(&self, db_path: Option<PathBuf>) {
+    pub(crate) fn exec_sql(&self, db_path: Option<&Path>) -> anyhow::Result<()> {
         {
-            let sqlite_conn = if let Some(ref db_path) = db_path {
+            let sqlite_conn = if let Some(db_path) = db_path {
                 if !self.is_random_db {
-                    rusqlite::Connection::open_with_flags(
-                        db_path.clone(),
-                        OpenFlags::SQLITE_OPEN_READ_ONLY,
-                    )
-                    .unwrap()
+                    rusqlite::Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                        .unwrap()
                 } else {
                     // This can be a random db_path that was not created yet
-                    rusqlite::Connection::open(db_path.clone()).unwrap()
+                    rusqlite::Connection::open(db_path).unwrap()
                 }
             } else {
                 rusqlite::Connection::open_in_memory().unwrap()
             };
-            self.exec_sql_sqlite(sqlite_conn, &db_path);
+            self.exec_sql_sqlite(sqlite_conn, db_path)?;
         }
 
         {
-            let db = if let Some(ref db_path) = db_path {
+            let db = if let Some(db_path) = db_path {
                 TempDatabase::new_existent(db_path)
             } else {
                 TempDatabase::new_in_memory()
@@ -205,15 +204,16 @@ impl<'a> DslTest<'a> {
                     limbo_core::OpenFlags::default() | limbo_core::OpenFlags::ReadOnly,
                 )
             };
-            self.exec_sql_limbo(db, limbo_conn, &db_path);
+            self.exec_sql_limbo(db, limbo_conn, db_path)?;
         }
+        Ok(())
     }
 
     // TODO: for now, duplicate code here for testing
     fn exec_sql_sqlite(
         &self,
         sqlite_conn: rusqlite::Connection,
-        db_path: &Option<PathBuf>,
+        db_path: Option<&Path>,
     ) -> anyhow::Result<()> {
         let db_path = db_path.as_ref().map(|db_path| db_path.to_string_lossy());
         let db_path = db_path.unwrap_or(std::borrow::Cow::Borrowed("memory"));
@@ -222,7 +222,7 @@ impl<'a> DslTest<'a> {
             Statement::Single(sql) => sqlite_exec_rows(&sqlite_conn, sql),
 
             Statement::Many(sql_queries) => {
-                assert!(!sql_queries.is_empty());
+                return_if_false!(!sql_queries.is_empty());
                 sql_queries
                     .into_iter()
                     .map(|sql| sqlite_exec_rows(&sqlite_conn, &sql))
@@ -292,7 +292,7 @@ impl<'a> DslTest<'a> {
         &self,
         db: TempDatabase,
         limbo_conn: std::rc::Rc<limbo_core::Connection>,
-        db_path: &Option<PathBuf>,
+        db_path: Option<&Path>,
     ) -> anyhow::Result<()> {
         let db_path = db_path.as_ref().map(|db_path| db_path.to_string_lossy());
         let db_path = db_path.unwrap_or(std::borrow::Cow::Borrowed("memory"));
@@ -301,7 +301,7 @@ impl<'a> DslTest<'a> {
             Statement::Single(sql) => limbo_exec_rows(&db, &limbo_conn, sql),
 
             Statement::Many(sql_queries) => {
-                assert!(!sql_queries.is_empty());
+                return_if_false!(!sql_queries.is_empty());
                 sql_queries
                     .into_iter()
                     .map(|sql| limbo_exec_rows(&db, &limbo_conn, sql))

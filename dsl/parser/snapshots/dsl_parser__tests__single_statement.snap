@@ -8,7 +8,7 @@ Test {
     mode: Normal,
     ident: "test_single",
     statement: Single(
-        "\"SELECT 1\"",
+        "SELECT 1",
     ),
     values: [
         [],

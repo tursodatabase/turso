@@ -1,14 +1,14 @@
 ---
 source: dsl/parser/lib.rs
-description: "input: test_error(test_error, \"SELECT\")"
+description: "input: test(test_single, \"SELECT 1 '\")"
 expression: res
 ---
 Test {
     kind: Default,
-    mode: Error,
-    ident: "test_error",
+    mode: Normal,
+    ident: "test_single",
     statement: Single(
-        "SELECT",
+        "SELECT 1 '",
     ),
     values: [
         [],

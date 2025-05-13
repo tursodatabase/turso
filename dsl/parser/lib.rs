@@ -6,7 +6,7 @@ use chumsky::prelude::*;
 pub use chumsky::Parser;
 use regex::Regex;
 use rusqlite::types::Value;
-use sqlite_values::sqlite_values_parser;
+use sqlite_values::{sqlite_values_parser, text};
 
 #[derive(Debug, PartialEq)]
 pub struct Test<'a> {
@@ -106,14 +106,10 @@ fn kind<'src>() -> impl Parser<'src, &'src str, TestKind<'src>, extra::Err<Rich<
 
 fn statement<'src>() -> impl Parser<'src, &'src str, Statement<'src>, extra::Err<Rich<'src, char>>>
 {
-    let sql_query = none_of('"')
-        .repeated()
-        .at_least(1)
-        .delimited_by(just('"'), just('"'))
-        .to_slice();
+    let sql_query = text();
 
     let statement = choice((
-        sql_query.map(|s| Statement::Single(s)),
+        sql_query.clone().map(|s| Statement::Single(s)),
         sql_query
             .separated_by(just(',').padded())
             .allow_trailing()
@@ -233,6 +229,10 @@ mod tests {
     fn test_single_statement() {
         let parser = test_parser();
         let input = r#"test(test_single, "SELECT 1")"#;
+        let res = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, res);
+
+        let input = r#"test(test_single, "SELECT 1 '")"#;
         let res = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, res);
     }

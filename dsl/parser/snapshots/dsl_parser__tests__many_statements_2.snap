@@ -9,9 +9,9 @@ Test {
     ident: "test_many",
     statement: Many(
         [
-            "\"SELECT\"",
-            "\"INSERT\"",
-            "\"DELETE\"",
+            "SELECT",
+            "INSERT",
+            "DELETE",
         ],
     ),
     values: [
