@@ -191,7 +191,15 @@ pub fn test_parser<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Er
 
     choice((
         test_keyword.ignore_then(contents_with_value),
-        test_error_keyword.ignore_then(contents_no_value),
+        test_error_keyword.ignore_then(contents_no_value.validate(|test, extra, emitter| {
+            if matches!(test.mode, TestMode::Error) && matches!(test.kind, TestKind::Regex(..)) {
+                emitter.emit(Rich::custom(
+                    extra.span(),
+                    "cannot have an error test with regex",
+                ));
+            }
+            test
+        })),
     ))
 }
 

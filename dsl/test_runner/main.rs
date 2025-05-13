@@ -5,12 +5,14 @@ use runner::Args;
 use walkdir::{DirEntry, WalkDir};
 
 mod runner;
+mod testing;
 
 fn main() {
     let args = Args::parse();
-    let path = args.file.unwrap_or(std::env::current_dir().unwrap());
+    let path = args.path.unwrap_or(std::env::current_dir().unwrap());
 
     let walker = WalkDir::new(path).into_iter();
+    // TODO: eventually ignore files from gitignore
     let sources = walker
         .filter_entry(|e| !is_hidden(e))
         .filter_map(|e| e.ok())

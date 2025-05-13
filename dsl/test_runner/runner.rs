@@ -1,7 +1,9 @@
 use ariadne::{Color, Label, Report, ReportKind, Source};
 use clap::Parser;
-use dsl_parser::{parser_dsl, Parser as _, Test};
+use dsl_parser::{parser_dsl, Parser as _};
 use std::path::PathBuf;
+
+use crate::testing::{DslTest, FileTest};
 
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
@@ -9,15 +11,8 @@ use std::path::PathBuf;
 #[command(version, about, long_about)]
 pub struct Args {
     /// File path to run test
-    #[arg(index = 1)]
-    pub file: Option<PathBuf>,
-}
-
-#[derive(Debug)]
-struct FileTest<'a> {
-    source: &'a str,
-    tests: Vec<Test<'a>>,
-    errors: Vec<Report<'a, ((), std::ops::Range<usize>)>>,
+    #[arg(short, long)]
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -52,7 +47,11 @@ impl<'src> Runner<'src> {
                     .collect::<Vec<_>>();
                 FileTest {
                     source,
-                    tests: out.unwrap_or_default(),
+                    tests: out
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(DslTest::new)
+                        .collect(),
                     errors: errs,
                 }
             })
