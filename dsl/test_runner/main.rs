@@ -1,11 +1,9 @@
 use std::fs;
 
 use clap::Parser as _;
+use dsl_test_runner::runner;
 use runner::Args;
 use walkdir::{DirEntry, WalkDir};
-
-mod runner;
-mod testing;
 
 fn main() {
     let args = Args::parse();
@@ -23,7 +21,7 @@ fn main() {
         })
         .collect::<Vec<_>>();
 
-    let runner = runner::Runner::new(&sources);
+    let mut runner = runner::Runner::new(&sources);
     if runner.has_errors() {
         runner.print_errors();
         return;

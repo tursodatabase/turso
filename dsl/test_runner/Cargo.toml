@@ -10,11 +10,15 @@ version.workspace = true
 name = "dsl_runner"
 path = "main.rs"
 
+[lib]
+path = "lib.rs"
+
 [dependencies]
 anyhow = "1.0.98"
 ariadne = { version = "0.5.1", features = ["concolor", "auto-color"] }
 clap = { version = "4.5.38", features = ["derive"] }
 dsl_parser = { workspace = true }
+gag = "1.0.0"
 limbo_core = { workspace = true }
 regex = "1.11.1"
 rusqlite = { workspace = true }

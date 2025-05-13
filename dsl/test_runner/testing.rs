@@ -158,6 +158,9 @@ impl TempDatabase {
 pub struct DslTest<'a> {
     inner: Test<'a>,
     is_random_db: bool,
+    /// If test fails print the captured stdout
+    pub stdout: String, // TODO: maybe this should be a Vec<u8> instead
+    pub stderr: String,
 }
 
 #[derive(Debug)]
@@ -172,6 +175,8 @@ impl<'a> DslTest<'a> {
         Self {
             inner: test,
             is_random_db: false,
+            stdout: String::new(),
+            stderr: String::new(),
         }
     }
 
@@ -236,6 +241,8 @@ impl<'a> DslTest<'a> {
                     .unwrap()
             }
         };
+
+        dbg!(&expected);
 
         if matches!(self.inner.mode, TestMode::Error) {
             if !expected.is_err() {

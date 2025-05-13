@@ -1,7 +1,8 @@
 use ariadne::{Color, Label, Report, ReportKind, Source};
 use clap::Parser;
 use dsl_parser::{parser_dsl, Parser as _};
-use std::path::PathBuf;
+use gag::BufferRedirect;
+use std::{io::Read, path::PathBuf};
 
 use crate::testing::{DslTest, FileTest};
 
@@ -76,19 +77,23 @@ impl<'src> Runner<'src> {
         }
     }
 
-    pub fn run(&self, default_dbs: Option<Vec<PathBuf>>) {
+    pub fn run(&mut self, default_dbs: Option<Vec<PathBuf>>) {
         assert!(!self.has_errors());
         let default_dbs = default_dbs;
-        for file_test in self.inner.iter() {
-            for test in file_test.tests.iter() {
-                // TODO: remove unwrap later
+        for file_test in self.inner.iter_mut() {
+            for test in file_test.tests.iter_mut() {
+                let mut stdout_redirect = BufferRedirect::stdout().unwrap();
+                let mut stderr_redirect = BufferRedirect::stderr().unwrap();
                 if let Some(default_dbs) = default_dbs.as_ref() {
                     for db_path in default_dbs {
+                        // TODO: remove unwrap later
                         test.exec_sql(Some(db_path)).unwrap()
                     }
                 } else {
                     test.exec_sql(None).unwrap();
                 }
+                stdout_redirect.read_to_string(&mut test.stdout).unwrap();
+                stderr_redirect.read_to_string(&mut test.stderr).unwrap();
             }
         }
     }
