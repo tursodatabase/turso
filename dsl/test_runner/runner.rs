@@ -1,6 +1,5 @@
 use ariadne::{Color, Label, Report, ReportKind, Source};
-use clap::Parser;
-use dsl_parser::{parser_dsl, Parser as _};
+use dsl_parser::{parser_dsl, Parser as _, TestKind};
 use owo_colors::{OwoColorize, Style, Styled};
 use std::{
     any::Any,
@@ -32,16 +31,6 @@ where
         Ok(Ok(v)) => Ok(v),
         Err(e) => Err(e),
     }
-}
-
-/// Simple program to greet a person
-#[derive(Parser, Debug)]
-#[command(name = "dsl_runner")]
-#[command(version, about, long_about)]
-pub struct Args {
-    /// File path to run test
-    #[arg(short, long)]
-    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,7 +137,7 @@ impl<'src> Runner<'src> {
         }
     }
 
-    pub fn run(&mut self, default_dbs: Option<Vec<PathBuf>>) {
+    pub fn run(&mut self, default_dbs: Vec<PathBuf>) {
         let (tests, failed, total_time) = self.run_inner(default_dbs);
         // TODO: in the future could avoid some computation if we know we did not fail.
         // But for now leave it here just to keep the code simpler
@@ -181,6 +170,7 @@ impl<'src> Runner<'src> {
                 .fold(String::new(), |mut acc, name| {
                     acc.push_str(indent);
                     acc.push_str(&name);
+                    acc.push('\n');
                     acc
                 });
             println!("{out}");
@@ -193,10 +183,7 @@ impl<'src> Runner<'src> {
         );
     }
 
-    fn run_inner(
-        &mut self,
-        default_dbs: Option<Vec<PathBuf>>,
-    ) -> (Vec<FinishedTest>, bool, Duration) {
+    fn run_inner(&mut self, default_dbs: Vec<PathBuf>) -> (Vec<FinishedTest>, bool, Duration) {
         assert!(!self.has_errors());
         let mut finished_tests = Vec::with_capacity(self.inner.capacity());
         let default_dbs = default_dbs;
@@ -211,13 +198,13 @@ impl<'src> Runner<'src> {
                 let mut stdout_redirect = BufferRedirect::stdout_stderr().unwrap();
                 let now = Instant::now();
                 let result = fold_err(catch_unwind(|| {
-                    if let Some(default_dbs) = default_dbs.as_ref() {
+                    if matches!(test.inner.kind, TestKind::Memory) {
+                        test.exec_sql(None)
+                    } else {
                         default_dbs
                             .iter()
                             .map(|db_path| test.exec_sql(Some(db_path)))
                             .collect()
-                    } else {
-                        test.exec_sql(None)
                     }
                 }));
                 let elapsed_time = now.elapsed();

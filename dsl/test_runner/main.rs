@@ -1,8 +1,7 @@
 use std::fs;
 
 use clap::Parser as _;
-use dsl_test_runner::runner;
-use runner::Args;
+use dsl_test_runner::{runner, Args};
 use walkdir::{DirEntry, WalkDir};
 
 fn main() {
@@ -29,7 +28,7 @@ fn main() {
         return;
     }
     // TODO: later pass default databases from Args
-    runner.run(None);
+    runner.run(args.databases);
 }
 
 fn is_hidden(entry: &DirEntry) -> bool {
