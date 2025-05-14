@@ -149,12 +149,16 @@ impl<'src> Runner<'src> {
     }
 
     pub fn run(&mut self, default_dbs: Option<Vec<PathBuf>>) {
-        let (tests, failed) = self.run_inner(default_dbs);
+        let (tests, failed, total_time) = self.run_inner(default_dbs);
+        // TODO: in the future could avoid some computation if we know we did not fail.
+        // But for now leave it here just to keep the code simpler
         if failed {
-            println!("failures:\n");
+            println!("\nfailures:\n");
         }
-        // TODO: add a final list containing all tests that failed
+        let mut failed_names = Vec::new();
+        let mut success_count = 0usize;
         for test in tests {
+            // TODO: eventually differentiate between cli output and Api output
             match test.status {
                 Status::Failed { stdout, error_msg } => {
                     println!(
@@ -163,19 +167,41 @@ impl<'src> Runner<'src> {
                         test.name.red()
                     );
                     println!("{}\n{}", stdout, error_msg);
+                    failed_names.push(format!("{}::{}", test.file_name, test.name));
                 }
-                _ => (),
+                _ => success_count += 1,
             }
         }
-        // TODO: in the end print a line with a summary of tests like this:
-        // test result: FAILED. 17 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+        let failed_count = failed_names.len();
+        if !failed_names.is_empty() {
+            println!("\nfailures:");
+            let indent = "    ";
+            let out = failed_names
+                .into_iter()
+                .fold(String::new(), |mut acc, name| {
+                    acc.push_str(indent);
+                    acc.push_str(&name);
+                    acc
+                });
+            println!("{out}");
+        }
+        let result = if failed { FAILED } else { OK };
+        // TODO: when we support ignore tests, adjust count here
+        println!(
+            "\ntest result: {}. {} passed; {} failed; 0 ignored; finished in {:?}",
+            result, success_count, failed_count, total_time
+        );
     }
 
-    fn run_inner(&mut self, default_dbs: Option<Vec<PathBuf>>) -> (Vec<FinishedTest>, bool) {
+    fn run_inner(
+        &mut self,
+        default_dbs: Option<Vec<PathBuf>>,
+    ) -> (Vec<FinishedTest>, bool, Duration) {
         assert!(!self.has_errors());
         let mut finished_tests = Vec::with_capacity(self.inner.capacity());
         let default_dbs = default_dbs;
         let mut failed = false;
+        let total_time = Instant::now();
         for file_test in self.inner.iter() {
             println!("Running {} tests", file_test.tests.len());
             for test in file_test.tests.iter() {
@@ -234,6 +260,6 @@ impl<'src> Runner<'src> {
                 finished_tests.push(finished_test);
             }
         }
-        (finished_tests, failed)
+        (finished_tests, failed, total_time.elapsed())
     }
 }

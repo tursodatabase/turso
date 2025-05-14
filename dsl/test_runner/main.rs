@@ -16,9 +16,10 @@ fn main() {
         .filter_map(|e| e.ok())
         .filter(|e| is_test_file(e))
         .map(|entry| {
-            println!("{}", entry.path().display());
-            // TODO: see a way to determine the 
-           ( entry.path().display().to_string(), fs::read_to_string(entry.path()).unwrap())
+            (
+                entry.path().display().to_string(),
+                fs::read_to_string(entry.path()).unwrap(),
+            )
         })
         .collect::<Vec<_>>();
 
