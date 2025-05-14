@@ -277,7 +277,8 @@ impl<'a> DslTest<'a> {
         return_if_neq!(
             self.inner.values,
             expected,
-            "query: {:#?}, 
+            "
+            query: {:?}, 
             values: {:?}, 
             sqlite: {:?}, 
             db: {}",
@@ -356,7 +357,8 @@ impl<'a> DslTest<'a> {
         return_if_neq!(
             self.inner.values,
             expected,
-            "query: {:#?}, 
+            "
+            query: {:?}, 
             values: {:?}, 
             limbo: {:?}, 
             db: {}",

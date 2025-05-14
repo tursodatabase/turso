@@ -1,7 +1,6 @@
 use ariadne::{Color, Label, Report, ReportKind, Source};
 use clap::Parser;
 use dsl_parser::{parser_dsl, Parser as _};
-use gag::BufferRedirect;
 use owo_colors::{OwoColorize, Style, Styled};
 use std::{
     any::Any,
@@ -12,7 +11,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::testing::{DslTest, FileTest};
+use crate::{
+    buffer::BufferRedirect,
+    testing::{DslTest, FileTest},
+};
 
 // TODO: later remove owo_dependency. Just lazy right now to mess with ansi escape codes
 const OK: Styled<&'static str> = Style::new().bold().green().style("ok");
@@ -42,13 +44,12 @@ pub struct Args {
     pub path: Option<PathBuf>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Status {
     Success,
-    // TODO: maybe this should be a Vec<u8> instead
     Failed {
+        // TODO: maybe this should be a Vec<u8> instead
         stdout: String,
-        stderr: String,
         error_msg: String,
     },
 }
@@ -63,27 +64,23 @@ pub struct FinishedTest<'a> {
 
 impl FinishedTest<'_> {
     fn print_status(&self) {
-        let sub_millis = self.time.subsec_micros();
-        let seconds = self.time.as_secs() % 60;
-        let minutes = (self.time.as_secs() / 60) % 60;
-        let time = format!("[{:0>2}:{:0>2}.{:0>4}]", minutes, seconds, sub_millis);
         if matches!(self.status, Status::Success) {
             println!(
-                "{} {}::{} ... {} {}",
+                "{} {}::{} ... {} {:?}",
                 "test".blue(),
                 self.file_name,
                 self.name,
                 OK,
-                time
+                self.time
             )
         } else {
             println!(
-                "{} {}::{} ... {} {}",
+                "{} {}::{} ... {} {:?}",
                 "test".blue(),
                 self.file_name,
                 self.name,
                 FAILED,
-                time
+                self.time
             )
         }
     }
@@ -92,7 +89,6 @@ impl FinishedTest<'_> {
 #[derive(Debug)]
 pub struct Runner<'a> {
     inner: Vec<FileTest<'a>>,
-    failed: bool,
 }
 
 impl<'src> Runner<'src> {
@@ -132,10 +128,7 @@ impl<'src> Runner<'src> {
                 }
             })
             .collect::<Vec<_>>();
-        Self {
-            inner: tests,
-            failed: false,
-        }
+        Self { inner: tests }
     }
 
     pub fn has_errors(&self) -> bool {
@@ -155,21 +148,41 @@ impl<'src> Runner<'src> {
         }
     }
 
-    pub fn run(&mut self, default_dbs: Option<Vec<PathBuf>>) -> bool {
-        let tests = self.run_inner(default_dbs);
-        self.failed
+    pub fn run(&mut self, default_dbs: Option<Vec<PathBuf>>) {
+        let (tests, failed) = self.run_inner(default_dbs);
+        if failed {
+            println!("failures:\n");
+        }
+        // TODO: add a final list containing all tests that failed
+        for test in tests {
+            match test.status {
+                Status::Failed { stdout, error_msg } => {
+                    println!(
+                        "---- {}::{} stdout ----",
+                        test.file_name.blue(),
+                        test.name.red()
+                    );
+                    println!("{}\n{}", stdout, error_msg);
+                }
+                _ => (),
+            }
+        }
+        // TODO: in the end print a line with a summary of tests like this:
+        // test result: FAILED. 17 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
     }
 
-    fn run_inner(&mut self, default_dbs: Option<Vec<PathBuf>>) -> Vec<FinishedTest> {
+    fn run_inner(&mut self, default_dbs: Option<Vec<PathBuf>>) -> (Vec<FinishedTest>, bool) {
         assert!(!self.has_errors());
         let mut finished_tests = Vec::with_capacity(self.inner.capacity());
         let default_dbs = default_dbs;
         let mut failed = false;
-        for file_test in self.inner.iter_mut() {
+        for file_test in self.inner.iter() {
             println!("Running {} tests", file_test.tests.len());
-            for test in file_test.tests.iter_mut() {
-                let mut stdout_redirect = BufferRedirect::stdout().unwrap();
-                let mut stderr_redirect = BufferRedirect::stderr().unwrap();
+            for test in file_test.tests.iter() {
+                // TODO: this redirect is nice, but it forces us to write the output to a file
+                // and then read it later
+                // Consider using unstable io::set_output_capture that is used in libtest
+                let mut stdout_redirect = BufferRedirect::stdout_stderr().unwrap();
                 let now = Instant::now();
                 let result = fold_err(catch_unwind(|| {
                     if let Some(default_dbs) = default_dbs.as_ref() {
@@ -203,15 +216,9 @@ impl<'src> Runner<'src> {
                 };
                 let status = if let Some(error_msg) = error_msg {
                     let mut stdout = String::new();
-                    let mut stderr = String::new();
                     stdout_redirect.read_to_string(&mut stdout).unwrap();
-                    stderr_redirect.read_to_string(&mut stderr).unwrap();
                     failed = true;
-                    Status::Failed {
-                        stdout,
-                        stderr,
-                        error_msg,
-                    }
+                    Status::Failed { stdout, error_msg }
                 } else {
                     Status::Success
                 };
@@ -222,13 +229,11 @@ impl<'src> Runner<'src> {
                     time: elapsed_time,
                 };
                 drop(stdout_redirect);
-                drop(stderr_redirect);
                 finished_test.print_status();
 
                 finished_tests.push(finished_test);
             }
         }
-        self.failed = failed;
-        finished_tests
+        (finished_tests, failed)
     }
 }
