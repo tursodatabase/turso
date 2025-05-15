@@ -16,6 +16,7 @@ expression: res
             ],
         ),
         values: [],
+        options: None,
     },
     Test {
         kind: Default,
@@ -27,6 +28,7 @@ expression: res
             ],
         ),
         values: [],
+        options: None,
     },
     Test {
         kind: Default,
@@ -36,5 +38,6 @@ expression: res
             "SELECT",
         ),
         values: [],
+        options: None,
     },
 ]

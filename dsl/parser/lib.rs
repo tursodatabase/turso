@@ -22,6 +22,9 @@ pub struct Test<'a> {
     pub statement: Statement,
     /// Expected Output Value from test
     pub values: Vec<Vec<Value>>,
+    /// Ignore test and specify a message
+    /// TODO: in the future support more options here like disabling CLI test etc
+    pub options: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +63,18 @@ pub enum TestMode {
 pub enum Statement {
     Single(String),
     Many(Vec<String>),
+}
+
+// TODO: for now just
+fn options<'src>() -> impl Parser<'src, &'src str, String, extra::Err<Rich<'src, char>>> + Copy {
+    just("#[")
+        .padded()
+        .then(just("ignore").padded())
+        .then(just("=").padded())
+        .ignored()
+        .ignore_then(none_of("]").repeated().at_least(1).collect::<String>())
+        .then_ignore(just(']').padded())
+        .labelled("options")
 }
 
 fn escape<'src>() -> impl Parser<'src, &'src str, (), extra::Err<Rich<'src, char>>> + Copy {
@@ -126,7 +141,7 @@ pub fn contents_without_values<'src>() -> impl Parser<
     &'src str,
     (Option<TestKind<'src>>, &'src str, Statement),
     extra::Err<Rich<'src, char>>,
-> {
+> + Clone {
     let ident = text::unicode::ident().padded();
 
     let contents = kind()
@@ -146,6 +161,7 @@ pub fn test_parser<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Er
     let test_error_keyword = text::keyword("test_error");
 
     let contents_with_value = contents_without_values()
+        .clone()
         .then(
             just(',')
                 .padded()
@@ -168,6 +184,7 @@ pub fn test_parser<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Er
                 ident: ident.into(),
                 statement,
                 values,
+                options: None,
             })
         })
         .delimited_by(just('(').padded(), just(')').padded())
@@ -180,38 +197,50 @@ pub fn test_parser<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Er
             ident: ident.into(),
             statement,
             values: vec![vec![]],
+            options: None,
         })
         .delimited_by(just('(').padded(), just(')').padded())
         .boxed();
 
-    choice((
-        test_keyword.ignore_then(contents_with_value),
-        test_error_keyword.ignore_then(contents_no_value.validate(|test, extra, emitter| {
-            if matches!(test.mode, TestMode::Error) && matches!(test.kind, TestKind::Regex(..)) {
-                emitter.emit(Rich::custom(
-                    extra.span(),
-                    "cannot have an error test with regex",
-                ));
-            }
+    options()
+        .or_not()
+        .then(
+            choice((
+                test_keyword.ignore_then(contents_with_value),
+                test_error_keyword.ignore_then(contents_no_value.validate(
+                    |test, extra, emitter| {
+                        if matches!(test.mode, TestMode::Error)
+                            && matches!(test.kind, TestKind::Regex(..))
+                        {
+                            emitter.emit(Rich::custom(
+                                extra.span(),
+                                "cannot have an error test with regex",
+                            ));
+                        }
+                        test
+                    },
+                )),
+            ))
+            .padded(),
+        )
+        .map(|(options, mut test)| {
+            test.options = options;
             test
-        })),
-    ))
+        })
+        .labelled("test")
+        .boxed()
 }
 
 pub fn parser_dsl<'src>(
 ) -> impl Parser<'src, &'src str, Vec<Test<'src>>, extra::Err<Rich<'src, char>>> + Clone {
-    test_parser()
-        .padded()
-        .repeated()
-        .collect::<Vec<_>>()
-        .boxed()
+    test_parser().repeated().collect::<Vec<_>>().boxed()
 }
 
 #[cfg(test)]
 mod tests {
     use chumsky::Parser;
 
-    use crate::{parser_dsl, test_parser};
+    use crate::{options, parser_dsl, test_parser};
 
     #[macro_export]
     macro_rules! assert_debug_snapshot_with_input {
@@ -320,5 +349,28 @@ mod tests {
         let input = r#"test(r"\d+\.\d+\.\d+", test_single, "SELECT", [Null, 1])"#;
         let res = parser.parse(input).has_errors();
         assert!(res);
+    }
+
+    #[test]
+    fn test_option_parser() {
+        let parser = options();
+        let input = "#[ignore = flaky]";
+        let res = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, res);
+    }
+
+    #[test]
+    fn test_ignore_option() {
+        let parser = test_parser();
+        let input = r#"#[ignore = flaky]
+        test(test_single, "SELECT 1")"#;
+        let res = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, res);
+
+        let input = r#"
+        #[ignore = because yes]
+        test(test_single, "SELECT 1 '")"#;
+        let res = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, res);
     }
 }

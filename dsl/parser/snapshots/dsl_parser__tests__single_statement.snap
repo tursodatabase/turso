@@ -11,4 +11,5 @@ Test {
         "SELECT 1",
     ),
     values: [],
+    options: None,
 }

@@ -1,6 +1,6 @@
 ---
 source: dsl/parser/lib.rs
-description: "input: test(test_single, \"SELECT 1 '\")"
+description: "input: #[ignore = flaky]\n        test(test_single, \"SELECT 1\")"
 expression: res
 ---
 Test {
@@ -8,8 +8,10 @@ Test {
     mode: Normal,
     ident: "test_single",
     statement: Single(
-        "SELECT 1 '",
+        "SELECT 1",
     ),
     values: [],
-    options: None,
+    options: Some(
+        "flaky",
+    ),
 }

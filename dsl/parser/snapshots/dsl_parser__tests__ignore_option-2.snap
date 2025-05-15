@@ -1,6 +1,6 @@
 ---
 source: dsl/parser/lib.rs
-description: "input: test(test_single, \"SELECT 1 '\")"
+description: "input: \n        #[ignore = because yes]\n        test(test_single, \"SELECT 1 '\")"
 expression: res
 ---
 Test {
@@ -11,5 +11,7 @@ Test {
         "SELECT 1 '",
     ),
     values: [],
-    options: None,
+    options: Some(
+        "because yes",
+    ),
 }

@@ -23,6 +23,7 @@ expression: res
                 ),
             ],
         ],
+        options: None,
     },
     Test {
         kind: Default,
@@ -46,6 +47,7 @@ expression: res
                 ),
             ],
         ],
+        options: None,
     },
     Test {
         kind: Default,
@@ -61,5 +63,6 @@ expression: res
                 ),
             ],
         ],
+        options: None,
     },
 ]
