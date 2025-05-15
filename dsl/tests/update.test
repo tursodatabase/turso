@@ -1,0 +1,223 @@
+test(
+    memory,
+    basic_update,
+    [
+        "CREATE TABLE temp (t1 INTEGER)",
+        "INSERT INTO temp VALUES (1)",
+        "UPDATE temp SET t1 = 2",
+        "SELECT * FROM temp"
+    ],
+    2
+)
+
+test(
+    memory,
+    update_mul,
+    [
+        "CREATE TABLE temp (t1 INTEGER)",
+        "INSERT INTO temp VALUES (1), (2.0), ('3'), ('4.0')",
+        "UPDATE temp SET t1 = 2",
+        "SELECT * FROM temp"
+    ],
+    [[2], [2], [2], [2]]
+)
+
+test(
+    memory,
+    update_where,
+    [
+        "CREATE TABLE temp (a, b, c)",
+        "INSERT INTO temp VALUES (1, 2, 33)",
+        "INSERT INTO temp VALUES (1, 22, 33)",
+        "INSERT INTO temp VALUES (1, 22, 33)",
+        "UPDATE temp SET a = 6 WHERE b = 2",
+        "SELECT * FROM temp"
+    ],
+    [[6, 2, 33], [1, 22, 33], [1, 22, 33]]
+)
+
+test(
+    memory,
+    update_where_2,
+    [
+        "CREATE TABLE temp (a, b, c)",
+        "INSERT INTO temp VALUES (1, 22, 33)",
+        "INSERT INTO temp VALUES (1, 22, 33)",
+        "INSERT INTO temp VALUES (1, 22, 33)",
+        "INSERT INTO temp VALUES (6, 22, 33)",
+        "INSERT INTO temp VALUES (1, 22, 33)",
+        "INSERT INTO temp VALUES (1, 22, 33)",
+        "UPDATE temp SET b = 100000 WHERE a = 6",
+        "SELECT b FROM temp WHERE a = 6"
+    ],
+    100000
+)
+
+test(
+    memory,
+    update_all_many,
+    [
+        "CREATE TABLE temp (a, b, c)",
+        "INSERT INTO temp VALUES (1, 22, 33), (1, 22, 33), (1, 22, 33), (1, 22, 33), (1, 22, 33), (1, 22, 33), (1, 22, 33), (1, 22, 33)",
+        "UPDATE temp SET a = 1234234234234234",
+        "SELECT COUNT(*) FROM temp WHERE a = 1234234234234234"
+    ],
+    8
+)
+
+test(
+    memory,
+    update_large_small,
+    [
+        "CREATE TABLE temp (a, b, c)",
+        "INSERT INTO temp VALUES (randomblob(1024), 1, 2)",
+        "UPDATE temp SET a = 'a'",
+        "SELECT * FROM temp"
+    ],
+    ["a", 1, 2]
+)
+
+test(
+    memory,
+    update_null,
+    [
+        "CREATE TABLE temp (a, b, c)",
+        "INSERT INTO temp VALUES (NULL, 1, 2)",
+        "INSERT INTO temp VALUES (3, 4, 5)",
+        "UPDATE temp SET a = 10 WHERE a IS NULL",
+        "SELECT * FROM temp"
+    ],
+    [[10, 1, 2], [3, 4, 5]]
+)
+
+test(
+    memory,
+    update_mixed_types,
+    [
+        "CREATE TABLE temp (a)",
+        "INSERT INTO temp VALUES (1)",
+        "INSERT INTO temp VALUES ('2')",
+        "INSERT INTO temp VALUES (3.0)",
+        "INSERT INTO temp VALUES (X'01')",
+        "UPDATE temp SET a = 'updated'",
+        "SELECT * FROM temp"
+    ],
+    [["updated"], ["updated"], ["updated"], ["updated"]]
+)
+
+test(
+    memory,
+    update_with_expression,
+    [
+        "CREATE TABLE temp (a, b)",
+        "INSERT INTO temp VALUES (1, 10)",
+        "INSERT INTO temp VALUES (2, 20)",
+        "INSERT INTO temp VALUES (3, 30)",
+        "UPDATE temp SET a = b * 3 / 2",
+        "SELECT * FROM temp"
+    ],
+    [[15, 10], [30, 20], [45, 30]]
+)
+
+test(
+    memory,
+    update_self_reference,
+    [
+        "CREATE TABLE temp (a, b)",
+        "INSERT INTO temp VALUES (1, 10)",
+        "INSERT INTO temp VALUES (2, 20)",
+        "UPDATE temp SET a = b WHERE a = 1",
+        "SELECT * FROM temp"
+    ],
+    [[10, 10], [2, 20]]
+)
+
+test(
+    memory,
+    update_self_ref_all,
+    [
+        "CREATE TABLE temp (a, b, c)",
+        "INSERT INTO temp VALUES (1, 2, 3)",
+        "INSERT INTO temp VALUES (4, 5, 6)",
+        "UPDATE temp SET a = b",
+        "SELECT * FROM temp"
+    ],
+    [[2, 2, 3], [5, 5, 6]]
+)
+
+test(
+    memory,
+    update_large_text,
+    [
+        "CREATE TABLE temp (a)",
+        "INSERT INTO temp VALUES ('short')",
+        "UPDATE temp SET a = 'this is a very large text field that exceeds the default cell size and should trigger overflow handling in the btree implementation'",
+        "SELECT * FROM temp"
+    ],
+    [["this is a very large text field that exceeds the default cell size and should trigger overflow handling in the btree implementation"]]
+)
+
+test(
+    memory,
+    update_with_null_condition,
+    [
+        "CREATE TABLE temp (a, b)",
+        "INSERT INTO temp VALUES (NULL, 1)",
+        "INSERT INTO temp VALUES (2, NULL)",
+        "INSERT INTO temp VALUES (3, 4)",
+        "UPDATE temp SET a = 99 WHERE b IS NULL",
+        "SELECT * FROM temp"
+    ],
+    [[Null, 1], [99, Null], [3, 4]]
+)
+
+test(
+    memory,
+    update_to_null,
+    [
+        "CREATE TABLE temp (a, b)",
+        "INSERT INTO temp VALUES (1, 10)",
+        "INSERT INTO temp VALUES (2, 20)",
+        "UPDATE temp SET a = NULL WHERE b = 10",
+        "SELECT * FROM temp"
+    ],
+    [[Null, 10], [2, 20]]
+)
+
+test(
+    memory,
+    update_with_randomblob,
+    [
+        "CREATE TABLE temp (a, b)",
+        "INSERT INTO temp VALUES (randomblob(100), 1)",
+        "UPDATE temp SET a = randomblob(200)",
+        "SELECT length(a) FROM temp"
+    ],
+    200
+)
+
+test(
+    memory,
+    update_multiple_columns,
+    [
+        "CREATE TABLE temp (a, b, c)",
+        "INSERT INTO temp VALUES (1, 2, 3)",
+        "INSERT INTO temp VALUES (4, 5, 6)",
+        "UPDATE temp SET a = 10, b = 20, c = 30",
+        "SELECT * FROM temp"
+    ],
+    [[10, 20, 30], [10, 20, 30]]
+)
+
+test(
+    memory,
+    update_true_expr,
+    [
+        "CREATE TABLE temp (a, b, c)",
+        "INSERT INTO temp VALUES (1, 2, 3)",
+        "INSERT INTO temp VALUES (4, 5, 6)",
+        "UPDATE temp SET a = 10, b = 20, c = 30 WHERE 1",
+        "SELECT * FROM temp"
+    ],
+    [[10, 20, 30], [10, 20, 30]]
+)
