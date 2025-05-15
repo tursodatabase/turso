@@ -59,6 +59,7 @@ pub(super) fn text<'src>(
                     })
                 },
             )),
+            any(),
         )))
         .boxed();
 

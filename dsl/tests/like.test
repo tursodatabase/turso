@@ -1,0 +1,172 @@
+test(
+    like_fn,
+    "select name, like('sweat%', name) from products",
+    [["hat", 0], ["cap", 0], ["shirt", 0], ["sweater", 1], ["sweatshirt", 1], ["shorts", 0], ["jeans", 0], ["sneakers", 0], ["boots", 0], ["coat", 0], ["accessories", 0]]
+)
+
+test(
+    where_like,
+    "select * from products where name like 'sweat%'",
+    [[4, "sweater", 25.0], [5, "sweatshirt", 74.0]]
+)
+
+test(
+    where_like_case_insensitive,
+    "select * from products where name like 'SWEAT%'",
+    [[4, "sweater", 25.0], [5, "sweatshirt", 74.0]]
+)
+
+test(
+    where_like_underscore,
+    "select * from products where name like 'sweat_r'",
+    [[4, "sweater", 25.0]]
+)
+
+test(
+    where_like_underscore_case_insensitive,
+    "select * from products where name like 'SwEaT_R'",
+    [[4, "sweater", 25.0]]
+)
+
+test(
+    where_like_fn,
+    "select * from products where like('sweat%', name)=1",
+    [[4, "sweater", 25.0], [5, "sweatshirt", 74.0]]
+)
+
+test(
+    where_not_like_and,
+    "select * from products where name not like 'sweat%' and price >= 70.0",
+    [[1, "hat", 79.0], [2, "cap", 82.0], [6, "shorts", 70.0], [7, "jeans", 78.0], [8, "sneakers", 82.0], [11, "accessories", 81.0]]
+)
+
+test(
+    where_like_or,
+    "select * from products where name like 'sweat%' or price >= 80.0",
+    [[2, "cap", 82.0], [4, "sweater", 25.0], [5, "sweatshirt", 74.0], [8, "sneakers", 82.0], [11, "accessories", 81.0]]
+)
+
+test(
+    where_like_another_column,
+    "select first_name, last_name from users where last_name like first_name",
+    [["James", "James"], ["Daniel", "Daniel"], ["Taylor", "Taylor"]]
+)
+
+test(
+    where_like_another_column_prefix,
+    "select first_name, last_name from users where last_name like concat(first_name, '%')",
+    [["James", "James"], ["Daniel", "Daniel"], ["William", "Williams"], ["John", "Johnson"], ["Taylor", "Taylor"], ["John", "Johnson"], ["Stephen", "Stephens"], ["Robert", "Roberts"]]
+)
+
+test(
+    where_like_escape,
+    "select count(*) from users where last_name like 'Pe#rry' escape '#'",
+    19
+)
+
+test(
+    where_like_impossible,
+    "select * from products where 'foobar' like 'fooba'"
+)
+
+test(
+    like_with_backslash,
+    "select like('\%A', '\A')",
+    1
+)
+
+test(
+    like_with_dollar,
+    "select like('A$%', 'A$')",
+    1
+)
+
+test(
+    like_with_dot,
+    "select like('%a.a', 'aaaa')",
+    0
+)
+
+test(
+    like_fn_esc_1,
+    "SELECT like('abcX%', 'abc%' , 'X')",
+    1
+)
+
+test(
+    like_fn_esc_2,
+    "SELECT like('abcX%', 'abc5' , 'X')",
+    0
+)
+
+test(
+    like_fn_esc_3,
+    "SELECT like('abcX%', 'abc', 'X')",
+    0
+)
+
+test(
+    like_fn_esc_4,
+    "SELECT like('abcX%', 'abcX%', 'X')",
+    0
+)
+
+test(
+    like_fn_esc_5,
+    "SELECT like('abcX%', 'abc%%', 'X')",
+    0
+)
+
+test(
+    like_fn_esc_6,
+    "SELECT like('abcX_', 'abc_' , 'X')",
+    1
+)
+
+test(
+    like_fn_esc_7,
+    "SELECT like('abcX_', 'abc5' , 'X')",
+    0
+)
+
+test(
+    like_fn_esc_8,
+    "SELECT like('abcX_', 'abc' , 'X')",
+    0
+)
+
+test(
+    like_fn_esc_9,
+    "SELECT like('abcX_', 'abcX_', 'X')",
+    0
+)
+
+test(
+    like_fn_esc_10,
+    "SELECT like('abcX_', 'abc__', 'X')",
+    0
+)
+
+test(
+    like_fn_esc_11,
+    "SELECT like('abcXX', 'abcX' , 'X')",
+    1
+)
+
+test(
+    like_fn_esc_12,
+    "SELECT like('abcXX', 'abc5' , 'X')",
+    0
+)
+
+test(
+    like_fn_esc_13,
+    "SELECT like('abcXX', 'abc' , 'X')",
+    0
+)
+
+test(
+    like_fn_esc_14,
+    "SELECT like('abcXX', 'abcXX', 'X')",
+    0
+)

@@ -27,7 +27,6 @@ fn main() {
         runner.print_errors();
         return;
     }
-    // TODO: later pass default databases from Args
     runner.run(args.databases);
 }
 
