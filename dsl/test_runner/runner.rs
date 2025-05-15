@@ -88,21 +88,24 @@ impl<'src> Runner<'src> {
             .map(|index| {
                 let (file_name, source) = sources.get(index).unwrap();
                 let (out, errs) = parser_dsl().parse(&source).into_output_errors();
-                let errs: Vec<Report<'_, ((), std::ops::Range<usize>)>> = errs
+                let errs = errs
                     .into_iter()
                     .map(|e| {
                         // Basic error message for now
-                        Report::build(ReportKind::Error, ((), e.span().into_range()))
-                            .with_config(
-                                ariadne::Config::new().with_index_type(ariadne::IndexType::Byte),
-                            )
-                            .with_message(e.to_string())
-                            .with_label(
-                                Label::new(((), e.span().into_range()))
-                                    .with_message(e.reason().to_string())
-                                    .with_color(Color::Red),
-                            )
-                            .finish()
+                        Report::build(
+                            ReportKind::Error,
+                            (file_name.as_str(), e.span().into_range()),
+                        )
+                        .with_config(
+                            ariadne::Config::new().with_index_type(ariadne::IndexType::Byte),
+                        )
+                        .with_message(e.to_string())
+                        .with_label(
+                            Label::new((file_name.as_str(), e.span().into_range()))
+                                .with_message(e.reason().to_string())
+                                .with_color(Color::Red),
+                        )
+                        .finish()
                     })
                     .collect::<Vec<_>>();
                 FileTest {
@@ -132,7 +135,9 @@ impl<'src> Runner<'src> {
     pub fn print_errors(&self) {
         for file_test in self.inner.iter() {
             for error in file_test.errors.iter() {
-                error.print(Source::from(file_test.source)).unwrap()
+                error
+                    .print((file_test.file_name, Source::from(file_test.source)))
+                    .unwrap()
             }
         }
     }

@@ -1,0 +1,8 @@
+---
+source: dsl/parser/sqlite_values.rs
+description: "input: \"[\\\"hat\\\",\\\"cap\\\",\\\"shirt\\\",\\\"sweater\\\",\\\"sweatshirt\\\",\\\"shorts\\\",\\\"jeans\\\",\\\"sneakers\\\",\\\"boots\\\",\\\"coat\\\",\\\"accessories\\\"]\""
+expression: val
+---
+Text(
+    "[\"hat\",\"cap\",\"shirt\",\"sweater\",\"sweatshirt\",\"shorts\",\"jeans\",\"sneakers\",\"boots\",\"coat\",\"accessories\"]",
+)

@@ -165,7 +165,7 @@ pub struct FileTest<'a> {
     pub file_name: &'a str,
     pub source: &'a str,
     pub tests: Vec<DslTest<'a>>,
-    pub errors: Vec<Report<'a, ((), std::ops::Range<usize>)>>,
+    pub errors: Vec<Report<'a, (&'a str, std::ops::Range<usize>)>>,
 }
 
 impl<'a> DslTest<'a> {

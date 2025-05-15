@@ -40,26 +40,32 @@ pub(super) fn real<'src>() -> impl Parser<'src, &'src str, f64, extra::Err<Rich<
 }
 
 pub(super) fn text<'src>(
-) -> impl Parser<'src, &'src str, &'src str, extra::Err<Rich<'src, char>>> + Clone {
+) -> impl Parser<'src, &'src str, String, extra::Err<Rich<'src, char>>> + Clone {
     let escape = just('\\')
-        .then(choice((
-            just('\\'),
-            just('/'),
-            just('"'),
+        .ignore_then(choice((
+            just('\\').to('\\'),
+            just('/').to('/'),
+            just('"').to('"'),
             just('b').to('\x08'),
             just('f').to('\x0C'),
             just('n').to('\n'),
             just('r').to('\r'),
             just('t').to('\t'),
+            just('u').ignore_then(text::digits(16).exactly(4).to_slice().validate(
+                |digits, e, emitter| {
+                    char::from_u32(u32::from_str_radix(digits, 16).unwrap()).unwrap_or_else(|| {
+                        emitter.emit(Rich::custom(e.span(), "invalid unicode character"));
+                        '\u{FFFD}' // unicode replacement character
+                    })
+                },
+            )),
         )))
-        .ignored()
         .boxed();
 
     none_of("\\\"")
-        .ignored()
         .or(escape)
         .repeated()
-        .to_slice()
+        .collect::<String>()
         .delimited_by(just('"'), just('"'))
         .labelled("text")
         .boxed()
@@ -87,7 +93,7 @@ pub(super) fn value_parser<'src>(
         boolean,
         real().map(|f| Value::Real(f)),
         integer().map(|i| Value::Integer(i)),
-        just("Null").to(Value::Null),
+        just("Null").to(Value::Null).labelled("Null"),
         text().map(|s| Value::Text(s.to_string())),
         blob().map(|b| Value::Blob(b)),
     ))
@@ -114,10 +120,12 @@ pub(super) fn sqlite_values_parser<'src>(
         .boxed();
 
     choice((
-        just("None").to(vec![vec![]]),
-        value_parser().map(|v| vec![vec![v]]),
-        value_list.map(|v_list| vec![v_list]),
-        value_list_2d,
+        just("None").to(vec![vec![]]).labelled("None"),
+        value_parser()
+            .map(|v| vec![vec![v]])
+            .labelled("single value"),
+        value_list.map(|v_list| vec![v_list]).labelled("single row"),
+        value_list_2d.labelled("rows and columns"),
     ))
 }
 
@@ -313,6 +321,11 @@ mod tests {
 
         let input = r#"test\n""#;
         let _ = parser.parse(input).into_result().unwrap_err();
+
+        let input = r#""[\"hat\",\"cap\",\"shirt\",\"sweater\",\"sweatshirt\",\"shorts\",\"jeans\",\"sneakers\",\"boots\",\"coat\",\"accessories\"]""#;
+        dbg!(&input);
+        let val = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, val);
     }
 
     #[test]

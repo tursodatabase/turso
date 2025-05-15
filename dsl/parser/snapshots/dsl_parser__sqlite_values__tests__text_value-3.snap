@@ -4,5 +4,5 @@ description: "input: \"test\\n\""
 expression: val
 ---
 Text(
-    "test\\n",
+    "test\n",
 )

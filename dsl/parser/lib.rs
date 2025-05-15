@@ -19,7 +19,7 @@ pub struct Test<'a> {
     // e.g converting the ident to snake_case
     pub ident: Cow<'a, str>,
     /// Sql Statement(s) to run
-    pub statement: Statement<'a>,
+    pub statement: Statement,
     /// Expected Output Value from test
     pub values: Vec<Vec<Value>>,
 }
@@ -57,9 +57,9 @@ pub enum TestMode {
 
 /// Sql Statement(s)
 #[derive(Debug, PartialEq, Eq)]
-pub enum Statement<'a> {
-    Single(&'a str),
-    Many(Vec<&'a str>),
+pub enum Statement {
+    Single(String),
+    Many(Vec<String>),
 }
 
 fn escape<'src>() -> impl Parser<'src, &'src str, (), extra::Err<Rich<'src, char>>> + Copy {
@@ -104,8 +104,7 @@ fn kind<'src>() -> impl Parser<'src, &'src str, TestKind<'src>, extra::Err<Rich<
     kind
 }
 
-fn statement<'src>() -> impl Parser<'src, &'src str, Statement<'src>, extra::Err<Rich<'src, char>>>
-{
+fn statement<'src>() -> impl Parser<'src, &'src str, Statement, extra::Err<Rich<'src, char>>> {
     let sql_query = text();
 
     let statement = choice((
@@ -116,7 +115,7 @@ fn statement<'src>() -> impl Parser<'src, &'src str, Statement<'src>, extra::Err
             .at_least(1)
             .collect::<Vec<_>>()
             .delimited_by(just('[').padded(), just(']').padded())
-            .map(|s: Vec<&str>| Statement::Many(s)),
+            .map(|s| Statement::Many(s)),
     ))
     .boxed();
     statement
@@ -125,7 +124,7 @@ fn statement<'src>() -> impl Parser<'src, &'src str, Statement<'src>, extra::Err
 pub fn contents_without_values<'src>() -> impl Parser<
     'src,
     &'src str,
-    (Option<TestKind<'src>>, &'src str, Statement<'src>),
+    (Option<TestKind<'src>>, &'src str, Statement),
     extra::Err<Rich<'src, char>>,
 > {
     let ident = text::unicode::ident().padded();
