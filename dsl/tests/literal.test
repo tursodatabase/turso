@@ -1,0 +1,115 @@
+test(
+    numeric_literal_1,
+    "SELECT 45",
+    45
+)
+
+test(
+    numeric_literal_2,
+    "SELECT 0x7FFFFFFFFFFFFFFF",
+    9223372036854775807
+)
+
+test(
+    numeric_literal_3,
+    "SELECT -0x7FFFFFFFFFFFFFFF",
+    -9223372036854775807
+)
+
+test(
+    numeric_literal_4,
+    "SELECT +0x7FFFFFFFFFFFFFFF",
+    9223372036854775807
+)
+
+test(
+    numeric_literal_5,
+    "SELECT 9_223_372_036_854_775_807",
+    9223372036854775807
+)
+
+test(
+    numeric_literal_6,
+    "SELECT -9_223_372_036_854_775_808",
+    -9223372036854775808
+)
+
+test(
+    numeric_literal_7,
+    "SELECT 1_000",
+    1000
+)
+
+test(
+    numeric_literal_8,
+    "SELECT 1.1_1",
+    1.11
+)
+
+test(
+    numeric_literal_9,
+    "SELECT 1e12",
+    1000000000000.0
+)
+
+test(
+    numeric_literal_10,
+    "SELECT 1.0",
+    1.0
+)
+
+test(
+    numeric_literal_11,
+    "SELECT 1e1000",
+    Inf
+)
+
+test(
+    numeric_literal_12,
+    "SELECT -1e1000",
+    -Inf
+)
+
+test(
+    numeric_literal_13,
+    "SELECT 1e1_000",
+    Inf
+)
+
+test(
+    numeric_literal_14,
+    "SELECT 12_3_456.7_8_9",
+    123456.789
+)
+
+test(
+    numeric_literal_exceed_max_i64,
+    "SELECT 9_223_372_036_854_775_808",
+    9.223372036854776e18
+)
+
+test(
+    numeric_literal_exceed_min_i64,
+    "SELECT -9_223_372_036_854_775_809",
+    -9.223372036854776e18
+)
+
+test_error(
+    invalid_numeric_literal_1,
+    "SELECT 0xFF__FF"
+)
+
+test_error(
+    invalid_numeric_literal_2,
+    "SELECT 12a3"
+)
+
+test_error(
+    invalid_numeric_literal_3,
+    "SELECT e12"
+)
+
+test_error(
+    invalid_numeric_literal_4,
+    "SELECT 1e"
+)
