@@ -65,6 +65,13 @@ pub enum Statement {
     Many(Vec<String>),
 }
 
+fn comment<'src>() -> impl Parser<'src, &'src str, (), extra::Err<Rich<'src, char>>> {
+    just("//")
+        .then(none_of("\r\n").repeated())
+        .padded()
+        .ignored()
+}
+
 // TODO: for now just copy the string inside
 fn options<'src>() -> impl Parser<'src, &'src str, String, extra::Err<Rich<'src, char>>> {
     just("#[")
@@ -201,9 +208,10 @@ pub fn test_parser<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Er
         })
         .delimited_by(just('(').padded(), just(')').padded())
         .boxed();
-
-    options()
+    comment()
+        .repeated()
         .or_not()
+        .ignore_then(options().or_not())
         .then(
             choice((
                 test_keyword.ignore_then(contents_with_value),
@@ -369,6 +377,24 @@ mod tests {
 
         let input = r#"
         #[ignore = "because yes"]
+        test(test_single, "SELECT 1 '")"#;
+        let res = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, res);
+    }
+
+    #[test]
+    fn test_comments() {
+        let parser = test_parser();
+        let input = r#"
+        // Hi shjdfsdhjfjhsdnjfhsdjnfj
+        // sdfjksnfjnskdfnjsndkfsj
+        #[ignore = "flaky"]
+        test(test_single, "SELECT 1")"#;
+        let res = parser.parse(input).unwrap();
+        assert_debug_snapshot_with_input!(input, res);
+
+        let input = r#"
+        // TESTING
         test(test_single, "SELECT 1 '")"#;
         let res = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, res);
