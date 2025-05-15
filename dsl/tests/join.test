@@ -80,6 +80,14 @@ test(
     ]
 )
 
+// Uncomment this test when it works. Sqlite3 returns 'Aaron' due to the way it reorders tables in the join based on the where clause.
+#[ignore = "Limbo returns Laura"]
+test(
+    inner_join_self_with_where_2,
+    "select u.first_name from users u join products as p on u.first_name != p.name where u.last_name = 'Williams' limit 1",
+    "Aaron"
+)
+
 test(
     inner_join_constant_condition_true,
     "select u.first_name, p.name from users u join products as p where 1 limit 5",
@@ -294,6 +302,7 @@ test(
     ]
 )
 
+// regression test for case where 3-way join that used 1 scan and 2 seeks (point lookups) was buggy due to incorrect jump opcodes
 test(
     three_way_inner_join_with_two_seeks,
     "select * from users u join users u2 on u.id=u2.id join products p on u2.id = p.id limit 3",
@@ -367,6 +376,8 @@ test(
     ]
 )
 
+// important difference between regular SELECT * join and a SELECT * USING join is that the join keys are deduplicated
+// from the result in the USING case.
 test(
     join_using,
     "select * from users join products using (id) limit 3",
@@ -397,6 +408,17 @@ test(
     ]
 )
 
+// NATURAL JOIN desugars to JOIN USING (common_column1, common_column2...)
+test(
+    join_using_2,
+    "select * from users natural join products limit 3",
+    [
+        [1, "Jamie", "Foster", "dylan00@example.com", "496-522-9493", "62375 Johnson Rest Suite 322", "West Lauriestad", "IL", "35865", 94, "hat", 79.0],
+        [2, "Cindy", "Salazar", "williamsrebecca@example.com", "287-934-1135", "75615 Stacey Shore", "South Stephanie", "NC", "85181", 37, "cap", 82.0],
+        [3, "Tommy", "Perry", "warechristopher@example.org", "001-288-554-8139x0276", "2896 Paul Fall Apt. 972", "Michaelborough", "VA", "15691", 18, "shirt", 18.0]
+    ]
+)
+
 test(
     natural_join,
     "select * from users natural join products limit 3",
@@ -417,6 +439,7 @@ test(
     ]
 )
 
+// have to be able to join between 1st table and 3rd table as well
 test(
     natural_join_and_using_join,
     "select u.id, u2.id, p.id from users u natural join products p join users u2 using (first_name) limit 3",
@@ -427,6 +450,8 @@ test(
     ]
 )
 
+// regression test for a backwards iteration left join case,
+// where the null flag of the right table was not cleared after a previous unmatched row.
 test(
     left_join_backwards_iteration,
     "select users.id, users.first_name as user_name, products.name as product_name from users left join products on users.id = products.id where users.id < 13 order by users.id desc limit 3",

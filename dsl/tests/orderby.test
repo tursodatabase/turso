@@ -112,6 +112,7 @@ test(
     [["Nicole"], ["Gina"], ["Dorothy"]]
 )
 
+// These two following tests may seem dumb but they verify that index scanning by age_idx doesn't drop any rows due to BTree bugs
 test(
     orderby_asc_verify_rows,
     "select count(1) from (select * from users order by age desc)",

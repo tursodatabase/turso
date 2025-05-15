@@ -1,3 +1,4 @@
+// Basic DROP INDEX functionality
 test(
     memory,
     drop_index_basic_1,
@@ -12,6 +13,7 @@ test(
     0
 )
 
+// Test DROP INDEX IF EXISTS on existing index
 test(
     memory,
     drop_index_if_exists_1,
@@ -24,6 +26,7 @@ test(
     0
 )
 
+// Test DROP INDEX IF EXISTS on non-existent index
 test(
     memory,
     drop_index_if_exists_2,
@@ -34,11 +37,13 @@ test(
     "success"
 )
 
+// Test dropping non-existant index produces an error
 test_error(
     drop_index_no_index,
     "DROP INDEX t_idx"
 )
 
+// Test dropping index after multiple inserts and deletes
 test(
     memory,
     drop_index_after_ops_1,

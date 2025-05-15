@@ -1,3 +1,4 @@
+// Basic single row delete test
 test(
     memory,
     delete_single_1,
@@ -12,6 +13,7 @@ test(
     [[1], [3]]
 )
 
+// Test alternating delete-insert pattern to stress freelist
 test(
     memory,
     delete_insert_alternate_1,
@@ -29,6 +31,7 @@ test(
     [[3], [4], [5]]
 )
 
+// Test deleting from both ends
 test(
     memory,
     delete_ends_1,
@@ -46,6 +49,7 @@ test(
     [[2], [3], [4]]
 )
 
+// Test delete-insert cycles with value reuse
 test(
     memory,
     delete_reuse_1,

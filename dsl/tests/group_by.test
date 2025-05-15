@@ -233,6 +233,7 @@ test(
     ]
 )
 
+// Wanda = 9, Whitney = 11, William = 111
 test(
     column_alias_in_group_by_order_by_having,
     "select first_name as fn, count(1) as fn_count from users where fn in ('Wanda', 'Whitney', 'William') group by fn having fn_count > 10 order by fn_count",
@@ -250,6 +251,7 @@ test(
     ]
 )
 
+// There was a regression where we incorrectly removed SOME order by terms and left others in place, which is invalid and results in wrong rows being returned.
 test(
     groupby_orderby_removal_regression_test,
     "select id, last_name, count(1) from users GROUP BY 1,2 order by id, last_name desc limit 3",

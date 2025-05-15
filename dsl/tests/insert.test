@@ -214,6 +214,17 @@ test_error(
     ]
 )
 
+#[ignore = "Uncomment following test case when unique constraint is added"]
+test_error(
+    strict_update_pk_constraint,
+    [
+        "CREATE TABLE test8(id INTEGER PRIMARY KEY, name TEXT) STRICT",
+        "INSERT INTO test8 VALUES(1, 'name1')",
+        "INSERT INTO test8 VALUES(2, 'name2')",
+        "UPDATE test8 SET id = 2 WHERE id = 1"
+    ]
+)
+
 test(
     memory,
     strict_update_multiple_columns,

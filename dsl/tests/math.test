@@ -1,3 +1,4 @@
+// math_expression_fuzz_run failure with seed 1743159584
 test(
     fuzz_test_failure,
     "SELECT mod(atanh(tanh(-1.0)), ((1.0))) / ((asinh(-1.0) / 2.0 * 1.0) + pow(0.0, 1.0) + 0.5)",

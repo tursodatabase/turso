@@ -190,6 +190,14 @@ test(
     "{\n3\"x\": 1\n}"
 )
 
+// Currently conversion from blob to string is not exactly the same as in sqlite.
+#[ignore = "The blob below should evaluate to two whitespaces TEXT value"]
+test(
+    json_pretty_ident_blob_2,
+    "SELECT json_pretty('{x: 1}', x'1111')",
+    "{\n  \"x\": 1\n}"
+)
+
 test(
     json_array_str,
     "SELECT json_array('a')",
@@ -352,6 +360,7 @@ test(
     Null
 )
 
+// \x61 is the ASCII code for 'a'
 test(
     json_extract_with_escaping,
     "SELECT json_extract('{\"\\x61\": 1}', '$.a')",
@@ -628,34 +637,54 @@ test(
     1
 )
 
+// Overflows 2**32 is equivalent to 0
 test(
     json_extract_overflow_int32_1,
     "SELECT json_extract('[1,2,3]', '$[4294967296]')",
     1
 )
 
+// Overflows 2**32 + 1 is equivalent to 1
 test(
     json_extract_overflow_int32_2,
     "SELECT json_extract('[1,2,3]', '$[4294967297]')",
     2
 )
 
+// Overflows -2**32 - 1 is equivalent to -1
 test(
     json_extract_overflow_int32_3,
     "SELECT json_extract('[1,2,3]', '$[#-4294967297]')",
     3
 )
 
+// Overflows -2**32 - 2 is equivalent to -2
 test(
     json_extract_overflow_int32_4,
     "SELECT json_extract('[1,2,3]', '$[#-4294967298]')",
     2
 )
 
+// pow(2,63) + 1 == 9223372036854775808
 test(
     json_extract_overflow_int64,
     "SELECT json_extract('[1,2,3]', '$[9223372036854775808]')",
     1
+)
+
+// pow(2, 127) + 1 == 170141183460469231731687303715884105729
+#[ignore = "fix me - this passes on SQLite and needs to be fixed in Limbo."]
+test(
+    json_extract_overflow_int128,
+    "SELECT json_extract('[1, 2, 3]', '$[170141183460469231731687303715884105729]')",
+    2
+)
+
+#[ignore = "fix me - this passes on SQLite and needs to be fixed in Limbo."]
+test(
+    json_extract_blob,
+    "select json_extract(CAST('[1,2,3]' as BLOB), '$[1]')",
+    2
 )
 
 test(
@@ -886,6 +915,8 @@ test(
     "{\"key\":\"value\"}"
 )
 
+// FIXME: this behaviour differs from sqlite. Although, sqlite docs states
+// that this could change in a "future enhancement" (https://www.sqlite.org/json1.html#jobj)
 test(
     json_object_duplicated_keys,
     "SELECT json_object('key', 'value', 'key', 'value2')",
@@ -902,6 +933,13 @@ test(
     json_valid_2,
     "SELECT json_valid('[\"a\",55,\"b\",72]')",
     1
+)
+
+#[ignore = "Unimplemented"]
+test(
+    json_valid_3,
+    "SELECT json_valid( CAST('{\"a\":1}' AS BLOB) )",
+    0
 )
 
 test(
@@ -1201,6 +1239,9 @@ test(
     "{\"field\":\"value\"}"
 )
 
+// The json_quote() function transforms a SQL value into a JSON value.
+// String values are quoted and interior quotes are escaped.  NULL values
+// are rendered as the unquoted string "null".
 test(
     json_quote_string_literal,
     "SELECT json_quote('abc\"xyz')",
@@ -1347,6 +1388,8 @@ test(
     "{\"control\":\"Bell: \\u0007 Backspace: \\u0008 Form feed: \\u000C\"}"
 )
 
+// Tests for json_replace() function
+// Basic replacement tests
 test(
     json_replace_basic_1,
     "SELECT json_replace('{\"a\": 1, \"b\": 2}', '$.a', 42)",
@@ -1365,6 +1408,7 @@ test(
     "{\"a\":10,\"b\":2,\"c\":30}"
 )
 
+// Testing different JSON types
 test(
     json_replace_string,
     "SELECT json_replace('{\"name\": \"Alice\"}', '$.name', 'Bob')",
@@ -1389,6 +1433,7 @@ test(
     "{\"user\":\"{\\\"name\\\": \\\"Bob\\\", \\\"age\\\": 30}\"}"
 )
 
+// Array tests
 test(
     json_replace_array_element,
     "SELECT json_replace('[1, 2, 3, 4]', '$[1]', 99)",
@@ -1413,6 +1458,7 @@ test(
     "\"{\\\"replaced\\\": true}\""
 )
 
+// Nested structures
 test(
     json_replace_nested_object,
     "SELECT json_replace('{\"user\": {\"name\": \"Alice\", \"age\": 30}}', '$.user.age', 31)",
@@ -1431,6 +1477,7 @@ test(
     "{\"level1\":{\"level2\":{\"level3\":{\"value\":42}}}}"
 )
 
+// Edge cases
 test(
     json_replace_empty_object,
     "SELECT json_replace('{}', '$.anything', 42)",
@@ -1479,6 +1526,9 @@ test(
     "text"
 )
 
+// Tests for json_remove() function
+
+// Basic removal tests
 test(
     json_remove_basic_1,
     "SELECT json_remove('{\"a\": 1, \"b\": 2, \"c\": 3}', '$.b')",
@@ -1503,6 +1553,7 @@ test(
     "[1,3,4]"
 )
 
+// Array tests
 test(
     json_remove_array_negative_index,
     "SELECT json_remove('[1, 2, 3, 4]', '$[#-1]')",
@@ -1521,6 +1572,7 @@ test(
     "[1,2,3]"
 )
 
+// Nested structures
 test(
     json_remove_nested_object,
     "SELECT json_remove('{\"user\": {\"name\": \"Alice\", \"age\": 30, \"email\": \"alice@example.com\"}}', '$.user.email')",
@@ -1539,6 +1591,7 @@ test(
     "{\"level1\":{\"level2\":{\"level3\":{\"a\":1,\"c\":3}}}}"
 )
 
+// Edge cases
 test(
     json_remove_empty_object,
     "SELECT json_remove('{}', '$.anything')",
@@ -1575,6 +1628,8 @@ test(
     Null
 )
 
+// Complex example tests
+
 test(
     json_remove_complex_1,
     "SELECT json_remove('{\"store\": {\"book\": [{\"category\": \"fiction\", \"author\": \"Herman Melville\", \"title\": \"Moby Dick\", \"price\": 8.99},{\"category\": \"fiction\", \"author\": \"J. R. R. Tolkien\", \"title\": \"The Lord of the Rings\", \"price\": 22.99}], \"bicycle\": {\"color\": \"red\", \"price\": 19.95}}}', '$.store.book[0].price', '$.store.bicycle')",
@@ -1587,6 +1642,7 @@ test(
     "{\"store\":{\"book\":[{\"category\":\"fiction\",\"author\":\"Herman Melville\",\"title\":\"Moby Dick\",\"price\":10.99},{\"category\":\"fiction\",\"author\":\"J. R. R. Tolkien\",\"title\":\"The Hobbit\",\"price\":22.99}],\"bicycle\":{\"color\":\"blue\",\"price\":19.95}}}"
 )
 
+// Combination of replace and remove
 test(
     json_replace_after_remove,
     "SELECT json_replace(json_remove('{\"a\": 1, \"b\": 2, \"c\": 3}', '$.a'), '$.b', 42)",
@@ -1599,6 +1655,7 @@ test(
     "{\"a\":1,\"b\":42}"
 )
 
+// Tests for idempotence
 test(
     json_replace_idempotence,
     "SELECT json_replace('{\"a\": 1}', '$.a', 1)",
@@ -1611,6 +1668,7 @@ test(
     "{\"b\":2}"
 )
 
+// Compare with extracted values
 test(
     json_remove_with_extract,
     "SELECT json_extract(json_remove('{\"a\": 1, \"b\": 2, \"c\": {\"d\": 3}}', '$.b'), '$.c.d')",
@@ -1623,6 +1681,7 @@ test(
     42
 )
 
+// Check for consistency between -> operator and json_extract after mutations
 test(
     json_replace_with_arrow,
     "SELECT json_replace('{\"a\": 1, \"b\": 2}', '$.a', 42) -> '$.a'",
@@ -1633,4 +1692,16 @@ test(
     json_remove_with_arrow,
     "SELECT json_remove('{\"a\": 1, \"b\": {\"c\": 3}}', '$.a') -> '$.b.c'",
     "3"
+)
+
+// Escape character tests in sqlite source depend on json_valid and in some syntax that is not implemented
+// yet in limbo.
+// See https://github.com/sqlite/sqlite/blob/255548562b125e6c148bb27d49aaa01b2fe61dba/test/json102.test#L690
+// So for now not all control characters escaped are tested
+#[ignore = "WITH RECURSIVE not implemented"]
+test(
+    json102_1501,
+    "WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM c WHERE x<0x1f)
+    SELECT sum(json_valid(json_quote('a'||char(x)||'z'))) FROM c ORDER BY x",
+    31
 )
