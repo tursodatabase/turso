@@ -195,7 +195,7 @@ impl<'src> Runner<'src> {
         let mut failed = false;
         let total_time = Instant::now();
         for file_test in self.inner.iter() {
-            println!("Running {} tests", file_test.tests.len());
+            println!("\nRunning {} tests", file_test.tests.len());
             for test in file_test.tests.iter() {
                 // TODO: this redirect is nice, but it forces us to write the output to a file
                 // and then read it later

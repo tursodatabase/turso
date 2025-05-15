@@ -1,0 +1,10 @@
+test(
+    memory,
+    alter_table_rename_table,
+    [
+        "CREATE TABLE t1(x INTEGER PRIMARY KEY)",
+        "ALTER TABLE t1 RENAME TO t2",
+        "SELECT tbl_name FROM sqlite_schema"
+    ],
+    "t2"
+)
