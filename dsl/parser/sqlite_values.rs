@@ -75,6 +75,7 @@ pub(super) fn text<'src>(
 
 pub(super) fn blob<'src>() -> impl Parser<'src, &'src str, Vec<u8>, extra::Err<Rich<'src, char>>> {
     text::digits(16)
+        .at_least(0)
         .to_slice()
         .try_map(|b, span| hex::decode(b).map_err(|e| Rich::custom(span, e)))
         .delimited_by(just("x\""), just('"'))

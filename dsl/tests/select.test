@@ -1,0 +1,407 @@
+// Tests for constant values
+// Selects integer constant
+test(
+    select_const_1,
+    "SELECT 1",
+    1
+)
+
+// Selects another integer constant
+test(
+    select_const_2,
+    "SELECT 2",
+    2
+)
+
+// Selects hexadecimal constant
+test(
+    select_const_3,
+    "SELECT 0xDEAF",
+    57007
+)
+
+// Selects negative hexadecimal constant
+test(
+    select_const_4,
+    "SELECT -0xA",
+    -10
+)
+
+// Selects boolean true
+test(
+    select_true,
+    "SELECT true",
+    1
+)
+
+// Selects boolean false
+test(
+    select_false,
+    "SELECT false",
+    0
+)
+
+// Selects escaped text with single quote
+test(
+    select_text_escape_1,
+    "SELECT '''a'",
+    "'a"
+)
+
+// Selects empty blob
+test(
+    select_blob_empty,
+    "SELECT x''",
+    x""
+)
+
+// Selects blob as ASCII text
+test(
+    select_blob_ascii,
+    "SELECT x'6C696D626F'",
+    x"6C696D626F"
+)
+
+// Selects blob as emoji
+test(
+    select_blob_emoji,
+    "SELECT x'F09FA680'",
+    x"F09FA680"
+)
+
+// Tests for LIMIT clause
+// Returns no rows with LIMIT 0
+test(
+    select_limit_0,
+    "SELECT id FROM users LIMIT 0"
+)
+
+// Returns one row with LIMIT true (1)
+test(
+    select_limit_true,
+    "SELECT id FROM users ORDER BY id LIMIT true",
+    [1]
+)
+
+// Returns no rows with LIMIT false (0)
+test(
+    select_limit_false,
+    "SELECT id FROM users ORDER BY id LIMIT false"
+)
+
+// Tests for type conversion
+// Ensures float output for price
+test(
+    realify,
+    "SELECT price from products limit 1",
+    79.0
+)
+
+// Tests for arithmetic operations
+// Adds 1 to age
+test(
+    select_add,
+    "SELECT u.age + 1 from users u where u.age = 91 limit 1",
+    92
+)
+
+// Subtracts 1 from age
+test(
+    select_subtract,
+    "SELECT u.age - 1 from users u where u.age = 91 limit 1",
+    90
+)
+
+// Tests case-insensitive column names
+test(
+    case_insensitive_columns,
+    "SELECT u.aGe + 1 from USERS u where U.AGe = 91 limit 1",
+    92
+)
+
+// Tests for table star (*) expansion
+// Selects all columns plus name
+test(
+    table_star,
+    "SELECT p.*, p.name from products p limit 1",
+    [1, "hat", 79.0, "hat"]
+)
+
+// Selects all columns from products and first_name from users
+test(
+    table_star_2,
+    "SELECT p.*, u.first_name from users u join products p on u.id = p.id limit 1",
+    [1, "hat", 79.0, "Jamie"]
+)
+
+// Tests for quoted identifiers
+// Selects id with various quoting styles
+test(
+    select_with_quoting,
+    "SELECT `users`.id from [users] where users.[id] = 5",
+    5
+)
+
+// Selects id with mixed quoting styles
+test(
+    select_with_quoting_2,
+    "SELECT \"users\".`id` from users where `users`.[id] = 5",
+    5
+)
+
+// Tests for rowid
+// Selects rowid and first_name
+test(
+    select_rowid,
+    "SELECT rowid, first_name from users u where rowid = 5",
+    [5, "Edward"]
+)
+
+// Selects rowid with table alias
+test(
+    select_rowid_2,
+    "SELECT u.rowid, first_name from users u where rowid = 5",
+    [5, "Edward"]
+)
+
+// Selects all columns using id
+test(
+    seekrowid,
+    "SELECT * from users u where u.id = 5",
+    [5, "Edward", "Miller", "christiankramer@example.com", "725-281-1033", "08522 English Plain", "Lake Keith", "ID", "23283", 15]
+)
+
+// Tests for parenthesized expressions
+// Adds 100 to price
+test(
+    select_parenthesized,
+    "SELECT (price + 100) from products limit 1",
+    179.0
+)
+
+// Tests for CASE expressions
+// CASE with ELSE clause
+test(
+    select_case_base_else,
+    "SELECT case when 0 then 'false' when 1 then 'true' else 'null' end",
+    "true"
+)
+
+// CASE without ELSE returns null
+test(
+    select_case_noelse_null,
+    "SELECT case when 0 then 0 end",
+    Null
+)
+
+// CASE with value matching
+test(
+    select_base_case_else,
+    "SELECT case 1 when 0 then 'zero' when 1 then 'one' else 'two' end",
+    "one"
+)
+
+// Tests CASE with NULL and non-NULL conditions
+test(
+    select_base_case_null_result,
+    [
+        "SELECT case NULL when 0 then 'first' else 'second' end",
+        "SELECT case NULL when NULL then 'first' else 'second' end",
+        "SELECT case 0 when 0 then 'first' else 'second' end"
+    ],
+    [["second"], ["second"], ["first"]]
+)
+
+// CASE without ELSE returns null
+test(
+    select_base_case_noelse_null,
+    "SELECT case 'null else' when 0 then 0 when 1 then 1 end",
+    Null
+)
+
+// Tests for IS NULL and IS NOT NULL
+// Checks null and division by zero
+test(
+    select_is_null,
+    [
+        "SELECT null is null, (1 / 0) is null, null is (1 / 0), (1 / 0) is (1 / 0)",
+        "SELECT 4 is null, '4' is null, 0 is null, (1 / 2) is null"
+    ],
+    [[1, 1, 1, 1], [0, 0, 0, 0]]
+)
+
+// Checks non-null values
+test(
+    select_is_not_null,
+    [
+        "SELECT null is not null, (1 / 0) is not null, null is not (1 / 0), (1 / 0) is not (1 / 0)", 
+        "SELECT 4 is not null, '4' is not null, 0 is not null, (1 / 2) is not null"
+    ],
+    [[0, 0, 0, 0], [1, 1, 1, 1]]
+)
+
+// Tests for bitwise right shift (>>)
+test(
+    select_bin_shr,
+    [
+        "SELECT 997623670 >> 0, 997623670 >> 1, 997623670 >> 10, 997623670 >> 30",
+        "SELECT -997623670 >> 0, -997623670 >> 1, -997623670 >> 10, -997623670 >> 30",
+        "SELECT 997623670 << 0, 997623670 << -1, 997623670 << -10, 997623670 << -30",
+        "SELECT -997623670 << 0, -997623670 << -1, -997623670 << -10, -997623670 << -30"
+    ],
+    [[997623670, 498811835, 974241, 0], [-997623670, -498811835, -974242, -1], [997623670, 498811835, 974241, 0], [-997623670, -498811835, -974242, -1]]
+)
+
+// Tests for bitwise left shift (<<)
+test(
+    select_bin_shl,
+    [
+        "select 997623670 << 0, 997623670 << 1, 997623670 << 10, 997623670 << 30",
+        "select -997623670 << 0, -997623670 << 1, -997623670 << 10, -997623670 << 30",
+        "select 997623670 >> 0, 997623670 >> -1, 997623670 >> -10, 997623670 >> -30",
+        "select -997623670 >> 0, -997623670 >> -1, -997623670 >> -10, -997623670 >> -30"
+    ],
+    [[997623670, 1995247340, 1021566638080, 1071190259091374080], [-997623670, -1995247340, -1021566638080, -1071190259091374080], [997623670, 1995247340, 1021566638080, 1071190259091374080], [-997623670, -1995247340, -1021566638080, -1071190259091374080]]
+)
+
+// Tests for LIKE expression
+// Checks if string matches pattern
+test(
+    select_like_expression,
+    "SELECT 'bar' like 'bar%'",
+    1
+)
+
+// Checks if string does not match pattern
+test(
+    select_not_like_expression,
+    "SELECT 'bar' not like 'bar%'",
+    0
+)
+
+// Tests modulus with float divisor
+test(
+    select_like_expression_2,
+    "SELECT 2 % 0.5",
+    Null
+)
+
+// Tests for floating-point infinity
+// Produces positive infinity
+test(
+    select_positive_infinite_float,
+    "SELECT 1.7976931348623157E+308 + 1e308",
+    Inf
+)
+
+// Produces negative infinity
+test(
+    select_negative_infinite_float,
+    "SELECT -1.7976931348623157E+308 - 1e308",
+    -Inf
+)
+
+// Tests left shift with large negative values
+test(
+    select_shl_large_negative_float,
+    [
+        "SELECT 1 << -1e19", 
+        "SELECT 1 << -9223372036854775808",
+        "SELECT 1 << 9223372036854775807"
+    ],
+    [[0], [0], [0]]
+)
+
+// Tests basic left shift
+test(
+    select_shl_basic,
+    [
+        "SELECT 1 << 0, 1 << 1, 1 << 2, 1 << 3",
+        "SELECT 2 << 0, 2 << 1, 2 << 2, 2 << 3"
+    ],
+    [[1, 2, 4, 8], [2, 4, 8, 16]]
+)
+
+// Tests left shift with negative numbers
+test(
+    select_shl_negative_numbers,
+    [
+        "SELECT -1 << 0, -1 << 1, -1 << 2, -1 << 3",
+        "SELECT -2 << 0, -2 << 1, -2 << 2, -2 << 3"
+    ],
+    [[-1, -2, -4, -8], [-2, -4, -8, -16]]
+)
+
+// Tests left shift with negative shifts
+test(
+    select_shl_negative_shifts,
+    [
+        "SELECT 8 << -1, 8 << -2, 8 << -3, 8 << -4",
+        "SELECT -8 << -1, -8 << -2, -8 << -3, -8 << -4"
+    ],
+    [[4, 2, 1, 0], [-4, -2, -1, -1]]
+)
+
+// Tests left shift with large shifts
+test(
+    select_shl_large_shifts,
+    [
+        "SELECT 1 << 62, 1 << 63, 1 << 64",
+        "SELECT -1 << 62, -1 << 63, -1 << 64"
+    ],
+    [[4611686018427387904, -9223372036854775808, 0], [-4611686018427387904, -9223372036854775808, 0]]
+)
+
+// Tests left shift with text conversion
+test(
+    select_shl_text_conversion,
+    [
+        "SELECT '1' << '2'",
+        "SELECT '8' << '-2'",
+        "SELECT '-4' << '2'"
+    ],
+    [[4], [2], [-16]]
+)
+
+// Tests chained left shifts
+test(
+    select_shl_chained,
+    [
+        "SELECT (1 << 2) << 3",
+        "SELECT (2 << 1) << (1 << 1)"
+    ],
+    [[32], [16]]
+)
+
+// Tests left shift with different numeric types
+test(
+    select_shl_numeric_types,
+    [
+        "SELECT CAST(1 AS INTEGER) << 2",
+        "SELECT 1.0 << 2",
+        "SELECT 1.5 << 2"
+    ],
+    [[4], [4], [4]]
+)
+
+// Tests complex bitwise and arithmetic expression
+test(
+    select_fuzz_failure_case,
+    "SELECT (-9 << ((-6) << (9)) >> ((5)) % -10 - + - (-9))",
+    -16
+)
+
+// Tests for invalid numeric text
+// Handles negation of 'e'
+test(
+    select_invalid_numeric_text,
+    "SELECT -'e'",
+    0
+)
+
+// Handles negation of 'E'
+test(
+    select_invalid_numeric_text_2,
+    "SELECT -'E'",
+    0
+)
