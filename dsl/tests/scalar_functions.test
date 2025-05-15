@@ -1,0 +1,1630 @@
+// Tests for concat() function
+// Concatenates two characters
+test(
+    concat_chars,
+    "SELECT concat('l', 'i')",
+    "li"
+)
+
+// Concatenates character and number
+test(
+    concat_char_and_number,
+    "SELECT concat('l', 1)",
+    "l1"
+)
+
+// Concatenates character and decimal
+test(
+    concat_char_and_decimal,
+    "SELECT concat('l', 1.5)",
+    "l1.5"
+)
+
+// Ignores null in concatenation
+test(
+    concat_char_null_char,
+    "SELECT concat('l', null, 'i')",
+    "li"
+)
+
+// Tests for concat_ws() function
+// Concatenates numbers with separator
+test(
+    concat_ws_numbers,
+    "SELECT concat_ws(',', 1, 2)",
+    "1,2"
+)
+
+// Returns single number without separator
+test(
+    concat_ws_single_number,
+    "SELECT concat_ws(',', 1)",
+    "1"
+)
+
+// Returns empty string for null separator
+test(
+    concat_ws_null,
+    "SELECT concat_ws(null, 1, 2)",
+    Null
+)
+
+// Concatenates multiple pairs with separator
+test(
+    concat_ws_multiple,
+    "SELECT concat_ws(',', 1, 2), concat_ws(',', 3, 4)",
+    ["1,2", "3,4"]
+)
+
+// Tests for char() function
+// Converts ASCII codes to characters
+test(
+    char,
+    "SELECT char(108, 105)",
+    "li"
+)
+
+// Handles computed ASCII codes
+test(
+    char_nested,
+    "SELECT char(106 + 2, 105)",
+    "li"
+)
+
+// Returns empty string for no arguments
+test(
+    char_empty,
+    "SELECT char()",
+    ""
+)
+
+// Returns empty string for null input
+#[ignore = "Limbo outputs Text(\"\")"]
+test(
+    char_null,
+    "SELECT char(null)",
+    "\0"
+)
+
+// Returns empty string for non-integer input
+#[ignore = "Limbo outputs Text(\"\")"]
+test(
+    char_non_integer,
+    "SELECT char('a')",
+    "\0"
+)
+
+// Tests for abs() function
+// Returns absolute value of positive number
+test(
+    abs,
+    "SELECT abs(1)",
+    1
+)
+
+// Returns absolute value of negative number
+test(
+    abs_negative,
+    "SELECT abs(-1)",
+    1
+)
+
+// Returns 0.0 for non-numeric input
+test(
+    abs_char,
+    "SELECT abs('a')",
+    0.0
+)
+
+// Returns null for null input
+test(
+    abs_null,
+    "SELECT abs(null)",
+    Null
+)
+
+// Tests for ifnull() function
+// Returns first non-null value
+test(
+    ifnull_1,
+    "SELECT ifnull(1, 2)",
+    1
+)
+
+// Returns second value if first is null
+test(
+    ifnull_2,
+    "SELECT ifnull(null, 2)",
+    2
+)
+
+// Tests for iif() function
+// Returns first value for true condition
+test(
+    iif_true,
+    "SELECT iif(1, 'pass', 'fail')",
+    "pass"
+)
+
+// Returns second value for false condition
+test(
+    iif_false,
+    "SELECT iif(0, 'fail', 'pass')",
+    "pass"
+)
+
+// Tests for instr() function
+// Finds substring position
+test(
+    instr_str,
+    "SELECT instr('limbo', 'im')",
+    2
+)
+
+// Returns 0 if substring not found
+test(
+    instr_str_not_found,
+    "SELECT instr('limbo', 'xyz')",
+    0
+)
+
+// Finds blob position
+test(
+    instr_blob,
+    "SELECT instr(x'000102', x'01')",
+    2
+)
+
+// Returns 0 if blob not found
+test(
+    instr_blob_not_found,
+    "SELECT instr(x'000102', x'10')",
+    0
+)
+
+// Returns null for null input
+test(
+    instr_null,
+    "SELECT instr(null, 'limbo')",
+    Null
+)
+
+// Finds digit in integer
+test(
+    instr_integer,
+    "SELECT instr(123, 2)",
+    2
+)
+
+// Returns 0 if digit not found
+test(
+    instr_integer_not_found,
+    "SELECT instr(123, 5)",
+    0
+)
+
+// Returns 0 for leading zeros
+test(
+    instr_integer_leading_zeros,
+    "SELECT instr(0001, 0)",
+    0
+)
+
+// Finds substring in real number
+test(
+    instr_real,
+    "SELECT instr(12.34, 2.3)",
+    2
+)
+
+// Returns 0 if substring not found in real
+test(
+    instr_real_not_found,
+    "SELECT instr(12.34, 5)",
+    0
+)
+
+// Returns 0 for trailing zeros
+test(
+    instr_real_trailing_zeros,
+    "SELECT instr(1.10000, 0)",
+    0
+)
+
+// Finds blob position (duplicate test)
+test(
+    instr_blob_2,
+    "SELECT instr(x'01020304', x'02')",
+    2
+)
+
+// Returns 0 if blob not found (duplicate test)
+test(
+    instr_blob_not_found_2,
+    "SELECT instr(x'01020304', x'05')",
+    0
+)
+
+// Tests for upper() function
+// Converts string to uppercase
+test(
+    upper,
+    "SELECT upper('Limbo')",
+    "LIMBO"
+)
+
+// Returns number unchanged
+#[ignore = "Limbo outputs Integer(1)"]
+test(
+    upper_number,
+    "SELECT upper(1)",
+    "1"
+)
+
+// Converts single character to uppercase
+test(
+    upper_char,
+    "SELECT upper('a')",
+    "A"
+)
+
+// Returns null for null input
+test(
+    upper_null,
+    "SELECT upper(null)",
+    Null
+)
+
+// Tests for lower() function
+// Converts string to lowercase
+test(
+    lower,
+    "SELECT lower('Limbo')",
+    "limbo"
+)
+
+// Returns number unchanged
+#[ignore = "Limbo outputs Integer(1)"]
+test(
+    lower_number,
+    "SELECT lower(1)",
+    "1"
+)
+
+// Converts single character to lowercase
+test(
+    lower_char,
+    "SELECT lower('A')",
+    "a"
+)
+
+// Returns null for null input
+test(
+    lower_null,
+    "SELECT lower(null)",
+    Null
+)
+
+// Tests for replace() function
+// Replaces substring
+test(
+    replace,
+    "SELECT replace('test', 'test', 'example')",
+    "example"
+)
+
+// Replaces number in string
+test(
+    replace_number,
+    "SELECT replace('tes3', 3, 0.3)",
+    "tes0.3"
+)
+
+// Returns null for null pattern
+test(
+    replace_null,
+    "SELECT replace('test', null, 'example')",
+    Null
+)
+
+// Tests for hex() function
+// Converts string to hexadecimal
+test(
+    hex,
+    "SELECT hex('limbo')",
+    "6C696D626F"
+)
+
+// Converts number to hexadecimal string
+test(
+    hex_number,
+    "SELECT hex(100)",
+    "313030"
+)
+
+// Returns null for null input
+#[ignore = "Limbo outputs Null"]
+test(
+    hex_null,
+    "SELECT hex(null)",
+    ""
+)
+
+// Tests for likely() function
+// Returns string unchanged
+test(
+    likely,
+    "SELECT likely('limbo')",
+    "limbo"
+)
+
+// Returns integer unchanged
+test(
+    likely_int,
+    "SELECT likely(100)",
+    100
+)
+
+// Returns decimal unchanged
+test(
+    likely_decimal,
+    "SELECT likely(12.34)",
+    12.34
+)
+
+// Returns null for null input
+test(
+    likely_null,
+    "SELECT likely(NULL)",
+    Null
+)
+
+// Tests for likelihood() function
+// Returns string with probability hint
+test(
+    likelihood_string,
+    "SELECT likelihood('limbo', 0.5)",
+    "limbo"
+)
+
+// Returns string with high probability
+test(
+    likelihood_string_high_probability,
+    "SELECT likelihood('database', 0.9375)",
+    "database"
+)
+
+// Returns integer with probability hint
+test(
+    likelihood_integer,
+    "SELECT likelihood(100, 0.0625)",
+    100
+)
+
+// Returns integer with certain probability
+test(
+    likelihood_integer_probability_1,
+    "SELECT likelihood(42, 1.0)",
+    42
+)
+
+// Returns decimal with probability hint
+test(
+    likelihood_decimal,
+    "SELECT likelihood(12.34, 0.5)",
+    12.34
+)
+
+// Returns null for null input
+test(
+    likelihood_null,
+    "SELECT likelihood(NULL, 0.5)",
+    Null
+)
+
+// Returns blob with probability hint
+test(
+    likelihood_blob,
+    "SELECT hex(likelihood(x'01020304', 0.5))",
+    "01020304"
+)
+
+// Returns value with zero probability
+test(
+    likelihood_zero_probability,
+    "SELECT likelihood(999, 0.0)",
+    999
+)
+
+// Tests for unhex() function
+// Converts hex string to binary
+test(
+    unhex_str_ab,
+    "SELECT unhex('6162')",
+    x"6162"
+)
+
+// Converts hex number to binary
+test(
+    unhex_int_ab,
+    "SELECT unhex(6162)",
+    x"6162"
+)
+
+// Converts uppercase hex to binary
+test(
+    unhex_dot_uppercase,
+    "SELECT unhex('2E')",
+    x"2E"
+)
+
+// Converts lowercase hex to binary
+test(
+    unhex_dot_lowercase,
+    "SELECT unhex('2e')",
+    x"2E"
+)
+
+// Returns null for invalid hex
+test(
+    unhex_no_hex,
+    "SELECT unhex('x')",
+    Null
+)
+
+// Returns null for null input
+test(
+    unhex_null,
+    "SELECT unhex(NULL)",
+    Null
+)
+
+// Strips prefix for hex decoding
+test(
+    unhex_x_y_prefix,
+    "SELECT unhex('x2E', 'x')",
+    x"2E"
+)
+
+// Strips suffix for hex decoding
+test(
+    unhex_x_y_suffix,
+    "SELECT unhex('2Ex', 'x')",
+    x"2E"
+)
+
+// Strips prefix and suffix for hex decoding
+test(
+    unhex_x_y_prefix_suffix,
+    "SELECT unhex('x2Ex', 'x')",
+    x"2E"
+)
+
+// Returns null for incorrect suffix
+test(
+    unhex_x_y_incorrect_suffix,
+    "SELECT unhex('x2Ey', 'x')",
+    Null
+)
+
+// Strips long prefix for hex decoding
+test(
+    unhex_x_y_long_prefix,
+    "SELECT unhex('xyz2E', 'xyz')",
+    x"2E"
+)
+
+// Strips shorter suffix for hex decoding
+test(
+    unhex_x_y_shorter_suffix,
+    "SELECT unhex('xyz2Exy', 'xyz')",
+    x"2E"
+)
+
+// Strips shorter prefix for hex decoding
+test(
+    unhex_x_y_shorter_prefix,
+    "SELECT unhex('xy2Exyz', 'xyz')",
+    x"2E"
+)
+
+// Strips prefix/suffix in random order
+test(
+    unhex_x_y_random_order,
+    "SELECT unhex('yx2Ezyx', 'xyz')",
+    x"2E"
+)
+
+// Returns null for character in middle
+test(
+    unhex_x_y_char_in_the_middle,
+    "SELECT unhex('yx2xEzyx', 'xyz')",
+    Null
+)
+
+// Returns null for character outside set
+test(
+    unhex_x_y_character_outside_set,
+    "SELECT unhex('yxn2Ezyx', 'xyz')",
+    Null
+)
+
+// Tests for trim() function
+// Removes leading and trailing whitespace
+test(
+    trim,
+    "SELECT trim('   Limbo    ')",
+    "Limbo"
+)
+
+// Returns number unchanged
+#[ignore = "Limbo outputs Integer(1)"]
+test(
+    trim_number,
+    "SELECT trim(1)",
+    "1"
+)
+
+// Returns null for null input
+test(
+    trim_null,
+    "SELECT trim(null)",
+    Null
+)
+
+// Removes leading whitespace
+test(
+    trim_leading_whitespace,
+    "SELECT trim('   Leading')",
+    "Leading"
+)
+
+// Removes trailing whitespace
+test(
+    trim_trailing_whitespace,
+    "SELECT trim('Trailing   ')",
+    "Trailing"
+)
+
+// Removes pattern entirely
+test(
+    trim_pattern,
+    "SELECT trim('Limbo', 'Limbo')",
+    ""
+)
+
+// Returns empty string for numeric pattern
+test(
+    trim_pattern_number,
+    "SELECT trim(1, '1')",
+    ""
+)
+
+// Returns null for null input
+test(
+    trim_pattern_null,
+    "SELECT trim(null, 'null')",
+    Null
+)
+
+// Returns string unchanged if pattern not found
+test(
+    trim_no_match_pattern,
+    "SELECT trim('Limbo', 'xyz')",
+    "Limbo"
+)
+
+// Tests for ltrim() function
+// Removes leading whitespace
+test(
+    ltrim,
+    "SELECT ltrim('   Limbo    ')",
+    "Limbo    "
+)
+
+// Returns number unchanged
+#[ignore = "Limbo outputs Integer(1)"]
+test(
+    ltrim_number,
+    "SELECT ltrim(1)",
+    "1"
+)
+
+// Returns null for null input
+test(
+    ltrim_null,
+    "SELECT ltrim(null)",
+    Null
+)
+
+// Removes leading whitespace
+test(
+    ltrim_leading_whitespace,
+    "SELECT ltrim('   Leading')",
+    "Leading"
+)
+
+// Returns string unchanged if no leading whitespace
+test(
+    ltrim_no_leading_whitespace,
+    "SELECT ltrim('Limbo')",
+    "Limbo"
+)
+
+// Removes pattern entirely
+test(
+    ltrim_pattern,
+    "SELECT ltrim('Limbo', 'Limbo')",
+    ""
+)
+
+// Returns empty string for numeric pattern
+test(
+    ltrim_pattern_number,
+    "SELECT ltrim(1, '1')",
+    ""
+)
+
+// Returns null for null input
+test(
+    ltrim_pattern_null,
+    "SELECT ltrim(null, 'null')",
+    Null
+)
+
+// Returns string unchanged if pattern not found
+test(
+    ltrim_no_match_pattern,
+    "SELECT ltrim('Limbo', 'xyz')",
+    "Limbo"
+)
+
+// Tests for rtrim() function
+// Removes trailing whitespace
+test(
+    rtrim,
+    "SELECT rtrim('   Limbo    ')",
+    "   Limbo"
+)
+
+// Returns number unchanged
+#[ignore = "Limbo outputs Integer(1)"]
+test(
+    rtrim_number,
+    "SELECT rtrim(1)",
+    "1"
+)
+
+// Returns null for null input
+test(
+    rtrim_null,
+    "SELECT rtrim(null)",
+    Null
+)
+
+// Removes trailing whitespace
+test(
+    rtrim_trailing_whitespace,
+    "SELECT rtrim('Trailing   ')",
+    "Trailing"
+)
+
+// Returns string unchanged if no trailing whitespace
+test(
+    rtrim_no_trailing_whitespace,
+    "SELECT rtrim('Limbo')",
+    "Limbo"
+)
+
+// Removes pattern entirely
+test(
+    rtrim_pattern,
+    "SELECT rtrim('Limbo', 'Limbo')",
+    ""
+)
+
+// Returns empty string for numeric pattern
+test(
+    rtrim_pattern_number,
+    "SELECT rtrim(1, '1')",
+    ""
+)
+
+// Returns null for null input
+test(
+    rtrim_pattern_null,
+    "SELECT rtrim(null, 'null')",
+    Null
+)
+
+// Returns string unchanged if pattern not found
+test(
+    rtrim_no_match_pattern,
+    "SELECT rtrim('Limbo', 'xyz')",
+    "Limbo"
+)
+
+// Tests for round() function
+// Rounds float to nearest integer
+test(
+    round_float_no_precision,
+    "SELECT round(123.456)",
+    123.0
+)
+
+// Rounds float to specified precision
+test(
+    round_float_with_precision,
+    "SELECT round(123.456, 2)",
+    123.46
+)
+
+// Rounds float with text precision
+test(
+    round_float_with_text_precision,
+    "SELECT round(123.5, '1')",
+    123.5
+)
+
+// Rounds text-parsable number
+test(
+    round_text_parsable,
+    "SELECT round('123.456', 2)",
+    123.46
+)
+
+// Returns 0.0 for non-parsable text
+test(
+    round_text_non_parsable,
+    "SELECT round('abc', 1)",
+    0.0
+)
+
+// Rounds integer to specified precision
+test(
+    round_integer_with_precision,
+    "SELECT round(123, 1)",
+    123.0
+)
+
+// Rounds float with negative precision
+test(
+    round_float_negative_precision,
+    "SELECT round(123.456, -1)",
+    123.0
+)
+
+// Rounds float with zero precision
+test(
+    round_float_zero_precision,
+    "SELECT round(123.456, 0)",
+    123.0
+)
+
+// Returns null for null precision
+test(
+    round_null_precision,
+    "SELECT round(123.456, null)",
+    Null
+)
+
+// Tests for length() function
+// Returns length of text
+test(
+    length_text,
+    "SELECT length('limbo')",
+    5
+)
+
+// Returns length of UTF-8 text
+test(
+    length_text_utf8_chars,
+    "SELECT length('ąłóżźć')",
+    6
+)
+
+// Returns length of integer string
+test(
+    length_integer,
+    "SELECT length(12345)",
+    5
+)
+
+// Returns length of float string
+test(
+    length_float,
+    "SELECT length(123.456)",
+    7
+)
+
+// Returns null for null input
+test(
+    length_null,
+    "SELECT length(NULL)",
+    Null
+)
+
+// Returns 0 for empty text
+test(
+    length_empty_text,
+    "SELECT length('')",
+    0
+)
+
+// Tests for octet_length() function
+// Returns byte length of text
+test(
+    octet_length_text,
+    "SELECT length('limbo')",
+    5
+)
+
+// Returns byte length of UTF-8 text
+test(
+    octet_length_text_utf8_chars,
+    "SELECT octet_length('ąłóżźć')",
+    12
+)
+
+// Returns byte length of integer string
+test(
+    octet_length_integer,
+    "SELECT octet_length(12345)",
+    5
+)
+
+// Returns byte length of float string
+test(
+    octet_length_float,
+    "SELECT octet_length(123.456)",
+    7
+)
+
+// Returns null for null input
+test(
+    octet_length_null,
+    "SELECT octet_length(NULL)",
+    Null
+)
+
+// Returns 0 for empty text
+test(
+    octet_length_empty_text,
+    "SELECT octet_length('')",
+    0
+)
+
+// Checks byte length of date string
+test(
+    octet_length_date_binary_expr,
+    "SELECT octet_length(date('now')) = 10",
+    1
+)
+
+// Tests for min() function
+// Returns minimum number
+test(
+    min_number,
+    "SELECT min(-10,2,3,+4)",
+    -10
+)
+
+// Returns minimum string lexicographically
+test(
+    min_str,
+    "SELECT min('b','a','z')",
+    "a"
+)
+
+// Compares string and number
+test(
+    min_str_number,
+    "SELECT min('42',100)",
+    100
+)
+
+// Compares blob and number
+test(
+    min_blob_number,
+    "SELECT min(3.14,x'616263')",
+    3.14
+)
+
+// Tests for max() function
+// Compares string and number
+test(
+    max_str_number,
+    "SELECT max('42',100)",
+    "42"
+)
+
+// Compares blob and number
+test(
+    max_blob_number,
+    "SELECT max(3.14,x'616263')",
+    x"616263"
+)
+
+// Returns null for null inputs
+test(
+    min_null,
+    "SELECT min(null,null)",
+    Null
+)
+
+// Returns maximum number
+test(
+    max_number,
+    "SELECT max(-10,2,3)",
+    3
+)
+
+// Returns maximum string lexicographically
+test(
+    max_str,
+    "SELECT max('b','a','z')",
+    "z"
+)
+
+// Compares integer and float
+test(
+    min_int_float,
+    "SELECT min(1,5.0)",
+    1
+)
+
+// Compares integer and float
+test(
+    max_int_float,
+    "SELECT max(1,5.0)",
+    5.0
+)
+
+// Compares float and integer
+test(
+    min_float_int,
+    "SELECT min(5.0,1)",
+    1
+)
+
+// Returns null for null inputs
+test(
+    max_null,
+    "SELECT max(null,null)",
+    Null
+)
+
+// Tests for nullif() function
+// Returns first value if not equal
+test(
+    nullif,
+    "SELECT nullif(1, 2)",
+    1
+)
+
+// Returns null if values equal
+test(
+    nullif_2,
+    "SELECT nullif(1, 1)",
+    Null
+)
+
+// Returns null if strings equal
+test(
+    nullif_3,
+    "SELECT nullif('limbo', 'limbo')",
+    Null
+)
+
+// Tests for substr() function
+// Extracts substring with start and length
+test(
+    substr_3_args,
+    "SELECT substr('limbo', 1, 3)",
+    "lim"
+)
+
+// Returns full string if length exceeds
+test(
+    substr_3_args_exceed_length,
+    "SELECT substr('limbo', 1, 10)",
+    "limbo"
+)
+
+// Returns empty string if start exceeds length
+test(
+    substr_3_args_start_exceed_length,
+    "SELECT substr('limbo', 10, 3)",
+    ""
+)
+
+// Extracts substring from start to end
+test(
+    substr_2_args,
+    "SELECT substr('limbo', 3)",
+    "mbo"
+)
+
+// Tests various substr cases
+test(
+    substr_cases,
+    [
+        "SELECT substr('limbo', 0)",
+        "SELECT substr('limbo', 0, 3)",
+        "SELECT substr('limbo', -2)",
+        "SELECT substr('limbo', -2, 1)",
+        "SELECT substr('limbo', -10, 7)",
+        "SELECT substr('limbo', 10, -7)"
+    ],
+    [["limbo"], ["li"], ["bo"], ["b"], ["li"], ["mbo"]]
+)
+
+// Tests for substring() function
+// Extracts substring with start and length
+test(
+    substring_3_args,
+    "SELECT substring('limbo', 1, 3)",
+    "lim"
+)
+
+// Returns full string if length exceeds
+test(
+    substring_3_args_exceed_length,
+    "SELECT substring('limbo', 1, 10)",
+    "limbo"
+)
+
+// Returns empty string if start exceeds length
+test(
+    substring_3_args_start_exceed_length,
+    "SELECT substring('limbo', 10, 3)",
+    ""
+)
+
+// Extracts substring from start to end
+test(
+    substring_2_args,
+    "SELECT substring('limbo', 3)",
+    "mbo"
+)
+
+// Returns empty string if start exceeds length
+test(
+    substring_2_args_exceed_length,
+    "SELECT substring('limbo', 10)",
+    ""
+)
+
+// Tests for typeof() function
+// Returns type of null
+test(
+    typeof_null,
+    "SELECT typeof(null)",
+    "null"
+)
+
+// Returns type of null (case-insensitive)
+test(
+    typeof_null_case,
+    "SELECT typeof(nuLL)",
+    "null"
+)
+
+// Returns type of text
+test(
+    typeof_text,
+    "SELECT typeof('hello')",
+    "text"
+)
+
+// Returns type of empty text
+test(
+    typeof_text_empty,
+    "SELECT typeof('')",
+    "text"
+)
+
+// Returns type of integer
+test(
+    typeof_integer,
+    "SELECT typeof(123)",
+    "integer"
+)
+
+// Returns type of real
+test(
+    typeof_real,
+    "SELECT typeof(1.0)",
+    "real"
+)
+
+// Returns type of blob
+test(
+    typeof_blob,
+    "SELECT typeof(x'61')",
+    "blob"
+)
+
+// Returns type of empty blob
+test(
+    typeof_blob_empty,
+    "SELECT typeof(x'')",
+    "blob"
+)
+
+// Returns type of sum of integers
+test(
+    typeof_sum_integer,
+    "SELECT typeof(sum(age)) from users",
+    "integer"
+)
+
+// Returns type of sum of reals
+test(
+    typeof_sum_real,
+    "SELECT typeof(sum(price)) from products",
+    "real"
+)
+
+// Returns type of group_concat
+test(
+    typeof_group_concat,
+    "SELECT typeof(group_concat(name)) from products",
+    "text"
+)
+
+// Tests for unicode() function
+// Returns Unicode code point of character
+test(
+    unicode_a,
+    "SELECT unicode('a')",
+    97
+)
+
+// Returns Unicode code point of emoji
+test(
+    unicode_emoji,
+    "SELECT unicode('😊')",
+    128522
+)
+
+// Returns null for empty string
+test(
+    unicode_empty,
+    "SELECT unicode('')",
+    Null
+)
+
+// Returns code point of first digit in number
+test(
+    unicode_number,
+    "SELECT unicode(23)",
+    50
+)
+
+// Returns code point of first digit in float
+test(
+    unicode_float,
+    "SELECT unicode(23.45)",
+    50
+)
+
+// Returns null for null input
+test(
+    unicode_null,
+    "SELECT unicode(NULL)",
+    Null
+)
+
+// Tests for quote() function
+// Truncates at embedded null
+test(
+    quote_string_embedded_nul,
+    "SELECT quote(concat('abc', char(0), 'def'))",
+    "'abc'"
+)
+
+// Quotes string
+test(
+    quote_string,
+    "SELECT quote('limbo')",
+    "'limbo'"
+)
+
+// Escapes single quotes
+test(
+    quote_escape,
+    "SELECT quote('''quote''')",
+    "'''quote'''"
+)
+
+// Returns NULL for null input
+test(
+    quote_null,
+    "SELECT quote(null)",
+    "NULL"
+)
+
+// Returns integer unchanged
+#[ignore = "Limbo outputs Integer(123)"]
+test(
+    quote_integer,
+    "SELECT quote(123)",
+    "123"
+)
+
+// Tests for sign() function
+// Returns sign of positive integer
+test(
+    sign_positive_integer,
+    "SELECT sign(42)",
+    1
+)
+
+// Returns sign of negative integer
+test(
+    sign_negative_integer,
+    "SELECT sign(-42)",
+    -1
+)
+
+// Returns sign of zero
+test(
+    sign_zero,
+    "SELECT sign(0)",
+    0
+)
+
+// Returns sign of positive float
+test(
+    sign_positive_float,
+    "SELECT sign(42.0)",
+    1
+)
+
+// Returns sign of negative float
+test(
+    sign_negative_float,
+    "SELECT sign(-42.0)",
+    -1
+)
+
+// Returns sign of zero float
+test(
+    sign_zero_float,
+    "SELECT sign(0.0)",
+    0
+)
+
+// Returns sign of text-parsable positive integer
+test(
+    sign_text_positive_integer,
+    "SELECT sign('42')",
+    1
+)
+
+// Returns sign of text-parsable negative integer
+test(
+    sign_text_negative_integer,
+    "SELECT sign('-42')",
+    -1
+)
+
+// Returns sign of text-parsable zero
+test(
+    sign_text_zero,
+    "SELECT sign('0')",
+    0
+)
+
+// Returns null for non-numeric text
+test(
+    sign_text_non_numeric,
+    "SELECT sign('abc')",
+    Null
+)
+
+// Returns null for null input
+test(
+    sign_null,
+    "SELECT sign(NULL)",
+    Null
+)
+
+// Tests for randomblob() function
+// Returns blob of specified length
+test(
+    randomblob_int_2,
+    "SELECT length(randomblob(2))",
+    2
+)
+
+// Returns blob of length 1 for zero
+test(
+    randomblob_int_0,
+    "SELECT length(randomblob(0))",
+    1
+)
+
+// Returns blob of length 1 for negative
+test(
+    randomblob_int_negative,
+    "SELECT length(randomblob(-2))",
+    1
+)
+
+// Returns blob of length from text
+test(
+    randomblob_str_2,
+    "SELECT length(randomblob('2'))",
+    2
+)
+
+// Tests for zeroblob() function
+// Returns empty blob for zero
+test(
+    zeroblob_int_0,
+    "SELECT zeroblob(0) = x''",
+    1
+)
+
+// Returns single zero byte
+test(
+    zeroblob_int_1,
+    "SELECT zeroblob(1) = x'00'",
+    1
+)
+
+// Returns three zero bytes
+test(
+    zeroblob_str_3,
+    "SELECT zeroblob('3') = x'000000'",
+    1
+)
+
+// Returns empty blob for non-numeric text
+test(
+    zeroblob_str_a,
+    "SELECT zeroblob('a') = x''",
+    1
+)
+
+// Returns empty blob for blob input
+test(
+    zeroblob_blob,
+    "SELECT zeroblob(x'01') = x''",
+    1
+)
+
+// Tests for CAST to INTEGER affinity
+// Converts text to integer
+test(
+    cast_text_to_integer,
+    "SELECT CAST('123' AS INTEGER)",
+    123
+)
+
+// Trims whitespace from text
+test(
+    cast_text_with_spaces_to_integer,
+    "SELECT CAST('  123  ' AS INTEGER)",
+    123
+)
+
+// Extracts leading number from text
+test(
+    cast_text_with_trailing_junk_to_integer,
+    "SELECT CAST('1abc' AS INTEGER)",
+    1
+)
+
+// Returns 0 for invalid text
+test(
+    cast_invalid_text_to_integer,
+    "SELECT CAST('abc' AS INTEGER)",
+    0
+)
+
+// Extracts leading number from text
+test(
+    cast_text_prefix_to_integer,
+    "SELECT CAST('123abc' AS INTEGER)",
+    123
+)
+
+// Truncates float to integer
+test(
+    cast_float_to_integer,
+    "SELECT CAST(123.45 AS INTEGER)",
+    123
+)
+
+// Tests rounding behavior for floats
+test(
+    cast_float_to_integer_rounding,
+    [
+        "SELECT CAST(0.6 AS INTEGER)", 
+        "SELECT CAST(1.0 AS INTEGER)",
+        "SELECT CAST(1.6 AS INTEGER)",
+        "SELECT CAST(-0.6 AS INTEGER)",
+        "SELECT CAST(-1.0 AS INTEGER)",
+        "SELECT CAST(-1.6 AS INTEGER)"
+    ],
+    [[0], [1], [1], [0], [-1], [-1]]
+)
+
+// Clamps large float to max integer
+test(
+    cast_large_float_to_integer,
+    "SELECT CAST(9223372036854775808.0 AS INTEGER)",
+    9223372036854775807
+)
+
+// Clamps small float to min integer
+test(
+    cast_small_float_to_integer,
+    "SELECT CAST(-9223372036854775809.0 AS INTEGER)",
+    -9223372036854775808
+)
+
+// Ignores exponent in text
+test(
+    cast_text_exp_to_integer,
+    "SELECT CAST('123e+5' AS INTEGER)",
+    123
+)
+
+// Tests for CAST to REAL affinity
+// Converts text to real
+test(
+    cast_text_to_real,
+    "SELECT CAST('123.45' AS REAL)",
+    123.45
+)
+
+// Trims whitespace from text
+test(
+    cast_text_with_spaces_to_real,
+    "SELECT CAST('  123.45  ' AS REAL)",
+    123.45
+)
+
+// Returns 0.0 for invalid text
+test(
+    cast_invalid_text_to_real,
+    "SELECT CAST('abc' AS REAL)",
+    0.0
+)
+
+// Extracts leading number from text
+test(
+    cast_text_prefix_to_real,
+    "SELECT CAST('123.45abc' AS REAL)",
+    123.45
+)
+
+// Converts integer to real
+test(
+    cast_integer_to_real,
+    "SELECT CAST(123 AS REAL)",
+    123.0
+)
+
+// Tests for CAST to TEXT affinity
+// Converts integer to text
+test(
+    cast_integer_to_text,
+    "SELECT CAST(123 AS TEXT)",
+    "123"
+)
+
+// Converts real to text
+test(
+    cast_real_to_text,
+    "SELECT CAST(123.45 AS TEXT)",
+    "123.45"
+)
+
+// Converts blob to text
+test(
+    cast_blob_to_text,
+    "SELECT CAST(x'68656C6C6F' AS TEXT)",
+    "hello"
+)
+
+// Tests for CAST to BLOB affinity
+// Converts text to blob
+test(
+    cast_text_to_blob,
+    "SELECT hex(CAST('hello' AS BLOB))",
+    "68656C6C6F"
+)
+
+// Converts integer to blob
+test(
+    cast_integer_to_blob,
+    "SELECT hex(CAST(123 AS BLOB))",
+    "313233"
+)
+
+// Tests for CAST to NUMERIC affinity
+// Converts text to integer
+test(
+    cast_integer_text_to_numeric,
+    "SELECT typeof(CAST('123' AS NUMERIC)), CAST('123' AS NUMERIC)",
+    ["integer", 123]
+)
+
+// Converts text to real
+test(
+    cast_float_text_to_numeric,
+    "SELECT typeof(CAST('123.45' AS NUMERIC)), CAST('123.45' AS NUMERIC)",
+    ["real", 123.45]
+)
+
+// Converts small float text to real
+test(
+    cast_small_float_to_numeric,
+    "SELECT typeof(CAST('1.23' AS NUMERIC)), CAST('1.23' AS NUMERIC)",
+    ["real", 1.23]
+)
+
+// Handles complex numeric text as integer
+test(
+    cast_signed_edgecase_int_to_numeric,
+    "SELECT typeof(CAST('-1230-23.40e24' AS NUMERIC)), CAST('-1230-23.40e24' AS NUMERIC)",
+    ["integer", -1230]
+)
+
+// Handles complex numeric text as integer
+test(
+    cast_edgecase_int_to_numeric,
+    "SELECT typeof(CAST('1230-23.40e24' AS NUMERIC)), CAST('1230-23.40e24' AS NUMERIC)",
+    ["integer", 1230]
+)
+
+// Converts text to real
+test(
+    cast_edgecase_int_to_numeric_2,
+    "SELECT typeof(CAST('123023.4024' AS NUMERIC)), CAST('123023.4024' AS NUMERIC)",
+    ["real", 123023.4024]
+)
+
+// Tests SQLite version format
+test(
+    r"\d+\.\d+\.\d+",
+    sqlite_version_should_return_valid_output,
+    "SELECT sqlite_version()"
+)
+
+// Tests for CAST with large text (commented in TCL)
+// Ignored due to SQLite returning 9.22337203685478e+18
+#[ignore = "Commented in TCL due to SQLite returning 9.22337203685478e18"]
+test(
+    cast_large_text_to_numeric,
+    "SELECT typeof(CAST('9223372036854775808' AS NUMERIC)), CAST('9223372036854775808' AS NUMERIC)",
+    ["real", 9.223372036854776e18]
+)
+
+// Tests for CAST with null inputs
+test(
+    cast_null_to_any,
+    "SELECT CAST(NULL AS INTEGER), CAST(NULL AS TEXT), CAST(NULL AS BLOB), CAST(NULL AS REAL), CAST(NULL AS NUMERIC)",
+    [Null, Null, Null, Null, Null]
+)
+
+// Tests CAST in WHERE clause
+test(
+    cast_in_where,
+    "SELECT age from users where age = cast('45' as integer) limit 1",
+    45
+)
+
+// Tests for soundex() function (commented in TCL)
+// Ignored due to SQLite requiring SQLITE_SOUNDEX build flag
+#[ignore = "Commented in TCL as soundex() requires SQLITE_SOUNDEX build flag"]
+test(
+    soundex_text,
+    "SELECT soundex('Pfister'), soundex('husobee'), soundex('Tymczak'), soundex('Ashcraft'), soundex('Robert'), soundex('Rupert'), soundex('Rubin'), soundex('Kant'), soundex('Knuth'), soundex('x'), soundex('')",
+    ["P236", "H210", "T522", "A261", "R163", "R163", "R150", "K530", "K530", "X000", "0000"]
+)

@@ -51,6 +51,7 @@ pub(super) fn text<'src>(
             just('n').to('\n'),
             just('r').to('\r'),
             just('t').to('\t'),
+            just('0').to('\0'),
             just('u').ignore_then(text::digits(16).exactly(4).to_slice().validate(
                 |digits, e, emitter| {
                     char::from_u32(u32::from_str_radix(digits, 16).unwrap()).unwrap_or_else(|| {
