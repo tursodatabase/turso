@@ -1,0 +1,2692 @@
+test(
+    fuzz_test_failure,
+    "SELECT mod(atanh(tanh(-1.0)), ((1.0))) / ((asinh(-1.0) / 2.0 * 1.0) + pow(0.0, 1.0) + 0.5)",
+    -16.85965165556754
+)
+
+test(
+    add_int_1,
+    "SELECT 10 + 1",
+    11
+)
+
+test(
+    add_int_2,
+    "SELECT 0xA + 0xFF",
+    265
+)
+
+test(
+    add_int_3,
+    "SELECT 0xA + 1",
+    11
+)
+
+test(
+    add_float,
+    "SELECT 10.1 + 0.3",
+    10.4
+)
+
+test(
+    add_int_float_1,
+    "SELECT 10 + 0.1",
+    10.1
+)
+
+test(
+    add_int_float_2,
+    "SELECT 0xa + 0.1",
+    10.1
+)
+
+test(
+    add_agg_int_agg_int,
+    "SELECT sum(1) + sum(2)",
+    3
+)
+
+test(
+    add_agg_int_agg_float,
+    "SELECT sum(1) + sum(2.5)",
+    3.5
+)
+
+test(
+    add_agg_float_agg_int,
+    "SELECT sum(1.5) + sum(2)",
+    3.5
+)
+
+test(
+    add_text_1,
+    "SELECT 'a' + 'a'",
+    0
+)
+
+test(
+    add_text_2,
+    "SELECT 'a' + 10",
+    10
+)
+
+test(
+    add_text_3,
+    "SELECT 10 + 'a'",
+    10
+)
+
+test(
+    add_text_4,
+    "SELECT 'a' + 11.0",
+    11.0
+)
+
+test(
+    add_text_5,
+    "SELECT 11.0 + 'a'",
+    11.0
+)
+
+test(
+    add_text_7,
+    "SELECT '1' + '2'",
+    3
+)
+
+test(
+    add_text_8,
+    "SELECT '1.0' + '2'",
+    3.0
+)
+
+test(
+    add_text_9,
+    "SELECT '1.0' + '3.0'",
+    4.0
+)
+
+test(
+    add_overflow_1,
+    "SELECT '9223372036854775807' + '0'",
+    9223372036854775807
+)
+
+test(
+    add_overflow_2,
+    "SELECT '9223372036854775807' + '1'",
+    9.223372036854776e18
+)
+
+test(
+    add_overflow_3,
+    "SELECT 9223372036854775807 + 0",
+    9223372036854775807
+)
+
+test(
+    add_overflow_4,
+    "SELECT 9223372036854775807 + 1",
+    9.223372036854776e18
+)
+
+test(
+    add_overflow_5,
+    "SELECT '-9223372036854775808' + '0'",
+    -9223372036854775808
+)
+
+test(
+    add_overflow_6,
+    "SELECT '-9223372036854775808' + '-1'",
+    -9.223372036854776e18
+)
+
+test(
+    add_overflow_7,
+    "SELECT -9223372036854775808 + 0",
+    -9223372036854775808
+)
+
+test(
+    add_overflow_8,
+    "SELECT -9223372036854775808 + -1",
+    -9.223372036854776e18
+)
+
+test(
+    subtract_int,
+    "SELECT 10 - 1",
+    9
+)
+
+test(
+    subtract_float,
+    "SELECT 10.2 - 0.1",
+    10.1
+)
+
+test(
+    subtract_int_float,
+    "SELECT 10 - 0.1",
+    9.9
+)
+
+test(
+    subtract_agg_int_agg_int,
+    "SELECT sum(3) - sum(1)",
+    2
+)
+
+test(
+    subtract_agg_int_agg_float,
+    "SELECT sum(3) - sum(1.5)",
+    1.5
+)
+
+test(
+    subtract_agg_float_agg_int,
+    "SELECT sum(3.5) - sum(1)",
+    2.5
+)
+
+test(
+    subtract_blob,
+    "SELECT -x'11'",
+    0
+)
+
+test(
+    subtract_blob_empty,
+    "SELECT -x''",
+    0
+)
+
+test(
+    subtract_blob_charcter,
+    "SELECT -'hi'",
+    0
+)
+
+test(
+    subtract_text_1,
+    "SELECT 'a' - 'a'",
+    0
+)
+
+test(
+    subtract_text_2,
+    "SELECT 'a' - 10",
+    -10
+)
+
+test(
+    subtract_text_3,
+    "SELECT 10 - 'a'",
+    10
+)
+
+test(
+    subtract_text_4,
+    "SELECT 'a' - 11.0",
+    -11.0
+)
+
+test(
+    subtract_text_5,
+    "SELECT 11.0 - 'a'",
+    11.0
+)
+
+test(
+    subtract_text_7,
+    "SELECT '1' - '2'",
+    -1
+)
+
+test(
+    subtract_text_8,
+    "SELECT '1.0' - '2'",
+    -1.0
+)
+
+test(
+    subtract_text_9,
+    "SELECT '1.0' - '3.0'",
+    -2.0
+)
+
+test(
+    subtract_overflow_1,
+    "SELECT '9223372036854775807' - '0'",
+    9223372036854775807
+)
+
+test(
+    subtract_overflow_2,
+    "SELECT '9223372036854775807' - '-1'",
+    9.223372036854776e18
+)
+
+test(
+    subtract_overflow_3,
+    "SELECT 9223372036854775807 - 0",
+    9223372036854775807
+)
+
+test(
+    subtract_overflow_4,
+    "SELECT 9223372036854775807 - -1",
+    9.223372036854776e18
+)
+
+test(
+    subtract_overflow_5,
+    "SELECT '-9223372036854775808' - '0'",
+    -9223372036854775808
+)
+
+test(
+    subtract_overflow_6,
+    "SELECT '-9223372036854775808' - '1'",
+    -9.223372036854776e18
+)
+
+test(
+    subtract_overflow_7,
+    "SELECT -9223372036854775808 - 0",
+    -9223372036854775808
+)
+
+test(
+    subtract_overflow_8,
+    "SELECT -9223372036854775808 - 1",
+    -9.223372036854776e18
+)
+
+test(
+    multiply_int,
+    "SELECT 10 * 2",
+    20
+)
+
+test(
+    multiply_float,
+    "SELECT 10.2 * 2.2",
+    22.44
+)
+
+test(
+    multiply_int_float,
+    "SELECT 10 * 1.45",
+    14.5
+)
+
+test(
+    multiply_float_int,
+    "SELECT 1.45 * 10",
+    14.5
+)
+
+test(
+    multiply_agg_int_agg_int,
+    "SELECT sum(2) * sum(3)",
+    6
+)
+
+test(
+    multiply_agg_int_agg_float,
+    "SELECT sum(2) * sum(3.5)",
+    7.0
+)
+
+test(
+    multiply_agg_float_agg_int,
+    "SELECT sum(2.5) * sum(3)",
+    7.5
+)
+
+test(
+    multiply_text_1,
+    "SELECT 'a' * 'a'",
+    0
+)
+
+test(
+    multiply_text_2,
+    "SELECT 'a' * 10",
+    0
+)
+
+test(
+    multiply_text_3,
+    "SELECT 10 * 'a'",
+    0
+)
+
+test(
+    multiply_text_4,
+    "SELECT 'a' * 11.0",
+    0.0
+)
+
+test(
+    multiply_text_5,
+    "SELECT 11.0 * 'a'",
+    0.0
+)
+
+test(
+    multiply_text_7,
+    "SELECT '1' * '2'",
+    2
+)
+
+test(
+    multiply_text_8,
+    "SELECT '1.0' * '2'",
+    2.0
+)
+
+test(
+    multiply_text_9,
+    "SELECT '1.0' * '3.0'",
+    3.0
+)
+
+test(
+    multiply_overflow_1,
+    "SELECT '9223372036854775807' * '1'",
+    9223372036854775807
+)
+
+test(
+    multiply_overflow_2,
+    "SELECT '9223372036854775807' * '2'",
+    1.8446744073709552e19
+)
+
+test(
+    multiply_overflow_3,
+    "SELECT 9223372036854775807 * 1",
+    9223372036854775807
+)
+
+test(
+    multiply_overflow_4,
+    "SELECT 9223372036854775807 * 2",
+    1.8446744073709552e19
+)
+
+test(
+    multiply_overflow_5,
+    "SELECT '-9223372036854775808' * '1'",
+    -9223372036854775808
+)
+
+test(
+    multiply_overflow_6,
+    "SELECT '-9223372036854775808' * '2'",
+    -1.8446744073709552e19
+)
+
+test(
+    multiply_overflow_7,
+    "SELECT -9223372036854775808 * 1",
+    -9223372036854775808
+)
+
+test(
+    multiply_overflow_8,
+    "SELECT -9223372036854775808 * 2",
+    -1.8446744073709552e19
+)
+
+test(
+    divide_int,
+    "SELECT 10 / 2",
+    5
+)
+
+test(
+    divide_int_no_fraction,
+    "SELECT 10 / 3",
+    3
+)
+
+test(
+    divide_float,
+    "SELECT 10.6 / 2.5",
+    4.24
+)
+
+test(
+    divide_int_float,
+    "SELECT 10 / 4.0",
+    2.5
+)
+
+test(
+    divide_float_int,
+    "SELECT 10.0 / 4",
+    2.5
+)
+
+test(
+    divide_by_zero,
+    "SELECT 10 / 0",
+    Null
+)
+
+test(
+    divide_int_null,
+    "SELECT 10 / null",
+    Null
+)
+
+test(
+    divide_null_int,
+    "SELECT null / 10",
+    Null
+)
+
+test(
+    divide_null,
+    "SELECT null / null",
+    Null
+)
+
+test(
+    divide_agg_int_agg_int,
+    "SELECT sum(4) / sum(2)",
+    2
+)
+
+test(
+    divide_agg_int_agg_float,
+    "SELECT sum(4) / sum(2.0)",
+    2.0
+)
+
+test(
+    divide_agg_float_agg_int,
+    "SELECT sum(4.0) / sum(2)",
+    2.0
+)
+
+test(
+    divide_text_1,
+    "SELECT 'a' / 'a'",
+    Null
+)
+
+test(
+    divide_text_2,
+    "SELECT 'a' / 10",
+    0
+)
+
+test(
+    divide_text_3,
+    "SELECT 10 / 'a'",
+    Null
+)
+
+test(
+    divide_text_4,
+    "SELECT 'a' / 11.0",
+    0.0
+)
+
+test(
+    divide_text_5,
+    "SELECT 11.0 / 'a'",
+    Null
+)
+
+test(
+    divide_text_7,
+    "SELECT '1' / '2'",
+    0
+)
+
+test(
+    divide_text_8,
+    "SELECT '1.0' / '2'",
+    0.5
+)
+
+test(
+    divide_text_9,
+    "SELECT '1.0' / '4.0'",
+    0.25
+)
+
+test(
+    divide_overflow_5,
+    "SELECT '-9223372036854775808' / '0'",
+    Null
+)
+
+test(
+    divide_overflow_6,
+    "SELECT '-9223372036854775808' / '-1'",
+    9.223372036854776e18
+)
+
+test(
+    divide_overflow_7,
+    "SELECT -9223372036854775808 / 0",
+    Null
+)
+
+test(
+    divide_overflow_8,
+    "SELECT -9223372036854775808 / -1",
+    9.223372036854776e18
+)
+
+test(
+    add_agg_int,
+    "SELECT sum(id) + 10 from products",
+    76
+)
+
+test(
+    add_int_agg,
+    "SELECT 10 + sum(id) from products",
+    76
+)
+
+test(
+    add_agg_float,
+    "SELECT sum(id) + 10.1 from products",
+    76.1
+)
+
+test(
+    add_float_agg,
+    "SELECT 10.1 + sum(id) from products",
+    76.1
+)
+
+test(
+    add_agg_int_agg_int_2,
+    "SELECT sum(id) + sum(id) from products",
+    132
+)
+
+test(
+    add_agg_float_agg_float,
+    "SELECT sum(price) + sum(price) from products",
+    1246.0
+)
+
+test(
+    add_agg_int_agg_float_2,
+    "SELECT sum(id) + sum(price) from products",
+    689.0
+)
+
+test(
+    add_float_text_edgecase,
+    "SELECT '-123.22342-24' + '232.3x32'",
+    109.07658
+)
+
+test(
+    add_str_edgecase,
+    "SELECT '-1+23.22342-24' + '2-32.3x32'",
+    1
+)
+
+test(
+    subtract_agg_int,
+    "SELECT sum(id) - 10 from products",
+    56
+)
+
+test(
+    subtract_int_agg,
+    "SELECT 10 - sum(id) from products",
+    -56
+)
+
+test(
+    subtract_agg_float,
+    "SELECT sum(id) - 10.1 from products",
+    55.9
+)
+
+test(
+    subtract_float_agg,
+    "SELECT 10.1 - sum(id) from products",
+    -55.9
+)
+
+test(
+    subtract_agg_int_agg_int_2,
+    "SELECT sum(id) - sum(id) from products",
+    0
+)
+
+test(
+    subtract_agg_float_agg_float,
+    "SELECT sum(price) - sum(price) from products",
+    0.0
+)
+
+test(
+    subtract_agg_int_agg_float_2,
+    "SELECT sum(id) - sum(price) from products",
+    -557.0
+)
+
+test(
+    subtract_agg_float_agg_int_2,
+    "SELECT sum(price) - sum(id) from products",
+    557.0
+)
+
+test(
+    subtract_str_float_edgecase,
+    "SELECT '-123.22342-24' - '232.3x32'",
+    -355.52342
+)
+
+test(
+    multiply_agg_int,
+    "SELECT sum(id) * 10 from products",
+    660
+)
+
+test(
+    multiply_int_agg,
+    "SELECT 10 * sum(id) from products",
+    660
+)
+
+test(
+    multiply_agg_float,
+    "SELECT sum(id) * 10.1 from products",
+    666.6
+)
+
+test(
+    multiply_float_agg,
+    "SELECT 10.1 * sum(id) from products",
+    666.6
+)
+
+test(
+    multiply_agg_int_agg_int_2,
+    "SELECT sum(id) * sum(id) from products",
+    4356
+)
+
+test(
+    multiply_agg_float_agg_float,
+    "SELECT sum(price) * sum(price) from products",
+    388129.0
+)
+
+test(
+    multiply_agg_int_agg_float_2,
+    "SELECT sum(id) * sum(price) from products",
+    41118.0
+)
+
+test(
+    multiply_agg_float_agg_int_2,
+    "SELECT sum(price) * sum(id) from products",
+    41118.0
+)
+
+test(
+    multiply_str_floats_edgecase,
+    "SELECT '-123.22341-24' * '232.3x32'",
+    -28624.798143
+)
+
+test(
+    divide_agg_int,
+    "SELECT sum(id) / 10 from products",
+    6
+)
+
+test(
+    divide_int_agg,
+    "SELECT 660 / sum(id) from products",
+    10
+)
+
+test(
+    divide_agg_float,
+    "SELECT sum(id) / 1.5 from products",
+    44.0
+)
+
+test(
+    divide_float_agg,
+    "SELECT 66.0 / sum(id) from products",
+    1.0
+)
+
+test(
+    divide_agg_int_agg_int_2,
+    "SELECT sum(id) / sum(id) from products",
+    1
+)
+
+test(
+    divide_agg_float_agg_float,
+    "SELECT sum(price) / sum(price) from products",
+    1.0
+)
+
+test(
+    divide_agg_int_agg_float_2,
+    "SELECT sum(id) / min(price) from products",
+    66.0
+)
+
+test(
+    divide_agg_float_agg_int_2,
+    "SELECT min(price) / min(id) from products",
+    1.0
+)
+
+test(
+    bitwise_and_int_null,
+    "SELECT 1234 & NULL",
+    Null
+)
+
+test(
+    bitwise_and_int_int,
+    "SELECT 1234 & 1234",
+    1234
+)
+
+test(
+    bitwise_and_int_float,
+    "SELECT 660 & 261.8",
+    4
+)
+
+test(
+    bitwise_and_float_float,
+    "SELECT 660.63 & 261.8",
+    4
+)
+
+test(
+    bitwise_and_float_int_rev,
+    "SELECT 261.8 & 660",
+    4
+)
+
+test(
+    bitwise_and_int_agg_int,
+    "SELECT 8261 & sum(id) from products",
+    64
+)
+
+test(
+    bitwise_and_int_agg_float,
+    "SELECT 1036.6 & sum(id) from products",
+    0
+)
+
+test(
+    bitwise_and_int_agg_int_agg,
+    "SELECT sum(id) & sum(id) from products",
+    66
+)
+
+test(
+    bitwise_and_text_1,
+    "SELECT 'a' & 'a'",
+    0
+)
+
+test(
+    bitwise_and_text_2,
+    "SELECT 'a' & 10",
+    0
+)
+
+test(
+    bitwise_and_text_3,
+    "SELECT 10 & 'a'",
+    0
+)
+
+test(
+    bitwise_and_text_4,
+    "SELECT 'a' & 11.0",
+    0
+)
+
+test(
+    bitwise_and_text_5,
+    "SELECT 11.0 & 'a'",
+    0
+)
+
+test(
+    bitwise_and_text_7,
+    "SELECT '1' & '2'",
+    0
+)
+
+test(
+    bitwise_and_text_8,
+    "SELECT '1.0' & '2'",
+    0
+)
+
+test(
+    bitwise_and_text_9,
+    "SELECT '1.0' & '4.0'",
+    0
+)
+
+test(
+    bitwise_and_text_10,
+    "SELECT '1.0' & '1.0'",
+    1
+)
+
+test(
+    bitwise_and_text_11,
+    "SELECT '1' & '1'",
+    1
+)
+
+test(
+    bitwise_or_int_null,
+    "SELECT 1234 | NULL",
+    Null
+)
+
+test(
+    bitwise_or_null_int,
+    "SELECT NULL | 1234",
+    Null
+)
+
+test(
+    bitwise_or_int_int,
+    "SELECT 4321 | 1234",
+    5363
+)
+
+test(
+    bitwise_or_int_float,
+    "SELECT 660 | 1234.0",
+    1750
+)
+
+test(
+    bitwise_or_int_agg,
+    "SELECT 18823 | sum(id) from products",
+    18887
+)
+
+test(
+    bitwise_or_float_float,
+    "SELECT 1234.6 | 5432.2",
+    5626
+)
+
+test(
+    bitwise_or_text_1,
+    "SELECT 'a' | 'a'",
+    0
+)
+
+test(
+    bitwise_or_text_2,
+    "SELECT 'a' | 10",
+    10
+)
+
+test(
+    bitwise_or_text_3,
+    "SELECT 10 | 'a'",
+    10
+)
+
+test(
+    bitwise_or_text_4,
+    "SELECT 'a' | 11.0",
+    11
+)
+
+test(
+    bitwise_or_text_5,
+    "SELECT 11.0 | 'a'",
+    11
+)
+
+test(
+    bitwise_or_text_7,
+    "SELECT '1' | '2'",
+    3
+)
+
+test(
+    bitwise_or_text_8,
+    "SELECT '1.0' | '2'",
+    3
+)
+
+test(
+    bitwise_or_text_9,
+    "SELECT '1.0' | '4.0'",
+    5
+)
+
+test(
+    bitwise_or_text_10,
+    "SELECT '1.0' | '1.0'",
+    1
+)
+
+test(
+    bitwise_or_text_11,
+    "SELECT '1' | '1'",
+    1
+)
+
+test(
+    bitwise_and_int_agg_int_agg_2,
+    "SELECT sum(id) | sum(id) from products",
+    66
+)
+
+test(
+    shift_left_int_int,
+    "SELECT 1 << 2",
+    4
+)
+
+test(
+    shift_left_int_neg_int,
+    "SELECT 8 << -2",
+    2
+)
+
+test(
+    shift_left_int_float,
+    "SELECT 1 << 4.0",
+    16
+)
+
+test(
+    shift_left_int_text,
+    "SELECT 1 << 'a'",
+    1
+)
+
+test(
+    shift_left_int_text_float,
+    "SELECT 1 << '3.0'",
+    8
+)
+
+test(
+    shift_left_int_text_int,
+    "SELECT 1 << '1'",
+    2
+)
+
+test(
+    shift_left_int_null,
+    "SELECT 1 << NULL",
+    Null
+)
+
+test(
+    shift_left_int_int_overflow,
+    "SELECT 1 << 64",
+    0
+)
+
+test(
+    shift_left_int_int_underflow,
+    "SELECT 1 << -64",
+    0
+)
+
+test(
+    shift_left_int_float_overflow,
+    "SELECT 1 << 64.0",
+    0
+)
+
+test(
+    shift_left_int_float_underflow,
+    "SELECT 1 << -64.0",
+    0
+)
+
+test(
+    shift_left_float_int,
+    "SELECT 1.0 << 2",
+    4
+)
+
+test(
+    shift_left_float_neg_int,
+    "SELECT 8.0 << -2",
+    2
+)
+
+test(
+    shift_left_float_float,
+    "SELECT 1.0 << 4.0",
+    16
+)
+
+test(
+    shift_left_float_text,
+    "SELECT 1.0 << 'a'",
+    1
+)
+
+test(
+    shift_left_float_text_float,
+    "SELECT 1.0 << '3.0'",
+    8
+)
+
+test(
+    shift_left_float_text_int,
+    "SELECT 1.0 << '1'",
+    2
+)
+
+test(
+    shift_left_float_null,
+    "SELECT 1.0 << NULL",
+    Null
+)
+
+test(
+    shift_left_float_int_overflow,
+    "SELECT 1.0 << 64",
+    0
+)
+
+test(
+    shift_left_float_int_underflow,
+    "SELECT 1.0 << -64",
+    0
+)
+
+test(
+    shift_left_float_float_overflow,
+    "SELECT 1.0 << 64.0",
+    0
+)
+
+test(
+    shift_left_float_float_underflow,
+    "SELECT 1.0 << -64.0",
+    0
+)
+
+test(
+    shift_left_text_int,
+    "SELECT 'a' << 2",
+    0
+)
+
+test(
+    shift_left_text_float,
+    "SELECT 'a' << 4.0",
+    0
+)
+
+test(
+    shift_left_text_text,
+    "SELECT 'a' << 'a'",
+    0
+)
+
+test(
+    shift_left_text_int_text_int,
+    "SELECT '1' << '1'",
+    2
+)
+
+test(
+    shift_left_text_int_text_float,
+    "SELECT '1' << '3.0'",
+    8
+)
+
+test(
+    shift_left_text_int_text,
+    "SELECT '1' << 'a'",
+    1
+)
+
+test(
+    shift_left_text_float_text_int,
+    "SELECT '1.0' << '1'",
+    2
+)
+
+test(
+    shift_left_text_float_text_float,
+    "SELECT '1.0' << '3.0'",
+    8
+)
+
+test(
+    shift_left_text_float_text,
+    "SELECT '1.0' << 'a'",
+    1
+)
+
+test(
+    shift_left_text_null,
+    "SELECT '1' << NULL",
+    Null
+)
+
+test(
+    shift_left_null_int,
+    "SELECT NULL << 2",
+    Null
+)
+
+test(
+    shift_left_null_float,
+    "SELECT NULL << 4.0",
+    Null
+)
+
+test(
+    shift_left_null_text,
+    "SELECT NULL << 'a'",
+    Null
+)
+
+test(
+    shift_left_null_null,
+    "SELECT NULL << NULL",
+    Null
+)
+
+test(
+    shift_right_int_int,
+    "SELECT 8 >> 2",
+    2
+)
+
+test(
+    shift_right_int_neg_int,
+    "SELECT 8 >> -2",
+    32
+)
+
+test(
+    shift_right_int_float,
+    "SELECT 8 >> 1.0",
+    4
+)
+
+test(
+    shift_right_int_text,
+    "SELECT 8 >> 'a'",
+    8
+)
+
+test(
+    shift_right_int_text_float,
+    "SELECT 8 >> '3.0'",
+    1
+)
+
+test(
+    shift_right_int_text_int,
+    "SELECT 8 >> '1'",
+    4
+)
+
+test(
+    shift_right_int_null,
+    "SELECT 8 >> NULL",
+    Null
+)
+
+test(
+    shift_right_int_int_overflow,
+    "SELECT 8 >> 64",
+    0
+)
+
+test(
+    shift_right_int_int_underflow,
+    "SELECT 8 >> -64",
+    0
+)
+
+test(
+    shift_right_int_float_overflow,
+    "SELECT 8 >> 64.0",
+    0
+)
+
+test(
+    shift_right_int_float_underflow,
+    "SELECT 8 >> -64.0",
+    0
+)
+
+test(
+    shift_right_float_int,
+    "SELECT 8.0 >> 2",
+    2
+)
+
+test(
+    shift_right_float_neg_int,
+    "SELECT 8.0 >> -2",
+    32
+)
+
+test(
+    shift_right_float_float,
+    "SELECT 8.0 >> 1.0",
+    4
+)
+
+test(
+    shift_right_float_text,
+    "SELECT 8.0 >> 'a'",
+    8
+)
+
+test(
+    shift_right_float_text_float,
+    "SELECT 8.0 >> '3.0'",
+    1
+)
+
+test(
+    shift_right_float_text_int,
+    "SELECT 8.0 >> '1'",
+    4
+)
+
+test(
+    shift_right_float_null,
+    "SELECT 8.0 >> NULL",
+    Null
+)
+
+test(
+    shift_right_float_int_overflow,
+    "SELECT 8.0 >> 64",
+    0
+)
+
+test(
+    shift_right_float_int_underflow,
+    "SELECT 8.0 >> -64",
+    0
+)
+
+test(
+    shift_right_float_float_overflow,
+    "SELECT 8.0 >> 64.0",
+    0
+)
+
+test(
+    shift_right_float_float_underflow,
+    "SELECT 8.0 >> -64.0",
+    0
+)
+
+test(
+    shift_right_text_int,
+    "SELECT 'a' >> 2",
+    0
+)
+
+test(
+    shift_right_text_float,
+    "SELECT 'a' >> 4.0",
+    0
+)
+
+test(
+    shift_right_text_text,
+    "SELECT 'a' >> 'a'",
+    0
+)
+
+test(
+    shift_right_text_int_text_int,
+    "SELECT '8' >> '1'",
+    4
+)
+
+test(
+    shift_right_text_int_text_float,
+    "SELECT '8' >> '3.0'",
+    1
+)
+
+test(
+    shift_right_text_int_text,
+    "SELECT '8' >> 'a'",
+    8
+)
+
+test(
+    shift_right_text_float_text_int,
+    "SELECT '8.0' >> '1'",
+    4
+)
+
+test(
+    shift_right_text_float_text_float,
+    "SELECT '8.0' >> '3.0'",
+    1
+)
+
+test(
+    shift_right_text_float_text,
+    "SELECT '8.0' >> 'a'",
+    8
+)
+
+test(
+    shift_right_text_int_text_edge,
+    "SELECT '123-23' >> 2",
+    30
+)
+
+test(
+    shift_right_text_signed_text_edge,
+    "SELECT '-123' >> '2xi'",
+    -31
+)
+
+test(
+    shift_right_text_null,
+    "SELECT '8' >> NULL",
+    Null
+)
+
+test(
+    shift_right_null_int,
+    "SELECT NULL >> 2",
+    Null
+)
+
+test(
+    shift_right_null_float,
+    "SELECT NULL >> 4.0",
+    Null
+)
+
+test(
+    shift_right_null_text,
+    "SELECT NULL >> 'a'",
+    Null
+)
+
+test(
+    shift_right_null_null,
+    "SELECT NULL >> NULL",
+    Null
+)
+
+test(
+    bitwise_not_null,
+    "SELECT ~NULL",
+    Null
+)
+
+test(
+    bitwise_not_int,
+    "SELECT ~1234",
+    -1235
+)
+
+test(
+    bitwise_not_float,
+    "SELECT ~823.34",
+    -824
+)
+
+test(
+    bitwise_not_text_float,
+    "SELECT ~'823.34'",
+    -824
+)
+
+test(
+    bitwise_not_text_int_1,
+    "SELECT ~'1234'",
+    -1235
+)
+
+test(
+    bitwise_not_text_int_2,
+    "SELECT ~0xA",
+    -11
+)
+
+test(
+    bitwise_not_scalar_float,
+    "SELECT ~abs(693.9)",
+    -694
+)
+
+test(
+    bitwise_not_scalar_int,
+    "SELECT ~abs(7566)",
+    -7567
+)
+
+test(
+    bitwise_not_agg_int,
+    "SELECT ~sum(693)",
+    -694
+)
+
+test(
+    bitwise_not_agg_and_agg,
+    "SELECT ~sum(693) & sum(-302)",
+    -958
+)
+
+test(
+    bitwise_not_agg_int_2,
+    "SELECT ~sum(693)",
+    -694
+)
+
+test(
+    bitwise_not_zero,
+    "SELECT ~0",
+    -1
+)
+
+test(
+    bitwise_not_empty_blob,
+    "SELECT ~x''",
+    -1
+)
+
+test(
+    bitwise_not_cast_blob,
+    "SELECT ~ CAST ('af' AS BLOB)",
+    -1
+)
+
+test(
+    bitwise_not_blob,
+    "SELECT ~ x'0000'",
+    -1
+)
+
+test(
+    bitwise_not_blob_2,
+    "SELECT ~ x'0001'",
+    -1
+)
+
+test(
+    pi,
+    "SELECT pi()",
+    3.141592653589793
+)
+
+test(
+    acos_int,
+    "SELECT acos(1)",
+    0.0
+)
+
+test(
+    acos_float,
+    "SELECT acos(-0.5)",
+    2.0943951023931957
+)
+
+test(
+    acos_str,
+    "SELECT acos('-0.5')",
+    2.0943951023931957
+)
+
+test(
+    acos_null,
+    "SELECT acos(null)",
+    Null
+)
+
+test(
+    acosh_int,
+    "SELECT acosh(1)",
+    0.0
+)
+
+test(
+    acosh_float,
+    "SELECT acosh(1.5)",
+    0.9624236501192069
+)
+
+test(
+    acosh_str,
+    "SELECT acosh('1.5')",
+    0.9624236501192069
+)
+
+test(
+    acosh_invalid,
+    "SELECT acosh(0.99)",
+    Null
+)
+
+test(
+    acosh_null,
+    "SELECT acosh(null)",
+    Null
+)
+
+test(
+    asin_int,
+    "SELECT asin(1)",
+    1.5707963267948966
+)
+
+#[ignore = "Limbo outputs Real(-0.5235987755982989)"]
+test(
+    asin_float,
+    "SELECT asin(-0.5)",
+    -0.5235987755982988
+)
+
+#[ignore = "Limbo outputs Real(-0.5235987755982989)"]
+test(
+    asin_str,
+    "SELECT asin('-0.5')",
+    -0.5235987755982988
+)
+
+test(
+    asin_null,
+    "SELECT asin(null)",
+    Null
+)
+
+test(
+    sin_int,
+    "SELECT sin(1)",
+    0.8414709848078965
+)
+
+test(
+    sin_float,
+    "SELECT sin(-0.5)",
+    -0.479425538604203
+)
+
+test(
+    sin_str,
+    "SELECT sin('-0.5')",
+    -0.479425538604203
+)
+
+test(
+    sin_null,
+    "SELECT sin(null)",
+    Null
+)
+
+#[ignore = "Limbo outputs [[Real(0.8414709848078965)], [Real(0.9092974268256817)], [Real(0.1411200080598672)], [Real(-0.7568024953079282)], [Real(-0.9589242746631385)]]"]
+test(
+    sin_products_id,
+    "SELECT sin(id) from products limit 5",
+    [[0.8414709848078965], [0.9092974268256817], [0.1411200080598672], [-0.7568024953079283], [-0.9589242746631385]]
+)
+
+test(
+    asinh_int,
+    "SELECT asinh(1)",
+    0.881373587019543
+)
+
+test(
+    asinh_float,
+    "SELECT asinh(-0.5)",
+    -0.48121182505960347
+)
+
+test(
+    asinh_str,
+    "SELECT asinh('-0.5')",
+    -0.48121182505960347
+)
+
+test(
+    asinh_null,
+    "SELECT asinh(null)",
+    Null
+)
+
+test(
+    atan_int,
+    "SELECT atan(1)",
+    0.7853981633974483
+)
+
+#[ignore = "Limbo outputs Real(-0.4636476090008061)"]
+test(
+    atan_float,
+    "SELECT atan(-0.5)",
+    -0.46364760900080615
+)
+
+#[ignore = "Limbo outputs Real(-0.4636476090008061)"]
+test(
+    atan_str,
+    "SELECT atan('-0.5')",
+    -0.46364760900080615
+)
+
+test(
+    atan_null,
+    "SELECT atan(null)",
+    Null
+)
+
+#[ignore = "Limbo outputs Real(1.5574077246549023)"]
+test(
+    tan_int,
+    "SELECT tan(1)",
+    1.557407724654902
+)
+
+test(
+    tan_float,
+    "SELECT tan(-0.5)",
+    -0.5463024898437905
+)
+
+test(
+    tan_str,
+    "SELECT tan('-0.5')",
+    -0.5463024898437905
+)
+
+test(
+    tan_null,
+    "SELECT tan(null)",
+    Null
+)
+
+test(
+    atanh_int,
+    "SELECT atanh(0)",
+    0.0
+)
+
+#[ignore = "Limbo outputs Real(-0.5493061443340548)"]
+test(
+    atanh_float,
+    "SELECT atanh(-0.5)",
+    -0.5493061443340549
+)
+
+#[ignore = "Limbo outputs Real(-0.5493061443340548)"]
+test(
+    atanh_str,
+    "SELECT atanh('-0.5')",
+    -0.5493061443340549
+)
+
+test(
+    atanh_null,
+    "SELECT atanh(null)",
+    Null
+)
+
+test(
+    ceil_int,
+    "SELECT ceil(1)",
+    1
+)
+
+test(
+    ceil_float,
+    "SELECT ceil(-1.5)",
+    -1.0
+)
+
+test(
+    ceil_str,
+    "SELECT ceil('1.5')",
+    2.0
+)
+
+test(
+    ceil_null,
+    "SELECT ceil(null)",
+    Null
+)
+
+test(
+    ceiling_int,
+    "SELECT ceiling(1)",
+    1
+)
+
+test(
+    ceiling_float,
+    "SELECT ceiling(-1.5)",
+    -1.0
+)
+
+test(
+    ceiling_str,
+    "SELECT ceiling('1.5')",
+    2.0
+)
+
+test(
+    ceiling_null,
+    "SELECT ceiling(null)",
+    Null
+)
+
+test(
+    cos_int,
+    "SELECT cos(1)",
+    0.5403023058681398
+)
+
+test(
+    cos_float,
+    "SELECT cos(-0.5)",
+    0.8775825618903728
+)
+
+test(
+    cos_str,
+    "SELECT cos('-0.5')",
+    0.8775825618903728
+)
+
+test(
+    cos_null,
+    "SELECT cos(null)",
+    Null
+)
+
+#[ignore = "Limbo outputs Real(1.543080634815244)"]
+test(
+    cosh_int,
+    "SELECT cosh(1)",
+    1.5430806348152437
+)
+
+test(
+    cosh_float,
+    "SELECT cosh(-0.5)",
+    1.1276259652063807
+)
+
+test(
+    cosh_str,
+    "SELECT cosh('-0.5')",
+    1.1276259652063807
+)
+
+test(
+    cosh_null,
+    "SELECT cosh(null)",
+    Null
+)
+
+test(
+    degrees_int,
+    "SELECT degrees(1)",
+    57.29577951308232
+)
+
+test(
+    degrees_float,
+    "SELECT degrees(-0.5)",
+    -28.64788975654116
+)
+
+test(
+    degrees_str,
+    "SELECT degrees('-0.5')",
+    -28.64788975654116
+)
+
+test(
+    degrees_null,
+    "SELECT degrees(null)",
+    Null
+)
+
+#[ignore = "Limbo outputs Real(2.7182818284590455)"]
+test(
+    exp_int,
+    "SELECT exp(1)",
+    2.718281828459045
+)
+
+test(
+    exp_float,
+    "SELECT exp(-0.5)",
+    0.6065306597126334
+)
+
+test(
+    exp_str,
+    "SELECT exp('-0.5')",
+    0.6065306597126334
+)
+
+test(
+    exp_null,
+    "SELECT exp(null)",
+    Null
+)
+
+test(
+    floor_int,
+    "SELECT floor(1)",
+    1
+)
+
+test(
+    floor_float,
+    "SELECT floor(-1.5)",
+    -2.0
+)
+
+test(
+    floor_str,
+    "SELECT floor('1.5')",
+    1.0
+)
+
+test(
+    floor_null,
+    "SELECT floor(null)",
+    Null
+)
+
+test(
+    ln_int,
+    "SELECT ln(1)",
+    0.0
+)
+
+test(
+    ln_float,
+    "SELECT ln(0.5)",
+    -0.6931471805599453
+)
+
+test(
+    ln_str,
+    "SELECT ln('0.5')",
+    -0.6931471805599453
+)
+
+test(
+    ln_negative,
+    "SELECT ln(-0.5)",
+    Null
+)
+
+test(
+    ln_null,
+    "SELECT ln(null)",
+    Null
+)
+
+test(
+    log10_int,
+    "SELECT log10(1)",
+    0.0
+)
+
+test(
+    log10_float,
+    "SELECT log10(0.5)",
+    -0.3010299956639812
+)
+
+test(
+    log10_str,
+    "SELECT log10('0.5')",
+    -0.3010299956639812
+)
+
+test(
+    log10_negative,
+    "SELECT log10(-0.5)",
+    Null
+)
+
+test(
+    log10_null,
+    "SELECT log10(null)",
+    Null
+)
+
+test(
+    log2_int,
+    "SELECT log2(1)",
+    0.0
+)
+
+test(
+    log2_float,
+    "SELECT log2(0.5)",
+    -1.0
+)
+
+test(
+    log2_str,
+    "SELECT log2('0.5')",
+    -1.0
+)
+
+test(
+    log2_negative,
+    "SELECT log2(-0.5)",
+    Null
+)
+
+test(
+    log2_null,
+    "SELECT log2(null)",
+    Null
+)
+
+test(
+    radians_int,
+    "SELECT radians(1)",
+    0.017453292519943295
+)
+
+test(
+    radians_float,
+    "SELECT radians(-0.5)",
+    -0.008726646259971648
+)
+
+test(
+    radians_str,
+    "SELECT radians('-0.5')",
+    -0.008726646259971648
+)
+
+test(
+    radians_null,
+    "SELECT radians(null)",
+    Null
+)
+
+test(
+    sinh_int,
+    "SELECT sinh(1)",
+    1.1752011936438014
+)
+
+test(
+    sinh_float,
+    "SELECT sinh(-0.5)",
+    -0.5210953054937474
+)
+
+test(
+    sinh_str,
+    "SELECT sinh('-0.5')",
+    -0.5210953054937474
+)
+
+test(
+    sinh_null,
+    "SELECT sinh(null)",
+    Null
+)
+
+test(
+    sqrt_int,
+    "SELECT sqrt(1)",
+    1.0
+)
+
+test(
+    sqrt_float,
+    "SELECT sqrt(0.5)",
+    0.7071067811865476
+)
+
+test(
+    sqrt_str,
+    "SELECT sqrt('0.5')",
+    0.7071067811865476
+)
+
+test(
+    sqrt_negative,
+    "SELECT sqrt(-0.5)",
+    Null
+)
+
+test(
+    sqrt_null,
+    "SELECT sqrt(null)",
+    Null
+)
+
+test(
+    tanh_int,
+    "SELECT tanh(1)",
+    0.7615941559557649
+)
+
+test(
+    tanh_float,
+    "SELECT tanh(-0.5)",
+    -0.46211715726000974
+)
+
+test(
+    tanh_str,
+    "SELECT tanh('-0.5')",
+    -0.46211715726000974
+)
+
+test(
+    tanh_null,
+    "SELECT tanh(null)",
+    Null
+)
+
+test(
+    trunc_int,
+    "SELECT trunc(1)",
+    1
+)
+
+test(
+    trunc_float,
+    "SELECT trunc(2.5)",
+    2.0
+)
+
+test(
+    trunc_float_negative,
+    "SELECT trunc(-2.5)",
+    -2.0
+)
+
+test(
+    trunc_str,
+    "SELECT trunc('2.5')",
+    2.0
+)
+
+test(
+    trunc_null,
+    "SELECT trunc(null)",
+    Null
+)
+
+test(
+    atan2_int_int,
+    "SELECT atan2(5, -1)",
+    1.7681918866447774
+)
+
+test(
+    atan2_int_float,
+    "SELECT atan2(5, -1.5)",
+    1.8622531212727638
+)
+
+test(
+    atan2_int_str,
+    "SELECT atan2(5, '-1.5')",
+    1.8622531212727638
+)
+
+#[ignore = "Limbo outputs Real(0.5028432109278609)"]
+test(
+    atan2_float_int,
+    "SELECT atan2(5.5, 10)",
+    0.5028432109278608
+)
+
+test(
+    atan2_float_float,
+    "SELECT atan2(5.5, -1.5)",
+    1.837048375945822
+)
+
+test(
+    atan2_float_str,
+    "SELECT atan2(5.5, '-1.5')",
+    1.837048375945822
+)
+
+test(
+    atan2_str_str,
+    "SELECT atan2('5.5', '-1.5')",
+    1.837048375945822
+)
+
+test(
+    atan2_null_int,
+    "SELECT atan2(null, 5)",
+    Null
+)
+
+test(
+    atan2_int_null,
+    "SELECT atan2(5, null)",
+    Null
+)
+
+test(
+    mod_int_int,
+    "SELECT mod(10, -3)",
+    1.0
+)
+
+test(
+    mod_int_float,
+    "SELECT mod(5, -1.5)",
+    0.5
+)
+
+test(
+    mod_int_str,
+    "SELECT mod(5, '-1.5')",
+    0.5
+)
+
+test(
+    mod_float_int,
+    "SELECT mod(5.5, 2)",
+    1.5
+)
+
+test(
+    mod_float_float,
+    "SELECT mod(5.5, -1.5)",
+    1.0
+)
+
+test(
+    mod_float_str,
+    "SELECT mod(5.5, '-1.5')",
+    1.0
+)
+
+test(
+    mod_str_str,
+    "SELECT mod('5.5', '-1.5')",
+    1.0
+)
+
+test(
+    mod_null_int,
+    "SELECT mod(null, 5)",
+    Null
+)
+
+test(
+    mod_int_null,
+    "SELECT mod(5, null)",
+    Null
+)
+
+test(
+    mod_float_zero,
+    "SELECT mod(1.5, 0)",
+    Null
+)
+
+test(
+    mod_tricky,
+    "SELECT mod(atanh(tanh(-1.0)), 1.0)",
+    -0.9999999999999999
+)
+
+test(
+    mod_products_id,
+    "SELECT mod(products.id, 3) from products limit 5",
+    [[1.0], [2.0], [0.0], [1.0], [2.0]]
+)
+
+test(
+    mod_products_price_id,
+    "SELECT mod(products.price, products.id) from products limit 5",
+    [[0.0], [0.0], [0.0], [1.0], [4.0]]
+)
+
+test(
+    pow_int_int,
+    "SELECT pow(5, -1)",
+    0.2
+)
+
+test(
+    pow_int_float,
+    "SELECT pow(5, -1.5)",
+    0.08944271909999159
+)
+
+test(
+    pow_int_str,
+    "SELECT pow(5, '-1.5')",
+    0.08944271909999159
+)
+
+test(
+    pow_float_int,
+    "SELECT pow(5.5, 2)",
+    30.25
+)
+
+test(
+    pow_float_float,
+    "SELECT pow(5.5, -1.5)",
+    0.07752753322022198
+)
+
+test(
+    pow_float_str,
+    "SELECT pow(5.5, '-1.5')",
+    0.07752753322022198
+)
+
+test(
+    pow_str_str,
+    "SELECT pow('5.5', '-1.5')",
+    0.07752753322022198
+)
+
+test(
+    pow_null_int,
+    "SELECT pow(null, 5)",
+    Null
+)
+
+test(
+    pow_int_null,
+    "SELECT pow(5, null)",
+    Null
+)
+
+test(
+    power_int_int,
+    "SELECT power(5, -1)",
+    0.2
+)
+
+test(
+    power_int_float,
+    "SELECT power(5, -1.5)",
+    0.08944271909999159
+)
+
+test(
+    power_int_str,
+    "SELECT power(5, '-1.5')",
+    0.08944271909999159
+)
+
+test(
+    power_float_int,
+    "SELECT power(5.5, 2)",
+    30.25
+)
+
+test(
+    power_float_float,
+    "SELECT power(5.5, -1.5)",
+    0.07752753322022198
+)
+
+test(
+    power_float_str,
+    "SELECT power(5.5, '-1.5')",
+    0.07752753322022198
+)
+
+test(
+    power_str_str,
+    "SELECT power('5.5', '-1.5')",
+    0.07752753322022198
+)
+
+test(
+    power_null_int,
+    "SELECT power(null, 5)",
+    Null
+)
+
+test(
+    power_int_null,
+    "SELECT power(5, null)",
+    Null
+)
+
+test(
+    log_int,
+    "SELECT log(1)",
+    0.0
+)
+
+test(
+    log_float,
+    "SELECT log(1.5)",
+    0.17609125905568124
+)
+
+test(
+    log_str,
+    "SELECT log('1.5')",
+    0.17609125905568124
+)
+
+test(
+    log_negative,
+    "SELECT log(-1.5)",
+    Null
+)
+
+test(
+    log_null,
+    "SELECT log(null)",
+    Null
+)
+
+test(
+    log_int_int,
+    "SELECT log(5, 1)",
+    0.0
+)
+
+test(
+    log_int_float,
+    "SELECT log(5, 1.5)",
+    0.25192963641259225
+)
+
+test(
+    log_int_str,
+    "SELECT log(5, '1.5')",
+    0.25192963641259225
+)
+
+test(
+    log_float_int,
+    "SELECT log(5.5, 10)",
+    1.350689350219849
+)
+
+test(
+    log_float_float,
+    "SELECT log(5.5, 1.5)",
+    0.23784458827331317
+)
+
+test(
+    log_float_str,
+    "SELECT log(5.5, '1.5')",
+    0.23784458827331317
+)
+
+test(
+    log_str_str,
+    "SELECT log('5.5', '1.5')",
+    0.23784458827331317
+)
+
+test(
+    log_negative_negative,
+    "SELECT log(-1.5, -1.5)",
+    Null
+)
+
+test(
+    log_float_negative,
+    "SELECT log(1.5, -1.5)",
+    Null
+)
+
+test(
+    log_null_int,
+    "SELECT log(null, 5)",
+    Null
+)
+
+test(
+    log_int_null,
+    "SELECT log(5, null)",
+    Null
+)
+
+test(
+    remainder_int_null,
+    "SELECT 183 % null",
+    Null
+)
+
+test(
+    remainder_int_0,
+    "SELECT 183 % 0",
+    Null
+)
+
+test(
+    remainder_int_int,
+    "SELECT 183 % 10",
+    3
+)
+
+test(
+    remainder_int_float,
+    "SELECT 38 % 10.35",
+    8.0
+)
+
+test(
+    remainder_float_int,
+    "SELECT 38.43 % 13",
+    12.0
+)
+
+test(
+    remainder_0_float,
+    "SELECT 0 % 12.0",
+    0.0
+)
+
+test(
+    remainder_float_0,
+    "SELECT 23.14 % 0",
+    Null
+)
+
+test(
+    remainder_float_float,
+    "SELECT 23.14 % 12.0",
+    11.0
+)
+
+test(
+    remainder_float_agg,
+    "SELECT 23.14 % sum(id) from products",
+    23.0
+)
+
+test(
+    remainder_int_agg,
+    "SELECT 17 % sum(id) from users",
+    17
+)
+
+test(
+    remainder_agg_int,
+    "SELECT count(*) % 17 from users",
+    4
+)
+
+test(
+    remainder_agg_float,
+    "SELECT count(*) % 2.43 from users",
+    0.0
+)
+
+test(
+    remainder_text_1,
+    "SELECT 'a' % 'a'",
+    Null
+)
+
+test(
+    remainder_text_2,
+    "SELECT 'a' % 10",
+    0
+)
+
+test(
+    remainder_text_3,
+    "SELECT 10 % 'a'",
+    Null
+)
+
+test(
+    remainder_text_4,
+    "SELECT 'a' % 11.0",
+    0.0
+)
+
+test(
+    remainder_text_5,
+    "SELECT 11.0 % 'a'",
+    Null
+)
+
+test(
+    remainder_text_7,
+    "SELECT '10' % '3'",
+    1
+)
+
+test(
+    remainder_text_8,
+    "SELECT '10.0' % '3'",
+    1.0
+)
+
+test(
+    remainder_text_9,
+    "SELECT '10.0' % -3",
+    1.0
+)
+
+test(
+    remainder_overflow_1,
+    "SELECT '-9223372036854775808' % '-1'",
+    0
+)
+
+test(
+    remainder_overflow_2,
+    "SELECT -9223372036854775808 % -1",
+    0
+)
+
+test(
+    remainder_overflow_3,
+    "SELECT -9223372036854775809 % -1",
+    0.0
+)
+
+test(
+    comp_float_float,
+    "SELECT 0.0 = 0.0",
+    1
+)
+
+test(
+    comp_int_float,
+    "SELECT 0 = 0.0",
+    1
+)
+
+test(
+    comp_float_int,
+    "SELECT 0.0 = 0",
+    1
+)
+
+test(
+    comp_int_string,
+    "SELECT 0 = '0'",
+    0
+)
+
+test(
+    comp_string_int,
+    "SELECT '0' = 0",
+    0
+)
+
+test(
+    comp_string_blob,
+    "SELECT '0' = cast('0' as BLOB)",
+    0
+)
+
+test(
+    comp_blob_string,
+    "SELECT cast('0' as BLOB) = '0'",
+    0
+)
+
+test(
+    comp_blob_blob,
+    "SELECT cast('0' as BLOB) = cast('0' as BLOB)",
+    1
+)
+
+test(
+    unary_plus_noop_string,
+    "SELECT +'000'",
+    "000"
+)
+
+test(
+    unary_plus_noop_blob,
+    "SELECT typeof(+x'00') = 'blob'",
+    1
+)
