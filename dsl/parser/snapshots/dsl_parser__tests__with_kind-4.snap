@@ -16,7 +16,5 @@ Test {
     statement: Single(
         "SELECT",
     ),
-    values: [
-        [],
-    ],
+    values: [],
 }

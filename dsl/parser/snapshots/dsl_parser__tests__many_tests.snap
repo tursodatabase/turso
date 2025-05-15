@@ -15,9 +15,7 @@ expression: res
                 "DELETE",
             ],
         ),
-        values: [
-            [],
-        ],
+        values: [],
     },
     Test {
         kind: Default,
@@ -28,9 +26,7 @@ expression: res
                 "SELECT",
             ],
         ),
-        values: [
-            [],
-        ],
+        values: [],
     },
     Test {
         kind: Default,
@@ -39,8 +35,6 @@ expression: res
         statement: Single(
             "SELECT",
         ),
-        values: [
-            [],
-        ],
+        values: [],
     },
 ]

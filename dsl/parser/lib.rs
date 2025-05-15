@@ -160,7 +160,7 @@ pub fn test_parser<'src>() -> impl Parser<'src, &'src str, Test<'src>, extra::Er
                     "regex text cannot have expected values declared",
                 ));
             }
-            let values = values.unwrap_or(vec![vec![]]);
+            let values = values.unwrap_or(vec![]);
 
             Ok(Test {
                 kind,

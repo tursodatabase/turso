@@ -3,6 +3,4 @@ source: dsl/parser/sqlite_values.rs
 description: "input: None"
 expression: val
 ---
-[
-    [],
-]
+[]

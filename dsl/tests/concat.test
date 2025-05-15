@@ -1,0 +1,28 @@
+test(
+    concat,
+    "SELECT 'Hello' || ' ' || 'World'",
+    "Hello World"
+)
+
+test(
+    concat_2,
+    "SELECT 'Hello' || NULL",
+    Null
+)
+
+test(
+    concat_3,
+    "SELECT 'Hello' || NULL",
+    Null
+)
+
+test(
+    concat_4_hat,
+    "SELECT 'A good ' || name FROM products WHERE name = 'hat'",
+    "A good hat"
+)
+
+test(
+    concat_4_watch,
+    "SELECT 'A good ' || name FROM products WHERE name = 'watch'"
+)

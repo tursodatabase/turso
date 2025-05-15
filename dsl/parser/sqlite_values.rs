@@ -120,7 +120,7 @@ pub(super) fn sqlite_values_parser<'src>(
         .boxed();
 
     choice((
-        just("None").to(vec![vec![]]).labelled("None"),
+        just("None").to(vec![]).labelled("None"),
         value_parser()
             .map(|v| vec![vec![v]])
             .labelled("single value"),

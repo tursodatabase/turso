@@ -12,7 +12,5 @@ Test {
             "SELECT",
         ],
     ),
-    values: [
-        [],
-    ],
+    values: [],
 }
