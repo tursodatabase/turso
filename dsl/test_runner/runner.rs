@@ -20,6 +20,8 @@ const OK: Styled<&'static str> = Style::new().bold().green().style("ok");
 
 const FAILED: Styled<&'static str> = Style::new().bold().red().style("FAILED");
 
+const IGNORED: Styled<&'static str> = Style::new().bold().yellow().style("ignored");
+
 fn fold_err<T, E>(
     result: Result<Result<T, E>, Box<dyn Any + Send>>,
 ) -> Result<T, Box<dyn Any + Send>>
@@ -34,8 +36,9 @@ where
 }
 
 #[derive(Debug, Clone)]
-enum Status {
+enum Status<'a> {
     Success,
+    Ignore(&'a str),
     Failed {
         // TODO: maybe this should be a Vec<u8> instead
         stdout: String,
@@ -48,29 +51,43 @@ pub struct FinishedTest<'a> {
     file_name: &'a str,
     name: Cow<'a, str>,
     time: Duration,
-    status: Status,
+    status: Status<'a>,
 }
 
 impl FinishedTest<'_> {
     fn print_status(&self) {
-        if matches!(self.status, Status::Success) {
-            println!(
-                "{} {}::{} ... {} {:?}",
-                "test".blue(),
-                self.file_name,
-                self.name,
-                OK,
-                self.time
-            )
-        } else {
-            println!(
-                "{} {}::{} ... {} {:?}",
-                "test".blue(),
-                self.file_name,
-                self.name,
-                FAILED,
-                self.time
-            )
+        match &self.status {
+            Status::Success => {
+                println!(
+                    "{} {}::{} ... {} {:?}",
+                    "test".blue(),
+                    self.file_name,
+                    self.name,
+                    OK,
+                    self.time
+                )
+            }
+            Status::Ignore(msg) => {
+                println!(
+                    "{} {}::{} ... {}, {} {:?}",
+                    "test".blue(),
+                    self.file_name,
+                    self.name,
+                    IGNORED,
+                    msg.yellow(),
+                    self.time
+                )
+            }
+            Status::Failed { .. } => {
+                println!(
+                    "{} {}::{} ... {} {:?}",
+                    "test".blue(),
+                    self.file_name,
+                    self.name,
+                    FAILED,
+                    self.time
+                )
+            }
         }
     }
 }
@@ -151,6 +168,7 @@ impl<'src> Runner<'src> {
         }
         let mut failed_names = Vec::new();
         let mut success_count = 0usize;
+        let mut ignore_count = 0usize;
         for test in tests {
             // TODO: eventually differentiate between cli output and Api output
             match test.status {
@@ -163,7 +181,8 @@ impl<'src> Runner<'src> {
                     println!("{}\n{}", stdout, error_msg);
                     failed_names.push(format!("{}::{}", test.file_name, test.name));
                 }
-                _ => success_count += 1,
+                Status::Success => success_count += 1,
+                Status::Ignore(..) => ignore_count += 1,
             }
         }
         let failed_count = failed_names.len();
@@ -183,8 +202,8 @@ impl<'src> Runner<'src> {
         let result = if failed { FAILED } else { OK };
         // TODO: when we support ignore tests, adjust count here
         println!(
-            "\ntest result: {}. {} passed; {} failed; 0 ignored; finished in {:.2?}",
-            result, success_count, failed_count, total_time
+            "\ntest result: {}. {} passed; {} failed; {} ignored; finished in {:.2?}",
+            result, success_count, failed_count, ignore_count, total_time
         );
     }
 
@@ -202,16 +221,21 @@ impl<'src> Runner<'src> {
                 // Consider using unstable io::set_output_capture that is used in libtest
                 let mut stdout_redirect = BufferRedirect::stdout_stderr().unwrap();
                 let now = Instant::now();
-                let result = fold_err(catch_unwind(|| {
-                    if matches!(test.inner.kind, TestKind::Memory) {
-                        test.exec_sql(None)
-                    } else {
-                        default_dbs
-                            .iter()
-                            .map(|db_path| test.exec_sql(Some(db_path)))
-                            .collect()
-                    }
-                }));
+                let result = if test.inner.options.is_some() {
+                    // Skip the test
+                    Ok(())
+                } else {
+                    fold_err(catch_unwind(|| {
+                        if matches!(test.inner.kind, TestKind::Memory) {
+                            test.exec_sql(None)
+                        } else {
+                            default_dbs
+                                .iter()
+                                .map(|db_path| test.exec_sql(Some(db_path)))
+                                .collect()
+                        }
+                    }))
+                };
                 let elapsed_time = now.elapsed();
                 let error_msg = match result {
                     Ok(()) => None,
@@ -238,7 +262,11 @@ impl<'src> Runner<'src> {
                     failed = true;
                     Status::Failed { stdout, error_msg }
                 } else {
-                    Status::Success
+                    if let Some(options) = &test.inner.options {
+                        Status::Ignore(options)
+                    } else {
+                        Status::Success
+                    }
                 };
                 let finished_test = FinishedTest {
                     file_name: file_test.file_name,

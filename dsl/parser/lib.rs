@@ -65,14 +65,14 @@ pub enum Statement {
     Many(Vec<String>),
 }
 
-// TODO: for now just
-fn options<'src>() -> impl Parser<'src, &'src str, String, extra::Err<Rich<'src, char>>> + Copy {
+// TODO: for now just copy the string inside
+fn options<'src>() -> impl Parser<'src, &'src str, String, extra::Err<Rich<'src, char>>> {
     just("#[")
         .padded()
         .then(just("ignore").padded())
         .then(just("=").padded())
         .ignored()
-        .ignore_then(none_of("]").repeated().at_least(1).collect::<String>())
+        .ignore_then(text())
         .then_ignore(just(']').padded())
         .labelled("options")
 }
@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn test_option_parser() {
         let parser = options();
-        let input = "#[ignore = flaky]";
+        let input = "#[ignore = \"flaky\"]";
         let res = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, res);
     }
@@ -362,13 +362,13 @@ mod tests {
     #[test]
     fn test_ignore_option() {
         let parser = test_parser();
-        let input = r#"#[ignore = flaky]
+        let input = r#"#[ignore = "flaky"]
         test(test_single, "SELECT 1")"#;
         let res = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, res);
 
         let input = r#"
-        #[ignore = because yes]
+        #[ignore = "because yes"]
         test(test_single, "SELECT 1 '")"#;
         let res = parser.parse(input).unwrap();
         assert_debug_snapshot_with_input!(input, res);
