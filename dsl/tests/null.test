@@ -1,0 +1,23 @@
+test(
+    isnull,
+    "select null isnull, 'hi' isnull",
+    [1, 0]
+)
+
+test(
+    is_null,
+    "select null is null, 'hi' is null",
+    [1, 0]
+)
+
+test(
+    notnull,
+    "select null notnull, 'hi' notnull",
+    [0, 1]
+)
+
+test(
+    not_null,
+    "select null not null, 'hi' not null",
+    [0, 1]
+)
