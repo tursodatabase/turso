@@ -865,10 +865,10 @@ dependencies = [
  "gag",
  "limbo_core",
  "owo-colors",
+ "rayon",
  "regex",
  "rusqlite",
  "tempfile",
- "thiserror 2.0.12",
  "walkdir",
 ]
 

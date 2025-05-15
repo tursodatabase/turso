@@ -21,8 +21,8 @@ dsl_parser = { workspace = true }
 gag = "1.0.0"
 limbo_core = { workspace = true }
 owo-colors = "4.2.0"
+rayon = "1.10.0"
 regex = "1.11.1"
 rusqlite = { workspace = true }
 tempfile = "3.20.0"
-thiserror = "2.0.12"
 walkdir = "2.5.0"

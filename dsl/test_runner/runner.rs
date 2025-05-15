@@ -1,12 +1,14 @@
 use ariadne::{Color, Label, Report, ReportKind, Source};
 use dsl_parser::{parser_dsl, Parser as _, TestKind};
 use owo_colors::{OwoColorize, Style, Styled};
+use rayon::prelude::*;
 use std::{
     any::Any,
     borrow::Cow,
     io::Read,
     panic::catch_unwind,
     path::{Path, PathBuf},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -14,6 +16,8 @@ use crate::{
     buffer::BufferRedirect,
     testing::{DslTest, FileTest},
 };
+
+static FAILED_RUN: OnceLock<bool> = OnceLock::new();
 
 // TODO: later remove owo_dependency. Just lazy right now to mess with ansi escape codes
 const OK: Styled<&'static str> = Style::new().bold().green().style("ok");
@@ -207,18 +211,18 @@ impl<'src> Runner<'src> {
         return failed;
     }
 
+    // TODO: reenable stdout redirect 
     fn run_inner(&mut self, default_dbs: Vec<PathBuf>) -> (Vec<FinishedTest>, bool, Duration) {
         assert!(!self.has_errors());
         let mut finished_tests = Vec::with_capacity(self.inner.capacity());
-        let mut failed = false;
         let total_time = Instant::now();
         for file_test in self.inner.iter() {
             println!("\nRunning {} tests", file_test.tests.len());
-            for test in file_test.tests.iter() {
+            let tests = file_test.tests.par_iter().map(|test| {
                 // TODO: this redirect is nice, but it forces us to write the output to a file
                 // and then read it later
                 // Consider using unstable io::set_output_capture that is used in libtest
-                let mut stdout_redirect = BufferRedirect::stdout_stderr().unwrap();
+                // let mut stdout_redirect = BufferRedirect::stdout_stderr().unwrap();
                 let now = Instant::now();
                 let result = if test.inner.options.is_some() {
                     // Skip the test
@@ -258,8 +262,8 @@ impl<'src> Runner<'src> {
                 };
                 let status = if let Some(error_msg) = error_msg {
                     let mut stdout = String::new();
-                    stdout_redirect.read_to_string(&mut stdout).unwrap();
-                    failed = true;
+                    // stdout_redirect.read_to_string(&mut stdout).unwrap();
+                    FAILED_RUN.get_or_init(|| true);
                     Status::Failed { stdout, error_msg }
                 } else {
                     if let Some(options) = &test.inner.options {
@@ -274,12 +278,17 @@ impl<'src> Runner<'src> {
                     status,
                     time: elapsed_time,
                 };
-                drop(stdout_redirect);
+                // drop(stdout_redirect);
                 finished_test.print_status();
 
-                finished_tests.push(finished_test);
-            }
+                finished_test
+            });
+            finished_tests.par_extend(tests);
         }
-        (finished_tests, failed, total_time.elapsed())
+        (
+            finished_tests,
+            *FAILED_RUN.get_or_init(|| false),
+            total_time.elapsed(),
+        )
     }
 }
