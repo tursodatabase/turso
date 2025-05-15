@@ -39,7 +39,7 @@ test(
     ["testing/testing_user_version_10.db"],
     pragma_user_version_user_set,
     "PRAGMA user_version",
-    0
+    10
 )
 
 #[ignore = "temporarily skip this test case. The issue is detailed in #1407"]
