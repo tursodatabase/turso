@@ -1,0 +1,33 @@
+test(
+    memory,
+    changes_on_basic_insert,
+    [
+        "create table temp (t1 integer, primary key (t1))",
+        "insert into temp values (1)",
+        "select changes()"
+    ],
+    1
+)
+
+test(
+    memory,
+    changes_on_multiple_row_insert,
+    [
+        "create table temp (t1 integer, primary key (t1))",
+        "insert into temp values (1), (2), (3)",
+        "select changes()"
+    ],
+    3
+)
+
+test(
+    memory,
+    changes_shows_most_recent,
+    [
+        "create table temp (t1 integer, primary key (t1))",
+        "insert into temp values (1), (2), (3)",
+        "insert into temp values (4), (5), (6), (7)",
+        "select changes()"
+    ],
+    4
+)
