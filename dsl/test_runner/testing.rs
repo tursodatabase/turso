@@ -420,13 +420,11 @@ pub(crate) fn limbo_exec_rows(
         let row = row
             .get_values()
             .map(|x| match x {
-                limbo_core::OwnedValue::Null => rusqlite::types::Value::Null,
-                limbo_core::OwnedValue::Integer(x) => rusqlite::types::Value::Integer(*x),
-                limbo_core::OwnedValue::Float(x) => rusqlite::types::Value::Real(*x),
-                limbo_core::OwnedValue::Text(x) => {
-                    rusqlite::types::Value::Text(x.as_str().to_string())
-                }
-                limbo_core::OwnedValue::Blob(x) => rusqlite::types::Value::Blob(x.to_vec()),
+                limbo_core::Value::Null => rusqlite::types::Value::Null,
+                limbo_core::Value::Integer(x) => rusqlite::types::Value::Integer(*x),
+                limbo_core::Value::Float(x) => rusqlite::types::Value::Real(*x),
+                limbo_core::Value::Text(x) => rusqlite::types::Value::Text(x.as_str().to_string()),
+                limbo_core::Value::Blob(x) => rusqlite::types::Value::Blob(x.to_vec()),
             })
             .collect();
         rows.push(row);

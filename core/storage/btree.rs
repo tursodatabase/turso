@@ -5496,7 +5496,7 @@ mod tests {
 
     #[allow(clippy::arc_with_non_send_sync)]
     fn get_database() -> Arc<Database> {
-        let mut path = TempDir::new().unwrap().into_path();
+        let mut path = TempDir::new().unwrap().keep();
         path.push("test.db");
         {
             let connection = rusqlite::Connection::open(&path).unwrap();
