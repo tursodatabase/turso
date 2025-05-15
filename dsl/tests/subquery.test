@@ -1,0 +1,257 @@
+test(
+    subquery_inner_filter,
+    "select sub.loud_hat from (select concat(name, '!!!') as loud_hat from products where name = 'hat') sub",
+    "hat!!!"
+)
+
+test(
+    subquery_inner_filter_cte,
+    "with sub as (select concat(name, '!!!') as loud_hat from products where name = 'hat') select sub.loud_hat from sub",
+    "hat!!!"
+)
+
+test(
+    subquery_outer_filter,
+    "select sub.loud_hat from (select concat(name, '!!!') as loud_hat from products) sub where sub.loud_hat = 'hat!!!'",
+    "hat!!!"
+)
+
+test(
+    subquery_outer_filter_cte,
+    "with sub as (select concat(name, '!!!') as loud_hat from products) select sub.loud_hat from sub where sub.loud_hat = 'hat!!!'",
+    "hat!!!"
+)
+
+test(
+    subquery_without_alias,
+    "select loud_hat from (select concat(name, '!!!') as loud_hat from products where name = 'hat')",
+    "hat!!!"
+)
+
+test(
+    subquery_without_alias_cte,
+    "with cte as (select concat(name, '!!!') as loud_hat from products where name = 'hat') select loud_hat from cte",
+    "hat!!!"
+)
+
+test(
+    subquery_no_alias_on_col,
+    "select price from (select * from products where name = 'hat')",
+    79.0
+)
+
+test(
+    subquery_no_alias_on_col_cte,
+    "with cte as (select * from products where name = 'hat') select price from cte",
+    79.0
+)
+
+test(
+    subquery_no_alias_on_col_named,
+    "select price from (select price from products where name = 'hat')",
+    79.0
+)
+
+test(
+    subquery_no_alias_on_col_named_cte,
+    "with cte as (select price from products where name = 'hat') select price from cte",
+    79.0
+)
+
+test(
+    subquery_select_star,
+    "select * from (select price, price + 1.0, name from products where name = 'hat')",
+    [79.0, 80.0, "hat"]
+)
+
+test(
+    subquery_select_star_cte,
+    "with cte as (select price, price + 1.0, name from products where name = 'hat') select * from cte",
+    [79.0, 80.0, "hat"]
+)
+
+test(
+    subquery_select_table_star,
+    "select sub.* from (select price, price + 1.0, name from products where name = 'hat') sub",
+    [79.0, 80.0, "hat"]
+)
+
+test(
+    subquery_select_table_star_cte,
+    "with sub as (select price, price + 1.0, name from products where name = 'hat') select sub.* from sub",
+    [79.0, 80.0, "hat"]
+)
+
+test(
+    nested_subquery,
+    "select sub.loudest_hat from (select upper(nested_sub.loud_hat) as loudest_hat from (select concat(name, '!!!') as loud_hat from products where name = 'hat') nested_sub) sub",
+    "HAT!!!"
+)
+
+test(
+    nested_subquery_cte,
+    "with nested_sub as (select concat(name, '!!!') as loud_hat from products where name = 'hat'), sub as (select upper(nested_sub.loud_hat) as loudest_hat from nested_sub) select sub.loudest_hat from sub",
+    "HAT!!!"
+)
+
+test(
+    subquery_orderby_limit,
+    "select upper(sub.loud_name) as loudest_name from (select concat(name, '!!!') as loud_name from products order by name limit 3) sub",
+    [["ACCESSORIES!!!"], ["BOOTS!!!"], ["CAP!!!"]]
+)
+
+test(
+    subquery_orderby_limit_cte,
+    "with sub as (select concat(name, '!!!') as loud_name from products order by name limit 3) select upper(sub.loud_name) as loudest_name from sub",
+    [["ACCESSORIES!!!"], ["BOOTS!!!"], ["CAP!!!"]]
+)
+
+test(
+    table_join_subquery,
+    "select sub.product_name, p.name from products p join (select name as product_name from products) sub on p.name = sub.product_name where p.name = 'hat'",
+    ["hat", "hat"]
+)
+
+test(
+    table_join_subquery_cte,
+    "with sub as (select name as product_name from products) select sub.product_name, p.name from products p join sub on p.name = sub.product_name where p.name = 'hat'",
+    ["hat", "hat"]
+)
+
+test(
+    subquery_join_table,
+    "select sub.product_name, p.name from (select name as product_name from products) sub join products p on sub.product_name = p.name where sub.product_name = 'hat'",
+    ["hat", "hat"]
+)
+
+test(
+    subquery_join_table_cte,
+    "with sub as (select name as product_name from products) select sub.product_name, p.name from sub join products p on sub.product_name = p.name where sub.product_name = 'hat'",
+    ["hat", "hat"]
+)
+
+test(
+    subquery_join_subquery,
+    "select sub1.sus_name, sub2.truthful_name from (select name as sus_name from products where name = 'cap') sub1 join (select concat('no ', name) as truthful_name from products where name = 'cap') sub2",
+    ["cap", "no cap"]
+)
+
+test(
+    subquery_join_subquery_cte,
+    "with sub1 as (select name as sus_name from products where name = 'cap'), sub2 as (select concat('no ', name) as truthful_name from products where name = 'cap') select sub1.sus_name, sub2.truthful_name from sub1 join sub2",
+    ["cap", "no cap"]
+)
+
+test(
+    select_star_table_subquery,
+    "select * from products p join (select name, price from products where name = 'hat') sub on p.name = sub.name",
+    [1, "hat", 79.0, "hat", 79.0]
+)
+
+test(
+    select_star_table_subquery_cte,
+    "with sub as (select name, price from products where name = 'hat') select * from products p join sub on p.name = sub.name",
+    [1, "hat", 79.0, "hat", 79.0]
+)
+
+test(
+    select_star_subquery_table,
+    "select * from (select name, price from products where name = 'hat') sub join products p on sub.name = p.name",
+    ["hat", 79.0, 1, "hat", 79.0]
+)
+
+test(
+    select_star_subquery_table_cte,
+    "with sub as (select name, price from products where name = 'hat') select * from sub join products p on sub.name = p.name",
+    ["hat", 79.0, 1, "hat", 79.0]
+)
+
+test(
+    select_star_subquery_subquery,
+    "select * from (select name, price from products where name = 'hat') sub1 join (select price from products where name = 'hat') sub2 on sub1.price = sub2.price",
+    ["hat", 79.0, 79.0]
+)
+
+test(
+    select_star_subquery_subquery_cte,
+    "with sub1 as (select name, price from products where name = 'hat'), sub2 as (select price from products where name = 'hat') select * from sub1 join sub2 on sub1.price = sub2.price",
+    ["hat", 79.0, 79.0]
+)
+
+test(
+    subquery_inner_grouping,
+    "select is_jennifer, person_count from (select first_name = 'Jennifer' as is_jennifer, count(1) as person_count from users group by first_name = 'Jennifer') order by person_count asc",
+    [[1, 151], [0, 9849]]
+)
+
+test(
+    subquery_inner_grouping_cte,
+    "with cte as (select first_name = 'Jennifer' as is_jennifer, count(1) as person_count from users group by first_name = 'Jennifer') select is_jennifer, person_count from cte order by person_count asc",
+    [[1, 151], [0, 9849]]
+)
+
+test(
+    subquery_outer_grouping,
+    "select is_jennifer, count(1) as person_count from (select first_name = 'Jennifer' as is_jennifer from users) group by is_jennifer order by count(1) asc",
+    [[1, 151], [0, 9849]]
+)
+
+test(
+    subquery_outer_grouping_cte,
+    "with cte as (select first_name = 'Jennifer' as is_jennifer from users) select is_jennifer, count(1) as person_count from cte group by is_jennifer order by count(1) asc",
+    [[1, 151], [0, 9849]]
+)
+
+test(
+    subquery_join_using_with_outer_limit,
+    "SELECT p.name, sub.funny_name FROM products p JOIN (select id, concat(name, '-lol') as funny_name from products) sub USING (id) LIMIT 3",
+    [["hat", "hat-lol"], ["cap", "cap-lol"], ["shirt", "shirt-lol"]]
+)
+
+test(
+    subquery_join_using_with_outer_limit_cte,
+    "WITH sub AS (select id, concat(name, '-lol') as funny_name from products) SELECT p.name, sub.funny_name FROM products p JOIN sub USING (id) LIMIT 3",
+    [["hat", "hat-lol"], ["cap", "cap-lol"], ["shirt", "shirt-lol"]]
+)
+
+test(
+    subquery_join_using_with_inner_limit,
+    "SELECT p.name, sub.funny_name FROM products p JOIN (select id, concat(name, '-lol') as funny_name from products limit 3) sub USING (id)",
+    [["hat", "hat-lol"], ["cap", "cap-lol"], ["shirt", "shirt-lol"]]
+)
+
+test(
+    subquery_join_using_with_inner_limit_cte,
+    "WITH sub AS (select id, concat(name, '-lol') as funny_name from products limit 3) SELECT p.name, sub.funny_name FROM products p JOIN sub USING (id)",
+    [["hat", "hat-lol"], ["cap", "cap-lol"], ["shirt", "shirt-lol"]]
+)
+
+test(
+    subquery_join_using_with_both_limits,
+    "SELECT p.name, sub.funny_name FROM products p JOIN (select id, concat(name, '-lol') as funny_name from products limit 3) sub USING (id) LIMIT 2",
+    [["hat", "hat-lol"], ["cap", "cap-lol"]]
+)
+
+test(
+    subquery_join_using_with_both_limits_cte,
+    "WITH sub AS (select id, concat(name, '-lol') as funny_name from products limit 3) SELECT p.name, sub.funny_name FROM products p JOIN sub USING (id) LIMIT 2",
+    [["hat", "hat-lol"], ["cap", "cap-lol"]]
+)
+
+test(
+    subquery_containing_join,
+    "select foo, bar from (select p.name as foo, u.first_name as bar from products p join users u using (id)) limit 3",
+    [["hat", "Jamie"], ["cap", "Cindy"], ["shirt", "Tommy"]]
+)
+
+test(
+    subquery_containing_join_cte,
+    "with cte as (select p.name as foo, u.first_name as bar from products p join users u using (id)) select foo, bar from cte limit 3",
+    [["hat", "Jamie"], ["cap", "Cindy"], ["shirt", "Tommy"]]
+)
+
+test(
+    subquery_ignore_unused_cte,
+    "with unused as (select last_name from users), sub as (select first_name from users where first_name = 'Jamie' limit 1) select * from sub",
+    "Jamie"
+)

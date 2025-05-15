@@ -8,6 +8,44 @@ test(TestKind, Name, Statement(s), Expected Output)
 
 test_error(TestKind, Name, Statement(s))
 
+## Ignore tests
+
+To ignore a test annotate it like this:
+
+```
+#[ignore = "message"]
+test(
+        pragma_table_info_equal_syntax,
+        "PRAGMA table_info=sqlite_schema",
+        [
+            [0, "type", "TEXT", 0, Null, 0],
+            [1, "name", "TEXT", 0, Null, 0],
+            [2, "tbl_name", "TEXT", 0, Null, 0],
+            [3, "rootpage", "INT", 0, Null, 0],
+            [4, "sql", "TEXT", 0, Null, 0]
+        ]
+    )
+```
+
+## Comments
+You may add comments before a test like this: 
+
+```
+// Comment 1
+// Comment 2
+test(
+        pragma_table_info_equal_syntax,
+        "PRAGMA table_info=sqlite_schema",
+        [
+            [0, "type", "TEXT", 0, Null, 0],
+            [1, "name", "TEXT", 0, Null, 0],
+            [2, "tbl_name", "TEXT", 0, Null, 0],
+            [3, "rootpage", "INT", 0, Null, 0],
+            [4, "sql", "TEXT", 0, Null, 0]
+        ]
+    )
+```
+
 ### TestKinds
 - Specific Databases -> [database_path, database_path, ...]
 - Memory -> memory
@@ -56,7 +94,7 @@ Rows and Columsn -> [
         where_equals_null,
         "SELECT count(*) FROM demo WHERE value = NULL",
         0
-    );
+    )
 ```
 
 #### Memory test with many statements
@@ -72,7 +110,7 @@ Rows and Columsn -> [
             "SELECT * FROM temp"
         ],
         [[10, 20, 30], [10, 20, 30]]
-    );
+    )
 ```
 
 #### Regex
@@ -81,12 +119,12 @@ Rows and Columsn -> [
         r"\d+\.\d+\.\d+",
         regex_sqlite_version_should_return_valid_output,
         "SELECT sqlite_version()"
-    );
+    )
 ```
 
 #### No output
 ```
-    test(pragma_table_info_invalid_table, "PRAGMA table_info=pekka");
+    test(pragma_table_info_invalid_table, "PRAGMA table_info=pekka")
 ```
 
 #### Test with Default Databases
@@ -101,7 +139,7 @@ Rows and Columsn -> [
             [3, "rootpage", "INT", 0, Null, 0],
             [4, "sql", "TEXT", 0, Null, 0]
         ]
-    );
+    )
 ```
 
 #### Memory Expect Error
@@ -110,7 +148,7 @@ Rows and Columsn -> [
         memory,
         strict_require_datatype,
         ["CREATE TABLE test2(id INTEGER, name) STRICT"]
-    );
+    )
 ```
 
 ## Define expected values
