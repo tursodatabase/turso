@@ -1,0 +1,21 @@
+// Use memory as our dbs are read only by default
+test(
+    memory,
+    basic_tx_1,
+    ["BEGIN IMMEDIATE", "END"],
+    None
+)
+
+// Use memory as our dbs are read only by default
+test(
+    memory,
+    basic_tx_2,
+    ["BEGIN EXCLUSIVE", "END"],
+    None
+)
+
+test(
+    basic_tx_3,
+    ["BEGIN DEFERRED", "END"],
+    None
+)
