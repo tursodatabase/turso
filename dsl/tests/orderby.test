@@ -1,0 +1,155 @@
+test(
+    basic_order_by,
+    "select * from products order by price",
+    [[9, "boots", 1.0], [3, "shirt", 18.0], [4, "sweater", 25.0], [10, "coat", 33.0], [6, "shorts", 70.0], [5, "sweatshirt", 74.0], [7, "jeans", 78.0], [1, "hat", 79.0], [11, "accessories", 81.0], [2, "cap", 82.0], [8, "sneakers", 82.0]]
+)
+
+test(
+    basic_order_by_2,
+    "select * from products order by price desc",
+    [[2, "cap", 82.0], [8, "sneakers", 82.0], [11, "accessories", 81.0], [1, "hat", 79.0], [7, "jeans", 78.0], [5, "sweatshirt", 74.0], [6, "shorts", 70.0], [10, "coat", 33.0], [4, "sweater", 25.0], [3, "shirt", 18.0], [9, "boots", 1.0]]
+)
+
+test(
+    basic_order_by_and_limit,
+    "select * from products order by name limit 5",
+    [[11, "accessories", 81.0], [9, "boots", 1.0], [2, "cap", 82.0], [10, "coat", 33.0], [1, "hat", 79.0]]
+)
+
+test(
+    basic_order_by_and_limit_2,
+    "select * from products order by name desc limit 5",
+    [[5, "sweatshirt", 74.0], [4, "sweater", 25.0], [8, "sneakers", 82.0], [6, "shorts", 70.0], [3, "shirt", 18.0]]
+)
+
+test(
+    basic_order_by_and_limit_3,
+    "select id, name from products order by name limit 5",
+    [[11, "accessories"], [9, "boots"], [2, "cap"], [10, "coat"], [1, "hat"]]
+)
+
+test(
+    basic_order_by_and_limit_4,
+    "select id, name from products order by name desc limit 5",
+    [[5, "sweatshirt"], [4, "sweater"], [8, "sneakers"], [6, "shorts"], [3, "shirt"]]
+)
+
+test(
+    basic_order_by_and_limit_5,
+    "select price, name from products where price > 70 order by name",
+    [[81.0, "accessories"], [82.0, "cap"], [79.0, "hat"], [78.0, "jeans"], [82.0, "sneakers"], [74.0, "sweatshirt"]]
+)
+
+test(
+    basic_order_by_and_limit_6,
+    "select price, name from products where price > 70 order by name desc",
+    [[74.0, "sweatshirt"], [82.0, "sneakers"], [78.0, "jeans"], [79.0, "hat"], [82.0, "cap"], [81.0, "accessories"]]
+)
+
+test(
+    order_by_qualified,
+    "select u.first_name from users u order by u.first_name limit 1",
+    [["Aaron"]]
+)
+
+test(
+    order_by_qualified_2,
+    "select u.first_name from users u order by u.first_name desc limit 1",
+    [["Zoe"]]
+)
+
+test(
+    order_by_column_number,
+    "select first_name, last_name, age from users order by 3,2 limit 2",
+    [["Teresa", "Allen", 1], ["David", "Baker", 1]]
+)
+
+test(
+    order_by_column_number_2,
+    "select first_name, last_name, age from users order by 3 desc, 2 asc limit 2",
+    [["Connor", "Adkins", 100], ["John", "Bell", 100]]
+)
+
+test(
+    order_by_column_number_3,
+    "select first_name, last_name, age from users order by 3 asc, 2 desc limit 2",
+    [["Kyle", "Wolf", 1], ["Jason", "Williams", 1]]
+)
+
+test(
+    order_by_column_number_4,
+    "select first_name, last_name, age from users order by 3 asc, 2 desc limit 10",
+    [["Kyle", "Wolf", 1], ["Jason", "Williams", 1], ["Tracey", "Williams", 1], ["Jessica", "Werner", 1], ["Jasmine", "Warren", 1], ["Dennis", "Ward", 1], ["Whitney", "Walker", 1], ["Robert", "Villanueva", 1], ["Cynthia", "Thomas", 1], ["Brandon", "Tate", 1]]
+)
+
+test(
+    order_by_case_insensitive_aggregate,
+    "select u.first_name, sum(u.age) from users u group by u.first_name order by SUM(u.aGe) desc limit 10",
+    [["Michael", 11204], ["David", 8758], ["Robert", 8109], ["Jennifer", 7700], ["John", 7299], ["Christopher", 6397], ["James", 5921], ["Joseph", 5711], ["Brian", 5059], ["William", 5047]]
+)
+
+test(
+    order_by_agg_not_mentioned_in_select,
+    "select u.first_name, length(group_concat(u.last_name)) from users u group by u.first_name order by max(u.email) desc limit 5",
+    [["Louis", 65], ["Carolyn", 118], ["Katelyn", 40], ["Erik", 88], ["Collin", 15]]
+)
+
+test(
+    case_insensitive_alias,
+    "select u.first_name as fF, count(1) > 0 as cC from users u where fF = 'Jamie' group by fF order by cC",
+    ["Jamie", 1]
+)
+
+test(
+    age_idx_order_desc,
+    "select first_name from users order by age desc limit 3",
+    [["Robert"], ["Sydney"], ["Matthew"]]
+)
+
+test(
+    rowid_or_integer_pk_desc,
+    "select first_name from users order by id desc limit 3",
+    [["Nicole"], ["Gina"], ["Dorothy"]]
+)
+
+test(
+    orderby_asc_verify_rows,
+    "select count(1) from (select * from users order by age desc)",
+    10000
+)
+
+test(
+    orderby_desc_verify_rows,
+    "select count(1) from (select * from users order by age desc)",
+    10000
+)
+
+test(
+    orderby_desc_with_offset,
+    "select first_name, age from users order by age desc limit 3 offset 666",
+    [["Francis", 94], ["Matthew", 94], ["Theresa", 94]]
+)
+
+test(
+    orderby_desc_with_filter,
+    "select first_name, age from users where age <= 50 order by age desc limit 5",
+    [["Gerald", 50], ["Nicole", 50], ["Tammy", 50], ["Marissa", 50], ["Daniel", 50]]
+)
+
+test(
+    orderby_asc_with_filter_range,
+    "select first_name, age from users where age <= 50 and age >= 49 order by age asc limit 5",
+    [["William", 49], ["Jennifer", 49], ["Robert", 49], ["David", 49], ["Stephanie", 49]]
+)
+
+test(
+    orderby_desc_with_filter_id_lt,
+    "select id from users where id < 6666 order by id desc limit 5",
+    [[6665], [6664], [6663], [6662], [6661]]
+)
+
+test(
+    orderby_desc_with_filter_id_le,
+    "select id from users where id <= 6666 order by id desc limit 5",
+    [[6666], [6665], [6664], [6663], [6662]]
+)
