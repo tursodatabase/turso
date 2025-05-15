@@ -6,7 +6,7 @@ use std::{
     borrow::Cow,
     io::Read,
     panic::catch_unwind,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -225,15 +225,16 @@ impl<'src> Runner<'src> {
                     // Skip the test
                     Ok(())
                 } else {
-                    fold_err(catch_unwind(|| {
-                        if matches!(test.inner.kind, TestKind::Memory) {
-                            test.exec_sql(None)
-                        } else {
-                            default_dbs
-                                .iter()
-                                .map(|db_path| test.exec_sql(Some(db_path)))
-                                .collect()
-                        }
+                    fold_err(catch_unwind(|| match &test.inner.kind {
+                        TestKind::Memory => test.exec_sql(None),
+                        TestKind::Databases(dbs) => dbs
+                            .iter()
+                            .map(|db_path| test.exec_sql(Some(Path::new(db_path))))
+                            .collect(),
+                        _ => default_dbs
+                            .iter()
+                            .map(|db_path| test.exec_sql(Some(db_path)))
+                            .collect(),
                     }))
                 };
                 let elapsed_time = now.elapsed();
