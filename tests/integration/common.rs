@@ -23,7 +23,7 @@ impl TempDatabase {
     }
 
     pub fn new(db_name: &str) -> Self {
-        let mut path = TempDir::new().unwrap().into_path();
+        let mut path = TempDir::new().unwrap().keep();
         path.push(db_name);
         let io: Arc<dyn IO + Send> = Arc::new(limbo_core::PlatformIO::new().unwrap());
         Self { path, io }
@@ -41,7 +41,7 @@ impl TempDatabase {
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
             .finish();
-        let mut path = TempDir::new().unwrap().into_path();
+        let mut path = TempDir::new().unwrap().keep();
         path.push("test.db");
         {
             let connection = rusqlite::Connection::open(&path).unwrap();
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_limbo_open_read_only() -> anyhow::Result<()> {
-        let path = TempDir::new().unwrap().into_path().join("temp_read_only");
+        let path = TempDir::new().unwrap().keep().join("temp_read_only");
         let db = TempDatabase::new_with_existent(&path);
         {
             let conn = db.connect_limbo();

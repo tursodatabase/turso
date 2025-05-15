@@ -210,7 +210,6 @@ impl<'src> Runner<'src> {
     fn run_inner(&mut self, default_dbs: Vec<PathBuf>) -> (Vec<FinishedTest>, bool, Duration) {
         assert!(!self.has_errors());
         let mut finished_tests = Vec::with_capacity(self.inner.capacity());
-        let default_dbs = default_dbs;
         let mut failed = false;
         let total_time = Instant::now();
         for file_test in self.inner.iter() {
