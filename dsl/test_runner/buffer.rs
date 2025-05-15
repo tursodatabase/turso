@@ -2,7 +2,6 @@
 
 use std::fs::File;
 use std::io::{self, Read};
-use std::sync::Arc;
 
 use gag::Redirect;
 use tempfile::NamedTempFile;
@@ -10,29 +9,18 @@ use tempfile::NamedTempFile;
 /// Buffer output in an in-memory buffer.
 pub struct BufferRedirect {
     #[allow(dead_code)]
-    stdout: Redirect<Arc<File>>,
+    stdout: Redirect<File>,
     #[allow(dead_code)]
-    stderr: Redirect<Arc<File>>,
+    stderr: Redirect<File>,
     outer: File,
-}
-
-/// An in-memory read-only buffer into which BufferRedirect buffers output.
-pub struct Buffer(File);
-
-impl Read for Buffer {
-    #[inline(always)]
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
-    }
 }
 
 impl BufferRedirect {
     pub fn stdout_stderr() -> io::Result<BufferRedirect> {
         let tempfile = NamedTempFile::new()?;
-        let inner = Arc::new(tempfile.reopen()?);
         let outer = tempfile.reopen()?;
-        let stdout = Redirect::stdout(inner.clone())?;
-        let stderr = Redirect::stderr(inner)?;
+        let stdout = Redirect::stdout(tempfile.reopen()?)?;
+        let stderr = Redirect::stderr(tempfile.reopen()?)?;
         Ok(BufferRedirect {
             stdout,
             stderr,
