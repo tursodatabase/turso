@@ -1,0 +1,20 @@
+// Tests basic string output with printf
+test(
+    printf_basic_string,
+    "SELECT printf('Hello World!')",
+    "Hello World!"
+)
+
+// Tests string replacement with %s format specifier
+test(
+    printf_string_replacement,
+    "SELECT printf('Hello, %s', 'Alice')",
+    "Hello, Alice"
+)
+
+// Tests numeric replacement with %d format specifier
+test(
+    printf_numeric_replacement,
+    "SELECT printf('My number is: %d', 42)",
+    "My number is: 42"
+)
