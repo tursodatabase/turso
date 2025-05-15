@@ -1,0 +1,205 @@
+test(
+    boolean_not_int_1,
+    "SELECT not 1",
+    0
+)
+test(
+    boolean_not_int_2,
+    "SELECT not 2",
+    0
+)
+test(
+    boolean_not_int_3,
+    "SELECT not 0",
+    1
+)
+test(
+    boolean_not_float_1,
+    "SELECT not 1.0",
+    0
+)
+test(
+    boolean_not_float_2,
+    "SELECT not 2.0",
+    0
+)
+test(
+    boolean_not_float_3,
+    "SELECT not 0.0",
+    1
+)
+test(
+    boolean_not_text,
+    "SELECT not 'a'",
+    1
+)
+test(
+    boolean_not_text_int_1,
+    "SELECT not '0'",
+    1
+)
+test(
+    boolean_not_text_int_2,
+    "SELECT not '1'",
+    0
+)
+test(
+    boolean_not_text_float_1,
+    "SELECT not '1.0'",
+    0
+)
+test(
+    boolean_not_text_float_2,
+    "SELECT not '0.0'",
+    1
+)
+test(
+    boolean_not_text_float_edge,
+    "SELECT not '12-23.0'",
+    0
+)
+test(
+    boolean_not_null,
+    "SELECT not NULL",
+    Null
+)
+test(
+    boolean_not_empty_blob,
+    "SELECT not x''",
+    1
+)
+test(
+    boolean_not_cast_blob,
+    "SELECT not CAST ('af' AS BLOB)",
+    1
+)
+test(
+    boolean_not_blob,
+    "SELECT not x'0000'",
+    1
+)
+test(
+    boolean_not_blob_2,
+    "SELECT not x'0001'",
+    1
+)
+test(
+    boolean_and_blob_blob,
+    "SELECT x'' AND x''",
+    0
+)
+test(
+    boolean_and_1_blob,
+    "SELECT 1 AND x''",
+    0
+)
+test(
+    boolean_and_0_blob,
+    "SELECT 0 AND x''",
+    0
+)
+test(
+    boolean_and_0_1,
+    "SELECT 0 AND 1",
+    0
+)
+test(
+    boolean_and_1_1,
+    "SELECT 1 AND 1",
+    1
+)
+test(
+    boolean_and_int_int,
+    "SELECT 20 AND 1000",
+    1
+)
+test(
+    boolean_and_int_float,
+    "SELECT 20 AND 1.0",
+    1
+)
+test(
+    boolean_and_int_0_0,
+    "SELECT 20 AND 0.0",
+    0
+)
+test(
+    boolean_and_0_0_0_0,
+    "SELECT 0.0 AND 0.0",
+    0
+)
+test(
+    boolean_and_text,
+    "SELECT 'a' AND 1",
+    0
+)
+test(
+    boolean_and_text_int_1,
+    "SELECT '0' AND 1",
+    0
+)
+test(
+    boolean_and_text_int_2,
+    "SELECT '1' AND 0",
+    0
+)
+test(
+    boolean_and_text_float_1,
+    "SELECT '1.0' AND 0",
+    0
+)
+test(
+    boolean_and_text_float_2,
+    "SELECT '0.0' AND 1",
+    0
+)
+test(
+    boolean_and_text_float_3,
+    "SELECT '1.0' AND 1",
+    1
+)
+test(
+    boolean_and_text_float_edge,
+    "SELECT '12-23.0' AND 0",
+    0
+)
+test(
+    boolean_and_null_null,
+    "SELECT NULL AND NULL",
+    Null
+)
+test(
+    boolean_and_1_null,
+    "SELECT 1 AND NULL",
+    Null
+)
+test(
+    boolean_and_1_0_null,
+    "SELECT 1.0 AND NULL",
+    Null
+)
+test(
+    boolean_and_blob_null,
+    "SELECT x'' AND NULL",
+    0
+)
+test(
+    boolean_and_blob2_null,
+    "SELECT x'0001' AND NULL",
+    0
+)
+test(
+    boolean_and_0_null,
+    "SELECT 0 AND NULL",
+    0
+)
+test(
+    boolean_and_0_0_null,
+    "SELECT 0.0 AND NULL",
+    0
+)
+test(
+    boolean_and_text_0_0_null,
+    "SELECT '0.0' AND NULL",
+    0
+)

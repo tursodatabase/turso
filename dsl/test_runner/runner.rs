@@ -183,7 +183,7 @@ impl<'src> Runner<'src> {
         let result = if failed { FAILED } else { OK };
         // TODO: when we support ignore tests, adjust count here
         println!(
-            "\ntest result: {}. {} passed; {} failed; 0 ignored; finished in {:?}",
+            "\ntest result: {}. {} passed; {} failed; 0 ignored; finished in {:.2?}",
             result, success_count, failed_count, total_time
         );
     }
