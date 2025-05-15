@@ -27,7 +27,10 @@ fn main() {
         runner.print_errors();
         return;
     }
-    runner.run(args.databases);
+    let failed = runner.run(args.databases);
+    if failed {
+        std::process::exit(1)
+    }
 }
 
 fn is_hidden(entry: &DirEntry) -> bool {

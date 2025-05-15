@@ -159,7 +159,7 @@ impl<'src> Runner<'src> {
         }
     }
 
-    pub fn run(&mut self, default_dbs: Vec<PathBuf>) {
+    pub fn run(&mut self, default_dbs: Vec<PathBuf>) -> bool {
         let (tests, failed, total_time) = self.run_inner(default_dbs);
         // TODO: in the future could avoid some computation if we know we did not fail.
         // But for now leave it here just to keep the code simpler
@@ -200,11 +200,11 @@ impl<'src> Runner<'src> {
             println!("{out}");
         }
         let result = if failed { FAILED } else { OK };
-        // TODO: when we support ignore tests, adjust count here
         println!(
             "\ntest result: {}. {} passed; {} failed; {} ignored; finished in {:.2?}",
             result, success_count, failed_count, ignore_count, total_time
         );
+        return failed;
     }
 
     fn run_inner(&mut self, default_dbs: Vec<PathBuf>) -> (Vec<FinishedTest>, bool, Duration) {
