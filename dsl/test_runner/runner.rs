@@ -211,84 +211,87 @@ impl<'src> Runner<'src> {
     // TODO: reenable stdout redirect
     fn run_inner(&mut self, default_dbs: Vec<PathBuf>) -> (Vec<FinishedTest>, bool, Duration) {
         assert!(!self.has_errors());
-        let mut finished_tests = Vec::with_capacity(self.inner.capacity());
         let total_time = Instant::now();
-        for file_test in self.inner.iter() {
-            println!("\nRunning {} tests", file_test.tests.len());
-            let tests = file_test.tests.par_iter().map(|test| {
-                // Buffer for capturing standard I/O
-                // let data = Arc::new(Mutex::new(Vec::new()));
+        let finished_tests = self
+            .inner
+            .par_iter()
+            .map(|file_test| {
+                println!("\nRunning {} tests", file_test.tests.len());
+                let tests = file_test.tests.par_iter().map(|test| {
+                    // Buffer for capturing standard I/O
+                    // let data = Arc::new(Mutex::new(Vec::new()));
 
-                // set_output_capture(Some(data.clone()));
+                    // set_output_capture(Some(data.clone()));
 
-                let now = Instant::now();
-                let result = if test.inner.options.is_some() {
-                    // Skip the test
-                    Ok(())
-                } else {
-                    fold_err(catch_unwind(|| match &test.inner.kind {
-                        TestKind::Memory => test.exec_sql(None),
-                        TestKind::Databases(dbs) => dbs
-                            .iter()
-                            .map(|db_path| test.exec_sql(Some(Path::new(db_path))))
-                            .collect(),
-                        _ => default_dbs
-                            .iter()
-                            .map(|db_path| test.exec_sql(Some(db_path)))
-                            .collect(),
-                    }))
-                };
-
-                // Release stdout
-                // set_output_capture(None);
-                let elapsed_time = now.elapsed();
-                let error_msg = match result {
-                    Ok(()) => None,
-                    Err(ref e) => {
-                        // Panic Message or Error message. Got this code from libtest
-                        let assert_msg = e
-                            .downcast_ref::<String>()
-                            .map(|e| &**e)
-                            .or_else(|| e.downcast_ref::<&'static str>().copied())
-                            .map(|s| s.to_string());
-                        let error_msg =
-                            e.downcast_ref::<anyhow::Error>().map(|err| err.to_string());
-                        match (assert_msg, error_msg) {
-                            (Some(msg), None) | (None, Some(msg)) => Some(msg),
-                            _ => unreachable!(
-                                "Either a panic happens or an error happens not both or none"
-                            ),
-                        }
-                    }
-                };
-                let status = if let Some(error_msg) = error_msg {
-                    // let stdout = data.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
-                    FAILED_RUN.get_or_init(|| true);
-                    Status::Failed {
-                        stdout: String::new(),
-                        error_msg,
-                    }
-                } else {
-                    if let Some(options) = &test.inner.options {
-                        Status::Ignore(options)
+                    let now = Instant::now();
+                    let result = if test.inner.options.is_some() {
+                        // Skip the test
+                        Ok(())
                     } else {
-                        Status::Success
-                    }
-                };
-                let finished_test = FinishedTest {
-                    file_name: file_test.file_name,
-                    name: test.inner.ident.clone(),
-                    status,
-                    time: elapsed_time,
-                };
-                finished_test.print_status();
+                        fold_err(catch_unwind(|| match &test.inner.kind {
+                            TestKind::Memory => test.exec_sql(None),
+                            TestKind::Databases(dbs) => dbs
+                                .iter()
+                                .map(|db_path| test.exec_sql(Some(Path::new(db_path))))
+                                .collect(),
+                            _ => default_dbs
+                                .iter()
+                                .map(|db_path| test.exec_sql(Some(db_path)))
+                                .collect(),
+                        }))
+                    };
 
-                finished_test
-            });
-            finished_tests.par_extend(tests);
-        }
+                    // Release stdout
+                    // set_output_capture(None);
+                    let elapsed_time = now.elapsed();
+                    let error_msg = match result {
+                        Ok(()) => None,
+                        Err(ref e) => {
+                            // Panic Message or Error message. Got this code from libtest
+                            let assert_msg = e
+                                .downcast_ref::<String>()
+                                .map(|e| &**e)
+                                .or_else(|| e.downcast_ref::<&'static str>().copied())
+                                .map(|s| s.to_string());
+                            let error_msg =
+                                e.downcast_ref::<anyhow::Error>().map(|err| err.to_string());
+                            match (assert_msg, error_msg) {
+                                (Some(msg), None) | (None, Some(msg)) => Some(msg),
+                                _ => unreachable!(
+                                    "Either a panic happens or an error happens not both or none"
+                                ),
+                            }
+                        }
+                    };
+                    let status = if let Some(error_msg) = error_msg {
+                        // let stdout = data.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
+                        FAILED_RUN.get_or_init(|| true);
+                        Status::Failed {
+                            stdout: String::new(),
+                            error_msg,
+                        }
+                    } else {
+                        if let Some(options) = &test.inner.options {
+                            Status::Ignore(options)
+                        } else {
+                            Status::Success
+                        }
+                    };
+                    let finished_test = FinishedTest {
+                        file_name: file_test.file_name,
+                        name: test.inner.ident.clone(),
+                        status,
+                        time: elapsed_time,
+                    };
+                    finished_test.print_status();
+
+                    finished_test
+                });
+                tests
+            })
+            .flatten();
         (
-            finished_tests,
+            finished_tests.collect(),
             *FAILED_RUN.get_or_init(|| false),
             total_time.elapsed(),
         )
