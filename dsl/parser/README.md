@@ -45,6 +45,7 @@ test(
         ]
     )
 ```
+For now, comments must be before an ignore clause, if there is one.
 
 ### TestKinds
 - Specific Databases -> [database_path, database_path, ...]
@@ -75,13 +76,13 @@ Rows and Columsn -> [
                         [4, "sql", "TEXT", 0, Null, 0]
                     ]
 
- This is the list of allowed values:
+This is the list of allowed values:
 
 - **boolean** -> converted to `Value::Integer`
 - **integer** -> converted to `Value::Integer`
 - **float** -> converted to `Value::Real`
 - **string literals** -> converted to `Value::Text`
-- **byte string** (e.g x"example") -> converted to `Value::Blob` and compile checked with `hex` crate to ensure it is a valid hex value
+- **byte string** (e.g x"example") -> converted to `Value::Blob` and checked with `hex` crate to ensure it is a valid hex value
 - **`Null`** identifier -> converted to `Value::Null`
 - **`Inf`** identifier -> converted to `Value::Real(std::f64::INFINITY)`
 - **`-Inf`** identifier -> converted to `Value::Real(std::f64::NEG_INFINITY)`
@@ -150,7 +151,3 @@ Rows and Columsn -> [
         ["CREATE TABLE test2(id INTEGER, name) STRICT"]
     )
 ```
-
-## Define expected values
-
-TODO
