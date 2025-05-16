@@ -397,10 +397,7 @@ impl Value {
         }
     }
 
-    pub fn from_json<S>(s: S) -> Self
-    where
-        S: Into<Box<str>> + ExactSizeIterator,
-    {
+    pub fn from_json(s: impl Into<Box<str>>) -> Self {
         let txt_value = TextValue::new_boxed(s, TextSubtype::Json);
         let ptr = Box::into_raw(txt_value);
         Self {
