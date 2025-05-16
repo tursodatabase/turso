@@ -127,5 +127,5 @@ jobs:
       - name: Test
         env:
           RUST_LOG: ${{ runner.debug && 'limbo_core::storage=trace' || '' }}
-        run: cargo run --bin dsl_runner -- -p dsl/tests -d testing/testing.db,testing/testing_norowidalias.db
+        run: cargo +nightly run --bin dsl_runner -- -p dsl/tests -d testing/testing.db,testing/testing_norowidalias.db
         timeout-minutes: 10

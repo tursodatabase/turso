@@ -1,8 +1,10 @@
+#![allow(internal_features)]
+#![feature(internal_output_capture)]
+
 use std::path::PathBuf;
 
 use clap::Parser;
 
-mod buffer;
 pub mod runner;
 mod testing;
 

@@ -5,17 +5,14 @@ use rayon::prelude::*;
 use std::{
     any::Any,
     borrow::Cow,
-    io::Read,
+    io::set_output_capture,
     panic::catch_unwind,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
-use crate::{
-    buffer::BufferRedirect,
-    testing::{DslTest, FileTest},
-};
+use crate::testing::{DslTest, FileTest};
 
 static FAILED_RUN: OnceLock<bool> = OnceLock::new();
 
@@ -211,7 +208,7 @@ impl<'src> Runner<'src> {
         return failed;
     }
 
-    // TODO: reenable stdout redirect 
+    // TODO: reenable stdout redirect
     fn run_inner(&mut self, default_dbs: Vec<PathBuf>) -> (Vec<FinishedTest>, bool, Duration) {
         assert!(!self.has_errors());
         let mut finished_tests = Vec::with_capacity(self.inner.capacity());
@@ -219,10 +216,11 @@ impl<'src> Runner<'src> {
         for file_test in self.inner.iter() {
             println!("\nRunning {} tests", file_test.tests.len());
             let tests = file_test.tests.par_iter().map(|test| {
-                // TODO: this redirect is nice, but it forces us to write the output to a file
-                // and then read it later
-                // Consider using unstable io::set_output_capture that is used in libtest
-                // let mut stdout_redirect = BufferRedirect::stdout_stderr().unwrap();
+                // Buffer for capturing standard I/O
+                let data = Arc::new(Mutex::new(Vec::new()));
+
+                set_output_capture(Some(data.clone()));
+
                 let now = Instant::now();
                 let result = if test.inner.options.is_some() {
                     // Skip the test
@@ -240,6 +238,9 @@ impl<'src> Runner<'src> {
                             .collect(),
                     }))
                 };
+
+                // Release stdout
+                set_output_capture(None);
                 let elapsed_time = now.elapsed();
                 let error_msg = match result {
                     Ok(()) => None,
@@ -261,10 +262,12 @@ impl<'src> Runner<'src> {
                     }
                 };
                 let status = if let Some(error_msg) = error_msg {
-                    let mut stdout = String::new();
-                    // stdout_redirect.read_to_string(&mut stdout).unwrap();
+                    let stdout = data.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
                     FAILED_RUN.get_or_init(|| true);
-                    Status::Failed { stdout, error_msg }
+                    Status::Failed {
+                        stdout: String::from_utf8(stdout).unwrap(),
+                        error_msg,
+                    }
                 } else {
                     if let Some(options) = &test.inner.options {
                         Status::Ignore(options)
@@ -278,7 +281,6 @@ impl<'src> Runner<'src> {
                     status,
                     time: elapsed_time,
                 };
-                // drop(stdout_redirect);
                 finished_test.print_status();
 
                 finished_test
