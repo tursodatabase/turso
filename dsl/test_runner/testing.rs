@@ -274,8 +274,6 @@ impl<'a> DslTest<'a> {
             return Ok(());
         }
 
-        println!("sqlite!1!!!!!@FDDGDFgdfjnvjdfnvkdfnjvd");
-
         return_if_neq!(
             self.inner.values,
             expected,

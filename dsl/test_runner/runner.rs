@@ -5,10 +5,10 @@ use rayon::prelude::*;
 use std::{
     any::Any,
     borrow::Cow,
-    io::set_output_capture,
+    // io::set_output_capture, // TODO: set_output_capture currently disabled as it is a nightly feature and messes up our build scripts
     panic::catch_unwind,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -217,9 +217,9 @@ impl<'src> Runner<'src> {
             println!("\nRunning {} tests", file_test.tests.len());
             let tests = file_test.tests.par_iter().map(|test| {
                 // Buffer for capturing standard I/O
-                let data = Arc::new(Mutex::new(Vec::new()));
+                // let data = Arc::new(Mutex::new(Vec::new()));
 
-                set_output_capture(Some(data.clone()));
+                // set_output_capture(Some(data.clone()));
 
                 let now = Instant::now();
                 let result = if test.inner.options.is_some() {
@@ -240,7 +240,7 @@ impl<'src> Runner<'src> {
                 };
 
                 // Release stdout
-                set_output_capture(None);
+                // set_output_capture(None);
                 let elapsed_time = now.elapsed();
                 let error_msg = match result {
                     Ok(()) => None,
@@ -262,10 +262,10 @@ impl<'src> Runner<'src> {
                     }
                 };
                 let status = if let Some(error_msg) = error_msg {
-                    let stdout = data.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
+                    // let stdout = data.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
                     FAILED_RUN.get_or_init(|| true);
                     Status::Failed {
-                        stdout: String::from_utf8(stdout).unwrap(),
+                        stdout: String::new(),
                         error_msg,
                     }
                 } else {
