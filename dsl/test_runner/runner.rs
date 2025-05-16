@@ -216,7 +216,6 @@ impl<'src> Runner<'src> {
             .inner
             .par_iter()
             .map(|file_test| {
-                println!("\nRunning {} tests", file_test.tests.len());
                 let tests = file_test.tests.par_iter().map(|test| {
                     // Buffer for capturing standard I/O
                     // let data = Arc::new(Mutex::new(Vec::new()));
