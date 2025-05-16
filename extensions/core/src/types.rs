@@ -154,9 +154,9 @@ impl TextValue {
         }
     }
 
-    fn new_boxed(s: String, sub: TextSubtype) -> Box<Self> {
-        let len = s.len();
-        let buffer = s.into_boxed_str();
+    fn new_boxed(s: impl Into<Box<str>>, sub: TextSubtype) -> Box<Self> {
+        let buffer: Box<str> = s.into();
+        let len = buffer.len();
         let strbox = Box::into_raw(buffer);
         Box::new(Self {
             _type: sub,
@@ -388,7 +388,7 @@ impl Value {
     }
 
     /// Creates a new text Value from a String
-    pub fn from_text(s: String) -> Self {
+    pub fn from_text(s: impl Into<Box<str>>) -> Self {
         let txt_value = TextValue::new_boxed(s, TextSubtype::Text);
         let ptr = Box::into_raw(txt_value);
         Self {
@@ -397,7 +397,10 @@ impl Value {
         }
     }
 
-    pub fn from_json(s: String) -> Self {
+    pub fn from_json<S>(s: S) -> Self
+    where
+        S: Into<Box<str>> + ExactSizeIterator,
+    {
         let txt_value = TextValue::new_boxed(s, TextSubtype::Json);
         let ptr = Box::into_raw(txt_value);
         Self {

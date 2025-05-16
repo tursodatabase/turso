@@ -29,7 +29,7 @@ use super::{emitter::OperationMode, planner::determine_where_to_eval_term, schem
 #[derive(Debug, Clone)]
 pub struct ResultSetColumn {
     pub expr: ast::Expr,
-    pub alias: Option<String>,
+    pub alias: Option<Box<str>>,
     // TODO: encode which aggregates (e.g. index bitmask of plan.aggregates) are present in this column
     pub contains_aggregates: bool,
 }
@@ -370,14 +370,14 @@ impl SelectPlan {
         }
 
         let count = limbo_sqlite3_parser::ast::Expr::FunctionCall {
-            name: limbo_sqlite3_parser::ast::Id("count".to_string()),
+            name: limbo_sqlite3_parser::ast::Id("count".to_string().into()),
             distinctness: None,
             args: None,
             order_by: None,
             filter_over: None,
         };
         let count_star = limbo_sqlite3_parser::ast::Expr::FunctionCallStar {
-            name: limbo_sqlite3_parser::ast::Id("count".to_string()),
+            name: limbo_sqlite3_parser::ast::Id("count".to_string().into()),
             filter_over: None,
         };
         let result_col_expr = &self.result_columns.first().unwrap().expr;
@@ -493,7 +493,7 @@ pub struct TableReference {
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
-    pub identifier: String,
+    pub identifier: Box<str>,
     /// The join info for this table reference, if it is the right side of a join (which all except the first table reference have)
     pub join_info: Option<JoinInfo>,
     /// Bitmask of columns that are referenced in the query.
@@ -585,14 +585,18 @@ impl TableReference {
     }
 
     /// Creates a new TableReference for a subquery.
-    pub fn new_subquery(identifier: String, plan: SelectPlan, join_info: Option<JoinInfo>) -> Self {
+    pub fn new_subquery(
+        identifier: Box<str>,
+        plan: SelectPlan,
+        join_info: Option<JoinInfo>,
+    ) -> Self {
         let table = Table::Pseudo(Rc::new(PseudoTable::new_with_columns(
             plan.result_columns
                 .iter()
                 .map(|rc| Column {
-                    name: rc.name(&plan.table_references).map(String::from),
+                    name: rc.name(&plan.table_references).map(Into::into),
                     ty: Type::Text, // FIXME: infer proper type
-                    ty_str: "TEXT".to_string(),
+                    ty_str: "TEXT".into(),
                     is_rowid_alias: false,
                     primary_key: false,
                     notnull: false,
@@ -840,10 +844,11 @@ impl Display for SelectPlan {
 
             match &reference.op {
                 Operation::Scan { .. } => {
-                    let table_name = if reference.table.get_name() == reference.identifier {
+                    let table_name = if reference.table.get_name() == reference.identifier.as_ref()
+                    {
                         reference.identifier.clone()
                     } else {
-                        format!("{} AS {}", reference.table.get_name(), reference.identifier)
+                        format!("{} AS {}", reference.table.get_name(), reference.identifier).into()
                     };
 
                     writeln!(f, "{}SCAN {}", indent, table_name)?;
@@ -889,10 +894,11 @@ impl Display for DeletePlan {
 
             match &reference.op {
                 Operation::Scan { .. } => {
-                    let table_name = if reference.table.get_name() == reference.identifier {
+                    let table_name = if reference.table.get_name() == reference.identifier.as_ref()
+                    {
                         reference.identifier.clone()
                     } else {
-                        format!("{} AS {}", reference.table.get_name(), reference.identifier)
+                        format!("{} AS {}", reference.table.get_name(), reference.identifier).into()
                     };
 
                     writeln!(f, "{}DELETE FROM {}", indent, table_name)?;
@@ -927,10 +933,11 @@ impl fmt::Display for UpdatePlan {
 
             match &reference.op {
                 Operation::Scan { .. } => {
-                    let table_name = if reference.table.get_name() == reference.identifier {
+                    let table_name = if reference.table.get_name() == reference.identifier.as_ref()
+                    {
                         reference.identifier.clone()
                     } else {
-                        format!("{} AS {}", reference.table.get_name(), reference.identifier)
+                        format!("{} AS {}", reference.table.get_name(), reference.identifier).into()
                     };
 
                     if i == 0 {

@@ -329,7 +329,7 @@ pub enum Insn {
     /// P4 is the name of a virtual table in database P1. Call the xDestroy method of that table.
     VDestroy {
         /// Name of a virtual table being destroyed
-        table_name: String,
+        table_name: Box<str>,
         ///  The database within which this virtual table needs to be destroyed (P1).
         db: usize,
     },
@@ -373,7 +373,7 @@ pub enum Insn {
         start_reg: usize, // P1
         count: usize,     // P2
         dest_reg: usize,  // P3
-        index_name: Option<String>,
+        index_name: Option<Box<str>>,
     },
 
     /// Emit a row of results.
@@ -396,7 +396,7 @@ pub enum Insn {
     /// Halt the program.
     Halt {
         err_code: usize,
-        description: String,
+        description: Box<str>,
     },
 
     /// Start a transaction.
@@ -445,7 +445,7 @@ pub enum Insn {
 
     // Write a string value into a register.
     String8 {
-        value: String,
+        value: Box<str>,
         dest: usize,
     },
 
@@ -655,7 +655,7 @@ pub enum Insn {
         key_reg: usize,    // Must be int.
         record_reg: usize, // Blob of record data.
         flag: usize,       // Flags used by insert, for now not used.
-        table_name: String,
+        table_name: Box<str>,
     },
 
     Delete {
@@ -709,7 +709,7 @@ pub enum Insn {
     OpenWrite {
         cursor_id: CursorID,
         root_page: RegisterOrLiteral<PageIdx>,
-        name: String,
+        name: Box<str>,
     },
 
     Copy {
@@ -747,7 +747,7 @@ pub enum Insn {
         ///  unused register p3
         _p3: usize,
         //  The name of the table being dropped
-        table_name: String,
+        table_name: Box<str>,
     },
     DropIndex {
         ///  The database within which this index needs to be dropped (P1).
@@ -771,7 +771,7 @@ pub enum Insn {
     },
     ParseSchema {
         db: usize,
-        where_clause: Option<String>,
+        where_clause: Option<Box<str>>,
     },
 
     /// Place the result of lhs >> rhs in dest register.
@@ -866,7 +866,7 @@ pub enum Insn {
     Affinity {
         start_reg: usize,
         count: NonZeroUsize,
-        affinities: String,
+        affinities: Box<str>,
     },
 
     /// Store the number of entries (an integer value) in the table or index opened by cursor P1 in register P2.

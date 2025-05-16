@@ -264,7 +264,7 @@ typetoken(A) ::= typename(X) LP signed(Y) COMMA signed(Z) RP. {
   A = Some(Type{ name: X, size: Some(TypeSize::TypeSize(Box::new(Y), Box::new(Z))) });
 }
 %type typename {String}
-typename(A) ::= ids(X). {A=from_token(@X, X);}
+typename(A) ::= ids(X). {A=from_token(@X, X).into();}
 typename(A) ::= typename(A) ids(Y). {let ids=from_token(@Y, Y); A.push(' '); A.push_str(&ids);}
 %type signed {Expr}
 signed ::= plus_num.

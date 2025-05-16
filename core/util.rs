@@ -431,7 +431,7 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
         }
         // Variables that are not bound to a specific value, are treated as NULL
         // https://sqlite.org/lang_expr.html#varparam
-        (Expr::Variable(var), Expr::Variable(var2)) if var == "" && var2 == "" => false,
+        (Expr::Variable(var), Expr::Variable(var2)) if **var == *"" && **var2 == *"" => false,
         // Named variables can be compared by their name
         (Expr::Variable(val), Expr::Variable(val2)) => val == val2,
         (Expr::Parenthesized(exprs1), Expr::Parenthesized(exprs2)) => {
@@ -542,8 +542,8 @@ pub fn columns_from_create_table_body(body: &ast::CreateTableBody) -> crate::Res
                 }),
                 ty_str: column_def
                     .col_type
-                    .clone()
-                    .map(|t| t.name.to_string())
+                    .as_ref()
+                    .map(|t| t.name.to_string().into())
                     .unwrap_or_default(),
                 primary_key: column_def.constraints.iter().any(|c| {
                     matches!(
@@ -1038,33 +1038,33 @@ pub mod tests {
 
     #[test]
     fn test_anonymous_variable_comparison() {
-        let expr1 = Expr::Variable("".to_string());
-        let expr2 = Expr::Variable("".to_string());
+        let expr1 = Expr::variable("");
+        let expr2 = Expr::variable("");
         assert!(!exprs_are_equivalent(&expr1, &expr2));
     }
 
     #[test]
     fn test_named_variable_comparison() {
-        let expr1 = Expr::Variable("1".to_string());
-        let expr2 = Expr::Variable("1".to_string());
+        let expr1 = Expr::variable("1");
+        let expr2 = Expr::variable("1");
         assert!(exprs_are_equivalent(&expr1, &expr2));
 
-        let expr1 = Expr::Variable("1".to_string());
-        let expr2 = Expr::Variable("2".to_string());
+        let expr1 = Expr::variable("1");
+        let expr2 = Expr::variable("2");
         assert!(!exprs_are_equivalent(&expr1, &expr2));
     }
 
     #[test]
     fn test_basic_addition_exprs_are_equivalent() {
         let expr1 = Expr::Binary(
-            Box::new(Expr::Literal(Literal::Numeric("826".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("826"))),
             Add,
-            Box::new(Expr::Literal(Literal::Numeric("389".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("389"))),
         );
         let expr2 = Expr::Binary(
-            Box::new(Expr::Literal(Literal::Numeric("389".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("389"))),
             Add,
-            Box::new(Expr::Literal(Literal::Numeric("826".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("826"))),
         );
         assert!(exprs_are_equivalent(&expr1, &expr2));
     }
@@ -1072,14 +1072,14 @@ pub mod tests {
     #[test]
     fn test_addition_expressions_equivalent_normalized() {
         let expr1 = Expr::Binary(
-            Box::new(Expr::Literal(Literal::Numeric("123.0".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("123.0"))),
             Add,
-            Box::new(Expr::Literal(Literal::Numeric("243".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("243"))),
         );
         let expr2 = Expr::Binary(
-            Box::new(Expr::Literal(Literal::Numeric("243.0".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("243.0"))),
             Add,
-            Box::new(Expr::Literal(Literal::Numeric("123".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("123"))),
         );
         assert!(exprs_are_equivalent(&expr1, &expr2));
     }
@@ -1087,14 +1087,14 @@ pub mod tests {
     #[test]
     fn test_subtraction_expressions_not_equivalent() {
         let expr3 = Expr::Binary(
-            Box::new(Expr::Literal(Literal::Numeric("364".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("364"))),
             Subtract,
-            Box::new(Expr::Literal(Literal::Numeric("22.0".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("22.0"))),
         );
         let expr4 = Expr::Binary(
-            Box::new(Expr::Literal(Literal::Numeric("22.0".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("22.0"))),
             Subtract,
-            Box::new(Expr::Literal(Literal::Numeric("364".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("364"))),
         );
         assert!(!exprs_are_equivalent(&expr3, &expr4));
     }
@@ -1102,14 +1102,14 @@ pub mod tests {
     #[test]
     fn test_subtraction_expressions_normalized() {
         let expr3 = Expr::Binary(
-            Box::new(Expr::Literal(Literal::Numeric("66.0".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("66.0"))),
             Subtract,
-            Box::new(Expr::Literal(Literal::Numeric("22".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("22"))),
         );
         let expr4 = Expr::Binary(
-            Box::new(Expr::Literal(Literal::Numeric("66".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("66"))),
             Subtract,
-            Box::new(Expr::Literal(Literal::Numeric("22.0".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("22.0"))),
         );
         assert!(exprs_are_equivalent(&expr3, &expr4));
     }
@@ -1117,25 +1117,25 @@ pub mod tests {
     #[test]
     fn test_expressions_equivalent_case_insensitive_functioncalls() {
         let func1 = Expr::FunctionCall {
-            name: Id("SUM".to_string()),
+            name: Id("SUM".into()),
             distinctness: None,
-            args: Some(vec![Expr::Id(Id("x".to_string()))]),
+            args: Some(vec![Expr::Id(Id("x".into()))]),
             order_by: None,
             filter_over: None,
         };
         let func2 = Expr::FunctionCall {
-            name: Id("sum".to_string()),
+            name: Id("sum".into()),
             distinctness: None,
-            args: Some(vec![Expr::Id(Id("x".to_string()))]),
+            args: Some(vec![Expr::Id(Id("x".into()))]),
             order_by: None,
             filter_over: None,
         };
         assert!(exprs_are_equivalent(&func1, &func2));
 
         let func3 = Expr::FunctionCall {
-            name: Id("SUM".to_string()),
+            name: Id("SUM".into()),
             distinctness: Some(ast::Distinctness::Distinct),
-            args: Some(vec![Expr::Id(Id("x".to_string()))]),
+            args: Some(vec![Expr::Id(Id("x".into()))]),
             order_by: None,
             filter_over: None,
         };
@@ -1145,16 +1145,16 @@ pub mod tests {
     #[test]
     fn test_expressions_equivalent_identical_fn_with_distinct() {
         let sum = Expr::FunctionCall {
-            name: Id("SUM".to_string()),
+            name: Id("SUM".into()),
             distinctness: None,
-            args: Some(vec![Expr::Id(Id("x".to_string()))]),
+            args: Some(vec![Expr::Id(Id("x".into()))]),
             order_by: None,
             filter_over: None,
         };
         let sum_distinct = Expr::FunctionCall {
-            name: Id("SUM".to_string()),
+            name: Id("SUM".into()),
             distinctness: Some(ast::Distinctness::Distinct),
-            args: Some(vec![Expr::Id(Id("x".to_string()))]),
+            args: Some(vec![Expr::Id(Id("x".into()))]),
             order_by: None,
             filter_over: None,
         };
@@ -1164,14 +1164,14 @@ pub mod tests {
     #[test]
     fn test_expressions_equivalent_multiplication() {
         let expr1 = Expr::Binary(
-            Box::new(Expr::Literal(Literal::Numeric("42.0".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("42.0"))),
             Multiply,
-            Box::new(Expr::Literal(Literal::Numeric("38".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("38"))),
         );
         let expr2 = Expr::Binary(
-            Box::new(Expr::Literal(Literal::Numeric("38.0".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("38.0"))),
             Multiply,
-            Box::new(Expr::Literal(Literal::Numeric("42".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("42"))),
         );
         assert!(exprs_are_equivalent(&expr1, &expr2));
     }
@@ -1179,28 +1179,28 @@ pub mod tests {
     #[test]
     fn test_expressions_both_parenthesized_equivalent() {
         let expr1 = Expr::Parenthesized(vec![Expr::Binary(
-            Box::new(Expr::Literal(Literal::Numeric("683".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("683"))),
             Add,
-            Box::new(Expr::Literal(Literal::Numeric("799.0".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("799.0"))),
         )]);
         let expr2 = Expr::Binary(
-            Box::new(Expr::Literal(Literal::Numeric("799".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("799"))),
             Add,
-            Box::new(Expr::Literal(Literal::Numeric("683".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("683"))),
         );
         assert!(exprs_are_equivalent(&expr1, &expr2));
     }
     #[test]
     fn test_expressions_parenthesized_equivalent() {
         let expr7 = Expr::Parenthesized(vec![Expr::Binary(
-            Box::new(Expr::Literal(Literal::Numeric("6".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("6"))),
             Add,
-            Box::new(Expr::Literal(Literal::Numeric("7".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("7"))),
         )]);
         let expr8 = Expr::Binary(
-            Box::new(Expr::Literal(Literal::Numeric("6".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("6"))),
             Add,
-            Box::new(Expr::Literal(Literal::Numeric("7".to_string()))),
+            Box::new(Expr::Literal(Literal::numeric("7"))),
         );
         assert!(exprs_are_equivalent(&expr7, &expr8));
     }
@@ -1208,18 +1208,18 @@ pub mod tests {
     #[test]
     fn test_like_expressions_equivalent() {
         let expr1 = Expr::Like {
-            lhs: Box::new(Expr::Id(Id("name".to_string()))),
+            lhs: Box::new(Expr::Id(Id("name".into()))),
             not: false,
             op: ast::LikeOperator::Like,
-            rhs: Box::new(Expr::Literal(Literal::String("%john%".to_string()))),
-            escape: Some(Box::new(Expr::Literal(Literal::String("\\".to_string())))),
+            rhs: Box::new(Expr::Literal(Literal::String("%john%".into()))),
+            escape: Some(Box::new(Expr::Literal(Literal::String("\\".into())))),
         };
         let expr2 = Expr::Like {
-            lhs: Box::new(Expr::Id(Id("name".to_string()))),
+            lhs: Box::new(Expr::Id(Id("name".into()))),
             not: false,
             op: ast::LikeOperator::Like,
-            rhs: Box::new(Expr::Literal(Literal::String("%john%".to_string()))),
-            escape: Some(Box::new(Expr::Literal(Literal::String("\\".to_string())))),
+            rhs: Box::new(Expr::Literal(Literal::String("%john%".into()))),
+            escape: Some(Box::new(Expr::Literal(Literal::String("\\".into())))),
         };
         assert!(exprs_are_equivalent(&expr1, &expr2));
     }
@@ -1227,58 +1227,58 @@ pub mod tests {
     #[test]
     fn test_expressions_equivalent_like_escaped() {
         let expr1 = Expr::Like {
-            lhs: Box::new(Expr::Id(Id("name".to_string()))),
+            lhs: Box::new(Expr::Id(Id("name".into()))),
             not: false,
             op: ast::LikeOperator::Like,
-            rhs: Box::new(Expr::Literal(Literal::String("%john%".to_string()))),
-            escape: Some(Box::new(Expr::Literal(Literal::String("\\".to_string())))),
+            rhs: Box::new(Expr::Literal(Literal::String("%john%".into()))),
+            escape: Some(Box::new(Expr::Literal(Literal::String("\\".into())))),
         };
         let expr2 = Expr::Like {
-            lhs: Box::new(Expr::Id(Id("name".to_string()))),
+            lhs: Box::new(Expr::Id(Id("name".into()))),
             not: false,
             op: ast::LikeOperator::Like,
-            rhs: Box::new(Expr::Literal(Literal::String("%john%".to_string()))),
-            escape: Some(Box::new(Expr::Literal(Literal::String("#".to_string())))),
+            rhs: Box::new(Expr::Literal(Literal::String("%john%".into()))),
+            escape: Some(Box::new(Expr::Literal(Literal::String("#".into())))),
         };
         assert!(!exprs_are_equivalent(&expr1, &expr2));
     }
     #[test]
     fn test_expressions_equivalent_between() {
         let expr1 = Expr::Between {
-            lhs: Box::new(Expr::Id(Id("age".to_string()))),
+            lhs: Box::new(Expr::Id(Id("age".into()))),
             not: false,
-            start: Box::new(Expr::Literal(Literal::Numeric("18".to_string()))),
-            end: Box::new(Expr::Literal(Literal::Numeric("65".to_string()))),
+            start: Box::new(Expr::Literal(Literal::numeric("18"))),
+            end: Box::new(Expr::Literal(Literal::numeric("65".into()))),
         };
         let expr2 = Expr::Between {
-            lhs: Box::new(Expr::Id(Id("age".to_string()))),
+            lhs: Box::new(Expr::Id(Id("age".into()))),
             not: false,
-            start: Box::new(Expr::Literal(Literal::Numeric("18".to_string()))),
-            end: Box::new(Expr::Literal(Literal::Numeric("65".to_string()))),
+            start: Box::new(Expr::Literal(Literal::numeric("18".into()))),
+            end: Box::new(Expr::Literal(Literal::numeric("65".into()))),
         };
         assert!(exprs_are_equivalent(&expr1, &expr2));
 
         // differing BETWEEN bounds
         let expr3 = Expr::Between {
-            lhs: Box::new(Expr::Id(Id("age".to_string()))),
+            lhs: Box::new(Expr::Id(Id("age".into()))),
             not: false,
-            start: Box::new(Expr::Literal(Literal::Numeric("20".to_string()))),
-            end: Box::new(Expr::Literal(Literal::Numeric("65".to_string()))),
+            start: Box::new(Expr::Literal(Literal::numeric("20"))),
+            end: Box::new(Expr::Literal(Literal::numeric("65"))),
         };
         assert!(!exprs_are_equivalent(&expr1, &expr3));
     }
     #[test]
     fn test_cast_exprs_equivalent() {
         let cast1 = Expr::Cast {
-            expr: Box::new(Expr::Literal(Literal::Numeric("123".to_string()))),
+            expr: Box::new(Expr::Literal(Literal::numeric("123"))),
             type_name: Some(Type {
-                name: "INTEGER".to_string(),
+                name: "INTEGER".into(),
                 size: None,
             }),
         };
 
         let cast2 = Expr::Cast {
-            expr: Box::new(Expr::Literal(Literal::Numeric("123".to_string()))),
+            expr: Box::new(Expr::Literal(Literal::numeric("123"))),
             type_name: Some(Type {
                 name: "integer".to_string(),
                 size: None,

@@ -44,7 +44,7 @@ pub fn translate_create_table(
         approx_num_insns: 30,
         approx_num_labels: 1,
     });
-    if schema.get_table(tbl_name.name.0.as_str()).is_some() {
+    if schema.get_table(tbl_name.name.0.as_ref()).is_some() {
         if if_not_exists {
             let init_label = program.emit_init();
             let start_offset = program.offset();
@@ -114,7 +114,7 @@ pub fn translate_create_table(
 
     let table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(
-        Some(SQLITE_TABLEID.to_owned()),
+        Some(SQLITE_TABLEID.into()),
         CursorType::BTreeTable(table.clone()),
     );
     program.emit_insn(Insn::OpenWrite {
@@ -162,7 +162,7 @@ pub fn translate_create_table(
     let parse_schema_where_clause = format!("tbl_name = '{}' AND type != 'trigger'", tbl_name);
     program.emit_insn(Insn::ParseSchema {
         db: sqlite_schema_cursor_id,
-        where_clause: Some(parse_schema_where_clause),
+        where_clause: Some(parse_schema_where_clause.into()),
     });
 
     // TODO: SqlExec
@@ -207,9 +207,9 @@ pub fn emit_schema_entry(
         prev_largest_reg: 0,
     });
 
-    let type_reg = program.emit_string8_new_reg(entry_type.as_str().to_string());
-    program.emit_string8_new_reg(name.to_string());
-    program.emit_string8_new_reg(tbl_name.to_string());
+    let type_reg = program.emit_string8_new_reg(entry_type.as_str());
+    program.emit_string8_new_reg(name);
+    program.emit_string8_new_reg(tbl_name);
 
     let rootpage_reg = program.alloc_register();
     if root_page_reg == 0 {
@@ -245,12 +245,12 @@ pub fn emit_schema_entry(
         key_reg: rowid_reg,
         record_reg,
         flag: 0,
-        table_name: tbl_name.to_string(),
+        table_name: tbl_name.to_string().into(),
     });
 }
 
 struct PrimaryKeyColumnInfo<'a> {
-    name: &'a String,
+    name: &'a Box<str>,
     is_descending: bool,
 }
 
@@ -534,7 +534,7 @@ pub fn translate_create_virtual_table(
     let table_name = tbl_name.name.0.clone();
     let module_name_str = module_name.0.clone();
     let args_vec = args.clone().unwrap_or_default();
-    let Some(vtab_module) = syms.vtab_modules.get(&module_name_str) else {
+    let Some(vtab_module) = syms.vtab_modules.get(module_name_str.as_ref()) else {
         bail_parse_error!("no such module: {}", module_name_str);
     };
     if !vtab_module.module_kind.eq(&VTabKind::VirtualTable) {
@@ -568,7 +568,7 @@ pub fn translate_create_virtual_table(
     });
     let init_label = program.emit_init();
     let start_offset = program.offset();
-    let module_name_reg = program.emit_string8_new_reg(module_name_str.clone());
+    let module_name_reg = program.emit_string8_new_reg(module_name_str);
     let table_name_reg = program.emit_string8_new_reg(table_name.clone());
     let args_reg = if !args_vec.is_empty() {
         let args_start = program.alloc_register();
@@ -598,7 +598,7 @@ pub fn translate_create_virtual_table(
     });
     let table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(
-        Some(SQLITE_TABLEID.to_owned()),
+        Some(SQLITE_TABLEID.into()),
         CursorType::BTreeTable(table.clone()),
     );
     program.emit_insn(Insn::OpenWrite {
@@ -621,7 +621,7 @@ pub fn translate_create_virtual_table(
     let parse_schema_where_clause = format!("tbl_name = '{}' AND type != 'trigger'", table_name);
     program.emit_insn(Insn::ParseSchema {
         db: sqlite_schema_cursor_id,
-        where_clause: Some(parse_schema_where_clause),
+        where_clause: Some(parse_schema_where_clause.into()),
     });
 
     program.emit_halt();
@@ -645,7 +645,7 @@ pub fn translate_drop_table(
         approx_num_insns: 30,
         approx_num_labels: 1,
     });
-    let table = schema.get_table(tbl_name.name.0.as_str());
+    let table = schema.get_table(tbl_name.name.0.as_ref());
     if table.is_none() {
         if if_exists {
             let init_label = program.emit_init();
@@ -658,7 +658,7 @@ pub fn translate_drop_table(
 
             return Ok(program);
         }
-        bail_parse_error!("No such table: {}", tbl_name.name.0.as_str());
+        bail_parse_error!("No such table: {}", tbl_name.name.0.as_ref());
     }
 
     let table = table.unwrap(); // safe since we just checked for None
@@ -671,14 +671,14 @@ pub fn translate_drop_table(
     let tbl_name_reg = program.alloc_register(); //  r2
     let table_reg = program.emit_string8_new_reg(tbl_name.name.0.clone()); //  r3
     program.mark_last_insn_constant();
-    let table_type = program.emit_string8_new_reg("trigger".to_string()); //  r4
+    let table_type = program.emit_string8_new_reg("trigger"); //  r4
     program.mark_last_insn_constant();
     let row_id_reg = program.alloc_register(); //  r5
 
     let table_name = "sqlite_schema";
     let schema_table = schema.get_btree_table(table_name).unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(
-        Some(table_name.to_string()),
+        Some(table_name.into()),
         CursorType::BTreeTable(schema_table.clone()),
     );
     program.emit_insn(Insn::OpenWrite {
@@ -776,7 +776,7 @@ pub fn translate_drop_table(
                 )));
             }
             program.emit_insn(Insn::VDestroy {
-                table_name: vtab.name.clone(),
+                table_name: vtab.name.clone().into(),
                 db: 0, // TODO change this for multiple databases
             });
         }

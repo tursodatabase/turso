@@ -70,6 +70,11 @@ impl<T: ?Sized + ToTokens> ToTokens for &T {
         ToTokens::to_tokens(&**self, s)
     }
 }
+impl ToTokens for Box<str> {
+    fn to_tokens<S: TokenStream>(&self, s: &mut S) -> Result<(), S::Error> {
+        s.append(TK_ANY, Some(self.as_ref()))
+    }
+}
 
 impl ToTokens for String {
     fn to_tokens<S: TokenStream>(&self, s: &mut S) -> Result<(), S::Error> {
@@ -1139,7 +1144,7 @@ impl ToTokens for Id {
 
 impl ToTokens for Name {
     fn to_tokens<S: TokenStream>(&self, s: &mut S) -> Result<(), S::Error> {
-        double_quote(self.0.as_str(), s)
+        double_quote(self.0.as_ref(), s)
     }
 }
 

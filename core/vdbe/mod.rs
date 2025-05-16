@@ -379,7 +379,7 @@ macro_rules! must_be_btree_cursor {
 pub struct Program {
     pub max_registers: usize,
     pub insns: Vec<(Insn, InsnFunction)>,
-    pub cursor_ref: Vec<(Option<String>, CursorType)>,
+    pub cursor_ref: Vec<(Option<Box<str>>, CursorType)>,
     pub database_header: Arc<SpinLock<DatabaseHeader>>,
     pub comments: Option<Vec<(InsnReference, &'static str)>>,
     pub parameters: crate::parameters::Parameters,

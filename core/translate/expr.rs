@@ -664,7 +664,7 @@ pub fn translate_expr(
                 // we make a comparison against uppercase static strs in the affinity() function,
                 // so we need to make sure we're comparing against the uppercase version,
                 // and it's better to do this once instead of every time we check affinity
-                value: type_name.name.to_uppercase(),
+                value: type_name.name.to_uppercase().into(),
                 dest: reg_expr + 1,
             });
             program.mark_last_insn_constant();
@@ -690,7 +690,7 @@ pub fn translate_expr(
             order_by: _,
         } => {
             let args_count = if let Some(args) = args { args.len() } else { 0 };
-            let func_name = normalize_ident(name.0.as_str());
+            let func_name = normalize_ident(name.0.as_ref());
             let func_type = resolver.resolve_function(&func_name, args_count);
 
             if func_type.is_none() {
@@ -2001,7 +2001,7 @@ pub fn translate_expr(
             }
             ast::Literal::String(s) => {
                 program.emit_insn(Insn::String8 {
-                    value: sanitize_string(s),
+                    value: sanitize_string(s).into(),
                     dest: target_register,
                 });
                 Ok(target_register)
@@ -2033,21 +2033,21 @@ pub fn translate_expr(
             }
             ast::Literal::CurrentDate => {
                 program.emit_insn(Insn::String8 {
-                    value: datetime::exec_date(&[]).to_string(),
+                    value: datetime::exec_date(&[]).to_string().into(),
                     dest: target_register,
                 });
                 Ok(target_register)
             }
             ast::Literal::CurrentTime => {
                 program.emit_insn(Insn::String8 {
-                    value: datetime::exec_time(&[]).to_string(),
+                    value: datetime::exec_time(&[]).to_string().into(),
                     dest: target_register,
                 });
                 Ok(target_register)
             }
             ast::Literal::CurrentTimestamp => {
                 program.emit_insn(Insn::String8 {
-                    value: datetime::exec_datetime_full(&[]).to_string(),
+                    value: datetime::exec_datetime_full(&[]).to_string().into(),
                     dest: target_register,
                 });
                 Ok(target_register)

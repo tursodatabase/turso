@@ -833,9 +833,9 @@ impl VirtualTable {
 }
 
 pub(crate) struct SymbolTable {
-    pub functions: HashMap<String, Rc<function::ExternalFunc>>,
-    pub vtabs: HashMap<String, Rc<VirtualTable>>,
-    pub vtab_modules: HashMap<String, Rc<crate::ext::VTabImpl>>,
+    pub functions: HashMap<Box<str>, Rc<function::ExternalFunc>>,
+    pub vtabs: HashMap<Box<str>, Rc<VirtualTable>>,
+    pub vtab_modules: HashMap<Box<str>, Rc<crate::ext::VTabImpl>>,
 }
 
 impl std::fmt::Debug for SymbolTable {

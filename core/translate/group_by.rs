@@ -212,7 +212,7 @@ pub fn group_by_create_pseudo_table(
             name: None,
             primary_key: false,
             ty,
-            ty_str: ty.to_string().to_uppercase(),
+            ty_str: ty.to_string().to_uppercase().into(),
             is_rowid_alias: false,
             notnull: false,
             default: None,
@@ -942,12 +942,15 @@ pub fn translate_aggregation_step_groupby(
                         delimiter_expr = agg_arg_source.args()[1].clone();
                     }
                     ast::Expr::Literal(ast::Literal::String(s)) => {
-                        delimiter_expr = ast::Expr::Literal(ast::Literal::String(s.to_string()));
+                        delimiter_expr = ast::Expr::Literal(ast::Literal::String(
+                            s.to_string().into_boxed_str(),
+                        ));
                     }
                     _ => crate::bail_parse_error!("Incorrect delimiter parameter"),
                 };
             } else {
-                delimiter_expr = ast::Expr::Literal(ast::Literal::String(String::from("\",\"")));
+                delimiter_expr =
+                    ast::Expr::Literal(ast::Literal::String("\",\"".to_string().into()));
             }
 
             let expr_reg = agg_arg_source.translate(program, 0)?;
@@ -1035,7 +1038,7 @@ pub fn translate_aggregation_step_groupby(
             let delimiter_expr = match &agg_arg_source.args()[1] {
                 ast::Expr::Column { .. } => agg_arg_source.args()[1].clone(),
                 ast::Expr::Literal(ast::Literal::String(s)) => {
-                    ast::Expr::Literal(ast::Literal::String(s.to_string()))
+                    ast::Expr::Literal(ast::Literal::String(s.to_string().into()))
                 }
                 _ => crate::bail_parse_error!("Incorrect delimiter parameter"),
             };

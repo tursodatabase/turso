@@ -38,7 +38,7 @@ pub fn prepare_delete_plan(
     where_clause: Option<Box<Expr>>,
     limit: Option<Box<Limit>>,
 ) -> Result<Plan> {
-    let table = match schema.get_table(tbl_name.name.0.as_str()) {
+    let table = match schema.get_table(tbl_name.name.0.as_ref()) {
         Some(table) => table,
         None => crate::bail_corrupt_error!("Parse error: no such table: {}", tbl_name),
     };
@@ -49,7 +49,7 @@ pub fn prepare_delete_plan(
     } else {
         crate::bail_corrupt_error!("Table is neither a virtual table nor a btree table");
     };
-    let name = tbl_name.name.0.as_str().to_string();
+    let name = tbl_name.name.0.to_string();
     let indexes = schema
         .get_indices(table.get_name())
         .iter()
@@ -57,7 +57,7 @@ pub fn prepare_delete_plan(
         .collect();
     let mut table_references = vec![TableReference {
         table,
-        identifier: name,
+        identifier: name.into(),
         op: Operation::Scan {
             iter_dir: IterationDirection::Forwards,
             index: None,

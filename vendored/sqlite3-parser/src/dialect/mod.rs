@@ -17,7 +17,7 @@ pub(crate) fn sentinel(start: usize) -> Token<'static> {
 
 impl Token<'_> {
     /// Access token value
-    pub fn unwrap(self) -> String {
+    pub fn unwrap(self) -> Box<str> {
         from_bytes(self.1)
     }
 }
@@ -37,8 +37,8 @@ impl TokenType {
     }
 }
 
-pub(crate) fn from_bytes(bytes: &[u8]) -> String {
-    unsafe { str::from_utf8_unchecked(bytes).to_owned() }
+pub(crate) fn from_bytes(bytes: &[u8]) -> Box<str> {
+    String::from_utf8_lossy(bytes).into()
 }
 
 include!(concat!(env!("OUT_DIR"), "/keywords.rs"));
@@ -75,7 +75,7 @@ pub(crate) fn is_identifier_continue(b: u8) -> bool {
 
 // keyword may become an identifier
 // see %fallback in parse.y
-pub(crate) fn from_token(_ty: u16, value: Token) -> String {
+pub(crate) fn from_token(_ty: u16, value: Token) -> Box<str> {
     from_bytes(value.1)
 }
 

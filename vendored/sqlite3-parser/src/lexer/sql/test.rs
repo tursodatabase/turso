@@ -60,10 +60,7 @@ fn duplicate_column() {
 
 #[test]
 fn create_table_without_column() {
-    expect_parser_err(
-        b"CREATE TABLE t ()",
-        ParserError::SyntaxError(")".to_owned()),
-    );
+    expect_parser_err(b"CREATE TABLE t ()", ParserError::SyntaxError(")".into()));
 }
 
 #[test]
@@ -77,11 +74,11 @@ fn vtab_args() -> Result<(), Error> {
         panic!("unexpected AST")
     };
     assert_eq!(create_virtual_table.tbl_name.name, "mail");
-    assert_eq!(create_virtual_table.module_name.0, "fts3");
+    assert_eq!(create_virtual_table.module_name.0, "fts3".into());
     let args = create_virtual_table.args.as_ref().unwrap();
     assert_eq!(args.len(), 2);
-    assert_eq!(args[0], "subject VARCHAR(256) NOT NULL");
-    assert_eq!(args[1], "body TEXT CHECK(length(body)<10240)");
+    assert_eq!(args[0], "subject VARCHAR(256) NOT NULL".into());
+    assert_eq!(args[1], "body TEXT CHECK(length(body)<10240)".into());
     Ok(())
 }
 
@@ -364,7 +361,7 @@ fn indexed_by_clause_within_triggers() {
 }
 
 fn expect_parser_err_msg(input: &[u8], error_msg: &str) {
-    expect_parser_err(input, ParserError::Custom(error_msg.to_owned()))
+    expect_parser_err(input, ParserError::Custom(error_msg.into()))
 }
 fn expect_parser_err(input: &[u8], err: ParserError) {
     let r = parse(input);

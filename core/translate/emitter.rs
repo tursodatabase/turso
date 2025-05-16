@@ -165,7 +165,7 @@ fn epilogue(
 ) -> Result<()> {
     program.emit_insn(Insn::Halt {
         err_code: 0,
-        description: String::new(),
+        description: "".into(),
     });
     program.preassign_label_to_next_insn(init_label);
 
@@ -813,9 +813,12 @@ fn emit_update_insns(
             }
         } else {
             let column_idx_in_index = index.as_ref().and_then(|(idx, _)| {
-                idx.columns
-                    .iter()
-                    .position(|c| Some(&c.name) == table_column.name.as_ref())
+                idx.columns.iter().position(|c| {
+                    table_column
+                        .name
+                        .as_ref()
+                        .is_some_and(|s| s.as_ref().eq(c.name.as_ref()))
+                })
             });
 
             // don't emit null for pkey of virtual tables. they require first two args
@@ -920,7 +923,7 @@ fn emit_update_insns(
 
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_PRIMARYKEY, // TODO: distinct between primary key and unique index for error code
-            description: column_names,
+            description: column_names.into(),
         });
 
         program.preassign_label_to_next_insn(constraint_check);
@@ -965,7 +968,8 @@ fn emit_update_insns(
                         .name
                         .as_ref()
                         .map_or("", |v| v)
-                ),
+                )
+                .into(),
             });
 
             program.preassign_label_to_next_insn(record_label);
@@ -1019,7 +1023,7 @@ fn emit_update_insns(
 
             program.emit_insn(Insn::IdxInsert {
                 cursor_id: idx_cursor_id,
-                record_reg: record_reg,
+                record_reg,
                 unpacked_start: Some(start),
                 unpacked_count: Some((index.columns.len() + 1) as u16),
                 flags: IdxInsertFlags::new(),

@@ -19,11 +19,11 @@ use ast::{Cmd, ExplainKind, Name, Stmt};
 #[derive(Debug, PartialEq)]
 pub enum ParserError {
     /// Syntax error
-    SyntaxError(String),
+    SyntaxError(Box<str>),
     /// Unexpected EOF
     UnexpectedEof,
     /// Custom error
-    Custom(String),
+    Custom(Box<str>),
 }
 
 impl std::fmt::Display for ParserError {
@@ -44,13 +44,13 @@ impl std::error::Error for ParserError {}
 #[macro_export]
 macro_rules! custom_err {
     ($msg:literal $(,)?) => {
-        $crate::parser::ParserError::Custom($msg.to_owned())
+        $crate::parser::ParserError::Custom($msg.into())
     };
     ($err:expr $(,)?) => {
         $crate::parser::ParserError::Custom(format!($err))
     };
     ($fmt:expr, $($arg:tt)*) => {
-        $crate::parser::ParserError::Custom(format!($fmt, $($arg)*))
+        $crate::parser::ParserError::Custom(format!($fmt, $($arg)*).into())
     };
 }
 
@@ -61,7 +61,7 @@ pub struct Context<'input> {
     stmt: Option<Stmt>,
     constraint_name: Option<Name>,      // transient
     module_arg: Option<(usize, usize)>, // Complete text of a module argument
-    module_args: Option<Vec<String>>,   // CREATE VIRTUAL TABLE args
+    module_args: Option<Vec<Box<str>>>, // CREATE VIRTUAL TABLE args
     done: bool,
     error: Option<ParserError>,
 }
@@ -114,11 +114,13 @@ impl<'input> Context<'input> {
     fn add_module_arg(&mut self) {
         if let Some((start, end)) = self.module_arg.take() {
             if let Ok(arg) = std::str::from_utf8(&self.input[start..end]) {
-                self.module_args.get_or_insert(vec![]).push(arg.to_owned());
+                self.module_args
+                    .get_or_insert(vec![])
+                    .push(arg.to_owned().into());
             } // FIXME error handling
         }
     }
-    fn module_args(&mut self) -> Option<Vec<String>> {
+    fn module_args(&mut self) -> Option<Vec<Box<str>>> {
         self.add_module_arg();
         self.module_args.take()
     }

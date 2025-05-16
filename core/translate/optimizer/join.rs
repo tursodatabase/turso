@@ -682,7 +682,7 @@ mod tests {
         const TABLE1: usize = 0;
         const TABLE2: usize = 1;
 
-        let mut available_indexes = HashMap::new();
+        let mut available_indexes = HashMap::<Box<str>, Vec<Arc<Index>>>::new();
         // Index on the outer table (table1)
         let index1 = Arc::new(Index {
             name: "index1".to_string(),
@@ -696,7 +696,7 @@ mod tests {
             ephemeral: false,
             root_page: 1,
         });
-        available_indexes.insert("table1".to_string(), vec![index1]);
+        available_indexes.insert("table1".into(), vec![index1]);
 
         // SELECT * FROM table1 JOIN table2 WHERE table1.id = table2.id
         // expecting table2 to be chosen first due to the index on table1.id
@@ -787,7 +787,7 @@ mod tests {
         const TABLE_NO_CUSTOMERS: usize = 1;
         const TABLE_NO_ORDER_ITEMS: usize = 2;
 
-        let mut available_indexes = HashMap::new();
+        let mut available_indexes = HashMap::<Box<str>, Vec<Arc<Index>>>::new();
         ["orders", "customers", "order_items"]
             .iter()
             .for_each(|table_name| {
@@ -805,7 +805,7 @@ mod tests {
                     ephemeral: false,
                     root_page: 1,
                 });
-                available_indexes.insert(table_name.to_string(), vec![index]);
+                available_indexes.insert(table_name.to_string().into(), vec![index]);
             });
         let customer_id_idx = Arc::new(Index {
             name: "orders_customer_id_idx".to_string(),
@@ -833,10 +833,10 @@ mod tests {
         });
 
         available_indexes
-            .entry("orders".to_string())
+            .entry("orders".into())
             .and_modify(|v| v.push(customer_id_idx));
         available_indexes
-            .entry("order_items".to_string())
+            .entry("order_items".into())
             .and_modify(|v| v.push(order_id_idx));
 
         // SELECT * FROM orders JOIN customers JOIN order_items
@@ -1197,9 +1197,9 @@ mod tests {
 
     fn _create_column(c: &TestColumn) -> Column {
         Column {
-            name: Some(c.name.clone()),
+            name: Some(c.name.clone().into()),
             ty: c.ty,
-            ty_str: c.ty.to_string(),
+            ty_str: c.ty.to_string().into(),
             is_rowid_alias: c.is_rowid_alias,
             primary_key: false,
             notnull: false,
@@ -1234,7 +1234,7 @@ mod tests {
     fn _create_btree_table(name: &str, columns: Vec<Column>) -> Rc<BTreeTable> {
         Rc::new(BTreeTable {
             root_page: 1, // Page number doesn't matter for tests
-            name: name.to_string(),
+            name: name.to_string().into(),
             primary_key_columns: vec![],
             columns,
             has_rowid: true,

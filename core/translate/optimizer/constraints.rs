@@ -172,7 +172,7 @@ fn estimate_selectivity(column: &Column, op: ast::Operator) -> f64 {
 pub fn constraints_from_where_clause(
     where_clause: &[WhereTerm],
     table_references: &[TableReference],
-    available_indexes: &HashMap<String, Vec<Arc<Index>>>,
+    available_indexes: &HashMap<Box<str>, Vec<Arc<Index>>>,
 ) -> Result<Vec<TableConstraints>> {
     let mut constraints = Vec::new();
 

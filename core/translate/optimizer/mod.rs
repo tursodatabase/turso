@@ -129,7 +129,7 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
 /// Returns the join order if it was optimized, or None if the default join order was considered best.
 fn optimize_table_access(
     table_references: &mut [TableReference],
-    available_indexes: &HashMap<String, Vec<Arc<Index>>>,
+    available_indexes: &HashMap<Box<str>, Vec<Arc<Index>>>,
     where_clause: &mut Vec<WhereTerm>,
     order_by: &mut Option<Vec<(ast::Expr, SortOrder)>>,
     group_by: &mut Option<GroupBy>,
@@ -777,11 +777,12 @@ fn ephemeral_index_build(
             "ephemeral_{}_{}",
             table_reference.table.get_name(),
             table_index
-        ),
+        )
+        .into(),
         columns: ephemeral_columns,
         unique: false,
         ephemeral: true,
-        table_name: table_reference.table.get_name().to_string(),
+        table_name: table_reference.table.get_name().into(),
         root_page: 0,
     };
 
@@ -1241,11 +1242,11 @@ pub fn rewrite_expr(expr: &mut ast::Expr, param_idx: &mut usize) -> Result<()> {
         ast::Expr::Id(id) => {
             // Convert "true" and "false" to 1 and 0
             if id.0.eq_ignore_ascii_case("true") {
-                *expr = ast::Expr::Literal(ast::Literal::Numeric(1.to_string()));
+                *expr = ast::Expr::Literal(ast::Literal::numeric("1"));
                 return Ok(());
             }
             if id.0.eq_ignore_ascii_case("false") {
-                *expr = ast::Expr::Literal(ast::Literal::Numeric(0.to_string()));
+                *expr = ast::Expr::Literal(ast::Literal::numeric("0"));
                 return Ok(());
             }
             Ok(())
@@ -1254,7 +1255,7 @@ pub fn rewrite_expr(expr: &mut ast::Expr, param_idx: &mut usize) -> Result<()> {
             if var.is_empty() {
                 // rewrite anonymous variables only, ensure that the `param_idx` starts at 1 and
                 // all the expressions are rewritten in the order they come in the statement
-                *expr = ast::Expr::Variable(format!("{}{param_idx}", PARAM_PREFIX));
+                *expr = ast::Expr::Variable(format!("{}{param_idx}", PARAM_PREFIX).into());
                 *param_idx += 1;
             }
             Ok(())

@@ -120,12 +120,12 @@ pub fn prepare_select_plan<'a>(
                         }
                     }
                     ResultColumn::TableStar(name) => {
-                        let name_normalized = normalize_ident(name.0.as_str());
+                        let name_normalized = normalize_ident(name.0.as_ref());
                         let referenced_table = plan
                             .table_references
                             .iter_mut()
                             .enumerate()
-                            .find(|(_, t)| t.identifier == name_normalized);
+                            .find(|(_, t)| t.identifier.to_string() == name_normalized);
 
                         if referenced_table.is_none() {
                             crate::bail_parse_error!("Table {} not found", name.0);
@@ -170,16 +170,14 @@ pub fn prepare_select_plan<'a>(
                                     0
                                 };
                                 match Func::resolve_function(
-                                    normalize_ident(name.0.as_str()).as_str(),
+                                    normalize_ident(name.0.as_ref()).as_str(),
                                     args_count,
                                 ) {
                                     Ok(Func::Agg(f)) => {
                                         let agg_args = match (args, &f) {
                                             (None, crate::function::AggFunc::Count0) => {
                                                 // COUNT() case
-                                                vec![ast::Expr::Literal(ast::Literal::Numeric(
-                                                    "1".to_string(),
-                                                ))]
+                                                vec![ast::Expr::Literal(ast::Literal::numeric("1"))]
                                             }
                                             (None, _) => crate::bail_parse_error!(
                                                 "Aggregate function {} requires arguments",
@@ -267,14 +265,12 @@ pub fn prepare_select_plan<'a>(
                                 filter_over: _,
                             } => {
                                 if let Ok(Func::Agg(f)) = Func::resolve_function(
-                                    normalize_ident(name.0.as_str()).as_str(),
+                                    normalize_ident(name.0.as_ref()).as_str(),
                                     0,
                                 ) {
                                     let agg = Aggregate {
                                         func: f,
-                                        args: vec![ast::Expr::Literal(ast::Literal::Numeric(
-                                            "1".to_string(),
-                                        ))],
+                                        args: vec![ast::Expr::Literal(ast::Literal::numeric("1"))],
                                         original_expr: expr.clone(),
                                     };
                                     aggregate_expressions.push(agg.clone());

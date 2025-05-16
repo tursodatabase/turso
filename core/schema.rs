@@ -13,18 +13,18 @@ use std::sync::Arc;
 use tracing::trace;
 
 pub struct Schema {
-    pub tables: HashMap<String, Arc<Table>>,
+    pub tables: HashMap<Box<str>, Arc<Table>>,
     // table_name to list of indexes for the table
-    pub indexes: HashMap<String, Vec<Arc<Index>>>,
+    pub indexes: HashMap<Box<str>, Vec<Arc<Index>>>,
 }
 
 impl Schema {
     pub fn new() -> Self {
-        let mut tables: HashMap<String, Arc<Table>> = HashMap::new();
-        let indexes: HashMap<String, Vec<Arc<Index>>> = HashMap::new();
+        let mut tables: HashMap<Box<str>, Arc<Table>> = HashMap::new();
+        let indexes: HashMap<Box<str>, Vec<Arc<Index>>> = HashMap::new();
         #[allow(clippy::arc_with_non_send_sync)]
         tables.insert(
-            "sqlite_schema".to_string(),
+            "sqlite_schema".into(),
             Arc::new(Table::BTree(sqlite_schema_table().into())),
         );
         Self { tables, indexes }
@@ -34,32 +34,33 @@ impl Schema {
         !self
             .indexes
             .iter()
-            .any(|idx| idx.1.iter().any(|i| i.name == name))
+            .any(|idx| idx.1.iter().any(|i| i.name.as_ref() == name))
     }
 
     pub fn add_btree_table(&mut self, table: Rc<BTreeTable>) {
         let name = normalize_ident(&table.name);
-        self.tables.insert(name, Table::BTree(table).into());
+        self.tables.insert(name.into(), Table::BTree(table).into());
     }
 
     pub fn add_virtual_table(&mut self, table: Rc<VirtualTable>) {
         let name = normalize_ident(&table.name);
-        self.tables.insert(name, Table::Virtual(table).into());
+        self.tables
+            .insert(name.into(), Table::Virtual(table).into());
     }
 
     pub fn get_table(&self, name: &str) -> Option<Arc<Table>> {
         let name = normalize_ident(name);
-        self.tables.get(&name).cloned()
+        self.tables.get(name.as_str()).cloned()
     }
 
     pub fn remove_table(&mut self, table_name: &str) {
         let name = normalize_ident(table_name);
-        self.tables.remove(&name);
+        self.tables.remove(name.as_str());
     }
 
     pub fn get_btree_table(&self, name: &str) -> Option<Rc<BTreeTable>> {
         let name = normalize_ident(name);
-        if let Some(table) = self.tables.get(&name) {
+        if let Some(table) = self.tables.get(name.as_str()) {
             table.btree()
         } else {
             None
@@ -69,7 +70,7 @@ impl Schema {
     pub fn add_index(&mut self, index: Arc<Index>) {
         let table_name = normalize_ident(&index.table_name);
         self.indexes
-            .entry(table_name)
+            .entry(table_name.into())
             .or_default()
             .push(index.clone())
     }
@@ -77,27 +78,27 @@ impl Schema {
     pub fn get_indices(&self, table_name: &str) -> &[Arc<Index>] {
         let name = normalize_ident(table_name);
         self.indexes
-            .get(&name)
+            .get(name.as_str())
             .map_or_else(|| &[] as &[Arc<Index>], |v| v.as_slice())
     }
 
     pub fn get_index(&self, table_name: &str, index_name: &str) -> Option<&Arc<Index>> {
         let name = normalize_ident(table_name);
         self.indexes
-            .get(&name)?
+            .get(name.as_str())?
             .iter()
-            .find(|index| index.name == index_name)
+            .find(|index| index.name.as_ref() == index_name)
     }
 
     pub fn remove_indices_for_table(&mut self, table_name: &str) {
         let name = normalize_ident(table_name);
-        self.indexes.remove(&name);
+        self.indexes.remove(name.as_str());
     }
 
     pub fn remove_index(&mut self, idx: &Index) {
         let name = normalize_ident(&idx.table_name);
         self.indexes
-            .get_mut(&name)
+            .get_mut(name.as_str())
             .expect("Must have the index")
             .retain_mut(|other_idx| other_idx.name != idx.name);
     }
@@ -173,7 +174,7 @@ impl PartialEq for Table {
 #[derive(Clone, Debug)]
 pub struct BTreeTable {
     pub root_page: usize,
-    pub name: String,
+    pub name: Box<str>,
     pub primary_key_columns: Vec<(String, SortOrder)>,
     pub columns: Vec<Column>,
     pub has_rowid: bool,
@@ -203,7 +204,7 @@ impl BTreeTable {
     pub fn get_column(&self, name: &str) -> Option<(usize, &Column)> {
         let name = normalize_ident(name);
         for (i, column) in self.columns.iter().enumerate() {
-            if column.name.as_ref().map_or(false, |n| *n == name) {
+            if column.name.as_ref().map_or(false, |n| *n.as_ref() == name) {
                 return Some((i, column));
             }
         }
@@ -253,9 +254,9 @@ impl PseudoTable {
 
     pub fn add_column(&mut self, name: &str, ty: Type, primary_key: bool) {
         self.columns.push(Column {
-            name: Some(normalize_ident(name)),
+            name: Some(normalize_ident(name).into()),
             ty,
-            ty_str: ty.to_string().to_uppercase(),
+            ty_str: ty.to_string().to_uppercase().into(),
             primary_key,
             is_rowid_alias: false,
             notnull: false,
@@ -266,7 +267,7 @@ impl PseudoTable {
     pub fn get_column(&self, name: &str) -> Option<(usize, &Column)> {
         let name = normalize_ident(name);
         for (i, column) in self.columns.iter().enumerate() {
-            if column.name.as_ref().map_or(false, |n| *n == name) {
+            if column.name.as_ref().map_or(false, |n| *n.as_ref() == name) {
                 return Some((i, column));
             }
         }
@@ -456,9 +457,9 @@ fn create_table(
                 }
 
                 cols.push(Column {
-                    name: Some(normalize_ident(&name)),
+                    name: Some(normalize_ident(&name).into()),
                     ty,
-                    ty_str,
+                    ty_str: ty_str.into(),
                     primary_key,
                     is_rowid_alias: typename_exactly_integer && primary_key,
                     notnull,
@@ -481,7 +482,7 @@ fn create_table(
     }
     Ok(BTreeTable {
         root_page,
-        name: table_name,
+        name: table_name.into(),
         has_rowid,
         primary_key_columns,
         columns: cols,
@@ -525,10 +526,10 @@ pub fn _build_pseudo_table(columns: &[ResultColumn]) -> PseudoTable {
 
 #[derive(Debug, Clone)]
 pub struct Column {
-    pub name: Option<String>,
+    pub name: Option<Box<str>>,
     pub ty: Type,
     // many sqlite operations like table_info retain the original string
-    pub ty_str: String,
+    pub ty_str: Box<str>,
     pub primary_key: bool,
     pub is_rowid_alias: bool,
     pub notnull: bool,
@@ -723,15 +724,15 @@ impl fmt::Display for Type {
 pub fn sqlite_schema_table() -> BTreeTable {
     BTreeTable {
         root_page: 1,
-        name: "sqlite_schema".to_string(),
+        name: "sqlite_schema".into(),
         has_rowid: true,
         is_strict: false,
         primary_key_columns: vec![],
         columns: vec![
             Column {
-                name: Some("type".to_string()),
+                name: Some("type".into()),
                 ty: Type::Text,
-                ty_str: "TEXT".to_string(),
+                ty_str: "TEXT".into(),
                 primary_key: false,
                 is_rowid_alias: false,
                 notnull: false,
@@ -739,9 +740,9 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 unique: false,
             },
             Column {
-                name: Some("name".to_string()),
+                name: Some("name".into()),
                 ty: Type::Text,
-                ty_str: "TEXT".to_string(),
+                ty_str: "TEXT".into(),
                 primary_key: false,
                 is_rowid_alias: false,
                 notnull: false,
@@ -749,9 +750,9 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 unique: false,
             },
             Column {
-                name: Some("tbl_name".to_string()),
+                name: Some("tbl_name".into()),
                 ty: Type::Text,
-                ty_str: "TEXT".to_string(),
+                ty_str: "TEXT".into(),
                 primary_key: false,
                 is_rowid_alias: false,
                 notnull: false,
@@ -759,9 +760,9 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 unique: false,
             },
             Column {
-                name: Some("rootpage".to_string()),
+                name: Some("rootpage".into()),
                 ty: Type::Integer,
-                ty_str: "INT".to_string(),
+                ty_str: "INT".into(),
                 primary_key: false,
                 is_rowid_alias: false,
                 notnull: false,
@@ -769,9 +770,9 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 unique: false,
             },
             Column {
-                name: Some("sql".to_string()),
+                name: Some("sql".into()),
                 ty: Type::Text,
-                ty_str: "TEXT".to_string(),
+                ty_str: "TEXT".into(),
                 primary_key: false,
                 is_rowid_alias: false,
                 notnull: false,
@@ -786,8 +787,8 @@ pub fn sqlite_schema_table() -> BTreeTable {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct Index {
-    pub name: String,
-    pub table_name: String,
+    pub name: Box<str>,
+    pub table_name: Box<str>,
     pub root_page: usize,
     pub columns: Vec<IndexColumn>,
     pub unique: bool,
@@ -797,7 +798,7 @@ pub struct Index {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct IndexColumn {
-    pub name: String,
+    pub name: Box<str>,
     pub order: SortOrder,
     /// the position of the column in the source table.
     /// for example:
@@ -830,14 +831,14 @@ impl Index {
                         )));
                     };
                     index_columns.push(IndexColumn {
-                        name,
+                        name: name.into(),
                         order: col.order.unwrap_or(SortOrder::Asc),
                         pos_in_table,
                     });
                 }
                 Ok(Index {
-                    name: index_name,
-                    table_name: normalize_ident(&tbl_name.0),
+                    name: index_name.into(),
+                    table_name: normalize_ident(&tbl_name.0).into(),
                     root_page,
                     columns: index_columns,
                     unique,
@@ -889,7 +890,7 @@ impl Index {
                     };
 
                     IndexColumn {
-                        name: normalize_ident(col_name),
+                        name: normalize_ident(col_name).into(),
                         order: order.clone(),
                         pos_in_table,
                     }
@@ -897,7 +898,7 @@ impl Index {
                 .collect::<Vec<_>>();
 
             indices.push(Index {
-                name: normalize_ident(index_name.as_str()),
+                name: normalize_ident(index_name.as_str()).into(),
                 table_name: table.name.clone(),
                 root_page,
                 columns: primary_keys,
@@ -917,17 +918,17 @@ impl Index {
                     let col_name = col.name.as_ref().unwrap();
                     if has_primary_key_index
                         && table.primary_key_columns.len() == 1
-                        && &table.primary_key_columns.first().as_ref().unwrap().0 == col_name {
+                        && &table.primary_key_columns.first().as_ref().unwrap().0 == col_name.as_ref() {
                             // skip unique columns that are satisfied with pk constraint
                             return None;
                     }
                     let (index_name, root_page) = auto_indices.next().expect("number of auto_indices in schema should be same number of indices calculated");
                     Some(Index {
-                        name: normalize_ident(index_name.as_str()),
+                        name: normalize_ident(index_name.as_str()).into(),
                         table_name: table.name.clone(),
                         root_page,
                         columns: vec![IndexColumn {
-                            name: normalize_ident(col_name),
+                            name: normalize_ident(col_name).into(),
                             order: SortOrder::Asc, // Default Sort Order
                             pos_in_table,
                         }],
@@ -991,13 +992,13 @@ impl Index {
                             );
                         };
                         IndexColumn {
-                            name: normalize_ident(col_name),
+                            name: normalize_ident(col_name).into(),
                             order: *order,
                             pos_in_table,
                         }
                     });
                     Index {
-                        name: normalize_ident(index_name.as_str()),
+                        name: normalize_ident(index_name.as_str()).into(),
                         table_name: table.name.clone(),
                         root_page,
                         columns: index_cols.collect(),
@@ -1281,7 +1282,7 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a InTeGeR);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert_eq!(column.ty_str, "INTEGER");
+        assert_eq!(column.ty_str.as_ref(), "INTEGER");
         Ok(())
     }
 
@@ -1290,7 +1291,7 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a InT);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert_eq!(column.ty_str, "INT");
+        assert_eq!(column.ty_str.as_ref(), "INT");
         Ok(())
     }
 
@@ -1299,7 +1300,7 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a bLoB);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert_eq!(column.ty_str, "BLOB");
+        assert_eq!(column.ty_str.as_ref(), "BLOB");
         Ok(())
     }
 
@@ -1308,7 +1309,7 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert_eq!(column.ty_str, "");
+        assert_eq!(column.ty_str.as_ref(), "");
         Ok(())
     }
 
@@ -1317,7 +1318,7 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a someNonsenseName);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert_eq!(column.ty_str, "someNonsenseName");
+        assert_eq!(column.ty_str.as_ref(), "someNonsenseName");
         Ok(())
     }
 
@@ -1393,14 +1394,14 @@ mod tests {
         // Create a table with a primary key column that doesn't exist in the table
         let table = BTreeTable {
             root_page: 0,
-            name: "t1".to_string(),
+            name: "t1".into(),
             has_rowid: true,
             is_strict: false,
-            primary_key_columns: vec![("nonexistent".to_string(), SortOrder::Asc)],
+            primary_key_columns: vec![("nonexistent".into(), SortOrder::Asc)],
             columns: vec![Column {
-                name: Some("a".to_string()),
+                name: Some("a".into()),
                 ty: Type::Integer,
-                ty_str: "INT".to_string(),
+                ty_str: "INT".into(),
                 primary_key: false,
                 is_rowid_alias: false,
                 notnull: false,

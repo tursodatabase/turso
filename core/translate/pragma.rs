@@ -187,7 +187,7 @@ fn query_pragma(
             program.emit_result_row(register, 1);
         }
         PragmaName::JournalMode => {
-            program.emit_string8("wal".into(), register);
+            program.emit_string8("wal", register);
             program.emit_result_row(register, 1);
         }
         PragmaName::LegacyFileFormat => {}

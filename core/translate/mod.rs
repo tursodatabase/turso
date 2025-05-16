@@ -84,7 +84,7 @@ pub fn translate(
                     let Some(btree) = table.btree() else { todo!() };
 
                     let mut btree = (*btree).clone();
-                    btree.name = rename.clone();
+                    btree.name = rename.to_string().into();
 
                     let sql = btree.to_sql();
 

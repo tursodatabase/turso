@@ -49,7 +49,7 @@ pub fn translate_insert(
     }
 
     let table_name = &tbl_name.name;
-    let table = match schema.get_table(table_name.0.as_str()) {
+    let table = match schema.get_table(table_name.0.as_ref()) {
         Some(table) => table,
         None => crate::bail_corrupt_error!("Parse error: no such table: {}", table_name),
     };
@@ -97,7 +97,7 @@ pub fn translate_insert(
                 ),
             )
         })
-        .collect::<Vec<(&String, usize, usize)>>();
+        .collect::<Vec<(&Box<str>, usize, usize)>>();
     let root_page = btree_table.root_page;
     let values = match body {
         InsertBody::Select(ref mut select, _) => match select.body.select.as_mut() {
@@ -211,7 +211,7 @@ pub fn translate_insert(
         program.emit_insn(Insn::OpenWrite {
             cursor_id: idx_cursor.2,
             root_page: idx_cursor.1.into(),
-            name: idx_cursor.0.clone(),
+            name: idx_cursor.0.clone().into(),
         });
     }
     // Common record insertion logic for both single and multiple rows
@@ -275,7 +275,7 @@ pub fn translate_insert(
 
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-            description: format!("{}.{}", table_name.0, rowid_column_name),
+            description: format!("{}.{}", table_name.0, rowid_column_name).into(),
         });
         program.preassign_label_to_next_insn(make_record_label);
     }
@@ -296,7 +296,7 @@ pub fn translate_insert(
         // find which cursor we opened earlier for this index
         let idx_cursor_id = idx_cursors
             .iter()
-            .find(|(name, _, _)| *name == &index_col_mapping.idx_name)
+            .find(|(name, _, _)| **name == index_col_mapping.idx_name)
             .map(|(_, _, c_id)| *c_id)
             .expect("no cursor found for index");
 
@@ -330,7 +330,7 @@ pub fn translate_insert(
             start_reg: idx_start_reg,
             count: num_cols + 1,
             dest_reg: record_reg,
-            index_name: Some(index_col_mapping.idx_name),
+            index_name: Some(index_col_mapping.idx_name.into()),
         });
 
         if index.unique {
@@ -366,7 +366,7 @@ pub fn translate_insert(
 
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                description: column_names,
+                description: column_names.into(),
             });
 
             program.resolve_label(label_idx_insert, program.offset());
@@ -396,7 +396,7 @@ pub fn translate_insert(
         key_reg: rowid_reg,
         record_reg: record_register,
         flag: 0,
-        table_name: table_name.to_string(),
+        table_name: table_name.0.clone(),
     });
 
     if inserting_multiple_rows {
@@ -409,7 +409,7 @@ pub fn translate_insert(
     program.resolve_label(halt_label, program.offset());
     program.emit_insn(Insn::Halt {
         err_code: 0,
-        description: String::new(),
+        description: "".into(),
     });
     program.preassign_label_to_next_insn(init_label);
 
@@ -504,7 +504,7 @@ fn resolve_columns_for_insert<'a>(
 
     // Map each named column to its value index
     for (value_index, column_name) in columns.as_ref().unwrap().iter().enumerate() {
-        let column_name = normalize_ident(column_name.0.as_str());
+        let column_name = normalize_ident(column_name.0.as_ref());
         let table_index = table_columns.iter().position(|c| {
             c.name
                 .as_ref()
@@ -530,13 +530,13 @@ fn resolve_columns_for_insert<'a>(
 /// possible value indices for each.
 #[derive(Debug, Default)]
 struct IndexColMapping {
-    idx_name: String,
+    idx_name: Box<str>,
     columns: Vec<(usize, IndexColumn)>,
     value_indicies: Vec<Option<usize>>,
 }
 
 impl IndexColMapping {
-    fn new(name: String) -> Self {
+    fn new(name: Box<str>) -> Self {
         IndexColMapping {
             idx_name: name,
             ..Default::default()
@@ -563,7 +563,7 @@ fn resolve_indicies_for_insert(
         // For each column in the index (in the order defined by the index),
         // try to find the corresponding column in the insert’s column mapping.
         for idx_col in &index.columns {
-            let target_name = normalize_ident(idx_col.name.as_str());
+            let target_name = normalize_ident(idx_col.name.as_ref());
             if let Some((i, col_mapping)) = columns.iter().enumerate().find(|(_, mapping)| {
                 mapping
                     .column
@@ -706,7 +706,7 @@ fn translate_virtual_table_insert(
     let conflict_action = on_conflict.as_ref().map(|c| c.bit_value()).unwrap_or(0) as u16;
 
     let cursor_id = program.alloc_cursor_id(
-        Some(virtual_table.name.clone()),
+        Some(virtual_table.name.clone().into()),
         CursorType::VirtualTable(virtual_table.clone()),
     );
 
@@ -722,7 +722,7 @@ fn translate_virtual_table_insert(
     program.resolve_label(halt_label, program.offset());
     program.emit_insn(Insn::Halt {
         err_code: 0,
-        description: String::new(),
+        description: "".into(),
     });
 
     program.resolve_label(init_label, program.offset());

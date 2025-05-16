@@ -28,7 +28,7 @@ pub struct ProgramBuilder {
     /// so that they get evaluated only once at the start of the program.
     pub constant_spans: Vec<(usize, usize)>,
     // Cursors that are referenced by the program. Indexed by CursorID.
-    pub cursor_ref: Vec<(Option<String>, CursorType)>,
+    pub cursor_ref: Vec<(Option<Box<str>>, CursorType)>,
     /// A vector where index=label number, value=resolved offset. Resolved in build().
     label_to_resolved_offset: Vec<Option<(InsnReference, JumpTarget)>>,
     // Bitmask of cursors that have emitted a SeekRowid instruction.
@@ -162,7 +162,7 @@ impl ProgramBuilder {
 
     pub fn alloc_cursor_id(
         &mut self,
-        table_identifier: Option<String>,
+        table_identifier: Option<Box<str>>,
         cursor_type: CursorType,
     ) -> usize {
         let cursor = self.next_free_cursor_id;
@@ -183,13 +183,19 @@ impl ProgramBuilder {
         }
     }
 
-    pub fn emit_string8(&mut self, value: String, dest: usize) {
-        self.emit_insn(Insn::String8 { value, dest });
+    pub fn emit_string8(&mut self, value: impl Into<Box<str>>, dest: usize) {
+        self.emit_insn(Insn::String8 {
+            value: value.into(),
+            dest,
+        });
     }
 
-    pub fn emit_string8_new_reg(&mut self, value: String) -> usize {
+    pub fn emit_string8_new_reg(&mut self, value: impl Into<Box<str>>) -> usize {
         let dest = self.alloc_register();
-        self.emit_insn(Insn::String8 { value, dest });
+        self.emit_insn(Insn::String8 {
+            value: value.into(),
+            dest,
+        });
         dest
     }
 
@@ -215,7 +221,7 @@ impl ProgramBuilder {
     pub fn emit_halt(&mut self) {
         self.emit_insn(Insn::Halt {
             err_code: 0,
-            description: String::new(),
+            description: String::new().into(),
         });
     }
 
@@ -226,7 +232,7 @@ impl ProgramBuilder {
     pub fn emit_halt_err(&mut self, err_code: usize, description: String) {
         self.emit_insn(Insn::Halt {
             err_code,
-            description,
+            description: description.into(),
         });
     }
 
@@ -580,7 +586,7 @@ impl ProgramBuilder {
         self.cursor_ref.iter().position(|(t_ident, _)| {
             t_ident
                 .as_ref()
-                .is_some_and(|ident| ident == table_identifier)
+                .is_some_and(|ident| ident.as_ref() == table_identifier)
         })
     }
 

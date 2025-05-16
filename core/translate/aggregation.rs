@@ -123,12 +123,14 @@ pub fn translate_aggregation_step(
                         delimiter_expr = agg.args[1].clone();
                     }
                     ast::Expr::Literal(ast::Literal::String(s)) => {
-                        delimiter_expr = ast::Expr::Literal(ast::Literal::String(s.to_string()));
+                        delimiter_expr =
+                            ast::Expr::Literal(ast::Literal::String(s.to_string().into()));
                     }
                     _ => crate::bail_parse_error!("Incorrect delimiter parameter"),
                 };
             } else {
-                delimiter_expr = ast::Expr::Literal(ast::Literal::String(String::from("\",\"")));
+                delimiter_expr =
+                    ast::Expr::Literal(ast::Literal::String(String::from("\",\"").into()));
             }
 
             translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
@@ -234,7 +236,7 @@ pub fn translate_aggregation_step(
             let delimiter_expr = match &agg.args[1] {
                 ast::Expr::Column { .. } => agg.args[1].clone(),
                 ast::Expr::Literal(ast::Literal::String(s)) => {
-                    ast::Expr::Literal(ast::Literal::String(s.to_string()))
+                    ast::Expr::Literal(ast::Literal::String(s.to_string().into()))
                 }
                 _ => crate::bail_parse_error!("Incorrect delimiter parameter"),
             };

@@ -36,7 +36,7 @@ pub fn translate_create_index(
     if !schema.is_unique_idx_name(&idx_name) {
         crate::bail_parse_error!("Error: index with name '{idx_name}' already exists.");
     }
-    let Some(tbl) = schema.tables.get(&tbl_name) else {
+    let Some(tbl) = schema.tables.get(tbl_name.as_str()) else {
         crate::bail_parse_error!("Error: table '{tbl_name}' does not exist.");
     };
     let Some(tbl) = tbl.btree() else {
@@ -49,7 +49,7 @@ pub fn translate_create_index(
     let start_offset = program.offset();
 
     let idx = Arc::new(Index {
-        name: idx_name.clone(),
+        name: idx_name.clone().into(),
         table_name: tbl.name.clone(),
         root_page: 0, //  we dont have access till its created, after we parse the schema table
         columns: columns
@@ -73,15 +73,15 @@ pub fn translate_create_index(
     // 5. pseudo_cursor_id        - pseudo table to store the sorted index values
     let sqlite_table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(
-        Some(SQLITE_TABLEID.to_owned()),
+        Some(SQLITE_TABLEID.into()),
         CursorType::BTreeTable(sqlite_table.clone()),
     );
     let btree_cursor_id = program.alloc_cursor_id(
-        Some(idx_name.to_owned()),
+        Some(idx_name.clone().into()),
         CursorType::BTreeIndex(idx.clone()),
     );
     let table_cursor_id = program.alloc_cursor_id(
-        Some(tbl_name.to_owned()),
+        Some(tbl_name.clone().into()),
         CursorType::BTreeTable(tbl.clone()),
     );
     let sorter_cursor_id = program.alloc_cursor_id(None, CursorType::Sorter);
@@ -165,7 +165,7 @@ pub fn translate_create_index(
         start_reg,
         count: columns.len() + 1,
         dest_reg: record_reg,
-        index_name: Some(idx_name.clone()),
+        index_name: Some(idx_name.clone().into()),
     });
     program.emit_insn(Insn::SorterInsert {
         cursor_id: sorter_cursor_id,
@@ -183,7 +183,7 @@ pub fn translate_create_index(
     program.emit_insn(Insn::OpenWrite {
         cursor_id: btree_cursor_id,
         root_page: RegisterOrLiteral::Register(root_page_reg),
-        name: idx_name.clone(),
+        name: idx_name.clone().into(),
     });
 
     let sorted_loop_start = program.allocate_label();
@@ -231,7 +231,7 @@ pub fn translate_create_index(
     let parse_schema_where_clause = format!("name = '{}' AND type = 'index'", idx_name);
     program.emit_insn(Insn::ParseSchema {
         db: sqlite_schema_cursor_id,
-        where_clause: Some(parse_schema_where_clause),
+        where_clause: Some(parse_schema_where_clause.into()),
     });
     // Close the final sqlite_schema cursor
     program.emit_insn(Insn::Close {
@@ -322,7 +322,7 @@ pub fn translate_drop_index(
             break;
         }
         for idx in val {
-            if idx.name == idx_name {
+            if idx.name.as_ref() == idx_name.as_str() {
                 maybe_index = Some(idx);
                 break;
             }
@@ -370,7 +370,7 @@ pub fn translate_drop_index(
     // We're going to use this cursor to search through sqlite_schema
     let sqlite_table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(
-        Some(SQLITE_TABLEID.to_owned()),
+        Some(SQLITE_TABLEID.into()),
         CursorType::BTreeTable(sqlite_table.clone()),
     );
 

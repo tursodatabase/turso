@@ -948,7 +948,7 @@ pub fn op_vcreate(
         .syms
         .borrow()
         .vtab_modules
-        .get(&module_name)
+        .get(module_name.as_str())
         .ok_or_else(|| {
             crate::LimboError::ExtensionError(format!("Module {} not found", module_name))
         })?
@@ -965,7 +965,7 @@ pub fn op_vcreate(
         conn.syms
             .borrow_mut()
             .vtabs
-            .insert(table_name, table.clone());
+            .insert(table_name.into(), table.clone());
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -1395,7 +1395,7 @@ pub fn op_type_check(
                 bail_constraint_error!(
                     "NOT NULL constraint failed: {}.{} ({})",
                     &table_reference.name,
-                    col.name.as_ref().map(|s| s.as_str()).unwrap_or(""),
+                    col.name.as_ref().map(|s| s.as_ref()).unwrap_or(""),
                     SQLITE_CONSTRAINT
                 )
             } else if col.is_rowid_alias && matches!(reg.get_owned_value(), Value::Null) {
@@ -1403,7 +1403,7 @@ pub fn op_type_check(
                 return Ok(());
             }
             let col_affinity = col.affinity();
-            let ty_str = col.ty_str.as_str();
+            let ty_str = col.ty_str.as_ref();
             let applied = apply_affinity_char(reg, col_affinity);
             let value_type = reg.get_owned_value().value_type();
             match (ty_str, value_type) {
@@ -1417,7 +1417,7 @@ pub fn op_type_check(
                     v,
                     t,
                     &table_reference.name,
-                    col.name.as_ref().map(|s| s.as_str()).unwrap_or(""),
+                    col.name.as_ref().map(|s| s.as_ref()).unwrap_or(""),
                     SQLITE_CONSTRAINT
                 ),
             };

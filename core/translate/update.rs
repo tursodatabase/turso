@@ -78,7 +78,7 @@ pub fn prepare_update_plan(
         bail_parse_error!("ON CONFLICT clause is not supported");
     }
     let table_name = &body.tbl_name.name;
-    let table = match schema.get_table(table_name.0.as_str()) {
+    let table = match schema.get_table(table_name.0.as_ref()) {
         Some(table) => table,
         None => bail_parse_error!("Parse error: no such table: {}", table_name),
     };
@@ -112,7 +112,7 @@ pub fn prepare_update_plan(
         .sets
         .iter_mut()
         .map(|set| {
-            let ident = normalize_ident(set.col_names[0].0.as_str());
+            let ident = normalize_ident(set.col_names[0].0.as_ref());
             let col_index = table
                 .columns()
                 .iter()
@@ -145,7 +145,7 @@ pub fn prepare_update_plan(
                     expr: expr.clone(),
                     alias: alias.as_ref().and_then(|a| {
                         if let ast::As::As(name) = a {
-                            Some(name.to_string())
+                            Some(name.0.clone())
                         } else {
                             None
                         }

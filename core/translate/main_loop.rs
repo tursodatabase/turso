@@ -110,7 +110,7 @@ pub fn init_loop(
                         cursor_id: table_cursor_id
                             .expect("table cursor is always opened in OperationMode::DELETE"),
                         root_page: root_page.into(),
-                        name: btree.name.clone(),
+                        name: btree.name.clone().into(),
                     });
                 }
                 (OperationMode::UPDATE, Table::BTree(btree)) => {
@@ -119,7 +119,7 @@ pub fn init_loop(
                         cursor_id: table_cursor_id
                             .expect("table cursor is always opened in OperationMode::UPDATE"),
                         root_page: root_page.into(),
-                        name: btree.name.clone(),
+                        name: btree.name.clone().into(),
                     });
                     if let Some(index_cursor_id) = index_cursor_id {
                         program.emit_insn(Insn::OpenWrite {
@@ -151,7 +151,7 @@ pub fn init_loop(
                         program.emit_insn(Insn::OpenWrite {
                             cursor_id: table_cursor_id,
                             root_page: table.table.get_root_page().into(),
-                            name: table.table.get_name().to_string(),
+                            name: table.table.get_name().to_string().into(),
                         });
                     }
                     _ => {
@@ -362,7 +362,7 @@ pub fn open_loop(
                             let reg = program.alloc_register();
                             program.emit_insn(Insn::String8 {
                                 dest: reg,
-                                value: idx_str,
+                                value: idx_str.into(),
                             });
                             Some(reg)
                         } else {

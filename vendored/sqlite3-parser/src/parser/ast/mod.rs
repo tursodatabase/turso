@@ -23,7 +23,7 @@ pub struct ParameterInfo {
     /// Number of SQL parameters in a prepared statement, like `sqlite3_bind_parameter_count`
     pub count: u32,
     /// Parameter name(s) if any
-    pub names: IndexSet<String>,
+    pub names: IndexSet<Box<str>>,
 }
 
 // https://sqlite.org/lang_expr.html#parameters
@@ -40,7 +40,7 @@ impl TokenStream for ParameterInfo {
                     if n > self.count {
                         self.count = n;
                     }
-                } else if self.names.insert(variable.to_owned()) {
+                } else if self.names.insert(variable.into()) {
                     self.count = self.count.saturating_add(1);
                 }
             }
@@ -201,7 +201,7 @@ pub struct CreateVirtualTable {
     /// module name
     pub module_name: Name,
     /// args
-    pub args: Option<Vec<String>>, // TODO smol str
+    pub args: Option<Vec<Box<str>>>, // TODO smol str
 }
 
 /// `CREATE TRIGGER
@@ -322,7 +322,7 @@ pub enum Expr {
         type_name: Option<Type>,
     },
     /// `COLLATE`: expression
-    Collate(Box<Expr>, String),
+    Collate(Box<Expr>, Box<str>),
     /// schema-name.table-name.column-name
     DoublyQualified(Name, Name, Name),
     /// `EXISTS` subquery
@@ -428,7 +428,13 @@ pub enum Expr {
     /// Unary expression
     Unary(UnaryOperator, Box<Expr>),
     /// Parameters
-    Variable(String),
+    Variable(Box<str>),
+}
+
+impl Default for Expr {
+    fn default() -> Self {
+        Self::Literal(Literal::Null)
+    }
 }
 
 impl Expr {
@@ -525,21 +531,26 @@ impl Expr {
     pub fn sub_query(query: Select) -> Self {
         Self::Subquery(Box::new(query))
     }
+
+    /// Constructor
+    pub fn variable(s: impl Into<Box<str>>) -> Self {
+        Self::Variable(s.into())
+    }
 }
 
 /// SQL literal
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Literal {
     /// Number
-    Numeric(String),
-    /// String
+    Numeric(Box<str>),
+    /// Box<str>
     // TODO Check that string is already quoted and correctly escaped
-    String(String),
+    String(Box<str>),
     /// BLOB
     // TODO Check that string is valid (only hexa)
-    Blob(String),
+    Blob(Box<str>),
     /// Keyword
-    Keyword(String),
+    Keyword(Box<str>),
     /// `NULL`
     Null,
     /// `CURRENT_DATE`
@@ -562,6 +573,10 @@ impl Literal {
         } else {
             unreachable!()
         }
+    }
+    /// Constructor
+    pub fn numeric(s: impl Into<Box<str>>) -> Self {
+        Self::Numeric(s.into())
     }
 }
 
@@ -614,7 +629,7 @@ pub enum Operator {
     BitwiseOr,
     /// `~`
     BitwiseNot,
-    /// String concatenation (`||`)
+    /// Box<str> concatenation (`||`)
     Concat,
     /// `=` or `==`
     Equals,
@@ -945,7 +960,7 @@ impl JoinOperator {
         Ok({
             let mut jt = JoinType::try_from(token.1)?;
             for n in [&n1, &n2].into_iter().flatten() {
-                jt |= JoinType::try_from(n.0.as_ref())?;
+                jt |= JoinType::try_from(n.0.as_bytes())?;
             }
             if (jt & (JoinType::INNER | JoinType::OUTER)) == (JoinType::INNER | JoinType::OUTER)
                 || (jt & (JoinType::OUTER | JoinType::LEFT | JoinType::RIGHT)) == JoinType::OUTER
@@ -1034,7 +1049,7 @@ pub struct GroupBy {
 
 /// identifier or one of several keywords or `INDEXED`
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Id(pub String);
+pub struct Id(pub Box<str>);
 
 impl Id {
     /// Constructor
@@ -1047,7 +1062,7 @@ impl Id {
 
 /// identifier or string or `CROSS` or `FULL` or `INNER` or `LEFT` or `NATURAL` or `OUTER` or `RIGHT`.
 #[derive(Clone, Debug, Eq)]
-pub struct Name(pub String); // TODO distinction between Name and "Name"/[Name]/`Name`
+pub struct Name(pub Box<str>); // TODO distinction between Name and "Name"/[Name]/`Name`
 
 impl Name {
     /// Constructor
@@ -1068,7 +1083,7 @@ impl Name {
         }
         debug_assert!(bytes.len() > 1);
         debug_assert_eq!(quote, bytes[bytes.len() - 1]);
-        let sub = &self.0.as_str()[1..bytes.len() - 1];
+        let sub = &self.0.as_ref()[1..bytes.len() - 1];
         if quote == b']' {
             return QuotedIterator(sub.bytes(), 0); // no escape
         }
@@ -1317,7 +1332,7 @@ impl ColumnDefinition {
             if truncate {
                 // str_split_whitespace_remainder
                 let new_type: Vec<&str> = split.collect();
-                col_type.name = new_type.join(" ");
+                col_type.name = new_type.join(" ").into();
             }
         }
         for constraint in &cd.constraints {
@@ -1969,13 +1984,14 @@ mod test {
     // pragma pragma_list expects this to be sorted. We can avoid allocations there if we keep
     // the list sorted.
     fn pragma_list_sorted() {
-        let pragma_strings: Vec<String> = PragmaName::iter().map(|x| x.to_string()).collect();
+        let pragma_strings: Vec<Box<str>> =
+            PragmaName::iter().map(|x| x.to_string().into()).collect();
         let mut pragma_strings_sorted = pragma_strings.clone();
         pragma_strings_sorted.sort();
         assert_eq!(pragma_strings, pragma_strings_sorted);
     }
 
     fn name(s: &'static str) -> Name {
-        Name(s.to_owned())
+        Name(s.into())
     }
 }

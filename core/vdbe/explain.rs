@@ -352,7 +352,7 @@ pub fn insn_to_str(
                     program.cursor_ref[*cursor_id]
                         .0
                         .as_ref()
-                        .unwrap_or(&format!("cursor {}", cursor_id)),
+                        .unwrap_or(&format!("cursor {}", cursor_id).into()),
                     root_page
                 ),
             ),
@@ -469,7 +469,7 @@ pub fn insn_to_str(
                     program.cursor_ref[*cursor_id]
                         .0
                         .as_ref()
-                        .unwrap_or(&format!("cursor {}", cursor_id))
+                        .unwrap_or(&format!("cursor {}", cursor_id).into())
                 ),
             ),
             Insn::Column {
@@ -478,21 +478,18 @@ pub fn insn_to_str(
                 dest,
             } => {
                 let (table_identifier, cursor_type) = &program.cursor_ref[*cursor_id];
-                let column_name: Option<&String> = match cursor_type {
+                let column_name: Option<Box<str>> = match cursor_type {
                     CursorType::BTreeTable(table) => {
-                        let name = table.columns.get(*column).unwrap().name.as_ref();
-                        name
+                        table.columns.get(*column).unwrap().name.clone()
                     }
                     CursorType::BTreeIndex(index) => {
-                        let name = &index.columns.get(*column).unwrap().name;
-                        Some(name)
+                        Some(index.columns.get(*column).unwrap().name.clone())
                     }
                     CursorType::Pseudo(pseudo_table) => {
-                        let name = pseudo_table.columns.get(*column).unwrap().name.as_ref();
-                        name
+                        pseudo_table.columns.get(*column).unwrap().name.clone()
                     }
                     CursorType::Sorter => None,
-                    CursorType::VirtualTable(v) => v.columns.get(*column).unwrap().name.as_ref(),
+                    CursorType::VirtualTable(v) => v.columns.get(*column).unwrap().name.clone(),
                 };
                 (
                     "Column",
@@ -506,8 +503,8 @@ pub fn insn_to_str(
                         dest,
                         table_identifier
                             .as_ref()
-                            .unwrap_or(&format!("cursor {}", cursor_id)),
-                        column_name.unwrap_or(&format!("column {}", *column))
+                            .unwrap_or(&format!("cursor {}", cursor_id).into()),
+                        column_name.unwrap_or(format!("column {}", *column).into())
                     ),
                 )
             }
@@ -687,7 +684,7 @@ pub fn insn_to_str(
                     &program.cursor_ref[*cursor_id]
                         .0
                         .as_ref()
-                        .unwrap_or(&format!("cursor {}", cursor_id))
+                        .unwrap_or(&format!("cursor {}", cursor_id).into())
                 ),
             ),
             Insn::IdxRowId { cursor_id, dest } => (
@@ -703,7 +700,7 @@ pub fn insn_to_str(
                     &program.cursor_ref[*cursor_id]
                         .0
                         .as_ref()
-                        .unwrap_or(&format!("cursor {}", cursor_id))
+                        .unwrap_or(&format!("cursor {}", cursor_id).into())
                 ),
             ),
             Insn::SeekRowid {
@@ -723,7 +720,7 @@ pub fn insn_to_str(
                     &program.cursor_ref[*cursor_id]
                         .0
                         .as_ref()
-                        .unwrap_or(&format!("cursor {}", cursor_id)),
+                        .unwrap_or(&format!("cursor {}", cursor_id).into()),
                     target_pc.to_debug_int()
                 ),
             ),
@@ -1244,9 +1241,9 @@ pub fn insn_to_str(
                 *db as i32,
                 0,
                 0,
-                Value::build_text(where_clause.clone().unwrap_or("NULL".to_string())),
+                Value::build_text(where_clause.clone().unwrap_or("NULL".into())),
                 0,
-                where_clause.clone().unwrap_or("NULL".to_string()),
+                where_clause.clone().unwrap_or("NULL".into()).to_string(),
             ),
             Insn::Prev {
                 cursor_id,

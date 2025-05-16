@@ -115,7 +115,7 @@ impl Database {
 impl Connection {
     fn register_scalar_function_impl(&self, name: &str, func: ScalarFunction) -> ResultCode {
         self.syms.borrow_mut().functions.insert(
-            name.to_string(),
+            name.to_string().into(),
             Rc::new(ExternalFunc::new_scalar(name.to_string(), func)),
         );
         ResultCode::OK
@@ -128,7 +128,7 @@ impl Connection {
         func: ExternAggFunc,
     ) -> ResultCode {
         self.syms.borrow_mut().functions.insert(
-            name.to_string(),
+            name.to_string().into(),
             Rc::new(ExternalFunc::new_aggregate(name.to_string(), args, func)),
         );
         ResultCode::OK
@@ -148,7 +148,7 @@ impl Connection {
         self.syms
             .borrow_mut()
             .vtab_modules
-            .insert(name.to_string(), vmodule.into());
+            .insert(name.to_string().into(), vmodule.into());
         ResultCode::OK
     }
 

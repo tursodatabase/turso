@@ -33,7 +33,7 @@ pub fn resolve_aggregates(expr: &Expr, aggs: &mut Vec<Aggregate>) -> bool {
             } else {
                 0
             };
-            match Func::resolve_function(normalize_ident(name.0.as_str()).as_str(), args_count) {
+            match Func::resolve_function(normalize_ident(name.0.as_ref()).as_str(), args_count) {
                 Ok(Func::Agg(f)) => {
                     aggs.push(Aggregate {
                         func: f,
@@ -55,7 +55,7 @@ pub fn resolve_aggregates(expr: &Expr, aggs: &mut Vec<Aggregate>) -> bool {
         }
         Expr::FunctionCallStar { name, .. } => {
             if let Ok(Func::Agg(f)) =
-                Func::resolve_function(normalize_ident(name.0.as_str()).as_str(), 0)
+                Func::resolve_function(normalize_ident(name.0.as_ref()).as_str(), 0)
             {
                 aggs.push(Aggregate {
                     func: f,
@@ -95,7 +95,7 @@ pub fn bind_column_references(
             if id.0.eq_ignore_ascii_case("true") || id.0.eq_ignore_ascii_case("false") {
                 return Ok(());
             }
-            let normalized_id = normalize_ident(id.0.as_str());
+            let normalized_id = normalize_ident(id.0.as_ref());
 
             if !referenced_tables.is_empty() {
                 if let Some(row_id_expr) =
@@ -146,7 +146,7 @@ pub fn bind_column_references(
             crate::bail_parse_error!("Column {} not found", id.0);
         }
         Expr::Qualified(tbl, id) => {
-            let normalized_table_name = normalize_ident(tbl.0.as_str());
+            let normalized_table_name = normalize_ident(tbl.0.as_ref());
             let matching_tbl_idx = referenced_tables
                 .iter()
                 .position(|t| t.identifier.eq_ignore_ascii_case(&normalized_table_name));
@@ -154,7 +154,7 @@ pub fn bind_column_references(
                 crate::bail_parse_error!("Table {} not found", normalized_table_name);
             }
             let tbl_idx = matching_tbl_idx.unwrap();
-            let normalized_id = normalize_ident(id.0.as_str());
+            let normalized_id = normalize_ident(id.0.as_ref());
 
             if let Some(row_id_expr) = parse_row_id(&normalized_id, tbl_idx, || false)? {
                 *expr = row_id_expr;
@@ -290,7 +290,7 @@ fn parse_from_clause_table<'a>(
 ) -> Result<()> {
     match table {
         ast::SelectTable::Table(qualified_name, maybe_alias, _) => {
-            let normalized_qualified_name = normalize_ident(qualified_name.name.0.as_str());
+            let normalized_qualified_name = normalize_ident(qualified_name.name.0.as_ref());
             // Check if the FROM clause table is referring to a CTE in the current scope.
             if let Some(cte) = scope
                 .ctes
@@ -299,8 +299,11 @@ fn parse_from_clause_table<'a>(
             {
                 // CTE can be rewritten as a subquery.
                 // TODO: find a way not to clone the CTE plan here.
-                let cte_table =
-                    TableReference::new_subquery(cte.name.clone(), cte.plan.clone(), None);
+                let cte_table = TableReference::new_subquery(
+                    cte.name.to_string().into(),
+                    cte.plan.clone(),
+                    None,
+                );
                 scope.tables.push(cte_table);
                 return Ok(());
             };
@@ -327,7 +330,7 @@ fn parse_from_clause_table<'a>(
                         index: None,
                     },
                     table: tbl_ref,
-                    identifier: alias.unwrap_or(normalized_qualified_name),
+                    identifier: alias.unwrap_or(normalized_qualified_name.into()),
                     join_info: None,
                     col_used_mask: ColumnUsedMask::new(),
                 });
@@ -339,7 +342,7 @@ fn parse_from_clause_table<'a>(
                 if let Some(table_ref_idx) = outer_scope
                     .tables
                     .iter()
-                    .position(|t| t.identifier == normalized_qualified_name)
+                    .position(|t| t.identifier.as_ref() == normalized_qualified_name.as_str())
                 {
                     // TODO: avoid cloning the table reference here.
                     scope.tables.push(outer_scope.tables[table_ref_idx].clone());
@@ -351,8 +354,11 @@ fn parse_from_clause_table<'a>(
                     .find(|cte| cte.name == normalized_qualified_name)
                 {
                     // TODO: avoid cloning the CTE plan here.
-                    let cte_table =
-                        TableReference::new_subquery(cte.name.clone(), cte.plan.clone(), None);
+                    let cte_table = TableReference::new_subquery(
+                        cte.name.clone().into(),
+                        cte.plan.clone(),
+                        None,
+                    );
                     scope.tables.push(cte_table);
                     return Ok(());
                 }
@@ -376,14 +382,14 @@ fn parse_from_clause_table<'a>(
                     ast::As::As(id) => id.0.clone(),
                     ast::As::Elided(id) => id.0.clone(),
                 })
-                .unwrap_or(format!("subquery_{}", cur_table_index));
+                .unwrap_or(format!("subquery_{}", cur_table_index).into());
             scope
                 .tables
                 .push(TableReference::new_subquery(identifier, subplan, None));
             Ok(())
         }
         ast::SelectTable::TableCall(qualified_name, maybe_args, maybe_alias) => {
-            let normalized_name = &normalize_ident(qualified_name.name.0.as_str());
+            let normalized_name = &normalize_ident(qualified_name.name.0.as_ref());
             let args = match maybe_args {
                 Some(ref args) => vtable_args(args),
                 None => vec![],
@@ -402,7 +408,7 @@ fn parse_from_clause_table<'a>(
                     ast::As::As(id) => id.0.clone(),
                     ast::As::Elided(id) => id.0.clone(),
                 })
-                .unwrap_or(normalized_name.to_string());
+                .unwrap_or(normalized_name.to_string().into());
 
             scope.tables.push(TableReference {
                 op: Operation::Scan {
@@ -504,7 +510,7 @@ pub fn parse_from<'a>(
             if scope
                 .tables
                 .iter()
-                .any(|t| t.identifier == cte_name_normalized)
+                .any(|t| t.identifier.as_ref() == cte_name_normalized.as_str())
             {
                 crate::bail_parse_error!("CTE name {} conflicts with table name", cte.tbl_name.0);
             }
@@ -1022,7 +1028,7 @@ fn parse_join<'a>(
             ast::JoinConstraint::Using(distinct_names) => {
                 // USING join is replaced with a list of equality predicates
                 for distinct_name in distinct_names.iter() {
-                    let name_normalized = normalize_ident(distinct_name.0.as_str());
+                    let name_normalized = normalize_ident(distinct_name.0.as_ref());
                     let cur_table_idx = scope.tables.len() - 1;
                     let left_tables = &scope.tables[..cur_table_idx];
                     assert!(!left_tables.is_empty());
@@ -1034,9 +1040,9 @@ fn parse_join<'a>(
                             .iter()
                             .enumerate()
                             .find(|(_, col)| {
-                                col.name
-                                    .as_ref()
-                                    .map_or(false, |name| *name == name_normalized)
+                                col.name.as_ref().map_or(false, |name| {
+                                    *name.as_ref() == *name_normalized.as_str()
+                                })
                             })
                             .map(|(idx, col)| (left_table_idx, idx, col));
                         if left_col.is_some() {
@@ -1052,7 +1058,7 @@ fn parse_join<'a>(
                     let right_col = right_table.columns().iter().enumerate().find(|(_, col)| {
                         col.name
                             .as_ref()
-                            .map_or(false, |name| *name == name_normalized)
+                            .map_or(false, |name| name.as_ref() == name_normalized.as_str())
                     });
                     if right_col.is_none() {
                         crate::bail_parse_error!(
