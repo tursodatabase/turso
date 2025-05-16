@@ -891,7 +891,7 @@ impl Index {
 
                     IndexColumn {
                         name: normalize_ident(col_name).into(),
-                        order: order.clone(),
+                        order: *order,
                         pos_in_table,
                     }
                 })
@@ -1264,7 +1264,7 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER NOT NULL);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert_eq!(column.notnull, true);
+        assert!(column.notnull);
         Ok(())
     }
 
@@ -1273,7 +1273,7 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert_eq!(column.notnull, false);
+        assert!(column.notnull);
         Ok(())
     }
 
@@ -1359,13 +1359,13 @@ mod tests {
 
         assert!(index.len() == 1);
         let index = index.pop().unwrap();
-        assert_eq!(index.name, "sqlite_autoindex_t1_1");
-        assert_eq!(index.table_name, "t1");
+        assert_eq!(index.name.as_ref(), "sqlite_autoindex_t1_1");
+        assert_eq!(index.table_name.as_ref(), "t1");
         assert_eq!(index.root_page, 2);
         assert!(index.unique);
         assert_eq!(index.columns.len(), 2);
-        assert_eq!(index.columns[0].name, "a");
-        assert_eq!(index.columns[1].name, "b");
+        assert_eq!(index.columns[0].name.as_ref(), "a");
+        assert_eq!(index.columns[1].name.as_ref(), "b");
         assert!(matches!(index.columns[0].order, SortOrder::Asc));
         assert!(matches!(index.columns[1].order, SortOrder::Asc));
         Ok(())
@@ -1429,12 +1429,12 @@ mod tests {
         assert!(index.len() == 1);
         let index = index.pop().unwrap();
 
-        assert_eq!(index.name, "sqlite_autoindex_t1_1");
-        assert_eq!(index.table_name, "t1");
+        assert_eq!(index.name.as_ref(), "sqlite_autoindex_t1_1");
+        assert_eq!(index.table_name.as_ref(), "t1");
         assert_eq!(index.root_page, 2);
         assert!(index.unique);
         assert_eq!(index.columns.len(), 1);
-        assert_eq!(index.columns[0].name, "y");
+        assert_eq!(index.columns[0].name.as_ref(), "y");
         assert!(matches!(index.columns[0].order, SortOrder::Asc));
         Ok(())
     }
@@ -1453,15 +1453,15 @@ mod tests {
 
         for (pos, index) in indices.iter().enumerate() {
             let (index_name, root_page) = &auto_indices[pos];
-            assert_eq!(index.name, *index_name);
-            assert_eq!(index.table_name, "t1");
+            assert_eq!(index.name.as_ref(), *index_name);
+            assert_eq!(index.table_name.as_ref(), "t1");
             assert_eq!(index.root_page, *root_page);
             assert!(index.unique);
             assert_eq!(index.columns.len(), 1);
             if pos == 0 {
-                assert_eq!(index.columns[0].name, "x");
+                assert_eq!(index.columns[0].name.as_ref(), "x");
             } else if pos == 1 {
-                assert_eq!(index.columns[0].name, "y");
+                assert_eq!(index.columns[0].name.as_ref(), "y");
             }
 
             assert!(matches!(index.columns[0].order, SortOrder::Asc));
@@ -1485,21 +1485,21 @@ mod tests {
 
         for (pos, index) in indices.iter().enumerate() {
             let (index_name, root_page) = &auto_indices[pos];
-            assert_eq!(index.name, *index_name);
-            assert_eq!(index.table_name, "t1");
+            assert_eq!(index.name.as_ref(), *index_name);
+            assert_eq!(index.table_name.as_ref(), "t1");
             assert_eq!(index.root_page, *root_page);
             assert!(index.unique);
 
             if pos == 0 {
                 assert_eq!(index.columns.len(), 1);
-                assert_eq!(index.columns[0].name, "a");
+                assert_eq!(index.columns[0].name.as_ref(), "a");
             } else if pos == 1 {
                 assert_eq!(index.columns.len(), 1);
-                assert_eq!(index.columns[0].name, "b");
+                assert_eq!(index.columns[0].name.as_ref(), "b");
             } else if pos == 2 {
                 assert_eq!(index.columns.len(), 2);
-                assert_eq!(index.columns[0].name, "c");
-                assert_eq!(index.columns[1].name, "d");
+                assert_eq!(index.columns[0].name.as_ref(), "c");
+                assert_eq!(index.columns[1].name.as_ref(), "d");
             }
 
             assert!(matches!(index.columns[0].order, SortOrder::Asc));
@@ -1520,14 +1520,14 @@ mod tests {
         assert!(index.len() == 1);
         let index = index.pop().unwrap();
 
-        assert_eq!(index.name, "sqlite_autoindex_t1_1");
-        assert_eq!(index.table_name, "t1");
+        assert_eq!(index.name.as_ref(), "sqlite_autoindex_t1_1");
+        assert_eq!(index.table_name.as_ref(), "t1");
         assert_eq!(index.root_page, 2);
         assert!(index.unique);
         assert_eq!(index.columns.len(), 2);
-        assert_eq!(index.columns[0].name, "a");
+        assert_eq!(index.columns[0].name.as_ref(), "a");
         assert!(matches!(index.columns[0].order, SortOrder::Asc));
-        assert_eq!(index.columns[1].name, "b");
+        assert_eq!(index.columns[1].name.as_ref(), "b");
         assert!(matches!(index.columns[1].order, SortOrder::Asc));
 
         Ok(())

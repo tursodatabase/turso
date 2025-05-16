@@ -300,8 +300,6 @@ pub fn check_literal_equivalency(lhs: &Literal, rhs: &Literal) -> bool {
 /// This function is used to determine whether two expressions are logically
 /// equivalent in the context of queries, even if their representations
 /// differ. e.g.: `SUM(x)` and `sum(x)`, `x + y` and `y + x`
-///
-/// *Note*: doesn't attempt to evaluate/compute "constexpr" results
 pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
     match (expr1, expr2) {
         (
@@ -1248,13 +1246,13 @@ pub mod tests {
             lhs: Box::new(Expr::Id(Id("age".into()))),
             not: false,
             start: Box::new(Expr::Literal(Literal::numeric("18"))),
-            end: Box::new(Expr::Literal(Literal::numeric("65".into()))),
+            end: Box::new(Expr::Literal(Literal::numeric("65"))),
         };
         let expr2 = Expr::Between {
             lhs: Box::new(Expr::Id(Id("age".into()))),
             not: false,
-            start: Box::new(Expr::Literal(Literal::numeric("18".into()))),
-            end: Box::new(Expr::Literal(Literal::numeric("65".into()))),
+            start: Box::new(Expr::Literal(Literal::numeric("18"))),
+            end: Box::new(Expr::Literal(Literal::numeric("65"))),
         };
         assert!(exprs_are_equivalent(&expr1, &expr2));
 
