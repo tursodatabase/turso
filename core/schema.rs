@@ -922,7 +922,7 @@ impl Index {
                     let col_name = col.name.as_ref().unwrap();
                     if has_primary_key_index
                         && table.primary_key_columns.len() == 1
-                        && &table.primary_key_columns.first().as_ref().unwrap().0 == col_name.as_ref() {
+                        && &table.primary_key_columns.first().as_ref().unwrap().0 == col_name {
                             // skip unique columns that are satisfied with pk constraint
                             return None;
                     }
@@ -977,7 +977,7 @@ impl Index {
                             .all(|col| set.contains(col))
                     {
                         // skip unique columns that are satisfied with pk constraint
-                        return false;
+                        false
                     } else {
                         true
                     }
@@ -1543,12 +1543,12 @@ mod tests {
         assert!(index.len() == 1);
         let index = index.pop().unwrap();
 
-        assert_eq!(index.name, "sqlite_autoindex_t1_1");
-        assert_eq!(index.table_name, "t1");
+        assert_eq!(index.name.as_ref(), "sqlite_autoindex_t1_1");
+        assert_eq!(index.table_name.as_ref(), "t1");
         assert_eq!(index.root_page, 2);
         assert!(index.unique);
         assert_eq!(index.columns.len(), 1);
-        assert_eq!(index.columns[0].name, "a");
+        assert_eq!(index.columns[0].name.as_ref(), "a");
         assert!(matches!(index.columns[0].order, SortOrder::Asc));
 
         Ok(())
@@ -1566,13 +1566,13 @@ mod tests {
         assert!(index.len() == 1);
         let index = index.pop().unwrap();
 
-        assert_eq!(index.name, "sqlite_autoindex_t1_1");
-        assert_eq!(index.table_name, "t1");
+        assert_eq!(index.name.as_ref(), "sqlite_autoindex_t1_1");
+        assert_eq!(index.table_name.as_ref(), "t1");
         assert_eq!(index.root_page, 2);
         assert!(index.unique);
         assert_eq!(index.columns.len(), 2);
-        assert_eq!(index.columns[0].name, "a");
-        assert_eq!(index.columns[1].name, "b");
+        assert_eq!(index.columns[0].name.as_ref(), "a");
+        assert_eq!(index.columns[1].name.as_ref(), "b");
         assert!(matches!(index.columns[0].order, SortOrder::Asc));
 
         Ok(())
@@ -1592,21 +1592,21 @@ mod tests {
 
         assert!(indexes.len() == 2);
         let index = indexes.pop().unwrap();
-        assert_eq!(index.name, "sqlite_autoindex_t1_2");
-        assert_eq!(index.table_name, "t1");
+        assert_eq!(index.name.as_ref(), "sqlite_autoindex_t1_2");
+        assert_eq!(index.table_name.as_ref(), "t1");
         assert_eq!(index.root_page, 3);
         assert!(index.unique);
         assert_eq!(index.columns.len(), 1);
-        assert_eq!(index.columns[0].name, "a");
+        assert_eq!(index.columns[0].name.as_ref(), "a");
         assert!(matches!(index.columns[0].order, SortOrder::Asc));
 
         let index = indexes.pop().unwrap();
-        assert_eq!(index.name, "sqlite_autoindex_t1_1");
-        assert_eq!(index.table_name, "t1");
+        assert_eq!(index.name.as_ref(), "sqlite_autoindex_t1_1");
+        assert_eq!(index.table_name.as_ref(), "t1");
         assert_eq!(index.root_page, 2);
         assert!(index.unique);
         assert_eq!(index.columns.len(), 1);
-        assert_eq!(index.columns[0].name, "b");
+        assert_eq!(index.columns[0].name.as_ref(), "b");
         assert!(matches!(index.columns[0].order, SortOrder::Asc));
 
         Ok(())
