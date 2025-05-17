@@ -175,11 +175,11 @@ impl PartialEq for Table {
 pub struct BTreeTable {
     pub root_page: usize,
     pub name: Box<str>,
-    pub primary_key_columns: Vec<(String, SortOrder)>,
+    pub primary_key_columns: Vec<(Box<str>, SortOrder)>,
     pub columns: Vec<Column>,
     pub has_rowid: bool,
     pub is_strict: bool,
-    pub unique_sets: Option<Vec<Vec<(String, SortOrder)>>>,
+    pub unique_sets: Option<Vec<Vec<(Box<str>, SortOrder)>>>,
 }
 
 impl BTreeTable {
@@ -204,7 +204,11 @@ impl BTreeTable {
     pub fn get_column(&self, name: &str) -> Option<(usize, &Column)> {
         let name = normalize_ident(name);
         for (i, column) in self.columns.iter().enumerate() {
-            if column.name.as_ref().map_or(false, |n| *n.as_ref() == name) {
+            if column
+                .name
+                .as_ref()
+                .map_or(false, |n| n.as_ref() == name.as_str())
+            {
                 return Some((i, column));
             }
         }
@@ -277,7 +281,7 @@ impl PseudoTable {
 
 #[derive(Debug, Eq)]
 struct UniqueColumnProps {
-    column_name: String,
+    column_name: Box<str>,
     order: SortOrder,
 }
 
@@ -327,9 +331,9 @@ fn create_table(
                     {
                         for column in columns {
                             let col_name = match column.expr {
-                                Expr::Id(id) => normalize_ident(&id.0),
+                                Expr::Id(id) => normalize_ident(&id.0).into(),
                                 Expr::Literal(Literal::String(value)) => {
-                                    value.trim_matches('\'').to_owned()
+                                    value.trim_matches('\'').to_owned().into()
                                 }
                                 _ => {
                                     todo!("Unsupported primary key expression");
@@ -350,7 +354,7 @@ fn create_table(
                             .into_iter()
                             .map(|column| {
                                 let column_name = match column.expr {
-                                    Expr::Id(id) => normalize_ident(&id.0),
+                                    Expr::Id(id) => normalize_ident(&id.0).into(),
                                     _ => {
                                         todo!("Unsupported unique expression");
                                     }
@@ -366,7 +370,7 @@ fn create_table(
                 }
             }
             for (col_name, col_def) in columns {
-                let name = col_name.0.to_string();
+                let name = col_name.0;
                 // Regular sqlite tables have an integer rowid that uniquely identifies a row.
                 // Even if you create a table with a column e.g. 'id INT PRIMARY KEY', there will still
                 // be a separate hidden rowid, and the 'id' column will have a separate index built for it.
@@ -427,7 +431,7 @@ fn create_table(
                         } => {
                             primary_key = true;
                             if let Some(o) = o {
-                                order = o.clone();
+                                order = *o;
                             }
                         }
                         limbo_sqlite3_parser::ast::ColumnConstraint::NotNull { .. } => {
@@ -451,7 +455,7 @@ fn create_table(
                     primary_key_columns.push((name.clone(), order));
                 } else if primary_key_columns
                     .iter()
-                    .any(|(col_name, _)| col_name == &name)
+                    .any(|(col_name, _)| *col_name == name)
                 {
                     primary_key = true;
                 }
@@ -1147,7 +1151,7 @@ mod tests {
         let column = table.get_column("c").unwrap().1;
         assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
         assert_eq!(
-            vec![("a".to_string(), SortOrder::Asc)],
+            vec![("a".into(), SortOrder::Asc)],
             table.primary_key_columns,
             "primary key column names should be ['a']"
         );
@@ -1165,10 +1169,7 @@ mod tests {
         let column = table.get_column("c").unwrap().1;
         assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
         assert_eq!(
-            vec![
-                ("a".to_string(), SortOrder::Asc),
-                ("b".to_string(), SortOrder::Asc)
-            ],
+            vec![("a".into(), SortOrder::Asc), ("b".into(), SortOrder::Asc)],
             table.primary_key_columns,
             "primary key column names should be ['a', 'b']"
         );
@@ -1186,7 +1187,7 @@ mod tests {
         let column = table.get_column("c").unwrap().1;
         assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
         assert_eq!(
-            vec![("a".to_string(), SortOrder::Desc)],
+            vec![("a".into(), SortOrder::Desc)],
             table.primary_key_columns,
             "primary key column names should be ['a']"
         );
@@ -1204,10 +1205,7 @@ mod tests {
         let column = table.get_column("c").unwrap().1;
         assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
         assert_eq!(
-            vec![
-                ("a".to_string(), SortOrder::Asc),
-                ("b".to_string(), SortOrder::Desc)
-            ],
+            vec![("a".into(), SortOrder::Asc), ("b".into(), SortOrder::Desc)],
             table.primary_key_columns,
             "primary key column names should be ['a', 'b']"
         );
@@ -1225,7 +1223,7 @@ mod tests {
         let column = table.get_column("c").unwrap().1;
         assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
         assert_eq!(
-            vec![("a".to_string(), SortOrder::Asc)],
+            vec![("a".into(), SortOrder::Asc)],
             table.primary_key_columns,
             "primary key column names should be ['a']"
         );
@@ -1242,7 +1240,7 @@ mod tests {
         let column = table.get_column("c").unwrap().1;
         assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
         assert_eq!(
-            vec![("a".to_string(), SortOrder::Asc)],
+            vec![("a".into(), SortOrder::Asc)],
             table.primary_key_columns,
             "primary key column names should be ['a']"
         );
@@ -1269,11 +1267,11 @@ mod tests {
     }
 
     #[test]
-    pub fn test_col_notnull_negative() -> Result<()> {
+    pub fn test_col_is_nullable() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(column.notnull);
+        assert!(!column.notnull);
         Ok(())
     }
 
