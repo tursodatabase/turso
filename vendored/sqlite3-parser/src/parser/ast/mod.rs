@@ -7,6 +7,7 @@ use std::num::ParseIntError;
 use std::ops::Deref;
 use std::str::{self, Bytes, FromStr};
 
+use smol_str::SmolStr;
 use strum_macros::{EnumIter, EnumString};
 
 use fmt::{ToTokens, TokenStream};
@@ -201,7 +202,7 @@ pub struct CreateVirtualTable {
     /// module name
     pub module_name: Name,
     /// args
-    pub args: Option<Vec<String>>, // TODO smol str
+    pub args: Option<Vec<SmolStr>>,
 }
 
 /// `CREATE TRIGGER

@@ -77,6 +77,12 @@ impl ToTokens for String {
     }
 }
 
+impl ToTokens for SmolStr {
+    fn to_tokens<S: TokenStream>(&self, s: &mut S) -> Result<(), S::Error> {
+        s.append(TK_ANY, Some(self.as_ref()))
+    }
+}
+
 /* FIXME: does not work, find why
 impl Display for dyn ToTokens {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {

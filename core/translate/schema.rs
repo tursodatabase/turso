@@ -575,7 +575,7 @@ pub fn translate_create_virtual_table(
 
         // Emit string8 instructions for each arg
         for (i, arg) in args_vec.iter().enumerate() {
-            program.emit_string8(arg.clone(), args_start + i);
+            program.emit_string8(arg.to_string().clone(), args_start + i);
         }
         let args_record_reg = program.alloc_register();
 

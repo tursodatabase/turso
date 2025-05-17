@@ -14,6 +14,7 @@ pub mod parse {
 
 use crate::dialect::Token;
 use ast::{Cmd, ExplainKind, Name, Stmt};
+use smol_str::SmolStr;
 
 /// Parser error
 #[derive(Debug, PartialEq)]
@@ -61,7 +62,7 @@ pub struct Context<'input> {
     stmt: Option<Stmt>,
     constraint_name: Option<Name>,      // transient
     module_arg: Option<(usize, usize)>, // Complete text of a module argument
-    module_args: Option<Vec<String>>,   // CREATE VIRTUAL TABLE args
+    module_args: Option<Vec<SmolStr>>,  // CREATE VIRTUAL TABLE args
     done: bool,
     error: Option<ParserError>,
 }
@@ -114,11 +115,13 @@ impl<'input> Context<'input> {
     fn add_module_arg(&mut self) {
         if let Some((start, end)) = self.module_arg.take() {
             if let Ok(arg) = std::str::from_utf8(&self.input[start..end]) {
-                self.module_args.get_or_insert(vec![]).push(arg.to_owned());
+                self.module_args
+                    .get_or_insert(vec![])
+                    .push(SmolStr::new(arg));
             } // FIXME error handling
         }
     }
-    fn module_args(&mut self) -> Option<Vec<String>> {
+    fn module_args(&mut self) -> Option<Vec<SmolStr>> {
         self.add_module_arg();
         self.module_args.take()
     }
