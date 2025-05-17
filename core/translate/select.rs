@@ -125,7 +125,7 @@ pub fn prepare_select_plan<'a>(
                             .table_references
                             .iter_mut()
                             .enumerate()
-                            .find(|(_, t)| t.identifier.to_string() == name_normalized);
+                            .find(|(_, t)| *t.identifier == name_normalized);
 
                         if referenced_table.is_none() {
                             crate::bail_parse_error!("Table {} not found", name.0);
