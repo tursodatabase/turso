@@ -157,6 +157,28 @@ impl Table {
             _ => None,
         }
     }
+
+    pub fn has_rowid(&self) -> bool {
+        match self {
+            Self::BTree(tree) => tree.has_rowid,
+            _ => false,
+        }
+    }
+
+    pub fn is_strict(&self) -> bool {
+        match self {
+            Self::BTree(tree) => tree.is_strict,
+            _ => false,
+        }
+    }
+
+    pub fn show_table_type(&self) -> String {
+        match self {
+            Self::BTree(_) => "table".to_string(),
+            Self::Virtual(_) => "virtual".to_string(),
+            _ => todo!("is it view or shadow table? then they're not yet implemented"),
+        }
+    }
 }
 
 impl PartialEq for Table {

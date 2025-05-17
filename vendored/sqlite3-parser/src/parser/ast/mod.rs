@@ -1632,6 +1632,8 @@ pub enum PragmaName {
     UserVersion,
     /// trigger a checkpoint to run on database(s) if WAL is enabled
     WalCheckpoint,
+    /// Returns information about the tables and views in the schema
+    TableList,
 }
 
 /// `CREATE TRIGGER` time

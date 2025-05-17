@@ -98,6 +98,15 @@ pub fn translate_pragma(
                     &mut program,
                 )?;
             }
+            PragmaName::TableList => {
+                query_pragma(
+                    pragma,
+                    schema,
+                    Some(value),
+                    database_header.clone(),
+                    &mut program,
+                )?;
+            }
             _ => {
                 todo!()
             }
@@ -167,6 +176,9 @@ fn update_pragma(
         PragmaName::PageSize => {
             todo!("updating page_size is not yet implemented")
         }
+        PragmaName::TableList => {
+            unreachable!();
+        }
     }
 }
 
@@ -179,6 +191,54 @@ fn query_pragma(
 ) -> crate::Result<()> {
     let register = program.alloc_register();
     match pragma {
+        PragmaName::TableList => {
+            let base_reg = register;
+            program.alloc_register();
+            program.alloc_register();
+            program.alloc_register();
+            program.alloc_register();
+            program.alloc_register();
+
+            let value = match value {
+                Some(ast::Expr::Name(ref name)) => Some(normalize_ident(&name.0)),
+                Some(expr) => unreachable!("{}", expr),
+                None => None,
+            };
+
+            let mut tables: Vec<_> = schema
+                .tables
+                .values()
+                .filter(|table| {
+                    if let Some(name) = &value {
+                        name.eq_ignore_ascii_case(table.get_name())
+                    } else {
+                        true
+                    }
+                })
+                .collect();
+
+            // sort here because we need deterministic ordering when testing
+            tables.sort_by_cached_key(|t| t.get_name());
+
+            for table in tables {
+                // Show real schema name when multiple attached schemas implemented
+                program.emit_string8("main".to_string(), base_reg);
+
+                program.emit_string8(table.get_name().to_string(), base_reg + 1);
+                program.emit_string8(table.show_table_type(), base_reg + 2);
+
+                // number of columns
+                program.emit_int(table.columns().len() as i64, base_reg + 3);
+
+                // without rowid?
+                program.emit_bool(!table.has_rowid(), base_reg + 4);
+
+                // strict?
+                program.emit_bool(table.is_strict(), base_reg + 5);
+
+                program.emit_result_row(base_reg, 6);
+            }
+        }
         PragmaName::CacheSize => {
             program.emit_int(
                 database_header.lock().default_page_cache_size.into(),
