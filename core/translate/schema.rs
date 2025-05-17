@@ -346,11 +346,11 @@ fn check_automatic_pk_index_required(
                         if conflict_clause.is_some() {
                             unimplemented!("ON CONFLICT not implemented");
                         }
-                        let col_names: HashSet<String> = columns
+                        let col_names: HashSet<Box<str>> = columns
                             .iter()
                             .map(|column| match &column.expr {
                                 limbo_sqlite3_parser::ast::Expr::Id(id) => {
-                                    crate::util::normalize_ident(&id.0)
+                                    crate::util::normalize_ident(&id.0).into()
                                 }
                                 _ => {
                                     todo!("Unsupported unique expression");
@@ -438,12 +438,12 @@ fn check_automatic_pk_index_required(
 
 enum PrimaryKeyDefinitionType<'a> {
     Simple {
-        column: String,
+        column: Box<str>,
         typename: Option<&'a str>,
         is_descending: bool,
     },
     Composite {
-        columns: HashSet<String>,
+        columns: HashSet<Box<str>>,
     },
 }
 
