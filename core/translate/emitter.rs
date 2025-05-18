@@ -21,7 +21,9 @@ use super::expr::{translate_condition_expr, translate_expr, ConditionMetadata};
 use super::group_by::{
     group_by_agg_phase, group_by_emit_row_phase, init_group_by, GroupByMetadata, GroupByRowSource,
 };
-use super::main_loop::{close_loop, emit_loop, init_loop, open_loop, LeftJoinMetadata, LoopLabels};
+use super::main_loop::{
+    close_loop, emit_loop, init_distinct, init_loop, open_loop, LeftJoinMetadata, LoopLabels,
+};
 use super::order_by::{emit_order_by, init_order_by, SortMetadata};
 use super::plan::{JoinOrderMember, Operation, SelectPlan, TableReference, UpdatePlan};
 use super::schema::ParseSchema;
@@ -243,6 +245,8 @@ pub fn emit_query<'a>(
     if let Some(ref group_by) = plan.group_by {
         init_group_by(program, t_ctx, group_by, &plan)?;
     }
+
+    init_distinct(program, plan);
     init_loop(
         program,
         t_ctx,

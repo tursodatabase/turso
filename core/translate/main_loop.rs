@@ -66,6 +66,43 @@ impl LoopLabels {
     }
 }
 
+pub fn init_distinct(program: &mut ProgramBuilder, plan: &mut SelectPlan) {
+    if let Distinctness::Distinct { ctx } = &mut plan.distinctness {
+        assert!(
+            ctx.is_none(),
+            "distinctness context should not be allocated yet"
+        );
+        let index_name = format!("distinct_{}", program.offset().to_offset_int()); // we don't really care about the name that much, just enough that we don't get name collisions
+        let index = Arc::new(Index {
+            name: index_name.clone(),
+            table_name: String::new(),
+            ephemeral: true,
+            root_page: 0,
+            columns: plan
+                .result_columns
+                .iter()
+                .enumerate()
+                .map(|(i, col)| IndexColumn {
+                    name: col.expr.to_string(),
+                    order: SortOrder::Asc,
+                    pos_in_table: i,
+                    collation: None, // FIXME: this should be inferred from the expression
+                })
+                .collect(),
+            unique: false,
+            has_rowid: false,
+        });
+        *ctx = Some(DistinctCtx {
+            cursor_id: program.alloc_cursor_id(
+                Some(index_name.clone()),
+                CursorType::BTreeIndex(index.clone()),
+            ),
+            ephemeral_index_name: index_name,
+            label_on_conflict: program.allocate_label(),
+        });
+    }
+}
+
 /// Initialize resources needed for the source operators (tables, joins, etc)
 pub fn init_loop(
     program: &mut ProgramBuilder,
