@@ -411,3 +411,25 @@ do_execsql_test subquery-ignore-unused-cte {
     sub as (select first_name from users where first_name = 'Jamie' limit 1) 
     select * from sub;
 } {Jamie}
+
+# Test verifying that select distinct works (distinct ages are 1-100)
+do_execsql_test subquery-count-distinct-age {
+    select count(1) from (select distinct age from users);
+} {100}
+
+# Test verifying that select distinct works for multiple columns, and across joins
+do_execsql_test subquery-count-distinct {
+    select count(1) from (
+        select distinct first_name, name 
+        from users u join products p 
+        where u.id < 100
+    );
+} {902}
+
+do_execsql_test subquery-count-all {
+    select count(1) from (
+        select first_name, name 
+        from users u join products p 
+        where u.id < 100
+    );
+} {1089}
