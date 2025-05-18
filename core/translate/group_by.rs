@@ -773,6 +773,11 @@ pub fn group_by_emit_row_phase<'a>(
         labels.label_group_by_end_without_emitting_row,
         program.offset(),
     );
+    // SELECT DISTINCT also jumps here if there is a duplicate.
+    if let Distinctness::Distinct { ctx } = &plan.distinctness {
+        let distinct_agg_ctx = ctx.as_ref().expect("distinct context must exist");
+        program.resolve_label(distinct_agg_ctx.label_on_conflict, program.offset());
+    }
     program.emit_insn(Insn::Return {
         return_reg: registers.reg_subrtn_acc_output_return_offset,
     });

@@ -8,7 +8,7 @@ use crate::{
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::Insn,
+        insn::{IdxInsertFlags, Insn},
     },
     Result,
 };
@@ -16,7 +16,7 @@ use crate::{
 use super::{
     emitter::{Resolver, TranslateCtx},
     expr::translate_expr,
-    plan::{ResultSetColumn, SelectPlan, TableReference},
+    plan::{Distinctness, ResultSetColumn, SelectPlan, TableReference},
     result_row::{emit_offset, emit_result_row_and_limit},
 };
 
@@ -227,6 +227,7 @@ pub fn order_by_sorter_insert(
     }
     let mut cur_reg = start_reg + order_by_len;
     let mut cur_idx_in_orderby_sorter = order_by_len;
+    let mut translated_result_col_count = 0;
     for (i, rc) in result_columns.iter().enumerate() {
         if let Some(ref v) = result_columns_to_skip {
             let found = v.iter().find(|(skipped_idx, _)| *skipped_idx == i);
@@ -243,9 +244,36 @@ pub fn order_by_sorter_insert(
             cur_reg,
             resolver,
         )?;
+        translated_result_col_count += 1;
         res_col_indexes_in_orderby_sorter.insert(i, cur_idx_in_orderby_sorter);
         cur_idx_in_orderby_sorter += 1;
         cur_reg += 1;
+    }
+
+    // Handle SELECT DISTINCT deduplication
+    if let Distinctness::Distinct { ctx } = &plan.distinctness {
+        let distinct_agg_ctx = ctx.as_ref().expect("distinct context must exist");
+        let num_regs = order_by_len + translated_result_col_count;
+        program.emit_insn(Insn::Found {
+            cursor_id: distinct_agg_ctx.cursor_id,
+            target_pc: distinct_agg_ctx.label_on_conflict,
+            record_reg: start_reg,
+            num_regs,
+        });
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg,
+            count: num_regs,
+            dest_reg: record_reg,
+            index_name: Some(distinct_agg_ctx.ephemeral_index_name.to_string()),
+        });
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: distinct_agg_ctx.cursor_id,
+            record_reg: record_reg,
+            unpacked_start: None,
+            unpacked_count: None,
+            flags: IdxInsertFlags::new(),
+        });
     }
 
     let SortMetadata {

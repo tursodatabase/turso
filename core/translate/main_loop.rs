@@ -92,13 +92,19 @@ pub fn init_distinct(program: &mut ProgramBuilder, plan: &mut SelectPlan) {
             unique: false,
             has_rowid: false,
         });
+        let cursor_id = program.alloc_cursor_id(
+            Some(index_name.clone()),
+            CursorType::BTreeIndex(index.clone()),
+        );
         *ctx = Some(DistinctCtx {
-            cursor_id: program.alloc_cursor_id(
-                Some(index_name.clone()),
-                CursorType::BTreeIndex(index.clone()),
-            ),
+            cursor_id,
             ephemeral_index_name: index_name,
             label_on_conflict: program.allocate_label(),
+        });
+
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id,
+            is_table: false,
         });
     }
 }
@@ -772,16 +778,25 @@ fn emit_loop_source<'a>(
 
             Ok(())
         }
-        LoopEmitTarget::OrderBySorter => order_by_sorter_insert(
-            program,
-            &t_ctx.resolver,
-            t_ctx
-                .meta_sort
-                .as_ref()
-                .expect("sort metadata must exist for ORDER BY"),
-            &mut t_ctx.result_column_indexes_in_orderby_sorter,
-            plan,
-        ),
+        LoopEmitTarget::OrderBySorter => {
+            order_by_sorter_insert(
+                program,
+                &t_ctx.resolver,
+                t_ctx
+                    .meta_sort
+                    .as_ref()
+                    .expect("sort metadata must exist for ORDER BY"),
+                &mut t_ctx.result_column_indexes_in_orderby_sorter,
+                plan,
+            )?;
+
+            if let Distinctness::Distinct { ctx } = &plan.distinctness {
+                let distinct_agg_ctx = ctx.as_ref().expect("distinct context must exist");
+                program.preassign_label_to_next_insn(distinct_agg_ctx.label_on_conflict);
+            }
+
+            Ok(())
+        }
         LoopEmitTarget::AggStep => {
             let num_aggs = plan.aggregates.len();
             let start_reg = program.alloc_registers(num_aggs);
@@ -870,6 +885,11 @@ fn emit_loop_source<'a>(
                 t_ctx.reg_limit,
                 t_ctx.reg_limit_offset_sum,
             )?;
+
+            if let Distinctness::Distinct { ctx } = &plan.distinctness {
+                let distinct_agg_ctx = ctx.as_ref().expect("distinct context must exist");
+                program.preassign_label_to_next_insn(distinct_agg_ctx.label_on_conflict);
+            }
 
             Ok(())
         }
