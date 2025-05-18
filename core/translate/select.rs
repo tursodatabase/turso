@@ -1,7 +1,5 @@
 use super::emitter::{emit_program, TranslateCtx};
-use super::plan::{
-    select_star, AggDistinctness, JoinOrderMember, Operation, Search, SelectQueryType,
-};
+use super::plan::{select_star, Distinctness, JoinOrderMember, Operation, Search, SelectQueryType};
 use super::planner::Scope;
 use crate::function::{AggFunc, ExtFunc, Func};
 use crate::schema::Table;
@@ -56,6 +54,7 @@ pub fn prepare_select_plan<'a>(
                 from,
                 where_clause,
                 group_by,
+                distinctness,
                 ..
             } = *select_inner;
             let col_count = columns.len();
@@ -111,6 +110,7 @@ pub fn prepare_select_plan<'a>(
                 offset: None,
                 contains_constant_false_condition: false,
                 query_type: SelectQueryType::TopLevel,
+                distinctness: Distinctness::from_ast(distinctness.as_ref()),
             };
 
             let mut aggregate_expressions = Vec::new();
@@ -174,7 +174,7 @@ pub fn prepare_select_plan<'a>(
                                 } else {
                                     0
                                 };
-                                let distinctness = AggDistinctness::from_ast(distinctness.as_ref());
+                                let distinctness = Distinctness::from_ast(distinctness.as_ref());
                                 if distinctness.is_distinct() && args_count != 1 {
                                     crate::bail_parse_error!("DISTINCT aggregate functions must have exactly one argument");
                                 }
@@ -287,7 +287,7 @@ pub fn prepare_select_plan<'a>(
                                             "1".to_string(),
                                         ))],
                                         original_expr: expr.clone(),
-                                        distinctness: AggDistinctness::NonDistinct,
+                                        distinctness: Distinctness::NonDistinct,
                                     };
                                     aggregate_expressions.push(agg.clone());
                                     plan.result_columns.push(ResultSetColumn {

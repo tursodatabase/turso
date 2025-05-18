@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::{
     schema::{Index, IndexColumn, Table},
     translate::{
-        plan::{AggDistinctness, DistinctAggCtx},
+        plan::{DistinctCtx, Distinctness},
         result_row::emit_select_result,
     },
     types::SeekOp,
@@ -116,8 +116,8 @@ pub fn init_loop(
                 is_table: false,
             });
         }
-        agg.distinctness = AggDistinctness::Distinct {
-            ctx: Some(DistinctAggCtx {
+        agg.distinctness = Distinctness::Distinct {
+            ctx: Some(DistinctCtx {
                 cursor_id,
                 ephemeral_index_name: index_name,
                 label_on_conflict: program.allocate_label(),
@@ -763,7 +763,7 @@ fn emit_loop_source<'a>(
                     reg,
                     &t_ctx.resolver,
                 )?;
-                if let AggDistinctness::Distinct { ctx } = &agg.distinctness {
+                if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
                         .as_ref()
                         .expect("distinct aggregate context not populated");

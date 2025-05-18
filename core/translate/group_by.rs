@@ -20,7 +20,7 @@ use super::{
     emitter::{Resolver, TranslateCtx},
     expr::{translate_condition_expr, translate_expr, ConditionMetadata},
     order_by::order_by_sorter_insert,
-    plan::{AggDistinctness, Aggregate, GroupBy, SelectPlan, TableReference},
+    plan::{Aggregate, Distinctness, GroupBy, SelectPlan, TableReference},
     result_row::emit_select_result,
 };
 
@@ -576,7 +576,7 @@ pub fn group_by_process_single_group(
             agg_result_reg,
             &t_ctx.resolver,
         )?;
-        if let AggDistinctness::Distinct { ctx } = &agg.distinctness {
+        if let Distinctness::Distinct { ctx } = &agg.distinctness {
             let ctx = ctx
                 .as_ref()
                 .expect("distinct aggregate context not populated");
@@ -924,7 +924,7 @@ pub fn group_by_emit_row_phase<'a>(
     plan.aggregates
         .iter()
         .filter_map(|agg| {
-            if let AggDistinctness::Distinct { ctx } = &agg.distinctness {
+            if let Distinctness::Distinct { ctx } = &agg.distinctness {
                 Some(ctx)
             } else {
                 None

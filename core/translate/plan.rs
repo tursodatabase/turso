@@ -292,6 +292,42 @@ impl Default for JoinOrderMember {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+
+/// Whether a column is DISTINCT or not.
+pub enum Distinctness {
+    /// The column is not a DISTINCT column.
+    NonDistinct,
+    /// The column is a DISTINCT column,
+    /// and includes a translation context for handling duplicates.
+    Distinct { ctx: Option<DistinctCtx> },
+}
+
+impl Distinctness {
+    pub fn from_ast(distinctness: Option<&ast::Distinctness>) -> Self {
+        match distinctness {
+            Some(ast::Distinctness::Distinct) => Self::Distinct { ctx: None },
+            Some(ast::Distinctness::All) => Self::NonDistinct,
+            None => Self::NonDistinct,
+        }
+    }
+    pub fn is_distinct(&self) -> bool {
+        matches!(self, Distinctness::Distinct { .. })
+    }
+}
+
+/// Translation context for handling DISTINCT columns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DistinctCtx {
+    /// The cursor ID for the ephemeral index opened for the purpose of deduplicating results.
+    pub cursor_id: usize,
+    /// The index name for the ephemeral index, needed to lookup the cursor ID.
+    pub ephemeral_index_name: String,
+    /// The label for the on conflict branch.
+    /// When a duplicate is found, the program will jump to the offset this label points to.
+    pub label_on_conflict: BranchOffset,
+}
+
 #[derive(Debug, Clone)]
 pub struct SelectPlan {
     /// List of table references in loop order, outermost first.
@@ -317,6 +353,8 @@ pub struct SelectPlan {
     pub contains_constant_false_condition: bool,
     /// query type (top level or subquery)
     pub query_type: SelectQueryType,
+    /// whether the query is DISTINCT
+    pub distinctness: Distinctness,
 }
 
 impl SelectPlan {
@@ -800,46 +838,11 @@ pub enum Search {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-
-pub enum AggDistinctness {
-    /// The aggregate is not a DISTINCT aggregate.
-    NonDistinct,
-    /// The aggregate is a DISTINCT aggregate.
-    Distinct { ctx: Option<DistinctAggCtx> },
-}
-
-impl AggDistinctness {
-    pub fn from_ast(distinctness: Option<&ast::Distinctness>) -> Self {
-        match distinctness {
-            Some(ast::Distinctness::Distinct) => Self::Distinct { ctx: None },
-            Some(ast::Distinctness::All) => Self::NonDistinct,
-            None => Self::NonDistinct,
-        }
-    }
-    pub fn is_distinct(&self) -> bool {
-        matches!(self, AggDistinctness::Distinct { .. })
-    }
-}
-
-/// Translation context for handling distinct aggregates.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DistinctAggCtx {
-    /// The cursor ID for the ephemeral index opened for the distinct aggregate.
-    /// This is used to track the distinct values and avoid duplicates.
-    pub cursor_id: usize,
-    /// The index name for the ephemeral index opened for the distinct aggregate.
-    pub ephemeral_index_name: String,
-    /// The label for the on conflict branch.
-    /// When a duplicate is found, the program will jump to the offset this label points to.
-    pub label_on_conflict: BranchOffset,
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub struct Aggregate {
     pub func: AggFunc,
     pub args: Vec<ast::Expr>,
     pub original_expr: ast::Expr,
-    pub distinctness: AggDistinctness,
+    pub distinctness: Distinctness,
 }
 
 impl Aggregate {

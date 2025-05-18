@@ -1,6 +1,6 @@
 use super::{
     plan::{
-        AggDistinctness, Aggregate, ColumnUsedMask, EvalAt, IterationDirection, JoinInfo,
+        Aggregate, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
         JoinOrderMember, Operation, Plan, ResultSetColumn, SelectPlan, SelectQueryType,
         TableReference, WhereTerm,
     },
@@ -41,7 +41,7 @@ pub fn resolve_aggregates(expr: &Expr, aggs: &mut Vec<Aggregate>) -> Result<bool
             };
             match Func::resolve_function(normalize_ident(name.0.as_str()).as_str(), args_count) {
                 Ok(Func::Agg(f)) => {
-                    let distinctness = AggDistinctness::from_ast(distinctness.as_ref());
+                    let distinctness = Distinctness::from_ast(distinctness.as_ref());
                     let num_args = args.as_ref().map_or(0, |args| args.len());
                     if distinctness.is_distinct() && num_args != 1 {
                         crate::bail_parse_error!(
@@ -75,7 +75,7 @@ pub fn resolve_aggregates(expr: &Expr, aggs: &mut Vec<Aggregate>) -> Result<bool
                     func: f,
                     args: vec![],
                     original_expr: expr.clone(),
-                    distinctness: AggDistinctness::NonDistinct,
+                    distinctness: Distinctness::NonDistinct,
                 });
                 Ok(true)
             } else {

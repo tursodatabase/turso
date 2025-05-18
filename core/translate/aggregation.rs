@@ -12,7 +12,7 @@ use crate::{
 use super::{
     emitter::{Resolver, TranslateCtx},
     expr::translate_expr,
-    plan::{AggDistinctness, Aggregate, SelectPlan, TableReference},
+    plan::{Aggregate, Distinctness, SelectPlan, TableReference},
     result_row::emit_select_result,
 };
 
@@ -64,7 +64,7 @@ pub fn emit_ungrouped_aggregation<'a>(
 /// This is used in both GROUP BY and non-GROUP BY aggregations to jump over
 /// the AggStep that would otherwise accumulate the same value multiple times.
 pub fn handle_distinct(program: &mut ProgramBuilder, agg: &Aggregate, agg_arg_reg: usize) {
-    let AggDistinctness::Distinct { ctx } = &agg.distinctness else {
+    let Distinctness::Distinct { ctx } = &agg.distinctness else {
         return;
     };
     let distinct_agg_ctx = ctx
