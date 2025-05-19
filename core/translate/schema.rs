@@ -249,6 +249,7 @@ pub fn emit_schema_entry(
     });
 }
 
+#[derive(Debug)]
 struct PrimaryKeyColumnInfo<'a> {
     name: &'a String,
     is_descending: bool,
@@ -288,36 +289,41 @@ fn check_automatic_pk_index_required(
                         if primary_key_definition.is_some() {
                             bail_parse_error!("table {} has more than one primary key", tbl_name);
                         }
-                        let primary_key_column_results: Vec<Result<PrimaryKeyColumnInfo>> = pk_cols
+                        let primary_key_column_results = pk_cols
                             .iter()
                             .map(|col| match &col.expr {
-                                ast::Expr::Id(name) => Ok(PrimaryKeyColumnInfo {
-                                    name: &name.0,
-                                    is_descending: matches!(col.order, Some(ast::SortOrder::Desc)),
-                                }),
+                                ast::Expr::Id(name) => {
+                                    if !columns.iter().any(|(k, _)| k.0 == name.0) {
+                                        bail_parse_error!("No such column: {}", name.0);
+                                    }
+                                    Ok(PrimaryKeyColumnInfo {
+                                        name: &name.0,
+                                        is_descending: matches!(
+                                            col.order,
+                                            Some(ast::SortOrder::Desc)
+                                        ),
+                                    })
+                                }
                                 _ => Err(LimboError::ParseError(
                                     "expressions prohibited in PRIMARY KEY and UNIQUE constraints"
                                         .to_string(),
                                 )),
                             })
-                            .collect();
+                            .collect::<Result<Vec<_>>>()?;
 
-                        for result in primary_key_column_results {
-                            if let Err(e) = result {
-                                bail_parse_error!("{}", e);
-                            }
-                            let pk_info = result?;
-
+                        for pk_info in primary_key_column_results {
                             let column_name = pk_info.name;
-                            let column_def = columns.get(&ast::Name(column_name.clone()));
-                            if column_def.is_none() {
-                                bail_parse_error!("No such column: {}", column_name);
-                            }
+                            let (_, column_def) = columns
+                                .iter()
+                                .find(|(k, _)| k.0 == *column_name)
+                                .expect("primary key column should be in Create Body columns");
 
                             match &mut primary_key_definition {
                                 Some(PrimaryKeyDefinitionType::Simple { column, .. }) => {
                                     let mut columns = HashSet::new();
-                                    columns.insert(column.clone());
+                                    columns.insert(std::mem::take(column));
+                                    // Have to also insert the current column_name we are iterating over in primary_key_column_results
+                                    columns.insert(column_name.clone());
                                     primary_key_definition =
                                         Some(PrimaryKeyDefinitionType::Composite { columns });
                                 }
@@ -325,7 +331,6 @@ fn check_automatic_pk_index_required(
                                     columns.insert(column_name.clone());
                                 }
                                 None => {
-                                    let column_def: &ast::ColumnDefinition = column_def.unwrap();
                                     let typename =
                                         column_def.col_type.as_ref().map(|t| t.name.as_str());
                                     let is_descending = pk_info.is_descending;
@@ -339,24 +344,28 @@ fn check_automatic_pk_index_required(
                             }
                         }
                     } else if let ast::TableConstraint::Unique {
-                        columns,
+                        columns: unique_columns,
                         conflict_clause,
                     } = &constraint.constraint
                     {
                         if conflict_clause.is_some() {
                             unimplemented!("ON CONFLICT not implemented");
                         }
-                        let col_names: HashSet<String> = columns
+
+                        let col_names = unique_columns
                             .iter()
                             .map(|column| match &column.expr {
                                 limbo_sqlite3_parser::ast::Expr::Id(id) => {
-                                    crate::util::normalize_ident(&id.0)
+                                    if !columns.iter().any(|(k, _)| k.0 == id.0) {
+                                        bail_parse_error!("No such column: {}", id.0);
+                                    }
+                                    Ok(crate::util::normalize_ident(&id.0))
                                 }
                                 _ => {
                                     todo!("Unsupported unique expression");
                                 }
                             })
-                            .collect();
+                            .collect::<Result<HashSet<String>>>()?;
                         unique_sets.push(col_names);
                     }
                 }
@@ -436,6 +445,7 @@ fn check_automatic_pk_index_required(
     }
 }
 
+#[derive(Debug)]
 enum PrimaryKeyDefinitionType<'a> {
     Simple {
         column: String,

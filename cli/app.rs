@@ -4,12 +4,13 @@ use crate::{
         import::ImportFile,
         Command, CommandParser,
     },
+    config::Config,
     helper::LimboHelper,
     input::{get_io, get_writer, DbLocation, OutputMode, Settings},
     opcodes_dictionary::OPCODE_DESCRIPTIONS,
     HISTORY_FILE,
 };
-use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Row, Table};
+use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Row, Table};
 use limbo_core::{Database, LimboError, Statement, StepResult, Value};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -72,6 +73,7 @@ pub struct Limbo {
     input_buff: String,
     opts: Settings,
     pub rl: Option<Editor<LimboHelper, DefaultHistory>>,
+    config: Option<Config>,
 }
 
 struct QueryStatistics {
@@ -103,8 +105,6 @@ macro_rules! query_internal {
         Ok::<(), LimboError>(())
     }};
 }
-
-static COLORS: &[Color] = &[Color::Green, Color::Black, Color::Grey];
 
 impl Limbo {
     pub fn new() -> anyhow::Result<Self> {
@@ -154,13 +154,23 @@ impl Limbo {
             input_buff: String::new(),
             opts: Settings::from(opts),
             rl: None,
+            config: None,
         };
         app.first_run(sql, quiet)?;
         Ok(app)
     }
 
+    pub fn with_config(mut self, config: Config) -> Self {
+        self.config = Some(config);
+        self
+    }
+
     pub fn with_readline(mut self, mut rl: Editor<LimboHelper, DefaultHistory>) -> Self {
-        let h = LimboHelper::new(self.conn.clone(), self.io.clone());
+        let h = LimboHelper::new(
+            self.conn.clone(),
+            self.io.clone(),
+            self.config.as_ref().map(|c| c.highlight.clone()),
+        );
         rl.set_helper(Some(h));
         self.rl = Some(rl);
         self
@@ -727,6 +737,7 @@ impl Limbo {
                         println!("Query interrupted.");
                         return Ok(());
                     }
+                    let config = self.config.as_ref().unwrap();
                     let mut table = Table::new();
                     table
                         .set_content_arrangement(ContentArrangement::Dynamic)
@@ -738,7 +749,7 @@ impl Limbo {
                                 let name = rows.get_column_name(i);
                                 Cell::new(name)
                                     .add_attribute(Attribute::Bold)
-                                    .fg(Color::White)
+                                    .fg(config.table.header_color.into_comfy_table_color())
                             })
                             .collect::<Vec<_>>();
                         table.set_header(header);
@@ -774,7 +785,9 @@ impl Limbo {
                                     row.add_cell(
                                         Cell::new(content)
                                             .set_alignment(alignment)
-                                            .fg(COLORS[idx % COLORS.len()]),
+                                            .fg(config.table.column_colors
+                                                [idx % config.table.column_colors.len()]
+                                            .into_comfy_table_color()),
                                     );
                                 }
                                 table.add_row(row);

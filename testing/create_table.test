@@ -1,0 +1,16 @@
+#!/usr/bin/env tclsh
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+do_execsql_test_in_memory_any_error create_table_one_unique_set {
+    CREATE TABLE t4(a, unique(b));
+}
+
+do_execsql_test_on_specific_db {:memory:} create_table_same_uniques_and_primary_keys {
+    CREATE TABLE t2(a,b, unique(a,b), primary key(a,b));
+} {}
+
+do_execsql_test_on_specific_db {:memory:} create_table_unique_contained_in_primary_keys {
+    CREATE TABLE t4(a,b, primary key(a,b), unique(a));
+} {}

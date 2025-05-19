@@ -1,10 +1,12 @@
 #![allow(clippy::arc_with_non_send_sync)]
 mod app;
 mod commands;
+mod config;
 mod helper;
 mod input;
 mod opcodes_dictionary;
 
+use config::CONFIG_DIR;
 use rustyline::{error::ReadlineError, Config, Editor};
 use std::{
     path::PathBuf,
@@ -32,6 +34,12 @@ fn main() -> anyhow::Result<()> {
         if HISTORY_FILE.exists() {
             rl.load_history(HISTORY_FILE.as_path())?;
         }
+        let config_file = CONFIG_DIR.join("limbo.toml");
+
+        let config = config::Config::from_config_file(config_file);
+        tracing::info!("Configuration: {:?}", config);
+        app = app.with_config(config);
+
         app = app.with_readline(rl);
     } else {
         tracing::debug!("not in tty");

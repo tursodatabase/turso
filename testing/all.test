@@ -33,3 +33,4 @@ source $testdir/default_value.test
 source $testdir/boolean.test
 source $testdir/literal.test
 source $testdir/null.test
+source $testdir/create_table.test

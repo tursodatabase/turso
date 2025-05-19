@@ -74,8 +74,13 @@ test-time:
 	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/time.test
 .PHONY: test-time
 
-test-sqlite3:
+reset-db:
+	./scripts/clone_test_db.sh
+.PHONY: reset-db
+
+test-sqlite3: reset-db
 	cargo test -p limbo_sqlite3 --test compat
+	./scripts/clone_test_db.sh
 	cargo test -p limbo_sqlite3 --test compat --features sqlite3
 .PHONY: test-sqlite3
 

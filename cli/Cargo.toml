@@ -33,7 +33,7 @@ limbo_core = { path = "../core", default-features = true, features = [
     "completion",
 ] }
 miette = { version = "7.4.0", features = ["fancy"] }
-nu-ansi-term = "0.50.1"
+nu-ansi-term = {version = "0.50.1", features = ["serde", "derive_serde_style"]}
 rustyline = { version = "15.0.0", default-features = true, features = [
     "derive",
 ] }
@@ -42,6 +42,11 @@ syntect = "5.2.0"
 tracing = "0.1.41"
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+toml = {version = "0.8.20", features = ["preserve_order"]}
+schemars = {version = "0.8.22", features = ["preserve_order"]}
+serde = {version = "1.0.218", features = ["derive"]}
+validator = {version = "0.20.0", features = ["derive"]}
+toml_edit = {version = "0.22.24", features = ["serde"]}
 
 [features]
 default = ["io_uring"]

@@ -70,10 +70,10 @@ impl OrderTarget {
 /// TODO: this does not currently handle the case where we definitely cannot eliminate
 /// the ORDER BY sorter, but we could still eliminate the GROUP BY sorter.
 pub fn compute_order_target(
-    order_by: &Option<Vec<(ast::Expr, SortOrder)>>,
-    group_by: Option<&mut GroupBy>,
+    order_by_opt: &mut Option<Vec<(ast::Expr, SortOrder)>>,
+    group_by_opt: Option<&mut GroupBy>,
 ) -> Option<OrderTarget> {
-    match (order_by, group_by) {
+    match (&order_by_opt, group_by_opt) {
         // No ordering demands - we don't care what order the joined result rows are in
         (None, None) => None,
         // Only ORDER BY - we would like the joined result rows to be in the order specified by the ORDER BY
@@ -97,10 +97,11 @@ pub fn compute_order_target(
         // however in this case we must take the ASC/DESC from ORDER BY into account.
         (Some(order_by), Some(group_by)) => {
             // Does the group by contain all expressions in the order by?
-            let group_by_contains_all = group_by.exprs.iter().all(|expr| {
-                order_by
+            let group_by_contains_all = order_by.iter().all(|(expr, _)| {
+                group_by
+                    .exprs
                     .iter()
-                    .any(|(order_by_expr, _)| exprs_are_equivalent(expr, order_by_expr))
+                    .any(|group_by_expr| exprs_are_equivalent(expr, group_by_expr))
             });
             // If not, let's try to target an ordering that matches the group by -- we don't care about ASC/DESC
             if !group_by_contains_all {
@@ -117,16 +118,32 @@ pub fn compute_order_target(
                     .position(|(order_by_expr, _)| exprs_are_equivalent(expr, order_by_expr))
                     .map_or(usize::MAX, |i| i)
             });
-            // Iterate over GROUP BY, but take the ORDER BY orderings into account.
+
+            // Now, regardless of whether we can eventually eliminate the sorting entirely in the optimizer,
+            // we know that we don't need ORDER BY sorting anyway, because the GROUP BY will sort the result since
+            // it contains all the necessary columns required for the ORDER BY, and the GROUP BY columns are now in the correct order.
+            // First, however, we need to make sure the GROUP BY sorter's column sort directions match the ORDER BY requirements.
+            assert!(group_by.exprs.len() >= order_by.len());
+            for (i, (_, order_by_dir)) in order_by.iter().enumerate() {
+                group_by
+                    .sort_order
+                    .as_mut()
+                    .expect("GROUP BY should have a sort order before optimization is run")[i] =
+                    *order_by_dir;
+            }
+            // Now we can remove the ORDER BY from the query.
+            order_by_opt.take();
+
             OrderTarget::maybe_from_iterator(
                 group_by
                     .exprs
                     .iter()
                     .zip(
-                        order_by
-                            .iter()
-                            .map(|(_, dir)| dir)
-                            .chain(std::iter::repeat(&SortOrder::Asc)),
+                        group_by
+                            .sort_order
+                            .as_ref()
+                            .expect("GROUP BY should have a sort order before optimization is run")
+                            .iter(),
                     )
                     .map(|(expr, dir)| (expr, *dir)),
                 EliminatesSort::GroupByAndOrderBy,

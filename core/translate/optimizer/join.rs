@@ -1276,6 +1276,7 @@ mod tests {
         WhereTerm {
             expr: Expr::Binary(Box::new(lhs), op, Box::new(rhs)),
             from_outer_join: None,
+            consumed: false,
         }
     }
 

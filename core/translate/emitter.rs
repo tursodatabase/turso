@@ -98,7 +98,6 @@ pub struct TranslateCtx<'a> {
     // This vector holds the indexes of the result columns that we need to skip.
     pub result_columns_to_skip_in_orderby_sorter: Option<Vec<usize>>,
     pub resolver: Resolver<'a>,
-    pub omit_predicates: Vec<usize>,
 }
 
 /// Used to distinguish database operations
@@ -141,7 +140,6 @@ fn prologue<'a>(
         result_column_indexes_in_orderby_sorter: (0..result_column_count).collect(),
         result_columns_to_skip_in_orderby_sorter: None,
         resolver: Resolver::new(syms),
-        omit_predicates: Vec::new(),
     };
 
     Ok((t_ctx, init_label, start_offset))
@@ -298,7 +296,7 @@ pub fn emit_query<'a>(
     for where_term in plan
         .where_clause
         .iter()
-        .filter(|wt| wt.is_constant(&plan.join_order))
+        .filter(|wt| wt.should_eval_before_loop(&plan.join_order))
     {
         let jump_target_when_true = program.allocate_label();
         let condition_metadata = ConditionMetadata {
@@ -322,7 +320,7 @@ pub fn emit_query<'a>(
         t_ctx,
         &plan.table_references,
         &plan.join_order,
-        &plan.where_clause,
+        &mut plan.where_clause,
     )?;
 
     // Process result columns and expressions in the inner loop
@@ -364,7 +362,7 @@ pub fn emit_query<'a>(
 
 fn emit_program_for_delete(
     program: &mut ProgramBuilder,
-    plan: DeletePlan,
+    mut plan: DeletePlan,
     syms: &SymbolTable,
 ) -> Result<()> {
     let (mut t_ctx, init_label, start_offset) = prologue(
@@ -405,7 +403,7 @@ fn emit_program_for_delete(
         &mut t_ctx,
         &plan.table_references,
         &[JoinOrderMember::default()],
-        &plan.where_clause,
+        &mut plan.where_clause,
     )?;
     emit_delete_insns(
         program,
@@ -534,7 +532,7 @@ fn emit_delete_insns(
 
 fn emit_program_for_update(
     program: &mut ProgramBuilder,
-    plan: UpdatePlan,
+    mut plan: UpdatePlan,
     syms: &SymbolTable,
 ) -> Result<()> {
     let (mut t_ctx, init_label, start_offset) = prologue(
@@ -612,7 +610,7 @@ fn emit_program_for_update(
         &mut t_ctx,
         &plan.table_references,
         &[JoinOrderMember::default()],
-        &plan.where_clause,
+        &mut plan.where_clause,
     )?;
     emit_update_insns(&plan, &t_ctx, program, index_cursors)?;
 
@@ -676,7 +674,7 @@ fn emit_update_insns(
     for cond in plan
         .where_clause
         .iter()
-        .filter(|c| c.is_constant(&[JoinOrderMember::default()]))
+        .filter(|c| c.should_eval_before_loop(&[JoinOrderMember::default()]))
     {
         let jump_target = program.allocate_label();
         let meta = ConditionMetadata {
@@ -762,7 +760,7 @@ fn emit_update_insns(
     for cond in plan
         .where_clause
         .iter()
-        .filter(|c| c.is_constant(&[JoinOrderMember::default()]))
+        .filter(|c| c.should_eval_before_loop(&[JoinOrderMember::default()]))
     {
         let meta = ConditionMetadata {
             jump_if_condition_is_true: false,

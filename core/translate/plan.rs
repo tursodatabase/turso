@@ -85,10 +85,19 @@ pub struct WhereTerm {
     /// regardless of which tables it references.
     /// We also cannot e.g. short circuit the entire query in the optimizer if the condition is statically false.
     pub from_outer_join: Option<usize>,
+    /// Whether the condition has been consumed by the optimizer in some way, and it should not be evaluated
+    /// in the normal place where WHERE terms are evaluated.
+    /// A term may have been consumed e.g. if:
+    /// - it has been converted into a constraint in a seek key
+    /// - it has been removed due to being trivially true or false
+    pub consumed: bool,
 }
 
 impl WhereTerm {
-    pub fn is_constant(&self, join_order: &[JoinOrderMember]) -> bool {
+    pub fn should_eval_before_loop(&self, join_order: &[JoinOrderMember]) -> bool {
+        if self.consumed {
+            return false;
+        }
         let Ok(eval_at) = self.eval_at(join_order) else {
             return false;
         };
@@ -96,6 +105,9 @@ impl WhereTerm {
     }
 
     pub fn should_eval_at_loop(&self, loop_idx: usize, join_order: &[JoinOrderMember]) -> bool {
+        if self.consumed {
+            return false;
+        }
         let Ok(eval_at) = self.eval_at(join_order) else {
             return false;
         };

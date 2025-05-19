@@ -203,7 +203,7 @@ pub fn open_loop(
     t_ctx: &mut TranslateCtx,
     tables: &[TableReference],
     join_order: &[JoinOrderMember],
-    predicates: &[WhereTerm],
+    predicates: &mut [WhereTerm],
 ) -> Result<()> {
     for (join_index, join) in join_order.iter().enumerate() {
         let table_index = join.table_no;
@@ -351,7 +351,7 @@ pub fn open_loop(
                                             &t_ctx.resolver,
                                         )?;
                                         if cinfo.usable && usage.omit {
-                                            t_ctx.omit_predicates.push(pred_idx)
+                                            predicates[pred_idx].consumed = true;
                                         }
                                     }
                                 }
@@ -413,10 +413,10 @@ pub fn open_loop(
                     }
                 }
 
-                for (_, cond) in predicates.iter().enumerate().filter(|(i, cond)| {
-                    cond.should_eval_at_loop(join_index, join_order)
-                        && !t_ctx.omit_predicates.contains(i)
-                }) {
+                for cond in predicates
+                    .iter()
+                    .filter(|cond| cond.should_eval_at_loop(join_index, join_order))
+                {
                     let jump_target_when_true = program.allocate_label();
                     let condition_metadata = ConditionMetadata {
                         jump_if_condition_is_true: false,

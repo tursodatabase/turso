@@ -347,6 +347,15 @@ def custom_test_2(limbo: TestLimboShell):
     )
 
 
+# Issue #1482
+def regression_test_update_single_key(limbo: TestLimboShell):
+    create = "CREATE TABLE t(a unique);"
+    first_insert = "INSERT INTO t VALUES (1);"
+    limbo.run_test("Create simple table with 1 unique value", create + first_insert, "")
+    update_single = "UPDATE t SET a=1 WHERE a=1;"
+    limbo.run_test("Update one single key to the same value", update_single, "")
+
+
 def all_tests() -> list[ConstraintTest]:
     tests: list[ConstraintTest] = []
     max_cols = 10
@@ -390,15 +399,17 @@ def main():
         cleanup(db_path)
 
     db_path = "testing/constraint.db"
-    try:
-        with TestLimboShell("") as limbo:
-            limbo.execute_dot(f".open {db_path}")
-            custom_test_2(limbo)
-    except Exception as e:
-        console.error(f"Test FAILED: {e}")
+    tests = [custom_test_2, regression_test_update_single_key]
+    for test in tests:
+        try:
+            with TestLimboShell("") as limbo:
+                limbo.execute_dot(f".open {db_path}")
+                test(limbo)
+        except Exception as e:
+            console.error(f"Test FAILED: {e}")
+            cleanup(db_path)
+            exit(1)
         cleanup(db_path)
-        exit(1)
-    cleanup(db_path)
     console.info("All tests passed successfully.")
 
 

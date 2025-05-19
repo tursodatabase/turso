@@ -74,7 +74,7 @@ mod tests {
         unsafe {
             let mut db = ptr::null_mut();
             assert_eq!(
-                sqlite3_open(b"not-found/local.db\0".as_ptr() as *const i8, &mut db),
+                sqlite3_open(c"not-found/local.db".as_ptr(), &mut db),
                 SQLITE_CANTOPEN
             );
         }
@@ -85,7 +85,7 @@ mod tests {
         unsafe {
             let mut db = ptr::null_mut();
             assert_eq!(
-                sqlite3_open(b"../testing/testing.db\0".as_ptr() as *const i8, &mut db),
+                sqlite3_open(c"../testing/testing_clone.db".as_ptr(), &mut db),
                 SQLITE_OK
             );
             assert_eq!(sqlite3_close(db), SQLITE_OK);
@@ -104,19 +104,13 @@ mod tests {
         unsafe {
             let mut db = ptr::null_mut();
             assert_eq!(
-                sqlite3_open(b"../testing/testing.db\0".as_ptr() as *const i8, &mut db),
+                sqlite3_open(c"../testing/testing_clone.db".as_ptr(), &mut db),
                 SQLITE_OK
             );
 
             let mut stmt = ptr::null_mut();
             assert_eq!(
-                sqlite3_prepare_v2(
-                    db,
-                    b"SELECT 1\0".as_ptr() as *const i8,
-                    -1,
-                    &mut stmt,
-                    ptr::null_mut()
-                ),
+                sqlite3_prepare_v2(db, c"SELECT 1".as_ptr(), -1, &mut stmt, ptr::null_mut()),
                 SQLITE_OK
             );
 
@@ -131,7 +125,7 @@ mod tests {
             // Test with valid db
             let mut db = ptr::null_mut();
             assert_eq!(
-                sqlite3_open(b"../testing/testing.db\0".as_ptr() as *const i8, &mut db),
+                sqlite3_open(c"../testing/testing_clone.db".as_ptr(), &mut db),
                 SQLITE_OK
             );
             assert_eq!(sqlite3_wal_checkpoint(db, ptr::null()), SQLITE_OK);
@@ -145,7 +139,7 @@ mod tests {
             // Test with valid db
             let mut db = ptr::null_mut();
             assert_eq!(
-                sqlite3_open(b"../testing/testing.db\0".as_ptr() as *const i8, &mut db),
+                sqlite3_open(c"../testing/testing_clone.db".as_ptr(), &mut db),
                 SQLITE_OK
             );
 
@@ -210,7 +204,7 @@ mod tests {
             unsafe {
                 let mut db = ptr::null_mut();
                 assert_eq!(
-                    sqlite3_open(b"../testing/testing.db\0".as_ptr() as *const i8, &mut db),
+                    sqlite3_open(c"../testing/testing_clone.db".as_ptr(), &mut db),
                     SQLITE_OK
                 );
                 // Ensure that WAL is initially empty.
@@ -222,7 +216,7 @@ mod tests {
                 assert_eq!(
                     sqlite3_prepare_v2(
                         db,
-                        b"CREATE TABLE test (id INTEGER PRIMARY KEY)\0".as_ptr() as *const i8,
+                        c"CREATE TABLE test (id INTEGER PRIMARY KEY)".as_ptr(),
                         -1,
                         &mut stmt,
                         ptr::null_mut()
@@ -235,7 +229,7 @@ mod tests {
                 assert_eq!(
                     sqlite3_prepare_v2(
                         db,
-                        b"INSERT INTO test (id) VALUES (1)\0".as_ptr() as *const i8,
+                        c"INSERT INTO test (id) VALUES (1)".as_ptr(),
                         -1,
                         &mut stmt,
                         ptr::null_mut()

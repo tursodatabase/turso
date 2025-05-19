@@ -209,8 +209,6 @@ fn optimize_table_access(
                 .map_or(false, |join_info| join_info.outer),
         })
         .collect();
-    let mut to_remove_from_where_clause = vec![];
-
     // Mutate the Operations in `table_references` to use the selected access methods.
     for (i, join_order_member) in best_join_order.iter().enumerate() {
         let table_number = join_order_member.table_no;
@@ -289,7 +287,12 @@ fn optimize_table_access(
             for cref in constraint_refs.iter() {
                 let constraint =
                     &constraints_per_table[table_number].constraints[cref.constraint_vec_pos];
-                to_remove_from_where_clause.push(constraint.where_clause_pos.0);
+                assert!(
+                    !where_clause[constraint.where_clause_pos.0].consumed,
+                    "trying to consume a where clause term twice: {:?}",
+                    where_clause[constraint.where_clause_pos.0]
+                );
+                where_clause[constraint.where_clause_pos.0].consumed = true;
             }
             if let Some(index) = &access_method.index {
                 table_references[table_number].op = Operation::Search(Search::Seek {
@@ -326,10 +329,6 @@ fn optimize_table_access(
             };
         }
     }
-    to_remove_from_where_clause.sort_by_key(|c| *c);
-    for position in to_remove_from_where_clause.iter().rev() {
-        where_clause.remove(*position);
-    }
 
     Ok(Some(best_join_order))
 }
@@ -351,7 +350,8 @@ fn eliminate_constant_conditions(
         let predicate = &where_clause[i];
         if predicate.expr.is_always_true()? {
             // true predicates can be removed since they don't affect the result
-            where_clause.remove(i);
+            where_clause[i].consumed = true;
+            i += 1;
         } else if predicate.expr.is_always_false()? {
             // any false predicate in a list of conjuncts (AND-ed predicates) will make the whole list false,
             // except an outer join condition, because that just results in NULLs, not skipping the whole loop
@@ -359,7 +359,9 @@ fn eliminate_constant_conditions(
                 i += 1;
                 continue;
             }
-            where_clause.truncate(0);
+            where_clause
+                .iter_mut()
+                .for_each(|term| term.consumed = true);
             return Ok(ConstantConditionEliminationResult::ImpossibleCondition);
         } else {
             i += 1;

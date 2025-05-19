@@ -83,7 +83,6 @@ pub fn emit_subquery<'a>(
         reg_offset: plan.offset.map(|_| program.alloc_register()),
         reg_limit_offset_sum: plan.offset.map(|_| program.alloc_register()),
         resolver: Resolver::new(t_ctx.resolver.symbol_table),
-        omit_predicates: Vec::new(),
     };
     let subquery_body_end_label = program.allocate_label();
     program.emit_insn(Insn::InitCoroutine {

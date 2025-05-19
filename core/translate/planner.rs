@@ -557,6 +557,7 @@ pub fn parse_where(
             out_where_clause.push(WhereTerm {
                 expr,
                 from_outer_join: None,
+                consumed: false,
             });
         }
         Ok(())
@@ -1016,6 +1017,7 @@ fn parse_join<'a>(
                         } else {
                             None
                         },
+                        consumed: false,
                     });
                 }
             }
@@ -1085,6 +1087,7 @@ fn parse_join<'a>(
                     out_where_clause.push(WhereTerm {
                         expr,
                         from_outer_join: if outer { Some(cur_table_idx) } else { None },
+                        consumed: false,
                     });
                 }
                 using = Some(distinct_names);

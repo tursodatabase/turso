@@ -11,8 +11,14 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::{ffi::OsString, path::PathBuf, str::FromStr as _};
+use syntect::dumps::from_uncompressed_data;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::{Scope, SyntaxSet};
+use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
 
 use crate::commands::CommandParser;
+use crate::config::{HighlightConfig, CONFIG_DIR};
 
 macro_rules! try_result {
     ($expr:expr, $err:expr) => {
@@ -27,14 +33,37 @@ macro_rules! try_result {
 pub struct LimboHelper {
     #[rustyline(Completer)]
     completer: SqlCompleter<CommandParser>,
+    syntax_set: SyntaxSet,
+    theme_set: ThemeSet,
+    syntax_config: HighlightConfig,
     #[rustyline(Hinter)]
     hinter: HistoryHinter,
 }
 
 impl LimboHelper {
-    pub fn new(conn: Rc<Connection>, io: Arc<dyn limbo_core::IO>) -> Self {
+    pub fn new(
+        conn: Rc<Connection>,
+        io: Arc<dyn limbo_core::IO>,
+        syntax_config: Option<HighlightConfig>,
+    ) -> Self {
+        // Load only predefined syntax
+        let ps = from_uncompressed_data(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/SQL_syntax_set_dump.packdump"
+        )))
+        .unwrap();
+        let mut ts = ThemeSet::load_defaults();
+        let theme_dir = CONFIG_DIR.join("themes");
+        if theme_dir.exists() {
+            if let Err(err) = ts.add_from_folder(theme_dir) {
+                tracing::error!("{err}");
+            }
+        }
         LimboHelper {
             completer: SqlCompleter::new(conn, io),
+            syntax_set: ps,
+            theme_set: ts,
+            syntax_config: syntax_config.unwrap_or_default(),
             hinter: HistoryHinter::new(),
         }
     }
@@ -43,9 +72,37 @@ impl LimboHelper {
 impl Highlighter for LimboHelper {
     fn highlight<'l>(&self, line: &'l str, pos: usize) -> std::borrow::Cow<'l, str> {
         let _ = pos;
-        let style = Style::new().fg(Color::White); // Standard shell text color
-        let styled_str = style.paint(line);
-        std::borrow::Cow::Owned(styled_str.to_string())
+        if self.syntax_config.enable {
+            // TODO use lifetimes to store highlight lines
+            let syntax = self
+                .syntax_set
+                .find_syntax_by_scope(Scope::new("source.sql").unwrap())
+                .unwrap();
+            let theme = self
+                .theme_set
+                .themes
+                .get(&self.syntax_config.theme)
+                .unwrap_or(&self.theme_set.themes["base16-ocean.dark"]);
+            let mut h = HighlightLines::new(syntax, theme);
+            let ranges = {
+                let mut ret_ranges = Vec::new();
+                for new_line in LinesWithEndings::from(line) {
+                    let ranges: Vec<(syntect::highlighting::Style, &str)> =
+                        h.highlight_line(new_line, &self.syntax_set).unwrap();
+                    ret_ranges.extend(ranges);
+                }
+                ret_ranges
+            };
+            let mut ret_line = as_24_bit_terminal_escaped(&ranges[..], false);
+            // Push this escape sequence to reset terminal color modes at the end of the string
+            ret_line.push_str("\x1b[0m");
+            std::borrow::Cow::Owned(ret_line)
+        } else {
+            // Appease Pekka in syntax highlighting
+            let style = Style::new().fg(Color::White); // Standard shell text color
+            let styled_str = style.paint(line);
+            std::borrow::Cow::Owned(styled_str.to_string())
+        }
     }
 
     fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
@@ -55,13 +112,13 @@ impl Highlighter for LimboHelper {
     ) -> std::borrow::Cow<'b, str> {
         let _ = default;
         // Dark emerald green for prompt
-        let style = Style::new().bold().fg(Color::Rgb(34u8, 197u8, 94u8));
+        let style = Style::new().bold().fg(self.syntax_config.prompt.0);
         let styled_str = style.paint(prompt);
         std::borrow::Cow::Owned(styled_str.to_string())
     }
 
     fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
-        let style = Style::new().bold().fg(Color::Rgb(107u8, 114u8, 128u8)); // Brighter dark grey for hints
+        let style = Style::new().bold().fg(self.syntax_config.hint.0); // Brighter dark grey for hints
         let styled_str = style.paint(hint);
         std::borrow::Cow::Owned(styled_str.to_string())
     }
@@ -72,7 +129,7 @@ impl Highlighter for LimboHelper {
         completion: rustyline::CompletionType,
     ) -> std::borrow::Cow<'c, str> {
         let _ = completion;
-        let style = Style::new().fg(Color::Green);
+        let style = Style::new().fg(self.syntax_config.candidate.0);
         let styled_str = style.paint(candidate);
         std::borrow::Cow::Owned(styled_str.to_string())
     }
