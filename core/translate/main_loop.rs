@@ -86,7 +86,7 @@ pub fn init_distinct(program: &mut ProgramBuilder, plan: &mut SelectPlan) {
                     name: col.expr.to_string(),
                     order: SortOrder::Asc,
                     pos_in_table: i,
-                    collation: None, // FIXME: this should be inferred from the expression
+                    collation: None, // FIXME: this should be determined based on the result column expression!
                 })
                 .collect(),
             unique: false,
