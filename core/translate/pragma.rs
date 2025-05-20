@@ -193,12 +193,7 @@ fn query_pragma(
     match pragma {
         PragmaName::TableList => {
             let base_reg = register;
-            program.alloc_register();
-            program.alloc_register();
-            program.alloc_register();
-            program.alloc_register();
-            program.alloc_register();
-
+            let _ = program.alloc_registers(5);
             let value = match value {
                 Some(ast::Expr::Name(ref name)) => Some(normalize_ident(&name.0)),
                 Some(expr) => unreachable!("{}", expr),
