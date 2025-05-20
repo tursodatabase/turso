@@ -51,18 +51,16 @@ do_execsql_test_on_specific_db ":memory:" pragma-user-version-default {
   PRAGMA user_version
 } {0}
 
-# TODO uncomment when we have sqlite_temp_schema
-# do_execsql_test_on_specific_db ":memory:" pragma-table-list {
-#   CREATE TABLE foo(bar);
-#   PRAGMA table_list;
-# } {main|foo|table|1|0|0
-# main|sqlite_schema|table|5|0|0
-# main|sqlite_temp_schema|table|5|0|0}
+do_execsql_test_on_specific_db ":memory:" pragma-table-list {
+  CREATE TABLE foo(bar);
+  PRAGMA table_list;
+} {main|foo|table|1|0|0
+main|sqlite_schema|table|5|0|0}
 
 do_execsql_test pragma-table-list-call-syntax-1 {
   PRAGMA table_list(sqlite_schema)
 } {main|sqlite_schema|table|5|0|0}
 
-do_execsql_test pragma-table-list-call-syntax-1 {
+do_execsql_test pragma-table-list-call-syntax-2 {
   PRAGMA table_list(foo);
 } {}
