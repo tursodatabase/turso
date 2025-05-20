@@ -195,7 +195,19 @@ fn query_pragma(
             let base_reg = register;
             let _ = program.alloc_registers(5);
             let value = match value {
-                Some(ast::Expr::Name(ref name)) => Some(normalize_ident(&name.0)),
+                Some(ast::Expr::Name(ref name)) => {
+                    // do nothing if sqlite_schema given. That is sqlite3 behavior
+                    if name.0.eq_ignore_ascii_case("sqlite_schema") {
+                        return Ok(());
+                    }
+
+                    let temp_name = if name.0.eq_ignore_ascii_case(&"sqlite_master") {
+                        "sqlite_schema"
+                    } else {
+                        &name.0
+                    };
+                    Some(normalize_ident(&temp_name))
+                }
                 Some(expr) => unreachable!("{}", expr),
                 None => None,
             };
