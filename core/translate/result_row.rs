@@ -1,9 +1,5 @@
 use crate::{
-    vdbe::{
-        builder::ProgramBuilder,
-        insn::{IdxInsertFlags, Insn},
-        BranchOffset,
-    },
+    vdbe::{builder::ProgramBuilder, insn::Insn, BranchOffset},
     Result,
 };
 
@@ -58,26 +54,7 @@ pub fn emit_select_result(
     if let Distinctness::Distinct { ctx } = &plan.distinctness {
         let distinct_agg_ctx = ctx.as_ref().expect("distinct context must exist");
         let num_regs = plan.result_columns.len();
-        program.emit_insn(Insn::Found {
-            cursor_id: distinct_agg_ctx.cursor_id,
-            target_pc: distinct_agg_ctx.label_on_conflict,
-            record_reg: reg_result_cols_start,
-            num_regs,
-        });
-        let record_reg = program.alloc_register();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: reg_result_cols_start,
-            count: num_regs,
-            dest_reg: record_reg,
-            index_name: Some(distinct_agg_ctx.ephemeral_index_name.to_string()),
-        });
-        program.emit_insn(Insn::IdxInsert {
-            cursor_id: distinct_agg_ctx.cursor_id,
-            record_reg: record_reg,
-            unpacked_start: None,
-            unpacked_count: None,
-            flags: IdxInsertFlags::new(),
-        });
+        distinct_agg_ctx.emit_deduplication_insns(program, num_regs, start_reg);
     }
 
     emit_result_row_and_limit(

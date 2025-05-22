@@ -8,7 +8,7 @@ use crate::{
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{IdxInsertFlags, Insn},
+        insn::Insn,
     },
     Result,
 };
@@ -254,26 +254,7 @@ pub fn order_by_sorter_insert(
     if let Distinctness::Distinct { ctx } = &plan.distinctness {
         let distinct_agg_ctx = ctx.as_ref().expect("distinct context must exist");
         let num_regs = order_by_len + translated_result_col_count;
-        program.emit_insn(Insn::Found {
-            cursor_id: distinct_agg_ctx.cursor_id,
-            target_pc: distinct_agg_ctx.label_on_conflict,
-            record_reg: start_reg,
-            num_regs,
-        });
-        let record_reg = program.alloc_register();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg,
-            count: num_regs,
-            dest_reg: record_reg,
-            index_name: Some(distinct_agg_ctx.ephemeral_index_name.to_string()),
-        });
-        program.emit_insn(Insn::IdxInsert {
-            cursor_id: distinct_agg_ctx.cursor_id,
-            record_reg: record_reg,
-            unpacked_start: None,
-            unpacked_count: None,
-            flags: IdxInsertFlags::new(),
-        });
+        distinct_agg_ctx.emit_deduplication_insns(program, num_regs, start_reg);
     }
 
     let SortMetadata {

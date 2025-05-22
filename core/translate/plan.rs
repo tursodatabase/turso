@@ -14,6 +14,7 @@ use crate::{
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
+        insn::{IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
     Result, VirtualTable,
@@ -326,6 +327,36 @@ pub struct DistinctCtx {
     /// The label for the on conflict branch.
     /// When a duplicate is found, the program will jump to the offset this label points to.
     pub label_on_conflict: BranchOffset,
+}
+
+impl DistinctCtx {
+    pub fn emit_deduplication_insns(
+        &self,
+        program: &mut ProgramBuilder,
+        num_regs: usize,
+        start_reg: usize,
+    ) {
+        program.emit_insn(Insn::Found {
+            cursor_id: self.cursor_id,
+            target_pc: self.label_on_conflict,
+            record_reg: start_reg,
+            num_regs,
+        });
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg,
+            count: num_regs,
+            dest_reg: record_reg,
+            index_name: Some(self.ephemeral_index_name.to_string()),
+        });
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: self.cursor_id,
+            record_reg: record_reg,
+            unpacked_start: None,
+            unpacked_count: None,
+            flags: IdxInsertFlags::new(),
+        });
+    }
 }
 
 #[derive(Debug, Clone)]
