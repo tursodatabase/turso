@@ -67,13 +67,13 @@ pub fn handle_distinct(program: &mut ProgramBuilder, agg: &Aggregate, agg_arg_re
     let Distinctness::Distinct { ctx } = &agg.distinctness else {
         return;
     };
-    let distinct_agg_ctx = ctx
+    let distinct_ctx = ctx
         .as_ref()
         .expect("distinct aggregate context not populated");
     let num_regs = 1;
     program.emit_insn(Insn::Found {
-        cursor_id: distinct_agg_ctx.cursor_id,
-        target_pc: distinct_agg_ctx.label_on_conflict,
+        cursor_id: distinct_ctx.cursor_id,
+        target_pc: distinct_ctx.label_on_conflict,
         record_reg: agg_arg_reg,
         num_regs,
     });
@@ -82,10 +82,10 @@ pub fn handle_distinct(program: &mut ProgramBuilder, agg: &Aggregate, agg_arg_re
         start_reg: agg_arg_reg,
         count: num_regs,
         dest_reg: record_reg,
-        index_name: Some(distinct_agg_ctx.ephemeral_index_name.to_string()),
+        index_name: Some(distinct_ctx.ephemeral_index_name.to_string()),
     });
     program.emit_insn(Insn::IdxInsert {
-        cursor_id: distinct_agg_ctx.cursor_id,
+        cursor_id: distinct_ctx.cursor_id,
         record_reg: record_reg,
         unpacked_start: None,
         unpacked_count: None,

@@ -791,8 +791,8 @@ fn emit_loop_source<'a>(
             )?;
 
             if let Distinctness::Distinct { ctx } = &plan.distinctness {
-                let distinct_agg_ctx = ctx.as_ref().expect("distinct context must exist");
-                program.preassign_label_to_next_insn(distinct_agg_ctx.label_on_conflict);
+                let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
+                program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
             }
 
             Ok(())
@@ -887,8 +887,8 @@ fn emit_loop_source<'a>(
             )?;
 
             if let Distinctness::Distinct { ctx } = &plan.distinctness {
-                let distinct_agg_ctx = ctx.as_ref().expect("distinct context must exist");
-                program.preassign_label_to_next_insn(distinct_agg_ctx.label_on_conflict);
+                let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
+                program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
             }
 
             Ok(())

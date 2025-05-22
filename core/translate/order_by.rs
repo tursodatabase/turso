@@ -252,9 +252,9 @@ pub fn order_by_sorter_insert(
 
     // Handle SELECT DISTINCT deduplication
     if let Distinctness::Distinct { ctx } = &plan.distinctness {
-        let distinct_agg_ctx = ctx.as_ref().expect("distinct context must exist");
+        let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
         let num_regs = order_by_len + translated_result_col_count;
-        distinct_agg_ctx.emit_deduplication_insns(program, num_regs, start_reg);
+        distinct_ctx.emit_deduplication_insns(program, num_regs, start_reg);
     }
 
     let SortMetadata {

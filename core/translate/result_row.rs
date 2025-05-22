@@ -52,9 +52,9 @@ pub fn emit_select_result(
 
     // Handle SELECT DISTINCT deduplication
     if let Distinctness::Distinct { ctx } = &plan.distinctness {
-        let distinct_agg_ctx = ctx.as_ref().expect("distinct context must exist");
+        let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
         let num_regs = plan.result_columns.len();
-        distinct_agg_ctx.emit_deduplication_insns(program, num_regs, start_reg);
+        distinct_ctx.emit_deduplication_insns(program, num_regs, start_reg);
     }
 
     emit_result_row_and_limit(
