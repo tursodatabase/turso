@@ -123,6 +123,30 @@ impl Connection {
         };
         Ok(statement)
     }
+
+    pub fn pragma_query<F>(&self, pragma_name: &str, mut f: F) -> Result<()>
+    where
+        F: FnMut(&Row) -> limbo_core::Result<()>,
+    {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+
+        let rows: Vec<Row> = conn
+            .pragma_query(pragma_name)
+            .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?
+            .iter()
+            .map(|row| row.iter().collect::<Row>())
+            .collect();
+
+        rows.iter().try_for_each(|row| {
+            f(row).map_err(|e| {
+                Error::SqlExecutionFailure(format!("Error executing user defined function: {}", e))
+            })
+        })?;
+        Ok(())
+    }
 }
 
 pub struct Statement {
@@ -305,5 +329,22 @@ impl Row {
 
     pub fn column_count(&self) -> usize {
         self.values.len()
+    }
+}
+
+impl<'a> FromIterator<&'a limbo_core::Value> for Row {
+    fn from_iter<T: IntoIterator<Item = &'a limbo_core::Value>>(iter: T) -> Self {
+        let values = iter
+            .into_iter()
+            .map(|v| match v {
+                limbo_core::Value::Integer(i) => limbo_core::Value::Integer(*i),
+                limbo_core::Value::Null => limbo_core::Value::Null,
+                limbo_core::Value::Float(f) => limbo_core::Value::Float(*f),
+                limbo_core::Value::Text(s) => limbo_core::Value::Text(s.clone()),
+                limbo_core::Value::Blob(b) => limbo_core::Value::Blob(b.clone()),
+            })
+            .collect();
+
+        Row { values }
     }
 }

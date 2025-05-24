@@ -10,19 +10,16 @@ use std::{
 
 use crate::{
     function::AggFunc,
-    schema::{BTreeTable, Column, Index, Table},
+    schema::{BTreeTable, Column, FromClauseSubquery, Index, Table},
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
+        insn::{IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
     Result, VirtualTable,
 };
-use crate::{
-    schema::{PseudoTable, Type},
-    types::SeekOp,
-    util::can_pushdown_predicate,
-};
+use crate::{schema::Type, types::SeekOp, util::can_pushdown_predicate};
 
 use super::{emitter::OperationMode, planner::determine_where_to_eval_term, schema::ParseSchema};
 
@@ -164,14 +161,14 @@ pub fn convert_where_to_vtab_constraint(
     term: &WhereTerm,
     table_index: usize,
     pred_idx: usize,
-) -> Option<ConstraintInfo> {
+) -> Result<Option<ConstraintInfo>> {
     if term.from_outer_join.is_some() {
-        return None;
+        return Ok(None);
     }
     let Expr::Binary(lhs, op, rhs) = &term.expr else {
-        return None;
+        return Ok(None);
     };
-    let expr_is_ready = |e: &Expr| -> bool { can_pushdown_predicate(e, table_index) };
+    let expr_is_ready = |e: &Expr| -> Result<bool> { can_pushdown_predicate(e, table_index) };
     let (vcol_idx, op_for_vtab, usable, is_rhs) = match (&**lhs, &**rhs) {
         (
             Expr::Column {
@@ -189,7 +186,7 @@ pub fn convert_where_to_vtab_constraint(
             let vtab_on_l = *tbl_l == table_index;
             let vtab_on_r = *tbl_r == table_index;
             if vtab_on_l == vtab_on_r {
-                return None; // either both or none -> not convertible
+                return Ok(None); // either both or none -> not convertible
             }
 
             if vtab_on_l {
@@ -206,26 +203,30 @@ pub fn convert_where_to_vtab_constraint(
             (
                 column,
                 op,
-                expr_is_ready(other), // literal / earlier‑table / deterministic func ?
+                expr_is_ready(other)?, // literal / earlier‑table / deterministic func ?
                 false,
             )
         }
         (other, Expr::Column { table, column, .. }) if *table == table_index => (
             column,
             &reverse_operator(op).unwrap_or(*op),
-            expr_is_ready(other),
+            expr_is_ready(other)?,
             true,
         ),
 
-        _ => return None, // does not involve the virtual table at all
+        _ => return Ok(None), // does not involve the virtual table at all
     };
 
-    Some(ConstraintInfo {
+    let Some(op) = to_ext_constraint_op(op_for_vtab) else {
+        return Ok(None);
+    };
+
+    Ok(Some(ConstraintInfo {
         column_index: *vcol_idx as u32,
-        op: to_ext_constraint_op(op_for_vtab)?,
+        op,
         usable,
         plan_info: ConstraintInfo::pack_plan_info(pred_idx as u32, is_rhs),
-    })
+    }))
 }
 /// The loop index where to evaluate the condition.
 /// For example, in `SELECT * FROM u JOIN p WHERE u.id = 5`, the condition can already be evaluated at the first loop (idx 0),
@@ -263,6 +264,13 @@ impl Ord for EvalAt {
 #[derive(Debug, Clone)]
 pub enum Plan {
     Select(SelectPlan),
+    CompoundSelect {
+        first: SelectPlan,
+        rest: Vec<(SelectPlan, ast::CompoundOperator)>,
+        limit: Option<isize>,
+        offset: Option<isize>,
+        order_by: Option<Vec<(ast::Expr, SortOrder)>>,
+    },
     Delete(DeletePlan),
     Update(UpdatePlan),
 }
@@ -296,6 +304,72 @@ impl Default for JoinOrderMember {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+
+/// Whether a column is DISTINCT or not.
+pub enum Distinctness {
+    /// The column is not a DISTINCT column.
+    NonDistinct,
+    /// The column is a DISTINCT column,
+    /// and includes a translation context for handling duplicates.
+    Distinct { ctx: Option<DistinctCtx> },
+}
+
+impl Distinctness {
+    pub fn from_ast(distinctness: Option<&ast::Distinctness>) -> Self {
+        match distinctness {
+            Some(ast::Distinctness::Distinct) => Self::Distinct { ctx: None },
+            Some(ast::Distinctness::All) => Self::NonDistinct,
+            None => Self::NonDistinct,
+        }
+    }
+    pub fn is_distinct(&self) -> bool {
+        matches!(self, Distinctness::Distinct { .. })
+    }
+}
+
+/// Translation context for handling DISTINCT columns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DistinctCtx {
+    /// The cursor ID for the ephemeral index opened for the purpose of deduplicating results.
+    pub cursor_id: usize,
+    /// The index name for the ephemeral index, needed to lookup the cursor ID.
+    pub ephemeral_index_name: String,
+    /// The label for the on conflict branch.
+    /// When a duplicate is found, the program will jump to the offset this label points to.
+    pub label_on_conflict: BranchOffset,
+}
+
+impl DistinctCtx {
+    pub fn emit_deduplication_insns(
+        &self,
+        program: &mut ProgramBuilder,
+        num_regs: usize,
+        start_reg: usize,
+    ) {
+        program.emit_insn(Insn::Found {
+            cursor_id: self.cursor_id,
+            target_pc: self.label_on_conflict,
+            record_reg: start_reg,
+            num_regs,
+        });
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg,
+            count: num_regs,
+            dest_reg: record_reg,
+            index_name: Some(self.ephemeral_index_name.to_string()),
+        });
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: self.cursor_id,
+            record_reg: record_reg,
+            unpacked_start: None,
+            unpacked_count: None,
+            flags: IdxInsertFlags::new(),
+        });
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SelectPlan {
     /// List of table references in loop order, outermost first.
@@ -321,6 +395,10 @@ pub struct SelectPlan {
     pub contains_constant_false_condition: bool,
     /// query type (top level or subquery)
     pub query_type: SelectQueryType,
+    /// whether the query is DISTINCT
+    pub distinctness: Distinctness,
+    /// values: https://sqlite.org/syntax/select-core.html
+    pub values: Vec<Vec<Expr>>,
 }
 
 impl SelectPlan {
@@ -493,11 +571,15 @@ pub struct JoinInfo {
 }
 
 /// A table reference in the query plan.
-/// For example, SELECT * FROM users u JOIN products p JOIN (SELECT * FROM users) sub
-/// has three table references:
-/// 1. operation=Scan, table=users, table_identifier=u, reference_type=BTreeTable, join_info=None
-/// 2. operation=Scan, table=products, table_identifier=p, reference_type=BTreeTable, join_info=Some(JoinInfo { outer: false, using: None }),
-/// 3. operation=Subquery, table=users, table_identifier=sub, reference_type=Subquery, join_info=None
+/// For example,
+/// ```sql
+/// SELECT * FROM users u JOIN products p JOIN (SELECT * FROM users) sub;
+/// ```
+/// has three table references where
+/// - all have [Operation::Scan]
+/// - identifiers are `t`, `p`, `sub`
+/// - `t` and `p` are [Table::BTree] while `sub` is [Table::FromClauseSubquery]
+/// - join_info is None for the first table reference, and Some(JoinInfo { outer: false, using: None }) for the second and third table references
 #[derive(Debug, Clone)]
 pub struct TableReference {
     /// The operation that this table reference performs.
@@ -561,13 +643,6 @@ pub enum Operation {
     // This operation is used to search for a row in a table using an index
     // (i.e. a primary key or a secondary index)
     Search(Search),
-    /// Subquery operation
-    /// This operation is used to represent a subquery in the query plan.
-    /// The subquery itself (recursively) contains an arbitrary SelectPlan.
-    Subquery {
-        plan: Box<SelectPlan>,
-        result_columns_start_reg: usize,
-    },
 }
 
 impl Operation {
@@ -576,7 +651,6 @@ impl Operation {
             Operation::Scan { index, .. } => index.as_ref(),
             Operation::Search(Search::RowidEq { .. }) => None,
             Operation::Search(Search::Seek { index, .. }) => index.as_ref(),
-            Operation::Subquery { .. } => None,
         }
     }
 }
@@ -598,28 +672,35 @@ impl TableReference {
 
     /// Creates a new TableReference for a subquery.
     pub fn new_subquery(identifier: String, plan: SelectPlan, join_info: Option<JoinInfo>) -> Self {
-        let table = Table::Pseudo(Rc::new(PseudoTable::new_with_columns(
-            plan.result_columns
-                .iter()
-                .map(|rc| Column {
-                    name: rc.name(&plan.table_references).map(String::from),
-                    ty: Type::Text, // FIXME: infer proper type
-                    ty_str: "TEXT".to_string(),
-                    is_rowid_alias: false,
-                    primary_key: false,
-                    notnull: false,
-                    default: None,
-                    unique: false,
-                })
-                .collect(),
-        )));
+        let columns = plan
+            .result_columns
+            .iter()
+            .map(|rc| Column {
+                name: rc.name(&plan.table_references).map(String::from),
+                ty: Type::Blob, // FIXME: infer proper type
+                ty_str: "BLOB".to_string(),
+                is_rowid_alias: false,
+                primary_key: false,
+                notnull: false,
+                default: None,
+                unique: false,
+                collation: None, // FIXME: infer collation from subquery
+            })
+            .collect();
+
+        let table = Table::FromClauseSubquery(FromClauseSubquery {
+            name: identifier.clone(),
+            plan: Box::new(plan),
+            columns,
+            result_columns_start_reg: None,
+        });
         Self {
-            op: Operation::Subquery {
-                plan: Box::new(plan),
-                result_columns_start_reg: 0, // Will be set in the bytecode emission phase
+            op: Operation::Scan {
+                iter_dir: IterationDirection::Forwards,
+                index: None,
             },
             table,
-            identifier: identifier.clone(),
+            identifier,
             join_info,
             col_used_mask: ColumnUsedMask::new(),
         }
@@ -677,6 +758,7 @@ impl TableReference {
                 Ok((table_cursor_id, index_cursor_id))
             }
             Table::Pseudo(_) => Ok((None, None)),
+            Table::FromClauseSubquery(..) => Ok((None, None)),
         }
     }
 
@@ -803,11 +885,18 @@ pub enum Search {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Aggregate {
     pub func: AggFunc,
     pub args: Vec<ast::Expr>,
     pub original_expr: ast::Expr,
+    pub distinctness: Distinctness,
+}
+
+impl Aggregate {
+    pub fn is_distinct(&self) -> bool {
+        self.distinctness.is_distinct()
+    }
 }
 
 impl Display for Aggregate {
@@ -827,6 +916,41 @@ impl Display for Plan {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Select(select_plan) => select_plan.fmt(f),
+            Self::CompoundSelect {
+                first,
+                rest,
+                limit,
+                offset,
+                order_by,
+            } => {
+                first.fmt(f)?;
+                for (plan, operator) in rest {
+                    writeln!(f, "{}", operator)?;
+                    plan.fmt(f)?;
+                }
+                if let Some(limit) = limit {
+                    writeln!(f, "LIMIT: {}", limit)?;
+                }
+                if let Some(offset) = offset {
+                    writeln!(f, "OFFSET: {}", offset)?;
+                }
+                if let Some(order_by) = order_by {
+                    writeln!(f, "ORDER BY:")?;
+                    for (expr, dir) in order_by {
+                        writeln!(
+                            f,
+                            "  - {} {}",
+                            expr,
+                            if *dir == SortOrder::Asc {
+                                "ASC"
+                            } else {
+                                "DESC"
+                            }
+                        )?;
+                    }
+                }
+                Ok(())
+            }
             Self::Delete(delete_plan) => delete_plan.fmt(f),
             Self::Update(update_plan) => update_plan.fmt(f),
         }
@@ -878,13 +1002,6 @@ impl Display for SelectPlan {
                         )?;
                     }
                 },
-                Operation::Subquery { plan, .. } => {
-                    writeln!(f, "{}SUBQUERY {}", indent, reference.identifier)?;
-                    // Indent and format the subquery plan
-                    for line in format!("{}", plan).lines() {
-                        writeln!(f, "{}   {}", indent, line)?;
-                    }
-                }
             }
         }
         Ok(())
@@ -911,9 +1028,6 @@ impl Display for DeletePlan {
                 }
                 Operation::Search { .. } => {
                     panic!("DELETE plans should not contain search operations");
-                }
-                Operation::Subquery { .. } => {
-                    panic!("DELETE plans should not contain subqueries");
                 }
             }
         }
@@ -969,12 +1083,6 @@ impl fmt::Display for UpdatePlan {
                         )?;
                     }
                 },
-                Operation::Subquery { plan, .. } => {
-                    writeln!(f, "{}SUBQUERY {}", indent, reference.identifier)?;
-                    for line in format!("{}", plan).lines() {
-                        writeln!(f, "{}   {}", indent, line)?;
-                    }
-                }
             }
         }
         if let Some(order_by) = &self.order_by {

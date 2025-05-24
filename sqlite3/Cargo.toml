@@ -25,7 +25,9 @@ crate-type = ["lib", "cdylib", "staticlib"]
 env_logger = { version = "0.11.3", default-features = false }
 libc = "0.2.169"
 limbo_core = { path = "../core" }
-log = "0.4.22"
+tracing = "0.1.41"
+tracing-appender = "0.2.3"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 
 [package.metadata.capi.header]
 name = "sqlite3.h"

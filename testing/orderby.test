@@ -200,3 +200,14 @@ do_execsql_test orderby_desc_with_filter_id_le {
 6664
 6663
 6662}
+
+# regression test where backwards iteration used to hang indefinitely
+do_execsql_test orderby_desc_regression {
+    select count(1) from (select * from users where id < 100 order by id desc)
+} {99}
+
+do_execsql_test orderby_desc_regression_verify_order {
+    select id from users where id < 100 order by id desc limit 3;
+} {99
+98
+97}

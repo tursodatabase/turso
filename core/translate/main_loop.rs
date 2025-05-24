@@ -1,14 +1,17 @@
 use limbo_ext::VTabKind;
-use limbo_sqlite3_parser::ast;
+use limbo_sqlite3_parser::ast::{self, SortOrder};
 
 use std::sync::Arc;
 
 use crate::{
-    schema::{Index, Table},
-    translate::result_row::emit_select_result,
+    schema::{Index, IndexColumn, Table},
+    translate::{
+        plan::{DistinctCtx, Distinctness},
+        result_row::emit_select_result,
+    },
     types::SeekOp,
     vdbe::{
-        builder::ProgramBuilder,
+        builder::{CursorType, ProgramBuilder},
         insn::{CmpInsFlags, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
@@ -26,8 +29,8 @@ use super::{
     optimizer::Optimizable,
     order_by::{order_by_sorter_insert, sorter_insert},
     plan::{
-        convert_where_to_vtab_constraint, IterationDirection, JoinOrderMember, Operation, Search,
-        SeekDef, SelectPlan, SelectQueryType, TableReference, WhereTerm,
+        convert_where_to_vtab_constraint, Aggregate, GroupBy, IterationDirection, JoinOrderMember,
+        Operation, Search, SeekDef, SelectPlan, SelectQueryType, TableReference, WhereTerm,
     },
 };
 
@@ -63,17 +66,107 @@ impl LoopLabels {
     }
 }
 
+pub fn init_distinct(program: &mut ProgramBuilder, plan: &mut SelectPlan) {
+    if let Distinctness::Distinct { ctx } = &mut plan.distinctness {
+        assert!(
+            ctx.is_none(),
+            "distinctness context should not be allocated yet"
+        );
+        let index_name = format!("distinct_{}", program.offset().to_offset_int()); // we don't really care about the name that much, just enough that we don't get name collisions
+        let index = Arc::new(Index {
+            name: index_name.clone(),
+            table_name: String::new(),
+            ephemeral: true,
+            root_page: 0,
+            columns: plan
+                .result_columns
+                .iter()
+                .enumerate()
+                .map(|(i, col)| IndexColumn {
+                    name: col.expr.to_string(),
+                    order: SortOrder::Asc,
+                    pos_in_table: i,
+                    collation: None, // FIXME: this should be determined based on the result column expression!
+                })
+                .collect(),
+            unique: false,
+            has_rowid: false,
+        });
+        let cursor_id = program.alloc_cursor_id(
+            Some(index_name.clone()),
+            CursorType::BTreeIndex(index.clone()),
+        );
+        *ctx = Some(DistinctCtx {
+            cursor_id,
+            ephemeral_index_name: index_name,
+            label_on_conflict: program.allocate_label(),
+        });
+
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id,
+            is_table: false,
+        });
+    }
+}
+
 /// Initialize resources needed for the source operators (tables, joins, etc)
 pub fn init_loop(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     tables: &[TableReference],
+    aggregates: &mut [Aggregate],
+    group_by: Option<&GroupBy>,
     mode: OperationMode,
 ) -> Result<()> {
     assert!(
         t_ctx.meta_left_joins.len() == tables.len(),
         "meta_left_joins length does not match tables length"
     );
+    // Initialize ephemeral indexes for distinct aggregates
+    for (i, agg) in aggregates
+        .iter_mut()
+        .enumerate()
+        .filter(|(_, agg)| agg.is_distinct())
+    {
+        assert!(
+            agg.args.len() == 1,
+            "DISTINCT aggregate functions must have exactly one argument"
+        );
+        let index_name = format!("distinct_agg_{}_{}", i, agg.args[0]);
+        let index = Arc::new(Index {
+            name: index_name.clone(),
+            table_name: String::new(),
+            ephemeral: true,
+            root_page: 0,
+            columns: vec![IndexColumn {
+                name: agg.args[0].to_string(),
+                order: SortOrder::Asc,
+                pos_in_table: 0,
+                collation: None, // FIXME: this should be inferred from the expression
+            }],
+            has_rowid: false,
+            unique: false,
+        });
+        let cursor_id = program.alloc_cursor_id(
+            Some(index_name.clone()),
+            CursorType::BTreeIndex(index.clone()),
+        );
+        if group_by.is_none() {
+            // In GROUP BY, the ephemeral index is reinitialized for every group
+            // in the clear accumulator subroutine, so we only do it here if there is no GROUP BY.
+            program.emit_insn(Insn::OpenEphemeral {
+                cursor_id,
+                is_table: false,
+            });
+        }
+        agg.distinctness = Distinctness::Distinct {
+            ctx: Some(DistinctCtx {
+                cursor_id,
+                ephemeral_index_name: index_name,
+                label_on_conflict: program.allocate_label(),
+            }),
+        };
+    }
     for (table_index, table) in tables.iter().enumerate() {
         // Initialize bookkeeping for OUTER JOIN
         if let Some(join_info) = table.join_info.as_ref() {
@@ -188,7 +281,6 @@ pub fn init_loop(
                     }
                 }
             }
-            _ => {}
         }
     }
 
@@ -233,175 +325,165 @@ pub fn open_loop(
         let (table_cursor_id, index_cursor_id) = table.resolve_cursors(program)?;
 
         match &table.op {
-            Operation::Subquery { plan, .. } => {
-                let (yield_reg, coroutine_implementation_start) = match &plan.query_type {
-                    SelectQueryType::Subquery {
-                        yield_reg,
-                        coroutine_implementation_start,
-                    } => (*yield_reg, *coroutine_implementation_start),
-                    _ => unreachable!("Subquery operator with non-subquery query type"),
-                };
-                // In case the subquery is an inner loop, it needs to be reinitialized on each iteration of the outer loop.
-                program.emit_insn(Insn::InitCoroutine {
-                    yield_reg,
-                    jump_on_definition: BranchOffset::Offset(0),
-                    start_offset: coroutine_implementation_start,
-                });
-                program.preassign_label_to_next_insn(loop_start);
-                // A subquery within the main loop of a parent query has no cursor, so instead of advancing the cursor,
-                // it emits a Yield which jumps back to the main loop of the subquery itself to retrieve the next row.
-                // When the subquery coroutine completes, this instruction jumps to the label at the top of the termination_label_stack,
-                // which in this case is the end of the Yield-Goto loop in the parent query.
-                program.emit_insn(Insn::Yield {
-                    yield_reg,
-                    end_offset: loop_end,
-                });
-
-                for cond in predicates
-                    .iter()
-                    .filter(|cond| cond.should_eval_at_loop(join_index, join_order))
-                {
-                    let jump_target_when_true = program.allocate_label();
-                    let condition_metadata = ConditionMetadata {
-                        jump_if_condition_is_true: false,
-                        jump_target_when_true,
-                        jump_target_when_false: next,
-                    };
-                    translate_condition_expr(
-                        program,
-                        tables,
-                        &cond.expr,
-                        condition_metadata,
-                        &t_ctx.resolver,
-                    )?;
-                    program.preassign_label_to_next_insn(jump_target_when_true);
-                }
-            }
             Operation::Scan { iter_dir, .. } => {
-                let iteration_cursor_id = index_cursor_id.unwrap_or_else(|| {
-                    table_cursor_id.expect("Either index or table cursor must be opened")
-                });
-                if !matches!(&table.table, Table::Virtual(_)) {
-                    if *iter_dir == IterationDirection::Backwards {
-                        program.emit_insn(Insn::Last {
-                            cursor_id: iteration_cursor_id,
-                            pc_if_empty: loop_end,
+                match &table.table {
+                    Table::BTree(_) => {
+                        let iteration_cursor_id = index_cursor_id.unwrap_or_else(|| {
+                            table_cursor_id.expect("Either index or table cursor must be opened")
                         });
-                    } else {
-                        program.emit_insn(Insn::Rewind {
-                            cursor_id: iteration_cursor_id,
-                            pc_if_empty: loop_end,
-                        });
+                        if *iter_dir == IterationDirection::Backwards {
+                            program.emit_insn(Insn::Last {
+                                cursor_id: iteration_cursor_id,
+                                pc_if_empty: loop_end,
+                            });
+                        } else {
+                            program.emit_insn(Insn::Rewind {
+                                cursor_id: iteration_cursor_id,
+                                pc_if_empty: loop_end,
+                            });
+                        }
+                        program.preassign_label_to_next_insn(loop_start);
                     }
-                    program.preassign_label_to_next_insn(loop_start);
-                } else if let Some(vtab) = table.virtual_table() {
-                    let (start_reg, count, maybe_idx_str, maybe_idx_int) = if vtab
-                        .kind
-                        .eq(&VTabKind::VirtualTable)
-                    {
-                        // Virtual‑table (non‑TVF) modules can receive constraints via xBestIndex.
-                        // They return information with which to pass to VFilter operation.
-                        // We forward every predicate that touches vtab columns.
-                        //
-                        // vtab.col = literal             (always usable)
-                        // vtab.col = outer_table.col     (usable, because outer_table is already positioned)
-                        // vtab.col = later_table.col     (forwarded with usable = false)
-                        //
-                        // xBestIndex decides which ones it wants by setting argvIndex and whether the
-                        // core layer may omit them (omit = true).
-                        // We then materialise the RHS/LHS into registers before issuing VFilter.
-                        let converted_constraints = predicates
-                            .iter()
-                            .filter(|p| p.should_eval_at_loop(join_index, join_order))
-                            .enumerate()
-                            .filter_map(|(i, p)| {
-                                // Build ConstraintInfo from the predicates
-                                convert_where_to_vtab_constraint(p, table_index, i)
-                            })
-                            .collect::<Vec<_>>();
-                        // TODO: get proper order_by information to pass to the vtab.
-                        // maybe encode more info on t_ctx? we need: [col_idx, is_descending]
-                        let index_info = vtab.best_index(&converted_constraints, &[]);
+                    Table::Virtual(vtab) => {
+                        let (start_reg, count, maybe_idx_str, maybe_idx_int) =
+                            if vtab.kind.eq(&VTabKind::VirtualTable) {
+                                // Virtual‑table (non‑TVF) modules can receive constraints via xBestIndex.
+                                // They return information with which to pass to VFilter operation.
+                                // We forward every predicate that touches vtab columns.
+                                //
+                                // vtab.col = literal             (always usable)
+                                // vtab.col = outer_table.col     (usable, because outer_table is already positioned)
+                                // vtab.col = later_table.col     (forwarded with usable = false)
+                                //
+                                // xBestIndex decides which ones it wants by setting argvIndex and whether the
+                                // core layer may omit them (omit = true).
+                                // We then materialise the RHS/LHS into registers before issuing VFilter.
+                                let converted_constraints = predicates
+                                    .iter()
+                                    .filter(|p| p.should_eval_at_loop(join_index, join_order))
+                                    .enumerate()
+                                    .filter_map(|(i, p)| {
+                                        // Build ConstraintInfo from the predicates
+                                        convert_where_to_vtab_constraint(p, table_index, i)
+                                            .unwrap_or(None)
+                                    })
+                                    .collect::<Vec<_>>();
+                                // TODO: get proper order_by information to pass to the vtab.
+                                // maybe encode more info on t_ctx? we need: [col_idx, is_descending]
+                                let index_info = vtab.best_index(&converted_constraints, &[]);
 
-                        // Determine the number of VFilter arguments (constraints with an argv_index).
-                        let args_needed = index_info
-                            .constraint_usages
-                            .iter()
-                            .filter(|u| u.argv_index.is_some())
-                            .count();
-                        let start_reg = program.alloc_registers(args_needed);
+                                // Determine the number of VFilter arguments (constraints with an argv_index).
+                                let args_needed = index_info
+                                    .constraint_usages
+                                    .iter()
+                                    .filter(|u| u.argv_index.is_some())
+                                    .count();
+                                let start_reg = program.alloc_registers(args_needed);
 
-                        // For each constraint used by best_index, translate the opposite side.
-                        for (i, usage) in index_info.constraint_usages.iter().enumerate() {
-                            if let Some(argv_index) = usage.argv_index {
-                                if let Some(cinfo) = converted_constraints.get(i) {
-                                    let (pred_idx, is_rhs) = cinfo.unpack_plan_info();
-                                    if let ast::Expr::Binary(lhs, _, rhs) =
-                                        &predicates[pred_idx].expr
-                                    {
-                                        // translate the opposite side of the referenced vtab column
-                                        let expr = if is_rhs { lhs } else { rhs };
-                                        // argv_index is 1-based; adjust to get the proper register offset.
-                                        let target_reg = start_reg + (argv_index - 1) as usize;
-                                        translate_expr(
-                                            program,
-                                            Some(tables),
-                                            expr,
-                                            target_reg,
-                                            &t_ctx.resolver,
-                                        )?;
-                                        if cinfo.usable && usage.omit {
-                                            predicates[pred_idx].consumed = true;
+                                // For each constraint used by best_index, translate the opposite side.
+                                for (i, usage) in index_info.constraint_usages.iter().enumerate() {
+                                    if let Some(argv_index) = usage.argv_index {
+                                        if let Some(cinfo) = converted_constraints.get(i) {
+                                            let (pred_idx, is_rhs) = cinfo.unpack_plan_info();
+                                            if let ast::Expr::Binary(lhs, _, rhs) =
+                                                &predicates[pred_idx].expr
+                                            {
+                                                // translate the opposite side of the referenced vtab column
+                                                let expr = if is_rhs { lhs } else { rhs };
+                                                // argv_index is 1-based; adjust to get the proper register offset.
+                                                let target_reg =
+                                                    start_reg + (argv_index - 1) as usize;
+                                                translate_expr(
+                                                    program,
+                                                    Some(tables),
+                                                    expr,
+                                                    target_reg,
+                                                    &t_ctx.resolver,
+                                                )?;
+                                                if cinfo.usable && usage.omit {
+                                                    predicates[pred_idx].consumed = true;
+                                                }
+                                            }
                                         }
                                     }
                                 }
-                            }
-                        }
-                        // If best_index provided an idx_str, translate it.
-                        let maybe_idx_str = if let Some(idx_str) = index_info.idx_str {
-                            let reg = program.alloc_register();
-                            program.emit_insn(Insn::String8 {
-                                dest: reg,
-                                value: idx_str,
-                            });
-                            Some(reg)
-                        } else {
-                            None
-                        };
-                        (
-                            start_reg,
-                            args_needed,
-                            maybe_idx_str,
-                            Some(index_info.idx_num),
-                        )
-                    } else {
-                        // For table-valued functions: translate the table args.
-                        let args = match vtab.args.as_ref() {
-                            Some(args) => args,
-                            None => &vec![],
-                        };
-                        let start_reg = program.alloc_registers(args.len());
-                        let mut cur_reg = start_reg;
-                        for arg in args {
-                            let reg = cur_reg;
-                            cur_reg += 1;
-                            let _ =
-                                translate_expr(program, Some(tables), arg, reg, &t_ctx.resolver)?;
-                        }
-                        (start_reg, args.len(), None, None)
-                    };
+                                // If best_index provided an idx_str, translate it.
+                                let maybe_idx_str = if let Some(idx_str) = index_info.idx_str {
+                                    let reg = program.alloc_register();
+                                    program.emit_insn(Insn::String8 {
+                                        dest: reg,
+                                        value: idx_str,
+                                    });
+                                    Some(reg)
+                                } else {
+                                    None
+                                };
+                                (
+                                    start_reg,
+                                    args_needed,
+                                    maybe_idx_str,
+                                    Some(index_info.idx_num),
+                                )
+                            } else {
+                                // For table-valued functions: translate the table args.
+                                let args = match vtab.args.as_ref() {
+                                    Some(args) => args,
+                                    None => &vec![],
+                                };
+                                let start_reg = program.alloc_registers(args.len());
+                                let mut cur_reg = start_reg;
+                                for arg in args {
+                                    let reg = cur_reg;
+                                    cur_reg += 1;
+                                    let _ = translate_expr(
+                                        program,
+                                        Some(tables),
+                                        arg,
+                                        reg,
+                                        &t_ctx.resolver,
+                                    )?;
+                                }
+                                (start_reg, args.len(), None, None)
+                            };
 
-                    // Emit VFilter with the computed arguments.
-                    program.emit_insn(Insn::VFilter {
-                        cursor_id: table_cursor_id
-                            .expect("Virtual tables do not support covering indexes"),
-                        arg_count: count,
-                        args_reg: start_reg,
-                        idx_str: maybe_idx_str,
-                        idx_num: maybe_idx_int.unwrap_or(0) as usize,
-                        pc_if_empty: loop_end,
-                    });
-                    program.preassign_label_to_next_insn(loop_start);
+                        // Emit VFilter with the computed arguments.
+                        program.emit_insn(Insn::VFilter {
+                            cursor_id: table_cursor_id
+                                .expect("Virtual tables do not support covering indexes"),
+                            arg_count: count,
+                            args_reg: start_reg,
+                            idx_str: maybe_idx_str,
+                            idx_num: maybe_idx_int.unwrap_or(0) as usize,
+                            pc_if_empty: loop_end,
+                        });
+                        program.preassign_label_to_next_insn(loop_start);
+                    }
+                    Table::FromClauseSubquery(from_clause_subquery) => {
+                        let (yield_reg, coroutine_implementation_start) =
+                            match &from_clause_subquery.plan.query_type {
+                                SelectQueryType::Subquery {
+                                    yield_reg,
+                                    coroutine_implementation_start,
+                                } => (*yield_reg, *coroutine_implementation_start),
+                                _ => unreachable!("Subquery table with non-subquery query type"),
+                            };
+                        // In case the subquery is an inner loop, it needs to be reinitialized on each iteration of the outer loop.
+                        program.emit_insn(Insn::InitCoroutine {
+                            yield_reg,
+                            jump_on_definition: BranchOffset::Offset(0),
+                            start_offset: coroutine_implementation_start,
+                        });
+                        program.preassign_label_to_next_insn(loop_start);
+                        // A subquery within the main loop of a parent query has no cursor, so instead of advancing the cursor,
+                        // it emits a Yield which jumps back to the main loop of the subquery itself to retrieve the next row.
+                        // When the subquery coroutine completes, this instruction jumps to the label at the top of the termination_label_stack,
+                        // which in this case is the end of the Yield-Goto loop in the parent query.
+                        program.emit_insn(Insn::Yield {
+                            yield_reg,
+                            end_offset: loop_end,
+                        });
+                    }
+                    Table::Pseudo(_) => panic!("Pseudo tables should not loop"),
                 }
 
                 if let Some(table_cursor_id) = table_cursor_id {
@@ -434,6 +516,10 @@ pub fn open_loop(
                 }
             }
             Operation::Search(search) => {
+                assert!(
+                    !matches!(table.table, Table::FromClauseSubquery(_)),
+                    "Subqueries do not support index seeks"
+                );
                 // Open the loop for the index search.
                 // Rowid equality point lookups are handled with a SeekRowid instruction which does not loop, since it is a single row lookup.
                 if let Search::RowidEq { cmp_expr } = search {
@@ -693,16 +779,25 @@ fn emit_loop_source<'a>(
 
             Ok(())
         }
-        LoopEmitTarget::OrderBySorter => order_by_sorter_insert(
-            program,
-            &t_ctx.resolver,
-            t_ctx
-                .meta_sort
-                .as_ref()
-                .expect("sort metadata must exist for ORDER BY"),
-            &mut t_ctx.result_column_indexes_in_orderby_sorter,
-            plan,
-        ),
+        LoopEmitTarget::OrderBySorter => {
+            order_by_sorter_insert(
+                program,
+                &t_ctx.resolver,
+                t_ctx
+                    .meta_sort
+                    .as_ref()
+                    .expect("sort metadata must exist for ORDER BY"),
+                &mut t_ctx.result_column_indexes_in_orderby_sorter,
+                plan,
+            )?;
+
+            if let Distinctness::Distinct { ctx } = &plan.distinctness {
+                let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
+                program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
+            }
+
+            Ok(())
+        }
         LoopEmitTarget::AggStep => {
             let num_aggs = plan.aggregates.len();
             let start_reg = program.alloc_registers(num_aggs);
@@ -721,6 +816,12 @@ fn emit_loop_source<'a>(
                     reg,
                     &t_ctx.resolver,
                 )?;
+                if let Distinctness::Distinct { ctx } = &agg.distinctness {
+                    let ctx = ctx
+                        .as_ref()
+                        .expect("distinct aggregate context not populated");
+                    program.preassign_label_to_next_insn(ctx.label_on_conflict);
+                }
             }
 
             let label_emit_nonagg_only_once = if let Some(flag) = t_ctx.reg_nonagg_emit_once_flag {
@@ -782,9 +883,14 @@ fn emit_loop_source<'a>(
                 t_ctx.reg_nonagg_emit_once_flag,
                 t_ctx.reg_offset,
                 t_ctx.reg_result_cols_start.unwrap(),
-                t_ctx.reg_limit,
+                t_ctx.limit_ctx,
                 t_ctx.reg_limit_offset_sum,
             )?;
+
+            if let Distinctness::Distinct { ctx } = &plan.distinctness {
+                let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
+                program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
+            }
 
             Ok(())
         }
@@ -819,23 +925,13 @@ pub fn close_loop(
         let (table_cursor_id, index_cursor_id) = table.resolve_cursors(program)?;
 
         match &table.op {
-            Operation::Subquery { .. } => {
-                program.resolve_label(loop_labels.next, program.offset());
-                // A subquery has no cursor to call Next on, so it just emits a Goto
-                // to the Yield instruction, which in turn jumps back to the main loop of the subquery,
-                // so that the next row from the subquery can be read.
-                program.emit_insn(Insn::Goto {
-                    target_pc: loop_labels.loop_start,
-                });
-                program.preassign_label_to_next_insn(loop_labels.loop_end);
-            }
             Operation::Scan { iter_dir, .. } => {
                 program.resolve_label(loop_labels.next, program.offset());
-                let iteration_cursor_id = index_cursor_id.unwrap_or_else(|| {
-                    table_cursor_id.expect("Either index or table cursor must be opened")
-                });
                 match &table.table {
                     Table::BTree(_) => {
+                        let iteration_cursor_id = index_cursor_id.unwrap_or_else(|| {
+                            table_cursor_id.expect("Either index or table cursor must be opened")
+                        });
                         if *iter_dir == IterationDirection::Backwards {
                             program.emit_insn(Insn::Prev {
                                 cursor_id: iteration_cursor_id,
@@ -855,11 +951,23 @@ pub fn close_loop(
                             pc_if_next: loop_labels.loop_start,
                         });
                     }
+                    Table::FromClauseSubquery(_) => {
+                        // A subquery has no cursor to call Next on, so it just emits a Goto
+                        // to the Yield instruction, which in turn jumps back to the main loop of the subquery,
+                        // so that the next row from the subquery can be read.
+                        program.emit_insn(Insn::Goto {
+                            target_pc: loop_labels.loop_start,
+                        });
+                    }
                     other => unreachable!("Unsupported table reference type: {:?}", other),
                 }
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
             }
             Operation::Search(search) => {
+                assert!(
+                    !matches!(table.table, Table::FromClauseSubquery(_)),
+                    "Subqueries do not support index seeks"
+                );
                 program.resolve_label(loop_labels.next, program.offset());
                 let iteration_cursor_id = index_cursor_id.unwrap_or_else(|| {
                     table_cursor_id.expect("Either index or table cursor must be opened")
@@ -1151,24 +1259,28 @@ fn emit_seek_termination(
             rhs: start_reg,
             target_pc: loop_end,
             flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
         }),
         (false, SeekOp::GT) => program.emit_insn(Insn::Gt {
             lhs: rowid_reg.unwrap(),
             rhs: start_reg,
             target_pc: loop_end,
             flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
         }),
         (false, SeekOp::LE) => program.emit_insn(Insn::Le {
             lhs: rowid_reg.unwrap(),
             rhs: start_reg,
             target_pc: loop_end,
             flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
         }),
         (false, SeekOp::LT) => program.emit_insn(Insn::Lt {
             lhs: rowid_reg.unwrap(),
             rhs: start_reg,
             target_pc: loop_end,
             flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
         }),
         (_, SeekOp::EQ) => {
             panic!("An index termination condition is never EQ")

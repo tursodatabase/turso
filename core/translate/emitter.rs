@@ -6,27 +6,29 @@ use std::sync::Arc;
 
 use limbo_sqlite3_parser::ast::{self};
 
-use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
-use crate::function::Func;
-use crate::schema::Index;
-use crate::translate::plan::{DeletePlan, Plan, Search};
-use crate::util::exprs_are_equivalent;
-use crate::vdbe::builder::{CursorType, ProgramBuilder};
-use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, RegisterOrLiteral};
-use crate::vdbe::{insn::Insn, BranchOffset};
-use crate::{Result, SymbolTable};
-
 use super::aggregation::emit_ungrouped_aggregation;
 use super::expr::{translate_condition_expr, translate_expr, ConditionMetadata};
 use super::group_by::{
     group_by_agg_phase, group_by_emit_row_phase, init_group_by, GroupByMetadata, GroupByRowSource,
 };
-use super::main_loop::{close_loop, emit_loop, init_loop, open_loop, LeftJoinMetadata, LoopLabels};
+use super::main_loop::{
+    close_loop, emit_loop, init_distinct, init_loop, open_loop, LeftJoinMetadata, LoopLabels,
+};
 use super::order_by::{emit_order_by, init_order_by, SortMetadata};
 use super::plan::{JoinOrderMember, Operation, SelectPlan, TableReference, UpdatePlan};
 use super::schema::ParseSchema;
 use super::select::emit_simple_count;
 use super::subquery::emit_subqueries;
+use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
+use crate::function::Func;
+use crate::schema::Index;
+use crate::translate::plan::{DeletePlan, Plan, Search};
+use crate::translate::values::emit_values;
+use crate::util::exprs_are_equivalent;
+use crate::vdbe::builder::{CursorType, ProgramBuilder};
+use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, RegisterOrLiteral};
+use crate::vdbe::{insn::Insn, BranchOffset};
+use crate::{Result, SymbolTable};
 
 #[derive(Debug)]
 pub struct Resolver<'a> {
@@ -60,6 +62,32 @@ impl<'a> Resolver<'a> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct LimitCtx {
+    /// Register holding the LIMIT value (e.g. LIMIT 5)
+    pub reg_limit: usize,
+    /// Whether to initialize the LIMIT counter to the LIMIT value;
+    /// There are cases like compound SELECTs where all the sub-selects
+    /// utilize the same limit register, but it is initialized only once.
+    pub initialize_counter: bool,
+}
+
+impl LimitCtx {
+    pub fn new(program: &mut ProgramBuilder) -> Self {
+        Self {
+            reg_limit: program.alloc_register(),
+            initialize_counter: true,
+        }
+    }
+
+    pub fn new_shared(reg_limit: usize) -> Self {
+        Self {
+            reg_limit,
+            initialize_counter: false,
+        }
+    }
+}
+
 /// The TranslateCtx struct holds various information and labels used during bytecode generation.
 /// It is used for maintaining state and control flow during the bytecode
 /// generation process.
@@ -78,8 +106,7 @@ pub struct TranslateCtx<'a> {
     pub reg_nonagg_emit_once_flag: Option<usize>,
     // First register of the result columns of the query
     pub reg_result_cols_start: Option<usize>,
-    // The register holding the limit value, if any.
-    pub reg_limit: Option<usize>,
+    pub limit_ctx: Option<LimitCtx>,
     // The register holding the offset value, if any.
     pub reg_offset: Option<usize>,
     // The register holding the limit+offset value, if any.
@@ -100,6 +127,32 @@ pub struct TranslateCtx<'a> {
     pub resolver: Resolver<'a>,
 }
 
+impl<'a> TranslateCtx<'a> {
+    pub fn new(
+        program: &mut ProgramBuilder,
+        syms: &'a SymbolTable,
+        table_count: usize,
+        result_column_count: usize,
+    ) -> Self {
+        TranslateCtx {
+            labels_main_loop: (0..table_count).map(|_| LoopLabels::new(program)).collect(),
+            label_main_loop_end: None,
+            reg_agg_start: None,
+            reg_nonagg_emit_once_flag: None,
+            limit_ctx: None,
+            reg_offset: None,
+            reg_limit_offset_sum: None,
+            reg_result_cols_start: None,
+            meta_group_by: None,
+            meta_left_joins: (0..table_count).map(|_| None).collect(),
+            meta_sort: None,
+            result_column_indexes_in_orderby_sorter: (0..result_column_count).collect(),
+            result_columns_to_skip_in_orderby_sorter: None,
+            resolver: Resolver::new(syms),
+        }
+    }
+}
+
 /// Used to distinguish database operations
 #[allow(clippy::upper_case_acronyms, dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,75 +163,11 @@ pub enum OperationMode {
     DELETE,
 }
 
-/// Initialize the program with basic setup and return initial metadata and labels
-fn prologue<'a>(
-    program: &mut ProgramBuilder,
-    syms: &'a SymbolTable,
-    table_count: usize,
-    result_column_count: usize,
-) -> Result<(TranslateCtx<'a>, BranchOffset, BranchOffset)> {
-    let init_label = program.allocate_label();
-
-    program.emit_insn(Insn::Init {
-        target_pc: init_label,
-    });
-
-    let start_offset = program.offset();
-
-    let t_ctx = TranslateCtx {
-        labels_main_loop: (0..table_count).map(|_| LoopLabels::new(program)).collect(),
-        label_main_loop_end: None,
-        reg_agg_start: None,
-        reg_nonagg_emit_once_flag: None,
-        reg_limit: None,
-        reg_offset: None,
-        reg_limit_offset_sum: None,
-        reg_result_cols_start: None,
-        meta_group_by: None,
-        meta_left_joins: (0..table_count).map(|_| None).collect(),
-        meta_sort: None,
-        result_column_indexes_in_orderby_sorter: (0..result_column_count).collect(),
-        result_columns_to_skip_in_orderby_sorter: None,
-        resolver: Resolver::new(syms),
-    };
-
-    Ok((t_ctx, init_label, start_offset))
-}
-
 #[derive(Clone, Copy, Debug)]
 pub enum TransactionMode {
     None,
     Read,
     Write,
-}
-
-/// Clean up and finalize the program, resolving any remaining labels
-/// Note that although these are the final instructions, typically an SQLite
-/// query will jump to the Transaction instruction via init_label.
-fn epilogue(
-    program: &mut ProgramBuilder,
-    init_label: BranchOffset,
-    start_offset: BranchOffset,
-    txn_mode: TransactionMode,
-) -> Result<()> {
-    program.emit_insn(Insn::Halt {
-        err_code: 0,
-        description: String::new(),
-    });
-    program.preassign_label_to_next_insn(init_label);
-
-    match txn_mode {
-        TransactionMode::Read => program.emit_insn(Insn::Transaction { write: false }),
-        TransactionMode::Write => program.emit_insn(Insn::Transaction { write: true }),
-        TransactionMode::None => {}
-    }
-
-    program.emit_constant_insns();
-    program.emit_insn(Insn::Goto {
-        target_pc: start_offset,
-    });
-
-    Ok(())
 }
 
 /// Main entry point for emitting bytecode for a SQL query
@@ -188,7 +177,103 @@ pub fn emit_program(program: &mut ProgramBuilder, plan: Plan, syms: &SymbolTable
         Plan::Select(plan) => emit_program_for_select(program, plan, syms),
         Plan::Delete(plan) => emit_program_for_delete(program, plan, syms),
         Plan::Update(plan) => emit_program_for_update(program, plan, syms),
+        Plan::CompoundSelect { .. } => emit_program_for_compound_select(program, plan, syms),
     }
+}
+
+fn emit_program_for_compound_select(
+    program: &mut ProgramBuilder,
+    plan: Plan,
+    syms: &SymbolTable,
+) -> Result<()> {
+    let Plan::CompoundSelect {
+        mut first,
+        mut rest,
+        limit,
+        ..
+    } = plan
+    else {
+        crate::bail_parse_error!("expected compound select plan");
+    };
+
+    // Trivial exit on LIMIT 0
+    if let Some(limit) = limit {
+        if limit == 0 {
+            program.epilogue(TransactionMode::Read);
+            program.result_columns = first.result_columns;
+            program.table_references = first.table_references;
+            return Ok(());
+        }
+    }
+
+    // Each subselect gets their own TranslateCtx, but they share the same limit_ctx
+    // because the LIMIT applies to the entire compound select, not just a single subselect.
+    let mut t_ctx_list = Vec::with_capacity(rest.len() + 1);
+    let reg_limit = if let Some(limit) = limit {
+        let reg = program.alloc_register();
+        program.emit_insn(Insn::Integer {
+            value: limit as i64,
+            dest: reg,
+        });
+        Some(reg)
+    } else {
+        None
+    };
+    let limit_ctx = if let Some(reg_limit) = reg_limit {
+        Some(LimitCtx::new_shared(reg_limit))
+    } else {
+        None
+    };
+    let mut t_ctx_first = TranslateCtx::new(
+        program,
+        syms,
+        first.table_references.len(),
+        first.result_columns.len(),
+    );
+    t_ctx_first.limit_ctx = limit_ctx;
+    t_ctx_list.push(t_ctx_first);
+
+    for (select, _) in rest.iter() {
+        let mut t_ctx = TranslateCtx::new(
+            program,
+            syms,
+            select.table_references.len(),
+            select.result_columns.len(),
+        );
+        t_ctx.limit_ctx = limit_ctx;
+        t_ctx_list.push(t_ctx);
+    }
+
+    let mut first_t_ctx = t_ctx_list.remove(0);
+    emit_query(program, &mut first, &mut first_t_ctx)?;
+
+    // TODO: add support for UNION, EXCEPT, INTERSECT
+    while !t_ctx_list.is_empty() {
+        let label_next_select = program.allocate_label();
+        // If the LIMIT is reached in any subselect, jump to either:
+        // a) the IfNot of the next subselect, or
+        // b) the end of the program
+        if let Some(reg_limit) = reg_limit {
+            program.emit_insn(Insn::IfNot {
+                reg: reg_limit,
+                target_pc: label_next_select,
+                jump_if_null: true,
+            });
+        }
+        let mut t_ctx = t_ctx_list.remove(0);
+        let (mut select, operator) = rest.remove(0);
+        if operator != ast::CompoundOperator::UnionAll {
+            crate::bail_parse_error!("unimplemented compound select operator: {:?}", operator);
+        }
+        emit_query(program, &mut select, &mut t_ctx)?;
+        program.preassign_label_to_next_insn(label_next_select);
+    }
+
+    program.epilogue(TransactionMode::Read);
+    program.result_columns = first.result_columns;
+    program.table_references = first.table_references;
+
+    Ok(())
 }
 
 fn emit_program_for_select(
@@ -196,17 +281,17 @@ fn emit_program_for_select(
     mut plan: SelectPlan,
     syms: &SymbolTable,
 ) -> Result<()> {
-    let (mut t_ctx, init_label, start_offset) = prologue(
+    let mut t_ctx = TranslateCtx::new(
         program,
         syms,
         plan.table_references.len(),
         plan.result_columns.len(),
-    )?;
+    );
 
     // Trivial exit on LIMIT 0
     if let Some(limit) = plan.limit {
         if limit == 0 {
-            epilogue(program, init_label, start_offset, TransactionMode::Read)?;
+            program.epilogue(TransactionMode::Read);
             program.result_columns = plan.result_columns;
             program.table_references = plan.table_references;
             return Ok(());
@@ -217,9 +302,9 @@ fn emit_program_for_select(
 
     // Finalize program
     if plan.table_references.is_empty() {
-        epilogue(program, init_label, start_offset, TransactionMode::None)?;
+        program.epilogue(TransactionMode::None);
     } else {
-        epilogue(program, init_label, start_offset, TransactionMode::Read)?;
+        program.epilogue(TransactionMode::Read);
     }
 
     program.result_columns = plan.result_columns;
@@ -232,19 +317,28 @@ pub fn emit_query<'a>(
     plan: &'a mut SelectPlan,
     t_ctx: &'a mut TranslateCtx<'a>,
 ) -> Result<usize> {
+    if !plan.values.is_empty() {
+        let reg_result_cols_start = emit_values(program, &plan, &t_ctx.resolver)?;
+        return Ok(reg_result_cols_start);
+    }
+
     // Emit subqueries first so the results can be read in the main query loop.
     emit_subqueries(program, t_ctx, &mut plan.table_references)?;
 
-    if t_ctx.reg_limit.is_none() {
-        t_ctx.reg_limit = plan.limit.map(|_| program.alloc_register());
+    if t_ctx.limit_ctx.is_none() {
+        t_ctx.limit_ctx = plan.limit.map(|_| LimitCtx::new(program));
     }
 
     if t_ctx.reg_offset.is_none() {
-        t_ctx.reg_offset = plan.offset.map(|_| program.alloc_register());
+        t_ctx.reg_offset = t_ctx
+            .reg_offset
+            .or_else(|| plan.offset.map(|_| program.alloc_register()));
     }
 
     if t_ctx.reg_limit_offset_sum.is_none() {
-        t_ctx.reg_limit_offset_sum = plan.offset.map(|_| program.alloc_register());
+        t_ctx.reg_limit_offset_sum = t_ctx
+            .reg_limit_offset_sum
+            .or_else(|| plan.offset.map(|_| program.alloc_register()));
     }
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
@@ -275,16 +369,20 @@ pub fn emit_query<'a>(
 
     // Initialize cursors and other resources needed for query execution
     if let Some(ref mut order_by) = plan.order_by {
-        init_order_by(program, t_ctx, order_by)?;
+        init_order_by(program, t_ctx, order_by, &plan.table_references)?;
     }
 
     if let Some(ref group_by) = plan.group_by {
         init_group_by(program, t_ctx, group_by, &plan)?;
     }
+
+    init_distinct(program, plan);
     init_loop(
         program,
         t_ctx,
         &plan.table_references,
+        &mut plan.aggregates,
+        plan.group_by.as_ref(),
         OperationMode::SELECT,
     )?;
 
@@ -365,16 +463,16 @@ fn emit_program_for_delete(
     mut plan: DeletePlan,
     syms: &SymbolTable,
 ) -> Result<()> {
-    let (mut t_ctx, init_label, start_offset) = prologue(
+    let mut t_ctx = TranslateCtx::new(
         program,
         syms,
         plan.table_references.len(),
         plan.result_columns.len(),
-    )?;
+    );
 
     // exit early if LIMIT 0
     if let Some(0) = plan.limit {
-        epilogue(program, init_label, start_offset, TransactionMode::Write)?;
+        program.epilogue(TransactionMode::Write);
         program.result_columns = plan.result_columns;
         program.table_references = plan.table_references;
         return Ok(());
@@ -394,6 +492,8 @@ fn emit_program_for_delete(
         program,
         &mut t_ctx,
         &plan.table_references,
+        &mut [],
+        None,
         OperationMode::DELETE,
     )?;
 
@@ -423,7 +523,7 @@ fn emit_program_for_delete(
     program.preassign_label_to_next_insn(after_main_loop_label);
 
     // Finalize program
-    epilogue(program, init_label, start_offset, TransactionMode::Write)?;
+    program.epilogue(TransactionMode::Write);
     program.result_columns = plan.result_columns;
     program.table_references = plan.table_references;
     Ok(())
@@ -447,7 +547,6 @@ fn emit_delete_insns(
                 index: Some(index), ..
             } => program.resolve_cursor_id(&index.name),
         },
-        _ => return Ok(()),
     };
     let main_table_cursor_id = program.resolve_cursor_id(table_reference.table.get_name());
 
@@ -458,7 +557,7 @@ fn emit_delete_insns(
         dest: key_reg,
     });
 
-    if let Some(vtab) = table_reference.virtual_table() {
+    if let Some(_) = table_reference.virtual_table() {
         let conflict_action = 0u16;
         let start_reg = key_reg;
 
@@ -471,7 +570,6 @@ fn emit_delete_insns(
             cursor_id,
             arg_count: 2,
             start_reg,
-            vtab_ptr: vtab.implementation.as_ref().ctx as usize,
             conflict_action,
         });
     } else {
@@ -535,26 +633,25 @@ fn emit_program_for_update(
     mut plan: UpdatePlan,
     syms: &SymbolTable,
 ) -> Result<()> {
-    let (mut t_ctx, init_label, start_offset) = prologue(
+    let mut t_ctx = TranslateCtx::new(
         program,
         syms,
         plan.table_references.len(),
         plan.returning.as_ref().map_or(0, |r| r.len()),
-    )?;
+    );
 
     // Exit on LIMIT 0
     if let Some(0) = plan.limit {
-        epilogue(program, init_label, start_offset, TransactionMode::None)?;
+        program.epilogue(TransactionMode::None);
         program.result_columns = plan.returning.unwrap_or_default();
         program.table_references = plan.table_references;
         return Ok(());
     }
-    if t_ctx.reg_limit.is_none() && plan.limit.is_some() {
-        let reg = program.alloc_register();
-        t_ctx.reg_limit = Some(reg);
+    if t_ctx.limit_ctx.is_none() && plan.limit.is_some() {
+        t_ctx.limit_ctx = Some(LimitCtx::new(program));
         program.emit_insn(Insn::Integer {
             value: plan.limit.unwrap() as i64,
-            dest: reg,
+            dest: t_ctx.limit_ctx.unwrap().reg_limit,
         });
         program.mark_last_insn_constant();
         if t_ctx.reg_offset.is_none() && plan.offset.is_some_and(|n| n.ne(&0)) {
@@ -568,7 +665,7 @@ fn emit_program_for_update(
             let combined_reg = program.alloc_register();
             t_ctx.reg_limit_offset_sum = Some(combined_reg);
             program.emit_insn(Insn::OffsetLimit {
-                limit_reg: t_ctx.reg_limit.unwrap(),
+                limit_reg: t_ctx.limit_ctx.unwrap().reg_limit,
                 offset_reg: reg,
                 combined_reg,
             });
@@ -586,6 +683,8 @@ fn emit_program_for_update(
         program,
         &mut t_ctx,
         &plan.table_references,
+        &mut [],
+        None,
         OperationMode::UPDATE,
     )?;
     // Open indexes for update.
@@ -634,7 +733,7 @@ fn emit_program_for_update(
     program.preassign_label_to_next_insn(after_main_loop_label);
 
     // Finalize program
-    epilogue(program, init_label, start_offset, TransactionMode::Write)?;
+    program.epilogue(TransactionMode::Write);
     program.result_columns = plan.returning.unwrap_or_default();
     program.table_references = plan.table_references;
     Ok(())
@@ -668,7 +767,6 @@ fn emit_update_insns(
                 false,
             ),
         },
-        _ => return Ok(()),
     };
 
     for cond in plan
@@ -914,6 +1012,7 @@ fn emit_update_insns(
             rhs: idx_rowid_reg,
             target_pc: constraint_check,
             flags: CmpInsFlags::default(), // TODO: not sure what type of comparison flag is needed
+            collation: program.curr_collation(),
         });
 
         program.emit_insn(Insn::Halt {
@@ -943,6 +1042,7 @@ fn emit_update_insns(
                 rhs: beg,
                 target_pc: record_label,
                 flags: CmpInsFlags::default(),
+                collation: program.curr_collation(),
             });
 
             program.emit_insn(Insn::NotExists {
@@ -1033,20 +1133,19 @@ fn emit_update_insns(
             flag: 0,
             table_name: table_ref.identifier.clone(),
         });
-    } else if let Some(vtab) = table_ref.virtual_table() {
+    } else if let Some(_) = table_ref.virtual_table() {
         let arg_count = table_ref.columns().len() + 2;
         program.emit_insn(Insn::VUpdate {
             cursor_id,
             arg_count,
             start_reg: beg,
-            vtab_ptr: vtab.implementation.as_ref().ctx as usize,
             conflict_action: 0u16,
         });
     }
 
-    if let Some(limit_reg) = t_ctx.reg_limit {
+    if let Some(limit_ctx) = t_ctx.limit_ctx {
         program.emit_insn(Insn::DecrJumpZero {
-            reg: limit_reg,
+            reg: limit_ctx.reg_limit,
             target_pc: t_ctx.label_main_loop_end.unwrap(),
         })
     }

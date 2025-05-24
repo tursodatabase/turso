@@ -14,6 +14,7 @@ Macros:
       - any-glob-to-any-file: ['macros/**/*']
 
 Extensions-Other:
+- all:
   - changed-files:
     - any-glob-to-any-file: 'extensions/**/*'
     - all-globs-to-all-files: '!extensions/core/**/*'

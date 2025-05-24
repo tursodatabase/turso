@@ -2,7 +2,7 @@ use limbo_sqlite3_parser::ast::{self, UnaryOperator};
 
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
-use super::plan::{Operation, TableReference};
+use super::plan::TableReference;
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
@@ -15,6 +15,8 @@ use crate::vdbe::{
     BranchOffset,
 };
 use crate::{Result, Value};
+
+use super::collate::CollationSeq;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ConditionMetadata {
@@ -37,59 +39,6 @@ fn emit_cond_jump(program: &mut ProgramBuilder, cond_meta: ConditionMetadata, re
             jump_if_null: true,
         });
     }
-}
-macro_rules! emit_cmp_insn {
-    (
-        $program:expr,
-        $cond:expr,
-        $op_true:ident,
-        $op_false:ident,
-        $lhs:expr,
-        $rhs:expr
-    ) => {{
-        if $cond.jump_if_condition_is_true {
-            $program.emit_insn(Insn::$op_true {
-                lhs: $lhs,
-                rhs: $rhs,
-                target_pc: $cond.jump_target_when_true,
-                flags: CmpInsFlags::default(),
-            });
-        } else {
-            $program.emit_insn(Insn::$op_false {
-                lhs: $lhs,
-                rhs: $rhs,
-                target_pc: $cond.jump_target_when_false,
-                flags: CmpInsFlags::default().jump_if_null(),
-            });
-        }
-    }};
-}
-
-macro_rules! emit_cmp_null_insn {
-    (
-        $program:expr,
-        $cond:expr,
-        $op_true:ident,
-        $op_false:ident,
-        $lhs:expr,
-        $rhs:expr
-    ) => {{
-        if $cond.jump_if_condition_is_true {
-            $program.emit_insn(Insn::$op_true {
-                lhs: $lhs,
-                rhs: $rhs,
-                target_pc: $cond.jump_target_when_true,
-                flags: CmpInsFlags::default().null_eq(),
-            });
-        } else {
-            $program.emit_insn(Insn::$op_false {
-                lhs: $lhs,
-                rhs: $rhs,
-                target_pc: $cond.jump_target_when_false,
-                flags: CmpInsFlags::default().null_eq(),
-            });
-        }
-    }};
 }
 
 macro_rules! expect_arguments_exact {
@@ -240,51 +189,6 @@ pub fn translate_condition_expr(
                 resolver,
             )?;
         }
-        ast::Expr::Binary(lhs, op, rhs)
-            if matches!(
-                op,
-                ast::Operator::Greater
-                    | ast::Operator::GreaterEquals
-                    | ast::Operator::Less
-                    | ast::Operator::LessEquals
-                    | ast::Operator::Equals
-                    | ast::Operator::NotEquals
-                    | ast::Operator::Is
-                    | ast::Operator::IsNot
-            ) =>
-        {
-            let lhs_reg = program.alloc_register();
-            let rhs_reg = program.alloc_register();
-            translate_expr(program, Some(referenced_tables), lhs, lhs_reg, resolver)?;
-            translate_expr(program, Some(referenced_tables), rhs, rhs_reg, resolver)?;
-            match op {
-                ast::Operator::Greater => {
-                    emit_cmp_insn!(program, condition_metadata, Gt, Le, lhs_reg, rhs_reg)
-                }
-                ast::Operator::GreaterEquals => {
-                    emit_cmp_insn!(program, condition_metadata, Ge, Lt, lhs_reg, rhs_reg)
-                }
-                ast::Operator::Less => {
-                    emit_cmp_insn!(program, condition_metadata, Lt, Ge, lhs_reg, rhs_reg)
-                }
-                ast::Operator::LessEquals => {
-                    emit_cmp_insn!(program, condition_metadata, Le, Gt, lhs_reg, rhs_reg)
-                }
-                ast::Operator::Equals => {
-                    emit_cmp_insn!(program, condition_metadata, Eq, Ne, lhs_reg, rhs_reg)
-                }
-                ast::Operator::NotEquals => {
-                    emit_cmp_insn!(program, condition_metadata, Ne, Eq, lhs_reg, rhs_reg)
-                }
-                ast::Operator::Is => {
-                    emit_cmp_null_insn!(program, condition_metadata, Eq, Ne, lhs_reg, rhs_reg)
-                }
-                ast::Operator::IsNot => {
-                    emit_cmp_null_insn!(program, condition_metadata, Ne, Eq, lhs_reg, rhs_reg)
-                }
-                _ => unreachable!(),
-            }
-        }
         ast::Expr::Binary(_, _, _) => {
             let result_reg = program.alloc_register();
             translate_expr(program, Some(referenced_tables), expr, result_reg, resolver)?;
@@ -370,6 +274,7 @@ pub fn translate_condition_expr(
                             rhs: rhs_reg,
                             target_pc: jump_target_when_true,
                             flags: CmpInsFlags::default(),
+                            collation: program.curr_collation(),
                         });
                     } else {
                         // If this is the last condition, we need to jump to the 'jump_target_when_false' label if there is no match.
@@ -378,6 +283,7 @@ pub fn translate_condition_expr(
                             rhs: rhs_reg,
                             target_pc: condition_metadata.jump_target_when_false,
                             flags: CmpInsFlags::default().jump_if_null(),
+                            collation: program.curr_collation(),
                         });
                     }
                 }
@@ -399,6 +305,7 @@ pub fn translate_condition_expr(
                         rhs: rhs_reg,
                         target_pc: condition_metadata.jump_target_when_false,
                         flags: CmpInsFlags::default().jump_if_null(),
+                        collation: program.curr_collation(),
                     });
                 }
                 // If we got here, then none of the conditions were a match, so we jump to the 'jump_target_when_true' label if 'jump_if_condition_is_true'.
@@ -552,15 +459,54 @@ pub fn translate_expr(
                 translate_expr(program, referenced_tables, e1, shared_reg, resolver)?;
 
                 emit_binary_insn(program, op, shared_reg, shared_reg, target_register)?;
+                program.reset_collation();
                 Ok(target_register)
             } else {
                 let e1_reg = program.alloc_registers(2);
                 let e2_reg = e1_reg + 1;
 
                 translate_expr(program, referenced_tables, e1, e1_reg, resolver)?;
+                let left_collation_ctx = program.curr_collation_ctx();
+                program.reset_collation();
+
                 translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
+                let right_collation_ctx = program.curr_collation_ctx();
+                program.reset_collation();
+
+                /*
+                 * The rules for determining which collating function to use for a binary comparison
+                 * operator (=, <, >, <=, >=, !=, IS, and IS NOT) are as follows:
+                 *
+                 * 1. If either operand has an explicit collating function assignment using the postfix COLLATE operator,
+                 * then the explicit collating function is used for comparison,
+                 * with precedence to the collating function of the left operand.
+                 *
+                 * 2. If either operand is a column, then the collating function of that column is used
+                 * with precedence to the left operand. For the purposes of the previous sentence,
+                 * a column name preceded by one or more unary "+" operators and/or CAST operators is still considered a column name.
+                 *
+                 * 3. Otherwise, the BINARY collating function is used for comparison.
+                 */
+                let collation_ctx = {
+                    match (left_collation_ctx, right_collation_ctx) {
+                        (Some((c_left, true)), _) => Some((c_left, true)),
+                        (_, Some((c_right, true))) => Some((c_right, true)),
+                        (Some((c_left, from_collate_left)), None) => {
+                            Some((c_left, from_collate_left))
+                        }
+                        (None, Some((c_right, from_collate_right))) => {
+                            Some((c_right, from_collate_right))
+                        }
+                        (Some((c_left, from_collate_left)), Some((_, false))) => {
+                            Some((c_left, from_collate_left))
+                        }
+                        _ => None,
+                    }
+                };
+                program.set_collation(collation_ctx);
 
                 emit_binary_insn(program, op, e1_reg, e2_reg, target_register)?;
+                program.reset_collation();
                 Ok(target_register)
             }
         }
@@ -609,6 +555,7 @@ pub fn translate_expr(
                         target_pc: next_case_label,
                         // A NULL result is considered untrue when evaluating WHEN terms.
                         flags: CmpInsFlags::default().jump_if_null(),
+                        collation: program.curr_collation(),
                     }),
                     // CASE WHEN 0 THEN 0 ELSE 1 becomes ifnot 0 branch to next clause
                     None => program.emit_insn(Insn::IfNot {
@@ -679,7 +626,14 @@ pub fn translate_expr(
             });
             Ok(target_register)
         }
-        ast::Expr::Collate(_, _) => todo!(),
+        ast::Expr::Collate(expr, collation) => {
+            // First translate inner expr, then set the curr collation. If we set curr collation before,
+            // it may be overwritten later by inner translate.
+            translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+            let collation = CollationSeq::new(collation)?;
+            program.set_collation(Some((collation, true)));
+            Ok(target_register)
+        }
         ast::Expr::DoublyQualified(_, _, _) => todo!(),
         ast::Expr::Exists(_) => todo!(),
         ast::Expr::FunctionCall {
@@ -1839,87 +1793,93 @@ pub fn translate_expr(
             let table_reference = referenced_tables.as_ref().unwrap().get(*table).unwrap();
             let index = table_reference.op.index();
             let use_covering_index = table_reference.utilizes_covering_index();
-            match table_reference.op {
-                // If we are reading a column from a table, we find the cursor that corresponds to
-                // the table and read the column from the cursor.
-                // If we have a covering index, we don't have an open table cursor so we read from the index cursor.
-                Operation::Scan { .. } | Operation::Search(_) => {
-                    match &table_reference.table {
-                        Table::BTree(_) => {
-                            let table_cursor_id = if use_covering_index {
-                                None
-                            } else {
-                                Some(program.resolve_cursor_id(&table_reference.identifier))
-                            };
-                            let index_cursor_id =
-                                index.map(|index| program.resolve_cursor_id(&index.name));
-                            if *is_rowid_alias {
-                                if let Some(index_cursor_id) = index_cursor_id {
-                                    program.emit_insn(Insn::IdxRowId {
-                                        cursor_id: index_cursor_id,
-                                        dest: target_register,
-                                    });
-                                } else if let Some(table_cursor_id) = table_cursor_id {
-                                    program.emit_insn(Insn::RowId {
-                                        cursor_id: table_cursor_id,
-                                        dest: target_register,
-                                    });
-                                } else {
-                                    unreachable!("Either index or table cursor must be opened");
-                                }
-                            } else {
-                                let read_cursor = if use_covering_index {
-                                    index_cursor_id
-                                    .expect("index cursor should be opened when use_covering_index=true")
-                                } else {
-                                    table_cursor_id
-                                    .expect("table cursor should be opened when use_covering_index=false")
-                                };
-                                let column = if use_covering_index {
-                                    let index = index.expect("index cursor should be opened when use_covering_index=true");
-                                    index.column_table_pos_to_index_pos(*column).unwrap_or_else(|| {
-                                        panic!("covering index {} does not contain column number {} of table {}", index.name, column, table_reference.identifier)
-                                    })
-                                } else {
-                                    *column
-                                };
-                                program.emit_insn(Insn::Column {
-                                    cursor_id: read_cursor,
-                                    column,
-                                    dest: target_register,
-                                });
-                            }
-                            let Some(column) = table_reference.table.get_column_at(*column) else {
-                                crate::bail_parse_error!("column index out of bounds");
-                            };
-                            maybe_apply_affinity(column.ty, target_register, program);
-                            Ok(target_register)
-                        }
-                        Table::Virtual(_) => {
-                            let cursor_id = program.resolve_cursor_id(&table_reference.identifier);
-                            program.emit_insn(Insn::VColumn {
-                                cursor_id,
-                                column: *column,
+
+            let Some(table_column) = table_reference.table.get_column_at(*column) else {
+                crate::bail_parse_error!("column index out of bounds");
+            };
+            // Counter intuitive but a column always needs to have a collation
+            program.set_collation(Some((table_column.collation.unwrap_or_default(), false)));
+
+            // If we are reading a column from a table, we find the cursor that corresponds to
+            // the table and read the column from the cursor.
+            // If we have a covering index, we don't have an open table cursor so we read from the index cursor.
+            match &table_reference.table {
+                Table::BTree(_) => {
+                    let table_cursor_id = if use_covering_index {
+                        None
+                    } else {
+                        Some(program.resolve_cursor_id(&table_reference.identifier))
+                    };
+                    let index_cursor_id = index.map(|index| program.resolve_cursor_id(&index.name));
+                    if *is_rowid_alias {
+                        if let Some(index_cursor_id) = index_cursor_id {
+                            program.emit_insn(Insn::IdxRowId {
+                                cursor_id: index_cursor_id,
                                 dest: target_register,
                             });
-                            Ok(target_register)
+                        } else if let Some(table_cursor_id) = table_cursor_id {
+                            program.emit_insn(Insn::RowId {
+                                cursor_id: table_cursor_id,
+                                dest: target_register,
+                            });
+                        } else {
+                            unreachable!("Either index or table cursor must be opened");
                         }
-                        _ => unreachable!(),
+                    } else {
+                        let read_cursor = if use_covering_index {
+                            index_cursor_id.expect(
+                                "index cursor should be opened when use_covering_index=true",
+                            )
+                        } else {
+                            table_cursor_id.expect(
+                                "table cursor should be opened when use_covering_index=false",
+                            )
+                        };
+                        let column = if use_covering_index {
+                            let index = index.expect(
+                                "index cursor should be opened when use_covering_index=true",
+                            );
+                            index.column_table_pos_to_index_pos(*column).unwrap_or_else(|| {
+                                        panic!("covering index {} does not contain column number {} of table {}", index.name, column, table_reference.identifier)
+                                    })
+                        } else {
+                            *column
+                        };
+                        program.emit_insn(Insn::Column {
+                            cursor_id: read_cursor,
+                            column,
+                            dest: target_register,
+                        });
                     }
+                    let Some(column) = table_reference.table.get_column_at(*column) else {
+                        crate::bail_parse_error!("column index out of bounds");
+                    };
+                    maybe_apply_affinity(column.ty, target_register, program);
+                    Ok(target_register)
                 }
-                // If we are reading a column from a subquery, we instead copy the column from the
-                // subquery's result registers.
-                Operation::Subquery {
-                    result_columns_start_reg,
-                    ..
-                } => {
+                Table::FromClauseSubquery(from_clause_subquery) => {
+                    // If we are reading a column from a subquery, we instead copy the column from the
+                    // subquery's result registers.
                     program.emit_insn(Insn::Copy {
-                        src_reg: result_columns_start_reg + *column,
+                        src_reg: from_clause_subquery
+                            .result_columns_start_reg
+                            .expect("Subquery result_columns_start_reg must be set")
+                            + *column,
                         dst_reg: target_register,
                         amount: 0,
                     });
                     Ok(target_register)
                 }
+                Table::Virtual(_) => {
+                    let cursor_id = program.resolve_cursor_id(&table_reference.identifier);
+                    program.emit_insn(Insn::VColumn {
+                        cursor_id,
+                        column: *column,
+                        dest: target_register,
+                    });
+                    Ok(target_register)
+                }
+                Table::Pseudo(_) => panic!("Column access on pseudo table"),
             }
         }
         ast::Expr::RowId { database: _, table } => {
@@ -2216,6 +2176,7 @@ fn emit_binary_insn(
                     rhs,
                     target_pc: if_true_label,
                     flags: CmpInsFlags::default(),
+                    collation: program.curr_collation(),
                 },
                 target_register,
                 if_true_label,
@@ -2232,6 +2193,7 @@ fn emit_binary_insn(
                     rhs,
                     target_pc: if_true_label,
                     flags: CmpInsFlags::default(),
+                    collation: program.curr_collation(),
                 },
                 target_register,
                 if_true_label,
@@ -2248,6 +2210,7 @@ fn emit_binary_insn(
                     rhs,
                     target_pc: if_true_label,
                     flags: CmpInsFlags::default(),
+                    collation: program.curr_collation(),
                 },
                 target_register,
                 if_true_label,
@@ -2264,6 +2227,7 @@ fn emit_binary_insn(
                     rhs,
                     target_pc: if_true_label,
                     flags: CmpInsFlags::default(),
+                    collation: program.curr_collation(),
                 },
                 target_register,
                 if_true_label,
@@ -2280,6 +2244,7 @@ fn emit_binary_insn(
                     rhs,
                     target_pc: if_true_label,
                     flags: CmpInsFlags::default(),
+                    collation: program.curr_collation(),
                 },
                 target_register,
                 if_true_label,
@@ -2296,6 +2261,7 @@ fn emit_binary_insn(
                     rhs,
                     target_pc: if_true_label,
                     flags: CmpInsFlags::default(),
+                    collation: program.curr_collation(),
                 },
                 target_register,
                 if_true_label,
@@ -2389,6 +2355,7 @@ fn emit_binary_insn(
                     rhs,
                     target_pc: if_true_label,
                     flags: CmpInsFlags::default().null_eq(),
+                    collation: program.curr_collation(),
                 },
                 target_register,
                 if_true_label,
@@ -2403,6 +2370,7 @@ fn emit_binary_insn(
                     rhs,
                     target_pc: if_true_label,
                     flags: CmpInsFlags::default().null_eq(),
+                    collation: program.curr_collation(),
                 },
                 target_register,
                 if_true_label,
@@ -2613,4 +2581,409 @@ fn unwrap_parens(expr: &ast::Expr) -> Result<&ast::Expr> {
         },
         _ => Ok(expr),
     }
+}
+
+/// Recursively unwrap parentheses from an owned Expr.
+/// Returns how many pairs of parentheses were removed.
+pub fn unwrap_parens_owned(expr: ast::Expr) -> Result<(ast::Expr, usize)> {
+    let mut paren_count = 0;
+    match expr {
+        ast::Expr::Parenthesized(mut exprs) => match exprs.len() {
+            1 => {
+                paren_count += 1;
+                let (expr, count) = unwrap_parens_owned(exprs.pop().unwrap())?;
+                paren_count += count;
+                Ok((expr, paren_count))
+            }
+            _ => crate::bail_parse_error!("expected single expression in parentheses"),
+        },
+        _ => Ok((expr, paren_count)),
+    }
+}
+
+/// Recursively walks an immutable expression, applying a function to each sub-expression.
+pub fn walk_expr<F>(expr: &ast::Expr, func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<()>,
+{
+    func(expr)?;
+    match expr {
+        ast::Expr::Between {
+            lhs, start, end, ..
+        } => {
+            walk_expr(lhs, func)?;
+            walk_expr(start, func)?;
+            walk_expr(end, func)?;
+        }
+        ast::Expr::Binary(lhs, _, rhs) => {
+            walk_expr(lhs, func)?;
+            walk_expr(rhs, func)?;
+        }
+        ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            if let Some(base_expr) = base {
+                walk_expr(base_expr, func)?;
+            }
+            for (when_expr, then_expr) in when_then_pairs {
+                walk_expr(when_expr, func)?;
+                walk_expr(then_expr, func)?;
+            }
+            if let Some(else_expr) = else_expr {
+                walk_expr(else_expr, func)?;
+            }
+        }
+        ast::Expr::Cast { expr, .. } => {
+            walk_expr(expr, func)?;
+        }
+        ast::Expr::Collate(expr, _) => {
+            walk_expr(expr, func)?;
+        }
+        ast::Expr::Exists(_select) | ast::Expr::Subquery(_select) => {
+            // TODO: Walk through select statements if needed
+        }
+        ast::Expr::FunctionCall {
+            args,
+            order_by,
+            filter_over,
+            ..
+        } => {
+            if let Some(args) = args {
+                for arg in args {
+                    walk_expr(arg, func)?;
+                }
+            }
+            if let Some(order_by) = order_by {
+                for sort_col in order_by {
+                    walk_expr(&sort_col.expr, func)?;
+                }
+            }
+            if let Some(filter_over) = filter_over {
+                if let Some(filter_clause) = &filter_over.filter_clause {
+                    walk_expr(filter_clause, func)?;
+                }
+                if let Some(over_clause) = &filter_over.over_clause {
+                    match over_clause.as_ref() {
+                        ast::Over::Window(window) => {
+                            if let Some(partition_by) = &window.partition_by {
+                                for part_expr in partition_by {
+                                    walk_expr(part_expr, func)?;
+                                }
+                            }
+                            if let Some(order_by_clause) = &window.order_by {
+                                for sort_col in order_by_clause {
+                                    walk_expr(&sort_col.expr, func)?;
+                                }
+                            }
+                            if let Some(frame_clause) = &window.frame_clause {
+                                walk_expr_frame_bound(&frame_clause.start, func)?;
+                                if let Some(end_bound) = &frame_clause.end {
+                                    walk_expr_frame_bound(end_bound, func)?;
+                                }
+                            }
+                        }
+                        ast::Over::Name(_) => {}
+                    }
+                }
+            }
+        }
+        ast::Expr::FunctionCallStar { filter_over, .. } => {
+            if let Some(filter_over) = filter_over {
+                if let Some(filter_clause) = &filter_over.filter_clause {
+                    walk_expr(filter_clause, func)?;
+                }
+                if let Some(over_clause) = &filter_over.over_clause {
+                    match over_clause.as_ref() {
+                        ast::Over::Window(window) => {
+                            if let Some(partition_by) = &window.partition_by {
+                                for part_expr in partition_by {
+                                    walk_expr(part_expr, func)?;
+                                }
+                            }
+                            if let Some(order_by_clause) = &window.order_by {
+                                for sort_col in order_by_clause {
+                                    walk_expr(&sort_col.expr, func)?;
+                                }
+                            }
+                            if let Some(frame_clause) = &window.frame_clause {
+                                walk_expr_frame_bound(&frame_clause.start, func)?;
+                                if let Some(end_bound) = &frame_clause.end {
+                                    walk_expr_frame_bound(end_bound, func)?;
+                                }
+                            }
+                        }
+                        ast::Over::Name(_) => {}
+                    }
+                }
+            }
+        }
+        ast::Expr::InList { lhs, rhs, .. } => {
+            walk_expr(lhs, func)?;
+            if let Some(rhs_exprs) = rhs {
+                for expr in rhs_exprs {
+                    walk_expr(expr, func)?;
+                }
+            }
+        }
+        ast::Expr::InSelect { lhs, rhs: _, .. } => {
+            walk_expr(lhs, func)?;
+            // TODO: Walk through select statements if needed
+        }
+        ast::Expr::InTable { lhs, args, .. } => {
+            walk_expr(lhs, func)?;
+            if let Some(arg_exprs) = args {
+                for expr in arg_exprs {
+                    walk_expr(expr, func)?;
+                }
+            }
+        }
+        ast::Expr::IsNull(expr) | ast::Expr::NotNull(expr) => {
+            walk_expr(expr, func)?;
+        }
+        ast::Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            walk_expr(lhs, func)?;
+            walk_expr(rhs, func)?;
+            if let Some(esc_expr) = escape {
+                walk_expr(esc_expr, func)?;
+            }
+        }
+        ast::Expr::Parenthesized(exprs) => {
+            for expr in exprs {
+                walk_expr(expr, func)?;
+            }
+        }
+        ast::Expr::Raise(_, expr) => {
+            if let Some(raise_expr) = expr {
+                walk_expr(raise_expr, func)?;
+            }
+        }
+        ast::Expr::Unary(_, expr) => {
+            walk_expr(expr, func)?;
+        }
+        ast::Expr::Id(_)
+        | ast::Expr::Column { .. }
+        | ast::Expr::RowId { .. }
+        | ast::Expr::Literal(_)
+        | ast::Expr::DoublyQualified(..)
+        | ast::Expr::Name(_)
+        | ast::Expr::Qualified(..)
+        | ast::Expr::Variable(_) => {
+            // No nested expressions
+        }
+    }
+    Ok(())
+}
+
+fn walk_expr_frame_bound<F>(bound: &ast::FrameBound, func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<()>,
+{
+    match bound {
+        ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) => {
+            walk_expr(expr, func)?;
+        }
+        ast::FrameBound::CurrentRow
+        | ast::FrameBound::UnboundedFollowing
+        | ast::FrameBound::UnboundedPreceding => {}
+    }
+
+    Ok(())
+}
+
+/// Recursively walks a mutable expression, applying a function to each sub-expression.
+pub fn walk_expr_mut<F>(expr: &mut ast::Expr, func: &mut F) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<()>,
+{
+    func(expr)?;
+    match expr {
+        ast::Expr::Between {
+            lhs, start, end, ..
+        } => {
+            walk_expr_mut(lhs, func)?;
+            walk_expr_mut(start, func)?;
+            walk_expr_mut(end, func)?;
+        }
+        ast::Expr::Binary(lhs, _, rhs) => {
+            walk_expr_mut(lhs, func)?;
+            walk_expr_mut(rhs, func)?;
+        }
+        ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            if let Some(base_expr) = base {
+                walk_expr_mut(base_expr, func)?;
+            }
+            for (when_expr, then_expr) in when_then_pairs {
+                walk_expr_mut(when_expr, func)?;
+                walk_expr_mut(then_expr, func)?;
+            }
+            if let Some(else_expr) = else_expr {
+                walk_expr_mut(else_expr, func)?;
+            }
+        }
+        ast::Expr::Cast { expr, .. } => {
+            walk_expr_mut(expr, func)?;
+        }
+        ast::Expr::Collate(expr, _) => {
+            walk_expr_mut(expr, func)?;
+        }
+        ast::Expr::Exists(_) | ast::Expr::Subquery(_) => {
+            // TODO: Walk through select statements if needed
+        }
+        ast::Expr::FunctionCall {
+            args,
+            order_by,
+            filter_over,
+            ..
+        } => {
+            if let Some(args) = args {
+                for arg in args {
+                    walk_expr_mut(arg, func)?;
+                }
+            }
+            if let Some(order_by) = order_by {
+                for sort_col in order_by {
+                    walk_expr_mut(&mut sort_col.expr, func)?;
+                }
+            }
+            if let Some(filter_over) = filter_over {
+                if let Some(filter_clause) = &mut filter_over.filter_clause {
+                    walk_expr_mut(filter_clause, func)?;
+                }
+                if let Some(over_clause) = &mut filter_over.over_clause {
+                    match over_clause.as_mut() {
+                        ast::Over::Window(window) => {
+                            if let Some(partition_by) = &mut window.partition_by {
+                                for part_expr in partition_by {
+                                    walk_expr_mut(part_expr, func)?;
+                                }
+                            }
+                            if let Some(order_by_clause) = &mut window.order_by {
+                                for sort_col in order_by_clause {
+                                    walk_expr_mut(&mut sort_col.expr, func)?;
+                                }
+                            }
+                            if let Some(frame_clause) = &mut window.frame_clause {
+                                walk_expr_mut_frame_bound(&mut frame_clause.start, func)?;
+                                if let Some(end_bound) = &mut frame_clause.end {
+                                    walk_expr_mut_frame_bound(end_bound, func)?;
+                                }
+                            }
+                        }
+                        ast::Over::Name(_) => {}
+                    }
+                }
+            }
+        }
+        ast::Expr::FunctionCallStar { filter_over, .. } => {
+            if let Some(filter_over) = filter_over {
+                if let Some(filter_clause) = &mut filter_over.filter_clause {
+                    walk_expr_mut(filter_clause, func)?;
+                }
+                if let Some(over_clause) = &mut filter_over.over_clause {
+                    match over_clause.as_mut() {
+                        ast::Over::Window(window) => {
+                            if let Some(partition_by) = &mut window.partition_by {
+                                for part_expr in partition_by {
+                                    walk_expr_mut(part_expr, func)?;
+                                }
+                            }
+                            if let Some(order_by_clause) = &mut window.order_by {
+                                for sort_col in order_by_clause {
+                                    walk_expr_mut(&mut sort_col.expr, func)?;
+                                }
+                            }
+                            if let Some(frame_clause) = &mut window.frame_clause {
+                                walk_expr_mut_frame_bound(&mut frame_clause.start, func)?;
+                                if let Some(end_bound) = &mut frame_clause.end {
+                                    walk_expr_mut_frame_bound(end_bound, func)?;
+                                }
+                            }
+                        }
+                        ast::Over::Name(_) => {}
+                    }
+                }
+            }
+        }
+        ast::Expr::InList { lhs, rhs, .. } => {
+            walk_expr_mut(lhs, func)?;
+            if let Some(rhs_exprs) = rhs {
+                for expr in rhs_exprs {
+                    walk_expr_mut(expr, func)?;
+                }
+            }
+        }
+        ast::Expr::InSelect { lhs, rhs: _, .. } => {
+            walk_expr_mut(lhs, func)?;
+            // TODO: Walk through select statements if needed
+        }
+        ast::Expr::InTable { lhs, args, .. } => {
+            walk_expr_mut(lhs, func)?;
+            if let Some(arg_exprs) = args {
+                for expr in arg_exprs {
+                    walk_expr_mut(expr, func)?;
+                }
+            }
+        }
+        ast::Expr::IsNull(expr) | ast::Expr::NotNull(expr) => {
+            walk_expr_mut(expr, func)?;
+        }
+        ast::Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            walk_expr_mut(lhs, func)?;
+            walk_expr_mut(rhs, func)?;
+            if let Some(esc_expr) = escape {
+                walk_expr_mut(esc_expr, func)?;
+            }
+        }
+        ast::Expr::Parenthesized(exprs) => {
+            for expr in exprs {
+                walk_expr_mut(expr, func)?;
+            }
+        }
+        ast::Expr::Raise(_, expr) => {
+            if let Some(raise_expr) = expr {
+                walk_expr_mut(raise_expr, func)?;
+            }
+        }
+        ast::Expr::Unary(_, expr) => {
+            walk_expr_mut(expr, func)?;
+        }
+        ast::Expr::Id(_)
+        | ast::Expr::Column { .. }
+        | ast::Expr::RowId { .. }
+        | ast::Expr::Literal(_)
+        | ast::Expr::DoublyQualified(..)
+        | ast::Expr::Name(_)
+        | ast::Expr::Qualified(..)
+        | ast::Expr::Variable(_) => {
+            // No nested expressions
+        }
+    }
+
+    Ok(())
+}
+
+fn walk_expr_mut_frame_bound<F>(bound: &mut ast::FrameBound, func: &mut F) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<()>,
+{
+    match bound {
+        ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) => {
+            walk_expr_mut(expr, func)?;
+        }
+        ast::FrameBound::CurrentRow
+        | ast::FrameBound::UnboundedFollowing
+        | ast::FrameBound::UnboundedPreceding => {}
+    }
+
+    Ok(())
 }

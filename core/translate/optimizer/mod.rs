@@ -5,13 +5,14 @@ use constraints::{
 };
 use cost::Cost;
 use join::{compute_best_join_order, BestJoinOrderResult};
+use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use limbo_sqlite3_parser::ast::{self, Expr, SortOrder};
 use order::{compute_order_target, plan_satisfies_order_target, EliminatesSort};
 
 use crate::{
     parameters::PARAM_PREFIX,
-    schema::{Index, IndexColumn, Schema},
-    translate::plan::TerminationKey,
+    schema::{Index, IndexColumn, Schema, Table},
+    translate::{expr::walk_expr_mut, plan::TerminationKey},
     types::SeekOp,
     Result,
 };
@@ -28,6 +29,7 @@ pub(crate) mod access_method;
 pub(crate) mod constraints;
 pub(crate) mod cost;
 pub(crate) mod join;
+pub(crate) mod lift_common_subexpressions;
 pub(crate) mod order;
 
 pub fn optimize_plan(plan: &mut Plan, schema: &Schema) -> Result<()> {
@@ -35,6 +37,13 @@ pub fn optimize_plan(plan: &mut Plan, schema: &Schema) -> Result<()> {
         Plan::Select(plan) => optimize_select_plan(plan, schema),
         Plan::Delete(plan) => optimize_delete_plan(plan, schema),
         Plan::Update(plan) => optimize_update_plan(plan, schema),
+        Plan::CompoundSelect { first, rest, .. } => {
+            optimize_select_plan(first, schema)?;
+            for (plan, _) in rest {
+                optimize_select_plan(plan, schema)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -108,8 +117,8 @@ fn optimize_update_plan(plan: &mut UpdatePlan, schema: &Schema) -> Result<()> {
 
 fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
     for table in plan.table_references.iter_mut() {
-        if let Operation::Subquery { plan, .. } = &mut table.op {
-            optimize_select_plan(&mut *plan, schema)?;
+        if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
+            optimize_select_plan(&mut from_clause_subquery.plan, schema)?;
         }
     }
 
@@ -213,21 +222,17 @@ fn optimize_table_access(
     for (i, join_order_member) in best_join_order.iter().enumerate() {
         let table_number = join_order_member.table_no;
         let access_method = &access_methods_arena.borrow()[best_access_methods[i]];
-        if matches!(
-            table_references[table_number].op,
-            Operation::Subquery { .. }
-        ) {
-            // FIXME: Operation::Subquery shouldn't exist. It's not an operation, it's a kind of temporary table.
-            assert!(
-                access_method.is_scan(),
-                "nothing in the current optimizer should be able to optimize subqueries, but got {:?} for table {}",
-                access_method,
-                table_references[table_number].table.get_name()
-            );
-            continue;
-        }
         if access_method.is_scan() {
-            if access_method.index.is_some() || i == 0 {
+            let is_leftmost_table = i == 0;
+            let uses_index = access_method.index.is_some();
+            let source_table_is_from_clause_subquery = matches!(
+                &table_references[table_number].table,
+                Table::FromClauseSubquery(_)
+            );
+
+            let try_to_build_ephemeral_index =
+                !is_leftmost_table && !uses_index && !source_table_is_from_clause_subquery;
+            if !try_to_build_ephemeral_index {
                 table_references[table_number].op = Operation::Scan {
                     iter_dir: access_method.iter_dir,
                     index: access_method.index.clone(),
@@ -379,6 +384,7 @@ fn rewrite_exprs_select(plan: &mut SelectPlan) -> Result<()> {
     for agg in plan.aggregates.iter_mut() {
         rewrite_expr(&mut agg.original_expr, &mut param_count)?;
     }
+    lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     for cond in plan.where_clause.iter_mut() {
         rewrite_expr(&mut cond.expr, &mut param_count)?;
     }
@@ -753,6 +759,7 @@ fn ephemeral_index_build(
             name: c.name.clone().unwrap(),
             order: SortOrder::Asc,
             pos_in_table: i,
+            collation: c.collation,
         })
         // only include columns that are used in the query
         .filter(|c| table_reference.column_is_used(c.pos_in_table))
@@ -785,6 +792,10 @@ fn ephemeral_index_build(
         ephemeral: true,
         table_name: table_reference.table.get_name().to_string(),
         root_page: 0,
+        has_rowid: table_reference
+            .table
+            .btree()
+            .map_or(false, |btree| btree.has_rowid),
     };
 
     ephemeral_index
@@ -1238,133 +1249,68 @@ fn build_seek_def(
     })
 }
 
-pub fn rewrite_expr(expr: &mut ast::Expr, param_idx: &mut usize) -> Result<()> {
-    match expr {
-        ast::Expr::Id(id) => {
-            // Convert "true" and "false" to 1 and 0
-            if id.0.eq_ignore_ascii_case("true") {
-                *expr = ast::Expr::Literal(ast::Literal::Numeric(1.to_string()));
-                return Ok(());
-            }
-            if id.0.eq_ignore_ascii_case("false") {
-                *expr = ast::Expr::Literal(ast::Literal::Numeric(0.to_string()));
-                return Ok(());
-            }
-            Ok(())
-        }
-        ast::Expr::Variable(var) => {
-            if var.is_empty() {
-                // rewrite anonymous variables only, ensure that the `param_idx` starts at 1 and
-                // all the expressions are rewritten in the order they come in the statement
-                *expr = ast::Expr::Variable(format!("{}{param_idx}", PARAM_PREFIX));
-                *param_idx += 1;
-            }
-            Ok(())
-        }
-        ast::Expr::Between {
-            lhs,
-            not,
-            start,
-            end,
-        } => {
-            // Convert `y NOT BETWEEN x AND z` to `x > y OR y > z`
-            let (lower_op, upper_op) = if *not {
-                (ast::Operator::Greater, ast::Operator::Greater)
-            } else {
-                // Convert `y BETWEEN x AND z` to `x <= y AND y <= z`
-                (ast::Operator::LessEquals, ast::Operator::LessEquals)
-            };
-
-            rewrite_expr(start, param_idx)?;
-            rewrite_expr(lhs, param_idx)?;
-            rewrite_expr(end, param_idx)?;
-
-            let start = start.take_ownership();
-            let lhs = lhs.take_ownership();
-            let end = end.take_ownership();
-
-            let lower_bound = ast::Expr::Binary(Box::new(start), lower_op, Box::new(lhs.clone()));
-            let upper_bound = ast::Expr::Binary(Box::new(lhs), upper_op, Box::new(end));
-
-            if *not {
-                *expr = ast::Expr::Binary(
-                    Box::new(lower_bound),
-                    ast::Operator::Or,
-                    Box::new(upper_bound),
-                );
-            } else {
-                *expr = ast::Expr::Binary(
-                    Box::new(lower_bound),
-                    ast::Operator::And,
-                    Box::new(upper_bound),
-                );
-            }
-            Ok(())
-        }
-        ast::Expr::Parenthesized(ref mut exprs) => {
-            for subexpr in exprs.iter_mut() {
-                rewrite_expr(subexpr, param_idx)?;
-            }
-            let exprs = std::mem::take(exprs);
-            *expr = ast::Expr::Parenthesized(exprs);
-            Ok(())
-        }
-        // Process other expressions recursively
-        ast::Expr::Binary(lhs, _, rhs) => {
-            rewrite_expr(lhs, param_idx)?;
-            rewrite_expr(rhs, param_idx)?;
-            Ok(())
-        }
-        ast::Expr::Like {
-            lhs, rhs, escape, ..
-        } => {
-            rewrite_expr(lhs, param_idx)?;
-            rewrite_expr(rhs, param_idx)?;
-            if let Some(escape) = escape {
-                rewrite_expr(escape, param_idx)?;
-            }
-            Ok(())
-        }
-        ast::Expr::Case {
-            base,
-            when_then_pairs,
-            else_expr,
-        } => {
-            if let Some(base) = base {
-                rewrite_expr(base, param_idx)?;
-            }
-            for (lhs, rhs) in when_then_pairs.iter_mut() {
-                rewrite_expr(lhs, param_idx)?;
-                rewrite_expr(rhs, param_idx)?;
-            }
-            if let Some(else_expr) = else_expr {
-                rewrite_expr(else_expr, param_idx)?;
-            }
-            Ok(())
-        }
-        ast::Expr::InList { lhs, rhs, .. } => {
-            rewrite_expr(lhs, param_idx)?;
-            if let Some(rhs) = rhs {
-                for expr in rhs.iter_mut() {
-                    rewrite_expr(expr, param_idx)?;
+pub fn rewrite_expr(top_level_expr: &mut ast::Expr, param_idx: &mut usize) -> Result<()> {
+    walk_expr_mut(top_level_expr, &mut |expr: &mut ast::Expr| -> Result<()> {
+        match expr {
+            ast::Expr::Id(id) => {
+                // Convert "true" and "false" to 1 and 0
+                if id.0.eq_ignore_ascii_case("true") {
+                    *expr = ast::Expr::Literal(ast::Literal::Numeric(1.to_string()));
+                    return Ok(());
+                }
+                if id.0.eq_ignore_ascii_case("false") {
+                    *expr = ast::Expr::Literal(ast::Literal::Numeric(0.to_string()));
                 }
             }
-            Ok(())
-        }
-        ast::Expr::FunctionCall { args, .. } => {
-            if let Some(args) = args {
-                for arg in args.iter_mut() {
-                    rewrite_expr(arg, param_idx)?;
+            ast::Expr::Variable(var) => {
+                if var.is_empty() {
+                    // rewrite anonymous variables only, ensure that the `param_idx` starts at 1 and
+                    // all the expressions are rewritten in the order they come in the statement
+                    *expr = ast::Expr::Variable(format!("{}{param_idx}", PARAM_PREFIX));
+                    *param_idx += 1;
                 }
             }
-            Ok(())
+            ast::Expr::Between {
+                lhs,
+                not,
+                start,
+                end,
+            } => {
+                // Convert `y NOT BETWEEN x AND z` to `x > y OR y > z`
+                let (lower_op, upper_op) = if *not {
+                    (ast::Operator::Greater, ast::Operator::Greater)
+                } else {
+                    // Convert `y BETWEEN x AND z` to `x <= y AND y <= z`
+                    (ast::Operator::LessEquals, ast::Operator::LessEquals)
+                };
+
+                let start = start.take_ownership();
+                let lhs = lhs.take_ownership();
+                let end = end.take_ownership();
+
+                let lower_bound =
+                    ast::Expr::Binary(Box::new(start), lower_op, Box::new(lhs.clone()));
+                let upper_bound = ast::Expr::Binary(Box::new(lhs), upper_op, Box::new(end));
+
+                if *not {
+                    *expr = ast::Expr::Binary(
+                        Box::new(lower_bound),
+                        ast::Operator::Or,
+                        Box::new(upper_bound),
+                    );
+                } else {
+                    *expr = ast::Expr::Binary(
+                        Box::new(lower_bound),
+                        ast::Operator::And,
+                        Box::new(upper_bound),
+                    );
+                }
+            }
+            _ => {}
         }
-        ast::Expr::Unary(_, arg) => {
-            rewrite_expr(arg, param_idx)?;
-            Ok(())
-        }
-        _ => Ok(()),
-    }
+
+        Ok(())
+    })
 }
 
 trait TakeOwnership {

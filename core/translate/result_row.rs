@@ -4,9 +4,9 @@ use crate::{
 };
 
 use super::{
-    emitter::Resolver,
+    emitter::{LimitCtx, Resolver},
     expr::translate_expr,
-    plan::{SelectPlan, SelectQueryType},
+    plan::{Distinctness, SelectPlan, SelectQueryType},
 };
 
 /// Emits the bytecode for:
@@ -22,7 +22,7 @@ pub fn emit_select_result(
     reg_nonagg_emit_once_flag: Option<usize>,
     reg_offset: Option<usize>,
     reg_result_cols_start: usize,
-    reg_limit: Option<usize>,
+    limit_ctx: Option<LimitCtx>,
     reg_limit_offset_sum: Option<usize>,
 ) -> Result<()> {
     if let (Some(jump_to), Some(_)) = (offset_jump_to, label_on_limit_reached) {
@@ -49,11 +49,19 @@ pub fn emit_select_result(
             resolver,
         )?;
     }
+
+    // Handle SELECT DISTINCT deduplication
+    if let Distinctness::Distinct { ctx } = &plan.distinctness {
+        let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
+        let num_regs = plan.result_columns.len();
+        distinct_ctx.emit_deduplication_insns(program, num_regs, start_reg);
+    }
+
     emit_result_row_and_limit(
         program,
         plan,
         start_reg,
-        reg_limit,
+        limit_ctx,
         reg_offset,
         reg_limit_offset_sum,
         label_on_limit_reached,
@@ -68,7 +76,7 @@ pub fn emit_result_row_and_limit(
     program: &mut ProgramBuilder,
     plan: &SelectPlan,
     result_columns_start_reg: usize,
-    reg_limit: Option<usize>,
+    limit_ctx: Option<LimitCtx>,
     reg_offset: Option<usize>,
     reg_limit_offset_sum: Option<usize>,
     label_on_limit_reached: Option<BranchOffset>,
@@ -95,11 +103,14 @@ pub fn emit_result_row_and_limit(
             // is always 1 here.
             return Ok(());
         }
-        program.emit_insn(Insn::Integer {
-            value: limit as i64,
-            dest: reg_limit.expect("reg_limit must be Some"),
-        });
-        program.mark_last_insn_constant();
+        let limit_ctx = limit_ctx.expect("limit_ctx must be Some if plan.limit is Some");
+        if limit_ctx.initialize_counter {
+            program.emit_insn(Insn::Integer {
+                value: limit as i64,
+                dest: limit_ctx.reg_limit,
+            });
+            program.mark_last_insn_constant();
+        }
 
         if let Some(offset) = plan.offset {
             program.emit_insn(Insn::Integer {
@@ -109,7 +120,7 @@ pub fn emit_result_row_and_limit(
             program.mark_last_insn_constant();
 
             program.emit_insn(Insn::OffsetLimit {
-                limit_reg: reg_limit.expect("reg_limit must be Some"),
+                limit_reg: limit_ctx.reg_limit,
                 combined_reg: reg_limit_offset_sum.expect("reg_limit_offset_sum must be Some"),
                 offset_reg: reg_offset.expect("reg_offset must be Some"),
             });
@@ -117,7 +128,7 @@ pub fn emit_result_row_and_limit(
         }
 
         program.emit_insn(Insn::DecrJumpZero {
-            reg: reg_limit.expect("reg_limit must be Some"),
+            reg: limit_ctx.reg_limit,
             target_pc: label_on_limit_reached.unwrap(),
         });
     }

@@ -240,3 +240,48 @@ do_execsql_test select-invalid-numeric-text {
 do_execsql_test select-invalid-numeric-text {
   select -'E';
 } {0}
+
+do_execsql_test_on_specific_db {:memory:} select-union-all-1 {
+  CREATE TABLE t1(x INTEGER);
+  CREATE TABLE t2(x INTEGER); 
+  CREATE TABLE t3(x INTEGER);
+  
+  INSERT INTO t1 VALUES(1),(2),(3);
+  INSERT INTO t2 VALUES(4),(5),(6);
+  INSERT INTO t3 VALUES(7),(8),(9);
+  
+  SELECT x FROM t1
+  UNION ALL 
+  SELECT x FROM t2
+  UNION ALL
+  SELECT x FROM t3;
+} {1
+2
+3
+4
+5
+6
+7
+8
+9}
+
+do_execsql_test_on_specific_db {:memory:} select-union-all-with-filters {
+  CREATE TABLE t4(x INTEGER);
+  CREATE TABLE t5(x INTEGER);
+  CREATE TABLE t6(x INTEGER);
+  
+  INSERT INTO t4 VALUES(1),(2),(3),(4);
+  INSERT INTO t5 VALUES(5),(6),(7),(8);
+  INSERT INTO t6 VALUES(9),(10),(11),(12);
+
+  SELECT x FROM t4 WHERE x > 2
+  UNION ALL
+  SELECT x FROM t5 WHERE x < 7 
+  UNION ALL
+  SELECT x FROM t6 WHERE x = 10;
+} {3
+4
+5
+6
+10}
+

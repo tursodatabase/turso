@@ -365,6 +365,7 @@ pub fn op_compare(
         start_reg_a,
         start_reg_b,
         count,
+        collation,
     } = insn
     else {
         unreachable!("unexpected Insn {:?}", insn)
@@ -372,6 +373,7 @@ pub fn op_compare(
     let start_reg_a = *start_reg_a;
     let start_reg_b = *start_reg_b;
     let count = *count;
+    let collation = collation.unwrap_or_default();
 
     if start_reg_a + count > start_reg_b {
         return Err(LimboError::InternalError(
@@ -383,7 +385,12 @@ pub fn op_compare(
     for i in 0..count {
         let a = state.registers[start_reg_a + i].get_owned_value();
         let b = state.registers[start_reg_b + i].get_owned_value();
-        cmp = Some(a.cmp(b));
+        cmp = match (a, b) {
+            (Value::Text(left), Value::Text(right)) => {
+                Some(collation.compare_strings(left.as_str(), right.as_str()))
+            }
+            _ => Some(a.cmp(b)),
+        };
         if cmp != Some(std::cmp::Ordering::Equal) {
             break;
         }
@@ -525,6 +532,7 @@ pub fn op_eq(
         rhs,
         target_pc,
         flags,
+        collation,
     } = insn
     else {
         unreachable!("unexpected Insn {:?}", insn)
@@ -536,9 +544,10 @@ pub fn op_eq(
     let cond = *state.registers[lhs].get_owned_value() == *state.registers[rhs].get_owned_value();
     let nulleq = flags.has_nulleq();
     let jump_if_null = flags.has_jump_if_null();
+    let collation = collation.unwrap_or_default();
     match (
-        &state.registers[lhs].get_owned_value(),
-        &state.registers[rhs].get_owned_value(),
+        state.registers[lhs].get_owned_value(),
+        state.registers[rhs].get_owned_value(),
     ) {
         (_, Value::Null) | (Value::Null, _) => {
             if (nulleq && cond) || (!nulleq && jump_if_null) {
@@ -547,8 +556,16 @@ pub fn op_eq(
                 state.pc += 1;
             }
         }
-        _ => {
-            if *state.registers[lhs].get_owned_value() == *state.registers[rhs].get_owned_value() {
+        (Value::Text(lhs), Value::Text(rhs)) => {
+            let order = collation.compare_strings(lhs.as_str(), rhs.as_str());
+            if order.is_eq() {
+                state.pc = target_pc.to_offset_int();
+            } else {
+                state.pc += 1;
+            }
+        }
+        (lhs, rhs) => {
+            if *lhs == *rhs {
                 state.pc = target_pc.to_offset_int();
             } else {
                 state.pc += 1;
@@ -570,6 +587,7 @@ pub fn op_ne(
         rhs,
         target_pc,
         flags,
+        collation,
     } = insn
     else {
         unreachable!("unexpected Insn {:?}", insn)
@@ -581,9 +599,10 @@ pub fn op_ne(
     let cond = *state.registers[lhs].get_owned_value() != *state.registers[rhs].get_owned_value();
     let nulleq = flags.has_nulleq();
     let jump_if_null = flags.has_jump_if_null();
+    let collation = collation.unwrap_or_default();
     match (
-        &state.registers[lhs].get_owned_value(),
-        &state.registers[rhs].get_owned_value(),
+        state.registers[lhs].get_owned_value(),
+        state.registers[rhs].get_owned_value(),
     ) {
         (_, Value::Null) | (Value::Null, _) => {
             if (nulleq && cond) || (!nulleq && jump_if_null) {
@@ -592,8 +611,16 @@ pub fn op_ne(
                 state.pc += 1;
             }
         }
-        _ => {
-            if *state.registers[lhs].get_owned_value() != *state.registers[rhs].get_owned_value() {
+        (Value::Text(lhs), Value::Text(rhs)) => {
+            let order = collation.compare_strings(lhs.as_str(), rhs.as_str());
+            if order.is_ne() {
+                state.pc = target_pc.to_offset_int();
+            } else {
+                state.pc += 1;
+            }
+        }
+        (lhs, rhs) => {
+            if *lhs != *rhs {
                 state.pc = target_pc.to_offset_int();
             } else {
                 state.pc += 1;
@@ -615,6 +642,7 @@ pub fn op_lt(
         rhs,
         target_pc,
         flags,
+        collation,
     } = insn
     else {
         unreachable!("unexpected Insn {:?}", insn)
@@ -624,9 +652,10 @@ pub fn op_lt(
     let rhs = *rhs;
     let target_pc = *target_pc;
     let jump_if_null = flags.has_jump_if_null();
+    let collation = collation.unwrap_or_default();
     match (
-        &state.registers[lhs].get_owned_value(),
-        &state.registers[rhs].get_owned_value(),
+        state.registers[lhs].get_owned_value(),
+        state.registers[rhs].get_owned_value(),
     ) {
         (_, Value::Null) | (Value::Null, _) => {
             if jump_if_null {
@@ -635,8 +664,16 @@ pub fn op_lt(
                 state.pc += 1;
             }
         }
-        _ => {
-            if *state.registers[lhs].get_owned_value() < *state.registers[rhs].get_owned_value() {
+        (Value::Text(lhs), Value::Text(rhs)) => {
+            let order = collation.compare_strings(lhs.as_str(), rhs.as_str());
+            if order.is_lt() {
+                state.pc = target_pc.to_offset_int();
+            } else {
+                state.pc += 1;
+            }
+        }
+        (lhs, rhs) => {
+            if *lhs < *rhs {
                 state.pc = target_pc.to_offset_int();
             } else {
                 state.pc += 1;
@@ -658,6 +695,7 @@ pub fn op_le(
         rhs,
         target_pc,
         flags,
+        collation,
     } = insn
     else {
         unreachable!("unexpected Insn {:?}", insn)
@@ -667,9 +705,10 @@ pub fn op_le(
     let rhs = *rhs;
     let target_pc = *target_pc;
     let jump_if_null = flags.has_jump_if_null();
+    let collation = collation.unwrap_or_default();
     match (
-        &state.registers[lhs].get_owned_value(),
-        &state.registers[rhs].get_owned_value(),
+        state.registers[lhs].get_owned_value(),
+        state.registers[rhs].get_owned_value(),
     ) {
         (_, Value::Null) | (Value::Null, _) => {
             if jump_if_null {
@@ -678,8 +717,16 @@ pub fn op_le(
                 state.pc += 1;
             }
         }
-        _ => {
-            if *state.registers[lhs].get_owned_value() <= *state.registers[rhs].get_owned_value() {
+        (Value::Text(lhs), Value::Text(rhs)) => {
+            let order = collation.compare_strings(lhs.as_str(), rhs.as_str());
+            if order.is_le() {
+                state.pc = target_pc.to_offset_int();
+            } else {
+                state.pc += 1;
+            }
+        }
+        (lhs, rhs) => {
+            if *lhs <= *rhs {
                 state.pc = target_pc.to_offset_int();
             } else {
                 state.pc += 1;
@@ -701,6 +748,7 @@ pub fn op_gt(
         rhs,
         target_pc,
         flags,
+        collation,
     } = insn
     else {
         unreachable!("unexpected Insn {:?}", insn)
@@ -710,9 +758,10 @@ pub fn op_gt(
     let rhs = *rhs;
     let target_pc = *target_pc;
     let jump_if_null = flags.has_jump_if_null();
+    let collation = collation.unwrap_or_default();
     match (
-        &state.registers[lhs].get_owned_value(),
-        &state.registers[rhs].get_owned_value(),
+        state.registers[lhs].get_owned_value(),
+        state.registers[rhs].get_owned_value(),
     ) {
         (_, Value::Null) | (Value::Null, _) => {
             if jump_if_null {
@@ -721,8 +770,16 @@ pub fn op_gt(
                 state.pc += 1;
             }
         }
-        _ => {
-            if *state.registers[lhs].get_owned_value() > *state.registers[rhs].get_owned_value() {
+        (Value::Text(lhs), Value::Text(rhs)) => {
+            let order = collation.compare_strings(lhs.as_str(), rhs.as_str());
+            if order.is_gt() {
+                state.pc = target_pc.to_offset_int();
+            } else {
+                state.pc += 1;
+            }
+        }
+        (lhs, rhs) => {
+            if *lhs > *rhs {
                 state.pc = target_pc.to_offset_int();
             } else {
                 state.pc += 1;
@@ -744,6 +801,7 @@ pub fn op_ge(
         rhs,
         target_pc,
         flags,
+        collation,
     } = insn
     else {
         unreachable!("unexpected Insn {:?}", insn)
@@ -753,9 +811,10 @@ pub fn op_ge(
     let rhs = *rhs;
     let target_pc = *target_pc;
     let jump_if_null = flags.has_jump_if_null();
+    let collation = collation.unwrap_or_default();
     match (
-        &state.registers[lhs].get_owned_value(),
-        &state.registers[rhs].get_owned_value(),
+        state.registers[lhs].get_owned_value(),
+        state.registers[rhs].get_owned_value(),
     ) {
         (_, Value::Null) | (Value::Null, _) => {
             if jump_if_null {
@@ -764,8 +823,16 @@ pub fn op_ge(
                 state.pc += 1;
             }
         }
-        _ => {
-            if *state.registers[lhs].get_owned_value() >= *state.registers[rhs].get_owned_value() {
+        (Value::Text(lhs), Value::Text(rhs)) => {
+            let order = collation.compare_strings(lhs.as_str(), rhs.as_str());
+            if order.is_ge() {
+                state.pc = target_pc.to_offset_int();
+            } else {
+                state.pc += 1;
+            }
+        }
+        (lhs, rhs) => {
+            if *lhs >= *rhs {
                 state.pc = target_pc.to_offset_int();
             } else {
                 state.pc += 1;
@@ -860,15 +927,39 @@ pub fn op_open_read(
     let mut cursors = state.cursors.borrow_mut();
     match cursor_type {
         CursorType::BTreeTable(_) => {
-            let cursor = BTreeCursor::new(mv_cursor, pager.clone(), *root_page);
+            let cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), *root_page);
             cursors
                 .get_mut(*cursor_id)
                 .unwrap()
                 .replace(Cursor::new_btree(cursor));
         }
         CursorType::BTreeIndex(index) => {
-            let cursor =
-                BTreeCursor::new_index(mv_cursor, pager.clone(), *root_page, index.as_ref());
+            let conn = program.connection.upgrade().unwrap();
+            let schema = conn.schema.try_read().ok_or(LimboError::SchemaLocked)?;
+            let table = schema
+                .get_table(&index.table_name)
+                .map_or(None, |table| table.btree());
+            let collations = table.map_or(Vec::new(), |table| {
+                index
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        table
+                            .columns
+                            .get(c.pos_in_table)
+                            .unwrap()
+                            .collation
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            });
+            let cursor = BTreeCursor::new_index(
+                mv_cursor,
+                pager.clone(),
+                *root_page,
+                index.as_ref(),
+                collations,
+            );
             cursors
                 .get_mut(*cursor_id)
                 .unwrap()
@@ -1466,7 +1557,7 @@ pub fn op_result_row(
     };
     state.result_row = Some(row);
     state.pc += 1;
-    return Ok(InsnFunctionStepResult::Row);
+    Ok(InsnFunctionStepResult::Row)
 }
 
 pub fn op_next(
@@ -2088,7 +2179,12 @@ pub fn op_idx_ge(
             let idx_values = idx_record.get_values();
             let idx_values = &idx_values[..record_from_regs.len()];
             let record_values = record_from_regs.get_values();
-            let ord = compare_immutable(&idx_values, &record_values, cursor.index_key_sort_order);
+            let ord = compare_immutable(
+                &idx_values,
+                &record_values,
+                cursor.key_sort_order(),
+                cursor.collations(),
+            );
             if ord.is_ge() {
                 target_pc.to_offset_int()
             } else {
@@ -2147,7 +2243,12 @@ pub fn op_idx_le(
             let idx_values = idx_record.get_values();
             let idx_values = &idx_values[..record_from_regs.len()];
             let record_values = record_from_regs.get_values();
-            let ord = compare_immutable(&idx_values, &record_values, cursor.index_key_sort_order);
+            let ord = compare_immutable(
+                &idx_values,
+                &record_values,
+                cursor.key_sort_order(),
+                cursor.collations(),
+            );
             if ord.is_le() {
                 target_pc.to_offset_int()
             } else {
@@ -2188,7 +2289,12 @@ pub fn op_idx_gt(
             let idx_values = idx_record.get_values();
             let idx_values = &idx_values[..record_from_regs.len()];
             let record_values = record_from_regs.get_values();
-            let ord = compare_immutable(&idx_values, &record_values, cursor.index_key_sort_order);
+            let ord = compare_immutable(
+                &idx_values,
+                &record_values,
+                cursor.key_sort_order(),
+                cursor.collations(),
+            );
             if ord.is_gt() {
                 target_pc.to_offset_int()
             } else {
@@ -2229,7 +2335,12 @@ pub fn op_idx_lt(
             let idx_values = idx_record.get_values();
             let idx_values = &idx_values[..record_from_regs.len()];
             let record_values = record_from_regs.get_values();
-            let ord = compare_immutable(&idx_values, &record_values, cursor.index_key_sort_order);
+            let ord = compare_immutable(
+                &idx_values,
+                &record_values,
+                cursor.key_sort_order(),
+                cursor.collations(),
+            );
             if ord.is_lt() {
                 target_pc.to_offset_int()
             } else {
@@ -2258,10 +2369,10 @@ pub fn op_decr_jump_zero(
     match state.registers[*reg].get_owned_value() {
         Value::Integer(n) => {
             let n = n - 1;
+            state.registers[*reg] = Register::Value(Value::Integer(n));
             if n == 0 {
                 state.pc = target_pc.to_offset_int();
             } else {
-                state.registers[*reg] = Register::Value(Value::Integer(n));
                 state.pc += 1;
             }
         }
@@ -2698,11 +2809,18 @@ pub fn op_sorter_open(
         cursor_id,
         columns: _,
         order,
+        collations,
     } = insn
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    let cursor = Sorter::new(order);
+    let cursor = Sorter::new(
+        order,
+        collations
+            .iter()
+            .map(|collation| collation.unwrap_or_default())
+            .collect(),
+    );
     let mut cursors = state.cursors.borrow_mut();
     cursors
         .get_mut(*cursor_id)
@@ -4128,14 +4246,38 @@ pub fn op_open_write(
         None => None,
     };
     if let Some(index) = maybe_index {
-        let cursor =
-            BTreeCursor::new_index(mv_cursor, pager.clone(), root_page as usize, index.as_ref());
+        let conn = program.connection.upgrade().unwrap();
+        let schema = conn.schema.try_read().ok_or(LimboError::SchemaLocked)?;
+        let table = schema
+            .get_table(&index.table_name)
+            .map_or(None, |table| table.btree());
+        let collations = table.map_or(Vec::new(), |table| {
+            index
+                .columns
+                .iter()
+                .map(|c| {
+                    table
+                        .columns
+                        .get(c.pos_in_table)
+                        .unwrap()
+                        .collation
+                        .unwrap_or_default()
+                })
+                .collect()
+        });
+        let cursor = BTreeCursor::new_index(
+            mv_cursor,
+            pager.clone(),
+            root_page as usize,
+            index.as_ref(),
+            collations,
+        );
         cursors
             .get_mut(*cursor_id)
             .unwrap()
             .replace(Cursor::new_btree(cursor));
     } else {
-        let cursor = BTreeCursor::new(mv_cursor, pager.clone(), root_page as usize);
+        let cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), root_page as usize);
         cursors
             .get_mut(*cursor_id)
             .unwrap()
@@ -4181,6 +4323,7 @@ pub fn op_create_btree(
         // TODO: implement temp databases
         todo!("temp databases not implemented yet");
     }
+    // FIXME: handle page cache is full
     let root_page = pager.btree_create(flags);
     state.registers[*root] = Register::Value(Value::Integer(root_page as i64));
     state.pc += 1;
@@ -4196,7 +4339,7 @@ pub fn op_destroy(
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Destroy {
         root,
-        former_root_reg: _,
+        former_root_reg,
         is_temp,
     } = insn
     else {
@@ -4205,8 +4348,13 @@ pub fn op_destroy(
     if *is_temp == 1 {
         todo!("temp databases not implemented yet.");
     }
-    let mut cursor = BTreeCursor::new(None, pager.clone(), *root);
-    cursor.btree_destroy()?;
+    // TODO not sure if should be BTreeCursor::new_table or BTreeCursor::new_index here or neither and just pass an emtpy vec
+    let mut cursor = BTreeCursor::new(None, pager.clone(), *root, Vec::new());
+    let former_root_page_result = cursor.btree_destroy()?;
+    if let CursorResult::Ok(former_root_page) = former_root_page_result {
+        state.registers[*former_root_reg] =
+            Register::Value(Value::Integer(former_root_page.unwrap_or(0) as i64));
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -4548,7 +4696,7 @@ pub fn op_open_ephemeral(
 
     let db_header = Pager::begin_open(db_file.clone())?;
     let buffer_pool = Rc::new(BufferPool::new(db_header.lock().get_page_size() as usize));
-    let page_cache = Arc::new(RwLock::new(DumbLruPageCache::new(10)));
+    let page_cache = Arc::new(RwLock::new(DumbLruPageCache::default()));
 
     let pager = Rc::new(Pager::finish_open(
         db_header,
@@ -4565,6 +4713,7 @@ pub fn op_open_ephemeral(
         &CreateBTreeFlags::new_index()
     };
 
+    // FIXME: handle page cache is full
     let root_page = pager.btree_create(flag);
 
     let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
@@ -4579,7 +4728,21 @@ pub fn op_open_ephemeral(
         }
         None => None,
     };
-    let mut cursor = BTreeCursor::new(mv_cursor, pager, root_page as usize);
+    let mut cursor = if let CursorType::BTreeIndex(index) = cursor_type {
+        BTreeCursor::new_index(
+            mv_cursor,
+            pager,
+            root_page as usize,
+            index,
+            index
+                .columns
+                .iter()
+                .map(|c| c.collation.unwrap_or_default())
+                .collect(),
+        )
+    } else {
+        BTreeCursor::new_table(mv_cursor, pager, root_page as usize)
+    };
     cursor.rewind()?; // Will never return io
 
     let mut cursors: std::cell::RefMut<'_, Vec<Option<Cursor>>> = state.cursors.borrow_mut();
@@ -4641,22 +4804,30 @@ pub fn op_once(
     Ok(InsnFunctionStepResult::Step)
 }
 
-pub fn op_not_found(
+pub fn op_found(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Rc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    let Insn::NotFound {
-        cursor_id,
-        target_pc,
-        record_reg,
-        num_regs,
-    } = insn
-    else {
-        unreachable!("unexpected Insn {:?}", insn)
+    let (cursor_id, target_pc, record_reg, num_regs) = match insn {
+        Insn::NotFound {
+            cursor_id,
+            target_pc,
+            record_reg,
+            num_regs,
+        } => (cursor_id, target_pc, record_reg, num_regs),
+        Insn::Found {
+            cursor_id,
+            target_pc,
+            record_reg,
+            num_regs,
+        } => (cursor_id, target_pc, record_reg, num_regs),
+        _ => unreachable!("unexpected Insn {:?}", insn),
     };
+
+    let not = matches!(insn, Insn::NotFound { .. });
 
     let found = {
         let mut cursor = state.get_cursor(*cursor_id);
@@ -4679,10 +4850,11 @@ pub fn op_not_found(
         }
     };
 
-    if found {
-        state.pc += 1;
-    } else {
+    let do_jump = (!found && not) || (found && !not);
+    if do_jump {
         state.pc = target_pc.to_offset_int();
+    } else {
+        state.pc += 1;
     }
 
     Ok(InsnFunctionStepResult::Step)

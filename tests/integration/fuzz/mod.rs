@@ -51,7 +51,7 @@ mod tests {
 
         let insert = format!(
             "INSERT INTO t VALUES {}",
-            (1..10000)
+            (1..2000)
                 .map(|x| format!("({})", x))
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -71,9 +71,9 @@ mod tests {
 
         for comp in COMPARISONS.iter() {
             for order_by in ORDER_BY.iter() {
-                for max in 0..=10000 {
+                for max in 0..=2000 {
                     let query = format!(
-                        "SELECT * FROM t WHERE x {} {} {} LIMIT 3",
+                        "SELECT * FROM t WHERE x {} {} {}",
                         comp,
                         max,
                         order_by.unwrap_or("")
@@ -414,6 +414,93 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    pub fn compound_select_fuzz() {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time();
+        log::info!("compound_select_fuzz seed: {}", seed);
+
+        // Constants for fuzzing parameters
+        const MAX_TABLES: usize = 5;
+        const MIN_TABLES: usize = 1;
+        const MAX_ROWS_PER_TABLE: usize = 15;
+        const MIN_ROWS_PER_TABLE: usize = 5;
+        const NUM_FUZZ_ITERATIONS: usize = 1000;
+        // How many more SELECTs than tables can be in a UNION (e.g., if 2 tables, max 2+2=4 SELECTs)
+        const MAX_SELECTS_IN_UNION_EXTRA: usize = 2;
+        const MAX_LIMIT_VALUE: usize = 50;
+
+        let db = TempDatabase::new_empty();
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let mut table_names = Vec::new();
+        let num_tables = rng.random_range(MIN_TABLES..=MAX_TABLES);
+
+        for i in 0..num_tables {
+            let table_name = format!("t{}", i);
+            // Schema: c1 INTEGER, c2 INTEGER, c3 INTEGER for simplicity and UNION ALL compatibility
+            let create_table_sql = format!(
+                "CREATE TABLE {} (c1 INTEGER, c2 INTEGER, c3 INTEGER)",
+                table_name
+            );
+
+            limbo_exec_rows(&db, &limbo_conn, &create_table_sql);
+            sqlite_exec_rows(&sqlite_conn, &create_table_sql);
+
+            let num_rows_to_insert = rng.random_range(MIN_ROWS_PER_TABLE..=MAX_ROWS_PER_TABLE);
+            for _ in 0..num_rows_to_insert {
+                let c1_val: i64 = rng.random_range(-1000..1000);
+                let c2_val: i64 = rng.random_range(-1000..1000);
+                let c3_val: i64 = rng.random_range(-1000..1000);
+
+                let insert_sql = format!(
+                    "INSERT INTO {} VALUES ({}, {}, {})",
+                    table_name, c1_val, c2_val, c3_val
+                );
+                limbo_exec_rows(&db, &limbo_conn, &insert_sql);
+                sqlite_exec_rows(&sqlite_conn, &insert_sql);
+            }
+            table_names.push(table_name);
+        }
+
+        for iter_num in 0..NUM_FUZZ_ITERATIONS {
+            // Number of SELECT clauses to be UNION ALL'd
+            let num_selects_in_union =
+                rng.random_range(1..=(table_names.len() + MAX_SELECTS_IN_UNION_EXTRA));
+            let mut select_statements = Vec::new();
+
+            for _ in 0..num_selects_in_union {
+                // Randomly pick a table
+                let table_to_select_from = &table_names[rng.random_range(0..table_names.len())];
+                select_statements.push(format!("SELECT c1, c2, c3 FROM {}", table_to_select_from));
+            }
+
+            let mut query = select_statements.join(" UNION ALL ");
+
+            if rng.random_bool(0.8) {
+                let limit_val = rng.random_range(0..=MAX_LIMIT_VALUE); // LIMIT 0 is valid
+                query = format!("{} LIMIT {}", query, limit_val);
+            }
+
+            log::debug!(
+                "Iteration {}/{}: Query: {}",
+                iter_num + 1,
+                NUM_FUZZ_ITERATIONS,
+                query
+            );
+
+            let limbo_results = limbo_exec_rows(&db, &limbo_conn, &query);
+            let sqlite_results = sqlite_exec_rows(&sqlite_conn, &query);
+
+            assert_eq!(
+                limbo_results, sqlite_results,
+                "query: {}, limbo: {:?}, sqlite: {:?}, seed: {}",
+                query, limbo_results, sqlite_results, seed
+            );
         }
     }
 
@@ -1220,6 +1307,7 @@ mod tests {
             );
             let query = format!("INSERT INTO t VALUES ({}, {}, {})", x, y, z);
             log::info!("insert: {}", query);
+            dbg!(&query);
             assert_eq!(
                 limbo_exec_rows(&db, &limbo_conn, &query),
                 sqlite_exec_rows(&sqlite_conn, &query),

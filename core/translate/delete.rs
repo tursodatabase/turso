@@ -16,18 +16,20 @@ pub fn translate_delete(
     where_clause: Option<Box<Expr>>,
     limit: Option<Box<Limit>>,
     syms: &SymbolTable,
+    mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
     let mut delete_plan = prepare_delete_plan(schema, tbl_name, where_clause, limit)?;
     optimize_plan(&mut delete_plan, schema)?;
     let Plan::Delete(ref delete) = delete_plan else {
         panic!("delete_plan is not a DeletePlan");
     };
-    let mut program = ProgramBuilder::new(ProgramBuilderOpts {
+    let opts = ProgramBuilderOpts {
         query_mode,
         num_cursors: 1,
         approx_num_insns: estimate_num_instructions(delete),
         approx_num_labels: 0,
-    });
+    };
+    program.extend(&opts);
     emit_program(&mut program, delete_plan, syms)?;
     Ok(program)
 }

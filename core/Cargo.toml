@@ -29,13 +29,14 @@ completion = ["limbo_completion/static"]
 testvfs = ["limbo_ext_tests/static"]
 static = ["limbo_ext/static"]
 fuzz = []
+csv = ["limbo_csv/static"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7.5", optional = true }
 
 [target.'cfg(target_family = "unix")'.dependencies]
 polling = "3.7.4"
-rustix = { version = "1.0.5", features = ["fs"]}
+rustix = { version = "1.0.5", features = ["fs"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 mimalloc = { version = "0.1.46", default-features = false }
@@ -68,12 +69,15 @@ limbo_series = { workspace = true, optional = true, features = ["static"] }
 limbo_ipaddr = { workspace = true, optional = true, features = ["static"] }
 limbo_completion = { workspace = true, optional = true, features = ["static"] }
 limbo_ext_tests = { workspace = true, optional = true, features = ["static"] }
+limbo_csv = { workspace = true, optional = true, features = ["static"] }
 miette = "7.6.0"
-strum = "0.26"
+strum = { workspace = true }
 parking_lot = "0.12.3"
 crossbeam-skiplist = "0.1.3"
 tracing = "0.1.41"
 ryu = "1.0.19"
+uncased = "0.9.10"
+strum_macros = {workspace = true }
 bitflags = "2.9.0"
 
 [build-dependencies]
@@ -99,6 +103,7 @@ rand_chacha = "0.9.0"
 env_logger = "0.11.6"
 test-log = { version = "0.2.17", features = ["trace"] }
 lru = "0.14.0"
+sorted-vec = "0.8.6"
 
 [[bench]]
 name = "benchmark"

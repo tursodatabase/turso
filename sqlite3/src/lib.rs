@@ -2,8 +2,8 @@
 #![allow(non_camel_case_types)]
 
 use limbo_core::Value;
-use log::trace;
 use std::ffi::{self, CStr, CString};
+use tracing::trace;
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -85,7 +85,7 @@ static INIT_DONE: std::sync::Once = std::sync::Once::new();
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_initialize() -> ffi::c_int {
     INIT_DONE.call_once(|| {
-        env_logger::init();
+        tracing_subscriber::fmt::init();
     });
     SQLITE_OK
 }
@@ -131,7 +131,7 @@ pub unsafe extern "C" fn sqlite3_open(
             SQLITE_OK
         }
         Err(e) => {
-            log::trace!("error opening database {}: {:?}", filename, e);
+            trace!("error opening database {}: {:?}", filename, e);
             SQLITE_CANTOPEN
         }
     }

@@ -11,9 +11,8 @@ pub type RegisterModuleFn = unsafe extern "C" fn(
 #[repr(C)]
 #[derive(Clone, Debug)]
 pub struct VTabModuleImpl {
-    pub ctx: *const c_void,
     pub name: *const c_char,
-    pub create_schema: VtabFnCreateSchema,
+    pub create: VtabFnCreate,
     pub open: VtabFnOpen,
     pub close: VtabFnClose,
     pub filter: VtabFnFilter,
@@ -26,24 +25,50 @@ pub struct VTabModuleImpl {
     pub best_idx: BestIdxFn,
 }
 
+#[repr(C)]
+pub struct VTabCreateResult {
+    pub code: ResultCode,
+    pub schema: *const c_char,
+    pub table: *const c_void,
+}
+
 #[cfg(feature = "core_only")]
 impl VTabModuleImpl {
-    pub fn init_schema(&self, args: Vec<Value>) -> crate::ExtResult<String> {
-        let schema = unsafe { (self.create_schema)(args.as_ptr(), args.len() as i32) };
-        if schema.is_null() {
-            return Err(ResultCode::InvalidArgs);
-        }
+    pub fn create(&self, args: Vec<Value>) -> crate::ExtResult<(String, *const c_void)> {
+        let result = unsafe { (self.create)(args.as_ptr(), args.len() as i32) };
         for arg in args {
             unsafe { arg.__free_internal_type() };
         }
-        let schema = unsafe { std::ffi::CString::from_raw(schema) };
-        Ok(schema.to_string_lossy().to_string())
+        if !result.code.is_ok() {
+            return Err(result.code);
+        }
+        let schema = unsafe { std::ffi::CString::from_raw(result.schema as *mut _) };
+        Ok((schema.to_string_lossy().to_string(), result.table))
+    }
+
+    // TODO: This function is temporary and should eventually be removed.
+    //       The only difference from `create` is that it takes ownership of the table instance.
+    //       Currently, it is used to generate virtual table column names that are stored in
+    //       `sqlite_schema` alongside the table's schema.
+    //       However, storing column names is not necessary to match SQLite's behavior.
+    //       SQLite computes the list of columns dynamically each time the `.schema` command
+    //       is executed, using the `shell_add_schema` UDF function.
+    pub fn create_schema(&self, args: Vec<Value>) -> crate::ExtResult<String> {
+        self.create(args).and_then(|(schema, table)| {
+            // Drop the allocated table instance to avoid a memory leak.
+            let result = unsafe { (self.destroy)(table) };
+            if result.is_ok() {
+                Ok(schema)
+            } else {
+                Err(result)
+            }
+        })
     }
 }
 
-pub type VtabFnCreateSchema = unsafe extern "C" fn(args: *const Value, argc: i32) -> *mut c_char;
+pub type VtabFnCreate = unsafe extern "C" fn(args: *const Value, argc: i32) -> VTabCreateResult;
 
-pub type VtabFnOpen = unsafe extern "C" fn(*const c_void) -> *const c_void;
+pub type VtabFnOpen = unsafe extern "C" fn(table: *const c_void) -> *const c_void;
 
 pub type VtabFnClose = unsafe extern "C" fn(cursor: *const c_void) -> ResultCode;
 
@@ -64,13 +89,14 @@ pub type VtabFnEof = unsafe extern "C" fn(cursor: *const c_void) -> bool;
 pub type VtabRowIDFn = unsafe extern "C" fn(cursor: *const c_void) -> i64;
 
 pub type VtabFnUpdate = unsafe extern "C" fn(
-    vtab: *const c_void,
+    table: *const c_void,
     argc: i32,
     argv: *const Value,
     p_out_rowid: *mut i64,
 ) -> ResultCode;
 
-pub type VtabFnDestroy = unsafe extern "C" fn(vtab: *const c_void) -> ResultCode;
+pub type VtabFnDestroy = unsafe extern "C" fn(table: *const c_void) -> ResultCode;
+
 pub type BestIdxFn = unsafe extern "C" fn(
     constraints: *const ConstraintInfo,
     constraint_len: i32,
@@ -86,21 +112,20 @@ pub enum VTabKind {
 }
 
 pub trait VTabModule: 'static {
-    type VCursor: VTabCursor<Error = Self::Error>;
+    type Table: VTable;
     const VTAB_KIND: VTabKind;
     const NAME: &'static str;
+
+    /// Creates a new instance of a virtual table.
+    /// Returns a tuple where the first element is the table's schema.
+    fn create(args: &[Value]) -> Result<(String, Self::Table), ResultCode>;
+}
+
+pub trait VTable {
+    type Cursor: VTabCursor<Error = Self::Error>;
     type Error: std::fmt::Display;
 
-    fn create_schema(args: &[Value]) -> String;
-    fn open(&self) -> Result<Self::VCursor, Self::Error>;
-    fn filter(
-        cursor: &mut Self::VCursor,
-        args: &[Value],
-        idx_info: Option<(&str, i32)>,
-    ) -> ResultCode;
-    fn column(cursor: &Self::VCursor, idx: u32) -> Result<Value, Self::Error>;
-    fn next(cursor: &mut Self::VCursor) -> ResultCode;
-    fn eof(cursor: &Self::VCursor) -> bool;
+    fn open(&self) -> Result<Self::Cursor, Self::Error>;
     fn update(&mut self, _rowid: i64, _args: &[Value]) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -133,6 +158,7 @@ pub trait VTabModule: 'static {
 
 pub trait VTabCursor: Sized {
     type Error: std::fmt::Display;
+    fn filter(&mut self, args: &[Value], idx_info: Option<(&str, i32)>) -> ResultCode;
     fn rowid(&self) -> i64;
     fn column(&self, idx: u32) -> Result<Value, Self::Error>;
     fn eof(&self) -> bool;

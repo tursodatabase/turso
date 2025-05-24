@@ -621,6 +621,89 @@ def test_create_virtual_table():
     limbo.quit()
 
 
+def test_csv():
+    limbo = TestLimboShell()
+    ext_path = "./target/debug/liblimbo_csv"
+    limbo.execute_dot(f".load {ext_path}")
+
+    limbo.run_test_fn(
+        "CREATE VIRTUAL TABLE temp.csv USING csv(filename=./testing/test_files/test.csv);",
+        null,
+        "Create virtual table from CSV file"
+    )
+    limbo.run_test_fn(
+        "SELECT * FROM temp.csv;",
+        lambda res: res == "1|2.0|String'1\n3|4.0|String2",
+        "Read all rows from CSV table"
+    )
+    limbo.run_test_fn(
+        "SELECT * FROM temp.csv WHERE c2 = 'String2';",
+        lambda res: res == "3|4.0|String2",
+        "Filter rows with WHERE clause"
+    )
+    limbo.run_test_fn(
+        "INSERT INTO temp.csv VALUES (5, 6.0, 'String3');",
+        lambda res: "Virtual table update failed" in res,
+        "INSERT into CSV table should fail"
+    )
+    limbo.run_test_fn(
+        "UPDATE temp.csv SET c0 = 10 WHERE c1 = '2.0';",
+        lambda res: "Virtual table update failed" in res,
+        "UPDATE on CSV table should fail"
+    )
+    limbo.run_test_fn(
+        "DELETE FROM temp.csv WHERE c1 = '2.0';",
+        lambda res: "Virtual table update failed" in res,
+        "DELETE on CSV table should fail"
+    )
+    limbo.run_test_fn(
+        "DROP TABLE temp.csv;",
+        null,
+        "Drop CSV table"
+    )
+    limbo.run_test_fn(
+        "SELECT * FROM temp.csv;",
+        lambda res: "Parse error: Table csv not found" in res,
+        "Query dropped CSV table should fail"
+    )
+    limbo.run_test_fn(
+        "create virtual table t1 using csv(data='1'\\'2');",
+        lambda res: "unrecognized token at" in res,
+        "Create CSV table with malformed escape sequence"
+    )
+    limbo.run_test_fn(
+        "create virtual table t1 using csv(data=\"12');",
+        lambda res: "non-terminated literal at" in res,
+        "Create CSV table with unterminated quoted string"
+    )
+
+    limbo.run_debug("create virtual table t1 using csv(data='');")
+    limbo.run_test_fn(
+        "SELECT c0 FROM t1;",
+        lambda res: res == "",
+        "Empty CSV table without a header should have one column: 'c0'"
+    )
+    limbo.run_test_fn(
+        "SELECT c1 FROM t1;",
+        lambda res: "Parse error: Column c1 not found" in res,
+        "Empty CSV table without header should not have columns other than 'c0'"
+    )
+
+    limbo.run_debug("create virtual table t2 using csv(data='', header=true);")
+    limbo.run_test_fn(
+        "SELECT \"(NULL)\" FROM t2;",
+        lambda res: res == "",
+        "Empty CSV table with header should have one column named '(NULL)'"
+    )
+    limbo.run_test_fn(
+        "SELECT c0 FROM t2;",
+        lambda res: "Parse error: Column c0 not found" in res,
+        "Empty CSV table with header should not have columns other than '(NULL)'"
+    )
+
+    limbo.quit()
+
+
 def cleanup():
     if os.path.exists("testing/vfs.db"):
         os.remove("testing/vfs.db")
@@ -641,6 +724,7 @@ def main():
         test_kv()
         test_drop_virtual_table()
         test_create_virtual_table()
+        test_csv()
     except Exception as e:
         console.error(f"Test FAILED: {e}")
         cleanup()

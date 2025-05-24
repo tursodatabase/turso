@@ -45,17 +45,19 @@ use limbo_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VT
 use limbo_sqlite3_parser::{ast, ast::Cmd, lexer::sql::Parser};
 use parking_lot::RwLock;
 use schema::{Column, Schema};
+use std::ffi::c_void;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell, UnsafeCell},
     collections::HashMap,
+    fmt::Display,
     io::Write,
     num::NonZero,
     ops::Deref,
     rc::Rc,
     sync::{Arc, OnceLock},
 };
-use storage::btree::btree_init_page;
+use storage::btree::{btree_init_page, BTreePageInner};
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
 pub use storage::{
@@ -77,8 +79,6 @@ use util::{columns_from_create_table_body, parse_schema_rows};
 use vdbe::{builder::QueryMode, VTabOpaqueCursor};
 pub type Result<T, E = LimboError> = std::result::Result<T, E>;
 pub static DATABASE_VERSION: OnceLock<String> = OnceLock::new();
-
-const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES: usize = 2000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TransactionState {
@@ -168,9 +168,7 @@ impl Database {
             None
         };
 
-        let shared_page_cache = Arc::new(RwLock::new(DumbLruPageCache::new(
-            DEFAULT_PAGE_CACHE_SIZE_IN_PAGES,
-        )));
+        let shared_page_cache = Arc::new(RwLock::new(DumbLruPageCache::default()));
         let schema = Arc::new(RwLock::new(Schema::new()));
         let db = Database {
             mv_store,
@@ -274,6 +272,9 @@ pub fn maybe_init_database_file(file: &Arc<dyn File>, io: &Arc<dyn IO>) -> Resul
             &Rc::new(BufferPool::new(db_header.get_page_size() as usize)),
             DATABASE_HEADER_SIZE,
         );
+        let page1 = Arc::new(BTreePageInner {
+            page: RefCell::new(page1),
+        });
         {
             // Create the sqlite_schema table, for this we just need to create the btree page
             // for the first page of the database which is basically like any other btree page
@@ -286,6 +287,7 @@ pub fn maybe_init_database_file(file: &Arc<dyn File>, io: &Arc<dyn IO>) -> Resul
                 (db_header.get_page_size() - db_header.reserved_space as u32) as u16,
             );
 
+            let page1 = page1.get();
             let contents = page1.get().contents.as_mut().unwrap();
             contents.write_database_header(&db_header);
             // write the first page to disk synchronously
@@ -585,6 +587,101 @@ impl Connection {
         }
         Ok(())
     }
+
+    // Clearly there is something to improve here, Vec<Vec<Value>> isn't a couple of tea
+    /// Query the current rows/values of `pragma_name`.
+    pub fn pragma_query(self: &Rc<Connection>, pragma_name: &str) -> Result<Vec<Vec<Value>>> {
+        let pragma = format!("PRAGMA {}", pragma_name);
+        let mut stmt = self.prepare(pragma)?;
+        let mut results = Vec::new();
+        loop {
+            match stmt.step()? {
+                vdbe::StepResult::Row => {
+                    let row: Vec<Value> = stmt
+                        .row()
+                        .unwrap()
+                        .get_values()
+                        .map(|v| v.clone())
+                        .collect();
+                    results.push(row);
+                }
+                vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
+                    return Err(LimboError::Busy);
+                }
+                _ => break,
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Set a new value to `pragma_name`.
+    ///
+    /// Some pragmas will return the updated value which cannot be retrieved
+    /// with this method.
+    pub fn pragma_update<V: Display>(
+        self: &Rc<Connection>,
+        pragma_name: &str,
+        pragma_value: V,
+    ) -> Result<Vec<Vec<Value>>> {
+        let pragma = format!("PRAGMA {} = {}", pragma_name, pragma_value);
+        let mut stmt = self.prepare(pragma)?;
+        let mut results = Vec::new();
+        loop {
+            match stmt.step()? {
+                vdbe::StepResult::Row => {
+                    let row: Vec<Value> = stmt
+                        .row()
+                        .unwrap()
+                        .get_values()
+                        .map(|v| v.clone())
+                        .collect();
+                    results.push(row);
+                }
+                vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
+                    return Err(LimboError::Busy);
+                }
+                _ => break,
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Query the current value(s) of `pragma_name` associated to
+    /// `pragma_value`.
+    ///
+    /// This method can be used with query-only pragmas which need an argument
+    /// (e.g. `table_info('one_tbl')`) or pragmas which returns value(s)
+    /// (e.g. `integrity_check`).
+    pub fn pragma<V: Display>(
+        self: &Rc<Connection>,
+        pragma_name: &str,
+        pragma_value: V,
+    ) -> Result<Vec<Vec<Value>>> {
+        let pragma = format!("PRAGMA {}({})", pragma_name, pragma_value);
+        let mut stmt = self.prepare(pragma)?;
+        let mut results = Vec::new();
+        loop {
+            match stmt.step()? {
+                vdbe::StepResult::Row => {
+                    let row: Vec<Value> = stmt
+                        .row()
+                        .unwrap()
+                        .get_values()
+                        .map(|v| v.clone())
+                        .collect();
+                    results.push(row);
+                }
+                vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
+                    return Err(LimboError::Busy);
+                }
+                _ => break,
+            }
+        }
+
+        Ok(results)
+    }
 }
 
 pub struct Statement {
@@ -674,6 +771,7 @@ pub struct VirtualTable {
     pub implementation: Rc<VTabModuleImpl>,
     columns: Vec<Column>,
     kind: VTabKind,
+    table_ptr: *const c_void,
 }
 
 impl VirtualTable {
@@ -719,7 +817,7 @@ impl VirtualTable {
                 )));
             }
         };
-        let schema = module.implementation.as_ref().init_schema(args)?;
+        let (schema, table_ptr) = module.implementation.as_ref().create(args)?;
         let mut parser = Parser::new(schema.as_bytes());
         if let ast::Cmd::Stmt(ast::Stmt::CreateTable { body, .. }) = parser.next()?.ok_or(
             LimboError::ParseError("Failed to parse schema from virtual table module".to_string()),
@@ -731,6 +829,7 @@ impl VirtualTable {
                 columns,
                 args: exprs,
                 kind,
+                table_ptr,
             });
             return Ok(vtab);
         }
@@ -740,7 +839,7 @@ impl VirtualTable {
     }
 
     pub fn open(&self) -> crate::Result<VTabOpaqueCursor> {
-        let cursor = unsafe { (self.implementation.open)(self.implementation.ctx) };
+        let cursor = unsafe { (self.implementation.open)(self.table_ptr) };
         VTabOpaqueCursor::new(cursor, self.implementation.close)
     }
 
@@ -797,10 +896,9 @@ impl VirtualTable {
         let arg_count = args.len();
         let ext_args = args.iter().map(|arg| arg.to_ffi()).collect::<Vec<_>>();
         let newrowid = 0i64;
-        let implementation = self.implementation.as_ref();
         let rc = unsafe {
             (self.implementation.update)(
-                implementation as *const VTabModuleImpl as *const std::ffi::c_void,
+                self.table_ptr,
                 arg_count as i32,
                 ext_args.as_ptr(),
                 &newrowid as *const _ as *mut i64,
@@ -819,12 +917,7 @@ impl VirtualTable {
     }
 
     pub fn destroy(&self) -> Result<()> {
-        let implementation = self.implementation.as_ref();
-        let rc = unsafe {
-            (self.implementation.destroy)(
-                implementation as *const VTabModuleImpl as *const std::ffi::c_void,
-            )
-        };
+        let rc = unsafe { (self.implementation.destroy)(self.table_ptr) };
         match rc {
             ResultCode::OK => Ok(()),
             _ => Err(LimboError::ExtensionError(rc.to_string())),
@@ -832,7 +925,7 @@ impl VirtualTable {
     }
 }
 
-pub(crate) struct SymbolTable {
+pub struct SymbolTable {
     pub functions: HashMap<String, Rc<function::ExternalFunc>>,
     pub vtabs: HashMap<String, Rc<VirtualTable>>,
     pub vtab_modules: HashMap<String, Rc<crate::ext::VTabImpl>>,

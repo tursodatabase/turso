@@ -154,7 +154,7 @@ impl Limbo {
             input_buff: String::new(),
             opts: Settings::from(opts),
             rl: None,
-            config: None,
+            config: Some(Config::default()),
         };
         app.first_run(sql, quiet)?;
         Ok(app)
@@ -536,13 +536,6 @@ impl Limbo {
                 }
             }
             return Ok(());
-        }
-
-        if let Some(comment_pos) = line.find("--") {
-            let before_comment = line[..comment_pos].trim();
-            if !before_comment.is_empty() {
-                return self.handle_input_line(before_comment);
-            }
         }
         if line.ends_with(';') {
             self.buffer_input(line);

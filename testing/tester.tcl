@@ -226,3 +226,13 @@ proc do_execsql_test_in_memory_any_error {test_name sql_statements} {
     set combined_sql [string trim $sql_statements]
     run_test_expecting_any_error $::sqlite_exec $db_name $combined_sql
 }
+
+proc do_execsql_test_in_memory_error_content {test_name sql_statements expected_error_text} {
+    test_put "Running error content test" in-memory $test_name
+
+    # Use ":memory:" special filename for in-memory database
+    set db_name ":memory:"
+
+    set combined_sql [string trim $sql_statements]
+    run_test_expecting_error_content $::sqlite_exec $db_name $combined_sql $expected_error_text
+}

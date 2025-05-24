@@ -27,10 +27,22 @@ test("Statement.get() returns null when no data", async (t) => {
 // it should return a result object, not a row object
 test("Statement.run() returns correct result object", async (t) => {
   const [db] = await connect(":memory:");
-  db.prepare("CREATE TABLE users (name TEXT)").run();
-  db.prepare("INSERT INTO users (name) VALUES (?)").run(["Alice"]);
+  db.prepare("CREATE TABLE users (name TEXT, age INTEGER)").run();
+  db.prepare("INSERT INTO users (name, age) VALUES (?, ?)").run(["Alice", 42]);
   let rows = db.prepare("SELECT * FROM users").all();
-  t.deepEqual(rows, [{ name: "Alice" }]);
+  t.deepEqual(rows, [{ name: "Alice", age: 42 }]);
+});
+
+test("Statment.iterate() should correctly return an iterable object", async (t) => {
+  const [db] = await connect(":memory:");
+  db.prepare("CREATE TABLE users (name TEXT, age INTEGER)").run();
+  db.prepare("INSERT INTO users (name, age) VALUES (?, ?)").run(["Alice", 42]);
+  db.prepare("INSERT INTO users (name, age) VALUES (?, ?)").run(["Bob", 24]);
+  let rows = db.prepare("SELECT * FROM users").iterate();
+  for (const row of rows) {
+    t.truthy(row.name);
+    t.true(typeof row.age === "number");
+  }
 });
 
 test("Empty prepared statement should throw", async (t) => {

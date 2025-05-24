@@ -170,7 +170,7 @@ Limbo aims to be fully compatible with SQLite, with opt-in features not supporte
 | PRAGMA temp_store_directory      | Not Needed | deprecated in SQLite                         |
 | PRAGMA threads                   | No         |                                              |
 | PRAGMA trusted_schema            | No         |                                              |
-| PRAGMA user_version              | Partial    | Only read implemented                        |
+| PRAGMA user_version              | Yes        |                                              |
 | PRAGMA vdbe_addoptrace           | No         |                                              |
 | PRAGMA vdbe_debug                | No         |                                              |
 | PRAGMA vdbe_listing              | No         |                                              |
@@ -193,7 +193,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | ... OVER (...)            | No      | Is incorrectly ignored                   |
 | (expr)                    | Yes     |                                          |
 | CAST (expr AS type)       | Yes     |                                          |
-| COLLATE                   | No      |                                          |
+| COLLATE                   | Partial | Custom Collations not supported          |
 | (NOT) LIKE                | Yes     |                                          |
 | (NOT) GLOB                | Yes     |                                          |
 | (NOT) REGEXP              | No      |                                          |

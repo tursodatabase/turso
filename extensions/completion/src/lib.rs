@@ -4,10 +4,12 @@
 mod keywords;
 
 use keywords::KEYWORDS;
-use limbo_ext::{register_extension, ResultCode, VTabCursor, VTabModule, VTabModuleDerive, Value};
+use limbo_ext::{
+    register_extension, ResultCode, VTabCursor, VTabModule, VTabModuleDerive, VTable, Value,
+};
 
 register_extension! {
-    vtabs: { CompletionVTab }
+    vtabs: { CompletionVTabModule }
 }
 
 macro_rules! try_option {
@@ -57,72 +59,33 @@ impl Into<i64> for CompletionPhase {
 
 /// A virtual table that generates candidate completions
 #[derive(Debug, Default, VTabModuleDerive)]
-struct CompletionVTab {}
+struct CompletionVTabModule {}
 
-impl VTabModule for CompletionVTab {
-    type VCursor = CompletionCursor;
+impl VTabModule for CompletionVTabModule {
+    type Table = CompletionTable;
     const NAME: &'static str = "completion";
     const VTAB_KIND: limbo_ext::VTabKind = limbo_ext::VTabKind::TableValuedFunction;
-    type Error = ResultCode;
 
-    fn create_schema(_args: &[Value]) -> String {
-        "CREATE TABLE completion(
+    fn create(_args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
+        let schema = "CREATE TABLE completion(
             candidate TEXT,
             prefix TEXT HIDDEN,
             wholeline TEXT HIDDEN,
             phase INT HIDDEN     
         )"
-        .to_string()
+        .to_string();
+        Ok((schema, CompletionTable {}))
     }
+}
 
-    fn open(&self) -> Result<Self::VCursor, Self::Error> {
+struct CompletionTable {}
+
+impl VTable for CompletionTable {
+    type Cursor = CompletionCursor;
+    type Error = ResultCode;
+
+    fn open(&self) -> Result<Self::Cursor, Self::Error> {
         Ok(CompletionCursor::default())
-    }
-
-    fn column(cursor: &Self::VCursor, idx: u32) -> Result<Value, ResultCode> {
-        cursor.column(idx)
-    }
-
-    fn next(cursor: &mut Self::VCursor) -> ResultCode {
-        cursor.next()
-    }
-
-    fn eof(cursor: &Self::VCursor) -> bool {
-        cursor.eof()
-    }
-
-    fn filter(cursor: &mut Self::VCursor, args: &[Value], _: Option<(&str, i32)>) -> ResultCode {
-        if args.is_empty() || args.len() > 2 {
-            return ResultCode::InvalidArgs;
-        }
-        cursor.reset();
-        let prefix = try_option!(args[0].to_text(), ResultCode::InvalidArgs);
-
-        let wholeline = args.get(1).map(|v| v.to_text().unwrap_or("")).unwrap_or("");
-
-        cursor.line = wholeline.to_string();
-        cursor.prefix = prefix.to_string();
-
-        // Currently best index is not implemented so the correct arg parsing is not done here
-        if !cursor.line.is_empty() && cursor.prefix.is_empty() {
-            let mut i = cursor.line.len();
-            while let Some(ch) = cursor.line.chars().next() {
-                if i > 0 && (ch.is_alphanumeric() || ch == '_') {
-                    i -= 1;
-                } else {
-                    break;
-                }
-            }
-            if cursor.line.len() - i > 0 {
-                // TODO see if need to inclusive range
-                cursor.prefix = cursor.line[..i].to_string();
-            }
-        }
-
-        cursor.rowid = 0;
-        cursor.phase = CompletionPhase::Keywords;
-
-        Self::next(cursor)
     }
 }
 
@@ -149,6 +112,40 @@ impl CompletionCursor {
 
 impl VTabCursor for CompletionCursor {
     type Error = ResultCode;
+
+    fn filter(&mut self, args: &[Value], _: Option<(&str, i32)>) -> ResultCode {
+        if args.is_empty() || args.len() > 2 {
+            return ResultCode::InvalidArgs;
+        }
+        self.reset();
+        let prefix = try_option!(args[0].to_text(), ResultCode::InvalidArgs);
+
+        let wholeline = args.get(1).map(|v| v.to_text().unwrap_or("")).unwrap_or("");
+
+        self.line = wholeline.to_string();
+        self.prefix = prefix.to_string();
+
+        // Currently best index is not implemented so the correct arg parsing is not done here
+        if !self.line.is_empty() && self.prefix.is_empty() {
+            let mut i = self.line.len();
+            while let Some(ch) = self.line.chars().next() {
+                if i > 0 && (ch.is_alphanumeric() || ch == '_') {
+                    i -= 1;
+                } else {
+                    break;
+                }
+            }
+            if self.line.len() - i > 0 {
+                // TODO see if need to inclusive range
+                self.prefix = self.line[..i].to_string();
+            }
+        }
+
+        self.rowid = 0;
+        self.phase = CompletionPhase::Keywords;
+
+        self.next()
+    }
 
     fn next(&mut self) -> ResultCode {
         self.rowid += 1;

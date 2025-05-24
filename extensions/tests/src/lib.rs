@@ -1,7 +1,8 @@
 use lazy_static::lazy_static;
 use limbo_ext::{
     register_extension, scalar, ConstraintInfo, ConstraintOp, ConstraintUsage, ExtResult,
-    IndexInfo, OrderByInfo, ResultCode, VTabCursor, VTabKind, VTabModule, VTabModuleDerive, Value,
+    IndexInfo, OrderByInfo, ResultCode, VTabCursor, VTabKind, VTabModule, VTabModuleDerive, VTable,
+    Value,
 };
 #[cfg(not(target_family = "wasm"))]
 use limbo_ext::{VfsDerive, VfsExtension, VfsFile};
@@ -11,7 +12,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Mutex;
 
 register_extension! {
-    vtabs: { KVStoreVTab },
+    vtabs: { KVStoreVTabModule },
     scalars: { test_scalar },
     vfs: { TestFS },
 }
@@ -21,7 +22,7 @@ lazy_static! {
 }
 
 #[derive(VTabModuleDerive, Default)]
-pub struct KVStoreVTab;
+pub struct KVStoreVTabModule;
 
 /// the cursor holds a snapshot of (rowid, key, value) in memory.
 pub struct KVStoreCursor {
@@ -29,17 +30,114 @@ pub struct KVStoreCursor {
     index: Option<usize>,
 }
 
-impl VTabModule for KVStoreVTab {
-    type VCursor = KVStoreCursor;
+impl VTabModule for KVStoreVTabModule {
+    type Table = KVStoreTable;
     const VTAB_KIND: VTabKind = VTabKind::VirtualTable;
     const NAME: &'static str = "kv_store";
+
+    fn create(_args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
+        let schema = "CREATE TABLE x (key TEXT PRIMARY KEY, value TEXT);".to_string();
+        Ok((schema, KVStoreTable {}))
+    }
+}
+
+fn hash_key(key: &str) -> i64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish() as i64
+}
+
+impl VTabCursor for KVStoreCursor {
     type Error = String;
 
-    fn create_schema(_args: &[Value]) -> String {
-        "CREATE TABLE x (key TEXT PRIMARY KEY, value TEXT);".to_string()
+    fn filter(&mut self, args: &[Value], idx_str: Option<(&str, i32)>) -> ResultCode {
+        match idx_str {
+            Some(("key_eq", 1)) => {
+                let key = args
+                    .first()
+                    .and_then(|v| v.to_text())
+                    .map(|s| s.to_string());
+                log::debug!("idx_str found: key_eq\n value: {:?}", key);
+                if let Some(key) = key {
+                    let rowid = hash_key(&key);
+                    let store = GLOBAL_STORE.lock().unwrap();
+                    if let Some((k, v)) = store.get(&rowid) {
+                        self.rows.push((rowid, k.clone(), v.clone()));
+                        self.index = Some(0);
+                    } else {
+                        self.rows.clear();
+                        self.index = None;
+                        return ResultCode::EOF;
+                    }
+                    return ResultCode::OK;
+                }
+                self.rows.clear();
+                self.index = None;
+                ResultCode::OK
+            }
+            _ => {
+                let store = GLOBAL_STORE.lock().unwrap();
+                self.rows = store
+                    .iter()
+                    .map(|(&rowid, (k, v))| (rowid, k.clone(), v.clone()))
+                    .collect();
+                self.rows.sort_by_key(|(rowid, _, _)| *rowid);
+                if self.rows.is_empty() {
+                    self.index = None;
+                    ResultCode::EOF
+                } else {
+                    self.index = Some(0);
+                    ResultCode::OK
+                }
+            }
+        }
     }
 
-    fn open(&self) -> Result<Self::VCursor, Self::Error> {
+    fn rowid(&self) -> i64 {
+        if self.index.is_some_and(|c| c < self.rows.len()) {
+            self.rows[self.index.unwrap_or(0)].0
+        } else {
+            log::error!("rowid: -1");
+            -1
+        }
+    }
+
+    fn column(&self, idx: u32) -> Result<Value, Self::Error> {
+        if self.index.is_some_and(|c| c >= self.rows.len()) {
+            return Err("cursor out of range".into());
+        }
+        if let Some((_, ref key, ref val)) = self.rows.get(self.index.unwrap_or(0)) {
+            match idx {
+                0 => Ok(Value::from_text(key.clone())), // key
+                1 => Ok(Value::from_text(val.clone())), // value
+                _ => Err("Invalid column".into()),
+            }
+        } else {
+            Err("Invalid Column".into())
+        }
+    }
+
+    fn eof(&self) -> bool {
+        self.index.is_some_and(|s| s >= self.rows.len()) || self.index.is_none()
+    }
+
+    fn next(&mut self) -> ResultCode {
+        self.index = Some(self.index.unwrap_or(0) + 1);
+        if self.index.is_some_and(|c| c >= self.rows.len()) {
+            return ResultCode::EOF;
+        }
+        ResultCode::OK
+    }
+}
+
+pub struct KVStoreTable {}
+
+impl VTable for KVStoreTable {
+    type Cursor = KVStoreCursor;
+    type Error = String;
+
+    fn open(&self) -> Result<Self::Cursor, Self::Error> {
         let _ = env_logger::try_init();
         Ok(KVStoreCursor {
             rows: Vec::new(),
@@ -88,53 +186,6 @@ impl VTabModule for KVStoreVTab {
         }
     }
 
-    fn filter(
-        cursor: &mut Self::VCursor,
-        args: &[Value],
-        idx_str: Option<(&str, i32)>,
-    ) -> ResultCode {
-        match idx_str {
-            Some(("key_eq", 1)) => {
-                let key = args
-                    .first()
-                    .and_then(|v| v.to_text())
-                    .map(|s| s.to_string());
-                log::debug!("idx_str found: key_eq\n value: {:?}", key);
-                if let Some(key) = key {
-                    let rowid = hash_key(&key);
-                    let store = GLOBAL_STORE.lock().unwrap();
-                    if let Some((k, v)) = store.get(&rowid) {
-                        cursor.rows.push((rowid, k.clone(), v.clone()));
-                        cursor.index = Some(0);
-                    } else {
-                        cursor.rows.clear();
-                        cursor.index = None;
-                        return ResultCode::EOF;
-                    }
-                    return ResultCode::OK;
-                }
-                cursor.rows.clear();
-                cursor.index = None;
-                ResultCode::OK
-            }
-            _ => {
-                let store = GLOBAL_STORE.lock().unwrap();
-                cursor.rows = store
-                    .iter()
-                    .map(|(&rowid, (k, v))| (rowid, k.clone(), v.clone()))
-                    .collect();
-                cursor.rows.sort_by_key(|(rowid, _, _)| *rowid);
-                if cursor.rows.is_empty() {
-                    cursor.index = None;
-                    ResultCode::EOF
-                } else {
-                    cursor.index = Some(0);
-                    ResultCode::OK
-                }
-            }
-        }
-    }
-
     fn insert(&mut self, values: &[Value]) -> Result<i64, Self::Error> {
         let key = values
             .first()
@@ -169,68 +220,9 @@ impl VTabModule for KVStoreVTab {
         Ok(())
     }
 
-    fn eof(cursor: &Self::VCursor) -> bool {
-        cursor.index.is_some_and(|s| s >= cursor.rows.len()) || cursor.index.is_none()
-    }
-
-    fn next(cursor: &mut Self::VCursor) -> ResultCode {
-        cursor.index = Some(cursor.index.unwrap_or(0) + 1);
-        if cursor.index.is_some_and(|c| c >= cursor.rows.len()) {
-            return ResultCode::EOF;
-        }
-        ResultCode::OK
-    }
-
-    fn column(cursor: &Self::VCursor, idx: u32) -> Result<Value, Self::Error> {
-        if cursor.index.is_some_and(|c| c >= cursor.rows.len()) {
-            return Err("cursor out of range".into());
-        }
-        if let Some((_, ref key, ref val)) = cursor.rows.get(cursor.index.unwrap_or(0)) {
-            match idx {
-                0 => Ok(Value::from_text(key.clone())), // key
-                1 => Ok(Value::from_text(val.clone())), // value
-                _ => Err("Invalid column".into()),
-            }
-        } else {
-            Err("Invalid Column".into())
-        }
-    }
-
     fn destroy(&mut self) -> Result<(), Self::Error> {
         println!("VDestroy called");
         Ok(())
-    }
-}
-
-fn hash_key(key: &str) -> i64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut hasher);
-    hasher.finish() as i64
-}
-
-impl VTabCursor for KVStoreCursor {
-    type Error = String;
-
-    fn rowid(&self) -> i64 {
-        if self.index.is_some_and(|c| c < self.rows.len()) {
-            self.rows[self.index.unwrap_or(0)].0
-        } else {
-            log::error!("rowid: -1");
-            -1
-        }
-    }
-
-    fn column(&self, idx: u32) -> Result<Value, Self::Error> {
-        <KVStoreVTab as VTabModule>::column(self, idx)
-    }
-
-    fn eof(&self) -> bool {
-        <KVStoreVTab as VTabModule>::eof(self)
-    }
-
-    fn next(&mut self) -> ResultCode {
-        <KVStoreVTab as VTabModule>::next(self)
     }
 }
 

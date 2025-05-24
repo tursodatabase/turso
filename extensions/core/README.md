@@ -172,29 +172,35 @@ impl AggFunc for Percentile {
 /// Example: A virtual table that operates on a CSV file as a database table.
 /// This example assumes that the CSV file is located at "data.csv" in the current directory.
 #[derive(Debug, VTabModuleDerive)]
-struct CsvVTable;
+struct CsvVTableModule;
 
-impl VTabModule for CsvVTable {
-    type VCursor = CsvCursor;
-    /// Define your error type. Must impl Display and match VCursor::Error
-    type Error = &'static str;
+impl VTabModule for CsvVTableModule {
+    type Table = CsvTable;
     /// Declare the name for your virtual table
     const NAME: &'static str = "csv_data";
-
     /// Declare the type of vtable (TableValuedFunction or VirtualTable)
     const VTAB_KIND: VTabKind = VTabKind::VirtualTable;
 
-    /// Function to initialize the schema of your vtable 
-    fn create_schema(_args: &[Value]) -> &'static str {
-        "CREATE TABLE csv_data(
+    /// Declare your virtual table and its schema
+    fn create(args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
+        let schema = "CREATE TABLE csv_data(
             name TEXT,
             age TEXT,
             city TEXT
-        )"
+        )".into();
+        Ok((schema, CsvTable {}))
     }
+}
+
+struct CsvTable {}
+
+impl VTable for CsvTable {
+    type Cursor = CsvCursor;
+    /// Define your error type. Must impl Display and match Cursor::Error
+    type Error = &'static str;
 
     /// Open to return a new cursor: In this simple example, the CSV file is read completely into memory on connect.
-    fn open(&self) -> Result<Self::VCursor, Self::Error> {
+    fn open(&self) -> Result<Self::Cursor, Self::Error> {
         // Read CSV file contents from "data.csv"
         let csv_content = fs::read_to_string("data.csv").unwrap_or_default();
         // For simplicity, we'll ignore the header row.
@@ -208,31 +214,6 @@ impl VTabModule for CsvVTable {
             })
             .collect();
         Ok(CsvCursor { rows, index: 0 })
-    }
-
-    /// Filter through result columns. (not used in this simple example)
-    fn filter(_cursor: &mut Self::VCursor, _args: &[Value]) -> ResultCode {
-        ResultCode::OK
-    }
-
-    /// Return the value for the column at the given index in the current row.
-    fn column(cursor: &Self::VCursor, idx: u32) -> Result<Value, Self::Error> {
-        cursor.column(idx)
-    }
-
-    /// Next advances the cursor to the next row.
-    fn next(cursor: &mut Self::VCursor) -> ResultCode {
-        if cursor.index < cursor.rows.len() - 1 {
-            cursor.index += 1;
-            ResultCode::OK
-        } else {
-            ResultCode::EOF
-        }
-    }
-
-    /// Return true if the cursor is at the end.
-    fn eof(cursor: &Self::VCursor) -> bool {
-        cursor.index >= cursor.rows.len()
     }
 
     /// *Optional* methods for non-readonly tables
@@ -263,14 +244,27 @@ struct CsvCursor {
 impl VTabCursor for CsvCursor {
     type Error = &'static str;
 
-    fn next(&mut self) -> ResultCode {
-        CsvCursor::next(self)
+    /// Filter through result columns. (not used in this simple example)
+    fn filter(&mut self, _args: &[Value], _idx_info: Option<(&str, i32)>) -> ResultCode {
+        ResultCode::OK
     }
 
+    /// Next advances the cursor to the next row.
+    fn next(&mut self) -> ResultCode {
+        if self.index < self.rows.len() - 1 {
+            self.index += 1;
+            ResultCode::OK
+        } else {
+            ResultCode::EOF
+        }
+    }
+
+    /// Return true if the cursor is at the end.
     fn eof(&self) -> bool {
         self.index >= self.rows.len()
     }
 
+    /// Return the value for the column at the given index in the current row.
     fn column(&self, idx: u32) -> Result<Value, Self::Error> {
         let row = &self.rows[self.index];
         if (idx as usize) < row.len() {

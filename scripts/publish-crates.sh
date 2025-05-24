@@ -5,6 +5,7 @@ cargo publish -p limbo_ext
 cargo publish -p limbo_ext_tests
 cargo publish -p limbo_completion
 cargo publish -p limbo_crypto
+cargo publish -p limbo_csv
 cargo publish -p limbo_percentile
 cargo publish -p limbo_regexp
 cargo publish -p limbo_series

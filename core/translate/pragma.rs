@@ -13,25 +13,17 @@ use crate::storage::wal::CheckpointMode;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::vdbe::BranchOffset;
 use crate::{bail_parse_error, Pager};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
-fn list_pragmas(
-    program: &mut ProgramBuilder,
-    init_label: BranchOffset,
-    start_offset: BranchOffset,
-) {
+fn list_pragmas(program: &mut ProgramBuilder) {
     for x in PragmaName::iter() {
         let register = program.emit_string8_new_reg(x.to_string());
         program.emit_result_row(register, 1);
     }
 
-    program.emit_halt();
-    program.preassign_label_to_next_insn(init_label);
-    program.emit_constant_insns();
-    program.emit_goto(start_offset);
+    program.epilogue(crate::translate::emitter::TransactionMode::None);
 }
 
 pub fn translate_pragma(
@@ -41,19 +33,19 @@ pub fn translate_pragma(
     body: Option<ast::PragmaBody>,
     database_header: Arc<SpinLock<DatabaseHeader>>,
     pager: Rc<Pager>,
+    mut program: ProgramBuilder,
 ) -> crate::Result<ProgramBuilder> {
-    let mut program = ProgramBuilder::new(ProgramBuilderOpts {
+    let opts = ProgramBuilderOpts {
         query_mode,
         num_cursors: 0,
         approx_num_insns: 20,
         approx_num_labels: 0,
-    });
-    let init_label = program.emit_init();
-    let start_offset = program.offset();
+    };
+    program.extend(&opts);
     let mut write = false;
 
     if name.name.0.to_lowercase() == "pragma_list" {
-        list_pragmas(&mut program, init_label, start_offset);
+        list_pragmas(&mut program);
         return Ok(program);
     }
 
@@ -103,11 +95,10 @@ pub fn translate_pragma(
             }
         },
     };
-    program.emit_halt();
-    program.preassign_label_to_next_insn(init_label);
-    program.emit_transaction(write);
-    program.emit_constant_insns();
-    program.emit_goto(start_offset);
+    program.epilogue(match write {
+        false => super::emitter::TransactionMode::Read,
+        true => super::emitter::TransactionMode::Write,
+    });
 
     Ok(program)
 }
@@ -151,8 +142,28 @@ fn update_pragma(
             Ok(())
         }
         PragmaName::UserVersion => {
-            // TODO: Implement updating user_version
-            todo!("updating user_version not yet implemented")
+            let version_value = match value {
+                ast::Expr::Literal(ast::Literal::Numeric(numeric_value)) => {
+                    numeric_value.parse::<i32>()?
+                }
+                ast::Expr::Unary(ast::UnaryOperator::Negative, expr) => match *expr {
+                    ast::Expr::Literal(ast::Literal::Numeric(numeric_value)) => {
+                        -numeric_value.parse::<i32>()?
+                    }
+                    _ => bail_parse_error!("Not a valid value"),
+                },
+                _ => bail_parse_error!("Not a valid value"),
+            };
+
+            let mut header_guard = header.lock();
+
+            // update in-memory
+            header_guard.user_version = version_value;
+
+            // update in disk
+            pager.write_database_header(&header_guard);
+
+            Ok(())
         }
         PragmaName::SchemaVersion => {
             // TODO: Implement updating schema_version
@@ -295,15 +306,18 @@ fn update_cache_size(value: i64, header: Arc<SpinLock<DatabaseHeader>>, pager: R
         cache_size_unformatted = MIN_PAGE_CACHE_SIZE as i64;
     }
 
+    let mut header_guard = header.lock();
+
     // update in-memory header
-    header.lock().default_page_cache_size = cache_size_unformatted
+    header_guard.default_page_cache_size = cache_size_unformatted
         .try_into()
         .unwrap_or_else(|_| panic!("invalid value, too big for a i32 {}", value));
 
     // update in disk
-    let header_copy = header.lock().clone();
-    pager.write_database_header(&header_copy);
+    pager.write_database_header(&header_guard);
 
     // update cache size
-    pager.change_page_cache_size(cache_size);
+    pager
+        .change_page_cache_size(cache_size)
+        .expect("couldn't update page cache size");
 }

@@ -127,3 +127,7 @@ do_execsql_test select-agg-json-array {
 do_execsql_test select-agg-json-array-object {
   SELECT json_group_array(json_object('name', name)) FROM products;
 } {[{"name":"hat"},{"name":"cap"},{"name":"shirt"},{"name":"sweater"},{"name":"sweatshirt"},{"name":"shorts"},{"name":"jeans"},{"name":"sneakers"},{"name":"boots"},{"name":"coat"},{"name":"accessories"}]}
+
+do_execsql_test select-distinct-agg-functions {
+  SELECT sum(distinct age), count(distinct age), avg(distinct age) FROM users;
+} {5050|100|50.5}

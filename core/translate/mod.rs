@@ -8,6 +8,7 @@
 //! will read rows from the database and filter them according to a WHERE clause.
 
 pub(crate) mod aggregation;
+pub(crate) mod collate;
 pub(crate) mod delete;
 pub(crate) mod emitter;
 pub(crate) mod expr;
@@ -26,6 +27,7 @@ pub(crate) mod select;
 pub(crate) mod subquery;
 pub(crate) mod transaction;
 pub(crate) mod update;
+mod values;
 
 use crate::fast_lock::SpinLock;
 use crate::schema::Schema;
@@ -50,7 +52,6 @@ use std::sync::Arc;
 use transaction::{translate_tx_begin, translate_tx_commit};
 use update::translate_update;
 
-/// Translate SQL statement into bytecode program.
 pub fn translate(
     schema: &Schema,
     stmt: ast::Stmt,
@@ -60,8 +61,50 @@ pub fn translate(
     syms: &SymbolTable,
     query_mode: QueryMode,
 ) -> Result<Program> {
-    let mut change_cnt_on = false;
+    let change_cnt_on = matches!(
+        stmt,
+        ast::Stmt::CreateIndex { .. } | ast::Stmt::Delete(..) | ast::Stmt::Insert(..)
+    );
 
+    // These options will be extended whithin each translate program
+    let mut program = ProgramBuilder::new(ProgramBuilderOpts {
+        query_mode,
+        num_cursors: 1,
+        approx_num_insns: 2,
+        approx_num_labels: 2,
+    });
+
+    program.prologue();
+
+    program = match stmt {
+        // There can be no nesting with pragma, so lift it up here
+        ast::Stmt::Pragma(name, body) => pragma::translate_pragma(
+            query_mode,
+            schema,
+            &name,
+            body.map(|b| *b),
+            database_header.clone(),
+            pager,
+            program,
+        )?,
+        stmt => translate_inner(schema, stmt, syms, query_mode, program)?,
+    };
+
+    // TODO: bring epilogue here when I can sort out what instructions correspond to a Write or a Read transaction
+
+    Ok(program.build(database_header, connection, change_cnt_on))
+}
+
+// TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
+// statements, we would have to return a program builder instead
+/// Translate SQL statement into bytecode program.
+pub fn translate_inner(
+    schema: &Schema,
+    stmt: ast::Stmt,
+    syms: &SymbolTable,
+    query_mode: QueryMode,
+    program: ProgramBuilder,
+) -> Result<ProgramBuilder> {
     let program = match stmt {
         ast::Stmt::AlterTable(a) => {
             let (table_name, alter_table) = a.as_ref();
@@ -109,6 +152,7 @@ pub fn translate(
                         &mut update,
                         syms,
                         ParseSchema::Reload,
+                        program,
                     )?
                 }
                 _ => todo!(),
@@ -116,8 +160,8 @@ pub fn translate(
         }
         ast::Stmt::Analyze(_) => bail_parse_error!("ANALYZE not supported yet"),
         ast::Stmt::Attach { .. } => bail_parse_error!("ATTACH not supported yet"),
-        ast::Stmt::Begin(tx_type, tx_name) => translate_tx_begin(tx_type, tx_name)?,
-        ast::Stmt::Commit(tx_name) => translate_tx_commit(tx_name)?,
+        ast::Stmt::Begin(tx_type, tx_name) => translate_tx_begin(tx_type, tx_name, program)?,
+        ast::Stmt::Commit(tx_name) => translate_tx_commit(tx_name, program)?,
         ast::Stmt::CreateIndex {
             unique,
             if_not_exists,
@@ -125,17 +169,15 @@ pub fn translate(
             tbl_name,
             columns,
             ..
-        } => {
-            change_cnt_on = true;
-            translate_create_index(
-                query_mode,
-                (unique, if_not_exists),
-                &idx_name.name.0,
-                &tbl_name.0,
-                &columns,
-                schema,
-            )?
-        }
+        } => translate_create_index(
+            query_mode,
+            (unique, if_not_exists),
+            &idx_name.name.0,
+            &tbl_name.0,
+            &columns,
+            schema,
+            program,
+        )?,
         ast::Stmt::CreateTable {
             temporary,
             if_not_exists,
@@ -148,11 +190,12 @@ pub fn translate(
             *body,
             if_not_exists,
             schema,
+            program,
         )?,
         ast::Stmt::CreateTrigger { .. } => bail_parse_error!("CREATE TRIGGER not supported yet"),
         ast::Stmt::CreateView { .. } => bail_parse_error!("CREATE VIEW not supported yet"),
         ast::Stmt::CreateVirtualTable(vtab) => {
-            translate_create_virtual_table(*vtab, schema, query_mode, &syms)?
+            translate_create_virtual_table(*vtab, schema, query_mode, &syms, program)?
         }
         ast::Stmt::Delete(delete) => {
             let Delete {
@@ -161,36 +204,43 @@ pub fn translate(
                 limit,
                 ..
             } = *delete;
-            change_cnt_on = true;
-            translate_delete(query_mode, schema, &tbl_name, where_clause, limit, syms)?
+            translate_delete(
+                query_mode,
+                schema,
+                &tbl_name,
+                where_clause,
+                limit,
+                syms,
+                program,
+            )?
         }
         ast::Stmt::Detach(_) => bail_parse_error!("DETACH not supported yet"),
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,
-        } => translate_drop_index(query_mode, &idx_name.name.0, if_exists, schema)?,
+        } => translate_drop_index(query_mode, &idx_name.name.0, if_exists, schema, program)?,
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
-        } => translate_drop_table(query_mode, tbl_name, if_exists, schema)?,
+        } => translate_drop_table(query_mode, tbl_name, if_exists, schema, program)?,
         ast::Stmt::DropTrigger { .. } => bail_parse_error!("DROP TRIGGER not supported yet"),
         ast::Stmt::DropView { .. } => bail_parse_error!("DROP VIEW not supported yet"),
-        ast::Stmt::Pragma(name, body) => pragma::translate_pragma(
-            query_mode,
-            schema,
-            &name,
-            body.map(|b| *b),
-            database_header.clone(),
-            pager,
-        )?,
+        ast::Stmt::Pragma(..) => {
+            bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
+        }
         ast::Stmt::Reindex { .. } => bail_parse_error!("REINDEX not supported yet"),
         ast::Stmt::Release(_) => bail_parse_error!("RELEASE not supported yet"),
         ast::Stmt::Rollback { .. } => bail_parse_error!("ROLLBACK not supported yet"),
         ast::Stmt::Savepoint(_) => bail_parse_error!("SAVEPOINT not supported yet"),
-        ast::Stmt::Select(select) => translate_select(query_mode, schema, *select, syms)?,
-        ast::Stmt::Update(mut update) => {
-            translate_update(query_mode, schema, &mut update, syms, ParseSchema::None)?
-        }
+        ast::Stmt::Select(select) => translate_select(query_mode, schema, *select, syms, program)?,
+        ast::Stmt::Update(mut update) => translate_update(
+            query_mode,
+            schema,
+            &mut update,
+            syms,
+            ParseSchema::None,
+            program,
+        )?,
         ast::Stmt::Vacuum(_, _) => bail_parse_error!("VACUUM not supported yet"),
         ast::Stmt::Insert(insert) => {
             let Insert {
@@ -201,7 +251,6 @@ pub fn translate(
                 mut body,
                 returning,
             } = *insert;
-            change_cnt_on = true;
             translate_insert(
                 query_mode,
                 schema,
@@ -212,9 +261,10 @@ pub fn translate(
                 &mut body,
                 &returning,
                 syms,
+                program,
             )?
         }
     };
 
-    Ok(program.build(database_header, connection, change_cnt_on))
+    Ok(program)
 }

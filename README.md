@@ -153,7 +153,7 @@ Example usage:
 ```go
 import (
     "database/sql"
-    _"github.com/tursodatabase/limbo"
+    _ "github.com/tursodatabase/limbo"
 )
 
 conn, _ = sql.Open("sqlite3", "sqlite.db")

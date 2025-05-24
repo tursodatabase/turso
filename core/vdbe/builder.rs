@@ -12,7 +12,11 @@ use crate::{
     parameters::Parameters,
     schema::{BTreeTable, Index, PseudoTable},
     storage::sqlite3_ondisk::DatabaseHeader,
-    translate::plan::{ResultSetColumn, TableReference},
+    translate::{
+        collate::CollationSeq,
+        emitter::TransactionMode,
+        plan::{ResultSetColumn, TableReference},
+    },
     Connection, VirtualTable,
 };
 
@@ -38,6 +42,12 @@ pub struct ProgramBuilder {
     pub parameters: Parameters,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: Vec<TableReference>,
+    /// Curr collation sequence. Bool indicates whether it was set by a COLLATE expr
+    collation: Option<(CollationSeq, bool)>,
+    /// Current parsing nesting level
+    nested_level: usize,
+    init_label: BranchOffset,
+    start_offset: BranchOffset,
 }
 
 #[derive(Debug, Clone)]
@@ -95,7 +105,19 @@ impl ProgramBuilder {
             parameters: Parameters::new(),
             result_columns: Vec::new(),
             table_references: Vec::new(),
+            collation: None,
+            nested_level: 0,
+            // These labels will be filled when `prologue()` is called
+            init_label: BranchOffset::Placeholder,
+            start_offset: BranchOffset::Placeholder,
         }
+    }
+
+    pub fn extend(&mut self, opts: &ProgramBuilderOpts) {
+        self.insns.reserve(opts.approx_num_insns);
+        self.cursor_ref.reserve(opts.num_cursors);
+        self.label_to_resolved_offset
+            .reserve(opts.approx_num_labels);
     }
 
     /// Start a new constant span. The next instruction to be emitted will be the first
@@ -212,7 +234,7 @@ impl ProgramBuilder {
         self.emit_insn(Insn::ResultRow { start_reg, count });
     }
 
-    pub fn emit_halt(&mut self) {
+    fn emit_halt(&mut self) {
         self.emit_insn(Insn::Halt {
             err_code: 0,
             description: String::new(),
@@ -228,20 +250,6 @@ impl ProgramBuilder {
             err_code,
             description,
         });
-    }
-
-    pub fn emit_init(&mut self) -> BranchOffset {
-        let target_pc = self.allocate_label();
-        self.emit_insn(Insn::Init { target_pc });
-        target_pc
-    }
-
-    pub fn emit_transaction(&mut self, write: bool) {
-        self.emit_insn(Insn::Transaction { write });
-    }
-
-    pub fn emit_goto(&mut self, target_pc: BranchOffset) {
-        self.emit_insn(Insn::Goto { target_pc });
     }
 
     pub fn add_comment(&mut self, insn_index: BranchOffset, comment: &'static str) {
@@ -260,7 +268,7 @@ impl ProgramBuilder {
         self.constant_spans.push((prev, prev));
     }
 
-    pub fn emit_constant_insns(&mut self) {
+    fn emit_constant_insns(&mut self) {
         // move compile-time constant instructions to the end of the program, where they are executed once after Init jumps to it.
         // any label_to_resolved_offset that points to an instruction within any moved constant span should be updated to point to the new location.
 
@@ -569,6 +577,12 @@ impl ProgramBuilder {
                 Insn::NoConflict { target_pc, .. } => {
                     resolve(target_pc, "NoConflict");
                 }
+                Insn::Found { target_pc, .. } => {
+                    resolve(target_pc, "Found");
+                }
+                Insn::NotFound { target_pc, .. } => {
+                    resolve(target_pc, "NotFound");
+                }
                 _ => {}
             }
         }
@@ -587,6 +601,66 @@ impl ProgramBuilder {
     pub fn resolve_cursor_id(&self, table_identifier: &str) -> CursorID {
         self.resolve_cursor_id_safe(table_identifier)
             .unwrap_or_else(|| panic!("Cursor not found: {}", table_identifier))
+    }
+
+    pub fn set_collation(&mut self, c: Option<(CollationSeq, bool)>) {
+        self.collation = c
+    }
+
+    pub fn curr_collation_ctx(&self) -> Option<(CollationSeq, bool)> {
+        self.collation
+    }
+
+    pub fn curr_collation(&self) -> Option<CollationSeq> {
+        self.collation.map(|c| c.0)
+    }
+
+    pub fn reset_collation(&mut self) {
+        self.collation = None;
+    }
+
+    #[inline]
+    pub fn incr_nesting(&mut self) {
+        self.nested_level += 1;
+    }
+
+    #[inline]
+    pub fn decr_nesting(&mut self) {
+        self.nested_level -= 1;
+    }
+
+    /// Initialize the program with basic setup and return initial metadata and labels
+    pub fn prologue<'a>(&mut self) {
+        if self.nested_level == 0 {
+            self.init_label = self.allocate_label();
+
+            self.emit_insn(Insn::Init {
+                target_pc: self.init_label,
+            });
+
+            self.start_offset = self.offset();
+        }
+    }
+
+    /// Clean up and finalize the program, resolving any remaining labels
+    /// Note that although these are the final instructions, typically an SQLite
+    /// query will jump to the Transaction instruction via init_label.
+    pub fn epilogue(&mut self, txn_mode: TransactionMode) {
+        if self.nested_level == 0 {
+            self.emit_halt();
+            self.preassign_label_to_next_insn(self.init_label);
+
+            match txn_mode {
+                TransactionMode::Read => self.emit_insn(Insn::Transaction { write: false }),
+                TransactionMode::Write => self.emit_insn(Insn::Transaction { write: true }),
+                TransactionMode::None => {}
+            }
+
+            self.emit_constant_insns();
+            self.emit_insn(Insn::Goto {
+                target_pc: self.start_offset,
+            });
+        }
     }
 
     pub fn build(

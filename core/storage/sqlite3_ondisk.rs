@@ -141,7 +141,7 @@ pub struct DatabaseHeader {
     text_encoding: u32,
 
     /// The "user version" as read and set by the user_version pragma.
-    pub user_version: u32,
+    pub user_version: i32,
 
     /// True (non-zero) for incremental-vacuum mode. False (zero) otherwise.
     incremental_vacuum_enabled: u32,
@@ -321,7 +321,7 @@ fn finish_read_database_header(
     }
     header.vacuum_mode_largest_root_page = u32::from_be_bytes([buf[52], buf[53], buf[54], buf[55]]);
     header.text_encoding = u32::from_be_bytes([buf[56], buf[57], buf[58], buf[59]]);
-    header.user_version = u32::from_be_bytes([buf[60], buf[61], buf[62], buf[63]]);
+    header.user_version = i32::from_be_bytes([buf[60], buf[61], buf[62], buf[63]]);
     header.incremental_vacuum_enabled = u32::from_be_bytes([buf[64], buf[65], buf[66], buf[67]]);
     header.application_id = u32::from_be_bytes([buf[68], buf[69], buf[70], buf[71]]);
     header.reserved_for_expansion.copy_from_slice(&buf[72..92]);

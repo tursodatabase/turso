@@ -1,3 +1,5 @@
+use crate::translate::collate::CollationSeq;
+use crate::translate::plan::SelectPlan;
 use crate::{util::normalize_ident, Result};
 use crate::{LimboError, VirtualTable};
 use core::fmt;
@@ -108,6 +110,7 @@ pub enum Table {
     BTree(Rc<BTreeTable>),
     Pseudo(Rc<PseudoTable>),
     Virtual(Rc<VirtualTable>),
+    FromClauseSubquery(FromClauseSubquery),
 }
 
 impl Table {
@@ -116,6 +119,7 @@ impl Table {
             Table::BTree(table) => table.root_page,
             Table::Pseudo(_) => unimplemented!(),
             Table::Virtual(_) => unimplemented!(),
+            Table::FromClauseSubquery(_) => unimplemented!(),
         }
     }
 
@@ -124,6 +128,7 @@ impl Table {
             Self::BTree(table) => &table.name,
             Self::Pseudo(_) => "",
             Self::Virtual(table) => &table.name,
+            Self::FromClauseSubquery(from_clause_subquery) => &from_clause_subquery.name,
         }
     }
 
@@ -132,6 +137,9 @@ impl Table {
             Self::BTree(table) => table.columns.get(index),
             Self::Pseudo(table) => table.columns.get(index),
             Self::Virtual(table) => table.columns.get(index),
+            Self::FromClauseSubquery(from_clause_subquery) => {
+                from_clause_subquery.columns.get(index)
+            }
         }
     }
 
@@ -140,6 +148,7 @@ impl Table {
             Self::BTree(table) => &table.columns,
             Self::Pseudo(table) => &table.columns,
             Self::Virtual(table) => &table.columns,
+            Self::FromClauseSubquery(from_clause_subquery) => &from_clause_subquery.columns,
         }
     }
 
@@ -148,6 +157,7 @@ impl Table {
             Self::BTree(table) => Some(table.clone()),
             Self::Pseudo(_) => None,
             Self::Virtual(_) => None,
+            Self::FromClauseSubquery(_) => None,
         }
     }
 
@@ -235,6 +245,10 @@ impl BTreeTable {
         sql.push_str(");\n");
         sql
     }
+
+    pub fn column_collations(&self) -> Vec<Option<CollationSeq>> {
+        self.columns.iter().map(|column| column.collation).collect()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -261,6 +275,7 @@ impl PseudoTable {
             notnull: false,
             default: None,
             unique: false,
+            collation: None,
         });
     }
     pub fn get_column(&self, name: &str) -> Option<(usize, &Column)> {
@@ -272,6 +287,20 @@ impl PseudoTable {
         }
         None
     }
+}
+
+/// A derived table from a FROM clause subquery.
+#[derive(Debug, Clone)]
+pub struct FromClauseSubquery {
+    /// The name of the derived table; uses the alias if available.
+    pub name: String,
+    /// The query plan for the derived table.
+    pub plan: Box<SelectPlan>,
+    /// The columns of the derived table.
+    pub columns: Vec<Column>,
+    /// The start register for the result columns of the derived table;
+    /// must be set before data is read from it.
+    pub result_columns_start_reg: Option<usize>,
 }
 
 #[derive(Debug, Eq)]
@@ -418,6 +447,7 @@ fn create_table(
                 let mut notnull = false;
                 let mut order = SortOrder::Asc;
                 let mut unique = false;
+                let mut collation = None;
                 for c_def in &col_def.constraints {
                     match &c_def.constraint {
                         limbo_sqlite3_parser::ast::ColumnConstraint::PrimaryKey {
@@ -442,6 +472,10 @@ fn create_table(
                             }
                             unique = true;
                         }
+                        limbo_sqlite3_parser::ast::ColumnConstraint::Collate { collation_name } => {
+                            collation = Some(CollationSeq::new(collation_name.0.as_str())?);
+                        }
+                        // Collate
                         _ => {}
                     }
                 }
@@ -464,6 +498,7 @@ fn create_table(
                     notnull,
                     default,
                     unique,
+                    collation,
                 });
             }
             if options.contains(TableOptions::WITHOUT_ROWID) {
@@ -534,6 +569,7 @@ pub struct Column {
     pub notnull: bool,
     pub default: Option<Expr>,
     pub unique: bool,
+    pub collation: Option<CollationSeq>,
 }
 
 impl Column {
@@ -737,6 +773,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 notnull: false,
                 default: None,
                 unique: false,
+                collation: None,
             },
             Column {
                 name: Some("name".to_string()),
@@ -747,6 +784,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 notnull: false,
                 default: None,
                 unique: false,
+                collation: None,
             },
             Column {
                 name: Some("tbl_name".to_string()),
@@ -757,6 +795,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 notnull: false,
                 default: None,
                 unique: false,
+                collation: None,
             },
             Column {
                 name: Some("rootpage".to_string()),
@@ -767,6 +806,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 notnull: false,
                 default: None,
                 unique: false,
+                collation: None,
             },
             Column {
                 name: Some("sql".to_string()),
@@ -777,6 +817,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 notnull: false,
                 default: None,
                 unique: false,
+                collation: None,
             },
         ],
         unique_sets: None,
@@ -792,6 +833,12 @@ pub struct Index {
     pub columns: Vec<IndexColumn>,
     pub unique: bool,
     pub ephemeral: bool,
+    /// Does the index have a rowid as the last column?
+    /// This is the case for btree indexes (persistent or ephemeral) that
+    /// have been created based on a table with a rowid.
+    /// For example, WITHOUT ROWID tables (not supported in Limbo yet),
+    /// and  SELECT DISTINCT ephemeral indexes will not have a rowid.
+    pub has_rowid: bool,
 }
 
 #[allow(dead_code)]
@@ -805,6 +852,7 @@ pub struct IndexColumn {
     /// CREATE INDEX idx ON t(b)
     /// b.pos_in_table == 1
     pub pos_in_table: usize,
+    pub collation: Option<CollationSeq>,
 }
 
 impl Index {
@@ -829,10 +877,12 @@ impl Index {
                             name, index_name, table.name
                         )));
                     };
+                    let collation = table.get_column(&name).unwrap().1.collation;
                     index_columns.push(IndexColumn {
                         name,
                         order: col.order.unwrap_or(SortOrder::Asc),
                         pos_in_table,
+                        collation,
                     });
                 }
                 Ok(Index {
@@ -842,6 +892,7 @@ impl Index {
                     columns: index_columns,
                     unique,
                     ephemeral: false,
+                    has_rowid: table.has_rowid,
                 })
             }
             _ => todo!("Expected create index statement"),
@@ -892,6 +943,7 @@ impl Index {
                         name: normalize_ident(col_name),
                         order: order.clone(),
                         pos_in_table,
+                        collation: table.get_column(col_name).unwrap().1.collation,
                     }
                 })
                 .collect::<Vec<_>>();
@@ -903,6 +955,7 @@ impl Index {
                 columns: primary_keys,
                 unique: true,
                 ephemeral: false,
+                has_rowid: table.has_rowid,
             });
         }
 
@@ -930,9 +983,11 @@ impl Index {
                             name: normalize_ident(col_name),
                             order: SortOrder::Asc, // Default Sort Order
                             pos_in_table,
+                            collation: table.get_column(col_name).unwrap().1.collation,
                         }],
                         unique: true,
                         ephemeral: false,
+                        has_rowid: table.has_rowid,
                     })
                 } else {
                     None
@@ -994,6 +1049,7 @@ impl Index {
                             name: normalize_ident(col_name),
                             order: *order,
                             pos_in_table,
+                            collation: table.get_column(col_name).unwrap().1.collation,
                         }
                     });
                     Index {
@@ -1003,6 +1059,7 @@ impl Index {
                         columns: index_cols.collect(),
                         unique: true,
                         ephemeral: false,
+                        has_rowid: table.has_rowid,
                     }
                 });
             indices.extend(unique_set_indices);
@@ -1406,6 +1463,7 @@ mod tests {
                 notnull: false,
                 default: None,
                 unique: false,
+                collation: None,
             }],
             unique_sets: None,
         };

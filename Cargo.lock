@@ -1822,6 +1822,7 @@ dependencies = [
  "libm",
  "limbo_completion",
  "limbo_crypto",
+ "limbo_csv",
  "limbo_ext",
  "limbo_ext_tests",
  "limbo_ipaddr",
@@ -1848,11 +1849,14 @@ dependencies = [
  "rusqlite",
  "rustix 1.0.7",
  "ryu",
+ "sorted-vec",
  "strum",
+ "strum_macros",
  "tempfile",
  "test-log",
  "thiserror 1.0.69",
  "tracing",
+ "uncased",
 ]
 
 [[package]]
@@ -1866,6 +1870,16 @@ dependencies = [
  "mimalloc",
  "ring",
  "urlencoding",
+]
+
+[[package]]
+name = "limbo_csv"
+version = "0.0.20"
+dependencies = [
+ "csv",
+ "limbo_ext",
+ "mimalloc",
+ "tempfile",
 ]
 
 [[package]]
@@ -1971,7 +1985,9 @@ dependencies = [
  "env_logger 0.11.7",
  "libc",
  "limbo_core",
- "log",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2214,9 +2230,9 @@ dependencies = [
 
 [[package]]
 name = "napi-build"
-version = "2.1.6"
+version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e28acfa557c083f6e254a786e01ba253fc56f18ee000afcd4f79af735f73a6da"
+checksum = "03acbfa4f156a32188bfa09b86dc11a431b5725253fc1fc6f6df5bed273382c4"
 
 [[package]]
 name = "napi-derive"
@@ -3320,6 +3336,12 @@ dependencies = [
  "libc",
  "windows-sys 0.52.0",
 ]
+
+[[package]]
+name = "sorted-vec"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d372029cb5195f9ab4e4b9aef550787dce78b124fcaee8d82519925defcd6f0d"
 
 [[package]]
 name = "sqlparser_bench"

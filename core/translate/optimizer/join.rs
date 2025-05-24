@@ -628,10 +628,12 @@ mod tests {
                 name: "id".to_string(),
                 order: SortOrder::Asc,
                 pos_in_table: 0,
+                collation: None,
             }],
             unique: true,
             ephemeral: false,
             root_page: 1,
+            has_rowid: true,
         });
         available_indexes.insert("test_table".to_string(), vec![index]);
 
@@ -691,10 +693,12 @@ mod tests {
                 name: "id".to_string(),
                 order: SortOrder::Asc,
                 pos_in_table: 0,
+                collation: None,
             }],
             unique: true,
             ephemeral: false,
             root_page: 1,
+            has_rowid: true,
         });
         available_indexes.insert("table1".to_string(), vec![index1]);
 
@@ -800,10 +804,12 @@ mod tests {
                         name: "id".to_string(),
                         order: SortOrder::Asc,
                         pos_in_table: 0,
+                        collation: None,
                     }],
                     unique: true,
                     ephemeral: false,
                     root_page: 1,
+                    has_rowid: true,
                 });
                 available_indexes.insert(table_name.to_string(), vec![index]);
             });
@@ -814,10 +820,12 @@ mod tests {
                 name: "customer_id".to_string(),
                 order: SortOrder::Asc,
                 pos_in_table: 1,
+                collation: None,
             }],
             unique: false,
             ephemeral: false,
             root_page: 1,
+            has_rowid: true,
         });
         let order_id_idx = Arc::new(Index {
             name: "order_items_order_id_idx".to_string(),
@@ -826,10 +834,12 @@ mod tests {
                 name: "order_id".to_string(),
                 order: SortOrder::Asc,
                 pos_in_table: 1,
+                collation: None,
             }],
             unique: false,
             ephemeral: false,
             root_page: 1,
+            has_rowid: true,
         });
 
         available_indexes
@@ -1205,6 +1215,7 @@ mod tests {
             notnull: false,
             default: None,
             unique: false,
+            collation: None,
         }
     }
     fn _create_column_of_type(name: &str, ty: Type) -> Column {

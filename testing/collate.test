@@ -1,0 +1,52 @@
+#!/usr/bin/env tclsh
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+# SIMPLE SMOKE TESTS THAT DO NOT DEPEND ON SPECIFIC DATABASE ROWS
+
+do_execsql_test collate_nocase {
+    SELECT 'hat' == 'hAt' COLLATE NOCASE;
+} {1}
+
+do_execsql_test collate_binary_1 {
+    SELECT 'hat' == 'hAt' COLLATE BINARY;
+} {0}
+
+do_execsql_test collate_binary_2 {
+    SELECT 'hat' == 'hat' COLLATE BINARY;
+} {1}
+
+do_execsql_test collate_rtrim_1 {
+    SELECT 'hat' == 'hAt ' COLLATE RTRIM;
+} {0}
+
+do_execsql_test collate_rtrim_2 {
+    SELECT 'hat' == 'hat ' COLLATE RTRIM;
+} {1}
+
+do_execsql_test collate_rtrim_3 {
+    SELECT 'hat' == ' hAt ' COLLATE RTRIM;
+} {0}
+
+do_execsql_test collate_rtrim_4 {
+    SELECT 'hat' == ' hat ' COLLATE RTRIM;
+} {0}
+
+do_execsql_test collate_left_precedence {
+    SELECT 'hat' COLLATE BINARY == 'hAt' COLLATE NOCASE;
+} {0}
+
+do_execsql_test collate_left_precedence_2 {
+    SELECT 'hat' COLLATE NOCASE == 'hAt' COLLATE BINARY;
+} {1}
+
+do_execsql_test_in_memory_any_error collate_unique_constraint {
+    CREATE TABLE t(a TEXT COLLATE NOCASE PRIMARY KEY);
+    INSERT INTO t VALUES ('lol'), ('LOL'), ('lOl');
+}
+
+do_execsql_test_in_memory_any_error collate_unique_constraint {
+    CREATE TABLE t(a TEXT COLLATE NOCASE PRIMARY KEY);
+    INSERT INTO t VALUES ('lol'), ('LOL'), ('lOl');
+}

@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use limbo_core::types::Text;
 use limbo_core::{maybe_init_database_file, LimboError};
+use napi::iterator::Generator;
+use napi::JsObject;
 use napi::{bindgen_prelude::ObjectFinalize, Env, JsUnknown};
 use napi_derive::napi;
 
@@ -136,20 +138,23 @@ impl Database {
 #[napi]
 pub struct Statement {
     // TODO: implement each property when core supports it
-    // #[napi(writable = false)]
+    // #[napi(able = false)]
     // pub reader: bool,
     // #[napi(writable = false)]
     // pub readonly: bool,
     // #[napi(writable = false)]
     // pub busy: bool,
     database: Database,
-    inner: RefCell<limbo_core::Statement>,
+    inner: Rc<RefCell<limbo_core::Statement>>,
 }
 
 #[napi]
 impl Statement {
     pub fn new(inner: RefCell<limbo_core::Statement>, database: Database) -> Self {
-        Self { inner, database }
+        Self {
+            inner: Rc::new(inner),
+            database,
+        }
     }
 
     #[napi]
@@ -194,8 +199,12 @@ impl Statement {
     }
 
     #[napi]
-    pub fn iterate() {
-        todo!()
+    pub fn iterate(&self, env: Env) -> IteratorStatement {
+        IteratorStatement {
+            stmt: Rc::clone(&self.inner),
+            database: self.database.clone(),
+            env,
+        }
     }
 
     #[napi]
@@ -263,6 +272,46 @@ impl Statement {
     #[napi]
     pub fn bind() {
         todo!()
+    }
+}
+
+#[napi(iterator)]
+pub struct IteratorStatement {
+    stmt: Rc<RefCell<limbo_core::Statement>>,
+    database: Database,
+    env: Env,
+}
+
+impl Generator for IteratorStatement {
+    type Yield = JsObject;
+
+    type Next = ();
+
+    type Return = ();
+
+    fn next(&mut self, _: Option<Self::Next>) -> Option<Self::Yield> {
+        let mut stmt = self.stmt.borrow_mut();
+
+        match stmt.step().ok()? {
+            limbo_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                let mut js_row = self.env.create_object().ok()?;
+
+                for (idx, value) in row.get_values().enumerate() {
+                    let key = stmt.get_column_name(idx);
+                    let js_value = to_js_value(&self.env, value);
+                    js_row.set_named_property(&key, js_value).ok()?;
+                }
+
+                Some(js_row)
+            }
+            limbo_core::StepResult::Done => None,
+            limbo_core::StepResult::IO => {
+                self.database.io.run_once().ok()?;
+                None // clearly it's incorrect it should return to user
+            }
+            limbo_core::StepResult::Interrupt | limbo_core::StepResult::Busy => None,
+        }
     }
 }
 

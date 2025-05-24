@@ -5,6 +5,7 @@ use limbo_sqlite3_parser::ast;
 use crate::{
     function::AggFunc,
     schema::{Column, PseudoTable},
+    translate::collate::CollationSeq,
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -15,10 +16,11 @@ use crate::{
 };
 
 use super::{
+    aggregation::handle_distinct,
     emitter::{Resolver, TranslateCtx},
     expr::{translate_condition_expr, translate_expr, ConditionMetadata},
     order_by::order_by_sorter_insert,
-    plan::{Aggregate, GroupBy, SelectPlan, TableReference},
+    plan::{Aggregate, Distinctness, GroupBy, SelectPlan, TableReference},
     result_row::emit_select_result,
 };
 
@@ -117,10 +119,39 @@ pub fn init_group_by(
     let row_source = if let Some(sort_order) = group_by.sort_order.as_ref() {
         let sort_cursor = program.alloc_cursor_id(None, CursorType::Sorter);
         let sorter_column_count = plan.group_by_sorter_column_count();
+        // Should work the same way as Order By
+        /*
+         * Terms of the ORDER BY clause that is part of a SELECT statement may be assigned a collating sequence using the COLLATE operator,
+         * in which case the specified collating function is used for sorting.
+         * Otherwise, if the expression sorted by an ORDER BY clause is a column,
+         * then the collating sequence of the column is used to determine sort order.
+         * If the expression is not a column and has no COLLATE clause, then the BINARY collating sequence is used.
+         */
+        let collations = group_by
+            .exprs
+            .iter()
+            .map(|expr| match expr {
+                ast::Expr::Collate(_, collation_name) => {
+                    CollationSeq::new(collation_name).map(Some)
+                }
+                ast::Expr::Column { table, column, .. } => {
+                    let table_reference = plan.table_references.get(*table).unwrap();
+
+                    let Some(table_column) = table_reference.table.get_column_at(*column) else {
+                        crate::bail_parse_error!("column index out of bounds");
+                    };
+
+                    Ok(table_column.collation)
+                }
+                _ => Ok(Some(CollationSeq::default())),
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         program.emit_insn(Insn::SorterOpen {
             cursor_id: sort_cursor,
             columns: sorter_column_count,
             order: sort_order.clone(),
+            collations,
         });
         let pseudo_cursor = group_by_create_pseudo_table(program, sorter_column_count);
         GroupByRowSource::Sorter {
@@ -217,6 +248,7 @@ pub fn group_by_create_pseudo_table(
             notnull: false,
             default: None,
             unique: false,
+            collation: None,
         })
         .collect::<Vec<_>>();
 
@@ -366,6 +398,14 @@ impl<'a> GroupByAggArgumentSource<'a> {
             aggregate,
         }
     }
+
+    pub fn aggregate(&self) -> &Aggregate {
+        match self {
+            GroupByAggArgumentSource::PseudoCursor { aggregate, .. } => aggregate,
+            GroupByAggArgumentSource::Register { aggregate, .. } => aggregate,
+        }
+    }
+
     pub fn agg_func(&self) -> &AggFunc {
         match self {
             GroupByAggArgumentSource::PseudoCursor { aggregate, .. } => &aggregate.func,
@@ -461,6 +501,7 @@ pub fn group_by_process_single_group(
         start_reg_a: registers.reg_group_exprs_cmp,
         start_reg_b: groups_start_reg,
         count: group_by.exprs.len(),
+        collation: program.curr_collation(),
     });
 
     program.add_comment(
@@ -535,6 +576,12 @@ pub fn group_by_process_single_group(
             agg_result_reg,
             &t_ctx.resolver,
         )?;
+        if let Distinctness::Distinct { ctx } = &agg.distinctness {
+            let ctx = ctx
+                .as_ref()
+                .expect("distinct aggregate context not populated");
+            program.preassign_label_to_next_insn(ctx.label_on_conflict);
+        }
         offset += agg.args.len();
     }
 
@@ -726,6 +773,11 @@ pub fn group_by_emit_row_phase<'a>(
         labels.label_group_by_end_without_emitting_row,
         program.offset(),
     );
+    // SELECT DISTINCT also jumps here if there is a duplicate.
+    if let Distinctness::Distinct { ctx } = &plan.distinctness {
+        let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
+        program.resolve_label(distinct_ctx.label_on_conflict, program.offset());
+    }
     program.emit_insn(Insn::Return {
         return_reg: registers.reg_subrtn_acc_output_return_offset,
     });
@@ -840,7 +892,7 @@ pub fn group_by_emit_row_phase<'a>(
                 t_ctx.reg_nonagg_emit_once_flag,
                 t_ctx.reg_offset,
                 t_ctx.reg_result_cols_start.unwrap(),
-                t_ctx.reg_limit,
+                t_ctx.limit_ctx,
                 t_ctx.reg_limit_offset_sum,
             )?;
         }
@@ -873,6 +925,26 @@ pub fn group_by_emit_row_phase<'a>(
         dest_end: Some(start_reg + plan.group_by_sorter_column_count() - 1),
     });
 
+    // Reopen ephemeral indexes for distinct aggregates (effectively clearing them).
+    plan.aggregates
+        .iter()
+        .filter_map(|agg| {
+            if let Distinctness::Distinct { ctx } = &agg.distinctness {
+                Some(ctx)
+            } else {
+                None
+            }
+        })
+        .for_each(|ctx| {
+            let ctx = ctx
+                .as_ref()
+                .expect("distinct aggregate context not populated");
+            program.emit_insn(Insn::OpenEphemeral {
+                cursor_id: ctx.cursor_id,
+                is_table: false,
+            });
+        });
+
     program.emit_insn(Insn::Integer {
         value: 0,
         dest: registers.reg_data_in_acc_flag,
@@ -904,6 +976,7 @@ pub fn translate_aggregation_step_groupby(
                 crate::bail_parse_error!("avg bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, 0)?;
+            handle_distinct(program, agg_arg_source.aggregate(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
@@ -914,6 +987,7 @@ pub fn translate_aggregation_step_groupby(
         }
         AggFunc::Count | AggFunc::Count0 => {
             let expr_reg = agg_arg_source.translate(program, 0)?;
+            handle_distinct(program, agg_arg_source.aggregate(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
@@ -951,6 +1025,7 @@ pub fn translate_aggregation_step_groupby(
             }
 
             let expr_reg = agg_arg_source.translate(program, 0)?;
+            handle_distinct(program, agg_arg_source.aggregate(), expr_reg);
             translate_expr(
                 program,
                 Some(referenced_tables),
@@ -973,6 +1048,7 @@ pub fn translate_aggregation_step_groupby(
                 crate::bail_parse_error!("max bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, 0)?;
+            handle_distinct(program, agg_arg_source.aggregate(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
@@ -986,6 +1062,7 @@ pub fn translate_aggregation_step_groupby(
                 crate::bail_parse_error!("min bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, 0)?;
+            handle_distinct(program, agg_arg_source.aggregate(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
@@ -1000,6 +1077,7 @@ pub fn translate_aggregation_step_groupby(
                 crate::bail_parse_error!("min bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, 0)?;
+            handle_distinct(program, agg_arg_source.aggregate(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
@@ -1015,6 +1093,7 @@ pub fn translate_aggregation_step_groupby(
             }
 
             let expr_reg = agg_arg_source.translate(program, 0)?;
+            handle_distinct(program, agg_arg_source.aggregate(), expr_reg);
             let value_reg = agg_arg_source.translate(program, 1)?;
 
             program.emit_insn(Insn::AggStep {
@@ -1041,6 +1120,7 @@ pub fn translate_aggregation_step_groupby(
             };
 
             let expr_reg = agg_arg_source.translate(program, 0)?;
+            handle_distinct(program, agg_arg_source.aggregate(), expr_reg);
             translate_expr(
                 program,
                 Some(referenced_tables),
@@ -1063,6 +1143,7 @@ pub fn translate_aggregation_step_groupby(
                 crate::bail_parse_error!("sum bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, 0)?;
+            handle_distinct(program, agg_arg_source.aggregate(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
@@ -1076,6 +1157,7 @@ pub fn translate_aggregation_step_groupby(
                 crate::bail_parse_error!("total bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, 0)?;
+            handle_distinct(program, agg_arg_source.aggregate(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,

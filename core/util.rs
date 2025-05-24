@@ -1,6 +1,6 @@
 use crate::{
-    function::Func,
     schema::{self, Column, Schema, Type},
+    translate::{collate::CollationSeq, expr::walk_expr},
     types::{Value, ValueType},
     LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable, IO,
 };
@@ -499,66 +499,83 @@ pub fn columns_from_create_table_body(body: &ast::CreateTableBody) -> crate::Res
                     return None;
                 }
             }
-            let column = Column {
-                name: Some(name.0.clone()),
-                ty: match column_def.col_type {
-                    Some(ref data_type) => {
-                        // https://www.sqlite.org/datatype3.html
-                        let type_name = data_type.name.as_str().to_uppercase();
-                        if type_name.contains("INT") {
-                            Type::Integer
-                        } else if type_name.contains("CHAR")
-                            || type_name.contains("CLOB")
-                            || type_name.contains("TEXT")
-                        {
-                            Type::Text
-                        } else if type_name.contains("BLOB") || type_name.is_empty() {
-                            Type::Blob
-                        } else if type_name.contains("REAL")
-                            || type_name.contains("FLOA")
-                            || type_name.contains("DOUB")
-                        {
-                            Type::Real
-                        } else {
-                            Type::Numeric
+            let column =
+                Column {
+                    name: Some(normalize_ident(&name.0)),
+                    ty: match column_def.col_type {
+                        Some(ref data_type) => {
+                            // https://www.sqlite.org/datatype3.html
+                            let type_name = data_type.name.as_str().to_uppercase();
+                            if type_name.contains("INT") {
+                                Type::Integer
+                            } else if type_name.contains("CHAR")
+                                || type_name.contains("CLOB")
+                                || type_name.contains("TEXT")
+                            {
+                                Type::Text
+                            } else if type_name.contains("BLOB") || type_name.is_empty() {
+                                Type::Blob
+                            } else if type_name.contains("REAL")
+                                || type_name.contains("FLOA")
+                                || type_name.contains("DOUB")
+                            {
+                                Type::Real
+                            } else {
+                                Type::Numeric
+                            }
                         }
-                    }
-                    None => Type::Null,
-                },
-                default: column_def
-                    .constraints
-                    .iter()
-                    .find_map(|c| match &c.constraint {
-                        limbo_sqlite3_parser::ast::ColumnConstraint::Default(val) => {
-                            Some(val.clone())
-                        }
-                        _ => None,
+                        None => Type::Null,
+                    },
+                    default: column_def
+                        .constraints
+                        .iter()
+                        .find_map(|c| match &c.constraint {
+                            limbo_sqlite3_parser::ast::ColumnConstraint::Default(val) => {
+                                Some(val.clone())
+                            }
+                            _ => None,
+                        }),
+                    notnull: column_def.constraints.iter().any(|c| {
+                        matches!(
+                            c.constraint,
+                            limbo_sqlite3_parser::ast::ColumnConstraint::NotNull { .. }
+                        )
                     }),
-                notnull: column_def.constraints.iter().any(|c| {
-                    matches!(
-                        c.constraint,
-                        limbo_sqlite3_parser::ast::ColumnConstraint::NotNull { .. }
-                    )
-                }),
-                ty_str: column_def
-                    .col_type
-                    .clone()
-                    .map(|t| t.name.to_string())
-                    .unwrap_or_default(),
-                primary_key: column_def.constraints.iter().any(|c| {
-                    matches!(
-                        c.constraint,
-                        limbo_sqlite3_parser::ast::ColumnConstraint::PrimaryKey { .. }
-                    )
-                }),
-                is_rowid_alias: false,
-                unique: column_def.constraints.iter().any(|c| {
-                    matches!(
-                        c.constraint,
-                        limbo_sqlite3_parser::ast::ColumnConstraint::Unique(..)
-                    )
-                }),
-            };
+                    ty_str: column_def
+                        .col_type
+                        .clone()
+                        .map(|t| t.name.to_string())
+                        .unwrap_or_default(),
+                    primary_key: column_def.constraints.iter().any(|c| {
+                        matches!(
+                            c.constraint,
+                            limbo_sqlite3_parser::ast::ColumnConstraint::PrimaryKey { .. }
+                        )
+                    }),
+                    is_rowid_alias: false,
+                    unique: column_def.constraints.iter().any(|c| {
+                        matches!(
+                            c.constraint,
+                            limbo_sqlite3_parser::ast::ColumnConstraint::Unique(..)
+                        )
+                    }),
+                    collation: column_def
+                        .constraints
+                        .iter()
+                        .find_map(|c| match &c.constraint {
+                            // TODO: see if this should be the correct behavior
+                            // currently there cannot be any user defined collation sequences.
+                            // But in the future, when a user defines a collation sequence, creates a table with it,
+                            // then closes the db and opens it again. This may panic here if the collation seq is not registered
+                            // before reading the columns
+                            limbo_sqlite3_parser::ast::ColumnConstraint::Collate {
+                                collation_name,
+                            } => Some(CollationSeq::new(collation_name.0.as_str()).expect(
+                                "collation should have been set correctly in create table",
+                            )),
+                            _ => None,
+                        }),
+                };
             Some(column)
         })
         .collect::<Vec<_>>())
@@ -566,35 +583,27 @@ pub fn columns_from_create_table_body(body: &ast::CreateTableBody) -> crate::Res
 
 /// This function checks if a given expression is a constant value that can be pushed down to the database engine.
 /// It is expected to be called with the other half of a binary expression with an Expr::Column
-pub fn can_pushdown_predicate(expr: &Expr, table_idx: usize) -> bool {
-    match expr {
-        Expr::Literal(_) => true,
-        Expr::Column { table, .. } => *table <= table_idx,
-        Expr::Binary(lhs, _, rhs) => {
-            can_pushdown_predicate(lhs, table_idx) && can_pushdown_predicate(rhs, table_idx)
-        }
-        Expr::Parenthesized(exprs) => can_pushdown_predicate(exprs.first().unwrap(), table_idx),
-        Expr::Unary(_, expr) => can_pushdown_predicate(expr, table_idx),
-        Expr::FunctionCall { args, name, .. } => {
-            let function = crate::function::Func::resolve_function(
-                &name.0,
-                args.as_ref().map_or(0, |a| a.len()),
-            );
-            // is deterministic
-            matches!(function, Ok(Func::Scalar(_)))
-        }
-        Expr::Like { lhs, rhs, .. } => {
-            can_pushdown_predicate(lhs, table_idx) && can_pushdown_predicate(rhs, table_idx)
-        }
-        Expr::Between {
-            lhs, start, end, ..
-        } => {
-            can_pushdown_predicate(lhs, table_idx)
-                && can_pushdown_predicate(start, table_idx)
-                && can_pushdown_predicate(end, table_idx)
-        }
-        _ => false,
-    }
+pub fn can_pushdown_predicate(top_level_expr: &Expr, table_idx: usize) -> Result<bool> {
+    let mut can_pushdown = true;
+    walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<()> {
+        match expr {
+            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
+                can_pushdown &= *table <= table_idx;
+            }
+            Expr::FunctionCall { args, name, .. } => {
+                let function = crate::function::Func::resolve_function(
+                    &name.0,
+                    args.as_ref().map_or(0, |a| a.len()),
+                )?;
+                // is deterministic
+                can_pushdown &= function.is_deterministic();
+            }
+            _ => {}
+        };
+        Ok(())
+    })?;
+
+    Ok(can_pushdown)
 }
 
 #[derive(Debug, Default, PartialEq)]

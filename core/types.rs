@@ -7,6 +7,7 @@ use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::sqlite3_ondisk::write_varint;
+use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
 use crate::vdbe::sorter::Sorter;
 use crate::vdbe::{Register, VTabOpaqueCursor};
@@ -1099,15 +1100,47 @@ impl Default for IndexKeySortOrder {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Metadata about an index, used for handling and comparing index keys.
+///
+/// This struct provides information about the sorting order of columns,
+/// whether the index includes a row ID, and the total number of columns
+/// in the index.
+pub struct IndexKeyInfo {
+    /// Specifies the sorting order (ascending or descending) for each column in the index.
+    pub sort_order: IndexKeySortOrder,
+    /// Indicates whether the index includes a row ID column.
+    pub has_rowid: bool,
+    /// The total number of columns in the index, including the row ID column if present.
+    pub num_cols: usize,
+}
+
+impl IndexKeyInfo {
+    pub fn new_from_index(index: &Index) -> Self {
+        Self {
+            sort_order: IndexKeySortOrder::from_index(index),
+            has_rowid: index.has_rowid,
+            num_cols: index.columns.len() + (index.has_rowid as usize),
+        }
+    }
+}
+
 pub fn compare_immutable(
     l: &[RefValue],
     r: &[RefValue],
     index_key_sort_order: IndexKeySortOrder,
+    collations: &[CollationSeq],
 ) -> std::cmp::Ordering {
     assert_eq!(l.len(), r.len());
     for (i, (l, r)) in l.iter().zip(r).enumerate() {
         let column_order = index_key_sort_order.get_sort_order_for_col(i);
-        let cmp = l.partial_cmp(r).unwrap();
+        let collation = collations.get(i).copied().unwrap_or_default();
+        let cmp = match (l, r) {
+            (RefValue::Text(left), RefValue::Text(right)) => {
+                collation.compare_strings(left.as_str(), right.as_str())
+            }
+            _ => l.partial_cmp(r).unwrap(),
+        };
         if !cmp.is_eq() {
             return match column_order {
                 SortOrder::Asc => cmp,

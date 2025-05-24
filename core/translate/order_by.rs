@@ -4,6 +4,7 @@ use limbo_sqlite3_parser::ast::{self, SortOrder};
 
 use crate::{
     schema::{Column, PseudoTable},
+    translate::collate::CollationSeq,
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -15,7 +16,7 @@ use crate::{
 use super::{
     emitter::{Resolver, TranslateCtx},
     expr::translate_expr,
-    plan::{ResultSetColumn, SelectPlan},
+    plan::{Distinctness, ResultSetColumn, SelectPlan, TableReference},
     result_row::{emit_offset, emit_result_row_and_limit},
 };
 
@@ -33,16 +34,42 @@ pub fn init_order_by(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     order_by: &[(ast::Expr, SortOrder)],
+    referenced_tables: &[TableReference],
 ) -> Result<()> {
     let sort_cursor = program.alloc_cursor_id(None, CursorType::Sorter);
     t_ctx.meta_sort = Some(SortMetadata {
         sort_cursor,
         reg_sorter_data: program.alloc_register(),
     });
+
+    /*
+     * Terms of the ORDER BY clause that is part of a SELECT statement may be assigned a collating sequence using the COLLATE operator,
+     * in which case the specified collating function is used for sorting.
+     * Otherwise, if the expression sorted by an ORDER BY clause is a column,
+     * then the collating sequence of the column is used to determine sort order.
+     * If the expression is not a column and has no COLLATE clause, then the BINARY collating sequence is used.
+     */
+    let collations = order_by
+        .iter()
+        .map(|(expr, _)| match expr {
+            ast::Expr::Collate(_, collation_name) => CollationSeq::new(collation_name).map(Some),
+            ast::Expr::Column { table, column, .. } => {
+                let table_reference = referenced_tables.get(*table).unwrap();
+
+                let Some(table_column) = table_reference.table.get_column_at(*column) else {
+                    crate::bail_parse_error!("column index out of bounds");
+                };
+
+                Ok(table_column.collation)
+            }
+            _ => Ok(Some(CollationSeq::default())),
+        })
+        .collect::<Result<Vec<_>>>()?;
     program.emit_insn(Insn::SorterOpen {
         cursor_id: sort_cursor,
         columns: order_by.len(),
         order: order_by.iter().map(|(_, direction)| *direction).collect(),
+        collations,
     });
     Ok(())
 }
@@ -73,6 +100,7 @@ pub fn emit_order_by(
             notnull: false,
             default: None,
             unique: false,
+            collation: None,
         });
     }
     for i in 0..result_columns.len() {
@@ -92,6 +120,7 @@ pub fn emit_order_by(
             notnull: false,
             default: None,
             unique: false,
+            collation: None,
         });
     }
 
@@ -148,7 +177,7 @@ pub fn emit_order_by(
         program,
         plan,
         start_reg,
-        t_ctx.reg_limit,
+        t_ctx.limit_ctx,
         t_ctx.reg_offset,
         t_ctx.reg_limit_offset_sum,
         Some(sort_loop_end_label),
@@ -198,6 +227,7 @@ pub fn order_by_sorter_insert(
     }
     let mut cur_reg = start_reg + order_by_len;
     let mut cur_idx_in_orderby_sorter = order_by_len;
+    let mut translated_result_col_count = 0;
     for (i, rc) in result_columns.iter().enumerate() {
         if let Some(ref v) = result_columns_to_skip {
             let found = v.iter().find(|(skipped_idx, _)| *skipped_idx == i);
@@ -214,9 +244,17 @@ pub fn order_by_sorter_insert(
             cur_reg,
             resolver,
         )?;
+        translated_result_col_count += 1;
         res_col_indexes_in_orderby_sorter.insert(i, cur_idx_in_orderby_sorter);
         cur_idx_in_orderby_sorter += 1;
         cur_reg += 1;
+    }
+
+    // Handle SELECT DISTINCT deduplication
+    if let Distinctness::Distinct { ctx } = &plan.distinctness {
+        let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
+        let num_regs = order_by_len + translated_result_col_count;
+        distinct_ctx.emit_deduplication_insns(program, num_regs, start_reg);
     }
 
     let SortMetadata {

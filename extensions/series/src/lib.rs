@@ -1,9 +1,10 @@
 use limbo_ext::{
-    register_extension, ResultCode, VTabCursor, VTabKind, VTabModule, VTabModuleDerive, Value,
+    register_extension, ResultCode, VTabCursor, VTabKind, VTabModule, VTabModuleDerive, VTable,
+    Value,
 };
 
 register_extension! {
-    vtabs: { GenerateSeriesVTab }
+    vtabs: { GenerateSeriesVTabModule }
 }
 
 macro_rules! try_option {
@@ -17,79 +18,38 @@ macro_rules! try_option {
 
 /// A virtual table that generates a sequence of integers
 #[derive(Debug, VTabModuleDerive, Default)]
-struct GenerateSeriesVTab;
+struct GenerateSeriesVTabModule;
 
-impl VTabModule for GenerateSeriesVTab {
-    type VCursor = GenerateSeriesCursor;
-    type Error = ResultCode;
+impl VTabModule for GenerateSeriesVTabModule {
+    type Table = GenerateSeriesTable;
     const NAME: &'static str = "generate_series";
     const VTAB_KIND: VTabKind = VTabKind::TableValuedFunction;
 
-    fn create_schema(_args: &[Value]) -> String {
-        // Create table schema
-        "CREATE TABLE generate_series(
+    fn create(_args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
+        let schema = "CREATE TABLE generate_series(
             value INTEGER,
             start INTEGER HIDDEN,
             stop INTEGER HIDDEN,
             step INTEGER HIDDEN
         )"
-        .into()
+        .into();
+        Ok((schema, GenerateSeriesTable {}))
     }
+}
 
-    fn open(&self) -> Result<Self::VCursor, Self::Error> {
+struct GenerateSeriesTable {}
+
+impl VTable for GenerateSeriesTable {
+    type Cursor = GenerateSeriesCursor;
+    type Error = ResultCode;
+
+    fn open(&self) -> Result<Self::Cursor, Self::Error> {
         Ok(GenerateSeriesCursor {
             start: 0,
             stop: 0,
             step: 0,
             current: 0,
         })
-    }
-
-    fn filter(cursor: &mut Self::VCursor, args: &[Value], _: Option<(&str, i32)>) -> ResultCode {
-        // args are the start, stop, and step
-        if args.is_empty() || args.len() > 3 {
-            return ResultCode::InvalidArgs;
-        }
-        let start = try_option!(args[0].to_integer(), ResultCode::InvalidArgs);
-        let stop = try_option!(
-            args.get(1).map(|v| v.to_integer().unwrap_or(i64::MAX)),
-            ResultCode::EOF // Sqlite returns an empty series for wacky args
-        );
-        let mut step = args
-            .get(2)
-            .map(|v| v.to_integer().unwrap_or(1))
-            .unwrap_or(1);
-
-        // Convert zero step to 1, matching SQLite behavior
-        if step == 0 {
-            step = 1;
-        }
-
-        cursor.start = start;
-        cursor.step = step;
-        cursor.stop = stop;
-
-        // Set initial value based on range validity
-        // For invalid input SQLite returns an empty series
-        cursor.current = if cursor.is_invalid_range() {
-            return ResultCode::EOF;
-        } else {
-            start
-        };
-
-        ResultCode::OK
-    }
-
-    fn column(cursor: &Self::VCursor, idx: u32) -> Result<Value, Self::Error> {
-        cursor.column(idx)
-    }
-
-    fn next(cursor: &mut Self::VCursor) -> ResultCode {
-        cursor.next()
-    }
-
-    fn eof(cursor: &Self::VCursor) -> bool {
-        cursor.eof()
     }
 }
 
@@ -127,6 +87,41 @@ impl GenerateSeriesCursor {
 
 impl VTabCursor for GenerateSeriesCursor {
     type Error = ResultCode;
+
+    fn filter(&mut self, args: &[Value], _: Option<(&str, i32)>) -> ResultCode {
+        // args are the start, stop, and step
+        if args.is_empty() || args.len() > 3 {
+            return ResultCode::InvalidArgs;
+        }
+        let start = try_option!(args[0].to_integer(), ResultCode::InvalidArgs);
+        let stop = try_option!(
+            args.get(1).map(|v| v.to_integer().unwrap_or(i64::MAX)),
+            ResultCode::EOF // Sqlite returns an empty series for wacky args
+        );
+        let mut step = args
+            .get(2)
+            .map(|v| v.to_integer().unwrap_or(1))
+            .unwrap_or(1);
+
+        // Convert zero step to 1, matching SQLite behavior
+        if step == 0 {
+            step = 1;
+        }
+
+        self.start = start;
+        self.step = step;
+        self.stop = stop;
+
+        // Set initial value based on range validity
+        // For invalid input SQLite returns an empty series
+        self.current = if self.is_invalid_range() {
+            return ResultCode::EOF;
+        } else {
+            start
+        };
+
+        ResultCode::OK
+    }
 
     fn next(&mut self) -> ResultCode {
         if self.eof() {
@@ -229,7 +224,7 @@ mod tests {
     }
     // Helper function to collect all values from a cursor, returns Result with error code
     fn collect_series(series: Series) -> Result<Vec<i64>, ResultCode> {
-        let tbl = GenerateSeriesVTab;
+        let tbl = GenerateSeriesTable {};
         let mut cursor = tbl.open()?;
 
         // Create args array for filter
@@ -240,7 +235,7 @@ mod tests {
         ];
 
         // Initialize cursor through filter
-        match GenerateSeriesVTab::filter(&mut cursor, &args, None) {
+        match cursor.filter(&args, None) {
             ResultCode::OK => (),
             ResultCode::EOF => return Ok(vec![]),
             err => return Err(err),
@@ -255,7 +250,7 @@ mod tests {
                     (series.stop - series.start) / series.step + 1
                 );
             }
-            match GenerateSeriesVTab::next(&mut cursor) {
+            match cursor.next() {
                 ResultCode::OK => (),
                 ResultCode::EOF => break,
                 err => return Err(err),
@@ -546,7 +541,7 @@ mod tests {
         let start = series.start;
         let stop = series.stop;
         let step = series.step;
-        let tbl = GenerateSeriesVTab {};
+        let tbl = GenerateSeriesTable {};
         let mut cursor = tbl.open().unwrap();
 
         let args = vec![
@@ -556,12 +551,12 @@ mod tests {
         ];
 
         // Initialize cursor through filter
-        GenerateSeriesVTab::filter(&mut cursor, &args, None);
+        cursor.filter(&args, None);
 
         let mut rowids = vec![];
-        while !GenerateSeriesVTab::eof(&cursor) {
+        while !cursor.eof() {
             let cur_rowid = cursor.rowid();
-            match GenerateSeriesVTab::next(&mut cursor) {
+            match cursor.next() {
                 ResultCode::OK => rowids.push(cur_rowid),
                 ResultCode::EOF => break,
                 err => panic!(

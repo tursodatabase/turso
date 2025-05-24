@@ -141,12 +141,13 @@ pub fn insn_to_str(
                 start_reg_a,
                 start_reg_b,
                 count,
+                collation,
             } => (
                 "Compare",
                 *start_reg_a as i32,
                 *start_reg_b as i32,
                 *count as i32,
-                Value::build_text(""),
+                Value::build_text(&format!("k({count}, {})", collation.unwrap_or_default())),
                 0,
                 format!(
                     "r[{}..{}]==r[{}..{}]",
@@ -211,13 +212,14 @@ pub fn insn_to_str(
                 lhs,
                 rhs,
                 target_pc,
+                collation,
                 ..
             } => (
                 "Eq",
                 *lhs as i32,
                 *rhs as i32,
                 target_pc.to_debug_int(),
-                Value::build_text(""),
+                Value::build_text(&collation.map_or("".to_string(), |c| c.to_string())),
                 0,
                 format!(
                     "if r[{}]==r[{}] goto {}",
@@ -230,13 +232,14 @@ pub fn insn_to_str(
                 lhs,
                 rhs,
                 target_pc,
+                collation,
                 ..
             } => (
                 "Ne",
                 *lhs as i32,
                 *rhs as i32,
                 target_pc.to_debug_int(),
-                Value::build_text(""),
+                Value::build_text(&collation.map_or("".to_string(), |c| c.to_string())),
                 0,
                 format!(
                     "if r[{}]!=r[{}] goto {}",
@@ -249,13 +252,14 @@ pub fn insn_to_str(
                 lhs,
                 rhs,
                 target_pc,
+                collation,
                 ..
             } => (
                 "Lt",
                 *lhs as i32,
                 *rhs as i32,
                 target_pc.to_debug_int(),
-                Value::build_text(""),
+                Value::build_text(&collation.map_or("".to_string(), |c| c.to_string())),
                 0,
                 format!("if r[{}]<r[{}] goto {}", lhs, rhs, target_pc.to_debug_int()),
             ),
@@ -263,13 +267,14 @@ pub fn insn_to_str(
                 lhs,
                 rhs,
                 target_pc,
+                collation,
                 ..
             } => (
                 "Le",
                 *lhs as i32,
                 *rhs as i32,
                 target_pc.to_debug_int(),
-                Value::build_text(""),
+                Value::build_text(&collation.map_or("".to_string(), |c| c.to_string())),
                 0,
                 format!(
                     "if r[{}]<=r[{}] goto {}",
@@ -282,13 +287,14 @@ pub fn insn_to_str(
                 lhs,
                 rhs,
                 target_pc,
+                collation,
                 ..
             } => (
                 "Gt",
                 *lhs as i32,
                 *rhs as i32,
                 target_pc.to_debug_int(),
-                Value::build_text(""),
+                Value::build_text(&collation.map_or("".to_string(), |c| c.to_string())),
                 0,
                 format!("if r[{}]>r[{}] goto {}", lhs, rhs, target_pc.to_debug_int()),
             ),
@@ -296,13 +302,14 @@ pub fn insn_to_str(
                 lhs,
                 rhs,
                 target_pc,
+                collation,
                 ..
             } => (
                 "Ge",
                 *lhs as i32,
                 *rhs as i32,
                 target_pc.to_debug_int(),
-                Value::build_text(""),
+                Value::build_text(&collation.map_or("".to_string(), |c| c.to_string())),
                 0,
                 format!(
                     "if r[{}]>=r[{}] goto {}",
@@ -409,14 +416,13 @@ pub fn insn_to_str(
                 cursor_id,
                 arg_count,       // P2: Number of arguments in argv[]
                 start_reg,       // P3: Start register for argv[]
-                vtab_ptr,        // P4: vtab pointer
-                conflict_action, // P5: Conflict resolution flags
+                conflict_action, // P4: Conflict resolution flags
             } => (
                 "VUpdate",
                 *cursor_id as i32,
                 *arg_count as i32,
                 *start_reg as i32,
-                Value::build_text(&format!("vtab:{}", vtab_ptr)),
+                Value::build_text(""),
                 *conflict_action,
                 format!("args=r[{}..{}]", start_reg, start_reg + arg_count - 1),
             ),
@@ -879,13 +885,22 @@ pub fn insn_to_str(
                 cursor_id,
                 columns,
                 order,
+                collations,
             } => {
                 let _p4 = String::new();
                 let to_print: Vec<String> = order
                     .iter()
-                    .map(|v| match v {
-                        SortOrder::Asc => "B".to_string(),
-                        SortOrder::Desc => "-B".to_string(),
+                    .zip(collations.iter())
+                    .map(|(v, collation)| {
+                        let sign = match v {
+                            SortOrder::Asc => "",
+                            SortOrder::Desc => "-",
+                        };
+                        if collation.is_some() {
+                            format!("{sign}{}", collation.unwrap())
+                        } else {
+                            format!("{sign}B")
+                        }
                     })
                     .collect();
                 (
@@ -1418,16 +1433,30 @@ pub fn insn_to_str(
                 target_pc,
                 record_reg,
                 ..
+            }
+            | Insn::Found {
+                cursor_id,
+                target_pc,
+                record_reg,
+                ..
             } => (
-                "NotFound",
+                if matches!(insn, Insn::NotFound { .. }) {
+                    "NotFound"
+                } else {
+                    "Found"
+                },
                 *cursor_id as i32,
                 target_pc.to_debug_int(),
                 *record_reg as i32,
                 Value::build_text(""),
                 0,
                 format!(
-                    "if (r[{}] != NULL) goto {}",
-                    record_reg,
+                    "if {}found goto {}",
+                    if matches!(insn, Insn::NotFound { .. }) {
+                        "not "
+                    } else {
+                        ""
+                    },
                     target_pc.to_debug_int()
                 ),
             ),

@@ -34,3 +34,5 @@ source $testdir/boolean.test
 source $testdir/literal.test
 source $testdir/null.test
 source $testdir/create_table.test
+source $testdir/collate.test
+source $testdir/values.test

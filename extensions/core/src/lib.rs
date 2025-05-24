@@ -17,7 +17,7 @@ pub use vfs_modules::{RegisterVfsFn, VfsExtension, VfsFile, VfsFileImpl, VfsImpl
 use vtabs::RegisterModuleFn;
 pub use vtabs::{
     ConstraintInfo, ConstraintOp, ConstraintUsage, ExtIndexInfo, IndexInfo, OrderByInfo,
-    VTabCursor, VTabKind, VTabModule, VTabModuleImpl,
+    VTabCreateResult, VTabCursor, VTabKind, VTabModule, VTabModuleImpl, VTable,
 };
 
 pub type ExtResult<T> = std::result::Result<T, ResultCode>;

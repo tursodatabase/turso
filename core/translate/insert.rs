@@ -34,13 +34,15 @@ pub fn translate_insert(
     body: &mut InsertBody,
     _returning: &Option<Vec<ResultColumn>>,
     syms: &SymbolTable,
+    mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
-    let mut program = ProgramBuilder::new(ProgramBuilderOpts {
+    let opts = ProgramBuilderOpts {
         query_mode,
         num_cursors: 1,
         approx_num_insns: 30,
         approx_num_labels: 5,
-    });
+    };
+    program.extend(&opts);
     if with.is_some() {
         crate::bail_parse_error!("WITH clause is not supported");
     }
@@ -53,7 +55,9 @@ pub fn translate_insert(
         Some(table) => table,
         None => crate::bail_corrupt_error!("Parse error: no such table: {}", table_name),
     };
+
     let resolver = Resolver::new(syms);
+
     if let Some(virtual_table) = &table.virtual_table() {
         translate_virtual_table_insert(
             &mut program,
@@ -63,13 +67,9 @@ pub fn translate_insert(
             on_conflict,
             &resolver,
         )?;
+        program.epilogue(super::emitter::TransactionMode::Write);
         return Ok(program);
     }
-    let init_label = program.allocate_label();
-    program.emit_insn(Insn::Init {
-        target_pc: init_label,
-    });
-    let start_offset = program.offset();
 
     let Some(btree_table) = table.btree() else {
         crate::bail_corrupt_error!("Parse error: no such table: {}", table_name);
@@ -407,17 +407,7 @@ pub fn translate_insert(
     }
 
     program.resolve_label(halt_label, program.offset());
-    program.emit_insn(Insn::Halt {
-        err_code: 0,
-        description: String::new(),
-    });
-    program.preassign_label_to_next_insn(init_label);
-
-    program.emit_insn(Insn::Transaction { write: true });
-    program.emit_constant_insns();
-    program.emit_insn(Insn::Goto {
-        target_pc: start_offset,
-    });
+    program.epilogue(super::emitter::TransactionMode::Write);
 
     Ok(program)
 }
@@ -663,12 +653,6 @@ fn translate_virtual_table_insert(
     on_conflict: &Option<ResolveType>,
     resolver: &Resolver,
 ) -> Result<()> {
-    let init_label = program.allocate_label();
-    program.emit_insn(Insn::Init {
-        target_pc: init_label,
-    });
-    let start_offset = program.offset();
-
     let values = match body {
         InsertBody::Select(select, None) => match &select.body.select.deref() {
             OneSelect::Values(values) => values,
@@ -714,22 +698,11 @@ fn translate_virtual_table_insert(
         cursor_id,
         arg_count: column_mappings.len() + 2,
         start_reg: registers_start,
-        vtab_ptr: virtual_table.implementation.as_ref().ctx as usize,
         conflict_action,
     });
 
     let halt_label = program.allocate_label();
     program.resolve_label(halt_label, program.offset());
-    program.emit_insn(Insn::Halt {
-        err_code: 0,
-        description: String::new(),
-    });
-
-    program.resolve_label(init_label, program.offset());
-
-    program.emit_insn(Insn::Goto {
-        target_pc: start_offset,
-    });
 
     Ok(())
 }

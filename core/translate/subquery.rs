@@ -1,12 +1,13 @@
 use crate::{
+    schema::Table,
     vdbe::{builder::ProgramBuilder, insn::Insn},
     Result,
 };
 
 use super::{
-    emitter::{emit_query, Resolver, TranslateCtx},
+    emitter::{emit_query, LimitCtx, Resolver, TranslateCtx},
     main_loop::LoopLabels,
-    plan::{Operation, SelectPlan, SelectQueryType, TableReference},
+    plan::{SelectPlan, SelectQueryType, TableReference},
 };
 
 /// Emit the subqueries contained in the FROM clause.
@@ -16,18 +17,15 @@ pub fn emit_subqueries(
     t_ctx: &mut TranslateCtx,
     tables: &mut [TableReference],
 ) -> Result<()> {
-    for table in tables.iter_mut() {
-        if let Operation::Subquery {
-            plan,
-            result_columns_start_reg,
-        } = &mut table.op
-        {
+    for table_reference in tables.iter_mut() {
+        if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
             // Emit the subquery and get the start register of the result columns.
-            let result_columns_start = emit_subquery(program, plan, t_ctx)?;
+            let result_columns_start =
+                emit_subquery(program, &mut from_clause_subquery.plan, t_ctx)?;
             // Set the start register of the subquery's result columns.
             // This is done so that translate_expr() can read the result columns of the subquery,
             // as if it were reading from a regular table.
-            *result_columns_start_reg = result_columns_start;
+            from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
         }
     }
     Ok(())
@@ -79,7 +77,7 @@ pub fn emit_subquery<'a>(
         reg_result_cols_start: None,
         result_column_indexes_in_orderby_sorter: (0..plan.result_columns.len()).collect(),
         result_columns_to_skip_in_orderby_sorter: None,
-        reg_limit: plan.limit.map(|_| program.alloc_register()),
+        limit_ctx: plan.limit.map(|_| LimitCtx::new(program)),
         reg_offset: plan.offset.map(|_| program.alloc_register()),
         reg_limit_offset_sum: plan.offset.map(|_| program.alloc_register()),
         resolver: Resolver::new(t_ctx.resolver.symbol_table),
@@ -97,7 +95,7 @@ pub fn emit_subquery<'a>(
     if let Some(limit) = plan.limit {
         program.emit_insn(Insn::Integer {
             value: limit as i64,
-            dest: metadata.reg_limit.unwrap(),
+            dest: metadata.limit_ctx.unwrap().reg_limit,
         });
     }
     let result_column_start_reg = emit_query(program, plan, &mut metadata)?;

@@ -27,12 +27,15 @@ class LimboShell:
         self.pipe = self._start_repl(init_commands)
 
     def _start_repl(self, init_commands: Optional[str]) -> subprocess.Popen:
+        env = os.environ.copy()
+        env["RUST_BACKTRACE"] = "1"
         pipe = subprocess.Popen(
             [self.config.sqlite_exec, *self.config.sqlite_flags],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            env=env,
         )
         if init_commands and pipe.stdin is not None:
             pipe.stdin.write((init_commands + "\n").encode())
@@ -73,15 +76,12 @@ class LimboShell:
         self.pipe.stdin.write((command + "\n").encode())
         self.pipe.stdin.flush()
 
-    def _handle_error(self) -> bool:
+    def _handle_error(self) -> None:
         while True:
-            ready, _, errors = select.select(
-                [self.pipe.stderr], [], [self.pipe.stderr], 0
-            )
-            if not (ready + errors):
-                break
-            error_output = self.pipe.stderr.read(PIPE_BUF).decode()
-            console.error(error_output, end="", _stack_offset=2)
+            chunk = self.pipe.stderr.read(PIPE_BUF).decode()
+            if not chunk:
+                break  # EOF
+            console.error(chunk, end="", _stack_offset=2)
         raise RuntimeError("Error encountered in Limbo shell.")
 
     @staticmethod

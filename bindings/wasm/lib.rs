@@ -288,18 +288,14 @@ impl limbo_core::IO for PlatformIO {
     }
 
     fn generate_random_number(&self) -> i64 {
-        let random_f64 = Math_random();
-        (random_f64 * i64::MAX as f64) as i64
+        let mut buf = [0u8; 8];
+        getrandom::getrandom(&mut buf).unwrap();
+        i64::from_ne_bytes(buf)
     }
 
     fn get_memory_io(&self) -> Arc<limbo_core::MemoryIO> {
         Arc::new(limbo_core::MemoryIO::new())
     }
-}
-
-#[wasm_bindgen]
-extern "C" {
-    fn Math_random() -> f64;
 }
 
 #[wasm_bindgen]

@@ -230,55 +230,47 @@ pub fn derive_agg_func(input: TokenStream) -> TokenStream {
 
 /// Macro to derive a VTabModule for your extension. This macro will generate
 /// the necessary functions to register your module with core. You must implement
-/// the VTabModule trait for your struct, and the VTabCursor trait for your cursor.
+/// the VTabModule, VTable, and VTabCursor traits.
 /// ```ignore
-///#[derive(Debug, VTabModuleDerive)]
-///struct CsvVTab;
-///impl VTabModule for CsvVTab {
-///    type VCursor = CsvCursor;
-///    const NAME: &'static str = "csv_data";
+/// #[derive(Debug, VTabModuleDerive)]
+/// struct CsvVTabModule;
 ///
-///    /// Declare the schema for your virtual table
-///    fn create_schema(args: &[&str]) -> &'static str {
-///        let sql = "CREATE TABLE csv_data(
-///            name TEXT,
-///            age TEXT,
-///            city TEXT
-///        )"
-///    }
-///    /// Open the virtual table and return a cursor
-///  fn open() -> Self::VCursor {
-///       let csv_content = fs::read_to_string("data.csv").unwrap_or_default();
-///       let rows: Vec<Vec<String>> = csv_content
-///           .lines()
-///           .skip(1)
-///           .map(|line| {
-///               line.split(',')
-///                   .map(|s| s.trim().to_string())
-///                   .collect()
-///           })
-///           .collect();
-///       CsvCursor { rows, index: 0 }
-///   }
-///   /// Filter the virtual table based on arguments (omitted here for simplicity)
-///   fn filter(_cursor: &mut Self::VCursor, _arg_count: i32, _args: &[Value]) -> ResultCode {
-///       ResultCode::OK
-///   }
-///   /// Return the value for a given column index
-///   fn column(cursor: &Self::VCursor, idx: u32) -> Value {
-///      cursor.column(idx)
+/// impl VTabModule for CsvVTabModule {
+///  type Table = CsvTable;
+///  const NAME: &'static str = "csv_data";
+///  const VTAB_KIND: VTabKind = VTabKind::VirtualTable;
+///
+///   /// Declare your virtual table and its schema
+///  fn create(args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
+///     let schema = "CREATE TABLE csv_data(
+///             name TEXT,
+///             age TEXT,
+///             city TEXT
+///         )".into();
+///     Ok((schema, CsvTable {}))
 ///  }
-///  /// Move the cursor to the next row
-///  fn next(cursor: &mut Self::VCursor) -> ResultCode {
-///      if cursor.index < cursor.rows.len() - 1 {
-///          cursor.index += 1;
-///          ResultCode::OK
-///      } else {
-///          ResultCode::EOF
-///      }
-///  }
-///  fn eof(cursor: &Self::VCursor) -> bool {
-///      cursor.index >= cursor.rows.len()
+/// }
+///
+/// struct CsvTable {}
+///
+/// // Implement the VTable trait for your virtual table
+/// impl VTable for CsvTable {
+///  type Cursor = CsvCursor;
+///  type Error = &'static str;
+///
+///  /// Open the virtual table and return a cursor
+///  fn open(&self) -> Result<Self::Cursor, Self::Error> {
+///     let csv_content = fs::read_to_string("data.csv").unwrap_or_default();
+///     let rows: Vec<Vec<String>> = csv_content
+///         .lines()
+///         .skip(1)
+///         .map(|line| {
+///             line.split(',')
+///                 .map(|s| s.trim().to_string())
+///                 .collect()
+///         })
+///         .collect();
+///     Ok(CsvCursor { rows, index: 0 })
 ///  }
 ///
 /// /// **Optional** methods for non-readonly tables:
@@ -287,23 +279,28 @@ pub fn derive_agg_func(input: TokenStream) -> TokenStream {
 ///  fn update(&mut self, rowid: i64, args: &[Value]) -> Result<Option<i64>, Self::Error> {
 ///      Ok(None)// return Ok(None) for read-only
 ///  }
+///
 ///  /// Insert a new row with the provided values, return the new rowid
 ///  fn insert(&mut self, args: &[Value]) -> Result<(), Self::Error> {
 ///      Ok(()) //
 ///  }
+///
 ///  /// Delete the row with the provided rowid
 ///  fn delete(&mut self, rowid: i64) -> Result<(), Self::Error> {
 ///    Ok(())
 ///  }
+///
 ///  /// Destroy the virtual table. Any cleanup logic for when the table is deleted comes heres
 ///  fn destroy(&mut self) -> Result<(), Self::Error> {
 ///     Ok(())
 ///  }
+/// }
 ///
 ///  #[derive(Debug)]
 /// struct CsvCursor {
 ///   rows: Vec<Vec<String>>,
 ///   index: usize,
+/// }
 ///
 /// impl CsvCursor {
 ///   /// Returns the value for a given column index.
@@ -315,20 +312,40 @@ pub fn derive_agg_func(input: TokenStream) -> TokenStream {
 ///           Value::null()
 ///       }
 ///   }
+/// }
+///
 /// // Implement the VTabCursor trait for your virtual cursor
 /// impl VTabCursor for CsvCursor {
-///   fn next(&mut self) -> ResultCode {
-///       Self::next(self)
-///   }
+///  type Error = &'static str;
+///
+///  /// Filter the virtual table based on arguments (omitted here for simplicity)
+///  fn filter(&mut self, _args: &[Value], _idx_info: Option<(&str, i32)>) -> ResultCode {
+///      ResultCode::OK
+///  }
+///
+///  /// Move the cursor to the next row
+///  fn next(&mut self) -> ResultCode {
+///     if self.index < self.rows.len() - 1 {
+///         self.index += 1;
+///         ResultCode::OK
+///     } else {
+///         ResultCode::EOF
+///     }
+///  }
+///
 ///  fn eof(&self) -> bool {
 ///      self.index >= self.rows.len()
 ///  }
-///  fn column(&self, idx: u32) -> Value {
+///
+///  /// Return the value for a given column index
+///  fn column(&self, idx: u32) -> Result<Value, Self::Error> {
 ///      self.column(idx)
 ///  }
+///
 ///  fn rowid(&self) -> i64 {
 ///      self.index as i64
 ///  }
+/// }
 ///
 #[proc_macro_derive(VTabModuleDerive)]
 pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
