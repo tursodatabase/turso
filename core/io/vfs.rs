@@ -42,7 +42,7 @@ impl IO for VfsMod {
         }
         Ok(())
     }
-    
+
     fn run_until_complete(&self) -> Result<()> {
         if self.ctx.is_null() {
             return Err(LimboError::ExtensionError("VFS is null".to_string()));
