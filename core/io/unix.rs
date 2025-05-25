@@ -256,6 +256,45 @@ impl IO for UnixIO {
         Ok(())
     }
 
+    fn run_until_complete(&self) -> Result<()> {
+        while !self.callbacks.is_empty() {
+            self.events.clear();
+            trace!("run_until_complete() waits for events");
+            self.poller.wait(self.events.as_mut(), None)?;
+
+            for event in self.events.iter() {
+                if let Some(cf) = self.callbacks.remove(event.key) {
+                    let result = match cf {
+                        CompletionCallback::Read(ref file, ref c, pos) => {
+                            let mut file = file.borrow_mut();
+                            let r = c.as_read();
+                            let mut buf = r.buf_mut();
+                            file.seek(std::io::SeekFrom::Start(pos as u64))?;
+                            file.read(buf.as_mut_slice())
+                        }
+                        CompletionCallback::Write(ref file, _, ref buf, pos) => {
+                            let mut file = file.borrow_mut();
+                            let buf = buf.borrow();
+                            file.seek(std::io::SeekFrom::Start(pos as u64))?;
+                            file.write(buf.as_slice())
+                        }
+                    };
+
+                    match result {
+                        Ok(n) => match &cf {
+                            CompletionCallback::Read(_, ref c, _) => c.complete(0),
+                            CompletionCallback::Write(_, ref c, _, _) => c.complete(n as i32),
+                        },
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+
     fn generate_random_number(&self) -> i64 {
         let mut buf = [0u8; 8];
         getrandom::getrandom(&mut buf).unwrap();
