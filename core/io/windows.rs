@@ -37,6 +37,10 @@ impl IO for WindowsIO {
         Ok(())
     }
 
+    fn run_until_complete(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn generate_random_number(&self) -> i64 {
         let mut buf = [0u8; 8];
         getrandom::getrandom(&mut buf).unwrap();
