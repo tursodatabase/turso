@@ -40,7 +40,7 @@ impl IO for GenericIO {
     }
 
     fn run_until_complete(&self) -> Result<()> {
-        Ok(())
+        self.run_once()
     }
 
     fn generate_random_number(&self) -> i64 {

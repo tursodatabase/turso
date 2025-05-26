@@ -54,8 +54,7 @@ impl IO for MemoryIO {
     }
 
     fn run_until_complete(&self) -> Result<()> {
-        // nop
-        Ok(())
+        self.run_once()
     }
 
     fn generate_random_number(&self) -> i64 {

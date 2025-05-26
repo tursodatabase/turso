@@ -168,30 +168,12 @@ impl IO for UringIO {
     }
 
     fn run_until_complete(&self) -> Result<()> {
-        let mut inner = self.inner.borrow_mut();
-        let ring = &mut inner.ring;
-
-        while !ring.empty() {
-            ring.wait_for_completion()?;
-
-            while let Some(cqe) = ring.get_completion() {
-                let result = cqe.result();
-                if result < 0 {
-                    return Err(LimboError::UringIOError(format!(
-                        "{} cqe: {:?}",
-                        UringIOError::IOUringCQError(result),
-                        cqe
-                    )));
-                }
-
-                if let Some(c) = ring.pending[cqe.user_data() as usize].as_ref() {
-                    c.complete(result);
-                }
-
-                ring.pending[cqe.user_data() as usize] = None;
-            }
+        while {
+            let inner = self.inner.borrow();
+            !inner.ring.empty()
+        } {
+            self.run_once()?;
         }
-
         Ok(())
     }
 

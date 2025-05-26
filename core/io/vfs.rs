@@ -44,17 +44,10 @@ impl IO for VfsMod {
     }
 
     fn run_until_complete(&self) -> Result<()> {
-        if self.ctx.is_null() {
-            return Err(LimboError::ExtensionError("VFS is null".to_string()));
-        }
-        let vfs = unsafe { &*self.ctx };
         loop {
-            let result = unsafe { (vfs.run_once)(vfs.vfs) };
-            if result.is_ok() {
-                break;
-            }
-            if !result.is_ok() {
-                return Err(LimboError::ExtensionError(result.to_string()));
+            match self.run_once() {
+                Ok(()) => break,
+                Err(e) => return Err(e),
             }
         }
         Ok(())
