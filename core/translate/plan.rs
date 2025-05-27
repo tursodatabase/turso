@@ -93,36 +93,48 @@ pub struct WhereTerm {
     /// A term may have been consumed e.g. if:
     /// - it has been converted into a constraint in a seek key
     /// - it has been removed due to being trivially true or false
-    ///
-    /// FIXME: this can be made into a simple `bool` once we move the virtual table constraint resolution
-    /// code out of `init_loop()`, because that's the only place that requires a mutable reference to the where clause
-    /// that causes problems to other code that needs immutable references to the where clause.
     pub consumed: Cell<bool>,
+    /// For WHERE clause subqueries, we separately determine where they should be evaluated based on which outer tables
+    /// the subquery depends on.
+    pub eval_at_override: Cell<Option<EvalAt>>,
 }
 
 impl WhereTerm {
-    pub fn should_eval_before_loop(&self, join_order: &[JoinOrderMember]) -> bool {
+    pub fn should_eval_before_loop(
+        &self,
+        join_order: &[JoinOrderMember],
+        outer_query_refs: &[OuterQueryReference],
+    ) -> bool {
         if self.consumed.get() {
             return false;
         }
-        let Ok(eval_at) = self.eval_at(join_order) else {
+        let Ok(eval_at) = self.eval_at(join_order, outer_query_refs) else {
             return false;
         };
         eval_at == EvalAt::BeforeLoop
     }
 
-    pub fn should_eval_at_loop(&self, loop_idx: usize, join_order: &[JoinOrderMember]) -> bool {
+    pub fn should_eval_at_loop(
+        &self,
+        loop_idx: usize,
+        join_order: &[JoinOrderMember],
+        outer_query_refs: &[OuterQueryReference],
+    ) -> bool {
         if self.consumed.get() {
             return false;
         }
-        let Ok(eval_at) = self.eval_at(join_order) else {
+        let Ok(eval_at) = self.eval_at(join_order, outer_query_refs) else {
             return false;
         };
         eval_at == EvalAt::Loop(loop_idx)
     }
 
-    fn eval_at(&self, join_order: &[JoinOrderMember]) -> Result<EvalAt> {
-        determine_where_to_eval_term(&self, join_order)
+    pub fn eval_at(
+        &self,
+        join_order: &[JoinOrderMember],
+        outer_query_refs: &[OuterQueryReference],
+    ) -> Result<EvalAt> {
+        determine_where_to_eval_term(&self, join_order, outer_query_refs)
     }
 }
 

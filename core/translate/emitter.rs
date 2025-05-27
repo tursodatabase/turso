@@ -570,11 +570,9 @@ pub fn emit_query<'a>(
         return Ok(t_ctx.reg_result_cols_start.unwrap());
     }
 
-    for where_term in plan
-        .where_clause
-        .iter()
-        .filter(|wt| wt.should_eval_before_loop(&plan.join_order))
-    {
+    for where_term in plan.where_clause.iter().filter(|wt| {
+        wt.should_eval_before_loop(&plan.join_order, &plan.table_references.outer_query_refs())
+    }) {
         let jump_target_when_true = program.allocate_label();
         let condition_metadata = ConditionMetadata {
             jump_if_condition_is_true: false,
@@ -929,11 +927,12 @@ fn emit_update_insns(
         },
     };
 
-    for cond in plan
-        .where_clause
-        .iter()
-        .filter(|c| c.should_eval_before_loop(&[JoinOrderMember::default()]))
-    {
+    for cond in plan.where_clause.iter().filter(|c| {
+        c.should_eval_before_loop(
+            &[JoinOrderMember::default()],
+            &plan.table_references.outer_query_refs(),
+        )
+    }) {
         let jump_target = program.allocate_label();
         let meta = ConditionMetadata {
             jump_if_condition_is_true: false,
@@ -1015,11 +1014,12 @@ fn emit_update_insns(
         });
     }
 
-    for cond in plan
-        .where_clause
-        .iter()
-        .filter(|c| c.should_eval_before_loop(&[JoinOrderMember::default()]))
-    {
+    for cond in plan.where_clause.iter().filter(|c| {
+        c.should_eval_before_loop(
+            &[JoinOrderMember::default()],
+            &plan.table_references.outer_query_refs(),
+        )
+    }) {
         let meta = ConditionMetadata {
             jump_if_condition_is_true: false,
             jump_target_when_true: BranchOffset::Placeholder,

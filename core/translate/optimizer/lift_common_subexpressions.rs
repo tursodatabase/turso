@@ -127,6 +127,7 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
                 expr: common_expr_to_add,
                 from_outer_join: term_from_outer_join,
                 consumed: Cell::new(false),
+                eval_at_override: Cell::new(None),
             });
         }
 
@@ -258,6 +259,7 @@ mod tests {
             expr: or_expr,
             from_outer_join: None,
             consumed: Cell::new(false),
+            eval_at_override: Cell::new(None),
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
@@ -357,6 +359,7 @@ mod tests {
             expr: or_expr,
             from_outer_join: None,
             consumed: Cell::new(false),
+            eval_at_override: Cell::new(None),
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
@@ -424,6 +427,7 @@ mod tests {
             expr: or_expr.clone(),
             from_outer_join: None,
             consumed: Cell::new(false),
+            eval_at_override: Cell::new(None),
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
@@ -491,6 +495,7 @@ mod tests {
             expr: or_expr,
             from_outer_join: Some(TableInternalId::default()), // Set from_outer_join
             consumed: Cell::new(false),
+            eval_at_override: Cell::new(None),
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
@@ -543,6 +548,7 @@ mod tests {
             expr: single_expr.clone(),
             from_outer_join: None,
             consumed: Cell::new(false),
+            eval_at_override: Cell::new(None),
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
@@ -596,6 +602,7 @@ mod tests {
             expr: or_expr,
             from_outer_join: None,
             consumed: Cell::new(false),
+            eval_at_override: Cell::new(None),
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;

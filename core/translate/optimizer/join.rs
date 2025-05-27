@@ -1343,6 +1343,7 @@ mod tests {
             expr: Expr::Binary(Box::new(lhs), op, Box::new(rhs)),
             from_outer_join: None,
             consumed: Cell::new(false),
+            eval_at_override: Cell::new(None),
         }
     }
 

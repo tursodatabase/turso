@@ -509,6 +509,7 @@ pub fn parse_where(
                 expr,
                 from_outer_join: None,
                 consumed: Cell::new(false),
+                eval_at_override: Cell::new(None),
             });
         }
         Ok(())
@@ -527,17 +528,22 @@ pub fn parse_where(
 pub fn determine_where_to_eval_term(
     term: &WhereTerm,
     join_order: &[JoinOrderMember],
+    outer_query_refs: &[OuterQueryReference],
 ) -> Result<EvalAt> {
     if let Some(table_id) = term.from_outer_join {
         return Ok(EvalAt::Loop(
             join_order
                 .iter()
                 .position(|t| t.table_id == table_id)
-                .unwrap_or(usize::MAX),
+                .expect("table not found in join order"),
         ));
     }
 
-    return determine_where_to_eval_expr(&term.expr, join_order);
+    if let Some(eval_at) = term.eval_at_override.get() {
+        return Ok(eval_at);
+    }
+
+    determine_where_to_eval_expr(&term.expr, join_order, outer_query_refs)
 }
 
 /// A bitmask representing a set of tables in a query plan.
@@ -672,16 +678,21 @@ pub fn table_mask_from_expr(
 pub fn determine_where_to_eval_expr<'a>(
     top_level_expr: &'a Expr,
     join_order: &[JoinOrderMember],
+    outer_query_refs: &[OuterQueryReference],
 ) -> Result<EvalAt> {
     let mut eval_at: EvalAt = EvalAt::BeforeLoop;
     walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<()> {
         match expr {
             Expr::Column { table, .. } | Expr::RowId { table, .. } => {
-                let join_idx = join_order
-                    .iter()
-                    .position(|t| t.table_id == *table)
-                    .unwrap_or(usize::MAX);
-                eval_at = eval_at.max(EvalAt::Loop(join_idx));
+                // If the expression references a table, we need to determine the earliest point at which
+                // the expression can be evaluated.
+                // If it's not found in the current join order then it must be found in the table's outer
+                // query references, or else it's an internal error.
+                if let Some(join_idx) = join_order.iter().position(|t| t.table_id == *table) {
+                    eval_at = eval_at.max(EvalAt::Loop(join_idx));
+                } else if !outer_query_refs.iter().any(|t| t.internal_id == *table) {
+                    panic!("table with internal id {} not found in join order or outer query references", table);
+                }
             }
             _ => {}
         }
@@ -792,6 +803,7 @@ fn parse_join<'a>(
                             None
                         },
                         consumed: Cell::new(false),
+                        eval_at_override: Cell::new(None),
                     });
                 }
             }
@@ -872,6 +884,7 @@ fn parse_join<'a>(
                             None
                         },
                         consumed: Cell::new(false),
+                        eval_at_override: Cell::new(None),
                     });
                 }
                 using = Some(distinct_names);

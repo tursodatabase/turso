@@ -354,7 +354,13 @@ pub fn open_loop(
                                 // We then materialise the RHS/LHS into registers before issuing VFilter.
                                 let converted_constraints = predicates
                                     .iter()
-                                    .filter(|p| p.should_eval_at_loop(join_index, join_order))
+                                    .filter(|p| {
+                                        p.should_eval_at_loop(
+                                            join_index,
+                                            join_order,
+                                            table_references.outer_query_refs(),
+                                        )
+                                    })
                                     .enumerate()
                                     .filter_map(|(i, p)| {
                                         // Build ConstraintInfo from the predicates
@@ -499,10 +505,13 @@ pub fn open_loop(
                     }
                 }
 
-                for cond in predicates
-                    .iter()
-                    .filter(|cond| cond.should_eval_at_loop(join_index, join_order))
-                {
+                for cond in predicates.iter().filter(|cond| {
+                    cond.should_eval_at_loop(
+                        join_index,
+                        join_order,
+                        table_references.outer_query_refs(),
+                    )
+                }) {
                     let jump_target_when_true = program.allocate_label();
                     let condition_metadata = ConditionMetadata {
                         jump_if_condition_is_true: false,
@@ -611,10 +620,13 @@ pub fn open_loop(
                     }
                 }
 
-                for cond in predicates
-                    .iter()
-                    .filter(|cond| cond.should_eval_at_loop(join_index, join_order))
-                {
+                for cond in predicates.iter().filter(|cond| {
+                    cond.should_eval_at_loop(
+                        join_index,
+                        join_order,
+                        table_references.outer_query_refs(),
+                    )
+                }) {
                     let jump_target_when_true = program.allocate_label();
                     let condition_metadata = ConditionMetadata {
                         jump_if_condition_is_true: false,
