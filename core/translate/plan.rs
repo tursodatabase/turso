@@ -23,7 +23,7 @@ use crate::{schema::Type, types::SeekOp, util::can_pushdown_predicate};
 
 use limbo_sqlite3_parser::ast::TableInternalId;
 
-use super::{emitter::OperationMode, planner::determine_where_to_eval_term, schema::ParseSchema};
+use super::{emitter::OperationMode, expr::walk_expr, schema::ParseSchema};
 
 #[derive(Debug, Clone)]
 pub struct ResultSetColumn {
@@ -121,8 +121,38 @@ impl WhereTerm {
         eval_at == EvalAt::Loop(loop_idx)
     }
 
+    /**
+        Returns the earliest point at which a WHERE term can be evaluated.
+        For expressions referencing tables, this is the innermost loop that contains a row for each
+        table referenced in the expression.
+        For expressions not referencing any tables (e.g. constants), this is before the main loop is opened,
+        because they do not need any table data.
+    */
     fn eval_at(&self, join_order: &[JoinOrderMember]) -> Result<EvalAt> {
-        determine_where_to_eval_term(&self, join_order)
+        if let Some(table_id) = self.from_outer_join {
+            let position = join_order.iter().position(|t| t.table_id == table_id);
+            return Ok(match position {
+                None => EvalAt::Never,
+                Some(position) => EvalAt::Loop(position),
+            });
+        }
+
+        let mut eval_at = EvalAt::BeforeLoop;
+        walk_expr(&self.expr, &mut |expr: &Expr| -> Result<()> {
+            match expr {
+                Expr::Column { table, .. } | Expr::RowId { table, .. } => {
+                    if let Some(join_idx) = join_order.iter().position(|t| t.table_id == *table) {
+                        eval_at = eval_at.max(EvalAt::Loop(join_idx));
+                    } else {
+                        eval_at = EvalAt::Never;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+
+        Ok(eval_at)
     }
 }
 
@@ -271,8 +301,15 @@ pub fn convert_where_to_vtab_constraint(
 /// but that is not implemented yet.
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub enum EvalAt {
+    /// The condition should be evaluated at the given loop index.
     Loop(usize),
+    /// The condition should be evaluated before the main loop is opened.
     BeforeLoop,
+    /// The condition should not be evaluated.
+    /// This is only applicable for join ordering optimizer pass where we consider different subsets of tables to join.
+    /// e.g. if we are considering 't1 JOIN t2' and there's a condition 't3.id = t4.id', we return EvalAt::Never for that
+    /// condition.
+    Never,
 }
 
 #[allow(clippy::non_canonical_partial_ord_impl)]
@@ -283,6 +320,10 @@ impl PartialOrd for EvalAt {
             (EvalAt::BeforeLoop, EvalAt::BeforeLoop) => Some(Ordering::Equal),
             (EvalAt::BeforeLoop, _) => Some(Ordering::Less),
             (_, EvalAt::BeforeLoop) => Some(Ordering::Greater),
+            // Never always has precedence, because it means the condition contains a component that is
+            // not in scope for the current join order. See the definition of [EvalAt::Never].
+            (EvalAt::Never, _) => Some(Ordering::Greater),
+            (_, EvalAt::Never) => Some(Ordering::Less),
         }
     }
 }

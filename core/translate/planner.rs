@@ -1,9 +1,8 @@
 use super::{
     expr::walk_expr,
     plan::{
-        Aggregate, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
-        JoinOrderMember, Operation, Plan, QueryDestination, ResultSetColumn, SelectPlan,
-        TableReference, WhereTerm,
+        Aggregate, ColumnUsedMask, Distinctness, IterationDirection, JoinInfo, Operation, Plan,
+        QueryDestination, ResultSetColumn, SelectPlan, TableReference, WhereTerm,
     },
     select::prepare_select_plan,
     SymbolTable,
@@ -523,29 +522,6 @@ pub fn parse_where(
     }
 }
 
-/**
-  Returns the earliest point at which a WHERE term can be evaluated.
-  For expressions referencing tables, this is the innermost loop that contains a row for each
-  table referenced in the expression.
-  For expressions not referencing any tables (e.g. constants), this is before the main loop is
-  opened, because they do not need any table data.
-*/
-pub fn determine_where_to_eval_term(
-    term: &WhereTerm,
-    join_order: &[JoinOrderMember],
-) -> Result<EvalAt> {
-    if let Some(table_id) = term.from_outer_join {
-        return Ok(EvalAt::Loop(
-            join_order
-                .iter()
-                .position(|t| t.table_id == table_id)
-                .unwrap_or(usize::MAX),
-        ));
-    }
-
-    return determine_where_to_eval_expr(&term.expr, join_order);
-}
-
 /// A bitmask representing a set of tables in a query plan.
 /// Tables are numbered by their index in [SelectPlan::table_references].
 /// In the bitmask, the first bit is unused so that a mask with all zeros
@@ -663,28 +639,6 @@ pub fn table_mask_from_expr(
     })?;
 
     Ok(mask)
-}
-
-pub fn determine_where_to_eval_expr<'a>(
-    top_level_expr: &'a Expr,
-    join_order: &[JoinOrderMember],
-) -> Result<EvalAt> {
-    let mut eval_at: EvalAt = EvalAt::BeforeLoop;
-    walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<()> {
-        match expr {
-            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
-                let join_idx = join_order
-                    .iter()
-                    .position(|t| t.table_id == *table)
-                    .unwrap_or(usize::MAX);
-                eval_at = eval_at.max(EvalAt::Loop(join_idx));
-            }
-            _ => {}
-        }
-        Ok(())
-    })?;
-
-    Ok(eval_at)
 }
 
 fn parse_join<'a>(
