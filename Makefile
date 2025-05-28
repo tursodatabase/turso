@@ -74,6 +74,15 @@ test-time:
 	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/time.test
 .PHONY: test-time
 
+test-tcl-single:
+	@if [ -z "$(FILE)" ]; then \
+		echo "Usage: make test-tcl-single FILE=<test-file>"; \
+		echo "Example: make test-tcl-single FILE=./testing/subquery.test"; \
+		exit 1; \
+	fi
+	SQLITE_EXEC=$(SQLITE_EXEC) "$(FILE)"
+.PHONY: test-tcl-single
+
 reset-db:
 	./scripts/clone_test_db.sh
 .PHONY: reset-db
