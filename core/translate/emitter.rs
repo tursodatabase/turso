@@ -471,6 +471,11 @@ fn emit_program_for_select(
     schema: &Schema,
     syms: &SymbolTable,
 ) -> Result<()> {
+    if matches!(plan.query_destination, QueryDestination::Exists { .. }) {
+        // There is no need to do any work towards retrieving result columns in an EXISTS subquery.
+        // The result is always a single row with a boolean value.
+        plan.result_columns.clear();
+    }
     let mut t_ctx = TranslateCtx::new(
         program,
         schema,

@@ -373,6 +373,9 @@ pub enum QueryDestination {
         /// The index that will be used to store the results.
         index: Arc<Index>,
     },
+    /// Whether the query returns any rows is stored as a boolean (0 or 1) in a register.
+    /// Used in `SELECT * FROM t WHERE EXISTS (SELECT ...)
+    Exists { exists_reg: usize },
     /// The query destination is not set yet.
     /// It must be set before translation, or an internal error is returned.
     /// This is used for subqueries that e.g. receive target registers from the parent query,

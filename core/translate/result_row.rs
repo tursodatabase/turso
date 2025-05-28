@@ -100,6 +100,12 @@ pub fn emit_result_row_and_limit(
                 flags: IdxInsertFlags::new(),
             });
         }
+        QueryDestination::Exists { exists_reg } => {
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: *exists_reg,
+            });
+        }
         QueryDestination::CoroutineYield { yield_reg, .. } => {
             program.emit_insn(Insn::Yield {
                 yield_reg: *yield_reg,

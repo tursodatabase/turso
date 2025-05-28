@@ -21,6 +21,13 @@ pub fn emit_values(
         QueryDestination::CoroutineYield { yield_reg, .. } => {
             emit_values_in_subquery(program, plan, resolver, yield_reg)?
         }
+        QueryDestination::Exists { exists_reg } => {
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: exists_reg,
+            });
+            exists_reg
+        }
         QueryDestination::EphemeralIndex { .. } => unreachable!(),
         QueryDestination::Unset => {
             return Err(crate::LimboError::InternalError(
@@ -60,6 +67,12 @@ fn emit_values_when_single_row(
             program.emit_insn(Insn::Yield {
                 yield_reg,
                 end_offset: BranchOffset::Offset(0),
+            });
+        }
+        QueryDestination::Exists { exists_reg } => {
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: exists_reg,
             });
         }
         QueryDestination::EphemeralIndex { .. } => unreachable!(),
