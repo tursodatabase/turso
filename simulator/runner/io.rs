@@ -101,10 +101,6 @@ impl IO for SimulatorIO {
         Ok(())
     }
 
-    fn run_until_complete(&self) -> Result<()> {
-        self.inner.run_until_complete()
-    }
-
     fn generate_random_number(&self) -> i64 {
         self.rng.borrow_mut().next_u64() as i64
     }

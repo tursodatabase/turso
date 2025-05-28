@@ -46,10 +46,6 @@ impl IO for GenericIO {
         Ok(())
     }
 
-    fn run_until_complete(&self) -> Result<()> {
-        self.run_once()
-    }
-
     fn generate_random_number(&self) -> i64 {
         let mut buf = [0u8; 8];
         getrandom::getrandom(&mut buf).unwrap();
