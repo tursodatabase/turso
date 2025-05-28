@@ -124,73 +124,119 @@ pub fn compute_plans_for_where_clause_subqueries<'a>(
     where_terms: &'a [WhereTerm],
     join_order: &[JoinOrderMember],
 ) -> Result<()> {
-    for where_term in where_terms {
-        walk_expr(&where_term.expr, &mut |expr: &'a ast::Expr| -> Result<()> {
-            if let ast::Expr::Exists(subselect) = expr {
-                let outer_query_refs = referenced_tables
-                    .joined_tables()
+    let get_outer_query_refs = |referenced_tables: &TableReferences| {
+        referenced_tables
+            .joined_tables()
+            .iter()
+            .map(|t| OuterQueryReference {
+                table: t.table.clone(),
+                identifier: t.identifier.clone(),
+                internal_id: t.internal_id,
+                col_used_mask: ColumnUsedMask::new(),
+            })
+            .chain(
+                referenced_tables
+                    .outer_query_refs()
                     .iter()
                     .map(|t| OuterQueryReference {
                         table: t.table.clone(),
                         identifier: t.identifier.clone(),
                         internal_id: t.internal_id,
                         col_used_mask: ColumnUsedMask::new(),
-                    })
-                    .chain(referenced_tables.outer_query_refs().iter().map(|t| {
-                        OuterQueryReference {
-                            table: t.table.clone(),
-                            identifier: t.identifier.clone(),
-                            internal_id: t.internal_id,
-                            col_used_mask: ColumnUsedMask::new(),
-                        }
-                    }))
-                    .collect::<Vec<_>>();
+                    }),
+            )
+            .collect::<Vec<_>>()
+    };
 
-                let plan = prepare_select_plan(
-                    t_ctx.resolver.schema,
-                    subselect.as_ref().clone(),
-                    t_ctx.resolver.symbol_table,
-                    &outer_query_refs,
-                    &mut program.table_reference_counter,
-                    QueryDestination::Unset, // The destination is set at translation time.
-                )?;
-                let Plan::Select(mut plan) = plan else {
-                    crate::bail_parse_error!(
-                        "compound SELECT queries not supported yet in WHERE clause subqueries"
-                    );
-                };
-                optimize_select_plan(&mut plan, t_ctx.resolver.schema)?;
+    let compute_eval_at = |plan: &SelectPlan| -> Result<EvalAt> {
+        let mut max_eval_at = EvalAt::BeforeLoop;
+        for outer_query_ref in plan
+            .table_references
+            .outer_query_refs()
+            .iter()
+            .filter(|t| t.is_used())
+        {
+            let Some(join_idx) = join_order
+                .iter()
+                .position(|j| j.table_id == outer_query_ref.internal_id)
+            else {
+                crate::bail_parse_error!("subquery references outer table {}, but it's not found in the outer query's join order", &outer_query_ref.identifier);
+            };
+            max_eval_at = max_eval_at.max(EvalAt::Loop(join_idx));
+        }
+        Ok(max_eval_at)
+    };
 
-                let mut max_eval_at = EvalAt::BeforeLoop;
-                for outer_query_ref in plan
-                    .table_references
-                    .outer_query_refs()
-                    .iter()
-                    .filter(|t| t.is_used())
-                {
-                    let Some(join_idx) = join_order
-                        .iter()
-                        .position(|j| j.table_id == outer_query_ref.internal_id)
-                    else {
-                        crate::bail_parse_error!("subquery references outer table {}, but it's not found in the outer query's join order", &outer_query_ref.identifier);
+    for where_term in where_terms {
+        walk_expr(&where_term.expr, &mut |expr: &'a ast::Expr| -> Result<()> {
+            match expr {
+                ast::Expr::Exists(subselect) => {
+                    let outer_query_refs = get_outer_query_refs(referenced_tables);
+
+                    let plan = prepare_select_plan(
+                        t_ctx.resolver.schema,
+                        subselect.as_ref().clone(),
+                        t_ctx.resolver.symbol_table,
+                        &outer_query_refs,
+                        &mut program.table_reference_counter,
+                        QueryDestination::Unset, // The destination is set at translation time.
+                    )?;
+                    let Plan::Select(mut plan) = plan else {
+                        crate::bail_parse_error!(
+                            "compound SELECT queries not supported yet in WHERE clause subqueries"
+                        );
                     };
-                    max_eval_at = max_eval_at.max(EvalAt::Loop(join_idx));
+                    optimize_select_plan(&mut plan, t_ctx.resolver.schema)?;
+                    where_term
+                        .eval_at_override
+                        .set(Some(compute_eval_at(&plan)?));
+
+                    t_ctx.resolver.where_clause_subquery_plans.push((
+                        expr,
+                        RefCell::new(Some(WhereClauseSubqueryPlan {
+                            subquery_type: WhereClauseSubqueryType::Exists,
+                            plan,
+                        })),
+                    ));
                 }
+                ast::Expr::Subquery(subselect) => {
+                    let outer_query_refs = get_outer_query_refs(referenced_tables);
+                    let plan = prepare_select_plan(
+                        t_ctx.resolver.schema,
+                        subselect.as_ref().clone(),
+                        t_ctx.resolver.symbol_table,
+                        &outer_query_refs,
+                        &mut program.table_reference_counter,
+                        QueryDestination::Unset, // The destination is set at translation time.
+                    )?;
+                    let Plan::Select(mut plan) = plan else {
+                        crate::bail_parse_error!(
+                            "compound SELECT queries not supported yet in WHERE clause subqueries"
+                        );
+                    };
+                    if plan.result_columns.len() != 1 {
+                        crate::bail_parse_error!(
+                            "scalar subqueries must return exactly one column"
+                        );
+                    }
+                    plan.limit = Some(1);
+                    optimize_select_plan(&mut plan, t_ctx.resolver.schema)?;
+                    where_term
+                        .eval_at_override
+                        .set(Some(compute_eval_at(&plan)?));
 
-                where_term.eval_at_override.set(Some(max_eval_at));
-
-                t_ctx.resolver.where_clause_subquery_plans.push((
-                    expr,
-                    RefCell::new(Some(WhereClauseSubqueryPlan {
-                        subquery_type: WhereClauseSubqueryType::Exists,
-                        plan,
-                    })),
-                ));
+                    t_ctx.resolver.where_clause_subquery_plans.push((
+                        expr,
+                        RefCell::new(Some(WhereClauseSubqueryPlan {
+                            subquery_type: WhereClauseSubqueryType::Scalar,
+                            plan,
+                        })),
+                    ));
+                }
+                _ => {}
             }
-
             Ok(())
         })?;
     }
-
     Ok(())
 }

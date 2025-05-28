@@ -539,11 +539,11 @@ pub fn determine_where_to_eval_term(
         ));
     }
 
-    if let Some(eval_at) = term.eval_at_override.get() {
-        return Ok(eval_at);
+    let eval_at = determine_where_to_eval_expr(&term.expr, join_order, outer_query_refs)?;
+    match term.eval_at_override.get() {
+        Some(eval_at_override) => Ok(eval_at_override.max(eval_at)),
+        None => Ok(eval_at),
     }
-
-    determine_where_to_eval_expr(&term.expr, join_order, outer_query_refs)
 }
 
 /// A bitmask representing a set of tables in a query plan.

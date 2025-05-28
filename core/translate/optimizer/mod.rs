@@ -509,7 +509,9 @@ impl Optimizable for ast::Expr {
                     return true;
                 }
 
-                let table_ref = tables.find_joined_table_by_internal_id(*table).unwrap();
+                let table_ref = tables
+                    .find_table_by_internal_id(*table)
+                    .expect("table must be found; a parse-error should have been raised earlier");
                 let columns = table_ref.columns();
                 let column = &columns[*column];
                 return column.primary_key || column.notnull;

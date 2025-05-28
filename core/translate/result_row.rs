@@ -106,6 +106,13 @@ pub fn emit_result_row_and_limit(
                 dest: *exists_reg,
             });
         }
+        QueryDestination::ScalarSubquery { scalar_reg } => {
+            program.emit_insn(Insn::Copy {
+                src_reg: result_columns_start_reg,
+                dst_reg: *scalar_reg,
+                amount: 0,
+            });
+        }
         QueryDestination::CoroutineYield { yield_reg, .. } => {
             program.emit_insn(Insn::Yield {
                 yield_reg: *yield_reg,

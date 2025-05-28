@@ -548,3 +548,27 @@ do_execsql_test_on_specific_db {:memory:} subquery-not-exists-all-match {
     );
 } {1|alice@test.com
 2|bob@test.com}
+
+# SCALAR SUBQUERIES
+
+# Get products with price higher than average price
+do_execsql_test_on_specific_db {:memory:} subquery-scalar-comparison {
+    create table products(id, name, price);
+    insert into products values (1, 'hat', 50), (2, 'cap', 25), (3, 'jacket', 75);
+    
+    select * from products where price >= (
+        select avg(price) from products
+    );
+} {1|hat|50
+3|jacket|75}
+
+# Get users with the highest score
+do_execsql_test_on_specific_db {:memory:} subquery-scalar-max {
+    create table users(id, name, score);
+    insert into users values (1, 'Alice', 85), (2, 'Bob', 92), (3, 'Charlie', 92);
+    
+    select * from users where score = (
+        select max(score) from users
+    );
+} {2|Bob|92
+3|Charlie|92}

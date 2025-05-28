@@ -1,5 +1,5 @@
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{translate_expr_no_constant_opt, NoConstantOptReason};
+use crate::translate::expr::{translate_expr, translate_expr_no_constant_opt, NoConstantOptReason};
 use crate::translate::plan::{QueryDestination, SelectPlan};
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::Insn;
@@ -27,6 +27,14 @@ pub fn emit_values(
                 dest: exists_reg,
             });
             exists_reg
+        }
+        QueryDestination::ScalarSubquery { scalar_reg } => {
+            assert!(
+                plan.values.len() == 1 && plan.values[0].len() == 1,
+                "scalar subqueries must return exactly one column and one row"
+            );
+            translate_expr(program, None, &plan.values[0][0], scalar_reg, resolver)?;
+            scalar_reg
         }
         QueryDestination::EphemeralIndex { .. } => unreachable!(),
         QueryDestination::Unset => {
@@ -74,6 +82,13 @@ fn emit_values_when_single_row(
                 value: 1,
                 dest: exists_reg,
             });
+        }
+        QueryDestination::ScalarSubquery { scalar_reg } => {
+            assert!(
+                plan.values.len() == 1 && plan.values[0].len() == 1,
+                "scalar subqueries must return exactly one column and one row"
+            );
+            translate_expr(program, None, &plan.values[0][0], scalar_reg, resolver)?;
         }
         QueryDestination::EphemeralIndex { .. } => unreachable!(),
         QueryDestination::Unset => {

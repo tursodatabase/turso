@@ -2222,6 +2222,23 @@ fn translate_where_clause_subquery(
     target_register: usize,
 ) -> Result<usize> {
     program.incr_nesting();
+    let is_correlated_subquery = subquery_plan
+        .plan
+        .table_references
+        .outer_query_refs()
+        .iter()
+        .any(|outer_query_ref| outer_query_ref.is_used());
+
+    let label_skip_after_first_run = if !is_correlated_subquery {
+        let label = program.allocate_label();
+        program.emit_insn(Insn::Once {
+            target_pc_when_reentered: label,
+        });
+        Some(label)
+    } else {
+        None
+    };
+
     match &subquery_plan.subquery_type {
         WhereClauseSubqueryType::Exists => {
             let subroutine_reg = program.alloc_register();
@@ -2256,8 +2273,37 @@ fn translate_where_clause_subquery(
             todo!();
         }
         WhereClauseSubqueryType::Scalar => {
-            todo!();
+            let subroutine_reg = program.alloc_register();
+            program.emit_insn(Insn::BeginSubrtn {
+                dest: subroutine_reg,
+                dest_end: None,
+            });
+            program.emit_insn(Insn::Null {
+                dest: target_register,
+                dest_end: None,
+            });
+            assert!(matches!(
+                subquery_plan.plan.query_destination,
+                QueryDestination::Unset,
+            ), "scalar subqueries should have an unset query destination, as the destination is determined at translation time");
+            subquery_plan.plan.query_destination = QueryDestination::ScalarSubquery {
+                scalar_reg: target_register,
+            };
+            emit_program_for_select(
+                program,
+                subquery_plan.plan,
+                resolver.schema,
+                resolver.symbol_table,
+            )?;
+            program.emit_insn(Insn::Return {
+                return_reg: subroutine_reg,
+                can_fallthrough: true,
+            });
         }
+    }
+
+    if let Some(label) = label_skip_after_first_run {
+        program.preassign_label_to_next_insn(label);
     }
 
     program.decr_nesting();
