@@ -572,3 +572,58 @@ do_execsql_test_on_specific_db {:memory:} subquery-scalar-max {
     );
 } {2|Bob|92
 3|Charlie|92}
+
+# (x,y) IN SUBQUERIES
+
+# Get products from specific categories using IN
+do_execsql_test_on_specific_db {:memory:} subquery-in-single-column {
+    create table products(id, name, category_id);
+    create table categories(id, name);
+    insert into categories values (1, 'Clothing'), (2, 'Electronics'), (3, 'Books');
+    insert into products values (1, 'hat', 1), (2, 'laptop', 2), (3, 'novel', 3), (4, 'cap', 1);
+    
+    select * from products where category_id in (
+        select id from categories where name in ('Clothing', 'Electronics')
+    );
+} {1|hat|1
+2|laptop|2
+4|cap|1}
+
+# Get products NOT in discontinued categories
+do_execsql_test_on_specific_db {:memory:} subquery-not-in-single-column {
+    create table products(id, name, category_id);
+    create table discontinued_categories(category_id);
+    insert into products values (1, 'hat', 1), (2, 'laptop', 2), (3, 'book', 3);
+    insert into discontinued_categories values (2);
+    
+    select * from products where category_id not in (
+        select category_id from discontinued_categories
+    );
+} {1|hat|1
+3|book|3}
+
+# Get order items matching specific product-quantity combinations
+do_execsql_test_on_specific_db {:memory:} subquery-in-multiple-columns {
+    create table order_items(order_id, product_id, quantity);
+    create table special_offers(product_id, min_quantity);
+    insert into order_items values (1, 10, 5), (2, 20, 3), (3, 10, 2), (4, 30, 1);
+    insert into special_offers values (10, 5), (20, 3);
+    
+    select * from order_items where (product_id, quantity) in (
+        select product_id, min_quantity from special_offers
+    );
+} {1|10|5
+2|20|3}
+
+# Get users whose (name, age) combination is not in the restricted list
+do_execsql_test_on_specific_db {:memory:} subquery-not-in-multiple-columns {
+    create table users(id, name, age);
+    create table restricted_profiles(name, age);
+    insert into users values (1, 'Alice', 25), (2, 'Bob', 30), (3, 'Charlie', 25);
+    insert into restricted_profiles values ('Bob', 30);
+    
+    select * from users where (name, age) not in (
+        select name, age from restricted_profiles
+    );
+} {1|Alice|25
+3|Charlie|25}

@@ -384,10 +384,10 @@ pub fn translate_condition_expr(
             translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
             emit_cond_jump(program, condition_metadata, expr_reg);
         }
-        ast::Expr::Exists(_) => {
-            let exists_reg = program.alloc_register();
-            translate_expr(program, Some(referenced_tables), expr, exists_reg, resolver)?;
-            emit_cond_jump(program, condition_metadata, exists_reg);
+        ast::Expr::Exists(_) | ast::Expr::InSelect { .. } | ast::Expr::Subquery { .. } => {
+            let result_reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), expr, result_reg, resolver)?;
+            emit_cond_jump(program, condition_metadata, result_reg);
         }
         other => todo!("expression {:?} not implemented", other),
     }
@@ -2098,8 +2098,13 @@ pub fn translate_expr(
             let Some(subquery_plan) = resolver.resolve_where_clause_subquery_plan(expr) else {
                 crate::bail_parse_error!("subquery for Expr::Subquery not found in resolver");
             };
-            let subquery_result_reg =
-                translate_where_clause_subquery(program, resolver, subquery_plan, target_register)?;
+            let subquery_result_reg = translate_where_clause_subquery(
+                program,
+                referenced_tables.expect("referenced_tables is only unset in insert path"),
+                resolver,
+                subquery_plan,
+                target_register,
+            )?;
             Ok(subquery_result_reg)
         }
         ast::Expr::Unary(op, expr) => match (op, expr.as_ref()) {
@@ -2217,6 +2222,7 @@ pub fn translate_expr(
 /// AI mostly generated the above roast and I think it's worth keeping.
 fn translate_where_clause_subquery(
     program: &mut ProgramBuilder,
+    referenced_tables: &TableReferences,
     resolver: &Resolver,
     mut subquery_plan: WhereClauseSubqueryPlan,
     target_register: usize,
@@ -2268,9 +2274,159 @@ fn translate_where_clause_subquery(
                 return_reg: subroutine_reg,
                 can_fallthrough: true,
             });
+            if let Some(label) = label_skip_after_first_run {
+                program.preassign_label_to_next_insn(label);
+            }
         }
-        WhereClauseSubqueryType::In { .. } => {
-            todo!();
+        WhereClauseSubqueryType::In {
+            not,
+            lhs,
+            ephemeral_index,
+        } => {
+            assert!(matches!(
+                subquery_plan.plan.query_destination,
+                QueryDestination::Unset,
+            ), "IN subqueries should have an unset query destination, as the destination is determined at translation time");
+            let (cursor_id, ephemeral_index) = ephemeral_index;
+
+            subquery_plan.plan.query_destination = QueryDestination::EphemeralIndex {
+                cursor_id: *cursor_id,
+                index: ephemeral_index.clone(),
+            };
+
+            let subroutine_reg = program.alloc_register();
+            program.emit_insn(Insn::BeginSubrtn {
+                dest: subroutine_reg,
+                dest_end: None,
+            });
+            program.emit_insn(Insn::OpenEphemeral {
+                cursor_id: *cursor_id,
+                is_table: false,
+            });
+            emit_program_for_select(
+                program,
+                subquery_plan.plan,
+                resolver.schema,
+                resolver.symbol_table,
+            )?;
+            program.emit_insn(Insn::Return {
+                return_reg: subroutine_reg,
+                can_fallthrough: true,
+            });
+
+            if let Some(label) = label_skip_after_first_run {
+                program.preassign_label_to_next_insn(label);
+            }
+
+            // jump here when we can definitely skip the row
+            let label_skip_row = program.allocate_label();
+            // jump here when we can definitely include the row
+            let label_include_row = program.allocate_label();
+            // jump here when we need to make extra null-related checks, because sql null is the greatest thing ever
+            let label_null_rewind = program.allocate_label();
+            let label_null_checks_loop_start = program.allocate_label();
+            let label_null_checks_next = program.allocate_label();
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: target_register,
+            });
+            let lhs_columns = match unwrap_parens(lhs.as_ref())? {
+                ast::Expr::Parenthesized(exprs) => exprs.iter(),
+                expr => std::slice::from_ref(expr).iter(),
+            };
+            let lhs_column_count = lhs_columns.len();
+            let lhs_column_regs_start = program.alloc_registers(lhs_column_count);
+            for (i, lhs_column) in lhs_columns.enumerate() {
+                translate_expr(
+                    program,
+                    Some(referenced_tables),
+                    lhs_column,
+                    lhs_column_regs_start + i,
+                    resolver,
+                )?;
+                if !lhs_column.is_nonnull(referenced_tables) {
+                    program.emit_insn(Insn::IsNull {
+                        reg: lhs_column_regs_start + i,
+                        target_pc: if *not {
+                            label_null_rewind
+                        } else {
+                            label_skip_row
+                        },
+                    });
+                }
+            }
+            if *not {
+                // WHERE ... NOT IN (SELECT ...)
+                // We must skip the row if we find a match.
+                program.emit_insn(Insn::Found {
+                    cursor_id: *cursor_id,
+                    target_pc: label_skip_row,
+                    record_reg: lhs_column_regs_start,
+                    num_regs: lhs_column_count,
+                });
+                // Ok, so Found didn't return a match.
+                // Because SQL NULL, we need do extra checks to see if we can include the row.
+                // Consider:
+                // 1. SELECT * FROM T WHERE 1 NOT IN (SELECT NULL),
+                // 2. SELECT * FROM T WHERE 1 IN (SELECT NULL) -- or anything else where the subquery evaluates to NULL.
+                // _Both_ of these queries should return nothing, because... SQL NULL.
+                // The same goes for e.g. SELECT * FROM T WHERE (1,1) NOT IN (SELECT NULL, NULL).
+                // However, it does _NOT_ apply for SELECT * FROM T WHERE (1,1) NOT IN (SELECT NULL, 1).
+                // BUT: it DOES apply for SELECT * FROM T WHERE (2,2) NOT IN ((1,1), (NULL, NULL))!!!
+                // Ergo: if the subquery result has _ANY_ tuples with all NULLs, we need to NOT include the row.
+                //
+                // So, if we didn't found a match (and hence, so far, our 'NOT IN' condition still applies),
+                // we must still rewind the subquery's ephemeral index cursor and go through ALL rows and compare each LHS column (with !=) to the corresponding column in the ephemeral index.
+                // Comparison instructions have the default behavior that if either operand is NULL, the comparison is completely skipped.
+                // That means: if we, for ANY row in the ephemeral index, get through all the != comparisons without jumping,
+                // it means our subquery result has a tuple that is exactly NULL (or (NULL, NULL) etc.),
+                // in which case we need to NOT include the row.
+                // If ALL the rows jump at one of the != comparisons, it means our subquery result has no tuples with all NULLs -> we can include the row.
+                program.preassign_label_to_next_insn(label_null_rewind);
+                program.emit_insn(Insn::Rewind {
+                    cursor_id: *cursor_id,
+                    pc_if_empty: label_include_row,
+                });
+                program.preassign_label_to_next_insn(label_null_checks_loop_start);
+                let column_check_reg = program.alloc_register();
+                for i in 0..lhs_column_count {
+                    program.emit_insn(Insn::Column {
+                        cursor_id: *cursor_id,
+                        column: i,
+                        dest: column_check_reg,
+                    });
+                    program.emit_insn(Insn::Ne {
+                        lhs: lhs_column_regs_start + i,
+                        rhs: column_check_reg,
+                        target_pc: label_null_checks_next,
+                        flags: CmpInsFlags::default(),
+                        collation: program.curr_collation(),
+                    });
+                }
+                program.emit_insn(Insn::Goto {
+                    target_pc: label_skip_row,
+                });
+                program.preassign_label_to_next_insn(label_null_checks_next);
+                program.emit_insn(Insn::Next {
+                    cursor_id: *cursor_id,
+                    pc_if_next: label_null_checks_loop_start,
+                })
+            } else {
+                // WHERE ... IN (SELECT ...)
+                // We can skip the row if we don't find a match
+                program.emit_insn(Insn::NotFound {
+                    cursor_id: *cursor_id,
+                    target_pc: label_skip_row,
+                    record_reg: lhs_column_regs_start,
+                    num_regs: lhs_column_count,
+                });
+            }
+            program.preassign_label_to_next_insn(label_include_row);
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: target_register,
+            });
+            program.preassign_label_to_next_insn(label_skip_row);
         }
         WhereClauseSubqueryType::Scalar => {
             let subroutine_reg = program.alloc_register();
@@ -2299,11 +2455,10 @@ fn translate_where_clause_subquery(
                 return_reg: subroutine_reg,
                 can_fallthrough: true,
             });
+            if let Some(label) = label_skip_after_first_run {
+                program.preassign_label_to_next_insn(label);
+            }
         }
-    }
-
-    if let Some(label) = label_skip_after_first_run {
-        program.preassign_label_to_next_insn(label);
     }
 
     program.decr_nesting();
@@ -2723,12 +2878,15 @@ pub fn as_binary_components(
 
 /// Recursively unwrap parentheses from an expression
 /// e.g. (((t.x > 5))) -> t.x > 5
-fn unwrap_parens(expr: &ast::Expr) -> Result<&ast::Expr> {
+/// Returns the expression without the parentheses,
+/// unless the parenthesized expression is a comma separated list, for example:
+/// (((t.x))) -> t.x,
+/// (((t.x, y))) -> (t.x, y),
+pub fn unwrap_parens(expr: &ast::Expr) -> Result<&ast::Expr> {
     match expr {
-        ast::Expr::Column { .. } => Ok(expr),
         ast::Expr::Parenthesized(exprs) => match exprs.len() {
             1 => unwrap_parens(exprs.first().unwrap()),
-            _ => crate::bail_parse_error!("expected single expression in parentheses"),
+            _ => Ok(expr),
         },
         _ => Ok(expr),
     }

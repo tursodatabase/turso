@@ -166,7 +166,11 @@ pub struct WhereClauseSubqueryPlan {
 ///     - `SELECT * FROM t WHERE x > (SELECT y FROM t2 WHERE z = 1)`
 pub enum WhereClauseSubqueryType {
     Exists,
-    In { not: bool, lhs: Box<ast::Expr> },
+    In {
+        not: bool,
+        lhs: Box<ast::Expr>,
+        ephemeral_index: (CursorID, Arc<Index>),
+    },
     Scalar,
 }
 

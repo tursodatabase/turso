@@ -1,8 +1,11 @@
-use std::cell::RefCell;
+use std::{cell::RefCell, sync::Arc};
 
 use crate::{
-    schema::Table,
-    vdbe::{builder::ProgramBuilder, insn::Insn},
+    schema::{Index, IndexColumn, Table},
+    vdbe::{
+        builder::{CursorType, ProgramBuilder},
+        insn::Insn,
+    },
     Result,
 };
 
@@ -10,7 +13,7 @@ use limbo_sqlite3_parser::ast;
 
 use super::{
     emitter::{emit_query, Resolver, TranslateCtx},
-    expr::walk_expr,
+    expr::{unwrap_parens, walk_expr},
     main_loop::LoopLabels,
     optimizer::optimize_select_plan,
     plan::{
@@ -167,7 +170,7 @@ pub fn compute_plans_for_where_clause_subqueries<'a>(
         Ok(max_eval_at)
     };
 
-    for where_term in where_terms {
+    for (where_term_idx, where_term) in where_terms.iter().enumerate() {
         walk_expr(&where_term.expr, &mut |expr: &'a ast::Expr| -> Result<()> {
             match expr {
                 ast::Expr::Exists(subselect) => {
@@ -229,6 +232,70 @@ pub fn compute_plans_for_where_clause_subqueries<'a>(
                         expr,
                         RefCell::new(Some(WhereClauseSubqueryPlan {
                             subquery_type: WhereClauseSubqueryType::Scalar,
+                            plan,
+                        })),
+                    ));
+                }
+                ast::Expr::InSelect { lhs, not, rhs } => {
+                    let outer_query_refs = get_outer_query_refs(referenced_tables);
+                    let plan = prepare_select_plan(
+                        t_ctx.resolver.schema,
+                        rhs.as_ref().clone(),
+                        t_ctx.resolver.symbol_table,
+                        &outer_query_refs,
+                        &mut program.table_reference_counter,
+                        QueryDestination::Unset, // The destination is set at translation time.
+                    )?;
+                    let Plan::Select(mut plan) = plan else {
+                        crate::bail_parse_error!(
+                            "compound SELECT queries not supported yet in WHERE clause subqueries"
+                        );
+                    };
+
+                    // e.g. (x,y) IN (SELECT ...)
+                    // or x IN (SELECT ...)
+                    let lhs_column_count = match unwrap_parens(lhs.as_ref())? {
+                        ast::Expr::Parenthesized(exprs) => exprs.len(),
+                        _ => 1,
+                    };
+                    if lhs_column_count != plan.result_columns.len() {
+                        crate::bail_parse_error!(
+                            "lhs of IN subquery must have the same number of columns as the subquery"
+                        );
+                    }
+                    optimize_select_plan(&mut plan, t_ctx.resolver.schema)?;
+
+                    let ephemeral_index = Arc::new(Index {
+                        columns: plan
+                            .result_columns
+                            .iter()
+                            .enumerate()
+                            .map(|(i, c)| IndexColumn {
+                                name: c.name(&plan.table_references).unwrap_or("").to_string(),
+                                order: ast::SortOrder::Asc,
+                                pos_in_table: i,
+                                collation: None, // TODO: this should be inferred
+                            })
+                            .collect(),
+                        name: format!("ephemeral_index_where_sub_{}", where_term_idx),
+                        table_name: String::new(),
+                        ephemeral: true,
+                        has_rowid: false,
+                        root_page: 0,
+                        unique: false,
+                    });
+
+                    let cursor_id =
+                        program.alloc_cursor_id(CursorType::BTreeIndex(ephemeral_index.clone()));
+
+                    t_ctx.resolver.where_clause_subquery_plans.push((
+                        expr,
+                        RefCell::new(Some(WhereClauseSubqueryPlan {
+                            subquery_type: WhereClauseSubqueryType::In {
+                                not: *not,
+                                lhs: lhs.clone(),
+                                ephemeral_index: (cursor_id, ephemeral_index),
+                            },
                             plan,
                         })),
                     ));
