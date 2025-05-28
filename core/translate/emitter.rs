@@ -20,7 +20,7 @@ use super::plan::{
 };
 use super::schema::ParseSchema;
 use super::select::emit_simple_count;
-use super::subquery::emit_subqueries;
+use super::subquery::emit_from_clause_subqueries;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::function::Func;
 use crate::schema::{Index, IndexColumn, Schema};

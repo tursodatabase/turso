@@ -22,6 +22,11 @@ pub fn emit_values(
             emit_values_in_subquery(program, plan, resolver, yield_reg)?
         }
         QueryDestination::EphemeralIndex { .. } => unreachable!(),
+        QueryDestination::Unset => {
+            return Err(crate::LimboError::InternalError(
+                "query destination must be set before translation".to_string(),
+            ))
+        }
     };
     Ok(reg_result_cols_start)
 }
@@ -58,6 +63,11 @@ fn emit_values_when_single_row(
             });
         }
         QueryDestination::EphemeralIndex { .. } => unreachable!(),
+        QueryDestination::Unset => {
+            return Err(crate::LimboError::InternalError(
+                "query destination must be set before translation".to_string(),
+            ))
+        }
     }
     Ok(start_reg)
 }

@@ -373,6 +373,11 @@ pub enum QueryDestination {
         /// The index that will be used to store the results.
         index: Arc<Index>,
     },
+    /// The query destination is not set yet.
+    /// It must be set before translation, or an internal error is returned.
+    /// This is used for subqueries that e.g. receive target registers from the parent query,
+    /// so their precise destination parameters are set ad-hoc.
+    Unset,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

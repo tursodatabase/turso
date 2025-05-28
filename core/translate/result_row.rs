@@ -106,6 +106,11 @@ pub fn emit_result_row_and_limit(
                 end_offset: BranchOffset::Offset(0),
             });
         }
+        QueryDestination::Unset => {
+            return Err(crate::LimboError::InternalError(
+                "query destination must be set before translation".to_string(),
+            ))
+        }
     }
 
     if plan.limit.is_some() {
