@@ -1,8 +1,10 @@
 use limbo_sqlite3_parser::ast::{self, UnaryOperator};
 
-use super::emitter::Resolver;
+use super::emitter::{emit_program_for_select, Resolver};
 use super::optimizer::Optimizable;
-use super::plan::TableReferences;
+use super::plan::{
+    QueryDestination, TableReferences, WhereClauseSubqueryPlan, WhereClauseSubqueryType,
+};
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
@@ -382,6 +384,11 @@ pub fn translate_condition_expr(
             translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
             emit_cond_jump(program, condition_metadata, expr_reg);
         }
+        ast::Expr::Exists(_) => {
+            let exists_reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), expr, exists_reg, resolver)?;
+            emit_cond_jump(program, condition_metadata, exists_reg);
+        }
         other => todo!("expression {:?} not implemented", other),
     }
     Ok(())
@@ -636,7 +643,6 @@ pub fn translate_expr(
             Ok(target_register)
         }
         ast::Expr::DoublyQualified(_, _, _) => todo!(),
-        ast::Expr::Exists(_) => todo!(),
         ast::Expr::FunctionCall {
             name,
             distinctness: _,
@@ -1937,7 +1943,6 @@ pub fn translate_expr(
             Ok(target_register)
         }
         ast::Expr::InList { .. } => todo!(),
-        ast::Expr::InSelect { .. } => todo!(),
         ast::Expr::InTable { .. } => todo!(),
         ast::Expr::IsNull(expr) => {
             let reg = program.alloc_register();
@@ -2089,7 +2094,14 @@ pub fn translate_expr(
             unreachable!("Qualified should be resolved to a Column before translation")
         }
         ast::Expr::Raise(_, _) => todo!(),
-        ast::Expr::Subquery(_) => todo!(),
+        ast::Expr::Subquery(_) | ast::Expr::InSelect { .. } | ast::Expr::Exists(_) => {
+            let Some(subquery_plan) = resolver.resolve_where_clause_subquery_plan(expr) else {
+                crate::bail_parse_error!("subquery for Expr::Subquery not found in resolver");
+            };
+            let subquery_result_reg =
+                translate_where_clause_subquery(program, resolver, subquery_plan, target_register)?;
+            Ok(subquery_result_reg)
+        }
         ast::Expr::Unary(op, expr) => match (op, expr.as_ref()) {
             (UnaryOperator::Positive, expr) => {
                 translate_expr(program, referenced_tables, expr, target_register, resolver)
@@ -2189,6 +2201,66 @@ pub fn translate_expr(
         program.constant_span_end(span);
     }
 
+    Ok(target_register)
+}
+
+/// Plan and translate a WHERE clause subquery ad hoc.
+/// Ending up in this function is an admission of defeat, a shameful proclamation
+/// of our inability to unnest this subquery in the optimization phase, and a searing indictment
+/// of us as a team of incompetent fools who have brought dishonor upon our ancestors and shame
+/// upon our profession. We are but mere pretenders to the throne of database engineering,
+/// unworthy of the sacred trust placed in us by users who foolishly believed we could craft
+/// a query optimizer worthy of their data. This function stands as a monument to our failures,
+/// a testament to our hubris, and a warning to future generations that we were here,
+/// and we were terrible at our jobs.
+///
+/// AI mostly generated the above roast and I think it's worth keeping.
+fn translate_where_clause_subquery(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    mut subquery_plan: WhereClauseSubqueryPlan,
+    target_register: usize,
+) -> Result<usize> {
+    program.incr_nesting();
+    match &subquery_plan.subquery_type {
+        WhereClauseSubqueryType::Exists => {
+            let subroutine_reg = program.alloc_register();
+            program.emit_insn(Insn::BeginSubrtn {
+                dest: subroutine_reg,
+                dest_end: None,
+            });
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: target_register,
+            });
+            subquery_plan.plan.limit = Some(1);
+            assert!(matches!(
+                subquery_plan.plan.query_destination,
+                QueryDestination::Unset,
+            ), "EXISTS subqueries should have an unset query destination, as the destination is determined at translation time");
+            subquery_plan.plan.query_destination = QueryDestination::Exists {
+                exists_reg: target_register,
+            };
+            emit_program_for_select(
+                program,
+                subquery_plan.plan,
+                resolver.schema,
+                resolver.symbol_table,
+            )?;
+            program.emit_insn(Insn::Return {
+                return_reg: subroutine_reg,
+                can_fallthrough: true,
+            });
+        }
+        WhereClauseSubqueryType::In { .. } => {
+            todo!();
+        }
+        WhereClauseSubqueryType::Scalar => {
+            todo!();
+        }
+    }
+
+    program.decr_nesting();
     Ok(target_register)
 }
 

@@ -3,6 +3,8 @@
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 
+# FROM CLAUSE SUBQUERIES
+
 do_execsql_test subquery-inner-filter {
     select sub.loud_hat from (
         select concat(name, '!!!') as loud_hat 
@@ -433,3 +435,116 @@ do_execsql_test subquery-count-all {
         where u.id < 100
     );
 } {1089}
+
+# WHERE CLAUSE SUBQUERIES
+
+# EXISTS/NOT EXISTS
+
+do_execsql_test_on_specific_db {:memory:} subquery-exists-basic {
+    create table test(a);
+    insert into test values (1);
+    select * from test where exists (select 0);
+    select * from test where not exists (select 0 where false)
+} {1
+1}
+
+# Trivial example: get all users if there are any products
+do_execsql_test_on_specific_db {:memory:} subquery-exists-uncorrelated {
+    create table products(id, name, price);
+    create table users(id, name);
+    insert into products values (1, 'hat', 50), (2, 'cap', 75), (3, 'shirt', 100);
+    insert into users values (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+    
+    select * from users where exists (select 1 from products);
+} {1|Alice
+2|Bob
+3|Charlie}
+
+# Get all products when there are no users
+do_execsql_test_on_specific_db {:memory:} subquery-not-exists-uncorrelated {
+    create table products(id, name, price);
+    create table users(id, name);
+    insert into products values (1, 'hat', 50), (2, 'cap', 75);
+    
+    select * from products where not exists (select 1 from users);
+} {1|hat|50
+2|cap|75}
+
+# Get products that have a matching category
+do_execsql_test_on_specific_db {:memory:} subquery-exists-correlated {
+    create table products(id, name, category_id);
+    create table categories(id, name);
+    insert into products values (1, 'hat', 10), (2, 'cap', 20), (3, 'shirt', 10);
+    insert into categories values (10, 'Clothing'), (30, 'Electronics');
+    
+    select * from products p where exists (
+        select * from categories c where c.id = p.category_id
+    );
+} {1|hat|10
+3|shirt|10}
+
+# Get users who have no orders
+do_execsql_test_on_specific_db {:memory:} subquery-not-exists-correlated {
+    create table users(id, name, age);
+    create table orders(id, user_id, amount);
+    insert into users values (1, 'Alice', 25), (2, 'Bob', 30), (3, 'Charlie', 35);
+    insert into orders values (1, 1, 100), (2, 3, 200);
+    
+    select * from users u where not exists (
+        select * from orders o where o.user_id = u.id
+    );
+} {2|Bob|30}
+
+# Get products that belong to the 'Clothing' category
+do_execsql_test_on_specific_db {:memory:} subquery-exists-with-conditions {
+    create table categories(id, name);
+    create table products(id, name, price, category_id);
+    insert into categories values (1, 'Clothing'), (2, 'Electronics');
+    insert into products values (1, 'hat', 50, 1), (2, 'cap', 25, 1), (3, 'macbook', 75, 2);
+    
+    select * from products p where exists (
+        select * from categories c 
+        where c.id = p.category_id and c.name = 'Clothing'
+    );
+} {1|hat|50|1
+2|cap|25|1}
+
+# Get users who have products with high-rated reviews
+do_execsql_test_on_specific_db {:memory:} subquery-nested-exists {
+    create table users(id, name);
+    create table products(id, name, user_id);
+    create table reviews(id, product_id, rating);
+    insert into users values (1, 'Alice'), (2, 'Bob');
+    insert into products values (1, 'hat', 1), (2, 'cap', 2);
+    insert into reviews values (1, 1, 5);
+    
+    select * from users u where exists (
+        select * from products p where p.user_id = u.id and exists (
+            select 1 from reviews r where r.product_id = p.id and r.rating >= 4
+        )
+    );
+} {1|Alice}
+
+# Get products that have tags (none exist, so empty result)
+do_execsql_test_on_specific_db {:memory:} subquery-exists-empty-result {
+    create table products(id, name);
+    create table tags(product_id, tag);
+    insert into products values (1, 'hat'), (2, 'cap');
+    
+    select * from products p where exists (
+        select * from tags t where t.product_id = p.id
+    );
+} {}
+
+# Get users whose emails are not in the blocked list
+do_execsql_test_on_specific_db {:memory:} subquery-not-exists-all-match {
+    create table users(id, email);
+    create table blocked_emails(email);
+    insert into users values (1, 'alice@test.com'), (2, 'bob@test.com');
+    insert into blocked_emails values ('spam@test.com');
+    
+    select * from users u where not exists (
+        select * from blocked_emails b where b.email = u.email
+    );
+} {1|alice@test.com
+2|bob@test.com}

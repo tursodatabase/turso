@@ -1,13 +1,23 @@
+use std::cell::RefCell;
+
 use crate::{
     schema::Table,
     vdbe::{builder::ProgramBuilder, insn::Insn},
     Result,
 };
 
+use limbo_sqlite3_parser::ast;
+
 use super::{
     emitter::{emit_query, Resolver, TranslateCtx},
+    expr::walk_expr,
     main_loop::LoopLabels,
-    plan::{QueryDestination, SelectPlan, TableReferences},
+    optimizer::optimize_select_plan,
+    plan::{
+        ColumnUsedMask, EvalAt, JoinOrderMember, OuterQueryReference, Plan, QueryDestination,
+        SelectPlan, TableReferences, WhereClauseSubqueryPlan, WhereClauseSubqueryType, WhereTerm,
+    },
+    select::prepare_select_plan,
 };
 
 /// Emit the subqueries contained in the FROM clause.
@@ -94,4 +104,93 @@ pub fn emit_from_clause_subquery<'a>(
     program.emit_insn(Insn::EndCoroutine { yield_reg });
     program.preassign_label_to_next_insn(subquery_body_end_label);
     Ok(result_column_start_reg)
+}
+
+/// Compute a [crate::translate::plan::WhereClauseSubqueryPlan] for each
+/// subquery appearing in the WHERE clause.
+///
+/// Ideally all of these subqueries would be unnested in the optimizer so that
+/// they could be written as regular joins, but right now we translate them in
+/// a naive manner.
+///
+/// This is not a huge problem for uncorrelated subqueries (subqueries that do not
+/// reference any columns from the outer query), but it is a problem for correlated
+/// subqueries, because they need to be evaluated for each row of the outer query,
+/// which has at least quadratic complexity.
+pub fn compute_plans_for_where_clause_subqueries<'a>(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx<'a>,
+    referenced_tables: &TableReferences,
+    where_terms: &'a [WhereTerm],
+    join_order: &[JoinOrderMember],
+) -> Result<()> {
+    for where_term in where_terms {
+        walk_expr(&where_term.expr, &mut |expr: &'a ast::Expr| -> Result<()> {
+            if let ast::Expr::Exists(subselect) = expr {
+                let outer_query_refs = referenced_tables
+                    .joined_tables()
+                    .iter()
+                    .map(|t| OuterQueryReference {
+                        table: t.table.clone(),
+                        identifier: t.identifier.clone(),
+                        internal_id: t.internal_id,
+                        col_used_mask: ColumnUsedMask::new(),
+                    })
+                    .chain(referenced_tables.outer_query_refs().iter().map(|t| {
+                        OuterQueryReference {
+                            table: t.table.clone(),
+                            identifier: t.identifier.clone(),
+                            internal_id: t.internal_id,
+                            col_used_mask: ColumnUsedMask::new(),
+                        }
+                    }))
+                    .collect::<Vec<_>>();
+
+                let plan = prepare_select_plan(
+                    t_ctx.resolver.schema,
+                    subselect.as_ref().clone(),
+                    t_ctx.resolver.symbol_table,
+                    &outer_query_refs,
+                    &mut program.table_reference_counter,
+                    QueryDestination::Unset, // The destination is set at translation time.
+                )?;
+                let Plan::Select(mut plan) = plan else {
+                    crate::bail_parse_error!(
+                        "compound SELECT queries not supported yet in WHERE clause subqueries"
+                    );
+                };
+                optimize_select_plan(&mut plan, t_ctx.resolver.schema)?;
+
+                let mut max_eval_at = EvalAt::BeforeLoop;
+                for outer_query_ref in plan
+                    .table_references
+                    .outer_query_refs()
+                    .iter()
+                    .filter(|t| t.is_used())
+                {
+                    let Some(join_idx) = join_order
+                        .iter()
+                        .position(|j| j.table_id == outer_query_ref.internal_id)
+                    else {
+                        crate::bail_parse_error!("subquery references outer table {}, but it's not found in the outer query's join order", &outer_query_ref.identifier);
+                    };
+                    max_eval_at = max_eval_at.max(EvalAt::Loop(join_idx));
+                }
+
+                where_term.eval_at_override.set(Some(max_eval_at));
+
+                t_ctx.resolver.where_clause_subquery_plans.push((
+                    expr,
+                    RefCell::new(Some(WhereClauseSubqueryPlan {
+                        subquery_type: WhereClauseSubqueryType::Exists,
+                        plan,
+                    })),
+                ));
+            }
+
+            Ok(())
+        })?;
+    }
+
+    Ok(())
 }
