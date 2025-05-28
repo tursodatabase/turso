@@ -513,8 +513,8 @@ pub fn emit_query<'a>(
         return Ok(reg_result_cols_start);
     }
 
-    // Emit subqueries first so the results can be read in the main query loop.
-    emit_subqueries(program, t_ctx, &mut plan.table_references)?;
+    // Emit FROM clause subqueries first so the results can be read in the main query loop.
+    emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references)?;
 
     init_limit(program, t_ctx, plan.limit, plan.offset);
 
