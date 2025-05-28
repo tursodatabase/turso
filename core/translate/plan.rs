@@ -138,6 +138,34 @@ impl WhereTerm {
     }
 }
 
+#[derive(Debug, Clone)]
+/// A WHERE clause subquery plan.
+pub struct WhereClauseSubqueryPlan {
+    /// The type of WHERE clause subquery.
+    pub subquery_type: WhereClauseSubqueryType,
+    /// The plan for the subquery.
+    pub plan: SelectPlan,
+}
+
+#[derive(Debug, Clone)]
+/// The type of WHERE clause subquery.
+///
+/// - `Exists` is a subquery that returns a boolean value indicating whether the subquery returned any rows.
+/// - `In` is a subquery that returns a list of values as the RHS of an IN operator, and LHS is the column(s) to be compared against.
+///     For example:
+///     - `SELECT * FROM t WHERE x IN (SELECT y FROM t2 WHERE z = 1)` or
+///     - `SELECT * FROM t WHERE (x,y) IN (SELECT y,z FROM t2 WHERE z = 1)`
+///      
+/// - `Scalar` is a subquery whose result is compared to another expression with some kind of other comparison operator. It must return a single column and a single row.
+///     For example:
+///     - `SELECT * FROM t WHERE x = (SELECT y FROM t2 WHERE z = 1)` or
+///     - `SELECT * FROM t WHERE x > (SELECT y FROM t2 WHERE z = 1)`
+pub enum WhereClauseSubqueryType {
+    Exists,
+    In { not: bool, lhs: Box<ast::Expr> },
+    Scalar,
+}
+
 use crate::ast::{Expr, Operator};
 
 // This function takes an operator and returns the operator you would obtain if the operands were swapped.
