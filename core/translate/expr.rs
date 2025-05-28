@@ -1790,7 +1790,12 @@ pub fn translate_expr(
             column,
             is_rowid_alias,
         } => {
-            let table_reference = referenced_tables.as_ref().unwrap().get(*table).unwrap();
+            let table_reference = referenced_tables
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|t| t.internal_id == *table)
+                .unwrap();
             let index = table_reference.op.index();
             let use_covering_index = table_reference.utilizes_covering_index();
 
@@ -1883,7 +1888,12 @@ pub fn translate_expr(
             }
         }
         ast::Expr::RowId { database: _, table } => {
-            let table_reference = referenced_tables.as_ref().unwrap().get(*table).unwrap();
+            let table_reference = referenced_tables
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|t| t.internal_id == *table)
+                .unwrap();
             let index = table_reference.op.index();
             let use_covering_index = table_reference.utilizes_covering_index();
             if use_covering_index {
@@ -2602,9 +2612,9 @@ pub fn unwrap_parens_owned(expr: ast::Expr) -> Result<(ast::Expr, usize)> {
 }
 
 /// Recursively walks an immutable expression, applying a function to each sub-expression.
-pub fn walk_expr<F>(expr: &ast::Expr, func: &mut F) -> Result<()>
+pub fn walk_expr<'a, F>(expr: &'a ast::Expr, func: &mut F) -> Result<()>
 where
-    F: FnMut(&ast::Expr) -> Result<()>,
+    F: FnMut(&'a ast::Expr) -> Result<()>,
 {
     func(expr)?;
     match expr {
@@ -2778,9 +2788,9 @@ where
     Ok(())
 }
 
-fn walk_expr_frame_bound<F>(bound: &ast::FrameBound, func: &mut F) -> Result<()>
+fn walk_expr_frame_bound<'a, F>(bound: &'a ast::FrameBound, func: &mut F) -> Result<()>
 where
-    F: FnMut(&ast::Expr) -> Result<()>,
+    F: FnMut(&'a ast::Expr) -> Result<()>,
 {
     match bound {
         ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) => {

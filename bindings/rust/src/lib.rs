@@ -485,4 +485,34 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_database_persistence_write_one_frame_many_times() -> Result<()> {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+
+        for i in 0..100 {
+            {
+                let db = Builder::new_local(db_path).build().await?;
+                let conn = db.connect()?;
+
+                conn.execute("CREATE TABLE IF NOT EXISTS test_persistence (id INTEGER PRIMARY KEY, name TEXT NOT NULL);", ()).await?;
+                conn.execute("INSERT INTO test_persistence (name) VALUES ('Alice');", ())
+                    .await?;
+            }
+            {
+                let db = Builder::new_local(db_path).build().await?;
+                let conn = db.connect()?;
+
+                let mut rows_iter = conn
+                    .query("SELECT count(*) FROM test_persistence;", ())
+                    .await?;
+                let rows = rows_iter.next().await?.unwrap();
+                assert_eq!(rows.get_value(0)?, Value::Integer(i as i64 + 1));
+                assert!(rows_iter.next().await?.is_none());
+            }
+        }
+
+        Ok(())
+    }
 }

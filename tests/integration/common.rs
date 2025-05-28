@@ -1,4 +1,4 @@
-use limbo_core::{CheckpointStatus, Connection, Database, IO};
+use limbo_core::{Connection, Database, PagerCacheflushStatus, IO};
 use rand::{rng, RngCore};
 use rusqlite::params;
 use std::path::{Path, PathBuf};
@@ -86,10 +86,10 @@ impl TempDatabase {
 pub(crate) fn do_flush(conn: &Rc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
     loop {
         match conn.cacheflush()? {
-            CheckpointStatus::Done(_) => {
+            PagerCacheflushStatus::Done(_) => {
                 break;
             }
-            CheckpointStatus::IO => {
+            PagerCacheflushStatus::IO => {
                 tmp_db.io.run_once()?;
             }
         }

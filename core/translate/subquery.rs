@@ -5,9 +5,9 @@ use crate::{
 };
 
 use super::{
-    emitter::{emit_query, LimitCtx, Resolver, TranslateCtx},
+    emitter::{emit_query, Resolver, TranslateCtx},
     main_loop::LoopLabels,
-    plan::{SelectPlan, SelectQueryType, TableReference},
+    plan::{QueryDestination, SelectPlan, TableReference},
 };
 
 /// Emit the subqueries contained in the FROM clause.
@@ -51,8 +51,8 @@ pub fn emit_subquery<'a>(
 ) -> Result<usize> {
     let yield_reg = program.alloc_register();
     let coroutine_implementation_start_offset = program.allocate_label();
-    match &mut plan.query_type {
-        SelectQueryType::Subquery {
+    match &mut plan.query_destination {
+        QueryDestination::CoroutineYield {
             yield_reg: y,
             coroutine_implementation_start,
         } => {
@@ -77,10 +77,10 @@ pub fn emit_subquery<'a>(
         reg_result_cols_start: None,
         result_column_indexes_in_orderby_sorter: (0..plan.result_columns.len()).collect(),
         result_columns_to_skip_in_orderby_sorter: None,
-        limit_ctx: plan.limit.map(|_| LimitCtx::new(program)),
-        reg_offset: plan.offset.map(|_| program.alloc_register()),
-        reg_limit_offset_sum: plan.offset.map(|_| program.alloc_register()),
-        resolver: Resolver::new(t_ctx.resolver.symbol_table),
+        limit_ctx: None,
+        reg_offset: None,
+        reg_limit_offset_sum: None,
+        resolver: Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table),
     };
     let subquery_body_end_label = program.allocate_label();
     program.emit_insn(Insn::InitCoroutine {
@@ -89,15 +89,6 @@ pub fn emit_subquery<'a>(
         start_offset: coroutine_implementation_start_offset,
     });
     program.preassign_label_to_next_insn(coroutine_implementation_start_offset);
-    // Normally we mark each LIMIT value as a constant insn that is emitted only once, but in the case of a subquery,
-    // we need to initialize it every time the subquery is run; otherwise subsequent runs of the subquery will already
-    // have the LIMIT counter at 0, and will never return rows.
-    if let Some(limit) = plan.limit {
-        program.emit_insn(Insn::Integer {
-            value: limit as i64,
-            dest: metadata.limit_ctx.unwrap().reg_limit,
-        });
-    }
     let result_column_start_reg = emit_query(program, plan, &mut metadata)?;
     program.resolve_label(end_coroutine_label, program.offset());
     program.emit_insn(Insn::EndCoroutine { yield_reg });

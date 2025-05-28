@@ -1,4 +1,3 @@
-use std::ops::Deref;
 use std::rc::Rc;
 
 use limbo_sqlite3_parser::ast::{
@@ -10,6 +9,7 @@ use crate::schema::{IndexColumn, Table};
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode};
 use crate::vdbe::insn::{IdxInsertFlags, RegisterOrLiteral};
+use crate::vdbe::BranchOffset;
 use crate::{
     schema::{Column, Schema},
     vdbe::{
@@ -20,19 +20,27 @@ use crate::{
 use crate::{Result, SymbolTable, VirtualTable};
 
 use super::emitter::Resolver;
-use super::expr::{translate_expr_no_constant_opt, NoConstantOptReason};
+use super::expr::{translate_expr, translate_expr_no_constant_opt, NoConstantOptReason};
 use super::optimizer::rewrite_expr;
+use super::plan::QueryDestination;
+use super::select::translate_select;
+
+struct TempTableCtx {
+    cursor_id: usize,
+    loop_start_label: BranchOffset,
+    loop_end_label: BranchOffset,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn translate_insert(
     query_mode: QueryMode,
     schema: &Schema,
-    with: &Option<With>,
-    on_conflict: &Option<ResolveType>,
-    tbl_name: &QualifiedName,
-    columns: &Option<DistinctNames>,
-    body: &mut InsertBody,
-    _returning: &Option<Vec<ResultColumn>>,
+    with: Option<With>,
+    on_conflict: Option<ResolveType>,
+    tbl_name: QualifiedName,
+    columns: Option<DistinctNames>,
+    mut body: InsertBody,
+    _returning: Option<Vec<ResultColumn>>,
     syms: &SymbolTable,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
@@ -56,11 +64,11 @@ pub fn translate_insert(
         None => crate::bail_corrupt_error!("Parse error: no such table: {}", table_name),
     };
 
-    let resolver = Resolver::new(syms);
+    let resolver = Resolver::new(schema, syms);
 
     if let Some(virtual_table) = &table.virtual_table() {
-        translate_virtual_table_insert(
-            &mut program,
+        program = translate_virtual_table_insert(
+            program,
             virtual_table.clone(),
             columns,
             body,
@@ -78,10 +86,187 @@ pub fn translate_insert(
         crate::bail_parse_error!("INSERT into WITHOUT ROWID table is not supported");
     }
 
-    let cursor_id = program.alloc_cursor_id(
-        Some(table_name.0.clone()),
-        CursorType::BTreeTable(btree_table.clone()),
-    );
+    let root_page = btree_table.root_page;
+
+    let mut values: Option<Vec<Expr>> = None;
+    let inserting_multiple_rows = match &mut body {
+        InsertBody::Select(select, _) => match select.body.select.as_mut() {
+            // TODO see how to avoid clone
+            OneSelect::Values(values_expr) if values_expr.len() <= 1 => {
+                if values_expr.is_empty() {
+                    crate::bail_parse_error!("no values to insert");
+                }
+                let mut param_idx = 1;
+                for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
+                    rewrite_expr(expr, &mut param_idx)?;
+                }
+                values = values_expr.pop();
+                false
+            }
+            _ => true,
+        },
+        InsertBody::DefaultValues => false,
+    };
+
+    let halt_label = program.allocate_label();
+    let loop_start_label = program.allocate_label();
+
+    let mut yield_reg_opt = None;
+    let mut temp_table_ctx = None;
+    let (num_values, cursor_id) = match body {
+        // TODO: upsert
+        InsertBody::Select(select, _) => {
+            // Simple Common case of INSERT INTO <table> VALUES (...)
+            if matches!(select.body.select.as_ref(),  OneSelect::Values(values) if values.len() <= 1)
+            {
+                (
+                    values.as_ref().unwrap().len(),
+                    program.alloc_cursor_id(
+                        Some(table_name.0.clone()),
+                        CursorType::BTreeTable(btree_table.clone()),
+                    ),
+                )
+            } else {
+                // Multiple rows - use coroutine for value population
+                let yield_reg = program.alloc_register();
+                let jump_on_definition_label = program.allocate_label();
+                let start_offset_label = program.allocate_label();
+                program.emit_insn(Insn::InitCoroutine {
+                    yield_reg,
+                    jump_on_definition: jump_on_definition_label,
+                    start_offset: start_offset_label,
+                });
+
+                program.preassign_label_to_next_insn(start_offset_label);
+
+                let query_destination = QueryDestination::CoroutineYield {
+                    yield_reg,
+                    coroutine_implementation_start: halt_label,
+                };
+                program.incr_nesting();
+                let result = translate_select(
+                    query_mode,
+                    schema,
+                    *select,
+                    syms,
+                    program,
+                    query_destination,
+                )?;
+                program = result.program;
+                program.decr_nesting();
+
+                program.emit_insn(Insn::EndCoroutine { yield_reg });
+                program.preassign_label_to_next_insn(jump_on_definition_label);
+
+                // Have to allocate the cursor here to avoid having `init_loop` inside `translate_select` selecting the incorrect
+                // cursor_id
+                let cursor_id = program.alloc_cursor_id(
+                    Some(table_name.0.clone()),
+                    CursorType::BTreeTable(btree_table.clone()),
+                );
+
+                // From SQLite
+                /* Set useTempTable to TRUE if the result of the SELECT statement
+                 ** should be written into a temporary table (template 4).  Set to
+                 ** FALSE if each output row of the SELECT can be written directly into
+                 ** the destination table (template 3).
+                 **
+                 ** A temp table must be used if the table being updated is also one
+                 ** of the tables being read by the SELECT statement.  Also use a
+                 ** temp table in the case of row triggers.
+                 */
+                if program.is_table_open(&table, schema) {
+                    let temp_cursor_id = program.alloc_cursor_id(
+                        Some("temp table".to_string()),
+                        CursorType::BTreeTable(btree_table.clone()),
+                    );
+                    temp_table_ctx = Some(TempTableCtx {
+                        cursor_id: temp_cursor_id,
+                        loop_start_label: program.allocate_label(),
+                        loop_end_label: program.allocate_label(),
+                    });
+
+                    program.emit_insn(Insn::OpenEphemeral {
+                        cursor_id: temp_cursor_id,
+                        is_table: true,
+                    });
+
+                    // Main loop
+                    // FIXME: rollback is not implemented. E.g. if you insert 2 rows and one fails to unique constraint violation,
+                    // the other row will still be inserted.
+                    program.preassign_label_to_next_insn(loop_start_label);
+
+                    let yield_label = program.allocate_label();
+
+                    program.emit_insn(Insn::Yield {
+                        yield_reg,
+                        end_offset: yield_label,
+                    });
+                    let record_reg = program.alloc_register();
+                    program.emit_insn(Insn::MakeRecord {
+                        start_reg: yield_reg + 1,
+                        count: result.num_result_cols,
+                        dest_reg: record_reg,
+                        index_name: None,
+                    });
+
+                    let rowid_reg = program.alloc_register();
+                    program.emit_insn(Insn::NewRowid {
+                        cursor: temp_cursor_id,
+                        rowid_reg,
+                        prev_largest_reg: 0,
+                    });
+
+                    program.emit_insn(Insn::Insert {
+                        cursor: temp_cursor_id,
+                        key_reg: rowid_reg,
+                        record_reg,
+                        flag: 0,
+                        table_name: "".to_string(),
+                    });
+
+                    // loop back
+                    program.emit_insn(Insn::Goto {
+                        target_pc: loop_start_label,
+                    });
+
+                    program.preassign_label_to_next_insn(yield_label);
+
+                    program.emit_insn(Insn::OpenWrite {
+                        cursor_id,
+                        root_page: RegisterOrLiteral::Literal(root_page),
+                        name: table_name.0.clone(),
+                    });
+                } else {
+                    program.emit_insn(Insn::OpenWrite {
+                        cursor_id,
+                        root_page: RegisterOrLiteral::Literal(root_page),
+                        name: table_name.0.clone(),
+                    });
+
+                    // Main loop
+                    // FIXME: rollback is not implemented. E.g. if you insert 2 rows and one fails to unique constraint violation,
+                    // the other row will still be inserted.
+                    program.preassign_label_to_next_insn(loop_start_label);
+                    program.emit_insn(Insn::Yield {
+                        yield_reg,
+                        end_offset: halt_label,
+                    });
+                }
+
+                yield_reg_opt = Some(yield_reg);
+                (result.num_result_cols, cursor_id)
+            }
+        }
+        InsertBody::DefaultValues => (
+            0,
+            program.alloc_cursor_id(
+                Some(table_name.0.clone()),
+                CursorType::BTreeTable(btree_table.clone()),
+            ),
+        ),
+    };
+
     // allocate cursor id's for each btree index cursor we'll need to populate the indexes
     // (idx name, root_page, idx cursor id)
     let idx_cursors = schema
@@ -98,21 +283,8 @@ pub fn translate_insert(
             )
         })
         .collect::<Vec<(&String, usize, usize)>>();
-    let root_page = btree_table.root_page;
-    let values = match body {
-        InsertBody::Select(ref mut select, _) => match select.body.select.as_mut() {
-            OneSelect::Values(ref mut values) => values,
-            _ => todo!(),
-        },
-        InsertBody::DefaultValues => &mut vec![vec![]],
-    };
-    let mut param_idx = 1;
-    for expr in values.iter_mut().flat_map(|v| v.iter_mut()) {
-        rewrite_expr(expr, &mut param_idx)?;
-    }
 
-    let column_mappings = resolve_columns_for_insert(&table, columns, values)?;
-    let index_col_mappings = resolve_indicies_for_insert(schema, table.as_ref(), &column_mappings)?;
+    let column_mappings = resolve_columns_for_insert(&table, &columns, num_values)?;
     // Check if rowid was provided (through INTEGER PRIMARY KEY as a rowid alias)
     let rowid_alias_index = btree_table.columns.iter().position(|c| c.is_rowid_alias);
     let has_user_provided_rowid = {
@@ -138,56 +310,24 @@ pub fn translate_insert(
     };
 
     let record_register = program.alloc_register();
-    let halt_label = program.allocate_label();
-    let loop_start_label = program.allocate_label();
 
-    let inserting_multiple_rows = values.len() > 1;
-
-    // Multiple rows - use coroutine for value population
     if inserting_multiple_rows {
-        let yield_reg = program.alloc_register();
-        let jump_on_definition_label = program.allocate_label();
-        let start_offset_label = program.allocate_label();
-        program.emit_insn(Insn::InitCoroutine {
-            yield_reg,
-            jump_on_definition: jump_on_definition_label,
-            start_offset: start_offset_label,
-        });
-
-        program.preassign_label_to_next_insn(start_offset_label);
-
-        for value in values.iter() {
-            populate_column_registers(
-                &mut program,
-                value,
-                &column_mappings,
-                column_registers_start,
-                true,
-                rowid_reg,
-                &resolver,
-            )?;
-            program.emit_insn(Insn::Yield {
-                yield_reg,
-                end_offset: halt_label,
+        if let Some(ref temp_table_ctx) = temp_table_ctx {
+            // Rewind loop to read from ephemeral table
+            program.emit_insn(Insn::Rewind {
+                cursor_id: temp_table_ctx.cursor_id,
+                pc_if_empty: temp_table_ctx.loop_end_label,
             });
+            program.preassign_label_to_next_insn(temp_table_ctx.loop_start_label);
         }
-        program.emit_insn(Insn::EndCoroutine { yield_reg });
-        program.preassign_label_to_next_insn(jump_on_definition_label);
-
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id,
-            root_page: RegisterOrLiteral::Literal(root_page),
-            name: table_name.0.clone(),
-        });
-
-        // Main loop
-        // FIXME: rollback is not implemented. E.g. if you insert 2 rows and one fails to unique constraint violation,
-        // the other row will still be inserted.
-        program.resolve_label(loop_start_label, program.offset());
-        program.emit_insn(Insn::Yield {
-            yield_reg,
-            end_offset: halt_label,
-        });
+        populate_columns_multiple_rows(
+            &mut program,
+            &column_mappings,
+            column_registers_start,
+            yield_reg_opt.unwrap() + 1,
+            &resolver,
+            &temp_table_ctx,
+        )?;
     } else {
         // Single row - populate registers directly
         program.emit_insn(Insn::OpenWrite {
@@ -198,10 +338,9 @@ pub fn translate_insert(
 
         populate_column_registers(
             &mut program,
-            &values[0],
+            &values.unwrap(),
             &column_mappings,
             column_registers_start,
-            false,
             rowid_reg,
             &resolver,
         )?;
@@ -292,6 +431,7 @@ pub fn translate_insert(
         _ => (),
     }
 
+    let index_col_mappings = resolve_indicies_for_insert(schema, table.as_ref(), &column_mappings)?;
     for index_col_mapping in index_col_mappings {
         // find which cursor we opened earlier for this index
         let idx_cursor_id = idx_cursors
@@ -400,10 +540,22 @@ pub fn translate_insert(
     });
 
     if inserting_multiple_rows {
-        // For multiple rows, loop back
-        program.emit_insn(Insn::Goto {
-            target_pc: loop_start_label,
-        });
+        if let Some(temp_table_ctx) = temp_table_ctx {
+            program.emit_insn(Insn::Next {
+                cursor_id: temp_table_ctx.cursor_id,
+                pc_if_next: temp_table_ctx.loop_start_label,
+            });
+            program.preassign_label_to_next_insn(temp_table_ctx.loop_end_label);
+
+            program.emit_insn(Insn::Close {
+                cursor_id: temp_table_ctx.cursor_id,
+            });
+        } else {
+            // For multiple rows which not require a temp table, loop back
+            program.emit_insn(Insn::Goto {
+                target_pc: loop_start_label,
+            });
+        }
     }
 
     program.resolve_label(halt_label, program.offset());
@@ -444,30 +596,18 @@ struct ColumnMapping<'a> {
 fn resolve_columns_for_insert<'a>(
     table: &'a Table,
     columns: &Option<DistinctNames>,
-    values: &[Vec<Expr>],
+    num_values: usize,
 ) -> Result<Vec<ColumnMapping<'a>>> {
-    if values.is_empty() {
-        crate::bail_parse_error!("no values to insert");
-    }
-
-    let table_columns = &table.columns();
+    let table_columns = table.columns();
     // Case 1: No columns specified - map values to columns in order
     if columns.is_none() {
-        let num_values = values[0].len();
-        if num_values > table_columns.len() {
+        if num_values != table_columns.len() {
             crate::bail_parse_error!(
                 "table {} has {} columns but {} values were supplied",
                 &table.get_name(),
                 table_columns.len(),
                 num_values
             );
-        }
-
-        // Verify all value tuples have same length
-        for value in values.iter().skip(1) {
-            if value.len() != num_values {
-                crate::bail_parse_error!("all VALUES must have the same number of terms");
-            }
         }
 
         // Map each column to either its corresponding value index or None
@@ -578,6 +718,62 @@ fn resolve_indicies_for_insert(
     Ok(index_col_mappings)
 }
 
+fn populate_columns_multiple_rows(
+    program: &mut ProgramBuilder,
+    column_mappings: &[ColumnMapping],
+    column_registers_start: usize,
+    yield_reg: usize,
+    resolver: &Resolver,
+    temp_table_ctx: &Option<TempTableCtx>,
+) -> Result<()> {
+    let mut value_index_seen = 0;
+    let mut other_values_seen = 0;
+    for (i, mapping) in column_mappings.iter().enumerate() {
+        let target_reg = column_registers_start + i;
+
+        other_values_seen += 1;
+        if let Some(value_index) = mapping.value_index {
+            // Decrement as we have now seen a value index instead
+            other_values_seen -= 1;
+            if let Some(temp_table_ctx) = temp_table_ctx {
+                program.emit_insn(Insn::Column {
+                    cursor_id: temp_table_ctx.cursor_id,
+                    column: value_index_seen,
+                    dest: column_registers_start + i,
+                });
+            } else {
+                program.emit_insn(Insn::Copy {
+                    src_reg: yield_reg + value_index_seen,
+                    dst_reg: column_registers_start + value_index + other_values_seen,
+                    amount: 0,
+                });
+            }
+
+            value_index_seen += 1;
+        } else if mapping.column.is_rowid_alias {
+            program.emit_insn(Insn::SoftNull { reg: target_reg });
+        } else if let Some(default_expr) = mapping.default_value {
+            translate_expr(program, None, default_expr, target_reg, resolver)?;
+        } else {
+            // Column was not specified as has no DEFAULT - use NULL if it is nullable, otherwise error
+            // Rowid alias columns can be NULL because we will autogenerate a rowid in that case.
+            let is_nullable = !mapping.column.primary_key || mapping.column.is_rowid_alias;
+            if is_nullable {
+                program.emit_insn(Insn::Null {
+                    dest: target_reg,
+                    dest_end: None,
+                });
+            } else {
+                crate::bail_parse_error!(
+                    "column {} is not nullable",
+                    mapping.column.name.as_ref().expect("column name is None")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Populates the column registers with values for a single row
 #[allow(clippy::too_many_arguments)]
 fn populate_column_registers(
@@ -585,7 +781,6 @@ fn populate_column_registers(
     value: &[Expr],
     column_mappings: &[ColumnMapping],
     column_registers_start: usize,
-    inserting_multiple_rows: bool,
     rowid_reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
@@ -595,10 +790,8 @@ fn populate_column_registers(
         // Column has a value in the VALUES tuple
         if let Some(value_index) = mapping.value_index {
             // When inserting a single row, SQLite writes the value provided for the rowid alias column (INTEGER PRIMARY KEY)
-            // directly into the rowid register and writes a NULL into the rowid alias column. Not sure why this only happens
-            // in the single row case, but let's copy it.
-            let write_directly_to_rowid_reg =
-                mapping.column.is_rowid_alias && !inserting_multiple_rows;
+            // directly into the rowid register and writes a NULL into the rowid alias column.
+            let write_directly_to_rowid_reg = mapping.column.is_rowid_alias;
             let reg = if write_directly_to_rowid_reg {
                 rowid_reg
             } else {
@@ -645,24 +838,25 @@ fn populate_column_registers(
     Ok(())
 }
 
+// TODO: comeback here later to apply the same improvements on select
 fn translate_virtual_table_insert(
-    program: &mut ProgramBuilder,
+    mut program: ProgramBuilder,
     virtual_table: Rc<VirtualTable>,
-    columns: &Option<DistinctNames>,
-    body: &InsertBody,
-    on_conflict: &Option<ResolveType>,
+    columns: Option<DistinctNames>,
+    mut body: InsertBody,
+    on_conflict: Option<ResolveType>,
     resolver: &Resolver,
-) -> Result<()> {
-    let values = match body {
-        InsertBody::Select(select, None) => match &select.body.select.deref() {
-            OneSelect::Values(values) => values,
+) -> Result<ProgramBuilder> {
+    let (num_values, value) = match &mut body {
+        InsertBody::Select(select, None) => match select.body.select.as_mut() {
+            OneSelect::Values(values) => (values[0].len(), values.pop().unwrap()),
             _ => crate::bail_parse_error!("Virtual tables only support VALUES clause in INSERT"),
         },
-        InsertBody::DefaultValues => &vec![],
+        InsertBody::DefaultValues => (0, vec![]),
         _ => crate::bail_parse_error!("Unsupported INSERT body for virtual tables"),
     };
     let table = Table::Virtual(virtual_table.clone());
-    let column_mappings = resolve_columns_for_insert(&table, columns, values)?;
+    let column_mappings = resolve_columns_for_insert(&table, &columns, num_values)?;
     let registers_start = program.alloc_registers(2);
 
     /* *
@@ -679,11 +873,10 @@ fn translate_virtual_table_insert(
 
     let values_reg = program.alloc_registers(column_mappings.len());
     populate_column_registers(
-        program,
-        &values[0],
+        &mut program,
+        &value,
         &column_mappings,
         values_reg,
-        false,
         registers_start,
         resolver,
     )?;
@@ -704,5 +897,5 @@ fn translate_virtual_table_insert(
     let halt_label = program.allocate_label();
     program.resolve_label(halt_label, program.offset());
 
-    Ok(())
+    Ok(program)
 }

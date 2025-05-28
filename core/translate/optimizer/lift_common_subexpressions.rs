@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use limbo_sqlite3_parser::ast::{Expr, Operator};
 
 use crate::{
@@ -112,7 +114,7 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
         if found_non_empty_or_branches {
             // If we found an empty OR branch, we can remove the entire OR term.
             // E.g. (a AND b) OR (a) OR (a AND c) just becomes a.
-            where_clause[i].consumed = true;
+            where_clause[i].consumed.set(true);
         } else {
             assert!(new_or_operands_for_original_term.len() > 1);
             // Update the original WhereTerm's expression with the new OR structure (without common parts).
@@ -124,7 +126,7 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
             where_clause.push(WhereTerm {
                 expr: common_expr_to_add,
                 from_outer_join: term_from_outer_join,
-                consumed: false,
+                consumed: Cell::new(false),
             });
         }
 
@@ -188,7 +190,7 @@ fn rebuild_or_expr_from_list(mut operands: Vec<Expr>) -> Expr {
 mod tests {
     use super::*;
     use crate::translate::plan::WhereTerm;
-    use limbo_sqlite3_parser::ast::{self, Expr, Literal, Operator};
+    use limbo_sqlite3_parser::ast::{self, Expr, Literal, Operator, TableInternalId};
 
     #[test]
     fn test_lift_common_subexpressions() -> Result<()> {
@@ -200,7 +202,7 @@ mod tests {
         let a_expr = Expr::Binary(
             Box::new(Expr::Column {
                 database: None,
-                table: 0,
+                table: TableInternalId::default(),
                 column: 0,
                 is_rowid_alias: false,
             }),
@@ -211,7 +213,7 @@ mod tests {
         let b_expr = Expr::Binary(
             Box::new(Expr::Column {
                 database: None,
-                table: 0,
+                table: TableInternalId::default(),
                 column: 1,
                 is_rowid_alias: false,
             }),
@@ -222,7 +224,7 @@ mod tests {
         let x_expr = Expr::Binary(
             Box::new(Expr::Column {
                 database: None,
-                table: 0,
+                table: TableInternalId::default(),
                 column: 2,
                 is_rowid_alias: false,
             }),
@@ -233,7 +235,7 @@ mod tests {
         let y_expr = Expr::Binary(
             Box::new(Expr::Column {
                 database: None,
-                table: 0,
+                table: TableInternalId::default(),
                 column: 3,
                 is_rowid_alias: false,
             }),
@@ -255,7 +257,7 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
             from_outer_join: None,
-            consumed: false,
+            consumed: Cell::new(false),
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
@@ -266,7 +268,7 @@ mod tests {
         // 3. b = 1
         let nonconsumed_terms = where_clause
             .iter()
-            .filter(|term| !term.consumed)
+            .filter(|term| !term.consumed.get())
             .collect::<Vec<_>>();
         assert_eq!(nonconsumed_terms.len(), 3);
         assert_eq!(
@@ -293,7 +295,7 @@ mod tests {
         let a_expr = Expr::Binary(
             Box::new(Expr::Column {
                 database: None,
-                table: 0,
+                table: TableInternalId::default(),
                 column: 0,
                 is_rowid_alias: false,
             }),
@@ -304,7 +306,7 @@ mod tests {
         let x_expr = Expr::Binary(
             Box::new(Expr::Column {
                 database: None,
-                table: 0,
+                table: TableInternalId::default(),
                 column: 1,
                 is_rowid_alias: false,
             }),
@@ -315,7 +317,7 @@ mod tests {
         let y_expr = Expr::Binary(
             Box::new(Expr::Column {
                 database: None,
-                table: 0,
+                table: TableInternalId::default(),
                 column: 2,
                 is_rowid_alias: false,
             }),
@@ -326,7 +328,7 @@ mod tests {
         let z_expr = Expr::Binary(
             Box::new(Expr::Column {
                 database: None,
-                table: 0,
+                table: TableInternalId::default(),
                 column: 3,
                 is_rowid_alias: false,
             }),
@@ -354,7 +356,7 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
             from_outer_join: None,
-            consumed: false,
+            consumed: Cell::new(false),
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
@@ -364,7 +366,7 @@ mod tests {
         // 2. a = 1
         let nonconsumed_terms = where_clause
             .iter()
-            .filter(|term| !term.consumed)
+            .filter(|term| !term.consumed.get())
             .collect::<Vec<_>>();
         assert_eq!(nonconsumed_terms.len(), 2);
         assert_eq!(
@@ -393,7 +395,7 @@ mod tests {
         let x_expr = Expr::Binary(
             Box::new(Expr::Column {
                 database: None,
-                table: 0,
+                table: TableInternalId::default(),
                 column: 0,
                 is_rowid_alias: false,
             }),
@@ -404,7 +406,7 @@ mod tests {
         let y_expr = Expr::Binary(
             Box::new(Expr::Column {
                 database: None,
-                table: 0,
+                table: TableInternalId::default(),
                 column: 1,
                 is_rowid_alias: false,
             }),
@@ -421,7 +423,7 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: or_expr.clone(),
             from_outer_join: None,
-            consumed: false,
+            consumed: Cell::new(false),
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
@@ -429,7 +431,7 @@ mod tests {
         // Should remain unchanged since no common terms
         let nonconsumed_terms = where_clause
             .iter()
-            .filter(|term| !term.consumed)
+            .filter(|term| !term.consumed.get())
             .collect::<Vec<_>>();
         assert_eq!(nonconsumed_terms.len(), 1);
         assert_eq!(nonconsumed_terms[0].expr, or_expr);
@@ -445,7 +447,7 @@ mod tests {
         let a_expr = Expr::Binary(
             Box::new(Expr::Column {
                 database: None,
-                table: 0,
+                table: TableInternalId::default(),
                 column: 0,
                 is_rowid_alias: false,
             }),
@@ -456,7 +458,7 @@ mod tests {
         let x_expr = Expr::Binary(
             Box::new(Expr::Column {
                 database: None,
-                table: 0,
+                table: TableInternalId::default(),
                 column: 1,
                 is_rowid_alias: false,
             }),
@@ -467,7 +469,7 @@ mod tests {
         let y_expr = Expr::Binary(
             Box::new(Expr::Column {
                 database: None,
-                table: 0,
+                table: TableInternalId::default(),
                 column: 2,
                 is_rowid_alias: false,
             }),
@@ -487,8 +489,8 @@ mod tests {
 
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
-            from_outer_join: Some(0), // Set from_outer_join
-            consumed: false,
+            from_outer_join: Some(TableInternalId::default()), // Set from_outer_join
+            consumed: Cell::new(false),
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
@@ -496,7 +498,7 @@ mod tests {
         // Should have 2 terms, both with from_outer_join set
         let nonconsumed_terms = where_clause
             .iter()
-            .filter(|term| !term.consumed)
+            .filter(|term| !term.consumed.get())
             .collect::<Vec<_>>();
         assert_eq!(nonconsumed_terms.len(), 2);
         assert_eq!(
@@ -507,9 +509,15 @@ mod tests {
                 Box::new(ast::Expr::Parenthesized(vec![y_expr]))
             )
         );
-        assert_eq!(nonconsumed_terms[0].from_outer_join, Some(0));
+        assert_eq!(
+            nonconsumed_terms[0].from_outer_join,
+            Some(TableInternalId::default())
+        );
         assert_eq!(nonconsumed_terms[1].expr, a_expr);
-        assert_eq!(nonconsumed_terms[1].from_outer_join, Some(0));
+        assert_eq!(
+            nonconsumed_terms[1].from_outer_join,
+            Some(TableInternalId::default())
+        );
 
         Ok(())
     }
@@ -523,7 +531,7 @@ mod tests {
         let single_expr = Expr::Binary(
             Box::new(Expr::Column {
                 database: None,
-                table: 0,
+                table: TableInternalId::default(),
                 column: 0,
                 is_rowid_alias: false,
             }),
@@ -534,7 +542,7 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: single_expr.clone(),
             from_outer_join: None,
-            consumed: false,
+            consumed: Cell::new(false),
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
@@ -542,7 +550,7 @@ mod tests {
         // Should remain unchanged
         let nonconsumed_terms = where_clause
             .iter()
-            .filter(|term| !term.consumed)
+            .filter(|term| !term.consumed.get())
             .collect::<Vec<_>>();
         assert_eq!(nonconsumed_terms.len(), 1);
         assert_eq!(nonconsumed_terms[0].expr, single_expr);
@@ -559,7 +567,7 @@ mod tests {
                 Expr::Binary(
                     Box::new(Expr::Column {
                         database: None,
-                        table: 0,
+                        table: TableInternalId::default(),
                         column: i,
                         is_rowid_alias: false,
                     }),
@@ -587,14 +595,14 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
             from_outer_join: None,
-            consumed: false,
+            consumed: Cell::new(false),
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
 
         let nonconsumed_terms = where_clause
             .iter()
-            .filter(|term| !term.consumed)
+            .filter(|term| !term.consumed.get())
             .collect::<Vec<_>>();
         assert_eq!(nonconsumed_terms.len(), 1);
         assert_eq!(nonconsumed_terms[0].expr, a_expr);

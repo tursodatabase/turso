@@ -1,4 +1,5 @@
 use crate::translate::plan::Operation;
+use crate::vdbe::builder::TableRefIdCounter;
 use crate::{
     bail_parse_error,
     schema::{Schema, Table},
@@ -54,7 +55,12 @@ pub fn translate_update(
     parse_schema: ParseSchema,
     mut program: ProgramBuilder,
 ) -> crate::Result<ProgramBuilder> {
-    let mut plan = prepare_update_plan(schema, body, parse_schema)?;
+    let mut plan = prepare_update_plan(
+        schema,
+        body,
+        parse_schema,
+        &mut program.table_reference_counter,
+    )?;
     optimize_plan(&mut plan, schema)?;
     // TODO: freestyling these numbers
     let opts = ProgramBuilderOpts {
@@ -64,7 +70,7 @@ pub fn translate_update(
         approx_num_labels: 4,
     };
     program.extend(&opts);
-    emit_program(&mut program, plan, syms)?;
+    emit_program(&mut program, plan, schema, syms)?;
     Ok(program)
 }
 
@@ -72,6 +78,7 @@ pub fn prepare_update_plan(
     schema: &Schema,
     body: &mut Update,
     parse_schema: ParseSchema,
+    table_ref_counter: &mut TableRefIdCounter,
 ) -> crate::Result<Plan> {
     if body.with.is_some() {
         bail_parse_error!("WITH clause is not supported");
@@ -103,6 +110,7 @@ pub fn prepare_update_plan(
             _ => unreachable!(),
         },
         identifier: table_name.0.clone(),
+        internal_id: table_ref_counter.next(),
         op: Operation::Scan {
             iter_dir,
             index: None,

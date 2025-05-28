@@ -83,6 +83,13 @@ impl IO for SimulatorIO {
         Ok(file)
     }
 
+    fn wait_for_completion(&self, c: Arc<limbo_core::Completion>) -> Result<()> {
+        while !c.is_completed() {
+            self.run_once()?;
+        }
+        Ok(())
+    }
+
     fn run_once(&self) -> Result<()> {
         if *self.fault.borrow() {
             *self.nr_run_once_faults.borrow_mut() += 1;

@@ -30,7 +30,7 @@ use super::{
     order_by::{order_by_sorter_insert, sorter_insert},
     plan::{
         convert_where_to_vtab_constraint, Aggregate, GroupBy, IterationDirection, JoinOrderMember,
-        Operation, Search, SeekDef, SelectPlan, SelectQueryType, TableReference, WhereTerm,
+        Operation, QueryDestination, Search, SeekDef, SelectPlan, TableReference, WhereTerm,
     },
 };
 
@@ -295,10 +295,10 @@ pub fn open_loop(
     t_ctx: &mut TranslateCtx,
     tables: &[TableReference],
     join_order: &[JoinOrderMember],
-    predicates: &mut [WhereTerm],
+    predicates: &[WhereTerm],
 ) -> Result<()> {
     for (join_index, join) in join_order.iter().enumerate() {
-        let table_index = join.table_no;
+        let table_index = join.original_idx;
         let table = &tables[table_index];
         let LoopLabels {
             loop_start,
@@ -345,110 +345,112 @@ pub fn open_loop(
                         program.preassign_label_to_next_insn(loop_start);
                     }
                     Table::Virtual(vtab) => {
-                        let (start_reg, count, maybe_idx_str, maybe_idx_int) =
-                            if vtab.kind.eq(&VTabKind::VirtualTable) {
-                                // Virtual‑table (non‑TVF) modules can receive constraints via xBestIndex.
-                                // They return information with which to pass to VFilter operation.
-                                // We forward every predicate that touches vtab columns.
-                                //
-                                // vtab.col = literal             (always usable)
-                                // vtab.col = outer_table.col     (usable, because outer_table is already positioned)
-                                // vtab.col = later_table.col     (forwarded with usable = false)
-                                //
-                                // xBestIndex decides which ones it wants by setting argvIndex and whether the
-                                // core layer may omit them (omit = true).
-                                // We then materialise the RHS/LHS into registers before issuing VFilter.
-                                let converted_constraints = predicates
-                                    .iter()
-                                    .filter(|p| p.should_eval_at_loop(join_index, join_order))
-                                    .enumerate()
-                                    .filter_map(|(i, p)| {
-                                        // Build ConstraintInfo from the predicates
-                                        convert_where_to_vtab_constraint(p, table_index, i)
-                                            .unwrap_or(None)
-                                    })
-                                    .collect::<Vec<_>>();
-                                // TODO: get proper order_by information to pass to the vtab.
-                                // maybe encode more info on t_ctx? we need: [col_idx, is_descending]
-                                let index_info = vtab.best_index(&converted_constraints, &[]);
+                        let (start_reg, count, maybe_idx_str, maybe_idx_int) = if vtab
+                            .kind
+                            .eq(&VTabKind::VirtualTable)
+                        {
+                            // Virtual‑table (non‑TVF) modules can receive constraints via xBestIndex.
+                            // They return information with which to pass to VFilter operation.
+                            // We forward every predicate that touches vtab columns.
+                            //
+                            // vtab.col = literal             (always usable)
+                            // vtab.col = outer_table.col     (usable, because outer_table is already positioned)
+                            // vtab.col = later_table.col     (forwarded with usable = false)
+                            //
+                            // xBestIndex decides which ones it wants by setting argvIndex and whether the
+                            // core layer may omit them (omit = true).
+                            // We then materialise the RHS/LHS into registers before issuing VFilter.
+                            let converted_constraints = predicates
+                                .iter()
+                                .filter(|p| p.should_eval_at_loop(join_index, join_order))
+                                .enumerate()
+                                .filter_map(|(i, p)| {
+                                    // Build ConstraintInfo from the predicates
+                                    convert_where_to_vtab_constraint(p, table_index, i, join_order)
+                                        .unwrap_or(None)
+                                })
+                                .collect::<Vec<_>>();
+                            // TODO: get proper order_by information to pass to the vtab.
+                            // maybe encode more info on t_ctx? we need: [col_idx, is_descending]
+                            let index_info = vtab.best_index(&converted_constraints, &[]);
 
-                                // Determine the number of VFilter arguments (constraints with an argv_index).
-                                let args_needed = index_info
-                                    .constraint_usages
-                                    .iter()
-                                    .filter(|u| u.argv_index.is_some())
-                                    .count();
-                                let start_reg = program.alloc_registers(args_needed);
+                            // Determine the number of VFilter arguments (constraints with an argv_index).
+                            let args_needed = index_info
+                                .constraint_usages
+                                .iter()
+                                .filter(|u| u.argv_index.is_some())
+                                .count();
+                            let start_reg = program.alloc_registers(args_needed);
 
-                                // For each constraint used by best_index, translate the opposite side.
-                                for (i, usage) in index_info.constraint_usages.iter().enumerate() {
-                                    if let Some(argv_index) = usage.argv_index {
-                                        if let Some(cinfo) = converted_constraints.get(i) {
-                                            let (pred_idx, is_rhs) = cinfo.unpack_plan_info();
-                                            if let ast::Expr::Binary(lhs, _, rhs) =
-                                                &predicates[pred_idx].expr
-                                            {
-                                                // translate the opposite side of the referenced vtab column
-                                                let expr = if is_rhs { lhs } else { rhs };
-                                                // argv_index is 1-based; adjust to get the proper register offset.
-                                                if argv_index == 0 {
-                                                    // invalid since argv_index is 1-based
-                                                    continue;
-                                                }
-                                                let target_reg =
-                                                    start_reg + (argv_index - 1) as usize;
-                                                translate_expr(
-                                                    program,
-                                                    Some(tables),
-                                                    expr,
-                                                    target_reg,
-                                                    &t_ctx.resolver,
-                                                )?;
-                                                if cinfo.usable && usage.omit {
-                                                    predicates[pred_idx].consumed = true;
-                                                }
+                            // For each constraint used by best_index, translate the opposite side.
+                            for (i, usage) in index_info.constraint_usages.iter().enumerate() {
+                                if let Some(argv_index) = usage.argv_index {
+                                    if let Some(cinfo) = converted_constraints.get(i) {
+                                        let (pred_idx, is_rhs) = cinfo.unpack_plan_info();
+                                        if let ast::Expr::Binary(lhs, _, rhs) =
+                                            &predicates[pred_idx].expr
+                                        {
+                                            // translate the opposite side of the referenced vtab column
+                                            let expr = if is_rhs { lhs } else { rhs };
+                                            // argv_index is 1-based; adjust to get the proper register offset.
+                                            if argv_index == 0 {
+                                                // invalid since argv_index is 1-based
+                                                continue;
+                                            }
+                                            let target_reg = start_reg + (argv_index - 1) as usize;
+                                            translate_expr(
+                                                program,
+                                                Some(tables),
+                                                expr,
+                                                target_reg,
+                                                &t_ctx.resolver,
+                                            )?;
+                                            if cinfo.usable && usage.omit {
+                                                predicates[pred_idx].consumed.set(true);
                                             }
                                         }
                                     }
                                 }
-                                // If best_index provided an idx_str, translate it.
-                                let maybe_idx_str = if let Some(idx_str) = index_info.idx_str {
-                                    let reg = program.alloc_register();
-                                    program.emit_insn(Insn::String8 {
-                                        dest: reg,
-                                        value: idx_str,
-                                    });
-                                    Some(reg)
-                                } else {
-                                    None
-                                };
-                                (
-                                    start_reg,
-                                    args_needed,
-                                    maybe_idx_str,
-                                    Some(index_info.idx_num),
-                                )
+                            }
+
+                            // If best_index provided an idx_str, translate it.
+                            let maybe_idx_str = if let Some(idx_str) = index_info.idx_str {
+                                let reg = program.alloc_register();
+                                program.emit_insn(Insn::String8 {
+                                    dest: reg,
+                                    value: idx_str,
+                                });
+                                Some(reg)
                             } else {
-                                // For table-valued functions: translate the table args.
-                                let args = match vtab.args.as_ref() {
-                                    Some(args) => args,
-                                    None => &vec![],
-                                };
-                                let start_reg = program.alloc_registers(args.len());
-                                let mut cur_reg = start_reg;
-                                for arg in args {
-                                    let reg = cur_reg;
-                                    cur_reg += 1;
-                                    let _ = translate_expr(
-                                        program,
-                                        Some(tables),
-                                        arg,
-                                        reg,
-                                        &t_ctx.resolver,
-                                    )?;
-                                }
-                                (start_reg, args.len(), None, None)
+                                None
                             };
+                            (
+                                start_reg,
+                                args_needed,
+                                maybe_idx_str,
+                                Some(index_info.idx_num),
+                            )
+                        } else {
+                            // For table-valued functions: translate the table args.
+                            let args = match vtab.args.as_ref() {
+                                Some(args) => args,
+                                None => &vec![],
+                            };
+                            let start_reg = program.alloc_registers(args.len());
+                            let mut cur_reg = start_reg;
+                            for arg in args {
+                                let reg = cur_reg;
+                                cur_reg += 1;
+                                let _ = translate_expr(
+                                    program,
+                                    Some(tables),
+                                    arg,
+                                    reg,
+                                    &t_ctx.resolver,
+                                )?;
+                            }
+                            (start_reg, args.len(), None, None)
+                        };
 
                         // Emit VFilter with the computed arguments.
                         program.emit_insn(Insn::VFilter {
@@ -464,8 +466,8 @@ pub fn open_loop(
                     }
                     Table::FromClauseSubquery(from_clause_subquery) => {
                         let (yield_reg, coroutine_implementation_start) =
-                            match &from_clause_subquery.plan.query_type {
-                                SelectQueryType::Subquery {
+                            match &from_clause_subquery.plan.query_destination {
+                                QueryDestination::CoroutineYield {
                                     yield_reg,
                                     coroutine_implementation_start,
                                 } => (*yield_reg, *coroutine_implementation_start),
@@ -888,7 +890,6 @@ fn emit_loop_source<'a>(
                 t_ctx.reg_offset,
                 t_ctx.reg_result_cols_start.unwrap(),
                 t_ctx.limit_ctx,
-                t_ctx.reg_limit_offset_sum,
             )?;
 
             if let Distinctness::Distinct { ctx } = &plan.distinctness {
@@ -919,7 +920,7 @@ pub fn close_loop(
     //   CLOSE t2
     // CLOSE t1
     for join in join_order.iter().rev() {
-        let table_index = join.table_no;
+        let table_index = join.original_idx;
         let table = &tables[table_index];
         let loop_labels = *t_ctx
             .labels_main_loop

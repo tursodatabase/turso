@@ -4,7 +4,8 @@ use crate::storage::btree::BTreePageInner;
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::sqlite3_ondisk::{self, DatabaseHeader, PageContent, PageType};
-use crate::storage::wal::{CheckpointResult, Wal};
+use crate::storage::wal::{CheckpointResult, Wal, WalFsyncStatus};
+use crate::Completion;
 use crate::{Buffer, LimboError, Result};
 use parking_lot::RwLock;
 use std::cell::{RefCell, UnsafeCell};
@@ -136,12 +137,19 @@ impl Page {
 }
 
 #[derive(Clone, Copy, Debug)]
+/// The state of the current pager cache flush.
 enum FlushState {
+    /// Idle.
     Start,
+    /// Waiting for all in-flight writes to the on-disk WAL to complete.
     WaitAppendFrames,
+    /// Fsync the on-disk WAL.
     SyncWal,
+    /// Checkpoint the WAL to the database file (if needed).
     Checkpoint,
+    /// Fsync the database file.
     SyncDbFile,
+    /// Waiting for the database file to be fsynced.
     WaitSyncDbFile,
 }
 
@@ -167,7 +175,7 @@ pub struct Pager {
     /// Source of the database pages.
     pub db_file: Arc<dyn DatabaseStorage>,
     /// The write-ahead log (WAL) for the database.
-    wal: Option<Rc<RefCell<dyn Wal>>>,
+    wal: Rc<RefCell<dyn Wal>>,
     /// A page cache for the database.
     page_cache: Arc<RwLock<DumbLruPageCache>>,
     /// Buffer pool for temporary data storage.
@@ -183,6 +191,24 @@ pub struct Pager {
     syncing: Rc<RefCell<bool>>,
 }
 
+#[derive(Debug, Copy, Clone)]
+/// The status of the current cache flush.
+/// A Done state means that the WAL was committed to disk and fsynced,
+/// plus potentially checkpointed to the DB (and the DB then fsynced).
+pub enum PagerCacheflushStatus {
+    Done(PagerCacheflushResult),
+    IO,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum PagerCacheflushResult {
+    /// The WAL was written to disk and fsynced.
+    WalWritten,
+    /// The WAL was written, fsynced, and a checkpoint was performed.
+    /// The database file was then also fsynced.
+    Checkpointed(CheckpointResult),
+}
+
 impl Pager {
     /// Begins opening a database by reading the database header.
     pub fn begin_open(db_file: Arc<dyn DatabaseStorage>) -> Result<Arc<SpinLock<DatabaseHeader>>> {
@@ -193,7 +219,7 @@ impl Pager {
     pub fn finish_open(
         db_header_ref: Arc<SpinLock<DatabaseHeader>>,
         db_file: Arc<dyn DatabaseStorage>,
-        wal: Option<Rc<RefCell<dyn Wal>>>,
+        wal: Rc<RefCell<dyn Wal>>,
         io: Arc<dyn crate::io::IO>,
         page_cache: Arc<RwLock<DumbLruPageCache>>,
         buffer_pool: Rc<BufferPool>,
@@ -271,42 +297,28 @@ impl Pager {
 
     #[inline(always)]
     pub fn begin_read_tx(&self) -> Result<LimboResult> {
-        if let Some(wal) = &self.wal {
-            return wal.borrow_mut().begin_read_tx();
-        }
-
-        Ok(LimboResult::Ok)
+        self.wal.borrow_mut().begin_read_tx()
     }
 
     #[inline(always)]
     pub fn begin_write_tx(&self) -> Result<LimboResult> {
-        if let Some(wal) = &self.wal {
-            return wal.borrow_mut().begin_write_tx();
-        }
-
-        Ok(LimboResult::Ok)
+        self.wal.borrow_mut().begin_write_tx()
     }
 
-    pub fn end_tx(&self) -> Result<CheckpointStatus> {
-        if let Some(wal) = &self.wal {
-            let checkpoint_status = self.cacheflush()?;
-            return match checkpoint_status {
-                CheckpointStatus::IO => Ok(checkpoint_status),
-                CheckpointStatus::Done(_) => {
-                    wal.borrow().end_write_tx()?;
-                    wal.borrow().end_read_tx()?;
-                    Ok(checkpoint_status)
-                }
-            };
-        }
-
-        Ok(CheckpointStatus::Done(CheckpointResult::default()))
+    pub fn end_tx(&self) -> Result<PagerCacheflushStatus> {
+        let cacheflush_status = self.cacheflush()?;
+        return match cacheflush_status {
+            PagerCacheflushStatus::IO => Ok(PagerCacheflushStatus::IO),
+            PagerCacheflushStatus::Done(_) => {
+                self.wal.borrow().end_write_tx()?;
+                self.wal.borrow().end_read_tx()?;
+                Ok(cacheflush_status)
+            }
+        };
     }
 
     pub fn end_read_tx(&self) -> Result<()> {
-        if let Some(wal) = &self.wal {
-            wal.borrow().end_read_tx()?;
-        }
+        self.wal.borrow().end_read_tx()?;
         Ok(())
     }
 
@@ -314,10 +326,7 @@ impl Pager {
     pub fn read_page(&self, page_idx: usize) -> Result<PageRef, LimboError> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
-        let max_frame = match &self.wal {
-            Some(wal) => wal.borrow().get_max_frame(),
-            None => 0,
-        };
+        let max_frame = self.wal.borrow().get_max_frame();
         let page_key = PageCacheKey::new(page_idx, Some(max_frame));
         if let Some(page) = page_cache.get(&page_key) {
             tracing::trace!("read_page(page_idx = {}) = cached", page_idx);
@@ -326,31 +335,31 @@ impl Pager {
         let page = Arc::new(Page::new(page_idx));
         page.set_locked();
 
-        if let Some(wal) = &self.wal {
-            if let Some(frame_id) = wal.borrow().find_frame(page_idx as u64)? {
-                wal.borrow()
-                    .read_frame(frame_id, page.clone(), self.buffer_pool.clone())?;
-                {
-                    page.set_uptodate();
-                }
-                // TODO(pere) should probably first insert to page cache, and if successful,
-                // read frame or page
-                match page_cache.insert(page_key, page.clone()) {
-                    Ok(_) => {}
-                    Err(CacheError::Full) => return Err(LimboError::CacheFull),
-                    Err(CacheError::KeyExists) => {
-                        unreachable!("Page should not exist in cache after get() miss")
-                    }
-                    Err(e) => {
-                        return Err(LimboError::InternalError(format!(
-                            "Failed to insert page into cache: {:?}",
-                            e
-                        )))
-                    }
-                }
-                return Ok(page);
+        if let Some(frame_id) = self.wal.borrow().find_frame(page_idx as u64)? {
+            self.wal
+                .borrow()
+                .read_frame(frame_id, page.clone(), self.buffer_pool.clone())?;
+            {
+                page.set_uptodate();
             }
+            // TODO(pere) should probably first insert to page cache, and if successful,
+            // read frame or page
+            match page_cache.insert(page_key, page.clone()) {
+                Ok(_) => {}
+                Err(CacheError::Full) => return Err(LimboError::CacheFull),
+                Err(CacheError::KeyExists) => {
+                    unreachable!("Page should not exist in cache after get() miss")
+                }
+                Err(e) => {
+                    return Err(LimboError::InternalError(format!(
+                        "Failed to insert page into cache: {:?}",
+                        e
+                    )))
+                }
+            }
+            return Ok(page);
         }
+
         sqlite3_ondisk::begin_read_page(
             self.db_file.clone(),
             self.buffer_pool.clone(),
@@ -391,15 +400,14 @@ impl Pager {
     }
 
     pub fn wal_frame_count(&self) -> Result<u64> {
-        let mut frame_count = 0;
-        let wal = self.wal.clone();
-        if let Some(wal) = &wal {
-            frame_count = wal.borrow().get_max_frame_in_wal();
-        }
-        Ok(frame_count)
+        Ok(self.wal.borrow().get_max_frame_in_wal())
     }
 
-    pub fn cacheflush(&self) -> Result<CheckpointStatus> {
+    /// Flush dirty pages to disk.
+    /// In the base case, it will write the dirty pages to the WAL and then fsync the WAL.
+    /// If the WAL size is over the checkpoint threshold, it will checkpoint the WAL to
+    /// the database file and then fsync the database file.
+    pub fn cacheflush(&self) -> Result<PagerCacheflushStatus> {
         let mut checkpoint_result = CheckpointResult::default();
         loop {
             let state = self.flush_info.borrow().state;
@@ -407,23 +415,18 @@ impl Pager {
             match state {
                 FlushState::Start => {
                     let db_size = self.db_header.lock().database_size;
-                    let max_frame = match &self.wal {
-                        Some(wal) => wal.borrow().get_max_frame(),
-                        None => 0,
-                    };
+                    let max_frame = self.wal.borrow().get_max_frame();
                     for page_id in self.dirty_pages.borrow().iter() {
                         let mut cache = self.page_cache.write();
                         let page_key = PageCacheKey::new(*page_id, Some(max_frame));
                         let page = cache.get(&page_key).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
-                        if let Some(wal) = &self.wal {
-                            let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
-                            trace!("cacheflush(page={}, page_type={:?}", page_id, page_type);
-                            wal.borrow_mut().append_frame(
-                                page.clone(),
-                                db_size,
-                                self.flush_info.borrow().in_flight_writes.clone(),
-                            )?;
-                        }
+                        let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
+                        trace!("cacheflush(page={}, page_type={:?}", page_id, page_type);
+                        self.wal.borrow_mut().append_frame(
+                            page.clone(),
+                            db_size,
+                            self.flush_info.borrow().in_flight_writes.clone(),
+                        )?;
                         page.clear_dirty();
                     }
                     // This is okay assuming we use shared cache by default.
@@ -433,33 +436,28 @@ impl Pager {
                     }
                     self.dirty_pages.borrow_mut().clear();
                     self.flush_info.borrow_mut().state = FlushState::WaitAppendFrames;
-                    return Ok(CheckpointStatus::IO);
+                    return Ok(PagerCacheflushStatus::IO);
                 }
                 FlushState::WaitAppendFrames => {
                     let in_flight = *self.flush_info.borrow().in_flight_writes.borrow();
                     if in_flight == 0 {
                         self.flush_info.borrow_mut().state = FlushState::SyncWal;
                     } else {
-                        return Ok(CheckpointStatus::IO);
+                        return Ok(PagerCacheflushStatus::IO);
                     }
                 }
                 FlushState::SyncWal => {
-                    let wal = self.wal.clone().ok_or(LimboError::InternalError(
-                        "SyncWal was called without a existing wal".to_string(),
-                    ))?;
-                    match wal.borrow_mut().sync() {
-                        Ok(CheckpointStatus::IO) => return Ok(CheckpointStatus::IO),
-                        Ok(CheckpointStatus::Done(res)) => checkpoint_result = res,
-                        Err(e) => return Err(e),
+                    if WalFsyncStatus::IO == self.wal.borrow_mut().sync()? {
+                        return Ok(PagerCacheflushStatus::IO);
                     }
 
-                    let should_checkpoint = wal.borrow().should_checkpoint();
-                    if should_checkpoint {
-                        self.flush_info.borrow_mut().state = FlushState::Checkpoint;
-                    } else {
+                    if !self.wal.borrow().should_checkpoint() {
                         self.flush_info.borrow_mut().state = FlushState::Start;
-                        break;
+                        return Ok(PagerCacheflushStatus::Done(
+                            PagerCacheflushResult::WalWritten,
+                        ));
                     }
+                    self.flush_info.borrow_mut().state = FlushState::Checkpoint;
                 }
                 FlushState::Checkpoint => {
                     match self.checkpoint()? {
@@ -467,7 +465,7 @@ impl Pager {
                             checkpoint_result = res;
                             self.flush_info.borrow_mut().state = FlushState::SyncDbFile;
                         }
-                        CheckpointStatus::IO => return Ok(CheckpointStatus::IO),
+                        CheckpointStatus::IO => return Ok(PagerCacheflushStatus::IO),
                     };
                 }
                 FlushState::SyncDbFile => {
@@ -476,7 +474,7 @@ impl Pager {
                 }
                 FlushState::WaitSyncDbFile => {
                     if *self.syncing.borrow() {
-                        return Ok(CheckpointStatus::IO);
+                        return Ok(PagerCacheflushStatus::IO);
                     } else {
                         self.flush_info.borrow_mut().state = FlushState::Start;
                         break;
@@ -484,7 +482,24 @@ impl Pager {
                 }
             }
         }
-        Ok(CheckpointStatus::Done(checkpoint_result))
+        Ok(PagerCacheflushStatus::Done(
+            PagerCacheflushResult::Checkpointed(checkpoint_result),
+        ))
+    }
+
+    pub fn wal_get_frame(
+        &self,
+        frame_no: u32,
+        p_frame: *mut u8,
+        frame_len: u32,
+    ) -> Result<Arc<Completion>> {
+        let wal = self.wal.borrow();
+        return wal.read_frame_raw(
+            frame_no.into(),
+            self.buffer_pool.clone(),
+            p_frame,
+            frame_len,
+        );
     }
 
     pub fn checkpoint(&self) -> Result<CheckpointStatus> {
@@ -495,13 +510,11 @@ impl Pager {
             match state {
                 CheckpointState::Checkpoint => {
                     let in_flight = self.checkpoint_inflight.clone();
-                    let wal = self.wal.clone().ok_or(LimboError::InternalError(
-                        "Checkpoint was called without a existing wal".to_string(),
-                    ))?;
-                    match wal
-                        .borrow_mut()
-                        .checkpoint(self, in_flight, CheckpointMode::Passive)?
-                    {
+                    match self.wal.borrow_mut().checkpoint(
+                        self,
+                        in_flight,
+                        CheckpointMode::Passive,
+                    )? {
                         CheckpointStatus::IO => return Ok(CheckpointStatus::IO),
                         CheckpointStatus::Done(res) => {
                             checkpoint_result = res;
@@ -538,7 +551,7 @@ impl Pager {
     pub fn clear_page_cache(&self) -> CheckpointResult {
         let checkpoint_result: CheckpointResult;
         loop {
-            match self.wal.clone().unwrap().borrow_mut().checkpoint(
+            match self.wal.borrow_mut().checkpoint(
                 self,
                 Rc::new(RefCell::new(0)),
                 CheckpointMode::Passive,
@@ -667,10 +680,7 @@ impl Pager {
             // setup page and add to cache
             page.set_dirty();
             self.add_dirty(page.get().id);
-            let max_frame = match &self.wal {
-                Some(wal) => wal.borrow().get_max_frame(),
-                None => 0,
-            };
+            let max_frame = self.wal.borrow().get_max_frame();
 
             let page_key = PageCacheKey::new(page.get().id, Some(max_frame));
             let mut cache = self.page_cache.write();
@@ -692,10 +702,7 @@ impl Pager {
         page: PageRef,
     ) -> Result<(), LimboError> {
         let mut cache = self.page_cache.write();
-        let max_frame = match &self.wal {
-            Some(wal) => wal.borrow().get_max_frame(),
-            None => 0,
-        };
+        let max_frame = self.wal.borrow().get_max_frame();
         let page_key = PageCacheKey::new(id, Some(max_frame));
 
         // FIXME: use specific page key for writer instead of max frame, this will make readers not conflict

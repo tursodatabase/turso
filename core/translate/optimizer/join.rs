@@ -1,5 +1,7 @@
 use std::{cell::RefCell, collections::HashMap};
 
+use limbo_sqlite3_parser::ast::TableInternalId;
+
 use crate::{
     translate::{
         optimizer::{cost::Cost, order::plan_satisfies_order_target},
@@ -75,7 +77,7 @@ pub fn join_lhs_and_rhs<'a>(
     let mut best_access_methods = Vec::with_capacity(join_order.len());
     best_access_methods.extend(lhs.map_or(vec![], |l| l.data.clone()));
 
-    let rhs_table_number = join_order.last().unwrap().table_no;
+    let rhs_table_number = join_order.last().unwrap().original_idx;
     best_access_methods.push((rhs_table_number, access_methods_arena.borrow().len() - 1));
 
     let lhs_mask = lhs.map_or(TableMask::new(), |l| {
@@ -163,7 +165,8 @@ pub fn compute_best_join_order<'a>(
     // Reuse a single mutable join order to avoid allocating join orders per permutation.
     let mut join_order = Vec::with_capacity(num_tables);
     join_order.push(JoinOrderMember {
-        table_no: 0,
+        table_id: TableInternalId::default(),
+        original_idx: 0,
         is_outer: false,
     });
 
@@ -187,7 +190,8 @@ pub fn compute_best_join_order<'a>(
         mask.add_table(i);
         let table_ref = &table_references[i];
         join_order[0] = JoinOrderMember {
-            table_no: i,
+            table_id: table_ref.internal_id,
+            original_idx: i,
             is_outer: false,
         };
         assert!(join_order.len() == 1);
@@ -291,7 +295,8 @@ pub fn compute_best_join_order<'a>(
                 // Build a JoinOrder out of the table bitmask we are now considering.
                 for table_no in lhs.table_numbers() {
                     join_order.push(JoinOrderMember {
-                        table_no,
+                        table_id: table_references[table_no].internal_id,
+                        original_idx: table_no,
                         is_outer: table_references[table_no]
                             .join_info
                             .as_ref()
@@ -299,7 +304,8 @@ pub fn compute_best_join_order<'a>(
                     });
                 }
                 join_order.push(JoinOrderMember {
-                    table_no: rhs_idx,
+                    table_id: table_references[rhs_idx].internal_id,
+                    original_idx: rhs_idx,
                     is_outer: table_references[rhs_idx]
                         .join_info
                         .as_ref()
@@ -402,7 +408,8 @@ pub fn compute_naive_left_deep_plan<'a>(
         .iter()
         .enumerate()
         .map(|(i, t)| JoinOrderMember {
-            table_no: i,
+            table_id: t.internal_id,
+            original_idx: i,
             is_outer: t.join_info.as_ref().map_or(false, |j| j.outer),
         })
         .collect::<Vec<_>>();
@@ -487,9 +494,9 @@ fn generate_join_bitmasks(table_number_max_exclusive: usize, how_many: usize) ->
 
 #[cfg(test)]
 mod tests {
-    use std::{rc::Rc, sync::Arc};
+    use std::{cell::Cell, rc::Rc, sync::Arc};
 
-    use limbo_sqlite3_parser::ast::{self, Expr, Operator, SortOrder};
+    use limbo_sqlite3_parser::ast::{self, Expr, Operator, SortOrder, TableInternalId};
 
     use super::*;
     use crate::{
@@ -499,6 +506,7 @@ mod tests {
             plan::{ColumnUsedMask, IterationDirection, JoinInfo, Operation, WhereTerm},
             planner::TableMask,
         },
+        vdbe::builder::TableRefIdCounter,
     };
 
     #[test]
@@ -538,7 +546,12 @@ mod tests {
     /// Test that [compute_best_join_order] returns a table scan access method when the where clause is empty.
     fn test_compute_best_join_order_single_table_no_indexes() {
         let t1 = _create_btree_table("test_table", _create_column_list(&["id"], Type::Integer));
-        let table_references = vec![_create_table_reference(t1.clone(), None)];
+        let mut table_id_counter = TableRefIdCounter::new();
+        let table_references = vec![_create_table_reference(
+            t1.clone(),
+            None,
+            table_id_counter.next(),
+        )];
         let available_indexes = HashMap::new();
         let where_clause = vec![];
 
@@ -567,10 +580,15 @@ mod tests {
     /// Test that [compute_best_join_order] returns a RowidEq access method when the where clause has an EQ constraint on the rowid alias.
     fn test_compute_best_join_order_single_table_rowid_eq() {
         let t1 = _create_btree_table("test_table", vec![_create_column_rowid_alias("id")]);
-        let table_references = vec![_create_table_reference(t1.clone(), None)];
+        let mut table_id_counter = TableRefIdCounter::new();
+        let table_references = vec![_create_table_reference(
+            t1.clone(),
+            None,
+            table_id_counter.next(),
+        )];
 
         let where_clause = vec![_create_binary_expr(
-            _create_column_expr(0, 0, true), // table 0, column 0 (rowid)
+            _create_column_expr(table_references[0].internal_id, 0, true), // table 0, column 0 (rowid)
             ast::Operator::Equals,
             _create_numeric_literal("42"),
         )];
@@ -611,10 +629,15 @@ mod tests {
             "test_table",
             vec![_create_column_of_type("id", Type::Integer)],
         );
-        let table_references = vec![_create_table_reference(t1.clone(), None)];
+        let mut table_id_counter = TableRefIdCounter::new();
+        let table_references = vec![_create_table_reference(
+            t1.clone(),
+            None,
+            table_id_counter.next(),
+        )];
 
         let where_clause = vec![_create_binary_expr(
-            _create_column_expr(0, 0, false), // table 0, column 0 (id)
+            _create_column_expr(table_references[0].internal_id, 0, false), // table 0, column 0 (id)
             ast::Operator::Equals,
             _create_numeric_literal("42"),
         )];
@@ -670,14 +693,16 @@ mod tests {
         let t1 = _create_btree_table("table1", _create_column_list(&["id"], Type::Integer));
         let t2 = _create_btree_table("table2", _create_column_list(&["id"], Type::Integer));
 
+        let mut table_id_counter = TableRefIdCounter::new();
         let mut table_references = vec![
-            _create_table_reference(t1.clone(), None),
+            _create_table_reference(t1.clone(), None, table_id_counter.next()),
             _create_table_reference(
                 t2.clone(),
                 Some(JoinInfo {
                     outer: false,
                     using: None,
                 }),
+                table_id_counter.next(),
             ),
         ];
 
@@ -705,9 +730,9 @@ mod tests {
         // SELECT * FROM table1 JOIN table2 WHERE table1.id = table2.id
         // expecting table2 to be chosen first due to the index on table1.id
         let where_clause = vec![_create_binary_expr(
-            _create_column_expr(TABLE1, 0, false), // table1.id
+            _create_column_expr(table_references[TABLE1].internal_id, 0, false), // table1.id
             ast::Operator::Equals,
-            _create_column_expr(TABLE2, 0, false), // table2.id
+            _create_column_expr(table_references[TABLE2].internal_id, 0, false), // table2.id
         )];
 
         let access_methods_arena = RefCell::new(Vec::new());
@@ -769,14 +794,16 @@ mod tests {
             ],
         );
 
+        let mut table_id_counter = TableRefIdCounter::new();
         let table_references = vec![
-            _create_table_reference(table_orders.clone(), None),
+            _create_table_reference(table_orders.clone(), None, table_id_counter.next()),
             _create_table_reference(
                 table_customers.clone(),
                 Some(JoinInfo {
                     outer: false,
                     using: None,
                 }),
+                table_id_counter.next(),
             ),
             _create_table_reference(
                 table_order_items.clone(),
@@ -784,6 +811,7 @@ mod tests {
                     outer: false,
                     using: None,
                 }),
+                table_id_counter.next(),
             ),
         ];
 
@@ -857,19 +885,19 @@ mod tests {
         let where_clause = vec![
             // orders.customer_id = customers.id
             _create_binary_expr(
-                _create_column_expr(TABLE_NO_ORDERS, 1, false), // orders.customer_id
+                _create_column_expr(table_references[TABLE_NO_ORDERS].internal_id, 1, false), // orders.customer_id
                 ast::Operator::Equals,
-                _create_column_expr(TABLE_NO_CUSTOMERS, 0, false), // customers.id
+                _create_column_expr(table_references[TABLE_NO_CUSTOMERS].internal_id, 0, false), // customers.id
             ),
             // orders.id = order_items.order_id
             _create_binary_expr(
-                _create_column_expr(TABLE_NO_ORDERS, 0, false), // orders.id
+                _create_column_expr(table_references[TABLE_NO_ORDERS].internal_id, 0, false), // orders.id
                 ast::Operator::Equals,
-                _create_column_expr(TABLE_NO_ORDER_ITEMS, 1, false), // order_items.order_id
+                _create_column_expr(table_references[TABLE_NO_ORDER_ITEMS].internal_id, 1, false), // order_items.order_id
             ),
             // customers.id = 42
             _create_binary_expr(
-                _create_column_expr(TABLE_NO_CUSTOMERS, 0, false), // customers.id
+                _create_column_expr(table_references[TABLE_NO_CUSTOMERS].internal_id, 0, false), // customers.id
                 ast::Operator::Equals,
                 _create_numeric_literal("42"),
             ),
@@ -946,14 +974,16 @@ mod tests {
         let t2 = _create_btree_table("t2", _create_column_list(&["id", "foo"], Type::Integer));
         let t3 = _create_btree_table("t3", _create_column_list(&["id", "foo"], Type::Integer));
 
+        let mut table_id_counter = TableRefIdCounter::new();
         let mut table_references = vec![
-            _create_table_reference(t1.clone(), None),
+            _create_table_reference(t1.clone(), None, table_id_counter.next()),
             _create_table_reference(
                 t2.clone(),
                 Some(JoinInfo {
                     outer: false,
                     using: None,
                 }),
+                table_id_counter.next(),
             ),
             _create_table_reference(
                 t3.clone(),
@@ -961,19 +991,20 @@ mod tests {
                     outer: false,
                     using: None,
                 }),
+                table_id_counter.next(),
             ),
         ];
 
         let where_clause = vec![
             // t2.foo = 42 (equality filter, more selective)
             _create_binary_expr(
-                _create_column_expr(1, 1, false), // table 1, column 1 (foo)
+                _create_column_expr(table_references[1].internal_id, 1, false), // table 1, column 1 (foo)
                 ast::Operator::Equals,
                 _create_numeric_literal("42"),
             ),
             // t1.foo > 10 (inequality filter, less selective)
             _create_binary_expr(
-                _create_column_expr(0, 1, false), // table 0, column 1 (foo)
+                _create_column_expr(table_references[0].internal_id, 1, false), // table 0, column 1 (foo)
                 ast::Operator::Greater,
                 _create_numeric_literal("10"),
             ),
@@ -1043,19 +1074,13 @@ mod tests {
             })
             .collect();
 
-        let mut where_clause = vec![];
-
-        // Add join conditions between fact and each dimension table
-        for i in 0..NUM_DIM_TABLES {
-            where_clause.push(_create_binary_expr(
-                _create_column_expr(FACT_TABLE_IDX, i + 1, false), // fact.dimX_id
-                ast::Operator::Equals,
-                _create_column_expr(i, 0, true), // dimX.id
-            ));
-        }
-
+        let mut table_id_counter = TableRefIdCounter::new();
         let table_references = {
-            let mut refs = vec![_create_table_reference(dim_tables[0].clone(), None)];
+            let mut refs = vec![_create_table_reference(
+                dim_tables[0].clone(),
+                None,
+                table_id_counter.next(),
+            )];
             refs.extend(dim_tables.iter().skip(1).map(|t| {
                 _create_table_reference(
                     t.clone(),
@@ -1063,6 +1088,7 @@ mod tests {
                         outer: false,
                         using: None,
                     }),
+                    table_id_counter.next(),
                 )
             }));
             refs.push(_create_table_reference(
@@ -1071,9 +1097,23 @@ mod tests {
                     outer: false,
                     using: None,
                 }),
+                table_id_counter.next(),
             ));
             refs
         };
+
+        let mut where_clause = vec![];
+
+        // Add join conditions between fact and each dimension table
+        for i in 0..NUM_DIM_TABLES {
+            let internal_id_fact = table_references[FACT_TABLE_IDX].internal_id;
+            let internal_id_other = table_references[i].internal_id;
+            where_clause.push(_create_binary_expr(
+                _create_column_expr(internal_id_fact, i + 1, false), // fact.dimX_id
+                ast::Operator::Equals,
+                _create_column_expr(internal_id_other, 0, true), // dimX.id
+            ));
+        }
 
         let access_methods_arena = RefCell::new(Vec::new());
         let available_indexes = HashMap::new();
@@ -1140,19 +1180,22 @@ mod tests {
 
         let available_indexes = HashMap::new();
 
+        let mut table_id_counter = TableRefIdCounter::new();
         // Create table references
         let table_references: Vec<_> = tables
             .iter()
-            .map(|t| _create_table_reference(t.clone(), None))
+            .map(|t| _create_table_reference(t.clone(), None, table_id_counter.next()))
             .collect();
 
         // Create where clause linking each table to the next
         let mut where_clause = Vec::new();
         for i in 0..NUM_TABLES - 1 {
+            let internal_id_left = table_references[i].internal_id;
+            let internal_id_right = table_references[i + 1].internal_id;
             where_clause.push(_create_binary_expr(
-                _create_column_expr(i, 1, false), // ti.next_id
+                _create_column_expr(internal_id_left, 1, false), // ti.next_id
                 ast::Operator::Equals,
-                _create_column_expr(i + 1, 0, true), // t(i+1).id
+                _create_column_expr(internal_id_right, 0, true), // t(i+1).id
             ));
         }
 
@@ -1258,6 +1301,7 @@ mod tests {
     fn _create_table_reference(
         table: Rc<BTreeTable>,
         join_info: Option<JoinInfo>,
+        internal_id: TableInternalId,
     ) -> TableReference {
         let name = table.name.clone();
         TableReference {
@@ -1267,13 +1311,14 @@ mod tests {
                 index: None,
             },
             identifier: name,
+            internal_id,
             join_info,
             col_used_mask: ColumnUsedMask::new(),
         }
     }
 
     /// Creates a column expression
-    fn _create_column_expr(table: usize, column: usize, is_rowid_alias: bool) -> Expr {
+    fn _create_column_expr(table: TableInternalId, column: usize, is_rowid_alias: bool) -> Expr {
         Expr::Column {
             database: None,
             table,
@@ -1287,7 +1332,7 @@ mod tests {
         WhereTerm {
             expr: Expr::Binary(Box::new(lhs), op, Box::new(rhs)),
             from_outer_join: None,
-            consumed: false,
+            consumed: Cell::new(false),
         }
     }
 

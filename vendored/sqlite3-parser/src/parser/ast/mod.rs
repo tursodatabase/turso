@@ -288,6 +288,43 @@ pub struct Delete {
     pub limit: Option<Box<Limit>>,
 }
 
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Internal ID of a table.
+///
+/// Used by [Expr::Column] and [Expr::RowId] to refer to a table.
+pub struct TableInternalId(usize);
+
+impl Default for TableInternalId {
+    fn default() -> Self {
+        Self(1)
+    }
+}
+
+impl From<usize> for TableInternalId {
+    fn from(value: usize) -> Self {
+        Self(value)
+    }
+}
+
+impl std::ops::AddAssign<usize> for TableInternalId {
+    fn add_assign(&mut self, rhs: usize) {
+        self.0 += rhs;
+    }
+}
+
+impl From<TableInternalId> for usize {
+    fn from(value: TableInternalId) -> Self {
+        value.0
+    }
+}
+
+impl std::fmt::Display for TableInternalId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "t{}", self.0)
+    }
+}
+
 /// SQL expression
 // https://sqlite.org/syntax/expr.html
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -354,7 +391,7 @@ pub enum Expr {
         /// the x in `x.y.z`. index of the db in catalog.
         database: Option<usize>,
         /// the y in `x.y.z`. index of the table in catalog.
-        table: usize,
+        table: TableInternalId,
         /// the z in `x.y.z`. index of the column in the table.
         column: usize,
         /// is the column a rowid alias
@@ -365,7 +402,7 @@ pub enum Expr {
         /// the x in `x.y.z`. index of the db in catalog.
         database: Option<usize>,
         /// the y in `x.y.z`. index of the table in catalog.
-        table: usize,
+        table: TableInternalId,
     },
     /// `IN`
     InList {

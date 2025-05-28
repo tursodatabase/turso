@@ -429,8 +429,11 @@ pub enum Insn {
     },
 
     /// Returns to the program counter stored in register 'return_reg'.
+    /// If can_fallthrough is true, fall through to the next instruction
+    /// if return_reg does not contain an integer value. Otherwise raise an error.
     Return {
         return_reg: usize,
+        can_fallthrough: bool,
     },
 
     /// Write an integer value into a register.
@@ -844,6 +847,14 @@ pub enum Insn {
         dest: usize,
         cookie: Cookie,
     },
+    /// Write the value in register P3 into cookie number P2 of database P1.
+    /// If P2 is the SCHEMA_VERSION cookie (cookie number 1) then the internal schema version is set to P3-P5
+    SetCookie {
+        db: usize,
+        cookie: Cookie,
+        value: i32,
+        p5: u16,
+    },
     /// Open a new cursor P1 to a transient table.
     OpenEphemeral {
         cursor_id: usize,
@@ -1010,6 +1021,7 @@ impl Insn {
             Insn::Noop => execute::op_noop,
             Insn::PageCount { .. } => execute::op_page_count,
             Insn::ReadCookie { .. } => execute::op_read_cookie,
+            Insn::SetCookie { .. } => execute::op_set_cookie,
             Insn::OpenEphemeral { .. } | Insn::OpenAutoindex { .. } => execute::op_open_ephemeral,
             Insn::Once { .. } => execute::op_once,
             Insn::Found { .. } | Insn::NotFound { .. } => execute::op_found,

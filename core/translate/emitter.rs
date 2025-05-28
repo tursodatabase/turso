@@ -4,7 +4,7 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use limbo_sqlite3_parser::ast::{self};
+use limbo_sqlite3_parser::ast::{self, SortOrder};
 
 use super::aggregation::emit_ungrouped_aggregation;
 use super::expr::{translate_condition_expr, translate_expr, ConditionMetadata};
@@ -15,13 +15,15 @@ use super::main_loop::{
     close_loop, emit_loop, init_distinct, init_loop, open_loop, LeftJoinMetadata, LoopLabels,
 };
 use super::order_by::{emit_order_by, init_order_by, SortMetadata};
-use super::plan::{JoinOrderMember, Operation, SelectPlan, TableReference, UpdatePlan};
+use super::plan::{
+    JoinOrderMember, Operation, QueryDestination, SelectPlan, TableReference, UpdatePlan,
+};
 use super::schema::ParseSchema;
 use super::select::emit_simple_count;
 use super::subquery::emit_subqueries;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::function::Func;
-use crate::schema::Index;
+use crate::schema::{Index, IndexColumn, Schema};
 use crate::translate::plan::{DeletePlan, Plan, Search};
 use crate::translate::values::emit_values;
 use crate::util::exprs_are_equivalent;
@@ -30,15 +32,16 @@ use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, RegisterOrLiteral};
 use crate::vdbe::{insn::Insn, BranchOffset};
 use crate::{Result, SymbolTable};
 
-#[derive(Debug)]
 pub struct Resolver<'a> {
+    pub schema: &'a Schema,
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache: Vec<(&'a ast::Expr, usize)>,
 }
 
 impl<'a> Resolver<'a> {
-    pub fn new(symbol_table: &'a SymbolTable) -> Self {
+    pub fn new(schema: &'a Schema, symbol_table: &'a SymbolTable) -> Self {
         Self {
+            schema,
             symbol_table,
             expr_to_reg_cache: Vec::new(),
         }
@@ -91,7 +94,6 @@ impl LimitCtx {
 /// The TranslateCtx struct holds various information and labels used during bytecode generation.
 /// It is used for maintaining state and control flow during the bytecode
 /// generation process.
-#[derive(Debug)]
 pub struct TranslateCtx<'a> {
     // A typical query plan is a nested loop. Each loop has its own LoopLabels (see the definition of LoopLabels for more details)
     pub labels_main_loop: Vec<LoopLabels>,
@@ -130,6 +132,7 @@ pub struct TranslateCtx<'a> {
 impl<'a> TranslateCtx<'a> {
     pub fn new(
         program: &mut ProgramBuilder,
+        schema: &'a Schema,
         syms: &'a SymbolTable,
         table_count: usize,
         result_column_count: usize,
@@ -148,7 +151,7 @@ impl<'a> TranslateCtx<'a> {
             meta_sort: None,
             result_column_indexes_in_orderby_sorter: (0..result_column_count).collect(),
             result_columns_to_skip_in_orderby_sorter: None,
-            resolver: Resolver::new(syms),
+            resolver: Resolver::new(schema, syms),
         }
     }
 }
@@ -172,18 +175,26 @@ pub enum TransactionMode {
 
 /// Main entry point for emitting bytecode for a SQL query
 /// Takes a query plan and generates the corresponding bytecode program
-pub fn emit_program(program: &mut ProgramBuilder, plan: Plan, syms: &SymbolTable) -> Result<()> {
+pub fn emit_program(
+    program: &mut ProgramBuilder,
+    plan: Plan,
+    schema: &Schema,
+    syms: &SymbolTable,
+) -> Result<()> {
     match plan {
-        Plan::Select(plan) => emit_program_for_select(program, plan, syms),
-        Plan::Delete(plan) => emit_program_for_delete(program, plan, syms),
-        Plan::Update(plan) => emit_program_for_update(program, plan, syms),
-        Plan::CompoundSelect { .. } => emit_program_for_compound_select(program, plan, syms),
+        Plan::Select(plan) => emit_program_for_select(program, plan, schema, syms),
+        Plan::Delete(plan) => emit_program_for_delete(program, plan, schema, syms),
+        Plan::Update(plan) => emit_program_for_update(program, plan, schema, syms),
+        Plan::CompoundSelect { .. } => {
+            emit_program_for_compound_select(program, plan, schema, syms)
+        }
     }
 }
 
 fn emit_program_for_compound_select(
     program: &mut ProgramBuilder,
     plan: Plan,
+    schema: &Schema,
     syms: &SymbolTable,
 ) -> Result<()> {
     let Plan::CompoundSelect {
@@ -208,65 +219,153 @@ fn emit_program_for_compound_select(
 
     // Each subselect gets their own TranslateCtx, but they share the same limit_ctx
     // because the LIMIT applies to the entire compound select, not just a single subselect.
-    let mut t_ctx_list = Vec::with_capacity(rest.len() + 1);
-    let reg_limit = if let Some(limit) = limit {
+    // The way LIMIT works with compound selects is:
+    // - If a given subselect appears BEFORE any UNION, then do NOT count those rows towards the LIMIT,
+    //   because the rows from those subselects need to be deduplicated before they start being counted.
+    // - If a given subselect appears AFTER the last UNION, then count those rows towards the LIMIT immediately.
+    let limit_ctx = limit.map(|limit| {
         let reg = program.alloc_register();
         program.emit_insn(Insn::Integer {
             value: limit as i64,
             dest: reg,
         });
-        Some(reg)
-    } else {
-        None
-    };
-    let limit_ctx = if let Some(reg_limit) = reg_limit {
-        Some(LimitCtx::new_shared(reg_limit))
-    } else {
-        None
-    };
-    let mut t_ctx_first = TranslateCtx::new(
+        LimitCtx::new_shared(reg)
+    });
+
+    // Each subselect gets their own TranslateCtx.
+    let mut t_ctx_list = Vec::with_capacity(rest.len() + 1);
+    t_ctx_list.push(TranslateCtx::new(
         program,
+        schema,
         syms,
         first.table_references.len(),
         first.result_columns.len(),
-    );
-    t_ctx_first.limit_ctx = limit_ctx;
-    t_ctx_list.push(t_ctx_first);
-
-    for (select, _) in rest.iter() {
-        let mut t_ctx = TranslateCtx::new(
+    ));
+    rest.iter().for_each(|(select, _)| {
+        let t_ctx = TranslateCtx::new(
             program,
+            schema,
             syms,
             select.table_references.len(),
             select.result_columns.len(),
         );
-        t_ctx.limit_ctx = limit_ctx;
         t_ctx_list.push(t_ctx);
+    });
+
+    // Compound select operators have the same precedence and are left-associative.
+    // If there is any remaining UNION operator on the right side of a given sub-SELECT,
+    // all of the rows from the preceding UNION arms need to be deduplicated.
+    // This is done by creating an ephemeral index and inserting all the rows from the left side of
+    // the last UNION arm into it.
+    // Then, as soon as there are no more UNION operators left, all the deduplicated rows from the
+    // ephemeral index are emitted, and lastly the rows from the remaining sub-SELECTS are emitted
+    // as is, as they don't require deduplication.
+    let mut first_t_ctx = t_ctx_list.remove(0);
+    let requires_union_deduplication = rest
+        .iter()
+        .any(|(_, operator)| operator == &ast::CompoundOperator::Union);
+    if requires_union_deduplication {
+        // appears BEFORE a UNION operator, so do not count those rows towards the LIMIT.
+        first.limit = None;
+    } else {
+        // appears AFTER the last UNION operator, so count those rows towards the LIMIT.
+        first_t_ctx.limit_ctx = limit_ctx;
     }
 
-    let mut first_t_ctx = t_ctx_list.remove(0);
+    let mut registers_subqery = None;
+    let yield_reg = match first.query_destination {
+        QueryDestination::CoroutineYield { yield_reg, .. } => {
+            registers_subqery = Some(program.alloc_registers(first.result_columns.len()));
+            first_t_ctx.reg_result_cols_start = registers_subqery.clone();
+            Some(yield_reg)
+        }
+        _ => None,
+    };
+
+    let mut union_dedupe_index = if requires_union_deduplication {
+        let dedupe_index = get_union_dedupe_index(program, &first);
+        first.query_destination = QueryDestination::EphemeralIndex {
+            cursor_id: dedupe_index.0,
+            index: dedupe_index.1.clone(),
+        };
+        Some(dedupe_index)
+    } else {
+        None
+    };
+
+    // Emit the first SELECT
     emit_query(program, &mut first, &mut first_t_ctx)?;
 
-    // TODO: add support for UNION, EXCEPT, INTERSECT
+    // Emit the remaining SELECTs. Any selects on the left side of a UNION must deduplicate their
+    // results with the ephemeral index created above.
     while !t_ctx_list.is_empty() {
         let label_next_select = program.allocate_label();
         // If the LIMIT is reached in any subselect, jump to either:
         // a) the IfNot of the next subselect, or
         // b) the end of the program
-        if let Some(reg_limit) = reg_limit {
+        if let Some(limit_ctx) = limit_ctx {
             program.emit_insn(Insn::IfNot {
-                reg: reg_limit,
+                reg: limit_ctx.reg_limit,
                 target_pc: label_next_select,
                 jump_if_null: true,
             });
         }
         let mut t_ctx = t_ctx_list.remove(0);
+        let requires_union_deduplication = rest
+            .iter()
+            .any(|(_, operator)| operator == &ast::CompoundOperator::Union);
         let (mut select, operator) = rest.remove(0);
-        if operator != ast::CompoundOperator::UnionAll {
+        if operator != ast::CompoundOperator::UnionAll && operator != ast::CompoundOperator::Union {
             crate::bail_parse_error!("unimplemented compound select operator: {:?}", operator);
+        }
+
+        if requires_union_deduplication {
+            // Again: appears BEFORE a UNION operator, so do not count those rows towards the LIMIT.
+            select.limit = None;
+        } else {
+            // appears AFTER the last UNION operator, so count those rows towards the LIMIT.
+            t_ctx.limit_ctx = limit_ctx;
+        }
+
+        if requires_union_deduplication {
+            select.query_destination = QueryDestination::EphemeralIndex {
+                cursor_id: union_dedupe_index.as_ref().unwrap().0,
+                index: union_dedupe_index.as_ref().unwrap().1.clone(),
+            };
+        } else if let Some((dedupe_cursor_id, dedupe_index)) = union_dedupe_index.take() {
+            // When there are no more UNION operators left, all the deduplicated rows from the preceding union arms need to be emitted
+            // as result rows.
+            read_deduplicated_union_rows(
+                program,
+                dedupe_cursor_id,
+                dedupe_index.as_ref(),
+                limit_ctx,
+                label_next_select,
+                yield_reg.clone(),
+            );
+        }
+        if matches!(
+            select.query_destination,
+            crate::translate::plan::QueryDestination::CoroutineYield { .. }
+        ) {
+            // Need to reuse the same registers when you are yielding
+            t_ctx.reg_result_cols_start = registers_subqery.clone();
         }
         emit_query(program, &mut select, &mut t_ctx)?;
         program.preassign_label_to_next_insn(label_next_select);
+    }
+
+    if let Some((dedupe_cursor_id, dedupe_index)) = union_dedupe_index {
+        let label_jump_over_dedupe = program.allocate_label();
+        read_deduplicated_union_rows(
+            program,
+            dedupe_cursor_id,
+            dedupe_index.as_ref(),
+            limit_ctx,
+            label_jump_over_dedupe,
+            yield_reg,
+        );
+        program.preassign_label_to_next_insn(label_jump_over_dedupe);
     }
 
     program.epilogue(TransactionMode::Read);
@@ -276,13 +375,108 @@ fn emit_program_for_compound_select(
     Ok(())
 }
 
+/// Creates an ephemeral index that will be used to deduplicate the results of any sub-selects
+/// that appear before the last UNION operator.
+fn get_union_dedupe_index(
+    program: &mut ProgramBuilder,
+    first_select_in_compound: &SelectPlan,
+) -> (usize, Arc<Index>) {
+    let dedupe_index = Arc::new(Index {
+        columns: first_select_in_compound
+            .result_columns
+            .iter()
+            .map(|c| IndexColumn {
+                name: c
+                    .name(&first_select_in_compound.table_references)
+                    .map(|n| n.to_string())
+                    .unwrap_or_default(),
+                order: SortOrder::Asc,
+                pos_in_table: 0,
+                collation: None, // FIXME: this should be inferred
+            })
+            .collect(),
+        name: "union_dedupe".to_string(),
+        root_page: 0,
+        ephemeral: true,
+        table_name: String::new(),
+        unique: true,
+        has_rowid: false,
+    });
+    let cursor_id = program.alloc_cursor_id(
+        Some(dedupe_index.name.clone()),
+        CursorType::BTreeIndex(dedupe_index.clone()),
+    );
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id,
+        is_table: false,
+    });
+    (cursor_id, dedupe_index.clone())
+}
+
+/// Emits the bytecode for reading deduplicated rows from the ephemeral index created for UNION operators.
+fn read_deduplicated_union_rows(
+    program: &mut ProgramBuilder,
+    dedupe_cursor_id: usize,
+    dedupe_index: &Index,
+    limit_ctx: Option<LimitCtx>,
+    label_limit_reached: BranchOffset,
+    yield_reg: Option<usize>,
+) {
+    let label_dedupe_next = program.allocate_label();
+    let label_dedupe_loop_start = program.allocate_label();
+    let dedupe_cols_start_reg = program.alloc_registers(dedupe_index.columns.len());
+    program.emit_insn(Insn::Rewind {
+        cursor_id: dedupe_cursor_id,
+        pc_if_empty: label_dedupe_next,
+    });
+    program.preassign_label_to_next_insn(label_dedupe_loop_start);
+    for col_idx in 0..dedupe_index.columns.len() {
+        let start_reg = if let Some(yield_reg) = yield_reg {
+            // Need to reuse the yield_reg for the column being emitted
+            yield_reg + 1
+        } else {
+            dedupe_cols_start_reg
+        };
+        program.emit_insn(Insn::Column {
+            cursor_id: dedupe_cursor_id,
+            column: col_idx,
+            dest: start_reg + col_idx,
+        });
+    }
+    if let Some(yield_reg) = yield_reg {
+        program.emit_insn(Insn::Yield {
+            yield_reg,
+            end_offset: BranchOffset::Offset(0),
+        });
+    } else {
+        program.emit_insn(Insn::ResultRow {
+            start_reg: dedupe_cols_start_reg,
+            count: dedupe_index.columns.len(),
+        });
+    }
+
+    if let Some(limit_ctx) = limit_ctx {
+        program.emit_insn(Insn::DecrJumpZero {
+            reg: limit_ctx.reg_limit,
+            target_pc: label_limit_reached,
+        })
+    }
+    program.preassign_label_to_next_insn(label_dedupe_next);
+    program.emit_insn(Insn::Next {
+        cursor_id: dedupe_cursor_id,
+        pc_if_next: label_dedupe_loop_start,
+    });
+}
+
 fn emit_program_for_select(
     program: &mut ProgramBuilder,
     mut plan: SelectPlan,
+    schema: &Schema,
     syms: &SymbolTable,
 ) -> Result<()> {
     let mut t_ctx = TranslateCtx::new(
         program,
+        schema,
         syms,
         plan.table_references.len(),
         plan.result_columns.len(),
@@ -325,21 +519,7 @@ pub fn emit_query<'a>(
     // Emit subqueries first so the results can be read in the main query loop.
     emit_subqueries(program, t_ctx, &mut plan.table_references)?;
 
-    if t_ctx.limit_ctx.is_none() {
-        t_ctx.limit_ctx = plan.limit.map(|_| LimitCtx::new(program));
-    }
-
-    if t_ctx.reg_offset.is_none() {
-        t_ctx.reg_offset = t_ctx
-            .reg_offset
-            .or_else(|| plan.offset.map(|_| program.alloc_register()));
-    }
-
-    if t_ctx.reg_limit_offset_sum.is_none() {
-        t_ctx.reg_limit_offset_sum = t_ctx
-            .reg_limit_offset_sum
-            .or_else(|| plan.offset.map(|_| program.alloc_register()));
-    }
+    init_limit(program, t_ctx, plan.limit, plan.offset);
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     // however an aggregation might still happen,
@@ -365,7 +545,9 @@ pub fn emit_query<'a>(
     }
 
     // Allocate registers for result columns
-    t_ctx.reg_result_cols_start = Some(program.alloc_registers(plan.result_columns.len()));
+    if t_ctx.reg_result_cols_start.is_none() {
+        t_ctx.reg_result_cols_start = Some(program.alloc_registers(plan.result_columns.len()));
+    }
 
     // Initialize cursors and other resources needed for query execution
     if let Some(ref mut order_by) = plan.order_by {
@@ -461,10 +643,12 @@ pub fn emit_query<'a>(
 fn emit_program_for_delete(
     program: &mut ProgramBuilder,
     mut plan: DeletePlan,
+    schema: &Schema,
     syms: &SymbolTable,
 ) -> Result<()> {
     let mut t_ctx = TranslateCtx::new(
         program,
+        schema,
         syms,
         plan.table_references.len(),
         plan.result_columns.len(),
@@ -477,6 +661,8 @@ fn emit_program_for_delete(
         program.table_references = plan.table_references;
         return Ok(());
     }
+
+    init_limit(program, &mut t_ctx, plan.limit, None);
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     let after_main_loop_label = program.allocate_label();
@@ -505,13 +691,7 @@ fn emit_program_for_delete(
         &[JoinOrderMember::default()],
         &mut plan.where_clause,
     )?;
-    emit_delete_insns(
-        program,
-        &mut t_ctx,
-        &plan.table_references,
-        &plan.indexes,
-        &plan.limit,
-    )?;
+    emit_delete_insns(program, &mut t_ctx, &plan.table_references, &plan.indexes)?;
 
     // Clean up and close the main execution loop
     close_loop(
@@ -534,7 +714,6 @@ fn emit_delete_insns(
     t_ctx: &mut TranslateCtx,
     table_references: &[TableReference],
     index_references: &[Arc<Index>],
-    limit: &Option<isize>,
 ) -> Result<()> {
     let table_reference = table_references.first().unwrap();
     let cursor_id = match &table_reference.op {
@@ -612,15 +791,9 @@ fn emit_delete_insns(
             cursor_id: main_table_cursor_id,
         });
     }
-    if let Some(limit) = limit {
-        let limit_reg = program.alloc_register();
-        program.emit_insn(Insn::Integer {
-            value: *limit as i64,
-            dest: limit_reg,
-        });
-        program.mark_last_insn_constant();
+    if let Some(limit_ctx) = t_ctx.limit_ctx {
         program.emit_insn(Insn::DecrJumpZero {
-            reg: limit_reg,
+            reg: limit_ctx.reg_limit,
             target_pc: t_ctx.label_main_loop_end.unwrap(),
         })
     }
@@ -631,10 +804,12 @@ fn emit_delete_insns(
 fn emit_program_for_update(
     program: &mut ProgramBuilder,
     mut plan: UpdatePlan,
+    schema: &Schema,
     syms: &SymbolTable,
 ) -> Result<()> {
     let mut t_ctx = TranslateCtx::new(
         program,
+        schema,
         syms,
         plan.table_references.len(),
         plan.returning.as_ref().map_or(0, |r| r.len()),
@@ -647,30 +822,8 @@ fn emit_program_for_update(
         program.table_references = plan.table_references;
         return Ok(());
     }
-    if t_ctx.limit_ctx.is_none() && plan.limit.is_some() {
-        t_ctx.limit_ctx = Some(LimitCtx::new(program));
-        program.emit_insn(Insn::Integer {
-            value: plan.limit.unwrap() as i64,
-            dest: t_ctx.limit_ctx.unwrap().reg_limit,
-        });
-        program.mark_last_insn_constant();
-        if t_ctx.reg_offset.is_none() && plan.offset.is_some_and(|n| n.ne(&0)) {
-            let reg = program.alloc_register();
-            t_ctx.reg_offset = Some(reg);
-            program.emit_insn(Insn::Integer {
-                value: plan.offset.unwrap() as i64,
-                dest: reg,
-            });
-            program.mark_last_insn_constant();
-            let combined_reg = program.alloc_register();
-            t_ctx.reg_limit_offset_sum = Some(combined_reg);
-            program.emit_insn(Insn::OffsetLimit {
-                limit_reg: t_ctx.limit_ctx.unwrap().reg_limit,
-                offset_reg: reg,
-                combined_reg,
-            });
-        }
-    }
+
+    init_limit(program, &mut t_ctx, plan.limit, plan.offset);
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
     if plan.contains_constant_false_condition {
@@ -1156,4 +1309,42 @@ fn emit_update_insns(
     }
 
     Ok(())
+}
+
+/// Initialize the limit/offset counters and registers.
+/// In case of compound SELECTs, the limit counter is initialized only once,
+/// hence [LimitCtx::initialize_counter] being false in those cases.
+fn init_limit(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    limit: Option<isize>,
+    offset: Option<isize>,
+) {
+    if t_ctx.limit_ctx.is_none() {
+        t_ctx.limit_ctx = limit.map(|_| LimitCtx::new(program));
+    }
+    let Some(limit_ctx) = t_ctx.limit_ctx else {
+        return;
+    };
+    if limit_ctx.initialize_counter {
+        program.emit_insn(Insn::Integer {
+            value: limit.expect("limit must be Some if limit_ctx is Some") as i64,
+            dest: limit_ctx.reg_limit,
+        });
+    }
+    if t_ctx.reg_offset.is_none() && offset.is_some_and(|n| n.ne(&0)) {
+        let reg = program.alloc_register();
+        t_ctx.reg_offset = Some(reg);
+        program.emit_insn(Insn::Integer {
+            value: offset.unwrap() as i64,
+            dest: reg,
+        });
+        let combined_reg = program.alloc_register();
+        t_ctx.reg_limit_offset_sum = Some(combined_reg);
+        program.emit_insn(Insn::OffsetLimit {
+            limit_reg: t_ctx.limit_ctx.unwrap().reg_limit,
+            offset_reg: reg,
+            combined_reg,
+        });
+    }
 }

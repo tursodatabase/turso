@@ -2,11 +2,11 @@
 /core/ @pereman2 @jussisaurio @penberg
 /core/storage @pereman2
 /core/translate @jussisaurio
+/extensions/ @PThorpe92
+/core/ext/ @PThorpe92
+/bindings/go @PThorpe92
 
 # These are commented out until they get access from the overlords
-# /extensions/ @PThorpe92
-# /core/ext/ @PThorpe92
-# /bindings/go @PThorpe92
 # /bindings/java @seonWKim
 # /simulator/ @alpaylan
 # /core/storage @krishvishal 

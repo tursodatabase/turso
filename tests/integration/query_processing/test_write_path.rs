@@ -332,8 +332,8 @@ fn test_insert_after_big_blob() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE temp (t1 BLOB, t2 INTEGER)");
     let conn = tmp_db.connect_limbo();
 
-    conn.execute("insert into temp values (zeroblob (262144))")?;
-    conn.execute("insert into temp values (1)")?;
+    conn.execute("insert into temp(t1) values (zeroblob (262144))")?;
+    conn.execute("insert into temp(t2) values (1)")?;
 
     Ok(())
 }

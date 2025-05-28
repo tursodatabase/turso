@@ -135,7 +135,11 @@ pub fn init_group_by(
                     CollationSeq::new(collation_name).map(Some)
                 }
                 ast::Expr::Column { table, column, .. } => {
-                    let table_reference = plan.table_references.get(*table).unwrap();
+                    let table_reference = plan
+                        .table_references
+                        .iter()
+                        .find(|t| t.internal_id == *table)
+                        .unwrap();
 
                     let Some(table_column) = table_reference.table.get_column_at(*column) else {
                         crate::bail_parse_error!("column index out of bounds");
@@ -756,6 +760,7 @@ pub fn group_by_emit_row_phase<'a>(
     });
     program.emit_insn(Insn::Return {
         return_reg: registers.reg_subrtn_acc_output_return_offset,
+        can_fallthrough: false,
     });
 
     program.resolve_label(labels.label_subrtn_acc_output, program.offset());
@@ -780,6 +785,7 @@ pub fn group_by_emit_row_phase<'a>(
     }
     program.emit_insn(Insn::Return {
         return_reg: registers.reg_subrtn_acc_output_return_offset,
+        can_fallthrough: false,
     });
 
     // Finalize aggregate values for output
@@ -893,7 +899,6 @@ pub fn group_by_emit_row_phase<'a>(
                 t_ctx.reg_offset,
                 t_ctx.reg_result_cols_start.unwrap(),
                 t_ctx.limit_ctx,
-                t_ctx.reg_limit_offset_sum,
             )?;
         }
         Some(_) => {
@@ -912,6 +917,7 @@ pub fn group_by_emit_row_phase<'a>(
 
     program.emit_insn(Insn::Return {
         return_reg: registers.reg_subrtn_acc_output_return_offset,
+        can_fallthrough: false,
     });
 
     // Subroutine to clear accumulators for a new group
@@ -951,6 +957,7 @@ pub fn group_by_emit_row_phase<'a>(
     });
     program.emit_insn(Insn::Return {
         return_reg: registers.reg_subrtn_acc_clear_return_offset,
+        can_fallthrough: false,
     });
     program.preassign_label_to_next_insn(labels.label_group_by_end);
     Ok(())

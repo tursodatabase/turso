@@ -1,3 +1,5 @@
+#![allow(clippy::arc_with_non_send_sync)]
+
 mod error;
 mod ext;
 mod fast_lock;
@@ -61,6 +63,7 @@ use std::{
 use storage::btree::{btree_init_page, BTreePageInner};
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
+pub use storage::pager::PagerCacheflushStatus;
 pub use storage::{
     buffer_pool::BufferPool,
     database::DatabaseStorage,
@@ -77,6 +80,7 @@ use translate::select::prepare_select_plan;
 pub use types::RefValue;
 pub use types::Value;
 use util::{columns_from_create_table_body, parse_schema_rows};
+use vdbe::builder::TableRefIdCounter;
 use vdbe::{builder::QueryMode, VTabOpaqueCursor};
 pub type Result<T, E = LimboError> = std::result::Result<T, E>;
 pub static DATABASE_VERSION: OnceLock<String> = OnceLock::new();
@@ -215,7 +219,7 @@ impl Database {
         let pager = Rc::new(Pager::finish_open(
             self.header.clone(),
             self.db_file.clone(),
-            Some(wal),
+            wal,
             self.io.clone(),
             Arc::new(RwLock::new(DumbLruPageCache::default())),
             buffer_pool,
@@ -300,7 +304,8 @@ pub fn maybe_init_database_file(file: &Arc<dyn File>, io: &Arc<dyn IO>) -> Resul
                 let completion = Completion::Write(WriteCompletion::new(Box::new(move |_| {
                     *flag_complete.borrow_mut() = true;
                 })));
-                file.pwrite(0, contents.buffer.clone(), completion)?;
+                #[allow(clippy::arc_with_non_send_sync)]
+                file.pwrite(0, contents.buffer.clone(), Arc::new(completion))?;
             }
             let mut limit = 100;
             loop {
@@ -407,6 +412,7 @@ impl Connection {
                 Ok(Some(stmt))
             }
             Cmd::ExplainQueryPlan(stmt) => {
+                let mut table_ref_counter = TableRefIdCounter::new();
                 match stmt {
                     ast::Stmt::Select(select) => {
                         let mut plan = prepare_select_plan(
@@ -417,6 +423,8 @@ impl Connection {
                             *select,
                             &syms,
                             None,
+                            &mut table_ref_counter,
+                            translate::plan::QueryDestination::ResultRows,
                         )?;
                         optimize_plan(
                             &mut plan,
@@ -500,7 +508,20 @@ impl Connection {
         self.pager.wal_frame_count()
     }
 
-    pub fn cacheflush(&self) -> Result<CheckpointStatus> {
+    pub fn wal_get_frame(
+        &self,
+        frame_no: u32,
+        p_frame: *mut u8,
+        frame_len: u32,
+    ) -> Result<Arc<Completion>> {
+        self.pager.wal_get_frame(frame_no, p_frame, frame_len)
+    }
+
+    /// Flush dirty pages to disk.
+    /// This will write the dirty pages to the WAL and then fsync the WAL.
+    /// If the WAL size is over the checkpoint threshold, it will checkpoint the WAL to
+    /// the database file and then fsync the database file.
+    pub fn cacheflush(&self) -> Result<PagerCacheflushStatus> {
         self.pager.cacheflush()
     }
 

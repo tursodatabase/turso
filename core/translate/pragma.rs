@@ -10,10 +10,10 @@ use crate::fast_lock::SpinLock;
 use crate::schema::Schema;
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, MIN_PAGE_CACHE_SIZE};
 use crate::storage::wal::CheckpointMode;
-use crate::util::normalize_ident;
+use crate::util::{normalize_ident, parse_signed_number};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, Pager};
+use crate::{bail_parse_error, Pager, Value};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
@@ -142,27 +142,19 @@ fn update_pragma(
             Ok(())
         }
         PragmaName::UserVersion => {
-            let version_value = match value {
-                ast::Expr::Literal(ast::Literal::Numeric(numeric_value)) => {
-                    numeric_value.parse::<i32>()?
-                }
-                ast::Expr::Unary(ast::UnaryOperator::Negative, expr) => match *expr {
-                    ast::Expr::Literal(ast::Literal::Numeric(numeric_value)) => {
-                        -numeric_value.parse::<i32>()?
-                    }
-                    _ => bail_parse_error!("Not a valid value"),
-                },
-                _ => bail_parse_error!("Not a valid value"),
+            let data = parse_signed_number(&value)?;
+            let version_value = match data {
+                Value::Integer(i) => i as i32,
+                Value::Float(f) => f as i32,
+                _ => unreachable!(),
             };
 
-            let mut header_guard = header.lock();
-
-            // update in-memory
-            header_guard.user_version = version_value;
-
-            // update in disk
-            pager.write_database_header(&header_guard);
-
+            program.emit_insn(Insn::SetCookie {
+                db: 0,
+                cookie: Cookie::UserVersion,
+                value: version_value,
+                p5: 1,
+            });
             Ok(())
         }
         PragmaName::SchemaVersion => {

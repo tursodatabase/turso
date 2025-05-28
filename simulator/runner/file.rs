@@ -77,7 +77,7 @@ impl File for SimulatorFile {
         self.inner.unlock_file()
     }
 
-    fn pread(&self, pos: usize, c: limbo_core::Completion) -> Result<()> {
+    fn pread(&self, pos: usize, c: Arc<limbo_core::Completion>) -> Result<()> {
         *self.nr_pread_calls.borrow_mut() += 1;
         if *self.fault.borrow() {
             *self.nr_pread_faults.borrow_mut() += 1;
@@ -92,7 +92,7 @@ impl File for SimulatorFile {
         &self,
         pos: usize,
         buffer: Arc<RefCell<limbo_core::Buffer>>,
-        c: limbo_core::Completion,
+        c: Arc<limbo_core::Completion>,
     ) -> Result<()> {
         *self.nr_pwrite_calls.borrow_mut() += 1;
         if *self.fault.borrow() {
@@ -104,7 +104,7 @@ impl File for SimulatorFile {
         self.inner.pwrite(pos, buffer, c)
     }
 
-    fn sync(&self, c: limbo_core::Completion) -> Result<()> {
+    fn sync(&self, c: Arc<limbo_core::Completion>) -> Result<()> {
         *self.nr_sync_calls.borrow_mut() += 1;
         self.inner.sync(c)
     }

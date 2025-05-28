@@ -2153,6 +2153,7 @@ impl BTreeCursor {
                         ) == Ordering::Equal {
 
                         tracing::debug!("insert_into_page: found exact match with cell_idx={cell_idx}, overwriting");
+                        self.has_record.set(CursorHasRecord::Yes { rowid: self.get_index_rowid_from_record() });
                         self.overwrite_cell(page.clone(), cell_idx, record)?;
                         self.state
                             .mut_write_info()
@@ -6308,7 +6309,7 @@ mod tests {
         let page_cache = Arc::new(parking_lot::RwLock::new(DumbLruPageCache::new(2000)));
         let pager = {
             let db_header = Arc::new(SpinLock::new(db_header.clone()));
-            Pager::finish_open(db_header, db_file, Some(wal), io, page_cache, buffer_pool).unwrap()
+            Pager::finish_open(db_header, db_file, wal, io, page_cache, buffer_pool).unwrap()
         };
         let pager = Rc::new(pager);
         // FIXME: handle page cache is full
@@ -6486,8 +6487,8 @@ mod tests {
                 .unwrap();
                 loop {
                     match pager.end_tx().unwrap() {
-                        crate::CheckpointStatus::Done(_) => break,
-                        crate::CheckpointStatus::IO => {
+                        crate::PagerCacheflushStatus::Done(_) => break,
+                        crate::PagerCacheflushStatus::IO => {
                             pager.io.run_once().unwrap();
                         }
                     }
@@ -6600,8 +6601,8 @@ mod tests {
                 cursor.move_to_root();
                 loop {
                     match pager.end_tx().unwrap() {
-                        crate::CheckpointStatus::Done(_) => break,
-                        crate::CheckpointStatus::IO => {
+                        crate::PagerCacheflushStatus::Done(_) => break,
+                        crate::PagerCacheflushStatus::IO => {
                             pager.io.run_once().unwrap();
                         }
                     }
@@ -6776,7 +6777,7 @@ mod tests {
 
         let write_complete = Box::new(|_| {});
         let c = Completion::Write(WriteCompletion::new(write_complete));
-        db_file.write_page(1, buf.clone(), c).unwrap();
+        db_file.write_page(1, buf.clone(), Arc::new(c)).unwrap();
 
         let wal_shared = WalFileShared::open_shared(&io, "test.wal", page_size).unwrap();
         let wal = Rc::new(RefCell::new(WalFile::new(
@@ -6790,7 +6791,7 @@ mod tests {
             Pager::finish_open(
                 db_header.clone(),
                 db_file,
-                Some(wal),
+                wal,
                 io,
                 Arc::new(parking_lot::RwLock::new(DumbLruPageCache::new(10))),
                 buffer_pool,
@@ -6826,9 +6827,10 @@ mod tests {
             )));
             let write_complete = Box::new(|_| {});
             let c = Completion::Write(WriteCompletion::new(write_complete));
+            #[allow(clippy::arc_with_non_send_sync)]
             pager
                 .db_file
-                .write_page(current_page as usize, buf.clone(), c)?;
+                .write_page(current_page as usize, buf.clone(), Arc::new(c))?;
             pager.io.run_once()?;
 
             let page = cursor.read_page(current_page as usize)?;

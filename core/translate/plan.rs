@@ -2,6 +2,7 @@ use core::fmt;
 use limbo_ext::{ConstraintInfo, ConstraintOp};
 use limbo_sqlite3_parser::ast::{self, SortOrder};
 use std::{
+    cell::Cell,
     cmp::Ordering,
     fmt::{Display, Formatter},
     rc::Rc,
@@ -21,6 +22,8 @@ use crate::{
 };
 use crate::{schema::Type, types::SeekOp, util::can_pushdown_predicate};
 
+use limbo_sqlite3_parser::ast::TableInternalId;
+
 use super::{emitter::OperationMode, planner::determine_where_to_eval_term, schema::ParseSchema};
 
 #[derive(Debug, Clone)]
@@ -38,11 +41,18 @@ impl ResultSetColumn {
         }
         match &self.expr {
             ast::Expr::Column { table, column, .. } => {
-                tables[*table].columns()[*column].name.as_deref()
+                let table_ref = tables.iter().find(|t| t.internal_id == *table).unwrap();
+                table_ref
+                    .table
+                    .get_column_at(*column)
+                    .unwrap()
+                    .name
+                    .as_deref()
             }
             ast::Expr::RowId { table, .. } => {
                 // If there is a rowid alias column, use its name
-                if let Table::BTree(table) = &tables[*table].table {
+                let table_ref = tables.iter().find(|t| t.internal_id == *table).unwrap();
+                if let Table::BTree(table) = &table_ref.table {
                     if let Some(rowid_alias_column) = table.get_rowid_alias_column() {
                         if let Some(name) = &rowid_alias_column.1.name {
                             return Some(name);
@@ -77,22 +87,27 @@ pub struct GroupBy {
 pub struct WhereTerm {
     /// The original condition expression.
     pub expr: ast::Expr,
-    /// Is this condition originally from an OUTER JOIN, and which table number in the plan's [TableReference] vector?
-    /// If so, we need to evaluate it at the loop of the right table in that JOIN,
+    /// Is this condition originally from an OUTER JOIN, and if so, what is the internal ID of the [TableReference] that it came from?
+    /// The ID is always the right-hand-side table of the OUTER JOIN.
+    /// If `from_outer_join` is Some, we need to evaluate this term at the loop of the the corresponding table,
     /// regardless of which tables it references.
     /// We also cannot e.g. short circuit the entire query in the optimizer if the condition is statically false.
-    pub from_outer_join: Option<usize>,
+    pub from_outer_join: Option<TableInternalId>,
     /// Whether the condition has been consumed by the optimizer in some way, and it should not be evaluated
     /// in the normal place where WHERE terms are evaluated.
     /// A term may have been consumed e.g. if:
     /// - it has been converted into a constraint in a seek key
     /// - it has been removed due to being trivially true or false
-    pub consumed: bool,
+    ///
+    /// FIXME: this can be made into a simple `bool` once we move the virtual table constraint resolution
+    /// code out of `init_loop()`, because that's the only place that requires a mutable reference to the where clause
+    /// that causes problems to other code that needs immutable references to the where clause.
+    pub consumed: Cell<bool>,
 }
 
 impl WhereTerm {
     pub fn should_eval_before_loop(&self, join_order: &[JoinOrderMember]) -> bool {
-        if self.consumed {
+        if self.consumed.get() {
             return false;
         }
         let Ok(eval_at) = self.eval_at(join_order) else {
@@ -102,7 +117,7 @@ impl WhereTerm {
     }
 
     pub fn should_eval_at_loop(&self, loop_idx: usize, join_order: &[JoinOrderMember]) -> bool {
-        if self.consumed {
+        if self.consumed.get() {
             return false;
         }
         let Ok(eval_at) = self.eval_at(join_order) else {
@@ -159,8 +174,9 @@ fn to_ext_constraint_op(op: &Operator) -> Option<ConstraintOp> {
 /// the filtration in the vdbe layer.
 pub fn convert_where_to_vtab_constraint(
     term: &WhereTerm,
-    table_index: usize,
+    table_idx: usize,
     pred_idx: usize,
+    join_order: &[JoinOrderMember],
 ) -> Result<Option<ConstraintInfo>> {
     if term.from_outer_join.is_some() {
         return Ok(None);
@@ -168,7 +184,8 @@ pub fn convert_where_to_vtab_constraint(
     let Expr::Binary(lhs, op, rhs) = &term.expr else {
         return Ok(None);
     };
-    let expr_is_ready = |e: &Expr| -> Result<bool> { can_pushdown_predicate(e, table_index) };
+    let expr_is_ready =
+        |e: &Expr| -> Result<bool> { can_pushdown_predicate(e, table_idx, join_order) };
     let (vcol_idx, op_for_vtab, usable, is_rhs) = match (&**lhs, &**rhs) {
         (
             Expr::Column {
@@ -183,23 +200,37 @@ pub fn convert_where_to_vtab_constraint(
             },
         ) => {
             // one side must be the virtual table
-            let vtab_on_l = *tbl_l == table_index;
-            let vtab_on_r = *tbl_r == table_index;
+            let tbl_l_idx = join_order
+                .iter()
+                .position(|j| j.table_id == *tbl_l)
+                .unwrap();
+            let tbl_r_idx = join_order
+                .iter()
+                .position(|j| j.table_id == *tbl_r)
+                .unwrap();
+            let vtab_on_l = tbl_l_idx == table_idx;
+            let vtab_on_r = tbl_r_idx == table_idx;
             if vtab_on_l == vtab_on_r {
                 return Ok(None); // either both or none -> not convertible
             }
 
             if vtab_on_l {
                 // vtab on left side: operator unchanged
-                let usable = *tbl_r < table_index; // usable if the other table is already positioned
+                let usable = tbl_r_idx < table_idx; // usable if the other table is already positioned
                 (col_l, op, usable, false)
             } else {
                 // vtab on right side of the expr: reverse operator
-                let usable = *tbl_l < table_index;
+                let usable = tbl_l_idx < table_idx;
                 (col_r, &reverse_operator(op).unwrap_or(*op), usable, true)
             }
         }
-        (Expr::Column { table, column, .. }, other) if *table == table_index => {
+        (Expr::Column { table, column, .. }, other)
+            if join_order
+                .iter()
+                .position(|j| j.table_id == *table)
+                .unwrap()
+                == table_idx =>
+        {
             (
                 column,
                 op,
@@ -207,12 +238,20 @@ pub fn convert_where_to_vtab_constraint(
                 false,
             )
         }
-        (other, Expr::Column { table, column, .. }) if *table == table_index => (
-            column,
-            &reverse_operator(op).unwrap_or(*op),
-            expr_is_ready(other)?,
-            true,
-        ),
+        (other, Expr::Column { table, column, .. })
+            if join_order
+                .iter()
+                .position(|j| j.table_id == *table)
+                .unwrap()
+                == table_idx =>
+        {
+            (
+                column,
+                &reverse_operator(op).unwrap_or(*op),
+                expr_is_ready(other)?,
+                true,
+            )
+        }
 
         _ => return Ok(None), // does not involve the virtual table at all
     };
@@ -275,22 +314,39 @@ pub enum Plan {
     Update(UpdatePlan),
 }
 
-/// The type of the query, either top level or subquery
+/// The destination of the results of a query.
+/// Typically, the results of a query are returned to the caller.
+/// However, there are some cases where the results are not returned to the caller,
+/// but rather are yielded to a parent query via coroutine, or stored in a temp table,
+/// later used by the parent query.
 #[derive(Debug, Clone)]
-pub enum SelectQueryType {
-    TopLevel,
-    Subquery {
-        /// The register that holds the program offset that handles jumping to/from the subquery.
+pub enum QueryDestination {
+    /// The results of the query are returned to the caller.
+    ResultRows,
+    /// The results of the query are yielded to a parent query via coroutine.
+    CoroutineYield {
+        /// The register that holds the program offset that handles jumping to/from the coroutine.
         yield_reg: usize,
-        /// The index of the first instruction in the bytecode that implements the subquery.
+        /// The index of the first instruction in the bytecode that implements the coroutine.
         coroutine_implementation_start: BranchOffset,
+    },
+    /// The results of the query are stored in an ephemeral index,
+    /// later used by the parent query.
+    EphemeralIndex {
+        /// The cursor ID of the ephemeral index that will be used to store the results.
+        cursor_id: CursorID,
+        /// The index that will be used to store the results.
+        index: Arc<Index>,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JoinOrderMember {
-    /// The index of the table in the plan's vector of [TableReference]
-    pub table_no: usize,
+    /// The internal ID of the[TableReference]
+    pub table_id: TableInternalId,
+    /// The index of the table in the original join order.
+    /// This is used to index into e.g. [SelectPlan::table_references]
+    pub original_idx: usize,
     /// Whether this member is the right side of an OUTER JOIN
     pub is_outer: bool,
 }
@@ -298,7 +354,8 @@ pub struct JoinOrderMember {
 impl Default for JoinOrderMember {
     fn default() -> Self {
         Self {
-            table_no: 0,
+            table_id: TableInternalId::default(),
+            original_idx: 0,
             is_outer: false,
         }
     }
@@ -393,8 +450,8 @@ pub struct SelectPlan {
     pub offset: Option<isize>,
     /// query contains a constant condition that is always false
     pub contains_constant_false_condition: bool,
-    /// query type (top level or subquery)
-    pub query_type: SelectQueryType,
+    /// the destination of the resulting rows from this plan.
+    pub query_destination: QueryDestination,
     /// whether the query is DISTINCT
     pub distinctness: Distinctness,
     /// values: https://sqlite.org/syntax/select-core.html
@@ -441,7 +498,10 @@ impl SelectPlan {
     pub fn is_simple_count(&self) -> bool {
         if !self.where_clause.is_empty()
             || self.aggregates.len() != 1
-            || matches!(self.query_type, SelectQueryType::Subquery { .. })
+            || matches!(
+                self.query_destination,
+                QueryDestination::CoroutineYield { .. }
+            )
             || self.table_references.len() != 1
             || self.result_columns.len() != 1
             || self.group_by.is_some()
@@ -524,7 +584,7 @@ pub enum IterationDirection {
 }
 
 pub fn select_star(tables: &[TableReference], out_columns: &mut Vec<ResultSetColumn>) {
-    for (current_table_index, table) in tables.iter().enumerate() {
+    for table in tables.iter() {
         let maybe_using_cols = table
             .join_info
             .as_ref()
@@ -551,7 +611,7 @@ pub fn select_star(tables: &[TableReference], out_columns: &mut Vec<ResultSetCol
                     alias: None,
                     expr: ast::Expr::Column {
                         database: None,
-                        table: current_table_index,
+                        table: table.internal_id,
                         column: i,
                         is_rowid_alias: col.is_rowid_alias,
                     },
@@ -588,6 +648,8 @@ pub struct TableReference {
     pub table: Table,
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
     pub identifier: String,
+    /// Internal ID of the table reference, used in e.g. [Expr::Column] to refer to this table.
+    pub internal_id: TableInternalId,
     /// The join info for this table reference, if it is the right side of a join (which all except the first table reference have)
     pub join_info: Option<JoinInfo>,
     /// Bitmask of columns that are referenced in the query.
@@ -671,7 +733,12 @@ impl TableReference {
     }
 
     /// Creates a new TableReference for a subquery.
-    pub fn new_subquery(identifier: String, plan: SelectPlan, join_info: Option<JoinInfo>) -> Self {
+    pub fn new_subquery(
+        identifier: String,
+        plan: SelectPlan,
+        join_info: Option<JoinInfo>,
+        internal_id: TableInternalId,
+    ) -> Self {
         let columns = plan
             .result_columns
             .iter()
@@ -701,6 +768,7 @@ impl TableReference {
             },
             table,
             identifier,
+            internal_id,
             join_info,
             col_used_mask: ColumnUsedMask::new(),
         }

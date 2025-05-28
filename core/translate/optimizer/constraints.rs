@@ -9,7 +9,7 @@ use crate::{
     },
     Result,
 };
-use limbo_sqlite3_parser::ast::{self, SortOrder};
+use limbo_sqlite3_parser::ast::{self, SortOrder, TableInternalId};
 
 use super::cost::ESTIMATED_HARDCODED_ROWS_PER_TABLE;
 
@@ -133,7 +133,8 @@ pub struct ConstraintUseCandidate {
 #[derive(Debug)]
 /// A collection of [Constraint]s and their potential [ConstraintUseCandidate]s for a given table.
 pub struct TableConstraints {
-    pub table_no: usize,
+    /// The internal ID of the [TableReference] that these constraints are for.
+    pub table_id: TableInternalId,
     /// The constraints for the table, i.e. any [WhereTerm]s that reference columns from this table.
     pub constraints: Vec<Constraint>,
     /// Candidates for indexes that may use the constraints to perform a lookup.
@@ -177,14 +178,14 @@ pub fn constraints_from_where_clause(
     let mut constraints = Vec::new();
 
     // For each table, collect all the Constraints and all potential index candidates that may use them.
-    for (table_no, table_reference) in table_references.iter().enumerate() {
+    for table_reference in table_references.iter() {
         let rowid_alias_column = table_reference
             .columns()
             .iter()
             .position(|c| c.is_rowid_alias);
 
         let mut cs = TableConstraints {
-            table_no,
+            table_id: table_reference.internal_id,
             constraints: Vec::new(),
             candidates: available_indexes
                 .get(table_reference.table.get_name())
@@ -212,7 +213,7 @@ pub fn constraints_from_where_clause(
             // Constraints originating from a LEFT JOIN must always be evaluated in that join's RHS table's loop,
             // regardless of which tables the constraint references.
             if let Some(outer_join_tbl) = term.from_outer_join {
-                if outer_join_tbl != table_no {
+                if outer_join_tbl != table_reference.internal_id {
                     continue;
                 }
             }
@@ -220,13 +221,13 @@ pub fn constraints_from_where_clause(
             // If either the LHS or RHS of the constraint is a column from the table, add the constraint.
             match lhs {
                 ast::Expr::Column { table, column, .. } => {
-                    if *table == table_no {
+                    if *table == table_reference.internal_id {
                         let table_column = &table_reference.table.columns()[*column];
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Rhs),
                             operator,
                             table_col_pos: *column,
-                            lhs_mask: table_mask_from_expr(rhs)?,
+                            lhs_mask: table_mask_from_expr(rhs, table_references)?,
                             selectivity: estimate_selectivity(table_column, operator),
                         });
                     }
@@ -235,14 +236,14 @@ pub fn constraints_from_where_clause(
                     // A rowid alias column must exist for the 'rowid' keyword to be considered a valid reference.
                     // This should be a parse error at an earlier stage of the query compilation, but nevertheless,
                     // we check it here.
-                    if *table == table_no && rowid_alias_column.is_some() {
+                    if *table == table_reference.internal_id && rowid_alias_column.is_some() {
                         let table_column =
                             &table_reference.table.columns()[rowid_alias_column.unwrap()];
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Rhs),
                             operator,
                             table_col_pos: rowid_alias_column.unwrap(),
-                            lhs_mask: table_mask_from_expr(rhs)?,
+                            lhs_mask: table_mask_from_expr(rhs, table_references)?,
                             selectivity: estimate_selectivity(table_column, operator),
                         });
                     }
@@ -251,26 +252,26 @@ pub fn constraints_from_where_clause(
             };
             match rhs {
                 ast::Expr::Column { table, column, .. } => {
-                    if *table == table_no {
+                    if *table == table_reference.internal_id {
                         let table_column = &table_reference.table.columns()[*column];
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Lhs),
                             operator: opposite_cmp_op(operator),
                             table_col_pos: *column,
-                            lhs_mask: table_mask_from_expr(lhs)?,
+                            lhs_mask: table_mask_from_expr(lhs, table_references)?,
                             selectivity: estimate_selectivity(table_column, operator),
                         });
                     }
                 }
                 ast::Expr::RowId { table, .. } => {
-                    if *table == table_no && rowid_alias_column.is_some() {
+                    if *table == table_reference.internal_id && rowid_alias_column.is_some() {
                         let table_column =
                             &table_reference.table.columns()[rowid_alias_column.unwrap()];
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Lhs),
                             operator: opposite_cmp_op(operator),
                             table_col_pos: rowid_alias_column.unwrap(),
-                            lhs_mask: table_mask_from_expr(lhs)?,
+                            lhs_mask: table_mask_from_expr(lhs, table_references)?,
                             selectivity: estimate_selectivity(table_column, operator),
                         });
                     }
@@ -383,11 +384,11 @@ pub fn usable_constraints_for_join_order<'a>(
     refs: &'a [ConstraintRef],
     join_order: &[JoinOrderMember],
 ) -> &'a [ConstraintRef] {
-    let table_no = join_order.last().unwrap().table_no;
+    let table_idx = join_order.last().unwrap().original_idx;
     let mut usable_until = 0;
     for cref in refs.iter() {
         let constraint = &constraints[cref.constraint_vec_pos];
-        let other_side_refers_to_self = constraint.lhs_mask.contains_table(table_no);
+        let other_side_refers_to_self = constraint.lhs_mask.contains_table(table_idx);
         if other_side_refers_to_self {
             break;
         }
@@ -395,7 +396,7 @@ pub fn usable_constraints_for_join_order<'a>(
             join_order
                 .iter()
                 .take(join_order.len() - 1)
-                .map(|j| j.table_no),
+                .map(|j| j.original_idx),
         );
         let all_required_tables_are_on_left_side = lhs_mask.contains_all(&constraint.lhs_mask);
         if !all_required_tables_are_on_left_side {

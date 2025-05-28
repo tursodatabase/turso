@@ -54,7 +54,7 @@ pub fn find_best_access_method_for_join_order<'a>(
     maybe_order_target: Option<&OrderTarget>,
     input_cardinality: f64,
 ) -> Result<AccessMethod<'a>> {
-    let table_no = join_order.last().unwrap().table_no;
+    let table_no = join_order.last().unwrap().table_id;
     let mut best_access_method =
         AccessMethod::new_table_scan(input_cardinality, IterationDirection::Forwards);
     let rowid_column_idx = rhs_table.columns().iter().position(|c| c.is_rowid_alias);
@@ -93,7 +93,7 @@ pub fn find_best_access_method_for_join_order<'a>(
             let mut all_same_direction = true;
             let mut all_opposite_direction = true;
             for i in 0..order_target.0.len().min(index_info.column_count) {
-                let correct_table = order_target.0[i].table_no == table_no;
+                let correct_table = order_target.0[i].table_id == table_no;
                 let correct_column = {
                     match &candidate.index {
                         Some(index) => index.columns[i].pos_in_table == order_target.0[i].column_no,

@@ -35,6 +35,13 @@ impl IO for GenericIO {
         }))
     }
 
+    fn wait_for_completion(&self, c: Arc<Completion>) -> Result<()> {
+        while !c.is_completed() {
+            self.run_once()?;
+        }
+        Ok(())
+    }
+
     fn run_once(&self) -> Result<()> {
         Ok(())
     }
@@ -83,11 +90,11 @@ impl File for GenericFile {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: Completion) -> Result<()> {
+    fn pread(&self, pos: usize, c: Arc<Completion>) -> Result<()> {
         let mut file = self.file.borrow_mut();
         file.seek(std::io::SeekFrom::Start(pos as u64))?;
         {
-            let r = match c {
+            let r = match *c {
                 Completion::Read(ref r) => r,
                 _ => unreachable!(),
             };
@@ -99,7 +106,7 @@ impl File for GenericFile {
         Ok(())
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<crate::Buffer>>, c: Completion) -> Result<()> {
+    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<crate::Buffer>>, c: Arc<Completion>) -> Result<()> {
         let mut file = self.file.borrow_mut();
         file.seek(std::io::SeekFrom::Start(pos as u64))?;
         let buf = buffer.borrow();
@@ -109,7 +116,7 @@ impl File for GenericFile {
         Ok(())
     }
 
-    fn sync(&self, c: Completion) -> Result<()> {
+    fn sync(&self, c: Arc<Completion>) -> Result<()> {
         let mut file = self.file.borrow_mut();
         file.sync_all().map_err(|err| LimboError::IOError(err))?;
         c.complete(0);

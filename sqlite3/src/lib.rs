@@ -1132,3 +1132,42 @@ pub unsafe extern "C" fn libsql_wal_frame_count(
     *p_frame_count = frame_count;
     SQLITE_OK
 }
+
+/// Get a frame from the WAL file
+///
+/// The `libsql_wal_get_frame` function extracts frame `frame_no` from
+/// the WAL for database connection `db` into memory pointed to by `p_frame`
+/// of size `frame_len`.
+///
+/// # Returns
+///
+/// - `SQLITE_OK` if the frame is successfully returned.
+/// - `SQLITE_MISUSE` if the `db` is `NULL`.
+/// - `SQLITE_ERROR` if an error occurs while getting the frame.
+///
+/// # Safety
+///
+/// - The `db` must be a valid pointer to a `sqlite3` database connection.
+/// - The `frame_no` must be a valid frame index.
+/// - The `p_frame` must be a valid pointer to a `u8` that will store
+///   the frame data.
+/// - The `frame_len` must be the size of the frame.
+#[no_mangle]
+pub unsafe extern "C" fn libsql_wal_get_frame(
+    db: *mut sqlite3,
+    frame_no: u32,
+    p_frame: *mut u8,
+    frame_len: u32,
+) -> ffi::c_int {
+    if db.is_null() {
+        return SQLITE_MISUSE;
+    }
+    let db: &mut sqlite3 = &mut *db;
+    match db.conn.wal_get_frame(frame_no, p_frame, frame_len) {
+        Ok(c) => match db.io.wait_for_completion(c) {
+            Ok(_) => SQLITE_OK,
+            Err(_) => SQLITE_ERROR,
+        },
+        Err(_) => SQLITE_ERROR,
+    }
+}

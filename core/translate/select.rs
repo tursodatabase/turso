@@ -1,5 +1,7 @@
 use super::emitter::{emit_program, TranslateCtx};
-use super::plan::{select_star, Distinctness, JoinOrderMember, Operation, Search, SelectQueryType};
+use super::plan::{
+    select_star, Distinctness, JoinOrderMember, Operation, QueryDestination, Search,
+};
 use super::planner::Scope;
 use crate::function::{AggFunc, ExtFunc, Func};
 use crate::schema::Table;
@@ -10,12 +12,17 @@ use crate::translate::planner::{
     parse_where, resolve_aggregates,
 };
 use crate::util::normalize_ident;
-use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode};
+use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode, TableRefIdCounter};
 use crate::vdbe::insn::Insn;
 use crate::SymbolTable;
 use crate::{schema::Schema, vdbe::builder::ProgramBuilder, Result};
 use limbo_sqlite3_parser::ast::{self, CompoundSelect, SortOrder};
 use limbo_sqlite3_parser::ast::{ResultColumn, SelectInner};
+
+pub struct TranslateSelectResult {
+    pub program: ProgramBuilder,
+    pub num_result_cols: usize,
+}
 
 pub fn translate_select(
     query_mode: QueryMode,
@@ -23,40 +30,60 @@ pub fn translate_select(
     select: ast::Select,
     syms: &SymbolTable,
     mut program: ProgramBuilder,
-) -> Result<ProgramBuilder> {
-    let mut select_plan = prepare_select_plan(schema, select, syms, None)?;
+    query_destination: QueryDestination,
+) -> Result<TranslateSelectResult> {
+    let mut select_plan = prepare_select_plan(
+        schema,
+        select,
+        syms,
+        None,
+        &mut program.table_reference_counter,
+        query_destination,
+    )?;
     optimize_plan(&mut select_plan, schema)?;
+    let num_result_cols;
     let opts = match &select_plan {
-        Plan::Select(select) => ProgramBuilderOpts {
-            query_mode,
-            num_cursors: count_plan_required_cursors(select),
-            approx_num_insns: estimate_num_instructions(select),
-            approx_num_labels: estimate_num_labels(select),
-        },
-        Plan::CompoundSelect { first, rest, .. } => ProgramBuilderOpts {
-            query_mode,
-            num_cursors: count_plan_required_cursors(first)
-                + rest
-                    .iter()
-                    .map(|(plan, _)| count_plan_required_cursors(plan))
-                    .sum::<usize>(),
-            approx_num_insns: estimate_num_instructions(first)
-                + rest
-                    .iter()
-                    .map(|(plan, _)| estimate_num_instructions(plan))
-                    .sum::<usize>(),
-            approx_num_labels: estimate_num_labels(first)
-                + rest
-                    .iter()
-                    .map(|(plan, _)| estimate_num_labels(plan))
-                    .sum::<usize>(),
-        },
+        Plan::Select(select) => {
+            num_result_cols = select.result_columns.len();
+            ProgramBuilderOpts {
+                query_mode,
+                num_cursors: count_plan_required_cursors(select),
+                approx_num_insns: estimate_num_instructions(select),
+                approx_num_labels: estimate_num_labels(select),
+            }
+        }
+        Plan::CompoundSelect { first, rest, .. } => {
+            // Compound Selects must return the same number of columns
+            num_result_cols = first.result_columns.len();
+
+            ProgramBuilderOpts {
+                query_mode,
+                num_cursors: count_plan_required_cursors(first)
+                    + rest
+                        .iter()
+                        .map(|(plan, _)| count_plan_required_cursors(plan))
+                        .sum::<usize>(),
+                approx_num_insns: estimate_num_instructions(first)
+                    + rest
+                        .iter()
+                        .map(|(plan, _)| estimate_num_instructions(plan))
+                        .sum::<usize>(),
+                approx_num_labels: estimate_num_labels(first)
+                    + rest
+                        .iter()
+                        .map(|(plan, _)| estimate_num_labels(plan))
+                        .sum::<usize>(),
+            }
+        }
         other => panic!("plan is not a SelectPlan: {:?}", other),
     };
 
     program.extend(&opts);
-    emit_program(&mut program, select_plan, syms)?;
-    Ok(program)
+    emit_program(&mut program, select_plan, schema, syms)?;
+    Ok(TranslateSelectResult {
+        program,
+        num_result_cols,
+    })
 }
 
 pub fn prepare_select_plan<'a>(
@@ -64,6 +91,8 @@ pub fn prepare_select_plan<'a>(
     mut select: ast::Select,
     syms: &SymbolTable,
     outer_scope: Option<&'a Scope<'a>>,
+    table_ref_counter: &mut TableRefIdCounter,
+    query_destination: QueryDestination,
 ) -> Result<Plan> {
     let compounds = select.body.compounds.take();
     match compounds {
@@ -77,6 +106,8 @@ pub fn prepare_select_plan<'a>(
                 select.with.take(),
                 syms,
                 outer_scope,
+                table_ref_counter,
+                query_destination,
             )?))
         }
         Some(compounds) => {
@@ -88,15 +119,30 @@ pub fn prepare_select_plan<'a>(
                 None,
                 syms,
                 outer_scope,
+                table_ref_counter,
+                query_destination.clone(),
             )?;
             let mut rest = Vec::with_capacity(compounds.len());
             for CompoundSelect { select, operator } in compounds {
-                // TODO: add support for UNION, EXCEPT and INTERSECT
-                if operator != ast::CompoundOperator::UnionAll {
-                    crate::bail_parse_error!("only UNION ALL is supported for compound SELECTs");
+                // TODO: add support for EXCEPT and INTERSECT
+                if operator != ast::CompoundOperator::UnionAll
+                    && operator != ast::CompoundOperator::Union
+                {
+                    crate::bail_parse_error!(
+                        "only UNION ALL and UNION are supported for compound SELECTs"
+                    );
                 }
-                let plan =
-                    prepare_one_select_plan(schema, *select, None, None, None, syms, outer_scope)?;
+                let plan = prepare_one_select_plan(
+                    schema,
+                    *select,
+                    None,
+                    None,
+                    None,
+                    syms,
+                    outer_scope,
+                    table_ref_counter,
+                    query_destination.clone(),
+                )?;
                 rest.push((plan, operator));
             }
             // Ensure all subplans have same number of result columns
@@ -144,6 +190,8 @@ fn prepare_one_select_plan<'a>(
     with: Option<ast::With>,
     syms: &SymbolTable,
     outer_scope: Option<&'a Scope<'a>>,
+    table_ref_counter: &mut TableRefIdCounter,
+    query_destination: QueryDestination,
 ) -> Result<SelectPlan> {
     match select {
         ast::OneSelect::Select(select_inner) => {
@@ -163,8 +211,15 @@ fn prepare_one_select_plan<'a>(
             let mut where_predicates = vec![];
 
             // Parse the FROM clause into a vec of TableReferences. Fold all the join conditions expressions into the WHERE clause.
-            let table_references =
-                parse_from(schema, from, syms, with, &mut where_predicates, outer_scope)?;
+            let table_references = parse_from(
+                schema,
+                from,
+                syms,
+                with,
+                &mut where_predicates,
+                outer_scope,
+                table_ref_counter,
+            )?;
 
             // Preallocate space for the result columns
             let result_columns = Vec::with_capacity(
@@ -192,7 +247,8 @@ fn prepare_one_select_plan<'a>(
                     .iter()
                     .enumerate()
                     .map(|(i, t)| JoinOrderMember {
-                        table_no: i,
+                        table_id: t.internal_id,
+                        original_idx: i,
                         is_outer: t.join_info.as_ref().map_or(false, |j| j.outer),
                     })
                     .collect(),
@@ -205,7 +261,7 @@ fn prepare_one_select_plan<'a>(
                 limit: None,
                 offset: None,
                 contains_constant_false_condition: false,
-                query_type: SelectQueryType::TopLevel,
+                query_destination,
                 distinctness: Distinctness::from_ast(distinctness.as_ref()),
                 values: vec![],
             };
@@ -226,13 +282,12 @@ fn prepare_one_select_plan<'a>(
                         let referenced_table = plan
                             .table_references
                             .iter_mut()
-                            .enumerate()
-                            .find(|(_, t)| t.identifier == name_normalized);
+                            .find(|t| t.identifier == name_normalized);
 
                         if referenced_table.is_none() {
                             crate::bail_parse_error!("Table {} not found", name.0);
                         }
-                        let (table_index, table) = referenced_table.unwrap();
+                        let table = referenced_table.unwrap();
                         let num_columns = table.columns().len();
                         for idx in 0..num_columns {
                             let is_rowid_alias = {
@@ -242,7 +297,7 @@ fn prepare_one_select_plan<'a>(
                             plan.result_columns.push(ResultSetColumn {
                                 expr: ast::Expr::Column {
                                     database: None, // TODO: support different databases
-                                    table: table_index,
+                                    table: table.internal_id,
                                     column: idx,
                                     is_rowid_alias,
                                 },
@@ -520,7 +575,7 @@ fn prepare_one_select_plan<'a>(
                 limit: None,
                 offset: None,
                 contains_constant_false_condition: false,
-                query_type: SelectQueryType::TopLevel,
+                query_destination,
                 distinctness: Distinctness::NonDistinct,
                 values,
             };

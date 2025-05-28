@@ -55,3 +55,13 @@ do_execsql_test_on_specific_db ":memory:" pragma-user-version-update {
   PRAGMA user_version = 42;
   PRAGMA user_version;
 } {42}
+
+do_execsql_test_on_specific_db ":memory:" pragma-user-version-negative-value {
+  PRAGMA user_version = -10;
+  PRAGMA user_version;
+} {-10}
+
+do_execsql_test_on_specific_db ":memory:" pragma-user-version-float-value {
+  PRAGMA user_version = 10.9;
+  PRAGMA user_version;
+} {10}

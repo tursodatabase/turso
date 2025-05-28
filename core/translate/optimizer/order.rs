@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 
-use limbo_sqlite3_parser::ast::{self, SortOrder};
+use limbo_sqlite3_parser::ast::{self, SortOrder, TableInternalId};
 
 use crate::{
     translate::plan::{GroupBy, IterationDirection, TableReference},
@@ -12,7 +12,7 @@ use super::{access_method::AccessMethod, join::JoinN};
 #[derive(Debug, PartialEq, Clone)]
 /// A convenience struct for representing a (table_no, column_no, [SortOrder]) tuple.
 pub struct ColumnOrder {
-    pub table_no: usize,
+    pub table_id: TableInternalId,
     pub column_no: usize,
     pub order: SortOrder,
 }
@@ -51,7 +51,7 @@ impl OrderTarget {
                     unreachable!();
                 };
                 ColumnOrder {
-                    table_no: *table,
+                    table_id: *table,
                     column_no: *column,
                     order,
                 }
@@ -162,10 +162,10 @@ pub fn plan_satisfies_order_target(
 ) -> bool {
     let mut target_col_idx = 0;
     let num_cols_in_order_target = order_target.0.len();
-    for (table_no, access_method_index) in plan.data.iter() {
+    for (table_index, access_method_index) in plan.data.iter() {
         let target_col = &order_target.0[target_col_idx];
-        let table_ref = &table_references[*table_no];
-        let correct_table = target_col.table_no == *table_no;
+        let table_ref = &table_references[*table_index];
+        let correct_table = target_col.table_id == table_ref.internal_id;
         if !correct_table {
             return false;
         }

@@ -80,17 +80,7 @@ impl Database {
     #[napi]
     pub fn prepare(&self, sql: String) -> napi::Result<Statement> {
         let stmt = self.conn.prepare(&sql).map_err(into_napi_error)?;
-        Ok(Statement::new(RefCell::new(stmt), self.clone()))
-    }
-
-    #[napi]
-    pub fn transaction(&self) {
-        todo!()
-    }
-
-    #[napi]
-    pub fn pragma(&self) {
-        todo!()
+        Ok(Statement::new(RefCell::new(stmt), self.clone(), sql))
     }
 
     #[napi]
@@ -119,23 +109,69 @@ impl Database {
     }
 
     #[napi]
-    pub fn load_extension(&self) {
-        todo!()
+    pub fn load_extension(&self, path: String) -> napi::Result<()> {
+        let ext_path = limbo_core::resolve_ext_path(path.as_str()).map_err(into_napi_error)?;
+        self.conn
+            .load_extension(ext_path)
+            .map_err(into_napi_error)?;
+        Ok(())
     }
 
     #[napi]
-    pub fn exec(&self) {
-        todo!()
+    pub fn exec(&self, sql: String) -> napi::Result<()> {
+        self.conn.execute(sql).map_err(into_napi_error)?;
+        Ok(())
     }
 
     #[napi]
-    pub fn close(&self) {
-        todo!()
+    pub fn close(&self) -> napi::Result<()> {
+        self.conn.close().map_err(into_napi_error)?;
+        Ok(())
+    }
+
+    // We assume that every pragma only returns one result, which isn't
+    // true.
+    #[napi]
+    pub fn pragma(&self, env: Env, pragma: String, simple: bool) -> napi::Result<JsUnknown> {
+        let stmt = self.prepare(pragma.clone())?;
+        let mut stmt = stmt.inner.borrow_mut();
+        let pragma_name = pragma
+            .split("PRAGMA")
+            .find(|s| !s.trim().is_empty())
+            .unwrap()
+            .trim();
+
+        let mut results = env.create_empty_array()?;
+
+        let step = stmt.step().map_err(into_napi_error)?;
+        match step {
+            limbo_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                let mut obj = env.create_object()?;
+                for value in row.get_values() {
+                    let js_value = to_js_value(&env, value)?;
+
+                    if simple {
+                        return Ok(js_value);
+                    }
+
+                    obj.set_named_property(pragma_name, js_value)?;
+                }
+
+                results.set_element(0, obj)?;
+                Ok(results.into_unknown())
+            }
+            limbo_core::StepResult::Done => Ok(env.get_undefined()?.into_unknown()),
+            limbo_core::StepResult::IO => todo!(),
+            limbo_core::StepResult::Interrupt | limbo_core::StepResult::Busy => Err(
+                napi::Error::new(napi::Status::GenericFailure, format!("{:?}", step)),
+            ),
+        }
     }
 }
 
-// TODO: Add the (parent) 'database' property
 #[napi]
+#[derive(Clone)]
 pub struct Statement {
     // TODO: implement each property when core supports it
     // #[napi(able = false)]
@@ -144,23 +180,31 @@ pub struct Statement {
     // pub readonly: bool,
     // #[napi(writable = false)]
     // pub busy: bool,
+    #[napi(writable = false)]
+    pub source: String,
+
     database: Database,
+    pluck: bool,
+    binded: bool,
     inner: Rc<RefCell<limbo_core::Statement>>,
 }
 
 #[napi]
 impl Statement {
-    pub fn new(inner: RefCell<limbo_core::Statement>, database: Database) -> Self {
+    pub fn new(inner: RefCell<limbo_core::Statement>, database: Database, source: String) -> Self {
         Self {
             inner: Rc::new(inner),
             database,
+            source,
+            pluck: false,
+            binded: false,
         }
     }
 
     #[napi]
-    pub fn get(&self, env: Env) -> napi::Result<JsUnknown> {
-        let mut stmt = self.inner.borrow_mut();
-        stmt.reset();
+    pub fn get(&self, env: Env, args: Option<Vec<JsUnknown>>) -> napi::Result<JsUnknown> {
+        let mut stmt = self.check_and_bind(args)?;
+
         let step = stmt.step().map_err(into_napi_error)?;
         match step {
             limbo_core::StepResult::Row => {
@@ -170,6 +214,10 @@ impl Statement {
                     let key = stmt.get_column_name(idx);
                     let js_value = to_js_value(&env, value);
                     obj.set_named_property(&key, js_value)?;
+
+                    if self.pluck {
+                        return Ok(obj.into_unknown());
+                    }
                 }
                 Ok(obj.into_unknown())
             }
@@ -182,35 +230,32 @@ impl Statement {
     }
 
     // TODO: Return Info object (https://github.com/WiseLibs/better-sqlite3/blob/master/docs/api.md#runbindparameters---object)
-    // The original function is variadic, check if we can do the same
     #[napi]
     pub fn run(&self, env: Env, args: Option<Vec<JsUnknown>>) -> napi::Result<JsUnknown> {
-        if let Some(args) = args {
-            for (i, elem) in args.into_iter().enumerate() {
-                let value = from_js_value(elem)?;
-                self.inner
-                    .borrow_mut()
-                    .bind_at(NonZeroUsize::new(i + 1).unwrap(), value);
-            }
-        }
+        let stmt = self.check_and_bind(args)?;
 
-        let stmt = self.inner.borrow_mut();
         self.internal_all(env, stmt)
     }
 
     #[napi]
-    pub fn iterate(&self, env: Env) -> IteratorStatement {
-        IteratorStatement {
+    pub fn iterate(
+        &self,
+        env: Env,
+        args: Option<Vec<JsUnknown>>,
+    ) -> napi::Result<IteratorStatement> {
+        self.check_and_bind(args)?;
+
+        Ok(IteratorStatement {
             stmt: Rc::clone(&self.inner),
             database: self.database.clone(),
             env,
-        }
+            plucked: self.pluck,
+        })
     }
 
     #[napi]
-    pub fn all(&self, env: Env) -> napi::Result<JsUnknown> {
-        let mut stmt = self.inner.borrow_mut();
-        stmt.reset();
+    pub fn all(&self, env: Env, args: Option<Vec<JsUnknown>>) -> napi::Result<JsUnknown> {
+        let stmt = self.check_and_bind(args)?;
 
         self.internal_all(env, stmt)
     }
@@ -231,6 +276,10 @@ impl Statement {
                         let key = stmt.get_column_name(idx);
                         let js_value = to_js_value(&env, value);
                         obj.set_named_property(&key, js_value)?;
+
+                        if self.pluck {
+                            break;
+                        }
                     }
                     results.set_element(index, obj)?;
                     index += 1;
@@ -254,24 +303,60 @@ impl Statement {
     }
 
     #[napi]
-    pub fn pluck() {
-        todo!()
+    pub fn pluck(&mut self, pluck: Option<bool>) {
+        if let Some(false) = pluck {
+            self.pluck = false;
+        }
+
+        self.pluck = true;
     }
+
     #[napi]
     pub fn expand() {
         todo!()
     }
+
     #[napi]
     pub fn raw() {
         todo!()
     }
+
     #[napi]
     pub fn columns() {
         todo!()
     }
+
     #[napi]
-    pub fn bind() {
-        todo!()
+    pub fn bind(&mut self, args: Option<Vec<JsUnknown>>) -> napi::Result<Self> {
+        self.check_and_bind(args)?;
+        self.binded = true;
+
+        Ok(self.clone())
+    }
+
+    /// Check if the Statement is already binded by the `bind()` method
+    /// and bind values do variables. The expected type for args is `Option<Vec<JsUnknown>>`
+    fn check_and_bind(
+        &self,
+        args: Option<Vec<JsUnknown>>,
+    ) -> napi::Result<RefMut<'_, limbo_core::Statement>> {
+        let mut stmt = self.inner.borrow_mut();
+        stmt.reset();
+        if let Some(args) = args {
+            if self.binded {
+                return Err(napi::Error::new(
+                    napi::Status::InvalidArg,
+                    "This statement already has bound parameters",
+                ));
+            }
+
+            for (i, elem) in args.into_iter().enumerate() {
+                let value = from_js_value(elem)?;
+                stmt.bind_at(NonZeroUsize::new(i + 1).unwrap(), value);
+            }
+        }
+
+        Ok(stmt)
     }
 }
 
@@ -280,6 +365,7 @@ pub struct IteratorStatement {
     stmt: Rc<RefCell<limbo_core::Statement>>,
     database: Database,
     env: Env,
+    plucked: bool,
 }
 
 impl Generator for IteratorStatement {
@@ -301,6 +387,10 @@ impl Generator for IteratorStatement {
                     let key = stmt.get_column_name(idx);
                     let js_value = to_js_value(&self.env, value);
                     js_row.set_named_property(&key, js_value).ok()?;
+
+                    if self.plucked {
+                        break;
+                    }
                 }
 
                 Some(js_row)
@@ -372,8 +462,8 @@ impl DatabaseFile {
 }
 
 impl limbo_core::DatabaseStorage for DatabaseFile {
-    fn read_page(&self, page_idx: usize, c: limbo_core::Completion) -> limbo_core::Result<()> {
-        let r = match c {
+    fn read_page(&self, page_idx: usize, c: Arc<limbo_core::Completion>) -> limbo_core::Result<()> {
+        let r = match *c {
             limbo_core::Completion::Read(ref r) => r,
             _ => unreachable!(),
         };
@@ -391,7 +481,7 @@ impl limbo_core::DatabaseStorage for DatabaseFile {
         &self,
         page_idx: usize,
         buffer: Arc<std::cell::RefCell<limbo_core::Buffer>>,
-        c: limbo_core::Completion,
+        c: Arc<limbo_core::Completion>,
     ) -> limbo_core::Result<()> {
         let size = buffer.borrow().len();
         let pos = (page_idx - 1) * size;
@@ -399,7 +489,7 @@ impl limbo_core::DatabaseStorage for DatabaseFile {
         Ok(())
     }
 
-    fn sync(&self, c: limbo_core::Completion) -> limbo_core::Result<()> {
+    fn sync(&self, c: Arc<limbo_core::Completion>) -> limbo_core::Result<()> {
         self.file.sync(c)
     }
 }

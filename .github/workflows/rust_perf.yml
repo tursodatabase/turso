@@ -11,10 +11,10 @@ env:
 
 jobs:
   bench:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v3
-      - uses: actions/setup-node@v4
+      - uses: useblacksmith/setup-node@v5
         with:
           node-version: 20
       #     cache: 'npm'
@@ -54,10 +54,10 @@ jobs:
           nyrkio-settings-threshold: 0%
 
   clickbench:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v3
-      - uses: actions/setup-node@v4
+      - uses: useblacksmith/setup-node@v5
         with:
           node-version: 20
 
@@ -101,18 +101,18 @@ jobs:
           nyrkio-public: true
 
   tpc-h-criterion:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     env:
       DB_FILE: "perf/tpc-h/TPC-H.db"
     steps:
       - uses: actions/checkout@v3
-      - uses: Swatinem/rust-cache@v2
+      - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
 
       - name: Cache TPC-H
         id: cache-primes
-        uses: actions/cache@v4
+        uses: useblacksmith/cache@v5
         with:
           path: ${{ env.DB_FILE }}
           key: tpc-h
@@ -155,7 +155,7 @@ jobs:
           nyrkio-settings-threshold: 0%
 
   tpc-h:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v3
       - name: TPC-H

@@ -16,7 +16,7 @@ env:
 
 jobs:
   configure-strategy:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       python-versions: ${{ steps.gen-matrix.outputs.python-versions }}
     steps:
@@ -33,7 +33,7 @@ jobs:
     strategy:
       matrix:
         os:
-          - ubuntu-latest
+          - blacksmith-4vcpu-ubuntu-2404
           - macos-latest
           - windows-latest
         python-version: ${{ fromJson(needs.configure-strategy.outputs.python-versions) }}
@@ -51,7 +51,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: useblacksmith/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -65,7 +65,7 @@ jobs:
         run: pytest tests
 
   lint:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
 
     defaults:
       run:
@@ -76,7 +76,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: useblacksmith/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -87,7 +87,7 @@ jobs:
         run: make lint
 
   check-requirements:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
 
     defaults:
       run:
@@ -98,7 +98,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: useblacksmith/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -109,7 +109,7 @@ jobs:
 #        run: make check-requirements
 
   linux:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     defaults:
       run:
         working-directory: ${{ env.working-directory }}
@@ -118,7 +118,7 @@ jobs:
         target: [x86_64]
     steps:
       - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
+      - uses: useblacksmith/setup-python@v6
         with:
           python-version: '3.10'
       - name: Build wheels
@@ -194,7 +194,7 @@ jobs:
           path: bindings/python/dist
 
   sdist:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     defaults:
       run:
         working-directory: ${{ env.working-directory }}
@@ -214,7 +214,7 @@ jobs:
 
   release:
     name: Release
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: "startsWith(github.ref, 'refs/tags/')"
     needs: [linux, macos-arm64, macos-x86_64, sdist]
     steps:

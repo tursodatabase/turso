@@ -1,6 +1,6 @@
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{translate_expr_no_constant_opt, NoConstantOptReason};
-use crate::translate::plan::{SelectPlan, SelectQueryType};
+use crate::translate::plan::{QueryDestination, SelectPlan};
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
@@ -16,11 +16,12 @@ pub fn emit_values(
         return Ok(start_reg);
     }
 
-    let reg_result_cols_start = match plan.query_type {
-        SelectQueryType::TopLevel => emit_toplevel_values(program, plan, resolver)?,
-        SelectQueryType::Subquery { yield_reg, .. } => {
+    let reg_result_cols_start = match plan.query_destination {
+        QueryDestination::ResultRows => emit_toplevel_values(program, plan, resolver)?,
+        QueryDestination::CoroutineYield { yield_reg, .. } => {
             emit_values_in_subquery(program, plan, resolver, yield_reg)?
         }
+        QueryDestination::EphemeralIndex { .. } => unreachable!(),
     };
     Ok(reg_result_cols_start)
 }
@@ -43,19 +44,20 @@ fn emit_values_when_single_row(
             NoConstantOptReason::RegisterReuse,
         )?;
     }
-    match plan.query_type {
-        SelectQueryType::TopLevel => {
+    match plan.query_destination {
+        QueryDestination::ResultRows => {
             program.emit_insn(Insn::ResultRow {
                 start_reg,
                 count: row_len,
             });
         }
-        SelectQueryType::Subquery { yield_reg, .. } => {
+        QueryDestination::CoroutineYield { yield_reg, .. } => {
             program.emit_insn(Insn::Yield {
                 yield_reg,
                 end_offset: BranchOffset::Offset(0),
             });
         }
+        QueryDestination::EphemeralIndex { .. } => unreachable!(),
     }
     Ok(start_reg)
 }

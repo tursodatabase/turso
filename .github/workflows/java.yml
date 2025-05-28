@@ -15,7 +15,7 @@ env:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
 
     defaults:
       run:
@@ -29,7 +29,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Set up JDK
-        uses: actions/setup-java@v3
+        uses: useblacksmith/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '8'

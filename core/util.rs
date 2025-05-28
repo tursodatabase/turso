@@ -1,10 +1,12 @@
 use crate::{
     schema::{self, Column, Schema, Type},
-    translate::{collate::CollationSeq, expr::walk_expr},
+    translate::{collate::CollationSeq, expr::walk_expr, plan::JoinOrderMember},
     types::{Value, ValueType},
     LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable, IO,
 };
-use limbo_sqlite3_parser::ast::{self, CreateTableBody, Expr, FunctionTail, Literal};
+use limbo_sqlite3_parser::ast::{
+    self, CreateTableBody, Expr, FunctionTail, Literal, UnaryOperator,
+};
 use std::{rc::Rc, sync::Arc};
 
 pub trait RoundToPrecision {
@@ -583,12 +585,20 @@ pub fn columns_from_create_table_body(body: &ast::CreateTableBody) -> crate::Res
 
 /// This function checks if a given expression is a constant value that can be pushed down to the database engine.
 /// It is expected to be called with the other half of a binary expression with an Expr::Column
-pub fn can_pushdown_predicate(top_level_expr: &Expr, table_idx: usize) -> Result<bool> {
+pub fn can_pushdown_predicate(
+    top_level_expr: &Expr,
+    table_idx: usize,
+    join_order: &[JoinOrderMember],
+) -> Result<bool> {
     let mut can_pushdown = true;
     walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<()> {
         match expr {
             Expr::Column { table, .. } | Expr::RowId { table, .. } => {
-                can_pushdown &= *table <= table_idx;
+                let join_idx = join_order
+                    .iter()
+                    .position(|t| t.table_id == *table)
+                    .expect("table not found in join_order");
+                can_pushdown &= join_idx <= table_idx;
             }
             Expr::FunctionCall { args, name, .. } => {
                 let function = crate::function::Func::resolve_function(
@@ -1001,6 +1011,27 @@ pub fn parse_numeric_literal(text: &str) -> Result<Value> {
 
     let float_value = text.parse::<f64>()?;
     Ok(Value::Float(float_value))
+}
+
+pub fn parse_signed_number(expr: &Expr) -> Result<Value> {
+    match expr {
+        Expr::Literal(Literal::Numeric(num)) => parse_numeric_literal(num),
+        Expr::Unary(op, expr) => match (op, expr.as_ref()) {
+            (UnaryOperator::Negative, Expr::Literal(Literal::Numeric(num))) => {
+                let data = "-".to_owned() + &num.to_string();
+                parse_numeric_literal(&data)
+            }
+            (UnaryOperator::Positive, Expr::Literal(Literal::Numeric(num))) => {
+                parse_numeric_literal(num)
+            }
+            _ => Err(LimboError::InvalidArgument(
+                "signed-number must follow the format: ([+|-] numeric-literal)".to_string(),
+            )),
+        },
+        _ => Err(LimboError::InvalidArgument(
+            "signed-number must follow the format: ([+|-] numeric-literal)".to_string(),
+        )),
+    }
 }
 
 // for TVF's we need these at planning time so we cannot emit translate_expr

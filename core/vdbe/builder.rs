@@ -5,12 +5,12 @@ use std::{
     sync::Arc,
 };
 
-use limbo_sqlite3_parser::ast;
+use limbo_sqlite3_parser::ast::{self, TableInternalId};
 
 use crate::{
     fast_lock::SpinLock,
     parameters::Parameters,
-    schema::{BTreeTable, Index, PseudoTable},
+    schema::{BTreeTable, Index, PseudoTable, Schema, Table},
     storage::sqlite3_ondisk::DatabaseHeader,
     translate::{
         collate::CollationSeq,
@@ -19,10 +19,31 @@ use crate::{
     },
     Connection, VirtualTable,
 };
+pub struct TableRefIdCounter {
+    next_free: TableInternalId,
+}
 
-use super::{BranchOffset, CursorID, Insn, InsnFunction, InsnReference, JumpTarget, Program};
+impl TableRefIdCounter {
+    pub fn new() -> Self {
+        Self {
+            next_free: TableInternalId::default(),
+        }
+    }
+
+    pub fn next(&mut self) -> ast::TableInternalId {
+        let id = self.next_free;
+        self.next_free += 1;
+        id
+    }
+}
+
+use super::{
+    insn::RegisterOrLiteral, BranchOffset, CursorID, Insn, InsnFunction, InsnReference, JumpTarget,
+    Program,
+};
 #[allow(dead_code)]
 pub struct ProgramBuilder {
+    pub table_reference_counter: TableRefIdCounter,
     next_free_register: usize,
     next_free_cursor_id: usize,
     /// Instruction, the function to execute it with, and its original index in the vector.
@@ -90,6 +111,7 @@ pub struct ProgramBuilderOpts {
 impl ProgramBuilder {
     pub fn new(opts: ProgramBuilderOpts) -> Self {
         Self {
+            table_reference_counter: TableRefIdCounter::new(),
             next_free_register: 1,
             next_free_cursor_id: 0,
             insns: Vec::with_capacity(opts.approx_num_insns),
@@ -661,6 +683,66 @@ impl ProgramBuilder {
                 target_pc: self.start_offset,
             });
         }
+    }
+
+    /// Checks whether `table` or any of its indices has been opened in the program
+    pub fn is_table_open(&self, table: &Table, schema: &Schema) -> bool {
+        let btree = table.btree();
+        let vtab = table.virtual_table();
+        for (insn, ..) in self.insns.iter() {
+            match insn {
+                Insn::OpenRead {
+                    cursor_id,
+                    root_page,
+                    ..
+                } => {
+                    if let Some(btree) = &btree {
+                        if btree.root_page == *root_page {
+                            return true;
+                        }
+                    }
+                    let name = self.cursor_ref[*cursor_id].0.as_ref();
+                    if name.is_none() {
+                        continue;
+                    }
+                    let name = name.unwrap();
+                    let indices = schema.get_indices(name);
+                    for index in indices {
+                        if index.root_page == *root_page {
+                            return true;
+                        }
+                    }
+                }
+                Insn::OpenWrite {
+                    root_page, name, ..
+                } => {
+                    let RegisterOrLiteral::Literal(root_page) = root_page else {
+                        unreachable!("root page can only be a literal");
+                    };
+                    if let Some(btree) = &btree {
+                        if btree.root_page == *root_page {
+                            return true;
+                        }
+                    }
+                    let indices = schema.get_indices(name);
+                    for index in indices {
+                        if index.root_page == *root_page {
+                            return true;
+                        }
+                    }
+                }
+                Insn::VOpen { cursor_id, .. } => {
+                    if let Some(vtab) = &vtab {
+                        let name = self.cursor_ref[*cursor_id].0.as_ref().unwrap();
+                        if vtab.name == *name {
+                            return true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     pub fn build(

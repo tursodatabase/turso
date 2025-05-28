@@ -370,7 +370,11 @@ pub fn insn_to_str(
                 0,
                 Value::build_text(""),
                 0,
-                "".to_string(),
+                program.cursor_ref[*cursor_id]
+                    .0
+                    .as_ref()
+                    .unwrap()
+                    .to_string(),
             ),
             Insn::VCreate {
                 table_name,
@@ -621,11 +625,14 @@ pub fn insn_to_str(
                 0,
                 "".to_string(),
             ),
-            Insn::Return { return_reg } => (
+            Insn::Return {
+                return_reg,
+                can_fallthrough,
+            } => (
                 "Return",
                 *return_reg as i32,
                 0,
-                0,
+                *can_fallthrough as i32,
                 Value::build_text(""),
                 0,
                 "".to_string(),
@@ -1367,6 +1374,20 @@ pub fn insn_to_str(
                 *cookie as i32,
                 Value::build_text(""),
                 0,
+                "".to_string(),
+            ),
+            Insn::SetCookie {
+                db,
+                cookie,
+                value,
+                p5,
+            } => (
+                "SetCookie",
+                *db as i32,
+                *cookie as i32,
+                *value,
+                Value::build_text(""),
+                *p5,
                 "".to_string(),
             ),
             Insn::AutoCommit {

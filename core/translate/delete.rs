@@ -3,7 +3,7 @@ use crate::translate::emitter::emit_program;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{DeletePlan, Operation, Plan};
 use crate::translate::planner::{parse_limit, parse_where};
-use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
+use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode, TableRefIdCounter};
 use crate::{schema::Schema, Result, SymbolTable};
 use limbo_sqlite3_parser::ast::{Expr, Limit, QualifiedName};
 
@@ -18,7 +18,13 @@ pub fn translate_delete(
     syms: &SymbolTable,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
-    let mut delete_plan = prepare_delete_plan(schema, tbl_name, where_clause, limit)?;
+    let mut delete_plan = prepare_delete_plan(
+        schema,
+        tbl_name,
+        where_clause,
+        limit,
+        &mut program.table_reference_counter,
+    )?;
     optimize_plan(&mut delete_plan, schema)?;
     let Plan::Delete(ref delete) = delete_plan else {
         panic!("delete_plan is not a DeletePlan");
@@ -30,7 +36,7 @@ pub fn translate_delete(
         approx_num_labels: 0,
     };
     program.extend(&opts);
-    emit_program(&mut program, delete_plan, syms)?;
+    emit_program(&mut program, delete_plan, schema, syms)?;
     Ok(program)
 }
 
@@ -39,6 +45,7 @@ pub fn prepare_delete_plan(
     tbl_name: &QualifiedName,
     where_clause: Option<Box<Expr>>,
     limit: Option<Box<Limit>>,
+    table_ref_counter: &mut TableRefIdCounter,
 ) -> Result<Plan> {
     let table = match schema.get_table(tbl_name.name.0.as_str()) {
         Some(table) => table,
@@ -60,6 +67,7 @@ pub fn prepare_delete_plan(
     let mut table_references = vec![TableReference {
         table,
         identifier: name,
+        internal_id: table_ref_counter.next(),
         op: Operation::Scan {
             iter_dir: IterationDirection::Forwards,
             index: None,

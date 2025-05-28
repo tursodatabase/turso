@@ -4,6 +4,7 @@ use crate::schema::Schema;
 use crate::storage::database::FileMemoryStorage;
 use crate::storage::page_cache::DumbLruPageCache;
 use crate::storage::pager::CreateBTreeFlags;
+use crate::storage::wal::DummyWAL;
 use crate::types::ImmutableRecord;
 use crate::{
     error::{LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_PRIMARYKEY},
@@ -49,7 +50,7 @@ use crate::{
 
 use super::{
     insn::{Cookie, RegisterOrLiteral},
-    HaltState,
+    CommitState,
 };
 use parking_lot::RwLock;
 use rand::thread_rng;
@@ -321,15 +322,17 @@ pub fn op_null(
     pager: &Rc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    let Insn::Null { dest, dest_end } = insn else {
-        unreachable!("unexpected Insn {:?}", insn)
-    };
-    if let Some(dest_end) = dest_end {
-        for i in *dest..=*dest_end {
-            state.registers[i] = Register::Value(Value::Null);
+    match insn {
+        Insn::Null { dest, dest_end } | Insn::BeginSubrtn { dest, dest_end } => {
+            if let Some(dest_end) = dest_end {
+                for i in *dest..=*dest_end {
+                    state.registers[i] = Register::Value(Value::Null);
+                }
+            } else {
+                state.registers[*dest] = Register::Value(Value::Null);
+            }
         }
-    } else {
-        state.registers[*dest] = Register::Value(Value::Null);
+        _ => unreachable!("unexpected Insn {:?}", insn),
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -997,7 +1000,9 @@ pub fn op_vopen(
     state
         .cursors
         .borrow_mut()
-        .insert(*cursor_id, Some(Cursor::Virtual(cursor)));
+        .get_mut(*cursor_id)
+        .unwrap_or_else(|| panic!("cursor id {} out of bounds", *cursor_id))
+        .replace(Cursor::Virtual(cursor));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -1651,7 +1656,7 @@ pub fn op_halt(
             )));
         }
     }
-    match program.halt(pager.clone(), state, mv_store)? {
+    match program.commit_txn(pager.clone(), state, mv_store)? {
         StepResult::Done => Ok(InsnFunctionStepResult::Done),
         StepResult::IO => Ok(InsnFunctionStepResult::IO),
         StepResult::Row => Ok(InsnFunctionStepResult::Row),
@@ -1726,8 +1731,8 @@ pub fn op_auto_commit(
         unreachable!("unexpected Insn {:?}", insn)
     };
     let conn = program.connection.upgrade().unwrap();
-    if matches!(state.halt_state, Some(HaltState::Checkpointing)) {
-        return match program.halt(pager.clone(), state, mv_store)? {
+    if state.commit_state == CommitState::Committing {
+        return match program.commit_txn(pager.clone(), state, mv_store)? {
             super::StepResult::Done => Ok(InsnFunctionStepResult::Done),
             super::StepResult::IO => Ok(InsnFunctionStepResult::IO),
             super::StepResult::Row => Ok(InsnFunctionStepResult::Row),
@@ -1755,7 +1760,7 @@ pub fn op_auto_commit(
             "cannot commit - no transaction is active".to_string(),
         ));
     }
-    return match program.halt(pager.clone(), state, mv_store)? {
+    return match program.commit_txn(pager.clone(), state, mv_store)? {
         super::StepResult::Done => Ok(InsnFunctionStepResult::Done),
         super::StepResult::IO => Ok(InsnFunctionStepResult::IO),
         super::StepResult::Row => Ok(InsnFunctionStepResult::Row),
@@ -1806,7 +1811,11 @@ pub fn op_return(
     pager: &Rc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    let Insn::Return { return_reg } = insn else {
+    let Insn::Return {
+        return_reg,
+        can_fallthrough,
+    } = insn
+    else {
         unreachable!("unexpected Insn {:?}", insn)
     };
     if let Value::Integer(pc) = state.registers[*return_reg].get_owned_value() {
@@ -1815,9 +1824,12 @@ pub fn op_return(
             .unwrap_or_else(|_| panic!("Return register is negative: {}", pc));
         state.pc = pc;
     } else {
-        return Err(LimboError::InternalError(
-            "Return register is not an integer".to_string(),
-        ));
+        if !*can_fallthrough {
+            return Err(LimboError::InternalError(
+                "Return register is not an integer".to_string(),
+            ));
+        }
+        state.pc += 1;
     }
     Ok(InsnFunctionStepResult::Step)
 }
@@ -3931,6 +3943,7 @@ pub fn op_idx_delete(
                 let n_change = program.n_change.get();
                 program.n_change.set(n_change + 1);
                 state.pc += 1;
+                state.op_idx_delete_state = None;
                 return Ok(InsnFunctionStepResult::Step);
             }
             None => {
@@ -4516,6 +4529,37 @@ pub fn op_read_cookie(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_set_cookie(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Rc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    let Insn::SetCookie {
+        db,
+        cookie,
+        value,
+        p5,
+    } = insn
+    else {
+        unreachable!("unexpected Insn {:?}", insn)
+    };
+    if *db > 0 {
+        todo!("temp databases not implemented yet");
+    }
+    match cookie {
+        Cookie::UserVersion => {
+            let mut header_guard = pager.db_header.lock();
+            header_guard.user_version = *value;
+            pager.write_database_header(&*header_guard);
+        }
+        cookie => todo!("{cookie:?} is not yet implement for SetCookie"),
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_shift_right(
     program: &Program,
     state: &mut ProgramState,
@@ -4701,7 +4745,7 @@ pub fn op_open_ephemeral(
     let pager = Rc::new(Pager::finish_open(
         db_header,
         db_file,
-        None,
+        Rc::new(RefCell::new(DummyWAL)),
         io,
         page_cache,
         buffer_pool,
