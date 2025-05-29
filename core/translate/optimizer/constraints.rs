@@ -3,7 +3,7 @@ use std::{cmp::Ordering, collections::HashMap, sync::Arc};
 use crate::{
     schema::{Column, Index},
     translate::{
-        expr::as_binary_components,
+        expr::{as_binary_components, walk_expr},
         plan::{JoinOrderMember, TableReferences, WhereTerm},
         planner::{table_mask_from_expr, TableMask},
     },
@@ -216,6 +216,28 @@ pub fn constraints_from_where_clause(
                 if outer_join_tbl != table_reference.internal_id {
                     continue;
                 }
+            }
+
+            let expr_contains_subquery = |expr: &ast::Expr| -> Result<bool> {
+                let mut contains_subquery = false;
+                walk_expr(expr, &mut |subexpr: &ast::Expr| -> Result<()> {
+                    match subexpr {
+                        ast::Expr::Exists(_)
+                        | ast::Expr::InSelect { .. }
+                        | ast::Expr::Subquery(_) => {
+                            contains_subquery = true;
+                            return Ok(());
+                        }
+                        _ => return Ok(()),
+                    }
+                })?;
+                Ok(contains_subquery)
+            };
+
+            // Currently we don't have an unnester for WHERE clause subqueries, and plans for them are computed ad-hoc after optimization
+            // in the translation phase, so never consider expressions that contain subqueries.
+            if expr_contains_subquery(&lhs)? || expr_contains_subquery(&rhs)? {
+                continue;
             }
 
             // If either the LHS or RHS of the constraint is a column from the table, add the constraint.
