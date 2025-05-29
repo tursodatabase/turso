@@ -1448,6 +1448,8 @@ mod tests {
             }
         }
 
+        log::debug!("DDL/DML to reproduce manually:\n{}", debug_ddl_dml_string);
+
         // Helper function to generate random simple WHERE condition
         let gen_simple_where = |rng: &mut ChaCha8Rng, table: &str| -> String {
             let conditions = match table {
@@ -1475,7 +1477,7 @@ mod tests {
         };
 
         // Helper function to generate simple subquery
-        fn gen_subquery(rng: &mut ChaCha8Rng, depth: usize) -> String {
+        fn gen_subquery(rng: &mut ChaCha8Rng, depth: usize, outer_table: Option<&str>) -> String {
             if depth > MAX_SUBQUERY_DEPTH {
                 // Reduced nesting depth
                 // Limit nesting depth
@@ -1507,6 +1509,63 @@ mod tests {
                 conditions[rng.random_range(0..conditions.len())].clone()
             };
 
+            // Helper function to generate correlated WHERE conditions
+            let gen_correlated_where =
+                |rng: &mut ChaCha8Rng, inner_table: &str, outer_table: &str| -> String {
+                    match (outer_table, inner_table) {
+                        ("t1", "t2") => {
+                            // t2.ref_id relates to t1.id
+                            let conditions = vec![
+                                format!("{}.ref_id = {}.id", inner_table, outer_table),
+                                format!("{}.id < {}.value1", inner_table, outer_table),
+                                format!("{}.data > {}.value2", inner_table, outer_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t1", "t3") => {
+                            let conditions = vec![
+                                format!("{}.id = {}.id", inner_table, outer_table),
+                                format!("{}.category < {}.value1", inner_table, outer_table),
+                                format!("{}.amount > {}.value2", inner_table, outer_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t2", "t1") => {
+                            let conditions = vec![
+                                format!("{}.id = {}.ref_id", inner_table, outer_table),
+                                format!("{}.value1 > {}.data", inner_table, outer_table),
+                                format!("{}.value2 < {}.id", inner_table, outer_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t2", "t3") => {
+                            let conditions = vec![
+                                format!("{}.id = {}.id", inner_table, outer_table),
+                                format!("{}.category = {}.ref_id", inner_table, outer_table),
+                                format!("{}.amount > {}.data", inner_table, outer_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t3", "t1") => {
+                            let conditions = vec![
+                                format!("{}.id = {}.id", inner_table, outer_table),
+                                format!("{}.value1 > {}.category", inner_table, outer_table),
+                                format!("{}.value2 < {}.amount", inner_table, outer_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t3", "t2") => {
+                            let conditions = vec![
+                                format!("{}.id = {}.id", inner_table, outer_table),
+                                format!("{}.ref_id = {}.category", inner_table, outer_table),
+                                format!("{}.data < {}.amount", inner_table, outer_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        _ => "1=1".to_string(),
+                    }
+                };
+
             let subquery_types = vec![
                 // Simple scalar subqueries - single column only for safe nesting
                 "SELECT MAX(amount) FROM t3".to_string(),
@@ -1533,22 +1592,55 @@ mod tests {
 
             let base_query = &subquery_types[rng.random_range(0..subquery_types.len())];
 
-            // Sometimes add nesting - but use scalar subquery for nesting to avoid column count issues
-            if depth < 1 && rng.random_bool(0.2) {
-                // Reduced probability and depth
-                let nested = gen_scalar_subquery(rng, 0);
-                if base_query.contains("WHERE") {
-                    format!("{} AND id IN ({})", base_query, nested)
+            // Add correlated conditions if outer_table is provided and sometimes
+            let final_query = if let Some(outer_table) = outer_table {
+                if rng.random_bool(0.4) {
+                    // 40% chance for correlation
+                    // Extract the inner table from the base query
+                    let inner_table = if base_query.contains("FROM t1") {
+                        "t1"
+                    } else if base_query.contains("FROM t2") {
+                        "t2"
+                    } else if base_query.contains("FROM t3") {
+                        "t3"
+                    } else {
+                        return base_query.clone(); // fallback
+                    };
+
+                    let correlated_condition = gen_correlated_where(rng, inner_table, outer_table);
+
+                    if base_query.contains("WHERE") {
+                        format!("{} AND {}", base_query, correlated_condition)
+                    } else {
+                        format!("{} WHERE {}", base_query, correlated_condition)
+                    }
                 } else {
-                    format!("{} WHERE id IN ({})", base_query, nested)
+                    base_query.clone()
                 }
             } else {
                 base_query.clone()
+            };
+
+            // Sometimes add nesting - but use scalar subquery for nesting to avoid column count issues
+            if depth < 1 && rng.random_bool(0.2) {
+                // Reduced probability and depth
+                let nested = gen_scalar_subquery(rng, 0, outer_table);
+                if final_query.contains("WHERE") {
+                    format!("{} AND id IN ({})", final_query, nested)
+                } else {
+                    format!("{} WHERE id IN ({})", final_query, nested)
+                }
+            } else {
+                final_query
             }
         }
 
         // Helper function to generate scalar subquery (single column only)
-        fn gen_scalar_subquery(rng: &mut ChaCha8Rng, depth: usize) -> String {
+        fn gen_scalar_subquery(
+            rng: &mut ChaCha8Rng,
+            depth: usize,
+            outer_table: Option<&str>,
+        ) -> String {
             if depth > MAX_SUBQUERY_DEPTH {
                 // Reduced nesting depth
                 return "SELECT 1".to_string();
@@ -1579,6 +1671,63 @@ mod tests {
                 conditions[rng.random_range(0..conditions.len())].clone()
             };
 
+            // Helper function to generate correlated WHERE conditions
+            let gen_correlated_where =
+                |rng: &mut ChaCha8Rng, inner_table: &str, outer_table: &str| -> String {
+                    match (outer_table, inner_table) {
+                        ("t1", "t2") => {
+                            // t2.ref_id relates to t1.id
+                            let conditions = vec![
+                                format!("{}.ref_id = {}.id", inner_table, outer_table),
+                                format!("{}.id < {}.value1", inner_table, outer_table),
+                                format!("{}.data > {}.value2", inner_table, outer_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t1", "t3") => {
+                            let conditions = vec![
+                                format!("{}.id = {}.id", inner_table, outer_table),
+                                format!("{}.category < {}.value1", inner_table, outer_table),
+                                format!("{}.amount > {}.value2", inner_table, outer_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t2", "t1") => {
+                            let conditions = vec![
+                                format!("{}.id = {}.ref_id", inner_table, outer_table),
+                                format!("{}.value1 > {}.data", inner_table, outer_table),
+                                format!("{}.value2 < {}.id", inner_table, outer_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t2", "t3") => {
+                            let conditions = vec![
+                                format!("{}.id = {}.id", inner_table, outer_table),
+                                format!("{}.category = {}.ref_id", inner_table, outer_table),
+                                format!("{}.amount > {}.data", inner_table, outer_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t3", "t1") => {
+                            let conditions = vec![
+                                format!("{}.id = {}.id", inner_table, outer_table),
+                                format!("{}.value1 > {}.category", inner_table, outer_table),
+                                format!("{}.value2 < {}.amount", inner_table, outer_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t3", "t2") => {
+                            let conditions = vec![
+                                format!("{}.id = {}.id", inner_table, outer_table),
+                                format!("{}.ref_id = {}.category", inner_table, outer_table),
+                                format!("{}.data < {}.amount", inner_table, outer_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        _ => "1=1".to_string(),
+                    }
+                };
+
             let scalar_subquery_types = vec![
                 // Only scalar subqueries - single column only
                 "SELECT MAX(amount) FROM t3".to_string(),
@@ -1606,24 +1755,53 @@ mod tests {
             let base_query =
                 &scalar_subquery_types[rng.random_range(0..scalar_subquery_types.len())];
 
-            // Sometimes add nesting
-            if depth < 1 && rng.random_bool(0.2) {
-                // Reduced probability and depth
-                let nested = gen_scalar_subquery(rng, depth + 1);
-                if base_query.contains("WHERE") {
-                    format!("{} AND id IN ({})", base_query, nested)
+            // Add correlated conditions if outer_table is provided and sometimes
+            let final_query = if let Some(outer_table) = outer_table {
+                if rng.random_bool(0.4) {
+                    // 40% chance for correlation
+                    // Extract the inner table from the base query
+                    let inner_table = if base_query.contains("FROM t1") {
+                        "t1"
+                    } else if base_query.contains("FROM t2") {
+                        "t2"
+                    } else if base_query.contains("FROM t3") {
+                        "t3"
+                    } else {
+                        return base_query.clone(); // fallback
+                    };
+
+                    let correlated_condition = gen_correlated_where(rng, inner_table, outer_table);
+
+                    if base_query.contains("WHERE") {
+                        format!("{} AND {}", base_query, correlated_condition)
+                    } else {
+                        format!("{} WHERE {}", base_query, correlated_condition)
+                    }
                 } else {
-                    format!("{} WHERE id IN ({})", base_query, nested)
+                    base_query.clone()
                 }
             } else {
                 base_query.clone()
+            };
+
+            // Sometimes add nesting
+            if depth < 1 && rng.random_bool(0.2) {
+                // Reduced probability and depth
+                let nested = gen_scalar_subquery(rng, depth + 1, outer_table);
+                if final_query.contains("WHERE") {
+                    format!("{} AND id IN ({})", final_query, nested)
+                } else {
+                    format!("{} WHERE id IN ({})", final_query, nested)
+                }
+            } else {
+                final_query
             }
         }
 
         for iter_num in 0..NUM_FUZZ_ITERATIONS {
             let main_table = ["t1", "t2", "t3"][rng.random_range(0..3)];
 
-            let query_type = rng.random_range(0..4);
+            let query_type = rng.random_range(0..6); // Increased from 4 to 6 for new correlated query types
             let query = match query_type {
                 0 => {
                     // Comparison subquery: WHERE column <op> (SELECT ...)
@@ -1634,7 +1812,7 @@ mod tests {
                         _ => "id",
                     };
                     let op = [">", "<", ">=", "<=", "=", "<>"][rng.random_range(0..6)];
-                    let subquery = gen_scalar_subquery(&mut rng, 0);
+                    let subquery = gen_scalar_subquery(&mut rng, 0, Some(main_table));
                     format!(
                         "SELECT * FROM {} WHERE {} {} ({})",
                         main_table, column, op, subquery
@@ -1643,7 +1821,7 @@ mod tests {
                 1 => {
                     // EXISTS subquery: WHERE [NOT] EXISTS (SELECT ...)
                     let not_exists = if rng.random_bool(0.3) { "NOT " } else { "" };
-                    let subquery = gen_subquery(&mut rng, 0);
+                    let subquery = gen_subquery(&mut rng, 0, Some(main_table));
                     format!(
                         "SELECT * FROM {} WHERE {}EXISTS ({})",
                         main_table, not_exists, subquery
@@ -1658,7 +1836,7 @@ mod tests {
                         "t3" => ["amount", "category", "id"][rng.random_range(0..3)],
                         _ => "id",
                     };
-                    let subquery = gen_scalar_subquery(&mut rng, 0);
+                    let subquery = gen_scalar_subquery(&mut rng, 0, Some(main_table));
                     format!(
                         "SELECT * FROM {} WHERE {} {}IN ({})",
                         main_table, column, not_in, subquery
@@ -1705,6 +1883,162 @@ mod tests {
                     format!(
                         "SELECT * FROM {} WHERE {} {}IN ({})",
                         main_table, columns, not_in, subquery
+                    )
+                }
+                4 => {
+                    // Correlated EXISTS subquery: WHERE [NOT] EXISTS (SELECT ... WHERE correlation)
+                    let not_exists = if rng.random_bool(0.3) { "NOT " } else { "" };
+
+                    // Choose a different table for the subquery to ensure correlation is meaningful
+                    let inner_tables = match main_table {
+                        "t1" => ["t2", "t3"],
+                        "t2" => ["t1", "t3"],
+                        "t3" => ["t1", "t2"],
+                        _ => ["t1", "t2"],
+                    };
+                    let inner_table = inner_tables[rng.random_range(0..inner_tables.len())];
+
+                    // Generate correlated condition
+                    let correlated_condition = match (main_table, inner_table) {
+                        ("t1", "t2") => {
+                            let conditions = vec![
+                                format!("{}.ref_id = {}.id", inner_table, main_table),
+                                format!("{}.id < {}.value1", inner_table, main_table),
+                                format!("{}.data > {}.value2", inner_table, main_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t1", "t3") => {
+                            let conditions = vec![
+                                format!("{}.id = {}.id", inner_table, main_table),
+                                format!("{}.category < {}.value1", inner_table, main_table),
+                                format!("{}.amount > {}.value2", inner_table, main_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t2", "t1") => {
+                            let conditions = vec![
+                                format!("{}.id = {}.ref_id", inner_table, main_table),
+                                format!("{}.value1 > {}.data", inner_table, main_table),
+                                format!("{}.value2 < {}.id", inner_table, main_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t2", "t3") => {
+                            let conditions = vec![
+                                format!("{}.id = {}.id", inner_table, main_table),
+                                format!("{}.category = {}.ref_id", inner_table, main_table),
+                                format!("{}.amount > {}.data", inner_table, main_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t3", "t1") => {
+                            let conditions = vec![
+                                format!("{}.id = {}.id", inner_table, main_table),
+                                format!("{}.value1 > {}.category", inner_table, main_table),
+                                format!("{}.value2 < {}.amount", inner_table, main_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t3", "t2") => {
+                            let conditions = vec![
+                                format!("{}.id = {}.id", inner_table, main_table),
+                                format!("{}.ref_id = {}.category", inner_table, main_table),
+                                format!("{}.data < {}.amount", inner_table, main_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        _ => "1=1".to_string(),
+                    };
+
+                    format!(
+                        "SELECT * FROM {} WHERE {}EXISTS (SELECT 1 FROM {} WHERE {})",
+                        main_table, not_exists, inner_table, correlated_condition
+                    )
+                }
+                5 => {
+                    // Correlated comparison subquery: WHERE column <op> (SELECT ... WHERE correlation)
+                    let column = match main_table {
+                        "t1" => ["value1", "value2", "id"][rng.random_range(0..3)],
+                        "t2" => ["data", "ref_id", "id"][rng.random_range(0..3)],
+                        "t3" => ["amount", "category", "id"][rng.random_range(0..3)],
+                        _ => "id",
+                    };
+                    let op = [">", "<", ">=", "<=", "=", "<>"][rng.random_range(0..6)];
+
+                    // Choose a different table for the subquery
+                    let inner_tables = match main_table {
+                        "t1" => ["t2", "t3"],
+                        "t2" => ["t1", "t3"],
+                        "t3" => ["t1", "t2"],
+                        _ => ["t1", "t2"],
+                    };
+                    let inner_table = inner_tables[rng.random_range(0..inner_tables.len())];
+
+                    // Choose what to select from inner table
+                    let select_column = match inner_table {
+                        "t1" => ["value1", "value2", "id"][rng.random_range(0..3)],
+                        "t2" => ["data", "ref_id", "id"][rng.random_range(0..3)],
+                        "t3" => ["amount", "category", "id"][rng.random_range(0..3)],
+                        _ => "id",
+                    };
+
+                    // Generate correlated condition
+                    let correlated_condition = match (main_table, inner_table) {
+                        ("t1", "t2") => {
+                            let conditions = vec![
+                                format!("{}.ref_id = {}.id", inner_table, main_table),
+                                format!("{}.id < {}.value1", inner_table, main_table),
+                                format!("{}.data > {}.value2", inner_table, main_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t1", "t3") => {
+                            let conditions = vec![
+                                format!("{}.id = {}.id", inner_table, main_table),
+                                format!("{}.category < {}.value1", inner_table, main_table),
+                                format!("{}.amount > {}.value2", inner_table, main_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t2", "t1") => {
+                            let conditions = vec![
+                                format!("{}.id = {}.ref_id", inner_table, main_table),
+                                format!("{}.value1 > {}.data", inner_table, main_table),
+                                format!("{}.value2 < {}.id", inner_table, main_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t2", "t3") => {
+                            let conditions = vec![
+                                format!("{}.id = {}.id", inner_table, main_table),
+                                format!("{}.category = {}.ref_id", inner_table, main_table),
+                                format!("{}.amount > {}.data", inner_table, main_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t3", "t1") => {
+                            let conditions = vec![
+                                format!("{}.id = {}.id", inner_table, main_table),
+                                format!("{}.value1 > {}.category", inner_table, main_table),
+                                format!("{}.value2 < {}.amount", inner_table, main_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t3", "t2") => {
+                            let conditions = vec![
+                                format!("{}.id = {}.id", inner_table, main_table),
+                                format!("{}.ref_id = {}.category", inner_table, main_table),
+                                format!("{}.data < {}.amount", inner_table, main_table),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        _ => "1=1".to_string(),
+                    };
+
+                    format!(
+                        "SELECT * FROM {} WHERE {} {} (SELECT {} FROM {} WHERE {})",
+                        main_table, column, op, select_column, inner_table, correlated_condition
                     )
                 }
                 _ => unreachable!(),
