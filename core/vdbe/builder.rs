@@ -248,6 +248,19 @@ impl ProgramBuilder {
         reg
     }
 
+    pub fn alloc_registers_and_init_w_null(&mut self, amount: usize) -> usize {
+        let reg = self.alloc_registers(amount);
+        self.emit_insn(Insn::Null {
+            dest: reg,
+            dest_end: if amount == 1 {
+                None
+            } else {
+                Some(reg + amount - 1)
+            },
+        });
+        reg
+    }
+
     pub fn alloc_cursor_id_keyed(&mut self, key: CursorKey, cursor_type: CursorType) -> usize {
         assert!(
             !self

@@ -583,6 +583,10 @@ pub fn emit_query<'a>(
 
     if let Some(ref group_by) = plan.group_by {
         init_group_by(program, t_ctx, group_by, &plan)?;
+    } else if !plan.aggregates.is_empty() {
+        // Aggregate registers need to be NULLed at the start because the same registers might be reused on another invocation of a subquery,
+        // and if they are not NULLed, the 2nd invocation of the same subquery will have values left over from the first invocation.
+        t_ctx.reg_agg_start = Some(program.alloc_registers_and_init_w_null(plan.aggregates.len()));
     }
 
     init_distinct(program, plan);

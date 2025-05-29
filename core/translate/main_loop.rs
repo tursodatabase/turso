@@ -821,9 +821,9 @@ fn emit_loop_source<'a>(
             Ok(())
         }
         LoopEmitTarget::AggStep => {
-            let num_aggs = plan.aggregates.len();
-            let start_reg = program.alloc_registers(num_aggs);
-            t_ctx.reg_agg_start = Some(start_reg);
+            let start_reg = t_ctx
+                .reg_agg_start
+                .expect("aggregate registers must be initialized");
 
             // In planner.rs, we have collected all aggregates from the SELECT clause, including ones where the aggregate is embedded inside
             // a more complex expression. Some examples: length(sum(x)), sum(x) + avg(y), sum(x) + 1, etc.
