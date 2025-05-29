@@ -1369,7 +1369,7 @@ pub fn op_column(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seek.take() {
+    if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seeks[*cursor_id].take() {
         let deferred_seek = {
             let rowid = {
                 let mut index_cursor = state.get_cursor(index_cursor_id);
@@ -1384,7 +1384,7 @@ pub fn op_column(
             }
         };
         if let Some(deferred_seek) = deferred_seek {
-            state.deferred_seek = Some(deferred_seek);
+            state.deferred_seeks[*cursor_id] = Some(deferred_seek);
             return Ok(InsnFunctionStepResult::IO);
         }
     }
@@ -1925,7 +1925,7 @@ pub fn op_row_id(
     let Insn::RowId { cursor_id, dest } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seek.take() {
+    if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seeks[*cursor_id].take() {
         let deferred_seek = {
             let rowid = {
                 let mut index_cursor = state.get_cursor(index_cursor_id);
@@ -1946,7 +1946,7 @@ pub fn op_row_id(
             }
         };
         if let Some(deferred_seek) = deferred_seek {
-            state.deferred_seek = Some(deferred_seek);
+            state.deferred_seeks[*cursor_id] = Some(deferred_seek);
             return Ok(InsnFunctionStepResult::IO);
         }
     }
@@ -2058,7 +2058,7 @@ pub fn op_deferred_seek(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    state.deferred_seek = Some((*index_cursor_id, *table_cursor_id));
+    state.deferred_seeks[*table_cursor_id] = Some((*index_cursor_id, *table_cursor_id));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

@@ -268,7 +268,7 @@ pub struct ProgramState {
     registers: Vec<Register>,
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
-    deferred_seek: Option<(CursorID, CursorID)>,
+    deferred_seeks: Vec<Option<(CursorID, CursorID)>>,
     ended_coroutine: Bitfield<4>, // flag to indicate that a coroutine has ended (key is the yield register. currently we assume that the yield register is always between 0-255, YOLO)
     /// Indicate whether an [Insn::Once] instruction at a given program counter position has already been executed, well, once.
     once: SmallVec<u32, 4>,
@@ -293,7 +293,7 @@ impl ProgramState {
             registers,
             result_row: None,
             last_compare: None,
-            deferred_seek: None,
+            deferred_seeks: vec![None; max_cursors],
             ended_coroutine: Bitfield::new(),
             once: SmallVec::<u32, 4>::new(),
             regex_cache: RegexCache::new(),
@@ -338,7 +338,7 @@ impl ProgramState {
             .iter_mut()
             .for_each(|r| *r = Register::Value(Value::Null));
         self.last_compare = None;
-        self.deferred_seek = None;
+        self.deferred_seeks.iter_mut().for_each(|s| *s = None);
         self.ended_coroutine.0 = [0; 4];
         self.regex_cache.like.clear();
         self.interrupted = false;
