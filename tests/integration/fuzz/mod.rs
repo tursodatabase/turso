@@ -1384,4 +1384,369 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    pub fn table_subquery_fuzz() {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time();
+        log::info!("table_subquery_fuzz seed: {}", seed);
+
+        // Constants for fuzzing parameters
+        const NUM_FUZZ_ITERATIONS: usize = 20000;
+        const MAX_ROWS_PER_TABLE: usize = 15;
+        const MIN_ROWS_PER_TABLE: usize = 5;
+        const MAX_SUBQUERY_DEPTH: usize = 3;
+
+        let db = TempDatabase::new_empty();
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let mut debug_ddl_dml_string = String::new();
+
+        // Create 3 simple tables
+        let table_schemas = [
+            "CREATE TABLE t1 (id INT PRIMARY KEY, value1 INTEGER, value2 INTEGER);",
+            "CREATE TABLE t2 (id INT PRIMARY KEY, ref_id INTEGER, data INTEGER);",
+            "CREATE TABLE t3 (id INT PRIMARY KEY, category INTEGER, amount INTEGER);",
+        ];
+
+        for schema in &table_schemas {
+            debug_ddl_dml_string.push_str(schema);
+            limbo_exec_rows(&db, &limbo_conn, schema);
+            sqlite_exec_rows(&sqlite_conn, schema);
+        }
+
+        // Populate tables with random data
+        for table_num in 1..=3 {
+            let num_rows = rng.random_range(MIN_ROWS_PER_TABLE..=MAX_ROWS_PER_TABLE);
+            for i in 1..=num_rows {
+                let insert_sql = match table_num {
+                    1 => format!(
+                        "INSERT INTO t1 VALUES ({}, {}, {});",
+                        i,
+                        rng.random_range(-10..20),
+                        rng.random_range(-5..15)
+                    ),
+                    2 => format!(
+                        "INSERT INTO t2 VALUES ({}, {}, {});",
+                        i,
+                        rng.random_range(1..=num_rows), // ref_id references t1 approximately
+                        rng.random_range(-5..10)
+                    ),
+                    3 => format!(
+                        "INSERT INTO t3 VALUES ({}, {}, {});",
+                        i,
+                        rng.random_range(1..5), // category 1-4
+                        rng.random_range(0..100)
+                    ),
+                    _ => unreachable!(),
+                };
+                log::debug!("{}", insert_sql);
+                debug_ddl_dml_string.push_str(&insert_sql);
+                limbo_exec_rows(&db, &limbo_conn, &insert_sql);
+                sqlite_exec_rows(&sqlite_conn, &insert_sql);
+            }
+        }
+
+        // Helper function to generate random simple WHERE condition
+        let gen_simple_where = |rng: &mut ChaCha8Rng, table: &str| -> String {
+            let conditions = match table {
+                "t1" => vec![
+                    format!("value1 > {}", rng.random_range(-5..15)),
+                    format!("value2 < {}", rng.random_range(-5..15)),
+                    format!("id <= {}", rng.random_range(1..20)),
+                    "value1 IS NOT NULL".to_string(),
+                ],
+                "t2" => vec![
+                    format!("data > {}", rng.random_range(-3..8)),
+                    format!("ref_id = {}", rng.random_range(1..15)),
+                    format!("id < {}", rng.random_range(5..25)),
+                    "data IS NOT NULL".to_string(),
+                ],
+                "t3" => vec![
+                    format!("category = {}", rng.random_range(1..5)),
+                    format!("amount > {}", rng.random_range(0..50)),
+                    format!("id <= {}", rng.random_range(1..20)),
+                    "amount IS NOT NULL".to_string(),
+                ],
+                _ => vec!["1=1".to_string()],
+            };
+            conditions[rng.random_range(0..conditions.len())].clone()
+        };
+
+        // Helper function to generate simple subquery
+        fn gen_subquery(rng: &mut ChaCha8Rng, depth: usize) -> String {
+            if depth > MAX_SUBQUERY_DEPTH {
+                // Reduced nesting depth
+                // Limit nesting depth
+                return "SELECT 1".to_string();
+            }
+
+            let gen_simple_where_inner = |rng: &mut ChaCha8Rng, table: &str| -> String {
+                let conditions = match table {
+                    "t1" => vec![
+                        format!("value1 > {}", rng.random_range(-5..15)),
+                        format!("value2 < {}", rng.random_range(-5..15)),
+                        format!("id <= {}", rng.random_range(1..20)),
+                        "value1 IS NOT NULL".to_string(),
+                    ],
+                    "t2" => vec![
+                        format!("data > {}", rng.random_range(-3..8)),
+                        format!("ref_id = {}", rng.random_range(1..15)),
+                        format!("id < {}", rng.random_range(5..25)),
+                        "data IS NOT NULL".to_string(),
+                    ],
+                    "t3" => vec![
+                        format!("category = {}", rng.random_range(1..5)),
+                        format!("amount > {}", rng.random_range(0..50)),
+                        format!("id <= {}", rng.random_range(1..20)),
+                        "amount IS NOT NULL".to_string(),
+                    ],
+                    _ => vec!["1=1".to_string()],
+                };
+                conditions[rng.random_range(0..conditions.len())].clone()
+            };
+
+            let subquery_types = vec![
+                // Simple scalar subqueries - single column only for safe nesting
+                "SELECT MAX(amount) FROM t3".to_string(),
+                "SELECT MIN(value1) FROM t1".to_string(),
+                "SELECT COUNT(*) FROM t2".to_string(),
+                "SELECT AVG(amount) FROM t3".to_string(),
+                "SELECT id FROM t1".to_string(),
+                "SELECT ref_id FROM t2".to_string(),
+                "SELECT category FROM t3".to_string(),
+                // Subqueries with WHERE - single column only
+                format!(
+                    "SELECT MAX(amount) FROM t3 WHERE {}",
+                    gen_simple_where_inner(rng, "t3")
+                ),
+                format!(
+                    "SELECT value1 FROM t1 WHERE {}",
+                    gen_simple_where_inner(rng, "t1")
+                ),
+                format!(
+                    "SELECT ref_id FROM t2 WHERE {}",
+                    gen_simple_where_inner(rng, "t2")
+                ),
+            ];
+
+            let base_query = &subquery_types[rng.random_range(0..subquery_types.len())];
+
+            // Sometimes add nesting - but use scalar subquery for nesting to avoid column count issues
+            if depth < 1 && rng.random_bool(0.2) {
+                // Reduced probability and depth
+                let nested = gen_scalar_subquery(rng, 0);
+                if base_query.contains("WHERE") {
+                    format!("{} AND id IN ({})", base_query, nested)
+                } else {
+                    format!("{} WHERE id IN ({})", base_query, nested)
+                }
+            } else {
+                base_query.clone()
+            }
+        }
+
+        // Helper function to generate scalar subquery (single column only)
+        fn gen_scalar_subquery(rng: &mut ChaCha8Rng, depth: usize) -> String {
+            if depth > MAX_SUBQUERY_DEPTH {
+                // Reduced nesting depth
+                return "SELECT 1".to_string();
+            }
+
+            let gen_simple_where_inner = |rng: &mut ChaCha8Rng, table: &str| -> String {
+                let conditions = match table {
+                    "t1" => vec![
+                        format!("value1 > {}", rng.random_range(-5..15)),
+                        format!("value2 < {}", rng.random_range(-5..15)),
+                        format!("id <= {}", rng.random_range(1..20)),
+                        "value1 IS NOT NULL".to_string(),
+                    ],
+                    "t2" => vec![
+                        format!("data > {}", rng.random_range(-3..8)),
+                        format!("ref_id = {}", rng.random_range(1..15)),
+                        format!("id < {}", rng.random_range(5..25)),
+                        "data IS NOT NULL".to_string(),
+                    ],
+                    "t3" => vec![
+                        format!("category = {}", rng.random_range(1..5)),
+                        format!("amount > {}", rng.random_range(0..50)),
+                        format!("id <= {}", rng.random_range(1..20)),
+                        "amount IS NOT NULL".to_string(),
+                    ],
+                    _ => vec!["1=1".to_string()],
+                };
+                conditions[rng.random_range(0..conditions.len())].clone()
+            };
+
+            let scalar_subquery_types = vec![
+                // Only scalar subqueries - single column only
+                "SELECT MAX(amount) FROM t3".to_string(),
+                "SELECT MIN(value1) FROM t1".to_string(),
+                "SELECT COUNT(*) FROM t2".to_string(),
+                "SELECT AVG(amount) FROM t3".to_string(),
+                "SELECT id FROM t1".to_string(),
+                "SELECT ref_id FROM t2".to_string(),
+                "SELECT category FROM t3".to_string(),
+                // Scalar subqueries with WHERE
+                format!(
+                    "SELECT MAX(amount) FROM t3 WHERE {}",
+                    gen_simple_where_inner(rng, "t3")
+                ),
+                format!(
+                    "SELECT value1 FROM t1 WHERE {}",
+                    gen_simple_where_inner(rng, "t1")
+                ),
+                format!(
+                    "SELECT ref_id FROM t2 WHERE {}",
+                    gen_simple_where_inner(rng, "t2")
+                ),
+            ];
+
+            let base_query =
+                &scalar_subquery_types[rng.random_range(0..scalar_subquery_types.len())];
+
+            // Sometimes add nesting
+            if depth < 1 && rng.random_bool(0.2) {
+                // Reduced probability and depth
+                let nested = gen_scalar_subquery(rng, depth + 1);
+                if base_query.contains("WHERE") {
+                    format!("{} AND id IN ({})", base_query, nested)
+                } else {
+                    format!("{} WHERE id IN ({})", base_query, nested)
+                }
+            } else {
+                base_query.clone()
+            }
+        }
+
+        for iter_num in 0..NUM_FUZZ_ITERATIONS {
+            let main_table = ["t1", "t2", "t3"][rng.random_range(0..3)];
+
+            let query_type = rng.random_range(0..4);
+            let query = match query_type {
+                0 => {
+                    // Comparison subquery: WHERE column <op> (SELECT ...)
+                    let column = match main_table {
+                        "t1" => ["value1", "value2", "id"][rng.random_range(0..3)],
+                        "t2" => ["data", "ref_id", "id"][rng.random_range(0..3)],
+                        "t3" => ["amount", "category", "id"][rng.random_range(0..3)],
+                        _ => "id",
+                    };
+                    let op = [">", "<", ">=", "<=", "=", "<>"][rng.random_range(0..6)];
+                    let subquery = gen_scalar_subquery(&mut rng, 0);
+                    format!(
+                        "SELECT * FROM {} WHERE {} {} ({})",
+                        main_table, column, op, subquery
+                    )
+                }
+                1 => {
+                    // EXISTS subquery: WHERE [NOT] EXISTS (SELECT ...)
+                    let not_exists = if rng.random_bool(0.3) { "NOT " } else { "" };
+                    let subquery = gen_subquery(&mut rng, 0);
+                    format!(
+                        "SELECT * FROM {} WHERE {}EXISTS ({})",
+                        main_table, not_exists, subquery
+                    )
+                }
+                2 => {
+                    // IN subquery with single column: WHERE column [NOT] IN (SELECT ...)
+                    let not_in = if rng.random_bool(0.3) { "NOT " } else { "" };
+                    let column = match main_table {
+                        "t1" => ["value1", "value2", "id"][rng.random_range(0..3)],
+                        "t2" => ["data", "ref_id", "id"][rng.random_range(0..3)],
+                        "t3" => ["amount", "category", "id"][rng.random_range(0..3)],
+                        _ => "id",
+                    };
+                    let subquery = gen_scalar_subquery(&mut rng, 0);
+                    format!(
+                        "SELECT * FROM {} WHERE {} {}IN ({})",
+                        main_table, column, not_in, subquery
+                    )
+                }
+                3 => {
+                    // IN subquery with tuple: WHERE (col1, col2) [NOT] IN (SELECT col1, col2 ...)
+                    let not_in = if rng.random_bool(0.3) { "NOT " } else { "" };
+                    let (columns, sub_columns) = match main_table {
+                        "t1" => {
+                            if rng.random_bool(0.5) {
+                                ("(id, value1)", "SELECT id, value1 FROM t1")
+                            } else {
+                                ("id", "SELECT id FROM t1")
+                            }
+                        }
+                        "t2" => {
+                            if rng.random_bool(0.5) {
+                                ("(ref_id, data)", "SELECT ref_id, data FROM t2")
+                            } else {
+                                ("ref_id", "SELECT ref_id FROM t2")
+                            }
+                        }
+                        "t3" => {
+                            if rng.random_bool(0.5) {
+                                ("(id, category)", "SELECT id, category FROM t3")
+                            } else {
+                                ("id", "SELECT id FROM t3")
+                            }
+                        }
+                        _ => ("id", "SELECT id FROM t1"),
+                    };
+                    let subquery = if rng.random_bool(0.5) {
+                        sub_columns.to_string()
+                    } else {
+                        let base = sub_columns;
+                        let table_for_where = base.split("FROM ").nth(1).unwrap_or("t1");
+                        format!(
+                            "{} WHERE {}",
+                            base,
+                            gen_simple_where(&mut rng, table_for_where)
+                        )
+                    };
+                    format!(
+                        "SELECT * FROM {} WHERE {} {}IN ({})",
+                        main_table, columns, not_in, subquery
+                    )
+                }
+                _ => unreachable!(),
+            };
+
+            log::debug!(
+                "Iteration {}/{}: Query: {}",
+                iter_num + 1,
+                NUM_FUZZ_ITERATIONS,
+                query
+            );
+
+            let limbo_results = limbo_exec_rows(&db, &limbo_conn, &query);
+            let sqlite_results = sqlite_exec_rows(&sqlite_conn, &query);
+
+            // Check if results match
+            if limbo_results.len() != sqlite_results.len() {
+                panic!(
+                    "Row count mismatch for query: {}\nLimbo: {} rows, SQLite: {} rows\nLimbo: {:?}\nSQLite: {:?}\nSeed: {}\n\n DDL/DML to reproduce manually:\n{}",
+                    query, limbo_results.len(), sqlite_results.len(), limbo_results, sqlite_results, seed, debug_ddl_dml_string
+                );
+            }
+
+            // Check if all rows match (order might be different)
+            // Since Value doesn't implement Ord, we'll check containment both ways
+            let all_limbo_in_sqlite = limbo_results.iter().all(|limbo_row| {
+                sqlite_results
+                    .iter()
+                    .any(|sqlite_row| limbo_row == sqlite_row)
+            });
+            let all_sqlite_in_limbo = sqlite_results.iter().all(|sqlite_row| {
+                limbo_results
+                    .iter()
+                    .any(|limbo_row| sqlite_row == limbo_row)
+            });
+
+            if !all_limbo_in_sqlite || !all_sqlite_in_limbo {
+                panic!(
+                    "Results mismatch for query: {}\nLimbo: {:?}\nSQLite: {:?}\nSeed: {}",
+                    query, limbo_results, sqlite_results, seed
+                );
+            }
+        }
+    }
 }
