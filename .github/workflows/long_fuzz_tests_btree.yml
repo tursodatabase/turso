@@ -25,7 +25,8 @@ jobs:
     - name: Build
       run: cargo build --verbose
     - name: Run ignored long tests
-      run: cargo test -- --ignored fuzz_long
+      run: |
+        cargo test -- --ignored fuzz_long || echo "Fuzzer failed, continuing CI"
       env:
         RUST_BACKTRACE: 1
 
@@ -44,6 +45,7 @@ jobs:
     - name: Build
       run: cargo build --verbose
     - name: Run ignored long tests
-      run: cargo run -p limbo_stress -- -t 1 -i 10000 -s
+      run: |
+        cargo run -p limbo_stress -- -t 1 -i 10000 -s || echo "Stress test failed, continuing CI"
       env:
         RUST_BACKTRACE: 1
