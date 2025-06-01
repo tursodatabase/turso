@@ -411,7 +411,7 @@ impl Program {
             // invalidate row
             let _ = state.result_row.take();
             let (insn, insn_function) = &self.insns[state.pc as usize];
-            trace_insn(self, state.pc as InsnReference, insn);
+            debug_insn(self, state.pc as InsnReference, insn);
             let res = insn_function(self, state, insn, &pager, mv_store.as_ref())?;
             match res {
                 InsnFunctionStepResult::Step => {}
@@ -528,11 +528,18 @@ impl Program {
 
 fn get_new_rowid<R: Rng>(cursor: &mut BTreeCursor, mut rng: R) -> Result<CursorResult<i64>> {
     match cursor.seek_to_last()? {
-        CursorResult::Ok(()) => {}
+        CursorResult::Ok(has_record) => {
+            if !has_record {
+                return Ok(CursorResult::Ok(1));
+            }
+        }
         CursorResult::IO => return Ok(CursorResult::IO),
     }
-    let mut rowid = cursor
-        .rowid()?
+    let rowid_opt = match cursor.rowid()? {
+        CursorResult::Ok(r) => r,
+        CursorResult::IO => return Ok(CursorResult::IO),
+    };
+    let mut rowid = rowid_opt
         .unwrap_or(0) // if BTree is empty - use 0 as initial value for rowid
         .checked_add(1) // add 1 but be careful with overflows
         .unwrap_or(i64::MAX); // in case of overflow - use i64::MAX
@@ -563,11 +570,11 @@ fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> Immu
     ImmutableRecord::from_registers(&registers[*start_reg..*start_reg + *count])
 }
 
-fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
-    if !tracing::enabled!(tracing::Level::TRACE) {
+fn debug_insn(program: &Program, addr: InsnReference, insn: &Insn) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
         return;
     }
-    tracing::trace!(
+    tracing::debug!(
         "{}",
         explain::insn_to_str(
             program,

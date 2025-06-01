@@ -46,6 +46,7 @@ mod tests {
 
     #[test]
     pub fn rowid_seek_fuzz() {
+        println!("rowid_seek_fuzz");
         let db = TempDatabase::new_with_rusqlite("CREATE TABLE t(x INTEGER PRIMARY KEY)"); // INTEGER PRIMARY KEY is a rowid alias, so an index is not created
         let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
 
@@ -69,6 +70,8 @@ mod tests {
             Some("ORDER BY x ASC"),
         ];
 
+        println!("rowid_seek_fuzz");
+
         for comp in COMPARISONS.iter() {
             for order_by in ORDER_BY.iter() {
                 for max in 0..=2000 {
@@ -78,7 +81,7 @@ mod tests {
                         max,
                         order_by.unwrap_or("")
                     );
-                    log::trace!("query: {}", query);
+                    println!("query: {}", query);
                     let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
                     let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
                     assert_eq!(
