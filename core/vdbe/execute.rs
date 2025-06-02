@@ -1311,13 +1311,13 @@ pub fn op_rewind(
         unreachable!("unexpected Insn {:?}", insn)
     };
     assert!(pc_if_empty.is_offset());
-    let is_empty = {
+    let has_record = {
         let mut cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Rewind");
         let cursor = cursor.as_btree_mut();
-        return_if_io!(cursor.rewind());
-        cursor.is_empty()
+        let has_record = return_if_io!(cursor.rewind());
+        has_record
     };
-    if is_empty {
+    if !has_record {
         state.pc = pc_if_empty.to_offset_int();
     } else {
         state.pc += 1;
@@ -1340,13 +1340,13 @@ pub fn op_last(
         unreachable!("unexpected Insn {:?}", insn)
     };
     assert!(pc_if_empty.is_offset());
-    let is_empty = {
+    let has_record = {
         let mut cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Last");
         let cursor = cursor.as_btree_mut();
-        return_if_io!(cursor.last());
-        cursor.is_empty()
+        let has_record = return_if_io!(cursor.last());
+        has_record
     };
-    if is_empty {
+    if !has_record {
         state.pc = pc_if_empty.to_offset_int();
     } else {
         state.pc += 1;
@@ -1615,15 +1615,15 @@ pub fn op_prev(
         unreachable!("unexpected Insn {:?}", insn)
     };
     assert!(pc_if_prev.is_offset());
-    let is_empty = {
+    let has_record = {
         let mut cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Prev");
         let cursor = cursor.as_btree_mut();
         cursor.set_null_flag(false);
-        return_if_io!(cursor.prev());
+        let has_record = return_if_io!(cursor.prev());
 
-        cursor.is_empty()
+        has_record
     };
-    if !is_empty {
+    if has_record {
         state.pc = pc_if_prev.to_offset_int();
     } else {
         state.pc += 1;

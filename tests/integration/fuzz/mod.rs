@@ -63,11 +63,10 @@ mod tests {
         let limbo_conn = db.connect_limbo();
 
         const COMPARISONS: [&str; 4] = ["<", "<=", ">", ">="];
-        const ORDER_BY: [Option<&str>; 4] = [
+        const ORDER_BY: [Option<&str>; 3] = [
             None,
             Some("ORDER BY x"),
             Some("ORDER BY x DESC"),
-            Some("ORDER BY x ASC"),
         ];
 
         println!("rowid_seek_fuzz");
@@ -131,6 +130,7 @@ mod tests {
                     );
                     let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
                     let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
+                    println!("query: {}, limbo: {:?}, sqlite: {:?}", query, limbo, sqlite);
                     assert_eq!(
                         limbo, sqlite,
                         "query: {}, limbo: {:?}, sqlite: {:?}",
