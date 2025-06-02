@@ -15,6 +15,7 @@ pub mod create;
 pub mod create_index;
 pub mod delete;
 pub mod drop;
+pub mod expr;
 pub mod insert;
 pub mod select;
 pub mod update;

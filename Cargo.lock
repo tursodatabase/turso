@@ -240,6 +240,9 @@ name = "bitflags"
 version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c8214115b7bf84099f1309324e63141d4c5d7cc26862f97a0a857dbefe165bd"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "blake3"
@@ -1428,6 +1431,7 @@ checksum = "3954d50fe15b02142bf25d3b8bdadb634ec3948f103d04ffe3031bc8fe9d7058"
 dependencies = [
  "equivalent",
  "hashbrown 0.15.2",
+ "serde",
 ]
 
 [[package]]
@@ -2002,6 +2006,7 @@ dependencies = [
  "phf",
  "phf_codegen",
  "phf_shared",
+ "serde",
  "strum",
  "strum_macros",
  "uncased",
