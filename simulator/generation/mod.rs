@@ -3,6 +3,7 @@ use std::{iter::Sum, ops::SubAssign};
 use anarchist_readable_name_generator_lib::readable_name_custom;
 use rand::{distributions::uniform::SampleUniform, Rng};
 
+mod expr;
 pub mod plan;
 pub mod property;
 pub mod query;
