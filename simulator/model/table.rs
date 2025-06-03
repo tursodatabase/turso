@@ -248,6 +248,30 @@ impl From<ast::Literal> for Value {
     }
 }
 
+impl From<Value> for ast::Literal {
+    fn from(value: Value) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            Value::Integer(i) => Self::Numeric(i.to_string()),
+            Value::Float(f) => Self::Numeric(f.to_string()),
+            Value::Text(string) => Self::String(string),
+            Value::Blob(blob) => Self::Blob(hex::encode(blob)),
+        }
+    }
+}
+
+impl From<&Value> for ast::Literal {
+    fn from(value: &Value) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            Value::Integer(i) => Self::Numeric(i.to_string()),
+            Value::Float(f) => Self::Numeric(f.to_string()),
+            Value::Text(string) => Self::String(string.clone()),
+            Value::Blob(blob) => Self::Blob(hex::encode(blob)),
+        }
+    }
+}
+
 impl From<Numeric> for Value {
     fn from(value: Numeric) -> Self {
         match value {

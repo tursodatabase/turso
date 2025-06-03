@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{model::table::Value, SimulatorEnv};
 
-use super::select::Predicate;
+use super::predicate::Predicate;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Delete {

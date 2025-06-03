@@ -18,7 +18,7 @@ macro_rules! assert_implemented_predicate_expr {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Predicate(ast::Expr);
+pub struct Predicate(pub ast::Expr);
 
 impl Predicate {
     pub(crate) fn true_() -> Self {
@@ -59,7 +59,8 @@ impl Predicate {
                 }
             }
             ast::Expr::Literal(literal) => Value::from(literal).into_bool(),
-            ast::Expr::Unary(unary_operator, expr) => todo!(),
+            // TODO: next implement unary operator
+            ast::Expr::Unary(..) => todo!(),
             expr => unimplemented!("{:?}", expr),
         }
     }

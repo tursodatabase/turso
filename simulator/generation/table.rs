@@ -197,7 +197,7 @@ impl ArbitraryFrom<&Value> for GTValue {
     }
 }
 
-pub(crate) struct LikeValue(pub(crate) String);
+pub(crate) struct LikeValue(pub(crate) Value);
 
 impl ArbitraryFromMaybe<&Value> for LikeValue {
     fn arbitrary_from_maybe<R: Rng>(rng: &mut R, value: &Value) -> Option<Self> {
@@ -221,7 +221,7 @@ impl ArbitraryFromMaybe<&Value> for LikeValue {
                 }
                 let index = rng.gen_range(0..t.len());
                 t.insert(index, '%');
-                Some(Self(t.into_iter().collect()))
+                Some(Self(Value::Text(t.into_iter().collect())))
             }
             _ => None,
         }

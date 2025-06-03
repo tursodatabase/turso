@@ -5,6 +5,7 @@ use rand::{distributions::uniform::SampleUniform, Rng};
 
 mod expr;
 pub mod plan;
+mod predicate;
 pub mod property;
 pub mod query;
 pub mod table;

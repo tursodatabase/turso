@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     model::{
         query::{
-            select::{Distinctness, Predicate, ResultColumn},
+            predicate::Predicate,
+            select::{Distinctness, ResultColumn},
             update::Update,
             Create, CreateIndex, Delete, Drop, Insert, Query, Select,
         },

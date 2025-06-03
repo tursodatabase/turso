@@ -4,6 +4,7 @@ use limbo_sqlite3_parser::ast::{
 
 use crate::{
     generation::{gen_random_text, pick, pick_index, Arbitrary, ArbitraryFrom},
+    model::table::Value,
     SimulatorEnv,
 };
 
@@ -56,6 +57,7 @@ where
     }
 }
 
+// Freestyling generation
 impl ArbitraryFrom<&SimulatorEnv> for Expr {
     fn arbitrary_from<R: rand::Rng>(rng: &mut R, t: &SimulatorEnv) -> Self {
         // Loop until we get an implmeneted expression
@@ -264,6 +266,22 @@ impl ArbitraryFrom<&SimulatorEnv> for ast::Literal {
             };
             break lit;
         }
+    }
+}
+
+// Creates a litreal value
+impl ArbitraryFrom<&Vec<&Value>> for ast::Expr {
+    fn arbitrary_from<R: rand::Rng>(rng: &mut R, values: &Vec<&Value>) -> Self {
+        if values.is_empty() {
+            return Self::Literal(ast::Literal::Null);
+        }
+        // TODO: for now just convert the value to an ast::Literal
+        let values = values
+            .iter()
+            .map(|value| ast::Expr::Literal((*value).into()))
+            .collect::<Vec<_>>();
+
+        pick(&values, rng).to_owned().clone()
     }
 }
 
