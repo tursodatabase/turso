@@ -1,0 +1,53 @@
+ INFO limbo_sim: 624: seed=8825480009738779594
+ INFO limbo_sim: 643: Generating database interaction plan...
+ INFO limbo_sim::generation::plan: 471: Generated plan with 2522 interactions
+ INFO limbo_sim: 651: Read: 749, Write: 1284, Delete: 314, Update: 280, Create: 145, Drop: 0
+ INFO limbo_sim: 668: Executing database interaction plan...
+ERROR limbo_sim::runner::execution: 155: error Internal error: row [["-8764217988.231829", "1058607710.2615395", "600358361.8981647", "X'696E7175697369746976655F6D617274696E64616C65'", "'technological_deutscher'", "-8084940719.693194", "'gorgeous_ervin'", "-2573272842.7607965", "8759121979743080371"]] not found in table glimmering_edinburgh. Inner error: Internal error: Parse error: Column stunning_farrow not found
+ INFO limbo_sim::runner::io: 46: run_once faults: 0
+ INFO limbo_sim::runner::io: 48: 
+ INFO limbo_sim::runner::io: 49: ===========================
+ INFO limbo_sim::runner::file: 35: op           calls   faults
+ INFO limbo_sim::runner::file: 36: --------- -------- --------
+ INFO limbo_sim::runner::file: 37: pread            5        0
+ INFO limbo_sim::runner::file: 42: pwrite           3        0
+ INFO limbo_sim::runner::file: 47: sync             1        0
+ INFO limbo_sim::runner::file: 52: --------- -------- --------
+ INFO limbo_sim::runner::file: 57: total            9        0
+ INFO limbo_sim::runner::io: 48: 
+ INFO limbo_sim::runner::io: 49: ===========================
+ INFO limbo_sim::runner::file: 35: op           calls   faults
+ INFO limbo_sim::runner::file: 36: --------- -------- --------
+ INFO limbo_sim::runner::file: 37: pread            5        0
+ INFO limbo_sim::runner::file: 42: pwrite           4        0
+ INFO limbo_sim::runner::file: 47: sync             5        0
+ INFO limbo_sim::runner::file: 52: --------- -------- --------
+ INFO limbo_sim::runner::file: 57: total           14        0
+ INFO limbo_sim: 683: Simulation completed
+ERROR limbo_sim: 311: simulation failed: 'InternalError("row [[\"-8764217988.231829\", \"1058607710.2615395\", \"600358361.8981647\", \"X'696E7175697369746976655F6D617274696E64616C65'\", \"'technological_deutscher'\", \"-8084940719.693194\", \"'gorgeous_ervin'\", \"-2573272842.7607965\", \"8759121979743080371\"]] not found in table glimmering_edinburgh. Inner error: Internal error: Parse error: Column stunning_farrow not found")'
+ INFO limbo_sim: 312: Starting to shrink
+ INFO limbo_sim::shrink::plan: 49: Shrinking interaction plan from 2522 to 4 properties
+ INFO limbo_sim: 318: Read: 2, Write: 1, Delete: 1, Update: 0, Create: 1, Drop: 0
+ INFO limbo_sim: 668: Executing database interaction plan...
+ERROR limbo_sim::runner::execution: 155: error Internal error: row [["-8764217988.231829", "1058607710.2615395", "600358361.8981647", "X'696E7175697369746976655F6D617274696E64616C65'", "'technological_deutscher'", "-8084940719.693194", "'gorgeous_ervin'", "-2573272842.7607965", "8759121979743080371"]] not found in table glimmering_edinburgh. Inner error: Internal error: Parse error: Column stunning_farrow not found
+ INFO limbo_sim::runner::io: 46: run_once faults: 0
+ INFO limbo_sim::runner::io: 48: 
+ INFO limbo_sim::runner::io: 49: ===========================
+ INFO limbo_sim::runner::file: 35: op           calls   faults
+ INFO limbo_sim::runner::file: 36: --------- -------- --------
+ INFO limbo_sim::runner::file: 37: pread            3        0
+ INFO limbo_sim::runner::file: 42: pwrite           1        0
+ INFO limbo_sim::runner::file: 47: sync             0        0
+ INFO limbo_sim::runner::file: 52: --------- -------- --------
+ INFO limbo_sim::runner::file: 57: total            4        0
+ INFO limbo_sim::runner::io: 48: 
+ INFO limbo_sim::runner::io: 49: ===========================
+ INFO limbo_sim::runner::file: 35: op           calls   faults
+ INFO limbo_sim::runner::file: 36: --------- -------- --------
+ INFO limbo_sim::runner::file: 37: pread            2        0
+ INFO limbo_sim::runner::file: 42: pwrite           4        0
+ INFO limbo_sim::runner::file: 47: sync             3        0
+ INFO limbo_sim::runner::file: 52: --------- -------- --------
+ INFO limbo_sim::runner::file: 57: total            9        0
+ INFO limbo_sim: 683: Simulation completed
+ INFO limbo_sim: 362: shrinking succeeded, reduced the plan from 2522 to 4

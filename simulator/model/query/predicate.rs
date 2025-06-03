@@ -8,15 +8,6 @@ use crate::model::{
     table::{Table, Value},
 };
 
-macro_rules! assert_implemented_predicate_expr {
-    ($val:expr) => {
-        assert!(matches!(
-            $val,
-            ast::Expr::DoublyQualified(..) | ast::Expr::Qualified(..) | ast::Expr::Literal(..)
-        ))
-    };
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Predicate(pub ast::Expr);
 
@@ -30,39 +21,8 @@ impl Predicate {
     }
 
     pub(crate) fn test(&self, row: &[Value], table: &Table) -> bool {
-        match &self.0 {
-            ast::Expr::Binary(lhs, operator, rhs) => {
-                let lhs = expr_to_value(lhs, row, table);
-                let rhs = expr_to_value(rhs, row, table);
-                match (lhs, rhs) {
-                    (Some(lhs), Some(rhs)) => lhs.binary_compare(&rhs, *operator),
-                    _ => false,
-                }
-            }
-            ast::Expr::Like {
-                lhs,
-                not,
-                op,
-                rhs,
-                escape: _, // TODO: support escape
-            } => {
-                let lhs = expr_to_value(lhs, row, table);
-                let rhs = expr_to_value(rhs, row, table);
-                let res = match (lhs, rhs) {
-                    (Some(lhs), Some(rhs)) => lhs.like_compare(&rhs, *op),
-                    _ => false,
-                };
-                if *not {
-                    !res
-                } else {
-                    res
-                }
-            }
-            ast::Expr::Literal(literal) => Value::from(literal).into_bool(),
-            // TODO: next implement unary operator
-            ast::Expr::Unary(..) => todo!(),
-            expr => unimplemented!("{:?}", expr),
-        }
+        let value = expr_to_value(&self.0, row, table);
+        value.map_or(false, |value| value.into_bool())
     }
 }
 
@@ -71,17 +31,42 @@ impl Predicate {
 // TODO: In the future, we can try to expand this computation if we want to support harder properties that require us
 // to already know more values before hand
 fn expr_to_value(expr: &ast::Expr, row: &[Value], table: &Table) -> Option<Value> {
-    assert_implemented_predicate_expr!(expr);
     match expr {
-        ast::Expr::DoublyQualified(_, _, col_name) | ast::Expr::Qualified(_, col_name) => table
+        ast::Expr::DoublyQualified(_, _, ast::Name(col_name))
+        | ast::Expr::Qualified(_, ast::Name(col_name))
+        | ast::Expr::Id(ast::Id(col_name)) => table
             .columns
             .iter()
             .zip(row.iter())
-            .find(|(column, _)| column.name == col_name.0)
+            .find(|(column, _)| column.name == *col_name)
             .map(|(_, value)| value)
             .cloned(),
         ast::Expr::Literal(literal) => Some(literal.into()),
-        // TODO: add binary and unary
+        ast::Expr::Binary(lhs, op, rhs) => {
+            let lhs = expr_to_value(lhs, row, table);
+            let rhs = expr_to_value(rhs, row, table);
+            match (lhs, rhs) {
+                (Some(lhs), Some(rhs)) => Some(lhs.binary_compare(&rhs, *op)),
+                _ => None,
+            }
+        }
+        ast::Expr::Like {
+            lhs,
+            not,
+            op,
+            rhs,
+            escape: _, // TODO: support escape
+        } => {
+            let lhs = expr_to_value(lhs, row, table);
+            let rhs = expr_to_value(rhs, row, table);
+            let res = match (lhs, rhs) {
+                (Some(lhs), Some(rhs)) => lhs.like_compare(&rhs, *op),
+                _ => return None,
+            };
+            let value: Value = if *not { !res } else { res }.into();
+            Some(value)
+        }
+        // TODO: add unary
         _ => unreachable!("{:?}", expr),
     }
 }

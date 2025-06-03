@@ -32,7 +32,7 @@ impl ArbitraryFrom<(&Table, bool)> for SimplePredicate {
                     Box::new(|rng| {
                         Expr::Binary(
                             Box::new(ast::Expr::Qualified(
-                                ast::Name("".to_string()),
+                                ast::Name(table.name.clone()),
                                 ast::Name(column.name.clone()),
                             )),
                             ast::Operator::Equals,
@@ -43,7 +43,7 @@ impl ArbitraryFrom<(&Table, bool)> for SimplePredicate {
                         let gt_value = GTValue::arbitrary_from(rng, &column_values).0;
                         Expr::Binary(
                             Box::new(ast::Expr::Qualified(
-                                ast::Name("".to_string()),
+                                ast::Name(table.name.clone()),
                                 ast::Name(column.name.clone()),
                             )),
                             ast::Operator::Greater,
@@ -54,7 +54,7 @@ impl ArbitraryFrom<(&Table, bool)> for SimplePredicate {
                         let lt_value = LTValue::arbitrary_from(rng, &column_values).0;
                         Expr::Binary(
                             Box::new(ast::Expr::Qualified(
-                                ast::Name("".to_string()),
+                                ast::Name(table.name.clone()),
                                 ast::Name(column.name.clone()),
                             )),
                             ast::Operator::Less,
@@ -69,7 +69,7 @@ impl ArbitraryFrom<(&Table, bool)> for SimplePredicate {
                     Box::new(|rng| {
                         Expr::Binary(
                             Box::new(Expr::Qualified(
-                                ast::Name("".to_string()),
+                                ast::Name(table.name.clone()),
                                 ast::Name(column.name.clone()),
                             )),
                             ast::Operator::NotEquals,
@@ -80,7 +80,7 @@ impl ArbitraryFrom<(&Table, bool)> for SimplePredicate {
                         let lt_value = LTValue::arbitrary_from(rng, &column_values).0;
                         Expr::Binary(
                             Box::new(Expr::Qualified(
-                                ast::Name("".to_string()),
+                                ast::Name(table.name.clone()),
                                 ast::Name(column.name.clone()),
                             )),
                             ast::Operator::Greater,
@@ -91,7 +91,7 @@ impl ArbitraryFrom<(&Table, bool)> for SimplePredicate {
                         let gt_value = GTValue::arbitrary_from(rng, &column_values).0;
                         Expr::Binary(
                             Box::new(Expr::Qualified(
-                                ast::Name("".to_string()),
+                                ast::Name(table.name.clone()),
                                 ast::Name(column.name.clone()),
                             )),
                             ast::Operator::Less,
@@ -203,10 +203,7 @@ impl ArbitraryFrom<(&str, &Value)> for Predicate {
             vec![
                 Box::new(|_| {
                     Predicate(Expr::Binary(
-                        Box::new(Expr::Qualified(
-                            ast::Name("".to_string()),
-                            ast::Name(column_name.to_string()),
-                        )),
+                        Box::new(Expr::Id(ast::Id(column_name.to_string()))),
                         ast::Operator::Equals,
                         Box::new(Expr::Literal(value.into())),
                     ))
@@ -214,10 +211,7 @@ impl ArbitraryFrom<(&str, &Value)> for Predicate {
                 Box::new(|rng| {
                     let gt_value = GTValue::arbitrary_from(rng, value).0;
                     Predicate(Expr::Binary(
-                        Box::new(ast::Expr::Qualified(
-                            ast::Name("".to_string()),
-                            ast::Name(column_name.to_string()),
-                        )),
+                        Box::new(Expr::Id(ast::Id(column_name.to_string()))),
                         ast::Operator::Greater,
                         Box::new(Expr::Literal(gt_value.into())),
                     ))
@@ -225,10 +219,7 @@ impl ArbitraryFrom<(&str, &Value)> for Predicate {
                 Box::new(|rng| {
                     let lt_value = LTValue::arbitrary_from(rng, value).0;
                     Predicate(Expr::Binary(
-                        Box::new(ast::Expr::Qualified(
-                            ast::Name("".to_string()),
-                            ast::Name(column_name.to_string()),
-                        )),
+                        Box::new(Expr::Id(ast::Id(column_name.to_string()))),
                         ast::Operator::Less,
                         Box::new(Expr::Literal(lt_value.into())),
                     ))
@@ -252,7 +243,7 @@ fn produce_true_predicate<R: Rng>(rng: &mut R, (t, row): (&Table, &Vec<Value>)) 
                 Box::new(|_| {
                     Some(Predicate(Expr::Binary(
                         Box::new(ast::Expr::Qualified(
-                            ast::Name("".to_string()),
+                            ast::Name(t.name.clone()),
                             ast::Name(column.name.clone()),
                         )),
                         ast::Operator::Equals,
@@ -269,7 +260,7 @@ fn produce_true_predicate<R: Rng>(rng: &mut R, (t, row): (&Table, &Vec<Value>)) 
                     } else {
                         Some(Predicate(Expr::Binary(
                             Box::new(ast::Expr::Qualified(
-                                ast::Name("".to_string()),
+                                ast::Name(t.name.clone()),
                                 ast::Name(column.name.clone()),
                             )),
                             ast::Operator::NotEquals,
@@ -284,7 +275,7 @@ fn produce_true_predicate<R: Rng>(rng: &mut R, (t, row): (&Table, &Vec<Value>)) 
                     let lt_value = LTValue::arbitrary_from(rng, value).0;
                     Some(Predicate(Expr::Binary(
                         Box::new(ast::Expr::Qualified(
-                            ast::Name("".to_string()),
+                            ast::Name(t.name.clone()),
                             ast::Name(column.name.clone()),
                         )),
                         ast::Operator::Greater,
@@ -298,7 +289,7 @@ fn produce_true_predicate<R: Rng>(rng: &mut R, (t, row): (&Table, &Vec<Value>)) 
                     let gt_value = GTValue::arbitrary_from(rng, value).0;
                     Some(Predicate(Expr::Binary(
                         Box::new(ast::Expr::Qualified(
-                            ast::Name("".to_string()),
+                            ast::Name(t.name.clone()),
                             ast::Name(column.name.clone()),
                         )),
                         ast::Operator::Less,
@@ -312,7 +303,7 @@ fn produce_true_predicate<R: Rng>(rng: &mut R, (t, row): (&Table, &Vec<Value>)) 
                     LikeValue::arbitrary_from_maybe(rng, value).map(|like| {
                         Predicate(Expr::Like {
                             lhs: Box::new(ast::Expr::Qualified(
-                                ast::Name("".to_string()),
+                                ast::Name(t.name.clone()),
                                 ast::Name(column.name.clone()),
                             )),
                             not: false, // TODO: also generate this value eventually
@@ -339,7 +330,7 @@ fn produce_false_predicate<R: Rng>(rng: &mut R, (t, row): (&Table, &Vec<Value>))
             Box::new(|_| {
                 Predicate(Expr::Binary(
                     Box::new(ast::Expr::Qualified(
-                        ast::Name("".to_string()),
+                        ast::Name(t.name.clone()),
                         ast::Name(column.name.clone()),
                     )),
                     ast::Operator::NotEquals,
@@ -355,7 +346,7 @@ fn produce_false_predicate<R: Rng>(rng: &mut R, (t, row): (&Table, &Vec<Value>))
                 };
                 Predicate(Expr::Binary(
                     Box::new(ast::Expr::Qualified(
-                        ast::Name("".to_string()),
+                        ast::Name(t.name.clone()),
                         ast::Name(column.name.clone()),
                     )),
                     ast::Operator::Equals,
@@ -366,7 +357,7 @@ fn produce_false_predicate<R: Rng>(rng: &mut R, (t, row): (&Table, &Vec<Value>))
                 let gt_value = GTValue::arbitrary_from(rng, value).0;
                 Predicate(Expr::Binary(
                     Box::new(ast::Expr::Qualified(
-                        ast::Name("".to_string()),
+                        ast::Name(t.name.clone()),
                         ast::Name(column.name.clone()),
                     )),
                     ast::Operator::Greater,
@@ -377,7 +368,7 @@ fn produce_false_predicate<R: Rng>(rng: &mut R, (t, row): (&Table, &Vec<Value>))
                 let lt_value = LTValue::arbitrary_from(rng, value).0;
                 Predicate(Expr::Binary(
                     Box::new(ast::Expr::Qualified(
-                        ast::Name("".to_string()),
+                        ast::Name(t.name.clone()),
                         ast::Name(column.name.clone()),
                     )),
                     ast::Operator::Less,

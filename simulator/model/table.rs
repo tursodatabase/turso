@@ -127,7 +127,8 @@ impl Value {
     }
 
     // TODO: support more predicates
-    pub fn binary_compare(&self, other: &Self, operator: ast::Operator) -> bool {
+    /// Returns a Value::TRUE or VALUE::FALSE
+    pub fn binary_compare(&self, other: &Self, operator: ast::Operator) -> Value {
         match operator {
             ast::Operator::Add => todo!(),
             ast::Operator::And => self.into_bool() && other.into_bool(),
@@ -153,6 +154,7 @@ impl Value {
             ast::Operator::RightShift => todo!(),
             ast::Operator::Subtract => todo!(),
         }
+        .into()
     }
 
     // TODO: support more operators. Copy the implementation for exec_glob
