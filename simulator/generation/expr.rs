@@ -256,7 +256,7 @@ impl ArbitraryFrom<&SimulatorEnv> for ast::Literal {
                         rng.gen_range(-1e10..1e10).to_string()
                     }
                 }),
-                1 => ast::Literal::String(gen_random_text(rng)),
+                1 => ast::Literal::String(format!("'{}'", gen_random_text(rng))),
                 2 => ast::Literal::Blob(hex::encode(gen_random_text(rng).as_bytes().to_vec())),
                 // TODO: skip Keyword
                 3 => continue,
