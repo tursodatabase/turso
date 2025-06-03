@@ -371,6 +371,12 @@ impl Display for ast::LikeOperator {
     }
 }
 
+/// Sanitaizes a string literal by removing single quote at front and back
+/// and escaping double single quotes
+pub fn sanitize_string(input: &str) -> String {
+    input[1..input.len() - 1].replace("''", "'").to_string()
+}
+
 impl Display for ast::Literal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -384,7 +390,7 @@ impl Display for ast::Literal {
                 Self::Keyword(keyword) => keyword.clone(),
                 Self::Null => "NULL".to_string(),
                 Self::Numeric(num) => num.clone(),
-                Self::String(s) => s.clone(),
+                Self::String(s) => format!("'{}'", sanitize_string(s)),
             }
         )
     }

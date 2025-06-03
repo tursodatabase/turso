@@ -77,6 +77,7 @@ impl ToSqlString for ast::OneSelect {
 
 impl ToSqlString for ast::SelectInner {
     fn to_sql_string<C: ToSqlContext>(&self, context: &C) -> String {
+        dbg!(&self);
         let mut ret = Vec::with_capacity(2 + self.columns.len());
         ret.push("SELECT".to_string());
         if let Some(distinct) = self.distinctness {
