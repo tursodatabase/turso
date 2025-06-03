@@ -268,7 +268,7 @@ impl From<&Value> for ast::Literal {
             Value::Null => Self::Null,
             Value::Integer(i) => Self::Numeric(i.to_string()),
             Value::Float(f) => Self::Numeric(f.to_string()),
-            Value::Text(string) => Self::String(string.clone()),
+            Value::Text(string) => Self::String(format!("'{}'", string)),
             Value::Blob(blob) => Self::Blob(hex::encode(blob)),
         }
     }

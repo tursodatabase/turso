@@ -43,12 +43,9 @@ fn expr_to_value(expr: &ast::Expr, row: &[Value], table: &Table) -> Option<Value
             .cloned(),
         ast::Expr::Literal(literal) => Some(literal.into()),
         ast::Expr::Binary(lhs, op, rhs) => {
-            let lhs = expr_to_value(lhs, row, table);
-            let rhs = expr_to_value(rhs, row, table);
-            match (lhs, rhs) {
-                (Some(lhs), Some(rhs)) => Some(lhs.binary_compare(&rhs, *op)),
-                _ => None,
-            }
+            let lhs = expr_to_value(lhs, row, table)?;
+            let rhs = expr_to_value(rhs, row, table)?;
+            Some(lhs.binary_compare(&rhs, *op))
         }
         ast::Expr::Like {
             lhs,
@@ -57,12 +54,9 @@ fn expr_to_value(expr: &ast::Expr, row: &[Value], table: &Table) -> Option<Value
             rhs,
             escape: _, // TODO: support escape
         } => {
-            let lhs = expr_to_value(lhs, row, table);
-            let rhs = expr_to_value(rhs, row, table);
-            let res = match (lhs, rhs) {
-                (Some(lhs), Some(rhs)) => lhs.like_compare(&rhs, *op),
-                _ => return None,
-            };
+            let lhs = expr_to_value(lhs, row, table)?;
+            let rhs = expr_to_value(rhs, row, table)?;
+            let res = lhs.like_compare(&rhs, *op);
             let value: Value = if *not { !res } else { res }.into();
             Some(value)
         }

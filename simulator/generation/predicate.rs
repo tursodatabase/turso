@@ -236,7 +236,7 @@ fn produce_true_predicate<R: Rng>(rng: &mut R, (t, row): (&Table, &Vec<Value>)) 
     let column_index = rng.gen_range(0..t.columns.len());
     let column = &t.columns[column_index];
     let value = &row[column_index];
-    backtrack(
+    let predicate = backtrack(
         vec![
             (
                 1,
@@ -316,7 +316,8 @@ fn produce_true_predicate<R: Rng>(rng: &mut R, (t, row): (&Table, &Vec<Value>)) 
             ),
         ],
         rng,
-    )
+    );
+    predicate
 }
 
 /// Produces a predicate that is false for the provided row in the given table
@@ -538,7 +539,6 @@ impl ArbitraryFrom<(&Table, &Vec<Value>)> for Predicate {
                 rng,
             );
         }
-
         result
     }
 }
