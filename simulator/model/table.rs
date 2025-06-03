@@ -1,5 +1,8 @@
 use std::{fmt::Display, ops::Deref};
 
+use limbo_core::numeric::{nonnan::NonNan, Numeric};
+use limbo_sqlite3_parser::ast;
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
 pub(crate) struct Name(pub(crate) String);
@@ -109,5 +112,179 @@ impl Display for Value {
             Self::Text(t) => write!(f, "'{}'", t),
             Self::Blob(b) => write!(f, "{}", to_sqlite_blob(b)),
         }
+    }
+}
+
+impl Value {
+    pub const FALSE: Self = Value::Integer(0);
+    pub const TRUE: Self = Value::Integer(1);
+
+    pub fn into_bool(&self) -> bool {
+        match Numeric::from(self).try_into_bool() {
+            None => false, // Value::Null
+            Some(v) => v,
+        }
+    }
+
+    // TODO: support more predicates
+    pub fn binary_compare(&self, other: &Self, operator: ast::Operator) -> bool {
+        match operator {
+            ast::Operator::Add => todo!(),
+            ast::Operator::And => self.into_bool() && other.into_bool(),
+            ast::Operator::ArrowRight => todo!(),
+            ast::Operator::ArrowRightShift => todo!(),
+            ast::Operator::BitwiseAnd => todo!(),
+            ast::Operator::BitwiseOr => todo!(),
+            ast::Operator::BitwiseNot => todo!(),
+            ast::Operator::Concat => todo!(),
+            ast::Operator::Equals => self == other,
+            ast::Operator::Divide => todo!(),
+            ast::Operator::Greater => self > other,
+            ast::Operator::GreaterEquals => self >= other,
+            ast::Operator::Is => todo!(),
+            ast::Operator::IsNot => todo!(),
+            ast::Operator::LeftShift => todo!(),
+            ast::Operator::Less => self < other,
+            ast::Operator::LessEquals => self <= other,
+            ast::Operator::Modulus => todo!(),
+            ast::Operator::Multiply => todo!(),
+            ast::Operator::NotEquals => self != other,
+            ast::Operator::Or => self.into_bool() || other.into_bool(),
+            ast::Operator::RightShift => todo!(),
+            ast::Operator::Subtract => todo!(),
+        }
+    }
+
+    // TODO: support more operators. Copy the implementation for exec_glob
+    pub fn like_compare(&self, other: &Self, operator: ast::LikeOperator) -> bool {
+        match operator {
+            ast::LikeOperator::Glob => todo!(),
+            ast::LikeOperator::Like => {
+                // TODO: support ESCAPE `expr` option in AST
+                exec_like(self.to_string().as_str(), other.to_string().as_str())
+            }
+            ast::LikeOperator::Match => todo!(),
+            ast::LikeOperator::Regexp => todo!(),
+        }
+    }
+}
+
+/// This function is a duplication of the exec_like function in core/vdbe/mod.rs at commit 9b9d5f9b4c9920e066ef1237c80878f4c3968524
+/// Any updates to the original function should be reflected here, otherwise the test will be incorrect.
+fn construct_like_regex(pattern: &str) -> Regex {
+    let mut regex_pattern = String::with_capacity(pattern.len() * 2);
+
+    regex_pattern.push('^');
+
+    for c in pattern.chars() {
+        match c {
+            '\\' => regex_pattern.push_str("\\\\"),
+            '%' => regex_pattern.push_str(".*"),
+            '_' => regex_pattern.push('.'),
+            ch => {
+                if regex_syntax::is_meta_character(c) {
+                    regex_pattern.push('\\');
+                }
+                regex_pattern.push(ch);
+            }
+        }
+    }
+
+    regex_pattern.push('$');
+
+    RegexBuilder::new(&regex_pattern)
+        .case_insensitive(true)
+        .dot_matches_new_line(true)
+        .build()
+        .unwrap()
+}
+
+fn exec_like(pattern: &str, text: &str) -> bool {
+    let re = construct_like_regex(pattern);
+    re.is_match(text)
+}
+
+impl From<&ast::Literal> for Value {
+    fn from(value: &ast::Literal) -> Self {
+        match value {
+            ast::Literal::Null => Self::Null,
+            ast::Literal::Numeric(number) => Numeric::from(number).into(),
+            ast::Literal::String(string) => Self::Text(string.clone()),
+            ast::Literal::Blob(blob) => Self::Blob(
+                blob.as_bytes()
+                    .chunks_exact(2)
+                    .map(|pair| {
+                        // We assume that sqlite3-parser has already validated that
+                        // the input is valid hex string, thus unwrap is safe.
+                        let hex_byte = std::str::from_utf8(pair).unwrap();
+                        u8::from_str_radix(hex_byte, 16).unwrap()
+                    })
+                    .collect(),
+            ),
+            lit => unimplemented!("{:?}", lit),
+        }
+    }
+}
+
+impl From<ast::Literal> for Value {
+    fn from(value: ast::Literal) -> Self {
+        match value {
+            ast::Literal::Null => Self::Null,
+            ast::Literal::Numeric(number) => Numeric::from(number).into(),
+            ast::Literal::String(string) => Self::Text(string),
+            ast::Literal::Blob(blob) => Self::Blob(
+                blob.as_bytes()
+                    .chunks_exact(2)
+                    .map(|pair| {
+                        // We assume that sqlite3-parser has already validated that
+                        // the input is valid hex string, thus unwrap is safe.
+                        let hex_byte = std::str::from_utf8(pair).unwrap();
+                        u8::from_str_radix(hex_byte, 16).unwrap()
+                    })
+                    .collect(),
+            ),
+            lit => unimplemented!("{:?}", lit),
+        }
+    }
+}
+
+impl From<Numeric> for Value {
+    fn from(value: Numeric) -> Self {
+        match value {
+            Numeric::Null => Value::Null,
+            Numeric::Integer(i) => Value::Integer(i),
+            Numeric::Float(f) => Value::Float(f.into()),
+        }
+    }
+}
+
+// Copied from numeric in Core
+impl From<Value> for Numeric {
+    fn from(value: Value) -> Self {
+        Self::from(&value)
+    }
+}
+
+impl From<&Value> for Numeric {
+    fn from(value: &Value) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            Value::Integer(v) => Self::Integer(*v),
+            Value::Float(v) => match NonNan::new(*v) {
+                Some(v) => Self::Float(v),
+                None => Self::Null,
+            },
+            Value::Text(text) => Numeric::from(text.as_str()),
+            Value::Blob(blob) => {
+                let text = String::from_utf8_lossy(blob.as_slice());
+                Numeric::from(&text)
+            }
+        }
+    }
+}
+
+impl From<bool> for Value {
+    fn from(value: bool) -> Self {
+        value.then_some(Value::TRUE).unwrap_or(Value::FALSE)
     }
 }

@@ -5,6 +5,7 @@ pub(crate) use create_index::CreateIndex;
 pub(crate) use delete::Delete;
 pub(crate) use drop::Drop;
 pub(crate) use insert::Insert;
+use limbo_sqlite3_parser::to_sql_string::ToSqlContext;
 pub(crate) use select::Select;
 use serde::{Deserialize, Serialize};
 use update::Update;
@@ -15,8 +16,8 @@ pub mod create;
 pub mod create_index;
 pub mod delete;
 pub mod drop;
-pub mod expr;
 pub mod insert;
+pub mod predicate;
 pub mod select;
 pub mod update;
 
@@ -82,5 +83,22 @@ impl Display for Query {
             Self::Drop(drop) => write!(f, "{}", drop),
             Self::CreateIndex(create_index) => write!(f, "{}", create_index),
         }
+    }
+}
+
+/// Used to print sql strings that already have all the context it needs
+struct EmptyContext;
+
+impl ToSqlContext for EmptyContext {
+    fn get_column_name(
+        &self,
+        _table_id: limbo_sqlite3_parser::ast::TableInternalId,
+        _col_idx: usize,
+    ) -> &str {
+        unreachable!()
+    }
+
+    fn get_table_name(&self, _id: limbo_sqlite3_parser::ast::TableInternalId) -> &str {
+        unreachable!()
     }
 }

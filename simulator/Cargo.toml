@@ -15,7 +15,7 @@ name = "limbo_sim"
 path = "main.rs"
 
 [dependencies]
-limbo_core = { path = "../core" }
+limbo_core = { path = "../core", features = ["fuzz"]}
 rand = "0.8.5"
 rand_chacha = "0.3.1"
 log = "0.4.20"

@@ -244,7 +244,7 @@ impl ArbitraryFrom<&SimulatorEnv> for LikeOperator {
 impl ArbitraryFrom<&SimulatorEnv> for ast::Literal {
     fn arbitrary_from<R: rand::Rng>(rng: &mut R, _t: &SimulatorEnv) -> Self {
         loop {
-            let choice = rng.gen_range(0..8);
+            let choice = rng.gen_range(0..5);
             let lit = match choice {
                 0 => ast::Literal::Numeric({
                     let integer = rng.gen_bool(0.5);
@@ -259,7 +259,7 @@ impl ArbitraryFrom<&SimulatorEnv> for ast::Literal {
                 // TODO: skip Keyword
                 3 => continue,
                 4 => ast::Literal::Null,
-                // TODO: Ignore CurrentDate stuff for now
+                // TODO: Ignore Date stuff for now
                 _ => continue,
             };
             break lit;
