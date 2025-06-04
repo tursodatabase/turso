@@ -120,10 +120,7 @@ impl Value {
     pub const TRUE: Self = Value::Integer(1);
 
     pub fn into_bool(&self) -> bool {
-        match Numeric::from(self).try_into_bool() {
-            None => false, // Value::Null
-            Some(v) => v,
-        }
+        Numeric::from(self).try_into_bool().unwrap_or_default()
     }
 
     // TODO: support more predicates
