@@ -880,7 +880,7 @@ fn build_seek_def(
             seek: Some(SeekKey {
                 len: key_len,
                 null_pad: false,
-                op: SeekOp::GE,
+                op: SeekOp::GE { eq_only: true },
             }),
             termination: Some(TerminationKey {
                 len: key_len,
@@ -904,8 +904,8 @@ fn build_seek_def(
                     (
                         key_len - 1,
                         key_len,
-                        SeekOp::LE.reverse(),
-                        SeekOp::LE.reverse(),
+                        SeekOp::LE { eq_only: false }.reverse(),
+                        SeekOp::LE { eq_only: false }.reverse(),
                     )
                 };
             SeekDef {
@@ -942,12 +942,17 @@ fn build_seek_def(
         (IterationDirection::Forwards, ast::Operator::GreaterEquals) => {
             let (seek_key_len, termination_key_len, seek_op, termination_op) =
                 if sort_order_of_last_key == SortOrder::Asc {
-                    (key_len, key_len - 1, SeekOp::GE, SeekOp::GT)
+                    (
+                        key_len,
+                        key_len - 1,
+                        SeekOp::GE { eq_only: false },
+                        SeekOp::GT,
+                    )
                 } else {
                     (
                         key_len - 1,
                         key_len,
-                        SeekOp::LE.reverse(),
+                        SeekOp::LE { eq_only: false }.reverse(),
                         SeekOp::LT.reverse(),
                     )
                 };
@@ -985,9 +990,19 @@ fn build_seek_def(
         (IterationDirection::Forwards, ast::Operator::Less) => {
             let (seek_key_len, termination_key_len, seek_op, termination_op) =
                 if sort_order_of_last_key == SortOrder::Asc {
-                    (key_len - 1, key_len, SeekOp::GT, SeekOp::GE)
+                    (
+                        key_len - 1,
+                        key_len,
+                        SeekOp::GT,
+                        SeekOp::GE { eq_only: false },
+                    )
                 } else {
-                    (key_len, key_len - 1, SeekOp::GT, SeekOp::GE)
+                    (
+                        key_len,
+                        key_len - 1,
+                        SeekOp::GT,
+                        SeekOp::GE { eq_only: false },
+                    )
                 };
             SeekDef {
                 key,
@@ -1028,8 +1043,8 @@ fn build_seek_def(
                     (
                         key_len,
                         key_len - 1,
-                        SeekOp::LE.reverse(),
-                        SeekOp::LE.reverse(),
+                        SeekOp::LE { eq_only: false }.reverse(),
+                        SeekOp::LE { eq_only: false }.reverse(),
                     )
                 };
             SeekDef {
@@ -1065,7 +1080,7 @@ fn build_seek_def(
             iter_dir,
             seek: Some(SeekKey {
                 len: key_len,
-                op: SeekOp::LE,
+                op: SeekOp::LE { eq_only: true },
                 null_pad: false,
             }),
             termination: Some(TerminationKey {
@@ -1085,13 +1100,18 @@ fn build_seek_def(
         (IterationDirection::Backwards, ast::Operator::Less) => {
             let (seek_key_len, termination_key_len, seek_op, termination_op) =
                 if sort_order_of_last_key == SortOrder::Asc {
-                    (key_len, key_len - 1, SeekOp::LT, SeekOp::LE)
+                    (
+                        key_len,
+                        key_len - 1,
+                        SeekOp::LT,
+                        SeekOp::LE { eq_only: false },
+                    )
                 } else {
                     (
                         key_len - 1,
                         key_len,
                         SeekOp::GT.reverse(),
-                        SeekOp::GE.reverse(),
+                        SeekOp::GE { eq_only: false }.reverse(),
                     )
                 };
             SeekDef {
@@ -1128,7 +1148,12 @@ fn build_seek_def(
         (IterationDirection::Backwards, ast::Operator::LessEquals) => {
             let (seek_key_len, termination_key_len, seek_op, termination_op) =
                 if sort_order_of_last_key == SortOrder::Asc {
-                    (key_len, key_len - 1, SeekOp::LE, SeekOp::LE)
+                    (
+                        key_len,
+                        key_len - 1,
+                        SeekOp::LE { eq_only: false },
+                        SeekOp::LE { eq_only: false },
+                    )
                 } else {
                     (
                         key_len - 1,
@@ -1171,7 +1196,12 @@ fn build_seek_def(
         (IterationDirection::Backwards, ast::Operator::Greater) => {
             let (seek_key_len, termination_key_len, seek_op, termination_op) =
                 if sort_order_of_last_key == SortOrder::Asc {
-                    (key_len - 1, key_len, SeekOp::LE, SeekOp::LE)
+                    (
+                        key_len - 1,
+                        key_len,
+                        SeekOp::LE { eq_only: false },
+                        SeekOp::LE { eq_only: false },
+                    )
                 } else {
                     (
                         key_len,
@@ -1214,12 +1244,17 @@ fn build_seek_def(
         (IterationDirection::Backwards, ast::Operator::GreaterEquals) => {
             let (seek_key_len, termination_key_len, seek_op, termination_op) =
                 if sort_order_of_last_key == SortOrder::Asc {
-                    (key_len - 1, key_len, SeekOp::LE, SeekOp::LT)
+                    (
+                        key_len - 1,
+                        key_len,
+                        SeekOp::LE { eq_only: false },
+                        SeekOp::LT,
+                    )
                 } else {
                     (
                         key_len,
                         key_len - 1,
-                        SeekOp::GE.reverse(),
+                        SeekOp::GE { eq_only: false }.reverse(),
                         SeekOp::GT.reverse(),
                     )
                 };

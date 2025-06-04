@@ -1182,12 +1182,13 @@ fn emit_seek(
         seek.len
     };
     match seek.op {
-        SeekOp::GE => program.emit_insn(Insn::SeekGE {
+        SeekOp::GE { eq_only } => program.emit_insn(Insn::SeekGE {
             is_index,
             cursor_id: seek_cursor_id,
             start_reg,
             num_regs,
             target_pc: loop_end,
+            eq_only,
         }),
         SeekOp::GT => program.emit_insn(Insn::SeekGT {
             is_index,
@@ -1196,12 +1197,13 @@ fn emit_seek(
             num_regs,
             target_pc: loop_end,
         }),
-        SeekOp::LE => program.emit_insn(Insn::SeekLE {
+        SeekOp::LE { eq_only } => program.emit_insn(Insn::SeekLE {
             is_index,
             cursor_id: seek_cursor_id,
             start_reg,
             num_regs,
             target_pc: loop_end,
+            eq_only,
         }),
         SeekOp::LT => program.emit_insn(Insn::SeekLT {
             is_index,
@@ -1210,7 +1212,6 @@ fn emit_seek(
             num_regs,
             target_pc: loop_end,
         }),
-        SeekOp::EQ => panic!("An index seek is never EQ"),
     };
 
     Ok(())
@@ -1293,7 +1294,7 @@ fn emit_seek_termination(
     }
 
     match (is_index, termination.op) {
-        (true, SeekOp::GE) => program.emit_insn(Insn::IdxGE {
+        (true, SeekOp::GE { .. }) => program.emit_insn(Insn::IdxGE {
             cursor_id: seek_cursor_id,
             start_reg,
             num_regs,
@@ -1305,7 +1306,7 @@ fn emit_seek_termination(
             num_regs,
             target_pc: loop_end,
         }),
-        (true, SeekOp::LE) => program.emit_insn(Insn::IdxLE {
+        (true, SeekOp::LE { .. }) => program.emit_insn(Insn::IdxLE {
             cursor_id: seek_cursor_id,
             start_reg,
             num_regs,
@@ -1317,7 +1318,7 @@ fn emit_seek_termination(
             num_regs,
             target_pc: loop_end,
         }),
-        (false, SeekOp::GE) => program.emit_insn(Insn::Ge {
+        (false, SeekOp::GE { .. }) => program.emit_insn(Insn::Ge {
             lhs: rowid_reg.unwrap(),
             rhs: start_reg,
             target_pc: loop_end,
@@ -1331,7 +1332,7 @@ fn emit_seek_termination(
             flags: CmpInsFlags::default(),
             collation: program.curr_collation(),
         }),
-        (false, SeekOp::LE) => program.emit_insn(Insn::Le {
+        (false, SeekOp::LE { .. }) => program.emit_insn(Insn::Le {
             lhs: rowid_reg.unwrap(),
             rhs: start_reg,
             target_pc: loop_end,
@@ -1345,9 +1346,6 @@ fn emit_seek_termination(
             flags: CmpInsFlags::default(),
             collation: program.curr_collation(),
         }),
-        (_, SeekOp::EQ) => {
-            panic!("An index termination condition is never EQ")
-        }
     };
 
     Ok(())

@@ -1346,7 +1346,10 @@ pub fn op_column(
             };
             let mut table_cursor = state.get_cursor(table_cursor_id);
             let table_cursor = table_cursor.as_btree_mut();
-            match table_cursor.seek(SeekKey::TableRowId(rowid.unwrap()), SeekOp::EQ)? {
+            match table_cursor.seek(
+                SeekKey::TableRowId(rowid.unwrap()),
+                SeekOp::GE { eq_only: true },
+            )? {
                 CursorResult::Ok(_) => None,
                 CursorResult::IO => Some((index_cursor_id, table_cursor_id)),
             }
@@ -1908,7 +1911,7 @@ pub fn op_row_id(
             };
             let mut table_cursor = state.get_cursor(table_cursor_id);
             let table_cursor = table_cursor.as_btree_mut();
-            match table_cursor.seek(SeekKey::TableRowId(rowid), SeekOp::EQ)? {
+            match table_cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })? {
                 CursorResult::Ok(_) => None,
                 CursorResult::IO => Some((index_cursor_id, table_cursor_id)),
             }
@@ -1994,7 +1997,9 @@ pub fn op_seek_rowid(
         };
         match rowid {
             Some(rowid) => {
-                let found = return_if_io!(cursor.seek(SeekKey::TableRowId(rowid), SeekOp::EQ));
+                let found = return_if_io!(
+                    cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
+                );
                 if !found {
                     target_pc.to_offset_int()
                 } else {
@@ -2040,6 +2045,7 @@ pub fn op_seek(
         num_regs,
         target_pc,
         is_index,
+        ..
     }
     | Insn::SeekGT {
         cursor_id,
@@ -2054,6 +2060,7 @@ pub fn op_seek(
         num_regs,
         target_pc,
         is_index,
+        ..
     }
     | Insn::SeekLT {
         cursor_id,
@@ -2065,24 +2072,28 @@ pub fn op_seek(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
+    let eq_only = match insn {
+        Insn::SeekGE { eq_only, .. } => *eq_only,
+        Insn::SeekLE { eq_only, .. } => *eq_only,
+        _ => false,
+    };
     assert!(
         target_pc.is_offset(),
         "target_pc should be an offset, is: {:?}",
         target_pc
     );
     let op = match insn {
-        Insn::SeekGE { .. } => SeekOp::GE,
+        Insn::SeekGE { eq_only, .. } => SeekOp::GE { eq_only: *eq_only },
         Insn::SeekGT { .. } => SeekOp::GT,
-        Insn::SeekLE { .. } => SeekOp::LE,
+        Insn::SeekLE { eq_only, .. } => SeekOp::LE { eq_only: *eq_only },
         Insn::SeekLT { .. } => SeekOp::LT,
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
     let op_name = match op {
-        SeekOp::GE => "SeekGE",
+        SeekOp::GE { .. } => "SeekGE",
         SeekOp::GT => "SeekGT",
-        SeekOp::LE => "SeekLE",
+        SeekOp::LE { .. } => "SeekLE",
         SeekOp::LT => "SeekLT",
-        _ => unreachable!("unexpected SeekOp {:?}", op),
     };
     if *is_index {
         let found = {
@@ -3897,7 +3908,9 @@ pub fn op_idx_delete(
                 {
                     let mut cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
-                    return_if_io!(cursor.seek(SeekKey::IndexKey(&record), SeekOp::EQ));
+                    return_if_io!(
+                        cursor.seek(SeekKey::IndexKey(&record), SeekOp::GE { eq_only: true })
+                    );
                     tracing::debug!(
                         "op_idx_delete(seek={}, record={} rowid={:?})",
                         &record,
@@ -4115,7 +4128,8 @@ pub fn op_no_conflict(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    let conflict = return_if_io!(cursor.seek(SeekKey::IndexKey(record), SeekOp::EQ));
+    let conflict =
+        return_if_io!(cursor.seek(SeekKey::IndexKey(record), SeekOp::GE { eq_only: true }));
     drop(cursor_ref);
     if !conflict {
         state.pc = target_pc.to_offset_int();
@@ -4871,10 +4885,10 @@ pub fn op_found(
                 }
             };
 
-            return_if_io!(cursor.seek(SeekKey::IndexKey(&record), SeekOp::EQ))
+            return_if_io!(cursor.seek(SeekKey::IndexKey(&record), SeekOp::GE { eq_only: true }))
         } else {
             let record = make_record(&state.registers, record_reg, num_regs);
-            return_if_io!(cursor.seek(SeekKey::IndexKey(&record), SeekOp::EQ))
+            return_if_io!(cursor.seek(SeekKey::IndexKey(&record), SeekOp::GE { eq_only: true }))
         }
     };
 

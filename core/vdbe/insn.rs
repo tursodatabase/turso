@@ -502,6 +502,7 @@ pub enum Insn {
         start_reg: usize,
         num_regs: usize,
         target_pc: BranchOffset,
+        eq_only: bool,
     },
 
     /// If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.
@@ -538,6 +539,7 @@ pub enum Insn {
         start_reg: usize,
         num_regs: usize,
         target_pc: BranchOffset,
+        eq_only: bool,
     },
 
     // If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.

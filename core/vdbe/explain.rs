@@ -809,6 +809,7 @@ pub fn insn_to_str(
                 start_reg,
                 num_regs,
                 target_pc,
+                ..
             }
             | Insn::SeekLE {
                 is_index: _,
@@ -816,6 +817,7 @@ pub fn insn_to_str(
                 start_reg,
                 num_regs,
                 target_pc,
+                ..
             }
             | Insn::SeekLT {
                 is_index: _,

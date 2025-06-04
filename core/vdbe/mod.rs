@@ -509,7 +509,7 @@ fn get_new_rowid<R: Rng>(cursor: &mut BTreeCursor, mut rng: R) -> Result<CursorR
         let max_attempts = 100;
         for count in 0..max_attempts {
             rowid = distribution.sample(&mut rng).try_into().unwrap();
-            match cursor.seek(SeekKey::TableRowId(rowid), SeekOp::EQ)? {
+            match cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })? {
                 CursorResult::Ok(false) => break, // Found a non-existing rowid
                 CursorResult::Ok(true) => {
                     if count == max_attempts - 1 {

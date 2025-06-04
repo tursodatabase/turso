@@ -1449,10 +1449,18 @@ pub enum CursorResult<T> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 /// The match condition of a table/index seek.
 pub enum SeekOp {
-    EQ,
-    GE,
+    /// If eq_only is true, this means in practice:
+    /// We are iterating forwards, but we are really looking for an exact match on the seek key.
+    /// All the previous SeekOp::EQs were replaced with this.
+    GE {
+        eq_only: bool,
+    },
     GT,
-    LE,
+    /// If eq_only is true, this means in practice:
+    /// We are iterating backwards, but we are really looking for an exact match on the seek key.
+    LE {
+        eq_only: bool,
+    },
     LT,
 }
 
@@ -1469,17 +1477,23 @@ impl SeekOp {
     #[inline(always)]
     pub fn iteration_direction(&self) -> IterationDirection {
         match self {
-            SeekOp::EQ | SeekOp::GE | SeekOp::GT => IterationDirection::Forwards,
-            SeekOp::LE | SeekOp::LT => IterationDirection::Backwards,
+            SeekOp::GE { .. } | SeekOp::GT => IterationDirection::Forwards,
+            SeekOp::LE { .. } | SeekOp::LT => IterationDirection::Backwards,
+        }
+    }
+
+    pub fn eq_only(&self) -> bool {
+        match self {
+            SeekOp::GE { eq_only } | SeekOp::LE { eq_only } => *eq_only,
+            _ => false,
         }
     }
 
     pub fn reverse(&self) -> Self {
         match self {
-            SeekOp::EQ => SeekOp::EQ,
-            SeekOp::GE => SeekOp::LE,
+            SeekOp::GE { eq_only } => SeekOp::LE { eq_only: *eq_only },
             SeekOp::GT => SeekOp::LT,
-            SeekOp::LE => SeekOp::GE,
+            SeekOp::LE { eq_only } => SeekOp::GE { eq_only: *eq_only },
             SeekOp::LT => SeekOp::GT,
         }
     }
