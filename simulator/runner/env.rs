@@ -73,14 +73,19 @@ impl SimulatorEnv {
         let write_percent =
             write_percent - create_percent - delete_percent - drop_percent - update_percent;
 
-        assert_eq!(
-            read_percent
-                + write_percent
-                + create_percent
-                + drop_percent
-                + update_percent
-                + delete_percent,
-            total
+        let sum: f64 = read_percent
+            + write_percent
+            + create_percent
+            + drop_percent
+            + update_percent
+            + delete_percent;
+
+        assert!(
+            (sum - total).abs() < 0.001,
+            "Sum of percentages ({}) does not match total ({}) - difference: {}",
+            sum,
+            total,
+            sum - total
         );
 
         let opts = SimulatorOpts {
