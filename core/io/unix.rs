@@ -1,6 +1,6 @@
-use crate::error::LimboError;
 use crate::io::common;
 use crate::Result;
+use crate::{error::LimboError, fast_lock::SpinLock};
 
 use super::{Completion, File, MemoryIO, OpenFlags, IO};
 use crate::io::clock::{Clock, Instant};
@@ -106,6 +106,7 @@ struct Callbacks {
     inline_entries: [MaybeUninit<(usize, CompletionCallback)>; FD_INLINE_SIZE],
     heap_entries: Vec<CallbackEntry>,
     inline_count: usize,
+    lock: SpinLock<()>, // simple lock to make callbacks thread safe
 }
 
 impl Callbacks {
@@ -114,10 +115,12 @@ impl Callbacks {
             inline_entries: [const { MaybeUninit::uninit() }; FD_INLINE_SIZE],
             heap_entries: Vec::new(),
             inline_count: 0,
+            lock: SpinLock::new(()),
         }
     }
 
     fn insert(&mut self, fd: usize, callback: CompletionCallback) {
+        let _l = self.lock.lock();
         if self.inline_count < FD_INLINE_SIZE {
             self.inline_entries[self.inline_count].write((fd, callback));
             self.inline_count += 1;
@@ -127,6 +130,7 @@ impl Callbacks {
     }
 
     fn remove(&mut self, fd: usize) -> Option<CompletionCallback> {
+        let _l = self.lock.lock();
         if let Some(pos) = self.find_inline(fd) {
             let (_, callback) = unsafe { self.inline_entries[pos].assume_init_read() };
 
@@ -148,6 +152,7 @@ impl Callbacks {
     }
 
     fn find_inline(&self, fd: usize) -> Option<usize> {
+        let _l = self.lock.lock();
         (0..self.inline_count)
             .find(|&i| unsafe { self.inline_entries[i].assume_init_ref().0 == fd })
     }
@@ -155,6 +160,7 @@ impl Callbacks {
 
 impl Drop for Callbacks {
     fn drop(&mut self) {
+        let _l = self.lock.lock();
         for i in 0..self.inline_count {
             unsafe { self.inline_entries[i].assume_init_drop() };
         }
@@ -365,7 +371,12 @@ impl File for UnixFile<'_> {
         }
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<crate::Buffer>>, c: Arc<Completion>) -> Result<()> {
+    fn pwrite(
+        &self,
+        pos: usize,
+        buffer: Arc<RefCell<crate::Buffer>>,
+        c: Arc<Completion>,
+    ) -> Result<()> {
         let file = self.file.borrow();
         let result = {
             let buf = buffer.borrow();
