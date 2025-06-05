@@ -6,7 +6,7 @@ use crate::storage::database::DatabaseStorage;
 use crate::storage::sqlite3_ondisk::{
     self, DatabaseHeader, PageContent, PageType, DATABASE_HEADER_PAGE_ID,
 };
-use crate::storage::wal::{CheckpointResult, Wal, WalFsyncStatus};
+use crate::storage::wal::{CheckpointResult, SyncTarget, Wal, WalFsyncStatus};
 use crate::Completion;
 use crate::{Buffer, LimboError, Result};
 use parking_lot::RwLock;
@@ -191,6 +191,16 @@ pub struct Pager {
     checkpoint_state: RefCell<CheckpointState>,
     checkpoint_inflight: Rc<RefCell<usize>>,
     syncing: Rc<RefCell<bool>>,
+}
+
+impl std::fmt::Debug for Pager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // TODO: Add other fields
+        f.debug_struct("Pager")
+            .field("dirty_pages", &self.dirty_pages)
+            .field("db_header", &self.db_header)
+            .finish()
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -458,7 +468,7 @@ impl Pager {
                     }
                 }
                 FlushState::SyncWal => {
-                    if WalFsyncStatus::IO == self.wal.borrow_mut().sync()? {
+                    if WalFsyncStatus::IO == self.wal.borrow_mut().sync(SyncTarget::Wal)? {
                         return Ok(PagerCacheflushStatus::IO);
                     }
 
