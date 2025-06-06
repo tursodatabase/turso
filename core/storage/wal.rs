@@ -18,6 +18,7 @@ use std::{
 use crate::fast_lock::SpinLock;
 use crate::io::{File, SyncCompletion, IO};
 use crate::result::LimboResult;
+use crate::storage::database::DatabaseStorage;
 use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_write_wal_frame, finish_read_page, WAL_FRAME_HEADER_SIZE,
     WAL_HEADER_SIZE,
@@ -308,19 +309,28 @@ impl Wal for DummyWAL {
 
 /// Syncing requires a state machine because we need to schedule a sync and then wait until it is
 /// finished. If we don't wait there will be undefined behaviour that no one wants to debug.
-#[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug)]
 enum SyncState {
     NotSyncing,
-    Syncing(SyncTarget),
+    Syncing,
 }
 
 /// SyncTarget is used to determine what we are syncing, either the WAL or the DB file.
-#[derive(Debug)]
 pub enum SyncTarget {
     Wal,
-    // Assuming the Pager life as long as the WalFile
-    Db { pager: &'static Pager },
+    Db { db_file: Arc<dyn DatabaseStorage> },
+}
+
+impl std::fmt::Debug for SyncTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wal => write!(f, "Wal"),
+            Self::Db { .. } => f
+                .debug_struct("Db")
+                .field("db_file", &"<DatabaseStorage>")
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -769,24 +779,38 @@ impl Wal for WalFile {
                     if *write_counter.borrow() > 0 {
                         return Ok(CheckpointStatus::IO);
                     }
-                    let shared = self.get_shared();
 
-                    // Record two num pages fields to return as checkpoint result to caller.
-                    // Ref: pnLog, pnCkpt on https://www.sqlite.org/c3ref/wal_checkpoint_v2.html
-                    let checkpoint_result = CheckpointResult {
-                        num_wal_frames: shared.max_frame.load(Ordering::SeqCst),
-                        num_checkpointed_frames: self.ongoing_checkpoint.max_frame,
-                    };
-                    let everything_backfilled = shared.max_frame.load(Ordering::SeqCst)
-                        == self.ongoing_checkpoint.max_frame;
+                    let checkpoint_result;
+                    let everything_backfilled;
+                    {
+                        let shared = self.get_shared();
+
+                        // Record two num pages fields to return as checkpoint result to caller.
+                        // Ref: pnLog, pnCkpt on https://www.sqlite.org/c3ref/wal_checkpoint_v2.html
+                        checkpoint_result = CheckpointResult {
+                            num_wal_frames: shared.max_frame.load(Ordering::SeqCst),
+                            num_checkpointed_frames: self.ongoing_checkpoint.max_frame,
+                        };
+                        everything_backfilled = shared.max_frame.load(Ordering::SeqCst)
+                            == self.ongoing_checkpoint.max_frame;
+                    }
+
                     if everything_backfilled {
                         // TODO: Even in Passive mode, if everything was backfilled we should
-                        // truncate and fsync the *db file*
+                        // truncate
+                        let sync_result = self.sync(SyncTarget::Db {
+                            db_file: pager.db_file.clone(),
+                        })?;
+
+                        if matches!(sync_result, WalFsyncStatus::IO) {
+                            return Ok(CheckpointStatus::IO);
+                        }
 
                         // To properly reset the *wal file* we will need restart and/or truncate mode.
                         // Currently, it will grow the WAL file indefinetly, but don't resetting is better than breaking.
                         // Check: https://github.com/sqlite/sqlite/blob/2bd9f69d40dd240c4122c6d02f1ff447e7b5c098/src/wal.c#L2193
                         if !matches!(mode, CheckpointMode::Passive) {
+                            let shared = self.get_shared();
                             // Here we know that we backfilled everything, therefore we can safely
                             // reset the wal.
                             shared.frame_cache.lock().clear();
@@ -797,6 +821,7 @@ impl Wal for WalFile {
                             // TODO(pere): truncate wal file here.
                         }
                     } else {
+                        let shared = self.get_shared();
                         shared
                             .nbackfills
                             .store(self.ongoing_checkpoint.max_frame, Ordering::SeqCst);
@@ -810,8 +835,11 @@ impl Wal for WalFile {
 
     fn sync(&mut self, target: SyncTarget) -> Result<WalFsyncStatus> {
         let binding = self.sync_state.clone();
-        let state = binding.borrow();
-        match *state {
+        let state_value = {
+            let state = binding.borrow();
+            *state
+        };
+        match state_value {
             SyncState::NotSyncing => {
                 let shared = self.get_shared();
                 debug!("wal_sync");
@@ -831,19 +859,19 @@ impl Wal for WalFile {
                         SyncTarget::Wal => {
                             shared.file.sync(Arc::new(completion))?;
                         }
-                        SyncTarget::Db { pager } => {
-                            pager.db_file.sync(Arc::new(completion))?;
+                        SyncTarget::Db { db_file } => {
+                            db_file.sync(Arc::new(completion))?;
                         }
                     }
                 }
-                self.sync_state.replace(SyncState::Syncing(target));
+                self.sync_state.replace(SyncState::Syncing);
                 Ok(WalFsyncStatus::IO)
             }
-            SyncState::Syncing(_) => {
+            SyncState::Syncing => {
                 debug!("wal_sync already syncing");
                 match *self.sync_state.clone().borrow() {
                     SyncState::NotSyncing => Ok(WalFsyncStatus::IO),
-                    SyncState::Syncing(_) => Ok(WalFsyncStatus::Done),
+                    SyncState::Syncing => Ok(WalFsyncStatus::Done),
                 }
             }
         }

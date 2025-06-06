@@ -193,16 +193,6 @@ pub struct Pager {
     syncing: Rc<RefCell<bool>>,
 }
 
-impl std::fmt::Debug for Pager {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // TODO: Add other fields
-        f.debug_struct("Pager")
-            .field("dirty_pages", &self.dirty_pages)
-            .field("db_header", &self.db_header)
-            .finish()
-    }
-}
-
 #[derive(Debug, Copy, Clone)]
 /// The status of the current cache flush.
 /// A Done state means that the WAL was committed to disk and fsynced,
