@@ -30,6 +30,7 @@ mod numeric;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use crate::vdbe::Program;
 use crate::{fast_lock::SpinLock, translate::optimizer::optimize_plan};
 pub use error::LimboError;
 use fallible_iterator::FallibleIterator;
@@ -46,6 +47,7 @@ use limbo_sqlite3_parser::{ast, ast::Cmd, lexer::sql::Parser};
 use parking_lot::RwLock;
 use schema::{Column, Schema};
 use std::ffi::c_void;
+use std::ptr::NonNull;
 use std::rc::Weak;
 use std::{
     borrow::Cow,
@@ -234,6 +236,7 @@ impl Database {
             syms: RefCell::new(SymbolTable::new()),
             total_changes: Cell::new(0),
             _shared_cache: false,
+            program_head: Cell::new(None),
         });
         if let Err(e) = conn.register_builtins() {
             return Err(LimboError::ExtensionError(e));
@@ -332,6 +335,7 @@ pub struct Connection {
     total_changes: Cell<i64>,
     syms: RefCell<SymbolTable>,
     _shared_cache: bool,
+    program_head: Cell<Option<NonNull<Program>>>,
 }
 
 impl Connection {
@@ -400,11 +404,10 @@ impl Connection {
                     &syms,
                     cmd.into(),
                 )?;
-                let stmt = Statement::new(
-                    program.into(),
-                    self._db.mv_store.clone(),
-                    self.pager.clone(),
-                );
+                let program_rc = Rc::new(program);
+                self.track_program(&program_rc);
+                let stmt =
+                    Statement::new(program_rc, self._db.mv_store.clone(), self.pager.clone());
                 Ok(Some(stmt))
             }
             Cmd::ExplainQueryPlan(stmt) => {
@@ -688,6 +691,45 @@ impl Connection {
         }
 
         Ok(results)
+    }
+
+    pub fn track_program(&self, program_rc: &Rc<Program>) {
+        let program_mut_ptr = Rc::as_ptr(program_rc) as *mut Program;
+        let new_node_ptr = NonNull::new(program_mut_ptr).unwrap();
+
+        let current_head = self.program_head.get();
+
+        unsafe {
+            new_node_ptr.as_ref().next_program.set(current_head);
+            new_node_ptr.as_ref().prev_program.set(None);
+
+            if let Some(old_head) = current_head {
+                old_head.as_ref().prev_program.set(Some(new_node_ptr));
+            }
+
+            self.program_head.set(Some(new_node_ptr));
+        }
+    }
+
+    fn untrack_program(&self, program: &mut Program) {
+        let program_ptr = NonNull::from(&mut *program);
+        let prev_program = program.prev_program.get();
+        let next_program = program.next_program.get();
+
+        unsafe {
+            if let Some(prev_program_ptr) = prev_program {
+                prev_program_ptr.as_ref().next_program.set(next_program);
+            } else if self.program_head.get() == Some(program_ptr) {
+                self.program_head.set(next_program);
+            }
+
+            if let Some(next_program_ptr) = next_program {
+                next_program_ptr.as_ref().prev_program.set(prev_program);
+            }
+        }
+
+        program.prev_program.set(None);
+        program.next_program.set(None);
     }
 }
 

@@ -50,6 +50,7 @@ use rand::{
     Rng,
 };
 use regex::Regex;
+use std::ptr::NonNull;
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -388,6 +389,8 @@ pub struct Program {
     pub change_cnt_on: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: Vec<TableReference>,
+    pub prev_program: Cell<Option<NonNull<Program>>>,
+    pub next_program: Cell<Option<NonNull<Program>>>,
 }
 
 impl Program {
@@ -520,6 +523,14 @@ impl Program {
             prev_insn = Some(insn);
         }
         buff
+    }
+}
+
+impl Drop for Program {
+    fn drop(&mut self) {
+        if let Some(conn_rc) = self.connection.upgrade() {
+            conn_rc.untrack_program(self);
+        }
     }
 }
 
