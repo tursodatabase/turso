@@ -109,9 +109,22 @@ pub(crate) fn pick_index<R: Rng>(choices: usize, rng: &mut R) -> usize {
     rng.gen_range(0..choices)
 }
 
+/// pick_n_unique is a helper function for uniformly picking N unique elements from a range.
+/// The elements themselves are usize, typically representing indices.
+pub(crate) fn pick_n_unique<R: Rng>(
+    range: std::ops::Range<usize>,
+    n: usize,
+    rng: &mut R,
+) -> Vec<usize> {
+    use rand::seq::SliceRandom;
+    let mut items: Vec<usize> = range.collect();
+    items.shuffle(rng);
+    items.into_iter().take(n).collect()
+}
+
 /// gen_random_text uses `anarchist_readable_name_generator_lib` to generate random
 /// readable names for tables, columns, text values etc.
-fn gen_random_text<T: Rng>(rng: &mut T) -> String {
+pub(crate) fn gen_random_text<T: Rng>(rng: &mut T) -> String {
     let big_text = rng.gen_ratio(1, 1000);
     if big_text {
         // let max_size: u64 = 2 * 1024 * 1024 * 1024;

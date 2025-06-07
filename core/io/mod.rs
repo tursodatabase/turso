@@ -4,7 +4,7 @@ use cfg_block::cfg_block;
 use std::fmt;
 use std::sync::Arc;
 use std::{
-    cell::{Ref, RefCell, RefMut},
+    cell::{Cell, Ref, RefCell, RefMut},
     fmt::Debug,
     mem::ManuallyDrop,
     pin::Pin,
@@ -14,9 +14,9 @@ use std::{
 pub trait File: Send + Sync {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
-    fn pread(&self, pos: usize, c: Completion) -> Result<()>;
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<Buffer>>, c: Completion) -> Result<()>;
-    fn sync(&self, c: Completion) -> Result<()>;
+    fn pread(&self, pos: usize, c: Arc<Completion>) -> Result<()>;
+    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<Buffer>>, c: Arc<Completion>) -> Result<()>;
+    fn sync(&self, c: Arc<Completion>) -> Result<()>;
     fn size(&self) -> Result<u64>;
 }
 
@@ -42,6 +42,8 @@ pub trait IO: Clock + Send + Sync {
 
     fn run_once(&self) -> Result<()>;
 
+    fn wait_for_completion(&self, c: Arc<Completion>) -> Result<()>;
+
     fn generate_random_number(&self) -> i64;
 
     fn get_memory_io(&self) -> Arc<MemoryIO>;
@@ -60,9 +62,18 @@ pub enum Completion {
 pub struct ReadCompletion {
     pub buf: Arc<RefCell<Buffer>>,
     pub complete: Box<Complete>,
+    pub is_completed: Cell<bool>,
 }
 
 impl Completion {
+    pub fn is_completed(&self) -> bool {
+        match self {
+            Self::Read(r) => r.is_completed.get(),
+            Self::Write(w) => w.is_completed.get(),
+            Self::Sync(s) => s.is_completed.get(),
+        }
+    }
+
     pub fn complete(&self, result: i32) {
         match self {
             Self::Read(r) => r.complete(),
@@ -83,15 +94,21 @@ impl Completion {
 
 pub struct WriteCompletion {
     pub complete: Box<WriteComplete>,
+    pub is_completed: Cell<bool>,
 }
 
 pub struct SyncCompletion {
     pub complete: Box<SyncComplete>,
+    pub is_completed: Cell<bool>,
 }
 
 impl ReadCompletion {
     pub fn new(buf: Arc<RefCell<Buffer>>, complete: Box<Complete>) -> Self {
-        Self { buf, complete }
+        Self {
+            buf,
+            complete,
+            is_completed: Cell::new(false),
+        }
     }
 
     pub fn buf(&self) -> Ref<'_, Buffer> {
@@ -104,26 +121,35 @@ impl ReadCompletion {
 
     pub fn complete(&self) {
         (self.complete)(self.buf.clone());
+        self.is_completed.set(true);
     }
 }
 
 impl WriteCompletion {
     pub fn new(complete: Box<WriteComplete>) -> Self {
-        Self { complete }
+        Self {
+            complete,
+            is_completed: Cell::new(false),
+        }
     }
 
     pub fn complete(&self, bytes_written: i32) {
         (self.complete)(bytes_written);
+        self.is_completed.set(true);
     }
 }
 
 impl SyncCompletion {
     pub fn new(complete: Box<SyncComplete>) -> Self {
-        Self { complete }
+        Self {
+            complete,
+            is_completed: Cell::new(false),
+        }
     }
 
     pub fn complete(&self, res: i32) {
         (self.complete)(res);
+        self.is_completed.set(true);
     }
 }
 

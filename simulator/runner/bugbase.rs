@@ -116,7 +116,7 @@ impl BugBase {
         for path in potential_paths {
             let path = path.join(".bugbase");
             if std::fs::create_dir_all(&path).is_ok() {
-                log::info!("bug base created at {}", path.display());
+                tracing::info!("bug base created at {}", path.display());
                 return BugBase::new(path);
             }
         }
@@ -172,7 +172,7 @@ impl BugBase {
             unreachable!("bug base already exists at {}", path.display());
         } else {
             std::fs::create_dir_all(&path).or(Err("failed to create bug base"))?;
-            log::info!("bug base created at {}", path.display());
+            tracing::info!("bug base created at {}", path.display());
             BugBase::new(path)
         }
     }
@@ -185,7 +185,7 @@ impl BugBase {
         error: Option<String>,
         cli_options: &SimulatorCLI,
     ) -> Result<(), String> {
-        log::debug!("adding bug with seed {}", seed);
+        tracing::debug!("adding bug with seed {}", seed);
         let bug = self.get_bug(seed);
 
         if bug.is_some() {
@@ -290,11 +290,11 @@ impl BugBase {
                 };
 
                 self.bugs.insert(seed, Bug::Loaded(bug.clone()));
-                log::debug!("Loaded bug with seed {}", seed);
+                tracing::debug!("Loaded bug with seed {}", seed);
                 Ok(bug)
             }
             Some(Bug::Loaded(bug)) => {
-                log::warn!(
+                tracing::warn!(
                     "Bug with seed {} is already loaded, returning the existing plan",
                     seed
                 );
@@ -311,7 +311,7 @@ impl BugBase {
         let bug = self.get_bug(seed);
         match bug {
             None => {
-                log::debug!("removing bug base entry for {}", seed);
+                tracing::debug!("removing bug base entry for {}", seed);
                 std::fs::remove_dir_all(self.path.join(seed.to_string()))
                     .or(Err("should be able to remove bug directory".to_string()))?;
             }
@@ -327,7 +327,7 @@ impl BugBase {
                 // Save the bug to the bug base.
                 self.save_bug(seed)
                     .or(Err("should be able to save bug".to_string()))?;
-                log::debug!("Updated bug with seed {}", seed);
+                tracing::debug!("Updated bug with seed {}", seed);
             }
         }
 

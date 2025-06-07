@@ -72,21 +72,13 @@ pub fn translate_create_index(
     // 4. sorter_cursor_id        - sorter
     // 5. pseudo_cursor_id        - pseudo table to store the sorted index values
     let sqlite_table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(
-        Some(SQLITE_TABLEID.to_owned()),
-        CursorType::BTreeTable(sqlite_table.clone()),
-    );
-    let btree_cursor_id = program.alloc_cursor_id(
-        Some(idx_name.to_owned()),
-        CursorType::BTreeIndex(idx.clone()),
-    );
-    let table_cursor_id = program.alloc_cursor_id(
-        Some(tbl_name.to_owned()),
-        CursorType::BTreeTable(tbl.clone()),
-    );
-    let sorter_cursor_id = program.alloc_cursor_id(None, CursorType::Sorter);
+    let sqlite_schema_cursor_id =
+        program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
+    let btree_cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(idx.clone()));
+    let table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(tbl.clone()));
+    let sorter_cursor_id = program.alloc_cursor_id(CursorType::Sorter);
     let pseudo_table = PseudoTable::new_with_columns(tbl.columns.clone());
-    let pseudo_cursor_id = program.alloc_cursor_id(None, CursorType::Pseudo(pseudo_table.into()));
+    let pseudo_cursor_id = program.alloc_cursor_id(CursorType::Pseudo(pseudo_table.into()));
 
     // Create a new B-Tree and store the root page index in a register
     let root_page_reg = program.alloc_register();
@@ -359,10 +351,8 @@ pub fn translate_drop_index(
 
     // We're going to use this cursor to search through sqlite_schema
     let sqlite_table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(
-        Some(SQLITE_TABLEID.to_owned()),
-        CursorType::BTreeTable(sqlite_table.clone()),
-    );
+    let sqlite_schema_cursor_id =
+        program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
 
     // Open root=1 iDb=0; sqlite_schema for writing
     program.emit_insn(Insn::OpenWrite {

@@ -1,7 +1,10 @@
+use std::collections::HashSet;
+
 use crate::generation::table::{GTValue, LTValue};
 use crate::generation::{one_of, Arbitrary, ArbitraryFrom};
 
 use crate::model::query::select::{Distinctness, Predicate, ResultColumn};
+use crate::model::query::update::Update;
 use crate::model::query::{Create, Delete, Drop, Insert, Query, Select};
 use crate::model::table::{Table, Value};
 use crate::SimulatorEnv;
@@ -125,7 +128,7 @@ impl ArbitraryFrom<(&SimulatorEnv, &Remaining)> for Query {
                     Box::new(|rng| Self::Insert(Insert::arbitrary_from(rng, env))),
                 ),
                 (
-                    remaining.write,
+                    f64::min(remaining.write, remaining.delete),
                     Box::new(|rng| Self::Delete(Delete::arbitrary_from(rng, env))),
                 ),
             ],
@@ -467,5 +470,34 @@ impl ArbitraryFrom<(&Table, &Vec<Value>)> for Predicate {
         }
 
         result
+    }
+}
+
+impl ArbitraryFrom<&SimulatorEnv> for Update {
+    fn arbitrary_from<R: Rng>(rng: &mut R, env: &SimulatorEnv) -> Self {
+        let table = pick(&env.tables, rng);
+        let mut seen = HashSet::new();
+        let num_cols = rng.gen_range(1..=table.columns.len());
+        let set_values: Vec<(String, Value)> = (0..num_cols)
+            .map(|_| {
+                let column = loop {
+                    let column = pick(&table.columns, rng);
+                    if seen.contains(&column.name) {
+                        continue;
+                    }
+                    break column;
+                };
+                seen.insert(column.name.clone());
+                (
+                    column.name.clone(),
+                    Value::arbitrary_from(rng, &column.column_type),
+                )
+            })
+            .collect();
+        Update {
+            table: table.name.clone(),
+            set_values,
+            predicate: Predicate::arbitrary_from(rng, table),
+        }
     }
 }

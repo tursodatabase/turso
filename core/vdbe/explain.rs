@@ -12,6 +12,16 @@ pub fn insn_to_str(
     indent: String,
     manual_comment: Option<&'static str>,
 ) -> String {
+    let get_table_or_index_name = |cursor_id: usize| {
+        let cursor_type = &program.cursor_ref[cursor_id].1;
+        match cursor_type {
+            CursorType::BTreeTable(table) => &table.name,
+            CursorType::BTreeIndex(index) => &index.name,
+            CursorType::Pseudo(_) => "pseudo",
+            CursorType::VirtualTable(virtual_table) => &virtual_table.name,
+            CursorType::Sorter => "sorter",
+        }
+    };
     let (opcode, p1, p2, p3, p4, p5, comment): (&str, i32, i32, i32, Value, u16, String) =
         match insn {
             Insn::Init { target_pc } => (
@@ -354,14 +364,25 @@ pub fn insn_to_str(
                 0,
                 Value::build_text(""),
                 0,
-                format!(
-                    "table={}, root={}",
-                    program.cursor_ref[*cursor_id]
-                        .0
-                        .as_ref()
-                        .unwrap_or(&format!("cursor {}", cursor_id)),
-                    root_page
-                ),
+                {
+                    let cursor_type =
+                        program.cursor_ref[*cursor_id]
+                            .0
+                            .as_ref()
+                            .map_or("", |cursor_key| {
+                                if cursor_key.index.is_some() {
+                                    "index"
+                                } else {
+                                    "table"
+                                }
+                            });
+                    format!(
+                        "{}={}, root={}",
+                        cursor_type,
+                        get_table_or_index_name(*cursor_id),
+                        root_page
+                    )
+                },
             ),
             Insn::VOpen { cursor_id } => (
                 "VOpen",
@@ -370,7 +391,20 @@ pub fn insn_to_str(
                 0,
                 Value::build_text(""),
                 0,
-                "".to_string(),
+                {
+                    let cursor_type =
+                        program.cursor_ref[*cursor_id]
+                            .0
+                            .as_ref()
+                            .map_or("", |cursor_key| {
+                                if cursor_key.index.is_some() {
+                                    "index"
+                                } else {
+                                    "table"
+                                }
+                            });
+                    format!("{} {}", cursor_type, get_table_or_index_name(*cursor_id),)
+                },
             ),
             Insn::VCreate {
                 table_name,
@@ -470,20 +504,31 @@ pub fn insn_to_str(
                 0,
                 Value::build_text(""),
                 0,
-                format!(
-                    "Rewind {}",
-                    program.cursor_ref[*cursor_id]
-                        .0
-                        .as_ref()
-                        .unwrap_or(&format!("cursor {}", cursor_id))
-                ),
+                {
+                    let cursor_type =
+                        program.cursor_ref[*cursor_id]
+                            .0
+                            .as_ref()
+                            .map_or("", |cursor_key| {
+                                if cursor_key.index.is_some() {
+                                    "index"
+                                } else {
+                                    "table"
+                                }
+                            });
+                    format!(
+                        "Rewind {} {}",
+                        cursor_type,
+                        get_table_or_index_name(*cursor_id),
+                    )
+                },
             ),
             Insn::Column {
                 cursor_id,
                 column,
                 dest,
             } => {
-                let (table_identifier, cursor_type) = &program.cursor_ref[*cursor_id];
+                let cursor_type = &program.cursor_ref[*cursor_id].1;
                 let column_name: Option<&String> = match cursor_type {
                     CursorType::BTreeTable(table) => {
                         let name = table.columns.get(*column).unwrap().name.as_ref();
@@ -510,9 +555,7 @@ pub fn insn_to_str(
                     format!(
                         "r[{}]={}.{}",
                         dest,
-                        table_identifier
-                            .as_ref()
-                            .unwrap_or(&format!("cursor {}", cursor_id)),
+                        get_table_or_index_name(*cursor_id),
                         column_name.unwrap_or(&format!("column {}", *column))
                     ),
                 )
@@ -621,11 +664,14 @@ pub fn insn_to_str(
                 0,
                 "".to_string(),
             ),
-            Insn::Return { return_reg } => (
+            Insn::Return {
+                return_reg,
+                can_fallthrough,
+            } => (
                 "Return",
                 *return_reg as i32,
                 0,
-                0,
+                *can_fallthrough as i32,
                 Value::build_text(""),
                 0,
                 "".to_string(),
@@ -687,14 +733,7 @@ pub fn insn_to_str(
                 0,
                 Value::build_text(""),
                 0,
-                format!(
-                    "r[{}]={}.rowid",
-                    dest,
-                    &program.cursor_ref[*cursor_id]
-                        .0
-                        .as_ref()
-                        .unwrap_or(&format!("cursor {}", cursor_id))
-                ),
+                format!("r[{}]={}.rowid", dest, get_table_or_index_name(*cursor_id)),
             ),
             Insn::IdxRowId { cursor_id, dest } => (
                 "IdxRowId",
@@ -706,10 +745,16 @@ pub fn insn_to_str(
                 format!(
                     "r[{}]={}.rowid",
                     dest,
-                    &program.cursor_ref[*cursor_id]
+                    program.cursor_ref[*cursor_id]
                         .0
                         .as_ref()
-                        .unwrap_or(&format!("cursor {}", cursor_id))
+                        .map(|k| format!(
+                            "cursor {} for {} {}",
+                            cursor_id,
+                            if k.index.is_some() { "index" } else { "table" },
+                            get_table_or_index_name(*cursor_id),
+                        ))
+                        .unwrap_or(format!("cursor {}", cursor_id))
                 ),
             ),
             Insn::SeekRowid {
@@ -729,7 +774,13 @@ pub fn insn_to_str(
                     &program.cursor_ref[*cursor_id]
                         .0
                         .as_ref()
-                        .unwrap_or(&format!("cursor {}", cursor_id)),
+                        .map(|k| format!(
+                            "cursor {} for {} {}",
+                            cursor_id,
+                            if k.index.is_some() { "index" } else { "table" },
+                            get_table_or_index_name(*cursor_id),
+                        ))
+                        .unwrap_or(format!("cursor {}", cursor_id)),
                     target_pc.to_debug_int()
                 ),
             ),
@@ -1367,6 +1418,20 @@ pub fn insn_to_str(
                 *cookie as i32,
                 Value::build_text(""),
                 0,
+                "".to_string(),
+            ),
+            Insn::SetCookie {
+                db,
+                cookie,
+                value,
+                p5,
+            } => (
+                "SetCookie",
+                *db as i32,
+                *cookie as i32,
+                *value,
+                Value::build_text(""),
+                *p5,
                 "".to_string(),
             ),
             Insn::AutoCommit {

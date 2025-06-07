@@ -4,7 +4,7 @@
 </p>
 
 <p align="center">
-  <i>Limbo</i> is a project to build the modern evolution of SQLite.
+  <i>Limbo</i> is a project to build the next evolution of SQLite.
 </p>
 
 <p align="center">
@@ -36,8 +36,8 @@ Limbo is a _work-in-progress_, in-process OLTP database engine library written i
 
 In the future, we will be also working on:
 
-* **Integrated vector search** for embeddings and vector similarity.
 * **`BEGIN CONCURRENT`** for improved write throughput.
+* **Indexing for vector search**.
 * **Improved schema management** including better `ALTER` support and strict column types by default.
 
 ## Getting Started
@@ -187,9 +187,13 @@ We'd love to have you contribute to Limbo! Please check out the [contribution gu
 
 ## FAQ
 
+### Is Limbo ready for production use?
+
+Limbo is currently under heavy development and is **not** ready for production use.
+
 ### How is Limbo different from Turso's libSQL?
 
-Limbo is a project to build the modern evolution of SQLite in Rust, with a strong open contribution focus and features like native async support, vector search, and more. The libSQL project is also an attempt to evolve SQLite in a similar direction, but through a fork rather than a rewrite.
+Limbo is a project to build the next evolution of SQLite in Rust, with a strong open contribution focus and features like native async support, vector search, and more. The libSQL project is also an attempt to evolve SQLite in a similar direction, but through a fork rather than a rewrite.
 
 Rewriting SQLite in Rust started as an unassuming experiment, and due to its incredible success, replaces libSQL as our intended direction. At this point, libSQL is production ready, Limbo is not - although it is evolving rapidly. As the project starts to near production readiness, we plan to rename it to just "Turso". More details [here](https://turso.tech/blog/we-will-rewrite-sqlite-and-we-are-going-all-in).
 

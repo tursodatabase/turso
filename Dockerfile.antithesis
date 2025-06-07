@@ -52,7 +52,7 @@ COPY --from=planner /app/vendored ./vendored/
 RUN if [ "$antithesis" = "true" ]; then \
         cp /opt/antithesis/libvoidstar.so /usr/lib/libvoidstar.so && \
         export RUSTFLAGS="-Ccodegen-units=1 -Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=3 -Cllvm-args=-sanitizer-coverage-trace-pc-guard -Clink-args=-Wl,--build-id -L/usr/lib/ -lvoidstar" && \
-        cargo build --bin limbo_stress; \
+        cargo build --bin limbo_stress --profile antithesis; \
     else \
         cargo build --bin limbo_stress --release; \
     fi

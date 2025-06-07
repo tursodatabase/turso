@@ -315,7 +315,7 @@ def test_series():
     ext_path = "./target/debug/liblimbo_series"
     limbo.run_test_fn(
         "SELECT * FROM generate_series(1, 10);",
-        lambda res: "Virtual table module not found: generate_series" in res,
+        lambda res: "No such table-valued function: generate_series" in res,
     )
     limbo.execute_dot(f".load {ext_path}")
     limbo.run_test_fn(
@@ -333,6 +333,12 @@ def test_series():
     limbo.run_test_fn(
         "SELECT * FROM generate_series(10, 1, -2);",
         lambda res: res == "10\n8\n6\n4\n2",
+    )
+    limbo.execute_dot("CREATE TABLE target (id integer primary key);")
+    limbo.execute_dot("INSERT INTO target SELECT * FROM generate_series(1, 5);")
+    limbo.run_test_fn(
+        "SELECT * FROM target;",
+        lambda res: res == "1\n2\n3\n4\n5",
     )
     limbo.quit()
 

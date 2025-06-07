@@ -10,7 +10,8 @@ use crate::storage::sqlite3_ondisk::write_varint;
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
 use crate::vdbe::sorter::Sorter;
-use crate::vdbe::{Register, VTabOpaqueCursor};
+use crate::vdbe::Register;
+use crate::vtab::VirtualTableCursor;
 use crate::Result;
 use std::fmt::Display;
 
@@ -1354,6 +1355,7 @@ impl Record {
                 Value::Integer(i) => {
                     let serial_type = SerialType::from(value);
                     match serial_type.kind() {
+                        SerialTypeKind::ConstInt0 | SerialTypeKind::ConstInt1 => {}
                         SerialTypeKind::I8 => buf.extend_from_slice(&(*i as i8).to_be_bytes()),
                         SerialTypeKind::I16 => buf.extend_from_slice(&(*i as i16).to_be_bytes()),
                         SerialTypeKind::I24 => {
@@ -1393,7 +1395,7 @@ pub enum Cursor {
     BTree(BTreeCursor),
     Pseudo(PseudoCursor),
     Sorter(Sorter),
-    Virtual(VTabOpaqueCursor),
+    Virtual(VirtualTableCursor),
 }
 
 impl Cursor {
@@ -1430,7 +1432,7 @@ impl Cursor {
         }
     }
 
-    pub fn as_virtual_mut(&mut self) -> &mut VTabOpaqueCursor {
+    pub fn as_virtual_mut(&mut self) -> &mut VirtualTableCursor {
         match self {
             Self::Virtual(cursor) => cursor,
             _ => panic!("Cursor is not a virtual cursor"),
@@ -1485,7 +1487,7 @@ impl SeekOp {
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum SeekKey<'a> {
-    TableRowId(u64),
+    TableRowId(i64),
     IndexKey(&'a ImmutableRecord),
 }
 
@@ -1525,6 +1527,8 @@ mod tests {
     #[test]
     fn test_serialize_integers() {
         let record = Record::new(vec![
+            Value::Integer(0),                 // Should use ConstInt0
+            Value::Integer(1),                 // Should use ConstInt1
             Value::Integer(42),                // Should use SERIAL_TYPE_I8
             Value::Integer(1000),              // Should use SERIAL_TYPE_I16
             Value::Integer(1_000_000),         // Should use SERIAL_TYPE_I24
@@ -1541,39 +1545,57 @@ mod tests {
         assert_eq!(header[0], header_length as u8); // Header should be larger than number of values
 
         // Check that correct serial types were chosen
-        assert_eq!(header[1] as u64, u64::from(SerialType::i8()));
-        assert_eq!(header[2] as u64, u64::from(SerialType::i16()));
-        assert_eq!(header[3] as u64, u64::from(SerialType::i24()));
-        assert_eq!(header[4] as u64, u64::from(SerialType::i32()));
-        assert_eq!(header[5] as u64, u64::from(SerialType::i48()));
-        assert_eq!(header[6] as u64, u64::from(SerialType::i64()));
+        assert_eq!(header[1] as u64, u64::from(SerialType::const_int0())); // 8
+        assert_eq!(header[2] as u64, u64::from(SerialType::const_int1())); // 9
+        assert_eq!(header[3] as u64, u64::from(SerialType::i8())); // 1
+        assert_eq!(header[4] as u64, u64::from(SerialType::i16())); // 2
+        assert_eq!(header[5] as u64, u64::from(SerialType::i24())); // 3
+        assert_eq!(header[6] as u64, u64::from(SerialType::i32())); // 4
+        assert_eq!(header[7] as u64, u64::from(SerialType::i48())); // 5
+        assert_eq!(header[8] as u64, u64::from(SerialType::i64())); // 6
 
         // test that the bytes after the header can be interpreted as the correct values
         let mut cur_offset = header_length;
+
+        // Value::Integer(0) - ConstInt0: NO PAYLOAD BYTES
+        // Value::Integer(1) - ConstInt1: NO PAYLOAD BYTES
+
+        // Value::Integer(42) - I8: 1 byte
         let i8_bytes = &buf[cur_offset..cur_offset + size_of::<i8>()];
         cur_offset += size_of::<i8>();
+
+        // Value::Integer(1000) - I16: 2 bytes
         let i16_bytes = &buf[cur_offset..cur_offset + size_of::<i16>()];
         cur_offset += size_of::<i16>();
-        let i24_bytes = &buf[cur_offset..cur_offset + size_of::<i32>() - 1];
-        cur_offset += size_of::<i32>() - 1; // i24
+
+        // Value::Integer(1_000_000) - I24: 3 bytes
+        let i24_bytes = &buf[cur_offset..cur_offset + 3];
+        cur_offset += 3;
+
+        // Value::Integer(1_000_000_000) - I32: 4 bytes
         let i32_bytes = &buf[cur_offset..cur_offset + size_of::<i32>()];
         cur_offset += size_of::<i32>();
-        let i48_bytes = &buf[cur_offset..cur_offset + size_of::<i64>() - 2];
-        cur_offset += size_of::<i64>() - 2; // i48
+
+        // Value::Integer(1_000_000_000_000) - I48: 6 bytes
+        let i48_bytes = &buf[cur_offset..cur_offset + 6];
+        cur_offset += 6;
+
+        // Value::Integer(i64::MAX) - I64: 8 bytes
         let i64_bytes = &buf[cur_offset..cur_offset + size_of::<i64>()];
 
+        // Verify the payload values
         let val_int8 = i8::from_be_bytes(i8_bytes.try_into().unwrap());
         let val_int16 = i16::from_be_bytes(i16_bytes.try_into().unwrap());
 
-        let mut leading_0 = vec![0];
-        leading_0.extend(i24_bytes);
-        let val_int24 = i32::from_be_bytes(leading_0.try_into().unwrap());
+        let mut i24_with_padding = vec![0];
+        i24_with_padding.extend(i24_bytes);
+        let val_int24 = i32::from_be_bytes(i24_with_padding.try_into().unwrap());
 
         let val_int32 = i32::from_be_bytes(i32_bytes.try_into().unwrap());
 
-        let mut leading_00 = vec![0, 0];
-        leading_00.extend(i48_bytes);
-        let val_int48 = i64::from_be_bytes(leading_00.try_into().unwrap());
+        let mut i48_with_padding = vec![0, 0];
+        i48_with_padding.extend(i48_bytes);
+        let val_int48 = i64::from_be_bytes(i48_with_padding.try_into().unwrap());
 
         let val_int64 = i64::from_be_bytes(i64_bytes.try_into().unwrap());
 
@@ -1584,17 +1606,53 @@ mod tests {
         assert_eq!(val_int48, 1_000_000_000_000);
         assert_eq!(val_int64, i64::MAX);
 
-        // assert correct size of buffer: header + values (bytes per value depends on serial type)
+        //Size of buffer = header + payload bytes
+        // ConstInt0 and ConstInt1 contribute 0 bytes to payload
         assert_eq!(
             buf.len(),
-            header_length
-                + size_of::<i8>()
-                + size_of::<i16>()
-                + (size_of::<i32>() - 1) // i24
-                + size_of::<i32>()
-                + (size_of::<i64>() - 2) // i48
-                + size_of::<f64>()
+            header_length  // 9 bytes (header size + 8 serial types)
+                + 0        // ConstInt0: 0 bytes
+                + 0        // ConstInt1: 0 bytes  
+                + size_of::<i8>()        // I8: 1 byte
+                + size_of::<i16>()        // I16: 2 bytes
+                + (size_of::<i32>() - 1)        // I24: 3 bytes
+                + size_of::<i32>()        // I32: 4 bytes
+                + (size_of::<i64>() - 2)        // I48: 6 bytes
+                + size_of::<i64>() // I64: 8 bytes
         );
+    }
+
+    #[test]
+    fn test_serialize_const_integers() {
+        let record = Record::new(vec![Value::Integer(0), Value::Integer(1)]);
+        let mut buf = Vec::new();
+        record.serialize(&mut buf);
+
+        // [header_size, serial_type_0, serial_type_1] + no payload bytes
+        let expected_header_size = 3; // 1 byte for header size + 2 bytes for serial types
+
+        assert_eq!(buf.len(), expected_header_size);
+
+        // Check header size
+        assert_eq!(buf[0], expected_header_size as u8);
+
+        assert_eq!(buf[1] as u64, u64::from(SerialType::const_int0())); // Should be 8
+        assert_eq!(buf[2] as u64, u64::from(SerialType::const_int1())); // Should be 9
+
+        assert_eq!(buf[1], 8); // ConstInt0 serial type
+        assert_eq!(buf[2], 9); // ConstInt1 serial type
+    }
+
+    #[test]
+    fn test_serialize_single_const_int0() {
+        let record = Record::new(vec![Value::Integer(0)]);
+        let mut buf = Vec::new();
+        record.serialize(&mut buf);
+
+        // Expected: [header_size=2, serial_type=8]
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf[0], 2); // Header size
+        assert_eq!(buf[1], 8); // ConstInt0 serial type
     }
 
     #[test]

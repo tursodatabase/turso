@@ -32,3 +32,6 @@ notify = "8.0.0"
 rusqlite = { version = "0.34", features = ["bundled"] }
 dirs = "6.0.0"
 chrono = { version = "0.4.40", features = ["serde"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+

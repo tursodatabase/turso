@@ -10,16 +10,16 @@ on:
 
 jobs:
   run-long-tests:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 0 
     
     steps:
     - uses: actions/checkout@v3
-    - uses: Swatinem/rust-cache@v2
+    - uses: useblacksmith/rust-cache@v3
       with:
         prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
     - name: Set up Python 3.10
-      uses: actions/setup-python@v5
+      uses: useblacksmith/setup-python@v6
       with:
         python-version: "3.10"
     - name: Build
@@ -27,4 +27,23 @@ jobs:
     - name: Run ignored long tests
       run: cargo test -- --ignored fuzz_long
       env:
-        RUST_BACKTRACE: 1  
+        RUST_BACKTRACE: 1
+
+  simple-stress-test:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 0
+    steps:
+    - uses: actions/checkout@v3
+    - uses: useblacksmith/rust-cache@v3
+      with:
+        prefix-key: "v1-rust"
+    - name: Set up Python 3.10
+      uses: useblacksmith/setup-python@v6
+      with:
+        python-version: "3.10"
+    - name: Build
+      run: cargo build --verbose
+    - name: Run ignored long tests
+      run: cargo run -p limbo_stress -- -t 1 -i 10000 -s
+      env:
+        RUST_BACKTRACE: 1

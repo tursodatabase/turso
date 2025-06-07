@@ -121,15 +121,15 @@ fn execute_plan(
     let interaction = &plan.plan[state.interaction_pointer].interactions()[state.secondary_pointer];
 
     if let SimConnection::Disconnected = connection {
-        log::debug!("connecting {}", connection_index);
+        tracing::debug!("connecting {}", connection_index);
         env.connections[connection_index] =
             SimConnection::LimboConnection(env.db.connect().unwrap());
     } else {
-        log::debug!("connection {} already connected", connection_index);
+        tracing::debug!("connection {} already connected", connection_index);
         match execute_interaction(env, connection_index, interaction, &mut state.stack) {
             Ok(next_execution) => {
                 interaction.shadow(env);
-                log::debug!("connection {} processed", connection_index);
+                tracing::debug!("connection {} processed", connection_index);
                 // Move to the next interaction or property
                 match next_execution {
                     ExecutionContinuation::NextInteraction => {
@@ -152,7 +152,7 @@ fn execute_plan(
                 }
             }
             Err(err) => {
-                log::error!("error {}", err);
+                tracing::error!("error {}", err);
                 return Err(err);
             }
         }
@@ -179,7 +179,7 @@ pub(crate) fn execute_interaction(
     interaction: &Interaction,
     stack: &mut Vec<ResultSet>,
 ) -> Result<ExecutionContinuation> {
-    log::trace!(
+    tracing::info!(
         "execute_interaction(connection_index={}, interaction={})",
         connection_index,
         interaction
@@ -192,9 +192,9 @@ pub(crate) fn execute_interaction(
                 SimConnection::Disconnected => unreachable!(),
             };
 
-            log::debug!("{}", interaction);
-            let results = interaction.execute_query(conn);
-            log::debug!("{:?}", results);
+            tracing::debug!("{}", interaction);
+            let results = interaction.execute_query(conn, &env.io);
+            tracing::debug!("{:?}", results);
             stack.push(results);
         }
         Interaction::Assertion(_) => {
@@ -206,7 +206,7 @@ pub(crate) fn execute_interaction(
             stack.clear();
 
             if assumption_result.is_err() {
-                log::warn!("assumption failed: {:?}", assumption_result);
+                tracing::warn!("assumption failed: {:?}", assumption_result);
                 return Ok(ExecutionContinuation::NextProperty);
             }
         }

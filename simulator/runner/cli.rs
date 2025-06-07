@@ -46,6 +46,18 @@ pub struct SimulatorCLI {
     pub differential: bool,
     #[clap(subcommand)]
     pub subcommand: Option<SimulatorCommand>,
+    #[clap(long, help = "disable BugBase", default_value_t = false)]
+    pub disable_bugbase: bool,
+    #[clap(long, help = "disable UPDATE Statement", default_value_t = false)]
+    pub disable_update: bool,
+    #[clap(long, help = "disable DELETE Statement", default_value_t = false)]
+    pub disable_delete: bool,
+    #[clap(long, help = "disable CREATE Statement", default_value_t = false)]
+    pub disable_create: bool,
+    #[clap(long, help = "disable CREATE INDEX Statement", default_value_t = false)]
+    pub disable_create_index: bool,
+    #[clap(long, help = "disable DROP Statement", default_value_t = false)]
+    pub disable_drop: bool,
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
@@ -90,7 +102,7 @@ impl SimulatorCLI {
         }
 
         if self.minimum_tests > self.maximum_tests {
-            log::warn!(
+            tracing::warn!(
                 "minimum size '{}' is greater than '{}' maximum size, setting both to '{}'",
                 self.minimum_tests,
                 self.maximum_tests,

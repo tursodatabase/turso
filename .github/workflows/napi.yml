@@ -142,11 +142,11 @@ jobs:
         node:
           - '18'
           - '20'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - name: Setup node
-        uses: actions/setup-node@v4
+        uses: useblacksmith/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
       - name: Install dependencies
@@ -205,7 +205,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Setup node
-        uses: actions/setup-node@v4
+        uses: useblacksmith/setup-node@v5
         with:
           node-version: 20
       - name: Install dependencies

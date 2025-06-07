@@ -24,8 +24,16 @@ print(f'Inserting {insertions} rows...')
 
 for i in range(insertions):
     values = [generate_random_value(tbl_schema[f'col_{col}']['data_type']) for col in range(tbl_schema['colCount'])]
-    cur.execute(f'''
-        INSERT INTO tbl_{selected_tbl} ({cols})
-        VALUES ({', '.join(values)})
-    ''')
+    try:
+        cur.execute(f'''
+            INSERT INTO tbl_{selected_tbl} ({cols})
+            VALUES ({', '.join(values)})
+        ''')
+    except limbo.OperationalError as e:
+        if "UNIQUE constraint failed" in str(e):
+            # Ignore UNIQUE constraint violations
+            pass
+        else:
+            # Re-raise other operational errors
+            raise
 

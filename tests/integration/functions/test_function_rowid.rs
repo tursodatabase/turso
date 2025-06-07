@@ -122,7 +122,7 @@ fn test_integer_primary_key() -> anyhow::Result<()> {
         }
     }
     assert_eq!(rowids.len(), 2);
-    assert!(rowids[0] > 0);
-    assert!(rowids[1] == -1);
+    assert!(rowids[0] == -1);
+    assert!(rowids[1] == 0);
     Ok(())
 }

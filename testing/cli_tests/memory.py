@@ -20,7 +20,10 @@ def stub_memory_test(
     # zero_blob_size = 1024 **2
     zero_blob = "0" * blob_size * 2
     # vals = 100
-    big_stmt = ["CREATE TABLE temp (t1 BLOB, t2 INTEGER);"]
+    big_stmt = [
+        "CREATE TABLE temp (t1 BLOB, t2 INTEGER);",
+        "CREATE INDEX temp_index ON temp(t1);",
+    ]
     big_stmt = big_stmt + [
         f"INSERT INTO temp (t1) VALUES (zeroblob({blob_size}));"
         if i % 2 == 0 and blobs
@@ -38,6 +41,10 @@ def stub_memory_test(
 
     big_stmt.append("SELECT count(*) FROM temp;")
     expected.append(str(vals * 2))
+
+    big_stmt.append("DELETE FROM temp;")
+    big_stmt.append("SELECT count(*) FROM temp;")
+    expected.append(str(0))
 
     big_stmt = "".join(big_stmt)
     expected = "\n".join(expected)

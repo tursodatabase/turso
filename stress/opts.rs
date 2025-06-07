@@ -35,12 +35,16 @@ pub struct Opts {
     )]
     pub load_log: bool,
 
-    /// Database file
+    /// Skip writing to log file
     #[clap(
-        short = 'd',
-        long,
-        help = "database file",
-        default_value = "limbostress.db"
+        short = 's',
+        long = "skip-log",
+        help = "load log file instead of creating a new one",
+        default_value_t = false
     )]
-    pub db_file: String,
+    pub skip_log: bool,
+
+    /// Database file
+    #[clap(short = 'd', long, help = "database file")]
+    pub db_file: Option<String>,
 }

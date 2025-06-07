@@ -31,7 +31,7 @@ pub(crate) fn run_simulation(
     let env = env.lock().unwrap();
     env.io.print_stats();
 
-    log::info!("Simulation completed");
+    tracing::info!("Simulation completed");
 
     result
 }
@@ -97,13 +97,13 @@ fn execute_plan(
     let interaction = &plan[state.interaction_pointer][state.secondary_pointer];
 
     if let SimConnection::Disconnected = connection {
-        log::debug!("connecting {}", connection_index);
+        tracing::debug!("connecting {}", connection_index);
         env.connections[connection_index] =
             SimConnection::LimboConnection(env.db.connect().unwrap());
     } else {
         match execute_interaction(env, connection_index, interaction, &mut state.stack) {
             Ok(next_execution) => {
-                log::debug!("connection {} processed", connection_index);
+                tracing::debug!("connection {} processed", connection_index);
                 // Move to the next interaction or property
                 match next_execution {
                     ExecutionContinuation::NextInteraction => {
@@ -124,7 +124,7 @@ fn execute_plan(
                 }
             }
             Err(err) => {
-                log::error!("error {}", err);
+                tracing::error!("error {}", err);
                 return Err(err);
             }
         }

@@ -512,7 +512,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "core_tester"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1718,7 +1718,7 @@ dependencies = [
 
 [[package]]
 name = "limbo"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "limbo_core",
  "tempfile",
@@ -1728,14 +1728,14 @@ dependencies = [
 
 [[package]]
 name = "limbo-go"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "limbo_core",
 ]
 
 [[package]]
 name = "limbo-java"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "jni",
  "limbo_core",
@@ -1744,7 +1744,7 @@ dependencies = [
 
 [[package]]
 name = "limbo-wasm"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "console_error_panic_hook",
  "getrandom 0.2.15",
@@ -1757,7 +1757,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_cli"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "anyhow",
  "cfg-if",
@@ -1787,7 +1787,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_completion"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "limbo_ext",
  "mimalloc",
@@ -1795,7 +1795,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_core"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "bitflags 2.9.0",
  "built",
@@ -1853,7 +1853,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_crypto"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -1866,7 +1866,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_csv"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "csv",
  "limbo_ext",
@@ -1876,7 +1876,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_ext"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "chrono",
  "getrandom 0.3.2",
@@ -1885,7 +1885,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_ext_tests"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "env_logger 0.11.7",
  "lazy_static",
@@ -1896,7 +1896,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_ipaddr"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "ipnetwork",
  "limbo_ext",
@@ -1905,7 +1905,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_macros"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1914,7 +1914,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_node"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "limbo_core",
  "napi",
@@ -1924,7 +1924,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_percentile"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "limbo_ext",
  "mimalloc",
@@ -1932,7 +1932,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_regexp"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "limbo_ext",
  "mimalloc",
@@ -1941,7 +1941,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_series"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "limbo_ext",
  "mimalloc",
@@ -1951,7 +1951,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sim"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "anarchist-readable-name-generator-lib",
  "chrono",
@@ -1968,15 +1968,18 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "limbo_sqlite3"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "env_logger 0.11.7",
  "libc",
  "limbo_core",
+ "tempfile",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -1984,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sqlite3_parser"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "bitflags 2.9.0",
  "cc",
@@ -2004,13 +2007,14 @@ dependencies = [
 
 [[package]]
 name = "limbo_stress"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "anarchist-readable-name-generator-lib",
  "antithesis_sdk",
  "clap",
  "hex",
  "limbo",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-appender",
@@ -2019,7 +2023,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_time"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "chrono",
  "limbo_ext",
@@ -2031,7 +2035,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_uuid"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "limbo_ext",
  "mimalloc",
@@ -2690,7 +2694,7 @@ dependencies = [
 
 [[package]]
 name = "py-limbo"
-version = "0.0.20"
+version = "0.0.22-pre.1"
 dependencies = [
  "anyhow",
  "limbo_core",

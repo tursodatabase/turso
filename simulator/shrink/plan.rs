@@ -46,7 +46,7 @@ impl InteractionPlan {
 
         let after = plan.plan.len();
 
-        log::info!(
+        tracing::info!(
             "Shrinking interaction plan from {} to {} properties",
             before,
             after

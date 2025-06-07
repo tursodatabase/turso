@@ -1,17 +1,18 @@
 use std::{fmt::Display, path::Path, rc::Rc, vec};
 
-use limbo_core::{Connection, Result, StepResult};
+use limbo_core::{Connection, Result, StepResult, IO};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     model::{
         query::{
             select::{Distinctness, Predicate, ResultColumn},
-            Create, Delete, Drop, Insert, Query, Select,
+            update::Update,
+            Create, CreateIndex, Delete, Drop, Insert, Query, Select,
         },
         table::Value,
     },
-    runner::env::SimConnection,
+    runner::{env::SimConnection, io::SimulatorIO},
     SimulatorEnv,
 };
 
@@ -202,7 +203,9 @@ pub(crate) struct InteractionStats {
     pub(crate) read_count: usize,
     pub(crate) write_count: usize,
     pub(crate) delete_count: usize,
+    pub(crate) update_count: usize,
     pub(crate) create_count: usize,
+    pub(crate) create_index_count: usize,
     pub(crate) drop_count: usize,
 }
 
@@ -210,11 +213,13 @@ impl Display for InteractionStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Read: {}, Write: {}, Delete: {}, Create: {}, Drop: {}",
+            "Read: {}, Write: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}",
             self.read_count,
             self.write_count,
             self.delete_count,
+            self.update_count,
             self.create_count,
+            self.create_index_count,
             self.drop_count
         )
     }
@@ -369,6 +374,12 @@ impl Interactions {
                             Query::Select(select) => {
                                 select.shadow(env);
                             }
+                            Query::Update(update) => {
+                                update.shadow(env);
+                            }
+                            Query::CreateIndex(create_index) => {
+                                create_index.shadow(env);
+                            }
                         },
                         Interaction::Assertion(_) => {}
                         Interaction::Assumption(_) => {}
@@ -395,6 +406,8 @@ impl InteractionPlan {
         let mut delete = 0;
         let mut create = 0;
         let mut drop = 0;
+        let mut update = 0;
+        let mut create_index = 0;
 
         for interactions in &self.plan {
             match interactions {
@@ -407,6 +420,8 @@ impl InteractionPlan {
                                 Query::Delete(_) => delete += 1,
                                 Query::Create(_) => create += 1,
                                 Query::Drop(_) => drop += 1,
+                                Query::Update(_) => update += 1,
+                                Query::CreateIndex(_) => create_index += 1,
                             }
                         }
                     }
@@ -417,6 +432,8 @@ impl InteractionPlan {
                     Query::Delete(_) => delete += 1,
                     Query::Create(_) => create += 1,
                     Query::Drop(_) => drop += 1,
+                    Query::Update(_) => update += 1,
+                    Query::CreateIndex(_) => create_index += 1,
                 },
                 Interactions::Fault(_) => {}
             }
@@ -426,7 +443,9 @@ impl InteractionPlan {
             read_count: read,
             write_count: write,
             delete_count: delete,
+            update_count: update,
             create_count: create,
+            create_index_count: create_index,
             drop_count: drop,
         }
     }
@@ -446,7 +465,7 @@ impl ArbitraryFrom<&mut SimulatorEnv> for InteractionPlan {
             .push(Interactions::Query(Query::Create(create_query)));
 
         while plan.plan.len() < num_interactions {
-            log::debug!(
+            tracing::debug!(
                 "Generating interaction {}/{}",
                 plan.plan.len(),
                 num_interactions
@@ -457,7 +476,7 @@ impl ArbitraryFrom<&mut SimulatorEnv> for InteractionPlan {
             plan.plan.push(interactions);
         }
 
-        log::info!("Generated plan with {} interactions", plan.plan.len());
+        tracing::info!("Generated plan with {} interactions", plan.plan.len());
         plan
     }
 }
@@ -469,13 +488,13 @@ impl Interaction {
             Self::Assumption(_) | Self::Assertion(_) | Self::Fault(_) => vec![],
         }
     }
-    pub(crate) fn execute_query(&self, conn: &mut Rc<Connection>) -> ResultSet {
+    pub(crate) fn execute_query(&self, conn: &mut Rc<Connection>, io: &SimulatorIO) -> ResultSet {
         if let Self::Query(query) = self {
             let query_str = query.to_string();
             let rows = conn.query(&query_str);
             if rows.is_err() {
                 let err = rows.err();
-                log::debug!(
+                tracing::debug!(
                     "Error running query '{}': {:?}",
                     &query_str[0..query_str.len().min(4096)],
                     err
@@ -503,7 +522,9 @@ impl Interaction {
                         }
                         out.push(r);
                     }
-                    StepResult::IO => {}
+                    StepResult::IO => {
+                        io.run_once().unwrap();
+                    }
                     StepResult::Interrupt => {}
                     StepResult::Done => {
                         break;
@@ -626,8 +647,21 @@ fn random_delete<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions 
     Interactions::Query(Query::Delete(Delete::arbitrary_from(rng, env)))
 }
 
+fn random_update<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
+    Interactions::Query(Query::Update(Update::arbitrary_from(rng, env)))
+}
+
 fn random_drop<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
     Interactions::Query(Query::Drop(Drop::arbitrary_from(rng, env)))
+}
+
+fn random_create_index<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Option<Interactions> {
+    if env.tables.is_empty() {
+        return None;
+    }
+    Some(Interactions::Query(Query::CreateIndex(
+        CreateIndex::arbitrary_from(rng, env),
+    )))
 }
 
 fn random_fault<R: rand::Rng>(_rng: &mut R, _env: &SimulatorEnv) -> Interactions {
@@ -661,8 +695,23 @@ impl ArbitraryFrom<(&SimulatorEnv, InteractionStats)> for Interactions {
                     Box::new(|rng: &mut R| random_create(rng, env)),
                 ),
                 (
+                    remaining_.create_index,
+                    Box::new(|rng: &mut R| {
+                        if let Some(interaction) = random_create_index(rng, env) {
+                            interaction
+                        } else {
+                            // if no tables exist, we can't create an index, so fallback to creating a table
+                            random_create(rng, env)
+                        }
+                    }),
+                ),
+                (
                     remaining_.delete,
                     Box::new(|rng: &mut R| random_delete(rng, env)),
+                ),
+                (
+                    remaining_.update,
+                    Box::new(|rng: &mut R| random_update(rng, env)),
                 ),
                 (
                     // remaining_.drop,

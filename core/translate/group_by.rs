@@ -20,7 +20,7 @@ use super::{
     emitter::{Resolver, TranslateCtx},
     expr::{translate_condition_expr, translate_expr, ConditionMetadata},
     order_by::order_by_sorter_insert,
-    plan::{Aggregate, Distinctness, GroupBy, SelectPlan, TableReference},
+    plan::{Aggregate, Distinctness, GroupBy, SelectPlan, TableReferences},
     result_row::emit_select_result,
 };
 
@@ -88,8 +88,6 @@ pub fn init_group_by(
     group_by: &GroupBy,
     plan: &SelectPlan,
 ) -> Result<()> {
-    let num_aggs = plan.aggregates.len();
-
     let non_aggregate_count = plan
         .result_columns
         .iter()
@@ -110,14 +108,24 @@ pub fn init_group_by(
     let reg_data_in_acc_flag = program.alloc_register();
     let reg_abort_flag = program.alloc_register();
     let reg_group_exprs_cmp = program.alloc_registers(group_by.exprs.len());
+
+    // The following two blocks of registers should always be allocated contiguously,
+    // because they are cleared in a contiguous block in the GROUP BYs clear accumulator subroutine.
+    // START BLOCK
     let reg_non_aggregate_exprs_acc = program.alloc_registers(non_aggregate_count);
-    let reg_agg_exprs_start = program.alloc_registers(num_aggs);
+    if !plan.aggregates.is_empty() {
+        // Aggregate registers need to be NULLed at the start because the same registers might be reused on another invocation of a subquery,
+        // and if they are not NULLed, the 2nd invocation of the same subquery will have values left over from the first invocation.
+        t_ctx.reg_agg_start = Some(program.alloc_registers_and_init_w_null(plan.aggregates.len()));
+    }
+    // END BLOCK
+
     let reg_sorter_key = program.alloc_register();
     let column_count = plan.group_by_sorter_column_count();
     let reg_group_by_source_cols_start = program.alloc_registers(column_count);
 
     let row_source = if let Some(sort_order) = group_by.sort_order.as_ref() {
-        let sort_cursor = program.alloc_cursor_id(None, CursorType::Sorter);
+        let sort_cursor = program.alloc_cursor_id(CursorType::Sorter);
         let sorter_column_count = plan.group_by_sorter_column_count();
         // Should work the same way as Order By
         /*
@@ -137,8 +145,7 @@ pub fn init_group_by(
                 ast::Expr::Column { table, column, .. } => {
                     let table_reference = plan
                         .table_references
-                        .iter()
-                        .find(|t| t.internal_id == *table)
+                        .find_joined_table_by_internal_id(*table)
                         .unwrap();
 
                     let Some(table_column) = table_reference.table.get_column_at(*column) else {
@@ -203,8 +210,6 @@ pub fn init_group_by(
         return_reg: reg_subrtn_acc_clear_return_offset,
     });
 
-    t_ctx.reg_agg_start = Some(reg_agg_exprs_start);
-
     t_ctx.meta_group_by = Some(GroupByMetadata {
         row_source,
         labels: GroupByLabels {
@@ -262,7 +267,7 @@ pub fn group_by_create_pseudo_table(
         columns: pseudo_columns,
     });
 
-    program.alloc_cursor_id(None, CursorType::Pseudo(pseudo_table.clone()))
+    program.alloc_cursor_id(CursorType::Pseudo(pseudo_table.clone()))
 }
 
 /// In case sorting is needed for GROUP BY, sorts the rows in the GROUP BY sorter
@@ -552,10 +557,12 @@ pub fn group_by_process_single_group(
 
     // Process each aggregate function for the current row
     program.resolve_label(labels.label_grouping_agg_step, program.offset());
-    let start_reg = t_ctx.reg_agg_start.unwrap();
     let cursor_index = *non_group_by_non_agg_column_count + group_by.exprs.len(); // Skipping all columns in sorter that not an aggregation arguments
     let mut offset = 0;
     for (i, agg) in plan.aggregates.iter().enumerate() {
+        let start_reg = t_ctx
+            .reg_agg_start
+            .expect("aggregate registers must be initialized");
         let agg_result_reg = start_reg + i;
         let agg_arg_source = match &row_source {
             GroupByRowSource::Sorter { pseudo_cursor, .. } => {
@@ -760,6 +767,7 @@ pub fn group_by_emit_row_phase<'a>(
     });
     program.emit_insn(Insn::Return {
         return_reg: registers.reg_subrtn_acc_output_return_offset,
+        can_fallthrough: false,
     });
 
     program.resolve_label(labels.label_subrtn_acc_output, program.offset());
@@ -784,13 +792,16 @@ pub fn group_by_emit_row_phase<'a>(
     }
     program.emit_insn(Insn::Return {
         return_reg: registers.reg_subrtn_acc_output_return_offset,
+        can_fallthrough: false,
     });
 
-    // Finalize aggregate values for output
-    let agg_start_reg = t_ctx.reg_agg_start.unwrap();
     // Resolve the label for the start of the group by output row subroutine
     program.resolve_label(labels.label_agg_final, program.offset());
+    // Finalize aggregate values for output
     for (i, agg) in plan.aggregates.iter().enumerate() {
+        let agg_start_reg = t_ctx
+            .reg_agg_start
+            .expect("aggregate registers must be initialized");
         let agg_result_reg = agg_start_reg + i;
         program.emit_insn(Insn::AggFinal {
             register: agg_result_reg,
@@ -863,6 +874,9 @@ pub fn group_by_emit_row_phase<'a>(
 
     // Map aggregate expressions to their result registers
     for (i, agg) in plan.aggregates.iter().enumerate() {
+        let agg_start_reg = t_ctx
+            .reg_agg_start
+            .expect("aggregate registers must be initialized");
         t_ctx
             .resolver
             .expr_to_reg_cache
@@ -897,7 +911,6 @@ pub fn group_by_emit_row_phase<'a>(
                 t_ctx.reg_offset,
                 t_ctx.reg_result_cols_start.unwrap(),
                 t_ctx.limit_ctx,
-                t_ctx.reg_limit_offset_sum,
             )?;
         }
         Some(_) => {
@@ -916,6 +929,7 @@ pub fn group_by_emit_row_phase<'a>(
 
     program.emit_insn(Insn::Return {
         return_reg: registers.reg_subrtn_acc_output_return_offset,
+        can_fallthrough: false,
     });
 
     // Subroutine to clear accumulators for a new group
@@ -955,6 +969,7 @@ pub fn group_by_emit_row_phase<'a>(
     });
     program.emit_insn(Insn::Return {
         return_reg: registers.reg_subrtn_acc_clear_return_offset,
+        can_fallthrough: false,
     });
     program.preassign_label_to_next_insn(labels.label_group_by_end);
     Ok(())
@@ -968,7 +983,7 @@ pub fn group_by_emit_row_phase<'a>(
 /// and the actual result value of the aggregation is materialized.
 pub fn translate_aggregation_step_groupby(
     program: &mut ProgramBuilder,
-    referenced_tables: &[TableReference],
+    referenced_tables: &TableReferences,
     agg_arg_source: GroupByAggArgumentSource,
     target_register: usize,
     resolver: &Resolver,

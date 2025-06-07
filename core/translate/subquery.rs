@@ -5,9 +5,9 @@ use crate::{
 };
 
 use super::{
-    emitter::{emit_query, LimitCtx, Resolver, TranslateCtx},
+    emitter::{emit_query, Resolver, TranslateCtx},
     main_loop::LoopLabels,
-    plan::{QueryDestination, SelectPlan, TableReference},
+    plan::{QueryDestination, SelectPlan, TableReferences},
 };
 
 /// Emit the subqueries contained in the FROM clause.
@@ -15,9 +15,9 @@ use super::{
 pub fn emit_subqueries(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
-    tables: &mut [TableReference],
+    tables: &mut TableReferences,
 ) -> Result<()> {
-    for table_reference in tables.iter_mut() {
+    for table_reference in tables.joined_tables_mut() {
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
             // Emit the subquery and get the start register of the result columns.
             let result_columns_start =
@@ -65,22 +65,22 @@ pub fn emit_subquery<'a>(
     }
     let end_coroutine_label = program.allocate_label();
     let mut metadata = TranslateCtx {
-        labels_main_loop: (0..plan.table_references.len())
+        labels_main_loop: (0..plan.joined_tables().len())
             .map(|_| LoopLabels::new(program))
             .collect(),
         label_main_loop_end: None,
         meta_group_by: None,
-        meta_left_joins: (0..plan.table_references.len()).map(|_| None).collect(),
+        meta_left_joins: (0..plan.joined_tables().len()).map(|_| None).collect(),
         meta_sort: None,
         reg_agg_start: None,
         reg_nonagg_emit_once_flag: None,
         reg_result_cols_start: None,
         result_column_indexes_in_orderby_sorter: (0..plan.result_columns.len()).collect(),
         result_columns_to_skip_in_orderby_sorter: None,
-        limit_ctx: plan.limit.map(|_| LimitCtx::new(program)),
-        reg_offset: plan.offset.map(|_| program.alloc_register()),
-        reg_limit_offset_sum: plan.offset.map(|_| program.alloc_register()),
-        resolver: Resolver::new(t_ctx.resolver.symbol_table),
+        limit_ctx: None,
+        reg_offset: None,
+        reg_limit_offset_sum: None,
+        resolver: Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table),
     };
     let subquery_body_end_label = program.allocate_label();
     program.emit_insn(Insn::InitCoroutine {
@@ -89,15 +89,6 @@ pub fn emit_subquery<'a>(
         start_offset: coroutine_implementation_start_offset,
     });
     program.preassign_label_to_next_insn(coroutine_implementation_start_offset);
-    // Normally we mark each LIMIT value as a constant insn that is emitted only once, but in the case of a subquery,
-    // we need to initialize it every time the subquery is run; otherwise subsequent runs of the subquery will already
-    // have the LIMIT counter at 0, and will never return rows.
-    if let Some(limit) = plan.limit {
-        program.emit_insn(Insn::Integer {
-            value: limit as i64,
-            dest: metadata.limit_ctx.unwrap().reg_limit,
-        });
-    }
     let result_column_start_reg = emit_query(program, plan, &mut metadata)?;
     program.resolve_label(end_coroutine_label, program.offset());
     program.emit_insn(Insn::EndCoroutine { yield_reg });

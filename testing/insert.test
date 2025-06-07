@@ -130,12 +130,12 @@ do_execsql_test_in_memory_any_error strict-update-not-null-constraint {
 }
 
 # Uncomment following test case when unique constraint is added
-#do_execsql_test_any_error strict-update-pk-constraint {
-#    CREATE TABLE test8(id INTEGER PRIMARY KEY, name TEXT) STRICT;
-#    INSERT INTO test8 VALUES(1, 'name1');
-#    INSERT INTO test8 VALUES(2, 'name2');
-#    UPDATE test8 SET id = 2 WHERE id = 1;
-#}
+do_execsql_test_in_memory_any_error strict-update-pk-constraint {
+    CREATE TABLE test8(id INTEGER PRIMARY KEY, name TEXT) STRICT;
+    INSERT INTO test8 VALUES(1, 'name1');
+    INSERT INTO test8 VALUES(2, 'name2');
+    UPDATE test8 SET id = 2 WHERE id = 1;
+}
 
 do_execsql_test_on_specific_db {:memory:} strict-update-multiple-columns {
     CREATE TABLE test9(id INTEGER, name TEXT, price REAL, quantity INT) STRICT;
@@ -196,3 +196,121 @@ do_execsql_test_on_specific_db {:memory:} unique_insert_with_pkey {
     SELECT * FROM t2;
 } {1|1
 2|6}
+
+do_execsql_test_on_specific_db {:memory:} insert_from_select_1 {
+    CREATE TABLE t(a);
+    CREATE TABLE t2(b, c);
+    INSERT INTO t2 values (1, 2), (10, 20);
+    INSERT INTO t SELECT b FROM t2;
+    SELECT * FROM t;
+    INSERT INTO t SELECT c FROM t2;
+    SELECT * FROM t;
+} {1
+10
+1
+10
+2
+20}
+
+do_execsql_test_on_specific_db {:memory:} insert_from_select_where {
+    CREATE TABLE t(a);
+    CREATE TABLE t2(b, c);
+    INSERT INTO t2 values (1, 2), (10, 20);
+    INSERT INTO t SELECT b FROM t2 WHERE b < 10;
+    SELECT * FROM t;
+    INSERT INTO t SELECT c FROM t2 WHERE c > 2;
+    SELECT * FROM t;
+} {1
+1
+20}
+
+do_execsql_test_on_specific_db {:memory:} insert_from_select_union_all {
+    CREATE TABLE t1(x INTEGER);
+    CREATE TABLE t2(x INTEGER); 
+    CREATE TABLE t3(x INTEGER);
+    
+    INSERT INTO t1 VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(4),(5),(6);
+    INSERT INTO t3 VALUES(7),(8),(9);
+
+    INSERT INTO t1 SELECT x FROM t2 UNION ALL SELECT x FROM t3;
+    SELECT * FROM t1;
+} {1
+2
+3
+4
+5
+6
+7
+8
+9}
+
+do_execsql_test_on_specific_db {:memory:} insert_from_select_union_all_where {
+    CREATE TABLE t1(x INTEGER);
+    CREATE TABLE t2(x INTEGER); 
+    CREATE TABLE t3(x INTEGER);
+    
+    INSERT INTO t1 VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(4),(5),(6);
+    INSERT INTO t3 VALUES(7),(8),(9);
+
+    INSERT INTO t1 SELECT x FROM t2 WHERE x != 4 UNION ALL SELECT x FROM t3 WHERE x == 8;
+    SELECT * FROM t1;
+} {1
+2
+3
+5
+6
+8}
+
+do_execsql_test_on_specific_db {:memory:} insert_from_select_same_table {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    
+    INSERT INTO t(b) VALUES (1),(2),(3);
+    SELECT * FROM t;
+    INSERT INTO t(b) SELECT b FROM t;
+    SELECT * FROM t;
+} {1|1
+2|2
+3|3
+1|1
+2|2
+3|3
+4|1
+5|2
+6|3}
+
+do_execsql_test_on_specific_db {:memory:} insert_from_select_same_table_2 {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b, c);
+    
+    INSERT INTO t(b, c) VALUES (1, 100),(2, 200),(3, 300);
+    SELECT * FROM t;
+    INSERT INTO t(b, c) SELECT b,c FROM t;
+    SELECT * FROM t;
+} {1|1|100
+2|2|200
+3|3|300
+1|1|100
+2|2|200
+3|3|300
+4|1|100
+5|2|200
+6|3|300}
+
+do_execsql_test_on_specific_db {:memory:} insert_from_select_union {
+    CREATE TABLE t(a, b); 
+    CREATE TABLE t2(b, c);
+
+    INSERT INTO t2 VALUES (1, 100), (2, 200);
+    INSERT INTO t SELECT * FROM t UNION SELECT * FROM t2;
+    SELECT * FROM t;
+} {1|100
+2|200}
+
+do_execsql_test_on_specific_db {:memory:} negative-primary-integer-key {
+    CREATE TABLE t(a INTEGER PRIMARY KEY);
+    insert into t values (-2),(13);
+    select * from t order by a asc;
+} {-2
+13}
+

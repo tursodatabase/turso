@@ -4,6 +4,7 @@ use crate::schema::Schema;
 use crate::storage::database::FileMemoryStorage;
 use crate::storage::page_cache::DumbLruPageCache;
 use crate::storage::pager::CreateBTreeFlags;
+use crate::storage::wal::DummyWAL;
 use crate::types::ImmutableRecord;
 use crate::{
     error::{LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_PRIMARYKEY},
@@ -49,7 +50,7 @@ use crate::{
 
 use super::{
     insn::{Cookie, RegisterOrLiteral},
-    HaltState,
+    CommitState,
 };
 use parking_lot::RwLock;
 use rand::thread_rng;
@@ -321,15 +322,17 @@ pub fn op_null(
     pager: &Rc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    let Insn::Null { dest, dest_end } = insn else {
-        unreachable!("unexpected Insn {:?}", insn)
-    };
-    if let Some(dest_end) = dest_end {
-        for i in *dest..=*dest_end {
-            state.registers[i] = Register::Value(Value::Null);
+    match insn {
+        Insn::Null { dest, dest_end } | Insn::BeginSubrtn { dest, dest_end } => {
+            if let Some(dest_end) = dest_end {
+                for i in *dest..=*dest_end {
+                    state.registers[i] = Register::Value(Value::Null);
+                }
+            } else {
+                state.registers[*dest] = Register::Value(Value::Null);
+            }
         }
-    } else {
-        state.registers[*dest] = Register::Value(Value::Null);
+        _ => unreachable!("unexpected Insn {:?}", insn),
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -997,7 +1000,9 @@ pub fn op_vopen(
     state
         .cursors
         .borrow_mut()
-        .insert(*cursor_id, Some(Cursor::Virtual(cursor)));
+        .get_mut(*cursor_id)
+        .unwrap_or_else(|| panic!("cursor id {} out of bounds", *cursor_id))
+        .replace(Cursor::Virtual(cursor));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -1035,23 +1040,8 @@ pub fn op_vcreate(
             "Failed to upgrade Connection".to_string(),
         ));
     };
-    let mod_type = conn
-        .syms
-        .borrow()
-        .vtab_modules
-        .get(&module_name)
-        .ok_or_else(|| {
-            crate::LimboError::ExtensionError(format!("Module {} not found", module_name))
-        })?
-        .module_kind;
-    let table = crate::VirtualTable::from_args(
-        Some(&table_name),
-        &module_name,
-        args,
-        &conn.syms.borrow(),
-        mod_type,
-        None,
-    )?;
+    let table =
+        crate::VirtualTable::table(Some(&table_name), &module_name, args, &conn.syms.borrow())?;
     {
         conn.syms
             .borrow_mut()
@@ -1080,28 +1070,19 @@ pub fn op_vfilter(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
-    let CursorType::VirtualTable(virtual_table) = cursor_type else {
-        panic!("VFilter on non-virtual table cursor");
-    };
     let has_rows = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_virtual_mut();
         let mut args = Vec::with_capacity(*arg_count);
         for i in 0..*arg_count {
-            args.push(
-                state.registers[args_reg + i]
-                    .get_owned_value()
-                    .clone()
-                    .to_ffi(),
-            );
+            args.push(state.registers[args_reg + i].get_owned_value().clone());
         }
         let idx_str = if let Some(idx_str) = idx_str {
             Some(state.registers[*idx_str].get_owned_value().to_string())
         } else {
             None
         };
-        virtual_table.filter(cursor, *idx_num as i32, idx_str, *arg_count, args)?
+        cursor.filter(*idx_num as i32, idx_str, *arg_count, args)?
     };
     if !has_rows {
         state.pc = pc_if_empty.to_offset_int();
@@ -1126,14 +1107,10 @@ pub fn op_vcolumn(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
-    let CursorType::VirtualTable(virtual_table) = cursor_type else {
-        panic!("VColumn on non-virtual table cursor");
-    };
     let value = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_virtual_mut();
-        virtual_table.column(cursor, *column)?
+        cursor.column(*column)?
     };
     state.registers[*dest] = Register::Value(value);
     state.pc += 1;
@@ -1184,7 +1161,7 @@ pub fn op_vupdate(
             if *conflict_action == 5 {
                 // ResolveType::Replace
                 if let Some(conn) = program.connection.upgrade() {
-                    conn.update_last_rowid(new_rowid as u64);
+                    conn.update_last_rowid(new_rowid);
                 }
             }
             state.pc += 1;
@@ -1218,14 +1195,10 @@ pub fn op_vnext(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
-    let CursorType::VirtualTable(virtual_table) = cursor_type else {
-        panic!("VNext on non-virtual table cursor");
-    };
     let has_more = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_virtual_mut();
-        virtual_table.next(cursor)?
+        cursor.next()?
     };
     if has_more {
         state.pc = pc_if_next.to_offset_int();
@@ -1364,7 +1337,7 @@ pub fn op_column(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seek.take() {
+    if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seeks[*cursor_id].take() {
         let deferred_seek = {
             let rowid = {
                 let mut index_cursor = state.get_cursor(index_cursor_id);
@@ -1379,7 +1352,7 @@ pub fn op_column(
             }
         };
         if let Some(deferred_seek) = deferred_seek {
-            state.deferred_seek = Some(deferred_seek);
+            state.deferred_seeks[*cursor_id] = Some(deferred_seek);
             return Ok(InsnFunctionStepResult::IO);
         }
     }
@@ -1636,6 +1609,10 @@ pub fn op_halt(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
+    if *err_code > 0 {
+        // invalidate page cache in case of error
+        pager.clear_page_cache();
+    }
     match *err_code {
         0 => {}
         SQLITE_CONSTRAINT_PRIMARYKEY => {
@@ -1651,7 +1628,7 @@ pub fn op_halt(
             )));
         }
     }
-    match program.halt(pager.clone(), state, mv_store)? {
+    match program.commit_txn(pager.clone(), state, mv_store)? {
         StepResult::Done => Ok(InsnFunctionStepResult::Done),
         StepResult::IO => Ok(InsnFunctionStepResult::IO),
         StepResult::Row => Ok(InsnFunctionStepResult::Row),
@@ -1726,8 +1703,8 @@ pub fn op_auto_commit(
         unreachable!("unexpected Insn {:?}", insn)
     };
     let conn = program.connection.upgrade().unwrap();
-    if matches!(state.halt_state, Some(HaltState::Checkpointing)) {
-        return match program.halt(pager.clone(), state, mv_store)? {
+    if state.commit_state == CommitState::Committing {
+        return match program.commit_txn(pager.clone(), state, mv_store)? {
             super::StepResult::Done => Ok(InsnFunctionStepResult::Done),
             super::StepResult::IO => Ok(InsnFunctionStepResult::IO),
             super::StepResult::Row => Ok(InsnFunctionStepResult::Row),
@@ -1755,7 +1732,7 @@ pub fn op_auto_commit(
             "cannot commit - no transaction is active".to_string(),
         ));
     }
-    return match program.halt(pager.clone(), state, mv_store)? {
+    return match program.commit_txn(pager.clone(), state, mv_store)? {
         super::StepResult::Done => Ok(InsnFunctionStepResult::Done),
         super::StepResult::IO => Ok(InsnFunctionStepResult::IO),
         super::StepResult::Row => Ok(InsnFunctionStepResult::Row),
@@ -1806,7 +1783,11 @@ pub fn op_return(
     pager: &Rc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    let Insn::Return { return_reg } = insn else {
+    let Insn::Return {
+        return_reg,
+        can_fallthrough,
+    } = insn
+    else {
         unreachable!("unexpected Insn {:?}", insn)
     };
     if let Value::Integer(pc) = state.registers[*return_reg].get_owned_value() {
@@ -1815,9 +1796,12 @@ pub fn op_return(
             .unwrap_or_else(|_| panic!("Return register is negative: {}", pc));
         state.pc = pc;
     } else {
-        return Err(LimboError::InternalError(
-            "Return register is not an integer".to_string(),
-        ));
+        if !*can_fallthrough {
+            return Err(LimboError::InternalError(
+                "Return register is not an integer".to_string(),
+            ));
+        }
+        state.pc += 1;
     }
     Ok(InsnFunctionStepResult::Step)
 }
@@ -1909,7 +1893,7 @@ pub fn op_row_id(
     let Insn::RowId { cursor_id, dest } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seek.take() {
+    if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seeks[*cursor_id].take() {
         let deferred_seek = {
             let rowid = {
                 let mut index_cursor = state.get_cursor(index_cursor_id);
@@ -1918,7 +1902,7 @@ pub fn op_row_id(
                 let record = record.as_ref().unwrap();
                 let rowid = record.get_values().last().unwrap();
                 match rowid {
-                    RefValue::Integer(rowid) => *rowid as u64,
+                    RefValue::Integer(rowid) => *rowid,
                     _ => unreachable!(),
                 }
             };
@@ -1930,7 +1914,7 @@ pub fn op_row_id(
             }
         };
         if let Some(deferred_seek) = deferred_seek {
-            state.deferred_seek = Some(deferred_seek);
+            state.deferred_seeks[*cursor_id] = Some(deferred_seek);
             return Ok(InsnFunctionStepResult::IO);
         }
     }
@@ -1942,11 +1926,7 @@ pub fn op_row_id(
             state.registers[*dest] = Register::Value(Value::Null);
         }
     } else if let Some(Cursor::Virtual(virtual_cursor)) = cursors.get_mut(*cursor_id).unwrap() {
-        let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
-        let CursorType::VirtualTable(virtual_table) = cursor_type else {
-            panic!("VUpdate on non-virtual table cursor");
-        };
-        let rowid = virtual_table.rowid(virtual_cursor);
+        let rowid = virtual_cursor.rowid();
         if rowid != 0 {
             state.registers[*dest] = Register::Value(Value::Integer(rowid));
         } else {
@@ -2003,7 +1983,7 @@ pub fn op_seek_rowid(
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
         let rowid = match state.registers[*src_reg].get_owned_value() {
-            Value::Integer(rowid) => Some(*rowid as u64),
+            Value::Integer(rowid) => Some(*rowid),
             Value::Null => None,
             other => {
                 return Err(LimboError::InternalError(format!(
@@ -2042,7 +2022,7 @@ pub fn op_deferred_seek(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    state.deferred_seek = Some((*index_cursor_id, *table_cursor_id));
+    state.deferred_seeks[*table_cursor_id] = Some((*index_cursor_id, *table_cursor_id));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2127,7 +2107,7 @@ pub fn op_seek(
                     return_if_io!(cursor.rewind());
                     None
                 }
-                Value::Integer(rowid) => Some(*rowid as u64),
+                Value::Integer(rowid) => Some(*rowid),
                 _ => {
                     return Err(LimboError::InternalError(format!(
                         "{}: the value in the register is not an integer",
@@ -2466,7 +2446,10 @@ pub fn op_agg_step(
         AggFunc::Avg => {
             let col = state.registers[*col].clone();
             let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                unreachable!();
+                panic!(
+                    "Unexpected value {:?} in AggStep at register {}",
+                    state.registers[*acc_reg], *acc_reg
+                );
             };
             let AggContext::Avg(acc, count) = agg.borrow_mut() else {
                 unreachable!();
@@ -2477,7 +2460,10 @@ pub fn op_agg_step(
         AggFunc::Sum | AggFunc::Total => {
             let col = state.registers[*col].clone();
             let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                unreachable!();
+                panic!(
+                    "Unexpected value {:?} at register {:?} in AggStep",
+                    state.registers[*acc_reg], *acc_reg
+                );
             };
             let AggContext::Sum(acc) = agg.borrow_mut() else {
                 unreachable!();
@@ -2496,7 +2482,10 @@ pub fn op_agg_step(
                     Register::Aggregate(AggContext::Count(Value::Integer(0)));
             }
             let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                unreachable!();
+                panic!(
+                    "Unexpected value {:?} in AggStep at register {}",
+                    state.registers[*acc_reg], *acc_reg
+                );
             };
             let AggContext::Count(count) = agg.borrow_mut() else {
                 unreachable!();
@@ -2509,7 +2498,10 @@ pub fn op_agg_step(
         AggFunc::Max => {
             let col = state.registers[*col].clone();
             let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                unreachable!();
+                panic!(
+                    "Unexpected value {:?} in AggStep at register {}",
+                    state.registers[*acc_reg], *acc_reg
+                );
             };
             let AggContext::Max(acc) = agg.borrow_mut() else {
                 unreachable!();
@@ -2542,7 +2534,10 @@ pub fn op_agg_step(
         AggFunc::Min => {
             let col = state.registers[*col].clone();
             let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                unreachable!();
+                panic!(
+                    "Unexpected value {:?} in AggStep",
+                    state.registers[*acc_reg]
+                );
             };
             let AggContext::Min(acc) = agg.borrow_mut() else {
                 unreachable!();
@@ -2790,8 +2785,8 @@ pub fn op_agg_final(
                 _ => {}
             }
         }
-        _ => {
-            unreachable!();
+        other => {
+            panic!("Unexpected value {:?} in AggFinal", other);
         }
     };
     state.pc += 1;
@@ -3834,7 +3829,7 @@ pub fn op_insert(
         // NOTE(pere): Sending moved_before == true is okay because we moved before but
         // if we were to set to false after starting a balance procedure, it might
         // leave undefined state.
-        return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key as u64, Some(record)), true));
+        return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(record)), true));
         // Only update last_insert_rowid for regular table inserts, not schema modifications
         if cursor.root_page() != 1 {
             if let Some(rowid) = cursor.rowid()? {
@@ -3876,6 +3871,7 @@ pub fn op_delete(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[derive(Debug)]
 pub enum OpIdxDeleteState {
     Seeking(ImmutableRecord), // First seek row to delete
     Deleting,
@@ -3931,6 +3927,7 @@ pub fn op_idx_delete(
                 let n_change = program.n_change.get();
                 program.n_change.set(n_change + 1);
                 state.pc += 1;
+                state.op_idx_delete_state = None;
                 return Ok(InsnFunctionStepResult::Step);
             }
             None => {
@@ -4516,6 +4513,37 @@ pub fn op_read_cookie(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_set_cookie(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Rc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    let Insn::SetCookie {
+        db,
+        cookie,
+        value,
+        p5,
+    } = insn
+    else {
+        unreachable!("unexpected Insn {:?}", insn)
+    };
+    if *db > 0 {
+        todo!("temp databases not implemented yet");
+    }
+    match cookie {
+        Cookie::UserVersion => {
+            let mut header_guard = pager.db_header.lock();
+            header_guard.user_version = *value;
+            pager.write_database_header(&*header_guard)?;
+        }
+        cookie => todo!("{cookie:?} is not yet implement for SetCookie"),
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_shift_right(
     program: &Program,
     state: &mut ProgramState,
@@ -4701,7 +4729,7 @@ pub fn op_open_ephemeral(
     let pager = Rc::new(Pager::finish_open(
         db_header,
         db_file,
-        None,
+        Rc::new(RefCell::new(DummyWAL)),
         io,
         page_cache,
         buffer_pool,

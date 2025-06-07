@@ -4,7 +4,7 @@ use crate::{
     schema::{Column, Index},
     translate::{
         expr::as_binary_components,
-        plan::{JoinOrderMember, TableReference, WhereTerm},
+        plan::{JoinOrderMember, TableReferences, WhereTerm},
         planner::{table_mask_from_expr, TableMask},
     },
     Result,
@@ -172,13 +172,13 @@ fn estimate_selectivity(column: &Column, op: ast::Operator) -> f64 {
 /// The resulting list of [TableConstraints] is then used to evaluate the best access methods for various join orders.
 pub fn constraints_from_where_clause(
     where_clause: &[WhereTerm],
-    table_references: &[TableReference],
+    table_references: &TableReferences,
     available_indexes: &HashMap<String, Vec<Arc<Index>>>,
 ) -> Result<Vec<TableConstraints>> {
     let mut constraints = Vec::new();
 
     // For each table, collect all the Constraints and all potential index candidates that may use them.
-    for table_reference in table_references.iter() {
+    for table_reference in table_references.joined_tables() {
         let rowid_alias_column = table_reference
             .columns()
             .iter()

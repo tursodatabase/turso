@@ -110,10 +110,7 @@ pub fn translate_create_table(
     }
 
     let table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(
-        Some(SQLITE_TABLEID.to_owned()),
-        CursorType::BTreeTable(table.clone()),
-    );
+    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1usize.into(),
@@ -588,10 +585,7 @@ pub fn translate_create_virtual_table(
         args_reg,
     });
     let table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(
-        Some(SQLITE_TABLEID.to_owned()),
-        CursorType::BTreeTable(table.clone()),
-    );
+    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1usize.into(),
@@ -658,7 +652,6 @@ pub fn translate_drop_table(
     let schema_table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id_0 = program.alloc_cursor_id(
         //  cursor 0
-        Some(SQLITE_TABLEID.to_string()),
         CursorType::BTreeTable(schema_table.clone()),
     );
     program.emit_insn(Insn::OpenWrite {
@@ -772,10 +765,8 @@ pub fn translate_drop_table(
         //  4. Open an ephemeral table, and read over the entry from the schema table whose root page was moved in the destroy operation
 
         //  cursor id 1
-        let sqlite_schema_cursor_id_1 = program.alloc_cursor_id(
-            Some(SQLITE_TABLEID.to_owned()),
-            CursorType::BTreeTable(schema_table.clone()),
-        );
+        let sqlite_schema_cursor_id_1 =
+            program.alloc_cursor_id(CursorType::BTreeTable(schema_table.clone()));
         let simple_table_rc = Rc::new(BTreeTable {
             root_page: 0, // Not relevant for ephemeral table definition
             name: "ephemeral_scratch".to_string(),
@@ -796,10 +787,7 @@ pub fn translate_drop_table(
             unique_sets: None,
         });
         //  cursor id 2
-        let ephemeral_cursor_id = program.alloc_cursor_id(
-            Some("scratch_table".to_string()),
-            CursorType::BTreeTable(simple_table_rc),
-        );
+        let ephemeral_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(simple_table_rc));
         program.emit_insn(Insn::OpenEphemeral {
             cursor_id: ephemeral_cursor_id,
             is_table: true,

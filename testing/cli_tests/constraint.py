@@ -2,6 +2,7 @@
 
 # Eventually extract these tests to be in the fuzzing integration tests
 import os
+import tempfile
 from faker import Faker
 from faker.providers.lorem.en_US import Provider as P
 from cli_tests.test_limbo_cli import TestLimboShell
@@ -244,7 +245,6 @@ class Table(BaseModel):
 
 class ConstraintTest(BaseModel):
     table: Table
-    db_path: str = "testing/constraint.db"
     insert_stmts: list[str]
     insert_errors: list[str]
     update_errors: list[str]
@@ -370,46 +370,31 @@ def all_tests() -> list[ConstraintTest]:
     return tests
 
 
-def cleanup(db_fullpath: str):
-    wal_path = f"{db_fullpath}-wal"
-    shm_path = f"{db_fullpath}-shm"
-    paths = [db_fullpath, wal_path, shm_path]
-    for path in paths:
-        if os.path.exists(path):
-            os.remove(path)
-
-
 def main():
     tests = all_tests()
     for test in tests:
         console.info(test.table)
-        db_path = test.db_path
-        try:
-            # Use with syntax to automatically close shell on error
-            with TestLimboShell("") as limbo:
-                limbo.execute_dot(f".open {db_path}")
-                test.run(limbo)
+        with tempfile.NamedTemporaryFile(suffix='.db') as tmp:
+            try:
+                # Use with syntax to automatically close shell on error
+                with TestLimboShell("") as limbo:
+                    limbo.execute_dot(f".open {tmp.name}")
+                    test.run(limbo)
+            except Exception as e:
+                console.error(f"Test FAILED: {e}")
+                console.debug(test.table.create_table(), test.insert_stmts)
+                exit(1)
 
-        except Exception as e:
-            console.error(f"Test FAILED: {e}")
-            console.debug(test.table.create_table(), test.insert_stmts)
-            cleanup(db_path)
-            exit(1)
-        # delete db after every compat test so we we have fresh db for next test
-        cleanup(db_path)
-
-    db_path = "testing/constraint.db"
     tests = [custom_test_2, regression_test_update_single_key]
     for test in tests:
-        try:
-            with TestLimboShell("") as limbo:
-                limbo.execute_dot(f".open {db_path}")
-                test(limbo)
-        except Exception as e:
-            console.error(f"Test FAILED: {e}")
-            cleanup(db_path)
-            exit(1)
-        cleanup(db_path)
+        with tempfile.NamedTemporaryFile(suffix='.db') as tmp:
+            try:
+                with TestLimboShell("") as limbo:
+                    limbo.execute_dot(f".open {tmp.name}")
+                    test(limbo)
+            except Exception as e:
+                console.error(f"Test FAILED: {e}")
+                exit(1)
     console.info("All tests passed successfully.")
 
 

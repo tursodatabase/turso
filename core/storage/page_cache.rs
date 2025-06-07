@@ -7,17 +7,9 @@ use super::pager::PageRef;
 
 const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES: usize = 2000;
 
-// In limbo, page cache is shared by default, meaning that multiple frames from WAL can reside in
-// the cache, meaning, we need a way to differentiate between pages cached in different
-// connections. For this we include the max_frame that a connection will read from so that if two
-// connections have different max_frames, they might or not have different frame read from WAL.
-//
-// WAL was introduced after Shared cache in SQLite, so this is why these two features don't work
-// well together because pages with different snapshots may collide.
 #[derive(Debug, Eq, Hash, PartialEq, Clone)]
 pub struct PageCacheKey {
     pgno: usize,
-    max_frame: Option<u64>,
 }
 
 #[allow(dead_code)]
@@ -67,8 +59,8 @@ pub enum CacheResizeResult {
 }
 
 impl PageCacheKey {
-    pub fn new(pgno: usize, max_frame: Option<u64>) -> Self {
-        Self { pgno, max_frame }
+    pub fn new(pgno: usize) -> Self {
+        Self { pgno }
     }
 }
 impl DumbLruPageCache {
@@ -474,8 +466,6 @@ impl DumbLruPageCache {
         );
     }
 
-    #[cfg(test)]
-    /// For testing purposes, in case we use cursor api directly, we might want to unmark pages as dirty because we bypass the WAL transaction layer
     pub fn unset_dirty_all_pages(&mut self) {
         for node in self.map.borrow_mut().iter_mut() {
             unsafe {
@@ -572,7 +562,6 @@ impl PageHashMap {
         self.buckets.iter().flat_map(|bucket| bucket.iter())
     }
 
-    #[cfg(test)]
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut HashMapNode> {
         self.buckets.iter_mut().flat_map(|bucket| bucket.iter_mut())
     }
@@ -607,7 +596,7 @@ mod tests {
     };
 
     fn create_key(id: usize) -> PageCacheKey {
-        PageCacheKey::new(id, Some(id as u64))
+        PageCacheKey::new(id)
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -844,20 +833,6 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_same_id_different_frame() {
-        let mut cache = DumbLruPageCache::default();
-        let key1_1 = PageCacheKey::new(1, Some(1 as u64));
-        let key1_2 = PageCacheKey::new(1, Some(2 as u64));
-        let page1_1 = page_with_content(1);
-        let page1_2 = page_with_content(1);
-
-        assert!(cache.insert(key1_1.clone(), page1_1.clone()).is_ok());
-        assert!(cache.insert(key1_2.clone(), page1_2.clone()).is_ok());
-        assert_eq!(cache.len(), 2);
-        cache.verify_list_integrity();
-    }
-
-    #[test]
     #[should_panic(expected = "Attempted to insert different page with same key")]
     fn test_insert_existing_key_fail() {
         let mut cache = DumbLruPageCache::default();
@@ -1018,8 +993,7 @@ mod tests {
                 0 => {
                     // add
                     let id_page = rng.next_u64() % max_pages;
-                    let id_frame = rng.next_u64() % max_pages;
-                    let key = PageCacheKey::new(id_page as usize, Some(id_frame));
+                    let key = PageCacheKey::new(id_page as usize);
                     #[allow(clippy::arc_with_non_send_sync)]
                     let page = Arc::new(Page::new(id_page as usize));
                     if let Some(_) = cache.peek(&key, false) {
@@ -1043,8 +1017,7 @@ mod tests {
                     let random = rng.next_u64() % 2 == 0;
                     let key = if random || lru.is_empty() {
                         let id_page: u64 = rng.next_u64() % max_pages;
-                        let id_frame = rng.next_u64() % max_pages;
-                        let key = PageCacheKey::new(id_page as usize, Some(id_frame));
+                        let key = PageCacheKey::new(id_page as usize);
                         key
                     } else {
                         let i = rng.next_u64() as usize % lru.len();
@@ -1069,7 +1042,6 @@ mod tests {
                 assert_eq!(page.get().id, key.pgno);
             }
         }
-        assert!(lru.len() > 0); // Check it inserted some
     }
 
     pub fn compare_to_lru(cache: &mut DumbLruPageCache, lru: &LruCache<PageCacheKey, PageRef>) {

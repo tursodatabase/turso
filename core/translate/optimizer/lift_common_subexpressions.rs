@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use limbo_sqlite3_parser::ast::{Expr, Operator};
 
 use crate::{
@@ -112,7 +114,7 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
         if found_non_empty_or_branches {
             // If we found an empty OR branch, we can remove the entire OR term.
             // E.g. (a AND b) OR (a) OR (a AND c) just becomes a.
-            where_clause[i].consumed = true;
+            where_clause[i].consumed.set(true);
         } else {
             assert!(new_or_operands_for_original_term.len() > 1);
             // Update the original WhereTerm's expression with the new OR structure (without common parts).
@@ -124,7 +126,7 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
             where_clause.push(WhereTerm {
                 expr: common_expr_to_add,
                 from_outer_join: term_from_outer_join,
-                consumed: false,
+                consumed: Cell::new(false),
             });
         }
 
@@ -255,7 +257,7 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
             from_outer_join: None,
-            consumed: false,
+            consumed: Cell::new(false),
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
@@ -266,7 +268,7 @@ mod tests {
         // 3. b = 1
         let nonconsumed_terms = where_clause
             .iter()
-            .filter(|term| !term.consumed)
+            .filter(|term| !term.consumed.get())
             .collect::<Vec<_>>();
         assert_eq!(nonconsumed_terms.len(), 3);
         assert_eq!(
@@ -354,7 +356,7 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
             from_outer_join: None,
-            consumed: false,
+            consumed: Cell::new(false),
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
@@ -364,7 +366,7 @@ mod tests {
         // 2. a = 1
         let nonconsumed_terms = where_clause
             .iter()
-            .filter(|term| !term.consumed)
+            .filter(|term| !term.consumed.get())
             .collect::<Vec<_>>();
         assert_eq!(nonconsumed_terms.len(), 2);
         assert_eq!(
@@ -421,7 +423,7 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: or_expr.clone(),
             from_outer_join: None,
-            consumed: false,
+            consumed: Cell::new(false),
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
@@ -429,7 +431,7 @@ mod tests {
         // Should remain unchanged since no common terms
         let nonconsumed_terms = where_clause
             .iter()
-            .filter(|term| !term.consumed)
+            .filter(|term| !term.consumed.get())
             .collect::<Vec<_>>();
         assert_eq!(nonconsumed_terms.len(), 1);
         assert_eq!(nonconsumed_terms[0].expr, or_expr);
@@ -488,7 +490,7 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
             from_outer_join: Some(TableInternalId::default()), // Set from_outer_join
-            consumed: false,
+            consumed: Cell::new(false),
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
@@ -496,7 +498,7 @@ mod tests {
         // Should have 2 terms, both with from_outer_join set
         let nonconsumed_terms = where_clause
             .iter()
-            .filter(|term| !term.consumed)
+            .filter(|term| !term.consumed.get())
             .collect::<Vec<_>>();
         assert_eq!(nonconsumed_terms.len(), 2);
         assert_eq!(
@@ -540,7 +542,7 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: single_expr.clone(),
             from_outer_join: None,
-            consumed: false,
+            consumed: Cell::new(false),
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
@@ -548,7 +550,7 @@ mod tests {
         // Should remain unchanged
         let nonconsumed_terms = where_clause
             .iter()
-            .filter(|term| !term.consumed)
+            .filter(|term| !term.consumed.get())
             .collect::<Vec<_>>();
         assert_eq!(nonconsumed_terms.len(), 1);
         assert_eq!(nonconsumed_terms[0].expr, single_expr);
@@ -593,14 +595,14 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
             from_outer_join: None,
-            consumed: false,
+            consumed: Cell::new(false),
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
 
         let nonconsumed_terms = where_clause
             .iter()
-            .filter(|term| !term.consumed)
+            .filter(|term| !term.consumed.get())
             .collect::<Vec<_>>();
         assert_eq!(nonconsumed_terms.len(), 1);
         assert_eq!(nonconsumed_terms[0].expr, a_expr);

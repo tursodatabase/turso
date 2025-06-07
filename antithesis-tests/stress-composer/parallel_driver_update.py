@@ -39,7 +39,15 @@ for i in range(updates):
     where_clause = f"col_{pk} = {generate_random_value(tbl_schema[f'col_{pk}']['data_type'])}"
     # print(where_clause)
 
-    cur.execute(f'''
-        UPDATE tbl_{selected_tbl} SET {set_clause} WHERE {where_clause}
-    ''')
+    try:
+        cur.execute(f'''
+            UPDATE tbl_{selected_tbl} SET {set_clause} WHERE {where_clause}
+        ''')
+    except limbo.OperationalError as e:
+        if "UNIQUE constraint failed" in str(e):
+            # Ignore UNIQUE constraint violations
+            pass
+        else:
+            # Re-raise other operational errors
+            raise
 

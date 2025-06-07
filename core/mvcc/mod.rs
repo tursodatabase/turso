@@ -44,11 +44,11 @@ pub use database::MvStore;
 mod tests {
     use crate::mvcc::clock::LocalClock;
     use crate::mvcc::database::{MvStore, Row, RowID};
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::AtomicI64;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
-    static IDS: AtomicU64 = AtomicU64::new(1);
+    static IDS: AtomicI64 = AtomicI64::new(1);
 
     #[test]
     fn test_non_overlapping_concurrent_inserts() {

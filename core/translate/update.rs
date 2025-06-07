@@ -12,7 +12,8 @@ use limbo_sqlite3_parser::ast::{self, Expr, ResultColumn, SortOrder, Update};
 use super::emitter::emit_program;
 use super::optimizer::optimize_plan;
 use super::plan::{
-    ColumnUsedMask, IterationDirection, Plan, ResultSetColumn, TableReference, UpdatePlan,
+    ColumnUsedMask, IterationDirection, JoinedTable, Plan, ResultSetColumn, TableReferences,
+    UpdatePlan,
 };
 use super::planner::bind_column_references;
 use super::planner::{parse_limit, parse_where};
@@ -70,7 +71,7 @@ pub fn translate_update(
         approx_num_labels: 4,
     };
     program.extend(&opts);
-    emit_program(&mut program, plan, syms)?;
+    emit_program(&mut program, plan, schema, syms)?;
     Ok(program)
 }
 
@@ -103,7 +104,7 @@ pub fn prepare_update_plan(
             })
         })
         .unwrap_or(IterationDirection::Forwards);
-    let mut table_references = vec![TableReference {
+    let joined_tables = vec![JoinedTable {
         table: match table.as_ref() {
             Table::Virtual(vtab) => Table::Virtual(vtab.clone()),
             Table::BTree(btree_table) => Table::BTree(btree_table.clone()),
@@ -118,6 +119,7 @@ pub fn prepare_update_plan(
         join_info: None,
         col_used_mask: ColumnUsedMask::new(),
     }];
+    let mut table_references = TableReferences::new(joined_tables, vec![]);
     let set_clauses = body
         .sets
         .iter_mut()

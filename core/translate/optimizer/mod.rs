@@ -20,8 +20,8 @@ use crate::{
 use super::{
     emitter::Resolver,
     plan::{
-        DeletePlan, GroupBy, IterationDirection, JoinOrderMember, Operation, Plan, Search, SeekDef,
-        SeekKey, SelectPlan, TableReference, UpdatePlan, WhereTerm,
+        DeletePlan, GroupBy, IterationDirection, JoinOrderMember, JoinedTable, Operation, Plan,
+        Search, SeekDef, SeekKey, SelectPlan, TableReferences, UpdatePlan, WhereTerm,
     },
 };
 
@@ -52,7 +52,7 @@ pub fn optimize_plan(plan: &mut Plan, schema: &Schema) -> Result<()> {
  * TODO: these could probably be done in less passes,
  * but having them separate makes them easier to understand
  */
-fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
+pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
     optimize_subqueries(plan, schema)?;
     rewrite_exprs_select(plan)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
@@ -116,7 +116,7 @@ fn optimize_update_plan(plan: &mut UpdatePlan, schema: &Schema) -> Result<()> {
 }
 
 fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
-    for table in plan.table_references.iter_mut() {
+    for table in plan.table_references.joined_tables_mut() {
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
             optimize_select_plan(&mut from_clause_subquery.plan, schema)?;
         }
@@ -131,13 +131,13 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
 /// - Computes a set of [Constraint]s for each table.
 /// - Using those constraints, computes the best join order for the list of [TableReference]s
 ///   and selects the best [crate::translate::optimizer::access_method::AccessMethod] for each table in the join order.
-/// - Mutates the [Operation]s in `table_references` to use the selected access methods.
+/// - Mutates the [Operation]s in `joined_tables` to use the selected access methods.
 /// - Removes predicates from the `where_clause` that are now redundant due to the selected access methods.
 /// - Removes sorting operations if the selected join order and access methods satisfy the [crate::translate::optimizer::order::OrderTarget].
 ///
 /// Returns the join order if it was optimized, or None if the default join order was considered best.
 fn optimize_table_access(
-    table_references: &mut [TableReference],
+    table_references: &mut TableReferences,
     available_indexes: &HashMap<String, Vec<Arc<Index>>>,
     where_clause: &mut Vec<WhereTerm>,
     order_by: &mut Option<Vec<(ast::Expr, SortOrder)>>,
@@ -146,9 +146,9 @@ fn optimize_table_access(
     let access_methods_arena = RefCell::new(Vec::new());
     let maybe_order_target = compute_order_target(order_by, group_by.as_mut());
     let constraints_per_table =
-        constraints_from_where_clause(where_clause, table_references, available_indexes)?;
+        constraints_from_where_clause(where_clause, &table_references, available_indexes)?;
     let Some(best_join_order_result) = compute_best_join_order(
-        table_references,
+        table_references.joined_tables_mut(),
         maybe_order_target.as_ref(),
         &constraints_per_table,
         &access_methods_arena,
@@ -161,6 +161,8 @@ fn optimize_table_access(
         best_plan,
         best_ordered_plan,
     } = best_join_order_result;
+
+    let joined_tables = table_references.joined_tables_mut();
 
     // See if best_ordered_plan is better than the overall best_plan if we add a sorting penalty
     // to the unordered plan's cost.
@@ -184,7 +186,7 @@ fn optimize_table_access(
         let satisfies_order_target = plan_satisfies_order_target(
             &best_plan,
             &access_methods_arena,
-            table_references,
+            joined_tables,
             &order_target,
         );
         if satisfies_order_target {
@@ -211,15 +213,15 @@ fn optimize_table_access(
     let best_join_order: Vec<JoinOrderMember> = best_table_numbers
         .into_iter()
         .map(|table_number| JoinOrderMember {
-            table_id: table_references[table_number].internal_id,
+            table_id: joined_tables[table_number].internal_id,
             original_idx: table_number,
-            is_outer: table_references[table_number]
+            is_outer: joined_tables[table_number]
                 .join_info
                 .as_ref()
                 .map_or(false, |join_info| join_info.outer),
         })
         .collect();
-    // Mutate the Operations in `table_references` to use the selected access methods.
+    // Mutate the Operations in `joined_tables` to use the selected access methods.
     for (i, join_order_member) in best_join_order.iter().enumerate() {
         let table_idx = join_order_member.original_idx;
         let access_method = &access_methods_arena.borrow()[best_access_methods[i]];
@@ -227,14 +229,14 @@ fn optimize_table_access(
             let is_leftmost_table = i == 0;
             let uses_index = access_method.index.is_some();
             let source_table_is_from_clause_subquery = matches!(
-                &table_references[table_idx].table,
+                &joined_tables[table_idx].table,
                 Table::FromClauseSubquery(_)
             );
 
             let try_to_build_ephemeral_index =
                 !is_leftmost_table && !uses_index && !source_table_is_from_clause_subquery;
             if !try_to_build_ephemeral_index {
-                table_references[table_idx].op = Operation::Scan {
+                joined_tables[table_idx].op = Operation::Scan {
                     iter_dir: access_method.iter_dir,
                     index: access_method.index.clone(),
                 };
@@ -246,7 +248,7 @@ fn optimize_table_access(
                 .iter()
                 .find(|c| c.table_id == join_order_member.table_id);
             let Some(table_constraints) = table_constraints else {
-                table_references[table_idx].op = Operation::Scan {
+                joined_tables[table_idx].op = Operation::Scan {
                     iter_dir: access_method.iter_dir,
                     index: access_method.index.clone(),
                 };
@@ -265,19 +267,19 @@ fn optimize_table_access(
                 &best_join_order[..=i],
             );
             if usable_constraint_refs.is_empty() {
-                table_references[table_idx].op = Operation::Scan {
+                joined_tables[table_idx].op = Operation::Scan {
                     iter_dir: access_method.iter_dir,
                     index: access_method.index.clone(),
                 };
                 continue;
             }
             let ephemeral_index = ephemeral_index_build(
-                &table_references[table_idx],
+                &joined_tables[table_idx],
                 &table_constraints.constraints,
                 &usable_constraint_refs,
             );
             let ephemeral_index = Arc::new(ephemeral_index);
-            table_references[table_idx].op = Operation::Search(Search::Seek {
+            joined_tables[table_idx].op = Operation::Search(Search::Seek {
                 index: Some(ephemeral_index),
                 seek_def: build_seek_def_from_constraints(
                     &table_constraints.constraints,
@@ -293,14 +295,16 @@ fn optimize_table_access(
                 let constraint =
                     &constraints_per_table[table_idx].constraints[cref.constraint_vec_pos];
                 assert!(
-                    !where_clause[constraint.where_clause_pos.0].consumed,
+                    !where_clause[constraint.where_clause_pos.0].consumed.get(),
                     "trying to consume a where clause term twice: {:?}",
                     where_clause[constraint.where_clause_pos.0]
                 );
-                where_clause[constraint.where_clause_pos.0].consumed = true;
+                where_clause[constraint.where_clause_pos.0]
+                    .consumed
+                    .set(true);
             }
             if let Some(index) = &access_method.index {
-                table_references[table_idx].op = Operation::Search(Search::Seek {
+                joined_tables[table_idx].op = Operation::Search(Search::Seek {
                     index: Some(index.clone()),
                     seek_def: build_seek_def_from_constraints(
                         &constraints_per_table[table_idx].constraints,
@@ -318,7 +322,7 @@ fn optimize_table_access(
             );
             let constraint = &constraints_per_table[table_idx].constraints
                 [constraint_refs[0].constraint_vec_pos];
-            table_references[table_idx].op = match constraint.operator {
+            joined_tables[table_idx].op = match constraint.operator {
                 ast::Operator::Equals => Operation::Search(Search::RowidEq {
                     cmp_expr: constraint.get_constraining_expr(where_clause),
                 }),
@@ -355,7 +359,7 @@ fn eliminate_constant_conditions(
         let predicate = &where_clause[i];
         if predicate.expr.is_always_true()? {
             // true predicates can be removed since they don't affect the result
-            where_clause[i].consumed = true;
+            where_clause[i].consumed.set(true);
             i += 1;
         } else if predicate.expr.is_always_false()? {
             // any false predicate in a list of conjuncts (AND-ed predicates) will make the whole list false,
@@ -366,7 +370,7 @@ fn eliminate_constant_conditions(
             }
             where_clause
                 .iter_mut()
-                .for_each(|term| term.consumed = true);
+                .for_each(|term| term.consumed.set(true));
             return Ok(ConstantConditionEliminationResult::ImpossibleCondition);
         } else {
             i += 1;
@@ -456,7 +460,7 @@ pub trait Optimizable {
             .map_or(false, |c| c == AlwaysTrueOrFalse::AlwaysFalse))
     }
     fn is_constant(&self, resolver: &Resolver<'_>) -> bool;
-    fn is_nonnull(&self, tables: &[TableReference]) -> bool;
+    fn is_nonnull(&self, tables: &TableReferences) -> bool;
 }
 
 impl Optimizable for ast::Expr {
@@ -466,7 +470,7 @@ impl Optimizable for ast::Expr {
     /// This function is currently very conservative, and will return false
     /// for any expression where we aren't sure and didn't bother to find out
     /// by writing more complex code.
-    fn is_nonnull(&self, tables: &[TableReference]) -> bool {
+    fn is_nonnull(&self, tables: &TableReferences) -> bool {
         match self {
             Expr::Between {
                 lhs, start, end, ..
@@ -505,7 +509,7 @@ impl Optimizable for ast::Expr {
                     return true;
                 }
 
-                let table_ref = tables.iter().find(|t| t.internal_id == *table).unwrap();
+                let table_ref = tables.find_joined_table_by_internal_id(*table).unwrap();
                 let columns = table_ref.columns();
                 let column = &columns[*column];
                 return column.primary_key || column.notnull;
@@ -746,7 +750,7 @@ impl Optimizable for ast::Expr {
 }
 
 fn ephemeral_index_build(
-    table_reference: &TableReference,
+    table_reference: &JoinedTable,
     constraints: &[Constraint],
     constraint_refs: &[ConstraintRef],
 ) -> Index {

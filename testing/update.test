@@ -163,3 +163,10 @@ do_execsql_test_on_specific_db {:memory:} update-true-expr {
 } {10|20|30
 10|20|30}
 
+# https://github.com/tursodatabase/limbo/issues/1625
+do_execsql_test_on_specific_db {:memory:} update_cache_full_regression_test_#1625 {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (randomblob(4096));
+    UPDATE t SET x = randomblob(4096) WHERE rowid = 1;
+    SELECT count(*) FROM t;
+} {1}

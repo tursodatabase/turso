@@ -1,16 +1,26 @@
+#![allow(clippy::arc_with_non_send_sync)]
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
+use std::array;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use tracing::{debug, trace};
 
 use std::fmt::Formatter;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::{cell::RefCell, fmt, rc::Rc, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    fmt,
+    rc::Rc,
+    sync::Arc,
+};
 
 use crate::fast_lock::SpinLock;
 use crate::io::{File, SyncCompletion, IO};
 use crate::result::LimboResult;
 use crate::storage::sqlite3_ondisk::{
-    begin_read_wal_frame, begin_write_wal_frame, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
+    begin_read_wal_frame, begin_write_wal_frame, finish_read_page, WAL_FRAME_HEADER_SIZE,
+    WAL_HEADER_SIZE,
 };
 use crate::{Buffer, Result};
 use crate::{Completion, Page};
@@ -52,9 +62,13 @@ impl CheckpointResult {
 
 #[derive(Debug, Copy, Clone)]
 pub enum CheckpointMode {
+    /// Checkpoint as many frames as possible without waiting for any database readers or writers to finish, then sync the database file if all frames in the log were checkpointed.
     Passive,
+    /// This mode blocks until there is no database writer and all readers are reading from the most recent database snapshot. It then checkpoints all frames in the log file and syncs the database file. This mode blocks new database writers while it is pending, but new database readers are allowed to continue unimpeded.
     Full,
+    /// This mode works the same way as `Full` with the addition that after checkpointing the log file it blocks (calls the busy-handler callback) until all readers are reading from the database file only. This ensures that the next writer will restart the log file from the beginning. Like `Full`, this mode blocks new database writer attempts while it is pending, but does not impede readers.
     Restart,
+    /// This mode works the same way as `Restart` with the addition that it also truncates the log file to zero bytes just prior to a successful return.
     Truncate,
 }
 
@@ -175,6 +189,15 @@ pub trait Wal {
     /// Read a frame from the WAL.
     fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Rc<BufferPool>) -> Result<()>;
 
+    /// Read a frame from the WAL.
+    fn read_frame_raw(
+        &self,
+        frame_id: u64,
+        buffer_pool: Rc<BufferPool>,
+        frame: *mut u8,
+        frame_len: u32,
+    ) -> Result<Arc<Completion>>;
+
     /// Write a frame to the WAL.
     fn append_frame(
         &mut self,
@@ -190,10 +213,97 @@ pub trait Wal {
         write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<CheckpointStatus>;
-    fn sync(&mut self) -> Result<CheckpointStatus>;
+    fn sync(&mut self) -> Result<WalFsyncStatus>;
     fn get_max_frame_in_wal(&self) -> u64;
     fn get_max_frame(&self) -> u64;
     fn get_min_frame(&self) -> u64;
+}
+
+/// A dummy WAL implementation that does nothing.
+/// This is used for ephemeral indexes where a WAL is not really
+/// needed, and is preferable to passing an Option<dyn Wal> around
+/// everywhere.
+pub struct DummyWAL;
+
+impl Wal for DummyWAL {
+    fn begin_read_tx(&mut self) -> Result<LimboResult> {
+        Ok(LimboResult::Ok)
+    }
+
+    fn end_read_tx(&self) -> Result<LimboResult> {
+        Ok(LimboResult::Ok)
+    }
+
+    fn begin_write_tx(&mut self) -> Result<LimboResult> {
+        Ok(LimboResult::Ok)
+    }
+
+    fn end_write_tx(&self) -> Result<LimboResult> {
+        Ok(LimboResult::Ok)
+    }
+
+    fn find_frame(&self, _page_id: u64) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    fn read_frame(
+        &self,
+        _frame_id: u64,
+        _page: crate::PageRef,
+        _buffer_pool: Rc<BufferPool>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn read_frame_raw(
+        &self,
+        _frame_id: u64,
+        _buffer_pool: Rc<BufferPool>,
+        _frame: *mut u8,
+        _frame_len: u32,
+    ) -> Result<Arc<Completion>> {
+        todo!();
+    }
+
+    fn append_frame(
+        &mut self,
+        _page: crate::PageRef,
+        _db_size: u32,
+        _write_counter: Rc<RefCell<usize>>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn should_checkpoint(&self) -> bool {
+        false
+    }
+
+    fn checkpoint(
+        &mut self,
+        _pager: &Pager,
+        _write_counter: Rc<RefCell<usize>>,
+        _mode: crate::CheckpointMode,
+    ) -> Result<crate::CheckpointStatus> {
+        Ok(crate::CheckpointStatus::Done(
+            crate::CheckpointResult::default(),
+        ))
+    }
+
+    fn sync(&mut self) -> Result<crate::storage::wal::WalFsyncStatus> {
+        Ok(crate::storage::wal::WalFsyncStatus::Done)
+    }
+
+    fn get_max_frame_in_wal(&self) -> u64 {
+        0
+    }
+
+    fn get_max_frame(&self) -> u64 {
+        0
+    }
+
+    fn get_min_frame(&self) -> u64 {
+        0
+    }
 }
 
 // Syncing requires a state machine because we need to schedule a sync and then wait until it is
@@ -212,6 +322,12 @@ pub enum CheckpointState {
     WritePage,
     WaitWritePage,
     Done,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum WalFsyncStatus {
+    Done,
+    IO,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -437,13 +553,43 @@ impl Wal for WalFile {
         debug!("read_frame({})", frame_id);
         let offset = self.frame_offset(frame_id);
         page.set_locked();
+        let frame = page.clone();
+        let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+            let frame = frame.clone();
+            finish_read_page(page.get().id, buf, frame).unwrap();
+        });
         begin_read_wal_frame(
             &self.get_shared().file,
             offset + WAL_FRAME_HEADER_SIZE,
             buffer_pool,
-            page,
+            complete,
         )?;
         Ok(())
+    }
+
+    fn read_frame_raw(
+        &self,
+        frame_id: u64,
+        buffer_pool: Rc<BufferPool>,
+        frame: *mut u8,
+        frame_len: u32,
+    ) -> Result<Arc<Completion>> {
+        debug!("read_frame({})", frame_id);
+        let offset = self.frame_offset(frame_id);
+        let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+            let buf = buf.borrow();
+            let buf_ptr = buf.as_ptr();
+            unsafe {
+                std::ptr::copy_nonoverlapping(buf_ptr, frame, frame_len as usize);
+            }
+        });
+        let c = begin_read_wal_frame(
+            &self.get_shared().file,
+            offset + WAL_FRAME_HEADER_SIZE,
+            buffer_pool,
+            complete,
+        )?;
+        Ok(c)
     }
 
     /// Write a frame to the WAL.
@@ -627,13 +773,22 @@ impl Wal for WalFile {
                     let everything_backfilled = shared.max_frame.load(Ordering::SeqCst)
                         == self.ongoing_checkpoint.max_frame;
                     if everything_backfilled {
-                        // Here we know that we backfilled everything, therefore we can safely
-                        // reset the wal.
-                        shared.frame_cache.lock().clear();
-                        shared.pages_in_frames.lock().clear();
-                        shared.max_frame.store(0, Ordering::SeqCst);
-                        shared.nbackfills.store(0, Ordering::SeqCst);
-                        // TODO(pere): truncate wal file here.
+                        // TODO: Even in Passive mode, if everything was backfilled we should
+                        // truncate and fsync the *db file*
+
+                        // To properly reset the *wal file* we will need restart and/or truncate mode.
+                        // Currently, it will grow the WAL file indefinetly, but don't resetting is better than breaking.
+                        // Check: https://github.com/sqlite/sqlite/blob/2bd9f69d40dd240c4122c6d02f1ff447e7b5c098/src/wal.c#L2193
+                        if !matches!(mode, CheckpointMode::Passive) {
+                            // Here we know that we backfilled everything, therefore we can safely
+                            // reset the wal.
+                            shared.frame_cache.lock().clear();
+                            shared.pages_in_frames.lock().clear();
+                            shared.max_frame.store(0, Ordering::SeqCst);
+                            shared.nbackfills.store(0, Ordering::SeqCst);
+                            // TODO: if all frames were backfilled into the db file, calls fsync
+                            // TODO(pere): truncate wal file here.
+                        }
                     } else {
                         shared
                             .nbackfills
@@ -646,7 +801,7 @@ impl Wal for WalFile {
         }
     }
 
-    fn sync(&mut self) -> Result<CheckpointStatus> {
+    fn sync(&mut self) -> Result<WalFsyncStatus> {
         let state = *self.sync_state.borrow();
         match state {
             SyncState::NotSyncing => {
@@ -660,22 +815,19 @@ impl Wal for WalFile {
                             debug!("wal_sync finish");
                             *syncing.borrow_mut() = false;
                         }),
+                        is_completed: Cell::new(false),
                     });
-                    shared.file.sync(completion)?;
+                    shared.file.sync(Arc::new(completion))?;
                 }
                 self.sync_state.replace(SyncState::Syncing);
-                Ok(CheckpointStatus::IO)
+                Ok(WalFsyncStatus::IO)
             }
             SyncState::Syncing => {
                 if *self.syncing.borrow() {
-                    Ok(CheckpointStatus::IO)
+                    Ok(WalFsyncStatus::IO)
                 } else {
                     self.sync_state.replace(SyncState::NotSyncing);
-                    let checkpoint_result = CheckpointResult {
-                        num_wal_frames: self.max_frame,
-                        num_checkpointed_frames: self.ongoing_checkpoint.max_frame,
-                    };
-                    Ok(CheckpointStatus::Done(checkpoint_result))
+                    Ok(WalFsyncStatus::Done)
                 }
             }
         }
@@ -758,7 +910,7 @@ impl WalFileShared {
         let header = if file.size()? > 0 {
             let wal_file_shared = sqlite3_ondisk::read_entire_wal_dumb(&file)?;
             // TODO: Return a completion instead.
-            let mut max_loops = 100000;
+            let mut max_loops = 100_000;
             while !unsafe { &*wal_file_shared.get() }
                 .loaded
                 .load(Ordering::SeqCst)
@@ -815,33 +967,11 @@ impl WalFileShared {
             last_checksum: checksum,
             file,
             pages_in_frames: Arc::new(SpinLock::new(Vec::new())),
-            read_locks: [
-                LimboRwLock {
-                    lock: AtomicU32::new(NO_LOCK),
-                    nreads: AtomicU32::new(0),
-                    value: AtomicU32::new(READMARK_NOT_USED),
-                },
-                LimboRwLock {
-                    lock: AtomicU32::new(NO_LOCK),
-                    nreads: AtomicU32::new(0),
-                    value: AtomicU32::new(READMARK_NOT_USED),
-                },
-                LimboRwLock {
-                    lock: AtomicU32::new(NO_LOCK),
-                    nreads: AtomicU32::new(0),
-                    value: AtomicU32::new(READMARK_NOT_USED),
-                },
-                LimboRwLock {
-                    lock: AtomicU32::new(NO_LOCK),
-                    nreads: AtomicU32::new(0),
-                    value: AtomicU32::new(READMARK_NOT_USED),
-                },
-                LimboRwLock {
-                    lock: AtomicU32::new(NO_LOCK),
-                    nreads: AtomicU32::new(0),
-                    value: AtomicU32::new(READMARK_NOT_USED),
-                },
-            ],
+            read_locks: array::from_fn(|_| LimboRwLock {
+                lock: AtomicU32::new(NO_LOCK),
+                nreads: AtomicU32::new(0),
+                value: AtomicU32::new(READMARK_NOT_USED),
+            }),
             write_lock: LimboRwLock {
                 lock: AtomicU32::new(NO_LOCK),
                 nreads: AtomicU32::new(0),

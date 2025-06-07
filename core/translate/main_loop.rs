@@ -11,7 +11,7 @@ use crate::{
     },
     types::SeekOp,
     vdbe::{
-        builder::{CursorType, ProgramBuilder},
+        builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{CmpInsFlags, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
@@ -30,7 +30,7 @@ use super::{
     order_by::{order_by_sorter_insert, sorter_insert},
     plan::{
         convert_where_to_vtab_constraint, Aggregate, GroupBy, IterationDirection, JoinOrderMember,
-        Operation, QueryDestination, Search, SeekDef, SelectPlan, TableReference, WhereTerm,
+        Operation, QueryDestination, Search, SeekDef, SelectPlan, TableReferences, WhereTerm,
     },
 };
 
@@ -92,10 +92,7 @@ pub fn init_distinct(program: &mut ProgramBuilder, plan: &mut SelectPlan) {
             unique: false,
             has_rowid: false,
         });
-        let cursor_id = program.alloc_cursor_id(
-            Some(index_name.clone()),
-            CursorType::BTreeIndex(index.clone()),
-        );
+        let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
         *ctx = Some(DistinctCtx {
             cursor_id,
             ephemeral_index_name: index_name,
@@ -113,13 +110,13 @@ pub fn init_distinct(program: &mut ProgramBuilder, plan: &mut SelectPlan) {
 pub fn init_loop(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
-    tables: &[TableReference],
+    tables: &TableReferences,
     aggregates: &mut [Aggregate],
     group_by: Option<&GroupBy>,
     mode: OperationMode,
 ) -> Result<()> {
     assert!(
-        t_ctx.meta_left_joins.len() == tables.len(),
+        t_ctx.meta_left_joins.len() == tables.joined_tables().len(),
         "meta_left_joins length does not match tables length"
     );
     // Initialize ephemeral indexes for distinct aggregates
@@ -147,10 +144,7 @@ pub fn init_loop(
             has_rowid: false,
             unique: false,
         });
-        let cursor_id = program.alloc_cursor_id(
-            Some(index_name.clone()),
-            CursorType::BTreeIndex(index.clone()),
-        );
+        let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
         if group_by.is_none() {
             // In GROUP BY, the ephemeral index is reinitialized for every group
             // in the clear accumulator subroutine, so we only do it here if there is no GROUP BY.
@@ -167,7 +161,7 @@ pub fn init_loop(
             }),
         };
     }
-    for (table_index, table) in tables.iter().enumerate() {
+    for (table_index, table) in tables.joined_tables().iter().enumerate() {
         // Initialize bookkeeping for OUTER JOIN
         if let Some(join_info) = table.join_info.as_ref() {
             if join_info.outer {
@@ -205,6 +199,34 @@ pub fn init_loop(
                         root_page: root_page.into(),
                         name: btree.name.clone(),
                     });
+                    if let Some(index_cursor_id) = index_cursor_id {
+                        program.emit_insn(Insn::OpenWrite {
+                            cursor_id: index_cursor_id,
+                            root_page: index.as_ref().unwrap().root_page.into(),
+                            name: index.as_ref().unwrap().name.clone(),
+                        });
+                    }
+                    // For delete, we need to open all the other indexes too for writing
+                    if let Some(indexes) = t_ctx.resolver.schema.indexes.get(&btree.name) {
+                        for index in indexes {
+                            if table
+                                .op
+                                .index()
+                                .is_some_and(|table_index| table_index.name == index.name)
+                            {
+                                continue;
+                            }
+                            let cursor_id = program.alloc_cursor_id_keyed(
+                                CursorKey::index(table.internal_id, index.clone()),
+                                CursorType::BTreeIndex(index.clone()),
+                            );
+                            program.emit_insn(Insn::OpenWrite {
+                                cursor_id,
+                                root_page: index.root_page.into(),
+                                name: index.name.clone(),
+                            });
+                        }
+                    }
                 }
                 (OperationMode::UPDATE, Table::BTree(btree)) => {
                     let root_page = btree.root_page;
@@ -246,6 +268,32 @@ pub fn init_loop(
                             root_page: table.table.get_root_page().into(),
                             name: table.table.get_name().to_string(),
                         });
+                        // For DELETE, we need to open all the indexes for writing
+                        // UPDATE opens these in emit_program_for_update() separately
+                        if mode == OperationMode::DELETE {
+                            if let Some(indexes) =
+                                t_ctx.resolver.schema.indexes.get(table.table.get_name())
+                            {
+                                for index in indexes {
+                                    if table
+                                        .op
+                                        .index()
+                                        .is_some_and(|table_index| table_index.name == index.name)
+                                    {
+                                        continue;
+                                    }
+                                    let cursor_id = program.alloc_cursor_id_keyed(
+                                        CursorKey::index(table.internal_id, index.clone()),
+                                        CursorType::BTreeIndex(index.clone()),
+                                    );
+                                    program.emit_insn(Insn::OpenWrite {
+                                        cursor_id,
+                                        root_page: index.root_page.into(),
+                                        name: index.name.clone(),
+                                    });
+                                }
+                            }
+                        }
                     }
                     _ => {
                         unimplemented!()
@@ -293,20 +341,20 @@ pub fn init_loop(
 pub fn open_loop(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
-    tables: &[TableReference],
+    table_references: &TableReferences,
     join_order: &[JoinOrderMember],
-    predicates: &mut [WhereTerm],
+    predicates: &[WhereTerm],
 ) -> Result<()> {
     for (join_index, join) in join_order.iter().enumerate() {
-        let table_index = join.original_idx;
-        let table = &tables[table_index];
+        let joined_table_index = join.original_idx;
+        let table = &table_references.joined_tables()[joined_table_index];
         let LoopLabels {
             loop_start,
             loop_end,
             next,
         } = *t_ctx
             .labels_main_loop
-            .get(table_index)
+            .get(joined_table_index)
             .expect("table has no loop labels");
 
         // Each OUTER JOIN has a "match flag" that is initially set to false,
@@ -314,7 +362,7 @@ pub fn open_loop(
         // This is used to determine whether to emit actual columns or NULLs for the columns of the right table.
         if let Some(join_info) = table.join_info.as_ref() {
             if join_info.outer {
-                let lj_meta = t_ctx.meta_left_joins[table_index].as_ref().unwrap();
+                let lj_meta = t_ctx.meta_left_joins[joined_table_index].as_ref().unwrap();
                 program.emit_insn(Insn::Integer {
                     value: 0,
                     dest: lj_meta.reg_match_flag,
@@ -345,112 +393,116 @@ pub fn open_loop(
                         program.preassign_label_to_next_insn(loop_start);
                     }
                     Table::Virtual(vtab) => {
-                        let (start_reg, count, maybe_idx_str, maybe_idx_int) = if vtab
-                            .kind
-                            .eq(&VTabKind::VirtualTable)
-                        {
-                            // Virtual‑table (non‑TVF) modules can receive constraints via xBestIndex.
-                            // They return information with which to pass to VFilter operation.
-                            // We forward every predicate that touches vtab columns.
-                            //
-                            // vtab.col = literal             (always usable)
-                            // vtab.col = outer_table.col     (usable, because outer_table is already positioned)
-                            // vtab.col = later_table.col     (forwarded with usable = false)
-                            //
-                            // xBestIndex decides which ones it wants by setting argvIndex and whether the
-                            // core layer may omit them (omit = true).
-                            // We then materialise the RHS/LHS into registers before issuing VFilter.
-                            let converted_constraints = predicates
-                                .iter()
-                                .filter(|p| p.should_eval_at_loop(join_index, join_order))
-                                .enumerate()
-                                .filter_map(|(i, p)| {
-                                    // Build ConstraintInfo from the predicates
-                                    convert_where_to_vtab_constraint(p, table_index, i, join_order)
+                        let (start_reg, count, maybe_idx_str, maybe_idx_int) =
+                            if vtab.kind.eq(&VTabKind::VirtualTable) {
+                                // Virtual‑table (non‑TVF) modules can receive constraints via xBestIndex.
+                                // They return information with which to pass to VFilter operation.
+                                // We forward every predicate that touches vtab columns.
+                                //
+                                // vtab.col = literal             (always usable)
+                                // vtab.col = outer_table.col     (usable, because outer_table is already positioned)
+                                // vtab.col = later_table.col     (forwarded with usable = false)
+                                //
+                                // xBestIndex decides which ones it wants by setting argvIndex and whether the
+                                // core layer may omit them (omit = true).
+                                // We then materialise the RHS/LHS into registers before issuing VFilter.
+                                let converted_constraints = predicates
+                                    .iter()
+                                    .filter(|p| p.should_eval_at_loop(join_index, join_order))
+                                    .enumerate()
+                                    .filter_map(|(i, p)| {
+                                        // Build ConstraintInfo from the predicates
+                                        convert_where_to_vtab_constraint(
+                                            p,
+                                            joined_table_index,
+                                            i,
+                                            join_order,
+                                        )
                                         .unwrap_or(None)
-                                })
-                                .collect::<Vec<_>>();
-                            // TODO: get proper order_by information to pass to the vtab.
-                            // maybe encode more info on t_ctx? we need: [col_idx, is_descending]
-                            let index_info = vtab.best_index(&converted_constraints, &[]);
+                                    })
+                                    .collect::<Vec<_>>();
+                                // TODO: get proper order_by information to pass to the vtab.
+                                // maybe encode more info on t_ctx? we need: [col_idx, is_descending]
+                                let index_info = vtab.best_index(&converted_constraints, &[]);
 
-                            // Determine the number of VFilter arguments (constraints with an argv_index).
-                            let args_needed = index_info
-                                .constraint_usages
-                                .iter()
-                                .filter(|u| u.argv_index.is_some())
-                                .count();
-                            let start_reg = program.alloc_registers(args_needed);
+                                // Determine the number of VFilter arguments (constraints with an argv_index).
+                                let args_needed = index_info
+                                    .constraint_usages
+                                    .iter()
+                                    .filter(|u| u.argv_index.is_some())
+                                    .count();
+                                let start_reg = program.alloc_registers(args_needed);
 
-                            // For each constraint used by best_index, translate the opposite side.
-                            for (i, usage) in index_info.constraint_usages.iter().enumerate() {
-                                if let Some(argv_index) = usage.argv_index {
-                                    if let Some(cinfo) = converted_constraints.get(i) {
-                                        let (pred_idx, is_rhs) = cinfo.unpack_plan_info();
-                                        if let ast::Expr::Binary(lhs, _, rhs) =
-                                            &predicates[pred_idx].expr
-                                        {
-                                            // translate the opposite side of the referenced vtab column
-                                            let expr = if is_rhs { lhs } else { rhs };
-                                            // argv_index is 1-based; adjust to get the proper register offset.
-                                            if argv_index == 0 {
-                                                // invalid since argv_index is 1-based
-                                                continue;
-                                            }
-                                            let target_reg = start_reg + (argv_index - 1) as usize;
-                                            translate_expr(
-                                                program,
-                                                Some(tables),
-                                                expr,
-                                                target_reg,
-                                                &t_ctx.resolver,
-                                            )?;
-                                            if cinfo.usable && usage.omit {
-                                                predicates[pred_idx].consumed = true;
+                                // For each constraint used by best_index, translate the opposite side.
+                                for (i, usage) in index_info.constraint_usages.iter().enumerate() {
+                                    if let Some(argv_index) = usage.argv_index {
+                                        if let Some(cinfo) = converted_constraints.get(i) {
+                                            let (pred_idx, is_rhs) = cinfo.unpack_plan_info();
+                                            if let ast::Expr::Binary(lhs, _, rhs) =
+                                                &predicates[pred_idx].expr
+                                            {
+                                                // translate the opposite side of the referenced vtab column
+                                                let expr = if is_rhs { lhs } else { rhs };
+                                                // argv_index is 1-based; adjust to get the proper register offset.
+                                                if argv_index == 0 {
+                                                    // invalid since argv_index is 1-based
+                                                    continue;
+                                                }
+                                                let target_reg =
+                                                    start_reg + (argv_index - 1) as usize;
+                                                translate_expr(
+                                                    program,
+                                                    Some(table_references),
+                                                    expr,
+                                                    target_reg,
+                                                    &t_ctx.resolver,
+                                                )?;
+                                                if cinfo.usable && usage.omit {
+                                                    predicates[pred_idx].consumed.set(true);
+                                                }
                                             }
                                         }
                                     }
                                 }
-                            }
 
-                            // If best_index provided an idx_str, translate it.
-                            let maybe_idx_str = if let Some(idx_str) = index_info.idx_str {
-                                let reg = program.alloc_register();
-                                program.emit_insn(Insn::String8 {
-                                    dest: reg,
-                                    value: idx_str,
-                                });
-                                Some(reg)
+                                // If best_index provided an idx_str, translate it.
+                                let maybe_idx_str = if let Some(idx_str) = index_info.idx_str {
+                                    let reg = program.alloc_register();
+                                    program.emit_insn(Insn::String8 {
+                                        dest: reg,
+                                        value: idx_str,
+                                    });
+                                    Some(reg)
+                                } else {
+                                    None
+                                };
+                                (
+                                    start_reg,
+                                    args_needed,
+                                    maybe_idx_str,
+                                    Some(index_info.idx_num),
+                                )
                             } else {
-                                None
+                                // For table-valued functions: translate the table args.
+                                let args = match vtab.args.as_ref() {
+                                    Some(args) => args,
+                                    None => &vec![],
+                                };
+                                let start_reg = program.alloc_registers(args.len());
+                                let mut cur_reg = start_reg;
+                                for arg in args {
+                                    let reg = cur_reg;
+                                    cur_reg += 1;
+                                    let _ = translate_expr(
+                                        program,
+                                        Some(table_references),
+                                        arg,
+                                        reg,
+                                        &t_ctx.resolver,
+                                    )?;
+                                }
+                                (start_reg, args.len(), None, None)
                             };
-                            (
-                                start_reg,
-                                args_needed,
-                                maybe_idx_str,
-                                Some(index_info.idx_num),
-                            )
-                        } else {
-                            // For table-valued functions: translate the table args.
-                            let args = match vtab.args.as_ref() {
-                                Some(args) => args,
-                                None => &vec![],
-                            };
-                            let start_reg = program.alloc_registers(args.len());
-                            let mut cur_reg = start_reg;
-                            for arg in args {
-                                let reg = cur_reg;
-                                cur_reg += 1;
-                                let _ = translate_expr(
-                                    program,
-                                    Some(tables),
-                                    arg,
-                                    reg,
-                                    &t_ctx.resolver,
-                                )?;
-                            }
-                            (start_reg, args.len(), None, None)
-                        };
 
                         // Emit VFilter with the computed arguments.
                         program.emit_insn(Insn::VFilter {
@@ -513,7 +565,7 @@ pub fn open_loop(
                     };
                     translate_condition_expr(
                         program,
-                        tables,
+                        table_references,
                         &cond.expr,
                         condition_metadata,
                         &t_ctx.resolver,
@@ -530,7 +582,13 @@ pub fn open_loop(
                 // Rowid equality point lookups are handled with a SeekRowid instruction which does not loop, since it is a single row lookup.
                 if let Search::RowidEq { cmp_expr } = search {
                     let src_reg = program.alloc_register();
-                    translate_expr(program, Some(tables), cmp_expr, src_reg, &t_ctx.resolver)?;
+                    translate_expr(
+                        program,
+                        Some(table_references),
+                        cmp_expr,
+                        src_reg,
+                        &t_ctx.resolver,
+                    )?;
                     program.emit_insn(Insn::SeekRowid {
                         cursor_id: table_cursor_id
                             .expect("Search::RowidEq requires a table cursor"),
@@ -576,7 +634,7 @@ pub fn open_loop(
                     let start_reg = program.alloc_registers(seek_def.key.len());
                     emit_seek(
                         program,
-                        tables,
+                        table_references,
                         seek_def,
                         t_ctx,
                         seek_cursor_id,
@@ -586,7 +644,7 @@ pub fn open_loop(
                     )?;
                     emit_seek_termination(
                         program,
-                        tables,
+                        table_references,
                         seek_def,
                         t_ctx,
                         seek_cursor_id,
@@ -619,7 +677,7 @@ pub fn open_loop(
                     };
                     translate_condition_expr(
                         program,
-                        tables,
+                        table_references,
                         &cond.expr,
                         condition_metadata,
                         &t_ctx.resolver,
@@ -635,7 +693,7 @@ pub fn open_loop(
         // for the right table's cursor.
         if let Some(join_info) = table.join_info.as_ref() {
             if join_info.outer {
-                let lj_meta = t_ctx.meta_left_joins[table_index].as_ref().unwrap();
+                let lj_meta = t_ctx.meta_left_joins[joined_table_index].as_ref().unwrap();
                 program.resolve_label(lj_meta.label_match_flag_set_true, program.offset());
                 program.emit_insn(Insn::Integer {
                     value: 1,
@@ -805,9 +863,9 @@ fn emit_loop_source<'a>(
             Ok(())
         }
         LoopEmitTarget::AggStep => {
-            let num_aggs = plan.aggregates.len();
-            let start_reg = program.alloc_registers(num_aggs);
-            t_ctx.reg_agg_start = Some(start_reg);
+            let start_reg = t_ctx
+                .reg_agg_start
+                .expect("aggregate registers must be initialized");
 
             // In planner.rs, we have collected all aggregates from the SELECT clause, including ones where the aggregate is embedded inside
             // a more complex expression. Some examples: length(sum(x)), sum(x) + avg(y), sum(x) + 1, etc.
@@ -890,7 +948,6 @@ fn emit_loop_source<'a>(
                 t_ctx.reg_offset,
                 t_ctx.reg_result_cols_start.unwrap(),
                 t_ctx.limit_ctx,
-                t_ctx.reg_limit_offset_sum,
             )?;
 
             if let Distinctness::Distinct { ctx } = &plan.distinctness {
@@ -909,7 +966,7 @@ fn emit_loop_source<'a>(
 pub fn close_loop(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
-    tables: &[TableReference],
+    tables: &TableReferences,
     join_order: &[JoinOrderMember],
 ) -> Result<()> {
     // We close the loops for all tables in reverse order, i.e. innermost first.
@@ -922,7 +979,7 @@ pub fn close_loop(
     // CLOSE t1
     for join in join_order.iter().rev() {
         let table_index = join.original_idx;
-        let table = &tables[table_index];
+        let table = &tables.joined_tables()[table_index];
         let loop_labels = *t_ctx
             .labels_main_loop
             .get(table_index)
@@ -1059,7 +1116,7 @@ pub fn close_loop(
 #[allow(clippy::too_many_arguments)]
 fn emit_seek(
     program: &mut ProgramBuilder,
-    tables: &[TableReference],
+    tables: &TableReferences,
     seek_def: &SeekDef,
     t_ctx: &mut TranslateCtx,
     seek_cursor_id: usize,
@@ -1170,7 +1227,7 @@ fn emit_seek(
 #[allow(clippy::too_many_arguments)]
 fn emit_seek_termination(
     program: &mut ProgramBuilder,
-    tables: &[TableReference],
+    tables: &TableReferences,
     seek_def: &SeekDef,
     t_ctx: &mut TranslateCtx,
     seek_cursor_id: usize,

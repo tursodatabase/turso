@@ -7,7 +7,7 @@ use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode, TableR
 use crate::{schema::Schema, Result, SymbolTable};
 use limbo_sqlite3_parser::ast::{Expr, Limit, QualifiedName};
 
-use super::plan::{ColumnUsedMask, IterationDirection, TableReference};
+use super::plan::{ColumnUsedMask, IterationDirection, JoinedTable, TableReferences};
 
 pub fn translate_delete(
     query_mode: QueryMode,
@@ -36,7 +36,7 @@ pub fn translate_delete(
         approx_num_labels: 0,
     };
     program.extend(&opts);
-    emit_program(&mut program, delete_plan, syms)?;
+    emit_program(&mut program, delete_plan, schema, syms)?;
     Ok(program)
 }
 
@@ -64,7 +64,7 @@ pub fn prepare_delete_plan(
         .iter()
         .cloned()
         .collect();
-    let mut table_references = vec![TableReference {
+    let joined_tables = vec![JoinedTable {
         table,
         identifier: name,
         internal_id: table_ref_counter.next(),
@@ -75,6 +75,7 @@ pub fn prepare_delete_plan(
         join_info: None,
         col_used_mask: ColumnUsedMask::new(),
     }];
+    let mut table_references = TableReferences::new(joined_tables, vec![]);
 
     let mut where_predicates = vec![];
 
@@ -106,5 +107,5 @@ pub fn prepare_delete_plan(
 fn estimate_num_instructions(plan: &DeletePlan) -> usize {
     let base = 20;
 
-    base + plan.table_references.len() * 10
+    base + plan.table_references.joined_tables().len() * 10
 }

@@ -2,6 +2,7 @@ use core::fmt;
 use limbo_ext::{ConstraintInfo, ConstraintOp};
 use limbo_sqlite3_parser::ast::{self, SortOrder};
 use std::{
+    cell::Cell,
     cmp::Ordering,
     fmt::{Display, Formatter},
     rc::Rc,
@@ -13,7 +14,7 @@ use crate::{
     schema::{BTreeTable, Column, FromClauseSubquery, Index, Table},
     util::exprs_are_equivalent,
     vdbe::{
-        builder::{CursorType, ProgramBuilder},
+        builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
@@ -34,24 +35,19 @@ pub struct ResultSetColumn {
 }
 
 impl ResultSetColumn {
-    pub fn name<'a>(&'a self, tables: &'a [TableReference]) -> Option<&'a str> {
+    pub fn name<'a>(&'a self, tables: &'a TableReferences) -> Option<&'a str> {
         if let Some(alias) = &self.alias {
             return Some(alias);
         }
         match &self.expr {
             ast::Expr::Column { table, column, .. } => {
-                let table_ref = tables.iter().find(|t| t.internal_id == *table).unwrap();
-                table_ref
-                    .table
-                    .get_column_at(*column)
-                    .unwrap()
-                    .name
-                    .as_deref()
+                let table_ref = tables.find_table_by_internal_id(*table).unwrap();
+                table_ref.get_column_at(*column).unwrap().name.as_deref()
             }
             ast::Expr::RowId { table, .. } => {
                 // If there is a rowid alias column, use its name
-                let table_ref = tables.iter().find(|t| t.internal_id == *table).unwrap();
-                if let Table::BTree(table) = &table_ref.table {
+                let table_ref = tables.find_table_by_internal_id(*table).unwrap();
+                if let Table::BTree(table) = &table_ref {
                     if let Some(rowid_alias_column) = table.get_rowid_alias_column() {
                         if let Some(name) = &rowid_alias_column.1.name {
                             return Some(name);
@@ -97,12 +93,16 @@ pub struct WhereTerm {
     /// A term may have been consumed e.g. if:
     /// - it has been converted into a constraint in a seek key
     /// - it has been removed due to being trivially true or false
-    pub consumed: bool,
+    ///
+    /// FIXME: this can be made into a simple `bool` once we move the virtual table constraint resolution
+    /// code out of `init_loop()`, because that's the only place that requires a mutable reference to the where clause
+    /// that causes problems to other code that needs immutable references to the where clause.
+    pub consumed: Cell<bool>,
 }
 
 impl WhereTerm {
     pub fn should_eval_before_loop(&self, join_order: &[JoinOrderMember]) -> bool {
-        if self.consumed {
+        if self.consumed.get() {
             return false;
         }
         let Ok(eval_at) = self.eval_at(join_order) else {
@@ -112,7 +112,7 @@ impl WhereTerm {
     }
 
     pub fn should_eval_at_loop(&self, loop_idx: usize, join_order: &[JoinOrderMember]) -> bool {
-        if self.consumed {
+        if self.consumed.get() {
             return false;
         }
         let Ok(eval_at) = self.eval_at(join_order) else {
@@ -340,7 +340,7 @@ pub struct JoinOrderMember {
     /// The internal ID of the[TableReference]
     pub table_id: TableInternalId,
     /// The index of the table in the original join order.
-    /// This is used to index into e.g. [SelectPlan::table_references]
+    /// This is used to index into e.g. [TableReferences::joined_tables()]
     pub original_idx: usize,
     /// Whether this member is the right side of an OUTER JOIN
     pub is_outer: bool,
@@ -424,9 +424,8 @@ impl DistinctCtx {
 
 #[derive(Debug, Clone)]
 pub struct SelectPlan {
-    /// List of table references in loop order, outermost first.
-    pub table_references: Vec<TableReference>,
-    /// The order in which the tables are joined. Tables have usize Ids (their index in table_references)
+    pub table_references: TableReferences,
+    /// The order in which the tables are joined. Tables have usize Ids (their index in joined_tables)
     pub join_order: Vec<JoinOrderMember>,
     /// the columns inside SELECT ... FROM
     pub result_columns: Vec<ResultSetColumn>,
@@ -454,6 +453,10 @@ pub struct SelectPlan {
 }
 
 impl SelectPlan {
+    pub fn joined_tables(&self) -> &[JoinedTable] {
+        self.table_references.joined_tables()
+    }
+
     pub fn agg_args_count(&self) -> usize {
         self.aggregates.iter().map(|agg| agg.args.len()).sum()
     }
@@ -497,7 +500,8 @@ impl SelectPlan {
                 self.query_destination,
                 QueryDestination::CoroutineYield { .. }
             )
-            || self.table_references.len() != 1
+            || self.table_references.joined_tables().len() != 1
+            || self.table_references.outer_query_refs().len() != 0
             || self.result_columns.len() != 1
             || self.group_by.is_some()
             || self.contains_constant_false_condition
@@ -505,7 +509,7 @@ impl SelectPlan {
         {
             return false;
         }
-        let table_ref = self.table_references.first().unwrap();
+        let table_ref = self.table_references.joined_tables().first().unwrap();
         if !matches!(table_ref.table, crate::schema::Table::BTree(..)) {
             return false;
         }
@@ -536,8 +540,7 @@ impl SelectPlan {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DeletePlan {
-    /// List of table references. Delete is always a single table.
-    pub table_references: Vec<TableReference>,
+    pub table_references: TableReferences,
     /// the columns inside SELECT ... FROM
     pub result_columns: Vec<ResultSetColumn>,
     /// where clause split into a vec at 'AND' boundaries.
@@ -556,8 +559,7 @@ pub struct DeletePlan {
 
 #[derive(Debug, Clone)]
 pub struct UpdatePlan {
-    // table being updated is always first
-    pub table_references: Vec<TableReference>,
+    pub table_references: TableReferences,
     // (colum index, new value) pairs
     pub set_clauses: Vec<(usize, ast::Expr)>,
     pub where_clause: Vec<WhereTerm>,
@@ -578,7 +580,7 @@ pub enum IterationDirection {
     Backwards,
 }
 
-pub fn select_star(tables: &[TableReference], out_columns: &mut Vec<ResultSetColumn>) {
+pub fn select_star(tables: &[JoinedTable], out_columns: &mut Vec<ResultSetColumn>) {
     for table in tables.iter() {
         let maybe_using_cols = table
             .join_info
@@ -625,7 +627,7 @@ pub struct JoinInfo {
     pub using: Option<ast::DistinctNames>,
 }
 
-/// A table reference in the query plan.
+/// A joined table in the query plan.
 /// For example,
 /// ```sql
 /// SELECT * FROM users u JOIN products p JOIN (SELECT * FROM users) sub;
@@ -636,7 +638,7 @@ pub struct JoinInfo {
 /// - `t` and `p` are [Table::BTree] while `sub` is [Table::FromClauseSubquery]
 /// - join_info is None for the first table reference, and Some(JoinInfo { outer: false, using: None }) for the second and third table references
 #[derive(Debug, Clone)]
-pub struct TableReference {
+pub struct JoinedTable {
     /// The operation that this table reference performs.
     pub op: Operation,
     /// Table object, which contains metadata about the table, e.g. columns.
@@ -650,6 +652,217 @@ pub struct TableReference {
     /// Bitmask of columns that are referenced in the query.
     /// Used to decide whether a covering index can be used.
     pub col_used_mask: ColumnUsedMask,
+}
+
+#[derive(Debug, Clone)]
+pub struct OuterQueryReference {
+    /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
+    pub identifier: String,
+    /// Internal ID of the table reference, used in e.g. [Expr::Column] to refer to this table.
+    pub internal_id: TableInternalId,
+    /// Table object, which contains metadata about the table, e.g. columns.
+    pub table: Table,
+    /// Bitmask of columns that are referenced in the query.
+    /// Used to track dependencies, so that it can be resolved
+    /// when a WHERE clause subquery should be evaluated;
+    /// i.e., if the subquery depends on tables T and U,
+    /// then both T and U need to be in scope for the subquery to be evaluated.
+    pub col_used_mask: ColumnUsedMask,
+}
+
+impl OuterQueryReference {
+    /// Returns the columns of the table that this outer query reference refers to.
+    pub fn columns(&self) -> &[Column] {
+        self.table.columns()
+    }
+
+    /// Marks a column as used; used means that the column is referenced in the query.
+    pub fn mark_column_used(&mut self, column_index: usize) {
+        self.col_used_mask.set(column_index);
+    }
+
+    /// Whether the OuterQueryReference is used by the current query scope.
+    /// This is used primarily to determine at what loop depth a subquery should be evaluated.
+    pub fn is_used(&self) -> bool {
+        !self.col_used_mask.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+/// A collection of table references in a given SQL statement.
+///
+/// `TableReferences::joined_tables` is the list of tables that are joined together.
+/// Example: SELECT * FROM t JOIN u JOIN v -- the joined tables are t, u and v.
+///
+/// `TableReferences::outer_query_refs` are references to tables outside the current scope.
+/// Example: SELECT * FROM t WHERE EXISTS (SELECT * FROM u WHERE u.foo = t.foo)
+/// -- here, 'u' is an outer query reference for the subquery (SELECT * FROM u WHERE u.foo = t.foo),
+/// since that query does not declare 't' in its FROM clause.
+///
+///
+/// Typically a query will only have joined tables, but the following may have outer query references:
+/// - CTEs that refer to other preceding CTEs
+/// - Correlated subqueries, i.e. subqueries that depend on the outer scope
+pub struct TableReferences {
+    /// Tables that are joined together in this query scope.
+    joined_tables: Vec<JoinedTable>,
+    /// Tables from outer scopes that are referenced in this query scope.
+    outer_query_refs: Vec<OuterQueryReference>,
+}
+
+impl TableReferences {
+    pub fn new(
+        joined_tables: Vec<JoinedTable>,
+        outer_query_refs: Vec<OuterQueryReference>,
+    ) -> Self {
+        Self {
+            joined_tables,
+            outer_query_refs,
+        }
+    }
+
+    /// Add a new [JoinedTable] to the query plan.
+    pub fn add_joined_table(&mut self, joined_table: JoinedTable) {
+        self.joined_tables.push(joined_table);
+    }
+
+    /// Returns an immutable reference to the [JoinedTable]s in the query plan.
+    pub fn joined_tables(&self) -> &[JoinedTable] {
+        &self.joined_tables
+    }
+
+    /// Returns a mutable reference to the [JoinedTable]s in the query plan.
+    pub fn joined_tables_mut(&mut self) -> &mut Vec<JoinedTable> {
+        &mut self.joined_tables
+    }
+
+    /// Returns an immutable reference to the [OuterQueryReference]s in the query plan.
+    pub fn outer_query_refs(&self) -> &[OuterQueryReference] {
+        &self.outer_query_refs
+    }
+
+    /// Returns an immutable reference to the [OuterQueryReference] with the given internal ID.
+    pub fn find_outer_query_ref_by_internal_id(
+        &self,
+        internal_id: TableInternalId,
+    ) -> Option<&OuterQueryReference> {
+        self.outer_query_refs
+            .iter()
+            .find(|t| t.internal_id == internal_id)
+    }
+
+    /// Returns a mutable reference to the [OuterQueryReference] with the given internal ID.
+    pub fn find_outer_query_ref_by_internal_id_mut(
+        &mut self,
+        internal_id: TableInternalId,
+    ) -> Option<&mut OuterQueryReference> {
+        self.outer_query_refs
+            .iter_mut()
+            .find(|t| t.internal_id == internal_id)
+    }
+
+    /// Returns an immutable reference to the [Table] with the given internal ID.
+    pub fn find_table_by_internal_id(&self, internal_id: TableInternalId) -> Option<&Table> {
+        self.joined_tables
+            .iter()
+            .find(|t| t.internal_id == internal_id)
+            .map(|t| &t.table)
+            .or_else(|| {
+                self.outer_query_refs
+                    .iter()
+                    .find(|t| t.internal_id == internal_id)
+                    .map(|t| &t.table)
+            })
+    }
+
+    /// Returns an immutable reference to the [Table] with the given identifier,
+    /// where identifier is either the literal name of the table or an alias.
+    pub fn find_table_by_identifier(&self, identifier: &str) -> Option<&Table> {
+        self.joined_tables
+            .iter()
+            .find(|t| t.identifier == identifier)
+            .map(|t| &t.table)
+            .or_else(|| {
+                self.outer_query_refs
+                    .iter()
+                    .find(|t| t.identifier == identifier)
+                    .map(|t| &t.table)
+            })
+    }
+
+    /// Returns an immutable reference to the [OuterQueryReference] with the given identifier,
+    /// where identifier is either the literal name of the table or an alias.
+    pub fn find_outer_query_ref_by_identifier(
+        &self,
+        identifier: &str,
+    ) -> Option<&OuterQueryReference> {
+        self.outer_query_refs
+            .iter()
+            .find(|t| t.identifier == identifier)
+    }
+
+    /// Returns the internal ID and immutable reference to the [Table] with the given identifier,
+    pub fn find_table_and_internal_id_by_identifier(
+        &self,
+        identifier: &str,
+    ) -> Option<(TableInternalId, &Table)> {
+        self.joined_tables
+            .iter()
+            .find(|t| t.identifier == identifier)
+            .map(|t| (t.internal_id, &t.table))
+            .or_else(|| {
+                self.outer_query_refs
+                    .iter()
+                    .find(|t| t.identifier == identifier)
+                    .map(|t| (t.internal_id, &t.table))
+            })
+    }
+
+    /// Returns an immutable reference to the [JoinedTable] with the given internal ID.
+    pub fn find_joined_table_by_internal_id(
+        &self,
+        internal_id: TableInternalId,
+    ) -> Option<&JoinedTable> {
+        self.joined_tables
+            .iter()
+            .find(|t| t.internal_id == internal_id)
+    }
+
+    /// Returns a mutable reference to the [JoinedTable] with the given internal ID.
+    pub fn find_joined_table_by_internal_id_mut(
+        &mut self,
+        internal_id: TableInternalId,
+    ) -> Option<&mut JoinedTable> {
+        self.joined_tables
+            .iter_mut()
+            .find(|t| t.internal_id == internal_id)
+    }
+
+    /// Marks a column as used; used means that the column is referenced in the query.
+    pub fn mark_column_used(&mut self, internal_id: TableInternalId, column_index: usize) {
+        if let Some(joined_table) = self.find_joined_table_by_internal_id_mut(internal_id) {
+            joined_table.mark_column_used(column_index);
+        } else if let Some(outer_query_ref) =
+            self.find_outer_query_ref_by_internal_id_mut(internal_id)
+        {
+            outer_query_ref.mark_column_used(column_index);
+        } else {
+            panic!(
+                "table with internal id {} not found in table references",
+                internal_id
+            );
+        }
+    }
+
+    pub fn contains_table(&self, table: &Table) -> bool {
+        self.joined_tables.iter().any(|t| t.table == *table)
+            || self.outer_query_refs.iter().any(|t| t.table == *table)
+    }
+
+    pub fn extend(&mut self, other: TableReferences) {
+        self.joined_tables.extend(other.joined_tables);
+        self.outer_query_refs.extend(other.outer_query_refs);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -712,7 +925,7 @@ impl Operation {
     }
 }
 
-impl TableReference {
+impl JoinedTable {
     /// Returns the btree table for this table reference, if it is a BTreeTable.
     pub fn btree(&self) -> Option<Rc<BTreeTable>> {
         match &self.table {
@@ -797,14 +1010,14 @@ impl TableReference {
                 let table_cursor_id = if table_not_required {
                     None
                 } else {
-                    Some(program.alloc_cursor_id(
-                        Some(self.identifier.clone()),
+                    Some(program.alloc_cursor_id_keyed(
+                        CursorKey::table(self.internal_id),
                         CursorType::BTreeTable(btree.clone()),
                     ))
                 };
                 let index_cursor_id = if let Some(index) = index {
-                    Some(program.alloc_cursor_id(
-                        Some(index.name.clone()),
+                    Some(program.alloc_cursor_id_keyed(
+                        CursorKey::index(self.internal_id, index.clone()),
                         CursorType::BTreeIndex(index.clone()),
                     ))
                 } else {
@@ -813,8 +1026,8 @@ impl TableReference {
                 Ok((table_cursor_id, index_cursor_id))
             }
             Table::Virtual(virtual_table) => {
-                let table_cursor_id = Some(program.alloc_cursor_id(
-                    Some(self.identifier.clone()),
+                let table_cursor_id = Some(program.alloc_cursor_id_keyed(
+                    CursorKey::table(self.internal_id),
                     CursorType::VirtualTable(virtual_table.clone()),
                 ));
                 let index_cursor_id = None;
@@ -831,8 +1044,10 @@ impl TableReference {
         program: &mut ProgramBuilder,
     ) -> Result<(Option<CursorID>, Option<CursorID>)> {
         let index = self.op.index();
-        let table_cursor_id = program.resolve_cursor_id_safe(&self.identifier);
-        let index_cursor_id = index.map(|index| program.resolve_cursor_id(&index.name));
+        let table_cursor_id = program.resolve_cursor_id_safe(&CursorKey::table(self.internal_id));
+        let index_cursor_id = index.map(|index| {
+            program.resolve_cursor_id(&CursorKey::index(self.internal_id, index.clone()))
+        });
         Ok((table_cursor_id, index_cursor_id))
     }
 
@@ -1025,8 +1240,8 @@ impl Display for SelectPlan {
         writeln!(f, "QUERY PLAN")?;
 
         // Print each table reference with appropriate indentation based on join depth
-        for (i, reference) in self.table_references.iter().enumerate() {
-            let is_last = i == self.table_references.len() - 1;
+        for (i, reference) in self.table_references.joined_tables().iter().enumerate() {
+            let is_last = i == self.table_references.joined_tables().len() - 1;
             let indent = if i == 0 {
                 if is_last { "`--" } else { "|--" }.to_string()
             } else {
@@ -1076,7 +1291,7 @@ impl Display for DeletePlan {
         writeln!(f, "QUERY PLAN")?;
 
         // Delete plan should only have one table reference
-        if let Some(reference) = self.table_references.first() {
+        if let Some(reference) = self.table_references.joined_tables().first() {
             let indent = "`--";
 
             match &reference.op {
@@ -1102,8 +1317,8 @@ impl fmt::Display for UpdatePlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "QUERY PLAN")?;
 
-        for (i, reference) in self.table_references.iter().enumerate() {
-            let is_last = i == self.table_references.len() - 1;
+        for (i, reference) in self.table_references.joined_tables().iter().enumerate() {
+            let is_last = i == self.table_references.joined_tables().len() - 1;
             let indent = if i == 0 {
                 if is_last { "`--" } else { "|--" }.to_string()
             } else {

@@ -27,7 +27,6 @@ pub fn emit_select_result(
     reg_offset: Option<usize>,
     reg_result_cols_start: usize,
     limit_ctx: Option<LimitCtx>,
-    reg_limit_offset_sum: Option<usize>,
 ) -> Result<()> {
     if let (Some(jump_to), Some(_)) = (offset_jump_to, label_on_limit_reached) {
         emit_offset(program, plan, jump_to, reg_offset)?;
@@ -61,15 +60,7 @@ pub fn emit_select_result(
         distinct_ctx.emit_deduplication_insns(program, num_regs, start_reg);
     }
 
-    emit_result_row_and_limit(
-        program,
-        plan,
-        start_reg,
-        limit_ctx,
-        reg_offset,
-        reg_limit_offset_sum,
-        label_on_limit_reached,
-    )?;
+    emit_result_row_and_limit(program, plan, start_reg, limit_ctx, label_on_limit_reached)?;
     Ok(())
 }
 
@@ -81,8 +72,6 @@ pub fn emit_result_row_and_limit(
     plan: &SelectPlan,
     result_columns_start_reg: usize,
     limit_ctx: Option<LimitCtx>,
-    reg_offset: Option<usize>,
-    reg_limit_offset_sum: Option<usize>,
     label_on_limit_reached: Option<BranchOffset>,
 ) -> Result<()> {
     match &plan.query_destination {
@@ -119,7 +108,7 @@ pub fn emit_result_row_and_limit(
         }
     }
 
-    if let Some(limit) = plan.limit {
+    if plan.limit.is_some() {
         if label_on_limit_reached.is_none() {
             // There are cases where LIMIT is ignored, e.g. aggregation without a GROUP BY clause.
             // We already early return on LIMIT 0, so we can just return here since the n of rows
@@ -127,28 +116,6 @@ pub fn emit_result_row_and_limit(
             return Ok(());
         }
         let limit_ctx = limit_ctx.expect("limit_ctx must be Some if plan.limit is Some");
-        if limit_ctx.initialize_counter {
-            program.emit_insn(Insn::Integer {
-                value: limit as i64,
-                dest: limit_ctx.reg_limit,
-            });
-            program.mark_last_insn_constant();
-        }
-
-        if let Some(offset) = plan.offset {
-            program.emit_insn(Insn::Integer {
-                value: offset as i64,
-                dest: reg_offset.expect("reg_offset must be Some"),
-            });
-            program.mark_last_insn_constant();
-
-            program.emit_insn(Insn::OffsetLimit {
-                limit_reg: limit_ctx.reg_limit,
-                combined_reg: reg_limit_offset_sum.expect("reg_limit_offset_sum must be Some"),
-                offset_reg: reg_offset.expect("reg_offset must be Some"),
-            });
-            program.mark_last_insn_constant();
-        }
 
         program.emit_insn(Insn::DecrJumpZero {
             reg: limit_ctx.reg_limit,

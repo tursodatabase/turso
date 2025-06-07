@@ -4,7 +4,7 @@ use limbo_sqlite3_parser::ast::SortOrder;
 
 use crate::{
     schema::Index,
-    translate::plan::{IterationDirection, JoinOrderMember, TableReference},
+    translate::plan::{IterationDirection, JoinOrderMember, JoinedTable},
     Result,
 };
 
@@ -48,7 +48,7 @@ impl<'a> AccessMethod<'a> {
 
 /// Return the best [AccessMethod] for a given join order.
 pub fn find_best_access_method_for_join_order<'a>(
-    rhs_table: &TableReference,
+    rhs_table: &JoinedTable,
     rhs_constraints: &'a TableConstraints,
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,

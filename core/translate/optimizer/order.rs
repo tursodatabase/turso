@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use limbo_sqlite3_parser::ast::{self, SortOrder, TableInternalId};
 
 use crate::{
-    translate::plan::{GroupBy, IterationDirection, TableReference},
+    translate::plan::{GroupBy, IterationDirection, JoinedTable},
     util::exprs_are_equivalent,
 };
 
@@ -157,14 +157,14 @@ pub fn compute_order_target(
 pub fn plan_satisfies_order_target(
     plan: &JoinN,
     access_methods_arena: &RefCell<Vec<AccessMethod>>,
-    table_references: &[TableReference],
+    joined_tables: &[JoinedTable],
     order_target: &OrderTarget,
 ) -> bool {
     let mut target_col_idx = 0;
     let num_cols_in_order_target = order_target.0.len();
     for (table_index, access_method_index) in plan.data.iter() {
         let target_col = &order_target.0[target_col_idx];
-        let table_ref = &table_references[*table_index];
+        let table_ref = &joined_tables[*table_index];
         let correct_table = target_col.table_id == table_ref.internal_id;
         if !correct_table {
             return false;

@@ -22,7 +22,7 @@ pub(crate) fn run_simulation(
     plans: &mut [InteractionPlan],
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
-    log::info!("Executing database interaction plan...");
+    tracing::info!("Executing database interaction plan...");
 
     let mut states = plans
         .iter()
@@ -52,7 +52,7 @@ pub(crate) fn run_simulation(
         last_execution,
     );
 
-    log::info!("Simulation completed");
+    tracing::info!("Simulation completed");
 
     result
 }
@@ -99,6 +99,14 @@ fn execute_query_rusqlite(
         }
         Query::Drop(drop) => {
             connection.execute(drop.to_string().as_str(), ())?;
+            Ok(vec![])
+        }
+        Query::Update(update) => {
+            connection.execute(update.to_string().as_str(), ())?;
+            Ok(vec![])
+        }
+        Query::CreateIndex(create_index) => {
+            connection.execute(create_index.to_string().as_str(), ())?;
             Ok(vec![])
         }
     }
@@ -184,7 +192,7 @@ fn execute_plan(
 
     match (connection, rusqlite_connection) {
         (SimConnection::Disconnected, SimConnection::Disconnected) => {
-            log::debug!("connecting {}", connection_index);
+            tracing::debug!("connecting {}", connection_index);
             env.connections[connection_index] =
                 SimConnection::LimboConnection(env.db.connect().unwrap());
             rusqlite_env.connections[connection_index] =
@@ -202,7 +210,7 @@ fn execute_plan(
             match (limbo_result, ruqlite_result) {
                 (Ok(next_execution), Ok(next_execution_rusqlite)) => {
                     if next_execution != next_execution_rusqlite {
-                        log::error!("limbo and rusqlite results do not match");
+                        tracing::error!("limbo and rusqlite results do not match");
                         return Err(limbo_core::LimboError::InternalError(
                             "limbo and rusqlite results do not match".into(),
                         ));
@@ -215,30 +223,30 @@ fn execute_plan(
                             match (limbo_values, rusqlite_values) {
                                 (Ok(limbo_values), Ok(rusqlite_values)) => {
                                     if limbo_values != rusqlite_values {
-                                        log::error!("limbo and rusqlite results do not match");
+                                        tracing::error!("limbo and rusqlite results do not match");
                                         return Err(limbo_core::LimboError::InternalError(
                                             "limbo and rusqlite results do not match".into(),
                                         ));
                                     }
                                 }
                                 (Err(limbo_err), Err(rusqlite_err)) => {
-                                    log::warn!(
+                                    tracing::warn!(
                                         "limbo and rusqlite both fail, requires manual check"
                                     );
-                                    log::warn!("limbo error {}", limbo_err);
-                                    log::warn!("rusqlite error {}", rusqlite_err);
+                                    tracing::warn!("limbo error {}", limbo_err);
+                                    tracing::warn!("rusqlite error {}", rusqlite_err);
                                 }
                                 (Ok(limbo_result), Err(rusqlite_err)) => {
-                                    log::error!("limbo and rusqlite results do not match");
-                                    log::error!("limbo values {:?}", limbo_result);
-                                    log::error!("rusqlite error {}", rusqlite_err);
+                                    tracing::error!("limbo and rusqlite results do not match");
+                                    tracing::error!("limbo values {:?}", limbo_result);
+                                    tracing::error!("rusqlite error {}", rusqlite_err);
                                     return Err(limbo_core::LimboError::InternalError(
                                         "limbo and rusqlite results do not match".into(),
                                     ));
                                 }
                                 (Err(limbo_err), Ok(_)) => {
-                                    log::error!("limbo and rusqlite results do not match");
-                                    log::error!("limbo error {}", limbo_err);
+                                    tracing::error!("limbo and rusqlite results do not match");
+                                    tracing::error!("limbo error {}", limbo_err);
                                     return Err(limbo_core::LimboError::InternalError(
                                         "limbo and rusqlite results do not match".into(),
                                     ));
@@ -247,7 +255,7 @@ fn execute_plan(
                         }
                         (None, None) => {}
                         _ => {
-                            log::error!("limbo and rusqlite results do not match");
+                            tracing::error!("limbo and rusqlite results do not match");
                             return Err(limbo_core::LimboError::InternalError(
                                 "limbo and rusqlite results do not match".into(),
                             ));
@@ -276,20 +284,20 @@ fn execute_plan(
                     }
                 }
                 (Err(err), Ok(_)) => {
-                    log::error!("limbo and rusqlite results do not match");
-                    log::error!("limbo error {}", err);
+                    tracing::error!("limbo and rusqlite results do not match");
+                    tracing::error!("limbo error {}", err);
                     return Err(err);
                 }
                 (Ok(val), Err(err)) => {
-                    log::error!("limbo and rusqlite results do not match");
-                    log::error!("limbo {:?}", val);
-                    log::error!("rusqlite error {}", err);
+                    tracing::error!("limbo and rusqlite results do not match");
+                    tracing::error!("limbo {:?}", val);
+                    tracing::error!("rusqlite error {}", err);
                     return Err(err);
                 }
                 (Err(err), Err(err_rusqlite)) => {
-                    log::error!("limbo and rusqlite both fail, requires manual check");
-                    log::error!("limbo error {}", err);
-                    log::error!("rusqlite error {}", err_rusqlite);
+                    tracing::error!("limbo and rusqlite both fail, requires manual check");
+                    tracing::error!("limbo error {}", err);
+                    tracing::error!("rusqlite error {}", err_rusqlite);
                     return Err(err);
                 }
             }
@@ -306,7 +314,7 @@ fn execute_interaction_rusqlite(
     interaction: &Interaction,
     stack: &mut Vec<ResultSet>,
 ) -> limbo_core::Result<ExecutionContinuation> {
-    log::trace!(
+    tracing::trace!(
         "execute_interaction_rusqlite(connection_index={}, interaction={})",
         connection_index,
         interaction
@@ -319,11 +327,11 @@ fn execute_interaction_rusqlite(
                 SimConnection::Disconnected => unreachable!(),
             };
 
-            log::debug!("{}", interaction);
+            tracing::debug!("{}", interaction);
             let results = execute_query_rusqlite(conn, query).map_err(|e| {
                 limbo_core::LimboError::InternalError(format!("error executing query: {}", e))
             });
-            log::debug!("{:?}", results);
+            tracing::debug!("{:?}", results);
             stack.push(results);
         }
         Interaction::Assertion(_) => {
@@ -335,7 +343,7 @@ fn execute_interaction_rusqlite(
             stack.clear();
 
             if assumption_result.is_err() {
-                log::warn!("assumption failed: {:?}", assumption_result);
+                tracing::warn!("assumption failed: {:?}", assumption_result);
                 return Ok(ExecutionContinuation::NextProperty);
             }
         }

@@ -43,10 +43,10 @@ impl SimulatorIO {
     }
 
     pub(crate) fn print_stats(&self) {
-        log::info!("run_once faults: {}", self.nr_run_once_faults.borrow());
+        tracing::info!("run_once faults: {}", self.nr_run_once_faults.borrow());
         for file in self.files.borrow().iter() {
-            log::info!("");
-            log::info!("===========================");
+            tracing::info!("");
+            tracing::info!("===========================");
             file.print_stats();
         }
     }
@@ -81,6 +81,13 @@ impl IO for SimulatorIO {
         });
         self.files.borrow_mut().push(file.clone());
         Ok(file)
+    }
+
+    fn wait_for_completion(&self, c: Arc<limbo_core::Completion>) -> Result<()> {
+        while !c.is_completed() {
+            self.run_once()?;
+        }
+        Ok(())
     }
 
     fn run_once(&self) -> Result<()> {

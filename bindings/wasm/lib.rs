@@ -208,8 +208,8 @@ impl limbo_core::File for File {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: limbo_core::Completion) -> Result<()> {
-        let r = match &c {
+    fn pread(&self, pos: usize, c: Arc<limbo_core::Completion>) -> Result<()> {
+        let r = match *c {
             limbo_core::Completion::Read(ref r) => r,
             _ => unreachable!(),
         };
@@ -227,9 +227,9 @@ impl limbo_core::File for File {
         &self,
         pos: usize,
         buffer: Arc<std::cell::RefCell<limbo_core::Buffer>>,
-        c: limbo_core::Completion,
+        c: Arc<limbo_core::Completion>,
     ) -> Result<()> {
-        let w = match &c {
+        let w = match *c {
             limbo_core::Completion::Write(ref w) => w,
             _ => unreachable!(),
         };
@@ -240,7 +240,7 @@ impl limbo_core::File for File {
         Ok(())
     }
 
-    fn sync(&self, c: limbo_core::Completion) -> Result<()> {
+    fn sync(&self, c: Arc<limbo_core::Completion>) -> Result<()> {
         self.vfs.sync(self.fd);
         c.complete(0);
         Ok(())
@@ -281,6 +281,13 @@ impl limbo_core::IO for PlatformIO {
             vfs: VFS::new(),
             fd,
         }))
+    }
+
+    fn wait_for_completion(&self, c: Arc<limbo_core::Completion>) -> Result<()> {
+        while !c.is_completed() {
+            self.run_once()?;
+        }
+        Ok(())
     }
 
     fn run_once(&self) -> Result<()> {
@@ -326,8 +333,8 @@ impl DatabaseFile {
 }
 
 impl limbo_core::DatabaseStorage for DatabaseFile {
-    fn read_page(&self, page_idx: usize, c: limbo_core::Completion) -> Result<()> {
-        let r = match c {
+    fn read_page(&self, page_idx: usize, c: Arc<limbo_core::Completion>) -> Result<()> {
+        let r = match *c {
             limbo_core::Completion::Read(ref r) => r,
             _ => unreachable!(),
         };
@@ -345,7 +352,7 @@ impl limbo_core::DatabaseStorage for DatabaseFile {
         &self,
         page_idx: usize,
         buffer: Arc<std::cell::RefCell<limbo_core::Buffer>>,
-        c: limbo_core::Completion,
+        c: Arc<limbo_core::Completion>,
     ) -> Result<()> {
         let size = buffer.borrow().len();
         let pos = (page_idx - 1) * size;
@@ -353,7 +360,7 @@ impl limbo_core::DatabaseStorage for DatabaseFile {
         Ok(())
     }
 
-    fn sync(&self, _c: limbo_core::Completion) -> Result<()> {
+    fn sync(&self, _c: Arc<limbo_core::Completion>) -> Result<()> {
         todo!()
     }
 }

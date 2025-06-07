@@ -2,13 +2,14 @@ use limbo_sqlite3_parser::ast::{self, UnaryOperator};
 
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
-use super::plan::TableReference;
+use super::plan::TableReferences;
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
 use crate::schema::{Table, Type};
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
+use crate::vdbe::builder::CursorKey;
 use crate::vdbe::{
     builder::ProgramBuilder,
     insn::{CmpInsFlags, Insn},
@@ -130,7 +131,7 @@ macro_rules! expect_arguments_even {
 
 pub fn translate_condition_expr(
     program: &mut ProgramBuilder,
-    referenced_tables: &[TableReference],
+    referenced_tables: &TableReferences,
     expr: &ast::Expr,
     condition_metadata: ConditionMetadata,
     resolver: &Resolver,
@@ -400,7 +401,7 @@ pub enum NoConstantOptReason {
 /// a register will end up being reused e.g. in a coroutine.
 pub fn translate_expr_no_constant_opt(
     program: &mut ProgramBuilder,
-    referenced_tables: Option<&[TableReference]>,
+    referenced_tables: Option<&TableReferences>,
     expr: &ast::Expr,
     target_register: usize,
     resolver: &Resolver,
@@ -420,7 +421,7 @@ pub fn translate_expr_no_constant_opt(
 /// Translate an expression into bytecode.
 pub fn translate_expr(
     program: &mut ProgramBuilder,
-    referenced_tables: Option<&[TableReference]>,
+    referenced_tables: Option<&TableReferences>,
     expr: &ast::Expr,
     target_register: usize,
     resolver: &Resolver,
@@ -1786,20 +1787,30 @@ pub fn translate_expr(
         ),
         ast::Expr::Column {
             database: _,
-            table,
+            table: table_ref_id,
             column,
             is_rowid_alias,
         } => {
-            let table_reference = referenced_tables
-                .as_ref()
-                .unwrap()
-                .iter()
-                .find(|t| t.internal_id == *table)
-                .unwrap();
-            let index = table_reference.op.index();
-            let use_covering_index = table_reference.utilizes_covering_index();
+            let (index, use_covering_index) = {
+                if let Some(table_reference) = referenced_tables
+                    .unwrap()
+                    .find_joined_table_by_internal_id(*table_ref_id)
+                {
+                    (
+                        table_reference.op.index(),
+                        table_reference.utilizes_covering_index(),
+                    )
+                } else {
+                    (None, false)
+                }
+            };
 
-            let Some(table_column) = table_reference.table.get_column_at(*column) else {
+            let table = referenced_tables
+                .unwrap()
+                .find_table_by_internal_id(*table_ref_id)
+                .expect("table reference should be found");
+
+            let Some(table_column) = table.get_column_at(*column) else {
                 crate::bail_parse_error!("column index out of bounds");
             };
             // Counter intuitive but a column always needs to have a collation
@@ -1808,14 +1819,16 @@ pub fn translate_expr(
             // If we are reading a column from a table, we find the cursor that corresponds to
             // the table and read the column from the cursor.
             // If we have a covering index, we don't have an open table cursor so we read from the index cursor.
-            match &table_reference.table {
+            match &table {
                 Table::BTree(_) => {
                     let table_cursor_id = if use_covering_index {
                         None
                     } else {
-                        Some(program.resolve_cursor_id(&table_reference.identifier))
+                        Some(program.resolve_cursor_id(&CursorKey::table(*table_ref_id)))
                     };
-                    let index_cursor_id = index.map(|index| program.resolve_cursor_id(&index.name));
+                    let index_cursor_id = index.map(|index| {
+                        program.resolve_cursor_id(&CursorKey::index(*table_ref_id, index.clone()))
+                    });
                     if *is_rowid_alias {
                         if let Some(index_cursor_id) = index_cursor_id {
                             program.emit_insn(Insn::IdxRowId {
@@ -1845,7 +1858,7 @@ pub fn translate_expr(
                                 "index cursor should be opened when use_covering_index=true",
                             );
                             index.column_table_pos_to_index_pos(*column).unwrap_or_else(|| {
-                                        panic!("covering index {} does not contain column number {} of table {}", index.name, column, table_reference.identifier)
+                                        panic!("covering index {} does not contain column number {} of table {}", index.name, column, table_ref_id)
                                     })
                         } else {
                             *column
@@ -1856,7 +1869,7 @@ pub fn translate_expr(
                             dest: target_register,
                         });
                     }
-                    let Some(column) = table_reference.table.get_column_at(*column) else {
+                    let Some(column) = table.get_column_at(*column) else {
                         crate::bail_parse_error!("column index out of bounds");
                     };
                     maybe_apply_affinity(column.ty, target_register, program);
@@ -1876,7 +1889,7 @@ pub fn translate_expr(
                     Ok(target_register)
                 }
                 Table::Virtual(_) => {
-                    let cursor_id = program.resolve_cursor_id(&table_reference.identifier);
+                    let cursor_id = program.resolve_cursor_id(&CursorKey::table(*table_ref_id));
                     program.emit_insn(Insn::VColumn {
                         cursor_id,
                         column: *column,
@@ -1887,25 +1900,35 @@ pub fn translate_expr(
                 Table::Pseudo(_) => panic!("Column access on pseudo table"),
             }
         }
-        ast::Expr::RowId { database: _, table } => {
-            let table_reference = referenced_tables
-                .as_ref()
-                .unwrap()
-                .iter()
-                .find(|t| t.internal_id == *table)
-                .unwrap();
-            let index = table_reference.op.index();
-            let use_covering_index = table_reference.utilizes_covering_index();
+        ast::Expr::RowId {
+            database: _,
+            table: table_ref_id,
+        } => {
+            let (index, use_covering_index) = {
+                if let Some(table_reference) = referenced_tables
+                    .unwrap()
+                    .find_joined_table_by_internal_id(*table_ref_id)
+                {
+                    (
+                        table_reference.op.index(),
+                        table_reference.utilizes_covering_index(),
+                    )
+                } else {
+                    (None, false)
+                }
+            };
+
             if use_covering_index {
                 let index =
                     index.expect("index cursor should be opened when use_covering_index=true");
-                let cursor_id = program.resolve_cursor_id(&index.name);
+                let cursor_id =
+                    program.resolve_cursor_id(&CursorKey::index(*table_ref_id, index.clone()));
                 program.emit_insn(Insn::IdxRowId {
                     cursor_id,
                     dest: target_register,
                 });
             } else {
-                let cursor_id = program.resolve_cursor_id(&table_reference.identifier);
+                let cursor_id = program.resolve_cursor_id(&CursorKey::table(*table_ref_id));
                 program.emit_insn(Insn::RowId {
                     cursor_id,
                     dest: target_register,
@@ -2423,7 +2446,7 @@ fn emit_binary_insn(
 /// see [translate_condition_expr] and [translate_expr] for implementations.
 fn translate_like_base(
     program: &mut ProgramBuilder,
-    referenced_tables: Option<&[TableReference]>,
+    referenced_tables: Option<&TableReferences>,
     expr: &ast::Expr,
     target_register: usize,
     resolver: &Resolver,
@@ -2482,7 +2505,7 @@ fn translate_like_base(
 fn translate_function(
     program: &mut ProgramBuilder,
     args: &[ast::Expr],
-    referenced_tables: Option<&[TableReference]>,
+    referenced_tables: Option<&TableReferences>,
     resolver: &Resolver,
     target_register: usize,
     func_ctx: FuncCtx,
@@ -2612,9 +2635,9 @@ pub fn unwrap_parens_owned(expr: ast::Expr) -> Result<(ast::Expr, usize)> {
 }
 
 /// Recursively walks an immutable expression, applying a function to each sub-expression.
-pub fn walk_expr<F>(expr: &ast::Expr, func: &mut F) -> Result<()>
+pub fn walk_expr<'a, F>(expr: &'a ast::Expr, func: &mut F) -> Result<()>
 where
-    F: FnMut(&ast::Expr) -> Result<()>,
+    F: FnMut(&'a ast::Expr) -> Result<()>,
 {
     func(expr)?;
     match expr {
@@ -2788,9 +2811,9 @@ where
     Ok(())
 }
 
-fn walk_expr_frame_bound<F>(bound: &ast::FrameBound, func: &mut F) -> Result<()>
+fn walk_expr_frame_bound<'a, F>(bound: &'a ast::FrameBound, func: &mut F) -> Result<()>
 where
-    F: FnMut(&ast::Expr) -> Result<()>,
+    F: FnMut(&'a ast::Expr) -> Result<()>,
 {
     match bound {
         ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) => {

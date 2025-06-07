@@ -28,21 +28,21 @@ use crate::{
     error::LimboError,
     fast_lock::SpinLock,
     function::{AggFunc, FuncCtx},
-    storage::sqlite3_ondisk::SmallVec,
+    storage::{pager::PagerCacheflushStatus, sqlite3_ondisk::SmallVec},
+    translate::plan::TableReferences,
 };
 
 use crate::{
     storage::{btree::BTreeCursor, pager::Pager, sqlite3_ondisk::DatabaseHeader},
-    translate::plan::{ResultSetColumn, TableReference},
+    translate::plan::ResultSetColumn,
     types::{AggContext, Cursor, CursorResult, ImmutableRecord, SeekKey, SeekOp, Value},
     vdbe::{builder::CursorType, insn::Insn},
 };
 
-use crate::CheckpointStatus;
-
 #[cfg(feature = "json")]
 use crate::json::JsonCacheCell;
 use crate::{Connection, MvStore, Result, TransactionState};
+use builder::CursorKey;
 use execute::{InsnFunction, InsnFunctionStepResult, OpIdxDeleteState};
 
 use rand::{
@@ -54,7 +54,6 @@ use std::ptr::NonNull;
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
-    ffi::c_void,
     num::NonZero,
     ops::Deref,
     rc::{Rc, Weak},
@@ -204,40 +203,16 @@ impl<const N: usize> Bitfield<N> {
     }
 }
 
-type VTabOpaqueCursorCloseFn = unsafe extern "C" fn(*const c_void) -> limbo_ext::ResultCode;
-
-pub struct VTabOpaqueCursor {
-    cursor: *const c_void,
-    close: VTabOpaqueCursorCloseFn,
-}
-
-impl VTabOpaqueCursor {
-    pub fn new(cursor: *const c_void, close: VTabOpaqueCursorCloseFn) -> Result<Self> {
-        if cursor.is_null() {
-            return Err(LimboError::InternalError(
-                "VTabOpaqueCursor: cursor is null".into(),
-            ));
-        }
-        Ok(Self { cursor, close })
-    }
-
-    pub fn as_ptr(&self) -> *const c_void {
-        self.cursor
-    }
-}
-
-impl Drop for VTabOpaqueCursor {
-    fn drop(&mut self) {
-        let result = unsafe { (self.close)(self.cursor) };
-        if !result.is_ok() {
-            tracing::error!("Failed to close virtual table cursor");
-        }
-    }
-}
-
-#[derive(Copy, Clone)]
-enum HaltState {
-    Checkpointing,
+#[derive(Copy, Clone, PartialEq, Eq)]
+/// The commit state of the program.
+/// There are two states:
+/// - Ready: The program is ready to run the next instruction, or has shut down after
+/// the last instruction.
+/// - Committing: The program is committing a write transaction. It is waiting for the pager to finish flushing the cache to disk,
+/// primarily to the WAL, but also possibly checkpointing the WAL to the database file.
+enum CommitState {
+    Ready,
+    Committing,
 }
 
 #[derive(Debug, Clone)]
@@ -262,7 +237,7 @@ pub struct ProgramState {
     registers: Vec<Register>,
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
-    deferred_seek: Option<(CursorID, CursorID)>,
+    deferred_seeks: Vec<Option<(CursorID, CursorID)>>,
     ended_coroutine: Bitfield<4>, // flag to indicate that a coroutine has ended (key is the yield register. currently we assume that the yield register is always between 0-255, YOLO)
     /// Indicate whether an [Insn::Once] instruction at a given program counter position has already been executed, well, once.
     once: SmallVec<u32, 4>,
@@ -270,7 +245,7 @@ pub struct ProgramState {
     pub(crate) mv_tx_id: Option<crate::mvcc::database::TxID>,
     interrupted: bool,
     parameters: HashMap<NonZero<usize>, Value>,
-    halt_state: Option<HaltState>,
+    commit_state: CommitState,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
     op_idx_delete_state: Option<OpIdxDeleteState>,
@@ -287,14 +262,14 @@ impl ProgramState {
             registers,
             result_row: None,
             last_compare: None,
-            deferred_seek: None,
+            deferred_seeks: vec![None; max_cursors],
             ended_coroutine: Bitfield::new(),
             once: SmallVec::<u32, 4>::new(),
             regex_cache: RegexCache::new(),
             mv_tx_id: None,
             interrupted: false,
             parameters: HashMap::new(),
-            halt_state: None,
+            commit_state: CommitState::Ready,
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
             op_idx_delete_state: None,
@@ -332,7 +307,7 @@ impl ProgramState {
             .iter_mut()
             .for_each(|r| *r = Register::Value(Value::Null));
         self.last_compare = None;
-        self.deferred_seek = None;
+        self.deferred_seeks.iter_mut().for_each(|s| *s = None);
         self.ended_coroutine.0 = [0; 4];
         self.regex_cache.like.clear();
         self.interrupted = false;
@@ -345,9 +320,9 @@ impl ProgramState {
         let cursors = self.cursors.borrow_mut();
         std::cell::RefMut::map(cursors, |c| {
             c.get_mut(cursor_id)
-                .expect("cursor id out of bounds")
+                .unwrap_or_else(|| panic!("cursor id {} out of bounds", cursor_id))
                 .as_mut()
-                .expect("cursor not allocated")
+                .unwrap_or_else(|| panic!("cursor id {} is None", cursor_id))
         })
     }
 }
@@ -380,7 +355,7 @@ macro_rules! must_be_btree_cursor {
 pub struct Program {
     pub max_registers: usize,
     pub insns: Vec<(Insn, InsnFunction)>,
-    pub cursor_ref: Vec<(Option<String>, CursorType)>,
+    pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
     pub database_header: Arc<SpinLock<DatabaseHeader>>,
     pub comments: Option<Vec<(InsnReference, &'static str)>>,
     pub parameters: crate::parameters::Parameters,
@@ -388,7 +363,7 @@ pub struct Program {
     pub n_change: Cell<i64>,
     pub change_cnt_on: bool,
     pub result_columns: Vec<ResultSetColumn>,
-    pub table_references: Vec<TableReference>,
+    pub table_references: TableReferences,
     pub prev_program: Cell<Option<NonNull<Program>>>,
     pub next_program: Cell<Option<NonNull<Program>>>,
 }
@@ -420,7 +395,7 @@ impl Program {
         }
     }
 
-    pub fn halt(
+    pub fn commit_txn(
         &self,
         pager: Rc<Pager>,
         program_state: &mut ProgramState,
@@ -444,18 +419,14 @@ impl Program {
                 .expect("only weak ref to connection?");
             let auto_commit = connection.auto_commit.get();
             tracing::trace!("Halt auto_commit {}", auto_commit);
-            assert!(
-                program_state.halt_state.is_none()
-                    || (matches!(program_state.halt_state.unwrap(), HaltState::Checkpointing))
-            );
-            if program_state.halt_state.is_some() {
-                self.step_end_write_txn(&pager, &mut program_state.halt_state, connection.deref())
+            if program_state.commit_state == CommitState::Committing {
+                self.step_end_write_txn(&pager, &mut program_state.commit_state, connection.deref())
             } else if auto_commit {
                 let current_state = connection.transaction_state.get();
                 match current_state {
                     TransactionState::Write => self.step_end_write_txn(
                         &pager,
-                        &mut program_state.halt_state,
+                        &mut program_state.commit_state,
                         connection.deref(),
                     ),
                     TransactionState::Read => {
@@ -479,23 +450,23 @@ impl Program {
     fn step_end_write_txn(
         &self,
         pager: &Rc<Pager>,
-        halt_state: &mut Option<HaltState>,
+        commit_state: &mut CommitState,
         connection: &Connection,
     ) -> Result<StepResult> {
-        let checkpoint_status = pager.end_tx()?;
-        match checkpoint_status {
-            CheckpointStatus::Done(_) => {
+        let cacheflush_status = pager.end_tx()?;
+        match cacheflush_status {
+            PagerCacheflushStatus::Done(_) => {
                 if self.change_cnt_on {
                     if let Some(conn) = self.connection.upgrade() {
                         conn.set_changes(self.n_change.get());
                     }
                 }
                 connection.transaction_state.replace(TransactionState::None);
-                let _ = halt_state.take();
+                *commit_state = CommitState::Ready;
             }
-            CheckpointStatus::IO => {
-                tracing::trace!("Checkpointing IO");
-                *halt_state = Some(HaltState::Checkpointing);
+            PagerCacheflushStatus::IO => {
+                tracing::trace!("Cacheflush IO");
+                *commit_state = CommitState::Committing;
                 return Ok(StepResult::IO);
             }
         }
@@ -543,7 +514,7 @@ fn get_new_rowid<R: Rng>(cursor: &mut BTreeCursor, mut rng: R) -> Result<CursorR
         .rowid()?
         .unwrap_or(0) // if BTree is empty - use 0 as initial value for rowid
         .checked_add(1) // add 1 but be careful with overflows
-        .unwrap_or(u64::MAX); // in case of overflow - use u64::MAX
+        .unwrap_or(i64::MAX); // in case of overflow - use i64::MAX
     if rowid > i64::MAX.try_into().unwrap() {
         let distribution = Uniform::from(1..=i64::MAX);
         let max_attempts = 100;
@@ -571,6 +542,7 @@ fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> Immu
     ImmutableRecord::from_registers(&registers[*start_reg..*start_reg + *count])
 }
 
+#[tracing::instrument(skip(program), level = tracing::Level::TRACE)]
 fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
     if !tracing::enabled!(tracing::Level::TRACE) {
         return;

@@ -53,6 +53,10 @@ impl IO for MemoryIO {
         Ok(())
     }
 
+    fn wait_for_completion(&self, _c: Arc<Completion>) -> Result<()> {
+        todo!();
+    }
+
     fn generate_random_number(&self) -> i64 {
         let mut buf = [0u8; 8];
         getrandom::getrandom(&mut buf).unwrap();
@@ -79,7 +83,7 @@ impl File for MemoryFile {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: Completion) -> Result<()> {
+    fn pread(&self, pos: usize, c: Arc<Completion>) -> Result<()> {
         let r = c.as_read();
         let buf_len = r.buf().len();
         if buf_len == 0 {
@@ -120,7 +124,7 @@ impl File for MemoryFile {
         Ok(())
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<Buffer>>, c: Completion) -> Result<()> {
+    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<Buffer>>, c: Arc<Completion>) -> Result<()> {
         let buf = buffer.borrow();
         let buf_len = buf.len();
         if buf_len == 0 {
@@ -156,7 +160,7 @@ impl File for MemoryFile {
         Ok(())
     }
 
-    fn sync(&self, c: Completion) -> Result<()> {
+    fn sync(&self, c: Arc<Completion>) -> Result<()> {
         // no-op
         c.complete(0);
         Ok(())

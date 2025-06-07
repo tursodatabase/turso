@@ -309,18 +309,22 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
         nr_iterations: opts.nr_iterations,
         nr_threads: opts.nr_threads,
     };
-    writeln!(log_file, "{}", opts.nr_threads)?;
-    writeln!(log_file, "{}", opts.nr_iterations)?;
-    writeln!(log_file, "{}", ddl_statements.len())?;
-    for stmt in &ddl_statements {
-        writeln!(log_file, "{}", stmt)?;
+    if !opts.skip_log {
+        writeln!(log_file, "{}", opts.nr_threads)?;
+        writeln!(log_file, "{}", opts.nr_iterations)?;
+        writeln!(log_file, "{}", ddl_statements.len())?;
+        for stmt in &ddl_statements {
+            writeln!(log_file, "{}", stmt)?;
+        }
     }
     plan.ddl_statements = ddl_statements;
     for _ in 0..opts.nr_threads {
         let mut queries = vec![];
         for _ in 0..opts.nr_iterations {
             let sql = generate_random_statement(&schema);
-            // writeln!(log_file, "{}", sql)?;
+            if !opts.skip_log {
+                writeln!(log_file, "{}", sql)?;
+            }
             queries.push(sql);
         }
         plan.queries_per_thread.push(queries);
@@ -403,8 +407,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut handles = Vec::with_capacity(opts.nr_threads);
     let plan = Arc::new(plan);
 
+    let tempfile = tempfile::NamedTempFile::new()?;
+    let db_file = if let Some(db_file) = opts.db_file {
+        db_file
+    } else {
+        tempfile.path().to_string_lossy().to_string()
+    };
+
     for thread in 0..opts.nr_threads {
-        let db = Arc::new(Builder::new_local(&opts.db_file).build().await?);
+        let db = Arc::new(Builder::new_local(&db_file).build().await?);
         let plan = plan.clone();
         let conn = db.connect()?;
 
@@ -438,6 +449,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         limbo::Error::SqlExecutionFailure(e) => {
                             if e.contains("Corrupt database") {
                                 panic!("Error executing query: {}", e);
+                            } else if e.contains("UNIQUE constraint failed") {
+                                println!("Skipping UNIQUE constraint violation: {}", e);
+                                continue;
                             } else {
                                 println!("Error executing query: {}", e);
                             }
@@ -455,6 +469,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         handle.await??;
     }
     println!("Done. SQL statements written to {}", opts.log_file);
-    println!("Database file: {}", opts.db_file);
+    println!("Database file: {}", db_file);
     Ok(())
 }

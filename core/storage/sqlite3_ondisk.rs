@@ -41,6 +41,8 @@
 //!
 //! https://www.sqlite.org/fileformat.html
 
+#![allow(clippy::arc_with_non_send_sync)]
+
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
 use crate::io::{Buffer, Complete, Completion, ReadCompletion, SyncCompletion, WriteCompletion};
@@ -51,7 +53,7 @@ use crate::types::{
     ImmutableRecord, RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype,
 };
 use crate::{File, Result, WalFileShared};
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
@@ -80,6 +82,8 @@ const MAX_PAGE_SIZE: u32 = 65536;
 
 /// The default page size in bytes.
 const DEFAULT_PAGE_SIZE: u16 = 4096;
+
+pub const DATABASE_HEADER_PAGE_ID: usize = 1;
 
 /// The database header.
 /// The first 100 bytes of the database file comprise the database file header.
@@ -190,9 +194,11 @@ pub struct WalHeader {
     pub checkpoint_seq: u32,
 
     /// Random value used for the first salt in checksum calculations
+    /// TODO: Incremented with each checkpoint
     pub salt_1: u32,
 
-    /// Random value used for the second salt in checksum calculations
+    /// Random value used for the second salt in checksum calculations.
+    /// TODO: A different random value for each checkpoint
     pub salt_2: u32,
 
     /// First checksum value in the wal-header
@@ -245,7 +251,7 @@ impl Default for DatabaseHeader {
             freelist_pages: 0,
             schema_cookie: 0,
             schema_format: 4, // latest format, new sqlite3 databases use this format
-            default_page_cache_size: 500, // pages
+            default_page_cache_size: DEFAULT_CACHE_SIZE,
             vacuum_mode_largest_root_page: 0,
             text_encoding: 1, // utf-8
             user_version: 0,
@@ -293,7 +299,8 @@ pub fn begin_read_database_header(
         finish_read_database_header(buf, header).unwrap();
     });
     let c = Completion::Read(ReadCompletion::new(buf, complete));
-    db_file.read_page(1, c)?;
+    #[allow(clippy::arc_with_non_send_sync)]
+    db_file.read_page(DATABASE_HEADER_PAGE_ID, Arc::new(c))?;
     Ok(result)
 }
 
@@ -330,47 +337,6 @@ fn finish_read_database_header(
     header.reserved_for_expansion.copy_from_slice(&buf[72..92]);
     header.version_valid_for = u32::from_be_bytes([buf[92], buf[93], buf[94], buf[95]]);
     header.version_number = u32::from_be_bytes([buf[96], buf[97], buf[98], buf[99]]);
-    Ok(())
-}
-
-pub fn begin_write_database_header(header: &DatabaseHeader, pager: &Pager) -> Result<()> {
-    let page_source = pager.db_file.clone();
-    let header = Rc::new(header.clone());
-
-    let drop_fn = Rc::new(|_buf| {});
-    #[allow(clippy::arc_with_non_send_sync)]
-    let buffer_to_copy = Arc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
-    let buffer_to_copy_in_cb = buffer_to_copy.clone();
-
-    let read_complete = Box::new(move |buffer: Arc<RefCell<Buffer>>| {
-        let buffer = buffer.borrow().clone();
-        let buffer = Rc::new(RefCell::new(buffer));
-        let mut buf_mut = buffer.borrow_mut();
-        write_header_to_buf(buf_mut.as_mut_slice(), &header);
-        let mut dest_buf = buffer_to_copy_in_cb.borrow_mut();
-        dest_buf.as_mut_slice().copy_from_slice(buf_mut.as_slice());
-    });
-
-    let drop_fn = Rc::new(|_buf| {});
-    #[allow(clippy::arc_with_non_send_sync)]
-    let buf = Arc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
-    let c = Completion::Read(ReadCompletion::new(buf, read_complete));
-    page_source.read_page(1, c)?;
-    // run get header block
-    pager.io.run_once()?;
-
-    let buffer_to_copy_in_cb = buffer_to_copy.clone();
-    let write_complete = Box::new(move |bytes_written: i32| {
-        let buf_len = buffer_to_copy_in_cb.borrow().len();
-        if bytes_written < buf_len as i32 {
-            tracing::error!("wrote({bytes_written}) less than expected({buf_len})");
-        }
-        // finish_read_database_header(buf, header).unwrap();
-    });
-
-    let c = Completion::Write(WriteCompletion::new(write_complete));
-    page_source.write_page(1, buffer_to_copy, c)?;
-
     Ok(())
 }
 
@@ -638,7 +604,7 @@ impl PageContent {
 
     /// Read the rowid of a table interior cell.
     #[inline(always)]
-    pub fn cell_table_interior_read_rowid(&self, idx: usize) -> Result<u64> {
+    pub fn cell_table_interior_read_rowid(&self, idx: usize) -> Result<i64> {
         debug_assert!(self.page_type() == PageType::TableInterior);
         let buf = self.as_ptr();
         const INTERIOR_PAGE_HEADER_SIZE_BYTES: usize = 12;
@@ -647,7 +613,7 @@ impl PageContent {
         let cell_pointer = self.read_u16(cell_pointer) as usize;
         const LEFT_CHILD_PAGE_SIZE_BYTES: usize = 4;
         let (rowid, _) = read_varint(&buf[cell_pointer + LEFT_CHILD_PAGE_SIZE_BYTES..])?;
-        Ok(rowid)
+        Ok(rowid as i64)
     }
 
     /// Read the left child page of a table interior cell.
@@ -669,7 +635,7 @@ impl PageContent {
 
     /// Read the rowid of a table leaf cell.
     #[inline(always)]
-    pub fn cell_table_leaf_read_rowid(&self, idx: usize) -> Result<u64> {
+    pub fn cell_table_leaf_read_rowid(&self, idx: usize) -> Result<i64> {
         debug_assert!(self.page_type() == PageType::TableLeaf);
         let buf = self.as_ptr();
         const LEAF_PAGE_HEADER_SIZE_BYTES: usize = 8;
@@ -680,7 +646,7 @@ impl PageContent {
         let (_, nr) = read_varint(&buf[pos..])?;
         pos += nr;
         let (rowid, _) = read_varint(&buf[pos..])?;
-        Ok(rowid)
+        Ok(rowid as i64)
     }
 
     /// The cell pointer array of a b-tree page immediately follows the b-tree page header.
@@ -819,17 +785,17 @@ pub fn begin_read_page(
         }
     });
     let c = Completion::Read(ReadCompletion::new(buf, complete));
-    db_file.read_page(page_idx, c)?;
+    db_file.read_page(page_idx, Arc::new(c))?;
     Ok(())
 }
 
-fn finish_read_page(
+pub fn finish_read_page(
     page_idx: usize,
     buffer_ref: Arc<RefCell<Buffer>>,
     page: PageRef,
 ) -> Result<()> {
     trace!("finish_read_btree_page(page_idx = {})", page_idx);
-    let pos = if page_idx == 1 {
+    let pos = if page_idx == DATABASE_HEADER_PAGE_ID {
         DATABASE_HEADER_SIZE
     } else {
         0
@@ -877,7 +843,7 @@ pub fn begin_write_btree_page(
         })
     };
     let c = Completion::Write(WriteCompletion::new(write_complete));
-    page_source.write_page(page_id, buffer.clone(), c)?;
+    page_source.write_page(page_id, buffer.clone(), Arc::new(c))?;
     Ok(())
 }
 
@@ -888,8 +854,10 @@ pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>, syncing: Rc<RefCell<bool>>)
         complete: Box::new(move |_| {
             *syncing.borrow_mut() = false;
         }),
+        is_completed: Cell::new(false),
     });
-    db_file.sync(completion)?;
+    #[allow(clippy::arc_with_non_send_sync)]
+    db_file.sync(Arc::new(completion))?;
     Ok(())
 }
 
@@ -905,12 +873,12 @@ pub enum BTreeCell {
 #[derive(Debug, Clone)]
 pub struct TableInteriorCell {
     pub _left_child_page: u32,
-    pub _rowid: u64,
+    pub _rowid: i64,
 }
 
 #[derive(Debug, Clone)]
 pub struct TableLeafCell {
-    pub _rowid: u64,
+    pub _rowid: i64,
     /// Payload of cell, if it overflows it won't include overflowed payload.
     pub _payload: &'static [u8],
     /// This is the complete payload size including overflow pages.
@@ -975,7 +943,7 @@ pub fn read_btree_cell(
             let (rowid, _) = read_varint(&page[pos..])?;
             Ok(BTreeCell::TableInteriorCell(TableInteriorCell {
                 _left_child_page: left_child_page,
-                _rowid: rowid,
+                _rowid: rowid as i64,
             }))
         }
         PageType::IndexLeaf => {
@@ -1009,7 +977,7 @@ pub fn read_btree_cell(
             let (payload, first_overflow_page) =
                 read_payload(&page[pos..pos + to_read], payload_size as usize);
             Ok(BTreeCell::TableLeafCell(TableLeafCell {
-                _rowid: rowid,
+                _rowid: rowid as i64,
                 _payload: payload,
                 first_overflow_page,
                 payload_size,
@@ -1465,11 +1433,16 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
             let frame_h_checksum_2 =
                 u32::from_be_bytes(frame_header_slice[20..24].try_into().unwrap());
 
+            // It contains more frames with mismatched SALT values, which means they're leftovers from previous checkpoints
             if frame_h_salt_1 != header_locked.salt_1 || frame_h_salt_2 != header_locked.salt_2 {
-                panic!(
-                    "WAL frame salt mismatch. Expected ({}, {}), Got ({}, {})",
-                    header_locked.salt_1, header_locked.salt_2, frame_h_salt_1, frame_h_salt_2
+                tracing::trace!(
+                    "WAL frame salt mismatch: expected ({}, {}), got ({}, {}), ignoring frame",
+                    header_locked.salt_1,
+                    header_locked.salt_2,
+                    frame_h_salt_1,
+                    frame_h_salt_2
                 );
+                break;
             }
 
             let checksum_after_fh_meta = checksum_wal(
@@ -1519,7 +1492,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
         wfs_data.loaded.store(true, Ordering::SeqCst);
     });
     let c = Completion::Read(ReadCompletion::new(buf_for_pread, complete));
-    file.pread(0, c)?;
+    file.pread(0, Arc::new(c))?;
 
     Ok(wal_file_shared_ret)
 }
@@ -1528,28 +1501,19 @@ pub fn begin_read_wal_frame(
     io: &Arc<dyn File>,
     offset: usize,
     buffer_pool: Rc<BufferPool>,
-    page: PageRef,
-) -> Result<()> {
-    trace!(
-        "begin_read_wal_frame(offset={}, page={})",
-        offset,
-        page.get().id
-    );
+    complete: Box<dyn Fn(Arc<RefCell<Buffer>>) -> ()>,
+) -> Result<Arc<Completion>> {
+    trace!("begin_read_wal_frame(offset={})", offset);
     let buf = buffer_pool.get();
     let drop_fn = Rc::new(move |buf| {
         let buffer_pool = buffer_pool.clone();
         buffer_pool.put(buf);
     });
-    #[allow(clippy::arc_with_non_send_sync)]
     let buf = Arc::new(RefCell::new(Buffer::new(buf, drop_fn)));
-    let frame = page.clone();
-    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
-        let frame = frame.clone();
-        finish_read_page(page.get().id, buf, frame).unwrap();
-    });
-    let c = Completion::Read(ReadCompletion::new(buf, complete));
-    io.pread(offset, c)?;
-    Ok(())
+    #[allow(clippy::arc_with_non_send_sync)]
+    let c = Arc::new(Completion::Read(ReadCompletion::new(buf, complete)));
+    io.pread(offset, c.clone())?;
+    Ok(c)
 }
 
 pub fn begin_write_wal_frame(
@@ -1631,7 +1595,8 @@ pub fn begin_write_wal_frame(
             }
         })
     };
-    let c = Completion::Write(WriteCompletion::new(write_complete));
+    #[allow(clippy::arc_with_non_send_sync)]
+    let c = Arc::new(Completion::Write(WriteCompletion::new(write_complete)));
     io.pwrite(offset, buffer.clone(), c)?;
     trace!("Frame written and synced at offset={offset}");
     Ok(checksums)
@@ -1666,7 +1631,8 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
             }
         })
     };
-    let c = Completion::Write(WriteCompletion::new(write_complete));
+    #[allow(clippy::arc_with_non_send_sync)]
+    let c = Arc::new(Completion::Write(WriteCompletion::new(write_complete)));
     io.pwrite(0, buffer.clone(), c)?;
     Ok(())
 }

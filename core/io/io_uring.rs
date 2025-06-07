@@ -1,3 +1,5 @@
+#![allow(clippy::arc_with_non_send_sync)]
+
 use super::{common, Completion, File, OpenFlags, WriteCompletion, IO};
 use crate::io::clock::{Clock, Instant};
 use crate::{LimboError, MemoryIO, Result};
@@ -43,7 +45,7 @@ unsafe impl Sync for UringIO {}
 struct WrappedIOUring {
     ring: io_uring::IoUring,
     pending_ops: usize,
-    pub pending: [Option<Completion>; MAX_IOVECS as usize + 1],
+    pub pending: [Option<Arc<Completion>>; MAX_IOVECS as usize + 1],
     key: u64,
 }
 
@@ -93,7 +95,7 @@ impl InnerUringIO {
 }
 
 impl WrappedIOUring {
-    fn submit_entry(&mut self, entry: &io_uring::squeue::Entry, c: Completion) {
+    fn submit_entry(&mut self, entry: &io_uring::squeue::Entry, c: Arc<Completion>) {
         trace!("submit_entry({:?})", entry);
         self.pending[entry.get_user_data() as usize] = Some(c);
         unsafe {
@@ -165,6 +167,13 @@ impl IO for UringIO {
             uring_file.lock_file(!flags.contains(OpenFlags::ReadOnly))?;
         }
         Ok(uring_file)
+    }
+
+    fn wait_for_completion(&self, c: Arc<Completion>) -> Result<()> {
+        while !c.is_completed() {
+            self.run_once()?;
+        }
+        Ok(())
     }
 
     fn run_once(&self) -> Result<()> {
@@ -263,7 +272,7 @@ impl File for UringFile {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: Completion) -> Result<()> {
+    fn pread(&self, pos: usize, c: Arc<Completion>) -> Result<()> {
         let r = c.as_read();
         trace!("pread(pos = {}, length = {})", pos, r.buf().len());
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
@@ -282,7 +291,7 @@ impl File for UringFile {
         Ok(())
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<crate::Buffer>>, c: Completion) -> Result<()> {
+    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<crate::Buffer>>, c: Arc<Completion>) -> Result<()> {
         let mut io = self.io.borrow_mut();
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
         let write = {
@@ -296,16 +305,16 @@ impl File for UringFile {
         };
         io.ring.submit_entry(
             &write,
-            Completion::Write(WriteCompletion::new(Box::new(move |result| {
+            Arc::new(Completion::Write(WriteCompletion::new(Box::new(move |result| {
                 c.complete(result);
                 // NOTE: Explicitly reference buffer to ensure it lives until here
                 let _ = buffer.borrow();
-            }))),
+            })))),
         );
         Ok(())
     }
 
-    fn sync(&self, c: Completion) -> Result<()> {
+    fn sync(&self, c: Arc<Completion>) -> Result<()> {
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
         let mut io = self.io.borrow_mut();
         trace!("sync()");

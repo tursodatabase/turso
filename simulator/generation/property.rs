@@ -443,7 +443,9 @@ pub(crate) struct Remaining {
     pub(crate) read: f64,
     pub(crate) write: f64,
     pub(crate) create: f64,
+    pub(crate) create_index: f64,
     pub(crate) delete: f64,
+    pub(crate) update: f64,
     pub(crate) drop: f64,
 }
 
@@ -457,8 +459,17 @@ pub(crate) fn remaining(env: &SimulatorEnv, stats: &InteractionStats) -> Remaini
     let remaining_create = ((env.opts.max_interactions as f64 * env.opts.create_percent / 100.0)
         - (stats.create_count as f64))
         .max(0.0);
+
+    let remaining_create_index =
+        ((env.opts.max_interactions as f64 * env.opts.create_index_percent / 100.0)
+            - (stats.create_index_count as f64))
+            .max(0.0);
+
     let remaining_delete = ((env.opts.max_interactions as f64 * env.opts.delete_percent / 100.0)
         - (stats.delete_count as f64))
+        .max(0.0);
+    let remaining_update = ((env.opts.max_interactions as f64 * env.opts.update_percent / 100.0)
+        - (stats.update_count as f64))
         .max(0.0);
     let remaining_drop = ((env.opts.max_interactions as f64 * env.opts.drop_percent / 100.0)
         - (stats.drop_count as f64))
@@ -468,8 +479,10 @@ pub(crate) fn remaining(env: &SimulatorEnv, stats: &InteractionStats) -> Remaini
         read: remaining_read,
         write: remaining_write,
         create: remaining_create,
+        create_index: remaining_create_index,
         delete: remaining_delete,
         drop: remaining_drop,
+        update: remaining_update,
     }
 }
 
@@ -711,7 +724,7 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
                     Box::new(|rng: &mut R| property_select_limit(rng, env)),
                 ),
                 (
-                    f64::min(remaining_.read, remaining_.write),
+                    f64::min(remaining_.read, remaining_.write).min(remaining_.delete),
                     Box::new(|rng: &mut R| property_delete_select(rng, env, &remaining_)),
                 ),
                 (

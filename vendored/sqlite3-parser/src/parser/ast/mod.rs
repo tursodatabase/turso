@@ -290,9 +290,13 @@ pub struct Delete {
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Internal ID of a table.
+/// Internal ID of a table reference.
 ///
 /// Used by [Expr::Column] and [Expr::RowId] to refer to a table.
+/// E.g. in 'SELECT * FROM t UNION ALL SELECT * FROM t', there are two table references,
+/// so there are two TableInternalIds.
+///
+/// FIXME: rename this to TableReferenceId.
 pub struct TableInternalId(usize);
 
 impl Default for TableInternalId {

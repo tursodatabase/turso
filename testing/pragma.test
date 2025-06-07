@@ -3,12 +3,30 @@
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 
+do_execsql_test_on_specific_db ":memory:" pragma-cache-size-default {
+  PRAGMA cache_size
+} {-2000}
+
+do_execsql_test pragma-set-cache-size {
+  PRAGMA cache_size = 100;
+  PRAGMA cache_size
+} {100}
+
+# Even though the cache size was set to 100 in previous test, a new connection defaults back to -2000.
 do_execsql_test pragma-cache-size {
   PRAGMA cache_size
 } {-2000}
 
+do_execsql_test pragma-function-cache-size {
+  SELECT * FROM pragma_cache_size()
+} {-2000}
+
 do_execsql_test pragma-update-journal-mode-wal {
   PRAGMA journal_mode=WAL
+} {wal}
+
+do_execsql_test pragma-function-update-journal-mode {
+  SELECT * FROM pragma_journal_mode()
 } {wal}
 
 do_execsql_test pragma-table-info-equal-syntax {
@@ -29,8 +47,21 @@ do_execsql_test pragma-table-info-call-syntax {
 4|sql|TEXT|0||0
 }
 
+do_execsql_test pragma-function-table-info {
+  SELECT * FROM pragma_table_info('sqlite_schema')
+} {0|type|TEXT|0||0
+1|name|TEXT|0||0
+2|tbl_name|TEXT|0||0
+3|rootpage|INT|0||0
+4|sql|TEXT|0||0
+}
+
 do_execsql_test pragma-table-info-invalid-table {
   PRAGMA table_info=pekka
+} {}
+
+do_execsql_test pragma-function-table-info-invalid-table {
+  SELECT * FROM pragma_table_info('pekka')
 } {}
 
 # temporarily skip this test case. The issue is detailed in #1407
@@ -55,3 +86,59 @@ do_execsql_test_on_specific_db ":memory:" pragma-user-version-update {
   PRAGMA user_version = 42;
   PRAGMA user_version;
 } {42}
+
+do_execsql_test_on_specific_db ":memory:" pragma-user-version-negative-value {
+  PRAGMA user_version = -10;
+  PRAGMA user_version;
+} {-10}
+
+do_execsql_test_on_specific_db ":memory:" pragma-user-version-float-value {
+  PRAGMA user_version = 10.9;
+  PRAGMA user_version;
+} {10}
+
+do_execsql_test pragma-legacy-file-format {
+  PRAGMA legacy_file_format
+} {}
+
+do_execsql_test_error_content pragma-function-legacy-file-format {
+  SELECT * FROM pragma_legacy_file_format()
+} {"No such table"}
+
+do_execsql_test_error_content pragma-function-too-many-arguments {
+  SELECT * FROM pragma_table_info('sqlite_schema', 'main', 'arg3')
+} {"Too many arguments"}
+
+do_execsql_test_error_content pragma-function-update {
+  SELECT * FROM pragma_wal_checkpoint()
+} {"No such table"}
+
+do_execsql_test pragma-function-nontext-argument {
+  SELECT * FROM pragma_table_info('sqlite_schema', NULL);
+} {0|type|TEXT|0||0
+1|name|TEXT|0||0
+2|tbl_name|TEXT|0||0
+3|rootpage|INT|0||0
+4|sql|TEXT|0||0
+}
+
+do_execsql_test pragma-function-no-arguments {
+  SELECT * FROM pragma_table_info();
+} {}
+
+do_execsql_test_on_specific_db ":memory:" pragma-function-argument-with-space {
+  CREATE TABLE "foo bar"(c0);
+  SELECT * FROM pragma_table_info('foo bar')
+} {0|c0||0||0}
+
+# If the argument passed to the first function call were simply concatenated with the underlying PRAGMA statement,
+# we would end up with: PRAGMA table_info='sqlite_schema';CREATE TABLE foo(c0);SELECT 'bar'. Depending on how many
+# statements are executed at once, at least one of the following would run:
+# - PRAGMA table_info='sqlite_schema';
+# - CREATE TABLE foo(c0);
+# - SELECT 'bar';
+# No output means that none of them were executed.
+do_execsql_test pragma-function-sql-injection {
+  SELECT * FROM pragma_table_info('sqlite_schema'';CREATE TABLE foo(c0);SELECT ''bar');
+  SELECT * FROM pragma_table_info('foo');
+} {}

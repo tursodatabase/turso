@@ -269,7 +269,6 @@ fn test_wal_checkpoint() -> anyhow::Result<()> {
     }
 
     do_flush(&conn, &tmp_db)?;
-    conn.clear_page_cache()?;
     let list_query = "SELECT * FROM test LIMIT 1";
     let mut current_index = 0;
     run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
@@ -332,8 +331,8 @@ fn test_insert_after_big_blob() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE temp (t1 BLOB, t2 INTEGER)");
     let conn = tmp_db.connect_limbo();
 
-    conn.execute("insert into temp values (zeroblob (262144))")?;
-    conn.execute("insert into temp values (1)")?;
+    conn.execute("insert into temp(t1) values (zeroblob (262144))")?;
+    conn.execute("insert into temp(t2) values (1)")?;
 
     Ok(())
 }

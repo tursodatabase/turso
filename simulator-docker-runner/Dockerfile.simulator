@@ -1,0 +1,74 @@
+FROM lukemathwalker/cargo-chef:latest-rust-1.87.0 AS chef
+RUN apt update \
+    && apt install -y git libssl-dev pkg-config\
+    && apt clean \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+
+#
+# Cache dependencies
+#
+
+FROM chef AS planner
+# cargo-chef requires all this crap to be present in the workspace
+COPY Cargo.toml Cargo.lock ./
+COPY core ./core/
+COPY simulator ./simulator/
+COPY bindings ./bindings/
+COPY extensions ./extensions/
+COPY macros ./macros/
+COPY vendored ./vendored/
+COPY cli ./cli/
+COPY sqlite3 ./sqlite3/
+COPY stress ./stress/
+COPY tests ./tests/
+RUN cargo chef prepare --bin limbo_sim --recipe-path recipe.json
+
+#
+# Build the project.
+#
+
+FROM chef AS builder 
+
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --bin limbo_sim --release --recipe-path recipe.json
+COPY --from=planner /app/core ./core/
+COPY --from=planner /app/vendored ./vendored/
+COPY --from=planner /app/extensions ./extensions/
+COPY --from=planner /app/macros ./macros/
+COPY --from=planner /app/simulator ./simulator/
+
+RUN cargo build --bin limbo_sim --release
+
+#
+# The final image.
+#
+
+FROM debian:bookworm-slim AS runtime
+# Install Bun (we want to use a fancy shell so we can e.g. post github issues when simulator fails)
+RUN apt-get update && apt-get install -y \
+    curl \
+    unzip \
+    ca-certificates \
+    libssl3 \
+    openssl \
+    && curl -fsSL https://bun.sh/install | bash \
+    && ln -s /root/.bun/bin/bun /usr/local/bin/bun \
+    && rm -rf /var/lib/apt/lists/*
+
+# Accept git hash as build argument
+ARG GIT_HASH
+ENV GIT_HASH=${GIT_HASH:-unknown}
+
+WORKDIR /app
+COPY --from=builder /app/target/release/limbo_sim /app/limbo_sim
+COPY simulator-docker-runner/package.json simulator-docker-runner/bun.lock simulator-docker-runner/tsconfig.json ./
+RUN bun install
+COPY simulator-docker-runner/* ./
+
+RUN chmod +x /app/docker-entrypoint.simulator.ts
+RUN chmod +x /app/limbo_sim
+
+ENTRYPOINT ["bun", "/app/docker-entrypoint.simulator.ts"]
+# Arguments can be passed at runtime
+CMD []

@@ -14,11 +14,11 @@ mod tests;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RowID {
     pub table_id: u64,
-    pub row_id: u64,
+    pub row_id: i64,
 }
 
 impl RowID {
-    pub fn new(table_id: u64, row_id: u64) -> Self {
+    pub fn new(table_id: u64, row_id: i64) -> Self {
         Self { table_id, row_id }
     }
 }
@@ -415,7 +415,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     row_id: 0,
                 }..RowID {
                     table_id,
-                    row_id: u64::MAX,
+                    row_id: i64::MAX,
                 },
             )
             .map(|entry| *entry.key())
@@ -425,7 +425,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn get_row_id_range(
         &self,
         table_id: u64,
-        start: u64,
+        start: i64,
         bucket: &mut Vec<RowID>,
         max_items: u64,
     ) -> Result<()> {
@@ -441,7 +441,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         let end_id = RowID {
             table_id,
-            row_id: u64::MAX,
+            row_id: i64::MAX,
         };
 
         self.rows
@@ -452,7 +452,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(())
     }
 
-    pub fn get_next_row_id_for_table(&self, table_id: u64, start: u64) -> Option<RowID> {
+    pub fn get_next_row_id_for_table(&self, table_id: u64, start: i64) -> Option<RowID> {
         tracing::trace!(
             "getting_next_id_for_table(table_id={}, range_start={})",
             table_id,
@@ -465,7 +465,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         let max_bound = RowID {
             table_id,
-            row_id: u64::MAX,
+            row_id: i64::MAX,
         };
 
         self.rows

@@ -49,9 +49,11 @@ use schema::{
 use select::translate_select;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
+use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
 use update::translate_update;
 
+#[instrument(skip_all, level = Level::TRACE)]
 pub fn translate(
     schema: &Schema,
     stmt: ast::Stmt,
@@ -60,6 +62,7 @@ pub fn translate(
     connection: Weak<Connection>,
     syms: &SymbolTable,
     query_mode: QueryMode,
+    _input: &str, // TODO: going to be used for CREATE VIEW
 ) -> Result<Program> {
     let change_cnt_on = matches!(
         stmt,
@@ -85,6 +88,7 @@ pub fn translate(
             body.map(|b| *b),
             database_header.clone(),
             pager,
+            connection.clone(),
             program,
         )?,
         stmt => translate_inner(schema, stmt, syms, query_mode, program)?,
@@ -232,7 +236,17 @@ pub fn translate_inner(
         ast::Stmt::Release(_) => bail_parse_error!("RELEASE not supported yet"),
         ast::Stmt::Rollback { .. } => bail_parse_error!("ROLLBACK not supported yet"),
         ast::Stmt::Savepoint(_) => bail_parse_error!("SAVEPOINT not supported yet"),
-        ast::Stmt::Select(select) => translate_select(query_mode, schema, *select, syms, program)?,
+        ast::Stmt::Select(select) => {
+            translate_select(
+                query_mode,
+                schema,
+                *select,
+                syms,
+                program,
+                plan::QueryDestination::ResultRows,
+            )?
+            .program
+        }
         ast::Stmt::Update(mut update) => translate_update(
             query_mode,
             schema,
@@ -248,18 +262,18 @@ pub fn translate_inner(
                 or_conflict,
                 tbl_name,
                 columns,
-                mut body,
+                body,
                 returning,
             } = *insert;
             translate_insert(
                 query_mode,
                 schema,
-                &with,
-                &or_conflict,
-                &tbl_name,
-                &columns,
-                &mut body,
-                &returning,
+                with,
+                or_conflict,
+                tbl_name,
+                columns,
+                body,
+                returning,
                 syms,
                 program,
             )?

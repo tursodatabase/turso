@@ -5,7 +5,7 @@ use limbo_sqlite3_parser::ast::TableInternalId;
 use crate::{
     translate::{
         optimizer::{cost::Cost, order::plan_satisfies_order_target},
-        plan::{JoinOrderMember, TableReference},
+        plan::{JoinOrderMember, JoinedTable},
         planner::TableMask,
     },
     Result,
@@ -45,7 +45,7 @@ impl JoinN {
 /// Returns None if the plan is worse than the provided cost upper bound.
 pub fn join_lhs_and_rhs<'a>(
     lhs: Option<&JoinN>,
-    rhs_table_reference: &TableReference,
+    rhs_table_reference: &JoinedTable,
     rhs_constraints: &'a TableConstraints,
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
@@ -118,21 +118,21 @@ pub struct BestJoinOrderResult {
 /// Compute the best way to join a given set of tables.
 /// Returns the best [JoinN] if one exists, otherwise returns None.
 pub fn compute_best_join_order<'a>(
-    table_references: &[TableReference],
+    joined_tables: &[JoinedTable],
     maybe_order_target: Option<&OrderTarget>,
     constraints: &'a [TableConstraints],
     access_methods_arena: &'a RefCell<Vec<AccessMethod<'a>>>,
 ) -> Result<Option<BestJoinOrderResult>> {
     // Skip work if we have no tables to consider.
-    if table_references.is_empty() {
+    if joined_tables.is_empty() {
         return Ok(None);
     }
 
-    let num_tables = table_references.len();
+    let num_tables = joined_tables.len();
 
     // Compute naive left-to-right plan to use as pruning threshold
     let naive_plan = compute_naive_left_deep_plan(
-        table_references,
+        joined_tables,
         maybe_order_target,
         access_methods_arena,
         &constraints,
@@ -146,7 +146,7 @@ pub fn compute_best_join_order<'a>(
         plan_satisfies_order_target(
             &naive_plan,
             &access_methods_arena,
-            table_references,
+            joined_tables,
             order_target,
         )
     } else {
@@ -154,7 +154,7 @@ pub fn compute_best_join_order<'a>(
     };
 
     // If we have one table, then the "naive left-to-right plan" is always the best.
-    if table_references.len() == 1 {
+    if joined_tables.len() == 1 {
         return Ok(Some(BestJoinOrderResult {
             best_plan: naive_plan,
             best_ordered_plan: None,
@@ -188,7 +188,7 @@ pub fn compute_best_join_order<'a>(
     for i in 0..num_tables {
         let mut mask = TableMask::new();
         mask.add_table(i);
-        let table_ref = &table_references[i];
+        let table_ref = &joined_tables[i];
         join_order[0] = JoinOrderMember {
             table_id: table_ref.internal_id,
             original_idx: i,
@@ -215,7 +215,7 @@ pub fn compute_best_join_order<'a>(
     // "a LEFT JOIN b" can NOT be reordered as "b LEFT JOIN a".
     // If there are outer joins in the plan, ensure correct ordering.
     let left_join_illegal_map = {
-        let left_join_count = table_references
+        let left_join_count = joined_tables
             .iter()
             .filter(|t| t.join_info.as_ref().map_or(false, |j| j.outer))
             .count();
@@ -225,9 +225,9 @@ pub fn compute_best_join_order<'a>(
             // map from rhs table index to lhs table index
             let mut left_join_illegal_map: HashMap<usize, TableMask> =
                 HashMap::with_capacity(left_join_count);
-            for (i, _) in table_references.iter().enumerate() {
-                for j in i + 1..table_references.len() {
-                    if table_references[j]
+            for (i, _) in joined_tables.iter().enumerate() {
+                for j in i + 1..joined_tables.len() {
+                    if joined_tables[j]
                         .join_info
                         .as_ref()
                         .map_or(false, |j| j.outer)
@@ -295,18 +295,18 @@ pub fn compute_best_join_order<'a>(
                 // Build a JoinOrder out of the table bitmask we are now considering.
                 for table_no in lhs.table_numbers() {
                     join_order.push(JoinOrderMember {
-                        table_id: table_references[table_no].internal_id,
+                        table_id: joined_tables[table_no].internal_id,
                         original_idx: table_no,
-                        is_outer: table_references[table_no]
+                        is_outer: joined_tables[table_no]
                             .join_info
                             .as_ref()
                             .map_or(false, |j| j.outer),
                     });
                 }
                 join_order.push(JoinOrderMember {
-                    table_id: table_references[rhs_idx].internal_id,
+                    table_id: joined_tables[rhs_idx].internal_id,
                     original_idx: rhs_idx,
-                    is_outer: table_references[rhs_idx]
+                    is_outer: joined_tables[rhs_idx]
                         .join_info
                         .as_ref()
                         .map_or(false, |j| j.outer),
@@ -316,7 +316,7 @@ pub fn compute_best_join_order<'a>(
                 // Calculate the best way to join LHS with RHS.
                 let rel = join_lhs_and_rhs(
                     Some(lhs),
-                    &table_references[rhs_idx],
+                    &joined_tables[rhs_idx],
                     &constraints[rhs_idx],
                     &join_order,
                     maybe_order_target,
@@ -333,7 +333,7 @@ pub fn compute_best_join_order<'a>(
                     plan_satisfies_order_target(
                         &rel,
                         &access_methods_arena,
-                        table_references,
+                        joined_tables,
                         order_target,
                     )
                 } else {
@@ -396,15 +396,15 @@ pub fn compute_best_join_order<'a>(
 /// in the SQL query. This is used as an upper bound for any other plans -- we can give up enumerating
 /// permutations if they exceed this cost during enumeration.
 pub fn compute_naive_left_deep_plan<'a>(
-    table_references: &[TableReference],
+    joined_tables: &[JoinedTable],
     maybe_order_target: Option<&OrderTarget>,
     access_methods_arena: &'a RefCell<Vec<AccessMethod<'a>>>,
     constraints: &'a [TableConstraints],
 ) -> Result<JoinN> {
-    let n = table_references.len();
+    let n = joined_tables.len();
     assert!(n > 0);
 
-    let join_order = table_references
+    let join_order = joined_tables
         .iter()
         .enumerate()
         .map(|(i, t)| JoinOrderMember {
@@ -417,7 +417,7 @@ pub fn compute_naive_left_deep_plan<'a>(
     // Start with first table
     let mut best_plan = join_lhs_and_rhs(
         None,
-        &table_references[0],
+        &joined_tables[0],
         &constraints[0],
         &join_order[..1],
         maybe_order_target,
@@ -430,7 +430,7 @@ pub fn compute_naive_left_deep_plan<'a>(
     for i in 1..n {
         best_plan = join_lhs_and_rhs(
             Some(&best_plan),
-            &table_references[i],
+            &joined_tables[i],
             &constraints[i],
             &join_order[..=i],
             maybe_order_target,
@@ -494,7 +494,7 @@ fn generate_join_bitmasks(table_number_max_exclusive: usize, how_many: usize) ->
 
 #[cfg(test)]
 mod tests {
-    use std::{rc::Rc, sync::Arc};
+    use std::{cell::Cell, rc::Rc, sync::Arc};
 
     use limbo_sqlite3_parser::ast::{self, Expr, Operator, SortOrder, TableInternalId};
 
@@ -503,7 +503,9 @@ mod tests {
         schema::{BTreeTable, Column, Index, IndexColumn, Table, Type},
         translate::{
             optimizer::constraints::{constraints_from_where_clause, BinaryExprSide},
-            plan::{ColumnUsedMask, IterationDirection, JoinInfo, Operation, WhereTerm},
+            plan::{
+                ColumnUsedMask, IterationDirection, JoinInfo, Operation, TableReferences, WhereTerm,
+            },
             planner::TableMask,
         },
         vdbe::builder::TableRefIdCounter,
@@ -523,7 +525,7 @@ mod tests {
     #[test]
     /// Test that [compute_best_join_order] returns None when there are no table references.
     fn test_compute_best_join_order_empty() {
-        let table_references = vec![];
+        let table_references = TableReferences::new(vec![], vec![]);
         let available_indexes = HashMap::new();
         let where_clause = vec![];
 
@@ -533,7 +535,7 @@ mod tests {
                 .unwrap();
 
         let result = compute_best_join_order(
-            &table_references,
+            table_references.joined_tables(),
             None,
             &table_constraints,
             &access_methods_arena,
@@ -547,11 +549,12 @@ mod tests {
     fn test_compute_best_join_order_single_table_no_indexes() {
         let t1 = _create_btree_table("test_table", _create_column_list(&["id"], Type::Integer));
         let mut table_id_counter = TableRefIdCounter::new();
-        let table_references = vec![_create_table_reference(
+        let joined_tables = vec![_create_table_reference(
             t1.clone(),
             None,
             table_id_counter.next(),
         )];
+        let table_references = TableReferences::new(joined_tables, vec![]);
         let available_indexes = HashMap::new();
         let where_clause = vec![];
 
@@ -563,7 +566,7 @@ mod tests {
         // SELECT * from test_table
         // expecting best_best_plan() not to do any work due to empty where clause.
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
-            &table_references,
+            table_references.joined_tables(),
             None,
             &table_constraints,
             &access_methods_arena,
@@ -581,18 +584,19 @@ mod tests {
     fn test_compute_best_join_order_single_table_rowid_eq() {
         let t1 = _create_btree_table("test_table", vec![_create_column_rowid_alias("id")]);
         let mut table_id_counter = TableRefIdCounter::new();
-        let table_references = vec![_create_table_reference(
+        let joined_tables = vec![_create_table_reference(
             t1.clone(),
             None,
             table_id_counter.next(),
         )];
 
         let where_clause = vec![_create_binary_expr(
-            _create_column_expr(table_references[0].internal_id, 0, true), // table 0, column 0 (rowid)
+            _create_column_expr(joined_tables[0].internal_id, 0, true), // table 0, column 0 (rowid)
             ast::Operator::Equals,
             _create_numeric_literal("42"),
         )];
 
+        let table_references = TableReferences::new(joined_tables, vec![]);
         let access_methods_arena = RefCell::new(Vec::new());
         let available_indexes = HashMap::new();
         let table_constraints =
@@ -602,7 +606,7 @@ mod tests {
         // SELECT * FROM test_table WHERE id = 42
         // expecting a RowidEq access method because id is a rowid alias.
         let result = compute_best_join_order(
-            &table_references,
+            table_references.joined_tables(),
             None,
             &table_constraints,
             &access_methods_arena,
@@ -630,18 +634,19 @@ mod tests {
             vec![_create_column_of_type("id", Type::Integer)],
         );
         let mut table_id_counter = TableRefIdCounter::new();
-        let table_references = vec![_create_table_reference(
+        let joined_tables = vec![_create_table_reference(
             t1.clone(),
             None,
             table_id_counter.next(),
         )];
 
         let where_clause = vec![_create_binary_expr(
-            _create_column_expr(table_references[0].internal_id, 0, false), // table 0, column 0 (id)
+            _create_column_expr(joined_tables[0].internal_id, 0, false), // table 0, column 0 (id)
             ast::Operator::Equals,
             _create_numeric_literal("42"),
         )];
 
+        let table_references = TableReferences::new(joined_tables, vec![]);
         let access_methods_arena = RefCell::new(Vec::new());
         let mut available_indexes = HashMap::new();
         let index = Arc::new(Index {
@@ -666,7 +671,7 @@ mod tests {
         // SELECT * FROM test_table WHERE id = 42
         // expecting an IndexScan access method because id is a primary key with an index
         let result = compute_best_join_order(
-            &table_references,
+            table_references.joined_tables(),
             None,
             &table_constraints,
             &access_methods_arena,
@@ -694,7 +699,7 @@ mod tests {
         let t2 = _create_btree_table("table2", _create_column_list(&["id"], Type::Integer));
 
         let mut table_id_counter = TableRefIdCounter::new();
-        let mut table_references = vec![
+        let joined_tables = vec![
             _create_table_reference(t1.clone(), None, table_id_counter.next()),
             _create_table_reference(
                 t2.clone(),
@@ -730,18 +735,19 @@ mod tests {
         // SELECT * FROM table1 JOIN table2 WHERE table1.id = table2.id
         // expecting table2 to be chosen first due to the index on table1.id
         let where_clause = vec![_create_binary_expr(
-            _create_column_expr(table_references[TABLE1].internal_id, 0, false), // table1.id
+            _create_column_expr(joined_tables[TABLE1].internal_id, 0, false), // table1.id
             ast::Operator::Equals,
-            _create_column_expr(table_references[TABLE2].internal_id, 0, false), // table2.id
+            _create_column_expr(joined_tables[TABLE2].internal_id, 0, false), // table2.id
         )];
 
+        let table_references = TableReferences::new(joined_tables, vec![]);
         let access_methods_arena = RefCell::new(Vec::new());
         let table_constraints =
             constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
                 .unwrap();
 
         let result = compute_best_join_order(
-            &mut table_references,
+            table_references.joined_tables(),
             None,
             &table_constraints,
             &access_methods_arena,
@@ -795,7 +801,7 @@ mod tests {
         );
 
         let mut table_id_counter = TableRefIdCounter::new();
-        let table_references = vec![
+        let joined_tables = vec![
             _create_table_reference(table_orders.clone(), None, table_id_counter.next()),
             _create_table_reference(
                 table_customers.clone(),
@@ -885,31 +891,32 @@ mod tests {
         let where_clause = vec![
             // orders.customer_id = customers.id
             _create_binary_expr(
-                _create_column_expr(table_references[TABLE_NO_ORDERS].internal_id, 1, false), // orders.customer_id
+                _create_column_expr(joined_tables[TABLE_NO_ORDERS].internal_id, 1, false), // orders.customer_id
                 ast::Operator::Equals,
-                _create_column_expr(table_references[TABLE_NO_CUSTOMERS].internal_id, 0, false), // customers.id
+                _create_column_expr(joined_tables[TABLE_NO_CUSTOMERS].internal_id, 0, false), // customers.id
             ),
             // orders.id = order_items.order_id
             _create_binary_expr(
-                _create_column_expr(table_references[TABLE_NO_ORDERS].internal_id, 0, false), // orders.id
+                _create_column_expr(joined_tables[TABLE_NO_ORDERS].internal_id, 0, false), // orders.id
                 ast::Operator::Equals,
-                _create_column_expr(table_references[TABLE_NO_ORDER_ITEMS].internal_id, 1, false), // order_items.order_id
+                _create_column_expr(joined_tables[TABLE_NO_ORDER_ITEMS].internal_id, 1, false), // order_items.order_id
             ),
             // customers.id = 42
             _create_binary_expr(
-                _create_column_expr(table_references[TABLE_NO_CUSTOMERS].internal_id, 0, false), // customers.id
+                _create_column_expr(joined_tables[TABLE_NO_CUSTOMERS].internal_id, 0, false), // customers.id
                 ast::Operator::Equals,
                 _create_numeric_literal("42"),
             ),
         ];
 
+        let table_references = TableReferences::new(joined_tables, vec![]);
         let access_methods_arena = RefCell::new(Vec::new());
         let table_constraints =
             constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
                 .unwrap();
 
         let result = compute_best_join_order(
-            &table_references,
+            table_references.joined_tables(),
             None,
             &table_constraints,
             &access_methods_arena,
@@ -975,7 +982,7 @@ mod tests {
         let t3 = _create_btree_table("t3", _create_column_list(&["id", "foo"], Type::Integer));
 
         let mut table_id_counter = TableRefIdCounter::new();
-        let mut table_references = vec![
+        let joined_tables = vec![
             _create_table_reference(t1.clone(), None, table_id_counter.next()),
             _create_table_reference(
                 t2.clone(),
@@ -998,18 +1005,19 @@ mod tests {
         let where_clause = vec![
             // t2.foo = 42 (equality filter, more selective)
             _create_binary_expr(
-                _create_column_expr(table_references[1].internal_id, 1, false), // table 1, column 1 (foo)
+                _create_column_expr(joined_tables[1].internal_id, 1, false), // table 1, column 1 (foo)
                 ast::Operator::Equals,
                 _create_numeric_literal("42"),
             ),
             // t1.foo > 10 (inequality filter, less selective)
             _create_binary_expr(
-                _create_column_expr(table_references[0].internal_id, 1, false), // table 0, column 1 (foo)
+                _create_column_expr(joined_tables[0].internal_id, 1, false), // table 0, column 1 (foo)
                 ast::Operator::Greater,
                 _create_numeric_literal("10"),
             ),
         ];
 
+        let table_references = TableReferences::new(joined_tables, vec![]);
         let available_indexes = HashMap::new();
         let access_methods_arena = RefCell::new(Vec::new());
         let table_constraints =
@@ -1017,7 +1025,7 @@ mod tests {
                 .unwrap();
 
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
-            &mut table_references,
+            table_references.joined_tables(),
             None,
             &table_constraints,
             &access_methods_arena,
@@ -1075,7 +1083,7 @@ mod tests {
             .collect();
 
         let mut table_id_counter = TableRefIdCounter::new();
-        let table_references = {
+        let joined_tables = {
             let mut refs = vec![_create_table_reference(
                 dim_tables[0].clone(),
                 None,
@@ -1106,8 +1114,8 @@ mod tests {
 
         // Add join conditions between fact and each dimension table
         for i in 0..NUM_DIM_TABLES {
-            let internal_id_fact = table_references[FACT_TABLE_IDX].internal_id;
-            let internal_id_other = table_references[i].internal_id;
+            let internal_id_fact = joined_tables[FACT_TABLE_IDX].internal_id;
+            let internal_id_other = joined_tables[i].internal_id;
             where_clause.push(_create_binary_expr(
                 _create_column_expr(internal_id_fact, i + 1, false), // fact.dimX_id
                 ast::Operator::Equals,
@@ -1115,6 +1123,7 @@ mod tests {
             ));
         }
 
+        let table_references = TableReferences::new(joined_tables, vec![]);
         let access_methods_arena = RefCell::new(Vec::new());
         let available_indexes = HashMap::new();
         let table_constraints =
@@ -1122,7 +1131,7 @@ mod tests {
                 .unwrap();
 
         let result = compute_best_join_order(
-            &table_references,
+            table_references.joined_tables(),
             None,
             &table_constraints,
             &access_methods_arena,
@@ -1182,7 +1191,7 @@ mod tests {
 
         let mut table_id_counter = TableRefIdCounter::new();
         // Create table references
-        let table_references: Vec<_> = tables
+        let joined_tables: Vec<_> = tables
             .iter()
             .map(|t| _create_table_reference(t.clone(), None, table_id_counter.next()))
             .collect();
@@ -1190,8 +1199,8 @@ mod tests {
         // Create where clause linking each table to the next
         let mut where_clause = Vec::new();
         for i in 0..NUM_TABLES - 1 {
-            let internal_id_left = table_references[i].internal_id;
-            let internal_id_right = table_references[i + 1].internal_id;
+            let internal_id_left = joined_tables[i].internal_id;
+            let internal_id_right = joined_tables[i + 1].internal_id;
             where_clause.push(_create_binary_expr(
                 _create_column_expr(internal_id_left, 1, false), // ti.next_id
                 ast::Operator::Equals,
@@ -1199,6 +1208,7 @@ mod tests {
             ));
         }
 
+        let table_references = TableReferences::new(joined_tables, vec![]);
         let access_methods_arena = RefCell::new(Vec::new());
         let table_constraints =
             constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
@@ -1206,7 +1216,7 @@ mod tests {
 
         // Run the optimizer
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
-            &table_references,
+            table_references.joined_tables(),
             None,
             &table_constraints,
             &access_methods_arena,
@@ -1302,9 +1312,9 @@ mod tests {
         table: Rc<BTreeTable>,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
-    ) -> TableReference {
+    ) -> JoinedTable {
         let name = table.name.clone();
-        TableReference {
+        JoinedTable {
             table: Table::BTree(table),
             op: Operation::Scan {
                 iter_dir: IterationDirection::Forwards,
@@ -1332,7 +1342,7 @@ mod tests {
         WhereTerm {
             expr: Expr::Binary(Box::new(lhs), op, Box::new(rhs)),
             from_outer_join: None,
-            consumed: false,
+            consumed: Cell::new(false),
         }
     }
 

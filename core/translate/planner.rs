@@ -1,9 +1,11 @@
+use std::cell::Cell;
+
 use super::{
     expr::walk_expr,
     plan::{
         Aggregate, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
-        JoinOrderMember, Operation, Plan, QueryDestination, ResultSetColumn, SelectPlan,
-        TableReference, WhereTerm,
+        JoinOrderMember, JoinedTable, Operation, OuterQueryReference, Plan, QueryDestination,
+        ResultSetColumn, TableReferences, WhereTerm,
     },
     select::prepare_select_plan,
     SymbolTable,
@@ -12,7 +14,7 @@ use crate::{
     function::Func,
     schema::{Schema, Table},
     translate::expr::walk_expr_mut,
-    util::{exprs_are_equivalent, normalize_ident, vtable_args},
+    util::{exprs_are_equivalent, normalize_ident},
     vdbe::{builder::TableRefIdCounter, BranchOffset},
     Result,
 };
@@ -95,7 +97,7 @@ pub fn resolve_aggregates(top_level_expr: &Expr, aggs: &mut Vec<Aggregate>) -> R
 
 pub fn bind_column_references(
     top_level_expr: &mut Expr,
-    referenced_tables: &mut [TableReference],
+    referenced_tables: &mut TableReferences,
     result_columns: Option<&[ResultSetColumn]>,
 ) -> Result<()> {
     walk_expr_mut(top_level_expr, &mut |expr: &mut Expr| -> Result<()> {
@@ -108,20 +110,22 @@ pub fn bind_column_references(
                 }
                 let normalized_id = normalize_ident(id.0.as_str());
 
-                if !referenced_tables.is_empty() {
-                    if let Some(row_id_expr) =
-                        parse_row_id(&normalized_id, referenced_tables[0].internal_id, || {
-                            referenced_tables.len() != 1
-                        })?
-                    {
+                if !referenced_tables.joined_tables().is_empty() {
+                    if let Some(row_id_expr) = parse_row_id(
+                        &normalized_id,
+                        referenced_tables.joined_tables()[0].internal_id,
+                        || referenced_tables.joined_tables().len() != 1,
+                    )? {
                         *expr = row_id_expr;
 
                         return Ok(());
                     }
                 }
                 let mut match_result = None;
-                for (tbl_idx, table) in referenced_tables.iter().enumerate() {
-                    let col_idx = table.columns().iter().position(|c| {
+
+                // First check joined tables
+                for joined_table in referenced_tables.joined_tables().iter() {
+                    let col_idx = joined_table.table.columns().iter().position(|c| {
                         c.name
                             .as_ref()
                             .map_or(false, |name| name.eq_ignore_ascii_case(&normalized_id))
@@ -130,18 +134,49 @@ pub fn bind_column_references(
                         if match_result.is_some() {
                             crate::bail_parse_error!("Column {} is ambiguous", id.0);
                         }
-                        let col = table.columns().get(col_idx.unwrap()).unwrap();
-                        match_result = Some((tbl_idx, col_idx.unwrap(), col.is_rowid_alias));
+                        let col = joined_table.table.columns().get(col_idx.unwrap()).unwrap();
+                        match_result = Some((
+                            joined_table.internal_id,
+                            col_idx.unwrap(),
+                            col.is_rowid_alias,
+                        ));
                     }
                 }
-                if let Some((tbl_idx, col_idx, is_rowid_alias)) = match_result {
+
+                // Then check outer query references, if we still didn't find something.
+                // Normally finding multiple matches for a non-qualified column is an error (column x is ambiguous)
+                // but in the case of subqueries, the inner query takes precedence.
+                // For example:
+                // SELECT * FROM t WHERE x = (SELECT x FROM t2)
+                // In this case, there is no ambiguity:
+                // - x in the outer query refers to t.x,
+                // - x in the inner query refers to t2.x.
+                if match_result.is_none() {
+                    for outer_ref in referenced_tables.outer_query_refs().iter() {
+                        let col_idx = outer_ref.table.columns().iter().position(|c| {
+                            c.name
+                                .as_ref()
+                                .map_or(false, |name| name.eq_ignore_ascii_case(&normalized_id))
+                        });
+                        if col_idx.is_some() {
+                            if match_result.is_some() {
+                                crate::bail_parse_error!("Column {} is ambiguous", id.0);
+                            }
+                            let col = outer_ref.table.columns().get(col_idx.unwrap()).unwrap();
+                            match_result =
+                                Some((outer_ref.internal_id, col_idx.unwrap(), col.is_rowid_alias));
+                        }
+                    }
+                }
+
+                if let Some((table_id, col_idx, is_rowid_alias)) = match_result {
                     *expr = Expr::Column {
                         database: None, // TODO: support different databases
-                        table: referenced_tables[tbl_idx].internal_id,
+                        table: table_id,
                         column: col_idx,
                         is_rowid_alias,
                     };
-                    referenced_tables[tbl_idx].mark_column_used(col_idx);
+                    referenced_tables.mark_column_used(table_id, col_idx);
                     return Ok(());
                 }
 
@@ -160,43 +195,35 @@ pub fn bind_column_references(
             }
             Expr::Qualified(tbl, id) => {
                 let normalized_table_name = normalize_ident(tbl.0.as_str());
-                let matching_tbl_idx = referenced_tables
-                    .iter()
-                    .position(|t| t.identifier.eq_ignore_ascii_case(&normalized_table_name));
-                if matching_tbl_idx.is_none() {
+                let matching_tbl = referenced_tables
+                    .find_table_and_internal_id_by_identifier(&normalized_table_name);
+                if matching_tbl.is_none() {
                     crate::bail_parse_error!("Table {} not found", normalized_table_name);
                 }
-                let tbl_idx = matching_tbl_idx.unwrap();
+                let (tbl_id, tbl) = matching_tbl.unwrap();
                 let normalized_id = normalize_ident(id.0.as_str());
 
-                if let Some(row_id_expr) = parse_row_id(
-                    &normalized_id,
-                    referenced_tables[tbl_idx].internal_id,
-                    || false,
-                )? {
+                if let Some(row_id_expr) = parse_row_id(&normalized_id, tbl_id, || false)? {
                     *expr = row_id_expr;
 
                     return Ok(());
                 }
-                let col_idx = referenced_tables[tbl_idx].columns().iter().position(|c| {
+                let col_idx = tbl.columns().iter().position(|c| {
                     c.name
                         .as_ref()
                         .map_or(false, |name| name.eq_ignore_ascii_case(&normalized_id))
                 });
-                if col_idx.is_none() {
+                let Some(col_idx) = col_idx else {
                     crate::bail_parse_error!("Column {} not found", normalized_id);
-                }
-                let col = referenced_tables[tbl_idx]
-                    .columns()
-                    .get(col_idx.unwrap())
-                    .unwrap();
+                };
+                let col = tbl.columns().get(col_idx).unwrap();
                 *expr = Expr::Column {
                     database: None, // TODO: support different databases
-                    table: referenced_tables[tbl_idx].internal_id,
-                    column: col_idx.unwrap(),
+                    table: tbl_id,
+                    column: col_idx,
                     is_rowid_alias: col.is_rowid_alias,
                 };
-                referenced_tables[tbl_idx].mark_column_used(col_idx.unwrap());
+                referenced_tables.mark_column_used(tbl_id, col_idx);
                 Ok(())
             }
             _ => Ok(()),
@@ -207,7 +234,8 @@ pub fn bind_column_references(
 fn parse_from_clause_table<'a>(
     schema: &Schema,
     table: ast::SelectTable,
-    scope: &mut Scope<'a>,
+    table_references: &mut TableReferences,
+    ctes: &mut Vec<JoinedTable>,
     syms: &SymbolTable,
     table_ref_counter: &mut TableRefIdCounter,
 ) -> Result<()> {
@@ -215,22 +243,16 @@ fn parse_from_clause_table<'a>(
         ast::SelectTable::Table(qualified_name, maybe_alias, _) => {
             let normalized_qualified_name = normalize_ident(qualified_name.name.0.as_str());
             // Check if the FROM clause table is referring to a CTE in the current scope.
-            if let Some(cte) = scope
-                .ctes
+            if let Some(cte_idx) = ctes
                 .iter()
-                .find(|cte| cte.name == normalized_qualified_name)
+                .position(|cte| cte.identifier == normalized_qualified_name)
             {
-                // CTE can be rewritten as a subquery.
-                // TODO: find a way not to clone the CTE plan here.
-                let cte_table = TableReference::new_subquery(
-                    cte.name.clone(),
-                    cte.plan.clone(),
-                    None,
-                    table_ref_counter.next(),
-                );
-                scope.tables.push(cte_table);
+                // TODO: what if the CTE is referenced multiple times?
+                let cte_table = ctes.remove(cte_idx);
+                table_references.add_joined_table(cte_table);
                 return Ok(());
             };
+
             // Check if our top level schema has this table.
             if let Some(table) = schema.get_table(&normalized_qualified_name) {
                 let alias = maybe_alias
@@ -248,7 +270,7 @@ fn parse_from_clause_table<'a>(
                         "Table type not supported".to_string(),
                     ));
                 };
-                scope.tables.push(TableReference {
+                table_references.add_joined_table(JoinedTable {
                     op: Operation::Scan {
                         iter_dir: IterationDirection::Forwards,
                         index: None,
@@ -262,30 +284,28 @@ fn parse_from_clause_table<'a>(
                 return Ok(());
             };
 
-            // Check if the outer query scope has this table.
-            if let Some(outer_scope) = scope.parent {
-                if let Some(table_ref_idx) = outer_scope
-                    .tables
-                    .iter()
-                    .position(|t| t.identifier == normalized_qualified_name)
-                {
-                    // TODO: avoid cloning the table reference here.
-                    scope.tables.push(outer_scope.tables[table_ref_idx].clone());
-                    return Ok(());
-                }
-                if let Some(cte) = outer_scope
-                    .ctes
-                    .iter()
-                    .find(|cte| cte.name == normalized_qualified_name)
-                {
-                    // TODO: avoid cloning the CTE plan here.
-                    let cte_table = TableReference::new_subquery(
-                        cte.name.clone(),
-                        cte.plan.clone(),
-                        None,
-                        table_ref_counter.next(),
-                    );
-                    scope.tables.push(cte_table);
+            // CTEs are transformed into FROM clause subqueries.
+            // If we find a CTE with this name in our outer query references,
+            // we can use it as a joined table, but we must clone it since it's not MATERIALIZED.
+            //
+            // For other types of tables in the outer query references, we do not add them as joined tables,
+            // because the query can simply _reference_ them in e.g. the SELECT columns or the WHERE clause,
+            // but it's not part of the join order.
+            if let Some(outer_ref) =
+                table_references.find_outer_query_ref_by_identifier(&normalized_qualified_name)
+            {
+                if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
+                    table_references.add_joined_table(JoinedTable {
+                        op: Operation::Scan {
+                            iter_dir: IterationDirection::Forwards,
+                            index: None,
+                        },
+                        table: outer_ref.table.clone(),
+                        identifier: outer_ref.identifier.clone(),
+                        internal_id: table_ref_counter.next(),
+                        join_info: None,
+                        col_used_mask: ColumnUsedMask::new(),
+                    });
                     return Ok(());
                 }
             }
@@ -293,23 +313,28 @@ fn parse_from_clause_table<'a>(
             crate::bail_parse_error!("Table {} not found", normalized_qualified_name);
         }
         ast::SelectTable::Select(subselect, maybe_alias) => {
-            let Plan::Select(mut subplan) =
-                prepare_select_plan(schema, *subselect, syms, Some(scope), table_ref_counter)?
+            let Plan::Select(subplan) = prepare_select_plan(
+                schema,
+                *subselect,
+                syms,
+                table_references.outer_query_refs(),
+                table_ref_counter,
+                QueryDestination::CoroutineYield {
+                    yield_reg: usize::MAX, // will be set later in bytecode emission
+                    coroutine_implementation_start: BranchOffset::Placeholder, // will be set later in bytecode emission
+                },
+            )?
             else {
                 crate::bail_parse_error!("Only non-compound SELECT queries are currently supported in FROM clause subqueries");
             };
-            subplan.query_destination = QueryDestination::CoroutineYield {
-                yield_reg: usize::MAX, // will be set later in bytecode emission
-                coroutine_implementation_start: BranchOffset::Placeholder, // will be set later in bytecode emission
-            };
-            let cur_table_index = scope.tables.len();
+            let cur_table_index = table_references.joined_tables().len();
             let identifier = maybe_alias
                 .map(|a| match a {
                     ast::As::As(id) => id.0.clone(),
                     ast::As::Elided(id) => id.0.clone(),
                 })
                 .unwrap_or(format!("subquery_{}", cur_table_index));
-            scope.tables.push(TableReference::new_subquery(
+            table_references.add_joined_table(JoinedTable::new_subquery(
                 identifier,
                 subplan,
                 None,
@@ -319,18 +344,7 @@ fn parse_from_clause_table<'a>(
         }
         ast::SelectTable::TableCall(qualified_name, maybe_args, maybe_alias) => {
             let normalized_name = &normalize_ident(qualified_name.name.0.as_str());
-            let args = match maybe_args {
-                Some(ref args) => vtable_args(args),
-                None => vec![],
-            };
-            let vtab = crate::VirtualTable::from_args(
-                None,
-                normalized_name,
-                args,
-                syms,
-                limbo_ext::VTabKind::TableValuedFunction,
-                maybe_args,
-            )?;
+            let vtab = crate::VirtualTable::function(normalized_name, maybe_args, syms)?;
             let alias = maybe_alias
                 .as_ref()
                 .map(|a| match a {
@@ -339,7 +353,7 @@ fn parse_from_clause_table<'a>(
                 })
                 .unwrap_or(normalized_name.to_string());
 
-            scope.tables.push(TableReference {
+            table_references.add_joined_table(JoinedTable {
                 op: Operation::Scan {
                     iter_dir: IterationDirection::Forwards,
                     index: None,
@@ -357,64 +371,20 @@ fn parse_from_clause_table<'a>(
     }
 }
 
-/// A scope is a list of tables that are visible to the current query.
-/// It is used to resolve table references in the FROM clause.
-/// To resolve table references that are potentially ambiguous, the resolution
-/// first looks at schema tables and tables in the current scope (which currently just means CTEs in the current query),
-/// and only after that looks at whether a table from an outer (upper) query level matches.
-///
-/// For example:
-///
-/// WITH nested AS (SELECT foo FROM bar)
-/// WITH sub AS (SELECT foo FROM bar)
-/// SELECT * FROM sub
-///
-/// 'sub' would preferentially refer to the 'foo' column from the 'bar' table in the catalog.
-/// With an explicit reference like:
-///
-/// SELECT nested.foo FROM sub
-///
-/// 'nested.foo' would refer to the 'foo' column from the 'nested' CTE.
-///
-/// TODO: we should probably use Scope in all of our identifier resolution, because it allows for e.g.
-/// WITH users AS (SELECT * FROM products) SELECT * FROM users  <-- returns products, even if there is a table named 'users' in the catalog!
-///
-/// Currently we are treating Schema as a first-class object in identifier resolution, when in reality
-/// be part of the 'Scope' struct.
-pub struct Scope<'a> {
-    /// The tables that are explicitly present in the current query, including catalog tables and CTEs.
-    tables: Vec<TableReference>,
-    ctes: Vec<Cte>,
-    /// The parent scope, if any. For example, a second CTE has access to the first CTE via the parent scope.
-    parent: Option<&'a Scope<'a>>,
-}
-
-pub struct Cte {
-    /// The name of the CTE.
-    name: String,
-    /// The query plan for the CTE.
-    /// Currently we only support SELECT queries in CTEs.
-    plan: SelectPlan,
-}
-
 pub fn parse_from<'a>(
     schema: &Schema,
     mut from: Option<FromClause>,
     syms: &SymbolTable,
     with: Option<With>,
     out_where_clause: &mut Vec<WhereTerm>,
-    outer_scope: Option<&'a Scope<'a>>,
+    table_references: &mut TableReferences,
     table_ref_counter: &mut TableRefIdCounter,
-) -> Result<Vec<TableReference>> {
+) -> Result<()> {
     if from.as_ref().and_then(|f| f.select.as_ref()).is_none() {
-        return Ok(vec![]);
+        return Ok(());
     }
 
-    let mut scope = Scope {
-        tables: vec![],
-        ctes: vec![],
-        parent: outer_scope,
-    };
+    let mut ctes_as_subqueries = vec![];
 
     if let Some(with) = with {
         if with.recursive {
@@ -438,56 +408,82 @@ pub fn parse_from<'a>(
                     cte.tbl_name.0
                 );
             }
-            if scope
-                .tables
+            if table_references
+                .outer_query_refs()
                 .iter()
                 .any(|t| t.identifier == cte_name_normalized)
             {
-                crate::bail_parse_error!("CTE name {} conflicts with table name", cte.tbl_name.0);
-            }
-            if scope.ctes.iter().any(|c| c.name == cte_name_normalized) {
-                crate::bail_parse_error!("duplicate WITH table name {}", cte.tbl_name.0);
+                crate::bail_parse_error!(
+                    "CTE name {} conflicts with WITH table name {}",
+                    cte.tbl_name.0,
+                    cte_name_normalized
+                );
             }
 
+            let mut outer_query_refs_for_cte = table_references.outer_query_refs().to_vec();
+            outer_query_refs_for_cte.extend(ctes_as_subqueries.iter().map(|t: &JoinedTable| {
+                OuterQueryReference {
+                    identifier: t.identifier.clone(),
+                    internal_id: t.internal_id,
+                    table: t.table.clone(),
+                    col_used_mask: ColumnUsedMask::new(),
+                }
+            }));
+
             // CTE can refer to other CTEs that came before it, plus any schema tables or tables in the outer scope.
-            let cte_plan =
-                prepare_select_plan(schema, *cte.select, syms, Some(&scope), table_ref_counter)?;
-            let Plan::Select(mut cte_plan) = cte_plan else {
+            let cte_plan = prepare_select_plan(
+                schema,
+                *cte.select,
+                syms,
+                &outer_query_refs_for_cte,
+                table_ref_counter,
+                QueryDestination::CoroutineYield {
+                    yield_reg: usize::MAX, // will be set later in bytecode emission
+                    coroutine_implementation_start: BranchOffset::Placeholder, // will be set later in bytecode emission
+                },
+            )?;
+            let Plan::Select(cte_plan) = cte_plan else {
                 crate::bail_parse_error!("Only SELECT queries are currently supported in CTEs");
             };
-            cte_plan.query_destination = QueryDestination::CoroutineYield {
-                yield_reg: usize::MAX, // will be set later in bytecode emission
-                coroutine_implementation_start: BranchOffset::Placeholder, // will be set later in bytecode emission
-            };
-            scope.ctes.push(Cte {
-                name: cte_name_normalized,
-                plan: cte_plan,
-            });
+            ctes_as_subqueries.push(JoinedTable::new_subquery(
+                cte_name_normalized,
+                cte_plan,
+                None,
+                table_ref_counter.next(),
+            ));
         }
     }
 
     let mut from_owned = std::mem::take(&mut from).unwrap();
     let select_owned = *std::mem::take(&mut from_owned.select).unwrap();
     let joins_owned = std::mem::take(&mut from_owned.joins).unwrap_or_default();
-    parse_from_clause_table(schema, select_owned, &mut scope, syms, table_ref_counter)?;
+    parse_from_clause_table(
+        schema,
+        select_owned,
+        table_references,
+        &mut ctes_as_subqueries,
+        syms,
+        table_ref_counter,
+    )?;
 
     for join in joins_owned.into_iter() {
         parse_join(
             schema,
             join,
             syms,
-            &mut scope,
+            &mut ctes_as_subqueries,
             out_where_clause,
+            table_references,
             table_ref_counter,
         )?;
     }
 
-    Ok(scope.tables)
+    Ok(())
 }
 
 pub fn parse_where(
     where_clause: Option<Expr>,
-    table_references: &mut [TableReference],
+    table_references: &mut TableReferences,
     result_columns: Option<&[ResultSetColumn]>,
     out_where_clause: &mut Vec<WhereTerm>,
 ) -> Result<()> {
@@ -501,7 +497,7 @@ pub fn parse_where(
             out_where_clause.push(WhereTerm {
                 expr,
                 from_outer_join: None,
-                consumed: false,
+                consumed: Cell::new(false),
             });
         }
         Ok(())
@@ -534,7 +530,7 @@ pub fn determine_where_to_eval_term(
 }
 
 /// A bitmask representing a set of tables in a query plan.
-/// Tables are numbered by their index in [SelectPlan::table_references].
+/// Tables are numbered by their index in [SelectPlan::joined_tables].
 /// In the bitmask, the first bit is unused so that a mask with all zeros
 /// can represent "no tables".
 ///
@@ -632,17 +628,27 @@ impl TableMask {
 /// Used in the optimizer for constraint analysis.
 pub fn table_mask_from_expr(
     top_level_expr: &Expr,
-    table_references: &[TableReference],
+    table_references: &TableReferences,
 ) -> Result<TableMask> {
     let mut mask = TableMask::new();
     walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<()> {
         match expr {
             Expr::Column { table, .. } | Expr::RowId { table, .. } => {
-                let table_idx = table_references
+                if let Some(table_idx) = table_references
+                    .joined_tables()
                     .iter()
                     .position(|t| t.internal_id == *table)
-                    .expect("table not found in table_references");
-                mask.add_table(table_idx);
+                {
+                    mask.add_table(table_idx);
+                } else if table_references
+                    .find_outer_query_ref_by_internal_id(*table)
+                    .is_none()
+                {
+                    // Tables from outer query scopes are guaranteed to be 'in scope' for this query,
+                    // so they don't need to be added to the table mask. However, if the table is not found
+                    // in the outer scope either, then it's an invalid reference.
+                    crate::bail_parse_error!("table not found in joined_tables");
+                }
             }
             _ => {}
         }
@@ -678,8 +684,9 @@ fn parse_join<'a>(
     schema: &Schema,
     join: ast::JoinedSelectTable,
     syms: &SymbolTable,
-    scope: &mut Scope<'a>,
+    ctes: &mut Vec<JoinedTable>,
     out_where_clause: &mut Vec<WhereTerm>,
+    table_references: &mut TableReferences,
     table_ref_counter: &mut TableRefIdCounter,
 ) -> Result<()> {
     let ast::JoinedSelectTable {
@@ -688,7 +695,14 @@ fn parse_join<'a>(
         constraint,
     } = join;
 
-    parse_from_clause_table(schema, table, scope, syms, table_ref_counter)?;
+    parse_from_clause_table(
+        schema,
+        table,
+        table_references,
+        ctes,
+        syms,
+        table_ref_counter,
+    )?;
 
     let (outer, natural) = match join_operator {
         ast::JoinOperator::TypedJoin(Some(join_type)) => {
@@ -706,15 +720,19 @@ fn parse_join<'a>(
     }
 
     let constraint = if natural {
-        assert!(scope.tables.len() >= 2);
-        let rightmost_table = scope.tables.last().unwrap();
+        assert!(table_references.joined_tables().len() >= 2);
+        let rightmost_table = table_references.joined_tables().last().unwrap();
         // NATURAL JOIN is first transformed into a USING join with the common columns
         let right_cols = rightmost_table.columns();
         let mut distinct_names: Option<ast::DistinctNames> = None;
         // TODO: O(n^2) maybe not great for large tables or big multiway joins
         for right_col in right_cols.iter() {
             let mut found_match = false;
-            for left_table in scope.tables.iter().take(scope.tables.len() - 1) {
+            for left_table in table_references
+                .joined_tables()
+                .iter()
+                .take(table_references.joined_tables().len() - 1)
+            {
                 for left_col in left_table.columns().iter() {
                     if left_col.name == right_col.name {
                         if let Some(distinct_names) = distinct_names.as_mut() {
@@ -752,17 +770,17 @@ fn parse_join<'a>(
                 let mut preds = vec![];
                 break_predicate_at_and_boundaries(expr, &mut preds);
                 for predicate in preds.iter_mut() {
-                    bind_column_references(predicate, &mut scope.tables, None)?;
+                    bind_column_references(predicate, table_references, None)?;
                 }
                 for pred in preds {
                     out_where_clause.push(WhereTerm {
                         expr: pred,
                         from_outer_join: if outer {
-                            Some(scope.tables.last().unwrap().internal_id)
+                            Some(table_references.joined_tables().last().unwrap().internal_id)
                         } else {
                             None
                         },
-                        consumed: false,
+                        consumed: Cell::new(false),
                     });
                 }
             }
@@ -770,10 +788,10 @@ fn parse_join<'a>(
                 // USING join is replaced with a list of equality predicates
                 for distinct_name in distinct_names.iter() {
                     let name_normalized = normalize_ident(distinct_name.0.as_str());
-                    let cur_table_idx = scope.tables.len() - 1;
-                    let left_tables = &scope.tables[..cur_table_idx];
+                    let cur_table_idx = table_references.joined_tables().len() - 1;
+                    let left_tables = &table_references.joined_tables()[..cur_table_idx];
                     assert!(!left_tables.is_empty());
-                    let right_table = scope.tables.last().unwrap();
+                    let right_table = table_references.joined_tables().last().unwrap();
                     let mut left_col = None;
                     for (left_table_idx, left_table) in left_tables.iter().enumerate() {
                         left_col = left_table
@@ -825,9 +843,15 @@ fn parse_join<'a>(
                         }),
                     );
 
-                    let left_table = scope.tables.get_mut(left_table_idx).unwrap();
+                    let left_table: &mut JoinedTable = table_references
+                        .joined_tables_mut()
+                        .get_mut(left_table_idx)
+                        .unwrap();
                     left_table.mark_column_used(left_col_idx);
-                    let right_table = scope.tables.get_mut(cur_table_idx).unwrap();
+                    let right_table: &mut JoinedTable = table_references
+                        .joined_tables_mut()
+                        .get_mut(cur_table_idx)
+                        .unwrap();
                     right_table.mark_column_used(right_col_idx);
                     out_where_clause.push(WhereTerm {
                         expr,
@@ -836,7 +860,7 @@ fn parse_join<'a>(
                         } else {
                             None
                         },
-                        consumed: false,
+                        consumed: Cell::new(false),
                     });
                 }
                 using = Some(distinct_names);
@@ -844,9 +868,12 @@ fn parse_join<'a>(
         }
     }
 
-    assert!(scope.tables.len() >= 2);
-    let last_idx = scope.tables.len() - 1;
-    let rightmost_table = scope.tables.get_mut(last_idx).unwrap();
+    assert!(table_references.joined_tables().len() >= 2);
+    let last_idx = table_references.joined_tables().len() - 1;
+    let rightmost_table = table_references
+        .joined_tables_mut()
+        .get_mut(last_idx)
+        .unwrap();
     rightmost_table.join_info = Some(JoinInfo { outer, using });
 
     Ok(())

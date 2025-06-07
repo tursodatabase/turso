@@ -1,4 +1,7 @@
 import test from "ava";
+import fs from "node:fs";
+import { fileURLToPath } from "url";
+import path from "node:path"
 
 import Database from "better-sqlite3";
 
@@ -51,6 +54,53 @@ test("Empty prepared statement should throw", async (t) => {
     { instanceOf: Error },
   );
 });
+
+test("Test pragma", async (t) => {
+  const [db] = await connect(":memory:");
+  t.deepEqual(typeof db.pragma("cache_size")[0].cache_size, "number");
+  t.deepEqual(typeof db.pragma("cache_size", { simple: true }), "number");
+});
+
+test("Test bind()", async (t) => {
+  const [db] = await connect(":memory:");
+  db.prepare("CREATE TABLE users (name TEXT, age INTEGER)").run();
+  db.prepare("INSERT INTO users (name, age) VALUES (?, ?)").run("Alice", 42);
+  let stmt = db.prepare("SELECT * FROM users WHERE name = ?").bind("Alice");
+  console.log(db.prepare("SELECT * FROM users").raw().get());
+
+  for (const row of stmt.iterate()) {
+    t.truthy(row.name);
+    t.true(typeof row.age === "number");
+  }
+
+  t.throws(
+    () => {
+      db.bind("Bob");
+    },
+    { instanceOf: Error },
+  );
+});
+
+test("Test exec()", async (t) => {
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = path.dirname(__filename);
+
+  const [db] = await connect(":memory:");
+  const file = fs.readFileSync(path.resolve(__dirname, "./artifacts/basic-test.sql"), "utf8");
+  db.exec(file);
+  let rows = db.prepare("SELECT * FROM users").iterate();
+  for (const row of rows) {
+    t.truthy(row.name);
+    t.true(typeof row.age === "number");
+  }
+});
+
+test("Test Statement.database gets the database object", async t => {
+  const [db] = await connect(":memory:");
+  let stmt = db.prepare("SELECT 1");
+  t.is(stmt.database, db);
+});
+
 
 const connect = async (path) => {
   const db = new Database(path);
