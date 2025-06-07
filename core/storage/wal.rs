@@ -798,12 +798,13 @@ impl Wal for WalFile {
                     if everything_backfilled {
                         // TODO: Even in Passive mode, if everything was backfilled we should
                         // truncate
+                        debug!("Everything backfilled");
                         let sync_result = self.sync(SyncTarget::Db {
                             db_file: pager.db_file.clone(),
                         })?;
 
                         if matches!(sync_result, WalFsyncStatus::IO) {
-                            return Ok(CheckpointStatus::IO);
+                            pager.io.run_once()?;
                         }
 
                         // To properly reset the *wal file* we will need restart and/or truncate mode.
@@ -839,16 +840,20 @@ impl Wal for WalFile {
             let state = binding.borrow();
             *state
         };
+        let target_name = match target {
+            SyncTarget::Wal => "wal",
+            SyncTarget::Db { .. } => "db",
+        };
         match state_value {
             SyncState::NotSyncing => {
                 let shared = self.get_shared();
-                debug!("wal_sync");
+                debug!("{}_sync", target_name);
                 {
                     let completion = Completion::Sync(SyncCompletion {
                         complete: Box::new({
                             let sync_state = self.sync_state.clone();
                             move |_| {
-                                debug!("wal_sync finish");
+                                debug!("{}_sync finished", target_name);
                                 *sync_state.borrow_mut() = SyncState::NotSyncing;
                             }
                         }),
@@ -868,7 +873,7 @@ impl Wal for WalFile {
                 Ok(WalFsyncStatus::IO)
             }
             SyncState::Syncing => {
-                debug!("wal_sync already syncing");
+                debug!("{}_sync already syncing", target_name);
                 match *self.sync_state.clone().borrow() {
                     SyncState::NotSyncing => Ok(WalFsyncStatus::IO),
                     SyncState::Syncing => Ok(WalFsyncStatus::Done),
