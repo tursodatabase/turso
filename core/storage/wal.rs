@@ -317,6 +317,7 @@ enum SyncState {
 #[derive(Debug, Copy, Clone)]
 pub enum CheckpointState {
     Start,
+    CollectPages,
     ReadFrame,
     WaitReadFrame,
     WritePage,
@@ -350,6 +351,7 @@ struct OngoingCheckpoint {
     min_frame: u64,
     max_frame: u64,
     current_page: u64,
+    pages_to_checkpoint: Vec<(u64, u64)>, // (page_id, frame_id)
 }
 
 impl fmt::Debug for OngoingCheckpoint {
@@ -683,57 +685,86 @@ impl Wal for WalFile {
                     }
                     self.ongoing_checkpoint.max_frame = max_safe_frame;
                     self.ongoing_checkpoint.current_page = 0;
-                    self.ongoing_checkpoint.state = CheckpointState::ReadFrame;
+                    self.ongoing_checkpoint.state = CheckpointState::CollectPages;
                     trace!(
                         "checkpoint_start(min_frame={}, max_frame={})",
                         self.ongoing_checkpoint.max_frame,
                         self.ongoing_checkpoint.min_frame
                     );
                 }
-                CheckpointState::ReadFrame => {
-                    let shared = self.get_shared();
+                CheckpointState::CollectPages => {
                     let min_frame = self.ongoing_checkpoint.min_frame;
                     let max_frame = self.ongoing_checkpoint.max_frame;
-                    let pages_in_frames = shared.pages_in_frames.clone();
-                    let pages_in_frames = pages_in_frames.lock();
+                    // this should always be true in this case, but just in case
+                    if self.ongoing_checkpoint.current_page == 0 {
+                        let pages_to_checkpoint = {
+                            let shared = self.get_shared();
+                            let pages_in_frames = shared.pages_in_frames.lock();
+                            let frame_cache = shared.frame_cache.lock();
 
-                    let frame_cache = shared.frame_cache.clone();
-                    let frame_cache = frame_cache.lock();
-                    assert!(self.ongoing_checkpoint.current_page as usize <= pages_in_frames.len());
-                    if self.ongoing_checkpoint.current_page as usize == pages_in_frames.len() {
+                            let mut pages_to_checkpoint = Vec::with_capacity(pages_in_frames.len());
+                            for page in pages_in_frames.iter() {
+                                if let Some(frames) = frame_cache.get(page) {
+                                    // Find the latest frame in range
+                                    for frame in frames.iter().rev() {
+                                        if *frame >= min_frame && *frame <= max_frame {
+                                            pages_to_checkpoint.push((*page, *frame));
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            pages_to_checkpoint // drop borrows
+                        };
+                        self.ongoing_checkpoint.pages_to_checkpoint = pages_to_checkpoint;
+                    }
+                    self.ongoing_checkpoint.state = CheckpointState::ReadFrame;
+                }
+                CheckpointState::ReadFrame => {
+                    // Check if we've processed all pages
+                    if self.ongoing_checkpoint.current_page
+                        >= self.ongoing_checkpoint.pages_to_checkpoint.len() as u64
+                    {
                         self.ongoing_checkpoint.state = CheckpointState::Done;
                         continue 'checkpoint_loop;
                     }
-                    let page = pages_in_frames[self.ongoing_checkpoint.current_page as usize];
-                    let frames = frame_cache
-                        .get(&page)
-                        .expect("page must be in frame cache if it's in list");
 
-                    for frame in frames.iter().rev() {
-                        if *frame >= min_frame && *frame <= max_frame {
-                            debug!(
-                                "checkpoint page(state={:?}, page={}, frame={})",
-                                state, page, *frame
-                            );
-                            self.ongoing_checkpoint.page.get().id = page as usize;
+                    // Process the current page
+                    let (page, frame) = self.ongoing_checkpoint.pages_to_checkpoint
+                        [self.ongoing_checkpoint.current_page as usize];
+                    debug!(
+                        "checkpoint page(state={:?}, page={}, frame={})",
+                        state, page, frame
+                    );
 
-                            self.read_frame(
-                                *frame,
-                                self.ongoing_checkpoint.page.clone(),
-                                self.buffer_pool.clone(),
-                            )?;
-                            self.ongoing_checkpoint.state = CheckpointState::WaitReadFrame;
-                            self.ongoing_checkpoint.current_page += 1;
-                            continue 'checkpoint_loop;
-                        }
-                    }
-                    self.ongoing_checkpoint.current_page += 1;
+                    self.ongoing_checkpoint.page.get().id = page as usize;
+                    self.read_frame(
+                        frame,
+                        self.ongoing_checkpoint.page.clone(),
+                        self.buffer_pool.clone(),
+                    )?;
+                    self.ongoing_checkpoint.state = CheckpointState::WaitReadFrame;
                 }
                 CheckpointState::WaitReadFrame => {
                     if self.ongoing_checkpoint.page.is_locked() {
                         return Ok(CheckpointStatus::IO);
                     } else {
                         self.ongoing_checkpoint.state = CheckpointState::WritePage;
+                    }
+                }
+                CheckpointState::WaitWritePage => {
+                    if *write_counter.borrow() > 0 {
+                        return Ok(CheckpointStatus::IO);
+                    }
+                    // increment after successful write
+                    self.ongoing_checkpoint.current_page += 1;
+
+                    if self.ongoing_checkpoint.current_page
+                        < self.ongoing_checkpoint.pages_to_checkpoint.len() as u64
+                    {
+                        self.ongoing_checkpoint.state = CheckpointState::ReadFrame;
+                    } else {
+                        self.ongoing_checkpoint.state = CheckpointState::Done;
                     }
                 }
                 CheckpointState::WritePage => {
@@ -745,25 +776,30 @@ impl Wal for WalFile {
                     )?;
                     self.ongoing_checkpoint.state = CheckpointState::WaitWritePage;
                 }
-                CheckpointState::WaitWritePage => {
-                    if *write_counter.borrow() > 0 {
-                        return Ok(CheckpointStatus::IO);
-                    }
-                    let shared = self.get_shared();
-                    if (self.ongoing_checkpoint.current_page as usize)
-                        < shared.pages_in_frames.lock().len()
-                    {
-                        self.ongoing_checkpoint.state = CheckpointState::ReadFrame;
-                    } else {
-                        self.ongoing_checkpoint.state = CheckpointState::Done;
-                    }
-                }
                 CheckpointState::Done => {
                     if *write_counter.borrow() > 0 {
                         return Ok(CheckpointStatus::IO);
                     }
                     let shared = self.get_shared();
 
+                    // Clean up checkpointed frames even in passive mode
+                    if self.ongoing_checkpoint.max_frame > 0 {
+                        let mut frame_cache = shared.frame_cache.lock();
+                        let mut pages_in_frames = shared.pages_in_frames.lock();
+                        let mut pages_to_remove = Vec::with_capacity(pages_in_frames.len());
+                        for (page, frames) in frame_cache.iter_mut() {
+                            // Remove all frames <= max_frame that was checkpointed
+                            frames.retain(|&f| f > self.ongoing_checkpoint.max_frame);
+                            if frames.is_empty() {
+                                pages_to_remove.push(*page);
+                            }
+                        }
+                        // Remove empty pages
+                        for page in pages_to_remove {
+                            frame_cache.remove(&page);
+                            pages_in_frames.retain(|&p| p != page);
+                        }
+                    }
                     // Record two num pages fields to return as checkpoint result to caller.
                     // Ref: pnLog, pnCkpt on https://www.sqlite.org/c3ref/wal_checkpoint_v2.html
                     let checkpoint_result = CheckpointResult {
@@ -871,6 +907,7 @@ impl WalFile {
             ongoing_checkpoint: OngoingCheckpoint {
                 page: checkpoint_page,
                 state: CheckpointState::Start,
+                pages_to_checkpoint: Vec::new(),
                 min_frame: 0,
                 max_frame: 0,
                 current_page: 0,
