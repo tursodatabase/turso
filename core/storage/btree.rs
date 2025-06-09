@@ -4537,7 +4537,8 @@ impl BTreeCursor {
                     let page = page.get();
                     let contents = page.get().contents.as_ref().unwrap();
                     let free_space = compute_free_space(contents, self.usable_space() as u16);
-                    let needs_balancing = free_space as usize * 3 > self.usable_space() * 2;
+                    let needs_balancing = self.stack.has_parent()
+                        && free_space as usize * 3 > self.usable_space() * 2;
 
                     let target_key = if page.is_index() {
                         DeleteSavepoint::Payload(self.record().as_ref().unwrap().clone())
