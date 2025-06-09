@@ -6989,16 +6989,10 @@ mod tests {
                         &mut rng,
                     ) == 0
                         || keys.len() == 0; // do write if the are no keys
-                    tracing::info!(
-                        "operation {}, insert={}, delete={}",
-                        i,
-                        do_insert,
-                        !do_insert
-                    );
                     if do_insert {
                         let key;
                         loop {
-                            let cols = (0..10)
+                            let cols = (0..1)
                                 .map(|_| (rng.next_u64() % (1 << 30)) as i64)
                                 .collect::<Vec<_>>();
                             if seen.contains(&cols) {
@@ -7009,6 +7003,7 @@ mod tests {
                             key = cols;
                             break;
                         }
+                        tracing::info!("operation {}, insert={:?}", i, key);
                         keys.push(key.clone());
                         let value = ImmutableRecord::from_registers(
                             &key.iter()
@@ -7029,6 +7024,7 @@ mod tests {
                         let key_idx = rng.next_u64() as usize % keys.len();
                         {
                             let key = &keys[key_idx];
+                            tracing::info!("operation {}, delete={:?}", i, key);
                             let value = ImmutableRecord::from_registers(
                                 &key.iter()
                                     .map(|col| Register::Value(Value::Integer(*col)))
@@ -7039,6 +7035,7 @@ mod tests {
                                 pager.deref(),
                             )
                             .unwrap();
+                            tracing::trace!("record={}", cursor.record().as_ref().unwrap());
                             assert!(
                                 found_key_to_delete,
                                 "we tried to remove a key ({}), that somehow wasn't found",
@@ -7046,6 +7043,7 @@ mod tests {
                             );
 
                             run_until_done(|| cursor.delete(), pager.deref()).unwrap();
+                            seen.remove(key);
                         }
                         keys.remove_index(key_idx);
                     }
@@ -7059,6 +7057,24 @@ mod tests {
                         }
                     }
                 }
+                pager.begin_read_tx().unwrap();
+                cursor.move_to_root();
+                for key in keys.iter() {
+                    tracing::trace!("seeking key: {:?}", key);
+                    run_until_done(|| cursor.next(), pager.deref()).unwrap();
+                    let record = cursor.record();
+                    let record = record.as_ref().unwrap();
+                    let cursor_key = record.get_values();
+                    assert_eq!(
+                        cursor_key,
+                        &key.iter()
+                            .map(|col| RefValue::Integer(*col))
+                            .collect::<Vec<_>>(),
+                        "key {:?} is not found",
+                        key
+                    );
+                }
+                pager.end_read_tx().unwrap();
             }
             pager.begin_read_tx().unwrap();
             cursor.move_to_root();
