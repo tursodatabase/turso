@@ -664,14 +664,21 @@ impl Wal for WalFile {
             match state {
                 CheckpointState::Start => {
                     // TODO(pere): check what frames are safe to checkpoint between many readers!
+                    //
+                    // start: decide min|max frame range that is safe to copy
                     self.ongoing_checkpoint.min_frame = self.min_frame;
                     let shared = self.get_shared();
                     let mut max_safe_frame = shared.max_frame.load(Ordering::SeqCst);
+                    //
+                    // If a reader is positioned before max_frame we either:
+                    // a. bump its mark up (if we can take the slot write-lock) OR
+                    // b. lower max_frame (reader is busy, cannot overtake).
                     for (read_lock_idx, read_lock) in shared.read_locks.iter_mut().enumerate() {
                         let this_mark = read_lock.value.load(Ordering::SeqCst);
                         if this_mark < max_safe_frame as u32 {
                             let busy = !read_lock.write();
                             if !busy {
+                                // Slot 0: update to max_frame; others: UNUSED
                                 let new_mark = if read_lock_idx == 0 {
                                     max_safe_frame as u32
                                 } else {
@@ -680,7 +687,7 @@ impl Wal for WalFile {
                                 read_lock.value.store(new_mark, Ordering::SeqCst);
                                 read_lock.unlock();
                             } else {
-                                max_safe_frame = this_mark as u64;
+                                max_safe_frame = this_mark as u64; // reader still active
                             }
                         }
                     }
@@ -694,9 +701,12 @@ impl Wal for WalFile {
                     );
                 }
                 CheckpointState::CollectPages => {
+                    // Build a snapshot of (page, frame) pairs we intend to back-fill.
+                    // This guarantees bounded loop length and no mutex churn for each page
+
                     let min_frame = self.ongoing_checkpoint.min_frame;
                     let max_frame = self.ongoing_checkpoint.max_frame;
-                    // this should always be true in this case, but just in case
+                    // Snapshot only once per checkpoint run.
                     if self.ongoing_checkpoint.current_page == 0 {
                         let pages_to_checkpoint = {
                             let shared = self.get_shared();
@@ -706,7 +716,7 @@ impl Wal for WalFile {
                             let mut pages_to_checkpoint = Vec::with_capacity(pages_in_frames.len());
                             for page in pages_in_frames.iter() {
                                 if let Some(frames) = frame_cache.get(page) {
-                                    // Find the latest frame in range
+                                    // newest-to-oldest, pick first within range
                                     for frame in frames.iter().rev() {
                                         if *frame >= min_frame && *frame <= max_frame {
                                             pages_to_checkpoint.push((*page, *frame));
@@ -717,6 +727,7 @@ impl Wal for WalFile {
                             }
                             pages_to_checkpoint // drop borrows
                         };
+                        trace!("checkpoint_collect_pages({})", pages_to_checkpoint.len());
                         self.ongoing_checkpoint.pages_to_checkpoint = pages_to_checkpoint;
                     }
                     self.ongoing_checkpoint.state = CheckpointState::ReadFrame;
@@ -744,6 +755,7 @@ impl Wal for WalFile {
                         self.ongoing_checkpoint.page.clone(),
                         self.buffer_pool.clone(),
                     )?;
+                    // we could skip writes if we increment current_page here and then return IO
                     self.ongoing_checkpoint.state = CheckpointState::WaitReadFrame;
                 }
                 CheckpointState::WaitReadFrame => {
@@ -757,7 +769,7 @@ impl Wal for WalFile {
                     if *write_counter.borrow() > 0 {
                         return Ok(CheckpointStatus::IO);
                     }
-                    // increment after successful write
+                    // increment only after successful write
                     self.ongoing_checkpoint.current_page += 1;
 
                     if self.ongoing_checkpoint.current_page
@@ -781,6 +793,8 @@ impl Wal for WalFile {
                     if *write_counter.borrow() > 0 {
                         return Ok(CheckpointStatus::IO);
                     }
+                    // Handle mode-specific post-processing and produce result.
+
                     let shared = self.get_shared();
 
                     let checkpoint_result = CheckpointResult {
@@ -794,7 +808,7 @@ impl Wal for WalFile {
                     if everything_backfilled {
                         match mode {
                             CheckpointMode::Restart => {
-                                // Reset read marks to force new readers to start fresh
+                                // Force new readers to start at WAL-frame 0 next time.
                                 for read_lock in shared.read_locks.iter_mut() {
                                     read_lock.value.store(READMARK_NOT_USED, Ordering::SeqCst);
                                 }
@@ -855,10 +869,8 @@ impl Wal for WalFile {
                             // Passive mode or Full modes don't modify the WAL, nothing to do
                             _ => {}
                         }
-                    }
-
-                    // Update nbackfills for partial checkpoints
-                    if !everything_backfilled {
+                    } else {
+                        // not everything backfilled, partial checkpoint: remember how far we got.
                         shared
                             .nbackfills
                             .store(self.ongoing_checkpoint.max_frame, Ordering::SeqCst);
@@ -880,33 +892,9 @@ impl Wal for WalFile {
                     if !self.ongoing_checkpoint.header_write_complete.get() {
                         return Ok(CheckpointStatus::IO);
                     }
-
-                    let truncate_complete = {
-                        let shared = self.get_shared();
-
-                        // Clear in-memory structures
-                        shared.frame_cache.lock().clear();
-                        shared.pages_in_frames.lock().clear();
-                        shared.max_frame.store(0, Ordering::SeqCst);
-                        shared.nbackfills.store(0, Ordering::SeqCst);
-                        let header = shared.wal_header.lock();
-                        shared.last_checksum = (header.checksum_1, header.checksum_2);
-
-                        // Truncate the WAL file to just the header
-                        let truncate_complete = Rc::new(Cell::new(false));
-                        let truncate_flag = truncate_complete.clone();
-                        let completion =
-                            Completion::Write(crate::WriteCompletion::new(Box::new(move |_| {
-                                truncate_flag.set(true);
-                            })));
-
-                        shared
-                            .file
-                            .truncate(WAL_HEADER_SIZE as u64, Arc::new(completion))?;
-                        truncate_complete
-                    };
                     self.ongoing_checkpoint.state = CheckpointState::WaitHeaderWrite;
-                    self.ongoing_checkpoint.truncate_complete = truncate_complete;
+                    // after header is written, we can truncate the WAL file
+                    self.ongoing_checkpoint.truncate_complete = self.schedule_wal_truncate()?;
                     return Ok(CheckpointStatus::IO);
                 }
                 CheckpointState::WaitHeaderWrite => {
@@ -1012,6 +1000,30 @@ impl WalFile {
             min_frame: 0,
             max_frame_read_lock_index: 0,
         }
+    }
+
+    fn schedule_wal_truncate(&self) -> Result<Rc<Cell<bool>>> {
+        let shared = self.get_shared();
+
+        // Clear in-memory structures
+        shared.frame_cache.lock().clear();
+        shared.pages_in_frames.lock().clear();
+        shared.max_frame.store(0, Ordering::SeqCst);
+        shared.nbackfills.store(0, Ordering::SeqCst);
+        let header = shared.wal_header.lock();
+        shared.last_checksum = (header.checksum_1, header.checksum_2);
+
+        // Truncate the WAL file to just the header
+        let truncate_complete = Rc::new(Cell::new(false));
+        let truncate_flag = truncate_complete.clone();
+        let completion = Completion::Write(crate::WriteCompletion::new(Box::new(move |_| {
+            truncate_flag.set(true);
+        })));
+
+        shared
+            .file
+            .truncate(WAL_HEADER_SIZE as u64, Arc::new(completion))?;
+        Ok(truncate_complete)
     }
 
     fn frame_offset(&self, frame_id: u64) -> usize {
