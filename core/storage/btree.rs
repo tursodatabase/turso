@@ -6952,6 +6952,134 @@ mod tests {
         }
     }
 
+    fn btree_index_insert_drop_fuzz_run(
+        attempts: usize,
+        operations: usize,
+        insert_weight_out_of_100: u64,
+    ) {
+        let (mut rng, seed) = if std::env::var("SEED").is_ok() {
+            let seed = std::env::var("SEED").unwrap();
+            let seed = seed.parse::<u64>().unwrap();
+            let rng = ChaCha8Rng::seed_from_u64(seed);
+            (rng, seed)
+        } else {
+            rng_from_time_or_env()
+        };
+        let mut seen = HashSet::new();
+        tracing::info!("super seed: {}", seed);
+        for _ in 0..attempts {
+            let (pager, _) = empty_btree();
+            let index_root_page = run_until_done(
+                || pager.btree_create(&CreateBTreeFlags::new_index()),
+                &pager,
+            )
+            .unwrap();
+            let index_root_page = index_root_page as usize;
+            let mut cursor = BTreeCursor::new_table(None, pager.clone(), index_root_page);
+            let mut keys = SortedVec::new();
+            tracing::info!("seed: {}", seed);
+            for i in 0..operations {
+                pager.begin_read_tx().unwrap();
+                pager.begin_write_tx().unwrap();
+                {
+                    let do_insert = *pick_weighted(
+                        &[0, 1],
+                        &[insert_weight_out_of_100, 100 - insert_weight_out_of_100],
+                        &mut rng,
+                    ) == 0
+                        || keys.len() == 0; // do write if the are no keys
+                    tracing::info!(
+                        "operation {}, insert={}, delete={}",
+                        i,
+                        do_insert,
+                        !do_insert
+                    );
+                    if do_insert {
+                        let key;
+                        loop {
+                            let cols = (0..10)
+                                .map(|_| (rng.next_u64() % (1 << 30)) as i64)
+                                .collect::<Vec<_>>();
+                            if seen.contains(&cols) {
+                                continue;
+                            } else {
+                                seen.insert(cols.clone());
+                            }
+                            key = cols;
+                            break;
+                        }
+                        keys.push(key.clone());
+                        let value = ImmutableRecord::from_registers(
+                            &key.iter()
+                                .map(|col| Register::Value(Value::Integer(*col)))
+                                .collect::<Vec<_>>(),
+                        );
+                        run_until_done(
+                            || {
+                                cursor.insert(
+                                    &BTreeKey::new_index_key(&value),
+                                    cursor.is_write_in_progress(),
+                                )
+                            },
+                            pager.deref(),
+                        )
+                        .unwrap();
+                    } else {
+                        let key_idx = rng.next_u64() as usize % keys.len();
+                        {
+                            let key = &keys[key_idx];
+                            let value = ImmutableRecord::from_registers(
+                                &key.iter()
+                                    .map(|col| Register::Value(Value::Integer(*col)))
+                                    .collect::<Vec<_>>(),
+                            );
+                            let found_key_to_delete = run_until_done(
+                                || cursor.seek(SeekKey::IndexKey(&value), SeekOp::EQ),
+                                pager.deref(),
+                            )
+                            .unwrap();
+                            assert!(
+                                found_key_to_delete,
+                                "we tried to remove a key ({}), that somehow wasn't found",
+                                value
+                            );
+
+                            run_until_done(|| cursor.delete(), pager.deref()).unwrap();
+                        }
+                        keys.remove_index(key_idx);
+                    }
+                }
+                cursor.move_to_root();
+                loop {
+                    match pager.end_tx().unwrap() {
+                        crate::PagerCacheflushStatus::Done(_) => break,
+                        crate::PagerCacheflushStatus::IO => {
+                            pager.io.run_once().unwrap();
+                        }
+                    }
+                }
+            }
+            pager.begin_read_tx().unwrap();
+            cursor.move_to_root();
+            for key in keys.iter() {
+                tracing::trace!("seeking key: {:?}", key);
+                run_until_done(|| cursor.next(), pager.deref()).unwrap();
+                let record = cursor.record();
+                let record = record.as_ref().unwrap();
+                let cursor_key = record.get_values();
+                assert_eq!(
+                    cursor_key,
+                    &key.iter()
+                        .map(|col| RefValue::Integer(*col))
+                        .collect::<Vec<_>>(),
+                    "key {:?} is not found",
+                    key
+                );
+            }
+            pager.end_read_tx().unwrap();
+        }
+    }
+
     #[test]
     pub fn test_drop_odd() {
         let db = get_database();
@@ -7067,6 +7195,50 @@ mod tests {
     #[ignore]
     pub fn fuzz_long_btree_insert_fuzz_run_overflow() {
         btree_insert_fuzz_run(2, 5_000, |rng| (rng.next_u32() % 32 * 1024) as usize);
+    }
+
+    #[test]
+    pub fn fuzz_test_index_insert_95_delete_5() {
+        btree_index_insert_drop_fuzz_run(2, 1024, 95);
+    }
+
+    #[test]
+    pub fn fuzz_test_index_insert_80_delete_20() {
+        btree_index_insert_drop_fuzz_run(2, 1024, 80);
+    }
+
+    #[test]
+    pub fn fuzz_test_index_insert_50_delete_50() {
+        btree_index_insert_drop_fuzz_run(2, 1024, 50);
+    }
+
+    #[test]
+    pub fn fuzz_test_index_insert_20_delete_80() {
+        btree_index_insert_drop_fuzz_run(2, 1024, 20);
+    }
+
+    #[test]
+    #[ignore]
+    pub fn fuzz_long_test_index_insert_95_delete_5() {
+        btree_index_insert_drop_fuzz_run(2, 5000, 95);
+    }
+
+    #[test]
+    #[ignore]
+    pub fn fuzz_long_test_index_insert_80_delete_20() {
+        btree_index_insert_drop_fuzz_run(2, 5000, 80);
+    }
+
+    #[test]
+    #[ignore]
+    pub fn fuzz_long_test_index_insert_50_delete_50() {
+        btree_index_insert_drop_fuzz_run(2, 5000, 50);
+    }
+
+    #[test]
+    #[ignore]
+    pub fn fuzz_long_test_index_insert_20_delete_80() {
+        btree_index_insert_drop_fuzz_run(2, 5000, 20);
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -8429,5 +8601,23 @@ mod tests {
             pager.clone(),
         );
         insert_into_cell(contents, &payload, i as usize, pager.usable_space() as u16).unwrap();
+    }
+
+    fn pick_weighted<'a, T>(choices: &'a [T], weights: &[u64], rng: &mut ChaCha8Rng) -> &'a T {
+        assert!(!choices.is_empty() && choices.len() == weights.len());
+
+        let total_weight: u64 = weights.iter().sum();
+        assert!(total_weight > 0);
+
+        let mut random_point = rng.next_u64() % total_weight;
+
+        for (i, &weight) in weights.iter().enumerate() {
+            if random_point < weight {
+                return &choices[i];
+            }
+            random_point -= weight;
+        }
+
+        &choices[choices.len() - 1]
     }
 }
