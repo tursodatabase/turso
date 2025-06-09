@@ -333,6 +333,19 @@ impl File for UnixFile<'_> {
         Ok(())
     }
 
+    fn truncate(&self, size: u64, c: Arc<Completion>) -> Result<()> {
+        let file = self.file.borrow();
+        let result = file.set_len(size);
+        match result {
+            Ok(()) => {
+                trace!("truncate to size: {}", size);
+                c.complete(0);
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     fn pread(&self, pos: usize, c: Arc<Completion>) -> Result<()> {
         let file = self.file.borrow();
         let result = {
@@ -365,7 +378,12 @@ impl File for UnixFile<'_> {
         }
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<crate::Buffer>>, c: Arc<Completion>) -> Result<()> {
+    fn pwrite(
+        &self,
+        pos: usize,
+        buffer: Arc<RefCell<crate::Buffer>>,
+        c: Arc<Completion>,
+    ) -> Result<()> {
         let file = self.file.borrow();
         let result = {
             let buf = buffer.borrow();

@@ -104,6 +104,15 @@ impl File for SimulatorFile {
         self.inner.pwrite(pos, buffer, c)
     }
 
+    fn truncate(&self, size: u64, c: Arc<limbo_core::Completion>) -> Result<()> {
+        if *self.fault.borrow() {
+            return Err(limbo_core::LimboError::InternalError(
+                "Injected fault".into(),
+            ));
+        }
+        self.inner.truncate(size, c)
+    }
+
     fn sync(&self, c: Arc<limbo_core::Completion>) -> Result<()> {
         *self.nr_sync_calls.borrow_mut() += 1;
         self.inner.sync(c)

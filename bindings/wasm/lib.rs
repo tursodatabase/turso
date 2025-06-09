@@ -246,6 +246,12 @@ impl limbo_core::File for File {
         Ok(())
     }
 
+    fn truncate(&self, size: u64, c: Arc<limbo_core::Completion>) -> Result<()> {
+        self.vfs.truncate(self.fd, size);
+        c.complete(0);
+        Ok(())
+    }
+
     fn size(&self) -> Result<u64> {
         Ok(self.vfs.size(self.fd))
     }
@@ -388,6 +394,9 @@ extern "C" {
     fn pread(this: &VFS, fd: i32, buffer: &mut [u8], offset: usize) -> i32;
 
     #[wasm_bindgen(method)]
+    fn truncate(this: &VFS, fd: i32, size: u64) -> bool;
+
+    #[wasm_bindgen(method)]
     fn size(this: &VFS, fd: i32) -> u64;
 
     #[wasm_bindgen(method)]
@@ -412,6 +421,9 @@ extern "C" {
 
     #[wasm_bindgen(method)]
     fn pread(this: &VFS, fd: i32, buffer: &mut [u8], offset: usize) -> i32;
+
+    #[wasm_bindgen(method)]
+    fn truncate(this: &VFS, fd: i32, size: u64) -> bool;
 
     #[wasm_bindgen(method)]
     fn size(this: &VFS, fd: i32) -> u64;

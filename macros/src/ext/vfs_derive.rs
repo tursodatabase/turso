@@ -14,6 +14,7 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
     let lock_fn_name = format_ident!("{}_lock", struct_name);
     let unlock_fn_name = format_ident!("{}_unlock", struct_name);
     let sync_fn_name = format_ident!("{}_sync", struct_name);
+    let truncate_fn_name = format_ident!("{}_truncate", struct_name);
     let size_fn_name = format_ident!("{}_size", struct_name);
     let run_once_fn_name = format_ident!("{}_run_once", struct_name);
     let generate_random_number_fn_name = format_ident!("{}_generate_random_number", struct_name);
@@ -36,6 +37,7 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
                 unlock: #unlock_fn_name,
                 sync: #sync_fn_name,
                 size: #size_fn_name,
+                truncate: #truncate_fn_name,
                 run_once: #run_once_fn_name,
                 gen_random_number: #generate_random_number_fn_name,
                 current_time: #get_current_time_fn_name,
@@ -59,6 +61,7 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
                 unlock: #unlock_fn_name,
                 sync: #sync_fn_name,
                 size: #size_fn_name,
+                truncate: #truncate_fn_name,
                 run_once: #run_once_fn_name,
                 gen_random_number: #generate_random_number_fn_name,
                 current_time: #get_current_time_fn_name,
@@ -186,6 +189,20 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
                 return -1;
             }
             0
+        }
+
+        #[no_mangle]
+        pub unsafe extern "C" fn #truncate_fn_name(file_ptr: *const ::std::ffi::c_void, len: i64) -> ResultCode {
+            if file_ptr.is_null() {
+                return ::limbo_ext::ResultCode::Error;
+            }
+            let vfs_file: &mut ::limbo_ext::VfsFileImpl = &mut *(file_ptr as *mut ::limbo_ext::VfsFileImpl);
+            let file: &mut <#struct_name as ::limbo_ext::VfsExtension>::File =
+                &mut *(vfs_file.file as *mut <#struct_name as ::limbo_ext::VfsExtension>::File);
+            if <#struct_name as ::limbo_ext::VfsExtension>::File::truncate(file, len).is_err() {
+                return ::limbo_ext::ResultCode::Error;
+            }
+            ::limbo_ext::ResultCode::OK
         }
 
         #[no_mangle]

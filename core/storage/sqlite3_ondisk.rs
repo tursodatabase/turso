@@ -1490,6 +1490,12 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
             .store(frame_idx.saturating_sub(1), Ordering::SeqCst);
         wfs_data.last_checksum = cumulative_checksum;
         wfs_data.loaded.store(true, Ordering::SeqCst);
+
+        // rebuild pages_in_frames with only unique ID's
+        let frame_cache = wfs_data.frame_cache.lock();
+        let mut pages_in_frames = wfs_data.pages_in_frames.lock();
+        pages_in_frames.clear();
+        pages_in_frames.extend(frame_cache.keys().copied());
     });
     let c = Completion::Read(ReadCompletion::new(buf_for_pread, complete));
     file.pread(0, Arc::new(c))?;
@@ -1602,7 +1608,11 @@ pub fn begin_write_wal_frame(
     Ok(checksums)
 }
 
-pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<()> {
+pub fn begin_write_wal_header(
+    io: &Arc<dyn File>,
+    header: &WalHeader,
+    completion: Option<Rc<Cell<bool>>>,
+) -> Result<()> {
     let buffer = {
         let drop_fn = Rc::new(|_buf| {});
 
@@ -1622,12 +1632,16 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
         Arc::new(RefCell::new(buffer))
     };
 
+    let complete = completion.clone();
     let write_complete = {
         Box::new(move |bytes_written: i32| {
             if bytes_written < WAL_HEADER_SIZE as i32 {
                 tracing::error!(
                     "wal header wrote({bytes_written}) less than expected({WAL_HEADER_SIZE})"
                 );
+            }
+            if let Some(completion) = complete.as_ref() {
+                completion.set(true);
             }
         })
     };

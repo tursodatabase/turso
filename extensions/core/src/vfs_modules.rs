@@ -42,6 +42,7 @@ pub trait VfsFile: Send + Sync {
     fn write(&mut self, buf: &[u8], count: usize, offset: i64) -> ExtResult<i32>;
     fn sync(&self) -> ExtResult<()>;
     fn size(&self) -> i64;
+    fn truncate(&self, size: i64) -> ExtResult<()>;
 }
 
 #[repr(C)]
@@ -53,6 +54,7 @@ pub struct VfsImpl {
     pub read: VfsRead,
     pub write: VfsWrite,
     pub sync: VfsSync,
+    pub truncate: VfsTruncate,
     pub lock: VfsLock,
     pub unlock: VfsUnlock,
     pub size: VfsSize,
@@ -92,6 +94,8 @@ pub type VfsRunOnce = unsafe extern "C" fn(file: *const c_void) -> ResultCode;
 pub type VfsGetCurrentTime = unsafe extern "C" fn() -> *const c_char;
 
 pub type VfsGenerateRandomNumber = unsafe extern "C" fn() -> i64;
+
+pub type VfsTruncate = unsafe extern "C" fn(file: *const c_void, size: i64) -> ResultCode;
 
 #[repr(C)]
 pub struct VfsFileImpl {

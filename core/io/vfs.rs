@@ -97,6 +97,16 @@ impl File for VfsFileImpl {
         Ok(())
     }
 
+    fn truncate(&self, size: u64, c: Arc<Completion>) -> Result<()> {
+        let vfs = unsafe { &*self.vfs };
+        let result = unsafe { (vfs.truncate)(self.file, size as i64) };
+        if !result.is_ok() {
+            return Err(LimboError::ExtensionError("truncate failed".to_string()));
+        }
+        c.complete(0);
+        Ok(())
+    }
+
     fn pread(&self, pos: usize, c: Arc<Completion>) -> Result<()> {
         let r = match &*c {
             Completion::Read(ref r) => r,

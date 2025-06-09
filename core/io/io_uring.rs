@@ -272,6 +272,19 @@ impl File for UringFile {
         Ok(())
     }
 
+    fn truncate(&self, size: u64, c: Arc<Completion>) -> Result<()> {
+        trace!("truncate(size = {})", size);
+        // io_uring doesn't support ftruncate directly, so use libc::ftruncate synchronously
+        use std::os::unix::io::AsRawFd;
+        let result = unsafe { libc::ftruncate(self.file.as_raw_fd(), size as libc::off_t) };
+        if result == 0 {
+            c.complete(0);
+            Ok(())
+        } else {
+            Err(LimboError::IOError(std::io::Error::last_os_error()))
+        }
+    }
+
     fn pread(&self, pos: usize, c: Arc<Completion>) -> Result<()> {
         let r = c.as_read();
         trace!("pread(pos = {}, length = {})", pos, r.buf().len());
@@ -291,7 +304,12 @@ impl File for UringFile {
         Ok(())
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<crate::Buffer>>, c: Arc<Completion>) -> Result<()> {
+    fn pwrite(
+        &self,
+        pos: usize,
+        buffer: Arc<RefCell<crate::Buffer>>,
+        c: Arc<Completion>,
+    ) -> Result<()> {
         let mut io = self.io.borrow_mut();
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
         let write = {
@@ -305,11 +323,13 @@ impl File for UringFile {
         };
         io.ring.submit_entry(
             &write,
-            Arc::new(Completion::Write(WriteCompletion::new(Box::new(move |result| {
-                c.complete(result);
-                // NOTE: Explicitly reference buffer to ensure it lives until here
-                let _ = buffer.borrow();
-            })))),
+            Arc::new(Completion::Write(WriteCompletion::new(Box::new(
+                move |result| {
+                    c.complete(result);
+                    // NOTE: Explicitly reference buffer to ensure it lives until here
+                    let _ = buffer.borrow();
+                },
+            )))),
         );
         Ok(())
     }

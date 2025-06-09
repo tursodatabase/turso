@@ -16,6 +16,7 @@ pub trait File: Send + Sync {
     fn unlock_file(&self) -> Result<()>;
     fn pread(&self, pos: usize, c: Arc<Completion>) -> Result<()>;
     fn pwrite(&self, pos: usize, buffer: Arc<RefCell<Buffer>>, c: Arc<Completion>) -> Result<()>;
+    fn truncate(&self, size: u64, c: Arc<Completion>) -> Result<()>;
     fn sync(&self, c: Arc<Completion>) -> Result<()>;
     fn size(&self) -> Result<u64>;
 }

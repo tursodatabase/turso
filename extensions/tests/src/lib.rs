@@ -287,6 +287,13 @@ impl VfsFile for TestFile {
             .map(|n| n as i32)
     }
 
+    fn truncate(&self, size: i64) -> ExtResult<()> {
+        log::debug!("truncating file with testing VFS to size: {}", size);
+        self.file
+            .set_len(size as u64)
+            .map_err(|_| ResultCode::Error)
+    }
+
     fn sync(&self) -> ExtResult<()> {
         log::debug!("syncing file with testing VFS");
         self.file.sync_all().map_err(|_| ResultCode::Error)

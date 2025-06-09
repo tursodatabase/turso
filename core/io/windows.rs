@@ -94,7 +94,12 @@ impl File for WindowsFile {
         Ok(())
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<crate::Buffer>>, c: Arc<Completion>) -> Result<()> {
+    fn pwrite(
+        &self,
+        pos: usize,
+        buffer: Arc<RefCell<crate::Buffer>>,
+        c: Arc<Completion>,
+    ) -> Result<()> {
         let mut file = self.file.borrow_mut();
         file.seek(std::io::SeekFrom::Start(pos as u64))?;
         let buf = buffer.borrow();
@@ -107,6 +112,13 @@ impl File for WindowsFile {
     fn sync(&self, c: Arc<Completion>) -> Result<()> {
         let file = self.file.borrow_mut();
         file.sync_all().map_err(LimboError::IOError)?;
+        c.complete(0);
+        Ok(())
+    }
+
+    fn truncate(&self, size: u64, c: Arc<Completion>) -> Result<()> {
+        let mut file = self.file.borrow_mut();
+        file.set_len(size).map_err(LimboError::IOError)?;
         c.complete(0);
         Ok(())
     }
