@@ -1,37 +1,37 @@
 const fs = require('node:fs');
 
 class VFS {
-	constructor() {
-	}
+  constructor() {
+  }
 
-	open(path, flags) {
-		return fs.openSync(path, flags);
-	}
+  open(path, flags) {
+    return fs.openSync(path, flags);
+  }
 
-	close(fd) {
-		fs.closeSync(fd);
-	}
+  close(fd) {
+    fs.closeSync(fd);
+  }
 
-	pread(fd, buffer, offset) {
-		return fs.readSync(fd, buffer, 0, buffer.length, offset);
-	}
+  pread(fd, buffer, offset) {
+    return fs.readSync(fd, buffer, 0, buffer.length, offset);
+  }
 
-	pwrite(fd, buffer, offset) {
-		return fs.writeSync(fd, buffer, 0, buffer.length, offset);
-	}
+  pwrite(fd, buffer, offset) {
+    return fs.writeSync(fd, buffer, 0, buffer.length, offset);
+  }
 
-	truncate(fd, size) {
-		return fs.ftruncateSync(fd, size);
-	}
+  size(fd) {
+    let stats = fs.fstatSync(fd);
+    return BigInt(stats.size);
+  }
 
-	size(fd) {
-		let stats = fs.fstatSync(fd);
-		return BigInt(stats.size);
-	}
+  truncate(fd, size) {
+    return fs.truncateSync(fd, size);
+  }
 
-	sync(fd) {
-		fs.fsyncSync(fd);
-	}
+  sync(fd) {
+    fs.fsyncSync(fd);
+  }
 }
 
 module.exports = { VFS };
