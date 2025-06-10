@@ -16,7 +16,9 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use clap::Parser;
+use futures::executor::block_on;
 use rustyline::{error::ReadlineError, history::DefaultHistory, Editor};
+use std::future::Future;
 use std::{
     fmt,
     io::{self, BufRead as _, Write},
@@ -194,7 +196,7 @@ impl Limbo {
         } else {
             self.run_query(cmd);
         }
-        self.close_conn()?;
+        block_on(self.close_conn())?;
         std::process::exit(0);
     }
 
@@ -312,7 +314,7 @@ impl Limbo {
             Err(x) => Err(x),
         }?;
 
-        self.conn.close()?;
+        block_on(self.conn.close_async())?;
         self.writeln("COMMIT;")?;
         Ok(())
     }
@@ -335,8 +337,8 @@ impl Limbo {
         self.input_buff.clear();
     }
 
-    pub fn close_conn(&mut self) -> Result<(), LimboError> {
-        self.conn.close()
+    pub fn close_conn(&mut self) -> impl Future<Output = Result<(), LimboError>> + '_ {
+        self.conn.close_async()
     }
 
     fn toggle_echo(&mut self, arg: EchoMode) {
@@ -567,7 +569,7 @@ impl Limbo {
                 }
                 Command::Quit => {
                     let _ = self.writeln("Exiting Limbo SQL Shell.");
-                    let _ = self.close_conn();
+                    let _ = block_on(self.close_conn());
                     self.save_history();
                     std::process::exit(0)
                 }

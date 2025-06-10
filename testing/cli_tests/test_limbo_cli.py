@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import os
 import select
-from time import sleep
 import subprocess
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -92,7 +91,6 @@ class LimboShell:
 
     def quit(self) -> None:
         self._write_to_pipe(".quit")
-        sleep(0.3)
         self.pipe.terminate()
         self.pipe.kill()
 

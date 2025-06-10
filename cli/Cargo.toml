@@ -47,6 +47,7 @@ schemars = {version = "0.8.22", features = ["preserve_order"]}
 serde = { workspace = true, features = ["derive"]}
 validator = {version = "0.20.0", features = ["derive"]}
 toml_edit = {version = "0.22.24", features = ["serde"]}
+futures = "0.3.31"
 
 [features]
 default = ["io_uring"]

@@ -581,7 +581,7 @@ impl Connection {
         }
     }
 
-    pub fn close_async(&self) -> impl Future<Output = Result<()>> + '_ {
+    pub fn close_async(&self) -> impl Future<Output = Result<(), LimboError>> + '_ {
         future::poll_fn(move |cx| match self.pager.checkpoint() {
             Ok(CheckpointStatus::Done(_)) => Poll::Ready(Ok(())),
             Ok(CheckpointStatus::IO) => {

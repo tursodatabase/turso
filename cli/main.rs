@@ -5,8 +5,8 @@ mod config;
 mod helper;
 mod input;
 mod opcodes_dictionary;
-
 use config::CONFIG_DIR;
+use futures::executor::block_on;
 use rustyline::{error::ReadlineError, Config, Editor};
 use std::{
     path::PathBuf,
@@ -58,7 +58,7 @@ fn main() -> anyhow::Result<()> {
                 // At prompt, increment interrupt count
                 if app.interrupt_count.fetch_add(1, Ordering::SeqCst) >= 1 {
                     eprintln!("Interrupted. Exiting...");
-                    let _ = app.close_conn();
+                    let _ = block_on(app.close_conn());
                     break;
                 }
                 println!("Use .quit to exit or press Ctrl-C again to force quit.");
@@ -67,11 +67,11 @@ fn main() -> anyhow::Result<()> {
             }
             Err(ReadlineError::Eof) => {
                 app.handle_remaining_input();
-                let _ = app.close_conn();
+                let _ = block_on(app.close_conn());
                 break;
             }
             Err(err) => {
-                let _ = app.close_conn();
+                let _ = block_on(app.close_conn());
                 anyhow::bail!(err)
             }
         }
