@@ -1,5 +1,6 @@
 use anyhow::Result;
 use errors::*;
+use futures::executor::block_on;
 use limbo_core::types::Text;
 use limbo_core::Value;
 use pyo3::prelude::*;
@@ -245,7 +246,7 @@ impl Connection {
     }
 
     pub fn close(&self) -> PyResult<()> {
-        self.conn.close().map_err(|e| {
+        block_on(self.conn.close_async()).map_err(|e| {
             PyErr::new::<OperationalError, _>(format!("Failed to close connection: {:?}", e))
         })?;
 

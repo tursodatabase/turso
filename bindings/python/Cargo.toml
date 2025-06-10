@@ -17,6 +17,7 @@ extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 anyhow = "1.0"
+futures = "0.3"
 limbo_core = { path = "../../core", features = ["io_uring"] }
 pyo3 = { version = "0.24.1", features = ["anyhow"] }
 

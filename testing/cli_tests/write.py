@@ -4,7 +4,6 @@ import tempfile
 from cli_tests.test_limbo_cli import TestLimboShell
 from pydantic import BaseModel
 from cli_tests import console
-from time import sleep
 
 
 sqlite_flags = os.getenv("SQLITE_FLAGS", "-q").split(" ")
@@ -153,7 +152,6 @@ def main():
                 with TestLimboShell("") as limbo:
                     limbo.execute_dot(f".open {test.db_path}")
                     test.run(limbo)
-                sleep(0.3)
                 test.test_compat()
 
             except Exception as e:
