@@ -906,6 +906,15 @@ pub enum Insn {
         target_reg: usize,
         exact: bool,
     },
+
+    // Cause precompiled statements to expire. When an expired statement is executed using sqlite3_step() it will either automatically reprepare itself (if it was originally created using sqlite3_prepare_v2()) or it will fail with SQLITE_SCHEMA.
+    // If P1 is 0, then all SQL statements become expired. If P1 is non-zero, then only the currently executing statement is expired.
+    //
+    // If P2 is 0, then SQL statements are expired immediately. If P2 is 1, then running SQL statements are allowed to continue to run to completion. The P2==1 case occurs when a CREATE INDEX or similar schema change happens that might help the statement run faster but which does not affect the correctness of operation.
+    Expire {
+        expire_all: bool,
+        deferred: bool,
+    }
 }
 
 impl Insn {
@@ -1028,6 +1037,7 @@ impl Insn {
             Insn::Affinity { .. } => execute::op_affinity,
             Insn::IdxDelete { .. } => execute::op_idx_delete,
             Insn::Count { .. } => execute::op_count,
+            Insn::Expire { .. } =>execute::op_expire,
         }
     }
 }

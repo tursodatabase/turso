@@ -4951,6 +4951,16 @@ pub fn op_count(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_expire(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Rc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    unimplemented!();
+}
+
 fn exec_lower(reg: &Value) -> Option<Value> {
     match reg {
         Value::Text(t) => Some(Value::build_text(&t.as_str().to_lowercase())),
