@@ -787,6 +787,17 @@ impl Connection {
         program.prev_program.set(None);
         program.next_program.set(None);
     }
+
+    fn expire_all_programs(&self, deferred: bool) {
+        let mut current_program = self.program_head.get();
+        while let Some(node) = current_program {
+            unsafe {
+                let node = node.as_ptr();
+                (*node).expired = true;
+                current_program = (*node).next_program.get();
+            }
+        }
+    }
 }
 
 pub struct Statement {
@@ -966,4 +977,12 @@ impl Iterator for QueryRunner<'_> {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_track_program() {}
 }

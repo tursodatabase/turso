@@ -787,6 +787,7 @@ impl ProgramBuilder {
             table_references: self.table_references,
             prev_program: Cell::new(None),
             next_program: Cell::new(None),
+            expired: false,
         }
     }
 }

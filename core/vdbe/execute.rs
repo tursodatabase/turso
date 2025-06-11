@@ -50,7 +50,7 @@ use crate::{
 
 use super::{
     insn::{Cookie, RegisterOrLiteral},
-    CommitState,
+    CommitState, ExpirationStatus,
 };
 use parking_lot::RwLock;
 use rand::thread_rng;
@@ -4958,7 +4958,27 @@ pub fn op_expire(
     pager: &Rc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    unimplemented!();
+    let Insn::Expire {
+        expire_all,
+        deferred,
+    } = insn
+    else {
+        unreachable!("unexpected Insn {:?}", insn)
+    };
+
+    if *expire_all {
+        if let Some(conn) = program.connection.upgrade() {
+            conn.expire_all_programs(*deferred)
+        }
+    } else {
+        state.expiration_status = match deferred {
+            false => Some(ExpirationStatus::Expired),
+            true => Some(ExpirationStatus::Pending),
+        }
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
 }
 
 fn exec_lower(reg: &Value) -> Option<Value> {

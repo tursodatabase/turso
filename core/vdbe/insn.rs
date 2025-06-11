@@ -914,7 +914,7 @@ pub enum Insn {
     Expire {
         expire_all: bool,
         deferred: bool,
-    }
+    },
 }
 
 impl Insn {
@@ -1037,7 +1037,7 @@ impl Insn {
             Insn::Affinity { .. } => execute::op_affinity,
             Insn::IdxDelete { .. } => execute::op_idx_delete,
             Insn::Count { .. } => execute::op_count,
-            Insn::Expire { .. } =>execute::op_expire,
+            Insn::Expire { .. } => execute::op_expire,
         }
     }
 }
