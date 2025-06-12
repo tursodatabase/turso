@@ -189,6 +189,19 @@ do_execsql_test_on_specific_db {:memory:} unique_insert_no_pkey {
 } {|1
 |6}
 
+do_execsql_test_on_specific_db {:memory:} insert_expr_constraint_check-1 {
+    CREATE TABLE t (x INTEGER check (x % 2 == 0));
+    INSERT INTO t VALUES (2);
+    INSERT INTO t VALUES (6);
+    SELECT * FROM t;
+} {2
+6}
+
+do_execsql_test_in_memory_any_error insert_expr_constraint_check-2 {
+    CREATE TABLE t (x INTEGER check (x % 2 == 0));
+    INSERT INTO t VALUES (1);
+}
+
 do_execsql_test_on_specific_db {:memory:} unique_insert_with_pkey {
     CREATE TABLE t2 (x INTEGER PRIMARY KEY, y INTEGER UNIQUE);
     INSERT INTO t2 (y) VALUES (1);
