@@ -1694,4 +1694,16 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_check_contraint() -> Result<()> {
+        let sql = r#"CREATE TABLE t1 (a int check (a % 2 == 0));"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+        assert!(table.columns[0].check_constraint.is_some());
+
+        let sql = r#"CREATE TABLE t1 (a int);"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+        assert!(table.columns[0].check_constraint.is_none());
+        Ok(())
+    }
 }
