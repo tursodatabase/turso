@@ -781,6 +781,7 @@ pub fn translate_drop_table(
                 notnull: false,
                 default: None,
                 unique: false,
+                check_constraint: None,
                 collation: None,
             }],
             is_strict: false,

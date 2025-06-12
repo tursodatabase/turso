@@ -952,6 +952,7 @@ impl JoinedTable {
                 notnull: false,
                 default: None,
                 unique: false,
+                check_constraint: None,
                 collation: None, // FIXME: infer collation from subquery
             })
             .collect();
