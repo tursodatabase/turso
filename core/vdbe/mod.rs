@@ -249,6 +249,7 @@ pub struct ProgramState {
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
     op_idx_delete_state: Option<OpIdxDeleteState>,
+    expiration_status: Option<ExpirationStatus>,
 }
 
 impl ProgramState {
@@ -273,6 +274,7 @@ impl ProgramState {
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
             op_idx_delete_state: None,
+            expiration_status: None,
         }
     }
 
@@ -327,6 +329,12 @@ impl ProgramState {
     }
 }
 
+#[derive(Debug)]
+pub enum ExpirationStatus {
+    Pending,
+    Expired,
+}
+
 impl Register {
     pub fn get_owned_value(&self) -> &Value {
         match self {
@@ -366,6 +374,7 @@ pub struct Program {
     pub table_references: TableReferences,
     pub prev_program: Cell<Option<NonNull<Program>>>,
     pub next_program: Cell<Option<NonNull<Program>>>,
+    pub expired: Option<ExpirationStatus>,
 }
 
 impl Program {
@@ -375,9 +384,19 @@ impl Program {
         mv_store: Option<Rc<MvStore>>,
         pager: Rc<Pager>,
     ) -> Result<StepResult> {
+        if self.expired.is_some() || state.expiration_status.is_some() {
+            return Err(LimboError::Schema);
+        }
+
         loop {
             if state.is_interrupted() {
                 return Ok(StepResult::Interrupt);
+            }
+
+            if let Some(ExpirationStatus::Expired) = state.expiration_status {
+                return Err(LimboError::Schema);
+            } else if let Some(ExpirationStatus::Pending) = state.expiration_status {
+                
             }
             // invalidate row
             let _ = state.result_row.take();

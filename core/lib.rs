@@ -34,7 +34,7 @@ mod numeric;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use crate::vdbe::Program;
+use crate::vdbe::{ExpirationStatus, Program};
 use crate::vtab::VirtualTable;
 use crate::{fast_lock::SpinLock, translate::optimizer::optimize_plan};
 use core::str;
@@ -385,6 +385,7 @@ impl Connection {
                     program,
                     self._db.mv_store.clone(),
                     self.pager.clone(),
+                    input,
                 ))
             }
             Cmd::Explain(_stmt) => todo!(),
@@ -432,9 +433,10 @@ impl Connection {
                 )?);
                 self.track_program(&program);
                 let stmt = Statement::new(
-                    program.into(),
+                    program,
                     self._db.mv_store.clone(),
                     self.pager.clone(),
+                    input,
                 );
                 Ok(Some(stmt))
             }
@@ -793,10 +795,68 @@ impl Connection {
         while let Some(node) = current_program {
             unsafe {
                 let node = node.as_ptr();
-                (*node).expired = true;
+                (*node).expired = match deferred { 
+                    true => Some(ExpirationStatus::Pending),
+                    false => Some(ExpirationStatus::Expired),
+                };
                 current_program = (*node).next_program.get();
             }
         }
+    }
+
+    pub fn recompile_program(self: &Rc<Connection>, original_sql: &str) -> Result<Program> {
+        let mut parser = Parser::new(original_sql.as_bytes());
+        let cmd = parser.next()?.ok_or_else(|| {
+            LimboError::InvalidArgument("Original SQL for re-prepare was empty".to_string())
+        })?;
+
+        let syms = self.syms.borrow();
+        let query_mode = QueryMode::from(cmd.clone());
+        let stmt_ast = match cmd {
+            Cmd::Stmt(s) | Cmd::Explain(s) => s,
+            _ => return Err(LimboError::InvalidArgument("Cannot re-prepare this command type".into())),
+        };
+
+        let program_value = translate::translate(
+            self.schema.try_read().ok_or(LimboError::SchemaLocked)?.deref(),
+            stmt_ast,
+            self.header.clone(),
+            self.pager.clone(),
+            Rc::downgrade(self),
+            &syms,
+            query_mode,
+            original_sql,
+        )?;
+
+        Ok(program_value)
+    }
+
+    /// Replaces an old program node with a new one in the intrusive list.
+    /// This is an internal helper for re-preparation.
+    pub fn replace_tracked_program(&self, old_program: &Rc<Program>, new_program: &Rc<Program>) {
+        let old_program_ptr = unsafe { NonNull::new_unchecked(Rc::as_ptr(old_program) as *mut Program) };
+        let new_program_ptr = unsafe { NonNull::new_unchecked(Rc::as_ptr(new_program) as *mut Program) };
+
+        let old_prev_opt = old_program.prev_program.get();
+        let old_next_opt = old_program.next_program.get();
+
+        unsafe {
+            (*new_program_ptr.as_ptr()).prev_program.set(old_prev_opt);
+            (*new_program_ptr.as_ptr()).next_program.set(old_next_opt);
+
+            if let Some(prev_ptr) = old_prev_opt {
+                (*prev_ptr.as_ptr()).next_program.set(Some(new_program_ptr));
+            } else if self.program_head.get() == Some(old_program_ptr) {
+                self.program_head.set(Some(new_program_ptr));
+            }
+
+            if let Some(next_ptr) = old_next_opt {
+                (*next_ptr.as_ptr()).prev_program.set(Some(new_program_ptr));
+            }
+        }
+
+        old_program.prev_program.set(None);
+        old_program.next_program.set(None);
     }
 }
 
@@ -805,6 +865,7 @@ pub struct Statement {
     state: vdbe::ProgramState,
     mv_store: Option<Rc<MvStore>>,
     pager: Rc<Pager>,
+    sql: String,
 }
 
 impl Statement {
@@ -812,6 +873,7 @@ impl Statement {
         program: Rc<vdbe::Program>,
         mv_store: Option<Rc<MvStore>>,
         pager: Rc<Pager>,
+        sql: &str,
     ) -> Self {
         let state = vdbe::ProgramState::new(program.max_registers, program.cursor_ref.len());
         Self {
@@ -819,6 +881,7 @@ impl Statement {
             state,
             mv_store,
             pager,
+            sql: sql.to_string(),
         }
     }
 
@@ -831,8 +894,31 @@ impl Statement {
     }
 
     pub fn step(&mut self) -> Result<StepResult> {
-        self.program
-            .step(&mut self.state, self.mv_store.clone(), self.pager.clone())
+        loop {
+            match self.program.step(
+                &mut self.state,
+                self.mv_store.clone(),
+                self.pager.clone(),
+            ) {
+                Ok(result) => return Ok(result),
+                Err(LimboError::Schema) => {
+                    match self.reprepare() {
+                        Ok(()) => {
+                            println!("Statement: Re-prepare successful. Retrying step.");
+                            continue;
+                        }
+                        Err(reprepare_err) => {
+                            eprintln!("Statement: Re-prepare attempt failed: {:?}", reprepare_err);
+                            return Err(reprepare_err);
+                        }
+                    }
+                }
+
+                // Any other error is final.
+                Err(other_err) => return Err(other_err),
+            }
+        }
+
     }
 
     pub fn run_once(&self) -> Result<()> {
@@ -873,6 +959,25 @@ impl Statement {
 
     pub fn explain(&self) -> String {
         self.program.explain()
+    }
+
+    fn reprepare(&mut self) -> Result<()> {
+        if let Some(conn_rc) = self.program.connection.upgrade() {
+            let new_program_value = conn_rc.recompile_program(&self.sql);
+            if let Ok(new_program) = new_program_value {
+                let new_program_rc = Rc::new(new_program);
+                conn_rc.replace_tracked_program(&self.program, &new_program_rc);
+                self.program = new_program_rc;
+                self.state.reset(); // Reset the VDBE state for the new program.
+                Ok(())
+            }
+            else {
+                Err(LimboError::Schema)
+            }
+        }
+        else {
+            Err(LimboError::Schema)
+        }
     }
 }
 
@@ -977,12 +1082,4 @@ impl Iterator for QueryRunner<'_> {
             }
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_track_program() {}
 }
