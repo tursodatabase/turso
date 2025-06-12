@@ -396,7 +396,6 @@ impl Program {
             if let Some(ExpirationStatus::Expired) = state.expiration_status {
                 return Err(LimboError::Schema);
             } else if let Some(ExpirationStatus::Pending) = state.expiration_status {
-                
             }
             // invalidate row
             let _ = state.result_row.take();
