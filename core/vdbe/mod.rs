@@ -30,6 +30,7 @@ use crate::{
     function::{AggFunc, FuncCtx},
     storage::{pager::PagerCacheflushStatus, sqlite3_ondisk::SmallVec},
     translate::plan::TableReferences,
+    vdbe::execute::OpIdxInsertState,
 };
 
 use crate::{
@@ -249,6 +250,7 @@ pub struct ProgramState {
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
     op_idx_delete_state: Option<OpIdxDeleteState>,
+    op_idx_insert_state: Option<OpIdxInsertState>,
 }
 
 impl ProgramState {
@@ -273,6 +275,7 @@ impl ProgramState {
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
             op_idx_delete_state: None,
+            op_idx_insert_state: None,
         }
     }
 
@@ -331,6 +334,13 @@ impl Register {
     pub fn get_owned_value(&self) -> &Value {
         match self {
             Register::Value(v) => v,
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn get_record(&self) -> &ImmutableRecord {
+        match self {
+            Register::Record(record) => record,
             _ => unreachable!(),
         }
     }

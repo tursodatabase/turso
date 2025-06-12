@@ -4384,6 +4384,12 @@ pub fn op_idx_delete(
     }
 }
 
+#[derive(Debug)]
+pub enum OpIdxInsertState {
+    KeyExists,
+    Insert(bool),
+}
+
 pub fn op_idx_insert(
     program: &Program,
     state: &mut ProgramState,
@@ -4402,58 +4408,99 @@ pub fn op_idx_insert(
         let CursorType::BTreeIndex(index_meta) = cursor_type else {
             panic!("IdxInsert: not a BTree index cursor");
         };
-        {
-            let mut cursor = state.get_cursor(cursor_id);
-            let cursor = cursor.as_btree_mut();
-            let record = match &state.registers[record_reg] {
-                Register::Record(ref r) => r,
-                o => {
-                    return Err(LimboError::InternalError(format!(
-                        "expected record, got {:?}",
-                        o
-                    )));
-                }
-            };
-            // To make this reentrant in case of `moved_before` = false, we need to check if the previous cursor.insert started
-            // a write/balancing operation. If it did, it means we already moved to the place we wanted.
-            let moved_before = if cursor.is_write_in_progress() {
-                true
-            } else {
-                if index_meta.unique {
-                    // check for uniqueness violation
-                    match cursor.key_exists_in_index(record)? {
-                        CursorResult::Ok(true) => {
-                            return Err(LimboError::Constraint(
-                                "UNIQUE constraint failed: duplicate key".into(),
-                            ))
-                        }
-                        CursorResult::IO => return Ok(InsnFunctionStepResult::IO),
-                        CursorResult::Ok(false) => {}
-                    };
-                    // uniqueness check already moved us to the correct place in the index.
-                    // the uniqueness check uses SeekOp::GE, which means a non-matching entry
-                    // will now be positioned at the insertion point where there currently is
-                    // a) nothing, or
-                    // b) the first entry greater than the key we are inserting.
-                    // In both cases, we can insert the new entry without moving again.
-                    //
-                    // This is re-entrant, because once we call cursor.insert() with moved_before=true,
-                    // we will immediately set BTreeCursor::state to CursorState::Write(WriteInfo::new()),
-                    // in BTreeCursor::insert_into_page; thus, if this function is called again,
-                    // moved_before will again be true due to cursor.is_write_in_progress() returning true.
-                    true
-                } else {
-                    flags.has(IdxInsertFlags::USE_SEEK)
-                }
-            };
+        loop {
+            tracing::debug!(?state.op_idx_insert_state);
+            match &state.op_idx_insert_state {
+                Some(insert_state) => match insert_state {
+                    OpIdxInsertState::KeyExists => {
+                        let moved_before = {
+                            let mut cursor = state.get_cursor(cursor_id);
+                            let cursor = cursor.as_btree_mut();
+                            let record = state.registers[record_reg].get_record();
+                            // To make this reentrant in case of `moved_before` = false, we need to check if the previous cursor.insert started
+                            // a write/balancing operation. If it did, it means we already moved to the place we wanted.
+                            let moved_before = if cursor.is_write_in_progress() {
+                                true
+                            } else {
+                                if index_meta.unique {
+                                    // check for uniqueness violation
+                                    match cursor.key_exists_in_index(record)? {
+                                        CursorResult::Ok(true) => {
+                                            return Err(LimboError::Constraint(
+                                                "UNIQUE constraint failed: duplicate key".into(),
+                                            ))
+                                        }
+                                        CursorResult::IO => return Ok(InsnFunctionStepResult::IO),
+                                        CursorResult::Ok(false) => {}
+                                    };
+                                    // uniqueness check already moved us to the correct place in the index.
+                                    // the uniqueness check uses SeekOp::GE, which means a non-matching entry
+                                    // will now be positioned at the insertion point where there currently is
+                                    // a) nothing, or
+                                    // b) the first entry greater than the key we are inserting.
+                                    // In both cases, we can insert the new entry without moving again.
+                                    //
+                                    // This is re-entrant, because once we call cursor.insert() with moved_before=true,
+                                    // we will immediately set BTreeCursor::state to CursorState::Write(WriteInfo::new()),
+                                    // in BTreeCursor::insert_into_page; thus, if this function is called again,
+                                    // moved_before will again be true due to cursor.is_write_in_progress() returning true.
+                                    true
+                                } else {
+                                    flags.has(IdxInsertFlags::USE_SEEK)
+                                }
+                            };
+                            moved_before
+                        };
 
-            // Start insertion of row. This might trigger a balance procedure which will take care of moving to different pages,
-            // therefore, we don't want to seek again if that happens, meaning we don't want to return on io without moving to the following opcode
-            // because it could trigger a movement to child page after a balance root which will leave the current page as the root page.
-            return_if_io!(cursor.insert(&BTreeKey::new_index_key(record), moved_before));
+                        state.op_idx_insert_state = Some(OpIdxInsertState::Insert(moved_before));
+                    }
+                    OpIdxInsertState::Insert(moved_before) => {
+                        {
+                            let mut cursor = state.get_cursor(cursor_id);
+                            let cursor = cursor.as_btree_mut();
+                            let record = state.registers[record_reg].get_record();
+
+                            // To make this reentrant in case of `moved_before` = false, we need to check if the previous cursor.insert started
+                            // a write/balancing operation. If it did, it means we already moved to the place we wanted.
+                            let moved_before = if cursor.is_write_in_progress() {
+                                true
+                            } else {
+                                *moved_before
+                            };
+
+                            // Start insertion of row. This might trigger a balance procedure which will take care of moving to different pages,
+                            // therefore, we don't want to seek again if that happens, meaning we don't want to return on io without moving to the following opcode
+                            // because it could trigger a movement to child page after a balance root which will leave the current page as the root page.
+                            return_if_io!(
+                                cursor.insert(&BTreeKey::new_index_key(record), moved_before)
+                            );
+                        }
+
+                        // TODO: flag optimizations, update n_change if OPFLAG_NCHANGE
+                        state.pc += 1;
+                        state.op_idx_insert_state = None;
+                        break;
+                    }
+                },
+                None => {
+                    // Check if register is a record
+                    {
+                        let mut cursor = state.get_cursor(cursor_id);
+                        let cursor = cursor.as_btree_mut();
+                        let record = match &state.registers[record_reg] {
+                            Register::Record(ref r) => r,
+                            o => {
+                                return Err(LimboError::InternalError(format!(
+                                    "expected record, got {:?}",
+                                    o
+                                )));
+                            }
+                        };
+                    }
+                    state.op_idx_insert_state = Some(OpIdxInsertState::KeyExists);
+                }
+            };
         }
-        // TODO: flag optimizations, update n_change if OPFLAG_NCHANGE
-        state.pc += 1;
     }
     Ok(InsnFunctionStepResult::Step)
 }

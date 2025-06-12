@@ -714,23 +714,27 @@ impl BTreeCursor {
 
     /// Reads the record of a cell that has overflow pages. This is a state machine that requires to be called until completion so everything
     /// that calls this function should be reentrant.
+    /// This function will always retunrn [CursorResult::IO]
     #[instrument(skip_all, level = Level::TRACE)]
-    fn process_overflow_read(
+    fn start_process_overflow_read(
         &self,
         payload: &'static [u8],
         start_next_page: u32,
         payload_size: u64,
     ) -> Result<CursorResult<()>> {
-        if self.read_overflow_state.borrow().is_none() {
-            let page = self.read_page(start_next_page as usize)?;
-            *self.read_overflow_state.borrow_mut() = Some(ReadPayloadOverflow {
-                payload: payload.to_vec(),
-                next_page: start_next_page,
-                remaining_to_read: payload_size as usize - payload.len(),
-                page,
-            });
-            return Ok(CursorResult::IO);
-        }
+        assert!(self.read_overflow_state.borrow().is_none());
+        let page = self.read_page(start_next_page as usize)?;
+        *self.read_overflow_state.borrow_mut() = Some(ReadPayloadOverflow {
+            payload: payload.to_vec(),
+            next_page: start_next_page,
+            remaining_to_read: payload_size as usize - payload.len(),
+            page,
+        });
+        Ok(CursorResult::IO)
+    }
+
+    #[instrument(skip_all, level = Level::TRACE)]
+    fn process_overflow_read(&self) -> Result<CursorResult<()>> {
         let mut read_overflow_state = self.read_overflow_state.borrow_mut();
         let ReadPayloadOverflow {
             payload,
@@ -739,9 +743,7 @@ impl BTreeCursor {
             page: page_btree,
         } = read_overflow_state.as_mut().unwrap();
 
-        if page_btree.get().is_locked() {
-            return Ok(CursorResult::IO);
-        }
+        return_if_locked_maybe_load!(self.pager, page_btree);
         tracing::debug!(next_page, remaining_to_read, "reading overflow page");
         let page = page_btree.get();
         let contents = page.get_contents();
@@ -1428,19 +1430,23 @@ impl BTreeCursor {
     ) -> Result<CursorResult<()>> {
         let iter_dir = cmp.iteration_direction();
         'outer: loop {
-            let page = self.stack.top();
-            return_if_locked_maybe_load!(self.pager, page);
-            let page = page.get();
-            let contents = page.get().contents.as_ref().unwrap();
-            if contents.is_leaf() {
-                let eq_seen = match &self.seek_state {
-                    CursorSeekState::MovingBetweenPages { eq_seen } => eq_seen.get(),
-                    _ => false,
-                };
-                self.seek_state = CursorSeekState::FoundLeaf {
-                    eq_seen: Cell::new(eq_seen),
-                };
-                return Ok(CursorResult::Ok(()));
+            let has_read_overflow = self.read_overflow_state.borrow().is_some();
+            if !has_read_overflow {
+                let page = self.stack.top();
+                return_if_locked_maybe_load!(self.pager, page);
+                let page = page.get();
+                let contents = page.get().contents.as_ref().unwrap();
+
+                if contents.is_leaf() {
+                    let eq_seen = match &self.seek_state {
+                        CursorSeekState::MovingBetweenPages { eq_seen } => eq_seen.get(),
+                        _ => false,
+                    };
+                    self.seek_state = CursorSeekState::FoundLeaf {
+                        eq_seen: Cell::new(eq_seen),
+                    };
+                    return Ok(CursorResult::Ok(()));
+                }
             }
 
             if matches!(
@@ -1451,6 +1457,12 @@ impl BTreeCursor {
                     CursorSeekState::MovingBetweenPages { eq_seen } => eq_seen.get(),
                     _ => false,
                 };
+
+                let page = self.stack.top();
+                return_if_locked_maybe_load!(self.pager, page);
+                let page = page.get();
+                let contents = page.get().contents.as_ref().unwrap();
+
                 let cell_count = contents.cell_count();
                 let min_cell_idx = Cell::new(0);
                 let max_cell_idx = Cell::new(cell_count as isize - 1);
@@ -1478,9 +1490,15 @@ impl BTreeCursor {
             };
 
             loop {
+                let has_read_overflow = self.read_overflow_state.borrow().is_some();
                 let min = min_cell_idx.get();
                 let max = max_cell_idx.get();
                 if min > max {
+                    let page = self.stack.top();
+                    return_if_locked_maybe_load!(self.pager, page);
+                    let page = page.get();
+                    let contents = page.get().contents.as_ref().unwrap();
+
                     let Some(leftmost_matching_cell) = nearest_matching_cell.get() else {
                         self.stack.set_cell_index(contents.cell_count() as i32 + 1);
                         match contents.rightmost_pointer() {
@@ -1492,11 +1510,9 @@ impl BTreeCursor {
                                 };
                                 continue 'outer;
                             }
-                            None => {
-                                unreachable!(
-                                    "we shall not go back up! The only way is down the slope"
-                                );
-                            }
+                            None => unreachable!(
+                                "we shall not go back up! The only way is down the slope"
+                            ),
                         }
                     };
                     let matching_cell = contents.cell_get(
@@ -1535,39 +1551,53 @@ impl BTreeCursor {
                     };
                     continue 'outer;
                 }
-
                 let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
-                self.stack.set_cell_index(cur_cell_idx as i32);
-                let cell = contents.cell_get(
-                    cur_cell_idx as usize,
-                    payload_overflow_threshold_max(
-                        contents.page_type(),
-                        self.usable_space() as u16,
-                    ),
-                    payload_overflow_threshold_min(
-                        contents.page_type(),
-                        self.usable_space() as u16,
-                    ),
-                    self.usable_space(),
-                )?;
-                let BTreeCell::IndexInteriorCell(IndexInteriorCell {
-                    payload,
-                    payload_size,
-                    first_overflow_page,
-                    ..
-                }) = &cell
-                else {
-                    unreachable!("unexpected cell type: {:?}", cell);
-                };
 
-                if let Some(next_page) = first_overflow_page {
-                    return_if_io!(self.process_overflow_read(payload, *next_page, *payload_size))
-                } else {
-                    crate::storage::sqlite3_ondisk::read_record(
+                if !has_read_overflow {
+                    let page = self.stack.top();
+                    return_if_locked_maybe_load!(self.pager, page);
+                    let page = page.get();
+                    let contents = page.get().contents.as_ref().unwrap();
+
+                    self.stack.set_cell_index(cur_cell_idx as i32);
+                    let cell = contents.cell_get(
+                        cur_cell_idx as usize,
+                        payload_overflow_threshold_max(
+                            contents.page_type(),
+                            self.usable_space() as u16,
+                        ),
+                        payload_overflow_threshold_min(
+                            contents.page_type(),
+                            self.usable_space() as u16,
+                        ),
+                        self.usable_space(),
+                    )?;
+                    let BTreeCell::IndexInteriorCell(IndexInteriorCell {
                         payload,
-                        self.get_immutable_record_or_create().as_mut().unwrap(),
-                    )?
-                };
+                        payload_size,
+                        first_overflow_page,
+                        ..
+                    }) = &cell
+                    else {
+                        unreachable!("unexpected cell type: {:?}", cell);
+                    };
+
+                    if let Some(next_page) = first_overflow_page {
+                        return_if_io!(self.start_process_overflow_read(
+                            payload,
+                            *next_page,
+                            *payload_size
+                        ))
+                    } else {
+                        crate::storage::sqlite3_ondisk::read_record(
+                            payload,
+                            self.get_immutable_record_or_create().as_mut().unwrap(),
+                        )?
+                    };
+                } else {
+                    return_if_io!(self.process_overflow_read());
+                }
+
                 let (target_leaf_page_is_in_left_subtree, is_eq) = {
                     let record = self.get_immutable_record();
                     let record = record.as_ref().unwrap();
@@ -1769,6 +1799,10 @@ impl BTreeCursor {
         ) {
             // No need for another move_to_root. Move_to already moves to root
             return_if_io!(self.move_to(SeekKey::IndexKey(key), seek_op));
+            assert!(matches!(self.seek_state, CursorSeekState::FoundLeaf { .. }));
+        }
+
+        if matches!(self.seek_state, CursorSeekState::FoundLeaf { .. }) {
             let CursorSeekState::FoundLeaf { eq_seen } = &self.seek_state else {
                 unreachable!(
                     "We must still be in FoundLeaf state after move_to, got: {:?}",
@@ -1825,45 +1859,56 @@ impl BTreeCursor {
         };
 
         if moving_up_to_parent.get() {
-            let page = self.stack.top();
-            return_if_locked_maybe_load!(self.pager, page);
-            let page = page.get();
-            let contents = page.get().contents.as_ref().unwrap();
-            let cur_cell_idx = self.stack.current_cell_index() as usize;
-            let cell = contents.cell_get(
-                cur_cell_idx,
-                payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
-                payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
-                self.usable_space(),
-            )?;
-            let BTreeCell::IndexInteriorCell(IndexInteriorCell {
-                payload,
-                first_overflow_page,
-                payload_size,
-                ..
-            }) = &cell
-            else {
-                unreachable!("unexpected cell type: {:?}", cell);
-            };
+            let has_read_overflow = self.read_overflow_state.borrow().is_some();
 
-            if let Some(next_page) = first_overflow_page {
-                return_if_io!(self.process_overflow_read(payload, *next_page, *payload_size))
-            } else {
-                crate::storage::sqlite3_ondisk::read_record(
+            if !has_read_overflow {
+                let page = self.stack.top();
+                return_if_locked_maybe_load!(self.pager, page);
+                let page = page.get();
+                let contents = page.get().contents.as_ref().unwrap();
+                let cur_cell_idx = self.stack.current_cell_index() as usize;
+                let cell = contents.cell_get(
+                    cur_cell_idx,
+                    payload_overflow_threshold_max(
+                        contents.page_type(),
+                        self.usable_space() as u16,
+                    ),
+                    payload_overflow_threshold_min(
+                        contents.page_type(),
+                        self.usable_space() as u16,
+                    ),
+                    self.usable_space(),
+                )?;
+                let BTreeCell::IndexInteriorCell(IndexInteriorCell {
                     payload,
-                    self.get_immutable_record_or_create().as_mut().unwrap(),
-                )?
-            };
+                    first_overflow_page,
+                    payload_size,
+                    ..
+                }) = &cell
+                else {
+                    unreachable!("unexpected cell type: {:?}", cell);
+                };
+
+                if let Some(next_page) = first_overflow_page {
+                    return_if_io!(self.start_process_overflow_read(
+                        payload,
+                        *next_page,
+                        *payload_size
+                    ))
+                } else {
+                    crate::storage::sqlite3_ondisk::read_record(
+                        payload,
+                        self.get_immutable_record_or_create().as_mut().unwrap(),
+                    )?
+                };
+            } else {
+                return_if_io!(self.process_overflow_read());
+            }
+
             let (_, found) = self.compare_with_current_record(key, seek_op);
             moving_up_to_parent.set(false);
             return Ok(CursorResult::Ok(found));
         }
-
-        let page = self.stack.top();
-        return_if_locked_maybe_load!(self.pager, page);
-        let page = page.get();
-        let contents = page.get().contents.as_ref().unwrap();
-        let cell_count = contents.cell_count();
 
         let iter_dir = seek_op.iteration_direction();
 
@@ -1897,6 +1942,13 @@ impl BTreeCursor {
                     if seek_op.eq_only() && !eq_seen.get() {
                         return Ok(CursorResult::Ok(false));
                     }
+
+                    let page = self.stack.top();
+                    return_if_locked_maybe_load!(self.pager, page);
+                    let page = page.get();
+                    let contents = page.get().contents.as_ref().unwrap();
+                    let cell_count = contents.cell_count();
+
                     match iter_dir {
                         IterationDirection::Forwards => {
                             if !moving_up_to_parent.get() {
@@ -1929,29 +1981,51 @@ impl BTreeCursor {
             let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
             self.stack.set_cell_index(cur_cell_idx as i32);
 
-            let cell = contents.cell_get(
-                cur_cell_idx as usize,
-                payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
-                payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
-                self.usable_space(),
-            )?;
-            let BTreeCell::IndexLeafCell(IndexLeafCell {
-                payload,
-                first_overflow_page,
-                payload_size,
-            }) = &cell
-            else {
-                unreachable!("unexpected cell type: {:?}", cell);
-            };
+            let has_read_overflow = self.read_overflow_state.borrow().is_some();
 
-            if let Some(next_page) = first_overflow_page {
-                return_if_io!(self.process_overflow_read(payload, *next_page, *payload_size))
-            } else {
-                crate::storage::sqlite3_ondisk::read_record(
+            if !has_read_overflow {
+                let page = self.stack.top();
+                return_if_locked_maybe_load!(self.pager, page);
+                let page = page.get();
+                let contents = page.get().contents.as_ref().unwrap();
+
+                let cell = contents.cell_get(
+                    cur_cell_idx as usize,
+                    payload_overflow_threshold_max(
+                        contents.page_type(),
+                        self.usable_space() as u16,
+                    ),
+                    payload_overflow_threshold_min(
+                        contents.page_type(),
+                        self.usable_space() as u16,
+                    ),
+                    self.usable_space(),
+                )?;
+                let BTreeCell::IndexLeafCell(IndexLeafCell {
                     payload,
-                    self.get_immutable_record_or_create().as_mut().unwrap(),
-                )?
-            };
+                    first_overflow_page,
+                    payload_size,
+                }) = &cell
+                else {
+                    unreachable!("unexpected cell type: {:?}", cell);
+                };
+
+                if let Some(next_page) = first_overflow_page {
+                    return_if_io!(self.start_process_overflow_read(
+                        payload,
+                        *next_page,
+                        *payload_size
+                    ))
+                } else {
+                    crate::storage::sqlite3_ondisk::read_record(
+                        payload,
+                        self.get_immutable_record_or_create().as_mut().unwrap(),
+                    )?
+                };
+            } else {
+                return_if_io!(self.process_overflow_read());
+            }
+
             let (cmp, found) = self.compare_with_current_record(key, seek_op);
             if found {
                 nearest_matching_cell.set(Some(cur_cell_idx as usize));
@@ -2017,14 +2091,19 @@ impl BTreeCursor {
         next_page: Option<u32>,
         payload_size: u64,
     ) -> Result<CursorResult<()>> {
-        if let Some(next_page) = next_page {
-            self.process_overflow_read(payload, next_page, payload_size)
+        let has_read_overflow = self.read_overflow_state.borrow().is_some();
+        if !has_read_overflow {
+            if let Some(next_page) = next_page {
+                self.start_process_overflow_read(payload, next_page, payload_size)
+            } else {
+                crate::storage::sqlite3_ondisk::read_record(
+                    payload,
+                    self.get_immutable_record_or_create().as_mut().unwrap(),
+                )?;
+                Ok(CursorResult::Ok(()))
+            }
         } else {
-            crate::storage::sqlite3_ondisk::read_record(
-                payload,
-                self.get_immutable_record_or_create().as_mut().unwrap(),
-            )?;
-            Ok(CursorResult::Ok(()))
+            self.process_overflow_read()
         }
     }
 
@@ -4074,45 +4153,53 @@ impl BTreeCursor {
                 payload: Vec::new(),
             };
         }
-        let page = self.stack.top();
-        return_if_locked_maybe_load!(self.pager, page);
-        let page = page.get();
-        let contents = page.get_contents();
-        let cell_idx = self.stack.current_cell_index();
-        let cell = contents.cell_get(
-            cell_idx as usize,
-            payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
-            payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
-            self.usable_space(),
-        )?;
-        let (payload, payload_size, first_overflow_page) = match cell {
-            BTreeCell::TableLeafCell(TableLeafCell {
-                _rowid,
-                _payload,
-                payload_size,
-                first_overflow_page,
-            }) => (_payload, payload_size, first_overflow_page),
-            BTreeCell::IndexInteriorCell(IndexInteriorCell {
-                left_child_page: _,
-                payload,
-                payload_size,
-                first_overflow_page,
-            }) => (payload, payload_size, first_overflow_page),
-            BTreeCell::IndexLeafCell(IndexLeafCell {
-                payload,
-                first_overflow_page,
-                payload_size,
-            }) => (payload, payload_size, first_overflow_page),
-            _ => unreachable!("unexpected page_type"),
-        };
-        if let Some(next_page) = first_overflow_page {
-            return_if_io!(self.process_overflow_read(payload, next_page, payload_size))
+
+        let has_read_overflow = self.read_overflow_state.borrow().is_some();
+
+        if !has_read_overflow {
+            let page = self.stack.top();
+            return_if_locked_maybe_load!(self.pager, page);
+            let page = page.get();
+            let contents = page.get_contents();
+            let cell_idx = self.stack.current_cell_index();
+            let cell = contents.cell_get(
+                cell_idx as usize,
+                payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
+                payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
+                self.usable_space(),
+            )?;
+            let (payload, payload_size, first_overflow_page) = match cell {
+                BTreeCell::TableLeafCell(TableLeafCell {
+                    _rowid,
+                    _payload,
+                    payload_size,
+                    first_overflow_page,
+                }) => (_payload, payload_size, first_overflow_page),
+                BTreeCell::IndexInteriorCell(IndexInteriorCell {
+                    left_child_page: _,
+                    payload,
+                    payload_size,
+                    first_overflow_page,
+                }) => (payload, payload_size, first_overflow_page),
+                BTreeCell::IndexLeafCell(IndexLeafCell {
+                    payload,
+                    first_overflow_page,
+                    payload_size,
+                }) => (payload, payload_size, first_overflow_page),
+                _ => unreachable!("unexpected page_type"),
+            };
+
+            if let Some(next_page) = first_overflow_page {
+                return_if_io!(self.start_process_overflow_read(payload, next_page, payload_size))
+            } else {
+                crate::storage::sqlite3_ondisk::read_record(
+                    payload,
+                    self.get_immutable_record_or_create().as_mut().unwrap(),
+                )?
+            };
         } else {
-            crate::storage::sqlite3_ondisk::read_record(
-                payload,
-                self.get_immutable_record_or_create().as_mut().unwrap(),
-            )?
-        };
+            return_if_io!(self.process_overflow_read());
+        }
 
         *self.parse_record_state.borrow_mut() = ParseRecordState::Init;
         let record_ref =
@@ -4142,7 +4229,7 @@ impl BTreeCursor {
                     // A balance happened so we need to move.
                     moved_before = false;
                 }
-                if !moved_before {
+                if !moved_before || !matches!(self.seek_state, CursorSeekState::Start) {
                     // Use move_to() so that we always end up on a leaf page. seek() might go back to an interior cell in index seeks,
                     // which we never want. The reason we can use move_to() is that
                     // find_cell() iterates the leaf page from left to right to find the insertion point anyway, so we don't care
@@ -4569,6 +4656,7 @@ impl BTreeCursor {
     }
 
     /// Search for a key in an Index Btree. Looking up indexes that need to be unique, we cannot compare the rowid
+    #[instrument(skip_all, level = Level::TRACE)]
     pub fn key_exists_in_index(&mut self, key: &ImmutableRecord) -> Result<CursorResult<bool>> {
         return_if_io!(self.seek(SeekKey::IndexKey(key), SeekOp::GE { eq_only: true }));
 
