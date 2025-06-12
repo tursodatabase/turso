@@ -5456,6 +5456,8 @@ pub fn op_integrity_check(
         max_errors,
         roots,
         message_register,
+        start_count_register,
+        max_error_updated_register,
     } = insn
     else {
         unreachable!("unexpected Insn {:?}", insn)
@@ -5474,6 +5476,8 @@ pub fn op_integrity_check(
             state: integrity_check_state,
         } => {
             return_if_io!(integrity_check(integrity_check_state, errors, pager));
+            state.registers[*start_count_register + *current_root_idx] =
+                Register::Value(Value::Integer(integrity_check_state.row_count as i64));
             *current_root_idx += 1;
             if *current_root_idx < roots.len() {
                 *integrity_check_state = IntegrityCheckState::new(roots[*current_root_idx]);
@@ -5489,6 +5493,8 @@ pub fn op_integrity_check(
                         .join("\n")
                 };
                 state.registers[*message_register] = Register::Value(Value::build_text(message));
+                state.registers[*max_error_updated_register] =
+                    Register::Value(Value::Integer((max_errors - errors.len()) as i64));
                 state.op_integrity_check_state = OpIntegrityCheckState::Start;
                 state.pc += 1;
             }

@@ -976,7 +976,10 @@ pub enum Insn {
     IntegrityCk {
         max_errors: usize,
         roots: Vec<usize>,
+        /// list of root pages to analyze
         message_register: usize,
+        start_count_register: usize, // list of registers to store the count of rows in the tree, roots.len() represents the end register
+        max_error_updated_register: usize,
     },
 }
 

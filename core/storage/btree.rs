@@ -655,7 +655,6 @@ impl BTreeCursor {
                         self.stack.pop();
                     } else {
                         // moved to begin of btree
-                        // dbg!(false);
                         return Ok(CursorResult::Ok(false));
                     }
                 }
@@ -5190,6 +5189,7 @@ pub struct IntegrityCheckState {
     pub current_page: usize,
     page_stack: Vec<IntegrityCheckPageEntry>,
     first_leaf_level: Option<usize>,
+    pub row_count: usize,
 }
 
 impl IntegrityCheckState {
@@ -5202,6 +5202,7 @@ impl IntegrityCheckState {
                 max_intkey: i64::MAX,
             }],
             first_leaf_level: None,
+            row_count: 0,
         }
     }
 }
@@ -5361,6 +5362,15 @@ pub fn integrity_check(
         }
     }
 
+    // go to rightmost page too!
+    if let Some(rightmost_page) = contents.rightmost_pointer() {
+        state.page_stack.push(IntegrityCheckPageEntry {
+            page_idx: rightmost_page as usize,
+            level: level + 1,
+            max_intkey, // we don't care about intkey in non-table pages
+        });
+    }
+
     // Now we add free blocks to the coverage checker
     let first_freeblock = contents.first_freeblock();
     if first_freeblock > 0 {
@@ -5389,6 +5399,10 @@ pub fn integrity_check(
         errors,
         contents.num_frag_free_bytes() as usize,
     );
+
+    if page.is_index() || page.is_leaf() {
+        state.row_count += contents.cell_count();
+    }
 
     Ok(CursorResult::IO)
 }

@@ -140,6 +140,13 @@ impl Page {
             PageType::TableLeaf | PageType::TableInterior => false,
         }
     }
+
+    pub fn is_leaf(&self) -> bool {
+        match self.get_contents().page_type() {
+            PageType::IndexLeaf | PageType::TableLeaf => true,
+            PageType::TableInterior | PageType::IndexInterior => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
