@@ -4386,8 +4386,8 @@ pub fn op_idx_delete(
 
 #[derive(Debug)]
 pub enum OpIdxInsertState {
-    KeyExists,
-    Insert(bool),
+    CheckSeekRequired,
+    Insert { moved_before: bool },
 }
 
 pub fn op_idx_insert(
@@ -4412,7 +4412,7 @@ pub fn op_idx_insert(
             tracing::debug!(?state.op_idx_insert_state);
             match &state.op_idx_insert_state {
                 Some(insert_state) => match insert_state {
-                    OpIdxInsertState::KeyExists => {
+                    OpIdxInsertState::CheckSeekRequired => {
                         let moved_before = {
                             let mut cursor = state.get_cursor(cursor_id);
                             let cursor = cursor.as_btree_mut();
@@ -4452,22 +4452,19 @@ pub fn op_idx_insert(
                             moved_before
                         };
 
-                        state.op_idx_insert_state = Some(OpIdxInsertState::Insert(moved_before));
+                        state.op_idx_insert_state = Some(OpIdxInsertState::Insert { moved_before });
                     }
-                    OpIdxInsertState::Insert(moved_before) => {
+                    OpIdxInsertState::Insert { moved_before } => {
                         {
                             let mut cursor = state.get_cursor(cursor_id);
                             let cursor = cursor.as_btree_mut();
                             let record = state.registers[record_reg].get_record();
 
-                            // To make this reentrant in case of `moved_before` = false, we need to check if the previous cursor.insert started
-                            // a write/balancing operation. If it did, it means we already moved to the place we wanted.
                             let moved_before = if cursor.is_write_in_progress() {
                                 true
                             } else {
                                 *moved_before
                             };
-
                             // Start insertion of row. This might trigger a balance procedure which will take care of moving to different pages,
                             // therefore, we don't want to seek again if that happens, meaning we don't want to return on io without moving to the following opcode
                             // because it could trigger a movement to child page after a balance root which will leave the current page as the root page.
@@ -4497,7 +4494,7 @@ pub fn op_idx_insert(
                             }
                         };
                     }
-                    state.op_idx_insert_state = Some(OpIdxInsertState::KeyExists);
+                    state.op_idx_insert_state = Some(OpIdxInsertState::CheckSeekRequired);
                 }
             };
         }

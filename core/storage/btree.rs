@@ -1553,7 +1553,9 @@ impl BTreeCursor {
                 }
                 let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
 
-                if !has_read_overflow {
+                if has_read_overflow {
+                    return_if_io!(self.process_overflow_read());
+                } else {
                     let page = self.stack.top();
                     return_if_locked_maybe_load!(self.pager, page);
                     let page = page.get();
@@ -1594,8 +1596,6 @@ impl BTreeCursor {
                             self.get_immutable_record_or_create().as_mut().unwrap(),
                         )?
                     };
-                } else {
-                    return_if_io!(self.process_overflow_read());
                 }
 
                 let (target_leaf_page_is_in_left_subtree, is_eq) = {
@@ -1861,7 +1861,9 @@ impl BTreeCursor {
         if moving_up_to_parent.get() {
             let has_read_overflow = self.read_overflow_state.borrow().is_some();
 
-            if !has_read_overflow {
+            if has_read_overflow {
+                return_if_io!(self.process_overflow_read());
+            } else {
                 let page = self.stack.top();
                 return_if_locked_maybe_load!(self.pager, page);
                 let page = page.get();
@@ -1901,8 +1903,6 @@ impl BTreeCursor {
                         self.get_immutable_record_or_create().as_mut().unwrap(),
                     )?
                 };
-            } else {
-                return_if_io!(self.process_overflow_read());
             }
 
             let (_, found) = self.compare_with_current_record(key, seek_op);
@@ -1983,7 +1983,9 @@ impl BTreeCursor {
 
             let has_read_overflow = self.read_overflow_state.borrow().is_some();
 
-            if !has_read_overflow {
+            if has_read_overflow {
+                return_if_io!(self.process_overflow_read());
+            } else {
                 let page = self.stack.top();
                 return_if_locked_maybe_load!(self.pager, page);
                 let page = page.get();
@@ -2022,8 +2024,6 @@ impl BTreeCursor {
                         self.get_immutable_record_or_create().as_mut().unwrap(),
                     )?
                 };
-            } else {
-                return_if_io!(self.process_overflow_read());
             }
 
             let (cmp, found) = self.compare_with_current_record(key, seek_op);
@@ -2092,7 +2092,9 @@ impl BTreeCursor {
         payload_size: u64,
     ) -> Result<CursorResult<()>> {
         let has_read_overflow = self.read_overflow_state.borrow().is_some();
-        if !has_read_overflow {
+        if has_read_overflow {
+            self.process_overflow_read()
+        } else {
             if let Some(next_page) = next_page {
                 self.start_process_overflow_read(payload, next_page, payload_size)
             } else {
@@ -2102,8 +2104,6 @@ impl BTreeCursor {
                 )?;
                 Ok(CursorResult::Ok(()))
             }
-        } else {
-            self.process_overflow_read()
         }
     }
 
@@ -4156,7 +4156,9 @@ impl BTreeCursor {
 
         let has_read_overflow = self.read_overflow_state.borrow().is_some();
 
-        if !has_read_overflow {
+        if has_read_overflow {
+            return_if_io!(self.process_overflow_read());
+        } else {
             let page = self.stack.top();
             return_if_locked_maybe_load!(self.pager, page);
             let page = page.get();
@@ -4197,8 +4199,6 @@ impl BTreeCursor {
                     self.get_immutable_record_or_create().as_mut().unwrap(),
                 )?
             };
-        } else {
-            return_if_io!(self.process_overflow_read());
         }
 
         *self.parse_record_state.borrow_mut() = ParseRecordState::Init;
