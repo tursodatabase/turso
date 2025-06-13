@@ -315,7 +315,8 @@ impl ProgramState {
         self.interrupted = false;
         self.parameters.clear();
         #[cfg(feature = "json")]
-        self.json_cache.clear()
+        self.json_cache.clear();
+        self.expiration_status = None;
     }
 
     pub fn get_cursor<'a>(&'a self, cursor_id: CursorID) -> std::cell::RefMut<'a, Cursor> {
