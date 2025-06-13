@@ -794,7 +794,6 @@ fn populate_column_registers(
                 program.emit_insn(Insn::SoftNull { reg: target_reg });
             } else if let Some(_check_constraint) = &mapping.column.check_constraint {
                 translate_check_constraint(&mapping, value, program, target_reg, resolver)?;
-                //translate_expr(program, None, check_constraint, target_reg, resolver)?;
             }
         } else if let Some(default_expr) = mapping.default_value {
             translate_expr_no_constant_opt(
@@ -897,7 +896,7 @@ fn translate_check_constraint(
         .check_constraint
         .clone()
         .expect("Check Contraint must be present");
-
+    let description = &check_constraint.to_string();
     use crate::ast;
     use crate::translate::expr::walk_expr_mut;
     walk_expr_mut(
@@ -933,11 +932,7 @@ fn translate_check_constraint(
             });
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_CHECK,
-                description: format!(
-                    "{}.{}",
-                    "todo:some_name".to_string(),
-                    "todo:some_column".to_string()
-                ),
+                description: description.to_string(),
             });
             program.preassign_label_to_next_insn(label);
         }
@@ -946,17 +941,13 @@ fn translate_check_constraint(
             translate_expr(program, None, &check_constraint, reg, resolver)?;
             let label = program.allocate_label();
             program.emit_insn(Insn::If {
-                reg: reg,
+                reg,
                 target_pc: label,
                 jump_if_null: false,
             });
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_CHECK,
-                description: format!(
-                    "{}.{}",
-                    "todo:some_name".to_string(),
-                    "todo:some_column".to_string()
-                ),
+                description: description.to_string(),
             });
             program.preassign_label_to_next_insn(label);
         }
@@ -966,11 +957,7 @@ fn translate_check_constraint(
             program.emit_insn(Insn::Goto { target_pc: label });
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_CHECK,
-                description: format!(
-                    "{}.{}",
-                    "todo:some_name".to_string(),
-                    "todo:some_column".to_string()
-                ),
+                description: description.to_string(),
             });
             program.preassign_label_to_next_insn(label);
         }
