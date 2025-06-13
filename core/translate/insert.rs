@@ -915,7 +915,7 @@ fn translate_check_constraint(
             }
         },
     )?;
-    use crate::error::SQLITE_CONSTRAINT;
+    use crate::error::SQLITE_CONSTRAINT_CHECK;
     match check_constraint {
         ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) => {
             let lhs_reg = program.alloc_register();
@@ -932,7 +932,7 @@ fn translate_check_constraint(
                 collation: program.curr_collation(),
             });
             program.emit_insn(Insn::Halt {
-                err_code: SQLITE_CONSTRAINT,
+                err_code: SQLITE_CONSTRAINT_CHECK,
                 description: format!(
                     "{}.{}",
                     "todo:some_name".to_string(),
@@ -951,7 +951,7 @@ fn translate_check_constraint(
                 jump_if_null: false,
             });
             program.emit_insn(Insn::Halt {
-                err_code: SQLITE_CONSTRAINT,
+                err_code: SQLITE_CONSTRAINT_CHECK,
                 description: format!(
                     "{}.{}",
                     "todo:some_name".to_string(),
@@ -965,7 +965,7 @@ fn translate_check_constraint(
             let label = program.allocate_label();
             program.emit_insn(Insn::Goto { target_pc: label });
             program.emit_insn(Insn::Halt {
-                err_code: SQLITE_CONSTRAINT,
+                err_code: SQLITE_CONSTRAINT_CHECK,
                 description: format!(
                     "{}.{}",
                     "todo:some_name".to_string(),

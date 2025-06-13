@@ -8,7 +8,7 @@ use crate::storage::wal::DummyWAL;
 use crate::translate::collate::CollationSeq;
 use crate::types::ImmutableRecord;
 use crate::{
-    error::{LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_PRIMARYKEY},
+    error::{LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_PRIMARYKEY},
     ext::ExtValue,
     function::{AggFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
     functions::{
@@ -1584,7 +1584,7 @@ pub fn op_halt(
                 description
             )));
         }
-        SQLITE_CONSTRAINT => {
+        SQLITE_CONSTRAINT_CHECK => {
             return Err(LimboError::Constraint(format!(
                 "CHECK constraint failed: {} (19)",
                 description
