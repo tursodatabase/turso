@@ -793,7 +793,14 @@ fn populate_column_registers(
             if write_directly_to_rowid_reg {
                 program.emit_insn(Insn::SoftNull { reg: target_reg });
             } else if let Some(_check_constraint) = &mapping.column.check_constraint {
-                translate_check_constraint(&mapping, value, program, target_reg, resolver)?;
+                translate_check_constraint(
+                    &mapping,
+                    &column_mappings,
+                    value,
+                    program,
+                    target_reg,
+                    resolver,
+                )?;
             }
         } else if let Some(default_expr) = mapping.default_value {
             translate_expr_no_constant_opt(
@@ -886,6 +893,7 @@ fn translate_virtual_table_insert(
 
 fn translate_check_constraint(
     column_mapping: &ColumnMapping,
+    column_mappings: &[ColumnMapping],
     values: &[Expr],
     program: &mut ProgramBuilder,
     target_reg: usize,
@@ -903,7 +911,11 @@ fn translate_check_constraint(
         &mut check_constraint,
         &mut |expr: &mut Expr| -> Result<()> {
             match expr {
-                ast::Expr::Id(_id) => {
+                ast::Expr::Id(id) => {
+                    let mut iter = column_mappings.iter();
+                    let column_mapping = iter
+                        .find(|cm| cm.column.name.as_ref().map_or(false, |n| *n == id.0))
+                        .expect("Must be present");
                     let maybe_val = values
                         .get(column_mapping.value_index.expect("Must be present"))
                         .expect("must be present");
