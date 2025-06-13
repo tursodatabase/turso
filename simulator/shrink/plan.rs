@@ -1,23 +1,23 @@
 use crate::{
     generation::{
-        plan::{InteractionPlan, Interactions},
+        plan::{Interaction, InteractionPlan, Interactions},
         property::Property,
     },
+    run_simulation,
+    runner::cli::SimulatorCLI,
     runner::execution::Execution,
     SimulatorEnv,
-    runner::cli::SimulatorCLI,
-    run_simulation,
 };
 use clap::Parser;
-use std::sync::{Arc, Mutex};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 impl InteractionPlan {
     /// Create a smaller interaction plan by deleting a property
     pub(crate) fn shrink_interaction_plan(&self, failing_execution: &Execution) -> InteractionPlan {
         // todo: this is a very naive implementation, next steps are;
-        // - Shrink to multiple values by removing random interactions
-        // - Shrink properties by removing their extensions, or shrinking their values
+        // - Shrink interaction plans more efficiently (i.e. tracking dependencies between queries)
+        // - Shrink values
         let mut plan = self.clone();
         let failing_property = &self.plan[failing_execution.interaction_index];
         let mut depending_tables = failing_property.dependencies();
@@ -57,26 +57,29 @@ impl InteractionPlan {
         for interaction in &mut plan.plan {
             if let Interactions::Property(property) = interaction {
                 match property {
-                    Property::InsertValuesSelect { queries, .. } |
-                    Property::DoubleCreateFailure { queries, .. } |
-                    Property::DeleteSelect { queries, .. } |
-                    Property::DropSelect { queries, .. } => {
+                    Property::InsertValuesSelect { queries, .. }
+                    | Property::DoubleCreateFailure { queries, .. }
+                    | Property::DeleteSelect { queries, .. }
+                    | Property::DropSelect { queries, .. } => {
                         let mut temp_plan = InteractionPlan {
-                            plan: queries.iter().map(|q| Interactions::Query(q.clone())).collect()
+                            plan: queries
+                                .iter()
+                                .map(|q| Interactions::Query(q.clone()))
+                                .collect(),
                         };
-                        
+
                         temp_plan = InteractionPlan::iterative_shrink(temp_plan, failing_execution);
-                        
-                        *queries = temp_plan.plan.into_iter()
+
+                        *queries = temp_plan
+                            .plan
+                            .into_iter()
                             .filter_map(|i| match i {
                                 Interactions::Query(q) => Some(q),
                                 _ => None,
                             })
                             .collect();
                     }
-                    Property::SelectLimit { .. } |
-                    Property::SelectSelectOptimizer { .. } => {
-                    }
+                    Property::SelectLimit { .. } | Property::SelectSelectOptimizer { .. } => {}
                 }
             }
         }
@@ -85,7 +88,8 @@ impl InteractionPlan {
         plan = Self::iterative_shrink(plan, failing_execution);
 
         // Remove all properties that do not use the failing tables
-        plan.plan.retain(|p| p.uses().iter().any(|t| depending_tables.contains(t)));
+        plan.plan
+            .retain(|p| p.uses().iter().any(|t| depending_tables.contains(t)));
 
         let after = plan.plan.len();
 
@@ -99,18 +103,21 @@ impl InteractionPlan {
     }
 
     /// shrink a plan by removing one interaction at a time (and its deps) while preserving the error
-    fn iterative_shrink(mut plan: InteractionPlan, failing_execution: &Execution) -> InteractionPlan {
+    fn iterative_shrink(
+        mut plan: InteractionPlan,
+        failing_execution: &Execution,
+    ) -> InteractionPlan {
         for i in (0..plan.plan.len()).rev() {
             if i == failing_execution.interaction_index {
                 continue;
             }
-            
+
             // let interaction = &plan.plan[i];
             // let mut dependencies: Vec<usize> = Vec::new();
-            
+
             // for j in (i + 1)..plan.plan.len() {
             //     let later_interaction = &plan.plan[j];
-        
+
             //     if interaction.modifies().iter().any(|t| later_interaction.dependencies().contains(t)) {
             //         dependencies.push(j);
             //     }
@@ -129,9 +136,13 @@ impl InteractionPlan {
                 seed: Some(0),
                 ..SimulatorCLI::parse()
             };
-            let env = Arc::new(Mutex::new(SimulatorEnv::new(0, &cli_opts, Path::new("test.db"))));
+            let env = Arc::new(Mutex::new(SimulatorEnv::new(
+                0,
+                &cli_opts,
+                Path::new("test.db"),
+            )));
             let last_execution = Arc::new(Mutex::new(*failing_execution));
-            
+
             let result = std::panic::catch_unwind(|| {
                 run_simulation(
                     env.clone(),
