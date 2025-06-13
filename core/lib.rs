@@ -751,33 +751,58 @@ impl Connection {
         Ok(results)
     }
 
-    pub fn track_program(&self, program_rc: &Rc<Program>) {
-        let program_mut_ptr = Rc::as_ptr(program_rc) as *mut Program;
-        let new_node_ptr = NonNull::new(program_mut_ptr).unwrap();
+    pub fn recompile_program(self: &Rc<Connection>, original_sql: &str) -> Result<Program> {
+        let mut parser = Parser::new(original_sql.as_bytes());
+        let cmd = parser.next()?.unwrap();
+        let syms = self.syms.borrow();
+        match cmd {
+            Cmd::Stmt(stmt) => {
+                let program = translate::translate(
+                    self.schema
+                        .try_read()
+                        .ok_or(LimboError::SchemaLocked)?
+                        .deref(),
+                    stmt,
+                    self.header.clone(),
+                    self.pager.clone(),
+                    Rc::downgrade(self),
+                    &syms,
+                    QueryMode::Normal,
+                    original_sql,
+                )?;
+                Ok(program)
+            },
+            Cmd::Explain(_stmt) => todo!(),
+            Cmd::ExplainQueryPlan(_stmt) => todo!(),
+        }
+    }
 
-        let current_head = self.program_head.get();
+    pub fn track_program(&self, program_rc: &Rc<Program>) {
+        let new_head_ptr = NonNull::from(&**program_rc);
+        let old_head = self.program_head.get();
 
         unsafe {
-            new_node_ptr.as_ref().next_program.set(current_head);
-            new_node_ptr.as_ref().prev_program.set(None);
+            let new_head = new_head_ptr.as_ref();
+            new_head.next_program.set(old_head);
+            new_head.prev_program.set(None);
 
-            if let Some(old_head) = current_head {
-                old_head.as_ref().prev_program.set(Some(new_node_ptr));
+            if let Some(old_head_ptr) = old_head {
+                old_head_ptr.as_ref().prev_program.set(Some(new_head_ptr));
             }
 
-            self.program_head.set(Some(new_node_ptr));
+            self.program_head.set(Some(new_head_ptr));
         }
     }
 
     fn untrack_program(&self, program: &mut Program) {
-        let program_ptr = NonNull::from(&mut *program);
+        let curr_program_ptr = NonNull::from(&*program);
         let prev_program = program.prev_program.get();
         let next_program = program.next_program.get();
 
         unsafe {
             if let Some(prev_program_ptr) = prev_program {
                 prev_program_ptr.as_ref().next_program.set(next_program);
-            } else if self.program_head.get() == Some(program_ptr) {
+            } else if self.program_head.get() == Some(curr_program_ptr) {
                 self.program_head.set(next_program);
             }
 
@@ -791,76 +816,38 @@ impl Connection {
     }
 
     fn expire_all_programs(&self, deferred: bool) {
-        let mut current_program = self.program_head.get();
-        while let Some(node) = current_program {
+        let mut curr_program = self.program_head.get();
+        while let Some(curr_program_ptr) = curr_program {
             unsafe {
-                let node = node.as_ptr();
+                let node = curr_program_ptr.as_ptr();
                 (*node).expired = match deferred {
                     true => Some(ExpirationStatus::Pending),
                     false => Some(ExpirationStatus::Expired),
                 };
-                current_program = (*node).next_program.get();
+                curr_program = (*node).next_program.get();
             }
         }
     }
 
-    pub fn recompile_program(self: &Rc<Connection>, original_sql: &str) -> Result<Program> {
-        let mut parser = Parser::new(original_sql.as_bytes());
-        let cmd = parser.next()?.ok_or_else(|| {
-            LimboError::InvalidArgument("Original SQL for re-prepare was empty".to_string())
-        })?;
-
-        let syms = self.syms.borrow();
-        let query_mode = QueryMode::from(cmd.clone());
-        let stmt_ast = match cmd {
-            Cmd::Stmt(s) | Cmd::Explain(s) => s,
-            _ => {
-                return Err(LimboError::InvalidArgument(
-                    "Cannot re-prepare this command type".into(),
-                ))
-            }
-        };
-
-        let program_value = translate::translate(
-            self.schema
-                .try_read()
-                .ok_or(LimboError::SchemaLocked)?
-                .deref(),
-            stmt_ast,
-            self.header.clone(),
-            self.pager.clone(),
-            Rc::downgrade(self),
-            &syms,
-            query_mode,
-            original_sql,
-        )?;
-
-        Ok(program_value)
-    }
-
-    /// Replaces an old program node with a new one in the intrusive list.
-    /// This is an internal helper for re-preparation.
     pub fn replace_tracked_program(&self, old_program: &Rc<Program>, new_program: &Rc<Program>) {
-        let old_program_ptr =
-            unsafe { NonNull::new_unchecked(Rc::as_ptr(old_program) as *mut Program) };
-        let new_program_ptr =
-            unsafe { NonNull::new_unchecked(Rc::as_ptr(new_program) as *mut Program) };
+        let old_program_ptr = NonNull::from(&**old_program);
+        let new_program_ptr = NonNull::from(&**new_program);
 
-        let old_prev_opt = old_program.prev_program.get();
-        let old_next_opt = old_program.next_program.get();
+        let old_program_prev = old_program.prev_program.get();
+        let old_program_next = old_program.next_program.get();
 
         unsafe {
-            (*new_program_ptr.as_ptr()).prev_program.set(old_prev_opt);
-            (*new_program_ptr.as_ptr()).next_program.set(old_next_opt);
+            new_program_ptr.as_ref().prev_program.set(old_program_prev);
+            new_program_ptr.as_ref().next_program.set(old_program_next);
 
-            if let Some(prev_ptr) = old_prev_opt {
-                (*prev_ptr.as_ptr()).next_program.set(Some(new_program_ptr));
+            if let Some(prev_ptr) = old_program_prev {
+                prev_ptr.as_ref().next_program.set(Some(new_program_ptr));
             } else if self.program_head.get() == Some(old_program_ptr) {
                 self.program_head.set(Some(new_program_ptr));
             }
 
-            if let Some(next_ptr) = old_next_opt {
-                (*next_ptr.as_ptr()).prev_program.set(Some(new_program_ptr));
+            if let Some(next_ptr) = old_program_next {
+                next_ptr.as_ref().prev_program.set(Some(new_program_ptr));
             }
         }
 
