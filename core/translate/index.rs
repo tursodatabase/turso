@@ -226,6 +226,11 @@ pub fn translate_create_index(
         db: sqlite_schema_cursor_id,
         where_clause: Some(parse_schema_where_clause),
     });
+
+    program.emit_insn(Insn::Expire {
+        expire_all: false,
+        deferred: true
+    });
     // Close the final sqlite_schema cursor
     program.emit_insn(Insn::Close {
         cursor_id: sqlite_schema_cursor_id,

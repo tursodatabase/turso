@@ -43,6 +43,10 @@ pub fn translate_pragma(
         approx_num_labels: 0,
     };
     program.extend(&opts);
+    program.emit_insn(Insn::Expire {
+        expire_all: true,
+        deferred: true,
+    });
     let mut write = false;
 
     if name.name.0.to_lowercase() == "pragma_list" {
