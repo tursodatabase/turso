@@ -19,7 +19,7 @@ path = "main.rs"
 
 
 [dependencies]
-anyhow = "1.0.75"
+anyhow.workspace = true
 cfg-if = "1.0.0"
 clap = { version = "4.5.31", features = ["derive"] }
 clap_complete = { version = "=4.5.47", features = ["unstable-dynamic"] }
@@ -44,7 +44,7 @@ tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 toml = {version = "0.8.20", features = ["preserve_order"]}
 schemars = {version = "0.8.22", features = ["preserve_order"]}
-serde = {version = "1.0.218", features = ["derive"]}
+serde = { workspace = true, features = ["derive"]}
 validator = {version = "0.20.0", features = ["derive"]}
 toml_edit = {version = "0.22.24", features = ["serde"]}
 

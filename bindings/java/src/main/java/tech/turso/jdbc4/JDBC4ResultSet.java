@@ -190,8 +190,12 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
 
   @Override
   public String getString(String columnLabel) throws SQLException {
-    // TODO
-    return "";
+    final Object result = this.resultSet.get(columnLabel);
+    if (result == null) {
+      return "";
+    }
+
+    return wrapTypeConversion(() -> (String) result);
   }
 
   @Override

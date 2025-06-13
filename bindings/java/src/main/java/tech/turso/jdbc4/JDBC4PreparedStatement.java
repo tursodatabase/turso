@@ -28,6 +28,7 @@ import tech.turso.core.LimboResultSet;
 public final class JDBC4PreparedStatement extends JDBC4Statement implements PreparedStatement {
 
   private final String sql;
+  private final JDBC4ResultSet resultSet;
 
   public JDBC4PreparedStatement(JDBC4Connection connection, String sql) throws SQLException {
     super(connection);
@@ -35,13 +36,13 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
     this.sql = sql;
     this.statement = connection.prepare(sql);
     this.statement.initializeColumnMetadata();
+    this.resultSet = new JDBC4ResultSet(this.statement.getResultSet());
   }
 
   @Override
   public ResultSet executeQuery() throws SQLException {
     // TODO: check bindings etc
-    requireNonNull(this.statement);
-    return new JDBC4ResultSet(this.statement.getResultSet());
+    return this.resultSet;
   }
 
   @Override
@@ -202,9 +203,8 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
   }
 
   @Override
-  @SkipNullableCheck
   public ResultSetMetaData getMetaData() throws SQLException {
-    return null;
+    return this.resultSet;
   }
 
   @Override

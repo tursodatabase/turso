@@ -54,6 +54,9 @@ limbo_time = { path = "extensions/time", version = "0.0.22-pre.1" }
 limbo_uuid = { path = "extensions/uuid", version = "0.0.22-pre.1" }
 strum = { version = "0.26", features = ["derive"] }
 strum_macros = "0.26"
+serde = "1.0"
+serde_json = "1.0"
+anyhow = "1.0.98"
 
 [profile.release]
 debug = "line-tables-only"

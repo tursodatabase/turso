@@ -8,8 +8,11 @@
 //! will read rows from the database and filter them according to a WHERE clause.
 
 pub(crate) mod aggregation;
+pub(crate) mod alter;
 pub(crate) mod collate;
+mod compound_select;
 pub(crate) mod delete;
+pub(crate) mod display;
 pub(crate) mod emitter;
 pub(crate) mod expr;
 pub(crate) mod group_by;
@@ -36,16 +39,12 @@ use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::translate::delete::translate_delete;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::Program;
-use crate::{bail_parse_error, Connection, LimboError, Result, SymbolTable};
-use fallible_iterator::FallibleIterator as _;
+use crate::{bail_parse_error, Connection, Result, SymbolTable};
+use alter::translate_alter_table;
 use index::{translate_create_index, translate_drop_index};
 use insert::translate_insert;
 use limbo_sqlite3_parser::ast::{self, Delete, Insert};
-use limbo_sqlite3_parser::lexer::sql::Parser;
-use schema::{
-    translate_create_table, translate_create_virtual_table, translate_drop_table, ParseSchema,
-    SQLITE_TABLEID,
-};
+use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
 use select::translate_select;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
@@ -110,58 +109,7 @@ pub fn translate_inner(
     program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
     let program = match stmt {
-        ast::Stmt::AlterTable(a) => {
-            let (table_name, alter_table) = a.as_ref();
-
-            match alter_table {
-                ast::AlterTableBody::RenameTo(name) => {
-                    let rename = &name.0;
-                    let name = &table_name.name.0;
-
-                    let Some(table) = schema.tables.get(name) else {
-                        return Err(LimboError::ParseError(format!("no such table: {name}")));
-                    };
-
-                    if schema.tables.contains_key(rename) {
-                        return Err(LimboError::ParseError(format!(
-                            "there is already another table or index with this name: {rename}"
-                        )));
-                    };
-
-                    let Some(btree) = table.btree() else { todo!() };
-
-                    let mut btree = (*btree).clone();
-                    btree.name = rename.clone();
-
-                    let sql = btree.to_sql();
-
-                    let stmt = format!(
-                        r#"
-                            UPDATE {SQLITE_TABLEID}
-                            SET name = '{rename}'
-                              , tbl_name = '{rename}'
-                              , sql = '{sql}'
-                            WHERE tbl_name = '{name}'
-                        "#,
-                    );
-
-                    let mut parser = Parser::new(stmt.as_bytes());
-                    let Some(ast::Cmd::Stmt(ast::Stmt::Update(mut update))) = parser.next()? else {
-                        unreachable!();
-                    };
-
-                    translate_update(
-                        QueryMode::Normal,
-                        schema,
-                        &mut update,
-                        syms,
-                        ParseSchema::Reload,
-                        program,
-                    )?
-                }
-                _ => todo!(),
-            }
-        }
+        ast::Stmt::AlterTable(alter) => translate_alter_table(*alter, syms, schema, program)?,
         ast::Stmt::Analyze(_) => bail_parse_error!("ANALYZE not supported yet"),
         ast::Stmt::Attach { .. } => bail_parse_error!("ATTACH not supported yet"),
         ast::Stmt::Begin(tx_type, tx_name) => translate_tx_begin(tx_type, tx_name, program)?,
@@ -247,14 +195,9 @@ pub fn translate_inner(
             )?
             .program
         }
-        ast::Stmt::Update(mut update) => translate_update(
-            query_mode,
-            schema,
-            &mut update,
-            syms,
-            ParseSchema::None,
-            program,
-        )?,
+        ast::Stmt::Update(mut update) => {
+            translate_update(query_mode, schema, &mut update, syms, program)?
+        }
         ast::Stmt::Vacuum(_, _) => bail_parse_error!("VACUUM not supported yet"),
         ast::Stmt::Insert(insert) => {
             let Insert {

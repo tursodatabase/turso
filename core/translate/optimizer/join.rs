@@ -657,6 +657,7 @@ mod tests {
                 order: SortOrder::Asc,
                 pos_in_table: 0,
                 collation: None,
+                default: None,
             }],
             unique: true,
             ephemeral: false,
@@ -724,6 +725,7 @@ mod tests {
                 order: SortOrder::Asc,
                 pos_in_table: 0,
                 collation: None,
+                default: None,
             }],
             unique: true,
             ephemeral: false,
@@ -839,6 +841,7 @@ mod tests {
                         order: SortOrder::Asc,
                         pos_in_table: 0,
                         collation: None,
+                        default: None,
                     }],
                     unique: true,
                     ephemeral: false,
@@ -855,6 +858,7 @@ mod tests {
                 order: SortOrder::Asc,
                 pos_in_table: 1,
                 collation: None,
+                default: None,
             }],
             unique: false,
             ephemeral: false,
@@ -869,6 +873,7 @@ mod tests {
                 order: SortOrder::Asc,
                 pos_in_table: 1,
                 collation: None,
+                default: None,
             }],
             unique: false,
             ephemeral: false,
@@ -1256,6 +1261,344 @@ mod tests {
             assert!(constraint.lhs_mask.contains_table(i - 1));
             assert!(constraint.operator == ast::Operator::Equals);
         }
+    }
+
+    #[test]
+    /// Test that [compute_best_join_order] figures out that the index can't be used when only the second column is referenced
+    fn test_index_second_column_only() {
+        let mut joined_tables = Vec::new();
+
+        let mut table_id_counter = TableRefIdCounter::new();
+
+        // Create a table with two columns
+        let table = _create_btree_table("t1", _create_column_list(&["x", "y"], Type::Integer));
+
+        // Create a two-column index on (x,y)
+        let index = Arc::new(Index {
+            name: "idx_xy".to_string(),
+            table_name: "t1".to_string(),
+            columns: vec![
+                IndexColumn {
+                    name: "x".to_string(),
+                    order: SortOrder::Asc,
+                    pos_in_table: 0,
+                    collation: None,
+                    default: None,
+                },
+                IndexColumn {
+                    name: "y".to_string(),
+                    order: SortOrder::Asc,
+                    pos_in_table: 1,
+                    collation: None,
+                    default: None,
+                },
+            ],
+            unique: false,
+            root_page: 2,
+            ephemeral: false,
+            has_rowid: true,
+        });
+
+        let mut available_indexes = HashMap::new();
+        available_indexes.insert("t1".to_string(), vec![index]);
+
+        joined_tables.push(JoinedTable {
+            table: Table::BTree(table),
+            internal_id: table_id_counter.next(),
+            op: Operation::Scan {
+                iter_dir: IterationDirection::Forwards,
+                index: None,
+            },
+            identifier: "t1".to_string(),
+            join_info: None,
+            col_used_mask: ColumnUsedMask::new(),
+        });
+
+        // Create where clause that only references second column
+        let where_clause = vec![WhereTerm {
+            expr: Expr::Binary(
+                Box::new(Expr::Column {
+                    database: None,
+                    table: joined_tables[0].internal_id,
+                    column: 1,
+                    is_rowid_alias: false,
+                }),
+                ast::Operator::Equals,
+                Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
+            ),
+            from_outer_join: None,
+            consumed: Cell::new(false),
+        }];
+
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let access_methods_arena = RefCell::new(Vec::new());
+        let table_constraints =
+            constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
+                .unwrap();
+
+        let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
+            table_references.joined_tables(),
+            None,
+            &table_constraints,
+            &access_methods_arena,
+        )
+        .unwrap()
+        .unwrap();
+
+        // Verify access method is a scan, not a seek, because the index can't be used when only the second column is referenced
+        let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
+        assert!(access_method.is_scan());
+    }
+
+    #[test]
+    /// Test that an index with a gap in referenced columns (e.g. index on (a,b,c), where clause on a and c)
+    /// only uses the prefix before the gap.
+    fn test_index_skips_middle_column() {
+        let mut table_id_counter = TableRefIdCounter::new();
+        let mut joined_tables = Vec::new();
+        let mut available_indexes = HashMap::new();
+
+        let columns = _create_column_list(&["c1", "c2", "c3"], Type::Integer);
+        let table = _create_btree_table("t1", columns);
+        let index = Arc::new(Index {
+            name: "idx1".to_string(),
+            table_name: "t1".to_string(),
+            columns: vec![
+                IndexColumn {
+                    name: "c1".to_string(),
+                    order: SortOrder::Asc,
+                    pos_in_table: 0,
+                    collation: None,
+                    default: None,
+                },
+                IndexColumn {
+                    name: "c2".to_string(),
+                    order: SortOrder::Asc,
+                    pos_in_table: 1,
+                    collation: None,
+                    default: None,
+                },
+                IndexColumn {
+                    name: "c3".to_string(),
+                    order: SortOrder::Asc,
+                    pos_in_table: 2,
+                    collation: None,
+                    default: None,
+                },
+            ],
+            unique: false,
+            root_page: 2,
+            ephemeral: false,
+            has_rowid: true,
+        });
+        available_indexes.insert("t1".to_string(), vec![index]);
+
+        joined_tables.push(JoinedTable {
+            table: Table::BTree(table),
+            internal_id: table_id_counter.next(),
+            op: Operation::Scan {
+                iter_dir: IterationDirection::Forwards,
+                index: None,
+            },
+            identifier: "t1".to_string(),
+            join_info: None,
+            col_used_mask: ColumnUsedMask::new(),
+        });
+
+        // Create where clause that references first and third columns
+        let where_clause = vec![
+            WhereTerm {
+                expr: Expr::Binary(
+                    Box::new(Expr::Column {
+                        database: None,
+                        table: joined_tables[0].internal_id,
+                        column: 0, // c1
+                        is_rowid_alias: false,
+                    }),
+                    ast::Operator::Equals,
+                    Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
+                ),
+                from_outer_join: None,
+                consumed: Cell::new(false),
+            },
+            WhereTerm {
+                expr: Expr::Binary(
+                    Box::new(Expr::Column {
+                        database: None,
+                        table: joined_tables[0].internal_id,
+                        column: 2, // c3
+                        is_rowid_alias: false,
+                    }),
+                    ast::Operator::Equals,
+                    Box::new(Expr::Literal(ast::Literal::Numeric(7.to_string()))),
+                ),
+                from_outer_join: None,
+                consumed: Cell::new(false),
+            },
+        ];
+
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let access_methods_arena = RefCell::new(Vec::new());
+        let table_constraints =
+            constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
+                .unwrap();
+
+        let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
+            table_references.joined_tables(),
+            None,
+            &table_constraints,
+            &access_methods_arena,
+        )
+        .unwrap()
+        .unwrap();
+
+        // Verify access method is a seek, and only uses the first column of the index
+        let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
+        assert!(!access_method.is_scan());
+        assert!(access_method
+            .index
+            .as_ref()
+            .is_some_and(|i| i.name == "idx1"));
+        assert!(access_method.constraint_refs.len() == 1);
+        let constraint =
+            &table_constraints[0].constraints[access_method.constraint_refs[0].constraint_vec_pos];
+        assert!(constraint.operator == ast::Operator::Equals);
+        assert!(constraint.table_col_pos == 0); // c1
+    }
+
+    #[test]
+    /// Test that an index seek stops after a range operator.
+    /// e.g. index on (a,b,c), where clause a=1, b>2, c=3. Only a and b should be used for seek.
+    fn test_index_stops_at_range_operator() {
+        let mut table_id_counter = TableRefIdCounter::new();
+        let mut joined_tables = Vec::new();
+        let mut available_indexes = HashMap::new();
+
+        let columns = _create_column_list(&["c1", "c2", "c3"], Type::Integer);
+        let table = _create_btree_table("t1", columns);
+        let index = Arc::new(Index {
+            name: "idx1".to_string(),
+            table_name: "t1".to_string(),
+            columns: vec![
+                IndexColumn {
+                    name: "c1".to_string(),
+                    order: SortOrder::Asc,
+                    pos_in_table: 0,
+                    collation: None,
+                    default: None,
+                },
+                IndexColumn {
+                    name: "c2".to_string(),
+                    order: SortOrder::Asc,
+                    pos_in_table: 1,
+                    collation: None,
+                    default: None,
+                },
+                IndexColumn {
+                    name: "c3".to_string(),
+                    order: SortOrder::Asc,
+                    pos_in_table: 2,
+                    collation: None,
+                    default: None,
+                },
+            ],
+            root_page: 2,
+            ephemeral: false,
+            has_rowid: true,
+            unique: false,
+        });
+        available_indexes.insert("t1".to_string(), vec![index]);
+
+        joined_tables.push(JoinedTable {
+            table: Table::BTree(table),
+            internal_id: table_id_counter.next(),
+            op: Operation::Scan {
+                iter_dir: IterationDirection::Forwards,
+                index: None,
+            },
+            identifier: "t1".to_string(),
+            join_info: None,
+            col_used_mask: ColumnUsedMask::new(),
+        });
+
+        // Create where clause: c1 = 5 AND c2 > 10 AND c3 = 7
+        let where_clause = vec![
+            WhereTerm {
+                expr: Expr::Binary(
+                    Box::new(Expr::Column {
+                        database: None,
+                        table: joined_tables[0].internal_id,
+                        column: 0, // c1
+                        is_rowid_alias: false,
+                    }),
+                    ast::Operator::Equals,
+                    Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
+                ),
+                from_outer_join: None,
+                consumed: Cell::new(false),
+            },
+            WhereTerm {
+                expr: Expr::Binary(
+                    Box::new(Expr::Column {
+                        database: None,
+                        table: joined_tables[0].internal_id,
+                        column: 1, // c2
+                        is_rowid_alias: false,
+                    }),
+                    ast::Operator::Greater,
+                    Box::new(Expr::Literal(ast::Literal::Numeric(10.to_string()))),
+                ),
+                from_outer_join: None,
+                consumed: Cell::new(false),
+            },
+            WhereTerm {
+                expr: Expr::Binary(
+                    Box::new(Expr::Column {
+                        database: None,
+                        table: joined_tables[0].internal_id,
+                        column: 2, // c3
+                        is_rowid_alias: false,
+                    }),
+                    ast::Operator::Equals,
+                    Box::new(Expr::Literal(ast::Literal::Numeric(7.to_string()))),
+                ),
+                from_outer_join: None,
+                consumed: Cell::new(false),
+            },
+        ];
+
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let access_methods_arena = RefCell::new(Vec::new());
+        let table_constraints =
+            constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
+                .unwrap();
+
+        let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
+            table_references.joined_tables(),
+            None,
+            &table_constraints,
+            &access_methods_arena,
+        )
+        .unwrap()
+        .unwrap();
+
+        // Verify access method is a seek, and uses the first two columns of the index.
+        // The third column can't be used because the second is a range query.
+        let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
+        assert!(!access_method.is_scan());
+        assert!(access_method
+            .index
+            .as_ref()
+            .is_some_and(|i| i.name == "idx1"));
+        assert!(access_method.constraint_refs.len() == 2);
+        let constraint =
+            &table_constraints[0].constraints[access_method.constraint_refs[0].constraint_vec_pos];
+        assert!(constraint.operator == ast::Operator::Equals);
+        assert!(constraint.table_col_pos == 0); // c1
+        let constraint =
+            &table_constraints[0].constraints[access_method.constraint_refs[1].constraint_vec_pos];
+        assert!(constraint.operator == ast::Operator::Greater);
+        assert!(constraint.table_col_pos == 1); // c2
     }
 
     fn _create_column(c: &TestColumn) -> Column {

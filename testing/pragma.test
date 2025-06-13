@@ -47,6 +47,33 @@ do_execsql_test pragma-table-info-call-syntax {
 4|sql|TEXT|0||0
 }
 
+do_execsql_test pragma-table-info-alt-name-equal-syntax {
+  PRAGMA table_info=sqlite_master
+} {0|type|TEXT|0||0
+1|name|TEXT|0||0
+2|tbl_name|TEXT|0||0
+3|rootpage|INT|0||0
+4|sql|TEXT|0||0
+}
+
+do_execsql_test pragma-table-info-alt-name-call-syntax {
+  PRAGMA table_info(sqlite_master)
+} {0|type|TEXT|0||0
+1|name|TEXT|0||0
+2|tbl_name|TEXT|0||0
+3|rootpage|INT|0||0
+4|sql|TEXT|0||0
+}
+
+do_execsql_test pragma-function-table-info-alt-name {
+  SELECT * FROM pragma_table_info('sqlite_master')
+} {0|type|TEXT|0||0
+1|name|TEXT|0||0
+2|tbl_name|TEXT|0||0
+3|rootpage|INT|0||0
+4|sql|TEXT|0||0
+}
+
 do_execsql_test pragma-function-table-info {
   SELECT * FROM pragma_table_info('sqlite_schema')
 } {0|type|TEXT|0||0

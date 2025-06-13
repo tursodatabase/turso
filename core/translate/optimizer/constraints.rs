@@ -348,18 +348,13 @@ pub fn constraints_from_where_clause(
             // Deduplicate by position, keeping first occurrence (which will be equality if one exists, since the constraints vec is sorted that way)
             candidate.refs.dedup_by_key(|cref| cref.index_col_pos);
             // Truncate at first gap in positions -- again, index columns must be consumed in contiguous order.
-            let mut last_pos = 0;
-            let mut i = 0;
-            for cref in candidate.refs.iter() {
-                if cref.index_col_pos != last_pos {
-                    if cref.index_col_pos != last_pos + 1 {
-                        break;
-                    }
-                    last_pos = cref.index_col_pos;
-                }
-                i += 1;
-            }
-            candidate.refs.truncate(i);
+            let contiguous_len = candidate
+                .refs
+                .iter()
+                .enumerate()
+                .take_while(|(i, cref)| cref.index_col_pos == *i)
+                .count();
+            candidate.refs.truncate(contiguous_len);
 
             // Truncate after the first inequality, since the left-prefix rule of indexes requires that all constraints but the last one must be equalities;
             // again see: https://www.solarwinds.com/blog/the-left-prefix-index-rule

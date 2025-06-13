@@ -69,6 +69,25 @@ do_execsql_test_on_specific_db {:memory:} update-null {
 } {10|1|2
 3|4|5}
 
+do_execsql_test_on_specific_db {:memory:} update-not-null-1 {
+    create table temp (a,b not null,c);
+    insert into temp values (1, 2, 3);
+    update temp set b = 999;
+    select * from temp;
+} {1|999|3}
+
+do_execsql_test_in_memory_any_error update-not-null-2 {
+    create table temp (a,b not null,c);
+    insert into temp values (1, 2, 3);
+    update temp set b = NULL;
+}
+
+do_execsql_test_on_specific_db {:memory:} update-not-null-3 {
+    create table temp (a not null, b not null, c not null);
+    update temp set a = null, b = null, c = null;
+    select * from temp;
+} {}
+
 do_execsql_test_on_specific_db {:memory:} update-mixed-types {
     create table temp (a);
     insert into temp values (1);
@@ -170,3 +189,26 @@ do_execsql_test_on_specific_db {:memory:} update_cache_full_regression_test_#162
     UPDATE t SET x = randomblob(4096) WHERE rowid = 1;
     SELECT count(*) FROM t;
 } {1}
+
+do_execsql_test_on_specific_db {:memory:} update_index_regression_test {
+    CREATE TABLE t(x, y);
+    CREATE INDEX tx ON t (x);
+    CREATE UNIQUE INDEX tyu ON t (y);
+    INSERT INTO t VALUES (1, 1);
+    SELECT x FROM t; -- uses tx index
+    SELECT y FROM t; -- uses ty index
+    UPDATE t SET x=2, y=2;
+    SELECT x FROM t; -- uses tx index
+    SELECT y FROM t; -- uses ty index    
+} {1
+1
+2
+2}
+
+do_execsql_test_on_specific_db {:memory:} update_where_or_regression_test {
+    CREATE TABLE t (a INTEGER);
+    INSERT INTO t VALUES (1), ('hi');
+    UPDATE t SET a = X'6C6F76656C795F7265766F6C74' WHERE ~ 'gorgeous_thropy' OR NOT -3830873834.233324;  
+    SELECT * from t;
+} {lovely_revolt
+lovely_revolt}

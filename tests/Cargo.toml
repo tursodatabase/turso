@@ -15,7 +15,7 @@ name = "integration_tests"
 path = "integration/mod.rs"
 
 [dependencies]
-anyhow = "1.0.75"
+anyhow.workspace = true
 env_logger = "0.10.1"
 limbo_core = { path = "../core" }
 rusqlite = { version = "0.34", features = ["bundled"] }

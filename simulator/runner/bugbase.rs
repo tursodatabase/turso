@@ -6,6 +6,7 @@ use std::{
     time::SystemTime,
 };
 
+use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -71,7 +72,7 @@ pub(crate) struct BugBase {
 
 impl BugBase {
     /// Create a new bug base.
-    fn new(path: PathBuf) -> Result<Self, String> {
+    fn new(path: PathBuf) -> anyhow::Result<Self> {
         let mut bugs = HashMap::new();
         // list all the bugs in the path as directories
         if let Ok(entries) = std::fs::read_dir(&path) {
@@ -82,10 +83,12 @@ impl BugBase {
                         .to_string_lossy()
                         .to_string()
                         .parse::<u64>()
-                        .or(Err(format!(
-                            "failed to parse seed from directory name {}",
-                            entry.file_name().to_string_lossy()
-                        )))?;
+                        .with_context(|| {
+                            format!(
+                                "failed to parse seed from directory name {}",
+                                entry.file_name().to_string_lossy()
+                            )
+                        })?;
                     bugs.insert(seed, Bug::Unloaded { seed });
                 }
             }
@@ -95,15 +98,14 @@ impl BugBase {
     }
 
     /// Load the bug base from one of the potential paths.
-    pub(crate) fn load() -> Result<Self, String> {
+    pub(crate) fn load() -> anyhow::Result<Self> {
         let potential_paths = vec![
             // limbo project directory
             BugBase::get_limbo_project_dir()?,
             // home directory
-            dirs::home_dir().ok_or("should be able to get home directory".to_string())?,
+            dirs::home_dir().with_context(|| "should be able to get home directory")?,
             // current directory
-            std::env::current_dir()
-                .or(Err("should be able to get current directory".to_string()))?,
+            std::env::current_dir().with_context(|| "should be able to get current directory")?,
         ];
 
         for path in &potential_paths {
@@ -121,19 +123,18 @@ impl BugBase {
             }
         }
 
-        Err("failed to create bug base".to_string())
+        Err(anyhow!("failed to create bug base"))
     }
 
     /// Load the bug base from one of the potential paths.
-    pub(crate) fn interactive_load() -> Result<Self, String> {
+    pub(crate) fn interactive_load() -> anyhow::Result<Self> {
         let potential_paths = vec![
             // limbo project directory
             BugBase::get_limbo_project_dir()?,
             // home directory
-            dirs::home_dir().ok_or("should be able to get home directory".to_string())?,
+            dirs::home_dir().with_context(|| "should be able to get home directory")?,
             // current directory
-            std::env::current_dir()
-                .or(Err("should be able to get current directory".to_string()))?,
+            std::env::current_dir().with_context(|| "should be able to get current directory")?,
         ];
 
         for path in potential_paths {
@@ -157,21 +158,21 @@ impl BugBase {
         let choice = choice
             .trim()
             .parse::<u32>()
-            .or(Err(format!("invalid choice {choice}")))?;
+            .with_context(|| format!("invalid choice {choice}"))?;
         let path = match choice {
             1 => BugBase::get_limbo_project_dir()?.join(".bugbase"),
             2 => {
-                let home = std::env::var("HOME").or(Err("failed to get home directory"))?;
+                let home = std::env::var("HOME").with_context(|| "failed to get home directory")?;
                 PathBuf::from(home).join(".bugbase")
             }
             3 => PathBuf::from(".bugbase"),
-            _ => return Err(format!("invalid choice {choice}")),
+            _ => anyhow::bail!(format!("invalid choice {choice}")),
         };
 
         if path.exists() {
             unreachable!("bug base already exists at {}", path.display());
         } else {
-            std::fs::create_dir_all(&path).or(Err("failed to create bug base"))?;
+            std::fs::create_dir_all(&path).with_context(|| "failed to create bug base")?;
             tracing::info!("bug base created at {}", path.display());
             BugBase::new(path)
         }
@@ -184,7 +185,7 @@ impl BugBase {
         plan: InteractionPlan,
         error: Option<String>,
         cli_options: &SimulatorCLI,
-    ) -> Result<(), String> {
+    ) -> anyhow::Result<()> {
         tracing::debug!("adding bug with seed {}", seed);
         let bug = self.get_bug(seed);
 
@@ -221,7 +222,7 @@ impl BugBase {
     }
 
     /// Save a bug to the bug base.
-    fn save_bug(&self, seed: u64) -> Result<(), String> {
+    fn save_bug(&self, seed: u64) -> anyhow::Result<()> {
         let bug = self.get_bug(seed);
 
         match bug {
@@ -231,57 +232,59 @@ impl BugBase {
             Some(Bug::Loaded(bug)) => {
                 let bug_path = self.path.join(seed.to_string());
                 std::fs::create_dir_all(&bug_path)
-                    .or(Err("should be able to create bug directory".to_string()))?;
+                    .with_context(|| "should be able to create bug directory")?;
 
                 let seed_path = bug_path.join("seed.txt");
                 std::fs::write(&seed_path, seed.to_string())
-                    .or(Err("should be able to write seed file".to_string()))?;
+                    .with_context(|| "should be able to write seed file")?;
 
                 let plan_path = bug_path.join("plan.json");
                 std::fs::write(
                     &plan_path,
                     serde_json::to_string_pretty(&bug.plan)
-                        .or(Err("should be able to serialize plan".to_string()))?,
+                        .with_context(|| "should be able to serialize plan")?,
                 )
-                .or(Err("should be able to write plan file".to_string()))?;
+                .with_context(|| "should be able to write plan file")?;
 
                 let readable_plan_path = bug_path.join("plan.sql");
                 std::fs::write(&readable_plan_path, bug.plan.to_string())
-                    .or(Err("should be able to write readable plan file".to_string()))?;
+                    .with_context(|| "should be able to write readable plan file")?;
 
                 let runs_path = bug_path.join("runs.json");
                 std::fs::write(
                     &runs_path,
                     serde_json::to_string_pretty(&bug.runs)
-                        .or(Err("should be able to serialize runs".to_string()))?,
+                        .with_context(|| "should be able to serialize runs")?,
                 )
-                .or(Err("should be able to write runs file".to_string()))?;
+                .with_context(|| "should be able to write runs file")?;
             }
         }
 
         Ok(())
     }
 
-    pub(crate) fn load_bug(&mut self, seed: u64) -> Result<LoadedBug, String> {
+    pub(crate) fn load_bug(&mut self, seed: u64) -> anyhow::Result<LoadedBug> {
         let seed_match = self.bugs.get(&seed);
 
         match seed_match {
-            None => Err(format!("No bugs found for seed {}", seed)),
+            None => anyhow::bail!("No bugs found for seed {}", seed),
             Some(Bug::Unloaded { .. }) => {
                 let plan =
                     std::fs::read_to_string(self.path.join(seed.to_string()).join("plan.json"))
-                        .or(Err(format!(
-                            "should be able to read plan file at {}",
-                            self.path.join(seed.to_string()).join("plan.json").display()
-                        )))?;
+                        .with_context(|| {
+                            format!(
+                                "should be able to read plan file at {}",
+                                self.path.join(seed.to_string()).join("plan.json").display()
+                            )
+                        })?;
                 let plan: InteractionPlan = serde_json::from_str(&plan)
-                    .or(Err("should be able to deserialize plan".to_string()))?;
+                    .with_context(|| "should be able to deserialize plan")?;
 
                 let runs =
                     std::fs::read_to_string(self.path.join(seed.to_string()).join("runs.json"))
-                        .or(Err("should be able to read runs file".to_string()))?;
+                        .with_context(|| "should be able to read runs file")?;
                 let runs: Vec<BugRun> = serde_json::from_str(&runs)
-                    .or(Err("should be able to deserialize runs".to_string()))?;
+                    .with_context(|| "should be able to deserialize runs")?;
 
                 let bug = LoadedBug {
                     seed,
@@ -307,13 +310,13 @@ impl BugBase {
         &mut self,
         seed: u64,
         cli_options: &SimulatorCLI,
-    ) -> Result<(), String> {
+    ) -> anyhow::Result<()> {
         let bug = self.get_bug(seed);
         match bug {
             None => {
                 tracing::debug!("removing bug base entry for {}", seed);
                 std::fs::remove_dir_all(self.path.join(seed.to_string()))
-                    .or(Err("should be able to remove bug directory".to_string()))?;
+                    .with_context(|| "should be able to remove bug directory")?;
             }
             Some(_) => {
                 let mut bug = self.load_bug(seed)?;
@@ -326,7 +329,7 @@ impl BugBase {
                 self.bugs.insert(seed, Bug::Loaded(bug.clone()));
                 // Save the bug to the bug base.
                 self.save_bug(seed)
-                    .or(Err("should be able to save bug".to_string()))?;
+                    .with_context(|| "should be able to save bug")?;
                 tracing::debug!("Updated bug with seed {}", seed);
             }
         }
@@ -334,7 +337,7 @@ impl BugBase {
         Ok(())
     }
 
-    pub(crate) fn load_bugs(&mut self) -> Result<Vec<LoadedBug>, String> {
+    pub(crate) fn load_bugs(&mut self) -> anyhow::Result<Vec<LoadedBug>> {
         let seeds = self.bugs.keys().map(|seed| *seed).collect::<Vec<_>>();
 
         seeds
@@ -343,7 +346,7 @@ impl BugBase {
             .collect::<Result<Vec<_>, _>>()
     }
 
-    pub(crate) fn list_bugs(&mut self) -> Result<(), String> {
+    pub(crate) fn list_bugs(&mut self) -> anyhow::Result<()> {
         let bugs = self.load_bugs()?;
         for bug in bugs {
             println!("seed: {}", bug.seed);
@@ -393,31 +396,31 @@ impl BugBase {
 }
 
 impl BugBase {
-    pub(crate) fn get_current_commit_hash() -> Result<String, String> {
+    pub(crate) fn get_current_commit_hash() -> anyhow::Result<String> {
         let output = Command::new("git")
             .args(["rev-parse", "HEAD"])
             .output()
-            .or(Err("should be able to get the commit hash".to_string()))?;
+            .with_context(|| "should be able to get the commit hash")?;
         let commit_hash = String::from_utf8(output.stdout)
-            .or(Err("commit hash should be valid utf8".to_string()))?
+            .with_context(|| "commit hash should be valid utf8")?
             .trim()
             .to_string();
         Ok(commit_hash)
     }
 
-    pub(crate) fn get_limbo_project_dir() -> Result<PathBuf, String> {
+    pub(crate) fn get_limbo_project_dir() -> anyhow::Result<PathBuf> {
         Ok(PathBuf::from(
             String::from_utf8(
                 Command::new("git")
                     .args(["rev-parse", "--git-dir"])
                     .output()
-                    .or(Err("should be able to get the git path".to_string()))?
+                    .with_context(|| "should be able to get the git path")?
                     .stdout,
             )
-            .or(Err("commit hash should be valid utf8".to_string()))?
+            .with_context(|| "commit hash should be valid utf8")?
             .trim()
             .strip_suffix(".git")
-            .ok_or("should be able to strip .git suffix".to_string())?,
+            .with_context(|| "should be able to strip .git suffix")?,
         ))
     }
 }

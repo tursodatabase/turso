@@ -4,6 +4,7 @@ import tempfile
 from cli_tests.test_limbo_cli import TestLimboShell
 from pydantic import BaseModel
 from cli_tests import console
+from time import sleep
 
 
 sqlite_flags = os.getenv("SQLITE_FLAGS", "-q").split(" ")
@@ -37,7 +38,7 @@ class InsertTest(BaseModel):
 
         big_stmt.append("SELECT count(*) FROM test;")
         expected.append(str(self.vals * 2))
-        
+
         big_stmt.append("DELETE FROM temp;")
         big_stmt.append("SELECT count(*) FROM temp;")
         expected.append(str(0))
@@ -71,6 +72,11 @@ class InsertTest(BaseModel):
                 "SELECT count(*) FROM test;",
                 lambda res: res == str(self.vals * 2),
                 "Counting total rows inserted",
+            )
+            sqlite.run_test_fn(
+                "PRAGMA integrity_check;",
+                lambda res: res == "ok",
+                "Integrity Check",
             )
         console.info()
 
@@ -140,14 +146,14 @@ def main():
     tests = blob_tests()
     for test in tests:
         console.info(test)
-        with tempfile.NamedTemporaryFile(suffix='.db') as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
             test.db_path = tmp.name
             try:
                 # Use with syntax to automatically close shell on error
                 with TestLimboShell("") as limbo:
                     limbo.execute_dot(f".open {test.db_path}")
                     test.run(limbo)
-
+                sleep(0.3)
                 test.test_compat()
 
             except Exception as e:

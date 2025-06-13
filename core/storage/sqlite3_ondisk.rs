@@ -43,6 +43,8 @@
 
 #![allow(clippy::arc_with_non_send_sync)]
 
+use tracing::{instrument, Level};
+
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
 use crate::io::{Buffer, Complete, Completion, ReadCompletion, SyncCompletion, WriteCompletion};
@@ -60,7 +62,6 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tracing::trace;
 
 use super::pager::PageRef;
 use super::wal::LimboRwLock;
@@ -75,7 +76,7 @@ const DEFAULT_CACHE_SIZE: i32 = -2000;
 pub const MIN_PAGE_CACHE_SIZE: usize = 10;
 
 /// The minimum page size in bytes.
-const MIN_PAGE_SIZE: u32 = 512;
+pub const MIN_PAGE_SIZE: u32 = 512;
 
 /// The maximum page size in bytes.
 const MAX_PAGE_SIZE: u32 = 65536;
@@ -142,7 +143,7 @@ pub struct DatabaseHeader {
 
     /// The page number of the largest root b-tree page when in auto-vacuum or
     /// incremental-vacuum modes, or zero otherwise.
-    vacuum_mode_largest_root_page: u32,
+    pub vacuum_mode_largest_root_page: u32,
 
     /// The database text encoding. 1=UTF-8, 2=UTF-16le, 3=UTF-16be.
     text_encoding: u32,
@@ -151,7 +152,7 @@ pub struct DatabaseHeader {
     pub user_version: i32,
 
     /// True (non-zero) for incremental-vacuum mode. False (zero) otherwise.
-    incremental_vacuum_enabled: u32,
+    pub incremental_vacuum_enabled: u32,
 
     /// The "Application ID" set by PRAGMA application_id.
     application_id: u32,
@@ -377,6 +378,15 @@ pub enum PageType {
     TableLeaf = 13,
 }
 
+impl PageType {
+    pub fn is_table(&self) -> bool {
+        match self {
+            PageType::IndexInterior | PageType::IndexLeaf => false,
+            PageType::TableInterior | PageType::TableLeaf => true,
+        }
+    }
+}
+
 impl TryFrom<u8> for PageType {
     type Error = LimboError;
 
@@ -585,7 +595,12 @@ impl PageContent {
         // the page header is 12 bytes for interior pages, 8 bytes for leaf pages
         // this is because the 4 last bytes in the interior page's header are used for the rightmost pointer.
         let cell_pointer_array_start = self.header_size();
-        assert!(idx < ncells, "cell_get: idx out of bounds");
+        assert!(
+            idx < ncells,
+            "cell_get: idx out of bounds: idx={}, ncells={}",
+            idx,
+            ncells
+        );
         let cell_pointer = cell_pointer_array_start + (idx * 2);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
 
@@ -770,7 +785,7 @@ pub fn begin_read_page(
     page: PageRef,
     page_idx: usize,
 ) -> Result<()> {
-    trace!("begin_read_btree_page(page_idx = {})", page_idx);
+    tracing::trace!("begin_read_btree_page(page_idx = {})", page_idx);
     let buf = buffer_pool.get();
     let drop_fn = Rc::new(move |buf| {
         let buffer_pool = buffer_pool.clone();
@@ -794,7 +809,7 @@ pub fn finish_read_page(
     buffer_ref: Arc<RefCell<Buffer>>,
     page: PageRef,
 ) -> Result<()> {
-    trace!("finish_read_btree_page(page_idx = {})", page_idx);
+    tracing::trace!("finish_read_btree_page(page_idx = {})", page_idx);
     let pos = if page_idx == DATABASE_HEADER_PAGE_ID {
         DATABASE_HEADER_SIZE
     } else {
@@ -815,12 +830,12 @@ pub fn begin_write_btree_page(
     page: &PageRef,
     write_counter: Rc<RefCell<usize>>,
 ) -> Result<()> {
-    trace!("begin_write_btree_page(page={})", page.get().id);
+    tracing::trace!("begin_write_btree_page(page={})", page.get().id);
     let page_source = &pager.db_file;
     let page_finish = page.clone();
 
     let page_id = page.get().id;
-    trace!("begin_write_btree_page(page_id={})", page_id);
+    tracing::trace!("begin_write_btree_page(page_id={})", page_id);
     let buffer = {
         let page = page.get();
         let contents = page.contents.as_ref().unwrap();
@@ -831,7 +846,7 @@ pub fn begin_write_btree_page(
     let write_complete = {
         let buf_copy = buffer.clone();
         Box::new(move |bytes_written: i32| {
-            trace!("finish_write_btree_page");
+            tracing::trace!("finish_write_btree_page");
             let buf_copy = buf_copy.clone();
             let buf_len = buf_copy.borrow().len();
             *write_counter.borrow_mut() -= 1;
@@ -1503,7 +1518,7 @@ pub fn begin_read_wal_frame(
     buffer_pool: Rc<BufferPool>,
     complete: Box<dyn Fn(Arc<RefCell<Buffer>>) -> ()>,
 ) -> Result<Arc<Completion>> {
-    trace!("begin_read_wal_frame(offset={})", offset);
+    tracing::trace!("begin_read_wal_frame(offset={})", offset);
     let buf = buffer_pool.get();
     let drop_fn = Rc::new(move |buf| {
         let buffer_pool = buffer_pool.clone();
@@ -1516,6 +1531,7 @@ pub fn begin_read_wal_frame(
     Ok(c)
 }
 
+#[instrument(skip(io, page, write_counter, wal_header, checksums), level = Level::TRACE)]
 pub fn begin_write_wal_frame(
     io: &Arc<dyn File>,
     offset: usize,
@@ -1528,7 +1544,7 @@ pub fn begin_write_wal_frame(
 ) -> Result<(u32, u32)> {
     let page_finish = page.clone();
     let page_id = page.get().id;
-    trace!("begin_write_wal_frame(offset={}, page={})", offset, page_id);
+    tracing::trace!(page_id);
 
     let mut header = WalFrameHeader {
         page_number: page_id as u32,
@@ -1598,7 +1614,7 @@ pub fn begin_write_wal_frame(
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Arc::new(Completion::Write(WriteCompletion::new(write_complete)));
     io.pwrite(offset, buffer.clone(), c)?;
-    trace!("Frame written and synced at offset={offset}");
+    tracing::trace!("Frame written and synced");
     Ok(checksums)
 }
 

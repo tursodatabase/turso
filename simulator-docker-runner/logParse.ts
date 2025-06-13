@@ -9,6 +9,7 @@ export type StackTraceInfo = {
 export type AssertionFailureInfo = {
   type: "assertion";
   output: string;
+  mainError: string;
 }
 
 /**
@@ -16,8 +17,6 @@ export type AssertionFailureInfo = {
  */
 export function extractFailureInfo(output: string): StackTraceInfo | AssertionFailureInfo {
   const lines = output.split('\n');
-
-  const panicLineIndex = lines.findIndex(line => line.includes("panic occurred"));
 
   const info = getTraceFromOutput(lines) ?? getAssertionFailureInfo(lines);
 
@@ -50,9 +49,10 @@ function getAssertionFailureInfo(lines: string[]): AssertionFailureInfo | null {
   }
 
   const startIndex = simulationFailedLineIndex;
-  const endIndex = Math.min(lines.length, startIndex + 1);
+  const endIndex = Math.min(lines.length, startIndex + 50);
 
   const output = lines.slice(startIndex, endIndex).join('\n');
+  const mainError = lines[startIndex] ?? "???";
 
-  return { type: "assertion", output };
+  return { type: "assertion", output, mainError };
 }

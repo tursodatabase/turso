@@ -59,6 +59,7 @@ use std::{
     rc::{Rc, Weak},
     sync::Arc,
 };
+use tracing::{instrument, Level};
 
 /// We use labels to indicate that we want to jump to whatever the instruction offset
 /// will be at runtime, because the offset cannot always be determined when the jump
@@ -203,7 +204,7 @@ impl<const N: usize> Bitfield<N> {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 /// The commit state of the program.
 /// There are two states:
 /// - Ready: The program is ready to run the next instruction, or has shut down after
@@ -414,6 +415,7 @@ impl Program {
         }
     }
 
+    #[instrument(skip_all, level = Level::TRACE)]
     pub fn commit_txn(
         &self,
         pager: Rc<Pager>,
@@ -466,6 +468,7 @@ impl Program {
         }
     }
 
+    #[instrument(skip(self, pager, connection), level = Level::TRACE)]
     fn step_end_write_txn(
         &self,
         pager: &Rc<Pager>,
@@ -529,17 +532,17 @@ fn get_new_rowid<R: Rng>(cursor: &mut BTreeCursor, mut rng: R) -> Result<CursorR
         CursorResult::Ok(()) => {}
         CursorResult::IO => return Ok(CursorResult::IO),
     }
-    let mut rowid = cursor
-        .rowid()?
-        .unwrap_or(0) // if BTree is empty - use 0 as initial value for rowid
-        .checked_add(1) // add 1 but be careful with overflows
-        .unwrap_or(i64::MAX); // in case of overflow - use i64::MAX
+    let mut rowid = match cursor.rowid()? {
+        CursorResult::Ok(Some(rowid)) => rowid.checked_add(1).unwrap_or(i64::MAX), // add 1 but be careful with overflows, in case of overflow - use i64::MAX
+        CursorResult::Ok(None) => 1,
+        CursorResult::IO => return Ok(CursorResult::IO),
+    };
     if rowid > i64::MAX.try_into().unwrap() {
         let distribution = Uniform::from(1..=i64::MAX);
         let max_attempts = 100;
         for count in 0..max_attempts {
             rowid = distribution.sample(&mut rng).try_into().unwrap();
-            match cursor.seek(SeekKey::TableRowId(rowid), SeekOp::EQ)? {
+            match cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })? {
                 CursorResult::Ok(false) => break, // Found a non-existing rowid
                 CursorResult::Ok(true) => {
                     if count == max_attempts - 1 {
@@ -561,13 +564,13 @@ fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> Immu
     ImmutableRecord::from_registers(&registers[*start_reg..*start_reg + *count])
 }
 
-#[tracing::instrument(skip(program), level = tracing::Level::TRACE)]
+#[instrument(skip(program), level = Level::TRACE)]
 fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
     if !tracing::enabled!(tracing::Level::TRACE) {
         return;
     }
     tracing::trace!(
-        "{}",
+        "\n{}",
         explain::insn_to_str(
             program,
             addr,

@@ -4,7 +4,7 @@ use crate::{util::normalize_ident, Result};
 use crate::{LimboError, VirtualTable};
 use core::fmt;
 use fallible_iterator::FallibleIterator;
-use limbo_sqlite3_parser::ast::{Expr, Literal, SortOrder, TableOptions};
+use limbo_sqlite3_parser::ast::{self, ColumnDefinition, Expr, Literal, SortOrder, TableOptions};
 use limbo_sqlite3_parser::{
     ast::{Cmd, CreateTableBody, QualifiedName, ResultColumn, Stmt},
     lexer::sql::Parser,
@@ -13,6 +13,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 use tracing::trace;
+
+const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
+const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
 
 pub struct Schema {
     pub tables: HashMap<String, Arc<Table>>,
@@ -26,7 +29,7 @@ impl Schema {
         let indexes: HashMap<String, Vec<Arc<Index>>> = HashMap::new();
         #[allow(clippy::arc_with_non_send_sync)]
         tables.insert(
-            "sqlite_schema".to_string(),
+            SCHEMA_TABLE_NAME.to_string(),
             Arc::new(Table::BTree(sqlite_schema_table().into())),
         );
         Self { tables, indexes }
@@ -51,7 +54,12 @@ impl Schema {
 
     pub fn get_table(&self, name: &str) -> Option<Arc<Table>> {
         let name = normalize_ident(name);
-        self.tables.get(&name).cloned()
+        let name = if name.eq_ignore_ascii_case(&SCHEMA_TABLE_NAME_ALT) {
+            SCHEMA_TABLE_NAME
+        } else {
+            &name
+        };
+        self.tables.get(name).cloned()
     }
 
     pub fn remove_table(&mut self, table_name: &str) {
@@ -212,12 +220,11 @@ impl BTreeTable {
     /// then get_column("b") returns (1, &Column { .. })
     pub fn get_column(&self, name: &str) -> Option<(usize, &Column)> {
         let name = normalize_ident(name);
-        for (i, column) in self.columns.iter().enumerate() {
-            if column.name.as_ref().map_or(false, |n| *n == name) {
-                return Some((i, column));
-            }
-        }
-        None
+
+        self.columns
+            .iter()
+            .enumerate()
+            .find(|(_, column)| column.name.as_ref() == Some(&name))
     }
 
     pub fn from_sql(sql: &str, root_page: usize) -> Result<BTreeTable> {
@@ -232,17 +239,30 @@ impl BTreeTable {
     }
 
     pub fn to_sql(&self) -> String {
-        let mut sql = format!("CREATE TABLE {} (\n", self.name);
+        let mut sql = format!("CREATE TABLE {} (", self.name);
         for (i, column) in self.columns.iter().enumerate() {
             if i > 0 {
-                sql.push_str(",\n");
+                sql.push(',');
             }
-            sql.push_str("  ");
+            sql.push(' ');
             sql.push_str(column.name.as_ref().expect("column name is None"));
             sql.push(' ');
             sql.push_str(&column.ty.to_string());
+
+            if column.unique {
+                sql.push_str(" UNIQUE");
+            }
+
+            if column.primary_key {
+                sql.push_str(" PRIMARY KEY");
+            }
+
+            if let Some(default) = &column.default {
+                sql.push_str(" DEFAULT ");
+                sql.push_str(&default.to_string());
+            }
         }
-        sql.push_str(");\n");
+        sql.push_str(" )");
         sql
     }
 
@@ -578,6 +598,80 @@ impl Column {
     }
 }
 
+// TODO: This might replace some of util::columns_from_create_table_body
+impl From<ColumnDefinition> for Column {
+    fn from(value: ColumnDefinition) -> Self {
+        let ast::Name(name) = value.col_name;
+
+        let mut default = None;
+        let mut notnull = false;
+        let mut primary_key = false;
+        let mut unique = false;
+        let mut collation = None;
+
+        for ast::NamedColumnConstraint { constraint, .. } in value.constraints {
+            match constraint {
+                ast::ColumnConstraint::PrimaryKey { .. } => primary_key = true,
+                ast::ColumnConstraint::NotNull { .. } => notnull = true,
+                ast::ColumnConstraint::Unique(..) => unique = true,
+                ast::ColumnConstraint::Default(expr) => {
+                    default.replace(expr);
+                }
+                ast::ColumnConstraint::Collate { collation_name } => {
+                    collation.replace(
+                        CollationSeq::new(&collation_name.0)
+                            .expect("collation should have been set correctly in create table"),
+                    );
+                }
+                _ => {}
+            };
+        }
+
+        let ty = match value.col_type {
+            Some(ref data_type) => {
+                // https://www.sqlite.org/datatype3.html
+                let type_name = data_type.name.clone().to_uppercase();
+
+                if type_name.contains("INT") {
+                    Type::Integer
+                } else if type_name.contains("CHAR")
+                    || type_name.contains("CLOB")
+                    || type_name.contains("TEXT")
+                {
+                    Type::Text
+                } else if type_name.contains("BLOB") || type_name.is_empty() {
+                    Type::Blob
+                } else if type_name.contains("REAL")
+                    || type_name.contains("FLOA")
+                    || type_name.contains("DOUB")
+                {
+                    Type::Real
+                } else {
+                    Type::Numeric
+                }
+            }
+            None => Type::Null,
+        };
+
+        let ty_str = value
+            .col_type
+            .map(|t| t.name.to_string())
+            .unwrap_or_default();
+
+        Column {
+            name: Some(name),
+            ty,
+            default,
+            notnull,
+            ty_str,
+            primary_key,
+            is_rowid_alias: primary_key && matches!(ty, Type::Integer),
+            unique,
+            collation,
+        }
+    }
+}
+
 /// 3.1. Determination Of Column Affinity
 /// For tables not declared as STRICT, the affinity of a column is determined by the declared type of the column, according to the following rules in the order shown:
 ///
@@ -740,6 +834,22 @@ impl Affinity {
             ))),
         }
     }
+
+    pub fn to_char_code(&self) -> u8 {
+        self.aff_mask() as u8
+    }
+
+    pub fn from_char_code(code: u8) -> Result<Self, LimboError> {
+        Self::from_char(code as char)
+    }
+
+    pub fn is_numeric(&self) -> bool {
+        matches!(self, Affinity::Integer | Affinity::Real | Affinity::Numeric)
+    }
+
+    pub fn has_affinity(&self) -> bool {
+        !matches!(self, Affinity::Blob)
+    }
 }
 
 impl fmt::Display for Type {
@@ -853,6 +963,7 @@ pub struct IndexColumn {
     /// b.pos_in_table == 1
     pub pos_in_table: usize,
     pub collation: Option<CollationSeq>,
+    pub default: Option<Expr>,
 }
 
 impl Index {
@@ -877,12 +988,13 @@ impl Index {
                             name, index_name, table.name
                         )));
                     };
-                    let collation = table.get_column(&name).unwrap().1.collation;
+                    let (_, column) = table.get_column(&name).unwrap();
                     index_columns.push(IndexColumn {
                         name,
                         order: col.order.unwrap_or(SortOrder::Asc),
                         pos_in_table,
-                        collation,
+                        collation: column.collation,
+                        default: column.default.clone(),
                     });
                 }
                 Ok(Index {
@@ -939,11 +1051,14 @@ impl Index {
                         );
                     };
 
+                    let (_, column) = table.get_column(col_name).unwrap();
+
                     IndexColumn {
                         name: normalize_ident(col_name),
-                        order: order.clone(),
+                        order: *order,
                         pos_in_table,
-                        collation: table.get_column(col_name).unwrap().1.collation,
+                        collation: column.collation,
+                        default: column.default.clone(),
                     }
                 })
                 .collect::<Vec<_>>();
@@ -975,6 +1090,7 @@ impl Index {
                             return None;
                     }
                     let (index_name, root_page) = auto_indices.next().expect("number of auto_indices in schema should be same number of indices calculated");
+                    let (_, column) = table.get_column(col_name).unwrap();
                     Some(Index {
                         name: normalize_ident(index_name.as_str()),
                         table_name: table.name.clone(),
@@ -983,7 +1099,8 @@ impl Index {
                             name: normalize_ident(col_name),
                             order: SortOrder::Asc, // Default Sort Order
                             pos_in_table,
-                            collation: table.get_column(col_name).unwrap().1.collation,
+                            collation: column.collation,
+                            default: column.default.clone(),
                         }],
                         unique: true,
                         ephemeral: false,
@@ -1045,11 +1162,13 @@ impl Index {
                                 col_name, index_name, table.name
                             );
                         };
+                        let (_, column) = table.get_column(col_name).unwrap();
                         IndexColumn {
                             name: normalize_ident(col_name),
                             order: *order,
                             pos_in_table,
-                            collation: table.get_column(col_name).unwrap().1.collation,
+                            collation: column.collation,
+                            default: column.default.clone(),
                         }
                     });
                     Index {
@@ -1380,13 +1499,7 @@ mod tests {
 
     #[test]
     pub fn test_sqlite_schema() {
-        let expected = r#"CREATE TABLE sqlite_schema (
-  type TEXT,
-  name TEXT,
-  tbl_name TEXT,
-  rootpage INTEGER,
-  sql TEXT);
-"#;
+        let expected = r#"CREATE TABLE sqlite_schema ( type TEXT, name TEXT, tbl_name TEXT, rootpage INTEGER, sql TEXT )"#;
         let actual = sqlite_schema_table().to_sql();
         assert_eq!(expected, actual);
     }

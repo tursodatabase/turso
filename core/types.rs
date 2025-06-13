@@ -1,5 +1,7 @@
 use limbo_ext::{AggCtx, FinalizeFunction, StepFunction};
 use limbo_sqlite3_parser::ast::SortOrder;
+#[cfg(feature = "serde")]
+use serde::Deserialize;
 
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
@@ -13,7 +15,7 @@ use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::Result;
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 
 const MAX_REAL_SIZE: u8 = 15;
 
@@ -42,6 +44,7 @@ impl Display for ValueType {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TextSubtype {
     Text,
     #[cfg(feature = "json")]
@@ -49,6 +52,7 @@ pub enum TextSubtype {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Text {
     pub value: Vec<u8>,
     pub subtype: TextSubtype,
@@ -89,6 +93,12 @@ impl Text {
     }
 }
 
+impl AsRef<str> for Text {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
 impl From<String> for Text {
     fn from(value: String) -> Self {
         Text {
@@ -108,10 +118,36 @@ impl TextRef {
     }
 }
 
+#[cfg(feature = "serde")]
+fn float_to_string<S>(float: &f64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&format!("{}", float))
+}
+
+#[cfg(feature = "serde")]
+fn string_to_float<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    s.parse().map_err(serde::de::Error::custom)
+}
+
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Value {
     Null,
     Integer(i64),
+    // we use custom serialization to preserve float precision
+    #[cfg_attr(
+        feature = "serde",
+        serde(
+            serialize_with = "float_to_string",
+            deserialize_with = "string_to_float"
+        )
+    )]
     Float(f64),
     Text(Text),
     Blob(Vec<u8>),
@@ -123,13 +159,43 @@ pub struct RawSlice {
     len: usize,
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(PartialEq, Clone)]
 pub enum RefValue {
     Null,
     Integer(i64),
     Float(f64),
     Text(TextRef),
     Blob(RawSlice),
+}
+
+impl Debug for RefValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RefValue::Null => write!(f, "Null"),
+            RefValue::Integer(i) => f.debug_tuple("Integer").field(i).finish(),
+            RefValue::Float(float) => f.debug_tuple("Float").field(float).finish(),
+            RefValue::Text(text_ref) => {
+                // truncate string to at most 256 chars
+                let text = text_ref.as_str();
+                let max_len = text.len().min(256);
+                f.debug_struct("Text")
+                    .field("data", &&text[0..max_len])
+                    // Indicates to the developer debugging that the data is truncated for printing
+                    .field("truncated", &(text.len() > max_len))
+                    .finish()
+            }
+            RefValue::Blob(raw_slice) => {
+                // truncate blob_slice to at most 32 bytes
+                let blob = raw_slice.to_slice();
+                let max_len = blob.len().min(32);
+                f.debug_struct("Blob")
+                    .field("data", &&blob[0..max_len])
+                    // Indicates to the developer debugging that the data is truncated for printing
+                    .field("truncated", &(blob.len() > max_len))
+                    .finish()
+            }
+        }
+    }
 }
 
 impl Value {
@@ -624,14 +690,10 @@ impl std::ops::DivAssign<Value> for Value {
     }
 }
 
-pub trait FromValue<'a> {
-    fn from_value(value: &'a RefValue) -> Result<Self>
-    where
-        Self: Sized + 'a;
-}
+impl<'a> TryFrom<&'a RefValue> for i64 {
+    type Error = LimboError;
 
-impl<'a> FromValue<'a> for i64 {
-    fn from_value(value: &'a RefValue) -> Result<Self> {
+    fn try_from(value: &'a RefValue) -> Result<Self, Self::Error> {
         match value {
             RefValue::Integer(i) => Ok(*i),
             _ => Err(LimboError::ConversionError("Expected integer value".into())),
@@ -639,8 +701,10 @@ impl<'a> FromValue<'a> for i64 {
     }
 }
 
-impl<'a> FromValue<'a> for String {
-    fn from_value(value: &'a RefValue) -> Result<Self> {
+impl<'a> TryFrom<&'a RefValue> for String {
+    type Error = LimboError;
+
+    fn try_from(value: &'a RefValue) -> Result<Self, Self::Error> {
         match value {
             RefValue::Text(s) => Ok(s.as_str().to_string()),
             _ => Err(LimboError::ConversionError("Expected text value".into())),
@@ -648,8 +712,10 @@ impl<'a> FromValue<'a> for String {
     }
 }
 
-impl<'a> FromValue<'a> for &'a str {
-    fn from_value(value: &'a RefValue) -> Result<Self> {
+impl<'a> TryFrom<&'a RefValue> for &'a str {
+    type Error = LimboError;
+
+    fn try_from(value: &'a RefValue) -> Result<Self, Self::Error> {
         match value {
             RefValue::Text(s) => Ok(s.as_str()),
             _ => Err(LimboError::ConversionError("Expected text value".into())),
@@ -661,7 +727,7 @@ impl<'a> FromValue<'a> for &'a str {
 /// A value in a record that has already been serialized can stay serialized and what this struct offsers
 /// is easy acces to each value which point to the payload.
 /// The name might be contradictory as it is immutable in the sense that you cannot modify the values without modifying the payload.
-#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
 pub struct ImmutableRecord {
     // We have to be super careful with this buffer since we make values point to the payload we need to take care reallocations
     // happen in a controlled manner. If we realocate with values that should be correct, they will now point to undefined data.
@@ -669,6 +735,21 @@ pub struct ImmutableRecord {
     payload: Vec<u8>,
     pub values: Vec<RefValue>,
     recreating: bool,
+}
+
+impl Debug for ImmutableRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImmutableRecord")
+            .field("values", &self.values)
+            .field("recreating", &self.recreating)
+            .finish()
+    }
+}
+
+#[derive(PartialEq)]
+pub enum ParseRecordState {
+    Init,
+    Parsing { payload: Vec<u8> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -743,12 +824,15 @@ impl ImmutableRecord {
         }
     }
 
-    pub fn get<'a, T: FromValue<'a> + 'a>(&'a self, idx: usize) -> Result<T> {
+    pub fn get<'a, T: TryFrom<&'a RefValue, Error = LimboError> + 'a>(
+        &'a self,
+        idx: usize,
+    ) -> Result<T> {
         let value = self
             .values
             .get(idx)
             .ok_or(LimboError::InternalError("Index out of bounds".into()))?;
-        T::from_value(value)
+        T::try_from(value)
     }
 
     pub fn count(&self) -> usize {
@@ -899,6 +983,10 @@ impl ImmutableRecord {
     pub fn invalidate(&mut self) {
         self.payload.clear();
         self.values.clear();
+    }
+
+    pub fn is_invalidated(&self) -> bool {
+        self.payload.is_empty()
     }
 
     pub fn get_payload(&self) -> &[u8] {
@@ -1449,10 +1537,17 @@ pub enum CursorResult<T> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 /// The match condition of a table/index seek.
 pub enum SeekOp {
-    EQ,
-    GE,
+    /// If eq_only is true, this means in practice:
+    /// We are iterating forwards, but we are really looking for an exact match on the seek key.
+    GE {
+        eq_only: bool,
+    },
     GT,
-    LE,
+    /// If eq_only is true, this means in practice:
+    /// We are iterating backwards, but we are really looking for an exact match on the seek key.
+    LE {
+        eq_only: bool,
+    },
     LT,
 }
 
@@ -1469,17 +1564,23 @@ impl SeekOp {
     #[inline(always)]
     pub fn iteration_direction(&self) -> IterationDirection {
         match self {
-            SeekOp::EQ | SeekOp::GE | SeekOp::GT => IterationDirection::Forwards,
-            SeekOp::LE | SeekOp::LT => IterationDirection::Backwards,
+            SeekOp::GE { .. } | SeekOp::GT => IterationDirection::Forwards,
+            SeekOp::LE { .. } | SeekOp::LT => IterationDirection::Backwards,
+        }
+    }
+
+    pub fn eq_only(&self) -> bool {
+        match self {
+            SeekOp::GE { eq_only } | SeekOp::LE { eq_only } => *eq_only,
+            _ => false,
         }
     }
 
     pub fn reverse(&self) -> Self {
         match self {
-            SeekOp::EQ => SeekOp::EQ,
-            SeekOp::GE => SeekOp::LE,
+            SeekOp::GE { eq_only } => SeekOp::LE { eq_only: *eq_only },
             SeekOp::GT => SeekOp::LT,
-            SeekOp::LE => SeekOp::GE,
+            SeekOp::LE { eq_only } => SeekOp::GE { eq_only: *eq_only },
             SeekOp::LT => SeekOp::GT,
         }
     }

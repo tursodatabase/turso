@@ -107,7 +107,7 @@ const run = async (seed: string, bin: string, args: string[]) => {
             type: "assertion",
             seed: seedForGithubIssue,
             command: args.join(" "),
-            output: output,
+            failureInfo,
           });
         }
       } catch (err2) {

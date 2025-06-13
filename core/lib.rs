@@ -573,17 +573,7 @@ impl Connection {
 
     /// Close a connection and checkpoint.
     pub fn close(&self) -> Result<()> {
-        loop {
-            // TODO: make this async?
-            match self.pager.checkpoint()? {
-                CheckpointStatus::Done(_) => {
-                    return Ok(());
-                }
-                CheckpointStatus::IO => {
-                    self.pager.io.run_once()?;
-                }
-            };
-        }
+        self.pager.checkpoint_shutdown()
     }
 
     pub fn last_insert_rowid(&self) -> i64 {
@@ -922,7 +912,7 @@ impl Statement {
     }
 
     pub fn get_column_name(&self, idx: usize) -> Cow<str> {
-        let column = &self.program.result_columns[idx];
+        let column = &self.program.result_columns.get(idx).expect("No column");
         match column.name(&self.program.table_references) {
             Some(name) => Cow::Borrowed(name),
             None => Cow::Owned(column.expr.to_string()),

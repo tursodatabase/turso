@@ -527,11 +527,12 @@ pub fn insn_to_str(
                 cursor_id,
                 column,
                 dest,
+                default,
             } => {
                 let cursor_type = &program.cursor_ref[*cursor_id].1;
                 let column_name: Option<&String> = match cursor_type {
                     CursorType::BTreeTable(table) => {
-                        let name = table.columns.get(*column).unwrap().name.as_ref();
+                        let name = table.columns.get(*column).and_then(|v| v.name.as_ref());
                         name
                     }
                     CursorType::BTreeIndex(index) => {
@@ -550,7 +551,7 @@ pub fn insn_to_str(
                     *cursor_id as i32,
                     *column as i32,
                     *dest as i32,
-                    Value::build_text(""),
+                    default.clone().unwrap_or_else(|| Value::build_text("")),
                     0,
                     format!(
                         "r[{}]={}.{}",
@@ -630,6 +631,19 @@ pub fn insn_to_str(
                 *err_code as i32,
                 0,
                 0,
+                Value::build_text(&description),
+                0,
+                "".to_string(),
+            ),
+            Insn::HaltIfNull {
+                err_code,
+                target_reg,
+                description,
+            } => (
+                "HaltIfNull",
+                *err_code as i32,
+                0,
+                *target_reg as i32,
                 Value::build_text(&description),
                 0,
                 "".to_string(),
@@ -809,6 +823,7 @@ pub fn insn_to_str(
                 start_reg,
                 num_regs,
                 target_pc,
+                ..
             }
             | Insn::SeekLE {
                 is_index: _,
@@ -816,6 +831,7 @@ pub fn insn_to_str(
                 start_reg,
                 num_regs,
                 target_pc,
+                ..
             }
             | Insn::SeekLT {
                 is_index: _,
@@ -1571,6 +1587,20 @@ pub fn insn_to_str(
                 Value::build_text(""),
                 0,
                 "".to_string(),
+            ),
+            Insn::Int64 {
+                _p1,
+                out_reg,
+                _p3,
+                value,
+            } => (
+                "Int64",
+                0,
+                *out_reg as i32,
+                0,
+                Value::Integer(*value),
+                0,
+                format!("r[{}]={}", *out_reg, *value),
             ),
         };
     format!(

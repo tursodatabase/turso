@@ -428,6 +428,25 @@ fn test_update_with_index() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_delete_with_index() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+
+    maybe_setup_tracing();
+
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t(x UNIQUE)");
+    let conn = tmp_db.connect_limbo();
+
+    run_query(&tmp_db, &conn, "INSERT INTO t VALUES (1), (2)")?;
+    run_query(&tmp_db, &conn, "DELETE FROM t WHERE x >= 1")?;
+
+    run_query_on_row(&tmp_db, &conn, "SELECT * FROM t", |_| {
+        panic!("Delete should've deleted every row!");
+    })?;
+
+    Ok(())
+}
+
 fn run_query(tmp_db: &TempDatabase, conn: &Rc<Connection>, query: &str) -> anyhow::Result<()> {
     run_query_core(tmp_db, conn, query, None::<fn(&Row)>)
 }

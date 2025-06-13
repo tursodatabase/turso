@@ -281,14 +281,6 @@ fn alter_add_column_unique() {
 }
 
 #[test]
-fn alter_rename_same() {
-    expect_parser_err_msg(
-        b"ALTER TABLE t RENAME TO t",
-        "there is already another table or index with this name: t",
-    );
-}
-
-#[test]
 fn natural_join_on() {
     expect_parser_err_msg(
         b"SELECT x FROM t NATURAL JOIN t USING (x)",

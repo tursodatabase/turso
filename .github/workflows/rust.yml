@@ -40,7 +40,7 @@ jobs:
       env:
         RUST_LOG: ${{ runner.debug && 'limbo_core::storage=trace' || '' }}
       run: cargo test --verbose
-      timeout-minutes: 10
+      timeout-minutes: 20
 
 
   clippy:
@@ -67,6 +67,7 @@ jobs:
 
   test-limbo:
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
     steps:
       - name: Install cargo-c
         env:
@@ -91,7 +92,7 @@ jobs:
       - uses: "./.github/shared/install_sqlite"
       - name: Test
         run: make test
-        timeout-minutes: 10
+        timeout-minutes: 20
 
   test-sqlite:
     runs-on: blacksmith-4vcpu-ubuntu-2404

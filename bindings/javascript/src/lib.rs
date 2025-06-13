@@ -9,7 +9,6 @@ use std::sync::Arc;
 use limbo_core::types::Text;
 use limbo_core::{maybe_init_database_file, LimboError, StepResult};
 use napi::iterator::Generator;
-use napi::JsObject;
 use napi::{bindgen_prelude::ObjectFinalize, Env, JsUnknown};
 use napi_derive::napi;
 
@@ -19,6 +18,11 @@ pub struct OpenDatabaseOptions {
     pub file_must_exist: bool,
     pub timeout: u32,
     // verbose => Callback,
+}
+
+#[napi(object)]
+pub struct PragmaOptions {
+    pub simple: bool,
 }
 
 #[napi(custom_finalize)]
@@ -81,6 +85,36 @@ impl Database {
     pub fn prepare(&self, sql: String) -> napi::Result<Statement> {
         let stmt = self.conn.prepare(&sql).map_err(into_napi_error)?;
         Ok(Statement::new(RefCell::new(stmt), self.clone(), sql))
+    }
+
+    #[napi]
+    pub fn pragma(
+        &self,
+        env: Env,
+        pragma_name: String,
+        options: Option<PragmaOptions>,
+    ) -> napi::Result<JsUnknown> {
+        let sql = format!("PRAGMA {}", pragma_name);
+        let stmt = self.prepare(sql)?;
+        match options {
+            Some(PragmaOptions { simple: true, .. }) => {
+                let mut stmt = stmt.inner.borrow_mut();
+                match stmt.step().map_err(into_napi_error)? {
+                    limbo_core::StepResult::Row => {
+                        let row: Vec<_> = stmt.row().unwrap().get_values().cloned().collect();
+                        to_js_value(&env, &row[0])
+                    }
+                    limbo_core::StepResult::Done => Ok(env.get_undefined()?.into_unknown()),
+                    limbo_core::StepResult::IO => todo!(),
+                    step @ limbo_core::StepResult::Interrupt
+                    | step @ limbo_core::StepResult::Busy => Err(napi::Error::new(
+                        napi::Status::GenericFailure,
+                        format!("{:?}", step),
+                    )),
+                }
+            }
+            _ => stmt.run(env, None),
+        }
     }
 
     #[napi]
@@ -160,46 +194,13 @@ impl Database {
         self.conn.close().map_err(into_napi_error)?;
         Ok(())
     }
+}
 
-    // We assume that every pragma only returns one result, which isn't
-    // true.
-    #[napi]
-    pub fn pragma(&self, env: Env, pragma: String, simple: bool) -> napi::Result<JsUnknown> {
-        let stmt = self.prepare(pragma.clone())?;
-        let mut stmt = stmt.inner.borrow_mut();
-        let pragma_name = pragma
-            .split("PRAGMA")
-            .find(|s| !s.trim().is_empty())
-            .unwrap()
-            .trim();
-
-        let mut results = env.create_empty_array()?;
-
-        let step = stmt.step().map_err(into_napi_error)?;
-        match step {
-            limbo_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                let mut obj = env.create_object()?;
-                for value in row.get_values() {
-                    let js_value = to_js_value(&env, value)?;
-
-                    if simple {
-                        return Ok(js_value);
-                    }
-
-                    obj.set_named_property(pragma_name, js_value)?;
-                }
-
-                results.set_element(0, obj)?;
-                Ok(results.into_unknown())
-            }
-            limbo_core::StepResult::Done => Ok(env.get_undefined()?.into_unknown()),
-            limbo_core::StepResult::IO => todo!(),
-            limbo_core::StepResult::Interrupt | limbo_core::StepResult::Busy => Err(
-                napi::Error::new(napi::Status::GenericFailure, format!("{:?}", step)),
-            ),
-        }
-    }
+#[derive(Debug, Clone)]
+enum PresentationMode {
+    Raw,
+    Pluck,
+    None,
 }
 
 #[napi]
@@ -216,8 +217,7 @@ pub struct Statement {
     pub source: String,
 
     database: Database,
-    raw: bool,
-    pluck: bool,
+    presentation_mode: PresentationMode,
     binded: bool,
     inner: Rc<RefCell<limbo_core::Statement>>,
 }
@@ -229,9 +229,8 @@ impl Statement {
             inner: Rc::new(inner),
             database,
             source,
-            pluck: false,
+            presentation_mode: PresentationMode::None,
             binded: false,
-            raw: false,
         }
     }
 
@@ -244,43 +243,40 @@ impl Statement {
             limbo_core::StepResult::Row => {
                 let row = stmt.row().unwrap();
 
-                if self.raw {
-                    assert!(!self.pluck, "Cannot use raw mode with pluck mode");
+                match self.presentation_mode {
+                    PresentationMode::Raw => {
+                        let mut raw_obj = env.create_array(row.len() as u32)?;
+                        for (idx, value) in row.get_values().enumerate() {
+                            let js_value = to_js_value(&env, value);
 
-                    let mut raw_obj = env.create_array(row.len() as u32)?;
-                    for (idx, value) in row.get_values().enumerate() {
-                        let js_value = to_js_value(&env, value);
+                            raw_obj.set(idx as u32, js_value)?;
+                        }
 
-                        raw_obj.set(idx as u32, js_value)?;
+                        Ok(raw_obj.coerce_to_object()?.into_unknown())
                     }
+                    PresentationMode::Pluck => {
+                        let (_, value) =
+                            row.get_values().enumerate().next().ok_or(napi::Error::new(
+                                napi::Status::GenericFailure,
+                                "Pluck mode requires at least one column in the result",
+                            ))?;
+                        let js_value = to_js_value(&env, value)?;
 
-                    return Ok(raw_obj.coerce_to_object()?.into_unknown());
+                        Ok(js_value)
+                    }
+                    PresentationMode::None => {
+                        let mut obj = env.create_object()?;
+
+                        for (idx, value) in row.get_values().enumerate() {
+                            let key = stmt.get_column_name(idx);
+                            let js_value = to_js_value(&env, value);
+
+                            obj.set_named_property(&key, js_value)?;
+                        }
+
+                        Ok(obj.into_unknown())
+                    }
                 }
-
-                let mut obj = env.create_object()?;
-                if self.pluck {
-                    assert!(!self.raw, "Cannot use pluck mode with raw mode");
-
-                    let (idx, value) =
-                        row.get_values().enumerate().next().ok_or(napi::Error::new(
-                            napi::Status::GenericFailure,
-                            "Pluck mode requires at least one column in the result",
-                        ))?;
-                    let key = stmt.get_column_name(idx);
-                    let js_value = to_js_value(&env, value);
-                    obj.set_named_property(&key, js_value)?;
-
-                    return Ok(obj.into_unknown());
-                }
-
-                for (idx, value) in row.get_values().enumerate() {
-                    let key = stmt.get_column_name(idx);
-                    let js_value = to_js_value(&env, value);
-
-                    obj.set_named_property(&key, js_value)?;
-                }
-
-                Ok(obj.into_unknown())
             }
             limbo_core::StepResult::Done => Ok(env.get_undefined()?.into_unknown()),
             limbo_core::StepResult::IO => todo!(),
@@ -305,20 +301,11 @@ impl Statement {
         args: Option<Vec<JsUnknown>>,
     ) -> napi::Result<IteratorStatement> {
         self.check_and_bind(args)?;
-        if self.raw {
-            assert!(!self.pluck, "Cannot use raw mode with pluck mode");
-        }
-
-        if self.pluck {
-            assert!(!self.raw, "Cannot use pluck mode with raw mode");
-        }
-
         Ok(IteratorStatement {
             stmt: Rc::clone(&self.inner),
             database: self.database.clone(),
             env,
-            pluck: self.pluck,
-            raw: self.raw,
+            presentation_mode: self.presentation_mode.clone(),
         })
     }
 
@@ -340,44 +327,40 @@ impl Statement {
             match stmt.step().map_err(into_napi_error)? {
                 limbo_core::StepResult::Row => {
                     let row = stmt.row().unwrap();
-                    let mut obj = env.create_object()?;
 
-                    if self.raw {
-                        assert!(!self.pluck, "Cannot use raw mode with pluck mode");
-
-                        let mut raw_array = env.create_array(row.len() as u32)?;
-                        for (idx, value) in row.get_values().enumerate() {
-                            let js_value = to_js_value(&env, value)?;
-                            raw_array.set(idx as u32, js_value)?;
+                    match self.presentation_mode {
+                        PresentationMode::Raw => {
+                            let mut raw_array = env.create_array(row.len() as u32)?;
+                            for (idx, value) in row.get_values().enumerate() {
+                                let js_value = to_js_value(&env, value)?;
+                                raw_array.set(idx as u32, js_value)?;
+                            }
+                            results.set_element(index, raw_array.coerce_to_object()?)?;
+                            index += 1;
+                            continue;
                         }
-                        results.set_element(index, raw_array.coerce_to_object()?)?;
-                        index += 1;
-                        continue;
+                        PresentationMode::Pluck => {
+                            let (_, value) =
+                                row.get_values().enumerate().next().ok_or(napi::Error::new(
+                                    napi::Status::GenericFailure,
+                                    "Pluck mode requires at least one column in the result",
+                                ))?;
+                            let js_value = to_js_value(&env, value)?;
+                            results.set_element(index, js_value)?;
+                            index += 1;
+                            continue;
+                        }
+                        PresentationMode::None => {
+                            let mut obj = env.create_object()?;
+                            for (idx, value) in row.get_values().enumerate() {
+                                let key = stmt.get_column_name(idx);
+                                let js_value = to_js_value(&env, value);
+                                obj.set_named_property(&key, js_value)?;
+                            }
+                            results.set_element(index, obj)?;
+                            index += 1;
+                        }
                     }
-
-                    if self.pluck {
-                        assert!(!self.raw, "Cannot use pluck mode with raw mode");
-
-                        let (idx, value) =
-                            row.get_values().enumerate().next().ok_or(napi::Error::new(
-                                napi::Status::GenericFailure,
-                                "Pluck mode requires at least one column in the result",
-                            ))?;
-                        let key = stmt.get_column_name(idx);
-                        let js_value = to_js_value(&env, value)?;
-                        obj.set_named_property(&key, js_value)?;
-                        results.set_element(index, obj)?;
-                        index += 1;
-                        continue;
-                    }
-
-                    for (idx, value) in row.get_values().enumerate() {
-                        let key = stmt.get_column_name(idx);
-                        let js_value = to_js_value(&env, value);
-                        obj.set_named_property(&key, js_value)?;
-                    }
-                    results.set_element(index, obj)?;
-                    index += 1;
                 }
                 limbo_core::StepResult::Done => {
                     break;
@@ -400,11 +383,10 @@ impl Statement {
     #[napi]
     pub fn pluck(&mut self, pluck: Option<bool>) {
         if let Some(false) = pluck {
-            self.pluck = false;
+            self.presentation_mode = PresentationMode::None;
         }
 
-        self.raw = false;
-        self.pluck = true;
+        self.presentation_mode = PresentationMode::Pluck;
     }
 
     #[napi]
@@ -415,11 +397,10 @@ impl Statement {
     #[napi]
     pub fn raw(&mut self, raw: Option<bool>) {
         if let Some(false) = raw {
-            self.raw = false;
+            self.presentation_mode = PresentationMode::None;
         }
 
-        self.pluck = false;
-        self.raw = true;
+        self.presentation_mode = PresentationMode::Raw;
     }
 
     #[napi]
@@ -466,12 +447,11 @@ pub struct IteratorStatement {
     stmt: Rc<RefCell<limbo_core::Statement>>,
     database: Database,
     env: Env,
-    pluck: bool,
-    raw: bool,
+    presentation_mode: PresentationMode,
 }
 
 impl Generator for IteratorStatement {
-    type Yield = JsObject;
+    type Yield = JsUnknown;
 
     type Next = ();
 
@@ -483,43 +463,37 @@ impl Generator for IteratorStatement {
         match stmt.step().ok()? {
             limbo_core::StepResult::Row => {
                 let row = stmt.row().unwrap();
-                let mut js_row = self.env.create_object().ok()?;
 
-                if self.raw {
-                    assert!(!self.pluck, "Cannot use raw mode with pluck mode");
+                match self.presentation_mode {
+                    PresentationMode::Raw => {
+                        let mut raw_array = self.env.create_array(row.len() as u32).ok()?;
+                        for (idx, value) in row.get_values().enumerate() {
+                            let js_value = to_js_value(&self.env, value);
+                            raw_array.set(idx as u32, js_value).ok()?;
+                        }
 
-                    let mut raw_array = self.env.create_array(row.len() as u32).ok()?;
-                    for (idx, value) in row.get_values().enumerate() {
-                        let js_value = to_js_value(&self.env, value);
-                        raw_array.set(idx as u32, js_value).ok()?;
+                        Some(raw_array.coerce_to_object().ok()?.into_unknown())
                     }
+                    PresentationMode::Pluck => {
+                        let (_, value) = row.get_values().enumerate().next()?;
+                        to_js_value(&self.env, value).ok()
+                    }
+                    PresentationMode::None => {
+                        let mut js_row = self.env.create_object().ok()?;
+                        for (idx, value) in row.get_values().enumerate() {
+                            let key = stmt.get_column_name(idx);
+                            let js_value = to_js_value(&self.env, value);
+                            js_row.set_named_property(&key, js_value).ok()?;
+                        }
 
-                    // TODO: fix this unwrap
-                    return Some(raw_array.coerce_to_object().unwrap());
+                        Some(js_row.into_unknown())
+                    }
                 }
-
-                if self.pluck {
-                    assert!(!self.raw, "Cannot use pluck mode with raw mode");
-
-                    let (idx, value) = row.get_values().enumerate().next()?;
-                    let key = stmt.get_column_name(idx);
-                    let js_value = to_js_value(&self.env, value);
-                    js_row.set_named_property(&key, js_value).ok()?;
-                    return Some(js_row);
-                }
-
-                for (idx, value) in row.get_values().enumerate() {
-                    let key = stmt.get_column_name(idx);
-                    let js_value = to_js_value(&self.env, value);
-                    js_row.set_named_property(&key, js_value).ok()?;
-                }
-
-                Some(js_row)
             }
             limbo_core::StepResult::Done => None,
             limbo_core::StepResult::IO => {
                 self.database.io.run_once().ok()?;
-                None // clearly it's incorrect it should return to user
+                None // clearly it's incorrect, it should return to user
             }
             limbo_core::StepResult::Interrupt | limbo_core::StepResult::Busy => None,
         }

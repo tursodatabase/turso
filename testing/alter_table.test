@@ -3,9 +3,114 @@
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 
-# ALTER TABLE _ RENAME TO _
 do_execsql_test_on_specific_db {:memory:} alter-table-rename-table {
-    CREATE TABLE t1(x INTEGER PRIMARY KEY);
+    CREATE TABLE t1(x INTEGER PRIMARY KEY, u UNIQUE);
     ALTER TABLE t1 RENAME TO t2;
-    SELECT tbl_name FROM sqlite_schema;
+    SELECT name FROM sqlite_schema WHERE type = 'table';
 } { "t2" }
+
+do_execsql_test_on_specific_db {:memory:} alter-table-rename-column {
+    CREATE TABLE t(a);
+    CREATE INDEX i ON t(a);
+    ALTER TABLE t RENAME a TO b;
+    SELECT sql FROM sqlite_schema;
+} {
+    "CREATE TABLE t(b)"
+    "CREATE INDEX i ON t(b)"
+}
+
+do_execsql_test_on_specific_db {:memory:} alter-table-add-column {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
+    SELECT * FROM t;
+
+    ALTER TABLE t ADD b;
+    SELECT sql FROM sqlite_schema;
+    SELECT * FROM t;
+} {
+  "1"
+  "CREATE TABLE t(a, b)"
+  "1|"
+}
+
+do_execsql_test_on_specific_db {:memory:} alter-table-add-column-typed {
+    CREATE TABLE t(a);
+    ALTER TABLE t ADD b DEFAULT 0;
+
+    SELECT sql FROM sqlite_schema;
+
+    INSERT INTO t (a) VALUES (1);
+    SELECT * FROM t;
+} {
+  "CREATE TABLE t(a, b DEFAULT 0)"
+  "1|0"
+}
+
+do_execsql_test_on_specific_db {:memory:} alter-table-add-column-default {
+    CREATE TABLE test(a);
+    INSERT INTO test VALUES (1), (2), (3);
+
+    ALTER TABLE test ADD b DEFAULT 0.1;
+    ALTER TABLE test ADD c DEFAULT 'hello';
+    SELECT * FROM test;
+
+    CREATE INDEX idx ON test (b);
+    SELECT b, c FROM test WHERE b = 0.1;
+
+    ALTER TABLE test DROP a;
+    SELECT * FROM test;
+
+} {
+  "1|0.1|hello"
+  "2|0.1|hello"
+  "3|0.1|hello"
+
+  "0.1|hello"
+  "0.1|hello"
+  "0.1|hello"
+
+  "0.1|hello"
+  "0.1|hello"
+  "0.1|hello"
+}
+
+do_execsql_test_on_specific_db {:memory:} alter-table-drop-column {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
+    SELECT * FROM t;
+
+    ALTER TABLE t DROP b;
+    SELECT sql FROM sqlite_schema;
+
+    SELECT * FROM t;
+} {
+  "1|1"
+  "2|2"
+  "3|3"
+
+  "CREATE TABLE t(a)"
+
+  "1"
+  "2"
+  "3"
+}
+
+do_execsql_test_in_memory_any_error fail-alter-table-drop-unique-column {
+    CREATE TABLE t(a, b UNIQUE);
+    ALTER TABLE t DROP b;
+}
+
+do_execsql_test_in_memory_any_error fail-alter-table-drop-unique-column-constraint {
+    CREATE TABLE t(a, b, UNIQUE (b));
+    ALTER TABLE t DROP b;
+}
+
+do_execsql_test_in_memory_any_error fail-alter-table-drop-primary-key-column {
+    CREATE TABLE t(a PRIMARY KEY, b);
+    ALTER TABLE t DROP a;
+}
+
+do_execsql_test_in_memory_any_error fail-alter-table-drop-primary-key-column-constrait {
+    CREATE TABLE t(a, b, PRIMARY KEY (a));
+    ALTER TABLE t DROP a;
+}

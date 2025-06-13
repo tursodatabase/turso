@@ -1,4 +1,5 @@
 #![allow(clippy::arc_with_non_send_sync, dead_code)]
+use anyhow::{anyhow, Context};
 use clap::Parser;
 use generation::plan::{Interaction, InteractionPlan, InteractionPlanState};
 use generation::ArbitraryFrom;
@@ -16,6 +17,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
+use tracing_subscriber::field::MakeExt;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -49,14 +51,14 @@ impl Paths {
     }
 }
 
-fn main() -> Result<(), String> {
+fn main() -> anyhow::Result<()> {
     init_logger();
     let mut cli_opts = SimulatorCLI::parse();
     cli_opts.validate()?;
 
     match cli_opts.subcommand {
         Some(SimulatorCommand::List) => {
-            let mut bugbase = BugBase::load().map_err(|e| format!("{:?}", e))?;
+            let mut bugbase = BugBase::load()?;
             bugbase.list_bugs()
         }
         Some(SimulatorCommand::Loop { n, short_circuit }) => {
@@ -76,7 +78,7 @@ fn main() -> Result<(), String> {
             Ok(())
         }
         Some(SimulatorCommand::Test { filter }) => {
-            let mut bugbase = BugBase::load().map_err(|e| format!("{:?}", e))?;
+            let mut bugbase = BugBase::load()?;
             let bugs = bugbase.load_bugs()?;
             let mut bugs = bugs
                 .into_iter()
@@ -127,11 +129,11 @@ fn main() -> Result<(), String> {
     }
 }
 
-fn testing_main(cli_opts: &SimulatorCLI) -> Result<(), String> {
+fn testing_main(cli_opts: &SimulatorCLI) -> anyhow::Result<()> {
     let mut bugbase = if cli_opts.disable_bugbase {
         None
     } else {
-        Some(BugBase::load().map_err(|e| format!("{:?}", e))?)
+        Some(BugBase::load()?)
     };
 
     let last_execution = Arc::new(Mutex::new(Execution::new(0, 0, 0)));
@@ -143,7 +145,7 @@ fn testing_main(cli_opts: &SimulatorCLI) -> Result<(), String> {
         return Ok(());
     }
 
-    let result = if cli_opts.differential {
+    let mut result = if cli_opts.differential {
         differential_testing(
             seed,
             bugbase.as_mut(),
@@ -162,6 +164,18 @@ fn testing_main(cli_opts: &SimulatorCLI) -> Result<(), String> {
             plans,
             last_execution.clone(),
         )
+    };
+
+    if let Err(err) = integrity_check(&paths.db) {
+        tracing::error!("simulation failed: integrity check failed:\n{}", err);
+        if result.is_err() {
+            result = result
+                .with_context(|| anyhow!("simulation failed: integrity check failed:\n{}", err));
+        } else {
+            result = Err(err);
+        }
+    } else if let Some(bugbase) = bugbase.as_mut() {
+        bugbase.mark_successful_run(seed, cli_opts).unwrap();
     };
 
     // Print the seed, the locations of the database and the plan file at the end again for easily accessing them.
@@ -237,7 +251,7 @@ fn run_simulator(
     env: SimulatorEnv,
     plans: Vec<InteractionPlan>,
     last_execution: Arc<Mutex<Execution>>,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     std::panic::set_hook(Box::new(move |info| {
         tracing::error!("panic occurred");
 
@@ -278,9 +292,6 @@ fn run_simulator(
             SandboxedResult::Correct => {
                 tracing::info!("simulation succeeded");
                 println!("simulation succeeded");
-                if let Some(bugbase) = bugbase {
-                    bugbase.mark_successful_run(seed, cli_opts).unwrap();
-                }
                 Ok(())
             }
             SandboxedResult::Panicked {
@@ -350,6 +361,8 @@ fn run_simulator(
                     ) => {
                         if e1 != e2 {
                             tracing::error!(
+                                ?shrunk,
+                                ?result,
                                 "shrinking failed, the error was not properly reproduced"
                             );
                             if let Some(bugbase) = bugbase {
@@ -357,7 +370,7 @@ fn run_simulator(
                                     .add_bug(seed, plans[0].clone(), Some(error.clone()), cli_opts)
                                     .unwrap();
                             }
-                            Err(format!("failed with error: '{}'", error))
+                            Err(anyhow!("failed with error: '{}'", error))
                         } else {
                             tracing::info!(
                                 "shrinking succeeded, reduced the plan from {} to {}",
@@ -375,20 +388,24 @@ fn run_simulator(
                                     )
                                     .unwrap();
                             }
-                            Err(format!("failed with error: '{}'", e1))
+                            Err(anyhow!("failed with error: '{}'", e1))
                         }
                     }
                     (_, SandboxedResult::Correct) => {
                         unreachable!("shrinking should never be called on a correct simulation")
                     }
                     _ => {
-                        tracing::error!("shrinking failed, the error was not properly reproduced");
+                        tracing::error!(
+                            ?shrunk,
+                            ?result,
+                            "shrinking failed, the error was not properly reproduced"
+                        );
                         if let Some(bugbase) = bugbase {
                             bugbase
                                 .add_bug(seed, plans[0].clone(), Some(error.clone()), cli_opts)
                                 .unwrap();
                         }
-                        Err(format!("failed with error: '{}'", error))
+                        Err(anyhow!("failed with error: '{}'", error))
                     }
                 }
             }
@@ -404,7 +421,7 @@ fn doublecheck(
     plans: &[InteractionPlan],
     last_execution: Arc<Mutex<Execution>>,
     result: SandboxedResult,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     let env = SimulatorEnv::new(seed, cli_opts, &paths.doublecheck_db);
     let env = Arc::new(Mutex::new(env));
 
@@ -456,9 +473,6 @@ fn doublecheck(
         Ok(_) => {
             tracing::info!("doublecheck succeeded");
             println!("doublecheck succeeded");
-            if let Some(bugbase) = bugbase {
-                bugbase.mark_successful_run(seed, cli_opts)?;
-            }
             Ok(())
         }
         Err(e) => {
@@ -468,7 +482,7 @@ fn doublecheck(
                     .add_bug(seed, plans[0].clone(), Some(e.clone()), cli_opts)
                     .unwrap();
             }
-            Err(format!("doublecheck failed: '{}'", e))
+            Err(anyhow!("doublecheck failed: '{}'", e))
         }
     }
 }
@@ -480,7 +494,7 @@ fn differential_testing(
     paths: &Paths,
     plans: Vec<InteractionPlan>,
     last_execution: Arc<Mutex<Execution>>,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     let env = Arc::new(Mutex::new(SimulatorEnv::new(seed, cli_opts, &paths.db)));
     let rusqlite_env = Arc::new(Mutex::new(SimulatorEnv::new(
         seed,
@@ -506,9 +520,6 @@ fn differential_testing(
         SandboxedResult::Correct => {
             tracing::info!("simulation succeeded, output of Limbo conforms to SQLite");
             println!("simulation succeeded, output of Limbo conforms to SQLite");
-            if let Some(bugbase) = bugbase {
-                bugbase.mark_successful_run(seed, cli_opts).unwrap();
-            }
             Ok(())
         }
         SandboxedResult::Panicked { error, .. } | SandboxedResult::FoundBug { error, .. } => {
@@ -518,7 +529,7 @@ fn differential_testing(
                     .add_bug(seed, plans[0].clone(), Some(error.clone()), cli_opts)
                     .unwrap();
             }
-            Err(format!("simulation failed: '{}'", error))
+            Err(anyhow!("simulation failed: '{}'", error))
         }
     }
 }
@@ -698,7 +709,8 @@ fn init_logger() {
                 .with_ansi(true)
                 .with_line_number(true)
                 .without_time()
-                .with_thread_ids(false),
+                .with_thread_ids(false)
+                .map_fmt_fields(|f| f.debug_alt()),
         )
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(
@@ -707,7 +719,8 @@ fn init_logger() {
                 .with_ansi(false)
                 .with_line_number(true)
                 .without_time()
-                .with_thread_ids(false),
+                .with_thread_ids(false)
+                .map_fmt_fields(|f| f.debug_alt()),
         )
         .try_init();
 }
@@ -738,3 +751,25 @@ const BANNER: &str = r#"
    \____________________________/
 
 "#;
+
+fn integrity_check(db_path: &Path) -> anyhow::Result<()> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    let mut stmt = conn.prepare("SELECT * FROM pragma_integrity_check;")?;
+    let mut rows = stmt.query(())?;
+    let mut result: Vec<String> = Vec::new();
+
+    while let Some(row) = rows.next()? {
+        result.push(row.get(0)?);
+    }
+    if result.is_empty() {
+        anyhow::bail!("simulation failed: integrity_check should return `ok` or a list of problems")
+    }
+    if !result[0].eq_ignore_ascii_case("ok") {
+        // Build a list of problems
+        result
+            .iter_mut()
+            .for_each(|row| *row = format!("- {}", row));
+        anyhow::bail!("simulation failed: {}", result.join("\n"))
+    }
+    Ok(())
+}

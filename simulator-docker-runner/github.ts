@@ -1,5 +1,5 @@
 import { App } from "octokit";
-import { StackTraceInfo } from "./logParse";
+import { AssertionFailureInfo, StackTraceInfo } from "./logParse";
 import { levenshtein } from "./levenshtein";
 
 type FaultPanic = {
@@ -13,7 +13,7 @@ type FaultAssertion = {
   type: "assertion"
   seed: string
   command: string
-  output: string
+  failureInfo: AssertionFailureInfo
 }
 
 type FaultTimeout = {
@@ -26,6 +26,9 @@ type FaultTimeout = {
 type Fault = FaultPanic | FaultTimeout | FaultAssertion;
 
 const MAX_OPEN_SIMULATOR_ISSUES = parseInt(process.env.MAX_OPEN_SIMULATOR_ISSUES || "10", 10);
+
+const GITHUB_ISSUE_TITLE_MAX_LENGTH = 256;
+const GITHUB_ISSUE_BODY_MAX_LENGTH = 65536;
 
 export class GithubClient {
   /* This is the git hash of the commit that the simulator was built from. */
@@ -84,15 +87,16 @@ export class GithubClient {
       await this.initialize();
     }
 
-    const title = ((f: Fault) => {
+    let title = ((f: Fault) => {
       if (f.type === "panic") {
         return `Simulator panic: "${f.stackTrace.mainError}"`;
       } else 
       if (f.type === "assertion") {
-        return `Simulator assertion failure: "${f.output}"`;
+        return `Simulator assertion failure: "${f.failureInfo.mainError}"`;
       }
       return `Simulator timeout using git hash ${this.GIT_HASH}`;
     })(fault);
+    title = title.slice(0, GITHUB_ISSUE_TITLE_MAX_LENGTH);
     for (const existingIssueTitle of this.openIssueTitles) {
       const MAGIC_NUMBER = 6;
       if (levenshtein(existingIssueTitle, title) < MAGIC_NUMBER) {
@@ -101,7 +105,8 @@ export class GithubClient {
       }
     }
 
-    const body = this.createIssueBody(fault);
+    let body = this.createIssueBody(fault);
+    body = body.slice(0, GITHUB_ISSUE_BODY_MAX_LENGTH);
 
     if (this.mode === 'dry-run') {
       console.log(`Dry-run mode: Would create issue in ${this.GITHUB_REPO} with title: ${title} and body: ${body}`);
@@ -133,7 +138,7 @@ export class GithubClient {
   private createIssueBody(fault: Fault): string {
     const gitShortHash = this.GIT_HASH.substring(0, 7);
     return `
- ## Simulator ${fault.type}
+ ## Simulator failure type:${fault.type}
  
  - **Seed**: ${fault.seed}
  - **Git Hash**: ${this.GIT_HASH}
@@ -151,7 +156,7 @@ export class GithubClient {
  ### ${fault.type === "panic" ? "Stack Trace" : "Output"}
  
  \`\`\`
- ${fault.type === "panic" ? fault.stackTrace.trace : fault.output}
+ ${fault.type === "panic" ? fault.stackTrace.trace : fault.type === "assertion" ? fault.failureInfo.output : fault.output}
  \`\`\`
  `;
   }

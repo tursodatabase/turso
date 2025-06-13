@@ -687,16 +687,85 @@ public final class JDBC4DatabaseMetaData implements DatabaseMetaData {
     return null;
   }
 
+  // TODO: make use of getSearchStringEscape
   @Override
-  @SkipNullableCheck
   public ResultSet getTables(
       @Nullable String catalog,
       @Nullable String schemaPattern,
       String tableNamePattern,
       @Nullable String[] types)
       throws SQLException {
-    // TODO: after union is supported
-    return null;
+    // SQLite doesn't support catalogs or schemas — reject if non-empty values provided
+    if (catalog != null && !catalog.isEmpty()) {
+      return connection.prepareStatement("SELECT * FROM sqlite_schema WHERE 1=0").executeQuery();
+    }
+
+    if (schemaPattern != null && !schemaPattern.isEmpty()) {
+      return connection.prepareStatement("SELECT * FROM sqlite_schema WHERE 1=0").executeQuery();
+    }
+
+    // Start building query
+    StringBuilder sql =
+        new StringBuilder(
+            "SELECT "
+                + "NULL AS TABLE_CAT, "
+                + "NULL AS TABLE_SCHEM, "
+                + "name AS TABLE_NAME, "
+                + "CASE type "
+                + "  WHEN 'table' THEN 'TABLE' "
+                + "  WHEN 'view' THEN 'VIEW' "
+                + "  ELSE UPPER(type) "
+                + "END AS TABLE_TYPE, "
+                + "NULL AS REMARKS, "
+                + "NULL AS TYPE_CAT, "
+                + "NULL AS TYPE_SCHEM, "
+                + "NULL AS TYPE_NAME, "
+                + "NULL AS SELF_REFERENCING_COL_NAME, "
+                + "NULL AS REF_GENERATION "
+                + "FROM sqlite_schema "
+                + "WHERE 1=1");
+
+    // Apply type filtering if needed
+    if (types != null && types.length > 0) {
+      sql.append(" AND type IN (");
+      for (int i = 0; i < types.length; i++) {
+        if (i > 0) sql.append(", ");
+        sql.append("?");
+      }
+      sql.append(")");
+    }
+
+    // Apply table name pattern filtering
+    if (tableNamePattern != null) {
+      sql.append(" AND name LIKE ?");
+    }
+
+    // Comply with spec: sort by TABLE_TYPE, TABLE_CAT, TABLE_SCHEM, TABLE_NAME
+    sql.append(" ORDER BY TABLE_TYPE, TABLE_CAT, TABLE_SCHEM, TABLE_NAME");
+
+    // Prepare and bind statement
+    PreparedStatement stmt = connection.prepareStatement(sql.toString());
+    int paramIndex = 1;
+
+    if (types != null && types.length > 0) {
+      for (String type : types) {
+        String sqliteType;
+        if ("TABLE".equalsIgnoreCase(type)) {
+          sqliteType = "table";
+        } else if ("VIEW".equalsIgnoreCase(type)) {
+          sqliteType = "view";
+        } else {
+          sqliteType = type.toLowerCase();
+        }
+        stmt.setString(paramIndex++, sqliteType);
+      }
+    }
+
+    if (tableNamePattern != null) {
+      stmt.setString(paramIndex, tableNamePattern);
+    }
+
+    return stmt.executeQuery();
   }
 
   @Override

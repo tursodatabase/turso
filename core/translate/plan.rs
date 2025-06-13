@@ -1,13 +1,6 @@
-use core::fmt;
 use limbo_ext::{ConstraintInfo, ConstraintOp};
 use limbo_sqlite3_parser::ast::{self, SortOrder};
-use std::{
-    cell::Cell,
-    cmp::Ordering,
-    fmt::{Display, Formatter},
-    rc::Rc,
-    sync::Arc,
-};
+use std::{cell::Cell, cmp::Ordering, rc::Rc, sync::Arc};
 
 use crate::{
     function::AggFunc,
@@ -24,7 +17,7 @@ use crate::{schema::Type, types::SeekOp, util::can_pushdown_predicate};
 
 use limbo_sqlite3_parser::ast::TableInternalId;
 
-use super::{emitter::OperationMode, planner::determine_where_to_eval_term, schema::ParseSchema};
+use super::{emitter::OperationMode, planner::determine_where_to_eval_term};
 
 #[derive(Debug, Clone)]
 pub struct ResultSetColumn {
@@ -299,8 +292,8 @@ impl Ord for EvalAt {
 pub enum Plan {
     Select(SelectPlan),
     CompoundSelect {
-        first: SelectPlan,
-        rest: Vec<(SelectPlan, ast::CompoundOperator)>,
+        left: Vec<(SelectPlan, ast::CompoundOperator)>,
+        right_most: SelectPlan,
         limit: Option<isize>,
         offset: Option<isize>,
         order_by: Option<Vec<(ast::Expr, SortOrder)>>,
@@ -571,7 +564,6 @@ pub struct UpdatePlan {
     // whether the WHERE clause is always false
     pub contains_constant_false_condition: bool,
     pub indexes_to_update: Vec<Arc<Index>>,
-    pub parse_schema: ParseSchema,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1174,220 +1166,5 @@ pub struct Aggregate {
 impl Aggregate {
     pub fn is_distinct(&self) -> bool {
         self.distinctness.is_distinct()
-    }
-}
-
-impl Display for Aggregate {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        let args_str = self
-            .args
-            .iter()
-            .map(|arg| arg.to_string())
-            .collect::<Vec<String>>()
-            .join(", ");
-        write!(f, "{:?}({})", self.func, args_str)
-    }
-}
-
-/// For EXPLAIN QUERY PLAN
-impl Display for Plan {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Select(select_plan) => select_plan.fmt(f),
-            Self::CompoundSelect {
-                first,
-                rest,
-                limit,
-                offset,
-                order_by,
-            } => {
-                first.fmt(f)?;
-                for (plan, operator) in rest {
-                    writeln!(f, "{}", operator)?;
-                    plan.fmt(f)?;
-                }
-                if let Some(limit) = limit {
-                    writeln!(f, "LIMIT: {}", limit)?;
-                }
-                if let Some(offset) = offset {
-                    writeln!(f, "OFFSET: {}", offset)?;
-                }
-                if let Some(order_by) = order_by {
-                    writeln!(f, "ORDER BY:")?;
-                    for (expr, dir) in order_by {
-                        writeln!(
-                            f,
-                            "  - {} {}",
-                            expr,
-                            if *dir == SortOrder::Asc {
-                                "ASC"
-                            } else {
-                                "DESC"
-                            }
-                        )?;
-                    }
-                }
-                Ok(())
-            }
-            Self::Delete(delete_plan) => delete_plan.fmt(f),
-            Self::Update(update_plan) => update_plan.fmt(f),
-        }
-    }
-}
-
-impl Display for SelectPlan {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        writeln!(f, "QUERY PLAN")?;
-
-        // Print each table reference with appropriate indentation based on join depth
-        for (i, reference) in self.table_references.joined_tables().iter().enumerate() {
-            let is_last = i == self.table_references.joined_tables().len() - 1;
-            let indent = if i == 0 {
-                if is_last { "`--" } else { "|--" }.to_string()
-            } else {
-                format!(
-                    "   {}{}",
-                    "|  ".repeat(i - 1),
-                    if is_last { "`--" } else { "|--" }
-                )
-            };
-
-            match &reference.op {
-                Operation::Scan { .. } => {
-                    let table_name = if reference.table.get_name() == reference.identifier {
-                        reference.identifier.clone()
-                    } else {
-                        format!("{} AS {}", reference.table.get_name(), reference.identifier)
-                    };
-
-                    writeln!(f, "{}SCAN {}", indent, table_name)?;
-                }
-                Operation::Search(search) => match search {
-                    Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
-                        writeln!(
-                            f,
-                            "{}SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
-                            indent, reference.identifier
-                        )?;
-                    }
-                    Search::Seek {
-                        index: Some(index), ..
-                    } => {
-                        writeln!(
-                            f,
-                            "{}SEARCH {} USING INDEX {}",
-                            indent, reference.identifier, index.name
-                        )?;
-                    }
-                },
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Display for DeletePlan {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        writeln!(f, "QUERY PLAN")?;
-
-        // Delete plan should only have one table reference
-        if let Some(reference) = self.table_references.joined_tables().first() {
-            let indent = "`--";
-
-            match &reference.op {
-                Operation::Scan { .. } => {
-                    let table_name = if reference.table.get_name() == reference.identifier {
-                        reference.identifier.clone()
-                    } else {
-                        format!("{} AS {}", reference.table.get_name(), reference.identifier)
-                    };
-
-                    writeln!(f, "{}DELETE FROM {}", indent, table_name)?;
-                }
-                Operation::Search { .. } => {
-                    panic!("DELETE plans should not contain search operations");
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-impl fmt::Display for UpdatePlan {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "QUERY PLAN")?;
-
-        for (i, reference) in self.table_references.joined_tables().iter().enumerate() {
-            let is_last = i == self.table_references.joined_tables().len() - 1;
-            let indent = if i == 0 {
-                if is_last { "`--" } else { "|--" }.to_string()
-            } else {
-                format!(
-                    "   {}{}",
-                    "|  ".repeat(i - 1),
-                    if is_last { "`--" } else { "|--" }
-                )
-            };
-
-            match &reference.op {
-                Operation::Scan { .. } => {
-                    let table_name = if reference.table.get_name() == reference.identifier {
-                        reference.identifier.clone()
-                    } else {
-                        format!("{} AS {}", reference.table.get_name(), reference.identifier)
-                    };
-
-                    if i == 0 {
-                        writeln!(f, "{}UPDATE {}", indent, table_name)?;
-                    } else {
-                        writeln!(f, "{}SCAN {}", indent, table_name)?;
-                    }
-                }
-                Operation::Search(search) => match search {
-                    Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
-                        writeln!(
-                            f,
-                            "{}SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
-                            indent, reference.identifier
-                        )?;
-                    }
-                    Search::Seek {
-                        index: Some(index), ..
-                    } => {
-                        writeln!(
-                            f,
-                            "{}SEARCH {} USING INDEX {}",
-                            indent, reference.identifier, index.name
-                        )?;
-                    }
-                },
-            }
-        }
-        if let Some(order_by) = &self.order_by {
-            writeln!(f, "ORDER BY:")?;
-            for (expr, dir) in order_by {
-                writeln!(
-                    f,
-                    "  - {} {}",
-                    expr,
-                    if *dir == SortOrder::Asc {
-                        "ASC"
-                    } else {
-                        "DESC"
-                    }
-                )?;
-            }
-        }
-        if let Some(limit) = self.limit {
-            writeln!(f, "LIMIT: {}", limit)?;
-        }
-        if let Some(ret) = &self.returning {
-            writeln!(f, "RETURNING:")?;
-            for col in ret {
-                writeln!(f, "  - {}", col.expr)?;
-            }
-        }
-
-        Ok(())
     }
 }

@@ -17,8 +17,6 @@ use super::plan::{
 };
 use super::planner::bind_column_references;
 use super::planner::{parse_limit, parse_where};
-use super::schema::ParseSchema;
-
 /*
 * Update is simple. By default we scan the table, and for each row, we check the WHERE
 * clause. If it evaluates to true, we build the new record with the updated value and insert.
@@ -53,15 +51,9 @@ pub fn translate_update(
     schema: &Schema,
     body: &mut Update,
     syms: &SymbolTable,
-    parse_schema: ParseSchema,
     mut program: ProgramBuilder,
 ) -> crate::Result<ProgramBuilder> {
-    let mut plan = prepare_update_plan(
-        schema,
-        body,
-        parse_schema,
-        &mut program.table_reference_counter,
-    )?;
+    let mut plan = prepare_update_plan(schema, body, &mut program.table_reference_counter)?;
     optimize_plan(&mut plan, schema)?;
     // TODO: freestyling these numbers
     let opts = ProgramBuilderOpts {
@@ -71,14 +63,35 @@ pub fn translate_update(
         approx_num_labels: 4,
     };
     program.extend(&opts);
-    emit_program(&mut program, plan, schema, syms)?;
+    emit_program(&mut program, plan, schema, syms, |_| {})?;
+    Ok(program)
+}
+
+pub fn translate_update_with_after(
+    query_mode: QueryMode,
+    schema: &Schema,
+    body: &mut Update,
+    syms: &SymbolTable,
+    mut program: ProgramBuilder,
+    after: impl FnOnce(&mut ProgramBuilder),
+) -> crate::Result<ProgramBuilder> {
+    let mut plan = prepare_update_plan(schema, body, &mut program.table_reference_counter)?;
+    optimize_plan(&mut plan, schema)?;
+    // TODO: freestyling these numbers
+    let opts = ProgramBuilderOpts {
+        query_mode,
+        num_cursors: 1,
+        approx_num_insns: 20,
+        approx_num_labels: 4,
+    };
+    program.extend(&opts);
+    emit_program(&mut program, plan, schema, syms, after)?;
     Ok(program)
 }
 
 pub fn prepare_update_plan(
     schema: &Schema,
     body: &mut Update,
-    parse_schema: ParseSchema,
     table_ref_counter: &mut TableRefIdCounter,
 ) -> crate::Result<Plan> {
     if body.with.is_some() {
@@ -215,6 +228,5 @@ pub fn prepare_update_plan(
         offset,
         contains_constant_false_condition: false,
         indexes_to_update,
-        parse_schema,
     }))
 }

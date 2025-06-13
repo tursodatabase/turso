@@ -58,6 +58,30 @@ pub struct SimulatorCLI {
     pub disable_create_index: bool,
     #[clap(long, help = "disable DROP Statement", default_value_t = false)]
     pub disable_drop: bool,
+    #[clap(
+        long,
+        help = "disable Insert-Values-Select Property",
+        default_value_t = false
+    )]
+    pub disable_insert_values_select: bool,
+    #[clap(
+        long,
+        help = "disable Double-Create-Failure Property",
+        default_value_t = false
+    )]
+    pub disable_double_create_failure: bool,
+    #[clap(long, help = "disable Select-Limit Property", default_value_t = false)]
+    pub disable_select_limit: bool,
+    #[clap(long, help = "disable Delete-Select Property", default_value_t = false)]
+    pub disable_delete_select: bool,
+    #[clap(long, help = "disable Drop-Select Property", default_value_t = false)]
+    pub disable_drop_select: bool,
+    #[clap(
+        long,
+        help = "disable Select-Select-Optimizer Property",
+        default_value_t = false
+    )]
+    pub disable_select_optimizer: bool,
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
@@ -93,12 +117,12 @@ pub enum SimulatorCommand {
 }
 
 impl SimulatorCLI {
-    pub fn validate(&mut self) -> Result<(), String> {
+    pub fn validate(&mut self) -> anyhow::Result<()> {
         if self.minimum_tests < 1 {
-            return Err("minimum size must be at least 1".to_string());
+            anyhow::bail!("minimum size must be at least 1");
         }
         if self.maximum_tests < 1 {
-            return Err("maximum size must be at least 1".to_string());
+            anyhow::bail!("maximum size must be at least 1");
         }
 
         if self.minimum_tests > self.maximum_tests {
@@ -112,7 +136,7 @@ impl SimulatorCLI {
         }
 
         if self.seed.is_some() && self.load.is_some() {
-            return Err("Cannot set seed and load plan at the same time".to_string());
+            anyhow::bail!("Cannot set seed and load plan at the same time");
         }
 
         Ok(())

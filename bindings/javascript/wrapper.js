@@ -22,6 +22,11 @@ class Database {
           return db.inTransaction();
         },
       },
+      name: {
+        get() {
+          return path;
+        },
+      },
     });
   }
 
@@ -88,8 +93,8 @@ class Database {
     const pragma = `PRAGMA ${source}`;
 
     return simple
-      ? this.db.pragma(pragma, true)
-      : this.db.pragma(pragma, false);
+      ? this.db.pragma(source, { simple: true })
+      : this.db.pragma(source);
   }
 
   backup(filename, options) {
@@ -173,8 +178,16 @@ class Statement {
     return this;
   }
 
+  get source() {
+    return this.stmt.source;
+  }
+
   get reader() {
     throw new Error("not implemented");
+  }
+
+  get source() {
+    return this.stmt.source;
   }
 
   get database() {

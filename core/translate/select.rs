@@ -52,24 +52,26 @@ pub fn translate_select(
                 approx_num_labels: estimate_num_labels(select),
             }
         }
-        Plan::CompoundSelect { first, rest, .. } => {
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
             // Compound Selects must return the same number of columns
-            num_result_cols = first.result_columns.len();
+            num_result_cols = right_most.result_columns.len();
 
             ProgramBuilderOpts {
                 query_mode,
-                num_cursors: count_plan_required_cursors(first)
-                    + rest
+                num_cursors: count_plan_required_cursors(right_most)
+                    + left
                         .iter()
                         .map(|(plan, _)| count_plan_required_cursors(plan))
                         .sum::<usize>(),
-                approx_num_insns: estimate_num_instructions(first)
-                    + rest
+                approx_num_insns: estimate_num_instructions(right_most)
+                    + left
                         .iter()
                         .map(|(plan, _)| estimate_num_instructions(plan))
                         .sum::<usize>(),
-                approx_num_labels: estimate_num_labels(first)
-                    + rest
+                approx_num_labels: estimate_num_labels(right_most)
+                    + left
                         .iter()
                         .map(|(plan, _)| estimate_num_labels(plan))
                         .sum::<usize>(),
@@ -79,7 +81,7 @@ pub fn translate_select(
     };
 
     program.extend(&opts);
-    emit_program(&mut program, select_plan, schema, syms)?;
+    emit_program(&mut program, select_plan, schema, syms, |_| {})?;
     Ok(TranslateSelectResult {
         program,
         num_result_cols,
@@ -111,7 +113,7 @@ pub fn prepare_select_plan<'a>(
             )?))
         }
         Some(compounds) => {
-            let mut first = prepare_one_select_plan(
+            let mut last = prepare_one_select_plan(
                 schema,
                 *select.body.select,
                 None,
@@ -122,7 +124,8 @@ pub fn prepare_select_plan<'a>(
                 table_ref_counter,
                 query_destination.clone(),
             )?;
-            let mut rest = Vec::with_capacity(compounds.len());
+
+            let mut left = Vec::with_capacity(compounds.len());
             for CompoundSelect { select, operator } in compounds {
                 // TODO: add support for EXCEPT and INTERSECT
                 if operator != ast::CompoundOperator::UnionAll
@@ -132,7 +135,8 @@ pub fn prepare_select_plan<'a>(
                         "only UNION ALL and UNION are supported for compound SELECTs"
                     );
                 }
-                let plan = prepare_one_select_plan(
+                left.push((last, operator));
+                last = prepare_one_select_plan(
                     schema,
                     *select,
                     None,
@@ -143,21 +147,16 @@ pub fn prepare_select_plan<'a>(
                     table_ref_counter,
                     query_destination.clone(),
                 )?;
-                rest.push((plan, operator));
             }
-            // Ensure all subplans have same number of result columns
-            let first_num_result_columns = first.result_columns.len();
-            for (plan, operator) in rest.iter() {
-                if plan.result_columns.len() != first_num_result_columns {
+
+            // Ensure all subplans have the same number of result columns
+            let right_most_num_result_columns = last.result_columns.len();
+            for (plan, operator) in left.iter() {
+                if plan.result_columns.len() != right_most_num_result_columns {
                     crate::bail_parse_error!("SELECTs to the left and right of {} do not have the same number of result columns", operator);
                 }
             }
             let (limit, offset) = select.limit.map_or(Ok((None, None)), |l| parse_limit(&l))?;
-
-            first.limit = limit.clone();
-            for (plan, _) in rest.iter_mut() {
-                plan.limit = limit.clone();
-            }
 
             // FIXME: handle OFFSET for compound selects
             if offset.map_or(false, |o| o > 0) {
@@ -172,8 +171,8 @@ pub fn prepare_select_plan<'a>(
                 crate::bail_parse_error!("WITH is not supported for compound SELECTs yet");
             }
             Ok(Plan::CompoundSelect {
-                first,
-                rest,
+                left,
+                right_most: last,
                 limit,
                 offset,
                 order_by: None,

@@ -2,19 +2,19 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{model::table::Value, SimulatorEnv};
+use crate::{model::table::SimValue, SimulatorEnv};
 
-use super::select::Predicate;
+use super::predicate::Predicate;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Update {
     pub(crate) table: String,
-    pub(crate) set_values: Vec<(String, Value)>, // Pair of value for set expressions => SET name=value
+    pub(crate) set_values: Vec<(String, SimValue)>, // Pair of value for set expressions => SET name=value
     pub(crate) predicate: Predicate,
 }
 
 impl Update {
-    pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<Value>> {
+    pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<SimValue>> {
         let table = env
             .tables
             .iter_mut()

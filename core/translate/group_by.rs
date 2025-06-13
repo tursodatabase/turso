@@ -442,11 +442,7 @@ impl<'a> GroupByAggArgumentSource<'a> {
                 dest_reg_start,
                 ..
             } => {
-                program.emit_insn(Insn::Column {
-                    cursor_id: *cursor_id,
-                    column: *col_start,
-                    dest: dest_reg_start + arg_idx,
-                });
+                program.emit_column(*cursor_id, *col_start, dest_reg_start + arg_idx);
                 Ok(dest_reg_start + arg_idx)
             }
             GroupByAggArgumentSource::Register {
@@ -493,11 +489,7 @@ pub fn group_by_process_single_group(
             for i in 0..group_by.exprs.len() {
                 let sorter_column_index = i;
                 let group_reg = groups_start_reg + i;
-                program.emit_insn(Insn::Column {
-                    cursor_id: *pseudo_cursor,
-                    column: sorter_column_index,
-                    dest: group_reg,
-                });
+                program.emit_column(*pseudo_cursor, sorter_column_index, group_reg);
             }
             groups_start_reg
         }
@@ -617,11 +609,7 @@ pub fn group_by_process_single_group(
         } => {
             for (sorter_column_index, dest_reg) in column_register_mapping.iter().enumerate() {
                 if let Some(dest_reg) = dest_reg {
-                    program.emit_insn(Insn::Column {
-                        cursor_id: *pseudo_cursor,
-                        column: sorter_column_index,
-                        dest: *dest_reg,
-                    });
+                    program.emit_column(*pseudo_cursor, sorter_column_index, *dest_reg);
                 }
             }
         }
@@ -885,6 +873,7 @@ pub fn group_by_emit_row_phase<'a>(
 
     if let Some(having) = &group_by.having {
         for expr in having.iter() {
+            let if_true_target = program.allocate_label();
             translate_condition_expr(
                 program,
                 &plan.table_references,
@@ -892,10 +881,11 @@ pub fn group_by_emit_row_phase<'a>(
                 ConditionMetadata {
                     jump_if_condition_is_true: false,
                     jump_target_when_false: labels.label_group_by_end_without_emitting_row,
-                    jump_target_when_true: BranchOffset::Placeholder, // not used. FIXME: this is a bug. HAVING can have e.g. HAVING a OR b.
+                    jump_target_when_true: if_true_target,
                 },
                 &t_ctx.resolver,
             )?;
+            program.preassign_label_to_next_insn(if_true_target);
         }
     }
 

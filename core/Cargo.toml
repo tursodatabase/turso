@@ -30,6 +30,9 @@ testvfs = ["limbo_ext_tests/static"]
 static = ["limbo_ext/static"]
 fuzz = []
 csv = ["limbo_csv/static"]
+omit_autovacuum = []
+simulator = ["fuzz", "serde"]
+serde = ["dep:serde"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7.5", optional = true }
@@ -77,8 +80,9 @@ crossbeam-skiplist = "0.1.3"
 tracing = "0.1.41"
 ryu = "1.0.19"
 uncased = "0.9.10"
-strum_macros = {workspace = true }
+strum_macros = { workspace = true }
 bitflags = "2.9.0"
+serde = { workspace = true , optional = true, features = ["derive"] }
 
 [build-dependencies]
 chrono = { version = "0.4.38", default-features = false }

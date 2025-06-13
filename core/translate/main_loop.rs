@@ -4,7 +4,7 @@ use limbo_sqlite3_parser::ast::{self, SortOrder};
 use std::sync::Arc;
 
 use crate::{
-    schema::{Index, IndexColumn, Table},
+    schema::{Affinity, Index, IndexColumn, Table},
     translate::{
         plan::{DistinctCtx, Distinctness},
         result_row::emit_select_result,
@@ -87,6 +87,7 @@ pub fn init_distinct(program: &mut ProgramBuilder, plan: &mut SelectPlan) {
                     order: SortOrder::Asc,
                     pos_in_table: i,
                     collation: None, // FIXME: this should be determined based on the result column expression!
+                    default: None, // FIXME: this should be determined based on the result column expression!
                 })
                 .collect(),
             unique: false,
@@ -140,6 +141,7 @@ pub fn init_loop(
                 order: SortOrder::Asc,
                 pos_in_table: 0,
                 collation: None, // FIXME: this should be inferred from the expression
+                default: None,   // FIXME: this should be inferred from the expression
             }],
             has_rowid: false,
             unique: false,
@@ -1182,12 +1184,13 @@ fn emit_seek(
         seek.len
     };
     match seek.op {
-        SeekOp::GE => program.emit_insn(Insn::SeekGE {
+        SeekOp::GE { eq_only } => program.emit_insn(Insn::SeekGE {
             is_index,
             cursor_id: seek_cursor_id,
             start_reg,
             num_regs,
             target_pc: loop_end,
+            eq_only,
         }),
         SeekOp::GT => program.emit_insn(Insn::SeekGT {
             is_index,
@@ -1196,12 +1199,13 @@ fn emit_seek(
             num_regs,
             target_pc: loop_end,
         }),
-        SeekOp::LE => program.emit_insn(Insn::SeekLE {
+        SeekOp::LE { eq_only } => program.emit_insn(Insn::SeekLE {
             is_index,
             cursor_id: seek_cursor_id,
             start_reg,
             num_regs,
             target_pc: loop_end,
+            eq_only,
         }),
         SeekOp::LT => program.emit_insn(Insn::SeekLT {
             is_index,
@@ -1210,7 +1214,6 @@ fn emit_seek(
             num_regs,
             target_pc: loop_end,
         }),
-        SeekOp::EQ => panic!("An index seek is never EQ"),
     };
 
     Ok(())
@@ -1284,16 +1287,30 @@ fn emit_seek_termination(
     }
     program.preassign_label_to_next_insn(loop_start);
     let mut rowid_reg = None;
+    let mut affinity = None;
     if !is_index {
         rowid_reg = Some(program.alloc_register());
         program.emit_insn(Insn::RowId {
             cursor_id: seek_cursor_id,
             dest: rowid_reg.unwrap(),
         });
-    }
 
+        affinity = if let Some(table_ref) = tables
+            .joined_tables()
+            .iter()
+            .find(|t| t.columns().iter().any(|c| c.is_rowid_alias))
+        {
+            if let Some(rowid_col_idx) = table_ref.columns().iter().position(|c| c.is_rowid_alias) {
+                Some(table_ref.columns()[rowid_col_idx].affinity())
+            } else {
+                Some(Affinity::Numeric)
+            }
+        } else {
+            Some(Affinity::Numeric)
+        };
+    }
     match (is_index, termination.op) {
-        (true, SeekOp::GE) => program.emit_insn(Insn::IdxGE {
+        (true, SeekOp::GE { .. }) => program.emit_insn(Insn::IdxGE {
             cursor_id: seek_cursor_id,
             start_reg,
             num_regs,
@@ -1305,7 +1322,7 @@ fn emit_seek_termination(
             num_regs,
             target_pc: loop_end,
         }),
-        (true, SeekOp::LE) => program.emit_insn(Insn::IdxLE {
+        (true, SeekOp::LE { .. }) => program.emit_insn(Insn::IdxLE {
             cursor_id: seek_cursor_id,
             start_reg,
             num_regs,
@@ -1317,37 +1334,42 @@ fn emit_seek_termination(
             num_regs,
             target_pc: loop_end,
         }),
-        (false, SeekOp::GE) => program.emit_insn(Insn::Ge {
+        (false, SeekOp::GE { .. }) => program.emit_insn(Insn::Ge {
             lhs: rowid_reg.unwrap(),
             rhs: start_reg,
             target_pc: loop_end,
-            flags: CmpInsFlags::default(),
+            flags: CmpInsFlags::default()
+                .jump_if_null()
+                .with_affinity(affinity.unwrap()),
             collation: program.curr_collation(),
         }),
         (false, SeekOp::GT) => program.emit_insn(Insn::Gt {
             lhs: rowid_reg.unwrap(),
             rhs: start_reg,
             target_pc: loop_end,
-            flags: CmpInsFlags::default(),
+            flags: CmpInsFlags::default()
+                .jump_if_null()
+                .with_affinity(affinity.unwrap()),
             collation: program.curr_collation(),
         }),
-        (false, SeekOp::LE) => program.emit_insn(Insn::Le {
+        (false, SeekOp::LE { .. }) => program.emit_insn(Insn::Le {
             lhs: rowid_reg.unwrap(),
             rhs: start_reg,
             target_pc: loop_end,
-            flags: CmpInsFlags::default(),
+            flags: CmpInsFlags::default()
+                .jump_if_null()
+                .with_affinity(affinity.unwrap()),
             collation: program.curr_collation(),
         }),
         (false, SeekOp::LT) => program.emit_insn(Insn::Lt {
             lhs: rowid_reg.unwrap(),
             rhs: start_reg,
             target_pc: loop_end,
-            flags: CmpInsFlags::default(),
+            flags: CmpInsFlags::default()
+                .jump_if_null()
+                .with_affinity(affinity.unwrap()),
             collation: program.curr_collation(),
         }),
-        (_, SeekOp::EQ) => {
-            panic!("An index termination condition is never EQ")
-        }
     };
 
     Ok(())
@@ -1385,11 +1407,7 @@ fn emit_autoindex(
     let ephemeral_cols_start_reg = program.alloc_registers(num_regs_to_reserve);
     for (i, col) in index.columns.iter().enumerate() {
         let reg = ephemeral_cols_start_reg + i;
-        program.emit_insn(Insn::Column {
-            cursor_id: table_cursor_id,
-            column: col.pos_in_table,
-            dest: reg,
-        });
+        program.emit_column(table_cursor_id, col.pos_in_table, reg);
     }
     if table_has_rowid {
         program.emit_insn(Insn::RowId {

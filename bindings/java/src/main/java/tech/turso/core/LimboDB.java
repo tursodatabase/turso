@@ -41,6 +41,7 @@ public final class LimboDB implements AutoCloseable {
   enum Architecture {
     MACOS_ARM64("libs/macos_arm64/lib_limbo_java.dylib", ".dylib"),
     MACOS_X86("libs/macos_x86/lib_limbo_java.dylib", ".dylib"),
+    LINUX_X86("libs/linux_x86/lib_limbo_java.so", ".so"),
     WINDOWS("libs/windows/lib_limbo_java.dll", ".dll"),
     UNSUPPORTED("", "");
 
@@ -63,6 +64,16 @@ public final class LimboDB implements AutoCloseable {
     public static Architecture detect() {
       String osName = System.getProperty("os.name").toLowerCase();
       String osArch = System.getProperty("os.arch").toLowerCase();
+
+      // TODO: add support for arm64 on Linux
+      if (osName.contains("linux")) {
+        if (osArch.contains("aarch64") || osArch.contains("arm64")) {
+          throw new UnsupportedOperationException(
+              "ARM64 architecture is not supported on Linux yet");
+        } else if (osArch.contains("x86_64") || osArch.contains("amd64")) {
+          return LINUX_X86;
+        }
+      }
 
       if (osName.contains("mac")) {
         if (osArch.contains("aarch64") || osArch.contains("arm64")) {

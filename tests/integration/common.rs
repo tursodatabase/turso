@@ -214,6 +214,7 @@ pub(crate) fn limbo_exec_rows_error(
 mod tests {
     use std::vec;
 
+    use rand::Rng;
     use tempfile::TempDir;
 
     use super::{limbo_exec_rows, limbo_exec_rows_error, TempDatabase};
@@ -279,6 +280,73 @@ mod tests {
             let err = limbo_exec_rows_error(&db, &conn, "INSERT INTO t values (1)").unwrap_err();
             assert!(matches!(err, limbo_core::LimboError::ReadOnly), "{:?}", err);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_unique_index_ordering() -> anyhow::Result<()> {
+        let db = TempDatabase::new_empty();
+        let conn = db.connect_limbo();
+
+        let _ = limbo_exec_rows(&db, &conn, "CREATE TABLE t(x INTEGER UNIQUE)");
+
+        // Insert 100 random integers between -1000 and 1000
+        let mut expected = Vec::new();
+        let mut rng = rand::rng();
+        let mut i = 0;
+        while i < 100 {
+            let val = rng.random_range(-1000..1000);
+            if expected.contains(&val) {
+                continue;
+            }
+            i += 1;
+            expected.push(val);
+            let ret = limbo_exec_rows(&db, &conn, &format!("INSERT INTO t VALUES ({})", val));
+            assert!(ret.is_empty(), "Insert failed for value {}: {:?}", val, ret);
+        }
+
+        // Sort expected values to match index order
+        expected.sort();
+
+        // Query all values and verify they come back in sorted order
+        let ret = limbo_exec_rows(&db, &conn, "SELECT x FROM t");
+        let actual: Vec<i64> = ret
+            .into_iter()
+            .map(|row| match &row[0] {
+                Value::Integer(i) => *i,
+                _ => panic!("Expected integer value"),
+            })
+            .collect();
+
+        assert_eq!(actual, expected, "Values not returned in sorted order");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_large_unique_blobs() -> anyhow::Result<()> {
+        let path = TempDir::new().unwrap().keep().join("temp_read_only");
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+
+        let _ = limbo_exec_rows(&db, &conn, "CREATE TABLE t(x BLOB UNIQUE)");
+
+        // Insert 11 unique 1MB blobs
+        for i in 0..11 {
+            println!("Inserting blob #{}", i);
+            let ret = limbo_exec_rows(&db, &conn, "INSERT INTO t VALUES (randomblob(1024*1024))");
+            assert!(ret.is_empty(), "Insert #{} failed: {:?}", i, ret);
+        }
+
+        // Verify we have 11 rows
+        let ret = limbo_exec_rows(&db, &conn, "SELECT count(*) FROM t");
+        assert_eq!(
+            ret,
+            vec![vec![Value::Integer(11)]],
+            "Expected 11 rows but got {:?}",
+            ret
+        );
+
         Ok(())
     }
 }

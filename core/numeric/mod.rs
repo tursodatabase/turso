@@ -1,6 +1,6 @@
 use crate::Value;
 
-mod nonnan;
+pub mod nonnan;
 
 use nonnan::NonNan;
 

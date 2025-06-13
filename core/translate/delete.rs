@@ -36,7 +36,7 @@ pub fn translate_delete(
         approx_num_labels: 0,
     };
     program.extend(&opts);
-    emit_program(&mut program, delete_plan, schema, syms)?;
+    emit_program(&mut program, delete_plan, schema, syms, |_| {})?;
     Ok(program)
 }
 

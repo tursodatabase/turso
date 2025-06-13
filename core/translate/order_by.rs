@@ -166,11 +166,11 @@ pub fn emit_order_by(
     let start_reg = t_ctx.reg_result_cols_start.unwrap();
     for i in 0..result_columns.len() {
         let reg = start_reg + i;
-        program.emit_insn(Insn::Column {
+        program.emit_column(
             cursor_id,
-            column: t_ctx.result_column_indexes_in_orderby_sorter[i],
-            dest: reg,
-        });
+            t_ctx.result_column_indexes_in_orderby_sorter[i],
+            reg,
+        );
     }
 
     emit_result_row_and_limit(

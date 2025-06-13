@@ -119,8 +119,17 @@ public final class LimboResultSet {
     this.open = false;
   }
 
-  // Note that columnIndex starts from 1
-  @Nullable
+  public Object get(String columnName) throws SQLException {
+    final int columnsLength = this.columnNames.length;
+    for (int i = 0; i < columnsLength; i++) {
+      if (this.columnNames[i].equals(columnName)) {
+        return get(i + 1);
+      }
+    }
+
+    throw new SQLException("column name " + columnName + " not found");
+  }
+
   public Object get(int columnIndex) throws SQLException {
     if (!this.isOpen()) {
       throw new SQLException("ResultSet is not open");

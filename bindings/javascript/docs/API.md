@@ -28,8 +28,6 @@ Prepares a SQL statement for execution.
 
 The function returns a `Statement` object.
 
-This function is currently not supported.
-
 ### transaction(function) ⇒ function
 
 Returns a function that runs the given function in a transaction.
@@ -38,11 +36,21 @@ Returns a function that runs the given function in a transaction.
 | -------- | --------------------- | ------------------------------------- |
 | function | <code>function</code> | The function to run in a transaction. |
 
-This function is currently not supported.
-
 ### pragma(string, [options]) ⇒ results
 
-This function is currently not supported.
+Executes the given PRAGMA and returns its results.
+
+| Param    | Type                  | Description           |
+| -------- | --------------------- | ----------------------|
+| source   | <code>string</code>   | Pragma to be executed |
+| options  | <code>object</code>   | Options.              |
+
+Most PRAGMA return a single value, the `simple: boolean` option is provided to return the first column of the first row.
+
+```js
+db.pragma('cache_size = 32000');
+console.log(db.pragma('cache_size', { simple: true })); // => 32000
+```
 
 ### backup(destination, [options]) ⇒ promise
 
@@ -68,7 +76,9 @@ This function is currently not supported.
 
 Loads a SQLite3 extension
 
-This function is currently not supported.
+| Param  | Type                | Description                              |
+| ------ | ------------------- | -----------------------------------------|
+| path   | <code>string</code> | The path to the extention to be loaded.  |
 
 ### exec(sql) ⇒ this
 
@@ -78,7 +88,7 @@ Executes a SQL statement.
 | ------ | ------------------- | ------------------------------------ |
 | sql    | <code>string</code> | The SQL statement string to execute. |
 
-This function is currently not supported.
+This can execute strings that contain multiple SQL statements.
 
 ### interrupt() ⇒ this
 
@@ -92,15 +102,15 @@ This function is currently not supported.
 
 Closes the database connection.
 
-This function is currently not supported.
-
 # class Statement
 
 ## Methods
 
 ### run([...bindParameters]) ⇒ object
 
-Executes the SQL statement and returns an info object.
+Executes the SQL statement and (currently) returns an array with results.
+
+**Note:** It should return an info object. 
 
 | Param          | Type                          | Description                                      |
 | -------------- | ----------------------------- | ------------------------------------------------ |
@@ -118,8 +128,6 @@ Executes the SQL statement and returns the first row.
 | -------------- | ----------------------------- | ------------------------------------------------ |
 | bindParameters | <code>array of objects</code> | The bind parameters for executing the statement. |
 
-This function is currently not supported.
-
 ### all([...bindParameters]) ⇒ array of rows
 
 Executes the SQL statement and returns an array of the resulting rows.
@@ -127,8 +135,6 @@ Executes the SQL statement and returns an array of the resulting rows.
 | Param          | Type                          | Description                                      |
 | -------------- | ----------------------------- | ------------------------------------------------ |
 | bindParameters | <code>array of objects</code> | The bind parameters for executing the statement. |
-
-This function is currently not supported.
 
 ### iterate([...bindParameters]) ⇒ iterator
 
@@ -138,11 +144,21 @@ Executes the SQL statement and returns an iterator to the resulting rows.
 | -------------- | ----------------------------- | ------------------------------------------------ |
 | bindParameters | <code>array of objects</code> | The bind parameters for executing the statement. |
 
-This function is currently not supported.
-
 ### pluck([toggleState]) ⇒ this
 
-This function is currently not supported.
+Makes the prepared statement only return the value of the first column of any rows that it retrieves.
+
+| Param          | Type                          | Description                                      |
+| -------------- | ----------------------------- | ------------------------------------------------ |
+| pluckMode       | <code>boolean</code>          | Enable of disable pluck mode. If you don't pass the paramenter, pluck mode is enabled.          |
+
+```js
+stmt.pluck(); // plucking ON
+stmt.pluck(true); // plucking ON
+stmt.pluck(false); // plucking OFF
+```
+
+> NOTE: When plucking is turned on, raw mode is turned off (they are mutually exclusive options).
 
 ### expand([toggleState]) ⇒ this
 
@@ -150,7 +166,7 @@ This function is currently not supported.
 
 ### raw([rawMode]) ⇒ this
 
-Toggle raw mode.
+Makes the prepared statement return rows as arrays instead of objects.
 
 | Param   | Type                 | Description                                                                       |
 | ------- | -------------------- | --------------------------------------------------------------------------------- |
@@ -158,7 +174,13 @@ Toggle raw mode.
 
 This function enables or disables raw mode. Prepared statements return objects by default, but if raw mode is enabled, the functions return arrays instead.
 
-This function is currently not supported.
+```js
+stmt.raw(); // raw mode ON
+stmt.raw(true); // raw mode ON
+stmt.raw(false); // raw mode OFF
+```
+
+> NOTE: When raw mode is turned on, plucking is turned off (they are mutually exclusive options).
 
 ### columns() ⇒ array of objects
 
@@ -168,4 +190,8 @@ This function is currently not supported.
 
 ### bind([...bindParameters]) ⇒ this
 
-This function is currently not supported.
+| Param          | Type                          | Description                                      |
+| -------------- | ----------------------------- | ------------------------------------------------ |
+| bindParameters | <code>array of objects</code> | The bind parameters for executing the statement. |
+
+Binds **permanently** the given parameters to the statement. After a statement's parameters are bound this way, you may no longer provide it with execution-specific (temporary) bound parameters.

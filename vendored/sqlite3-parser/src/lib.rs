@@ -6,3 +6,4 @@ pub mod dialect;
 pub mod lexer;
 mod parser;
 pub use parser::ast;
+pub mod to_sql_string;

@@ -152,9 +152,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.97"
+version = "1.0.98"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dcfed56ad506cb2c684a14971b8861fdc3baaaae314b9e5f9bb532cbe3ba7a4f"
+checksum = "e16d2d3311acee920a9eb8d33b8cbc1787ce4a264e85f964c2404b969bdcd487"
 
 [[package]]
 name = "arrayref"
@@ -240,6 +240,9 @@ name = "bitflags"
 version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c8214115b7bf84099f1309324e63141d4c5d7cc26862f97a0a857dbefe165bd"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "blake3"
@@ -1428,6 +1431,7 @@ checksum = "3954d50fe15b02142bf25d3b8bdadb634ec3948f103d04ffe3031bc8fe9d7058"
 dependencies = [
  "equivalent",
  "hashbrown 0.15.2",
+ "serde",
 ]
 
 [[package]]
@@ -1841,6 +1845,7 @@ dependencies = [
  "rusqlite",
  "rustix 1.0.7",
  "ryu",
+ "serde",
  "sorted-vec",
  "strum",
  "strum_macros",
@@ -1954,11 +1959,14 @@ name = "limbo_sim"
 version = "0.0.22-pre.1"
 dependencies = [
  "anarchist-readable-name-generator-lib",
+ "anyhow",
  "chrono",
  "clap",
  "dirs 6.0.0",
  "env_logger 0.10.2",
+ "hex",
  "limbo_core",
+ "limbo_sqlite3_parser",
  "log",
  "notify",
  "rand 0.8.5",
@@ -2000,6 +2008,7 @@ dependencies = [
  "phf",
  "phf_codegen",
  "phf_shared",
+ "serde",
  "strum",
  "strum_macros",
  "uncased",

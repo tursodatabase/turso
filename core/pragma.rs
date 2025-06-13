@@ -69,6 +69,10 @@ fn pragma_for(pragma: PragmaName) -> Pragma {
             &["user_version"],
         ),
         WalCheckpoint => Pragma::new(PragmaFlags::NeedSchema, &["busy", "log", "checkpointed"]),
+        AutoVacuum => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["auto_vacuum"],
+        ),
     }
 }
 

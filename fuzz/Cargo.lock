@@ -523,9 +523,9 @@ checksum = "8355be11b20d696c8f18f6cc018c4e372165b1fa8126cef092399c9951984ffa"
 
 [[package]]
 name = "libmimalloc-sys"
-version = "0.1.39"
+version = "0.1.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23aa6811d3bd4deb8a84dde645f943476d13b248d818edcf8ce0b2f37f036b44"
+checksum = "ec9d6fac27761dabcd4ee73571cdb06b7022dc99089acbe5435691edffaac0f4"
 dependencies = [
  "cc",
  "libc",
@@ -566,8 +566,9 @@ dependencies = [
 
 [[package]]
 name = "limbo_core"
-version = "0.0.19"
+version = "0.0.21"
 dependencies = [
+ "bitflags",
  "built",
  "cfg_block",
  "chrono",
@@ -590,16 +591,18 @@ dependencies = [
  "rand",
  "regex",
  "regex-syntax",
- "rustix",
+ "rustix 1.0.7",
  "ryu",
  "strum",
+ "strum_macros",
  "thiserror 1.0.69",
  "tracing",
+ "uncased",
 ]
 
 [[package]]
 name = "limbo_ext"
-version = "0.0.19"
+version = "0.0.21"
 dependencies = [
  "chrono",
  "getrandom 0.3.1",
@@ -608,7 +611,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_macros"
-version = "0.0.19"
+version = "0.0.21"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -617,7 +620,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sqlite3_parser"
-version = "0.0.19"
+version = "0.0.21"
 dependencies = [
  "bitflags",
  "cc",
@@ -636,7 +639,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_time"
-version = "0.0.19"
+version = "0.0.21"
 dependencies = [
  "chrono",
  "limbo_ext",
@@ -648,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_uuid"
-version = "0.0.19"
+version = "0.0.21"
 dependencies = [
  "limbo_ext",
  "mimalloc",
@@ -660,6 +663,12 @@ name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d26c52dbd32dccf2d10cac7725f8eae5296885fb5703b261f7d0a0739ec807ab"
+
+[[package]]
+name = "linux-raw-sys"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd945864f07fe9f5371a27ad7b52a172b4b499999f1d97574c9fa68373937e12"
 
 [[package]]
 name = "litemap"
@@ -691,21 +700,20 @@ checksum = "78ca9ab1a0babb1e7d5695e3530886289c18cf2f87ec19a575a0abdce112e3a3"
 
 [[package]]
 name = "miette"
-version = "7.5.0"
+version = "7.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a955165f87b37fd1862df2a59547ac542c77ef6d17c666f619d1ad22dd89484"
+checksum = "5f98efec8807c63c752b5bd61f862c165c115b0a35685bdcfd9238c7aeb592b7"
 dependencies = [
  "cfg-if",
  "miette-derive",
- "thiserror 1.0.69",
  "unicode-width",
 ]
 
 [[package]]
 name = "miette-derive"
-version = "7.5.0"
+version = "7.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf45bf44ab49be92fd1227a3be6fc6f617f1a337c06af54981048574d8783147"
+checksum = "db5b29714e950dbb20d5e6f74f9dcec4edbcc1067bb7f8ed198c097b8c1a818b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -714,9 +722,9 @@ dependencies = [
 
 [[package]]
 name = "mimalloc"
-version = "0.1.43"
+version = "0.1.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68914350ae34959d83f732418d51e2427a794055d0b9529f48259ac07af65633"
+checksum = "995942f432bbb4822a7e9c3faa87a695185b0d09273ba85f097b54f4e458f2af"
 dependencies = [
  "libmimalloc-sys",
 ]
@@ -826,7 +834,7 @@ dependencies = [
  "concurrent-queue",
  "hermit-abi",
  "pin-project-lite",
- "rustix",
+ "rustix 0.38.44",
  "tracing",
  "windows-sys",
 ]
@@ -949,7 +957,20 @@ dependencies = [
  "bitflags",
  "errno",
  "libc",
- "linux-raw-sys",
+ "linux-raw-sys 0.4.15",
+ "windows-sys",
+]
+
+[[package]]
+name = "rustix"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c71e83d6afe7ff64890ec6b71d6a69bb8a610ab78ce364b3352876bb4c801266"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys 0.9.4",
  "windows-sys",
 ]
 

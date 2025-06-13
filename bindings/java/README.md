@@ -18,7 +18,7 @@ maven local to use it.
 ```shell
 $ cd bindings/java 
 
-# Please select the appropriate target platform, currently supports `macos_x86`, `macos_arm64`, `windows`
+# Please select the appropriate target platform, currently supports `macos_x86`, `macos_arm64`, `windows` and `linux_x86`
 $ make macos_x86
 
 # deploy to maven local 

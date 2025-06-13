@@ -6,7 +6,10 @@ use constraints::{
 use cost::Cost;
 use join::{compute_best_join_order, BestJoinOrderResult};
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
-use limbo_sqlite3_parser::ast::{self, Expr, SortOrder};
+use limbo_sqlite3_parser::{
+    ast::{self, Expr, SortOrder},
+    to_sql_string::ToSqlString as _,
+};
 use order::{compute_order_target, plan_satisfies_order_target, EliminatesSort};
 
 use crate::{
@@ -32,19 +35,24 @@ pub(crate) mod join;
 pub(crate) mod lift_common_subexpressions;
 pub(crate) mod order;
 
+#[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub fn optimize_plan(plan: &mut Plan, schema: &Schema) -> Result<()> {
     match plan {
-        Plan::Select(plan) => optimize_select_plan(plan, schema),
-        Plan::Delete(plan) => optimize_delete_plan(plan, schema),
-        Plan::Update(plan) => optimize_update_plan(plan, schema),
-        Plan::CompoundSelect { first, rest, .. } => {
-            optimize_select_plan(first, schema)?;
-            for (plan, _) in rest {
+        Plan::Select(plan) => optimize_select_plan(plan, schema)?,
+        Plan::Delete(plan) => optimize_delete_plan(plan, schema)?,
+        Plan::Update(plan) => optimize_update_plan(plan, schema)?,
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            optimize_select_plan(right_most, schema)?;
+            for (plan, _) in left {
                 optimize_select_plan(plan, schema)?;
             }
-            Ok(())
         }
     }
+    // When debug tracing is enabled, print the optimized plan as a SQL string for debugging
+    tracing::debug!(plan_sql = plan.to_sql_string(&crate::translate::display::PlanContext(&[])));
+    Ok(())
 }
 
 /**
@@ -77,7 +85,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
     Ok(())
 }
 
-fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
+fn optimize_delete_plan(plan: &mut DeletePlan, _schema: &Schema) -> Result<()> {
     rewrite_exprs_delete(plan)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
@@ -86,18 +94,20 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
         return Ok(());
     }
 
-    let _ = optimize_table_access(
-        &mut plan.table_references,
-        &schema.indexes,
-        &mut plan.where_clause,
-        &mut plan.order_by,
-        &mut None,
-    )?;
+    // FIXME: don't use indexes for delete right now because it's buggy. See for example:
+    // https://github.com/tursodatabase/limbo/issues/1714
+    // let _ = optimize_table_access(
+    //     &mut plan.table_references,
+    //     &schema.indexes,
+    //     &mut plan.where_clause,
+    //     &mut plan.order_by,
+    //     &mut None,
+    // )?;
 
     Ok(())
 }
 
-fn optimize_update_plan(plan: &mut UpdatePlan, schema: &Schema) -> Result<()> {
+fn optimize_update_plan(plan: &mut UpdatePlan, _schema: &Schema) -> Result<()> {
     rewrite_exprs_update(plan)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
@@ -105,13 +115,18 @@ fn optimize_update_plan(plan: &mut UpdatePlan, schema: &Schema) -> Result<()> {
         plan.contains_constant_false_condition = true;
         return Ok(());
     }
-    let _ = optimize_table_access(
-        &mut plan.table_references,
-        &schema.indexes,
-        &mut plan.where_clause,
-        &mut plan.order_by,
-        &mut None,
-    )?;
+    // FIXME: don't use indexes for update right now because it's not safe to traverse an index
+    // while also updating the same table, things go wrong.
+    // e.g. in 'explain update t set x=x+5 where x > 10;' where x is an indexed column,
+    // sqlite first creates an ephemeral index to store the current values so the tree traversal
+    // doesn't get messed up while updating.
+    // let _ = optimize_table_access(
+    //     &mut plan.table_references,
+    //     &schema.indexes,
+    //     &mut plan.where_clause,
+    //     &mut plan.order_by,
+    //     &mut None,
+    // )?;
     Ok(())
 }
 
@@ -763,6 +778,7 @@ fn ephemeral_index_build(
             order: SortOrder::Asc,
             pos_in_table: i,
             collation: c.collation,
+            default: c.default.clone(),
         })
         // only include columns that are used in the query
         .filter(|c| table_reference.column_is_used(c.pos_in_table))
@@ -880,7 +896,7 @@ fn build_seek_def(
             seek: Some(SeekKey {
                 len: key_len,
                 null_pad: false,
-                op: SeekOp::GE,
+                op: SeekOp::GE { eq_only: true },
             }),
             termination: Some(TerminationKey {
                 len: key_len,
@@ -904,8 +920,8 @@ fn build_seek_def(
                     (
                         key_len - 1,
                         key_len,
-                        SeekOp::LE.reverse(),
-                        SeekOp::LE.reverse(),
+                        SeekOp::LE { eq_only: false }.reverse(),
+                        SeekOp::LE { eq_only: false }.reverse(),
                     )
                 };
             SeekDef {
@@ -942,12 +958,17 @@ fn build_seek_def(
         (IterationDirection::Forwards, ast::Operator::GreaterEquals) => {
             let (seek_key_len, termination_key_len, seek_op, termination_op) =
                 if sort_order_of_last_key == SortOrder::Asc {
-                    (key_len, key_len - 1, SeekOp::GE, SeekOp::GT)
+                    (
+                        key_len,
+                        key_len - 1,
+                        SeekOp::GE { eq_only: false },
+                        SeekOp::GT,
+                    )
                 } else {
                     (
                         key_len - 1,
                         key_len,
-                        SeekOp::LE.reverse(),
+                        SeekOp::LE { eq_only: false }.reverse(),
                         SeekOp::LT.reverse(),
                     )
                 };
@@ -985,9 +1006,19 @@ fn build_seek_def(
         (IterationDirection::Forwards, ast::Operator::Less) => {
             let (seek_key_len, termination_key_len, seek_op, termination_op) =
                 if sort_order_of_last_key == SortOrder::Asc {
-                    (key_len - 1, key_len, SeekOp::GT, SeekOp::GE)
+                    (
+                        key_len - 1,
+                        key_len,
+                        SeekOp::GT,
+                        SeekOp::GE { eq_only: false },
+                    )
                 } else {
-                    (key_len, key_len - 1, SeekOp::GT, SeekOp::GE)
+                    (
+                        key_len,
+                        key_len - 1,
+                        SeekOp::GT,
+                        SeekOp::GE { eq_only: false },
+                    )
                 };
             SeekDef {
                 key,
@@ -1028,8 +1059,8 @@ fn build_seek_def(
                     (
                         key_len,
                         key_len - 1,
-                        SeekOp::LE.reverse(),
-                        SeekOp::LE.reverse(),
+                        SeekOp::LE { eq_only: false }.reverse(),
+                        SeekOp::LE { eq_only: false }.reverse(),
                     )
                 };
             SeekDef {
@@ -1065,7 +1096,7 @@ fn build_seek_def(
             iter_dir,
             seek: Some(SeekKey {
                 len: key_len,
-                op: SeekOp::LE,
+                op: SeekOp::LE { eq_only: true },
                 null_pad: false,
             }),
             termination: Some(TerminationKey {
@@ -1085,13 +1116,18 @@ fn build_seek_def(
         (IterationDirection::Backwards, ast::Operator::Less) => {
             let (seek_key_len, termination_key_len, seek_op, termination_op) =
                 if sort_order_of_last_key == SortOrder::Asc {
-                    (key_len, key_len - 1, SeekOp::LT, SeekOp::LE)
+                    (
+                        key_len,
+                        key_len - 1,
+                        SeekOp::LT,
+                        SeekOp::LE { eq_only: false },
+                    )
                 } else {
                     (
                         key_len - 1,
                         key_len,
                         SeekOp::GT.reverse(),
-                        SeekOp::GE.reverse(),
+                        SeekOp::GE { eq_only: false }.reverse(),
                     )
                 };
             SeekDef {
@@ -1128,7 +1164,12 @@ fn build_seek_def(
         (IterationDirection::Backwards, ast::Operator::LessEquals) => {
             let (seek_key_len, termination_key_len, seek_op, termination_op) =
                 if sort_order_of_last_key == SortOrder::Asc {
-                    (key_len, key_len - 1, SeekOp::LE, SeekOp::LE)
+                    (
+                        key_len,
+                        key_len - 1,
+                        SeekOp::LE { eq_only: false },
+                        SeekOp::LE { eq_only: false },
+                    )
                 } else {
                     (
                         key_len - 1,
@@ -1171,7 +1212,12 @@ fn build_seek_def(
         (IterationDirection::Backwards, ast::Operator::Greater) => {
             let (seek_key_len, termination_key_len, seek_op, termination_op) =
                 if sort_order_of_last_key == SortOrder::Asc {
-                    (key_len - 1, key_len, SeekOp::LE, SeekOp::LE)
+                    (
+                        key_len - 1,
+                        key_len,
+                        SeekOp::LE { eq_only: false },
+                        SeekOp::LE { eq_only: false },
+                    )
                 } else {
                     (
                         key_len,
@@ -1214,12 +1260,17 @@ fn build_seek_def(
         (IterationDirection::Backwards, ast::Operator::GreaterEquals) => {
             let (seek_key_len, termination_key_len, seek_op, termination_op) =
                 if sort_order_of_last_key == SortOrder::Asc {
-                    (key_len - 1, key_len, SeekOp::LE, SeekOp::LT)
+                    (
+                        key_len - 1,
+                        key_len,
+                        SeekOp::LE { eq_only: false },
+                        SeekOp::LT,
+                    )
                 } else {
                     (
                         key_len,
                         key_len - 1,
-                        SeekOp::GE.reverse(),
+                        SeekOp::GE { eq_only: false }.reverse(),
                         SeekOp::GT.reverse(),
                     )
                 };

@@ -207,3 +207,18 @@ do_execsql_test distinct_agg_functions {
 } {Aaron|1769|33|53.6060606060606
 Abigail|833|15|55.5333333333333
 Adam|1517|30|50.5666666666667}
+
+do_execsql_test_on_specific_db {:memory:} having_or {
+  CREATE TABLE users (first_name TEXT, age INTEGER);
+  INSERT INTO users VALUES
+    ('Michael', 25), ('Michael', 50),
+    ('David', 50),
+    ('Sarah', 65);
+
+  select first_name, count(*) as cnt, avg(age) as avg_age
+  from users
+  group by first_name
+  having cnt = 2 or avg_age = 65
+  order by cnt desc
+} {Michael|2|37.5
+Sarah|1|65.0}
