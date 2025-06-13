@@ -792,6 +792,9 @@ fn populate_column_registers(
             )?;
             if write_directly_to_rowid_reg {
                 program.emit_insn(Insn::SoftNull { reg: target_reg });
+            } else if let Some(_check_constraint) = &mapping.column.check_constraint {
+                translate_check_constraint(&mapping, value, program, target_reg, resolver)?;
+                //translate_expr(program, None, check_constraint, target_reg, resolver)?;
             }
         } else if let Some(default_expr) = mapping.default_value {
             translate_expr_no_constant_opt(
@@ -880,4 +883,98 @@ fn translate_virtual_table_insert(
     program.resolve_label(halt_label, program.offset());
 
     Ok(program)
+}
+
+fn translate_check_constraint(
+    column_mapping: &ColumnMapping,
+    values: &[Expr],
+    program: &mut ProgramBuilder,
+    target_reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let mut check_constraint = column_mapping
+        .column
+        .check_constraint
+        .clone()
+        .expect("Check Contraint must be present");
+
+    use crate::ast;
+    use crate::translate::expr::walk_expr_mut;
+    walk_expr_mut(
+        &mut check_constraint,
+        &mut |expr: &mut Expr| -> Result<()> {
+            match expr {
+                ast::Expr::Id(_id) => {
+                    let maybe_val = values
+                        .get(column_mapping.value_index.expect("Must be present"))
+                        .expect("must be present");
+                    *expr = maybe_val.clone();
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        },
+    )?;
+    use crate::error::SQLITE_CONSTRAINT;
+    match check_constraint {
+        ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) => {
+            let lhs_reg = program.alloc_register();
+            translate_expr(program, None, &lhs, lhs_reg, resolver)?;
+            let rhs_reg = program.alloc_register();
+            translate_expr(program, None, &rhs, rhs_reg, resolver)?;
+            let label = program.allocate_label();
+            use crate::vdbe::insn::CmpInsFlags;
+            program.emit_insn(Insn::Eq {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                target_pc: label,
+                flags: CmpInsFlags::default(),
+                collation: program.curr_collation(),
+            });
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_CONSTRAINT,
+                description: format!(
+                    "{}.{}",
+                    "todo:some_name".to_string(),
+                    "todo:some_column".to_string()
+                ),
+            });
+            program.preassign_label_to_next_insn(label);
+        }
+        ast::Expr::Binary(_, _, _) => {
+            let reg = program.alloc_register();
+            translate_expr(program, None, &check_constraint, reg, resolver)?;
+            let label = program.allocate_label();
+            program.emit_insn(Insn::If {
+                reg: reg,
+                target_pc: label,
+                jump_if_null: false,
+            });
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_CONSTRAINT,
+                description: format!(
+                    "{}.{}",
+                    "todo:some_name".to_string(),
+                    "todo:some_column".to_string()
+                ),
+            });
+            program.preassign_label_to_next_insn(label);
+        }
+        ast::Expr::Literal(_) => {
+            translate_expr(program, None, &check_constraint, target_reg, resolver)?;
+            let label = program.allocate_label();
+            program.emit_insn(Insn::Goto { target_pc: label });
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_CONSTRAINT,
+                description: format!(
+                    "{}.{}",
+                    "todo:some_name".to_string(),
+                    "todo:some_column".to_string()
+                ),
+            });
+            program.preassign_label_to_next_insn(label);
+        }
+        _ => todo!(),
+    }
+    Ok(())
 }

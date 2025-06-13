@@ -1584,6 +1584,12 @@ pub fn op_halt(
                 description
             )));
         }
+        SQLITE_CONSTRAINT => {
+            return Err(LimboError::Constraint(format!(
+                "CHECK constraint failed: {} (19)",
+                description
+            )));
+        }
         _ => {
             return Err(LimboError::Constraint(format!(
                 "undocumented halt error code {}",
