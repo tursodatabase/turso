@@ -229,7 +229,7 @@ pub fn translate_create_index(
 
     program.emit_insn(Insn::Expire {
         expire_all: false,
-        deferred: true
+        deferred: true,
     });
     // Close the final sqlite_schema cursor
     program.emit_insn(Insn::Close {

@@ -771,7 +771,7 @@ impl Connection {
                     original_sql,
                 )?;
                 Ok(program)
-            },
+            }
             Cmd::Explain(_stmt) => todo!(),
             Cmd::ExplainQueryPlan(_stmt) => todo!(),
         }
