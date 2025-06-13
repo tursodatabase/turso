@@ -3012,7 +3012,7 @@ impl BTreeCursor {
                     assert_eq!(left_pointer, page.get().get().id as u32);
                     // FIXME: remove this lock
                     assert!(
-                        left_pointer <= self.pager.db_header.lock().database_size,
+                        left_pointer <= self.pager.db_header()?.database_size,
                         "invalid page number divider left pointer {} > database number of pages",
                         left_pointer,
                     );
@@ -4638,7 +4638,7 @@ impl BTreeCursor {
                 }
                 OverflowState::ProcessPage { next_page } => {
                     if next_page < 2
-                        || next_page as usize > self.pager.db_header.lock().database_size as usize
+                        || next_page as usize > self.pager.db_header()?.database_size as usize
                     {
                         self.overflow_state = None;
                         return Err(LimboError::Corrupt("Invalid overflow page number".into()));
@@ -6138,18 +6138,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        fast_lock::SpinLock,
         io::{Buffer, Completion, MemoryIO, OpenFlags, IO},
-        storage::{
-            database::DatabaseFile,
-            page_cache::DumbLruPageCache,
-            pager::CreateBTreeFlags,
-            sqlite3_ondisk::{self, DatabaseHeader},
-        },
+        storage::{database::DatabaseFile, page_cache::DumbLruPageCache, pager::CreateBTreeFlags},
         types::Text,
         vdbe::Register,
-        BufferPool, Connection, DatabaseStorage, StepResult, WalFile, WalFileShared,
-        WriteCompletion,
+        BufferPool, Connection, StepResult, WalFile, WalFileShared, WriteCompletion,
     };
     use std::{
         cell::RefCell, collections::HashSet, mem::transmute, ops::Deref, panic, rc::Rc, sync::Arc,
@@ -6482,32 +6475,30 @@ mod tests {
     }
 
     fn empty_btree() -> (Rc<Pager>, usize) {
-        let db_header = DatabaseHeader::default();
-        let page_size = db_header.get_page_size();
+        let page_size = 4096;
 
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let io_file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
         let db_file = Arc::new(DatabaseFile::new(io_file));
+        let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
 
-        let buffer_pool = Rc::new(BufferPool::new(page_size as usize));
-        let wal_shared = WalFileShared::open_shared(&io, "test.wal", page_size).unwrap();
-        let wal_file = WalFile::new(io.clone(), page_size, wal_shared, buffer_pool.clone());
+        let buffer_pool = Rc::new(BufferPool::new(Some(page_size as usize)));
+        let wal_shared = WalFileShared::new_shared(page_size, &io, wal_file).unwrap();
+        let wal_file = WalFile::new(io.clone(), wal_shared, buffer_pool.clone());
         let wal = Rc::new(RefCell::new(wal_file));
 
         let page_cache = Arc::new(parking_lot::RwLock::new(DumbLruPageCache::new(2000)));
-        let pager = {
-            let db_header = Arc::new(SpinLock::new(db_header.clone()));
-            Pager::finish_open(db_header, db_file, wal, io, page_cache, buffer_pool).unwrap()
-        };
+        let pager = { Pager::new(db_file, wal, io, page_cache, buffer_pool).unwrap() };
         let pager = Rc::new(pager);
         // FIXME: handle page cache is full
-        let page1 = pager.allocate_page().unwrap();
-        let page1 = Arc::new(BTreePageInner {
-            page: RefCell::new(page1),
+        pager.allocate_page1().unwrap();
+        let page2 = pager.allocate_page().unwrap();
+        let page2 = Arc::new(BTreePageInner {
+            page: RefCell::new(page2),
         });
-        btree_init_page(&page1, PageType::TableLeaf, 0, 4096);
-        (pager, page1.get().get().id)
+        btree_init_page(&page2, PageType::TableLeaf, 0, 4096);
+        (pager, page2.get().get().id)
     }
 
     #[test]
@@ -6986,14 +6977,10 @@ mod tests {
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
-    fn setup_test_env(database_size: u32) -> (Rc<Pager>, Arc<SpinLock<DatabaseHeader>>) {
+    fn setup_test_env(database_size: u32) -> Rc<Pager> {
         let page_size = 512;
-        let mut db_header = DatabaseHeader::default();
-        db_header.update_page_size(page_size);
-        db_header.database_size = database_size;
-        let db_header = Arc::new(SpinLock::new(db_header));
 
-        let buffer_pool = Rc::new(BufferPool::new(10));
+        let buffer_pool = Rc::new(BufferPool::new(Some(page_size as usize)));
 
         // Initialize buffer pool with correctly sized buffers
         for _ in 0..10 {
@@ -7006,29 +6993,16 @@ mod tests {
             io.open_file("test.db", OpenFlags::Create, false).unwrap(),
         ));
 
-        let drop_fn = Rc::new(|_buf| {});
-        let buf = Arc::new(RefCell::new(Buffer::allocate(page_size as usize, drop_fn)));
-        {
-            let mut buf_mut = buf.borrow_mut();
-            let buf_slice = buf_mut.as_mut_slice();
-            sqlite3_ondisk::write_header_to_buf(buf_slice, &db_header.lock());
-        }
-
-        let write_complete = Box::new(|_| {});
-        let c = Completion::Write(WriteCompletion::new(write_complete));
-        db_file.write_page(1, buf.clone(), Arc::new(c)).unwrap();
-
-        let wal_shared = WalFileShared::open_shared(&io, "test.wal", page_size).unwrap();
+        let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
+        let wal_shared = WalFileShared::new_shared(page_size, &io, wal_file).unwrap();
         let wal = Rc::new(RefCell::new(WalFile::new(
             io.clone(),
-            page_size,
             wal_shared,
             buffer_pool.clone(),
         )));
 
         let pager = Rc::new(
-            Pager::finish_open(
-                db_header.clone(),
+            Pager::new(
                 db_file,
                 wal,
                 io,
@@ -7040,13 +7014,31 @@ mod tests {
 
         pager.io.run_once().unwrap();
 
-        (pager, db_header)
+        pager.allocate_page1().unwrap();
+
+        for _ in 0..(database_size - 1) {
+            pager.allocate_page().unwrap();
+        }
+
+        let mut db_header = pager.db_header().unwrap();
+        db_header.page_size = page_size as u16;
+        let page1 = pager.read_page(1).unwrap();
+        while page1.is_locked() {
+            pager.io.run_once().unwrap();
+        }
+        page1.set_dirty();
+        let page1 = page1.get();
+        let contents = page1.contents.as_mut().unwrap();
+        contents.write_database_header(&db_header);
+        pager.add_dirty(page1.id);
+
+        pager
     }
 
     #[test]
     #[ignore]
     pub fn test_clear_overflow_pages() -> Result<()> {
-        let (pager, db_header) = setup_test_env(5);
+        let pager = setup_test_env(5);
         let mut cursor = BTreeCursor::new_table(None, pager.clone(), 1);
 
         let max_local = payload_overflow_threshold_max(PageType::TableLeaf, 4096);
@@ -7061,7 +7053,7 @@ mod tests {
             let drop_fn = Rc::new(|_buf| {});
             #[allow(clippy::arc_with_non_send_sync)]
             let buf = Arc::new(RefCell::new(Buffer::allocate(
-                db_header.lock().get_page_size() as usize,
+                pager.db_header().unwrap().get_page_size() as usize,
                 drop_fn,
             )));
             let write_complete = Box::new(|_| {});
@@ -7104,20 +7096,20 @@ mod tests {
             payload_size: large_payload.len() as u64,
         });
 
-        let initial_freelist_pages = db_header.lock().freelist_pages;
+        let initial_freelist_pages = pager.db_header().unwrap().freelist_pages;
         // Clear overflow pages
         let clear_result = cursor.clear_overflow_pages(&leaf_cell)?;
         match clear_result {
             CursorResult::Ok(_) => {
                 // Verify proper number of pages were added to freelist
                 assert_eq!(
-                    db_header.lock().freelist_pages,
+                    pager.db_header().unwrap().freelist_pages,
                     initial_freelist_pages + 3,
                     "Expected 3 pages to be added to freelist"
                 );
 
                 // If this is first trunk page
-                let trunk_page_id = db_header.lock().freelist_trunk_page;
+                let trunk_page_id = pager.db_header().unwrap().freelist_trunk_page;
                 if trunk_page_id > 0 {
                     // Verify trunk page structure
                     let trunk_page = cursor.read_page(trunk_page_id as usize)?;
@@ -7147,7 +7139,7 @@ mod tests {
 
     #[test]
     pub fn test_clear_overflow_pages_no_overflow() -> Result<()> {
-        let (pager, db_header) = setup_test_env(5);
+        let pager = setup_test_env(5);
         let mut cursor = BTreeCursor::new_table(None, pager.clone(), 1);
 
         let small_payload = vec![b'A'; 10];
@@ -7160,7 +7152,7 @@ mod tests {
             payload_size: small_payload.len() as u64,
         });
 
-        let initial_freelist_pages = db_header.lock().freelist_pages;
+        let initial_freelist_pages = pager.db_header().unwrap().freelist_pages;
 
         // Try to clear non-existent overflow pages
         let clear_result = cursor.clear_overflow_pages(&leaf_cell)?;
@@ -7168,14 +7160,14 @@ mod tests {
             CursorResult::Ok(_) => {
                 // Verify freelist was not modified
                 assert_eq!(
-                    db_header.lock().freelist_pages,
+                    pager.db_header().unwrap().freelist_pages,
                     initial_freelist_pages,
                     "Freelist should not change when no overflow pages exist"
                 );
 
                 // Verify trunk page wasn't created
                 assert_eq!(
-                    db_header.lock().freelist_trunk_page,
+                    pager.db_header().unwrap().freelist_trunk_page,
                     0,
                     "No trunk page should be created when no overflow pages exist"
                 );
@@ -7190,26 +7182,15 @@ mod tests {
 
     #[test]
     fn test_btree_destroy() -> Result<()> {
-        let initial_size = 3;
-        let (pager, db_header) = setup_test_env(initial_size);
+        let initial_size = 1;
+        let pager = setup_test_env(initial_size);
         let mut cursor = BTreeCursor::new_table(None, pager.clone(), 2);
-        assert_eq!(
-            db_header.lock().database_size,
-            initial_size,
-            "Database should initially have 3 pages"
-        );
 
         // Initialize page 2 as a root page (interior)
-        let root_page = cursor.read_page(2)?;
-        {
-            btree_init_page(&root_page, PageType::TableInterior, 0, 512); // Use proper page size
-        }
+        let root_page = cursor.allocate_page(PageType::TableInterior, 0);
 
         // Allocate two leaf pages
-        // FIXME: handle page cache is full
         let page3 = cursor.allocate_page(PageType::TableLeaf, 0);
-
-        // FIXME: handle page cache is full
         let page4 = cursor.allocate_page(PageType::TableLeaf, 0);
 
         // Configure the root page to point to the two leaf pages
@@ -7256,18 +7237,18 @@ mod tests {
 
         // Verify structure before destruction
         assert_eq!(
-            db_header.lock().database_size,
-            5, // We should have pages 0-4
+            pager.db_header().unwrap().database_size,
+            4, // We should have pages 1-4
             "Database should have 4 pages total"
         );
 
         // Track freelist state before destruction
-        let initial_free_pages = db_header.lock().freelist_pages;
+        let initial_free_pages = pager.db_header().unwrap().freelist_pages;
         assert_eq!(initial_free_pages, 0, "should start with no free pages");
 
         run_until_done(|| cursor.btree_destroy(), pager.deref())?;
 
-        let pages_freed = db_header.lock().freelist_pages - initial_free_pages;
+        let pages_freed = pager.db_header().unwrap().freelist_pages - initial_free_pages;
         assert_eq!(pages_freed, 3, "should free 3 pages (root + 2 leaves)");
 
         Ok(())

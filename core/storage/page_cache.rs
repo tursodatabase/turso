@@ -102,7 +102,8 @@ impl DumbLruPageCache {
             if let Some(existing_page_ref) = self.get(&key) {
                 assert!(
                     Arc::ptr_eq(&value, &existing_page_ref),
-                    "Attempted to insert different page with same key"
+                    "Attempted to insert different page with same key: {:?}",
+                    key
                 );
                 return Err(CacheError::KeyExists);
             }

@@ -1,22 +1,21 @@
-use crate::fast_lock::SpinLock;
 use crate::result::LimboResult;
 use crate::storage::btree::BTreePageInner;
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::sqlite3_ondisk::{
-    self, DatabaseHeader, PageContent, PageType, DATABASE_HEADER_PAGE_ID,
+    self, DatabaseHeader, PageContent, PageType, DATABASE_HEADER_PAGE_ID, DEFAULT_CACHE_SIZE,
 };
 use crate::storage::wal::{CheckpointResult, Wal, WalFsyncStatus};
 use crate::types::CursorResult;
-use crate::Completion;
 use crate::{Buffer, LimboError, Result};
+use crate::{Completion, WalFile};
 use parking_lot::RwLock;
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tracing::trace;
+use tracing::{trace, Level};
 
 use super::btree::BTreePage;
 use super::page_cache::{CacheError, CacheResizeResult, DumbLruPageCache, PageCacheKey};
@@ -203,11 +202,10 @@ pub struct Pager {
     /// A page cache for the database.
     page_cache: Arc<RwLock<DumbLruPageCache>>,
     /// Buffer pool for temporary data storage.
-    buffer_pool: Rc<BufferPool>,
+    pub buffer_pool: Rc<BufferPool>,
     /// I/O interface for input/output operations.
     pub io: Arc<dyn crate::io::IO>,
     dirty_pages: Rc<RefCell<HashSet<usize>>>,
-    pub db_header: Arc<SpinLock<DatabaseHeader>>,
 
     flush_info: RefCell<FlushInfo>,
     checkpoint_state: RefCell<CheckpointState>,
@@ -235,14 +233,7 @@ pub enum PagerCacheflushResult {
 }
 
 impl Pager {
-    /// Begins opening a database by reading the database header.
-    pub fn begin_open(db_file: Arc<dyn DatabaseStorage>) -> Result<Arc<SpinLock<DatabaseHeader>>> {
-        sqlite3_ondisk::begin_read_database_header(db_file)
-    }
-
-    /// Completes opening a database by initializing the Pager with the database header.
-    pub fn finish_open(
-        db_header_ref: Arc<SpinLock<DatabaseHeader>>,
+    pub fn new(
         db_file: Arc<dyn DatabaseStorage>,
         wal: Rc<RefCell<dyn Wal>>,
         io: Arc<dyn crate::io::IO>,
@@ -255,7 +246,6 @@ impl Pager {
             page_cache,
             io,
             dirty_pages: Rc::new(RefCell::new(HashSet::new())),
-            db_header: db_header_ref.clone(),
             flush_info: RefCell::new(FlushInfo {
                 state: FlushState::Start,
                 in_flight_writes: Rc::new(RefCell::new(0)),
@@ -266,6 +256,54 @@ impl Pager {
             buffer_pool,
             auto_vacuum_mode: RefCell::new(AutoVacuumMode::None),
         })
+    }
+
+    pub fn set_wal(&mut self, wal: Rc<RefCell<WalFile>>) {
+        self.wal = wal;
+    }
+
+    pub fn db_header(&self) -> Result<DatabaseHeader> {
+        // read page 1
+        let page = self.read_page(1)?;
+        let mut header = DatabaseHeader::default();
+        while !page.is_loaded() || page.is_locked() {
+            // FIXME: LETS STOP DOING THESE SYNCHRONOUS IO HACKS
+            self.io.run_once()?;
+        }
+        let page_inner = page.get();
+        let page_content = page_inner.contents.as_ref().unwrap();
+        let buf = page_content.buffer.borrow();
+        let buf = buf.as_slice();
+        header.magic.copy_from_slice(&buf[0..16]);
+        header.page_size = u16::from_be_bytes([buf[16], buf[17]]);
+        header.write_version = buf[18];
+        header.read_version = buf[19];
+        header.reserved_space = buf[20];
+        header.max_embed_frac = buf[21];
+        header.min_embed_frac = buf[22];
+        header.min_leaf_frac = buf[23];
+        header.change_counter = u32::from_be_bytes([buf[24], buf[25], buf[26], buf[27]]);
+        header.database_size = u32::from_be_bytes([buf[28], buf[29], buf[30], buf[31]]);
+        header.freelist_trunk_page = u32::from_be_bytes([buf[32], buf[33], buf[34], buf[35]]);
+        header.freelist_pages = u32::from_be_bytes([buf[36], buf[37], buf[38], buf[39]]);
+        header.schema_cookie = u32::from_be_bytes([buf[40], buf[41], buf[42], buf[43]]);
+        header.schema_format = u32::from_be_bytes([buf[44], buf[45], buf[46], buf[47]]);
+        header.default_page_cache_size = i32::from_be_bytes([buf[48], buf[49], buf[50], buf[51]]);
+        if header.default_page_cache_size == 0 {
+            header.default_page_cache_size = DEFAULT_CACHE_SIZE;
+        }
+        header.vacuum_mode_largest_root_page =
+            u32::from_be_bytes([buf[52], buf[53], buf[54], buf[55]]);
+        header.text_encoding = u32::from_be_bytes([buf[56], buf[57], buf[58], buf[59]]);
+        header.user_version = i32::from_be_bytes([buf[60], buf[61], buf[62], buf[63]]);
+        header.incremental_vacuum_enabled =
+            u32::from_be_bytes([buf[64], buf[65], buf[66], buf[67]]);
+        header.application_id = u32::from_be_bytes([buf[68], buf[69], buf[70], buf[71]]);
+        header.reserved_for_expansion.copy_from_slice(&buf[72..92]);
+        header.version_valid_for = u32::from_be_bytes([buf[92], buf[93], buf[94], buf[95]]);
+        header.version_number = u32::from_be_bytes([buf[96], buf[97], buf[98], buf[99]]);
+
+        Ok(header)
     }
 
     pub fn get_auto_vacuum_mode(&self) -> AutoVacuumMode {
@@ -282,7 +320,7 @@ impl Pager {
     #[cfg(not(feature = "omit_autovacuum"))]
     pub fn ptrmap_get(&self, target_page_num: u32) -> Result<CursorResult<Option<PtrmapEntry>>> {
         tracing::trace!("ptrmap_get(page_idx = {})", target_page_num);
-        let configured_page_size = self.db_header.lock().get_page_size() as usize;
+        let configured_page_size = self.db_header()?.get_page_size() as usize;
 
         if target_page_num < FIRST_PTRMAP_PAGE_NO
             || is_ptrmap_page(target_page_num, configured_page_size)
@@ -368,7 +406,7 @@ impl Pager {
             parent_page_no
         );
 
-        let page_size = self.db_header.lock().get_page_size() as usize;
+        let page_size = self.db_header()?.get_page_size() as usize;
 
         if db_page_no_to_update < FIRST_PTRMAP_PAGE_NO
             || is_ptrmap_page(db_page_no_to_update, page_size)
@@ -463,15 +501,13 @@ impl Pager {
                     return Ok(CursorResult::Ok(page_id as u32));
                 }
                 AutoVacuumMode::Full => {
-                    let mut root_page_num = self.db_header.lock().vacuum_mode_largest_root_page;
+                    let mut root_page_num = self.db_header()?.vacuum_mode_largest_root_page;
                     assert!(root_page_num > 0); //  Largest root page number cannot be 0 because that is set to 1 when creating the database with autovacuum enabled
                     root_page_num += 1;
                     assert!(root_page_num >= FIRST_PTRMAP_PAGE_NO); //  can never be less than 2 because we have already incremented
 
-                    while is_ptrmap_page(
-                        root_page_num,
-                        self.db_header.lock().get_page_size() as usize,
-                    ) {
+                    while is_ptrmap_page(root_page_num, self.db_header()?.get_page_size() as usize)
+                    {
                         root_page_num += 1;
                     }
                     assert!(root_page_num >= 3); //  the very first root page is page 3
@@ -544,7 +580,7 @@ impl Pager {
     /// The usable size of a page might be an odd number. However, the usable size is not allowed to be less than 480.
     /// In other words, if the page size is 512, then the reserved space size cannot exceed 32.
     pub fn usable_space(&self) -> usize {
-        let db_header = self.db_header.lock();
+        let db_header = self.db_header().unwrap();
         (db_header.get_page_size() - db_header.reserved_space as u32) as usize
     }
 
@@ -576,6 +612,7 @@ impl Pager {
     }
 
     /// Reads a page from the database.
+    #[tracing::instrument(skip_all, level = Level::DEBUG)]
     pub fn read_page(&self, page_idx: usize) -> Result<PageRef, LimboError> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
@@ -677,7 +714,7 @@ impl Pager {
             trace!("cacheflush {:?}", state);
             match state {
                 FlushState::Start => {
-                    let db_size = self.db_header.lock().database_size;
+                    let db_size = self.db_header()?.database_size;
                     for page_id in self.dirty_pages.borrow().iter() {
                         let mut cache = self.page_cache.write();
                         let page_key = PageCacheKey::new(*page_id);
@@ -877,7 +914,7 @@ impl Pager {
         const TRUNK_PAGE_NEXT_PAGE_OFFSET: usize = 0; // Offset to next trunk page pointer
         const TRUNK_PAGE_LEAF_COUNT_OFFSET: usize = 4; // Offset to leaf count
 
-        if page_id < 2 || page_id > self.db_header.lock().database_size as usize {
+        if page_id < 2 || page_id > self.db_header()?.database_size as usize {
             return Err(LimboError::Corrupt(format!(
                 "Invalid page number {} for free operation",
                 page_id
@@ -892,9 +929,11 @@ impl Pager {
             None => self.read_page(page_id)?,
         };
 
-        self.db_header.lock().freelist_pages += 1;
+        let mut header = self.db_header()?;
+        header.freelist_pages += 1;
+        self.write_database_header(&header)?;
 
-        let trunk_page_id = self.db_header.lock().freelist_trunk_page;
+        let trunk_page_id = header.freelist_trunk_page;
 
         if trunk_page_id != 0 {
             // Add as leaf to current trunk
@@ -932,11 +971,32 @@ impl Pager {
         // Zero leaf count
         contents.write_u32(TRUNK_PAGE_LEAF_COUNT_OFFSET, 0);
         // Update page 1 to point to new trunk
-        self.db_header.lock().freelist_trunk_page = page_id as u32;
+        let mut header = self.db_header()?;
+        header.freelist_trunk_page = page_id as u32;
+        self.write_database_header(&header)?;
         // Clear flags
         page.clear_uptodate();
         page.clear_loaded();
         Ok(())
+    }
+
+    pub fn allocate_page1(&self) -> Result<PageRef> {
+        let mut default_header = DatabaseHeader::default();
+        default_header.database_size = 1;
+        let page = allocate_page(1, &self.buffer_pool, 0);
+        page.set_dirty();
+        self.add_dirty(page.get().id);
+        page.get()
+            .contents
+            .as_mut()
+            .unwrap()
+            .write_database_header(&default_header);
+        let page_key = PageCacheKey::new(page.get().id);
+        let mut cache = self.page_cache.write();
+        cache.insert(page_key, page.clone()).map_err(|e| {
+            LimboError::InternalError(format!("Failed to insert page 1 into cache: {:?}", e))
+        })?;
+        Ok(page)
     }
 
     /*
@@ -946,9 +1006,10 @@ impl Pager {
     // FIXME: handle no room in page cache
     #[allow(clippy::readonly_write_lock)]
     pub fn allocate_page(&self) -> Result<PageRef> {
-        let header = &self.db_header;
-        let mut header = header.lock();
+        let mut header = self.db_header()?;
         header.database_size += 1;
+
+        tracing::debug!("allocate_page(database_size={})", header.database_size);
 
         #[cfg(not(feature = "omit_autovacuum"))]
         {
@@ -1022,7 +1083,7 @@ impl Pager {
     }
 
     pub fn usable_size(&self) -> usize {
-        let db_header = self.db_header.lock();
+        let db_header = self.db_header().unwrap();
         (db_header.get_page_size() - db_header.reserved_space as u32) as usize
     }
 }
@@ -1307,20 +1368,24 @@ mod ptrmap_tests {
         db_header_arc.lock().vacuum_mode_largest_root_page = 1;
 
         //  Construct interfaces for the pager
-        let buffer_pool = Rc::new(BufferPool::new(page_size as usize));
+        let buffer_pool = Rc::new(BufferPool::new(Some(page_size as usize)));
         let page_cache = Arc::new(RwLock::new(DumbLruPageCache::new(
             (initial_db_pages + 10) as usize,
         )));
 
         let wal = Rc::new(RefCell::new(WalFile::new(
             io.clone(),
-            page_size,
-            WalFileShared::open_shared(&io, "test.db-wal", page_size).unwrap(),
+            WalFileShared::new_shared(
+                page_size,
+                &io,
+                io.open_file("test.db-wal", OpenFlags::Create, false)
+                    .unwrap(),
+            )
+            .unwrap(),
             buffer_pool.clone(),
         )));
 
-        let pager = Pager::finish_open(db_header_arc, db_storage, wal, io, page_cache, buffer_pool)
-            .unwrap();
+        let pager = Pager::new(db_storage, wal, io, page_cache, buffer_pool).unwrap();
         pager.set_auto_vacuum_mode(AutoVacuumMode::Full);
 
         //  Allocate all the pages as btree root pages
@@ -1356,7 +1421,10 @@ mod ptrmap_tests {
         assert!(ptrmap_page_ref.is_ok());
 
         //  Ensure that the database header size is correctly reflected
-        assert_eq!(pager.db_header.lock().database_size, initial_db_pages + 2); // (1+1) -> (header + ptrmap)
+        assert_eq!(
+            pager.db_header().unwrap().database_size,
+            initial_db_pages + 2
+        ); // (1+1) -> (header + ptrmap)
 
         //  Read the entry from the ptrmap page and verify it
         let entry = pager.ptrmap_get(db_page_to_update).unwrap();

@@ -9,11 +9,9 @@ use limbo_sqlite3_parser::ast::{self, TableInternalId};
 use tracing::{instrument, Level};
 
 use crate::{
-    fast_lock::SpinLock,
     numeric::Numeric,
     parameters::Parameters,
     schema::{BTreeTable, Index, PseudoTable, Table},
-    storage::sqlite3_ondisk::DatabaseHeader,
     translate::{
         collate::CollationSeq,
         emitter::TransactionMode,
@@ -853,12 +851,7 @@ impl ProgramBuilder {
         });
     }
 
-    pub fn build(
-        mut self,
-        database_header: Arc<SpinLock<DatabaseHeader>>,
-        connection: Weak<Connection>,
-        change_cnt_on: bool,
-    ) -> Program {
+    pub fn build(mut self, connection: Weak<Connection>, change_cnt_on: bool) -> Program {
         self.resolve_labels();
 
         self.parameters.list.dedup();
@@ -870,7 +863,6 @@ impl ProgramBuilder {
                 .map(|(insn, function, _)| (insn, function))
                 .collect(),
             cursor_ref: self.cursor_ref,
-            database_header,
             comments: self.comments,
             connection,
             parameters: self.parameters,

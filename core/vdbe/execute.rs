@@ -83,7 +83,6 @@ use crate::{
 use super::{get_new_rowid, make_record, Program, ProgramState, Register};
 use crate::{
     bail_constraint_error, must_be_btree_cursor, resolve_ext_path, MvStore, Pager, Result,
-    DATABASE_VERSION,
 };
 
 macro_rules! return_if_io {
@@ -3615,7 +3614,8 @@ pub fn op_function(
                 }
             }
             ScalarFunc::SqliteVersion => {
-                let version_integer: i64 = DATABASE_VERSION.get().unwrap().parse()?;
+                let header = pager.db_header()?;
+                let version_integer: i64 = header.version_number as i64;
                 let version = execute_sqlite_version(version_integer);
                 state.registers[*dest] = Register::Value(Value::build_text(&version));
             }
@@ -4816,7 +4816,7 @@ pub fn op_page_count(
         // TODO: implement temp databases
         todo!("temp databases not implemented yet");
     }
-    let count = pager.db_header.lock().database_size.into();
+    let count = pager.db_header()?.database_size.into();
     state.registers[*dest] = Register::Value(Value::Integer(count));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -4894,11 +4894,9 @@ pub fn op_read_cookie(
         todo!("temp databases not implemented yet");
     }
     let cookie_value = match cookie {
-        Cookie::UserVersion => pager.db_header.lock().user_version.into(),
-        Cookie::SchemaVersion => pager.db_header.lock().schema_cookie.into(),
-        Cookie::LargestRootPageNumber => {
-            pager.db_header.lock().vacuum_mode_largest_root_page.into()
-        }
+        Cookie::UserVersion => pager.db_header()?.user_version.into(),
+        Cookie::SchemaVersion => pager.db_header()?.schema_cookie.into(),
+        Cookie::LargestRootPageNumber => pager.db_header()?.vacuum_mode_largest_root_page.into(),
         cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
     };
     state.registers[*dest] = Register::Value(Value::Integer(cookie_value));
@@ -4927,19 +4925,19 @@ pub fn op_set_cookie(
     }
     match cookie {
         Cookie::UserVersion => {
-            let mut header_guard = pager.db_header.lock();
+            let mut header_guard = pager.db_header()?;
             header_guard.user_version = *value;
-            pager.write_database_header(&*header_guard)?;
+            pager.write_database_header(&header_guard)?;
         }
         Cookie::LargestRootPageNumber => {
-            let mut header_guard = pager.db_header.lock();
+            let mut header_guard = pager.db_header()?;
             header_guard.vacuum_mode_largest_root_page = *value as u32;
-            pager.write_database_header(&*header_guard)?;
+            pager.write_database_header(&header_guard)?;
         }
         Cookie::IncrementalVacuum => {
-            let mut header_guard = pager.db_header.lock();
+            let mut header_guard = pager.db_header()?;
             header_guard.incremental_vacuum_enabled = *value as u32;
-            pager.write_database_header(&*header_guard)?;
+            pager.write_database_header(&header_guard)?;
         }
         cookie => todo!("{cookie:?} is not yet implement for SetCookie"),
     }
@@ -5130,18 +5128,19 @@ pub fn op_open_ephemeral(
     maybe_init_database_file(&file, &(io.clone() as Arc<dyn IO>))?;
     let db_file = Arc::new(FileMemoryStorage::new(file));
 
-    let db_header = Pager::begin_open(db_file.clone())?;
-    let buffer_pool = Rc::new(BufferPool::new(db_header.lock().get_page_size() as usize));
+    let buffer_pool = Rc::new(BufferPool::new(None));
     let page_cache = Arc::new(RwLock::new(DumbLruPageCache::default()));
 
-    let pager = Rc::new(Pager::finish_open(
-        db_header,
+    let pager = Rc::new(Pager::new(
         db_file,
         Rc::new(RefCell::new(DummyWAL)),
         io,
         page_cache,
-        buffer_pool,
+        buffer_pool.clone(),
     )?);
+
+    let header = pager.db_header()?;
+    buffer_pool.set_page_size(header.get_page_size() as usize);
 
     let flag = if is_table {
         &CreateBTreeFlags::new_table()

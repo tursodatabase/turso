@@ -34,8 +34,9 @@ mod numeric;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use crate::storage::wal::DummyWAL;
+use crate::translate::optimizer::optimize_plan;
 use crate::vtab::VirtualTable;
-use crate::{fast_lock::SpinLock, translate::optimizer::optimize_plan};
 use core::str;
 pub use error::LimboError;
 use fallible_iterator::FallibleIterator;
@@ -59,7 +60,7 @@ use std::{
     num::NonZero,
     ops::Deref,
     rc::Rc,
-    sync::{Arc, OnceLock},
+    sync::Arc,
 };
 use storage::btree::{btree_init_page, BTreePageInner};
 #[cfg(feature = "fs")]
@@ -86,7 +87,6 @@ use vdbe::builder::QueryMode;
 use vdbe::builder::TableRefIdCounter;
 
 pub type Result<T, E = LimboError> = std::result::Result<T, E>;
-pub static DATABASE_VERSION: OnceLock<String> = OnceLock::new();
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TransactionState {
@@ -102,15 +102,13 @@ pub(crate) type MvCursor = mvcc::cursor::ScanCursor<mvcc::LocalClock>;
 pub struct Database {
     mv_store: Option<Rc<MvStore>>,
     schema: Arc<RwLock<Schema>>,
-    // TODO: make header work without lock
-    header: Arc<SpinLock<DatabaseHeader>>,
     db_file: Arc<dyn DatabaseStorage>,
+    path: String,
     io: Arc<dyn IO>,
-    page_size: u32,
     // Shared structures of a Database are the parts that are common to multiple threads that might
     // create DB connections.
     _shared_page_cache: Arc<RwLock<DumbLruPageCache>>,
-    shared_wal: Arc<UnsafeCell<WalFileShared>>,
+    maybe_shared_wal: Option<Arc<UnsafeCell<WalFileShared>>>,
     open_flags: OpenFlags,
 }
 
@@ -154,18 +152,8 @@ impl Database {
         flags: OpenFlags,
         enable_mvcc: bool,
     ) -> Result<Arc<Database>> {
-        let db_header = Pager::begin_open(db_file.clone())?;
-        // ensure db header is there
-        io.run_once()?;
-
-        let page_size = db_header.lock().get_page_size();
         let wal_path = format!("{}-wal", path);
-        let shared_wal = WalFileShared::open_shared(&io, wal_path.as_str(), page_size)?;
-
-        DATABASE_VERSION.get_or_init(|| {
-            let version = db_header.lock().version_number;
-            version.to_string()
-        });
+        let maybe_shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path.as_str())?;
 
         let mv_store = if enable_mvcc {
             Some(Rc::new(MvStore::new(
@@ -180,13 +168,12 @@ impl Database {
         let schema = Arc::new(RwLock::new(Schema::new()));
         let db = Database {
             mv_store,
+            path: path.to_string(),
             schema: schema.clone(),
-            header: db_header.clone(),
             _shared_page_cache: shared_page_cache.clone(),
-            shared_wal: shared_wal.clone(),
+            maybe_shared_wal,
             db_file,
             io: io.clone(),
-            page_size,
             open_flags: flags,
         };
         let db = Arc::new(db);
@@ -210,38 +197,78 @@ impl Database {
     }
 
     pub fn connect(self: &Arc<Database>) -> Result<Rc<Connection>> {
-        let buffer_pool = Rc::new(BufferPool::new(self.page_size as usize));
+        let buffer_pool = Rc::new(BufferPool::new(None));
 
-        let wal = Rc::new(RefCell::new(WalFile::new(
-            self.io.clone(),
-            self.page_size,
-            self.shared_wal.clone(),
-            buffer_pool.clone(),
-        )));
-        // For now let's open database without shared cache by default.
-        let pager = Rc::new(Pager::finish_open(
-            self.header.clone(),
-            self.db_file.clone(),
-            wal,
-            self.io.clone(),
-            Arc::new(RwLock::new(DumbLruPageCache::default())),
-            buffer_pool,
-        )?);
-        let conn = Rc::new(Connection {
-            _db: self.clone(),
-            pager: pager.clone(),
-            schema: self.schema.clone(),
-            header: self.header.clone(),
-            last_insert_rowid: Cell::new(0),
-            auto_commit: Cell::new(true),
-            mv_transactions: RefCell::new(Vec::new()),
-            transaction_state: Cell::new(TransactionState::None),
-            last_change: Cell::new(0),
-            syms: RefCell::new(SymbolTable::new()),
-            total_changes: Cell::new(0),
-            _shared_cache: false,
-            cache_size: Cell::new(self.header.lock().default_page_cache_size),
-        });
+        let conn = if let Some(shared_wal) = self.maybe_shared_wal.clone() {
+            let wal = Rc::new(RefCell::new(WalFile::new(
+                self.io.clone(),
+                shared_wal,
+                buffer_pool.clone(),
+            )));
+            let pager = Rc::new(Pager::new(
+                self.db_file.clone(),
+                wal,
+                self.io.clone(),
+                Arc::new(RwLock::new(DumbLruPageCache::default())),
+                buffer_pool,
+            )?);
+
+            let header = pager.db_header()?;
+            pager
+                .buffer_pool
+                .set_page_size(header.get_page_size() as usize);
+            let conn = Rc::new(Connection {
+                _db: self.clone(),
+                pager: pager.clone(),
+                schema: self.schema.clone(),
+                last_insert_rowid: Cell::new(0),
+                auto_commit: Cell::new(true),
+                mv_transactions: RefCell::new(Vec::new()),
+                transaction_state: Cell::new(TransactionState::None),
+                last_change: Cell::new(0),
+                syms: RefCell::new(SymbolTable::new()),
+                total_changes: Cell::new(0),
+                _shared_cache: false,
+                cache_size: Cell::new(header.default_page_cache_size as i32),
+            });
+            conn
+        } else {
+            let dummy_wal = Rc::new(RefCell::new(DummyWAL {}));
+            let mut pager = Pager::new(
+                self.db_file.clone(),
+                dummy_wal,
+                self.io.clone(),
+                Arc::new(RwLock::new(DumbLruPageCache::default())),
+                buffer_pool.clone(),
+            )?;
+            let header = pager.db_header()?;
+            let wal_path = format!("{}-wal", self.path);
+            let file = self.io.open_file(&wal_path, OpenFlags::Create, false)?;
+            let real_shared_wal =
+                WalFileShared::new_shared(header.get_page_size(), &self.io, file)?;
+            let wal = Rc::new(RefCell::new(WalFile::new(
+                self.io.clone(),
+                real_shared_wal,
+                buffer_pool,
+            )));
+            pager.set_wal(wal);
+            let conn = Rc::new(Connection {
+                _db: self.clone(),
+                pager: Rc::new(pager),
+                schema: self.schema.clone(),
+                auto_commit: Cell::new(true),
+                mv_transactions: RefCell::new(Vec::new()),
+                transaction_state: Cell::new(TransactionState::None),
+                last_insert_rowid: Cell::new(0),
+                last_change: Cell::new(0),
+                total_changes: Cell::new(0),
+                syms: RefCell::new(SymbolTable::new()),
+                _shared_cache: false,
+                cache_size: Cell::new(header.default_page_cache_size as i32),
+            });
+            conn
+        };
+
         if let Err(e) = conn.register_builtins() {
             return Err(LimboError::ExtensionError(e));
         }
@@ -280,7 +307,7 @@ pub fn maybe_init_database_file(file: &Arc<dyn File>, io: &Arc<dyn IO>) -> Resul
         let db_header = DatabaseHeader::default();
         let page1 = allocate_page(
             1,
-            &Rc::new(BufferPool::new(db_header.get_page_size() as usize)),
+            &Rc::new(BufferPool::new(Some(db_header.get_page_size() as usize))),
             DATABASE_HEADER_SIZE,
         );
         let page1 = Arc::new(BTreePageInner {
@@ -331,7 +358,6 @@ pub struct Connection {
     _db: Arc<Database>,
     pager: Rc<Pager>,
     schema: Arc<RwLock<Schema>>,
-    header: Arc<SpinLock<DatabaseHeader>>,
     auto_commit: Cell<bool>,
     mv_transactions: RefCell<Vec<crate::mvcc::database::TxID>>,
     transaction_state: Cell<TransactionState>,
@@ -370,7 +396,6 @@ impl Connection {
                         .ok_or(LimboError::SchemaLocked)?
                         .deref(),
                     stmt,
-                    self.header.clone(),
                     self.pager.clone(),
                     Rc::downgrade(self),
                     &syms,
@@ -419,7 +444,6 @@ impl Connection {
                         .ok_or(LimboError::SchemaLocked)?
                         .deref(),
                     stmt.clone(),
-                    self.header.clone(),
                     self.pager.clone(),
                     Rc::downgrade(self),
                     &syms,
@@ -489,7 +513,6 @@ impl Connection {
                             .ok_or(LimboError::SchemaLocked)?
                             .deref(),
                         stmt,
-                        self.header.clone(),
                         self.pager.clone(),
                         Rc::downgrade(self),
                         &syms,
@@ -506,7 +529,6 @@ impl Connection {
                             .ok_or(LimboError::SchemaLocked)?
                             .deref(),
                         stmt,
-                        self.header.clone(),
                         self.pager.clone(),
                         Rc::downgrade(self),
                         &syms,

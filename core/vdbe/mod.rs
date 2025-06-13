@@ -26,14 +26,13 @@ pub mod sorter;
 
 use crate::{
     error::LimboError,
-    fast_lock::SpinLock,
     function::{AggFunc, FuncCtx},
     storage::{pager::PagerCacheflushStatus, sqlite3_ondisk::SmallVec},
     translate::plan::TableReferences,
 };
 
 use crate::{
-    storage::{btree::BTreeCursor, pager::Pager, sqlite3_ondisk::DatabaseHeader},
+    storage::{btree::BTreeCursor, pager::Pager},
     translate::plan::ResultSetColumn,
     types::{AggContext, Cursor, CursorResult, ImmutableRecord, SeekKey, SeekOp, Value},
     vdbe::{builder::CursorType, insn::Insn},
@@ -56,7 +55,6 @@ use std::{
     num::NonZero,
     ops::Deref,
     rc::{Rc, Weak},
-    sync::Arc,
 };
 use tracing::{instrument, Level};
 
@@ -356,7 +354,6 @@ pub struct Program {
     pub max_registers: usize,
     pub insns: Vec<(Insn, InsnFunction)>,
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
-    pub database_header: Arc<SpinLock<DatabaseHeader>>,
     pub comments: Option<Vec<(InsnReference, &'static str)>>,
     pub parameters: crate::parameters::Parameters,
     pub connection: Weak<Connection>,

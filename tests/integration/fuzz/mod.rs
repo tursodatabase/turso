@@ -629,7 +629,7 @@ mod tests {
             // Insert random values
             let mut i = 0;
             let mut seen = HashSet::new();
-            while i <num_rows {
+            while i < num_rows {
                 let val = rng.random_range(i64::MIN..=i64::MAX);
                 if seen.contains(&val) {
                     continue;
@@ -653,7 +653,9 @@ mod tests {
                 "Results don't match ({} != {}) on iter {}, seed {}",
                 limbo_rows.len(),
                 sqlite_rows.len(),
-                iter, seed);
+                iter,
+                seed
+            );
             assert_eq!(
                 limbo_rows, sqlite_rows,
                 "Results don't match on iter {}, seed {}",
