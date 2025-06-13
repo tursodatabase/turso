@@ -3,10 +3,14 @@ use crate::{
         plan::{InteractionPlan, Interactions},
         property::Property,
     },
-    model::query::Query,
     runner::execution::Execution,
-    Interaction,
+    SimulatorEnv,
+    runner::cli::SimulatorCLI,
+    run_simulation,
 };
+use clap::Parser;
+use std::sync::{Arc, Mutex};
+use std::path::Path;
 
 impl InteractionPlan {
     /// Create a smaller interaction plan by deleting a property
@@ -47,50 +51,41 @@ impl InteractionPlan {
 
         let before = self.plan.len();
 
-        // Remove all properties after the failing one
         plan.plan.truncate(failing_execution.interaction_index + 1);
 
-        let mut idx = 0;
-        // Remove all properties that do not use the failing tables
-        plan.plan.retain_mut(|interactions| {
-            let retain = if idx == failing_execution.interaction_index {
-                true
-            } else {
-                let mut has_table = interactions
-                    .uses()
-                    .iter()
-                    .any(|t| depending_tables.contains(t));
-                if has_table {
-                    // Remove the extensional parts of the properties
-                    if let Interactions::Property(p) = interactions {
-                        match p {
-                            Property::InsertValuesSelect { queries, .. }
-                            | Property::DoubleCreateFailure { queries, .. }
-                            | Property::DeleteSelect { queries, .. }
-                            | Property::DropSelect { queries, .. } => {
-                                queries.clear();
-                            }
-                            Property::SelectLimit { .. }
-                            | Property::SelectSelectOptimizer { .. } => {}
-                        }
+        // phase 1: shrink extensions
+        for interaction in &mut plan.plan {
+            if let Interactions::Property(property) = interaction {
+                match property {
+                    Property::InsertValuesSelect { queries, .. } |
+                    Property::DoubleCreateFailure { queries, .. } |
+                    Property::DeleteSelect { queries, .. } |
+                    Property::DropSelect { queries, .. } => {
+                        let mut temp_plan = InteractionPlan {
+                            plan: queries.iter().map(|q| Interactions::Query(q.clone())).collect()
+                        };
+                        
+                        temp_plan = InteractionPlan::iterative_shrink(temp_plan, failing_execution);
+                        
+                        *queries = temp_plan.plan.into_iter()
+                            .filter_map(|i| match i {
+                                Interactions::Query(q) => Some(q),
+                                _ => None,
+                            })
+                            .collect();
                     }
-                    // Check again after query clear if the interactions still uses the failing table
-                    has_table = interactions
-                        .uses()
-                        .iter()
-                        .any(|t| depending_tables.contains(t));
+                    Property::SelectLimit { .. } |
+                    Property::SelectSelectOptimizer { .. } => {
+                    }
                 }
-                has_table
-                    && !matches!(
-                        interactions,
-                        Interactions::Query(Query::Select(_))
-                            | Interactions::Property(Property::SelectLimit { .. })
-                            | Interactions::Property(Property::SelectSelectOptimizer { .. })
-                    )
-            };
-            idx += 1;
-            retain
-        });
+            }
+        }
+
+        // phase 2: shrink the entire plan
+        plan = Self::iterative_shrink(plan, failing_execution);
+
+        // Remove all properties that do not use the failing tables
+        plan.plan.retain(|p| p.uses().iter().any(|t| depending_tables.contains(t)));
 
         let after = plan.plan.len();
 
@@ -100,6 +95,59 @@ impl InteractionPlan {
             after
         );
 
+        plan
+    }
+
+    /// shrink a plan by removing one interaction at a time (and its deps) while preserving the error
+    fn iterative_shrink(mut plan: InteractionPlan, failing_execution: &Execution) -> InteractionPlan {
+        for i in (0..plan.plan.len()).rev() {
+            if i == failing_execution.interaction_index {
+                continue;
+            }
+            
+            // let interaction = &plan.plan[i];
+            // let mut dependencies: Vec<usize> = Vec::new();
+            
+            // for j in (i + 1)..plan.plan.len() {
+            //     let later_interaction = &plan.plan[j];
+        
+            //     if interaction.modifies().iter().any(|t| later_interaction.dependencies().contains(t)) {
+            //         dependencies.push(j);
+            //     }
+            // }
+
+            let mut test_plan = plan.clone();
+
+            // for &dep_idx in dependencies.iter().rev() {
+            //     test_plan.plan.remove(dep_idx);
+            // }
+
+            test_plan.plan.remove(i);
+
+            // run the test plan to see if it reproduces the error
+            let cli_opts = SimulatorCLI {
+                seed: Some(0),
+                ..SimulatorCLI::parse()
+            };
+            let env = Arc::new(Mutex::new(SimulatorEnv::new(0, &cli_opts, Path::new("test.db"))));
+            let last_execution = Arc::new(Mutex::new(*failing_execution));
+            
+            let result = std::panic::catch_unwind(|| {
+                run_simulation(
+                    env.clone(),
+                    &mut [test_plan.clone()],
+                    last_execution.clone(),
+                )
+            });
+
+            if let Ok(execution_result) = result {
+                if let Some(_) = execution_result.error {
+                    // if we get the same error, shrink is valid
+                    plan = test_plan;
+                    continue;
+                }
+            }
+        }
         plan
     }
 }
