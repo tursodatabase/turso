@@ -607,6 +607,83 @@ mod tests {
     }
 
     #[test]
+    pub fn unique_index_insert_fuzz() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+        // let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time_or_env();
+
+        let db = TempDatabase::new_empty();
+        let limbo_conn = db.connect_limbo();
+        limbo_exec_rows(&db, &limbo_conn, "CREATE TABLE t(x INTEGER UNIQUE,a,b,c,d)");
+
+        println!("seed: {}", seed);
+
+        // Run multiple iterations with different row counts
+        for iter in 0..20 {
+            println!("unique_index_insert_fuzz iter: {}", iter);
+            let limbo_conn = db.connect_limbo();
+            let num_rows = rng.random_range(50..1000);
+
+            // Insert random values
+            let mut i = 0;
+            let mut seen = HashSet::new();
+            while i <num_rows {
+                let val = rng.random_range(i64::MIN..=i64::MAX);
+                if seen.contains(&val) {
+                    continue;
+                }
+                seen.insert(val);
+                i += 1;
+                let query = format!("INSERT INTO t VALUES ({},{},{},{},{})", val, i, i, i, i);
+                limbo_exec_rows(&db, &limbo_conn, &query);
+            }
+
+            let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
+
+            // Select all rows without ORDER BY - should be sorted due to unique index
+            let limbo_rows = limbo_exec_rows(&db, &limbo_conn, "SELECT x FROM t");
+            let sqlite_rows = sqlite_exec_rows(&sqlite_conn, "SELECT x FROM t");
+
+            // Verify results match and are sorted
+            assert_eq!(
+                limbo_rows.len(),
+                sqlite_rows.len(),
+                "Results don't match ({} != {}) on iter {}, seed {}",
+                limbo_rows.len(),
+                sqlite_rows.len(),
+                iter, seed);
+            assert_eq!(
+                limbo_rows, sqlite_rows,
+                "Results don't match on iter {}, seed {}",
+                iter, seed
+            );
+
+            // Verify results are sorted
+            let mut prev = None;
+            for row in &limbo_rows {
+                if let Some(rusqlite::types::Value::Integer(val)) = row.get(0) {
+                    if let Some(prev) = prev {
+                        assert!(
+                            *val > prev,
+                            "Results not sorted on iter {}, seed {}",
+                            iter,
+                            seed
+                        );
+                    }
+                    prev = Some(*val);
+                } else {
+                    panic!("Expected integer value, got {:?}", row.get(0));
+                }
+            }
+
+            // Clear table for next iteration
+            limbo_exec_rows(&db, &limbo_conn, "DELETE FROM t");
+        }
+    }
+
+    #[test]
     pub fn arithmetic_expression_fuzz() {
         let _ = env_logger::try_init();
         let g = GrammarGenerator::new();
