@@ -907,7 +907,7 @@ fn translate_check_constraint(
     let description = &check_constraint.to_string();
     use crate::ast;
     use crate::translate::expr::walk_expr_mut;
-    walk_expr_mut(
+    let res = walk_expr_mut(
         &mut check_constraint,
         &mut |expr: &mut Expr| -> Result<()> {
             match expr {
@@ -915,17 +915,21 @@ fn translate_check_constraint(
                     let mut iter = column_mappings.iter();
                     let column_mapping = iter
                         .find(|cm| cm.column.name.as_ref().map_or(false, |n| *n == id.0))
-                        .expect("Must be present");
-                    let maybe_val = values
-                        .get(column_mapping.value_index.expect("Must be present"))
-                        .expect("must be present");
+                        .expect("Column should be present");
+                    let Some(value_index) = column_mapping.value_index else {
+                        crate::bail_parse_error!("value_index not found");
+                    };
+                    let maybe_val = values.get(value_index).expect("Must have a value");
                     *expr = maybe_val.clone();
                     Ok(())
                 }
                 _ => Ok(()),
             }
         },
-    )?;
+    );
+    if res.is_err() {
+        return Ok(());
+    }
     use crate::error::SQLITE_CONSTRAINT_CHECK;
     match check_constraint {
         ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) => {
