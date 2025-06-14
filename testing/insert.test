@@ -202,6 +202,27 @@ do_execsql_test_in_memory_any_error insert_expr_constraint_check-2 {
     INSERT INTO t VALUES (1);
 }
 
+# CHECK expression can refer to many columns
+do_execsql_test_on_specific_db {:memory:} insert_expr_constraint_check-3 {
+    CREATE TABLE t (a int, x INTEGER check ((a + x) % 2 == 0));
+    INSERT INTO t VALUES (4, 2);
+    INSERT INTO t VALUES (1, 5);
+    SELECT * FROM t;
+} {4|2
+1|5}
+
+# CHECK expressions are disabled if its expression evaluates to NULL
+do_execsql_test_on_specific_db {:memory:} insert_expr_constraint_check-4 {
+    CREATE TABLE t (a int, x INTEGER check ((a + x) % 2 == 0));
+    INSERT INTO t (x) VALUES (99);
+    INSERT INTO t (a) VALUES (1);
+    INSERT INTO t (a, b) VALUES (3, NULL);
+    SELECT * FROM t;
+} {|99
+1|
+1|}
+
+
 do_execsql_test_on_specific_db {:memory:} unique_insert_with_pkey {
     CREATE TABLE t2 (x INTEGER PRIMARY KEY, y INTEGER UNIQUE);
     INSERT INTO t2 (y) VALUES (1);
