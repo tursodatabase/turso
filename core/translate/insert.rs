@@ -930,6 +930,7 @@ fn translate_check_constraint(
     if res.is_err() {
         return Ok(());
     }
+    use crate::ast::Literal;
     use crate::error::SQLITE_CONSTRAINT_CHECK;
     match check_constraint {
         ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) => {
@@ -966,6 +967,13 @@ fn translate_check_constraint(
                 description: description.to_string(),
             });
             program.preassign_label_to_next_insn(label);
+        }
+        ast::Expr::Literal(Literal::Numeric(ref val)) if *val == "0".to_string() => {
+            translate_expr(program, None, &check_constraint, target_reg, resolver)?;
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_CONSTRAINT_CHECK,
+                description: description.to_string(),
+            });
         }
         ast::Expr::Literal(_) => {
             translate_expr(program, None, &check_constraint, target_reg, resolver)?;
