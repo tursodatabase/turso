@@ -943,7 +943,7 @@ fn translate_check_constraint(
                 lhs: lhs_reg,
                 rhs: rhs_reg,
                 target_pc: label,
-                flags: CmpInsFlags::default(),
+                flags: CmpInsFlags::default().jump_if_null(),
                 collation: program.curr_collation(),
             });
             program.emit_insn(Insn::Halt {
@@ -959,7 +959,7 @@ fn translate_check_constraint(
             program.emit_insn(Insn::If {
                 reg,
                 target_pc: label,
-                jump_if_null: false,
+                jump_if_null: true,
             });
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_CHECK,

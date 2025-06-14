@@ -216,11 +216,11 @@ do_execsql_test_on_specific_db {:memory:} insert_expr_constraint_check-4 {
     CREATE TABLE t (a int, x INTEGER check ((a + x) % 2 == 0));
     INSERT INTO t (x) VALUES (99);
     INSERT INTO t (a) VALUES (1);
-    INSERT INTO t (a, b) VALUES (3, NULL);
+    INSERT INTO t (a, x) VALUES (3, NULL);
     SELECT * FROM t;
 } {|99
 1|
-1|}
+3|}
 
 
 do_execsql_test_on_specific_db {:memory:} unique_insert_with_pkey {
