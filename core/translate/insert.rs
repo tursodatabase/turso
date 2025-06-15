@@ -971,6 +971,76 @@ fn translate_jump_if_truthy(
                 collation: program.curr_collation(),
             });
         }
+        ast::Expr::Binary(lhs, ast::Operator::NotEquals, rhs) => {
+            let lhs_reg = program.alloc_register();
+            translate_expr(program, None, &lhs, lhs_reg, resolver)?;
+            let rhs_reg = program.alloc_register();
+            translate_expr(program, None, &rhs, rhs_reg, resolver)?;
+            use crate::vdbe::insn::CmpInsFlags;
+            program.emit_insn(Insn::Ne {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                target_pc: jump_if_true,
+                flags: CmpInsFlags::default().jump_if_null(),
+                collation: program.curr_collation(),
+            });
+        }
+        ast::Expr::Binary(lhs, ast::Operator::Less, rhs) => {
+            let lhs_reg = program.alloc_register();
+            translate_expr(program, None, &lhs, lhs_reg, resolver)?;
+            let rhs_reg = program.alloc_register();
+            translate_expr(program, None, &rhs, rhs_reg, resolver)?;
+            use crate::vdbe::insn::CmpInsFlags;
+            program.emit_insn(Insn::Lt {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                target_pc: jump_if_true,
+                flags: CmpInsFlags::default().jump_if_null(),
+                collation: program.curr_collation(),
+            });
+        }
+        ast::Expr::Binary(lhs, ast::Operator::LessEquals, rhs) => {
+            let lhs_reg = program.alloc_register();
+            translate_expr(program, None, &lhs, lhs_reg, resolver)?;
+            let rhs_reg = program.alloc_register();
+            translate_expr(program, None, &rhs, rhs_reg, resolver)?;
+            use crate::vdbe::insn::CmpInsFlags;
+            program.emit_insn(Insn::Le {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                target_pc: jump_if_true,
+                flags: CmpInsFlags::default().jump_if_null(),
+                collation: program.curr_collation(),
+            });
+        }
+        ast::Expr::Binary(lhs, ast::Operator::Greater, rhs) => {
+            let lhs_reg = program.alloc_register();
+            translate_expr(program, None, &lhs, lhs_reg, resolver)?;
+            let rhs_reg = program.alloc_register();
+            translate_expr(program, None, &rhs, rhs_reg, resolver)?;
+            use crate::vdbe::insn::CmpInsFlags;
+            program.emit_insn(Insn::Gt {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                target_pc: jump_if_true,
+                flags: CmpInsFlags::default().jump_if_null(),
+                collation: program.curr_collation(),
+            });
+        }
+        ast::Expr::Binary(lhs, ast::Operator::GreaterEquals, rhs) => {
+            let lhs_reg = program.alloc_register();
+            translate_expr(program, None, &lhs, lhs_reg, resolver)?;
+            let rhs_reg = program.alloc_register();
+            translate_expr(program, None, &rhs, rhs_reg, resolver)?;
+            use crate::vdbe::insn::CmpInsFlags;
+            program.emit_insn(Insn::Ge {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                target_pc: jump_if_true,
+                flags: CmpInsFlags::default().jump_if_null(),
+                collation: program.curr_collation(),
+            });
+        }
         ast::Expr::Binary(_, _, _) => {
             let reg = program.alloc_register();
             translate_expr(program, None, &check_constraint, reg, resolver)?;
