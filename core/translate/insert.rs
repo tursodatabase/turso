@@ -1059,7 +1059,15 @@ fn translate_jump_if_truthy(
                 target_pc: jump_if_true,
             });
         }
-        _ => todo!(),
+        e => {
+            let reg = program.alloc_register();
+            translate_expr(program, None, &check_constraint, reg, resolver)?;
+            program.emit_insn(Insn::If {
+                reg,
+                target_pc: jump_if_true,
+                jump_if_null: true,
+            });
+        }
     }
     Ok(())
 }
