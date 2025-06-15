@@ -930,60 +930,64 @@ fn translate_check_constraint(
     if res.is_err() {
         return Ok(());
     }
-    use crate::ast::Literal;
     use crate::error::SQLITE_CONSTRAINT_CHECK;
+    let jump_if_true = program.allocate_label();
+    translate_jump_if_truthy(
+        program,
+        &check_constraint,
+        target_reg,
+        jump_if_true,
+        resolver,
+    )?;
+    program.emit_insn(Insn::Halt {
+        err_code: SQLITE_CONSTRAINT_CHECK,
+        description: description.to_string(),
+    });
+    program.preassign_label_to_next_insn(jump_if_true);
+    Ok(())
+}
+
+fn translate_jump_if_truthy(
+    program: &mut ProgramBuilder,
+    check_constraint: &Expr,
+    target_reg: usize,
+    jump_if_true: BranchOffset,
+    resolver: &Resolver,
+) -> Result<()> {
+    use crate::ast;
+    use crate::ast::Literal;
     match check_constraint {
         ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) => {
             let lhs_reg = program.alloc_register();
             translate_expr(program, None, &lhs, lhs_reg, resolver)?;
             let rhs_reg = program.alloc_register();
             translate_expr(program, None, &rhs, rhs_reg, resolver)?;
-            let label = program.allocate_label();
             use crate::vdbe::insn::CmpInsFlags;
             program.emit_insn(Insn::Eq {
                 lhs: lhs_reg,
                 rhs: rhs_reg,
-                target_pc: label,
+                target_pc: jump_if_true,
                 flags: CmpInsFlags::default().jump_if_null(),
                 collation: program.curr_collation(),
             });
-            program.emit_insn(Insn::Halt {
-                err_code: SQLITE_CONSTRAINT_CHECK,
-                description: description.to_string(),
-            });
-            program.preassign_label_to_next_insn(label);
         }
         ast::Expr::Binary(_, _, _) => {
             let reg = program.alloc_register();
             translate_expr(program, None, &check_constraint, reg, resolver)?;
-            let label = program.allocate_label();
             program.emit_insn(Insn::If {
                 reg,
-                target_pc: label,
+                target_pc: jump_if_true,
                 jump_if_null: true,
             });
-            program.emit_insn(Insn::Halt {
-                err_code: SQLITE_CONSTRAINT_CHECK,
-                description: description.to_string(),
-            });
-            program.preassign_label_to_next_insn(label);
         }
         ast::Expr::Literal(Literal::Numeric(ref val)) if *val == "0".to_string() => {
             translate_expr(program, None, &check_constraint, target_reg, resolver)?;
-            program.emit_insn(Insn::Halt {
-                err_code: SQLITE_CONSTRAINT_CHECK,
-                description: description.to_string(),
-            });
         }
         ast::Expr::Literal(_) => {
             translate_expr(program, None, &check_constraint, target_reg, resolver)?;
-            let label = program.allocate_label();
-            program.emit_insn(Insn::Goto { target_pc: label });
-            program.emit_insn(Insn::Halt {
-                err_code: SQLITE_CONSTRAINT_CHECK,
-                description: description.to_string(),
+            program.emit_insn(Insn::Goto {
+                target_pc: jump_if_true,
             });
-            program.preassign_label_to_next_insn(label);
         }
         _ => todo!(),
     }
