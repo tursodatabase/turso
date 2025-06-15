@@ -111,23 +111,7 @@ impl InteractionPlan {
             if i == failing_execution.interaction_index {
                 continue;
             }
-
-            // let interaction = &plan.plan[i];
-            // let mut dependencies: Vec<usize> = Vec::new();
-
-            // for j in (i + 1)..plan.plan.len() {
-            //     let later_interaction = &plan.plan[j];
-
-            //     if interaction.modifies().iter().any(|t| later_interaction.dependencies().contains(t)) {
-            //         dependencies.push(j);
-            //     }
-            // }
-
             let mut test_plan = plan.clone();
-
-            // for &dep_idx in dependencies.iter().rev() {
-            //     test_plan.plan.remove(dep_idx);
-            // }
 
             test_plan.plan.remove(i);
 
