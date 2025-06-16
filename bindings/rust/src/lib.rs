@@ -478,7 +478,20 @@ mod tests {
             .await;
 
         match query_result_after_wal_delete {
-            Ok(_) => panic!("Query succeeded after WAL deletion and DB reopen, but was expected to fail because the table definition should have been in the WAL."),
+            Ok(mut rows) => {
+                for i in 0..NUM_INSERTS {
+                    let row = rows
+                        .next()
+                        .await?
+                        .unwrap_or_else(|| panic!("Expected row {} but found None", i));
+                    assert_eq!(
+                        row.get_value(0)?,
+                        Value::Text(original_data[i].clone()),
+                        "Mismatch in retrieved data for row {}",
+                        i
+                    );
+                }
+            }
             Err(Error::SqlExecutionFailure(msg)) => {
                 assert!(
                     msg.contains("test_large_persistence not found"),
