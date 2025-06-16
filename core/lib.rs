@@ -551,6 +551,11 @@ impl Connection {
         Ok(())
     }
 
+    pub fn wal_insert_end(&self) -> Result<()> {
+        self.pager.end_tx()?;
+        Ok(())
+    }
+
     /// Flush dirty pages to disk.
     /// This will write the dirty pages to the WAL and then fsync the WAL.
     /// If the WAL size is over the checkpoint threshold, it will checkpoint the WAL to

@@ -1213,6 +1213,30 @@ pub unsafe extern "C" fn libsql_wal_insert_begin(db: *mut sqlite3) -> ffi::c_int
     }
 }
 
+/// End a WAL frame insert transaction.
+///
+/// The `libsql_wal_insert_end` function ends a WAL frame insert transaction
+/// started by `libsql_wal_insert_begin` for database connection `db`.
+///
+/// # Returns
+///
+/// - `SQLITE_OK` if the WAL frame insert transaction is successfully ended.
+/// - `SQLITE_MISUSE` if the `db` is `NULL`.
+/// - `SQLITE_ERROR` if an error occurs while ending the WAL frame insert
+///   transaction.
+#[no_mangle]
+pub unsafe extern "C" fn libsql_wal_insert_end(db: *mut sqlite3) -> ffi::c_int {
+    if db.is_null() {
+        return SQLITE_MISUSE;
+    }
+    let db: &mut sqlite3 = &mut *db;
+    let db = db.inner.lock().unwrap();
+    match db.conn.wal_insert_end() {
+        Ok(_) => SQLITE_OK,
+        Err(_) => SQLITE_ERROR,
+    }
+}
+
 fn sqlite3_safety_check_sick_or_ok(db: &sqlite3Inner) -> bool {
     match db.e_open_state {
         SQLITE_STATE_SICK | SQLITE_STATE_OPEN | SQLITE_STATE_BUSY => true,
