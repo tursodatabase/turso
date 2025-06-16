@@ -666,6 +666,16 @@ impl Pager {
         Ok(self.wal.borrow().get_max_frame_in_wal())
     }
 
+    pub fn wal_insert_frame(&self, _frame_no: u32, frame: &[u8], _is_conflict: *mut bool) -> Result<()> {
+        assert_eq!(frame.len(), 4096 + 24);
+        let db_size = self.db_header.lock().database_size;
+        let write_counter = Rc::new(RefCell::new(0));
+        let page_number = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]);
+        let data: &[u8] = &frame[24..];
+        self.wal.borrow_mut().append_frame(page_number as u64, data, db_size, write_counter, Box::new(|| {}))?;
+        Ok(())
+    }
+
     /// Flush dirty pages to disk.
     /// In the base case, it will write the dirty pages to the WAL and then fsync the WAL.
     /// If the WAL size is over the checkpoint threshold, it will checkpoint the WAL to

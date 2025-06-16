@@ -556,6 +556,11 @@ impl Connection {
         Ok(())
     }
 
+    pub fn wal_insert_frame(&self, frame_no: u32, frame: &[u8], is_conflict: *mut bool) -> Result<()> {
+        self.pager.wal_insert_frame(frame_no, frame, is_conflict)?;
+        Ok(())
+    }
+
     /// Flush dirty pages to disk.
     /// This will write the dirty pages to the WAL and then fsync the WAL.
     /// If the WAL size is over the checkpoint threshold, it will checkpoint the WAL to
