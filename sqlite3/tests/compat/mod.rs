@@ -27,6 +27,8 @@ extern "C" {
         stmt: *mut *mut sqlite3_stmt,
         tail: *mut *const libc::c_char,
     ) -> i32;
+    fn sqlite3_column_count(stmt: *mut sqlite3_stmt) -> i32;
+    fn sqlite3_column_type(stmt: *mut sqlite3_stmt, col: i32) -> i32;
     fn sqlite3_step(stmt: *mut sqlite3_stmt) -> i32;
     fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> i32;
     fn sqlite3_wal_checkpoint(db: *mut sqlite3, db_name: *const libc::c_char) -> i32;
@@ -44,11 +46,21 @@ extern "C" {
         p_frame: *mut u8,
         frame_len: u32,
     ) -> i32;
+    fn libsql_wal_insert_begin(db: *mut sqlite3) -> i32;
+    fn libsql_wal_insert_end(db: *mut sqlite3) -> i32;
+    fn libsql_wal_insert_frame(
+        db: *mut sqlite3,
+        frame_no: u32,
+        p_frame: *mut u8,
+        frame_len: u32,
+        is_conflict: *mut bool,
+    ) -> i32;
 }
 
 const SQLITE_OK: i32 = 0;
 const SQLITE_CANTOPEN: i32 = 14;
 const SQLITE_DONE: i32 = 101;
+const SQLITE_ROW: i32 = 100;
 
 const SQLITE_CHECKPOINT_PASSIVE: i32 = 0;
 const SQLITE_CHECKPOINT_FULL: i32 = 1;
@@ -301,6 +313,119 @@ mod tests {
                     let page_num = u32::from_be_bytes(frame[0..4].try_into().unwrap());
                     assert_eq!(page_num, pages[i as usize - 1]);
                 }
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+            }
+        }
+
+        #[test]
+        fn test_insert_frame() {
+            unsafe {
+                let mut db = ptr::null_mut();
+                let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+                let path = temp_file.path();
+                let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+                assert_eq!(sqlite3_open(c_path.as_ptr(), &mut db), SQLITE_OK);
+                let mut stmt = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_prepare_v2(
+                        db,
+                        c"CREATE TABLE t (x)".as_ptr(),
+                        -1,
+                        &mut stmt,
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+                assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+                let mut stmt = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_prepare_v2(
+                        db,
+                        c"INSERT INTO t (x) VALUES (1)".as_ptr(),
+                        -1,
+                        &mut stmt,
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+                assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+                let mut other_db = ptr::null_mut();
+                let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+                let path = temp_file.path();
+                let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+                assert_eq!(sqlite3_open(c_path.as_ptr(), &mut other_db), SQLITE_OK);
+
+                libsql_wal_insert_begin(other_db);
+                let mut frame_count = 0;
+                assert_eq!(libsql_wal_frame_count(db, &mut frame_count), SQLITE_OK);
+                assert_eq!(frame_count, 3);
+                for i in 1..frame_count + 1 {
+                    let frame_len = 4096 + 24;
+                    let mut frame = vec![0; frame_len];
+                    assert_eq!(
+                        libsql_wal_get_frame(db, i, frame.as_mut_ptr(), frame_len as u32),
+                        SQLITE_OK
+                    );
+                    assert_eq!(
+                        libsql_wal_insert_frame(
+                            other_db,
+                            i,
+                            frame.as_mut_ptr(),
+                            frame_len as u32,
+                            ptr::null_mut()
+                        ),
+                        SQLITE_OK
+                    );
+                }
+                libsql_wal_insert_end(other_db);
+
+                let mut stmt = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_prepare_v2(
+                        other_db,
+                        c"SELECT * FROM t".as_ptr(),
+                        -1,
+                        &mut stmt,
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                let mut other_stmt = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_prepare_v2(
+                        other_db,
+                        c"SELECT * FROM t".as_ptr(),
+                        -1,
+                        &mut other_stmt,
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                loop {
+                    let rc = sqlite3_step(stmt);
+                    let other_rc = sqlite3_step(other_stmt);
+                    assert_eq!(rc, other_rc);
+                    if rc == SQLITE_DONE {
+                        break;
+                    }
+                    if rc == SQLITE_ROW {
+                        assert_eq!(sqlite3_column_count(stmt), sqlite3_column_count(other_stmt));
+                        for i in 0..sqlite3_column_count(stmt) {
+                            assert_eq!(
+                                sqlite3_column_type(stmt, i),
+                                sqlite3_column_type(other_stmt, i)
+                            );
+                        }
+                    }
+                }
+
+                assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+                assert_eq!(sqlite3_finalize(other_stmt), SQLITE_OK);
+
+                assert_eq!(sqlite3_close(other_db), SQLITE_OK);
                 assert_eq!(sqlite3_close(db), SQLITE_OK);
             }
         }
