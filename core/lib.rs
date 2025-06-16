@@ -546,6 +546,11 @@ impl Connection {
         self.pager.wal_get_frame(frame_no, p_frame, frame_len)
     }
 
+    pub fn wal_insert_begin(&self) -> Result<()> {
+        self.pager.begin_write_tx()?;
+        Ok(())
+    }
+
     /// Flush dirty pages to disk.
     /// This will write the dirty pages to the WAL and then fsync the WAL.
     /// If the WAL size is over the checkpoint threshold, it will checkpoint the WAL to
