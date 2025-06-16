@@ -223,9 +223,11 @@ pub trait Wal {
     /// Write a frame to the WAL.
     fn append_frame(
         &mut self,
-        page: PageRef,
+        page_id: u64,
+        frame: &[u8],
         db_size: u32,
         write_counter: Rc<RefCell<usize>>,
+        write_finish: Box<dyn Fn() -> ()>,
     ) -> Result<()>;
 
     fn should_checkpoint(&self) -> bool;
@@ -289,9 +291,11 @@ impl Wal for DummyWAL {
 
     fn append_frame(
         &mut self,
-        _page: crate::PageRef,
+        _page_id: u64,
+        _frame: &[u8],
         _db_size: u32,
         _write_counter: Rc<RefCell<usize>>,
+        _write_finish: Box<dyn Fn() -> ()>,
     ) -> Result<()> {
         Ok(())
     }
@@ -619,11 +623,12 @@ impl Wal for WalFile {
     /// Write a frame to the WAL.
     fn append_frame(
         &mut self,
-        page: PageRef,
+        page_id: u64,
+        frame: &[u8],
         db_size: u32,
         write_counter: Rc<RefCell<usize>>,
+        write_finish: Box<dyn Fn() -> ()>,
     ) -> Result<()> {
-        let page_id = page.get().id;
         let shared = self.get_shared();
         let max_frame = shared.max_frame.load(Ordering::SeqCst);
         let frame_id = if max_frame == 0 { 1 } else { max_frame + 1 };
@@ -640,12 +645,14 @@ impl Wal for WalFile {
         let checksums = begin_write_wal_frame(
             &shared.file,
             offset,
-            &page,
+            page_id,
+            frame,
             self.page_size as u16,
             db_size,
             write_counter,
             &header,
             checksums,
+            write_finish,
         )?;
         shared.last_checksum = checksums;
         shared.max_frame.store(frame_id, Ordering::SeqCst);

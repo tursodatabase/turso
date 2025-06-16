@@ -684,10 +684,17 @@ impl Pager {
                         let page = cache.get(&page_key).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
                         let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
                         trace!("cacheflush(page={}, page_type={:?}", page_id, page_type);
+                        let page_id = page.get().id as u64;
+                        let data = page.get().contents.as_ref().unwrap().as_ptr();
+                        let page_finish = page.clone();
                         self.wal.borrow_mut().append_frame(
-                            page.clone(),
+                            page_id,
+                            data,
                             db_size,
                             self.flush_info.borrow().in_flight_writes.clone(),
+                            Box::new(move || {
+                                page_finish.clear_dirty();
+                            }),
                         )?;
                         page.clear_dirty();
                     }

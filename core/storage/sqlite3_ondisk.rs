@@ -1532,19 +1532,19 @@ pub fn begin_read_wal_frame(
     Ok(c)
 }
 
-#[instrument(skip(io, page, write_counter, wal_header, checksums), level = Level::TRACE)]
+#[instrument(skip(io, data, write_counter, wal_header, checksums, write_finish), level = Level::TRACE)]
 pub fn begin_write_wal_frame(
     io: &Arc<dyn File>,
     offset: usize,
-    page: &PageRef,
+    page_id: u64,
+    data: &[u8],
     page_size: u16,
     db_size: u32,
     write_counter: Rc<RefCell<usize>>,
     wal_header: &WalHeader,
     checksums: (u32, u32),
+    write_finish: Box<dyn Fn() -> ()>,
 ) -> Result<(u32, u32)> {
-    let page_finish = page.clone();
-    let page_id = page.get().id;
     tracing::trace!(page_id);
 
     let mut header = WalFrameHeader {
@@ -1556,26 +1556,18 @@ pub fn begin_write_wal_frame(
         checksum_2: 0,
     };
     let (buffer, checksums) = {
-        let page = page.get();
-        let contents = page.contents.as_ref().unwrap();
         let drop_fn = Rc::new(|_buf| {});
 
-        let mut buffer = Buffer::allocate(
-            contents.buffer.borrow().len() + WAL_FRAME_HEADER_SIZE,
-            drop_fn,
-        );
+        let mut buffer = Buffer::allocate(data.len() + WAL_FRAME_HEADER_SIZE, drop_fn);
         let buf = buffer.as_mut_slice();
         buf[0..4].copy_from_slice(&header.page_number.to_be_bytes());
         buf[4..8].copy_from_slice(&header.db_size.to_be_bytes());
         buf[8..12].copy_from_slice(&header.salt_1.to_be_bytes());
         buf[12..16].copy_from_slice(&header.salt_2.to_be_bytes());
 
-        let contents_buf = contents.as_ptr();
-        let content_len = contents_buf.len();
-        buf[WAL_FRAME_HEADER_SIZE..WAL_FRAME_HEADER_SIZE + content_len]
-            .copy_from_slice(contents_buf);
-        if content_len < page_size as usize {
-            buf[WAL_FRAME_HEADER_SIZE + content_len..WAL_FRAME_HEADER_SIZE + page_size as usize]
+        buf[WAL_FRAME_HEADER_SIZE..WAL_FRAME_HEADER_SIZE + data.len()].copy_from_slice(data);
+        if data.len() < page_size as usize {
+            buf[WAL_FRAME_HEADER_SIZE + data.len()..WAL_FRAME_HEADER_SIZE + page_size as usize]
                 .fill(0);
         }
 
@@ -1605,8 +1597,7 @@ pub fn begin_write_wal_frame(
             let buf_copy = buf_copy.clone();
             let buf_len = buf_copy.borrow().len();
             *write_counter.borrow_mut() -= 1;
-
-            page_finish.clear_dirty();
+            write_finish();
             if bytes_written < buf_len as i32 {
                 tracing::error!("wrote({bytes_written}) less than expected({buf_len})");
             }
