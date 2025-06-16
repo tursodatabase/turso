@@ -840,8 +840,6 @@ impl Limbo {
                 anyhow::bail!("We have to throw here, even if we printed error");
             }
         }
-        // for now let's cache flush always
-        self.conn.cacheflush()?;
         Ok(())
     }
 

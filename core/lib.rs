@@ -551,7 +551,7 @@ impl Connection {
     /// If the WAL size is over the checkpoint threshold, it will checkpoint the WAL to
     /// the database file and then fsync the database file.
     pub fn cacheflush(&self) -> Result<PagerCacheflushStatus> {
-        self.pager.cacheflush()
+        self.pager.cacheflush(false)
     }
 
     pub fn clear_page_cache(&self) -> Result<()> {
@@ -566,7 +566,7 @@ impl Connection {
 
     /// Close a connection and checkpoint.
     pub fn close(&self) -> Result<()> {
-        self.pager.checkpoint_shutdown()
+        self.pager.checkpoint_shutdown(false)
     }
 
     pub fn last_insert_rowid(&self) -> i64 {
@@ -732,6 +732,15 @@ impl Connection {
         }
 
         Ok(results)
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        let res = self.pager.checkpoint_shutdown(true);
+        if res.is_err() {
+            tracing::error!(?res);
+        }
     }
 }
 

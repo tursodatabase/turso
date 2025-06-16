@@ -559,7 +559,7 @@ impl Pager {
     }
 
     pub fn end_tx(&self) -> Result<PagerCacheflushStatus> {
-        let cacheflush_status = self.cacheflush()?;
+        let cacheflush_status = self.cacheflush(false)?;
         return match cacheflush_status {
             PagerCacheflushStatus::IO => Ok(PagerCacheflushStatus::IO),
             PagerCacheflushStatus::Done(_) => {
@@ -670,7 +670,7 @@ impl Pager {
     /// In the base case, it will write the dirty pages to the WAL and then fsync the WAL.
     /// If the WAL size is over the checkpoint threshold, it will checkpoint the WAL to
     /// the database file and then fsync the database file.
-    pub fn cacheflush(&self) -> Result<PagerCacheflushStatus> {
+    pub fn cacheflush(&self, last_conn: bool) -> Result<PagerCacheflushStatus> {
         let mut checkpoint_result = CheckpointResult::default();
         loop {
             let state = self.flush_info.borrow().state;
@@ -713,7 +713,7 @@ impl Pager {
                         return Ok(PagerCacheflushStatus::IO);
                     }
 
-                    if !self.wal.borrow().should_checkpoint() {
+                    if !last_conn && !self.wal.borrow().should_checkpoint() {
                         self.flush_info.borrow_mut().state = FlushState::Start;
                         return Ok(PagerCacheflushStatus::Done(
                             PagerCacheflushResult::WalWritten,
@@ -821,7 +821,8 @@ impl Pager {
             .expect("Failed to clear page cache");
     }
 
-    pub fn checkpoint_shutdown(&self) -> Result<()> {
+    /// If it is the last active connection it will force a checkpoint in the DB file
+    pub fn checkpoint_shutdown(&self, last_conn: bool) -> Result<()> {
         let mut attempts = 0;
         {
             let mut wal = self.wal.borrow_mut();
@@ -836,7 +837,28 @@ impl Pager {
                 attempts += 1;
             }
         }
-        self.wal_checkpoint();
+        loop {
+            match self.cacheflush(last_conn)? {
+                PagerCacheflushStatus::Done(pager_cacheflush_result) => {
+                    // If not the last_conn just break on WalWritten, else wait for Checkpointed
+                    if matches!(
+                        pager_cacheflush_result,
+                        PagerCacheflushResult::Checkpointed(..)
+                    ) || !last_conn
+                    {
+                        break;
+                    }
+                }
+                PagerCacheflushStatus::IO => {
+                    let _ = self.io.run_once()?;
+                }
+            };
+        }
+        // TODO: only clear cache of things that are really invalidated
+        self.page_cache
+            .write()
+            .clear()
+            .expect("Failed to clear page cache");
         Ok(())
     }
 
