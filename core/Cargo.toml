@@ -78,6 +78,7 @@ miette = "7.6.0"
 strum = { workspace = true }
 parking_lot = "0.12.3"
 crossbeam-skiplist = "0.1.3"
+tempfile = "3.8.0"
 tracing = "0.1.41"
 ryu = "1.0.19"
 uncased = "0.9.10"
@@ -100,7 +101,6 @@ criterion = { version = "0.5", features = [
 ] }
 rstest = "0.18.2"
 rusqlite = "0.34.0"
-tempfile = "3.8.0"
 quickcheck = { version = "1.0", default-features = false }
 quickcheck_macros = { version = "1.0", default-features = false }
 rand = "0.8.5" # Required for quickcheck

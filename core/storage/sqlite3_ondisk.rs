@@ -1105,7 +1105,7 @@ impl<T: Default + Copy, const N: usize> Iterator for SmallVecIter<'_, T, N> {
     }
 }
 
-pub fn read_record(payload: &[u8], reuse_immutable: &mut ImmutableRecord) -> Result<()> {
+pub fn read_record(payload: &[u8], reuse_immutable: &mut ImmutableRecord) -> Result<usize> {
     // Let's clear previous use
     reuse_immutable.invalidate();
     // Copy payload to ImmutableRecord in order to make RefValue that point to this new buffer.
@@ -1146,7 +1146,7 @@ pub fn read_record(payload: &[u8], reuse_immutable: &mut ImmutableRecord) -> Res
         }
     }
 
-    Ok(())
+    Ok(pos)
 }
 
 /// Reads a value that might reference the buffer it is reading from. Be sure to store RefValue with the buffer

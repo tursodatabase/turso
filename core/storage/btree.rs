@@ -721,7 +721,7 @@ impl BTreeCursor {
         payload: &'static [u8],
         start_next_page: u32,
         payload_size: u64,
-    ) -> Result<CursorResult<()>> {
+    ) -> Result<CursorResult<usize>> {
         if self.read_overflow_state.borrow().is_none() {
             let page = self.read_page(start_next_page as usize)?;
             *self.read_overflow_state.borrow_mut() = Some(ReadPayloadOverflow {
@@ -772,13 +772,13 @@ impl BTreeCursor {
         std::mem::swap(payload, &mut payload_swap);
 
         let mut reuse_immutable = self.get_immutable_record_or_create();
-        crate::storage::sqlite3_ondisk::read_record(
+        let bytes_consumed = crate::storage::sqlite3_ondisk::read_record(
             &payload_swap,
             reuse_immutable.as_mut().unwrap(),
         )?;
 
         let _ = read_overflow_state.take();
-        Ok(CursorResult::Ok(()))
+        Ok(CursorResult::Ok(bytes_consumed))
     }
 
     /// Calculates how much of a cell's payload should be stored locally vs in overflow pages
@@ -2012,15 +2012,15 @@ impl BTreeCursor {
         payload: &'static [u8],
         next_page: Option<u32>,
         payload_size: u64,
-    ) -> Result<CursorResult<()>> {
+    ) -> Result<CursorResult<usize>> {
         if let Some(next_page) = next_page {
             self.process_overflow_read(payload, next_page, payload_size)
         } else {
-            crate::storage::sqlite3_ondisk::read_record(
+            let bytes_consumed = crate::storage::sqlite3_ondisk::read_record(
                 payload,
                 self.get_immutable_record_or_create().as_mut().unwrap(),
             )?;
-            Ok(CursorResult::Ok(()))
+            Ok(CursorResult::Ok(bytes_consumed))
         }
     }
 
