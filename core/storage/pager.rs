@@ -11,12 +11,12 @@ use crate::types::CursorResult;
 use crate::Completion;
 use crate::{Buffer, LimboError, Result};
 use parking_lot::RwLock;
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tracing::trace;
+use tracing::{instrument, Level};
 
 use super::btree::BTreePage;
 use super::page_cache::{CacheError, CacheResizeResult, DumbLruPageCache, PageCacheKey};
@@ -214,6 +214,7 @@ pub struct Pager {
     checkpoint_inflight: Rc<RefCell<usize>>,
     syncing: Rc<RefCell<bool>>,
     auto_vacuum_mode: RefCell<AutoVacuumMode>,
+    pub checkpoint_result: Cell<CheckpointResult>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -265,6 +266,7 @@ impl Pager {
             checkpoint_inflight: Rc::new(RefCell::new(0)),
             buffer_pool,
             auto_vacuum_mode: RefCell::new(AutoVacuumMode::None),
+            checkpoint_result: Cell::new(CheckpointResult::default()),
         })
     }
 
@@ -670,11 +672,11 @@ impl Pager {
     /// In the base case, it will write the dirty pages to the WAL and then fsync the WAL.
     /// If the WAL size is over the checkpoint threshold, it will checkpoint the WAL to
     /// the database file and then fsync the database file.
+    #[instrument(skip(self), level = Level::TRACE)]
     pub fn cacheflush(&self, last_conn: bool) -> Result<PagerCacheflushStatus> {
-        let mut checkpoint_result = CheckpointResult::default();
         loop {
             let state = self.flush_info.borrow().state;
-            trace!("cacheflush {:?}", state);
+            tracing::trace!(?state);
             match state {
                 FlushState::Start => {
                     let db_size = self.db_header.lock().database_size;
@@ -683,7 +685,7 @@ impl Pager {
                         let page_key = PageCacheKey::new(*page_id);
                         let page = cache.get(&page_key).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
                         let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
-                        trace!("cacheflush(page={}, page_type={:?}", page_id, page_type);
+                        tracing::trace!(page = page_id, ?page_type);
                         self.wal.borrow_mut().append_frame(
                             page.clone(),
                             db_size,
@@ -723,8 +725,7 @@ impl Pager {
                 }
                 FlushState::Checkpoint => {
                     match self.checkpoint()? {
-                        CheckpointStatus::Done(res) => {
-                            checkpoint_result = res;
+                        CheckpointStatus::Done => {
                             self.flush_info.borrow_mut().state = FlushState::SyncDbFile;
                         }
                         CheckpointStatus::IO => return Ok(PagerCacheflushStatus::IO),
@@ -745,7 +746,7 @@ impl Pager {
             }
         }
         Ok(PagerCacheflushStatus::Done(
-            PagerCacheflushResult::Checkpointed(checkpoint_result),
+            PagerCacheflushResult::Checkpointed(self.checkpoint_result.get()),
         ))
     }
 
@@ -764,11 +765,11 @@ impl Pager {
         );
     }
 
+    #[instrument(skip_all, level = Level::TRACE)]
     pub fn checkpoint(&self) -> Result<CheckpointStatus> {
-        let mut checkpoint_result = CheckpointResult::default();
         loop {
             let state = *self.checkpoint_state.borrow();
-            trace!("pager_checkpoint(state={:?})", state);
+            tracing::trace!(?state);
             match state {
                 CheckpointState::Checkpoint => {
                     let in_flight = self.checkpoint_inflight.clone();
@@ -778,8 +779,7 @@ impl Pager {
                         CheckpointMode::Passive,
                     )? {
                         CheckpointStatus::IO => return Ok(CheckpointStatus::IO),
-                        CheckpointStatus::Done(res) => {
-                            checkpoint_result = res;
+                        CheckpointStatus::Done => {
                             self.checkpoint_state.replace(CheckpointState::SyncDbFile);
                         }
                     };
@@ -802,7 +802,7 @@ impl Pager {
                         Ok(CheckpointStatus::IO)
                     } else {
                         self.checkpoint_state.replace(CheckpointState::Checkpoint);
-                        Ok(CheckpointStatus::Done(checkpoint_result))
+                        Ok(CheckpointStatus::Done)
                     };
                 }
             }
@@ -863,7 +863,6 @@ impl Pager {
     }
 
     pub fn wal_checkpoint(&self) -> CheckpointResult {
-        let checkpoint_result: CheckpointResult;
         loop {
             match self.wal.borrow_mut().checkpoint(
                 self,
@@ -873,8 +872,7 @@ impl Pager {
                 Ok(CheckpointStatus::IO) => {
                     let _ = self.io.run_once();
                 }
-                Ok(CheckpointStatus::Done(res)) => {
-                    checkpoint_result = res;
+                Ok(CheckpointStatus::Done) => {
                     break;
                 }
                 Err(err) => panic!("error while clearing cache {}", err),
@@ -885,7 +883,7 @@ impl Pager {
             .write()
             .clear()
             .expect("Failed to clear page cache");
-        checkpoint_result
+        self.checkpoint_result.get()
     }
 
     // Providing a page is optional, if provided it will be used to avoid reading the page from disk.

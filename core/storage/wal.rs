@@ -306,9 +306,7 @@ impl Wal for DummyWAL {
         _write_counter: Rc<RefCell<usize>>,
         _mode: crate::CheckpointMode,
     ) -> Result<crate::CheckpointStatus> {
-        Ok(crate::CheckpointStatus::Done(
-            crate::CheckpointResult::default(),
-        ))
+        Ok(crate::CheckpointStatus::Done)
     }
 
     fn sync(&mut self) -> Result<crate::storage::wal::WalFsyncStatus> {
@@ -354,7 +352,7 @@ pub enum WalFsyncStatus {
 
 #[derive(Debug, Copy, Clone)]
 pub enum CheckpointStatus {
-    Done(CheckpointResult),
+    Done,
     IO,
 }
 
@@ -820,7 +818,8 @@ impl Wal for WalFile {
                             .store(self.ongoing_checkpoint.max_frame, Ordering::SeqCst);
                     }
                     self.ongoing_checkpoint.state = CheckpointState::Start;
-                    return Ok(CheckpointStatus::Done(checkpoint_result));
+                    pager.checkpoint_result.set(checkpoint_result);
+                    return Ok(CheckpointStatus::Done);
                 }
             }
         }
