@@ -1515,10 +1515,11 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
 pub fn begin_read_wal_frame(
     io: &Arc<dyn File>,
     offset: usize,
+    read_size: usize,
     buffer_pool: Rc<BufferPool>,
     complete: Box<dyn Fn(Arc<RefCell<Buffer>>) -> ()>,
 ) -> Result<Arc<Completion>> {
-    tracing::trace!("begin_read_wal_frame(offset={})", offset);
+    tracing::trace!("begin_read_wal_frame(offset={}, read_size={})", offset, read_size);
     let buf = buffer_pool.get();
     let drop_fn = Rc::new(move |buf| {
         let buffer_pool = buffer_pool.clone();

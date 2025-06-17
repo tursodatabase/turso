@@ -290,6 +290,7 @@ mod tests {
                 let mut frame_count = 0;
                 assert_eq!(libsql_wal_frame_count(db, &mut frame_count), SQLITE_OK);
                 assert_eq!(frame_count, 3);
+                let pages = vec![1, 2, 2];
                 for i in 1..frame_count + 1 {
                     let frame_len = 4096 + 24;
                     let mut frame = vec![0; frame_len];
@@ -297,6 +298,8 @@ mod tests {
                         libsql_wal_get_frame(db, i, frame.as_mut_ptr(), frame_len as u32),
                         SQLITE_OK
                     );
+                    let page_num = u32::from_be_bytes(frame[0..4].try_into().unwrap());
+                    assert_eq!(page_num, pages[i as usize - 1]);
                 }
                 assert_eq!(sqlite3_close(db), SQLITE_OK);
             }
