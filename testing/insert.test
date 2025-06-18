@@ -241,6 +241,15 @@ do_execsql_test_in_memory_any_error insert_expr_constraint_check-7 {
     INSERT INTO t VALUES (3, 1), (1, 5), (2, 1);
 }
 
+# column 'a' is not refered to
+do_execsql_test_on_specific_db {:memory:} insert_expr_constraint_check-8 {
+    CREATE TABLE t (a int, b INTEGER check ((a + b) % 2 == 0));
+    INSERT INTO t (b) VALUES (1), (5), (1);
+    SELECT * FROM t;
+} {|1
+|5
+|1}
+
 
 do_execsql_test_on_specific_db {:memory:} unique_insert_with_pkey {
     CREATE TABLE t2 (x INTEGER PRIMARY KEY, y INTEGER UNIQUE);

@@ -720,15 +720,16 @@ fn translate_helper(
             return reg;
         }
         ast::Expr::Id(id) => {
-            let finding = &column_mappings
-                .iter()
-                .find(|cm| cm.column.name.as_ref().map_or(false, |name| *name == id.0));
-            let reg = yield_reg
-                + finding
-                    .expect("Should find")
-                    .value_index
-                    .unwrap_or_else(|| program.alloc_register());
-            return reg;
+            for (i, cm) in column_mappings.iter().enumerate() {
+                if cm.column.name.as_ref().map_or(false, |name| *name == id.0) {
+                    if let Some(value_index) = cm.value_index {
+                        return yield_reg + value_index;
+                    } else {
+                        return yield_reg + i;
+                    }
+                }
+            }
+            unreachable!();
         }
         ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) => {
             use crate::vdbe::insn::CmpInsFlags;
