@@ -50,6 +50,7 @@ pub use io::{
 use limbo_sqlite3_parser::{ast, ast::Cmd, lexer::sql::Parser};
 use parking_lot::RwLock;
 use schema::Schema;
+use std::sync::atomic::AtomicU64;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell, UnsafeCell},
@@ -112,6 +113,7 @@ pub struct Database {
     _shared_page_cache: Arc<RwLock<DumbLruPageCache>>,
     shared_wal: Arc<UnsafeCell<WalFileShared>>,
     open_flags: OpenFlags,
+    conn_counter: AtomicU64,
 }
 
 unsafe impl Send for Database {}
@@ -188,6 +190,7 @@ impl Database {
             io: io.clone(),
             page_size,
             open_flags: flags,
+            conn_counter: AtomicU64::new(0),
         };
         let db = Arc::new(db);
         {
@@ -245,6 +248,7 @@ impl Database {
         if let Err(e) = conn.register_builtins() {
             return Err(LimboError::ExtensionError(e));
         }
+        self.increase_conn_counter();
         Ok(conn)
     }
 
@@ -271,6 +275,24 @@ impl Database {
         };
         let db = Self::open_file(io.clone(), path, false)?;
         Ok((io, db))
+    }
+
+    fn increase_conn_counter(&self) {
+        let prev_counter = self
+            .conn_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Means we wrapped around in the add operation
+        if prev_counter == u64::MAX {
+            panic!("too many connections created");
+        }
+    }
+
+    // Returns if it is the Last Connection dropped
+    fn decrease_conn_counter(&self) -> bool {
+        let prev_counter = self
+            .conn_counter
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        prev_counter == 1
     }
 }
 
@@ -737,7 +759,8 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        let res = self.pager.checkpoint_shutdown(true);
+        let last_conn = self._db.decrease_conn_counter();
+        let res = self.pager.checkpoint_shutdown(last_conn);
         if res.is_err() {
             tracing::error!(?res);
         }
