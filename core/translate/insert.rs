@@ -1052,7 +1052,60 @@ fn translate_helper(
             }
             return dest_reg;
         }
-        _ => todo!(),
+        ast::Expr::Binary(lhs, ast::Operator::Modulus, rhs) => {
+            let lhs_reg = translate_helper(
+                program,
+                lhs,
+                column_mappings,
+                yield_reg,
+                label,
+                false,
+                resolver,
+            );
+            let rhs_reg = translate_helper(
+                program,
+                rhs,
+                column_mappings,
+                yield_reg,
+                label,
+                false,
+                resolver,
+            );
+            let dest_reg = program.alloc_register();
+            program.emit_insn(Insn::Remainder {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                dest: dest_reg,
+            });
+            if should_jump {
+                program.emit_insn(Insn::If {
+                    reg: dest_reg,
+                    target_pc: label,
+                    jump_if_null: true,
+                });
+            }
+            return dest_reg;
+        }
+        ast::Expr::Parenthesized(expr) => {
+            let dest_reg = translate_helper(
+                program,
+                expr.get(0).expect("Expr should exist"),
+                column_mappings,
+                yield_reg,
+                label,
+                false,
+                resolver,
+            );
+            if should_jump {
+                program.emit_insn(Insn::If {
+                    reg: dest_reg,
+                    target_pc: label,
+                    jump_if_null: true,
+                });
+            }
+            return dest_reg;
+        }
+        e => todo!("{}", &e),
     }
 }
 
@@ -1169,9 +1222,8 @@ fn populate_column_registers(
                 translate_check_constraint(
                     &mapping,
                     &column_mappings,
-                    value,
                     program,
-                    target_reg,
+                    column_registers_start,
                     resolver,
                 )?;
             }
@@ -1265,6 +1317,37 @@ fn translate_virtual_table_insert(
 }
 
 fn translate_check_constraint(
+    column_mapping: &ColumnMapping,
+    column_mappings: &[ColumnMapping],
+    program: &mut ProgramBuilder,
+    column_registers_start: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let check_constraint = column_mapping
+        .column
+        .check_constraint
+        .clone()
+        .expect("Check Contraint must be present");
+    let description = &check_constraint.to_string();
+    let jump_if_true = program.allocate_label();
+    let _ = translate_helper(
+        program,
+        &check_constraint,
+        column_mappings,
+        column_registers_start,
+        jump_if_true,
+        true,
+        resolver,
+    );
+    program.emit_insn(Insn::Halt {
+        err_code: SQLITE_CONSTRAINT_CHECK,
+        description: description.to_string(),
+    });
+    program.preassign_label_to_next_insn(jump_if_true);
+    Ok(())
+}
+
+fn _translate_check_constraint(
     column_mapping: &ColumnMapping,
     column_mappings: &[ColumnMapping],
     values: &[Expr],

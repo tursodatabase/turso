@@ -1127,7 +1127,7 @@ fn emit_update_insns(
                 translate_expr(
                     program,
                     Some(&plan.table_references),
-                    dbg!(expr),
+                    expr,
                     target_reg,
                     &t_ctx.resolver,
                 )?;
