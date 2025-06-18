@@ -10,7 +10,6 @@ pub struct Database {
     conn: Arc<limbo_core::Connection>,
 }
 
-#[allow(clippy::arc_with_non_send_sync)]
 #[wasm_bindgen]
 impl Database {
     #[wasm_bindgen(constructor)]
