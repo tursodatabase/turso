@@ -1386,36 +1386,6 @@ fn emit_update_insns(
     Ok(())
 }
 
-use crate::ast::Expr;
-use crate::translate::plan::JoinedTable;
-fn rewrite_check_constraint(table: &JoinedTable, check_constraint_expr: &mut Expr) {
-    use crate::translate::expr::walk_expr_mut;
-    let _ = walk_expr_mut(
-        check_constraint_expr,
-        &mut |expr: &mut Expr| -> Result<()> {
-            match expr {
-                ast::Expr::Id(id) => {
-                    let res = table
-                        .columns()
-                        .iter()
-                        .enumerate()
-                        .find(|(_i, col)| col.name.as_ref().map_or(false, |c| *c == id.0));
-                    if let Some((i, col)) = res {
-                        *expr = Expr::Column {
-                            database: None, // TODO: support different databases
-                            table: table.internal_id,
-                            column: i,
-                            is_rowid_alias: col.is_rowid_alias,
-                        };
-                    }
-                    Ok(())
-                }
-                _ => Ok(()),
-            }
-        },
-    );
-}
-
 /// Initialize the limit/offset counters and registers.
 /// In case of compound SELECTs, the limit counter is initialized only once,
 /// hence [LimitCtx::initialize_counter] being false in those cases.
