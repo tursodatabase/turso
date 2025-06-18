@@ -79,7 +79,8 @@ impl InteractionPlan {
 
                         temp_plan =
                             InteractionPlan::iterative_shrink(temp_plan, failing_execution, result);
-
+                        temp_plan = Self::shrink_queries(temp_plan, failing_execution, result, env);
+                        
                         *queries = temp_plan
                             .plan
                             .into_iter()
