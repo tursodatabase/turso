@@ -5,8 +5,7 @@ use limbo_core::Value;
 use std::ffi::{self, CStr, CString};
 use tracing::trace;
 
-use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 macro_rules! stub {
     () => {
@@ -35,14 +34,14 @@ pub const SQLITE_CHECKPOINT_FULL: ffi::c_int = 1;
 pub const SQLITE_CHECKPOINT_RESTART: ffi::c_int = 2;
 pub const SQLITE_CHECKPOINT_TRUNCATE: ffi::c_int = 3;
 
-pub mod util;
-
-use util::sqlite3_safety_check_sick_or_ok;
-
 pub struct sqlite3 {
+    pub(crate) inner: Arc<Mutex<sqlite3Inner>>,
+}
+
+struct sqlite3Inner {
     pub(crate) io: Arc<dyn limbo_core::IO>,
     pub(crate) _db: Arc<limbo_core::Database>,
-    pub(crate) conn: Rc<limbo_core::Connection>,
+    pub(crate) conn: Arc<limbo_core::Connection>,
     pub(crate) err_code: ffi::c_int,
     pub(crate) err_mask: ffi::c_int,
     pub(crate) malloc_failed: bool,
@@ -54,9 +53,9 @@ impl sqlite3 {
     pub fn new(
         io: Arc<dyn limbo_core::IO>,
         db: Arc<limbo_core::Database>,
-        conn: Rc<limbo_core::Connection>,
+        conn: Arc<limbo_core::Connection>,
     ) -> Self {
-        Self {
+        let inner = sqlite3Inner {
             io,
             _db: db,
             conn,
@@ -65,7 +64,10 @@ impl sqlite3 {
             malloc_failed: false,
             e_open_state: SQLITE_STATE_OPEN,
             p_err: std::ptr::null_mut(),
-        }
+        };
+        #[allow(clippy::arc_with_non_send_sync)]
+        let inner = Arc::new(Mutex::new(inner));
+        Self { inner }
     }
 }
 
@@ -207,16 +209,17 @@ pub unsafe extern "C" fn sqlite3_context_db_handle(_context: *mut ffi::c_void) -
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_prepare_v2(
-    db: *mut sqlite3,
+    raw_db: *mut sqlite3,
     sql: *const ffi::c_char,
     _len: ffi::c_int,
     out_stmt: *mut *mut sqlite3_stmt,
     _tail: *mut *const ffi::c_char,
 ) -> ffi::c_int {
-    if db.is_null() || sql.is_null() || out_stmt.is_null() {
+    if raw_db.is_null() || sql.is_null() || out_stmt.is_null() {
         return SQLITE_MISUSE;
     }
-    let db: &mut sqlite3 = &mut *db;
+    let db: &mut sqlite3 = &mut *raw_db;
+    let db = db.inner.lock().unwrap();
     let sql = CStr::from_ptr(sql);
     let sql = match sql.to_str() {
         Ok(s) => s,
@@ -226,7 +229,7 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
         Ok(stmt) => stmt,
         Err(_) => return SQLITE_ERROR,
     };
-    *out_stmt = Box::leak(Box::new(sqlite3_stmt::new(db, stmt)));
+    *out_stmt = Box::leak(Box::new(sqlite3_stmt::new(raw_db, stmt)));
     SQLITE_OK
 }
 
@@ -244,6 +247,7 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let stmt = &mut *stmt;
     let db = &mut *stmt.db;
     loop {
+        let db = db.inner.lock().unwrap();
         if let Ok(result) = stmt.stmt.step() {
             match result {
                 limbo_core::StepResult::IO => {
@@ -283,6 +287,7 @@ pub unsafe extern "C" fn sqlite3_exec(
         return SQLITE_MISUSE;
     }
     let db: &mut sqlite3 = &mut *db;
+    let db = db.inner.lock().unwrap();
     let sql = CStr::from_ptr(sql);
     let sql = match sql.to_str() {
         Ok(s) => s,
@@ -393,17 +398,21 @@ pub unsafe extern "C" fn sqlite3_free(_ptr: *mut ffi::c_void) {
     stub!();
 }
 
+/// Returns the error code for the most recent failed API call to connection.
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_errcode(_db: *mut sqlite3) -> ffi::c_int {
-    if !_db.is_null() && !sqlite3_safety_check_sick_or_ok(&*_db) {
+pub unsafe extern "C" fn sqlite3_errcode(db: *mut sqlite3) -> ffi::c_int {
+    if db.is_null() {
         return SQLITE_MISUSE;
     }
-
-    if _db.is_null() || (*_db).malloc_failed {
+    let db: &mut sqlite3 = &mut *db;
+    let db = db.inner.lock().unwrap();
+    if !sqlite3_safety_check_sick_or_ok(&db) {
+        return SQLITE_MISUSE;
+    }
+    if db.malloc_failed {
         return SQLITE_NOMEM;
     }
-
-    (*_db).err_code & (*_db).err_mask
+    db.err_code & db.err_mask
 }
 
 #[no_mangle]
@@ -944,46 +953,50 @@ pub unsafe extern "C" fn sqlite3_create_window_function(
     stub!();
 }
 
+/// Returns the error message for the most recent failed API call to connection.
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_errmsg(_db: *mut sqlite3) -> *const ffi::c_char {
-    if _db.is_null() {
+pub unsafe extern "C" fn sqlite3_errmsg(db: *mut sqlite3) -> *const ffi::c_char {
+    if db.is_null() {
         return sqlite3_errstr(SQLITE_NOMEM);
     }
-    if !sqlite3_safety_check_sick_or_ok(&*_db) {
+    let db: &mut sqlite3 = &mut *db;
+    let db = db.inner.lock().unwrap();
+    if !sqlite3_safety_check_sick_or_ok(&db) {
         return sqlite3_errstr(SQLITE_MISUSE);
     }
-    if (*_db).malloc_failed {
+    if db.malloc_failed {
         return sqlite3_errstr(SQLITE_NOMEM);
     }
-
-    let err_msg = if (*_db).err_code != SQLITE_OK {
-        if !(*_db).p_err.is_null() {
-            (*_db).p_err as *const ffi::c_char
+    let err_msg = if db.err_code != SQLITE_OK {
+        if !db.p_err.is_null() {
+            db.p_err as *const ffi::c_char
         } else {
             std::ptr::null()
         }
     } else {
         std::ptr::null()
     };
-
     if err_msg.is_null() {
-        return sqlite3_errstr((*_db).err_code);
+        return sqlite3_errstr(db.err_code);
     }
-
     err_msg
 }
 
+/// Returns the extended error code for the most recent failed API call to connection.
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_extended_errcode(_db: *mut sqlite3) -> ffi::c_int {
-    if !_db.is_null() && !sqlite3_safety_check_sick_or_ok(&*_db) {
+pub unsafe extern "C" fn sqlite3_extended_errcode(db: *mut sqlite3) -> ffi::c_int {
+    if db.is_null() {
         return SQLITE_MISUSE;
     }
-
-    if _db.is_null() || (*_db).malloc_failed {
+    let db: &mut sqlite3 = &mut *db;
+    let db = db.inner.lock().unwrap();
+    if !sqlite3_safety_check_sick_or_ok(&db) {
+        return SQLITE_MISUSE;
+    }
+    if db.malloc_failed {
         return SQLITE_NOMEM;
     }
-
-    (*_db).err_code & (*_db).err_mask
+    db.err_code & db.err_mask
 }
 
 #[no_mangle]
@@ -1067,12 +1080,12 @@ fn sqlite3_errstr_impl(rc: i32) -> *const ffi::c_char {
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_wal_checkpoint(
-    _db: *mut sqlite3,
-    _db_name: *const ffi::c_char,
+    db: *mut sqlite3,
+    db_name: *const ffi::c_char,
 ) -> ffi::c_int {
     sqlite3_wal_checkpoint_v2(
-        _db,
-        _db_name,
+        db,
+        db_name,
         SQLITE_CHECKPOINT_PASSIVE,
         std::ptr::null_mut(),
         std::ptr::null_mut(),
@@ -1091,6 +1104,7 @@ pub unsafe extern "C" fn sqlite3_wal_checkpoint_v2(
         return SQLITE_MISUSE;
     }
     let db: &mut sqlite3 = &mut *db;
+    let db = db.inner.lock().unwrap();
     // TODO: Checkpointing modes and reporting back log size and checkpoint count to caller.
     if db.conn.checkpoint().is_err() {
         return SQLITE_ERROR;
@@ -1125,6 +1139,7 @@ pub unsafe extern "C" fn libsql_wal_frame_count(
         return SQLITE_MISUSE;
     }
     let db: &mut sqlite3 = &mut *db;
+    let db = db.inner.lock().unwrap();
     let frame_count = match db.conn.wal_frame_count() {
         Ok(count) => count as u32,
         Err(_) => return SQLITE_ERROR,
@@ -1163,11 +1178,22 @@ pub unsafe extern "C" fn libsql_wal_get_frame(
         return SQLITE_MISUSE;
     }
     let db: &mut sqlite3 = &mut *db;
+    let db = db.inner.lock().unwrap();
     match db.conn.wal_get_frame(frame_no, p_frame, frame_len) {
         Ok(c) => match db.io.wait_for_completion(c) {
             Ok(_) => SQLITE_OK,
             Err(_) => SQLITE_ERROR,
         },
         Err(_) => SQLITE_ERROR,
+    }
+}
+
+fn sqlite3_safety_check_sick_or_ok(db: &sqlite3Inner) -> bool {
+    match db.e_open_state {
+        SQLITE_STATE_SICK | SQLITE_STATE_OPEN | SQLITE_STATE_BUSY => true,
+        _ => {
+            eprintln!("Invalid database state: {}", db.e_open_state);
+            false
+        }
     }
 }

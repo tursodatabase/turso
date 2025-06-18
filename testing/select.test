@@ -285,76 +285,79 @@ do_execsql_test_on_specific_db {:memory:} select-union-all-with-filters {
 6
 10}
 
-do_execsql_test_on_specific_db {:memory:} select-union-1 {
-  CREATE TABLE t(x TEXT, y TEXT);
-  CREATE TABLE u(x TEXT, y TEXT);
-  INSERT INTO t VALUES('x','x'),('y','y');
-  INSERT INTO u VALUES('x','x'),('y','y');
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+    do_execsql_test_on_specific_db {:memory:} select-union-1 {
+    CREATE TABLE t(x TEXT, y TEXT);
+    CREATE TABLE u(x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('y','y');
 
-  select * from t UNION select * from u;
-} {x|x
-y|y}
+    select * from t UNION select * from u;
+    } {x|x
+    y|y}
 
-do_execsql_test_on_specific_db {:memory:} select-union-all-union {
-  CREATE TABLE t(x TEXT, y TEXT);
-  CREATE TABLE u(x TEXT, y TEXT);
-  CREATE TABLE v(x TEXT, y TEXT);
-  INSERT INTO t VALUES('x','x'),('y','y');
-  INSERT INTO u VALUES('x','x'),('y','y');
-  INSERT INTO v VALUES('x','x'),('y','y');
+    do_execsql_test_on_specific_db {:memory:} select-union-all-union {
+    CREATE TABLE t(x TEXT, y TEXT);
+    CREATE TABLE u(x TEXT, y TEXT);
+    CREATE TABLE v(x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('y','y');
+    INSERT INTO v VALUES('x','x'),('y','y');
 
-  select * from t UNION select * from u UNION ALL select * from v;
-} {x|x
-y|y
-x|x
-y|y}
+    select * from t UNION select * from u UNION ALL select * from v;
+    } {x|x
+    y|y
+    x|x
+    y|y}
 
-do_execsql_test_on_specific_db {:memory:} select-union-all-union-2 {
-  CREATE TABLE t(x TEXT, y TEXT);
-  CREATE TABLE u(x TEXT, y TEXT);
-  CREATE TABLE v(x TEXT, y TEXT);
-  INSERT INTO t VALUES('x','x'),('y','y');
-  INSERT INTO u VALUES('x','x'),('y','y');
-  INSERT INTO v VALUES('x','x'),('y','y');
+    do_execsql_test_on_specific_db {:memory:} select-union-all-union-2 {
+    CREATE TABLE t(x TEXT, y TEXT);
+    CREATE TABLE u(x TEXT, y TEXT);
+    CREATE TABLE v(x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('y','y');
+    INSERT INTO v VALUES('x','x'),('y','y');
 
-  select * from t UNION ALL select * from u UNION select * from v;
-} {x|x
-y|y}
+    select * from t UNION ALL select * from u UNION select * from v;
+    } {x|x
+    y|y}
 
-do_execsql_test_on_specific_db {:memory:} select-union-3 {
-  CREATE TABLE t(x TEXT, y TEXT);
-  CREATE TABLE u(x TEXT, y TEXT);
-  CREATE TABLE v(x TEXT, y TEXT);
-  INSERT INTO t VALUES('x','x'),('y','y');
-  INSERT INTO u VALUES('x','x'),('y','y');
-  INSERT INTO v VALUES('x','x'),('y','y');
+    do_execsql_test_on_specific_db {:memory:} select-union-3 {
+    CREATE TABLE t(x TEXT, y TEXT);
+    CREATE TABLE u(x TEXT, y TEXT);
+    CREATE TABLE v(x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('y','y');
+    INSERT INTO v VALUES('x','x'),('y','y');
 
-  select * from t UNION select * from u UNION select * from v;
-} {x|x
-y|y}
+    select * from t UNION select * from u UNION select * from v;
+    } {x|x
+    y|y}
 
-do_execsql_test_on_specific_db {:memory:} select-union-4 {
-  CREATE TABLE t(x TEXT, y TEXT);
-  CREATE TABLE u(x TEXT, y TEXT);
-  CREATE TABLE v(x TEXT, y TEXT);
-  INSERT INTO t VALUES('x','x'),('y','y');
-  INSERT INTO u VALUES('x','x'),('y','y');
-  INSERT INTO v VALUES('x','x'),('y','y');
+    do_execsql_test_on_specific_db {:memory:} select-union-4 {
+    CREATE TABLE t(x TEXT, y TEXT);
+    CREATE TABLE u(x TEXT, y TEXT);
+    CREATE TABLE v(x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('y','y');
+    INSERT INTO v VALUES('x','x'),('y','y');
 
-  select * from t UNION select * from u UNION select * from v UNION select * from t;
-} {x|x
-y|y}
+    select * from t UNION select * from u UNION select * from v UNION select * from t;
+    } {x|x
+    y|y}
 
-do_execsql_test_on_specific_db {:memory:} select-union-all-union-3 {
-  CREATE TABLE t(x TEXT, y TEXT);
-  CREATE TABLE u(x TEXT, y TEXT);
-  CREATE TABLE v(x TEXT, y TEXT);
-  INSERT INTO t VALUES('x','x'),('y','y');
-  INSERT INTO u VALUES('x','x'),('y','y');
-  INSERT INTO v VALUES('x','x'),('y','y');
+    do_execsql_test_on_specific_db {:memory:} select-union-all-union-3 {
+    CREATE TABLE t(x TEXT, y TEXT);
+    CREATE TABLE u(x TEXT, y TEXT);
+    CREATE TABLE v(x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('y','y');
+    INSERT INTO v VALUES('x','x'),('y','y');
 
-  select * from t UNION select * from u UNION select * from v UNION ALL select * from t;
-} {x|x
-y|y
-x|x
-y|y}
+    select * from t UNION select * from u UNION select * from v UNION ALL select * from t;
+    } {x|x
+    y|y
+    x|x
+    y|y}
+}
+

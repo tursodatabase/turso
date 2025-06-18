@@ -37,12 +37,29 @@ FROM chef AS builder
 
 ARG antithesis=true
 
+RUN apt-get update && apt-get install -y pip && rm -rf /var/lib/apt/lists/*
+RUN pip install maturin
+
 # Source: https://antithesis.com/assets/instrumentation/libvoidstar.so
 COPY stress/libvoidstar.so /opt/antithesis/libvoidstar.so
 
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --bin limbo_stress --release --recipe-path recipe.json
+COPY --from=planner /app/Cargo.toml ./Cargo.toml
+COPY --from=planner /app/cli ./cli/
+COPY --from=planner /app/core ./core/
+COPY --from=planner /app/extensions ./extensions/
+COPY --from=planner /app/macros ./macros/
+COPY --from=planner /app/simulator ./simulator/
+COPY --from=planner /app/sqlite3 ./sqlite3/
+COPY --from=planner /app/tests ./tests/
+COPY --from=planner /app/stress ./stress/
 COPY --from=planner /app/bindings/rust ./bindings/rust/
+COPY --from=planner /app/bindings/go ./bindings/go/
+COPY --from=planner /app/bindings/javascript ./bindings/javascript/
+COPY --from=planner /app/bindings/java ./bindings/java/
+COPY --from=planner /app/bindings/python ./bindings/python/
+COPY --from=planner /app/bindings/wasm ./bindings/wasm/
 COPY --from=planner /app/core ./core/
 COPY --from=planner /app/extensions ./extensions/
 COPY --from=planner /app/macros ./macros/
@@ -57,13 +74,16 @@ RUN if [ "$antithesis" = "true" ]; then \
         cargo build --bin limbo_stress --release; \
     fi
 
+WORKDIR /app/bindings/python
+RUN maturin build
+
 #
 # The final image.
 #
 
 FROM debian:bullseye-slim AS runtime
 RUN apt-get update && apt-get install -y bash curl xz-utils python3 sqlite3 bc binutils pip && rm -rf /var/lib/apt/lists/*
-RUN pip install antithesis pylimbo
+RUN pip install antithesis
 
 WORKDIR /app
 EXPOSE 8080
@@ -72,6 +92,10 @@ COPY --from=builder /app/target/release/limbo_stress /bin/limbo_stress
 COPY stress/docker-entrypoint.sh /bin
 RUN chmod +x /bin/docker-entrypoint.sh
 
+COPY --from=builder /app/target/wheels/* /tmp 
+RUN pip install /tmp/*.whl
+
+WORKDIR /app
 COPY ./antithesis-tests/bank-test/*.py /opt/antithesis/test/v1/bank-test/
 COPY ./antithesis-tests/stress-composer/*.py /opt/antithesis/test/v1/stress-composer/
 COPY ./antithesis-tests/stress /opt/antithesis/test/v1/stress

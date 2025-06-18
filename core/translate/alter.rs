@@ -24,6 +24,16 @@ pub fn translate_alter_table(
 ) -> Result<ProgramBuilder> {
     let (table_name, alter_table) = alter;
     let ast::Name(table_name) = table_name.name;
+    #[cfg(not(feature = "index_experimental"))]
+    {
+        if schema.table_has_indexes(&table_name) && cfg!(not(feature = "index_experimental")) {
+            // Let's disable altering a table with indices altogether instead of checking column by
+            // column to be extra safe.
+            crate::bail_parse_error!(
+                "Alter table disabled for table with indexes without index_experimental feature flag"
+            );
+        }
+    }
 
     let Some(original_btree) = schema
         .get_table(&table_name)
@@ -138,7 +148,7 @@ pub fn translate_alter_table(
                             cursor: cursor_id,
                             key_reg: rowid,
                             record_reg: record,
-                            flag: 0,
+                            flag: crate::vdbe::insn::InsertFlags(0),
                             table_name: table_name.clone(),
                         });
                     });
@@ -284,7 +294,7 @@ pub fn translate_alter_table(
                     cursor: cursor_id,
                     key_reg: rowid,
                     record_reg: record,
-                    flag: 0,
+                    flag: crate::vdbe::insn::InsertFlags(0),
                     table_name: table_name.clone(),
                 });
             });
@@ -362,7 +372,7 @@ pub fn translate_alter_table(
                     cursor: cursor_id,
                     key_reg: rowid,
                     record_reg: record,
-                    flag: 0,
+                    flag: crate::vdbe::insn::InsertFlags(0),
                     table_name: table_name.clone(),
                 });
             });

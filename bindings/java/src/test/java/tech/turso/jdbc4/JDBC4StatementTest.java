@@ -11,7 +11,6 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.Properties;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import tech.turso.TestUtils;
 
@@ -33,25 +32,25 @@ class JDBC4StatementTest {
 
   @Test
   void execute_ddl_should_return_false() throws Exception {
-    assertFalse(stmt.execute("CREATE TABLE users (id INT PRIMARY KEY, username TEXT);"));
+    assertFalse(stmt.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT);"));
   }
 
   @Test
   void execute_insert_should_return_false() throws Exception {
-    stmt.execute("CREATE TABLE users (id INT PRIMARY KEY, username TEXT);");
+    stmt.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT);");
     assertFalse(stmt.execute("INSERT INTO users VALUES (1, 'limbo');"));
   }
 
   @Test
   void execute_update_should_return_false() throws Exception {
-    stmt.execute("CREATE TABLE users (id INT PRIMARY KEY, username TEXT);");
+    stmt.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT);");
     stmt.execute("INSERT INTO users VALUES (1, 'limbo');");
     assertFalse(stmt.execute("UPDATE users SET username = 'seonwoo' WHERE id = 1;"));
   }
 
   @Test
   void execute_select_should_return_true() throws Exception {
-    stmt.execute("CREATE TABLE users (id INT PRIMARY KEY, username TEXT);");
+    stmt.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT);");
     stmt.execute("INSERT INTO users VALUES (1, 'limbo');");
     assertTrue(stmt.execute("SELECT * FROM users;"));
   }
@@ -83,11 +82,9 @@ class JDBC4StatementTest {
   }
 
   @Test
-  @Disabled("limbo's total_changes() works differently from sqlite's total_changes()")
   void execute_update_should_return_number_of_updated_elements() throws Exception {
     assertThat(stmt.executeUpdate("CREATE TABLE s1 (c1 INT);")).isEqualTo(0);
     assertThat(stmt.executeUpdate("INSERT INTO s1 VALUES (1), (2), (3);")).isEqualTo(3);
-
     assertThat(stmt.executeUpdate("UPDATE s1 SET c1 = 0;")).isEqualTo(3);
   }
 

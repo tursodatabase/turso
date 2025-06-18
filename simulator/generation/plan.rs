@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     fmt::{Debug, Display},
     path::Path,
-    rc::Rc,
+    sync::Arc,
     vec,
 };
 
@@ -504,7 +504,7 @@ impl Interaction {
             Self::Assumption(_) | Self::Assertion(_) | Self::Fault(_) => vec![],
         }
     }
-    pub(crate) fn execute_query(&self, conn: &mut Rc<Connection>, io: &SimulatorIO) -> ResultSet {
+    pub(crate) fn execute_query(&self, conn: &mut Arc<Connection>, io: &SimulatorIO) -> ResultSet {
         if let Self::Query(query) = self {
             let query_str = query.to_string();
             let rows = conn.query(&query_str);

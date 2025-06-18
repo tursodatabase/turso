@@ -7,7 +7,8 @@ use limbo_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VT
 use limbo_sqlite3_parser::{ast, lexer::sql::Parser};
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 enum VirtualTableType {
@@ -90,7 +91,7 @@ impl VirtualTable {
         }
     }
 
-    pub(crate) fn open(&self, conn: Weak<Connection>) -> crate::Result<VirtualTableCursor> {
+    pub(crate) fn open(&self, conn: Arc<Connection>) -> crate::Result<VirtualTableCursor> {
         match &self.vtab_type {
             VirtualTableType::Pragma(table) => Ok(VirtualTableCursor::Pragma(table.open(conn)?)),
             VirtualTableType::External(table) => {
@@ -237,11 +238,11 @@ impl ExtVirtualTable {
         Ok((vtab, schema))
     }
 
-    /// Accepts a Weak pointer to the connection that owns the VTable, that the module
+    /// Accepts a pointer connection that owns the VTable, that the module
     /// can optionally use to query the other tables.
-    fn open(&self, conn: Weak<Connection>) -> crate::Result<ExtVirtualTableCursor> {
+    fn open(&self, conn: Arc<Connection>) -> crate::Result<ExtVirtualTableCursor> {
         // we need a Weak<Connection> to upgrade and call from the extension.
-        let weak_box: *mut Weak<Connection> = Box::into_raw(Box::new(conn));
+        let weak_box: *mut Arc<Connection> = Box::into_raw(Box::new(conn));
         let conn = limbo_ext::Conn::new(
             weak_box.cast(),
             crate::ext::prepare_stmt,

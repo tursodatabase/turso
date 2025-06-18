@@ -79,7 +79,7 @@ def test_fetchall_select_user_ids(provider):
 def test_in_memory_fetchone_select_all_users(provider):
     conn = connect(provider, ":memory:")
     cursor = conn.cursor()
-    cursor.execute("CREATE TABLE users (id INT PRIMARY KEY, username TEXT)")
+    cursor.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT)")
     cursor.execute("INSERT INTO users VALUES (1, 'alice')")
 
     cursor.execute("SELECT * FROM users")

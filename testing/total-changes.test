@@ -21,3 +21,24 @@ do_execsql_test_on_specific_db {:memory:} total-changes-on-multiple-inserts {
     insert into temp values (4), (5), (6), (7);
     select total_changes();
 } {7}
+
+do_execsql_test_on_specific_db {:memory:} total-changes-on-update-single-row {
+    create table temp (t1 integer primary key, t2 text);
+    insert into temp values (1, 'a'), (2, 'b'), (3, 'c');
+    update temp set t2 = 'z' where t1 = 2;
+    select total_changes();
+} {4}
+
+do_execsql_test_on_specific_db {:memory:} total-changes-on-update-multiple-rows {
+    create table temp (t1 integer primary key, t2 text);
+    insert into temp values (1, 'a'), (2, 'b'), (3, 'c');
+    update temp set t2 = 'x' where t1 > 1;
+    select total_changes();
+} {5}
+
+do_execsql_test_on_specific_db {:memory:} total-changes-on-update-no-match {
+    create table temp (t1 integer primary key, t2 text);
+    insert into temp values (1, 'a'), (2, 'b');
+    update temp set t2 = 'y' where t1 = 99;
+    select total_changes();
+} {2}

@@ -228,7 +228,7 @@ fn stmt_is_ddl(sql: &str) -> bool {
 #[pyclass(unsendable)]
 #[derive(Clone)]
 pub struct Connection {
-    conn: Rc<limbo_core::Connection>,
+    conn: Arc<limbo_core::Connection>,
     io: Arc<dyn limbo_core::IO>,
 }
 
@@ -310,13 +310,13 @@ pub fn connect(path: &str) -> Result<Connection> {
         ":memory:" => {
             let io: Arc<dyn limbo_core::IO> = Arc::new(limbo_core::MemoryIO::new());
             let db = open_or(io.clone(), path)?;
-            let conn: Rc<limbo_core::Connection> = db.connect().unwrap();
+            let conn: Arc<limbo_core::Connection> = db.connect().unwrap();
             Ok(Connection { conn, io })
         }
         path => {
             let io: Arc<dyn limbo_core::IO> = Arc::new(limbo_core::PlatformIO::new()?);
             let db = open_or(io.clone(), path)?;
-            let conn: Rc<limbo_core::Connection> = db.connect().unwrap();
+            let conn: Arc<limbo_core::Connection> = db.connect().unwrap();
             Ok(Connection { conn, io })
         }
     }

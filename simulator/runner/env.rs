@@ -1,7 +1,6 @@
 use std::fmt::Display;
 use std::mem;
 use std::path::Path;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use limbo_core::Database;
@@ -164,7 +163,7 @@ where
 }
 
 pub(crate) enum SimConnection {
-    LimboConnection(Rc<limbo_core::Connection>),
+    LimboConnection(Arc<limbo_core::Connection>),
     SQLiteConnection(rusqlite::Connection),
     Disconnected,
 }

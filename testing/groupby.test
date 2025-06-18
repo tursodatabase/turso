@@ -199,14 +199,16 @@ do_execsql_test group_by_no_sorting_required {
 2|113
 3|97}
 
-do_execsql_test distinct_agg_functions {
-  select first_name, sum(distinct age), count(distinct age), avg(distinct age) 
-  from users 
-  group by 1 
-  limit 3;
-} {Aaron|1769|33|53.6060606060606
-Abigail|833|15|55.5333333333333
-Adam|1517|30|50.5666666666667}
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+    do_execsql_test distinct_agg_functions {
+    select first_name, sum(distinct age), count(distinct age), avg(distinct age)
+    from users
+    group by 1
+    limit 3;
+    } {Aaron|1769|33|53.6060606060606
+    Abigail|833|15|55.5333333333333
+    Adam|1517|30|50.5666666666667}
+}
 
 do_execsql_test_on_specific_db {:memory:} having_or {
   CREATE TABLE users (first_name TEXT, age INTEGER);

@@ -1,8 +1,8 @@
 use crate::{Connection, LimboError, Statement, StepResult, Value};
 use bitflags::bitflags;
 use limbo_sqlite3_parser::ast::PragmaName;
-use std::rc::{Rc, Weak};
 use std::str::FromStr;
+use std::sync::Arc;
 
 bitflags! {
     // Flag names match those used in SQLite:
@@ -73,6 +73,10 @@ fn pragma_for(pragma: PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["auto_vacuum"],
         ),
+        IntegrityCheck => Pragma::new(
+            PragmaFlags::NeedSchema | PragmaFlags::ReadOnly | PragmaFlags::Result0,
+            &["message"],
+        ),
     }
 }
 
@@ -141,13 +145,11 @@ impl PragmaVirtualTable {
         ))
     }
 
-    pub(crate) fn open(&self, conn: Weak<Connection>) -> crate::Result<PragmaVirtualTableCursor> {
+    pub(crate) fn open(&self, conn: Arc<Connection>) -> crate::Result<PragmaVirtualTableCursor> {
         Ok(PragmaVirtualTableCursor {
             pragma_name: self.pragma_name.clone(),
             pos: 0,
-            conn: conn
-                .upgrade()
-                .ok_or_else(|| LimboError::InternalError("Connection was dropped".into()))?,
+            conn,
             stmt: None,
             arg: None,
             visible_column_count: self.visible_column_count,
@@ -160,7 +162,7 @@ impl PragmaVirtualTable {
 pub struct PragmaVirtualTableCursor {
     pragma_name: String,
     pos: usize,
-    conn: Rc<Connection>,
+    conn: Arc<Connection>,
     stmt: Option<Statement>,
     arg: Option<String>,
     visible_column_count: usize,

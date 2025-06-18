@@ -3,44 +3,46 @@
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 
-# Basic DROP INDEX functionality
-do_execsql_test_on_specific_db {:memory:} drop-index-basic-1 {
-    CREATE TABLE t1(x INTEGER PRIMARY KEY);
-    CREATE INDEX t_idx on t1 (x);
-    INSERT INTO t1 VALUES (1);
-    INSERT INTO t1 VALUES (2);
-    DROP INDEX t_idx;
-    SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='t_idx';
-} {0}
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+    # Basic DROP INDEX functionality
+    do_execsql_test_on_specific_db {:memory:} drop-index-basic-1 {
+        CREATE TABLE t1(x INTEGER PRIMARY KEY);
+        CREATE INDEX t_idx on t1 (x);
+        INSERT INTO t1 VALUES (1);
+        INSERT INTO t1 VALUES (2);
+        DROP INDEX t_idx;
+        SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='t_idx';
+    } {0}
 
-# Test DROP INDEX IF EXISTS on existing index
-do_execsql_test_on_specific_db {:memory:} drop-index-if-exists-1 {
-    CREATE TABLE t2(x INTEGER PRIMARY KEY);
-    CREATE INDEX t_idx2 on t2 (x);
-    DROP INDEX IF EXISTS t_idx2;
-    SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='t_idx2';
-} {0}
+    # Test DROP INDEX IF EXISTS on existing index
+    do_execsql_test_on_specific_db {:memory:} drop-index-if-exists-1 {
+        CREATE TABLE t2(x INTEGER PRIMARY KEY);
+        CREATE INDEX t_idx2 on t2 (x);
+        DROP INDEX IF EXISTS t_idx2;
+        SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='t_idx2';
+    } {0}
 
-# Test DROP INDEX IF EXISTS on non-existent index
-do_execsql_test_on_specific_db {:memory:} drop-index-if-exists-2 {
-    DROP TABLE IF EXISTS nonexistent_index;
-    SELECT 'success';
-} {success}
+    # Test DROP INDEX IF EXISTS on non-existent index
+    do_execsql_test_on_specific_db {:memory:} drop-index-if-exists-2 {
+        DROP TABLE IF EXISTS nonexistent_index;
+        SELECT 'success';
+    } {success}
 
-# Test dropping non-existant index produces an error
-do_execsql_test_error_content drop-index-no-index {
-    DROP INDEX t_idx;
-} {"No such index: t_idx"}
+    # Test dropping non-existant index produces an error
+    do_execsql_test_error_content drop-index-no-index {
+        DROP INDEX t_idx;
+    } {"No such index: t_idx"}
 
 
-# Test dropping index after multiple inserts and deletes
-do_execsql_test_on_specific_db {:memory:} drop-index-after-ops-1 {
-    CREATE TABLE t6(x INTEGER PRIMARY KEY);
-    CREATE INDEX t_idx6 on t6 (x);
-    INSERT INTO t6 VALUES (1);
-    INSERT INTO t6 VALUES (2);
-    DELETE FROM t6 WHERE x = 1;
-    INSERT INTO t6 VALUES (3);
-    DROP INDEX t_idx6;
-    SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='t_idx6';
-} {0}
+    # Test dropping index after multiple inserts and deletes
+    do_execsql_test_on_specific_db {:memory:} drop-index-after-ops-1 {
+        CREATE TABLE t6(x INTEGER PRIMARY KEY);
+        CREATE INDEX t_idx6 on t6 (x);
+        INSERT INTO t6 VALUES (1);
+        INSERT INTO t6 VALUES (2);
+        DELETE FROM t6 WHERE x = 1;
+        INSERT INTO t6 VALUES (3);
+        DROP INDEX t_idx6;
+        SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='t_idx6';
+    } {0}
+}

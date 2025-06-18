@@ -38,7 +38,7 @@ class JDBC4ResultSetTest {
 
   @Test
   void invoking_next_before_the_last_row_should_return_true() throws Exception {
-    stmt.executeUpdate("CREATE TABLE users (id INT PRIMARY KEY, username TEXT);");
+    stmt.executeUpdate("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT);");
     stmt.executeUpdate("INSERT INTO users VALUES (1, 'sinwoo');");
     stmt.executeUpdate("INSERT INTO users VALUES (2, 'seonwoo');");
 
@@ -51,7 +51,7 @@ class JDBC4ResultSetTest {
 
   @Test
   void invoking_next_after_the_last_row_should_return_false() throws Exception {
-    stmt.executeUpdate("CREATE TABLE users (id INT PRIMARY KEY, username TEXT);");
+    stmt.executeUpdate("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT);");
     stmt.executeUpdate("INSERT INTO users VALUES (1, 'sinwoo');");
     stmt.executeUpdate("INSERT INTO users VALUES (2, 'seonwoo');");
 

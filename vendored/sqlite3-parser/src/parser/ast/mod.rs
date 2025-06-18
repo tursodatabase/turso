@@ -1730,6 +1730,8 @@ pub enum PragmaName {
     AutoVacuum,
     /// `cache_size` pragma
     CacheSize,
+    /// Run integrity check on the database file
+    IntegrityCheck,
     /// `journal_mode` pragma
     JournalMode,
     /// Noop as per SQLite docs

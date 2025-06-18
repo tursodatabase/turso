@@ -2,7 +2,7 @@ use crate::{types::StepResult, ExtResult, ResultCode, Value};
 use std::{
     ffi::{c_char, c_void, CStr, CString},
     num::NonZeroUsize,
-    rc::Rc,
+    sync::Arc,
 };
 
 pub type RegisterModuleFn = unsafe extern "C" fn(
@@ -131,7 +131,7 @@ pub trait VTable {
 
     /// 'conn' is an Option to allow for testing. Otherwise a valid connection to the core database
     /// that created the virtual table will be available to use in your extension here.
-    fn open(&self, _conn: Option<Rc<Connection>>) -> Result<Self::Cursor, Self::Error>;
+    fn open(&self, _conn: Option<Arc<Connection>>) -> Result<Self::Cursor, Self::Error>;
     fn update(&mut self, _rowid: i64, _args: &[Value]) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -463,7 +463,7 @@ impl Connection {
     }
 
     /// From the included SQL string, prepare a statement for execution.
-    pub fn prepare(self: &Rc<Self>, sql: &str) -> ExtResult<Statement> {
+    pub fn prepare(self: &Arc<Self>, sql: &str) -> ExtResult<Statement> {
         let stmt = unsafe { (*self.0).prepare_stmt(sql) };
         if stmt.is_null() {
             return Err(ResultCode::Error);
@@ -473,7 +473,7 @@ impl Connection {
 
     /// Execute a SQL statement with the given arguments.
     /// Optionally returns the last inserted rowid for the query.
-    pub fn execute(self: &Rc<Self>, sql: &str, args: &[Value]) -> crate::ExtResult<Option<usize>> {
+    pub fn execute(self: &Arc<Self>, sql: &str, args: &[Value]) -> crate::ExtResult<Option<usize>> {
         if self.0.is_null() {
             return Err(ResultCode::Error);
         }

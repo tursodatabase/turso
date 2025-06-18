@@ -2,7 +2,7 @@ use crate::common::{self, maybe_setup_tracing};
 use crate::common::{compare_string, do_flush, TempDatabase};
 use limbo_core::{Connection, Row, StepResult, Value};
 use log::debug;
-use std::rc::Rc;
+use std::sync::Arc;
 
 #[test]
 #[ignore]
@@ -286,7 +286,7 @@ fn test_wal_restart() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY);");
     // threshold is 1000 by default
 
-    fn insert(i: usize, conn: &Rc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
+    fn insert(i: usize, conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
         debug!("inserting {}", i);
         let insert_query = format!("INSERT INTO test VALUES ({})", i);
         run_query(tmp_db, conn, &insert_query)?;
@@ -295,7 +295,7 @@ fn test_wal_restart() -> anyhow::Result<()> {
         Ok(())
     }
 
-    fn count(conn: &Rc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<usize> {
+    fn count(conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<usize> {
         debug!("counting");
         let list_query = "SELECT count(x) FROM test";
         let mut count = None;
@@ -393,6 +393,7 @@ fn test_write_delete_with_index() -> anyhow::Result<()> {
 }
 
 #[test]
+#[cfg(feature = "index_experimental")]
 fn test_update_with_index() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
 
@@ -447,13 +448,13 @@ fn test_delete_with_index() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_query(tmp_db: &TempDatabase, conn: &Rc<Connection>, query: &str) -> anyhow::Result<()> {
+fn run_query(tmp_db: &TempDatabase, conn: &Arc<Connection>, query: &str) -> anyhow::Result<()> {
     run_query_core(tmp_db, conn, query, None::<fn(&Row)>)
 }
 
 fn run_query_on_row(
     tmp_db: &TempDatabase,
-    conn: &Rc<Connection>,
+    conn: &Arc<Connection>,
     query: &str,
     on_row: impl FnMut(&Row),
 ) -> anyhow::Result<()> {
@@ -462,7 +463,7 @@ fn run_query_on_row(
 
 fn run_query_core(
     tmp_db: &TempDatabase,
-    conn: &Rc<Connection>,
+    conn: &Arc<Connection>,
     query: &str,
     mut on_row: Option<impl FnMut(&Row)>,
 ) -> anyhow::Result<()> {

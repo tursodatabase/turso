@@ -112,7 +112,7 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
 /// Execute a statement and get strings result
 pub(crate) fn execute_and_get_strings(
     tmp_db: &TempDatabase,
-    conn: &Rc<Connection>,
+    conn: &Arc<Connection>,
     sql: &str,
 ) -> Result<Vec<String>> {
     let statement = conn.prepare(sql)?;
@@ -140,7 +140,7 @@ pub(crate) fn execute_and_get_strings(
 /// Execute a statement and get integers
 pub(crate) fn execute_and_get_ints(
     tmp_db: &TempDatabase,
-    conn: &Rc<Connection>,
+    conn: &Arc<Connection>,
     sql: &str,
 ) -> Result<Vec<i64>> {
     let statement = conn.prepare(sql)?;

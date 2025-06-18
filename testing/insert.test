@@ -181,21 +181,23 @@ do_execsql_test_on_specific_db {:memory:} multi-rows {
 } {1|1
 2|1}
 
-do_execsql_test_on_specific_db {:memory:} unique_insert_no_pkey {
-    CREATE TABLE t2 (x INTEGER, y INTEGER UNIQUE);
-    INSERT INTO t2 (y) VALUES (1);
-    INSERT INTO t2 (y) VALUES (6);
-    SELECT * FROM t2;
-} {|1
-|6}
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+    do_execsql_test_on_specific_db {:memory:} unique_insert_no_pkey {
+        CREATE TABLE t2 (x INTEGER, y INTEGER UNIQUE);
+        INSERT INTO t2 (y) VALUES (1);
+        INSERT INTO t2 (y) VALUES (6);
+        SELECT * FROM t2;
+    } {|1
+    |6}
 
-do_execsql_test_on_specific_db {:memory:} unique_insert_with_pkey {
-    CREATE TABLE t2 (x INTEGER PRIMARY KEY, y INTEGER UNIQUE);
-    INSERT INTO t2 (y) VALUES (1);
-    INSERT INTO t2 (y) VALUES (6);
-    SELECT * FROM t2;
-} {1|1
-2|6}
+    do_execsql_test_on_specific_db {:memory:} unique_insert_with_pkey {
+        CREATE TABLE t2 (x INTEGER PRIMARY KEY, y INTEGER UNIQUE);
+        INSERT INTO t2 (y) VALUES (1);
+        INSERT INTO t2 (y) VALUES (6);
+        SELECT * FROM t2;
+    } {1|1
+    2|6}
+}
 
 do_execsql_test_on_specific_db {:memory:} not_null_insert {
     CREATE TABLE t2 (y INTEGER NOT NULL);
@@ -324,15 +326,17 @@ do_execsql_test_on_specific_db {:memory:} insert_from_select_same_table_2 {
 5|2|200
 6|3|300}
 
-do_execsql_test_on_specific_db {:memory:} insert_from_select_union {
-    CREATE TABLE t(a, b); 
-    CREATE TABLE t2(b, c);
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+    do_execsql_test_on_specific_db {:memory:} insert_from_select_union {
+        CREATE TABLE t(a, b); 
+        CREATE TABLE t2(b, c);
 
-    INSERT INTO t2 VALUES (1, 100), (2, 200);
-    INSERT INTO t SELECT * FROM t UNION SELECT * FROM t2;
-    SELECT * FROM t;
-} {1|100
-2|200}
+        INSERT INTO t2 VALUES (1, 100), (2, 200);
+        INSERT INTO t SELECT * FROM t UNION SELECT * FROM t2;
+        SELECT * FROM t;
+    } {1|100
+    2|200}
+}
 
 do_execsql_test_on_specific_db {:memory:} negative-primary-integer-key {
     CREATE TABLE t(a INTEGER PRIMARY KEY);

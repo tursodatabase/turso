@@ -5,7 +5,7 @@ use std::{
     ffi::{c_char, c_void, CStr, CString},
     num::NonZeroUsize,
     ptr,
-    rc::Weak,
+    sync::Arc,
 };
 
 /// Free memory for the internal context of the connection.
@@ -17,7 +17,7 @@ pub unsafe extern "C" fn close(ctx: *mut c_void) {
     }
     // only free the memory for the boxed connection, we don't upgrade
     // or actually close the core connection, as we were 'sharing' it.
-    let _ = Box::from_raw(ctx as *mut Weak<Connection>);
+    let _ = Box::from_raw(ctx as *mut Arc<Connection>);
 }
 
 /// Wrapper around core Connection::execute with optional arguments to bind
@@ -41,12 +41,8 @@ pub unsafe extern "C" fn execute(
         tracing::error!("query: null connection");
         return ResultCode::Error;
     };
-    let weak_ptr = extcon._ctx as *const Weak<Connection>;
-    let weak = &*weak_ptr;
-    let Some(conn) = weak.upgrade() else {
-        tracing::error!("prepare_stmt: failed to upgrade weak pointer in prepare stmt");
-        return ResultCode::Error;
-    };
+    let conn_ptr = extcon._ctx as *const Arc<Connection>;
+    let conn = &*conn_ptr;
     match conn.query(&sql_str) {
         Ok(Some(mut stmt)) => {
             if arg_count > 0 {
@@ -102,12 +98,8 @@ pub unsafe extern "C" fn prepare_stmt(ctx: *mut ExtConn, sql: *const c_char) -> 
         tracing::error!("prepare_stmt: null connection");
         return ptr::null_mut();
     };
-    let weak_ptr = extcon._ctx as *const Weak<Connection>;
-    let weak = &*weak_ptr;
-    let Some(conn) = weak.upgrade() else {
-        tracing::error!("prepare_stmt: failed to upgrade weak pointer in prepare stmt");
-        return ptr::null_mut();
-    };
+    let db_ptr = extcon._ctx as *const Arc<Connection>;
+    let conn = &*db_ptr;
     match conn.prepare(&sql_str) {
         Ok(stmt) => {
             let raw_stmt = Box::into_raw(Box::new(stmt)) as *mut c_void;

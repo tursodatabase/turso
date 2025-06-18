@@ -1,7 +1,7 @@
 use clap::Args;
 use clap_complete::{ArgValueCompleter, PathCompleter};
 use limbo_core::Connection;
-use std::{fs::File, io::Write, path::PathBuf, rc::Rc, sync::Arc};
+use std::{fs::File, io::Write, path::PathBuf, sync::Arc};
 
 #[derive(Debug, Clone, Args)]
 pub struct ImportArgs {
@@ -20,14 +20,14 @@ pub struct ImportArgs {
 }
 
 pub struct ImportFile<'a> {
-    conn: Rc<Connection>,
+    conn: Arc<Connection>,
     io: Arc<dyn limbo_core::IO>,
     writer: &'a mut dyn Write,
 }
 
 impl<'a> ImportFile<'a> {
     pub fn new(
-        conn: Rc<Connection>,
+        conn: Arc<Connection>,
         io: Arc<dyn limbo_core::IO>,
         writer: &'a mut dyn Write,
     ) -> Self {
