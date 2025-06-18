@@ -727,7 +727,7 @@ fn translate_helper(
                 + finding
                     .expect("Should find")
                     .value_index
-                    .expect("value_index should be present");
+                    .unwrap_or_else(|| program.alloc_register());
             return reg;
         }
         ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) => {
