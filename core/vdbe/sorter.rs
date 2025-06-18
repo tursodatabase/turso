@@ -255,9 +255,9 @@ mod tests {
         ]);
 
         let mut fd = tempfile::tempfile().expect("Failed to create temp file");
-        fd.write(record_a.get_payload())
+        fd.write_all(record_a.get_payload())
             .expect("Failed to write the first record");
-        fd.write(record_b.get_payload())
+        fd.write_all(record_b.get_payload())
             .expect("Failed to write the second record");
         fd.flush().expect("Failed to flush the file");
         fd.seek(io::SeekFrom::Start(0))
