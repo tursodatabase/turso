@@ -322,10 +322,14 @@ fn run_simulator(
                 tracing::error!("simulation failed: '{}'", error);
                 tracing::info!("Starting to shrink");
 
+                // Create a new environment for shrinking
+                let shrink_env = SimulatorEnv::new(seed, cli_opts, &paths.db);
+
                 let shrunk_plans = plans
                     .iter()
                     .map(|plan| {
-                        let shrunk = plan.shrink_interaction_plan(last_execution);
+                        let shrunk =
+                            plan.shrink_interaction_plan(last_execution, &shrink_env, &result);
                         tracing::info!("{}", shrunk.stats());
                         shrunk
                     })
