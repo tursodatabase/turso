@@ -1,12 +1,12 @@
+use crate::model::query::{select::Select, Query};
 use crate::{
     generation::{
         plan::{Interaction, InteractionPlan, Interactions},
         property::Property,
     },
     run_simulation,
-    runner::cli::SimulatorCLI,
-    runner::execution::Execution,
-    SimulatorEnv,
+    runner::{cli::SimulatorCLI, execution::Execution},
+    SandboxedResult, SimulatorEnv,
 };
 use clap::Parser;
 use std::path::Path;
@@ -14,7 +14,12 @@ use std::sync::{Arc, Mutex};
 
 impl InteractionPlan {
     /// Create a smaller interaction plan by deleting a property
-    pub(crate) fn shrink_interaction_plan(&self, failing_execution: &Execution) -> InteractionPlan {
+    pub(crate) fn shrink_interaction_plan(
+        &self,
+        failing_execution: &Execution,
+        env: &SimulatorEnv,
+        result: &SandboxedResult,
+    ) -> InteractionPlan {
         // todo: this is a very naive implementation, next steps are;
         // - Shrink interaction plans more efficiently (i.e. tracking dependencies between queries)
         // - Shrink values
@@ -53,6 +58,10 @@ impl InteractionPlan {
 
         plan.plan.truncate(failing_execution.interaction_index + 1);
 
+        // Remove all properties that do not use the failing tables
+        plan.plan
+            .retain(|p| p.uses().iter().any(|t| depending_tables.contains(t)));
+
         // phase 1: shrink extensions
         for interaction in &mut plan.plan {
             if let Interactions::Property(property) = interaction {
@@ -68,7 +77,8 @@ impl InteractionPlan {
                                 .collect(),
                         };
 
-                        temp_plan = InteractionPlan::iterative_shrink(temp_plan, failing_execution);
+                        temp_plan =
+                            InteractionPlan::iterative_shrink(temp_plan, failing_execution, result);
 
                         *queries = temp_plan
                             .plan
@@ -85,11 +95,9 @@ impl InteractionPlan {
         }
 
         // phase 2: shrink the entire plan
-        plan = Self::iterative_shrink(plan, failing_execution);
-
-        // Remove all properties that do not use the failing tables
-        plan.plan
-            .retain(|p| p.uses().iter().any(|t| depending_tables.contains(t)));
+        plan = Self::iterative_shrink(plan, failing_execution, result);
+        // phase 3: shrink individual queries
+        plan = Self::shrink_queries(plan, failing_execution, result, env);
 
         let after = plan.plan.len();
 
@@ -106,6 +114,7 @@ impl InteractionPlan {
     fn iterative_shrink(
         mut plan: InteractionPlan,
         failing_execution: &Execution,
+        old_result: &SandboxedResult,
     ) -> InteractionPlan {
         for i in (0..plan.plan.len()).rev() {
             if i == failing_execution.interaction_index {
@@ -115,34 +124,142 @@ impl InteractionPlan {
 
             test_plan.plan.remove(i);
 
-            // run the test plan to see if it reproduces the error
-            let cli_opts = SimulatorCLI {
-                seed: Some(0),
-                ..SimulatorCLI::parse()
-            };
-            let env = Arc::new(Mutex::new(SimulatorEnv::new(
-                0,
-                &cli_opts,
-                Path::new("test.db"),
-            )));
-            let last_execution = Arc::new(Mutex::new(*failing_execution));
+            if Self::test_shrunk_plan(&test_plan, failing_execution, old_result) {
+                plan = test_plan;
+            }
+        }
+        plan
+    }
 
-            let result = std::panic::catch_unwind(|| {
+    fn shrink_queries(
+        mut plan: InteractionPlan,
+        failing_execution: &Execution,
+        old_result: &SandboxedResult,
+        env: &SimulatorEnv,
+    ) -> InteractionPlan {
+        for i in 0..plan.plan.len() {
+            match &plan.plan[i] {
+                Interactions::Query(query) => {
+                    match query {
+                        Query::Select(Select {
+                            table,
+                            result_columns,
+                            ..
+                        }) => {
+                            let mut current_cols =
+                                if let crate::model::query::select::ResultColumn::Star =
+                                    &result_columns[0]
+                                {
+                                    let column_names = Self::get_table_column_names(&table, env);
+                                    column_names
+                                        .into_iter()
+                                        .map(|name| {
+                                            crate::model::query::select::ResultColumn::Column(name)
+                                        })
+                                        .collect::<Vec<_>>()
+                                } else {
+                                    result_columns.clone()
+                                };
+
+                            // try removing columns one by one while preserving the bug
+                            while current_cols.len() > 1 {
+                                let mut found_shrink = false;
+                                for remove_idx in 0..current_cols.len() {
+                                    let mut candidate = current_cols.clone();
+                                    candidate.remove(remove_idx);
+
+                                    let mut test_plan = plan.clone();
+                                    if let Interactions::Query(Query::Select(Select {
+                                        result_columns: test_columns,
+                                        ..
+                                    })) = &mut test_plan.plan[i]
+                                    {
+                                        *test_columns = candidate.clone();
+                                    }
+                                    if Self::test_shrunk_plan(
+                                        &test_plan,
+                                        failing_execution,
+                                        old_result,
+                                    ) {
+                                        current_cols = candidate;
+                                        found_shrink = true;
+                                        break;
+                                    }
+                                }
+                                if !found_shrink {
+                                    break;
+                                }
+                            }
+
+                            // update the plan with the shrunk columns
+                            if let Interactions::Query(Query::Select(Select {
+                                result_columns,
+                                ..
+                            })) = &mut plan.plan[i]
+                            {
+                                tracing::info!("Shrunk query {} to {:?}", i, current_cols);
+                                *result_columns = current_cols;
+                            }
+                        }
+                        Query::Insert { .. } => {
+                            // todo: shrink insert queries
+                        }
+                        Query::Update { .. } => {
+                            // todo: shrink update queries
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        plan
+    }
+
+    fn test_shrunk_plan(
+        test_plan: &InteractionPlan,
+        failing_execution: &Execution,
+        old_result: &SandboxedResult,
+    ) -> bool {
+        let cli_opts = SimulatorCLI {
+            seed: Some(0),
+            ..SimulatorCLI::parse()
+        };
+        let env = Arc::new(Mutex::new(SimulatorEnv::new(
+            0,
+            &cli_opts,
+            Path::new("test.db"),
+        )));
+        let last_execution = Arc::new(Mutex::new(*failing_execution));
+
+        let result = SandboxedResult::from(
+            std::panic::catch_unwind(|| {
                 run_simulation(
                     env.clone(),
                     &mut [test_plan.clone()],
                     last_execution.clone(),
                 )
-            });
-
-            if let Ok(execution_result) = result {
-                if let Some(_) = execution_result.error {
-                    // if we get the same error, shrink is valid
-                    plan = test_plan;
-                    continue;
-                }
-            }
+            }),
+            last_execution.clone(),
+        );
+        match (old_result, &result) {
+            (
+                SandboxedResult::Panicked { error: e1, .. },
+                SandboxedResult::Panicked { error: e2, .. },
+            )
+            | (
+                SandboxedResult::FoundBug { error: e1, .. },
+                SandboxedResult::FoundBug { error: e2, .. },
+            ) => e1 == e2,
+            _ => false,
         }
-        plan
+    }
+    fn get_table_column_names(table_name: &str, env: &SimulatorEnv) -> Vec<String> {
+        env.tables
+            .iter()
+            .find(|t| t.name == table_name)
+            .map(|table| table.columns.iter().map(|col| col.name.clone()).collect())
+            .unwrap_or_default()
     }
 }
