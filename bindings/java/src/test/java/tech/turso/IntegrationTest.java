@@ -22,7 +22,7 @@ public class IntegrationTest {
   @Test
   void create_table_multi_inserts_select() throws Exception {
     Statement stmt = createDefaultStatement();
-    stmt.execute("CREATE TABLE users (id INT PRIMARY KEY, username TEXT);");
+    stmt.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT);");
     stmt.execute("INSERT INTO users VALUES (1, 'seonwoo');");
     stmt.execute("INSERT INTO users VALUES (2, 'seonwoo');");
     stmt.execute("INSERT INTO users VALUES (3, 'seonwoo');");

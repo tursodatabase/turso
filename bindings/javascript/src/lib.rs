@@ -41,7 +41,7 @@ pub struct Database {
     #[napi(writable = false)]
     pub name: String,
     _db: Arc<limbo_core::Database>,
-    conn: Rc<limbo_core::Connection>,
+    conn: Arc<limbo_core::Connection>,
     io: Arc<dyn limbo_core::IO>,
 }
 

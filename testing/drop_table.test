@@ -25,24 +25,26 @@ do_execsql_test_on_specific_db {:memory:} drop-table-if-exists-2 {
     SELECT 'success';
 } {success}
 
-# Test dropping table with index
-do_execsql_test_on_specific_db {:memory:} drop-table-with-index-1 {
-    CREATE TABLE t3(x INTEGER PRIMARY KEY, y TEXT);
-    CREATE INDEX idx_t3_y ON t3(y);
-    INSERT INTO t3 VALUES(1, 'one');
-    DROP TABLE t3;
-    SELECT count(*) FROM sqlite_schema WHERE tbl_name='t3';
-} {0}
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+    # Test dropping table with index
+    do_execsql_test_on_specific_db {:memory:} drop-table-with-index-1 {
+        CREATE TABLE t3(x INTEGER PRIMARY KEY, y TEXT);
+        CREATE INDEX idx_t3_y ON t3(y);
+        INSERT INTO t3 VALUES(1, 'one');
+        DROP TABLE t3;
+        SELECT count(*) FROM sqlite_schema WHERE tbl_name='t3';
+    } {0}
+    # Test dropping table cleans up related schema entries
+    do_execsql_test_on_specific_db {:memory:} drop-table-schema-cleanup-1 {
+        CREATE TABLE t4(x INTEGER PRIMARY KEY, y TEXT);
+        CREATE INDEX idx1_t4 ON t4(x);
+        CREATE INDEX idx2_t4 ON t4(y);
+        INSERT INTO t4 VALUES(1, 'one');
+        DROP TABLE t4;
+        SELECT count(*) FROM sqlite_schema WHERE tbl_name='t4';
+    } {0}
+}
 
-# Test dropping table cleans up related schema entries
-do_execsql_test_on_specific_db {:memory:} drop-table-schema-cleanup-1 {
-    CREATE TABLE t4(x INTEGER PRIMARY KEY, y TEXT);
-    CREATE INDEX idx1_t4 ON t4(x);
-    CREATE INDEX idx2_t4 ON t4(y);
-    INSERT INTO t4 VALUES(1, 'one');
-    DROP TABLE t4;
-    SELECT count(*) FROM sqlite_schema WHERE tbl_name='t4';
-} {0}
 
 # Test dropping table after multiple inserts and deletes
 do_execsql_test_on_specific_db {:memory:} drop-table-after-ops-1 {

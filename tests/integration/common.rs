@@ -2,7 +2,6 @@ use limbo_core::{Connection, Database, PagerCacheflushStatus, IO};
 use rand::{rng, RngCore};
 use rusqlite::params;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tracing_subscriber::layer::SubscriberExt;
@@ -55,14 +54,14 @@ impl TempDatabase {
         Self { path, io }
     }
 
-    pub fn connect_limbo(&self) -> Rc<limbo_core::Connection> {
+    pub fn connect_limbo(&self) -> Arc<limbo_core::Connection> {
         Self::connect_limbo_with_flags(&self, limbo_core::OpenFlags::default())
     }
 
     pub fn connect_limbo_with_flags(
         &self,
         flags: limbo_core::OpenFlags,
-    ) -> Rc<limbo_core::Connection> {
+    ) -> Arc<limbo_core::Connection> {
         log::debug!("conneting to limbo");
         let db = Database::open_file_with_flags(
             self.io.clone(),
@@ -83,7 +82,7 @@ impl TempDatabase {
     }
 }
 
-pub(crate) fn do_flush(conn: &Rc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
+pub(crate) fn do_flush(conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
     loop {
         match conn.cacheflush()? {
             PagerCacheflushStatus::Done(_) => {
@@ -155,7 +154,7 @@ pub(crate) fn sqlite_exec_rows(
 
 pub(crate) fn limbo_exec_rows(
     db: &TempDatabase,
-    conn: &Rc<limbo_core::Connection>,
+    conn: &Arc<limbo_core::Connection>,
     query: &str,
 ) -> Vec<Vec<rusqlite::types::Value>> {
     let mut stmt = conn.prepare(query).unwrap();
@@ -193,7 +192,7 @@ pub(crate) fn limbo_exec_rows(
 
 pub(crate) fn limbo_exec_rows_error(
     db: &TempDatabase,
-    conn: &Rc<limbo_core::Connection>,
+    conn: &Arc<limbo_core::Connection>,
     query: &str,
 ) -> limbo_core::Result<()> {
     let mut stmt = conn.prepare(query)?;
@@ -284,6 +283,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "index_experimental")]
     fn test_unique_index_ordering() -> anyhow::Result<()> {
         let db = TempDatabase::new_empty();
         let conn = db.connect_limbo();
@@ -324,6 +324,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "index_experimental")]
     fn test_large_unique_blobs() -> anyhow::Result<()> {
         let path = TempDir::new().unwrap().keep().join("temp_read_only");
         let db = TempDatabase::new_with_existent(&path);

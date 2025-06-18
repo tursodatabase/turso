@@ -52,11 +52,13 @@ do_execsql_test_on_specific_db {:memory:} delete-reuse-1 {
 } {1 2 3}
 
 # Test delete works when there are indexes
-do_execsql_test_on_specific_db {:memory:} delete-all-with-indexes-1 {
-    CREATE TABLE t(a PRIMARY KEY);
-    CREATE INDEX tasc ON t(a);
-    CREATE INDEX tdesc ON t(a DESC);
-    INSERT INTO t VALUES (randomblob(1000));
-    DELETE FROM t;
-    SELECT * FROM t;
-} {}
+if {[info exists ::env(SQLITE_EXEC)] && $::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental"} {
+    do_execsql_test_on_specific_db {:memory:} delete-all-with-indexes-1 {
+        CREATE TABLE t(a PRIMARY KEY);
+        CREATE INDEX tasc ON t(a);
+        CREATE INDEX tdesc ON t(a DESC);
+        INSERT INTO t VALUES (randomblob(1000));
+        DELETE FROM t;
+        SELECT * FROM t;
+    } {}
+}

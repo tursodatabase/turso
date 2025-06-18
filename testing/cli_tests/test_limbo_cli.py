@@ -107,7 +107,9 @@ class TestLimboShell:
         flags="",
     ):
         if exec_name is None:
-            exec_name = "./scripts/limbo-sqlite3"
+            exec_name = os.environ.get('SQLITE_EXEC')
+            if exec_name is None:
+                exec_name = "./scripts/limbo-sqlite3"
             if flags == "":
                 flags = "-q"
         self.config = ShellConfig(exe_name=exec_name, flags=flags)

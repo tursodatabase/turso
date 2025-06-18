@@ -18,6 +18,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use tracing_subscriber::field::MakeExt;
+use tracing_subscriber::fmt::format;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -700,6 +701,7 @@ fn run_simulation(
     result
 }
 
+#[allow(deprecated)]
 fn init_logger() {
     let file = OpenOptions::new()
         .create(true)
@@ -713,14 +715,14 @@ fn init_logger() {
                 .with_ansi(true)
                 .with_line_number(true)
                 .without_time()
-                .with_thread_ids(false)
-                .map_fmt_fields(|f| f.debug_alt()),
+                .with_thread_ids(false),
         )
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(file)
                 .with_ansi(false)
+                .fmt_fields(format::PrettyFields::new().with_ansi(false)) // with_ansi is deprecated, but I cannot find another way to remove ansi codes
                 .with_line_number(true)
                 .without_time()
                 .with_thread_ids(false)

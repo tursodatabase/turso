@@ -10,8 +10,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
-use std::rc::Rc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 register_extension! {
     vtabs: { KVStoreVTabModule, TableStatsVtabModule },
@@ -139,7 +138,7 @@ impl VTable for KVStoreTable {
     type Cursor = KVStoreCursor;
     type Error = String;
 
-    fn open(&self, _conn: Option<Rc<Connection>>) -> Result<Self::Cursor, Self::Error> {
+    fn open(&self, _conn: Option<Arc<Connection>>) -> Result<Self::Cursor, Self::Error> {
         let _ = env_logger::try_init();
         Ok(KVStoreCursor {
             rows: Vec::new(),
@@ -303,7 +302,7 @@ pub struct TableStatsVtabModule;
 pub struct StatsCursor {
     pos: usize,
     rows: Vec<(String, i64)>,
-    conn: Option<Rc<Connection>>,
+    conn: Option<Arc<Connection>>,
 }
 
 pub struct StatsTable {}
@@ -322,7 +321,7 @@ impl VTable for StatsTable {
     type Cursor = StatsCursor;
     type Error = String;
 
-    fn open(&self, conn: Option<Rc<Connection>>) -> Result<Self::Cursor, Self::Error> {
+    fn open(&self, conn: Option<Arc<Connection>>) -> Result<Self::Cursor, Self::Error> {
         Ok(StatsCursor {
             pos: 0,
             rows: Vec::new(),

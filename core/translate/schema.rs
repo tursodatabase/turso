@@ -15,7 +15,7 @@ use crate::translate::ProgramBuilderOpts;
 use crate::translate::QueryMode;
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vdbe::builder::CursorType;
-use crate::vdbe::insn::{CmpInsFlags, Insn};
+use crate::vdbe::insn::{CmpInsFlags, InsertFlags, Insn};
 use crate::LimboError;
 use crate::SymbolTable;
 use crate::{bail_parse_error, Result};
@@ -93,6 +93,9 @@ pub fn translate_create_table(
 
     let index_regs = check_automatic_pk_index_required(&body, &mut program, &tbl_name.name.0)?;
     if let Some(index_regs) = index_regs.as_ref() {
+        if cfg!(not(feature = "index_experimental")) {
+            bail_parse_error!("Constraints UNIQUE and PRIMARY KEY (unless INTEGER PRIMARY KEY) on table are not supported without indexes");
+        }
         for index_reg in index_regs.clone() {
             program.emit_insn(Insn::CreateBtree {
                 db: 0,
@@ -227,7 +230,7 @@ pub fn emit_schema_entry(
         cursor: sqlite_schema_cursor_id,
         key_reg: rowid_reg,
         record_reg,
-        flag: 0,
+        flag: InsertFlags::new(),
         table_name: tbl_name.to_string(),
     });
 }
@@ -610,6 +613,14 @@ pub fn translate_drop_table(
     schema: &Schema,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
+    #[cfg(not(feature = "index_experimental"))]
+    {
+        if schema.table_has_indexes(&tbl_name.name.to_string()) {
+            bail_parse_error!(
+                "DROP Table with indexes on the table enabled only with index_experimental feature"
+            );
+        }
+    }
     let opts = ProgramBuilderOpts {
         query_mode,
         num_cursors: 3,
@@ -828,7 +839,7 @@ pub fn translate_drop_table(
             cursor: ephemeral_cursor_id,
             key_reg: schema_row_id_register,
             record_reg: schema_data_register,
-            flag: 0,
+            flag: InsertFlags::new(),
             table_name: "scratch_table".to_string(),
         });
 
@@ -894,7 +905,7 @@ pub fn translate_drop_table(
             cursor: sqlite_schema_cursor_id_1,
             key_reg: schema_row_id_register,
             record_reg: new_record_register,
-            flag: 0,
+            flag: InsertFlags::new(),
             table_name: SQLITE_TABLEID.to_string(),
         });
 

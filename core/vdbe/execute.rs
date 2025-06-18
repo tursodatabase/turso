@@ -2,6 +2,7 @@
 use crate::function::AlterTableFunc;
 use crate::numeric::{NullableInteger, Numeric};
 use crate::schema::Schema;
+use crate::storage::btree::{integrity_check, IntegrityCheckError, IntegrityCheckState};
 use crate::storage::database::FileMemoryStorage;
 use crate::storage::page_cache::DumbLruPageCache;
 use crate::storage::pager::CreateBTreeFlags;
@@ -83,6 +84,7 @@ use crate::{
 };
 
 use super::{get_new_rowid, make_record, Program, ProgramState, Register};
+use crate::vdbe::insn::InsertFlags;
 use crate::{
     bail_constraint_error, must_be_btree_cursor, resolve_ext_path, MvStore, Pager, Result,
     DATABASE_VERSION,
@@ -214,10 +216,8 @@ pub fn op_drop_index(
     let Insn::DropIndex { index, db: _ } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    if let Some(conn) = program.connection.upgrade() {
-        let mut schema = conn.schema.write();
-        schema.remove_index(&index);
-    }
+    let mut schema = program.connection.schema.write();
+    schema.remove_index(&index);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -310,7 +310,7 @@ pub fn op_checkpoint(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    let result = program.connection.upgrade().unwrap().checkpoint();
+    let result = program.connection.checkpoint();
     match result {
         Ok(CheckpointResult {
             num_wal_frames: num_wal_pages,
@@ -900,7 +900,7 @@ pub fn op_open_read(
                 .replace(Cursor::new_btree(cursor));
         }
         CursorType::BTreeIndex(index) => {
-            let conn = program.connection.upgrade().unwrap();
+            let conn = program.connection.clone();
             let schema = conn.schema.try_read().ok_or(LimboError::SchemaLocked)?;
             let table = schema
                 .get_table(&index.table_name)
@@ -998,11 +998,7 @@ pub fn op_vcreate(
     } else {
         vec![]
     };
-    let Some(conn) = program.connection.upgrade() else {
-        return Err(crate::LimboError::ExtensionError(
-            "Failed to upgrade Connection".to_string(),
-        ));
-    };
+    let conn = program.connection.clone();
     let table =
         crate::VirtualTable::table(Some(&table_name), &module_name, args, &conn.syms.borrow())?;
     {
@@ -1123,9 +1119,7 @@ pub fn op_vupdate(
         Ok(Some(new_rowid)) => {
             if *conflict_action == 5 {
                 // ResolveType::Replace
-                if let Some(conn) = program.connection.upgrade() {
-                    conn.update_last_rowid(new_rowid);
-                }
+                program.connection.update_last_rowid(new_rowid);
             }
             state.pc += 1;
         }
@@ -1181,12 +1175,7 @@ pub fn op_vdestroy(
     let Insn::VDestroy { db, table_name } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    let Some(conn) = program.connection.upgrade() else {
-        return Err(crate::LimboError::ExtensionError(
-            "Failed to upgrade Connection".to_string(),
-        ));
-    };
-
+    let conn = program.connection.clone();
     {
         let Some(vtab) = conn.syms.borrow_mut().vtabs.remove(table_name) else {
             return Err(crate::LimboError::InternalError(
@@ -1339,15 +1328,6 @@ pub fn op_column(
 
                 let Some(record) = record.as_ref() else {
                     break 'value Value::Null;
-                };
-
-                let value = if cursor.get_null_flag() {
-                    Value::Null
-                } else {
-                    match record.get_value_opt(*column) {
-                        Some(val) => val.to_owned(),
-                        None => Value::Null,
-                    }
                 };
 
                 if cursor.get_null_flag() {
@@ -1700,7 +1680,7 @@ pub fn op_transaction(
     let Insn::Transaction { write } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    let connection = program.connection.upgrade().unwrap();
+    let connection = program.connection.clone();
     if *write && connection._db.open_flags.contains(OpenFlags::ReadOnly) {
         return Err(LimboError::ReadOnly);
     }
@@ -1755,7 +1735,7 @@ pub fn op_auto_commit(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    let conn = program.connection.upgrade().unwrap();
+    let conn = program.connection.clone();
     if state.commit_state == CommitState::Committing {
         return match program.commit_txn(pager.clone(), state, mv_store)? {
             super::StepResult::Done => Ok(InsnFunctionStepResult::Done),
@@ -3396,7 +3376,7 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::Changes => {
-                let res = &program.connection.upgrade().unwrap().last_change;
+                let res = &program.connection.last_change;
                 let changes = res.get();
                 state.registers[*dest] = Register::Value(Value::Integer(changes));
             }
@@ -3444,12 +3424,8 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::LastInsertRowid => {
-                if let Some(conn) = program.connection.upgrade() {
-                    state.registers[*dest] =
-                        Register::Value(Value::Integer(conn.last_insert_rowid() as i64));
-                } else {
-                    state.registers[*dest] = Register::Value(Value::Null);
-                }
+                state.registers[*dest] =
+                    Register::Value(Value::Integer(program.connection.last_insert_rowid() as i64));
             }
             ScalarFunc::Like => {
                 let pattern = &state.registers[*start_reg];
@@ -3654,7 +3630,7 @@ pub fn op_function(
                 }
             }
             ScalarFunc::TotalChanges => {
-                let res = &program.connection.upgrade().unwrap().total_changes;
+                let res = &program.connection.total_changes;
                 let total_changes = res.get();
                 state.registers[*dest] = Register::Value(Value::Integer(total_changes));
             }
@@ -3715,9 +3691,7 @@ pub fn op_function(
             ScalarFunc::LoadExtension => {
                 let extension = &state.registers[*start_reg];
                 let ext = resolve_ext_path(&extension.get_owned_value().to_string())?;
-                if let Some(conn) = program.connection.upgrade() {
-                    conn.load_extension(ext)?;
-                }
+                program.connection.load_extension(ext)?;
             }
             ScalarFunc::StrfTime => {
                 let result = exec_strftime(&state.registers[*start_reg..*start_reg + arg_count]);
@@ -4222,7 +4196,7 @@ pub fn op_insert(
         cursor,
         key_reg,
         record_reg,
-        flag: _,
+        flag,
         table_name: _,
     } = insn
     else {
@@ -4243,11 +4217,13 @@ pub fn op_insert(
         // Only update last_insert_rowid for regular table inserts, not schema modifications
         if cursor.root_page() != 1 {
             if let Some(rowid) = return_if_io!(cursor.rowid()) {
-                if let Some(conn) = program.connection.upgrade() {
-                    conn.update_last_rowid(rowid);
+                program.connection.update_last_rowid(rowid);
+
+                // n_change is increased when Insn::Delete is executed, so we can skip for Insn::Insert
+                if !flag.has(InsertFlags::UPDATE) {
+                    let prev_changes = program.n_change.get();
+                    program.n_change.set(prev_changes + 1);
                 }
-                let prev_changes = program.n_change.get();
-                program.n_change.set(prev_changes + 1);
             }
         }
     }
@@ -4706,7 +4682,7 @@ pub fn op_open_write(
         None => None,
     };
     if let Some(index) = maybe_index {
-        let conn = program.connection.upgrade().unwrap();
+        let conn = program.connection.clone();
         let schema = conn.schema.try_read().ok_or(LimboError::SchemaLocked)?;
         let table = schema
             .get_table(&index.table_name)
@@ -4832,7 +4808,8 @@ pub fn op_drop_table(
     if *db > 0 {
         todo!("temp databases not implemented yet");
     }
-    if let Some(conn) = program.connection.upgrade() {
+    let conn = program.connection.clone();
+    {
         let mut schema = conn.schema.write();
         schema.remove_indices_for_table(table_name);
         schema.remove_table(table_name);
@@ -4909,8 +4886,7 @@ pub fn op_parse_schema(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    let conn = program.connection.upgrade();
-    let conn = conn.as_ref().unwrap();
+    let conn = program.connection.clone();
 
     if let Some(where_clause) = where_clause {
         let stmt = conn.prepare(format!(
@@ -5196,7 +5172,7 @@ pub fn op_open_ephemeral(
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
 
-    let conn = program.connection.upgrade().unwrap();
+    let conn = program.connection.clone();
     let io = conn.pager.io.get_memory_io();
 
     let file = io.open_file("", OpenFlags::Create, true)?;
@@ -5429,6 +5405,68 @@ pub fn op_count(
     state.registers[*target_reg] = Register::Value(Value::Integer(count as i64));
 
     state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+#[derive(Debug)]
+pub enum OpIntegrityCheckState {
+    Start,
+    Checking {
+        errors: Vec<IntegrityCheckError>,
+        current_root_idx: usize,
+        state: IntegrityCheckState,
+    },
+}
+pub fn op_integrity_check(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Rc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    let Insn::IntegrityCk {
+        max_errors,
+        roots,
+        message_register,
+    } = insn
+    else {
+        unreachable!("unexpected Insn {:?}", insn)
+    };
+    match &mut state.op_integrity_check_state {
+        OpIntegrityCheckState::Start => {
+            state.op_integrity_check_state = OpIntegrityCheckState::Checking {
+                errors: Vec::new(),
+                current_root_idx: 0,
+                state: IntegrityCheckState::new(roots[0]),
+            };
+        }
+        OpIntegrityCheckState::Checking {
+            errors,
+            current_root_idx,
+            state: integrity_check_state,
+        } => {
+            return_if_io!(integrity_check(integrity_check_state, errors, pager));
+            *current_root_idx += 1;
+            if *current_root_idx < roots.len() {
+                *integrity_check_state = IntegrityCheckState::new(roots[*current_root_idx]);
+                return Ok(InsnFunctionStepResult::Step);
+            } else {
+                let message = if errors.is_empty() {
+                    "ok".to_string()
+                } else {
+                    errors
+                        .iter()
+                        .map(|e| e.to_string())
+                        .collect::<Vec<String>>()
+                        .join("\n")
+                };
+                state.registers[*message_register] = Register::Value(Value::build_text(message));
+                state.op_integrity_check_state = OpIntegrityCheckState::Start;
+                state.pc += 1;
+            }
+        }
+    }
+
     Ok(InsnFunctionStepResult::Step)
 }
 
@@ -5754,10 +5792,11 @@ impl Value {
 
     pub fn exec_hex(&self) -> Value {
         match self {
-            Value::Text(_) | Value::Integer(_) | Value::Float(_) | Value::Blob(_) => {
+            Value::Text(_) | Value::Integer(_) | Value::Float(_) => {
                 let text = self.to_string();
                 Value::build_text(&hex::encode_upper(text))
             }
+            Value::Blob(blob_bytes) => Value::build_text(&hex::encode_upper(blob_bytes)),
             _ => Value::Null,
         }
     }
@@ -7510,6 +7549,10 @@ mod tests {
         let input_float = Value::Float(12.34);
         let expected_val = Value::build_text("31322E3334");
         assert_eq!(input_float.exec_hex(), expected_val);
+
+        let input_blob = Value::Blob(vec![0xff]);
+        let expected_val = Value::build_text("FF");
+        assert_eq!(input_blob.exec_hex(), expected_val);
     }
 
     #[test]

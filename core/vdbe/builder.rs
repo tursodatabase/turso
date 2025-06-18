@@ -1,9 +1,4 @@
-use std::{
-    cell::Cell,
-    cmp::Ordering,
-    rc::{Rc, Weak},
-    sync::Arc,
-};
+use std::{cell::Cell, cmp::Ordering, rc::Rc, sync::Arc};
 
 use limbo_sqlite3_parser::ast::{self, TableInternalId};
 use tracing::{instrument, Level};
@@ -856,7 +851,7 @@ impl ProgramBuilder {
     pub fn build(
         mut self,
         database_header: Arc<SpinLock<DatabaseHeader>>,
-        connection: Weak<Connection>,
+        connection: Arc<Connection>,
         change_cnt_on: bool,
     ) -> Program {
         self.resolve_labels();

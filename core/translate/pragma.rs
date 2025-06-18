@@ -3,7 +3,7 @@
 
 use limbo_sqlite3_parser::ast::PragmaName;
 use limbo_sqlite3_parser::ast::{self, Expr};
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::fast_lock::SpinLock;
@@ -17,6 +17,8 @@ use crate::vdbe::insn::{Cookie, Insn};
 use crate::{bail_parse_error, LimboError, Pager, Value};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
+
+use super::integrity_check::translate_integrity_check;
 
 fn list_pragmas(program: &mut ProgramBuilder) {
     for x in PragmaName::iter() {
@@ -34,7 +36,7 @@ pub fn translate_pragma(
     body: Option<ast::PragmaBody>,
     database_header: Arc<SpinLock<DatabaseHeader>>,
     pager: Rc<Pager>,
-    connection: Weak<crate::Connection>,
+    connection: Arc<crate::Connection>,
     mut program: ProgramBuilder,
 ) -> crate::Result<ProgramBuilder> {
     let opts = ProgramBuilderOpts {
@@ -68,7 +70,7 @@ pub fn translate_pragma(
                 &mut program,
             )?;
         }
-        Some(ast::PragmaBody::Equals(value)) => match pragma {
+        Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
             PragmaName::TableInfo => {
                 query_pragma(
                     pragma,
@@ -93,22 +95,6 @@ pub fn translate_pragma(
                 )?;
             }
         },
-        Some(ast::PragmaBody::Call(value)) => match pragma {
-            PragmaName::TableInfo => {
-                query_pragma(
-                    pragma,
-                    schema,
-                    Some(value),
-                    database_header.clone(),
-                    pager,
-                    connection,
-                    &mut program,
-                )?;
-            }
-            _ => {
-                todo!()
-            }
-        },
     };
     program.epilogue(match write {
         false => super::emitter::TransactionMode::Read,
@@ -124,7 +110,7 @@ fn update_pragma(
     value: ast::Expr,
     header: Arc<SpinLock<DatabaseHeader>>,
     pager: Rc<Pager>,
-    connection: Weak<crate::Connection>,
+    connection: Arc<crate::Connection>,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
     match pragma {
@@ -154,7 +140,7 @@ fn update_pragma(
             query_pragma(
                 PragmaName::WalCheckpoint,
                 schema,
-                None,
+                Some(value),
                 header,
                 pager,
                 connection,
@@ -259,6 +245,7 @@ fn update_pragma(
             });
             Ok(())
         }
+        PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
     }
 }
 
@@ -268,16 +255,13 @@ fn query_pragma(
     value: Option<ast::Expr>,
     database_header: Arc<SpinLock<DatabaseHeader>>,
     pager: Rc<Pager>,
-    connection: Weak<crate::Connection>,
+    connection: Arc<crate::Connection>,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
     let register = program.alloc_register();
     match pragma {
         PragmaName::CacheSize => {
-            program.emit_int(
-                connection.upgrade().unwrap().get_cache_size() as i64,
-                register,
-            );
+            program.emit_int(connection.get_cache_size() as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
         }
@@ -290,11 +274,26 @@ fn query_pragma(
         PragmaName::WalCheckpoint => {
             // Checkpoint uses 3 registers: P1, P2, P3. Ref Insn::Checkpoint for more info.
             // Allocate two more here as one was allocated at the top.
-            program.alloc_register();
-            program.alloc_register();
+            let mode = match value {
+                Some(ast::Expr::Name(name)) => {
+                    let mode_name = normalize_ident(&name.0);
+                    CheckpointMode::from_str(&mode_name).map_err(|e| {
+                        LimboError::ParseError(format!("Unknown Checkpoint Mode: {}", e))
+                    })?
+                }
+                _ => CheckpointMode::Passive,
+            };
+
+            if !matches!(mode, CheckpointMode::Passive) {
+                return Err(LimboError::ParseError(
+                    "only Passive mode supported".to_string(),
+                ));
+            }
+
+            program.alloc_registers(2);
             program.emit_insn(Insn::Checkpoint {
                 database: 0,
-                checkpoint_mode: CheckpointMode::Passive,
+                checkpoint_mode: mode,
                 dest: register,
             });
             program.emit_result_row(register, 3);
@@ -317,11 +316,7 @@ fn query_pragma(
             };
 
             let base_reg = register;
-            program.alloc_register();
-            program.alloc_register();
-            program.alloc_register();
-            program.alloc_register();
-            program.alloc_register();
+            program.alloc_registers(5);
             if let Some(table) = table {
                 for (i, column) in table.columns().iter().enumerate() {
                     // cid
@@ -395,6 +390,9 @@ fn query_pragma(
             });
             program.emit_result_row(register, 1);
         }
+        PragmaName::IntegrityCheck => {
+            translate_integrity_check(schema, program)?;
+        }
     }
 
     Ok(())
@@ -417,7 +415,7 @@ fn update_cache_size(
     value: i64,
     header: Arc<SpinLock<DatabaseHeader>>,
     pager: Rc<Pager>,
-    connection: Weak<crate::Connection>,
+    connection: Arc<crate::Connection>,
 ) -> crate::Result<()> {
     let mut cache_size_unformatted: i64 = value;
     let mut cache_size = if cache_size_unformatted < 0 {
@@ -432,10 +430,7 @@ fn update_cache_size(
         cache_size = MIN_PAGE_CACHE_SIZE;
         cache_size_unformatted = MIN_PAGE_CACHE_SIZE as i64;
     }
-    connection
-        .upgrade()
-        .unwrap()
-        .set_cache_size(cache_size_unformatted as i32);
+    connection.set_cache_size(cache_size_unformatted as i32);
 
     // update cache size
     pager

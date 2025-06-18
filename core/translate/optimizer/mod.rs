@@ -241,15 +241,19 @@ fn optimize_table_access(
         let table_idx = join_order_member.original_idx;
         let access_method = &access_methods_arena.borrow()[best_access_methods[i]];
         if access_method.is_scan() {
-            let is_leftmost_table = i == 0;
-            let uses_index = access_method.index.is_some();
-            let source_table_is_from_clause_subquery = matches!(
-                &joined_tables[table_idx].table,
-                Table::FromClauseSubquery(_)
-            );
+            #[cfg(feature = "index_experimental")]
+            let try_to_build_ephemeral_index = {
+                let is_leftmost_table = i == 0;
+                let uses_index = access_method.index.is_some();
+                let source_table_is_from_clause_subquery = matches!(
+                    &joined_tables[table_idx].table,
+                    Table::FromClauseSubquery(_)
+                );
+                !is_leftmost_table && !uses_index && !source_table_is_from_clause_subquery
+            };
+            #[cfg(not(feature = "index_experimental"))]
+            let try_to_build_ephemeral_index = false;
 
-            let try_to_build_ephemeral_index =
-                !is_leftmost_table && !uses_index && !source_table_is_from_clause_subquery;
             if !try_to_build_ephemeral_index {
                 joined_tables[table_idx].op = Operation::Scan {
                     iter_dir: access_method.iter_dir,

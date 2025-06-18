@@ -190,20 +190,22 @@ do_execsql_test_on_specific_db {:memory:} update_cache_full_regression_test_#162
     SELECT count(*) FROM t;
 } {1}
 
-do_execsql_test_on_specific_db {:memory:} update_index_regression_test {
-    CREATE TABLE t(x, y);
-    CREATE INDEX tx ON t (x);
-    CREATE UNIQUE INDEX tyu ON t (y);
-    INSERT INTO t VALUES (1, 1);
-    SELECT x FROM t; -- uses tx index
-    SELECT y FROM t; -- uses ty index
-    UPDATE t SET x=2, y=2;
-    SELECT x FROM t; -- uses tx index
-    SELECT y FROM t; -- uses ty index    
-} {1
-1
-2
-2}
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+    do_execsql_test_on_specific_db {:memory:} update_index_regression_test {
+        CREATE TABLE t(x, y);
+        CREATE INDEX tx ON t (x);
+        CREATE UNIQUE INDEX tyu ON t (y);
+        INSERT INTO t VALUES (1, 1);
+        SELECT x FROM t; -- uses tx index
+        SELECT y FROM t; -- uses ty index
+        UPDATE t SET x=2, y=2;
+        SELECT x FROM t; -- uses tx index
+        SELECT y FROM t; -- uses ty index    
+    } {1
+    1
+    2
+    2}
+}
 
 do_execsql_test_on_specific_db {:memory:} update_where_or_regression_test {
     CREATE TABLE t (a INTEGER);

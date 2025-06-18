@@ -18,6 +18,7 @@ pub(crate) mod expr;
 pub(crate) mod group_by;
 pub(crate) mod index;
 pub(crate) mod insert;
+pub(crate) mod integrity_check;
 pub(crate) mod main_loop;
 pub(crate) mod optimizer;
 pub(crate) mod order_by;
@@ -46,7 +47,7 @@ use insert::translate_insert;
 use limbo_sqlite3_parser::ast::{self, Delete, Insert};
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
 use select::translate_select;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use std::sync::Arc;
 use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
@@ -58,14 +59,17 @@ pub fn translate(
     stmt: ast::Stmt,
     database_header: Arc<SpinLock<DatabaseHeader>>,
     pager: Rc<Pager>,
-    connection: Weak<Connection>,
+    connection: Arc<Connection>,
     syms: &SymbolTable,
     query_mode: QueryMode,
     _input: &str, // TODO: going to be used for CREATE VIEW
 ) -> Result<Program> {
     let change_cnt_on = matches!(
         stmt,
-        ast::Stmt::CreateIndex { .. } | ast::Stmt::Delete(..) | ast::Stmt::Insert(..)
+        ast::Stmt::CreateIndex { .. }
+            | ast::Stmt::Delete(..)
+            | ast::Stmt::Insert(..)
+            | ast::Stmt::Update(..)
     );
 
     // These options will be extended whithin each translate program

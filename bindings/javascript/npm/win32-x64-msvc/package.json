@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/limbo-win32-x64-msvc",
-  "version": "0.0.22-pre.1",
+  "version": "0.0.22-pre.2",
   "repository": {
     "type": "git",
     "url": "https://github.com/tursodatabase/limbo"

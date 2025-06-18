@@ -202,6 +202,14 @@ fn prepare_one_select_plan<'a>(
                 distinctness,
                 ..
             } = *select_inner;
+            #[cfg(not(feature = "index_experimental"))]
+            {
+                if distinctness.is_some() {
+                    crate::bail_parse_error!(
+                        "SELECT with DISTINCT is not allowed without indexes enabled"
+                    );
+                }
+            }
             let col_count = columns.len();
             if col_count == 0 {
                 crate::bail_parse_error!("SELECT without columns is not allowed");
@@ -336,6 +344,15 @@ fn prepare_one_select_plan<'a>(
                                     0
                                 };
                                 let distinctness = Distinctness::from_ast(distinctness.as_ref());
+
+                                #[cfg(not(feature = "index_experimental"))]
+                                {
+                                    if distinctness.is_distinct() {
+                                        crate::bail_parse_error!(
+                                            "SELECT with DISTINCT is not allowed without indexes enabled"
+                                        );
+                                    }
+                                }
                                 if distinctness.is_distinct() && args_count != 1 {
                                     crate::bail_parse_error!("DISTINCT aggregate functions must have exactly one argument");
                                 }

@@ -4,6 +4,7 @@
 use std::array;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
+use strum::EnumString;
 use tracing::{instrument, Level};
 
 use std::fmt::Formatter;
@@ -60,7 +61,8 @@ impl CheckpointResult {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, EnumString)]
+#[strum(ascii_case_insensitive)]
 pub enum CheckpointMode {
     /// Checkpoint as many frames as possible without waiting for any database readers or writers to finish, then sync the database file if all frames in the log were checkpointed.
     Passive,

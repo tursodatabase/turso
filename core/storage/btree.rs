@@ -24,7 +24,8 @@ use crate::{
 use std::collections::HashSet;
 use std::{
     cell::{Cell, Ref, RefCell},
-    cmp::Ordering,
+    cmp::{Ordering, Reverse},
+    collections::BinaryHeap,
     fmt::Debug,
     pin::Pin,
     rc::Rc,
@@ -5096,16 +5097,309 @@ impl BTreeCursor {
     }
 
     pub fn read_page(&self, page_idx: usize) -> Result<BTreePage> {
-        self.pager.read_page(page_idx).map(|page| {
-            Arc::new(BTreePageInner {
-                page: RefCell::new(page),
-            })
-        })
+        btree_read_page(&self.pager, page_idx)
     }
 
     pub fn allocate_page(&self, page_type: PageType, offset: usize) -> BTreePage {
         self.pager
             .do_allocate_page(page_type, offset, BtreePageAllocMode::Any)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum IntegrityCheckError {
+    #[error("Cell {cell_idx} in page {page_id} is out of range. cell_range={cell_start}..{cell_end}, content_area={content_area}, usable_space={usable_space}")]
+    CellOutOfRange {
+        cell_idx: usize,
+        page_id: usize,
+        cell_start: usize,
+        cell_end: usize,
+        content_area: usize,
+        usable_space: usize,
+    },
+    #[error("Cell {cell_idx} in page {page_id} extends out of page. cell_range={cell_start}..{cell_end}, content_area={content_area}, usable_space={usable_space}")]
+    CellOverflowsPage {
+        cell_idx: usize,
+        page_id: usize,
+        cell_start: usize,
+        cell_end: usize,
+        content_area: usize,
+        usable_space: usize,
+    },
+    #[error("Page {page_id} cell {cell_idx} has rowid={rowid} in wrong order. Parent cell has parent_rowid={max_intkey} and next_rowid={next_rowid}")]
+    CellRowidOutOfRange {
+        page_id: usize,
+        cell_idx: usize,
+        rowid: i64,
+        max_intkey: i64,
+        next_rowid: i64,
+    },
+    #[error("Page {page_id} is at different depth from another leaf page this_page_depth={this_page_depth}, other_page_depth={other_page_depth} ")]
+    LeafDepthMismatch {
+        page_id: usize,
+        this_page_depth: usize,
+        other_page_depth: usize,
+    },
+    #[error("Page {page_id} detected freeblock that extends page start={start} end={end}")]
+    FreeBlockOutOfRange {
+        page_id: usize,
+        start: usize,
+        end: usize,
+    },
+    #[error("Page {page_id} cell overlap detected at position={start} with previous_end={prev_end}. content_area={content_area}, is_free_block={is_free_block}")]
+    CellOverlap {
+        page_id: usize,
+        start: usize,
+        prev_end: usize,
+        content_area: usize,
+        is_free_block: bool,
+    },
+    #[error("Page {page_id} unexpected fragmentation got={got}, expected={expected}")]
+    UnexpectedFragmentation {
+        page_id: usize,
+        got: usize,
+        expected: usize,
+    },
+}
+
+#[derive(Clone)]
+struct IntegrityCheckPageEntry {
+    page_idx: usize,
+    level: usize,
+    max_intkey: i64,
+}
+pub struct IntegrityCheckState {
+    pub current_page: usize,
+    page_stack: Vec<IntegrityCheckPageEntry>,
+    first_leaf_level: Option<usize>,
+}
+
+impl IntegrityCheckState {
+    pub fn new(page_idx: usize) -> Self {
+        Self {
+            current_page: page_idx,
+            page_stack: vec![IntegrityCheckPageEntry {
+                page_idx,
+                level: 0,
+                max_intkey: i64::MAX,
+            }],
+            first_leaf_level: None,
+        }
+    }
+}
+impl std::fmt::Debug for IntegrityCheckState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IntegrityCheckState")
+            .field("current_page", &self.current_page)
+            .field("first_leaf_level", &self.first_leaf_level)
+            .finish()
+    }
+}
+
+/// Perform integrity check on a whole table/index. We check for:
+/// 1. Correct order of keys in case of rowids.
+/// 2. There are no overlap between cells.
+/// 3. Cells do not scape outside expected range.
+/// 4. Depth of leaf pages are equal.
+/// 5. Overflow pages are correct (TODO)
+///
+/// In order to keep this reentrant, we keep a stack of pages we need to check. Ideally, like in
+/// SQLlite, we would have implemented a recursive solution which would make it easier to check the
+/// depth.
+pub fn integrity_check(
+    state: &mut IntegrityCheckState,
+    errors: &mut Vec<IntegrityCheckError>,
+    pager: &Rc<Pager>,
+) -> Result<CursorResult<()>> {
+    let Some(IntegrityCheckPageEntry {
+        page_idx,
+        level,
+        max_intkey,
+    }) = state.page_stack.last().cloned()
+    else {
+        return Ok(CursorResult::Ok(()));
+    };
+    let page = btree_read_page(pager, page_idx)?;
+    return_if_locked_maybe_load!(pager, page);
+    state.page_stack.pop();
+
+    let page = page.get();
+    let contents = page.get_contents();
+    let usable_space = pager.usable_space() as u16;
+    let mut coverage_checker = CoverageChecker::new(page.get().id);
+
+    // Now we check every cell for few things:
+    // 1. Check cell is in correct range. Not exceeds page and not starts before we have marked
+    //    (cell content area).
+    // 2. We add the cell to coverage checker in order to check if cells do not overlap.
+    // 3. We check order of rowids in case of table pages. We iterate backwards in order to check
+    //    if current cell's rowid is less than the next cell. We also check rowid is less than the
+    //    parent's divider cell. In case of this page being root page max rowid will be i64::MAX.
+    // 4. We append pages to the stack to check later.
+    // 5. In case of leaf page, check if the current level(depth) is equal to other leaf pages we
+    //    have seen.
+    let mut next_rowid = max_intkey;
+    for cell_idx in (0..contents.cell_count()).rev() {
+        let (cell_start, cell_length) = contents.cell_get_raw_region(
+            cell_idx,
+            payload_overflow_threshold_max(contents.page_type(), usable_space),
+            payload_overflow_threshold_min(contents.page_type(), usable_space),
+            usable_space as usize,
+        );
+        if cell_start < contents.cell_content_area() as usize
+            || cell_start > usable_space as usize - 4
+        {
+            errors.push(IntegrityCheckError::CellOutOfRange {
+                cell_idx,
+                page_id: page.get().id,
+                cell_start,
+                cell_end: cell_start + cell_length,
+                content_area: contents.cell_content_area() as usize,
+                usable_space: usable_space as usize,
+            });
+        }
+        if cell_start + cell_length > usable_space as usize {
+            errors.push(IntegrityCheckError::CellOverflowsPage {
+                cell_idx,
+                page_id: page.get().id,
+                cell_start,
+                cell_end: cell_start + cell_length,
+                content_area: contents.cell_content_area() as usize,
+                usable_space: usable_space as usize,
+            });
+        }
+        coverage_checker.add_cell(cell_start, cell_start + cell_length);
+        let cell = contents.cell_get(
+            cell_idx,
+            payload_overflow_threshold_max(contents.page_type(), usable_space),
+            payload_overflow_threshold_min(contents.page_type(), usable_space),
+            usable_space as usize,
+        )?;
+        match cell {
+            BTreeCell::TableInteriorCell(table_interior_cell) => {
+                state.page_stack.push(IntegrityCheckPageEntry {
+                    page_idx: table_interior_cell._left_child_page as usize,
+                    level: level + 1,
+                    max_intkey: table_interior_cell._rowid,
+                });
+                let rowid = table_interior_cell._rowid;
+                if rowid > max_intkey || rowid > next_rowid {
+                    errors.push(IntegrityCheckError::CellRowidOutOfRange {
+                        page_id: page.get().id,
+                        cell_idx,
+                        rowid,
+                        max_intkey,
+                        next_rowid,
+                    });
+                }
+                next_rowid = rowid;
+            }
+            BTreeCell::TableLeafCell(table_leaf_cell) => {
+                // check depth of leaf pages are equal
+                if let Some(expected_leaf_level) = state.first_leaf_level {
+                    if expected_leaf_level != level {
+                        errors.push(IntegrityCheckError::LeafDepthMismatch {
+                            page_id: page.get().id,
+                            this_page_depth: level,
+                            other_page_depth: expected_leaf_level,
+                        });
+                    }
+                } else {
+                    state.first_leaf_level = Some(level);
+                }
+                let rowid = table_leaf_cell._rowid;
+                if rowid > max_intkey || rowid > next_rowid {
+                    errors.push(IntegrityCheckError::CellRowidOutOfRange {
+                        page_id: page.get().id,
+                        cell_idx,
+                        rowid,
+                        max_intkey,
+                        next_rowid,
+                    });
+                }
+                next_rowid = rowid;
+            }
+            BTreeCell::IndexInteriorCell(index_interior_cell) => {
+                state.page_stack.push(IntegrityCheckPageEntry {
+                    page_idx: index_interior_cell.left_child_page as usize,
+                    level: level + 1,
+                    max_intkey, // we don't care about intkey in non-table pages
+                });
+            }
+            BTreeCell::IndexLeafCell(_) => {
+                // check depth of leaf pages are equal
+                if let Some(expected_leaf_level) = state.first_leaf_level {
+                    if expected_leaf_level != level {
+                        errors.push(IntegrityCheckError::LeafDepthMismatch {
+                            page_id: page.get().id,
+                            this_page_depth: level,
+                            other_page_depth: expected_leaf_level,
+                        });
+                    }
+                } else {
+                    state.first_leaf_level = Some(level);
+                }
+            }
+        }
+    }
+
+    // Now we add free blocks to the coverage checker
+    let first_freeblock = contents.first_freeblock();
+    if first_freeblock > 0 {
+        let mut pc = first_freeblock;
+        while pc > 0 {
+            let next = contents.read_u16_no_offset(pc as usize);
+            let size = contents.read_u16_no_offset(pc as usize + 2) as usize;
+            // check it doesn't go out of range
+            if pc > usable_space - 4 {
+                errors.push(IntegrityCheckError::FreeBlockOutOfRange {
+                    page_id: page.get().id,
+                    start: pc as usize,
+                    end: pc as usize + size,
+                });
+                break;
+            }
+            coverage_checker.add_free_block(pc as usize, pc as usize + size);
+            pc = next;
+        }
+    }
+
+    // Let's check the overlap of freeblocks and cells now that we have collected them all.
+    coverage_checker.analyze(
+        usable_space,
+        contents.cell_content_area() as usize,
+        errors,
+        contents.num_frag_free_bytes() as usize,
+    );
+
+    Ok(CursorResult::IO)
+}
+
+pub fn btree_read_page(pager: &Rc<Pager>, page_idx: usize) -> Result<BTreePage> {
+    pager.read_page(page_idx).map(|page| {
+        Arc::new(BTreePageInner {
+            page: RefCell::new(page),
+        })
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IntegrityCheckCellRange {
+    start: usize,
+    end: usize,
+    is_free_block: bool,
+}
+
+// Implement ordering for min-heap (smallest start address first)
+impl Ord for IntegrityCheckCellRange {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.start.cmp(&other.start)
+    }
+}
+
+impl PartialOrd for IntegrityCheckCellRange {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -5116,6 +5410,72 @@ fn validate_cells_after_insertion(cell_array: &CellArray, leaf_data: bool) {
 
         if leaf_data {
             assert!(cell[0] != 0, "payload is {:?}", cell);
+        }
+    }
+}
+
+pub struct CoverageChecker {
+    /// Min-heap ordered by cell start
+    heap: BinaryHeap<Reverse<IntegrityCheckCellRange>>,
+    page_idx: usize,
+}
+
+impl CoverageChecker {
+    pub fn new(page_idx: usize) -> Self {
+        Self {
+            heap: BinaryHeap::new(),
+            page_idx,
+        }
+    }
+
+    fn add_range(&mut self, cell_start: usize, cell_end: usize, is_free_block: bool) {
+        self.heap.push(Reverse(IntegrityCheckCellRange {
+            start: cell_start,
+            end: cell_end,
+            is_free_block,
+        }));
+    }
+
+    pub fn add_cell(&mut self, cell_start: usize, cell_end: usize) {
+        self.add_range(cell_start, cell_end, false);
+    }
+
+    pub fn add_free_block(&mut self, cell_start: usize, cell_end: usize) {
+        self.add_range(cell_start, cell_end, true);
+    }
+
+    pub fn analyze(
+        &mut self,
+        usable_space: u16,
+        content_area: usize,
+        errors: &mut Vec<IntegrityCheckError>,
+        expected_fragmentation: usize,
+    ) {
+        let mut fragmentation = 0;
+        let mut prev_end = content_area;
+        while let Some(cell) = self.heap.pop() {
+            let start = cell.0.start;
+            if prev_end > start {
+                errors.push(IntegrityCheckError::CellOverlap {
+                    page_id: self.page_idx,
+                    start,
+                    prev_end,
+                    content_area,
+                    is_free_block: cell.0.is_free_block,
+                });
+                break;
+            } else {
+                fragmentation += start - prev_end;
+                prev_end = cell.0.end;
+            }
+        }
+        fragmentation += usable_space as usize - prev_end;
+        if fragmentation != expected_fragmentation {
+            errors.push(IntegrityCheckError::UnexpectedFragmentation {
+                page_id: self.page_idx,
+                got: fragmentation,
+                expected: expected_fragmentation,
+            });
         }
     }
 }
@@ -6227,7 +6587,7 @@ mod tests {
         pos: usize,
         page: &mut PageContent,
         record: ImmutableRecord,
-        conn: &Rc<Connection>,
+        conn: &Arc<Connection>,
     ) -> Vec<u8> {
         let mut payload: Vec<u8> = Vec::new();
         fill_cell_payload(
@@ -6737,6 +7097,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "index_experimental")]
     fn btree_index_insert_fuzz_run(attempts: usize, inserts: usize) {
         let (mut rng, seed) = if std::env::var("SEED").is_ok() {
             let seed = std::env::var("SEED").unwrap();
@@ -6922,6 +7283,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "index_experimental")]
     pub fn btree_index_insert_fuzz_run_equal_size() {
         btree_index_insert_fuzz_run(2, 1024);
     }
@@ -6957,6 +7319,7 @@ mod tests {
 
     #[test]
     #[ignore]
+    #[cfg(feature = "index_experimental")]
     pub fn fuzz_long_btree_index_insert_fuzz_run_equal_size() {
         btree_index_insert_fuzz_run(2, 10_000);
     }

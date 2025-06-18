@@ -228,11 +228,21 @@ do_execsql_test left-join-constant-condition-true-inner-join-constant-condition-
     select u.first_name, p.name, u2.first_name from users u left join products as p on 1 join users u2 on 0 limit 5;
 } {}
 
-do_execsql_test join-utilizing-both-seekrowid-and-secondary-index {
-  select u.first_name, p.name from users u join products p on u.id = p.id and u.age > 70;
-} {Matthew|boots
-Nicholas|shorts
-Jamie|hat}
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+    do_execsql_test join-utilizing-both-seekrowid-and-secondary-index {
+    select u.first_name, p.name from users u join products p on u.id = p.id and u.age > 70;
+    } {Matthew|boots
+    Nicholas|shorts
+    Jamie|hat}
+} else {
+    # without index experimental the order is different since we don't use indexes
+    do_execsql_test join-utilizing-both-seekrowid-and-secondary-index {
+    select u.first_name, p.name from users u join products p on u.id = p.id and u.age > 70;
+    } {Jamie|hat
+    Nicholas|shorts
+    Matthew|boots}
+
+}
 
 # important difference between regular SELECT * join and a SELECT * USING join is that the join keys are deduplicated
 # from the result in the USING case.

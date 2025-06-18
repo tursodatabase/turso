@@ -63,7 +63,7 @@ class JDBC4ConnectionTest {
 
   @Test
   void prepare_simple_create_table() throws Exception {
-    connection.prepare("CREATE TABLE users (id INT PRIMARY KEY, username TEXT)");
+    connection.prepare("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT)");
   }
 
   @Test

@@ -154,8 +154,12 @@ fn emit_compound_select(
                         (cursor_id, index.clone())
                     }
                     _ => {
-                        new_dedupe_index = true;
-                        create_union_dedupe_index(program, &right_most)
+                        if cfg!(not(feature = "index_experimental")) {
+                            crate::bail_parse_error!("UNION not supported without indexes");
+                        } else {
+                            new_dedupe_index = true;
+                            create_union_dedupe_index(program, &right_most)
+                        }
                     }
                 };
                 plan.query_destination = QueryDestination::EphemeralIndex {

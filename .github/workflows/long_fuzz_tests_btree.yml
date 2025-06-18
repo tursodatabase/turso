@@ -28,6 +28,10 @@ jobs:
       run: cargo test -- --ignored fuzz_long
       env:
         RUST_BACKTRACE: 1
+    - name: Run ignored long tests with index
+      run: cargo test --features index_experimental -- --ignored fuzz_long
+      env:
+        RUST_BACKTRACE: 1
 
   simple-stress-test:
     runs-on: blacksmith-4vcpu-ubuntu-2404
