@@ -309,5 +309,6 @@ mod tests {
             assert_eq!(record.values[0], RefValue::Integer(i));
             sorter.next().expect("Failed to get the next record");
         }
+        assert!(!sorter.has_more());
     }
 }
