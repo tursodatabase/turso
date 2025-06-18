@@ -1101,10 +1101,33 @@ fn emit_update_insns(
 
                 program.emit_null(target_reg, None);
             } else {
+                /*
+                if let Some(check_constraint) = &table_column.check_constraint {
+                    let mut expr = check_constraint.clone();
+                    let description = expr.to_string();
+                    rewrite_check_constraint(table_ref, &mut expr);
+                    use crate::error::SQLITE_CONSTRAINT_CHECK;
+                    translate_expr(
+                        program,
+                        Some(&plan.table_references),
+                        &expr,
+                        target_reg,
+                        &t_ctx.resolver,
+                    )?;
+                    let label = program.allocate_label();
+                    program.emit_insn(Insn::If {
+                        reg: target_reg,
+                        target_pc: label,
+                        jump_if_null: true,
+                    });
+                    program.emit_halt_err(SQLITE_CONSTRAINT_CHECK, description);
+                    program.preassign_label_to_next_insn(label);
+                }
+                */
                 translate_expr(
                     program,
                     Some(&plan.table_references),
-                    expr,
+                    dbg!(expr),
                     target_reg,
                     &t_ctx.resolver,
                 )?;
@@ -1361,6 +1384,36 @@ fn emit_update_insns(
     }
 
     Ok(())
+}
+
+use crate::ast::Expr;
+use crate::translate::plan::JoinedTable;
+fn rewrite_check_constraint(table: &JoinedTable, check_constraint_expr: &mut Expr) {
+    use crate::translate::expr::walk_expr_mut;
+    let _ = walk_expr_mut(
+        check_constraint_expr,
+        &mut |expr: &mut Expr| -> Result<()> {
+            match expr {
+                ast::Expr::Id(id) => {
+                    let res = table
+                        .columns()
+                        .iter()
+                        .enumerate()
+                        .find(|(_i, col)| col.name.as_ref().map_or(false, |c| *c == id.0));
+                    if let Some((i, col)) = res {
+                        *expr = Expr::Column {
+                            database: None, // TODO: support different databases
+                            table: table.internal_id,
+                            column: i,
+                            is_rowid_alias: col.is_rowid_alias,
+                        };
+                    }
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        },
+    );
 }
 
 /// Initialize the limit/offset counters and registers.
