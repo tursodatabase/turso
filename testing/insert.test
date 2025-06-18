@@ -236,10 +236,10 @@ do_execsql_test_in_memory_any_error insert_expr_constraint_check-6 {
 }
 
 
-#do_execsql_test_in_memory_any_error insert_expr_constraint_check-7 {
-#    CREATE TABLE t (a int, b INTEGER check ((a + b) % 2 == 0));
-#    INSERT INTO t VALUES (3, 1), (1, 5), (2, 1);
-#}
+do_execsql_test_in_memory_any_error insert_expr_constraint_check-7 {
+    CREATE TABLE t (a int, b INTEGER check ((a + b) % 2 == 0));
+    INSERT INTO t VALUES (3, 1), (1, 5), (2, 1);
+}
 
 
 do_execsql_test_on_specific_db {:memory:} unique_insert_with_pkey {
