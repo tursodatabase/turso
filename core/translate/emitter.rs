@@ -1101,29 +1101,31 @@ fn emit_update_insns(
 
                 program.emit_null(target_reg, None);
             } else {
-                /*
-                if let Some(check_constraint) = &table_column.check_constraint {
-                    let mut expr = check_constraint.clone();
-                    let description = expr.to_string();
-                    rewrite_check_constraint(table_ref, &mut expr);
-                    use crate::error::SQLITE_CONSTRAINT_CHECK;
-                    translate_expr(
+                if let Some(check_constraint_expr) = &table_column.check_constraint {
+                    let jump_if_true = program.allocate_label();
+                    translate_check_constraint(
                         program,
-                        Some(&plan.table_references),
-                        &expr,
-                        target_reg,
+                        &check_constraint_expr,
+                        table_ref
+                            .columns()
+                            .iter()
+                            .enumerate()
+                            .map(|(i, col)| (start + i, col))
+                            .collect::<Vec<_>>()
+                            .as_ref(),
+                        Some(jump_if_true),
                         &t_ctx.resolver,
-                    )?;
-                    let label = program.allocate_label();
-                    program.emit_insn(Insn::If {
-                        reg: target_reg,
-                        target_pc: label,
-                        jump_if_null: true,
+                    );
+
+                    use crate::error::SQLITE_CONSTRAINT_CHECK;
+                    let description = check_constraint_expr.to_string();
+                    program.emit_insn(Insn::Halt {
+                        err_code: SQLITE_CONSTRAINT_CHECK,
+                        description: description.to_string(),
                     });
-                    program.emit_halt_err(SQLITE_CONSTRAINT_CHECK, description);
-                    program.preassign_label_to_next_insn(label);
-                }
-                */
+
+                    program.preassign_label_to_next_insn(jump_if_true);
+                };
                 translate_expr(
                     program,
                     Some(&plan.table_references),
@@ -1384,6 +1386,167 @@ fn emit_update_insns(
     }
 
     Ok(())
+}
+
+use crate::schema::Column;
+use limbo_sqlite3_parser::ast::Expr;
+fn translate_check_constraint(
+    program: &mut ProgramBuilder,
+    check_constraint_expr: &Expr,
+    registers_by_columns: &[(usize, &Column)],
+    jump_if_true: Option<BranchOffset>,
+    resolver: &Resolver,
+) -> usize {
+    match check_constraint_expr {
+        ast::Expr::Literal(_) => {
+            let reg = program.alloc_register();
+            let _ = translate_expr(program, None, &check_constraint_expr, reg, resolver);
+            return reg;
+        }
+        ast::Expr::Id(id) => {
+            for (reg, col) in registers_by_columns.iter() {
+                if col.name.as_ref().map_or(false, |name| *name == id.0) {
+                    return *reg;
+                }
+            }
+            unreachable!();
+        }
+        ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) => {
+            use crate::vdbe::insn::CmpInsFlags;
+            let lhs_reg =
+                translate_check_constraint(program, lhs, registers_by_columns, None, resolver);
+            let rhs_reg =
+                translate_check_constraint(program, rhs, registers_by_columns, None, resolver);
+            if let Some(label) = jump_if_true {
+                program.emit_insn(Insn::Eq {
+                    lhs: lhs_reg,
+                    rhs: rhs_reg,
+                    target_pc: label,
+                    flags: CmpInsFlags::default().jump_if_null(),
+                    collation: program.curr_collation(),
+                });
+            }
+            return rhs_reg;
+        }
+        ast::Expr::Binary(lhs, ast::Operator::Add, rhs) => {
+            let lhs_reg =
+                translate_check_constraint(program, lhs, registers_by_columns, None, resolver);
+            let rhs_reg =
+                translate_check_constraint(program, rhs, registers_by_columns, None, resolver);
+            let dest_reg = program.alloc_register();
+            program.emit_insn(Insn::Add {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                dest: dest_reg,
+            });
+            if let Some(label) = jump_if_true {
+                program.emit_insn(Insn::If {
+                    reg: dest_reg,
+                    target_pc: label,
+                    jump_if_null: true,
+                });
+            }
+            return dest_reg;
+        }
+        ast::Expr::Binary(lhs, ast::Operator::Subtract, rhs) => {
+            let lhs_reg =
+                translate_check_constraint(program, lhs, registers_by_columns, None, resolver);
+            let rhs_reg =
+                translate_check_constraint(program, rhs, registers_by_columns, None, resolver);
+            let dest_reg = program.alloc_register();
+            program.emit_insn(Insn::Subtract {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                dest: dest_reg,
+            });
+            if let Some(label) = jump_if_true {
+                program.emit_insn(Insn::If {
+                    reg: dest_reg,
+                    target_pc: label,
+                    jump_if_null: true,
+                });
+            }
+            return dest_reg;
+        }
+        ast::Expr::Binary(lhs, ast::Operator::Multiply, rhs) => {
+            let lhs_reg =
+                translate_check_constraint(program, lhs, registers_by_columns, None, resolver);
+            let rhs_reg =
+                translate_check_constraint(program, rhs, registers_by_columns, None, resolver);
+            let dest_reg = program.alloc_register();
+            program.emit_insn(Insn::Multiply {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                dest: dest_reg,
+            });
+            if let Some(label) = jump_if_true {
+                program.emit_insn(Insn::If {
+                    reg: dest_reg,
+                    target_pc: label,
+                    jump_if_null: true,
+                });
+            }
+            return dest_reg;
+        }
+        ast::Expr::Binary(lhs, ast::Operator::Divide, rhs) => {
+            let lhs_reg =
+                translate_check_constraint(program, lhs, registers_by_columns, None, resolver);
+            let rhs_reg =
+                translate_check_constraint(program, rhs, registers_by_columns, None, resolver);
+            let dest_reg = program.alloc_register();
+            program.emit_insn(Insn::Divide {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                dest: dest_reg,
+            });
+            if let Some(label) = jump_if_true {
+                program.emit_insn(Insn::If {
+                    reg: dest_reg,
+                    target_pc: label,
+                    jump_if_null: true,
+                });
+            }
+            return dest_reg;
+        }
+        ast::Expr::Binary(lhs, ast::Operator::Modulus, rhs) => {
+            let lhs_reg =
+                translate_check_constraint(program, lhs, registers_by_columns, None, resolver);
+            let rhs_reg =
+                translate_check_constraint(program, rhs, registers_by_columns, None, resolver);
+            let dest_reg = program.alloc_register();
+            program.emit_insn(Insn::Remainder {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                dest: dest_reg,
+            });
+            if let Some(label) = jump_if_true {
+                program.emit_insn(Insn::If {
+                    reg: dest_reg,
+                    target_pc: label,
+                    jump_if_null: true,
+                });
+            }
+            return dest_reg;
+        }
+        ast::Expr::Parenthesized(expr) => {
+            let dest_reg = translate_check_constraint(
+                program,
+                expr.get(0).expect("Expr should exist"),
+                registers_by_columns,
+                None,
+                resolver,
+            );
+            if let Some(label) = jump_if_true {
+                program.emit_insn(Insn::If {
+                    reg: dest_reg,
+                    target_pc: label,
+                    jump_if_null: true,
+                });
+            }
+            return dest_reg;
+        }
+        e => todo!("{}", &e),
+    }
 }
 
 /// Initialize the limit/offset counters and registers.
