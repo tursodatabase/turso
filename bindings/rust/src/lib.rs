@@ -40,7 +40,6 @@ impl Builder {
         }
     }
 
-    #[allow(unused_variables, clippy::arc_with_non_send_sync)]
     pub async fn build(self) -> Result<Database> {
         match self.path.as_str() {
             ":memory:" => {
