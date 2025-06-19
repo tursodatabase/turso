@@ -293,7 +293,6 @@ impl Drop for Connection {
     }
 }
 
-#[allow(clippy::arc_with_non_send_sync)]
 #[pyfunction]
 pub fn connect(path: &str) -> Result<Connection> {
     #[inline(always)]
