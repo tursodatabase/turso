@@ -136,7 +136,6 @@ impl Database {
         Self::open_with_flags(io, path, db_file, flags, enable_mvcc)
     }
 
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn open(
         io: Arc<dyn IO>,
         path: &str,
@@ -146,7 +145,6 @@ impl Database {
         Self::open_with_flags(io, path, db_file, OpenFlags::default(), enable_mvcc)
     }
 
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn open_with_flags(
         io: Arc<dyn IO>,
         path: &str,
@@ -251,7 +249,6 @@ impl Database {
     /// Open a new database file with a specified VFS without an existing database
     /// connection and symbol table to register extensions.
     #[cfg(feature = "fs")]
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn open_new(path: &str, vfs: &str) -> Result<(Arc<dyn IO>, Arc<Database>)> {
         let vfsmods = ext::add_builtin_vfs_extensions(None)?;
         let io: Arc<dyn IO> = match vfsmods.iter().find(|v| v.0 == vfs).map(|v| v.1.clone()) {
@@ -308,7 +305,6 @@ pub fn maybe_init_database_file(file: &Arc<dyn File>, io: &Arc<dyn IO>) -> Resul
                 let completion = Completion::Write(WriteCompletion::new(Box::new(move |_| {
                     *flag_complete.borrow_mut() = true;
                 })));
-                #[allow(clippy::arc_with_non_send_sync)]
                 file.pwrite(0, contents.buffer.clone(), Arc::new(completion))?;
             }
             let mut limit = 100;

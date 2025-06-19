@@ -35,7 +35,7 @@ impl Schema {
         #[cfg(not(feature = "index_experimental"))]
         let has_indexes = std::collections::HashSet::new();
         let indexes: HashMap<String, Vec<Arc<Index>>> = HashMap::new();
-        #[allow(clippy::arc_with_non_send_sync)]
+
         tables.insert(
             SCHEMA_TABLE_NAME.to_string(),
             Arc::new(Table::BTree(sqlite_schema_table().into())),
