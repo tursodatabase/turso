@@ -15,7 +15,7 @@ pub struct TempDatabase {
 }
 unsafe impl Send for TempDatabase {}
 
-#[allow(dead_code, clippy::arc_with_non_send_sync)]
+#[allow(dead_code)]
 impl TempDatabase {
     pub fn new_empty() -> Self {
         Self::new(&format!("test-{}.db", rng().next_u32()))
