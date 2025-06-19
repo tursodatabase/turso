@@ -1,8 +1,11 @@
 use limbo_sqlite3_parser::ast::SortOrder;
 
+use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
+use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io;
 use std::io::prelude::*;
+use std::rc::Rc;
 use tempfile;
 
 use crate::{
@@ -14,7 +17,7 @@ use crate::{
 
 pub struct Sorter {
     /// The records in the in-memory buffer.
-    records: Vec<ImmutableRecord>,
+    records: Vec<SortableImmutableRecord>,
     /// The current record.
     current: Option<ImmutableRecord>,
     /// The sort order.
@@ -22,9 +25,11 @@ pub struct Sorter {
     /// The number of values in the key.
     key_len: usize,
     /// The collations.
-    collations: Vec<CollationSeq>,
+    collations: Rc<Vec<CollationSeq>>,
     /// Readers for the sorted chunks stored on disk.
     chunk_readers: Vec<ChunkReader>,
+    /// The heap of records and their chunk index.
+    chunk_heap: BinaryHeap<(Reverse<SortableImmutableRecord>, usize)>,
     /// The maximum size of the in-memory buffer in bytes.
     max_buffer_size: usize,
     /// The current size of the in-memory buffer in bytes.
@@ -46,8 +51,9 @@ impl Sorter {
             current: None,
             key_len: order.len(),
             order: IndexKeySortOrder::from_list(order),
-            collations,
+            collations: Rc::new(collations),
             chunk_readers: Vec::new(),
+            chunk_heap: BinaryHeap::new(),
             max_buffer_size: max_buffer_size_bytes,
             current_buffer_size: 0,
             max_payload_size_in_buffer: 0,
@@ -66,12 +72,13 @@ impl Sorter {
     // We do the sorting here since this is what is called by the SorterSort instruction
     pub fn sort(&mut self) -> Result<()> {
         if self.chunk_readers.is_empty() {
-            self.sort_buffer();
+            self.records.sort();
             self.records.reverse();
         } else {
             self.flush()?;
-            for chunk_reader in &mut self.chunk_readers {
-                chunk_reader.next()?;
+            self.chunk_heap.reserve(self.chunk_readers.len());
+            for chunk_idx in 0..self.chunk_readers.len() {
+                self.push_to_heap_from_chunk(chunk_idx, true)?;
             }
         }
         self.next()
@@ -79,9 +86,14 @@ impl Sorter {
 
     pub fn next(&mut self) -> Result<()> {
         if self.chunk_readers.is_empty() {
-            self.current = self.records.pop();
+            self.current = self.records.pop().map(|r| r.record);
         } else {
-            self.current = self.consume_from_chunks()?;
+            if let Some((next_record, next_chunk_idx)) = self.chunk_heap.pop() {
+                self.current = Some(next_record.0.record);
+                self.push_to_heap_from_chunk(next_chunk_idx, false)?;
+            } else {
+                self.current = None;
+            }
         }
         Ok(())
     }
@@ -95,48 +107,48 @@ impl Sorter {
         if self.current_buffer_size + payload_size > self.max_buffer_size {
             self.flush()?;
         }
-        self.records.push(record.clone());
+        self.records.push(SortableImmutableRecord::new(
+            record.clone(),
+            self.key_len,
+            self.order,
+            self.collations.clone(),
+        ));
         self.current_buffer_size += payload_size;
         self.max_payload_size_in_buffer = self.max_payload_size_in_buffer.max(payload_size);
         self.max_values_len_in_buffer = self.max_values_len_in_buffer.max(record.len());
         Ok(())
     }
 
-    fn consume_from_chunks(&mut self) -> Result<Option<ImmutableRecord>> {
-        let mut next_chunk_idx: Option<usize> = None;
-        let mut next_chunk_record: Option<&ImmutableRecord> = None;
-        for (chunk_idx, chunk_reader) in self.chunk_readers.iter().enumerate() {
-            if chunk_reader.has_more() {
-                let record = chunk_reader.record().unwrap();
-                if next_chunk_record.is_none()
-                    || compare_immutable(
-                        &record.values[..self.key_len],
-                        &next_chunk_record.unwrap().values[..self.key_len],
-                        self.order,
-                        &self.collations,
-                    )
-                    .is_le()
-                {
-                    next_chunk_idx = Some(chunk_idx);
-                    next_chunk_record = Some(record);
-                }
-            }
+    fn push_to_heap_from_chunk(&mut self, chunk_idx: usize, init: bool) -> Result<()> {
+        let chunk_reader = &mut self.chunk_readers[chunk_idx];
+
+        if init {
+            chunk_reader.next()?;
         }
-        if let Some(idx) = next_chunk_idx {
-            Ok(self.chunk_readers[idx].consume_record()?)
-        } else {
-            Ok(None)
+
+        if chunk_reader.has_more() {
+            let record = chunk_reader.consume_record()?.unwrap();
+            self.chunk_heap.push((
+                Reverse(SortableImmutableRecord::new(
+                    record,
+                    self.key_len,
+                    self.order,
+                    self.collations.clone(),
+                )),
+                chunk_idx,
+            ));
         }
+        Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.sort_buffer();
+        self.records.sort();
 
         let mut fd = tempfile::tempfile()?;
         let mut writer = io::BufWriter::new(fd.try_clone()?);
         for record in self.records.drain(..) {
             writer
-                .write(record.get_payload())
+                .write(record.record.get_payload())
                 .map_err(LimboError::IOError)?;
         }
         writer.flush().map_err(LimboError::IOError)?;
@@ -154,17 +166,6 @@ impl Sorter {
         self.max_values_len_in_buffer = 0;
 
         Ok(())
-    }
-
-    fn sort_buffer(&mut self) {
-        self.records.sort_by(|a, b| {
-            compare_immutable(
-                &a.values[..self.key_len],
-                &b.values[..self.key_len],
-                self.order,
-                &self.collations,
-            )
-        });
     }
 }
 
@@ -194,10 +195,6 @@ impl ChunkReader {
 
     fn has_more(&self) -> bool {
         self.current.is_some()
-    }
-
-    fn record(&self) -> Option<&ImmutableRecord> {
-        self.current.as_ref()
     }
 
     fn consume_record(&mut self) -> Result<Option<ImmutableRecord>> {
@@ -234,6 +231,54 @@ impl ChunkReader {
         Ok(())
     }
 }
+
+struct SortableImmutableRecord {
+    record: ImmutableRecord,
+    key_len: usize,
+    order: IndexKeySortOrder,
+    collations: Rc<Vec<CollationSeq>>,
+}
+
+impl SortableImmutableRecord {
+    fn new(
+        record: ImmutableRecord,
+        key_len: usize,
+        order: IndexKeySortOrder,
+        collations: Rc<Vec<CollationSeq>>,
+    ) -> Self {
+        Self {
+            record,
+            key_len,
+            order,
+            collations,
+        }
+    }
+}
+
+impl Ord for SortableImmutableRecord {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_immutable(
+            &self.record.values[..self.key_len],
+            &other.record.values[..self.key_len],
+            self.order,
+            &self.collations[..],
+        )
+    }
+}
+
+impl PartialOrd for SortableImmutableRecord {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for SortableImmutableRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for SortableImmutableRecord {}
 
 #[cfg(test)]
 mod tests {
@@ -275,14 +320,13 @@ mod tests {
         assert_eq!(record_a_from_chunk.values, record_a.values);
 
         assert!(reader.has_more());
-        let record_b_from_chunk = reader.record().unwrap();
+        let record_b_from_chunk = reader
+            .consume_record()
+            .expect("Failed to consume the record")
+            .unwrap();
         assert_eq!(record_b_from_chunk.values, record_b.values);
 
-        assert!(reader.has_more());
-        reader.next().expect("Failed to perform the next read");
         assert!(!reader.has_more());
-        assert!(reader.record().is_none());
-
         reader.next().expect("Failed to perform the next read");
         assert!(reader
             .consume_record()
@@ -302,6 +346,7 @@ mod tests {
         }
 
         sorter.sort().expect("Failed to sort the records");
+        assert_eq!(sorter.chunk_readers.len(), 63);
 
         for i in 0..1024 {
             assert!(sorter.has_more());
