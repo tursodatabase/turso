@@ -2,7 +2,11 @@
 #![allow(non_camel_case_types)]
 
 use limbo_core::Value;
-use std::{cell::RefCell, ffi::{self, CStr, CString}, rc::Rc};
+use std::{
+    cell::RefCell,
+    ffi::{self, CStr, CString},
+    rc::Rc,
+};
 use tracing::trace;
 
 use std::sync::{Arc, Mutex};
