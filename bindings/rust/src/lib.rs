@@ -175,7 +175,6 @@ impl Statement {
             }
             params::Params::Named(_items) => todo!(),
         }
-        #[allow(clippy::arc_with_non_send_sync)]
         let rows = Rows {
             inner: Arc::clone(&self.inner),
         };

@@ -35,7 +35,6 @@ fn to_limbo_db(ptr: jlong) -> Result<&'static mut LimboDB> {
 }
 
 #[no_mangle]
-#[allow(clippy::arc_with_non_send_sync)]
 pub extern "system" fn Java_tech_turso_core_LimboDB_openUtf8<'local>(
     mut env: JNIEnv<'local>,
     obj: JObject<'local>,

@@ -6532,7 +6532,6 @@ mod tests {
 
     use super::{btree_init_page, defragment_page, drop_cell, insert_into_cell};
 
-    #[allow(clippy::arc_with_non_send_sync)]
     fn get_page(id: usize) -> BTreePage {
         let page = Arc::new(Page::new(id));
 
@@ -6553,7 +6552,6 @@ mod tests {
         page
     }
 
-    #[allow(clippy::arc_with_non_send_sync)]
     fn get_database() -> Arc<Database> {
         let mut path = TempDir::new().unwrap().keep();
         path.push("test.db");
@@ -6845,7 +6843,6 @@ mod tests {
         let db_header = DatabaseHeader::default();
         let page_size = db_header.get_page_size();
 
-        #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let io_file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
         let db_file = Arc::new(DatabaseFile::new(io_file));
@@ -7348,7 +7345,6 @@ mod tests {
         btree_insert_fuzz_run(2, 5_000, |rng| (rng.next_u32() % 32 * 1024) as usize);
     }
 
-    #[allow(clippy::arc_with_non_send_sync)]
     fn setup_test_env(database_size: u32) -> (Rc<Pager>, Arc<SpinLock<DatabaseHeader>>) {
         let page_size = 512;
         let mut db_header = DatabaseHeader::default();
@@ -7422,14 +7418,14 @@ mod tests {
         let mut current_page = 2u32;
         while current_page <= 4 {
             let drop_fn = Rc::new(|_buf| {});
-            #[allow(clippy::arc_with_non_send_sync)]
+
             let buf = Arc::new(RefCell::new(Buffer::allocate(
                 db_header.lock().get_page_size() as usize,
                 drop_fn,
             )));
             let write_complete = Box::new(|_| {});
             let c = Completion::Write(WriteCompletion::new(write_complete));
-            #[allow(clippy::arc_with_non_send_sync)]
+
             pager
                 .db_file
                 .write_page(current_page as usize, buf.clone(), Arc::new(c))?;

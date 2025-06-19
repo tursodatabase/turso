@@ -12,7 +12,6 @@ use std::{
 /// Safe to be called from Go with null terminated DSN string.
 /// performs null check on the path.
 #[no_mangle]
-#[allow(clippy::arc_with_non_send_sync)]
 pub unsafe extern "C" fn db_open(path: *const c_char) -> *mut c_void {
     if path.is_null() {
         println!("Path is null");

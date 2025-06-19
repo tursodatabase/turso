@@ -41,8 +41,6 @@
 //!
 //! https://www.sqlite.org/fileformat.html
 
-#![allow(clippy::arc_with_non_send_sync)]
-
 use tracing::{instrument, Level};
 
 use crate::error::LimboError;
@@ -291,7 +289,6 @@ pub fn begin_read_database_header(
     db_file: Arc<dyn DatabaseStorage>,
 ) -> Result<Arc<SpinLock<DatabaseHeader>>> {
     let drop_fn = Rc::new(|_buf| {});
-    #[allow(clippy::arc_with_non_send_sync)]
     let buf = Arc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
     let result = Arc::new(SpinLock::new(DatabaseHeader::default()));
     let header = result.clone();
@@ -300,7 +297,6 @@ pub fn begin_read_database_header(
         finish_read_database_header(buf, header).unwrap();
     });
     let c = Completion::Read(ReadCompletion::new(buf, complete));
-    #[allow(clippy::arc_with_non_send_sync)]
     db_file.read_page(DATABASE_HEADER_PAGE_ID, Arc::new(c))?;
     Ok(result)
 }
@@ -416,7 +412,6 @@ pub struct PageContent {
 
 impl Clone for PageContent {
     fn clone(&self) -> Self {
-        #[allow(clippy::arc_with_non_send_sync)]
         Self {
             offset: self.offset,
             buffer: Arc::new(RefCell::new((*self.buffer.borrow()).clone())),
@@ -791,7 +786,6 @@ pub fn begin_read_page(
         let buffer_pool = buffer_pool.clone();
         buffer_pool.put(buf);
     });
-    #[allow(clippy::arc_with_non_send_sync)]
     let buf = Arc::new(RefCell::new(Buffer::new(buf, drop_fn)));
     let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
         let page = page.clone();
@@ -871,7 +865,6 @@ pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>, syncing: Rc<RefCell<bool>>)
         }),
         is_completed: Cell::new(false),
     });
-    #[allow(clippy::arc_with_non_send_sync)]
     db_file.sync(Arc::new(completion))?;
     Ok(())
 }
@@ -1344,10 +1337,8 @@ pub fn write_varint_to_vec(value: u64, payload: &mut Vec<u8>) {
 pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFileShared>>> {
     let drop_fn = Rc::new(|_buf| {});
     let size = file.size()?;
-    #[allow(clippy::arc_with_non_send_sync)]
     let buf_for_pread = Arc::new(RefCell::new(Buffer::allocate(size as usize, drop_fn)));
     let header = Arc::new(SpinLock::new(WalHeader::default()));
-    #[allow(clippy::arc_with_non_send_sync)]
     let wal_file_shared_ret = Arc::new(UnsafeCell::new(WalFileShared {
         wal_header: header.clone(),
         min_frame: AtomicU64::new(0),
@@ -1525,7 +1516,6 @@ pub fn begin_read_wal_frame(
         buffer_pool.put(buf);
     });
     let buf = Arc::new(RefCell::new(Buffer::new(buf, drop_fn)));
-    #[allow(clippy::arc_with_non_send_sync)]
     let c = Arc::new(Completion::Read(ReadCompletion::new(buf, complete)));
     io.pread(offset, c.clone())?;
     Ok(c)
@@ -1593,7 +1583,6 @@ pub fn begin_write_wal_frame(
         buf[16..20].copy_from_slice(&header.checksum_1.to_be_bytes());
         buf[20..24].copy_from_slice(&header.checksum_2.to_be_bytes());
 
-        #[allow(clippy::arc_with_non_send_sync)]
         (Arc::new(RefCell::new(buffer)), final_checksum)
     };
 
@@ -1611,7 +1600,6 @@ pub fn begin_write_wal_frame(
             }
         })
     };
-    #[allow(clippy::arc_with_non_send_sync)]
     let c = Arc::new(Completion::Write(WriteCompletion::new(write_complete)));
     io.pwrite(offset, buffer.clone(), c)?;
     tracing::trace!("Frame written and synced");
@@ -1634,7 +1622,6 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
         buf[24..28].copy_from_slice(&header.checksum_1.to_be_bytes());
         buf[28..32].copy_from_slice(&header.checksum_2.to_be_bytes());
 
-        #[allow(clippy::arc_with_non_send_sync)]
         Arc::new(RefCell::new(buffer))
     };
 
@@ -1647,7 +1634,6 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
             }
         })
     };
-    #[allow(clippy::arc_with_non_send_sync)]
     let c = Arc::new(Completion::Write(WriteCompletion::new(write_complete)));
     io.pwrite(0, buffer.clone(), c)?;
     Ok(())
