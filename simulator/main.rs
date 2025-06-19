@@ -269,7 +269,7 @@ fn run_simulator(
         let bt = Backtrace::force_capture();
         tracing::error!("captured backtrace:\n{}", bt);
     }));
-
+    #[allow(clippy::arc_with_non_send_sync)]
     let env = Arc::new(Mutex::new(env));
     let result = SandboxedResult::from(
         std::panic::catch_unwind(|| {
@@ -340,6 +340,7 @@ fn run_simulator(
                 let last_execution = Arc::new(Mutex::new(*last_execution));
                 let env = SimulatorEnv::new(seed, cli_opts, &paths.shrunk_db);
 
+                #[allow(clippy::arc_with_non_send_sync)]
                 let env = Arc::new(Mutex::new(env));
                 let shrunk = SandboxedResult::from(
                     std::panic::catch_unwind(|| {
@@ -425,6 +426,8 @@ fn doublecheck(
     result: SandboxedResult,
 ) -> anyhow::Result<()> {
     let env = SimulatorEnv::new(seed, cli_opts, &paths.doublecheck_db);
+
+    #[allow(clippy::arc_with_non_send_sync)]
     let env = Arc::new(Mutex::new(env));
 
     // Run the simulation again
@@ -489,6 +492,7 @@ fn doublecheck(
     }
 }
 
+#[allow(clippy::arc_with_non_send_sync)]
 fn differential_testing(
     seed: u64,
     bugbase: Option<&mut BugBase>,
