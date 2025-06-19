@@ -5,7 +5,6 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-#[allow(clippy::arc_with_non_send_sync)]
 #[test]
 fn test_wal_checkpoint_result() -> Result<()> {
     maybe_setup_tracing();
