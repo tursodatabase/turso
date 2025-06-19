@@ -9,7 +9,7 @@ use std::{
 };
 use tracing::trace;
 
-use std::sync::{Arc};
+use std::sync::Arc;
 
 macro_rules! stub {
     () => {
