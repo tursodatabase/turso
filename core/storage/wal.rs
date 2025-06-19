@@ -1,4 +1,3 @@
-#![allow(clippy::arc_with_non_send_sync)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::array;

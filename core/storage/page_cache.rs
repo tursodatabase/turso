@@ -599,7 +599,6 @@ mod tests {
         PageCacheKey::new(id)
     }
 
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn page_with_content(page_id: usize) -> PageRef {
         let page = Arc::new(Page::new(page_id));
         {
@@ -994,7 +993,6 @@ mod tests {
                     // add
                     let id_page = rng.next_u64() % max_pages;
                     let key = PageCacheKey::new(id_page as usize);
-                    #[allow(clippy::arc_with_non_send_sync)]
                     let page = Arc::new(Page::new(id_page as usize));
                     if let Some(_) = cache.peek(&key, false) {
                         continue; // skip duplicate page ids

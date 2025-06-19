@@ -207,7 +207,6 @@ impl IO for UnixIO {
 
         let file = file.open(path)?;
 
-        #[allow(clippy::arc_with_non_send_sync)]
         let unix_file = Arc::new(UnixFile {
             file: Arc::new(RefCell::new(file)),
             poller: BorrowedPollHandler(self.poller.as_mut().into()),
@@ -285,7 +284,6 @@ enum CompletionCallback {
 }
 
 pub struct UnixFile<'io> {
-    #[allow(clippy::arc_with_non_send_sync)]
     file: Arc<RefCell<std::fs::File>>,
     poller: BorrowedPollHandler<'io>,
     callbacks: BorrowedCallbacks<'io>,
@@ -365,7 +363,12 @@ impl File for UnixFile<'_> {
         }
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<crate::Buffer>>, c: Arc<Completion>) -> Result<()> {
+    fn pwrite(
+        &self,
+        pos: usize,
+        buffer: Arc<RefCell<crate::Buffer>>,
+        c: Arc<Completion>,
+    ) -> Result<()> {
         let file = self.file.borrow();
         let result = {
             let buf = buffer.borrow();

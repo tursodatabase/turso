@@ -85,7 +85,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
 
 impl Database {
     #[cfg(feature = "fs")]
-    #[allow(clippy::arc_with_non_send_sync, dead_code)]
+    #[allow(dead_code)]
     pub fn open_with_vfs(
         &self,
         path: &str,

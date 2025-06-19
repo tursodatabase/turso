@@ -68,7 +68,6 @@ impl Connection {
     }
 }
 
-#[allow(clippy::arc_with_non_send_sync)]
 pub(crate) unsafe extern "C" fn register_vfs(
     name: *const c_char,
     vfs: *const VfsImpl,
@@ -89,7 +88,6 @@ pub(crate) unsafe extern "C" fn register_vfs(
 /// any other types that are defined in the same extension will not be registered
 /// until the database file is opened and `register_builtins` is called.
 #[cfg(feature = "fs")]
-#[allow(clippy::arc_with_non_send_sync)]
 pub fn add_builtin_vfs_extensions(
     api: Option<ExtensionApi>,
 ) -> crate::Result<Vec<(String, Arc<VfsMod>)>> {

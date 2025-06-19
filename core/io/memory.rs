@@ -17,7 +17,6 @@ const PAGE_SIZE: usize = 4096;
 type MemPage = Box<[u8; PAGE_SIZE]>;
 
 impl MemoryIO {
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new() -> Self {
         debug!("Using IO backend 'memory'");
         Self {}

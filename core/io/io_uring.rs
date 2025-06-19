@@ -1,5 +1,3 @@
-#![allow(clippy::arc_with_non_send_sync)]
-
 use super::{common, Completion, File, OpenFlags, WriteCompletion, IO};
 use crate::io::clock::{Clock, Instant};
 use crate::{LimboError, MemoryIO, Result};
@@ -291,7 +289,12 @@ impl File for UringFile {
         Ok(())
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<crate::Buffer>>, c: Arc<Completion>) -> Result<()> {
+    fn pwrite(
+        &self,
+        pos: usize,
+        buffer: Arc<RefCell<crate::Buffer>>,
+        c: Arc<Completion>,
+    ) -> Result<()> {
         let mut io = self.io.borrow_mut();
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
         let write = {
@@ -305,11 +308,13 @@ impl File for UringFile {
         };
         io.ring.submit_entry(
             &write,
-            Arc::new(Completion::Write(WriteCompletion::new(Box::new(move |result| {
-                c.complete(result);
-                // NOTE: Explicitly reference buffer to ensure it lives until here
-                let _ = buffer.borrow();
-            })))),
+            Arc::new(Completion::Write(WriteCompletion::new(Box::new(
+                move |result| {
+                    c.complete(result);
+                    // NOTE: Explicitly reference buffer to ensure it lives until here
+                    let _ = buffer.borrow();
+                },
+            )))),
         );
         Ok(())
     }
