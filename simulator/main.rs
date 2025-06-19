@@ -1,4 +1,3 @@
-#![allow(clippy::arc_with_non_send_sync, dead_code)]
 use anyhow::{anyhow, Context};
 use clap::Parser;
 use generation::plan::{Interaction, InteractionPlan, InteractionPlanState};
@@ -13,9 +12,11 @@ use runner::execution::{execute_plans, Execution, ExecutionHistory, ExecutionRes
 use runner::{differential, watch};
 use std::any::Any;
 use std::backtrace::Backtrace;
+use std::cell::RefCell;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
 use tracing_subscriber::field::MakeExt;
 use tracing_subscriber::fmt::format;
@@ -220,7 +221,7 @@ fn watch_mode(
                                     i.shadow(&mut env);
                                 });
                             });
-                            let env = Arc::new(Mutex::new(env.clone_without_connections()));
+                            let env = Rc::new(RefCell::new(env.clone_without_connections()));
                             watch::run_simulation(env, &mut [plan], last_execution.clone())
                         }),
                         last_execution.clone(),

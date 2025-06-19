@@ -1,4 +1,8 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
 
 use crate::{
     generation::{
@@ -14,7 +18,7 @@ use super::{
 };
 
 pub(crate) fn run_simulation(
-    env: Arc<Mutex<SimulatorEnv>>,
+    env: Rc<RefCell<SimulatorEnv>>,
     plans: &mut [Vec<Vec<Interaction>>],
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
@@ -28,7 +32,7 @@ pub(crate) fn run_simulation(
         .collect::<Vec<_>>();
     let result = execute_plans(env.clone(), plans, &mut states, last_execution);
 
-    let env = env.lock().unwrap();
+    let env = env.borrow();
     env.io.print_stats();
 
     tracing::info!("Simulation completed");
@@ -37,14 +41,14 @@ pub(crate) fn run_simulation(
 }
 
 pub(crate) fn execute_plans(
-    env: Arc<Mutex<SimulatorEnv>>,
+    env: Rc<RefCell<SimulatorEnv>>,
     plans: &mut [Vec<Vec<Interaction>>],
     states: &mut [InteractionPlanState],
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
     let mut history = ExecutionHistory::new();
     let now = std::time::Instant::now();
-    let mut env = env.lock().unwrap();
+    let mut env = env.borrow_mut();
     for _tick in 0..env.opts.ticks {
         // Pick the connection to interact with
         let connection_index = pick_index(env.connections.len(), &mut env.rng);
