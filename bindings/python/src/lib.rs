@@ -65,7 +65,7 @@ pub struct Cursor {
     smt: Option<Rc<RefCell<limbo_core::Statement>>>,
 }
 
-#[allow(unused_variables, clippy::arc_with_non_send_sync)]
+#[allow(unused_variables)]
 #[pymethods]
 impl Cursor {
     #[pyo3(signature = (sql, parameters=None))]
