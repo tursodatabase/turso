@@ -2,7 +2,7 @@
 #![allow(non_camel_case_types)]
 
 use limbo_core::Value;
-use std::ffi::{self, CStr, CString};
+use std::{cell::RefCell, ffi::{self, CStr, CString}, rc::Rc};
 use tracing::trace;
 
 use std::sync::{Arc, Mutex};
@@ -35,7 +35,7 @@ pub const SQLITE_CHECKPOINT_RESTART: ffi::c_int = 2;
 pub const SQLITE_CHECKPOINT_TRUNCATE: ffi::c_int = 3;
 
 pub struct sqlite3 {
-    pub(crate) inner: Arc<Mutex<sqlite3Inner>>,
+    pub(crate) inner: Rc<RefCell<sqlite3Inner>>,
 }
 
 struct sqlite3Inner {
@@ -65,8 +65,7 @@ impl sqlite3 {
             e_open_state: SQLITE_STATE_OPEN,
             p_err: std::ptr::null_mut(),
         };
-        #[allow(clippy::arc_with_non_send_sync)]
-        let inner = Arc::new(Mutex::new(inner));
+        let inner = Rc::new(RefCell::new(inner));
         Self { inner }
     }
 }
@@ -219,7 +218,7 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
         return SQLITE_MISUSE;
     }
     let db: &mut sqlite3 = &mut *raw_db;
-    let db = db.inner.lock().unwrap();
+    let db = db.inner.borrow();
     let sql = CStr::from_ptr(sql);
     let sql = match sql.to_str() {
         Ok(s) => s,
@@ -247,7 +246,7 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let stmt = &mut *stmt;
     let db = &mut *stmt.db;
     loop {
-        let db = db.inner.lock().unwrap();
+        let db = db.inner.borrow();
         if let Ok(result) = stmt.stmt.step() {
             match result {
                 limbo_core::StepResult::IO => {
@@ -287,7 +286,7 @@ pub unsafe extern "C" fn sqlite3_exec(
         return SQLITE_MISUSE;
     }
     let db: &mut sqlite3 = &mut *db;
-    let db = db.inner.lock().unwrap();
+    let db = db.inner.borrow();
     let sql = CStr::from_ptr(sql);
     let sql = match sql.to_str() {
         Ok(s) => s,
@@ -405,7 +404,7 @@ pub unsafe extern "C" fn sqlite3_errcode(db: *mut sqlite3) -> ffi::c_int {
         return SQLITE_MISUSE;
     }
     let db: &mut sqlite3 = &mut *db;
-    let db = db.inner.lock().unwrap();
+    let db = db.inner.borrow();
     if !sqlite3_safety_check_sick_or_ok(&db) {
         return SQLITE_MISUSE;
     }
@@ -960,7 +959,7 @@ pub unsafe extern "C" fn sqlite3_errmsg(db: *mut sqlite3) -> *const ffi::c_char 
         return sqlite3_errstr(SQLITE_NOMEM);
     }
     let db: &mut sqlite3 = &mut *db;
-    let db = db.inner.lock().unwrap();
+    let db = db.inner.borrow();
     if !sqlite3_safety_check_sick_or_ok(&db) {
         return sqlite3_errstr(SQLITE_MISUSE);
     }
@@ -989,7 +988,7 @@ pub unsafe extern "C" fn sqlite3_extended_errcode(db: *mut sqlite3) -> ffi::c_in
         return SQLITE_MISUSE;
     }
     let db: &mut sqlite3 = &mut *db;
-    let db = db.inner.lock().unwrap();
+    let db = db.inner.borrow();
     if !sqlite3_safety_check_sick_or_ok(&db) {
         return SQLITE_MISUSE;
     }
@@ -1104,7 +1103,7 @@ pub unsafe extern "C" fn sqlite3_wal_checkpoint_v2(
         return SQLITE_MISUSE;
     }
     let db: &mut sqlite3 = &mut *db;
-    let db = db.inner.lock().unwrap();
+    let db = db.inner.borrow();
     // TODO: Checkpointing modes and reporting back log size and checkpoint count to caller.
     if db.conn.checkpoint().is_err() {
         return SQLITE_ERROR;
@@ -1139,7 +1138,7 @@ pub unsafe extern "C" fn libsql_wal_frame_count(
         return SQLITE_MISUSE;
     }
     let db: &mut sqlite3 = &mut *db;
-    let db = db.inner.lock().unwrap();
+    let db = db.inner.borrow();
     let frame_count = match db.conn.wal_frame_count() {
         Ok(count) => count as u32,
         Err(_) => return SQLITE_ERROR,
@@ -1178,7 +1177,7 @@ pub unsafe extern "C" fn libsql_wal_get_frame(
         return SQLITE_MISUSE;
     }
     let db: &mut sqlite3 = &mut *db;
-    let db = db.inner.lock().unwrap();
+    let db = db.inner.borrow();
     match db.conn.wal_get_frame(frame_no, p_frame, frame_len) {
         Ok(c) => match db.io.wait_for_completion(c) {
             Ok(_) => SQLITE_OK,
