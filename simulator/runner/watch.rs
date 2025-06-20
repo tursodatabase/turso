@@ -1,17 +1,16 @@
 use std::sync::{Arc, Mutex};
 
-use crate::{
+use limbo_sim::{
     generation::{
         pick_index,
         plan::{Interaction, InteractionPlanState},
     },
-    runner::execution::ExecutionContinuation,
+    model::SimConnection,
 };
 
-use super::{
-    env::{SimConnection, LimboSimulatorEnv},
-    execution::{execute_interaction, Execution, ExecutionHistory, ExecutionResult},
-};
+use crate::runner::{env::LimboSimulatorEnv, execution::ExecutionContinuation};
+
+use super::execution::{execute_interaction, Execution, ExecutionHistory, ExecutionResult};
 
 pub(crate) fn run_simulation(
     env: Arc<Mutex<LimboSimulatorEnv>>,

@@ -2,16 +2,14 @@ use serde::{Deserialize, Serialize};
 use turso_core::LimboError;
 use turso_sqlite3_parser::ast;
 
-use crate::{
-    model::{
-        query::{
-            predicate::Predicate,
-            select::{Distinctness, ResultColumn},
-            Create, Delete, Drop, Insert, Query, Select,
-        },
-        table::SimValue,
+use crate::model::{
+    query::{
+        predicate::Predicate,
+        select::{Distinctness, ResultColumn},
+        Create, Delete, Drop, Insert, Query, Select,
     },
-    runner::env::LimboSimulatorEnv,
+    table::SimValue,
+    SimulatorEnv,
 };
 
 use super::{
@@ -23,7 +21,7 @@ use super::{
 /// Properties are representations of executable specifications
 /// about the database behavior.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum Property {
+pub enum Property {
     /// Insert-Select is a property in which the inserted row
     /// must be in the resulting rows of a select query that has a
     /// where clause that matches the inserted row.
@@ -190,8 +188,8 @@ impl Property {
                     message: format!("table {} exists", insert.table()),
                     func: Box::new({
                         let table_name = table.clone();
-                        move |_: &Vec<ResultSet>, env: &LimboSimulatorEnv| {
-                            Ok(env.tables.iter().any(|t| t.name == table_name))
+                        move |_: &Vec<ResultSet>, env: &dyn SimulatorEnv| {
+                            Ok(env.tables().iter().any(|t| t.name == table_name))
                         }
                     }),
                 });
@@ -202,7 +200,7 @@ impl Property {
                         row.iter().map(|v| v.to_string()).collect::<Vec<String>>(),
                         insert.table(),
                     ),
-                    func: Box::new(move |stack: &Vec<ResultSet>, _: &LimboSimulatorEnv| {
+                    func: Box::new(move |stack: &Vec<ResultSet>, _: &dyn SimulatorEnv| {
                         let rows = stack.last().unwrap();
                         match rows {
                             Ok(rows) => Ok(rows.iter().any(|r| r == &row)),
@@ -226,8 +224,8 @@ impl Property {
                 let assumption = Interaction::Assumption(Assertion {
                     message: "Double-Create-Failure should not be called on an existing table"
                         .to_string(),
-                    func: Box::new(move |_: &Vec<ResultSet>, env: &LimboSimulatorEnv| {
-                        Ok(!env.tables.iter().any(|t| t.name == table_name))
+                    func: Box::new(move |_: &Vec<ResultSet>, env: &dyn SimulatorEnv| {
+                        Ok(!env.tables().iter().any(|t| t.name == table_name))
                     }),
                 });
 
@@ -240,7 +238,7 @@ impl Property {
                     message:
                         "creating two tables with the name should result in a failure for the second query"
                             .to_string(),
-                    func: Box::new(move |stack: &Vec<ResultSet>, _: &LimboSimulatorEnv| {
+                    func: Box::new(move |stack: &Vec<ResultSet>, _: &dyn SimulatorEnv| {
                         let last = stack.last().unwrap();
                         match last {
                             Ok(_) => Ok(false),
@@ -265,8 +263,8 @@ impl Property {
                     message: format!("table {} exists", table_name),
                     func: Box::new({
                         let table_name = table_name.clone();
-                        move |_: &Vec<ResultSet>, env: &LimboSimulatorEnv| {
-                            Ok(env.tables.iter().any(|t| t.name == table_name))
+                        move |_: &Vec<ResultSet>, env: &dyn SimulatorEnv| {
+                            Ok(env.tables().iter().any(|t| t.name == table_name))
                         }
                     }),
                 });
@@ -277,7 +275,7 @@ impl Property {
 
                 let assertion = Interaction::Assertion(Assertion {
                     message: "select query should respect the limit clause".to_string(),
-                    func: Box::new(move |stack: &Vec<ResultSet>, _: &LimboSimulatorEnv| {
+                    func: Box::new(move |stack: &Vec<ResultSet>, _: &dyn SimulatorEnv| {
                         let last = stack.last().unwrap();
                         match last {
                             Ok(rows) => Ok(limit >= rows.len()),
@@ -301,8 +299,8 @@ impl Property {
                     message: format!("table {} exists", table),
                     func: Box::new({
                         let table = table.clone();
-                        move |_: &Vec<ResultSet>, env: &LimboSimulatorEnv| {
-                            Ok(env.tables.iter().any(|t| t.name == table))
+                        move |_: &Vec<ResultSet>, env: &dyn SimulatorEnv| {
+                            Ok(env.tables().iter().any(|t| t.name == table))
                         }
                     }),
                 });
@@ -322,7 +320,7 @@ impl Property {
 
                 let assertion = Interaction::Assertion(Assertion {
                     message: format!("`{}` should return no values for table `{}`", select, table,),
-                    func: Box::new(move |stack: &Vec<ResultSet>, _: &LimboSimulatorEnv| {
+                    func: Box::new(move |stack: &Vec<ResultSet>, _: &dyn SimulatorEnv| {
                         let rows = stack.last().unwrap();
                         match rows {
                             Ok(rows) => Ok(rows.is_empty()),
@@ -349,8 +347,8 @@ impl Property {
                     message: format!("table {} exists", table),
                     func: Box::new({
                         let table = table.clone();
-                        move |_: &Vec<ResultSet>, env: &LimboSimulatorEnv| {
-                            Ok(env.tables.iter().any(|t| t.name == table))
+                        move |_: &Vec<ResultSet>, env: &dyn SimulatorEnv| {
+                            Ok(env.tables().iter().any(|t| t.name == table))
                         }
                     }),
                 });
@@ -362,7 +360,7 @@ impl Property {
                         "select query should result in an error for table '{}'",
                         table
                     ),
-                    func: Box::new(move |stack: &Vec<ResultSet>, _: &LimboSimulatorEnv| {
+                    func: Box::new(move |stack: &Vec<ResultSet>, _: &dyn SimulatorEnv| {
                         let last = stack.last().unwrap();
                         match last {
                             Ok(_) => Ok(false),
@@ -394,8 +392,8 @@ impl Property {
                     message: format!("table {} exists", table),
                     func: Box::new({
                         let table = table.clone();
-                        move |_: &Vec<ResultSet>, env: &LimboSimulatorEnv| {
-                            Ok(env.tables.iter().any(|t| t.name == table))
+                        move |_: &Vec<ResultSet>, env: &dyn SimulatorEnv| {
+                            Ok(env.tables().iter().any(|t| t.name == table))
                         }
                     }),
                 });
@@ -418,7 +416,7 @@ impl Property {
 
                 let assertion = Interaction::Assertion(Assertion {
                     message: "select queries should return the same amount of results".to_string(),
-                    func: Box::new(move |stack: &Vec<ResultSet>, _: &LimboSimulatorEnv| {
+                    func: Box::new(move |stack: &Vec<ResultSet>, _: &dyn SimulatorEnv| {
                         let select_star = stack.last().unwrap();
                         let select_predicate = stack.get(stack.len() - 2).unwrap();
                         match (select_predicate, select_star) {
@@ -505,29 +503,30 @@ pub(crate) struct Remaining {
     pub(crate) drop: f64,
 }
 
-pub(crate) fn remaining(env: &LimboSimulatorEnv, stats: &InteractionStats) -> Remaining {
-    let remaining_read = ((env.opts.max_interactions as f64 * env.opts.read_percent / 100.0)
+pub(crate) fn remaining<E: SimulatorEnv>(env: &E, stats: &InteractionStats) -> Remaining {
+    let opts = env.opts();
+    let remaining_read = ((opts.max_interactions as f64 * opts.read_percent / 100.0)
         - (stats.read_count as f64))
         .max(0.0);
-    let remaining_write = ((env.opts.max_interactions as f64 * env.opts.write_percent / 100.0)
+    let remaining_write = ((opts.max_interactions as f64 * opts.write_percent / 100.0)
         - (stats.write_count as f64))
         .max(0.0);
-    let remaining_create = ((env.opts.max_interactions as f64 * env.opts.create_percent / 100.0)
+    let remaining_create = ((opts.max_interactions as f64 * opts.create_percent / 100.0)
         - (stats.create_count as f64))
         .max(0.0);
 
-    let remaining_create_index =
-        ((env.opts.max_interactions as f64 * env.opts.create_index_percent / 100.0)
-            - (stats.create_index_count as f64))
-            .max(0.0);
+    let remaining_create_index = ((opts.max_interactions as f64 * opts.create_index_percent
+        / 100.0)
+        - (stats.create_index_count as f64))
+        .max(0.0);
 
-    let remaining_delete = ((env.opts.max_interactions as f64 * env.opts.delete_percent / 100.0)
+    let remaining_delete = ((opts.max_interactions as f64 * opts.delete_percent / 100.0)
         - (stats.delete_count as f64))
         .max(0.0);
-    let remaining_update = ((env.opts.max_interactions as f64 * env.opts.update_percent / 100.0)
+    let remaining_update = ((opts.max_interactions as f64 * opts.update_percent / 100.0)
         - (stats.update_count as f64))
         .max(0.0);
-    let remaining_drop = ((env.opts.max_interactions as f64 * env.opts.drop_percent / 100.0)
+    let remaining_drop = ((opts.max_interactions as f64 * opts.drop_percent / 100.0)
         - (stats.drop_count as f64))
         .max(0.0);
 
@@ -542,13 +541,13 @@ pub(crate) fn remaining(env: &LimboSimulatorEnv, stats: &InteractionStats) -> Re
     }
 }
 
-fn property_insert_values_select<R: rand::Rng>(
+fn property_insert_values_select<R: rand::Rng, E: SimulatorEnv>(
     rng: &mut R,
-    env: &LimboSimulatorEnv,
+    env: &E,
     remaining: &Remaining,
 ) -> Property {
     // Get a random table
-    let table = pick(&env.tables, rng);
+    let table = pick(&env.tables(), rng);
     // Generate rows to insert
     let rows = (0..rng.gen_range(1..=5))
         .map(|_| Vec::<SimValue>::arbitrary_from(rng, table))
@@ -611,9 +610,9 @@ fn property_insert_values_select<R: rand::Rng>(
     }
 }
 
-fn property_select_limit<R: rand::Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Property {
+fn property_select_limit<R: rand::Rng, E: SimulatorEnv>(rng: &mut R, env: &E) -> Property {
     // Get a random table
-    let table = pick(&env.tables, rng);
+    let table = pick(&env.tables(), rng);
     // Select the table
     let select = Select {
         table: table.name.clone(),
@@ -625,13 +624,13 @@ fn property_select_limit<R: rand::Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> 
     Property::SelectLimit { select }
 }
 
-fn property_double_create_failure<R: rand::Rng>(
+fn property_double_create_failure<R: rand::Rng, E: SimulatorEnv>(
     rng: &mut R,
-    env: &LimboSimulatorEnv,
+    env: &E,
     remaining: &Remaining,
 ) -> Property {
     // Get a random table
-    let table = pick(&env.tables, rng);
+    let table = pick(&env.tables(), rng);
     // Create the table
     let create_query = Create {
         table: table.clone(),
@@ -660,13 +659,13 @@ fn property_double_create_failure<R: rand::Rng>(
     }
 }
 
-fn property_delete_select<R: rand::Rng>(
+fn property_delete_select<R: rand::Rng, E: SimulatorEnv>(
     rng: &mut R,
-    env: &LimboSimulatorEnv,
+    env: &E,
     remaining: &Remaining,
 ) -> Property {
     // Get a random table
-    let table = pick(&env.tables, rng);
+    let table = pick(&env.tables(), rng);
     // Generate a random predicate
     let predicate = Predicate::arbitrary_from(rng, table);
 
@@ -703,13 +702,13 @@ fn property_delete_select<R: rand::Rng>(
     }
 }
 
-fn property_drop_select<R: rand::Rng>(
+fn property_drop_select<R: rand::Rng, E: SimulatorEnv>(
     rng: &mut R,
-    env: &LimboSimulatorEnv,
+    env: &E,
     remaining: &Remaining,
 ) -> Property {
     // Get a random table
-    let table = pick(&env.tables, rng);
+    let table = pick(&env.tables(), rng);
 
     // Create random queries respecting the constraints
     let mut queries = Vec::new();
@@ -741,9 +740,12 @@ fn property_drop_select<R: rand::Rng>(
     }
 }
 
-fn property_select_select_optimizer<R: rand::Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Property {
+fn property_select_select_optimizer<R: rand::Rng, E: SimulatorEnv>(
+    rng: &mut R,
+    env: &E,
+) -> Property {
     // Get a random table
-    let table = pick(&env.tables, rng);
+    let table = pick(&env.tables(), rng);
     // Generate a random predicate
     let predicate = Predicate::arbitrary_from(rng, table);
     // Transform into a Binary predicate to force values to be casted to a bool
@@ -781,16 +783,14 @@ fn property_faulty_query<R: rand::Rng>(
     }
 }
 
-impl ArbitraryFrom<(&LimboSimulatorEnv, &InteractionStats)> for Property {
-    fn arbitrary_from<R: rand::Rng>(
-        rng: &mut R,
-        (env, stats): (&LimboSimulatorEnv, &InteractionStats),
-    ) -> Self {
+impl<E: SimulatorEnv> ArbitraryFrom<(&E, &InteractionStats)> for Property {
+    fn arbitrary_from<R: rand::Rng>(rng: &mut R, (env, stats): (&E, &InteractionStats)) -> Self {
         let remaining_ = remaining(env, stats);
+        let opts = env.opts();
         frequency(
             vec![
                 (
-                    if !env.opts.disable_insert_values_select {
+                    if !opts.disable_insert_values_select {
                         f64::min(remaining_.read, remaining_.write)
                     } else {
                         0.0
@@ -798,7 +798,7 @@ impl ArbitraryFrom<(&LimboSimulatorEnv, &InteractionStats)> for Property {
                     Box::new(|rng: &mut R| property_insert_values_select(rng, env, &remaining_)),
                 ),
                 (
-                    if !env.opts.disable_double_create_failure {
+                    if !opts.disable_double_create_failure {
                         remaining_.create / 2.0
                     } else {
                         0.0
@@ -806,7 +806,7 @@ impl ArbitraryFrom<(&LimboSimulatorEnv, &InteractionStats)> for Property {
                     Box::new(|rng: &mut R| property_double_create_failure(rng, env, &remaining_)),
                 ),
                 (
-                    if !env.opts.disable_select_limit {
+                    if !opts.disable_select_limit {
                         remaining_.read
                     } else {
                         0.0
@@ -814,7 +814,7 @@ impl ArbitraryFrom<(&LimboSimulatorEnv, &InteractionStats)> for Property {
                     Box::new(|rng: &mut R| property_select_limit(rng, env)),
                 ),
                 (
-                    if !env.opts.disable_delete_select {
+                    if !opts.disable_delete_select {
                         f64::min(remaining_.read, remaining_.write).min(remaining_.delete)
                     } else {
                         0.0
@@ -822,16 +822,15 @@ impl ArbitraryFrom<(&LimboSimulatorEnv, &InteractionStats)> for Property {
                     Box::new(|rng: &mut R| property_delete_select(rng, env, &remaining_)),
                 ),
                 (
-                    if !env.opts.disable_drop_select {
-                        // remaining_.drop
-                        0.0
+                    if !opts.disable_drop_select {
+                        remaining_.drop
                     } else {
                         0.0
                     },
                     Box::new(|rng: &mut R| property_drop_select(rng, env, &remaining_)),
                 ),
                 (
-                    if !env.opts.disable_select_optimizer {
+                    if !opts.disable_select_optimizer {
                         remaining_.read / 2.0
                     } else {
                         0.0
@@ -839,7 +838,7 @@ impl ArbitraryFrom<(&LimboSimulatorEnv, &InteractionStats)> for Property {
                     Box::new(|rng: &mut R| property_select_select_optimizer(rng, env)),
                 ),
                 (
-                    if !env.opts.disable_fsync_no_wait {
+                    if !opts.disable_fsync_no_wait {
                         50.0 // Freestyle number
                     } else {
                         0.0
@@ -847,7 +846,7 @@ impl ArbitraryFrom<(&LimboSimulatorEnv, &InteractionStats)> for Property {
                     Box::new(|rng: &mut R| property_fsync_no_wait(rng, env, &remaining_)),
                 ),
                 (
-                    if !env.opts.disable_faulty_query {
+                    if !opts.disable_faulty_query {
                         20.0
                     } else {
                         0.0

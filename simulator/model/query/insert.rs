@@ -2,12 +2,12 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{model::table::SimValue, runner::env::LimboSimulatorEnv};
+use crate::model::{table::SimValue, SimulatorEnv};
 
 use super::select::Select;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) enum Insert {
+pub enum Insert {
     Values {
         table: String,
         values: Vec<Vec<SimValue>>,
@@ -19,16 +19,16 @@ pub(crate) enum Insert {
 }
 
 impl Insert {
-    pub(crate) fn shadow(&self, env: &mut LimboSimulatorEnv) -> Vec<Vec<SimValue>> {
+    pub fn shadow<E: SimulatorEnv>(&self, env: &mut E) -> Vec<Vec<SimValue>> {
         match self {
             Insert::Values { table, values } => {
-                if let Some(t) = env.tables.iter_mut().find(|t| &t.name == table) {
+                if let Some(t) = env.tables_mut().iter_mut().find(|t| &t.name == table) {
                     t.rows.extend(values.clone());
                 }
             }
             Insert::Select { table, select } => {
                 let rows = select.shadow(env);
-                if let Some(t) = env.tables.iter_mut().find(|t| &t.name == table) {
+                if let Some(t) = env.tables_mut().iter_mut().find(|t| &t.name == table) {
                     t.rows.extend(rows);
                 }
             }

@@ -1,14 +1,16 @@
 use std::sync::{Arc, Mutex};
 
+use limbo_sim::{
+    generation::{
+        pick_index,
+        plan::{Interaction, InteractionPlan, InteractionPlanState, ResultSet},
+    },
+    model::SimConnection,
+};
 use tracing::instrument;
 use turso_core::{Connection, LimboError, Result, StepResult};
 
-use crate::generation::{
-    pick_index,
-    plan::{Interaction, InteractionPlan, InteractionPlanState, ResultSet},
-};
-
-use super::env::{SimConnection, LimboSimulatorEnv};
+use crate::runner::env::LimboSimulatorEnv;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Execution {
@@ -191,7 +193,7 @@ pub(crate) fn execute_interaction(
                 SimConnection::Disconnected => unreachable!(),
             };
 
-            let results = interaction.execute_query(conn, &env.io);
+            let results = interaction.execute_query(conn);
             tracing::debug!(?results);
             stack.push(results);
             limbo_integrity_check(conn)?;

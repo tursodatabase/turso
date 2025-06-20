@@ -8,9 +8,10 @@ use std::{
 
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
+use limbo_sim::generation::plan::InteractionPlan;
 use serde::{Deserialize, Serialize};
 
-use crate::{generation::plan::InteractionPlan, Paths};
+use crate::Paths;
 
 use super::cli::SimulatorCLI;
 

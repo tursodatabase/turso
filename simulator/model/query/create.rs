@@ -2,20 +2,20 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    model::table::{SimValue, Table},
-    runner::env::LimboSimulatorEnv,
+use crate::model::{
+    table::{SimValue, Table},
+    SimulatorEnv,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Create {
-    pub(crate) table: Table,
+pub struct Create {
+    pub table: Table,
 }
 
 impl Create {
-    pub(crate) fn shadow(&self, env: &mut LimboSimulatorEnv) -> Vec<Vec<SimValue>> {
-        if !env.tables.iter().any(|t| t.name == self.table.name) {
-            env.tables.push(self.table.clone());
+    pub(crate) fn shadow<E: SimulatorEnv>(&self, env: &mut E) -> Vec<Vec<SimValue>> {
+        if !env.tables().iter().any(|t| t.name == self.table.name) {
+            env.add_table(self.table.clone());
         }
 
         vec![]
