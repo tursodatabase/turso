@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     model::table::{SimValue, Table},
-    SimulatorEnv,
+    runner::env::SimulatorEnv,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

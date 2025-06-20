@@ -14,8 +14,10 @@ use crate::{
         query::{update::Update, Create, CreateIndex, Delete, Drop, Insert, Query, Select},
         table::SimValue,
     },
-    runner::{env::SimConnection, io::SimulatorIO},
-    SimulatorEnv,
+    runner::{
+        env::{SimConnection, SimulatorEnv},
+        io::SimulatorIO,
+    },
 };
 
 use crate::generation::{frequency, Arbitrary, ArbitraryFrom};
