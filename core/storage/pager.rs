@@ -160,6 +160,7 @@ impl Page {
     }
 }
 
+// TODO: maybe we could use metrics to record this?
 #[cfg(test)]
 /// Total cache hits, misses, writes, spills
 pub struct PagerStats((AtomicUsize, AtomicUsize, AtomicUsize, AtomicUsize));
@@ -1310,6 +1311,28 @@ impl Pager {
         }
         self.wal.borrow_mut().rollback()?;
 
+        Ok(())
+    }
+
+    // TODO: find better name for this, use as a callback like SQLite?
+    /// This function is called by the cache layer when it has reached some soft memory limit.
+    /// The pager must be purgeable (not in-memory)
+    pub fn stress(&self, page: PageRef) -> Result<()> {
+        assert!(page.is_dirty());
+        #[cfg(test)]
+        {
+            self.stats.spill();
+        }
+        // subjounalPageIfRequired
+
+        let db_size = self.db_header.lock().database_size;
+        self.wal.borrow_mut().append_frame(
+            page.clone(),
+            db_size,
+            self.flush_info.borrow().in_flight_writes.clone(),
+        )?;
+
+        page.clear_dirty();
         Ok(())
     }
 }

@@ -21,6 +21,8 @@ struct PageCacheEntry {
 pub struct DumbLruPageCache {
     capacity: usize,
     map: RefCell<PageHashMap>,
+    /// size before spilling occurs
+    size_spill: usize,
     head: RefCell<Option<NonNull<PageCacheEntry>>>,
     tail: RefCell<Option<NonNull<PageCacheEntry>>>,
 }
@@ -31,7 +33,7 @@ struct PageHashMap {
     // FIXME: do we prefer array buckets or list? Deletes will be slower here which I guess happens often. I will do this for now to test how well it does.
     buckets: Vec<Vec<HashMapNode>>,
     capacity: usize,
-    size: usize,
+    pub size: usize,
 }
 
 #[derive(Clone)]
@@ -64,6 +66,7 @@ impl DumbLruPageCache {
             map: RefCell::new(PageHashMap::new(capacity)),
             head: RefCell::new(None),
             tail: RefCell::new(None),
+            size_spill: 0,
         }
     }
 
@@ -473,6 +476,10 @@ impl DumbLruPageCache {
                 entry.page.clear_dirty()
             };
         }
+    }
+
+    fn fetch_stress(&self) {
+        if self.map.borrow().size > self.size_spill {}
     }
 }
 
