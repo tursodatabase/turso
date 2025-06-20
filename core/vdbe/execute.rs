@@ -24,6 +24,7 @@ use crate::{
     },
     types::compare_immutable,
 };
+use std::ops::DerefMut;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 use std::{borrow::BorrowMut, rc::Rc, sync::Arc};
@@ -1322,22 +1323,30 @@ pub fn op_column(
                 let mut cursor =
                     must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Column");
                 let cursor = cursor.as_btree_mut();
-                let record = return_if_io!(cursor.record());
 
-                let Some(record) = record.as_ref() else {
-                    break 'value Value::Null;
-                };
-
+                // Check if cursor has a null flag set
                 if cursor.get_null_flag() {
                     break 'value Value::Null;
                 }
 
-                if let Some(value) = record.get_value_opt(*column) {
-                    break 'value value.to_owned();
-                }
+                // Get the record from the cursor
+                let record_result = return_if_io!(cursor.record());
+                let Some(record) = record_result.as_ref() else {
+                    break 'value Value::Null;
+                };
 
-                default.clone().unwrap_or(Value::Null)
+                // Use the record cursor to get just the specified column
+                let result = cursor.get_column(*column);
+                match result {
+                    Ok(ref_value) => ref_value.to_owned(),
+                    Err(_) => {
+                        // If column index is out of bounds or any other error,
+                        // use the default value or Null
+                        default.clone().unwrap_or(Value::Null)
+                    }
+                }
             };
+
             // If we are copying a text/blob, let's try to simply update size of text if we need to allocate more and reuse.
             match (&value, &mut state.registers[*dest]) {
                 (Value::Text(text_ref), Register::Value(Value::Text(text_reg))) => {
@@ -1374,7 +1383,7 @@ pub fn op_column(
                 let mut cursor = state.get_cursor(*cursor_id);
                 let cursor = cursor.as_pseudo_mut();
                 if let Some(record) = cursor.record() {
-                    record.get_value(*column).to_owned()
+                    record.get_value(*column)?.to_owned()
                 } else {
                     Value::Null
                 }
@@ -1991,9 +2000,11 @@ pub fn op_row_id(
                     CursorResult::Ok(record) => record,
                 };
                 let record = record.as_ref().unwrap();
-                let rowid = record.get_values().last().unwrap();
+                let mut record_cursor_ref = index_cursor.record_cursor.borrow_mut();
+                let record_cursor = record_cursor_ref.deref_mut();
+                let rowid = record.last_value(record_cursor).unwrap();
                 match rowid {
-                    RefValue::Integer(rowid) => *rowid,
+                    Ok(RefValue::Integer(rowid)) => rowid,
                     _ => unreachable!(),
                 }
             };
@@ -2324,8 +2335,8 @@ pub fn op_idx_ge(
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
             // Compare against the same number of values
             let idx_values = idx_record.get_values();
-            let idx_values = &idx_values[..record_from_regs.len()];
             let record_values = record_from_regs.get_values();
+            let idx_values = &idx_values[..record_values.len()];
             let ord = compare_immutable(
                 idx_values,
                 record_values,
@@ -2388,8 +2399,8 @@ pub fn op_idx_le(
         let pc = if let Some(ref idx_record) = return_if_io!(cursor.record()) {
             // Compare against the same number of values
             let idx_values = idx_record.get_values();
-            let idx_values = &idx_values[..record_from_regs.len()];
             let record_values = record_from_regs.get_values();
+            let idx_values = &idx_values[..record_values.len()];
             let ord = compare_immutable(
                 idx_values,
                 record_values,
@@ -2434,8 +2445,8 @@ pub fn op_idx_gt(
         let pc = if let Some(ref idx_record) = return_if_io!(cursor.record()) {
             // Compare against the same number of values
             let idx_values = idx_record.get_values();
-            let idx_values = &idx_values[..record_from_regs.len()];
             let record_values = record_from_regs.get_values();
+            let idx_values = &idx_values[..record_values.len()];
             let ord = compare_immutable(
                 idx_values,
                 record_values,
@@ -2480,8 +2491,8 @@ pub fn op_idx_lt(
         let pc = if let Some(ref idx_record) = return_if_io!(cursor.record()) {
             // Compare against the same number of values
             let idx_values = idx_record.get_values();
-            let idx_values = &idx_values[..record_from_regs.len()];
             let record_values = record_from_regs.get_values();
+            let idx_values = &idx_values[..record_values.len()];
             let ord = compare_immutable(
                 idx_values,
                 record_values,
