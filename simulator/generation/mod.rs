@@ -113,11 +113,7 @@ pub fn pick_index<R: Rng>(choices: usize, rng: &mut R) -> usize {
 
 /// pick_n_unique is a helper function for uniformly picking N unique elements from a range.
 /// The elements themselves are usize, typically representing indices.
-pub fn pick_n_unique<R: Rng>(
-    range: std::ops::Range<usize>,
-    n: usize,
-    rng: &mut R,
-) -> Vec<usize> {
+pub fn pick_n_unique<R: Rng>(range: std::ops::Range<usize>, n: usize, rng: &mut R) -> Vec<usize> {
     use rand::seq::SliceRandom;
     let mut items: Vec<usize> = range.collect();
     items.shuffle(rng);

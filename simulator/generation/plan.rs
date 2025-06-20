@@ -17,7 +17,7 @@ use crate::model::{
         Create, CreateIndex, Delete, Drop, Insert, Query, Select,
     },
     table::SimValue,
-    SimConnection, SimulatorEnv,
+    Shadow, SimConnection, SimulatorEnv,
 };
 
 use crate::generation::{frequency, Arbitrary, ArbitraryFrom};
@@ -382,8 +382,8 @@ impl<E: SimulatorEnv> ArbitraryFrom<&mut E> for InteractionPlan {
     }
 }
 
-impl Interaction {
-    pub fn shadow<E: SimulatorEnv>(&self, env: &mut E) -> Vec<Vec<SimValue>> {
+impl Shadow for Interaction {
+    fn shadow<E: SimulatorEnv>(&self, env: &mut E) -> Vec<Vec<SimValue>> {
         match self {
             Self::Query(query) => query.shadow(env),
             Self::FsyncQuery(query) => {
@@ -396,6 +396,9 @@ impl Interaction {
             }
         }
     }
+}
+
+impl Interaction {
     pub fn execute_query(&self, conn: &mut Arc<Connection>) -> ResultSet {
         if let Self::Query(query) = self {
             let query_str = query.to_string();

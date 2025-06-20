@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{table::SimValue, SimulatorEnv};
+use crate::model::{table::SimValue, Shadow, SimulatorEnv};
 
 use super::select::Select;
 
@@ -19,7 +19,15 @@ pub enum Insert {
 }
 
 impl Insert {
-    pub fn shadow<E: SimulatorEnv>(&self, env: &mut E) -> Vec<Vec<SimValue>> {
+    pub(crate) fn table(&self) -> &str {
+        match self {
+            Insert::Values { table, .. } | Insert::Select { table, .. } => table,
+        }
+    }
+}
+
+impl Shadow for Insert {
+    fn shadow<E: SimulatorEnv>(&self, env: &mut E) -> Vec<Vec<SimValue>> {
         match self {
             Insert::Values { table, values } => {
                 if let Some(t) = env.tables_mut().iter_mut().find(|t| &t.name == table) {
@@ -35,12 +43,6 @@ impl Insert {
         }
 
         vec![]
-    }
-
-    pub(crate) fn table(&self) -> &str {
-        match self {
-            Insert::Values { table, .. } | Insert::Select { table, .. } => table,
-        }
     }
 }
 

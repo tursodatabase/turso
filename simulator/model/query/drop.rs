@@ -2,15 +2,15 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{table::SimValue, SimulatorEnv};
+use crate::model::{table::SimValue, Shadow, SimulatorEnv};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Drop {
     pub table: String,
 }
 
-impl Drop {
-    pub fn shadow<E: SimulatorEnv>(&self, env: &mut E) -> Vec<Vec<SimValue>> {
+impl Shadow for Drop {
+    fn shadow<E: SimulatorEnv>(&self, env: &mut E) -> Vec<Vec<SimValue>> {
         env.remove_table(&self.table);
         vec![]
     }

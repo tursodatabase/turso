@@ -3,6 +3,7 @@ use anyhow::{anyhow, Context};
 use clap::Parser;
 use limbo_sim::generation::plan::{Interaction, InteractionPlan, InteractionPlanState};
 use limbo_sim::generation::ArbitraryFrom as _;
+use limbo_sim::model::Shadow as _;
 use notify::event::{DataChange, ModifyKind};
 use notify::{EventKind, RecursiveMode, Watcher};
 use rand::prelude::*;
