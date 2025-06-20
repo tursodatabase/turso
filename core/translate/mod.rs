@@ -8,6 +8,7 @@
 //! will read rows from the database and filter them according to a WHERE clause.
 
 pub(crate) mod aggregation;
+pub(crate) mod check_constraint;
 pub(crate) mod collate;
 pub(crate) mod delete;
 pub(crate) mod display;
