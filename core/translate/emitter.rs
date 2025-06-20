@@ -8,7 +8,7 @@ use limbo_sqlite3_parser::ast::{self, SortOrder};
 use tracing::{instrument, Level};
 
 use super::aggregation::emit_ungrouped_aggregation;
-use super::check_constraint::translate_check_constraint;
+use super::check_constraint::{check_col_is_referred, translate_check_constraint};
 use super::expr::{translate_condition_expr, translate_expr, ConditionMetadata};
 use super::group_by::{
     group_by_agg_phase, group_by_emit_row_phase, init_group_by, GroupByMetadata, GroupByRowSource,
@@ -1080,6 +1080,44 @@ fn emit_update_insns(
     // we scan a column at a time, loading either the column's values, or the new value
     // from the Set expression, into registers so we can emit a MakeRecord and update the row.
     let start = if is_virtual { beg + 2 } else { beg + 1 };
+
+    let check_constraints: Vec<_> = table_ref
+        .columns()
+        .iter()
+        .filter(|col| col.check_constraint.is_some())
+        .map(|col| col.check_constraint.as_ref().unwrap())
+        .collect();
+    for constraint in &check_constraints {
+        for column in table_ref.columns().iter() {
+            if !check_col_is_referred(constraint, column.name.as_ref().map_or("", |name| &name)) {
+                continue;
+            }
+            let jump_if_true = program.allocate_label();
+            translate_check_constraint(
+                program,
+                constraint,
+                table_ref
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, col)| (start + i, col))
+                    .collect::<Vec<_>>()
+                    .as_ref(),
+                Some(jump_if_true),
+                &t_ctx.resolver,
+            );
+
+            use crate::error::SQLITE_CONSTRAINT_CHECK;
+            let description = constraint.to_string();
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_CONSTRAINT_CHECK,
+                description: description.to_string(),
+            });
+
+            program.preassign_label_to_next_insn(jump_if_true);
+            break;
+        }
+    }
     for (idx, table_column) in table_ref.columns().iter().enumerate() {
         let target_reg = start + idx;
         if let Some((_, expr)) = plan.set_clauses.iter().find(|(i, _)| *i == idx) {
@@ -1102,31 +1140,6 @@ fn emit_update_insns(
 
                 program.emit_null(target_reg, None);
             } else {
-                if let Some(check_constraint_expr) = &table_column.check_constraint {
-                    let jump_if_true = program.allocate_label();
-                    translate_check_constraint(
-                        program,
-                        &check_constraint_expr,
-                        table_ref
-                            .columns()
-                            .iter()
-                            .enumerate()
-                            .map(|(i, col)| (start + i, col))
-                            .collect::<Vec<_>>()
-                            .as_ref(),
-                        Some(jump_if_true),
-                        &t_ctx.resolver,
-                    );
-
-                    use crate::error::SQLITE_CONSTRAINT_CHECK;
-                    let description = check_constraint_expr.to_string();
-                    program.emit_insn(Insn::Halt {
-                        err_code: SQLITE_CONSTRAINT_CHECK,
-                        description: description.to_string(),
-                    });
-
-                    program.preassign_label_to_next_insn(jump_if_true);
-                };
                 translate_expr(
                     program,
                     Some(&plan.table_references),
