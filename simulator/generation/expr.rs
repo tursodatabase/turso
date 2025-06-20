@@ -5,7 +5,7 @@ use limbo_sqlite3_parser::ast::{
 use crate::{
     generation::{gen_random_text, pick, pick_index, Arbitrary, ArbitraryFrom},
     model::table::SimValue,
-    SimulatorEnv,
+    runner::env::SimulatorEnv,
 };
 
 impl<T> Arbitrary for Box<T>

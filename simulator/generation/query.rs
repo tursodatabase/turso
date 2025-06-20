@@ -6,7 +6,7 @@ use crate::model::query::select::{Distinctness, ResultColumn};
 use crate::model::query::update::Update;
 use crate::model::query::{Create, Delete, Drop, Insert, Query, Select};
 use crate::model::table::{SimValue, Table};
-use crate::SimulatorEnv;
+use crate::runner::env::SimulatorEnv;
 use rand::Rng;
 
 use super::property::Remaining;

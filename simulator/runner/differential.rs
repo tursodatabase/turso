@@ -5,11 +5,10 @@ use limbo_core::Value;
 use crate::{
     generation::{
         pick_index,
-        plan::{Interaction, InteractionPlanState, ResultSet},
+        plan::{Interaction, InteractionPlan, InteractionPlanState, ResultSet},
     },
     model::{query::Query, table::SimValue},
     runner::execution::ExecutionContinuation,
-    InteractionPlan,
 };
 
 use super::{

@@ -14,6 +14,10 @@ publish = false
 name = "limbo_sim"
 path = "main.rs"
 
+[lib]
+name = "limbo_sim"
+path = "lib.rs"
+
 [dependencies]
 limbo_core = { path = "../core", features = ["simulator"]}
 rand = "0.8.5"

@@ -19,8 +19,10 @@ use crate::{
         },
         table::SimValue,
     },
-    runner::{env::SimConnection, io::SimulatorIO},
-    SimulatorEnv,
+    runner::{
+        env::{SimConnection, SimulatorEnv},
+        io::SimulatorIO,
+    },
 };
 
 use crate::generation::{frequency, Arbitrary, ArbitraryFrom};

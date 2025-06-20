@@ -1,11 +1,10 @@
 use crate::{
     generation::{
-        plan::{InteractionPlan, Interactions},
+        plan::{Interaction, InteractionPlan, Interactions},
         property::Property,
     },
     model::query::Query,
     runner::execution::Execution,
-    Interaction,
 };
 
 impl InteractionPlan {

@@ -10,7 +10,7 @@ use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{InteractionPlan, Paths};
+use crate::{generation::plan::InteractionPlan, Paths};
 
 use super::cli::SimulatorCLI;
 
