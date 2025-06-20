@@ -19,6 +19,7 @@ use crate::{
 };
 use crate::{Result, SymbolTable, VirtualTable};
 
+use super::check_constraint::translate_check_constraint;
 use super::emitter::Resolver;
 use super::expr::{translate_expr, translate_expr_no_constant_opt, NoConstantOptReason};
 use super::optimizer::rewrite_expr;
@@ -703,413 +704,6 @@ fn resolve_indicies_for_insert(
     Ok(index_col_mappings)
 }
 
-use crate::ast;
-fn translate_helper(
-    program: &mut ProgramBuilder,
-    expr: &Expr,
-    column_mappings: &[ColumnMapping],
-    yield_reg: usize,
-    label: BranchOffset,
-    should_jump: bool,
-    resolver: &Resolver,
-) -> usize {
-    match expr {
-        ast::Expr::Literal(_) => {
-            let reg = program.alloc_register();
-            let _ = translate_expr(program, None, &expr, reg, resolver);
-            return reg;
-        }
-        ast::Expr::Id(id) => {
-            for (i, cm) in column_mappings.iter().enumerate() {
-                if cm.column.name.as_ref().map_or(false, |name| *name == id.0) {
-                    if let Some(value_index) = cm.value_index {
-                        return yield_reg + value_index;
-                    } else {
-                        return yield_reg + i;
-                    }
-                }
-            }
-            unreachable!();
-        }
-        ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) => {
-            use crate::vdbe::insn::CmpInsFlags;
-            let lhs_reg = translate_helper(
-                program,
-                lhs,
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            let rhs_reg = translate_helper(
-                program,
-                rhs,
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            if should_jump {
-                program.emit_insn(Insn::Eq {
-                    lhs: lhs_reg,
-                    rhs: rhs_reg,
-                    target_pc: label,
-                    flags: CmpInsFlags::default().jump_if_null(),
-                    collation: program.curr_collation(),
-                });
-            }
-            return rhs_reg;
-        }
-        ast::Expr::Binary(lhs, ast::Operator::NotEquals, rhs) => {
-            use crate::vdbe::insn::CmpInsFlags;
-            let lhs_reg = translate_helper(
-                program,
-                lhs,
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            let rhs_reg = translate_helper(
-                program,
-                rhs,
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            if should_jump {
-                program.emit_insn(Insn::Ne {
-                    lhs: lhs_reg,
-                    rhs: rhs_reg,
-                    target_pc: label,
-                    flags: CmpInsFlags::default().jump_if_null(),
-                    collation: program.curr_collation(),
-                });
-            }
-            return rhs_reg;
-        }
-        ast::Expr::Binary(lhs, ast::Operator::Less, rhs) => {
-            use crate::vdbe::insn::CmpInsFlags;
-            let lhs_reg = translate_helper(
-                program,
-                lhs,
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            let rhs_reg = translate_helper(
-                program,
-                rhs,
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            if should_jump {
-                program.emit_insn(Insn::Lt {
-                    lhs: lhs_reg,
-                    rhs: rhs_reg,
-                    target_pc: label,
-                    flags: CmpInsFlags::default().jump_if_null(),
-                    collation: program.curr_collation(),
-                });
-            }
-            return rhs_reg;
-        }
-        ast::Expr::Binary(lhs, ast::Operator::LessEquals, rhs) => {
-            use crate::vdbe::insn::CmpInsFlags;
-            let lhs_reg = translate_helper(
-                program,
-                lhs,
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            let rhs_reg = translate_helper(
-                program,
-                rhs,
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            if should_jump {
-                program.emit_insn(Insn::Le {
-                    lhs: lhs_reg,
-                    rhs: rhs_reg,
-                    target_pc: label,
-                    flags: CmpInsFlags::default().jump_if_null(),
-                    collation: program.curr_collation(),
-                });
-            }
-            return rhs_reg;
-        }
-        ast::Expr::Binary(lhs, ast::Operator::Greater, rhs) => {
-            use crate::vdbe::insn::CmpInsFlags;
-            let lhs_reg = translate_helper(
-                program,
-                lhs,
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            let rhs_reg = translate_helper(
-                program,
-                rhs,
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            if should_jump {
-                program.emit_insn(Insn::Gt {
-                    lhs: lhs_reg,
-                    rhs: rhs_reg,
-                    target_pc: label,
-                    flags: CmpInsFlags::default().jump_if_null(),
-                    collation: program.curr_collation(),
-                });
-            }
-            return rhs_reg;
-        }
-        ast::Expr::Binary(lhs, ast::Operator::GreaterEquals, rhs) => {
-            use crate::vdbe::insn::CmpInsFlags;
-            let lhs_reg = translate_helper(
-                program,
-                lhs,
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            let rhs_reg = translate_helper(
-                program,
-                rhs,
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            if should_jump {
-                program.emit_insn(Insn::Ge {
-                    lhs: lhs_reg,
-                    rhs: rhs_reg,
-                    target_pc: label,
-                    flags: CmpInsFlags::default().jump_if_null(),
-                    collation: program.curr_collation(),
-                });
-            }
-            return rhs_reg;
-        }
-        ast::Expr::Binary(lhs, ast::Operator::Add, rhs) => {
-            let lhs_reg = translate_helper(
-                program,
-                lhs,
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            let rhs_reg = translate_helper(
-                program,
-                rhs,
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            let dest_reg = program.alloc_register();
-            program.emit_insn(Insn::Add {
-                lhs: lhs_reg,
-                rhs: rhs_reg,
-                dest: dest_reg,
-            });
-            if should_jump {
-                program.emit_insn(Insn::If {
-                    reg: dest_reg,
-                    target_pc: label,
-                    jump_if_null: true,
-                });
-            }
-            return dest_reg;
-        }
-        ast::Expr::Binary(lhs, ast::Operator::Subtract, rhs) => {
-            let lhs_reg = translate_helper(
-                program,
-                lhs,
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            let rhs_reg = translate_helper(
-                program,
-                rhs,
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            let dest_reg = program.alloc_register();
-            program.emit_insn(Insn::Subtract {
-                lhs: lhs_reg,
-                rhs: rhs_reg,
-                dest: dest_reg,
-            });
-            if should_jump {
-                program.emit_insn(Insn::If {
-                    reg: dest_reg,
-                    target_pc: label,
-                    jump_if_null: true,
-                });
-            }
-            return dest_reg;
-        }
-        ast::Expr::Binary(lhs, ast::Operator::Multiply, rhs) => {
-            let lhs_reg = translate_helper(
-                program,
-                lhs,
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            let rhs_reg = translate_helper(
-                program,
-                rhs,
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            let dest_reg = program.alloc_register();
-            program.emit_insn(Insn::Multiply {
-                lhs: lhs_reg,
-                rhs: rhs_reg,
-                dest: dest_reg,
-            });
-            if should_jump {
-                program.emit_insn(Insn::If {
-                    reg: dest_reg,
-                    target_pc: label,
-                    jump_if_null: true,
-                });
-            }
-            return dest_reg;
-        }
-        ast::Expr::Binary(lhs, ast::Operator::Divide, rhs) => {
-            let lhs_reg = translate_helper(
-                program,
-                lhs,
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            let rhs_reg = translate_helper(
-                program,
-                rhs,
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            let dest_reg = program.alloc_register();
-            program.emit_insn(Insn::Divide {
-                lhs: lhs_reg,
-                rhs: rhs_reg,
-                dest: dest_reg,
-            });
-            if should_jump {
-                program.emit_insn(Insn::If {
-                    reg: dest_reg,
-                    target_pc: label,
-                    jump_if_null: true,
-                });
-            }
-            return dest_reg;
-        }
-        ast::Expr::Binary(lhs, ast::Operator::Modulus, rhs) => {
-            let lhs_reg = translate_helper(
-                program,
-                lhs,
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            let rhs_reg = translate_helper(
-                program,
-                rhs,
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            let dest_reg = program.alloc_register();
-            program.emit_insn(Insn::Remainder {
-                lhs: lhs_reg,
-                rhs: rhs_reg,
-                dest: dest_reg,
-            });
-            if should_jump {
-                program.emit_insn(Insn::If {
-                    reg: dest_reg,
-                    target_pc: label,
-                    jump_if_null: true,
-                });
-            }
-            return dest_reg;
-        }
-        ast::Expr::Parenthesized(expr) => {
-            let dest_reg = translate_helper(
-                program,
-                expr.get(0).expect("Expr should exist"),
-                column_mappings,
-                yield_reg,
-                label,
-                false,
-                resolver,
-            );
-            if should_jump {
-                program.emit_insn(Insn::If {
-                    reg: dest_reg,
-                    target_pc: label,
-                    jump_if_null: true,
-                });
-            }
-            return dest_reg;
-        }
-        e => todo!("{}", &e),
-    }
-}
-
 fn populate_columns_multiple_rows(
     program: &mut ProgramBuilder,
     column_mappings: &[ColumnMapping],
@@ -1126,27 +720,6 @@ fn populate_columns_multiple_rows(
         if let Some(value_index) = mapping.value_index {
             // Decrement as we have now seen a value index instead
             other_values_seen -= 1;
-            if let Some(check_constraint) = &mapping.column.check_constraint {
-                let expr = check_constraint.clone();
-                let description = &check_constraint.to_string();
-                let label = program.allocate_label();
-                let _ = translate_helper(
-                    program,
-                    &expr,
-                    column_mappings,
-                    yield_reg,
-                    label,
-                    true,
-                    resolver,
-                );
-
-                program.emit_insn(Insn::Halt {
-                    err_code: SQLITE_CONSTRAINT_CHECK,
-                    description: description.to_string(),
-                });
-
-                program.preassign_label_to_next_insn(label);
-            }
             if let Some(temp_table_ctx) = temp_table_ctx {
                 program.emit_insn(Insn::Column {
                     cursor_id: temp_table_ctx.cursor_id,
@@ -1182,6 +755,35 @@ fn populate_columns_multiple_rows(
                 );
             }
         }
+    }
+    let check_constraints: Vec<_> = column_mappings
+        .iter()
+        .filter(|cm| cm.column.check_constraint.is_some())
+        .map(|cm| cm.column.check_constraint.as_ref().unwrap())
+        .collect();
+    for constraint in &check_constraints {
+        let jump_if_true = program.allocate_label();
+        translate_check_constraint(
+            program,
+            constraint,
+            column_mappings
+                .iter()
+                .enumerate()
+                .map(|(i, cm)| (column_registers_start + i, cm.column))
+                .collect::<Vec<_>>()
+                .as_ref(),
+            Some(jump_if_true),
+            &resolver,
+        );
+
+        use crate::error::SQLITE_CONSTRAINT_CHECK;
+        let description = constraint.to_string();
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_CHECK,
+            description: description.to_string(),
+        });
+
+        program.preassign_label_to_next_insn(jump_if_true);
     }
     Ok(())
 }
@@ -1219,14 +821,6 @@ fn populate_column_registers(
             )?;
             if write_directly_to_rowid_reg {
                 program.emit_insn(Insn::SoftNull { reg: target_reg });
-            } else if let Some(_check_constraint) = &mapping.column.check_constraint {
-                translate_check_constraint(
-                    &mapping,
-                    &column_mappings,
-                    program,
-                    column_registers_start,
-                    resolver,
-                )?;
             }
         } else if let Some(default_expr) = mapping.default_value {
             translate_expr_no_constant_opt(
@@ -1254,6 +848,35 @@ fn populate_column_registers(
                 );
             }
         }
+    }
+    let check_constraints: Vec<_> = column_mappings
+        .iter()
+        .filter(|cm| cm.column.check_constraint.is_some())
+        .map(|cm| cm.column.check_constraint.as_ref().unwrap())
+        .collect();
+    for constraint in &check_constraints {
+        let jump_if_true = program.allocate_label();
+        translate_check_constraint(
+            program,
+            constraint,
+            column_mappings
+                .iter()
+                .enumerate()
+                .map(|(i, cm)| (column_registers_start + i, cm.column))
+                .collect::<Vec<_>>()
+                .as_ref(),
+            Some(jump_if_true),
+            &resolver,
+        );
+
+        use crate::error::SQLITE_CONSTRAINT_CHECK;
+        let description = constraint.to_string();
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_CHECK,
+            description: description.to_string(),
+        });
+
+        program.preassign_label_to_next_insn(jump_if_true);
     }
     Ok(())
 }
@@ -1315,35 +938,4 @@ fn translate_virtual_table_insert(
     program.resolve_label(halt_label, program.offset());
 
     Ok(program)
-}
-
-fn translate_check_constraint(
-    column_mapping: &ColumnMapping,
-    column_mappings: &[ColumnMapping],
-    program: &mut ProgramBuilder,
-    column_registers_start: usize,
-    resolver: &Resolver,
-) -> Result<()> {
-    let check_constraint = column_mapping
-        .column
-        .check_constraint
-        .clone()
-        .expect("Check Contraint must be present");
-    let description = &check_constraint.to_string();
-    let jump_if_true = program.allocate_label();
-    let _ = translate_helper(
-        program,
-        &check_constraint,
-        column_mappings,
-        column_registers_start,
-        jump_if_true,
-        true,
-        resolver,
-    );
-    program.emit_insn(Insn::Halt {
-        err_code: SQLITE_CONSTRAINT_CHECK,
-        description: description.to_string(),
-    });
-    program.preassign_label_to_next_insn(jump_if_true);
-    Ok(())
 }
