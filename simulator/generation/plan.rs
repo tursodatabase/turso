@@ -17,7 +17,7 @@ use crate::model::{
         Create, CreateIndex, Delete, Drop, Insert, Query, Select,
     },
     table::SimValue,
-    SimConnection, SimulatorEnv,
+    Shadow, SimConnection, SimulatorEnv,
 };
 
 use crate::generation::{frequency, Arbitrary, ArbitraryFrom};
@@ -283,8 +283,8 @@ impl Display for Fault {
     }
 }
 
-impl Interactions {
-    pub(crate) fn shadow<E: SimulatorEnv>(&self, env: &mut E) {
+impl Shadow for Interactions {
+    fn shadow<E: SimulatorEnv>(&self, env: &mut E) -> Vec<Vec<SimValue>> {
         match self {
             Interactions::Property(property) => {
                 match property {
@@ -302,7 +302,7 @@ impl Interactions {
                     }
                     Property::DoubleCreateFailure { create, queries } => {
                         if env.tables().iter().any(|t| t.name == create.table.name) {
-                            return;
+                            return vec![];
                         }
                         create.shadow(env);
                         for query in queries {
@@ -408,6 +408,7 @@ impl Interactions {
             }
             Interactions::Fault(_) => {}
         }
+        vec![]
     }
 }
 
@@ -497,13 +498,16 @@ impl<E: SimulatorEnv> ArbitraryFrom<&mut E> for InteractionPlan {
     }
 }
 
-impl Interaction {
-    pub fn shadow<E: SimulatorEnv>(&self, env: &mut E) -> Vec<Vec<SimValue>> {
+impl Shadow for Interaction {
+    fn shadow<E: SimulatorEnv>(&self, env: &mut E) -> Vec<Vec<SimValue>> {
         match self {
             Self::Query(query) => query.shadow(env),
             Self::Assumption(_) | Self::Assertion(_) | Self::Fault(_) => vec![],
         }
     }
+}
+
+impl Interaction {
     pub fn execute_query(&self, conn: &mut Arc<Connection>) -> ResultSet {
         if let Self::Query(query) = self {
             let query_str = query.to_string();

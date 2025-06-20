@@ -6,7 +6,7 @@ use limbo_sim::{
         pick_index,
         plan::{Interaction, InteractionPlan, InteractionPlanState, ResultSet},
     },
-    model::SimConnection,
+    model::{Shadow as _, SimConnection},
 };
 use tracing::instrument;
 

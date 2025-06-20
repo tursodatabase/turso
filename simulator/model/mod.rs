@@ -2,7 +2,7 @@ use std::{fmt::Display, mem, sync::Arc};
 
 use limbo_core::{Database, IO};
 
-use crate::model::table::Table;
+use crate::model::table::{SimValue, Table};
 
 pub mod query;
 pub mod table;
@@ -104,4 +104,8 @@ pub struct SimulatorOpts {
     pub max_interactions: usize,
     pub page_size: usize,
     pub max_time_simulation: usize,
+}
+
+pub trait Shadow {
+    fn shadow<E: SimulatorEnv>(&self, env: &mut E) -> Vec<Vec<SimValue>>;
 }

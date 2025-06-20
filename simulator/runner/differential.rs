@@ -1,7 +1,13 @@
 use std::sync::{Arc, Mutex};
 
 use limbo_core::Value;
-use limbo_sim::{generation::{pick_index, plan::{Interaction, InteractionPlan, InteractionPlanState, ResultSet}}, model::{query::Query, table::SimValue, SimConnection}};
+use limbo_sim::{
+    generation::{
+        pick_index,
+        plan::{Interaction, InteractionPlan, InteractionPlanState, ResultSet},
+    },
+    model::{query::Query, table::SimValue, SimConnection},
+};
 
 use crate::runner::execution::ExecutionContinuation;
 

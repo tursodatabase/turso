@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{table::SimValue, SimulatorEnv};
+use crate::model::{table::SimValue, Shadow, SimulatorEnv};
 
 use super::predicate::Predicate;
 
@@ -12,8 +12,8 @@ pub struct Delete {
     pub predicate: Predicate,
 }
 
-impl Delete {
-    pub fn shadow<E: SimulatorEnv>(&self, env: &mut E) -> Vec<Vec<SimValue>> {
+impl Shadow for Delete {
+    fn shadow<E: SimulatorEnv>(&self, env: &mut E) -> Vec<Vec<SimValue>> {
         let table = env
             .tables_mut()
             .iter_mut()

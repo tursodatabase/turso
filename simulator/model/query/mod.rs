@@ -10,7 +10,7 @@ pub(crate) use select::Select;
 use serde::{Deserialize, Serialize};
 use update::Update;
 
-use crate::model::{table::SimValue, SimulatorEnv};
+use crate::model::{table::SimValue, Shadow, SimulatorEnv};
 
 pub mod create;
 pub mod create_index;
@@ -60,8 +60,10 @@ impl Query {
             Query::CreateIndex(CreateIndex { table_name, .. }) => vec![table_name.clone()],
         }
     }
+}
 
-    pub fn shadow<E: SimulatorEnv>(&self, env: &mut E) -> Vec<Vec<SimValue>> {
+impl Shadow for Query {
+    fn shadow<E: SimulatorEnv>(&self, env: &mut E) -> Vec<Vec<SimValue>> {
         match self {
             Query::Create(create) => create.shadow(env),
             Query::Insert(insert) => insert.shadow(env),
