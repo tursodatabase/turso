@@ -992,7 +992,82 @@ impl ImmutableRecord {
 
     pub fn debug_string(&mut self) -> String {
         if self.is_invalidated() {
-            return "ImmutableRecord { invalidated }".to_string();
+            return Some(Err(LimboError::InternalError(
+                "Record is invalidated".into(),
+            )));
+        }
+        record_cursor.parse_full_header(self).unwrap();
+        let last_idx = record_cursor.serial_types.len().checked_sub(1)?;
+        Some(record_cursor.get_value(self, last_idx))
+    }
+
+    pub fn get_value(&self, idx: usize) -> Result<RefValue> {
+        let mut cursor = RecordCursor::new();
+        cursor.get_value(self, idx)
+    }
+
+    pub fn get_value_opt(&self, idx: usize) -> Option<RefValue> {
+        if self.is_invalidated() {
+            return None;
+        }
+
+        let mut cursor = RecordCursor::new();
+
+        match cursor.ensure_parsed_upto(self, idx) {
+            Ok(()) => {
+                if idx >= cursor.serial_types.len() {
+                    return None;
+                }
+
+                match cursor.deserialize_column(self, idx) {
+                    Ok(value) => Some(value),
+                    Err(_) => None,
+                }
+            }
+            Err(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct RecordCursor {
+    header_offsets: Vec<u32>,
+    serial_types: Vec<u32>,
+    header_parsed_count: usize,
+    header_offset: usize,
+}
+
+impl RecordCursor {
+    pub fn new() -> Self {
+        RecordCursor {
+            header_offsets: Vec::new(),
+            serial_types: Vec::new(),
+            header_parsed_count: 0,
+            header_offset: 0,
+        }
+    }
+
+    pub fn invalidate(&mut self) {
+        self.header_offsets.clear();
+        self.serial_types.clear();
+        self.header_parsed_count = 0;
+        self.header_offset = 0;
+    }
+
+    pub fn is_invalidated(&self) -> bool {
+        self.header_offsets.is_empty() && self.serial_types.is_empty()
+    }
+
+    pub fn parse_full_header(&mut self, record: &ImmutableRecord) -> Result<()> {
+        let payload = record.get_payload();
+        if payload.is_empty() {
+            return Ok(());
+        }
+
+        if self.header_parsed_count == 0 && self.header_offsets.is_empty() {
+            let (header_size, bytes_read) = read_varint(payload)?;
+            self.header_offset = bytes_read;
+            self.header_offsets.push(header_size as u32);
         }
 
         if !self.header_offsets.is_empty() {
