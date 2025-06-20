@@ -34,12 +34,22 @@ impl Sorter {
     // We do the sorting here since this is what is called by the SorterSort instruction
     pub fn sort(&mut self) {
         self.records.sort_by(|a, b| {
-            compare_immutable(
-                &a.values[..self.key_len],
-                &b.values[..self.key_len],
-                self.order,
-                &self.collations,
-            )
+            let a_values = a.get_values();
+            let b_values = b.get_values();
+
+            let a_key = if a_values.len() >= self.key_len {
+                &a_values[..self.key_len]
+            } else {
+                &a_values[..]
+            };
+
+            let b_key = if b_values.len() >= self.key_len {
+                &b_values[..self.key_len]
+            } else {
+                &b_values[..]
+            };
+
+            compare_immutable(a_key, b_key, self.order, &self.collations)
         });
         self.records.reverse();
         self.next()
