@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use anyhow::{anyhow, Context};
 use clap::Parser;
 use generation::plan::{Interaction, InteractionPlan, InteractionPlanState};

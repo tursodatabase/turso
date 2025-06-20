@@ -40,6 +40,7 @@ impl Builder {
         }
     }
 
+    #[allow(unused_variables)]
     pub async fn build(self) -> Result<Database> {
         match self.path.as_str() {
             ":memory:" => {
