@@ -6,7 +6,7 @@ use crate::model::query::select::{Distinctness, ResultColumn};
 use crate::model::query::update::Update;
 use crate::model::query::{Create, Delete, Drop, Insert, Query, Select};
 use crate::model::table::{SimValue, Table};
-use crate::runner::env::SimulatorEnv;
+use crate::runner::env::LimboSimulatorEnv;
 use rand::Rng;
 
 use super::property::Remaining;
@@ -20,8 +20,8 @@ impl Arbitrary for Create {
     }
 }
 
-impl ArbitraryFrom<&SimulatorEnv> for Select {
-    fn arbitrary_from<R: Rng>(rng: &mut R, env: &SimulatorEnv) -> Self {
+impl ArbitraryFrom<&LimboSimulatorEnv> for Select {
+    fn arbitrary_from<R: Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Self {
         let table = pick(&env.tables, rng);
         Self {
             table: table.name.clone(),
@@ -33,8 +33,8 @@ impl ArbitraryFrom<&SimulatorEnv> for Select {
     }
 }
 
-impl ArbitraryFrom<&SimulatorEnv> for Insert {
-    fn arbitrary_from<R: Rng>(rng: &mut R, env: &SimulatorEnv) -> Self {
+impl ArbitraryFrom<&LimboSimulatorEnv> for Insert {
+    fn arbitrary_from<R: Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Self {
         let gen_values = |rng: &mut R| {
             let table = pick(&env.tables, rng);
             let num_rows = rng.gen_range(1..10);
@@ -86,8 +86,8 @@ impl ArbitraryFrom<&SimulatorEnv> for Insert {
     }
 }
 
-impl ArbitraryFrom<&SimulatorEnv> for Delete {
-    fn arbitrary_from<R: Rng>(rng: &mut R, env: &SimulatorEnv) -> Self {
+impl ArbitraryFrom<&LimboSimulatorEnv> for Delete {
+    fn arbitrary_from<R: Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Self {
         let table = pick(&env.tables, rng);
         Self {
             table: table.name.clone(),
@@ -96,8 +96,8 @@ impl ArbitraryFrom<&SimulatorEnv> for Delete {
     }
 }
 
-impl ArbitraryFrom<&SimulatorEnv> for Drop {
-    fn arbitrary_from<R: Rng>(rng: &mut R, env: &SimulatorEnv) -> Self {
+impl ArbitraryFrom<&LimboSimulatorEnv> for Drop {
+    fn arbitrary_from<R: Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Self {
         let table = pick(&env.tables, rng);
         Self {
             table: table.name.clone(),
@@ -105,8 +105,11 @@ impl ArbitraryFrom<&SimulatorEnv> for Drop {
     }
 }
 
-impl ArbitraryFrom<(&SimulatorEnv, &Remaining)> for Query {
-    fn arbitrary_from<R: Rng>(rng: &mut R, (env, remaining): (&SimulatorEnv, &Remaining)) -> Self {
+impl ArbitraryFrom<(&LimboSimulatorEnv, &Remaining)> for Query {
+    fn arbitrary_from<R: Rng>(
+        rng: &mut R,
+        (env, remaining): (&LimboSimulatorEnv, &Remaining),
+    ) -> Self {
         frequency(
             vec![
                 (
@@ -131,8 +134,8 @@ impl ArbitraryFrom<(&SimulatorEnv, &Remaining)> for Query {
     }
 }
 
-impl ArbitraryFrom<&SimulatorEnv> for Update {
-    fn arbitrary_from<R: Rng>(rng: &mut R, env: &SimulatorEnv) -> Self {
+impl ArbitraryFrom<&LimboSimulatorEnv> for Update {
+    fn arbitrary_from<R: Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Self {
         let table = pick(&env.tables, rng);
         let mut seen = HashSet::new();
         let num_cols = rng.gen_range(1..=table.columns.len());

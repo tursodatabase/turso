@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{model::table::SimValue, runner::env::SimulatorEnv};
+use crate::{model::table::SimValue, runner::env::LimboSimulatorEnv};
 
 use super::predicate::Predicate;
 
@@ -14,7 +14,7 @@ pub(crate) struct Update {
 }
 
 impl Update {
-    pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<SimValue>> {
+    pub(crate) fn shadow(&self, env: &mut LimboSimulatorEnv) -> Vec<Vec<SimValue>> {
         let table = env
             .tables
             .iter_mut()

@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{model::table::SimValue, runner::env::SimulatorEnv};
+use crate::{model::table::SimValue, runner::env::LimboSimulatorEnv};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Drop {
@@ -10,7 +10,7 @@ pub(crate) struct Drop {
 }
 
 impl Drop {
-    pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<SimValue>> {
+    pub(crate) fn shadow(&self, env: &mut LimboSimulatorEnv) -> Vec<Vec<SimValue>> {
         env.tables.retain(|t| t.name != self.table);
         vec![]
     }

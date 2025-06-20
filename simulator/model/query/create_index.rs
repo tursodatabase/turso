@@ -1,6 +1,6 @@
 use crate::{
     generation::{gen_random_text, pick, pick_n_unique, ArbitraryFrom},
-    runner::env::SimulatorEnv,
+    runner::env::LimboSimulatorEnv,
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,7 @@ pub(crate) struct CreateIndex {
 impl CreateIndex {
     pub(crate) fn shadow(
         &self,
-        _env: &mut crate::runner::env::SimulatorEnv,
+        _env: &mut crate::runner::env::LimboSimulatorEnv,
     ) -> Vec<Vec<crate::model::table::SimValue>> {
         // CREATE INDEX doesn't require any shadowing; we don't need to keep track
         // in the simulator what indexes exist.
@@ -54,8 +54,8 @@ impl std::fmt::Display for CreateIndex {
     }
 }
 
-impl ArbitraryFrom<&SimulatorEnv> for CreateIndex {
-    fn arbitrary_from<R: Rng>(rng: &mut R, env: &SimulatorEnv) -> Self {
+impl ArbitraryFrom<&LimboSimulatorEnv> for CreateIndex {
+    fn arbitrary_from<R: Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Self {
         assert!(
             !env.tables.is_empty(),
             "Cannot create an index when no tables exist in the environment."

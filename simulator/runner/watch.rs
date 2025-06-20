@@ -9,12 +9,12 @@ use crate::{
 };
 
 use super::{
-    env::{SimConnection, SimulatorEnv},
+    env::{SimConnection, LimboSimulatorEnv},
     execution::{execute_interaction, Execution, ExecutionHistory, ExecutionResult},
 };
 
 pub(crate) fn run_simulation(
-    env: Arc<Mutex<SimulatorEnv>>,
+    env: Arc<Mutex<LimboSimulatorEnv>>,
     plans: &mut [Vec<Vec<Interaction>>],
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
@@ -37,7 +37,7 @@ pub(crate) fn run_simulation(
 }
 
 pub(crate) fn execute_plans(
-    env: Arc<Mutex<SimulatorEnv>>,
+    env: Arc<Mutex<LimboSimulatorEnv>>,
     plans: &mut [Vec<Vec<Interaction>>],
     states: &mut [InteractionPlanState],
     last_execution: Arc<Mutex<Execution>>,
@@ -81,7 +81,7 @@ pub(crate) fn execute_plans(
 }
 
 fn execute_plan(
-    env: &mut SimulatorEnv,
+    env: &mut LimboSimulatorEnv,
     connection_index: usize,
     plans: &mut [Vec<Vec<Interaction>>],
     states: &mut [InteractionPlanState],

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     model::table::{SimValue, Table},
-    runner::env::SimulatorEnv,
+    runner::env::LimboSimulatorEnv,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,7 +13,7 @@ pub(crate) struct Create {
 }
 
 impl Create {
-    pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<SimValue>> {
+    pub(crate) fn shadow(&self, env: &mut LimboSimulatorEnv) -> Vec<Vec<SimValue>> {
         if !env.tables.iter().any(|t| t.name == self.table.name) {
             env.tables.push(self.table.clone());
         }
