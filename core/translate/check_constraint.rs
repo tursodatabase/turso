@@ -7,6 +7,24 @@ use crate::vdbe::{insn::Insn, BranchOffset};
 use limbo_sqlite3_parser::ast;
 use limbo_sqlite3_parser::ast::Expr;
 
+use crate::translate::expr::walk_expr;
+use crate::Result;
+pub fn check_col_is_referred(expr: &Expr, name: &str) -> bool {
+    let mut col_is_referred = false;
+    let _ = walk_expr(expr, &mut |expr: &Expr| -> Result<()> {
+        match expr {
+            ast::Expr::Id(id) => {
+                if !col_is_referred {
+                    col_is_referred = id.0 == name;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    });
+    col_is_referred
+}
+
 pub fn translate_check_constraint(
     program: &mut ProgramBuilder,
     check_constraint_expr: &Expr,
