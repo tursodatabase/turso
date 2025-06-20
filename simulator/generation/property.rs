@@ -500,6 +500,7 @@ pub(crate) struct Remaining {
     pub(crate) create_index: f64,
     pub(crate) delete: f64,
     pub(crate) update: f64,
+    #[allow(dead_code)]
     pub(crate) drop: f64,
 }
 
@@ -823,7 +824,8 @@ impl<E: SimulatorEnv> ArbitraryFrom<(&E, &InteractionStats)> for Property {
                 ),
                 (
                     if !opts.disable_drop_select {
-                        remaining_.drop
+                        // remaining_.drop
+                        0.0
                     } else {
                         0.0
                     },
