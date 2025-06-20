@@ -56,16 +56,27 @@ impl ObjectFinalize for Database {
 #[napi]
 impl Database {
     #[napi(constructor)]
-    pub fn new(path: String, _options: Option<OpenDatabaseOptions>) -> napi::Result<Self> {
+    pub fn new(path: String, options: Option<OpenDatabaseOptions>) -> napi::Result<Self> {
         let memory = path == ":memory:";
         let io: Arc<dyn limbo_core::IO> = if memory {
             Arc::new(limbo_core::MemoryIO::new())
         } else {
             Arc::new(limbo_core::PlatformIO::new().map_err(into_napi_error)?)
         };
-        let file = io
-            .open_file(&path, limbo_core::OpenFlags::Create, false)
-            .map_err(into_napi_error)?;
+
+        let opts = options.unwrap_or(OpenDatabaseOptions {
+            readonly: false,
+            file_must_exist: false,
+            timeout: 0,
+        });
+
+        let flag = if opts.readonly {
+            limbo_core::OpenFlags::ReadOnly
+        } else {
+            limbo_core::OpenFlags::Create
+        };
+
+        let file = io.open_file(&path, flag, false).map_err(into_napi_error)?;
         maybe_init_database_file(&file, &io).map_err(into_napi_error)?;
         let db_file = Arc::new(DatabaseFile::new(file));
         let db = limbo_core::Database::open(io.clone(), &path, db_file, false)
@@ -115,6 +126,11 @@ impl Database {
             }
             _ => stmt.run(env, None),
         }
+    }
+
+    #[napi]
+    pub fn readonly(&self) {
+        todo!()
     }
 
     #[napi]
