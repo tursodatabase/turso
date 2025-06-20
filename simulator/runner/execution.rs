@@ -8,7 +8,7 @@ use crate::generation::{
     plan::{Interaction, InteractionPlan, InteractionPlanState, ResultSet},
 };
 
-use super::env::{SimConnection, SimulatorEnv};
+use super::env::{SimConnection, LimboSimulatorEnv};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Execution {
@@ -56,7 +56,7 @@ impl ExecutionResult {
 }
 
 pub(crate) fn execute_plans(
-    env: Arc<Mutex<SimulatorEnv>>,
+    env: Arc<Mutex<LimboSimulatorEnv>>,
     plans: &mut [InteractionPlan],
     states: &mut [InteractionPlanState],
     last_execution: Arc<Mutex<Execution>>,
@@ -106,7 +106,7 @@ pub(crate) fn execute_plans(
 }
 
 fn execute_plan(
-    env: &mut SimulatorEnv,
+    env: &mut LimboSimulatorEnv,
     connection_index: usize,
     plans: &mut [InteractionPlan],
     states: &mut [InteractionPlanState],
@@ -176,7 +176,7 @@ pub(crate) enum ExecutionContinuation {
 
 #[instrument(skip(env, interaction, stack), fields(interaction = %interaction))]
 pub(crate) fn execute_interaction(
-    env: &mut SimulatorEnv,
+    env: &mut LimboSimulatorEnv,
     connection_index: usize,
     interaction: &Interaction,
     stack: &mut Vec<ResultSet>,

@@ -13,7 +13,7 @@ use crate::runner::io::SimulatorIO;
 
 use super::cli::SimulatorCLI;
 
-pub(crate) struct SimulatorEnv {
+pub(crate) struct LimboSimulatorEnv {
     pub(crate) opts: SimulatorOpts,
     pub(crate) tables: Vec<Table>,
     pub(crate) connections: Vec<SimConnection>,
@@ -23,9 +23,9 @@ pub(crate) struct SimulatorEnv {
     pub(crate) db_path: String,
 }
 
-impl SimulatorEnv {
+impl LimboSimulatorEnv {
     pub(crate) fn clone_without_connections(&self) -> Self {
-        SimulatorEnv {
+        LimboSimulatorEnv {
             opts: self.opts.clone(),
             tables: self.tables.clone(),
             connections: (0..self.connections.len())
@@ -39,7 +39,7 @@ impl SimulatorEnv {
     }
 }
 
-impl SimulatorEnv {
+impl LimboSimulatorEnv {
     pub(crate) fn new(seed: u64, cli_opts: &SimulatorCLI, db_path: &Path) -> Self {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
@@ -146,7 +146,7 @@ impl SimulatorEnv {
             .map(|_| SimConnection::Disconnected)
             .collect::<Vec<_>>();
 
-        SimulatorEnv {
+        LimboSimulatorEnv {
             opts,
             tables: Vec::new(),
             connections,

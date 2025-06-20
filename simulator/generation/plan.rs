@@ -20,7 +20,7 @@ use crate::{
         table::SimValue,
     },
     runner::{
-        env::{SimConnection, SimulatorEnv},
+        env::{LimboSimulatorEnv, SimConnection},
         io::SimulatorIO,
     },
 };
@@ -253,7 +253,7 @@ impl Display for Interaction {
     }
 }
 
-type AssertionFunc = dyn Fn(&Vec<ResultSet>, &SimulatorEnv) -> Result<bool>;
+type AssertionFunc = dyn Fn(&Vec<ResultSet>, &LimboSimulatorEnv) -> Result<bool>;
 
 enum AssertionAST {
     Pick(),
@@ -288,7 +288,7 @@ impl Display for Fault {
 }
 
 impl Interactions {
-    pub(crate) fn shadow(&self, env: &mut SimulatorEnv) {
+    pub(crate) fn shadow(&self, env: &mut LimboSimulatorEnv) {
         match self {
             Interactions::Property(property) => {
                 match property {
@@ -471,8 +471,8 @@ impl InteractionPlan {
     }
 }
 
-impl ArbitraryFrom<&mut SimulatorEnv> for InteractionPlan {
-    fn arbitrary_from<R: rand::Rng>(rng: &mut R, env: &mut SimulatorEnv) -> Self {
+impl ArbitraryFrom<&mut LimboSimulatorEnv> for InteractionPlan {
+    fn arbitrary_from<R: rand::Rng>(rng: &mut R, env: &mut LimboSimulatorEnv) -> Self {
         let mut plan = InteractionPlan::new();
 
         let num_interactions = env.opts.max_interactions;
@@ -502,7 +502,7 @@ impl ArbitraryFrom<&mut SimulatorEnv> for InteractionPlan {
 }
 
 impl Interaction {
-    pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<SimValue>> {
+    pub(crate) fn shadow(&self, env: &mut LimboSimulatorEnv) -> Vec<Vec<SimValue>> {
         match self {
             Self::Query(query) => query.shadow(env),
             Self::Assumption(_) | Self::Assertion(_) | Self::Fault(_) => vec![],
@@ -556,7 +556,7 @@ impl Interaction {
     pub(crate) fn execute_assertion(
         &self,
         stack: &Vec<ResultSet>,
-        env: &SimulatorEnv,
+        env: &LimboSimulatorEnv,
     ) -> Result<()> {
         match self {
             Self::Query(_) => {
@@ -587,7 +587,7 @@ impl Interaction {
     pub(crate) fn execute_assumption(
         &self,
         stack: &Vec<ResultSet>,
-        env: &SimulatorEnv,
+        env: &LimboSimulatorEnv,
     ) -> Result<()> {
         match self {
             Self::Query(_) => {
@@ -615,7 +615,11 @@ impl Interaction {
         }
     }
 
-    pub(crate) fn execute_fault(&self, env: &mut SimulatorEnv, conn_index: usize) -> Result<()> {
+    pub(crate) fn execute_fault(
+        &self,
+        env: &mut LimboSimulatorEnv,
+        conn_index: usize,
+    ) -> Result<()> {
         match self {
             Self::Query(_) => {
                 unreachable!("unexpected: this function should only be called on faults")
@@ -671,31 +675,31 @@ impl Interaction {
     }
 }
 
-fn random_create<R: rand::Rng>(rng: &mut R, _env: &SimulatorEnv) -> Interactions {
+fn random_create<R: rand::Rng>(rng: &mut R, _env: &LimboSimulatorEnv) -> Interactions {
     Interactions::Query(Query::Create(Create::arbitrary(rng)))
 }
 
-fn random_read<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
+fn random_read<R: rand::Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Interactions {
     Interactions::Query(Query::Select(Select::arbitrary_from(rng, env)))
 }
 
-fn random_write<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
+fn random_write<R: rand::Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Interactions {
     Interactions::Query(Query::Insert(Insert::arbitrary_from(rng, env)))
 }
 
-fn random_delete<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
+fn random_delete<R: rand::Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Interactions {
     Interactions::Query(Query::Delete(Delete::arbitrary_from(rng, env)))
 }
 
-fn random_update<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
+fn random_update<R: rand::Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Interactions {
     Interactions::Query(Query::Update(Update::arbitrary_from(rng, env)))
 }
 
-fn random_drop<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
+fn random_drop<R: rand::Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Interactions {
     Interactions::Query(Query::Drop(Drop::arbitrary_from(rng, env)))
 }
 
-fn random_create_index<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Option<Interactions> {
+fn random_create_index<R: rand::Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Option<Interactions> {
     if env.tables.is_empty() {
         return None;
     }
@@ -704,7 +708,7 @@ fn random_create_index<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Option<
     )))
 }
 
-fn random_fault<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
+fn random_fault<R: rand::Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Interactions {
     let faults = if env.opts.disable_reopen_database {
         vec![Fault::Disconnect]
     } else {
@@ -714,10 +718,10 @@ fn random_fault<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
     Interactions::Fault(fault)
 }
 
-impl ArbitraryFrom<(&SimulatorEnv, InteractionStats)> for Interactions {
+impl ArbitraryFrom<(&LimboSimulatorEnv, InteractionStats)> for Interactions {
     fn arbitrary_from<R: rand::Rng>(
         rng: &mut R,
-        (env, stats): (&SimulatorEnv, InteractionStats),
+        (env, stats): (&LimboSimulatorEnv, InteractionStats),
     ) -> Self {
         let remaining_ = remaining(env, &stats);
         frequency(

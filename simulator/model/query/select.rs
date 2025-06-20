@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{model::table::SimValue, runner::env::SimulatorEnv};
+use crate::{model::table::SimValue, runner::env::LimboSimulatorEnv};
 
 use super::predicate::Predicate;
 
@@ -46,7 +46,7 @@ pub(crate) struct Select {
 }
 
 impl Select {
-    pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<SimValue>> {
+    pub(crate) fn shadow(&self, env: &mut LimboSimulatorEnv) -> Vec<Vec<SimValue>> {
         let table = env.tables.iter().find(|t| t.name == self.table.as_str());
         if let Some(table) = table {
             table
