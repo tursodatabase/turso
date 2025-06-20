@@ -8,9 +8,11 @@ use crate::storage::wal::{CheckpointResult, Wal, WalFsyncStatus};
 use crate::types::CursorResult;
 use crate::{Buffer, Connection, LimboError, Result};
 use crate::{Completion, WalFile};
+use core::fmt;
 use parking_lot::RwLock;
 use std::cell::{OnceCell, RefCell, UnsafeCell};
 use std::collections::HashSet;
+use std::fmt::Display;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -141,6 +143,68 @@ impl Page {
     }
 }
 
+#[cfg(test)]
+/// Total cache hits, misses, writes, spills
+pub struct PagerStats((AtomicUsize, AtomicUsize, AtomicUsize, AtomicUsize));
+
+#[cfg(test)]
+impl PagerStats {
+    pub fn new() -> Self {
+        Self((
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        ))
+    }
+
+    pub fn hit(&self) {
+        self.0 .0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn miss(&self) {
+        self.0 .1.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn write(&self) {
+        self.0 .2.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn spill(&self) {
+        self.0 .3.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn hits(&self) -> usize {
+        self.0 .0.load(Ordering::SeqCst)
+    }
+
+    pub fn misses(&self) -> usize {
+        self.0 .1.load(Ordering::SeqCst)
+    }
+
+    pub fn writes(&self) -> usize {
+        self.0 .2.load(Ordering::SeqCst)
+    }
+
+    pub fn spills(&self) -> usize {
+        self.0 .3.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+impl Display for PagerStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Hits: {}, Misses: {}, Writes: {}, Spills: {}",
+            self.hits(),
+            self.misses(),
+            self.writes(),
+            self.spills()
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 /// The state of the current pager cache flush.
 enum FlushState {
@@ -227,6 +291,9 @@ pub struct Pager {
     /// to change it.
     page_size: OnceCell<u16>,
     reserved_space: OnceCell<u8>,
+
+    #[cfg(test)]
+    stats: PagerStats,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -293,6 +360,8 @@ impl Pager {
             allocate_page1_state,
             page_size: OnceCell::new(),
             reserved_space: OnceCell::new(),
+            #[cfg(test)]
+            stats: PagerStats::new(),
         })
     }
 
