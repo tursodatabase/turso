@@ -1,14 +1,13 @@
 #![allow(clippy::arc_with_non_send_sync, dead_code)]
 use anyhow::{anyhow, Context};
 use clap::Parser;
-use generation::plan::{Interaction, InteractionPlan, InteractionPlanState};
-use generation::ArbitraryFrom;
+use limbo_sim::generation::plan::{Interaction, InteractionPlan, InteractionPlanState};
+use limbo_sim::generation::ArbitraryFrom as _;
 use notify::event::{DataChange, ModifyKind};
 use notify::{EventKind, RecursiveMode, Watcher};
 use rand::prelude::*;
 use runner::bugbase::{Bug, BugBase, LoadedBug};
 use runner::cli::{SimulatorCLI, SimulatorCommand};
-use runner::env::SimulatorEnv;
 use runner::execution::{execute_plans, Execution, ExecutionHistory, ExecutionResult};
 use runner::{differential, watch};
 use std::any::Any;
@@ -22,8 +21,9 @@ use tracing_subscriber::fmt::format;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod generation;
-mod model;
+use crate::runner::env::LimboSimulatorEnv;
+use crate::shrink::plan::shrink_interaction_plan;
+
 mod runner;
 mod shrink;
 struct Paths {
@@ -214,7 +214,7 @@ fn watch_mode(
                         std::panic::catch_unwind(|| {
                             let plan: Vec<Vec<Interaction>> =
                                 InteractionPlan::compute_via_diff(&paths.plan);
-                            let mut env = SimulatorEnv::new(seed, cli_opts, &paths.db);
+                            let mut env = LimboSimulatorEnv::new(seed, cli_opts, &paths.db);
                             plan.iter().for_each(|is| {
                                 is.iter().for_each(|i| {
                                     i.shadow(&mut env);
@@ -249,7 +249,7 @@ fn run_simulator(
     bugbase: Option<&mut BugBase>,
     cli_opts: &SimulatorCLI,
     paths: &Paths,
-    env: SimulatorEnv,
+    env: LimboSimulatorEnv,
     plans: Vec<InteractionPlan>,
     last_execution: Arc<Mutex<Execution>>,
 ) -> anyhow::Result<()> {
@@ -326,7 +326,7 @@ fn run_simulator(
                 let shrunk_plans = plans
                     .iter()
                     .map(|plan| {
-                        let shrunk = plan.shrink_interaction_plan(last_execution);
+                        let shrunk = shrink_interaction_plan(plan, last_execution);
                         tracing::info!("{}", shrunk.stats());
                         shrunk
                     })
@@ -337,7 +337,7 @@ fn run_simulator(
                 f.write_all(shrunk_plans[0].to_string().as_bytes()).unwrap();
 
                 let last_execution = Arc::new(Mutex::new(*last_execution));
-                let env = SimulatorEnv::new(seed, cli_opts, &paths.shrunk_db);
+                let env = LimboSimulatorEnv::new(seed, cli_opts, &paths.shrunk_db);
 
                 let env = Arc::new(Mutex::new(env));
                 let shrunk = SandboxedResult::from(
@@ -423,7 +423,7 @@ fn doublecheck(
     last_execution: Arc<Mutex<Execution>>,
     result: SandboxedResult,
 ) -> anyhow::Result<()> {
-    let env = SimulatorEnv::new(seed, cli_opts, &paths.doublecheck_db);
+    let env = LimboSimulatorEnv::new(seed, cli_opts, &paths.doublecheck_db);
     let env = Arc::new(Mutex::new(env));
 
     // Run the simulation again
@@ -496,8 +496,10 @@ fn differential_testing(
     plans: Vec<InteractionPlan>,
     last_execution: Arc<Mutex<Execution>>,
 ) -> anyhow::Result<()> {
-    let env = Arc::new(Mutex::new(SimulatorEnv::new(seed, cli_opts, &paths.db)));
-    let rusqlite_env = Arc::new(Mutex::new(SimulatorEnv::new(
+    let env = Arc::new(Mutex::new(LimboSimulatorEnv::new(
+        seed, cli_opts, &paths.db,
+    )));
+    let rusqlite_env = Arc::new(Mutex::new(LimboSimulatorEnv::new(
         seed,
         cli_opts,
         &paths.diff_db,
@@ -593,7 +595,7 @@ fn setup_simulation(
     cli_opts: &SimulatorCLI,
     plan_path: fn(&Paths) -> &Path,
     db_path: fn(&Paths) -> &Path,
-) -> (u64, SimulatorEnv, Vec<InteractionPlan>, Paths) {
+) -> (u64, LimboSimulatorEnv, Vec<InteractionPlan>, Paths) {
     if let Some(seed) = &cli_opts.load {
         let seed = seed.parse::<u64>().expect("seed should be a number");
         let bugbase = bugbase.expect("BugBase must be enabled to load a bug");
@@ -606,7 +608,7 @@ fn setup_simulation(
         if !paths.base.exists() {
             std::fs::create_dir_all(&paths.base).unwrap();
         }
-        let env = SimulatorEnv::new(bug.seed(), cli_opts, db_path(&paths));
+        let env = LimboSimulatorEnv::new(bug.seed(), cli_opts, db_path(&paths));
 
         let plan = match bug {
             Bug::Loaded(LoadedBug { plan, .. }) => plan.clone(),
@@ -650,7 +652,7 @@ fn setup_simulation(
             Paths::new(&dir)
         };
 
-        let mut env = SimulatorEnv::new(seed, cli_opts, &paths.db);
+        let mut env = LimboSimulatorEnv::new(seed, cli_opts, &paths.db);
 
         tracing::info!("Generating database interaction plan...");
 
@@ -673,7 +675,7 @@ fn setup_simulation(
 }
 
 fn run_simulation(
-    env: Arc<Mutex<SimulatorEnv>>,
+    env: Arc<Mutex<LimboSimulatorEnv>>,
     plans: &mut [InteractionPlan],
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {

@@ -1,13 +1,10 @@
-use std::fmt::Display;
-use std::mem;
 use std::path::Path;
 use std::sync::Arc;
 
-use limbo_core::Database;
+use limbo_core::{Database, IO};
+use limbo_sim::model::{table::Table, SimConnection, SimulatorEnv, SimulatorOpts};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-
-use crate::model::table::Table;
 
 use crate::runner::io::SimulatorIO;
 
@@ -23,19 +20,49 @@ pub(crate) struct LimboSimulatorEnv {
     pub(crate) db_path: String,
 }
 
-impl LimboSimulatorEnv {
-    pub(crate) fn clone_without_connections(&self) -> Self {
-        LimboSimulatorEnv {
-            opts: self.opts.clone(),
-            tables: self.tables.clone(),
-            connections: (0..self.connections.len())
-                .map(|_| SimConnection::Disconnected)
-                .collect(),
-            io: self.io.clone(),
-            db: self.db.clone(),
-            rng: self.rng.clone(),
-            db_path: self.db_path.clone(),
-        }
+impl SimulatorEnv for LimboSimulatorEnv {
+    fn tables(&self) -> &[Table] {
+        &self.tables
+    }
+
+    fn tables_mut(&mut self) -> &mut [Table] {
+        &mut self.tables
+    }
+
+    fn add_table(&mut self, table: Table) {
+        self.tables.push(table);
+    }
+
+    fn remove_table(&mut self, table_name: &str) {
+        self.tables.retain(|t| t.name != table_name);
+    }
+
+    fn opts(&self) -> &SimulatorOpts {
+        &self.opts
+    }
+
+    fn connections(&self) -> &[SimConnection] {
+        &self.connections
+    }
+
+    fn connections_mut(&mut self) -> &mut Vec<SimConnection> {
+        &mut self.connections
+    }
+
+    fn db_path(&self) -> &str {
+        &self.db_path
+    }
+
+    fn io(&self) -> Arc<dyn IO> {
+        self.io.clone()
+    }
+
+    fn get_db(&self) -> Arc<Database> {
+        self.db.clone()
+    }
+
+    fn set_db(&mut self, db: Arc<Database>) {
+        self.db = db;
     }
 }
 
@@ -156,84 +183,18 @@ impl LimboSimulatorEnv {
             db_path: db_path.to_str().unwrap().to_string(),
         }
     }
-}
 
-pub trait ConnectionTrait
-where
-    Self: std::marker::Sized + Clone,
-{
-    fn is_connected(&self) -> bool;
-    fn disconnect(&mut self);
-}
-
-pub(crate) enum SimConnection {
-    LimboConnection(Arc<limbo_core::Connection>),
-    SQLiteConnection(rusqlite::Connection),
-    Disconnected,
-}
-
-impl SimConnection {
-    pub(crate) fn is_connected(&self) -> bool {
-        match self {
-            SimConnection::LimboConnection(_) | SimConnection::SQLiteConnection(_) => true,
-            SimConnection::Disconnected => false,
+    pub(crate) fn clone_without_connections(&self) -> Self {
+        LimboSimulatorEnv {
+            opts: self.opts.clone(),
+            tables: self.tables.clone(),
+            connections: (0..self.connections.len())
+                .map(|_| SimConnection::Disconnected)
+                .collect(),
+            io: self.io.clone(),
+            db: self.db.clone(),
+            db_path: self.db_path.clone(),
+            rng: self.rng.clone(),
         }
     }
-    pub(crate) fn disconnect(&mut self) {
-        let conn = mem::replace(self, SimConnection::Disconnected);
-
-        match conn {
-            SimConnection::LimboConnection(conn) => {
-                conn.close().unwrap();
-            }
-            SimConnection::SQLiteConnection(conn) => {
-                conn.close().unwrap();
-            }
-            SimConnection::Disconnected => {}
-        }
-    }
-}
-
-impl Display for SimConnection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SimConnection::LimboConnection(_) => {
-                write!(f, "LimboConnection")
-            }
-            SimConnection::SQLiteConnection(_) => {
-                write!(f, "SQLiteConnection")
-            }
-            SimConnection::Disconnected => {
-                write!(f, "Disconnected")
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct SimulatorOpts {
-    pub(crate) ticks: usize,
-    pub(crate) max_connections: usize,
-    pub(crate) max_tables: usize,
-    // this next options are the distribution of workload where read_percent + write_percent +
-    // delete_percent == 100%
-    pub(crate) create_percent: f64,
-    pub(crate) create_index_percent: f64,
-    pub(crate) read_percent: f64,
-    pub(crate) write_percent: f64,
-    pub(crate) delete_percent: f64,
-    pub(crate) update_percent: f64,
-    pub(crate) drop_percent: f64,
-
-    pub(crate) disable_select_optimizer: bool,
-    pub(crate) disable_insert_values_select: bool,
-    pub(crate) disable_double_create_failure: bool,
-    pub(crate) disable_select_limit: bool,
-    pub(crate) disable_delete_select: bool,
-    pub(crate) disable_drop_select: bool,
-    pub(crate) disable_reopen_database: bool,
-
-    pub(crate) max_interactions: usize,
-    pub(crate) page_size: usize,
-    pub(crate) max_time_simulation: usize,
 }

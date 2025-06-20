@@ -2,13 +2,13 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{model::table::SimValue, runner::env::LimboSimulatorEnv};
+use crate::model::{table::SimValue, SimulatorEnv};
 
 use super::predicate::Predicate;
 
 /// `SELECT` distinctness
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) enum Distinctness {
+pub enum Distinctness {
     /// `DISTINCT`
     Distinct,
     /// `ALL`
@@ -37,17 +37,17 @@ impl Display for ResultColumn {
     }
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Select {
-    pub(crate) table: String,
-    pub(crate) result_columns: Vec<ResultColumn>,
-    pub(crate) predicate: Predicate,
-    pub(crate) distinct: Distinctness,
-    pub(crate) limit: Option<usize>,
+pub struct Select {
+    pub table: String,
+    pub result_columns: Vec<ResultColumn>,
+    pub predicate: Predicate,
+    pub distinct: Distinctness,
+    pub limit: Option<usize>,
 }
 
 impl Select {
-    pub(crate) fn shadow(&self, env: &mut LimboSimulatorEnv) -> Vec<Vec<SimValue>> {
-        let table = env.tables.iter().find(|t| t.name == self.table.as_str());
+    pub(crate) fn shadow<E: SimulatorEnv>(&self, env: &mut E) -> Vec<Vec<SimValue>> {
+        let table = env.tables().iter().find(|t| t.name == self.table.as_str());
         if let Some(table) = table {
             table
                 .rows

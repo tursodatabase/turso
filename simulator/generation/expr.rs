@@ -4,8 +4,7 @@ use limbo_sqlite3_parser::ast::{
 
 use crate::{
     generation::{gen_random_text, pick, pick_index, Arbitrary, ArbitraryFrom},
-    model::table::SimValue,
-    runner::env::LimboSimulatorEnv,
+    model::{table::SimValue, SimulatorEnv},
 };
 
 impl<T> Arbitrary for Box<T>
@@ -55,8 +54,8 @@ where
 }
 
 // Freestyling generation
-impl ArbitraryFrom<&LimboSimulatorEnv> for Expr {
-    fn arbitrary_from<R: rand::Rng>(rng: &mut R, t: &LimboSimulatorEnv) -> Self {
+impl<E: SimulatorEnv> ArbitraryFrom<&E> for Expr {
+    fn arbitrary_from<R: rand::Rng>(rng: &mut R, t: &E) -> Self {
         let choice = rng.gen_range(0..13);
 
         match choice {
@@ -112,8 +111,9 @@ impl ArbitraryFrom<&LimboSimulatorEnv> for Expr {
             // TODO: only supports one paranthesized expression
             10 => Expr::Parenthesized(vec![Expr::arbitrary_from(rng, t)]),
             11 => {
-                let table_idx = pick_index(t.tables.len(), rng);
-                let table = &t.tables[table_idx];
+                let tables = t.tables();
+                let table_idx = pick_index(tables.len(), rng);
+                let table = &tables[table_idx];
                 let col_idx = pick_index(table.columns.len(), rng);
                 let col = &table.columns[col_idx];
                 Expr::Qualified(Name(table.name.clone()), Name(col.name.clone()))
@@ -196,18 +196,19 @@ impl Arbitrary for CollateName {
     }
 }
 
-impl ArbitraryFrom<&LimboSimulatorEnv> for QualifiedName {
-    fn arbitrary_from<R: rand::Rng>(rng: &mut R, t: &LimboSimulatorEnv) -> Self {
+impl<E: SimulatorEnv> ArbitraryFrom<&E> for QualifiedName {
+    fn arbitrary_from<R: rand::Rng>(rng: &mut R, t: &E) -> Self {
         // TODO: for now just generate table name
-        let table_idx = pick_index(t.tables.len(), rng);
-        let table = &t.tables[table_idx];
+        let tables = t.tables();
+        let table_idx = pick_index(tables.len(), rng);
+        let table = &tables[table_idx];
         // TODO: for now forego alias
         Self::single(Name(table.name.clone()))
     }
 }
 
-impl ArbitraryFrom<&LimboSimulatorEnv> for LikeOperator {
-    fn arbitrary_from<R: rand::Rng>(rng: &mut R, _t: &LimboSimulatorEnv) -> Self {
+impl<E: SimulatorEnv> ArbitraryFrom<&E> for LikeOperator {
+    fn arbitrary_from<R: rand::Rng>(rng: &mut R, _t: &E) -> Self {
         let choice = rng.gen_range(0..4);
         match choice {
             0 => LikeOperator::Glob,
@@ -220,8 +221,8 @@ impl ArbitraryFrom<&LimboSimulatorEnv> for LikeOperator {
 }
 
 // Current implementation does not take into account the columns affinity nor if table is Strict
-impl ArbitraryFrom<&LimboSimulatorEnv> for ast::Literal {
-    fn arbitrary_from<R: rand::Rng>(rng: &mut R, _t: &LimboSimulatorEnv) -> Self {
+impl<E: SimulatorEnv> ArbitraryFrom<&E> for ast::Literal {
+    fn arbitrary_from<R: rand::Rng>(rng: &mut R, _t: &E) -> Self {
         loop {
             let choice = rng.gen_range(0..5);
             let lit = match choice {
@@ -258,8 +259,8 @@ impl ArbitraryFrom<&Vec<&SimValue>> for ast::Expr {
     }
 }
 
-impl ArbitraryFrom<&LimboSimulatorEnv> for UnaryOperator {
-    fn arbitrary_from<R: rand::Rng>(rng: &mut R, _t: &LimboSimulatorEnv) -> Self {
+impl<E: SimulatorEnv> ArbitraryFrom<&E> for UnaryOperator {
+    fn arbitrary_from<R: rand::Rng>(rng: &mut R, _t: &E) -> Self {
         let choice = rng.gen_range(0..4);
         match choice {
             0 => Self::BitwiseNot,

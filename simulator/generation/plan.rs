@@ -6,34 +6,29 @@ use std::{
     vec,
 };
 
-use limbo_core::{Connection, Result, StepResult, IO};
+use limbo_core::{Connection, Result, StepResult};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    model::{
-        query::{
-            predicate::Predicate,
-            select::{Distinctness, ResultColumn},
-            update::Update,
-            Create, CreateIndex, Delete, Drop, Insert, Query, Select,
-        },
-        table::SimValue,
+use crate::model::{
+    query::{
+        predicate::Predicate,
+        select::{Distinctness, ResultColumn},
+        update::Update,
+        Create, CreateIndex, Delete, Drop, Insert, Query, Select,
     },
-    runner::{
-        env::{LimboSimulatorEnv, SimConnection},
-        io::SimulatorIO,
-    },
+    table::SimValue,
+    SimConnection, SimulatorEnv,
 };
 
 use crate::generation::{frequency, Arbitrary, ArbitraryFrom};
 
 use super::property::{remaining, Property};
 
-pub(crate) type ResultSet = Result<Vec<Vec<SimValue>>>;
+pub type ResultSet = Result<Vec<Vec<SimValue>>>;
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct InteractionPlan {
-    pub(crate) plan: Vec<Interactions>,
+pub struct InteractionPlan {
+    pub plan: Vec<Interactions>,
 }
 
 impl InteractionPlan {
@@ -43,7 +38,7 @@ impl InteractionPlan {
     /// delete interactions from the human readable file, and this function uses the JSON file as
     /// a baseline to detect with interactions were deleted and constructs the plan from the
     /// remaining interactions.
-    pub(crate) fn compute_via_diff(plan_path: &Path) -> Vec<Vec<Interaction>> {
+    pub fn compute_via_diff(plan_path: &Path) -> Vec<Vec<Interaction>> {
         let interactions = std::fs::read_to_string(plan_path).unwrap();
         let interactions = interactions.lines().collect::<Vec<_>>();
 
@@ -100,21 +95,21 @@ impl InteractionPlan {
     }
 }
 
-pub(crate) struct InteractionPlanState {
-    pub(crate) stack: Vec<ResultSet>,
-    pub(crate) interaction_pointer: usize,
-    pub(crate) secondary_pointer: usize,
+pub struct InteractionPlanState {
+    pub stack: Vec<ResultSet>,
+    pub interaction_pointer: usize,
+    pub secondary_pointer: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum Interactions {
+pub enum Interactions {
     Property(Property),
     Query(Query),
     Fault(Fault),
 }
 
 impl Interactions {
-    pub(crate) fn name(&self) -> Option<&str> {
+    pub fn name(&self) -> Option<&str> {
         match self {
             Interactions::Property(property) => Some(property.name()),
             Interactions::Query(_) => None,
@@ -122,7 +117,7 @@ impl Interactions {
         }
     }
 
-    pub(crate) fn interactions(&self) -> Vec<Interaction> {
+    pub fn interactions(&self) -> Vec<Interaction> {
         match self {
             Interactions::Property(property) => property.interactions(),
             Interactions::Query(query) => vec![Interaction::Query(query.clone())],
@@ -132,7 +127,7 @@ impl Interactions {
 }
 
 impl Interactions {
-    pub(crate) fn dependencies(&self) -> HashSet<String> {
+    pub fn dependencies(&self) -> HashSet<String> {
         match self {
             Interactions::Property(property) => {
                 property
@@ -151,7 +146,7 @@ impl Interactions {
         }
     }
 
-    pub(crate) fn uses(&self) -> Vec<String> {
+    pub fn uses(&self) -> Vec<String> {
         match self {
             Interactions::Property(property) => {
                 property
@@ -208,14 +203,14 @@ impl Display for InteractionPlan {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct InteractionStats {
-    pub(crate) read_count: usize,
-    pub(crate) write_count: usize,
-    pub(crate) delete_count: usize,
-    pub(crate) update_count: usize,
-    pub(crate) create_count: usize,
-    pub(crate) create_index_count: usize,
-    pub(crate) drop_count: usize,
+pub struct InteractionStats {
+    pub read_count: usize,
+    pub write_count: usize,
+    pub delete_count: usize,
+    pub update_count: usize,
+    pub create_count: usize,
+    pub create_index_count: usize,
+    pub drop_count: usize,
 }
 
 impl Display for InteractionStats {
@@ -235,7 +230,7 @@ impl Display for InteractionStats {
 }
 
 #[derive(Debug)]
-pub(crate) enum Interaction {
+pub enum Interaction {
     Query(Query),
     Assumption(Assertion),
     Assertion(Assertion),
@@ -253,15 +248,16 @@ impl Display for Interaction {
     }
 }
 
-type AssertionFunc = dyn Fn(&Vec<ResultSet>, &LimboSimulatorEnv) -> Result<bool>;
+type AssertionFunc = dyn Fn(&Vec<ResultSet>, &dyn SimulatorEnv) -> Result<bool>;
 
+#[allow(dead_code)]
 enum AssertionAST {
     Pick(),
 }
 
-pub(crate) struct Assertion {
-    pub(crate) func: Box<AssertionFunc>,
-    pub(crate) message: String,
+pub struct Assertion {
+    pub func: Box<AssertionFunc>,
+    pub message: String,
 }
 
 impl Debug for Assertion {
@@ -273,7 +269,7 @@ impl Debug for Assertion {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum Fault {
+pub enum Fault {
     Disconnect,
     ReopenDatabase,
 }
@@ -288,7 +284,7 @@ impl Display for Fault {
 }
 
 impl Interactions {
-    pub(crate) fn shadow(&self, env: &mut LimboSimulatorEnv) {
+    pub(crate) fn shadow<E: SimulatorEnv>(&self, env: &mut E) {
         match self {
             Interactions::Property(property) => {
                 match property {
@@ -305,7 +301,7 @@ impl Interactions {
                         select.shadow(env);
                     }
                     Property::DoubleCreateFailure { create, queries } => {
-                        if env.tables.iter().any(|t| t.name == create.table.name) {
+                        if env.tables().iter().any(|t| t.name == create.table.name) {
                             return;
                         }
                         create.shadow(env);
@@ -416,11 +412,11 @@ impl Interactions {
 }
 
 impl InteractionPlan {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self { plan: Vec::new() }
     }
 
-    pub(crate) fn stats(&self) -> InteractionStats {
+    pub fn stats(&self) -> InteractionStats {
         let mut read = 0;
         let mut write = 0;
         let mut delete = 0;
@@ -471,15 +467,15 @@ impl InteractionPlan {
     }
 }
 
-impl ArbitraryFrom<&mut LimboSimulatorEnv> for InteractionPlan {
-    fn arbitrary_from<R: rand::Rng>(rng: &mut R, env: &mut LimboSimulatorEnv) -> Self {
+impl<E: SimulatorEnv> ArbitraryFrom<&mut E> for InteractionPlan {
+    fn arbitrary_from<R: rand::Rng>(rng: &mut R, env: &mut E) -> Self {
         let mut plan = InteractionPlan::new();
 
-        let num_interactions = env.opts.max_interactions;
+        let num_interactions = env.opts().max_interactions;
 
         // First create at least one table
         let create_query = Create::arbitrary(rng);
-        env.tables.push(create_query.table.clone());
+        env.add_table(create_query.table.clone());
 
         plan.plan
             .push(Interactions::Query(Query::Create(create_query)));
@@ -502,13 +498,13 @@ impl ArbitraryFrom<&mut LimboSimulatorEnv> for InteractionPlan {
 }
 
 impl Interaction {
-    pub(crate) fn shadow(&self, env: &mut LimboSimulatorEnv) -> Vec<Vec<SimValue>> {
+    pub fn shadow<E: SimulatorEnv>(&self, env: &mut E) -> Vec<Vec<SimValue>> {
         match self {
             Self::Query(query) => query.shadow(env),
             Self::Assumption(_) | Self::Assertion(_) | Self::Fault(_) => vec![],
         }
     }
-    pub(crate) fn execute_query(&self, conn: &mut Arc<Connection>, io: &SimulatorIO) -> ResultSet {
+    pub fn execute_query(&self, conn: &mut Arc<Connection>) -> ResultSet {
         if let Self::Query(query) = self {
             let query_str = query.to_string();
             let rows = conn.query(&query_str);
@@ -537,7 +533,7 @@ impl Interaction {
                         out.push(r);
                     }
                     StepResult::IO => {
-                        io.run_once().unwrap();
+                        rows.run_once().unwrap();
                     }
                     StepResult::Interrupt => {}
                     StepResult::Done => {
@@ -553,10 +549,10 @@ impl Interaction {
         }
     }
 
-    pub(crate) fn execute_assertion(
+    pub fn execute_assertion<E: SimulatorEnv>(
         &self,
         stack: &Vec<ResultSet>,
-        env: &LimboSimulatorEnv,
+        env: &E,
     ) -> Result<()> {
         match self {
             Self::Query(_) => {
@@ -584,10 +580,10 @@ impl Interaction {
         }
     }
 
-    pub(crate) fn execute_assumption(
+    pub fn execute_assumption<E: SimulatorEnv>(
         &self,
         stack: &Vec<ResultSet>,
-        env: &LimboSimulatorEnv,
+        env: &E,
     ) -> Result<()> {
         match self {
             Self::Query(_) => {
@@ -615,11 +611,7 @@ impl Interaction {
         }
     }
 
-    pub(crate) fn execute_fault(
-        &self,
-        env: &mut LimboSimulatorEnv,
-        conn_index: usize,
-    ) -> Result<()> {
+    pub fn execute_fault<E: SimulatorEnv>(&self, env: &mut E, conn_index: usize) -> Result<()> {
         match self {
             Self::Query(_) => {
                 unreachable!("unexpected: this function should only be called on faults")
@@ -633,25 +625,26 @@ impl Interaction {
             Self::Fault(fault) => {
                 match fault {
                     Fault::Disconnect => {
-                        if env.connections[conn_index].is_connected() {
-                            env.connections[conn_index].disconnect();
+                        let connections = env.connections_mut();
+                        if connections[conn_index].is_connected() {
+                            connections[conn_index].disconnect();
                         } else {
                             return Err(limbo_core::LimboError::InternalError(
                                 "connection already disconnected".into(),
                             ));
                         }
-                        env.connections[conn_index] = SimConnection::Disconnected;
+                        connections[conn_index] = SimConnection::Disconnected;
                     }
                     Fault::ReopenDatabase => {
                         // 1. Close all connections without default checkpoint-on-close behavior
                         // to expose bugs related to how we handle WAL
-                        let num_conns = env.connections.len();
-                        env.connections.clear();
+                        let num_conns = env.connections().len();
+                        env.connections_mut().clear();
 
                         // 2. Re-open database
-                        let db_path = env.db_path.clone();
+                        let db_path = env.db_path();
                         let db = match limbo_core::Database::open_file(
-                            env.io.clone(),
+                            env.io().clone(),
                             &db_path,
                             false,
                             false,
@@ -661,11 +654,12 @@ impl Interaction {
                                 panic!("error opening simulator test file {:?}: {:?}", db_path, e);
                             }
                         };
-                        env.db = db;
+                        env.set_db(db);
+                        let db = env.get_db();
 
+                        let connections = env.connections_mut();
                         for _ in 0..num_conns {
-                            env.connections
-                                .push(SimConnection::LimboConnection(env.db.connect().unwrap()));
+                            connections.push(SimConnection::LimboConnection(db.connect().unwrap()));
                         }
                     }
                 }
@@ -675,32 +669,35 @@ impl Interaction {
     }
 }
 
-fn random_create<R: rand::Rng>(rng: &mut R, _env: &LimboSimulatorEnv) -> Interactions {
+fn random_create<R: rand::Rng, E: SimulatorEnv>(rng: &mut R, _env: &E) -> Interactions {
     Interactions::Query(Query::Create(Create::arbitrary(rng)))
 }
 
-fn random_read<R: rand::Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Interactions {
+fn random_read<R: rand::Rng, E: SimulatorEnv>(rng: &mut R, env: &E) -> Interactions {
     Interactions::Query(Query::Select(Select::arbitrary_from(rng, env)))
 }
 
-fn random_write<R: rand::Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Interactions {
+fn random_write<R: rand::Rng, E: SimulatorEnv>(rng: &mut R, env: &E) -> Interactions {
     Interactions::Query(Query::Insert(Insert::arbitrary_from(rng, env)))
 }
 
-fn random_delete<R: rand::Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Interactions {
+fn random_delete<R: rand::Rng, E: SimulatorEnv>(rng: &mut R, env: &E) -> Interactions {
     Interactions::Query(Query::Delete(Delete::arbitrary_from(rng, env)))
 }
 
-fn random_update<R: rand::Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Interactions {
+fn random_update<R: rand::Rng, E: SimulatorEnv>(rng: &mut R, env: &E) -> Interactions {
     Interactions::Query(Query::Update(Update::arbitrary_from(rng, env)))
 }
 
-fn random_drop<R: rand::Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Interactions {
+fn random_drop<R: rand::Rng, E: SimulatorEnv>(rng: &mut R, env: &E) -> Interactions {
     Interactions::Query(Query::Drop(Drop::arbitrary_from(rng, env)))
 }
 
-fn random_create_index<R: rand::Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Option<Interactions> {
-    if env.tables.is_empty() {
+fn random_create_index<R: rand::Rng, E: SimulatorEnv>(
+    rng: &mut R,
+    env: &E,
+) -> Option<Interactions> {
+    if env.tables().is_empty() {
         return None;
     }
     Some(Interactions::Query(Query::CreateIndex(
@@ -708,8 +705,8 @@ fn random_create_index<R: rand::Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Op
     )))
 }
 
-fn random_fault<R: rand::Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Interactions {
-    let faults = if env.opts.disable_reopen_database {
+fn random_fault<R: rand::Rng, E: SimulatorEnv>(rng: &mut R, env: &E) -> Interactions {
+    let faults = if env.opts().disable_reopen_database {
         vec![Fault::Disconnect]
     } else {
         vec![Fault::Disconnect, Fault::ReopenDatabase]
@@ -718,11 +715,8 @@ fn random_fault<R: rand::Rng>(rng: &mut R, env: &LimboSimulatorEnv) -> Interacti
     Interactions::Fault(fault)
 }
 
-impl ArbitraryFrom<(&LimboSimulatorEnv, InteractionStats)> for Interactions {
-    fn arbitrary_from<R: rand::Rng>(
-        rng: &mut R,
-        (env, stats): (&LimboSimulatorEnv, InteractionStats),
-    ) -> Self {
+impl<E: SimulatorEnv> ArbitraryFrom<(&E, InteractionStats)> for Interactions {
+    fn arbitrary_from<R: rand::Rng>(rng: &mut R, (env, stats): (&E, InteractionStats)) -> Self {
         let remaining_ = remaining(env, &stats);
         frequency(
             vec![

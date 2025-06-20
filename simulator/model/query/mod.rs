@@ -10,7 +10,7 @@ pub(crate) use select::Select;
 use serde::{Deserialize, Serialize};
 use update::Update;
 
-use crate::{model::table::SimValue, runner::env::LimboSimulatorEnv};
+use crate::model::{table::SimValue, SimulatorEnv};
 
 pub mod create;
 pub mod create_index;
@@ -23,7 +23,7 @@ pub mod update;
 
 // This type represents the potential queries on the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum Query {
+pub enum Query {
     Create(Create),
     Select(Select),
     Insert(Insert),
@@ -34,7 +34,7 @@ pub(crate) enum Query {
 }
 
 impl Query {
-    pub(crate) fn dependencies(&self) -> HashSet<String> {
+    pub fn dependencies(&self) -> HashSet<String> {
         match self {
             Query::Create(_) => HashSet::new(),
             Query::Select(Select { table, .. })
@@ -48,7 +48,7 @@ impl Query {
             }
         }
     }
-    pub(crate) fn uses(&self) -> Vec<String> {
+    pub fn uses(&self) -> Vec<String> {
         match self {
             Query::Create(Create { table }) => vec![table.name.clone()],
             Query::Select(Select { table, .. })
@@ -61,7 +61,7 @@ impl Query {
         }
     }
 
-    pub(crate) fn shadow(&self, env: &mut LimboSimulatorEnv) -> Vec<Vec<SimValue>> {
+    pub fn shadow<E: SimulatorEnv>(&self, env: &mut E) -> Vec<Vec<SimValue>> {
         match self {
             Query::Create(create) => create.shadow(env),
             Query::Insert(insert) => insert.shadow(env),

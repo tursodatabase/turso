@@ -15,18 +15,18 @@ impl Deref for Name {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Table {
-    pub(crate) rows: Vec<Vec<SimValue>>,
-    pub(crate) name: String,
-    pub(crate) columns: Vec<Column>,
+pub struct Table {
+    pub rows: Vec<Vec<SimValue>>,
+    pub name: String,
+    pub columns: Vec<Column>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Column {
-    pub(crate) name: String,
-    pub(crate) column_type: ColumnType,
-    pub(crate) primary: bool,
-    pub(crate) unique: bool,
+pub struct Column {
+    pub name: String,
+    pub column_type: ColumnType,
+    pub primary: bool,
+    pub unique: bool,
 }
 
 // Uniquely defined by name in this case
@@ -45,7 +45,7 @@ impl PartialEq for Column {
 impl Eq for Column {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum ColumnType {
+pub enum ColumnType {
     Integer,
     Float,
     Text,
@@ -63,23 +63,8 @@ impl Display for ColumnType {
     }
 }
 
-fn float_to_string<S>(float: &f64, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    serializer.serialize_str(&format!("{}", float))
-}
-
-fn string_to_float<'de, D>(deserializer: D) -> Result<f64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s = String::deserialize(deserializer)?;
-    s.parse().map_err(serde::de::Error::custom)
-}
-
 #[derive(Clone, Debug, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub(crate) struct SimValue(pub limbo_core::Value);
+pub struct SimValue(pub limbo_core::Value);
 
 fn to_sqlite_blob(bytes: &[u8]) -> String {
     format!(

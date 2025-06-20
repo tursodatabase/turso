@@ -1,18 +1,12 @@
 use std::sync::{Arc, Mutex};
 
 use limbo_core::Value;
+use limbo_sim::{generation::{pick_index, plan::{Interaction, InteractionPlan, InteractionPlanState, ResultSet}}, model::{query::Query, table::SimValue, SimConnection}};
 
-use crate::{
-    generation::{
-        pick_index,
-        plan::{Interaction, InteractionPlan, InteractionPlanState, ResultSet},
-    },
-    model::{query::Query, table::SimValue},
-    runner::execution::ExecutionContinuation,
-};
+use crate::runner::execution::ExecutionContinuation;
 
 use super::{
-    env::{SimConnection, LimboSimulatorEnv},
+    env::LimboSimulatorEnv,
     execution::{execute_interaction, Execution, ExecutionHistory, ExecutionResult},
 };
 
