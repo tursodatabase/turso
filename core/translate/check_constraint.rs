@@ -15,8 +15,12 @@ pub fn new_translate_check_constraint(
     column_registers_start: usize,
     resolver: &Resolver,
 ) {
-    // Run table check constraints
-    for check_constraint in &table.table_check_constraints {
+    let check_constraints = table
+        .table_check_constraints
+        .iter()
+        .chain(table.column_check_constraints.iter());
+    // Run all constraint checks
+    for check_constraint in check_constraints {
         let jump_if_true = program.allocate_label();
         translate_check_constraint(
             program,
@@ -36,40 +40,6 @@ pub fn new_translate_check_constraint(
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_CHECK,
             description: check_constraint.description(),
-        });
-
-        program.preassign_label_to_next_insn(jump_if_true);
-    }
-
-    // Run column check constraints
-    let check_constraints: Vec<_> = table
-        .columns
-        .iter()
-        .filter(|col| col.check_constraint.is_some())
-        .map(|col| col.check_constraint.as_ref().unwrap())
-        .collect();
-
-    for constraint in &check_constraints {
-        let jump_if_true = program.allocate_label();
-        translate_check_constraint(
-            program,
-            constraint,
-            table
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(i, col)| (column_registers_start + i, col))
-                .collect::<Vec<_>>()
-                .as_ref(),
-            Some(jump_if_true),
-            &resolver,
-        );
-
-        use crate::error::SQLITE_CONSTRAINT_CHECK;
-        let description = constraint.to_string();
-        program.emit_insn(Insn::Halt {
-            err_code: SQLITE_CONSTRAINT_CHECK,
-            description: description.to_string(),
         });
 
         program.preassign_label_to_next_insn(jump_if_true);

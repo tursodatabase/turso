@@ -513,7 +513,6 @@ pub fn columns_from_create_table_body(body: &ast::CreateTableBody) -> crate::Res
                         }
                         None => Type::Null,
                     },
-                    check_constraint: None,
                     default: column_def
                         .constraints
                         .iter()

@@ -198,6 +198,7 @@ pub struct BTreeTable {
     pub is_strict: bool,
     pub unique_sets: Option<Vec<Vec<(String, SortOrder)>>>,
     pub table_check_constraints: Vec<CheckConstraint>,
+    pub column_check_constraints: Vec<CheckConstraint>,
 }
 
 impl BTreeTable {
@@ -282,7 +283,6 @@ impl PseudoTable {
             primary_key,
             is_rowid_alias: false,
             notnull: false,
-            check_constraint: None,
             default: None,
             unique: false,
             collation: None,
@@ -351,6 +351,7 @@ fn create_table(
     // BtreeSet here to preserve order of inserted keys
     let mut unique_sets: Vec<BTreeSet<UniqueColumnProps>> = vec![];
     let mut table_check_constraints = vec![];
+    let mut column_check_constraints = vec![];
     match body {
         CreateTableBody::ColumnsAndConstraints {
             columns,
@@ -468,7 +469,6 @@ fn create_table(
                 let mut notnull = false;
                 let mut order = SortOrder::Asc;
                 let mut unique = false;
-                let mut check_constraint = None;
                 let mut collation = None;
                 for c_def in &col_def.constraints {
                     match &c_def.constraint {
@@ -488,7 +488,10 @@ fn create_table(
                             default = Some(expr.clone())
                         }
                         limbo_sqlite3_parser::ast::ColumnConstraint::Check(expr) => {
-                            check_constraint = Some(expr.clone())
+                            column_check_constraints.push(CheckConstraint {
+                                name: None,
+                                expr: expr.clone(),
+                            });
                         }
                         // TODO: for now we don't check Resolve type of unique
                         limbo_sqlite3_parser::ast::ColumnConstraint::Unique(on_conflict) => {
@@ -513,7 +516,6 @@ fn create_table(
                 {
                     primary_key = true;
                 }
-
                 cols.push(Column {
                     name: Some(normalize_ident(&name)),
                     ty,
@@ -521,7 +523,6 @@ fn create_table(
                     primary_key,
                     is_rowid_alias: typename_exactly_integer && primary_key,
                     notnull,
-                    check_constraint,
                     default,
                     unique,
                     collation,
@@ -547,6 +548,7 @@ fn create_table(
         primary_key_columns,
         columns: cols,
         table_check_constraints,
+        column_check_constraints,
         is_strict,
         unique_sets: if unique_sets.is_empty() {
             None
@@ -611,7 +613,6 @@ pub struct Column {
     pub notnull: bool,
     pub default: Option<Expr>,
     pub unique: bool,
-    pub check_constraint: Option<Expr>,
     pub collation: Option<CollationSeq>,
 }
 
@@ -823,6 +824,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
         is_strict: false,
         primary_key_columns: vec![],
         table_check_constraints: vec![],
+        column_check_constraints: vec![],
         columns: vec![
             Column {
                 name: Some("type".to_string()),
@@ -831,7 +833,6 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 primary_key: false,
                 is_rowid_alias: false,
                 notnull: false,
-                check_constraint: None,
                 default: None,
                 unique: false,
                 collation: None,
@@ -843,7 +844,6 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 primary_key: false,
                 is_rowid_alias: false,
                 notnull: false,
-                check_constraint: None,
                 default: None,
                 unique: false,
                 collation: None,
@@ -855,7 +855,6 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 primary_key: false,
                 is_rowid_alias: false,
                 notnull: false,
-                check_constraint: None,
                 default: None,
                 unique: false,
                 collation: None,
@@ -867,7 +866,6 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 primary_key: false,
                 is_rowid_alias: false,
                 notnull: false,
-                check_constraint: None,
                 default: None,
                 unique: false,
                 collation: None,
@@ -879,7 +877,6 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 primary_key: false,
                 is_rowid_alias: false,
                 notnull: false,
-                check_constraint: None,
                 default: None,
                 unique: false,
                 collation: None,
@@ -1527,7 +1524,6 @@ mod tests {
                 is_rowid_alias: false,
                 notnull: false,
                 default: None,
-                check_constraint: None,
                 unique: false,
                 collation: None,
             }],

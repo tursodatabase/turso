@@ -773,6 +773,7 @@ pub fn translate_drop_table(
             has_rowid: true,
             primary_key_columns: vec![],
             table_check_constraints: vec![],
+            column_check_constraints: vec![],
             columns: vec![Column {
                 name: Some("rowid".to_string()),
                 ty: Type::Integer,
@@ -782,7 +783,6 @@ pub fn translate_drop_table(
                 notnull: false,
                 default: None,
                 unique: false,
-                check_constraint: None,
                 collation: None,
             }],
             is_strict: false,
