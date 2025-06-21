@@ -408,9 +408,8 @@ impl SortedChunk {
         let buffer_ref_copy = buffer_ref.clone();
         let chunk_io_state_copy = self.io_state.clone();
         let write_complete = Box::new(move |bytes_written: i32| {
-            let buf_len = buffer_ref_copy.borrow().len();
             chunk_io_state_copy.set(SortedChunkIOState::WriteComplete);
-
+            let buf_len = buffer_ref_copy.borrow().len();
             if bytes_written < buf_len as i32 {
                 tracing::error!("wrote({bytes_written}) less than expected({buf_len})");
             }

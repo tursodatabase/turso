@@ -89,8 +89,8 @@ impl File for WindowsFile {
             let mut buf = r.buf_mut();
             let buf = buf.as_mut_slice();
             file.read_exact(buf)?;
-        }
-        c.complete(0);
+            c.complete(buf.len() as i32);
+        };
         Ok(())
     }
 
