@@ -416,6 +416,21 @@ fn create_table(
                 }
             }
             for (col_name, col_def) in columns {
+                for c in col_def.constraints.iter() {
+                    match c {
+                        limbo_sqlite3_parser::ast::NamedColumnConstraint { name, constraint } => {
+                            match constraint {
+                                limbo_sqlite3_parser::ast::ColumnConstraint::Check(expr) => {
+                                    column_check_constraints.push(CheckConstraint {
+                                        name: name.as_ref().map(|name| name.0.clone()),
+                                        expr: expr.clone(),
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
                 let name = col_name.0.to_string();
                 // Regular sqlite tables have an integer rowid that uniquely identifies a row.
                 // Even if you create a table with a column e.g. 'id INT PRIMARY KEY', there will still
@@ -504,7 +519,9 @@ fn create_table(
                             collation = Some(CollationSeq::new(collation_name.0.as_str())?);
                         }
                         // Collate
-                        _ => {}
+                        e => {
+                            dbg!(&e);
+                        }
                     }
                 }
 
