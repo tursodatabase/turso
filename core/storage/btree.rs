@@ -4335,12 +4335,12 @@ impl BTreeCursor {
                         };
                         // Convert LazyRecord to ImmutableRecord for cloning
                         let values = lazy_record.get_values()?;
-                        let immutable = ImmutableRecord::from_registers(
-                            &values
-                                .into_iter()
-                                .map(|v| crate::vdbe::Register::Value(v.to_owned()))
-                                .collect::<Vec<_>>(),
-                        );
+                        let registers: Vec<_> = values
+                            .into_iter()
+                            .map(|v| crate::vdbe::Register::Value(v.to_owned()))
+                            .collect();
+                        let immutable =
+                            ImmutableRecord::from_registers(&registers, registers.len());
                         DeleteSavepoint::Payload(immutable)
                     } else {
                         let Some(rowid) = return_if_io!(self.rowid()) else {

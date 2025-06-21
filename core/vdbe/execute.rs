@@ -1941,12 +1941,11 @@ pub fn op_row_data(
 
         // Convert LazyRecord to ImmutableRecord for storing in register
         let values = lazy_record.get_values()?;
-        ImmutableRecord::from_registers(
-            &values
-                .into_iter()
-                .map(|v| Register::Value(v.to_owned()))
-                .collect::<Vec<_>>(),
-        )
+        let registers: Vec<_> = values
+            .into_iter()
+            .map(|v| Register::Value(v.to_owned()))
+            .collect();
+        ImmutableRecord::from_registers(&registers, registers.len())
     };
 
     let reg = &mut state.registers[*dest];
