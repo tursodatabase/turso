@@ -246,7 +246,7 @@ impl IO for UnixIO {
                 };
                 match result {
                     Ok(n) => match &cf {
-                        CompletionCallback::Read(_, ref c, _) => c.complete(0),
+                        CompletionCallback::Read(_, ref c, _) => c.complete(n as i32),
                         CompletionCallback::Write(_, ref c, _, _) => c.complete(n as i32),
                     },
                     Err(e) => return Err(e.into()),
@@ -344,7 +344,7 @@ impl File for UnixFile<'_> {
             Ok(n) => {
                 trace!("pread n: {}", n);
                 // Read succeeded immediately
-                c.complete(0);
+                c.complete(n as i32);
                 Ok(())
             }
             Err(Errno::AGAIN) => {

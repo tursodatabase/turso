@@ -217,13 +217,14 @@ impl limbo_core::File for File {
             limbo_core::Completion::Read(ref r) => r,
             _ => unreachable!(),
         };
+        let nr = 0;
         {
             let mut buf = r.buf_mut();
             let buf: &mut [u8] = buf.as_mut_slice();
             let nr = self.vfs.pread(self.fd, buf, pos);
             assert!(nr >= 0);
         }
-        r.complete();
+        r.complete(nr);
         Ok(())
     }
 

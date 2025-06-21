@@ -295,7 +295,7 @@ pub fn begin_read_database_header(
     let buf = Arc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
     let result = Arc::new(SpinLock::new(DatabaseHeader::default()));
     let header = result.clone();
-    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>, _bytes_read: i32| {
         let header = header.clone();
         finish_read_database_header(buf, header).unwrap();
     });
@@ -793,7 +793,7 @@ pub fn begin_read_page(
     });
     #[allow(clippy::arc_with_non_send_sync)]
     let buf = Arc::new(RefCell::new(Buffer::new(buf, drop_fn)));
-    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>, _bytes_read: i32| {
         let page = page.clone();
         if finish_read_page(page_idx, buf, page.clone()).is_err() {
             page.set_error();
@@ -1368,7 +1368,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
     }));
     let wal_file_shared_for_completion = wal_file_shared_ret.clone();
 
-    let complete: Box<Complete> = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+    let complete: Box<Complete> = Box::new(move |buf: Arc<RefCell<Buffer>>, _bytes_read: i32| {
         let buf = buf.borrow();
         let buf_slice = buf.as_slice();
         let mut header_locked = header.lock();
@@ -1514,7 +1514,7 @@ pub fn begin_read_wal_frame(
     io: &Arc<dyn File>,
     offset: usize,
     buffer_pool: Rc<BufferPool>,
-    complete: Box<dyn Fn(Arc<RefCell<Buffer>>)>,
+    complete: Box<dyn Fn(Arc<RefCell<Buffer>>, i32)>,
 ) -> Result<Arc<Completion>> {
     tracing::trace!("begin_read_wal_frame(offset={})", offset);
     let buf = buffer_pool.get();

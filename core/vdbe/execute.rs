@@ -2957,10 +2957,11 @@ pub fn op_sorter_open(
     };
     let cache_size = program.connection.get_cache_size();
     // Set the buffer size threshold to be roughly the same as the limit configured for the page-cache.
+    let page_size = program.database_header.lock().get_page_size() as usize;
     let max_buffer_size_bytes = if cache_size < 0 {
         (cache_size.abs() * 1024) as usize
     } else {
-        (cache_size as usize) * (program.database_header.lock().get_page_size() as usize)
+        (cache_size as usize) * page_size
     };
     let cursor = Sorter::new(
         order,
@@ -2969,6 +2970,8 @@ pub fn op_sorter_open(
             .map(|collation| collation.unwrap_or_default())
             .collect(),
         max_buffer_size_bytes,
+        page_size,
+        pager.io.clone(),
     );
     let mut cursors = state.cursors.borrow_mut();
     cursors
@@ -3061,7 +3064,9 @@ pub fn op_sorter_sort(
         let cursor = cursor.as_sorter_mut();
         let is_empty = cursor.is_empty();
         if !is_empty {
-            cursor.sort()?;
+            if let CursorResult::IO = cursor.sort()? {
+                return Ok(InsnFunctionStepResult::IO);
+            }
         }
         is_empty
     };
@@ -3091,7 +3096,9 @@ pub fn op_sorter_next(
     let has_more = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_sorter_mut();
-        cursor.next()?;
+        if let CursorResult::IO = cursor.next()? {
+            return Ok(InsnFunctionStepResult::IO);
+        }
         cursor.has_more()
     };
     if has_more {

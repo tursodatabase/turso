@@ -579,7 +579,7 @@ impl Wal for WalFile {
         let offset = self.frame_offset(frame_id);
         page.set_locked();
         let frame = page.clone();
-        let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+        let complete = Box::new(move |buf: Arc<RefCell<Buffer>>, _bytes_read: i32| {
             let frame = frame.clone();
             finish_read_page(page.get().id, buf, frame).unwrap();
         });
@@ -601,7 +601,7 @@ impl Wal for WalFile {
     ) -> Result<Arc<Completion>> {
         tracing::debug!("read_frame({})", frame_id);
         let offset = self.frame_offset(frame_id);
-        let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+        let complete = Box::new(move |buf: Arc<RefCell<Buffer>>, _bytes_read: i32| {
             let buf = buf.borrow();
             let buf_ptr = buf.as_ptr();
             unsafe {
