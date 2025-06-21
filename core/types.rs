@@ -8,13 +8,16 @@ use crate::ext::{ExtValue, ExtValueType};
 use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
 use crate::storage::btree::BTreeCursor;
-use crate::storage::sqlite3_ondisk::write_varint;
+use crate::storage::sqlite3_ondisk::{read_value, read_varint, validate_serial_type, write_varint};
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
 use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::Result;
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::fmt::{Debug, Display};
 
 const MAX_REAL_SIZE: u8 = 15;
@@ -720,6 +723,208 @@ impl<'a> TryFrom<&'a RefValue> for &'a str {
             RefValue::Text(s) => Ok(s.as_str()),
             _ => Err(LimboError::ConversionError("Expected text value".into())),
         }
+    }
+}
+
+/// Lazy record implementation that only parses values on demand.
+/// The header is parsed to build an offset table for O(1) access to any column.
+#[derive(Debug)]
+pub struct LazyRecord<'a> {
+    /// The raw record payload containing header and data
+    payload: Cow<'a, [u8]>,
+    /// Size of the header in bytes
+    _header_size: usize,
+    /// Offset of each column's data within the payload
+    column_offsets: Vec<usize>,
+    /// Serial type for each column
+    serial_types: Vec<SerialType>,
+    /// Cache of parsed values, populated on demand
+    parsed_values: RefCell<Option<Vec<Option<RefValue>>>>,
+}
+
+impl<'a> LazyRecord<'a> {
+    pub fn new(payload_capacity: usize, column_capacity: usize) -> Self {
+        Self {
+            payload: Cow::Owned(Vec::with_capacity(payload_capacity)),
+            _header_size: 0,
+            column_offsets: Vec::with_capacity(column_capacity),
+            serial_types: Vec::with_capacity(column_capacity),
+            parsed_values: RefCell::new(None),
+        }
+    }
+
+    /// Parse only the header and build the offset table
+    pub fn parse_header(payload: &'a [u8]) -> Result<Self> {
+        let mut pos = 0;
+        let (header_size_u64, nr) = read_varint(&payload)?;
+        let header_size = header_size_u64 as usize;
+        pos += nr;
+
+        let mut serial_types = Vec::new();
+        let mut column_offsets = Vec::new();
+        let mut data_offset = header_size;
+
+        // Parse all serial types and compute offsets
+        while pos < header_size {
+            let (serial_type_u64, nr) = read_varint(&payload[pos..])?;
+            validate_serial_type(serial_type_u64)?;
+            let serial_type = SerialType(serial_type_u64);
+
+            serial_types.push(serial_type);
+            column_offsets.push(data_offset);
+            data_offset += serial_type.size();
+            pos += nr;
+        }
+
+        Ok(LazyRecord {
+            payload: Cow::Borrowed(payload),
+            _header_size: header_size,
+            column_offsets,
+            serial_types,
+            parsed_values: RefCell::new(None),
+        })
+    }
+
+    /// Get a value by column index, parsing it lazily if needed
+    #[inline]
+    pub fn get_value(&self, column: usize) -> Result<RefValue> {
+        if column >= self.serial_types.len() {
+            return Err(LimboError::InternalError(format!(
+                "Column index {} out of bounds",
+                column
+            )));
+        }
+
+        // Initialize cache lazily if needed
+        let mut cache = self.parsed_values.borrow_mut();
+        if cache.is_none() {
+            *cache = Some(vec![None; self.serial_types.len()]);
+        }
+
+        // Check cache first
+        if let Some(ref cached_vec) = *cache {
+            if let Some(ref cached_value) = cached_vec[column] {
+                return Ok(cached_value.clone());
+            }
+        }
+
+        // Parse on demand
+        let offset = self.column_offsets[column];
+        let serial_type = self.serial_types[column];
+        let (value, _) = read_value(&self.payload[offset..], serial_type)?;
+
+        // Cache the parsed value
+        if let Some(ref mut cached_vec) = *cache {
+            cached_vec[column] = Some(value.clone());
+        }
+        Ok(value)
+    }
+
+    #[inline]
+    pub fn get_value_opt(&self, column: usize) -> Option<RefValue> {
+        self.get_value(column).ok()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.serial_types.len()
+    }
+
+    #[inline]
+    pub fn count(&self) -> usize {
+        self.serial_types.len()
+    }
+
+    /// Get all values - triggers parsing of all unparsed values
+    pub fn get_values(&self) -> Result<Vec<RefValue>> {
+        let mut values = Vec::with_capacity(self.serial_types.len());
+        for i in 0..self.serial_types.len() {
+            values.push(self.get_value(i)?);
+        }
+        Ok(values)
+    }
+
+    /// Compare a prefix of this record's values with another set of values
+    /// This version streams values one by one without materializing all of them
+    pub fn compare_prefix(
+        &self,
+        other: &[RefValue],
+        count: usize,
+        sort_order: IndexKeySortOrder,
+        collations: &[CollationSeq],
+    ) -> Result<Ordering> {
+        let compare_count = count.min(other.len()).min(self.len());
+
+        for i in 0..compare_count {
+            let my_val = self.get_value(i)?;
+            let other_val = &other[i];
+            let column_order = sort_order.get_sort_order_for_col(i);
+            let collation = collations.get(i).copied().unwrap_or_default();
+
+            let cmp = match (&my_val, other_val) {
+                (RefValue::Text(left), RefValue::Text(right)) => {
+                    collation.compare_strings(left.as_str(), right.as_str())
+                }
+                _ => my_val.partial_cmp(other_val).unwrap_or(Ordering::Equal),
+            };
+
+            if !cmp.is_eq() {
+                return Ok(match column_order {
+                    SortOrder::Asc => cmp,
+                    SortOrder::Desc => cmp.reverse(),
+                });
+            }
+        }
+
+        Ok(Ordering::Equal)
+    }
+
+    pub fn get_payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// Invalidate the record (clear all data)
+    pub fn invalidate(&mut self) {
+        self.payload = Cow::Owned(Vec::new());
+        self.column_offsets.clear();
+        self.serial_types.clear();
+        *self.parsed_values.borrow_mut() = None;
+    }
+
+    pub fn is_invalidated(&self) -> bool {
+        self.payload.is_empty()
+    }
+
+    /// Parse header from owned data (for compatibility)
+    pub fn parse_header_owned(payload: Vec<u8>) -> Result<LazyRecord<'static>> {
+        let mut pos = 0;
+        let (header_size_u64, nr) = read_varint(&payload)?;
+        let header_size = header_size_u64 as usize;
+        pos += nr;
+
+        let mut serial_types = Vec::new();
+        let mut column_offsets = Vec::new();
+        let mut data_offset = header_size;
+
+        // Parse all serial types and compute offsets
+        while pos < header_size {
+            let (serial_type_u64, nr) = read_varint(&payload[pos..])?;
+            validate_serial_type(serial_type_u64)?;
+            let serial_type = SerialType(serial_type_u64);
+
+            serial_types.push(serial_type);
+            column_offsets.push(data_offset);
+            data_offset += serial_type.size();
+            pos += nr;
+        }
+
+        Ok(LazyRecord {
+            payload: Cow::Owned(payload),
+            _header_size: header_size,
+            column_offsets,
+            serial_types,
+            parsed_values: RefCell::new(None),
+        })
     }
 }
 
@@ -1864,5 +2069,70 @@ mod tests {
             buf.len(),
             header_length + size_of::<i8>() + size_of::<f64>() + text.len()
         );
+    }
+
+    #[test]
+    fn test_lazy_record_parsing() {
+        use crate::storage::sqlite3_ondisk::read_record_lazy;
+
+        // Create a simple record payload: NULL, INTEGER(42), TEXT("hello")
+        // Header size: 1 (header size varint) + 3 (serial types) = 4
+        // Serial types: NULL=0, Integer=1, Text(5)=23
+        let mut payload = vec![
+            4,  // Header size
+            0,  // NULL
+            1,  // I8
+            23, // Text of length 5: (5*2 + 13) = 23
+            42, // Integer value
+        ];
+        payload.extend_from_slice(b"hello"); // Text value
+
+        // Parse lazily
+        let lazy_record = read_record_lazy(&payload).unwrap();
+
+        // Verify we can access values lazily
+        assert_eq!(lazy_record.len(), 3);
+
+        // Access first value (NULL)
+        let val0 = lazy_record.get_value(0).unwrap();
+        assert_eq!(val0, RefValue::Null);
+
+        // Access second value (INTEGER)
+        let val1 = lazy_record.get_value(1).unwrap();
+        assert_eq!(val1, RefValue::Integer(42));
+
+        // Access third value (TEXT)
+        let val2 = lazy_record.get_value(2).unwrap();
+        match val2 {
+            RefValue::Text(text) => {
+                assert_eq!(text.as_str(), "hello");
+            }
+            _ => panic!("Expected text value"),
+        }
+
+        // Verify we can get all values
+        let all_values = lazy_record.get_values().unwrap();
+        assert_eq!(all_values.len(), 3);
+    }
+
+    #[test]
+    fn test_lazy_record_caching() {
+        use crate::storage::sqlite3_ondisk::read_record_lazy;
+
+        // Create record with INTEGER(100)
+        let payload = vec![
+            2,   // Header size: 1 (header size varint) + 1 (serial type) = 2
+            1,   // I8
+            100, // Value
+        ];
+
+        let lazy_record = read_record_lazy(&payload).unwrap();
+
+        // Access same value twice - should use cache
+        let val1 = lazy_record.get_value(0).unwrap();
+        let val2 = lazy_record.get_value(0).unwrap();
+
+        assert_eq!(val1, RefValue::Integer(100));
+        assert_eq!(val2, RefValue::Integer(100));
     }
 }

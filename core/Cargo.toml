@@ -125,3 +125,7 @@ harness = false
 [[bench]]
 name = "tpc_h_benchmark"
 harness = false
+
+[[bench]]
+name = "column_selectivity_benchmark"
+harness = false

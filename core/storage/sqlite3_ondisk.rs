@@ -1150,6 +1150,17 @@ pub fn read_record(payload: &[u8], reuse_immutable: &mut ImmutableRecord) -> Res
     Ok(())
 }
 
+/// Lazy version of read_record that only parses the header and builds an offset table.
+/// Values are parsed on-demand when accessed.
+pub fn read_record_lazy(payload: &[u8]) -> Result<crate::types::LazyRecord> {
+    crate::types::LazyRecord::parse_header(payload)
+}
+
+/// Lazy version for owned data (when we need 'static lifetime)
+pub fn read_record_lazy_owned(payload: Vec<u8>) -> Result<crate::types::LazyRecord<'static>> {
+    crate::types::LazyRecord::parse_header_owned(payload)
+}
+
 /// Reads a value that might reference the buffer it is reading from. Be sure to store RefValue with the buffer
 /// always.
 #[inline(always)]

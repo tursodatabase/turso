@@ -484,7 +484,9 @@ pub struct BTreeCursor {
     /// Page stack used to traverse the btree.
     /// Each cursor has a stack because each cursor traverses the btree independently.
     stack: PageStack,
-    /// Reusable immutable record, used to allow better allocation strategy.
+    /// Reusable lazy record, used to allow better allocation strategy and lazy parsing.
+    reusable_lazy_record: RefCell<Option<crate::types::LazyRecord<'static>>>,
+    /// Reusable immutable record, used for backward compatibility in some code paths.
     reusable_immutable_record: RefCell<Option<ImmutableRecord>>,
     /// Reusable immutable record, used to allow better allocation strategy.
     parse_record_state: RefCell<ParseRecordState>,
@@ -528,6 +530,7 @@ impl BTreeCursor {
                 cell_indices: RefCell::new([0; BTCURSOR_MAX_DEPTH + 1]),
                 stack: RefCell::new([const { None }; BTCURSOR_MAX_DEPTH + 1]),
             },
+            reusable_lazy_record: RefCell::new(None),
             reusable_immutable_record: RefCell::new(None),
             index_key_info: None,
             count: 0,
@@ -579,8 +582,11 @@ impl BTreeCursor {
         if !self.has_rowid() {
             return None;
         }
-        let rowid = match self.get_immutable_record().as_ref().unwrap().last_value() {
-            Some(RefValue::Integer(rowid)) => *rowid as i64,
+        let record = self.get_lazy_record();
+        let record = record.as_ref()?;
+        let last_idx = record.len().saturating_sub(1);
+        let rowid = match record.get_value(last_idx).ok()? {
+            RefValue::Integer(rowid) => rowid as i64,
             _ => unreachable!(
                 "index where has_rowid() is true should have an integer rowid as the last value"
             ),
@@ -771,11 +777,81 @@ impl BTreeCursor {
         let mut payload_swap = Vec::new();
         std::mem::swap(payload, &mut payload_swap);
 
-        let mut reuse_immutable = self.get_immutable_record_or_create();
+        // This function still uses eager parsing - it's only called from old code paths
+        if self.reusable_immutable_record.borrow().is_none() {
+            let record = ImmutableRecord::new(4096, 10);
+            self.reusable_immutable_record.replace(Some(record));
+        }
         crate::storage::sqlite3_ondisk::read_record(
             &payload_swap,
-            reuse_immutable.as_mut().unwrap(),
+            self.reusable_immutable_record
+                .borrow_mut()
+                .as_mut()
+                .unwrap(),
         )?;
+
+        let _ = read_overflow_state.take();
+        Ok(CursorResult::Ok(()))
+    }
+
+    fn process_overflow_read_lazy(
+        &self,
+        payload: &'static [u8],
+        start_next_page: u32,
+        payload_size: u64,
+    ) -> Result<CursorResult<()>> {
+        if self.read_overflow_state.borrow().is_none() {
+            let page = self.read_page(start_next_page as usize)?;
+            *self.read_overflow_state.borrow_mut() = Some(ReadPayloadOverflow {
+                payload: payload.to_vec(),
+                next_page: start_next_page,
+                remaining_to_read: payload_size as usize - payload.len(),
+                page,
+            });
+            return Ok(CursorResult::IO);
+        }
+        let mut read_overflow_state = self.read_overflow_state.borrow_mut();
+        let ReadPayloadOverflow {
+            payload,
+            next_page,
+            remaining_to_read,
+            page: page_btree,
+        } = read_overflow_state.as_mut().unwrap();
+
+        if page_btree.get().is_locked() {
+            return Ok(CursorResult::IO);
+        }
+        tracing::debug!(next_page, remaining_to_read, "reading overflow page");
+        let page = page_btree.get();
+        let contents = page.get_contents();
+        // The first four bytes of each overflow page are a big-endian integer which is the page number of the next page in the chain, or zero for the final page in the chain.
+        let next = contents.read_u32_no_offset(0);
+        let buf = contents.as_ptr();
+        let usable_space = self.pager.usable_space();
+        let to_read = (*remaining_to_read).min(usable_space - 4);
+        payload.extend_from_slice(&buf[4..4 + to_read]);
+        *remaining_to_read -= to_read;
+
+        if *remaining_to_read != 0 && next != 0 {
+            let new_page = self.pager.read_page(next as usize).map(|page| {
+                Arc::new(BTreePageInner {
+                    page: RefCell::new(page),
+                })
+            })?;
+            *page_btree = new_page;
+            *next_page = next;
+            return Ok(CursorResult::IO);
+        }
+        assert!(
+            *remaining_to_read == 0 && next == 0,
+            "we can't have more pages to read while also have read everything"
+        );
+        let mut payload_swap = Vec::new();
+        std::mem::swap(payload, &mut payload_swap);
+
+        // Use lazy parsing with owned data since we've collected from overflow pages
+        let lazy_record = crate::storage::sqlite3_ondisk::read_record_lazy_owned(payload_swap)?;
+        *self.reusable_lazy_record.borrow_mut() = Some(lazy_record);
 
         let _ = read_overflow_state.take();
         Ok(CursorResult::Ok(()))
@@ -1855,7 +1931,7 @@ impl BTreeCursor {
                     self.get_immutable_record_or_create().as_mut().unwrap(),
                 )?
             };
-            let (_, found) = self.compare_with_current_record(key, seek_op);
+            let (_, found) = self.compare_with_current_record(key, seek_op)?;
             moving_up_to_parent.set(false);
             return Ok(CursorResult::Ok(found));
         }
@@ -1953,7 +2029,7 @@ impl BTreeCursor {
                     self.get_immutable_record_or_create().as_mut().unwrap(),
                 )?
             };
-            let (cmp, found) = self.compare_with_current_record(key, seek_op);
+            let (cmp, found) = self.compare_with_current_record(key, seek_op)?;
             if found {
                 nearest_matching_cell.set(Some(cur_cell_idx as usize));
                 match iter_dir {
@@ -1987,19 +2063,21 @@ impl BTreeCursor {
         &self,
         key: &ImmutableRecord,
         seek_op: SeekOp,
-    ) -> (Ordering, bool) {
+    ) -> Result<(Ordering, bool)> {
         let cmp = {
-            let record = self.get_immutable_record();
-            let record = record.as_ref().unwrap();
+            let record = self.get_lazy_record();
+            let record = record.as_ref().ok_or_else(|| {
+                LimboError::InternalError("Expected lazy record to be present".into())
+            })?;
             tracing::debug!(?record);
-            let record_slice_equal_number_of_cols =
-                &record.get_values().as_slice()[..key.get_values().len()];
-            compare_immutable(
-                record_slice_equal_number_of_cols,
+
+            // Use the new compare_prefix method to avoid allocating a Vec
+            record.compare_prefix(
                 key.get_values(),
+                key.get_values().len(),
                 self.key_sort_order(),
                 &self.collations,
-            )
+            )?
         };
         let found = match seek_op {
             SeekOp::GT => cmp.is_gt(),
@@ -2009,7 +2087,7 @@ impl BTreeCursor {
             SeekOp::LE { eq_only: false } => cmp.is_le(),
             SeekOp::LT => cmp.is_lt(),
         };
-        (cmp, found)
+        Ok((cmp, found))
     }
 
     fn read_record_w_possible_overflow(
@@ -2019,12 +2097,11 @@ impl BTreeCursor {
         payload_size: u64,
     ) -> Result<CursorResult<()>> {
         if let Some(next_page) = next_page {
-            self.process_overflow_read(payload, next_page, payload_size)
+            self.process_overflow_read_lazy(payload, next_page, payload_size)
         } else {
-            crate::storage::sqlite3_ondisk::read_record(
-                payload,
-                self.get_immutable_record_or_create().as_mut().unwrap(),
-            )?;
+            // Use lazy parsing - payload is &'static [u8] so we can borrow it
+            let lazy_record = crate::storage::sqlite3_ondisk::read_record_lazy(payload)?;
+            *self.reusable_lazy_record.borrow_mut() = Some(lazy_record);
             Ok(CursorResult::Ok(()))
         }
     }
@@ -2144,15 +2221,19 @@ impl BTreeCursor {
                             }
                             BTreeCell::IndexLeafCell(..) => {
                                 // Not necessary to read record again here, as find_cell already does that for us
-                                let cmp = compare_immutable(
-                                    record.get_values(),
-                                    self.get_immutable_record()
-                                        .as_ref()
-                                        .unwrap()
-                                        .get_values(),
+                                let cmp = {
+                                    let lazy_record = self.get_lazy_record();
+                                    let lazy_record = lazy_record.as_ref().ok_or_else(|| {
+                                        LimboError::InternalError("Expected lazy record to be present".into())
+                                    })?;
+                                    let lazy_values = lazy_record.get_values()?;
+                                    compare_immutable(
+                                        record.get_values(),
+                                        &lazy_values,
                                         self.key_sort_order(),
                                         &self.collations,
-                                );
+                                    )
+                                };
                                 if cmp == Ordering::Equal {
                                     tracing::debug!("found exact match with cell_idx={cell_idx}, overwriting");
                                     self.has_record.set(true);
@@ -3870,15 +3951,21 @@ impl BTreeCursor {
                         payload_size,
                     ));
                     let key_values = key.to_index_key_values();
-                    let record = self.get_immutable_record();
-                    let record = record.as_ref().unwrap();
-                    let record_same_number_cols = &record.get_values()[..key_values.len()];
-                    let order = compare_immutable(
-                        key_values,
-                        record_same_number_cols,
-                        self.key_sort_order(),
-                        &self.collations,
-                    );
+                    let record = self.get_lazy_record();
+                    let record = record.as_ref().ok_or_else(|| {
+                        LimboError::InternalError("Expected lazy record to be present".into())
+                    })?;
+
+                    // Use compare_prefix to avoid allocating a Vec
+                    // Note: We need to reverse the comparison since we're comparing key to record
+                    let order = record
+                        .compare_prefix(
+                            key_values,
+                            key_values.len(),
+                            self.key_sort_order(),
+                            &self.collations,
+                        )?
+                        .reverse();
                     match order {
                         Ordering::Less | Ordering::Equal => {
                             break;
@@ -4054,20 +4141,19 @@ impl BTreeCursor {
     /// If record was not parsed yet, then we have to parse it and in case of I/O we yield control
     /// back.
     #[instrument(skip(self), level = Level::TRACE)]
-    pub fn record(&self) -> Result<CursorResult<Option<Ref<ImmutableRecord>>>> {
+    pub fn record(&self) -> Result<CursorResult<Option<Ref<crate::types::LazyRecord>>>> {
         if !self.has_record.get() {
             return Ok(CursorResult::Ok(None));
         }
         let invalidated = self
-            .reusable_immutable_record
+            .reusable_lazy_record
             .borrow()
             .as_ref()
             .map_or(true, |record| record.is_invalidated());
         if !invalidated {
             *self.parse_record_state.borrow_mut() = ParseRecordState::Init;
             let record_ref =
-                Ref::filter_map(self.reusable_immutable_record.borrow(), |opt| opt.as_ref())
-                    .unwrap();
+                Ref::filter_map(self.reusable_lazy_record.borrow(), |opt| opt.as_ref()).unwrap();
             return Ok(CursorResult::Ok(Some(record_ref)));
         }
         if *self.parse_record_state.borrow() == ParseRecordState::Init {
@@ -4106,18 +4192,18 @@ impl BTreeCursor {
             }) => (payload, payload_size, first_overflow_page),
             _ => unreachable!("unexpected page_type"),
         };
+
         if let Some(next_page) = first_overflow_page {
-            return_if_io!(self.process_overflow_read(payload, next_page, payload_size))
+            return_if_io!(self.process_overflow_read_lazy(payload, next_page, payload_size))
         } else {
-            crate::storage::sqlite3_ondisk::read_record(
-                payload,
-                self.get_immutable_record_or_create().as_mut().unwrap(),
-            )?
+            // Use lazy parsing - payload is &'static [u8] from the page
+            let lazy_record = crate::storage::sqlite3_ondisk::read_record_lazy(payload)?;
+            *self.reusable_lazy_record.borrow_mut() = Some(lazy_record);
         };
 
         *self.parse_record_state.borrow_mut() = ParseRecordState::Init;
         let record_ref =
-            Ref::filter_map(self.reusable_immutable_record.borrow(), |opt| opt.as_ref()).unwrap();
+            Ref::filter_map(self.reusable_lazy_record.borrow(), |opt| opt.as_ref()).unwrap();
         Ok(CursorResult::Ok(Some(record_ref)))
     }
 
@@ -4243,11 +4329,19 @@ impl BTreeCursor {
                     let page = self.stack.top();
                     return_if_locked_maybe_load!(self.pager, page);
                     let target_key = if page.get().is_index() {
-                        let record = match return_if_io!(self.record()) {
-                            Some(record) => record.clone(),
+                        let lazy_record = match return_if_io!(self.record()) {
+                            Some(record) => record,
                             None => unreachable!("there should've been a record"),
                         };
-                        DeleteSavepoint::Payload(record)
+                        // Convert LazyRecord to ImmutableRecord for cloning
+                        let values = lazy_record.get_values()?;
+                        let immutable = ImmutableRecord::from_registers(
+                            &values
+                                .into_iter()
+                                .map(|v| crate::vdbe::Register::Value(v.to_owned()))
+                                .collect::<Vec<_>>(),
+                        );
+                        DeleteSavepoint::Payload(immutable)
                     } else {
                         let Some(rowid) = return_if_io!(self.rowid()) else {
                             panic!("cursor should be pointing to a record with a rowid");
@@ -4577,7 +4671,8 @@ impl BTreeCursor {
         match record_opt.as_ref() {
             Some(record) => {
                 // Existing record found — compare prefix
-                let existing_key = &record.get_values()[..record.count().saturating_sub(1)];
+                let record_values = record.get_values()?;
+                let existing_key = &record_values[..record.count().saturating_sub(1)];
                 let inserted_key_vals = &key.get_values();
                 // Need this check because .all returns True on an empty iterator,
                 // So when record_opt is invalidated, it would always indicate show up as a duplicate key
@@ -4937,6 +5032,10 @@ impl BTreeCursor {
         buf[dest_offset..dest_offset + new_payload.len()].copy_from_slice(&new_payload);
 
         Ok(CursorResult::Ok(()))
+    }
+
+    fn get_lazy_record(&self) -> std::cell::RefMut<'_, Option<crate::types::LazyRecord<'static>>> {
+        self.reusable_lazy_record.borrow_mut()
     }
 
     fn get_immutable_record_or_create(&self) -> std::cell::RefMut<'_, Option<ImmutableRecord>> {
@@ -7210,7 +7309,7 @@ mod tests {
                 run_until_done(|| cursor.next(), pager.deref()).unwrap();
                 let record = run_until_done(|| cursor.record(), &pager).unwrap();
                 let record = record.as_ref().unwrap();
-                let cur = record.get_values().clone();
+                let cur = record.get_values().unwrap();
                 if let Some(prev) = prev {
                     if prev >= cur {
                         println!("Seed: {}", seed);

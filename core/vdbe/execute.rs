@@ -1334,8 +1334,9 @@ pub fn op_column(
                     break 'value Value::Null;
                 }
 
-                if let Some(value) = record.get_value_opt(*column) {
-                    break 'value value.to_owned();
+                // LazyRecord returns RefValue, convert to owned Value
+                if let Some(ref_value) = record.get_value_opt(*column) {
+                    break 'value ref_value.to_owned();
                 }
 
                 default.clone().unwrap_or(Value::Null)
@@ -1934,10 +1935,18 @@ pub fn op_row_data(
         let cursor = cursor_ref.as_btree_mut();
         let record_option = return_if_io!(cursor.record());
 
-        let ret = record_option
-            .ok_or_else(|| LimboError::InternalError("RowData: cursor has no record".to_string()))?
-            .clone();
-        ret
+        let lazy_record = record_option.ok_or_else(|| {
+            LimboError::InternalError("RowData: cursor has no record".to_string())
+        })?;
+
+        // Convert LazyRecord to ImmutableRecord for storing in register
+        let values = lazy_record.get_values()?;
+        ImmutableRecord::from_registers(
+            &values
+                .into_iter()
+                .map(|v| Register::Value(v.to_owned()))
+                .collect::<Vec<_>>(),
+        )
     };
 
     let reg = &mut state.registers[*dest];
@@ -1969,9 +1978,15 @@ pub fn op_row_id(
                     CursorResult::Ok(record) => record,
                 };
                 let record = record.as_ref().unwrap();
-                let rowid = record.get_values().last().unwrap();
+                if record.len() == 0 {
+                    return Err(LimboError::InternalError(
+                        "RowId: record has no values".to_string(),
+                    ));
+                }
+                let last_idx = record.len() - 1;
+                let rowid = record.get_value(last_idx)?;
                 match rowid {
-                    RefValue::Integer(rowid) => *rowid,
+                    RefValue::Integer(rowid) => rowid,
                     _ => unreachable!(),
                 }
             };
@@ -2307,7 +2322,7 @@ pub fn op_idx_ge(
         let record_from_regs = make_record(&state.registers, start_reg, num_regs);
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
             // Compare against the same number of values
-            let idx_values = idx_record.get_values();
+            let idx_values = idx_record.get_values().unwrap();
             let idx_values = &idx_values[..record_from_regs.len()];
             let record_values = record_from_regs.get_values();
             let ord = compare_immutable(
@@ -2371,7 +2386,7 @@ pub fn op_idx_le(
         let record_from_regs = make_record(&state.registers, start_reg, num_regs);
         let pc = if let Some(ref idx_record) = return_if_io!(cursor.record()) {
             // Compare against the same number of values
-            let idx_values = idx_record.get_values();
+            let idx_values = idx_record.get_values().unwrap();
             let idx_values = &idx_values[..record_from_regs.len()];
             let record_values = record_from_regs.get_values();
             let ord = compare_immutable(
@@ -2417,7 +2432,7 @@ pub fn op_idx_gt(
         let record_from_regs = make_record(&state.registers, start_reg, num_regs);
         let pc = if let Some(ref idx_record) = return_if_io!(cursor.record()) {
             // Compare against the same number of values
-            let idx_values = idx_record.get_values();
+            let idx_values = idx_record.get_values().unwrap();
             let idx_values = &idx_values[..record_from_regs.len()];
             let record_values = record_from_regs.get_values();
             let ord = compare_immutable(
@@ -2463,7 +2478,7 @@ pub fn op_idx_lt(
         let record_from_regs = make_record(&state.registers, start_reg, num_regs);
         let pc = if let Some(ref idx_record) = return_if_io!(cursor.record()) {
             // Compare against the same number of values
-            let idx_values = idx_record.get_values();
+            let idx_values = idx_record.get_values().unwrap();
             let idx_values = &idx_values[..record_from_regs.len()];
             let record_values = record_from_regs.get_values();
             let ord = compare_immutable(
