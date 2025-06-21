@@ -405,6 +405,32 @@ pub fn translate_insert(
         program.preassign_label_to_next_insn(make_record_label);
     }
 
+    // Run table check constraints
+    for check_constraint in &btree_table.table_check_constraints {
+        let jump_if_true = program.allocate_label();
+        translate_check_constraint(
+            &mut program,
+            &check_constraint.expr,
+            btree_table
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, column)| (column_registers_start + i, column))
+                .collect::<Vec<_>>()
+                .as_ref(),
+            Some(jump_if_true),
+            &resolver,
+        );
+
+        use crate::error::SQLITE_CONSTRAINT_CHECK;
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_CHECK,
+            description: check_constraint.description(),
+        });
+
+        program.preassign_label_to_next_insn(jump_if_true);
+    }
+
     match table.btree() {
         Some(t) if t.is_strict => {
             program.emit_insn(Insn::TypeCheck {

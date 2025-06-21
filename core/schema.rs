@@ -197,6 +197,7 @@ pub struct BTreeTable {
     pub has_rowid: bool,
     pub is_strict: bool,
     pub unique_sets: Option<Vec<Vec<(String, SortOrder)>>>,
+    pub table_check_constraints: Vec<CheckConstraint>,
 }
 
 impl BTreeTable {
@@ -349,6 +350,7 @@ fn create_table(
     let is_strict: bool;
     // BtreeSet here to preserve order of inserted keys
     let mut unique_sets: Vec<BTreeSet<UniqueColumnProps>> = vec![];
+    let mut table_check_constraints = vec![];
     match body {
         CreateTableBody::ColumnsAndConstraints {
             columns,
@@ -358,8 +360,18 @@ fn create_table(
             is_strict = options.contains(TableOptions::STRICT);
             if let Some(constraints) = constraints {
                 for c in constraints {
-                    if let limbo_sqlite3_parser::ast::TableConstraint::PrimaryKey {
-                        columns, ..
+                    if let limbo_sqlite3_parser::ast::NamedTableConstraint {
+                        name,
+                        constraint: limbo_sqlite3_parser::ast::TableConstraint::Check(expr),
+                    } = c
+                    {
+                        table_check_constraints.push(CheckConstraint {
+                            name: name.map(|name| name.0),
+                            expr,
+                        });
+                    } else if let limbo_sqlite3_parser::ast::TableConstraint::PrimaryKey {
+                        columns,
+                        ..
                     } = c.constraint
                     {
                         for column in columns {
@@ -534,6 +546,7 @@ fn create_table(
         has_rowid,
         primary_key_columns,
         columns: cols,
+        table_check_constraints,
         is_strict,
         unique_sets: if unique_sets.is_empty() {
             None
@@ -552,6 +565,21 @@ fn create_table(
             )
         },
     })
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckConstraint {
+    name: Option<String>,
+    pub expr: Expr,
+}
+
+impl CheckConstraint {
+    pub fn description(&self) -> String {
+        match self.name.as_ref() {
+            Some(name) => name.to_owned(),
+            _ => self.expr.to_string(),
+        }
+    }
 }
 
 pub fn _build_pseudo_table(columns: &[ResultColumn]) -> PseudoTable {
@@ -794,6 +822,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
         has_rowid: true,
         is_strict: false,
         primary_key_columns: vec![],
+        table_check_constraints: vec![],
         columns: vec![
             Column {
                 name: Some("type".to_string()),

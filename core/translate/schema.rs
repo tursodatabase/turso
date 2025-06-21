@@ -772,6 +772,7 @@ pub fn translate_drop_table(
             name: "ephemeral_scratch".to_string(),
             has_rowid: true,
             primary_key_columns: vec![],
+            table_check_constraints: vec![],
             columns: vec![Column {
                 name: Some("rowid".to_string()),
                 ty: Type::Integer,
