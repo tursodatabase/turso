@@ -1013,6 +1013,12 @@ impl BTreeCursor {
 
             return Ok(CursorResult::IO);
         }
+
+        // Invalidate cached records after write operations
+        if is_write {
+            self.invalidate_record();
+        }
+
         Ok(CursorResult::Ok(()))
     }
 
@@ -1132,6 +1138,10 @@ impl BTreeCursor {
 
                     if *remaining_to_read == 0 {
                         self.state = CursorState::None;
+                        // Invalidate cached records after write operations
+                        if *is_write {
+                            self.invalidate_record();
+                        }
                         return Ok(CursorResult::Ok(()));
                     }
                     let next = contents.read_u32_no_offset(0);
@@ -4069,6 +4079,9 @@ impl BTreeCursor {
             .as_mut()
             .unwrap()
             .invalidate();
+        if let Some(ref mut lazy_record) = *self.reusable_lazy_record.borrow_mut() {
+            lazy_record.invalidate();
+        }
     }
 
     pub fn prev(&mut self) -> Result<CursorResult<bool>> {
