@@ -48,6 +48,21 @@ do_execsql_test_in_memory_any_error insert_expr_constraint_check-6 {
     INSERT INTO t VALUES (3, 1);
 }
 
+do_execsql_test_in_memory_any_error insert_expr_constraint_check_multiple-6 {
+    CREATE TABLE t (a int, b INTEGER check (0));
+    INSERT INTO t VALUES (3, 1), (99, 88);
+}
+
+do_execsql_test_in_memory_any_error insert_expr_constraint_check-constant_expr-6 {
+    CREATE TABLE t (a int, b INTEGER check (5-5));
+    INSERT INTO t VALUES (3, 1);
+}
+
+do_execsql_test_in_memory_any_error insert_expr_constraint_check-constant_named-6 {
+    CREATE TABLE t (a int, b INTEGER check (5-5), c int);
+    INSERT INTO t (a, c) VALUES (3, 1);
+}
+
 
 do_execsql_test_in_memory_any_error insert_expr_constraint_check-7 {
     CREATE TABLE t (a int, b INTEGER check ((a + b) % 2 == 0));
@@ -135,5 +150,28 @@ do_execsql_test_in_memory_any_error update_constraint_checks_8 {
   CREATE TABLE t (c int, a int, b INTEGER check ((a + b) % 2 = 0));
   insert into t values (1, 2, 2);
   insert into t values (99, 4, 4);
+  update t set b = 5;
+}
+
+do_execsql_test_in_memory_any_error update_constraint_checks_9 {
+  CREATE TABLE t (c int, a int, b INTEGER check (5-5));
+  insert into t values (1, 2, null);
+  update t set b = 5;
+}
+
+do_execsql_test_in_memory_any_error insert_table_constraint_checks_10 {
+  CREATE TABLE t (c int, a int, b int, check ((a + b) % 2 = 0));
+  insert into t values (1, 2, 3);
+}
+
+do_execsql_test_in_memory_any_error update_table_constraint_checks_11 {
+  CREATE TABLE t (c int, a int, b int, check ((a + b) % 2 = 0));
+  insert into t values (1, 2, 2);
+  update t set b = 5;
+}
+
+do_execsql_test_in_memory_any_error update_table_constraint_checks_12 {
+  CREATE TABLE t (c int, a int, b int, constraint check_is_even check ((a + b) % 2 = 0));
+  insert into t values (1, 2, 2);
   update t set b = 5;
 }
