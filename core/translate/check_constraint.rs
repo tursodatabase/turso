@@ -7,25 +7,76 @@ use crate::vdbe::{insn::Insn, BranchOffset};
 use limbo_sqlite3_parser::ast;
 use limbo_sqlite3_parser::ast::Expr;
 
-use crate::translate::expr::walk_expr;
-use crate::Result;
-pub fn check_col_is_referred(expr: &Expr, name: &str) -> bool {
-    let mut col_is_referred = false;
-    let _ = walk_expr(expr, &mut |expr: &Expr| -> Result<()> {
-        match expr {
-            ast::Expr::Id(id) => {
-                if !col_is_referred {
-                    col_is_referred = id.0 == name;
-                }
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    });
-    col_is_referred
+use crate::schema::BTreeTable;
+
+pub fn new_translate_check_constraint(
+    program: &mut ProgramBuilder,
+    table: &BTreeTable,
+    column_registers_start: usize,
+    resolver: &Resolver,
+) {
+    // Run table check constraints
+    for check_constraint in &table.table_check_constraints {
+        let jump_if_true = program.allocate_label();
+        translate_check_constraint(
+            program,
+            &check_constraint.expr,
+            table
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, column)| (column_registers_start + i, column))
+                .collect::<Vec<_>>()
+                .as_ref(),
+            Some(jump_if_true),
+            &resolver,
+        );
+
+        use crate::error::SQLITE_CONSTRAINT_CHECK;
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_CHECK,
+            description: check_constraint.description(),
+        });
+
+        program.preassign_label_to_next_insn(jump_if_true);
+    }
+
+    // Run column check constraints
+    let check_constraints: Vec<_> = table
+        .columns
+        .iter()
+        .filter(|col| col.check_constraint.is_some())
+        .map(|col| col.check_constraint.as_ref().unwrap())
+        .collect();
+
+    for constraint in &check_constraints {
+        let jump_if_true = program.allocate_label();
+        translate_check_constraint(
+            program,
+            constraint,
+            table
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, col)| (column_registers_start + i, col))
+                .collect::<Vec<_>>()
+                .as_ref(),
+            Some(jump_if_true),
+            &resolver,
+        );
+
+        use crate::error::SQLITE_CONSTRAINT_CHECK;
+        let description = constraint.to_string();
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_CHECK,
+            description: description.to_string(),
+        });
+
+        program.preassign_label_to_next_insn(jump_if_true);
+    }
 }
 
-pub fn translate_check_constraint(
+fn translate_check_constraint(
     program: &mut ProgramBuilder,
     check_constraint_expr: &Expr,
     registers_by_columns: &[(usize, &Column)],

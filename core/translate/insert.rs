@@ -4,7 +4,7 @@ use limbo_sqlite3_parser::ast::{
     DistinctNames, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, With,
 };
 
-use crate::error::{SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_PRIMARYKEY};
+use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{IndexColumn, Table};
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode};
@@ -19,12 +19,12 @@ use crate::{
 };
 use crate::{Result, SymbolTable, VirtualTable};
 
-use super::check_constraint::translate_check_constraint;
 use super::emitter::Resolver;
 use super::expr::{translate_expr, translate_expr_no_constant_opt, NoConstantOptReason};
 use super::optimizer::rewrite_expr;
 use super::plan::QueryDestination;
 use super::select::translate_select;
+use crate::translate::check_constraint::new_translate_check_constraint;
 
 struct TempTableCtx {
     cursor_id: usize,
@@ -405,31 +405,12 @@ pub fn translate_insert(
         program.preassign_label_to_next_insn(make_record_label);
     }
 
-    // Run table check constraints
-    for check_constraint in &btree_table.table_check_constraints {
-        let jump_if_true = program.allocate_label();
-        translate_check_constraint(
-            &mut program,
-            &check_constraint.expr,
-            btree_table
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(i, column)| (column_registers_start + i, column))
-                .collect::<Vec<_>>()
-                .as_ref(),
-            Some(jump_if_true),
-            &resolver,
-        );
-
-        use crate::error::SQLITE_CONSTRAINT_CHECK;
-        program.emit_insn(Insn::Halt {
-            err_code: SQLITE_CONSTRAINT_CHECK,
-            description: check_constraint.description(),
-        });
-
-        program.preassign_label_to_next_insn(jump_if_true);
-    }
+    new_translate_check_constraint(
+        &mut program,
+        &btree_table,
+        column_registers_start,
+        &resolver,
+    );
 
     match table.btree() {
         Some(t) if t.is_strict => {
@@ -782,35 +763,6 @@ fn populate_columns_multiple_rows(
             }
         }
     }
-    let check_constraints: Vec<_> = column_mappings
-        .iter()
-        .filter(|cm| cm.column.check_constraint.is_some())
-        .map(|cm| cm.column.check_constraint.as_ref().unwrap())
-        .collect();
-    for constraint in &check_constraints {
-        let jump_if_true = program.allocate_label();
-        translate_check_constraint(
-            program,
-            constraint,
-            column_mappings
-                .iter()
-                .enumerate()
-                .map(|(i, cm)| (column_registers_start + i, cm.column))
-                .collect::<Vec<_>>()
-                .as_ref(),
-            Some(jump_if_true),
-            &resolver,
-        );
-
-        use crate::error::SQLITE_CONSTRAINT_CHECK;
-        let description = constraint.to_string();
-        program.emit_insn(Insn::Halt {
-            err_code: SQLITE_CONSTRAINT_CHECK,
-            description: description.to_string(),
-        });
-
-        program.preassign_label_to_next_insn(jump_if_true);
-    }
     Ok(())
 }
 
@@ -874,35 +826,6 @@ fn populate_column_registers(
                 );
             }
         }
-    }
-    let check_constraints: Vec<_> = column_mappings
-        .iter()
-        .filter(|cm| cm.column.check_constraint.is_some())
-        .map(|cm| cm.column.check_constraint.as_ref().unwrap())
-        .collect();
-    for constraint in &check_constraints {
-        let jump_if_true = program.allocate_label();
-        translate_check_constraint(
-            program,
-            constraint,
-            column_mappings
-                .iter()
-                .enumerate()
-                .map(|(i, cm)| (column_registers_start + i, cm.column))
-                .collect::<Vec<_>>()
-                .as_ref(),
-            Some(jump_if_true),
-            &resolver,
-        );
-
-        use crate::error::SQLITE_CONSTRAINT_CHECK;
-        let description = constraint.to_string();
-        program.emit_insn(Insn::Halt {
-            err_code: SQLITE_CONSTRAINT_CHECK,
-            description: description.to_string(),
-        });
-
-        program.preassign_label_to_next_insn(jump_if_true);
     }
     Ok(())
 }
