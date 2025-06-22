@@ -25,7 +25,7 @@ members = [
     "stress",
     "tests",
     "vendored/sqlite3-parser/sqlparser_bench",
-    "testing/sqlite_test_ext",
+    "testing/sqlite_test_ext", "assertion",
 ]
 exclude = ["perf/latency/limbo"]
 
@@ -54,6 +54,7 @@ strum_macros = "0.26"
 serde = "1.0"
 serde_json = "1.0"
 anyhow = "1.0.98"
+antithesis_sdk = { version = "0.2.5", default-features = false }
 
 [profile.release]
 debug = "line-tables-only"

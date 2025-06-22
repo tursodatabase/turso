@@ -185,6 +185,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "assertion"
+version = "0.0.22"
+dependencies = [
+ "antithesis_sdk",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
