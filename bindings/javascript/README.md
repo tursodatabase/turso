@@ -3,7 +3,7 @@
 Limbo is a _work-in-progress_, in-process OLTP database engine library written in Rust that has:
 
 * **Asynchronous I/O** support on Linux with `io_uring`
-* **SQLite compatibility** [[doc](../../COMPAT.md)] for SQL dialect, file formats, and the C API
+* **SQLite compatibility** [doc](../../COMPAT.md) for SQL dialect, file formats, and the C API
 * **Language bindings** for JavaScript/WebAssembly, [Rust](../rust), [Go](../go), [Python](../python), and [Java](../java)
 * **OS support** for Linux, macOS, and Windows
 
