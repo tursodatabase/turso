@@ -37,3 +37,4 @@ source $testdir/create_table.test
 source $testdir/collate.test
 source $testdir/values.test
 source $testdir/integrity_check.test
+source $testdir/check-constraints.test
