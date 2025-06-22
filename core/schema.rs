@@ -596,6 +596,9 @@ fn create_table(
     }
 
     // Ensure check constraints have valid columns
+    // for example
+    // CREATE TABLE t (b int check (a + b));
+    // should yield a ParseError, because there's no 'a' column
     let all_check_constraints = table_check_constraints
         .iter()
         .chain(column_check_constraints.iter());
@@ -614,7 +617,7 @@ fn create_table(
                     _ => Ok(WalkControl::Continue),
                 }
             },
-        );
+        )?;
     }
 
     Ok(BTreeTable {
