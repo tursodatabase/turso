@@ -558,6 +558,25 @@ fn create_table(
             col.is_rowid_alias = false;
         }
     }
+
+    // Ensure check constraints have valid columns
+    let all_check_constraints = table_check_constraints
+        .iter()
+        .chain(column_check_constraints.iter());
+    use crate::translate::expr::walk_expr;
+    for check_constraint in all_check_constraints {
+        walk_expr(&check_constraint.expr, &mut |expr: &Expr| -> Result<()> {
+            match expr {
+                Expr::Id(id) => cols
+                    .iter()
+                    .find(|col| col.name.as_ref().map_or(false, |name| *name == id.0))
+                    .ok_or_else(|| LimboError::ParseError(format!("no such column: {}", id.0)))
+                    .map(|_| ()),
+                _ => Ok(()),
+            }
+        })?
+    }
+
     Ok(BTreeTable {
         root_page,
         name: table_name,
