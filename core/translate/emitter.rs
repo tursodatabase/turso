@@ -1276,46 +1276,6 @@ fn emit_update_insns(
         }
 
         translate_check_constraint(program, &btree_table, start, &t_ctx.resolver);
-        /*
-                let check_constraints: Vec<_> = table_ref
-                    .columns()
-                    .iter()
-                    .filter(|col| col.check_constraint.is_some())
-                    .map(|col| col.check_constraint.as_ref().unwrap())
-                    .collect();
-                for constraint in &check_constraints {
-                    for column in table_ref.columns().iter() {
-                        if !check_col_is_referred(constraint, column.name.as_ref().map_or("", |name| &name))
-                        {
-                            continue;
-                        }
-                        let jump_if_true = program.allocate_label();
-                        translate_check_constraint(
-                            program,
-                            constraint,
-                            table_ref
-                                .columns()
-                                .iter()
-                                .enumerate()
-                                .map(|(i, col)| (start + i, col))
-                                .collect::<Vec<_>>()
-                                .as_ref(),
-                            Some(jump_if_true),
-                            &t_ctx.resolver,
-                        );
-
-                        use crate::error::SQLITE_CONSTRAINT_CHECK;
-                        let description = constraint.to_string();
-                        program.emit_insn(Insn::Halt {
-                            err_code: SQLITE_CONSTRAINT_CHECK,
-                            description: description.to_string(),
-                        });
-
-                        program.preassign_label_to_next_insn(jump_if_true);
-                        break;
-                    }
-                }
-        */
 
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
