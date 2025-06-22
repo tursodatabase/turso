@@ -32,9 +32,8 @@ pub struct Database {
     #[napi(writable = false)]
     pub memory: bool,
 
-    // TODO: implement each property
-    // #[napi(writable = false)]
-    // pub readonly: bool,
+    #[napi(writable = false)]
+    pub readonly: bool,
     // #[napi(writable = false)]
     // pub in_transaction: bool,
     // #[napi(writable = false)]
@@ -81,6 +80,7 @@ impl Database {
         let conn = db.connect().map_err(into_napi_error)?;
 
         Ok(Self {
+            readonly: opts.readonly,
             memory,
             _db: db,
             conn,
@@ -126,8 +126,8 @@ impl Database {
     }
 
     #[napi]
-    pub fn readonly(&self) {
-        todo!()
+    pub fn readonly(&self) -> bool {
+        self.readonly
     }
 
     #[napi]

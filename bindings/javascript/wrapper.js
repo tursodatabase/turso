@@ -11,6 +11,10 @@ class Database {
    *
    * @constructor
    * @param {string} path - Path to the database file.
+   * @param {Object} opts - Options for database behavior.
+   * @param {boolean} [opts.readonly=false] - Open the database in read-only mode.
+   * @param {boolean} [opts.file_must_exist=false] - If true, throws if database file does not exist.
+   * @param {function} [opts.verbose] - Optional logging callback for SQL execution.
    */
   constructor(path, opts) {
     this.db = new NativeDB(path, opts);
@@ -25,6 +29,11 @@ class Database {
       name: {
         get() {
           return path;
+        },
+      },
+      readonly: {
+        get() {
+          return opts.readonly;
         },
       },
     });
