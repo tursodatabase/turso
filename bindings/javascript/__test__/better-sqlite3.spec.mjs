@@ -1,7 +1,7 @@
 import test from "ava";
 import fs from "node:fs";
 import { fileURLToPath } from "url";
-import path from "node:path"
+import path from "node:path";
 
 import Database from "better-sqlite3";
 
@@ -13,13 +13,23 @@ test("Open in-memory database", async (t) => {
 test("Property .name of in-memory database", async (t) => {
   let name = ":memory:";
   const db = new Database(name);
-  t.is(db.name,name);
+  t.is(db.name, name);
 });
 
 test("Property .name of database", async (t) => {
   let name = "foobar.db";
   const db = new Database(name);
-  t.is(db.name,name);
+  t.is(db.name, name);
+});
+
+test("Property .readonly of database if set", async (t) => {
+  const db = new Database("foobar.db", { readonly: true });
+  t.is(db.readonly, true);
+});
+
+test("Property .readonly of database if not set", async (t) => {
+  const db = new Database("foobar.db");
+  t.is(db.readonly, false);
 });
 
 test("Statement.get() returns data", async (t) => {
@@ -87,7 +97,7 @@ test("Test pragma()", async (t) => {
 test("pragma query", async (t) => {
   const [db] = await connect(":memory:");
   let page_size = db.pragma("page_size");
-  let expectedValue = [{page_size: 4096}];
+  let expectedValue = [{ page_size: 4096 }];
   t.deepEqual(page_size, expectedValue);
 });
 
@@ -96,11 +106,25 @@ test("pragma table_list", async (t) => {
   let param = "sqlite_schema";
   let actual = db.pragma(`table_info(${param})`);
   let expectedValue = [
-    {cid: 0, name: "type", type: "TEXT", notnull: 0, dflt_value: null, pk: 0},
-    {cid: 1, name: "name", type: "TEXT", notnull: 0, dflt_value: null, pk: 0},
-    {cid: 2, name: "tbl_name", type: "TEXT", notnull: 0, dflt_value: null, pk: 0},
-    {cid: 3, name: "rootpage", type: "INT", notnull: 0, dflt_value: null, pk: 0},
-    {cid: 4, name: "sql", type: "TEXT", notnull: 0, dflt_value: null, pk: 0},
+    { cid: 0, name: "type", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
+    { cid: 1, name: "name", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
+    {
+      cid: 2,
+      name: "tbl_name",
+      type: "TEXT",
+      notnull: 0,
+      dflt_value: null,
+      pk: 0,
+    },
+    {
+      cid: 3,
+      name: "rootpage",
+      type: "INT",
+      notnull: 0,
+      dflt_value: null,
+      pk: 0,
+    },
+    { cid: 4, name: "sql", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
   ];
   t.deepEqual(actual, expectedValue);
 });
@@ -108,7 +132,7 @@ test("pragma table_list", async (t) => {
 test("simple pragma table_list", async (t) => {
   const [db] = await connect(":memory:");
   let param = "sqlite_schema";
-  let actual = db.pragma(`table_info(${param})`, {simple: true});
+  let actual = db.pragma(`table_info(${param})`, { simple: true });
   let expectedValue = 0;
   t.deepEqual(actual, expectedValue);
 });
@@ -152,7 +176,6 @@ test("Test raw(): Rows should be returned as arrays", async (t) => {
   db.prepare("INSERT INTO users (name, age) VALUES (?, ?)").run("Alice", 42);
   db.prepare("INSERT INTO users (name, age) VALUES (?, ?)").run("Bob", 24);
 
-
   let stmt = db.prepare("SELECT * FROM users").raw();
 
   for (const row of stmt.iterate()) {
@@ -179,13 +202,11 @@ test("Test raw(): Rows should be returned as arrays", async (t) => {
   t.deepEqual(rows[1], ["Bob", 24]);
 });
 
-
 test("Presentation modes should be mutually exclusive", async (t) => {
   const [db] = await connect(":memory:");
   db.prepare("CREATE TABLE users (name TEXT, age INTEGER)").run();
   db.prepare("INSERT INTO users (name, age) VALUES (?, ?)").run("Alice", 42);
   db.prepare("INSERT INTO users (name, age) VALUES (?, ?)").run("Bob", 24);
-
 
   // test raw()
   let stmt = db.prepare("SELECT * FROM users").pluck().raw();
@@ -222,13 +243,15 @@ test("Presentation modes should be mutually exclusive", async (t) => {
   }
 });
 
-
 test("Test exec(): Should correctly load multiple statements from file", async (t) => {
   const __filename = fileURLToPath(import.meta.url);
   const __dirname = path.dirname(__filename);
 
   const [db] = await connect(":memory:");
-  const file = fs.readFileSync(path.resolve(__dirname, "./artifacts/basic-test.sql"), "utf8");
+  const file = fs.readFileSync(
+    path.resolve(__dirname, "./artifacts/basic-test.sql"),
+    "utf8",
+  );
   db.exec(file);
   let rows = db.prepare("SELECT * FROM users").iterate();
   for (const row of rows) {
@@ -237,13 +260,13 @@ test("Test exec(): Should correctly load multiple statements from file", async (
   }
 });
 
-test("Test Statement.database gets the database object", async t => {
+test("Test Statement.database gets the database object", async (t) => {
   const [db] = await connect(":memory:");
   let stmt = db.prepare("SELECT 1");
   t.is(stmt.database, db);
 });
 
-test("Test Statement.source", async t => {
+test("Test Statement.source", async (t) => {
   const [db] = await connect(":memory:");
   let sql = "CREATE TABLE t (id int)";
   let stmt = db.prepare(sql);
