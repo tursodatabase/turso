@@ -9,7 +9,7 @@ use limbo_sqlite3_parser::ast::Expr;
 
 use crate::schema::BTreeTable;
 
-pub fn new_translate_check_constraint(
+pub fn translate_check_constraint(
     program: &mut ProgramBuilder,
     table: &BTreeTable,
     column_registers_start: usize,
@@ -22,7 +22,7 @@ pub fn new_translate_check_constraint(
     // Run all constraint checks
     for check_constraint in check_constraints {
         let jump_if_true = program.allocate_label();
-        translate_check_constraint(
+        inner_translate_check_constraint(
             program,
             &check_constraint.expr,
             table
@@ -46,7 +46,7 @@ pub fn new_translate_check_constraint(
     }
 }
 
-fn translate_check_constraint(
+fn inner_translate_check_constraint(
     program: &mut ProgramBuilder,
     check_constraint_expr: &Expr,
     registers_by_columns: &[(usize, &Column)],
@@ -68,10 +68,20 @@ fn translate_check_constraint(
             unreachable!();
         }
         ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) => {
-            let lhs_reg =
-                translate_check_constraint(program, lhs, registers_by_columns, None, resolver);
-            let rhs_reg =
-                translate_check_constraint(program, rhs, registers_by_columns, None, resolver);
+            let lhs_reg = inner_translate_check_constraint(
+                program,
+                lhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
+            let rhs_reg = inner_translate_check_constraint(
+                program,
+                rhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
             if let Some(label) = jump_if_true {
                 program.emit_insn(Insn::Eq {
                     lhs: lhs_reg,
@@ -83,11 +93,125 @@ fn translate_check_constraint(
             }
             return rhs_reg;
         }
+        ast::Expr::Binary(lhs, ast::Operator::Greater, rhs) => {
+            let lhs_reg = inner_translate_check_constraint(
+                program,
+                lhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
+            let rhs_reg = inner_translate_check_constraint(
+                program,
+                rhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
+            if let Some(label) = jump_if_true {
+                program.emit_insn(Insn::Gt {
+                    lhs: lhs_reg,
+                    rhs: rhs_reg,
+                    target_pc: label,
+                    flags: CmpInsFlags::default().jump_if_null(),
+                    collation: program.curr_collation(),
+                });
+            }
+            return rhs_reg;
+        }
+        ast::Expr::Binary(lhs, ast::Operator::GreaterEquals, rhs) => {
+            let lhs_reg = inner_translate_check_constraint(
+                program,
+                lhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
+            let rhs_reg = inner_translate_check_constraint(
+                program,
+                rhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
+            if let Some(label) = jump_if_true {
+                program.emit_insn(Insn::Ge {
+                    lhs: lhs_reg,
+                    rhs: rhs_reg,
+                    target_pc: label,
+                    flags: CmpInsFlags::default().jump_if_null(),
+                    collation: program.curr_collation(),
+                });
+            }
+            return rhs_reg;
+        }
+        ast::Expr::Binary(lhs, ast::Operator::Less, rhs) => {
+            let lhs_reg = inner_translate_check_constraint(
+                program,
+                lhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
+            let rhs_reg = inner_translate_check_constraint(
+                program,
+                rhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
+            if let Some(label) = jump_if_true {
+                program.emit_insn(Insn::Lt {
+                    lhs: lhs_reg,
+                    rhs: rhs_reg,
+                    target_pc: label,
+                    flags: CmpInsFlags::default().jump_if_null(),
+                    collation: program.curr_collation(),
+                });
+            }
+            return rhs_reg;
+        }
+        ast::Expr::Binary(lhs, ast::Operator::LessEquals, rhs) => {
+            let lhs_reg = inner_translate_check_constraint(
+                program,
+                lhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
+            let rhs_reg = inner_translate_check_constraint(
+                program,
+                rhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
+            if let Some(label) = jump_if_true {
+                program.emit_insn(Insn::Le {
+                    lhs: lhs_reg,
+                    rhs: rhs_reg,
+                    target_pc: label,
+                    flags: CmpInsFlags::default().jump_if_null(),
+                    collation: program.curr_collation(),
+                });
+            }
+            return rhs_reg;
+        }
         ast::Expr::Binary(lhs, ast::Operator::Add, rhs) => {
-            let lhs_reg =
-                translate_check_constraint(program, lhs, registers_by_columns, None, resolver);
-            let rhs_reg =
-                translate_check_constraint(program, rhs, registers_by_columns, None, resolver);
+            let lhs_reg = inner_translate_check_constraint(
+                program,
+                lhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
+            let rhs_reg = inner_translate_check_constraint(
+                program,
+                rhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
             let dest_reg = program.alloc_register();
             program.emit_insn(Insn::Add {
                 lhs: lhs_reg,
@@ -104,10 +228,20 @@ fn translate_check_constraint(
             return dest_reg;
         }
         ast::Expr::Binary(lhs, ast::Operator::Subtract, rhs) => {
-            let lhs_reg =
-                translate_check_constraint(program, lhs, registers_by_columns, None, resolver);
-            let rhs_reg =
-                translate_check_constraint(program, rhs, registers_by_columns, None, resolver);
+            let lhs_reg = inner_translate_check_constraint(
+                program,
+                lhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
+            let rhs_reg = inner_translate_check_constraint(
+                program,
+                rhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
             let dest_reg = program.alloc_register();
             program.emit_insn(Insn::Subtract {
                 lhs: lhs_reg,
@@ -124,10 +258,20 @@ fn translate_check_constraint(
             return dest_reg;
         }
         ast::Expr::Binary(lhs, ast::Operator::Multiply, rhs) => {
-            let lhs_reg =
-                translate_check_constraint(program, lhs, registers_by_columns, None, resolver);
-            let rhs_reg =
-                translate_check_constraint(program, rhs, registers_by_columns, None, resolver);
+            let lhs_reg = inner_translate_check_constraint(
+                program,
+                lhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
+            let rhs_reg = inner_translate_check_constraint(
+                program,
+                rhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
             let dest_reg = program.alloc_register();
             program.emit_insn(Insn::Multiply {
                 lhs: lhs_reg,
@@ -144,10 +288,20 @@ fn translate_check_constraint(
             return dest_reg;
         }
         ast::Expr::Binary(lhs, ast::Operator::Divide, rhs) => {
-            let lhs_reg =
-                translate_check_constraint(program, lhs, registers_by_columns, None, resolver);
-            let rhs_reg =
-                translate_check_constraint(program, rhs, registers_by_columns, None, resolver);
+            let lhs_reg = inner_translate_check_constraint(
+                program,
+                lhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
+            let rhs_reg = inner_translate_check_constraint(
+                program,
+                rhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
             let dest_reg = program.alloc_register();
             program.emit_insn(Insn::Divide {
                 lhs: lhs_reg,
@@ -164,10 +318,20 @@ fn translate_check_constraint(
             return dest_reg;
         }
         ast::Expr::Binary(lhs, ast::Operator::Modulus, rhs) => {
-            let lhs_reg =
-                translate_check_constraint(program, lhs, registers_by_columns, None, resolver);
-            let rhs_reg =
-                translate_check_constraint(program, rhs, registers_by_columns, None, resolver);
+            let lhs_reg = inner_translate_check_constraint(
+                program,
+                lhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
+            let rhs_reg = inner_translate_check_constraint(
+                program,
+                rhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
             let dest_reg = program.alloc_register();
             program.emit_insn(Insn::Remainder {
                 lhs: lhs_reg,
@@ -183,8 +347,68 @@ fn translate_check_constraint(
             }
             return dest_reg;
         }
+        ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
+            let lhs_reg = inner_translate_check_constraint(
+                program,
+                lhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
+            let rhs_reg = inner_translate_check_constraint(
+                program,
+                rhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
+            let dest_reg = program.alloc_register();
+            program.emit_insn(Insn::And {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                dest: dest_reg,
+            });
+            if let Some(label) = jump_if_true {
+                program.emit_insn(Insn::If {
+                    reg: dest_reg,
+                    target_pc: label,
+                    jump_if_null: true,
+                });
+            }
+            return dest_reg;
+        }
+        ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
+            let lhs_reg = inner_translate_check_constraint(
+                program,
+                lhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
+            let rhs_reg = inner_translate_check_constraint(
+                program,
+                rhs,
+                registers_by_columns,
+                None,
+                resolver,
+            );
+            let dest_reg = program.alloc_register();
+            program.emit_insn(Insn::Or {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                dest: dest_reg,
+            });
+            if let Some(label) = jump_if_true {
+                program.emit_insn(Insn::If {
+                    reg: dest_reg,
+                    target_pc: label,
+                    jump_if_null: true,
+                });
+            }
+            return dest_reg;
+        }
         ast::Expr::Parenthesized(expr) => {
-            let dest_reg = translate_check_constraint(
+            let dest_reg = inner_translate_check_constraint(
                 program,
                 expr.get(0).expect("Expr should exist"),
                 registers_by_columns,

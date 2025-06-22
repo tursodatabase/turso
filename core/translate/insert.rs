@@ -24,7 +24,7 @@ use super::expr::{translate_expr, translate_expr_no_constant_opt, NoConstantOptR
 use super::optimizer::rewrite_expr;
 use super::plan::QueryDestination;
 use super::select::translate_select;
-use crate::translate::check_constraint::new_translate_check_constraint;
+use crate::translate::check_constraint::translate_check_constraint;
 
 struct TempTableCtx {
     cursor_id: usize,
@@ -405,7 +405,7 @@ pub fn translate_insert(
         program.preassign_label_to_next_insn(make_record_label);
     }
 
-    new_translate_check_constraint(
+    translate_check_constraint(
         &mut program,
         &btree_table,
         column_registers_start,

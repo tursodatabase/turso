@@ -25,7 +25,7 @@ use super::subquery::emit_subqueries;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::function::Func;
 use crate::schema::{Index, IndexColumn, Schema};
-use crate::translate::check_constraint::new_translate_check_constraint;
+use crate::translate::check_constraint::translate_check_constraint;
 use crate::translate::plan::{DeletePlan, Plan, Search};
 use crate::translate::values::emit_values;
 use crate::util::exprs_are_equivalent;
@@ -1275,7 +1275,7 @@ fn emit_update_insns(
             program.preassign_label_to_next_insn(record_label);
         }
 
-        new_translate_check_constraint(program, &btree_table, start, &t_ctx.resolver);
+        translate_check_constraint(program, &btree_table, start, &t_ctx.resolver);
         /*
                 let check_constraints: Vec<_> = table_ref
                     .columns()
