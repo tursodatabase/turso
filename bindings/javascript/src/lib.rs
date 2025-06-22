@@ -12,6 +12,7 @@ use napi::iterator::Generator;
 use napi::{bindgen_prelude::ObjectFinalize, Env, JsUnknown};
 use napi_derive::napi;
 
+#[derive(Default)]
 #[napi(object)]
 pub struct OpenDatabaseOptions {
     pub readonly: bool,
@@ -64,11 +65,7 @@ impl Database {
             Arc::new(limbo_core::PlatformIO::new().map_err(into_napi_error)?)
         };
 
-        let opts = options.unwrap_or(OpenDatabaseOptions {
-            readonly: false,
-            file_must_exist: false,
-            timeout: 0,
-        });
+        let opts = options.unwrap_or_default();
 
         let flag = if opts.readonly {
             limbo_core::OpenFlags::ReadOnly
