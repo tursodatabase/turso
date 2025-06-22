@@ -19,6 +19,10 @@ rusqlite = { version = "0.34.0", features = ["bundled"] }
 members = ["."]
 
 [[bin]]
+name = "schema"
+path = "fuzz_targets/schema.rs"
+
+[[bin]]
 name = "expression"
 path = "fuzz_targets/expression.rs"
 

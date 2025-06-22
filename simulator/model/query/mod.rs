@@ -5,17 +5,19 @@ pub(crate) use create_index::CreateIndex;
 pub(crate) use delete::Delete;
 pub(crate) use drop::Drop;
 pub(crate) use insert::Insert;
+use limbo_sqlite3_parser::to_sql_string::ToSqlContext;
 pub(crate) use select::Select;
 use serde::{Deserialize, Serialize};
 use update::Update;
 
-use crate::{model::table::Value, runner::env::SimulatorEnv};
+use crate::{model::table::SimValue, runner::env::SimulatorEnv};
 
 pub mod create;
 pub mod create_index;
 pub mod delete;
 pub mod drop;
 pub mod insert;
+pub mod predicate;
 pub mod select;
 pub mod update;
 
@@ -59,7 +61,7 @@ impl Query {
         }
     }
 
-    pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<Value>> {
+    pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<SimValue>> {
         match self {
             Query::Create(create) => create.shadow(env),
             Query::Insert(insert) => insert.shadow(env),
@@ -83,5 +85,22 @@ impl Display for Query {
             Self::Drop(drop) => write!(f, "{}", drop),
             Self::CreateIndex(create_index) => write!(f, "{}", create_index),
         }
+    }
+}
+
+/// Used to print sql strings that already have all the context it needs
+struct EmptyContext;
+
+impl ToSqlContext for EmptyContext {
+    fn get_column_name(
+        &self,
+        _table_id: limbo_sqlite3_parser::ast::TableInternalId,
+        _col_idx: usize,
+    ) -> &str {
+        unreachable!()
+    }
+
+    fn get_table_name(&self, _id: limbo_sqlite3_parser::ast::TableInternalId) -> &str {
+        unreachable!()
     }
 }

@@ -17,7 +17,6 @@ dist = true
 name = "limbo"
 path = "main.rs"
 
-
 [dependencies]
 anyhow.workspace = true
 cfg-if = "1.0.0"
@@ -51,6 +50,7 @@ toml_edit = {version = "0.22.24", features = ["serde"]}
 [features]
 default = ["io_uring"]
 io_uring = ["limbo_core/io_uring"]
+index_experimental = ["limbo_core/index_experimental"]
 
 [build-dependencies]
 syntect = "5.2.0"

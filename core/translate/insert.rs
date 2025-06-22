@@ -4,11 +4,11 @@ use limbo_sqlite3_parser::ast::{
     DistinctNames, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, With,
 };
 
-use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
+use crate::error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY};
 use crate::schema::{IndexColumn, Table};
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode};
-use crate::vdbe::insn::{IdxInsertFlags, RegisterOrLiteral};
+use crate::vdbe::insn::{IdxInsertFlags, InsertFlags, RegisterOrLiteral};
 use crate::vdbe::BranchOffset;
 use crate::{
     schema::{Column, Schema},
@@ -59,10 +59,20 @@ pub fn translate_insert(
         crate::bail_parse_error!("ON CONFLICT clause is not supported");
     }
 
+    #[cfg(not(feature = "index_experimental"))]
+    {
+        if schema.table_has_indexes(&tbl_name.name.to_string()) {
+            // Let's disable altering a table with indices altogether instead of checking column by
+            // column to be extra safe.
+            crate::bail_parse_error!(
+                "INSERT table disabled for table with indexes and without index_experimental feature flag"
+            );
+        }
+    }
     let table_name = &tbl_name.name;
     let table = match schema.get_table(table_name.0.as_str()) {
         Some(table) => table,
-        None => crate::bail_corrupt_error!("Parse error: no such table: {}", table_name),
+        None => crate::bail_parse_error!("no such table: {}", table_name),
     };
 
     let resolver = Resolver::new(schema, syms);
@@ -81,7 +91,7 @@ pub fn translate_insert(
     }
 
     let Some(btree_table) = table.btree() else {
-        crate::bail_corrupt_error!("Parse error: no such table: {}", table_name);
+        crate::bail_parse_error!("no such table: {}", table_name);
     };
     if !btree_table.has_rowid {
         crate::bail_parse_error!("INSERT into WITHOUT ROWID table is not supported");
@@ -213,7 +223,7 @@ pub fn translate_insert(
                         cursor: temp_cursor_id,
                         key_reg: rowid_reg,
                         record_reg,
-                        flag: 0,
+                        flag: InsertFlags::new(),
                         table_name: "".to_string(),
                     });
 
@@ -516,6 +526,25 @@ pub fn translate_insert(
         });
     }
 
+    for (i, col) in column_mappings
+        .iter()
+        .enumerate()
+        .filter(|(_, col)| col.column.notnull)
+    {
+        let target_reg = i + column_registers_start;
+        program.emit_insn(Insn::HaltIfNull {
+            target_reg,
+            err_code: SQLITE_CONSTRAINT_NOTNULL,
+            description: format!(
+                "{}.{}",
+                table_name,
+                col.column
+                    .name
+                    .as_ref()
+                    .expect("Column name must be present")
+            ),
+        });
+    }
     // Create and insert the record
     program.emit_insn(Insn::MakeRecord {
         start_reg: column_registers_start,
@@ -528,7 +557,7 @@ pub fn translate_insert(
         cursor: cursor_id,
         key_reg: rowid_reg,
         record_reg: record_register,
-        flag: 0,
+        flag: InsertFlags::new(),
         table_name: table_name.to_string(),
     });
 
@@ -728,11 +757,11 @@ fn populate_columns_multiple_rows(
             // Decrement as we have now seen a value index instead
             other_values_seen -= 1;
             if let Some(temp_table_ctx) = temp_table_ctx {
-                program.emit_insn(Insn::Column {
-                    cursor_id: temp_table_ctx.cursor_id,
-                    column: value_index_seen,
-                    dest: column_registers_start + i,
-                });
+                program.emit_column(
+                    temp_table_ctx.cursor_id,
+                    value_index_seen,
+                    column_registers_start + i,
+                );
             } else {
                 program.emit_insn(Insn::Copy {
                     src_reg: yield_reg + value_index_seen,

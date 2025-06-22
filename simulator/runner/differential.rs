@@ -1,11 +1,13 @@
 use std::sync::{Arc, Mutex};
 
+use limbo_core::Value;
+
 use crate::{
     generation::{
         pick_index,
         plan::{Interaction, InteractionPlanState, ResultSet},
     },
-    model::{query::Query, table::Value},
+    model::{query::Query, table::SimValue},
     runner::execution::ExecutionContinuation,
     InteractionPlan,
 };
@@ -60,7 +62,7 @@ pub(crate) fn run_simulation(
 fn execute_query_rusqlite(
     connection: &rusqlite::Connection,
     query: &Query,
-) -> rusqlite::Result<Vec<Vec<Value>>> {
+) -> rusqlite::Result<Vec<Vec<SimValue>>> {
     match query {
         Query::Create(create) => {
             connection.execute(create.to_string().as_str(), ())?;
@@ -73,13 +75,14 @@ fn execute_query_rusqlite(
                 let mut values = vec![];
                 for i in 0..columns {
                     let value = row.get_unwrap(i);
-                    match value {
-                        rusqlite::types::Value::Null => values.push(Value::Null),
-                        rusqlite::types::Value::Integer(i) => values.push(Value::Integer(i)),
-                        rusqlite::types::Value::Real(f) => values.push(Value::Float(f)),
-                        rusqlite::types::Value::Text(s) => values.push(Value::Text(s)),
-                        rusqlite::types::Value::Blob(b) => values.push(Value::Blob(b)),
-                    }
+                    let value = match value {
+                        rusqlite::types::Value::Null => Value::Null,
+                        rusqlite::types::Value::Integer(i) => Value::Integer(i),
+                        rusqlite::types::Value::Real(f) => Value::Float(f),
+                        rusqlite::types::Value::Text(s) => Value::build_text(s),
+                        rusqlite::types::Value::Blob(b) => Value::Blob(b),
+                    };
+                    values.push(SimValue(value));
                 }
                 Ok(values)
             })?;

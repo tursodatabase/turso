@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import os
+
+from cli_tests import console
 from cli_tests.test_limbo_cli import TestLimboShell
 from pydantic import BaseModel
-from cli_tests import console
-
 
 sqlite_flags = os.getenv("SQLITE_FLAGS", "-q").split(" ")
 
@@ -39,10 +39,7 @@ class UpdateTest(BaseModel):
                 f"{self.vals}",
             )
 
-            stmt = [
-                f"SELECT hex(t1), t2, t3 FROM test LIMIT 1 OFFSET {i};"
-                for i in range(self.vals)
-            ]
+            stmt = [f"SELECT hex(t1), t2, t3 FROM test LIMIT 1 OFFSET {i};" for i in range(self.vals)]
 
             expected = [f"{zero_blob}|{t2_val}|{t3_val}" for _ in range(self.vals)]
             sqlite.run_test(
@@ -84,15 +81,10 @@ class UpdateTest(BaseModel):
                 f"{self.vals}",
             )
 
-            stmt = [
-                f"SELECT hex(t1), t2, t3 FROM test LIMIT 1 OFFSET {i};"
-                for i in range(self.vals)
-            ]
+            stmt = [f"SELECT hex(t1), t2, t3 FROM test LIMIT 1 OFFSET {i};" for i in range(self.vals)]
 
             expected = [
-                f"{zero_blob}|{t2_val}|{t3_val}"
-                if i != 0
-                else f"{zero_blob}|{t2_update_val}|{t3_val}"
+                f"{zero_blob}|{t2_val}|{t3_val}" if i != 0 else f"{zero_blob}|{t2_update_val}|{t3_val}"
                 for i in range(self.vals)
             ]
             sqlite.run_test(

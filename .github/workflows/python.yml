@@ -55,58 +55,37 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Install uv
+        uses: useblacksmith/setup-uv@v4
+        with:
+          enable-cache: true
 
-      - name: Install Limbo
-        run: pip install -e .
+      - name: Install the project
+        run: uv sync --all-extras --dev
 
       - name: Run Pytest
-        run: pytest tests
+        run: uvx pytest tests
 
   lint:
     runs-on: blacksmith-4vcpu-ubuntu-2404
 
-    defaults:
-      run:
-        working-directory: ${{ env.working-directory }}
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: useblacksmith/setup-python@v6
+
+      - name: Install uv
+        uses: useblacksmith/setup-uv@v4
         with:
-          python-version: "3.12"
+          enable-cache: true
 
-      - name: Install dev dependencies
-        run: pip install -r requirements-dev.txt
+      - name: Install the project
+        run: uv sync --all-extras --dev --all-packages
 
-      - name: Run lint
-        run: make lint
-
-  check-requirements:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-
-    defaults:
-      run:
-        working-directory: ${{ env.working-directory }}
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: useblacksmith/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Install pip-tools
-        run: pip install pip-tools
-
-#      - name: Check requirements files
-#        run: make check-requirements
+      - name: Ruff lint
+        run: uvx ruff check
 
   linux:
     runs-on: blacksmith-4vcpu-ubuntu-2404

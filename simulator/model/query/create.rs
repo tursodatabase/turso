@@ -3,7 +3,7 @@ use std::fmt::Display;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    model::table::{Table, Value},
+    model::table::{SimValue, Table},
     SimulatorEnv,
 };
 
@@ -13,7 +13,7 @@ pub(crate) struct Create {
 }
 
 impl Create {
-    pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<Value>> {
+    pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<SimValue>> {
         if !env.tables.iter().any(|t| t.name == self.table.name) {
             env.tables.push(self.table.clone());
         }

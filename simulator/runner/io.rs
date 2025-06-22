@@ -45,9 +45,7 @@ impl SimulatorIO {
     pub(crate) fn print_stats(&self) {
         tracing::info!("run_once faults: {}", self.nr_run_once_faults.borrow());
         for file in self.files.borrow().iter() {
-            tracing::info!("");
-            tracing::info!("===========================");
-            file.print_stats();
+            tracing::info!("\n===========================\n{}", file.stats_table());
         }
     }
 }

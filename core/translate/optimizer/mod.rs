@@ -41,9 +41,11 @@ pub fn optimize_plan(plan: &mut Plan, schema: &Schema) -> Result<()> {
         Plan::Select(plan) => optimize_select_plan(plan, schema)?,
         Plan::Delete(plan) => optimize_delete_plan(plan, schema)?,
         Plan::Update(plan) => optimize_update_plan(plan, schema)?,
-        Plan::CompoundSelect { first, rest, .. } => {
-            optimize_select_plan(first, schema)?;
-            for (plan, _) in rest {
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            optimize_select_plan(right_most, schema)?;
+            for (plan, _) in left {
                 optimize_select_plan(plan, schema)?;
             }
         }
@@ -105,7 +107,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, _schema: &Schema) -> Result<()> {
     Ok(())
 }
 
-fn optimize_update_plan(plan: &mut UpdatePlan, _schema: &Schema) -> Result<()> {
+fn optimize_update_plan(plan: &mut UpdatePlan, schema: &Schema) -> Result<()> {
     rewrite_exprs_update(plan)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
@@ -113,18 +115,16 @@ fn optimize_update_plan(plan: &mut UpdatePlan, _schema: &Schema) -> Result<()> {
         plan.contains_constant_false_condition = true;
         return Ok(());
     }
-    // FIXME: don't use indexes for update right now because it's not safe to traverse an index
-    // while also updating the same table, things go wrong.
-    // e.g. in 'explain update t set x=x+5 where x > 10;' where x is an indexed column,
-    // sqlite first creates an ephemeral index to store the current values so the tree traversal
-    // doesn't get messed up while updating.
-    // let _ = optimize_table_access(
-    //     &mut plan.table_references,
-    //     &schema.indexes,
-    //     &mut plan.where_clause,
-    //     &mut plan.order_by,
-    //     &mut None,
-    // )?;
+    if let Some(ephemeral_plan) = &mut plan.ephemeral_plan {
+        optimize_select_plan(ephemeral_plan, schema)?;
+    }
+    let _ = optimize_table_access(
+        &mut plan.table_references,
+        &schema.indexes,
+        &mut plan.where_clause,
+        &mut plan.order_by,
+        &mut None,
+    )?;
     Ok(())
 }
 
@@ -234,20 +234,25 @@ fn optimize_table_access(
                 .map_or(false, |join_info| join_info.outer),
         })
         .collect();
+
     // Mutate the Operations in `joined_tables` to use the selected access methods.
     for (i, join_order_member) in best_join_order.iter().enumerate() {
         let table_idx = join_order_member.original_idx;
         let access_method = &access_methods_arena.borrow()[best_access_methods[i]];
         if access_method.is_scan() {
-            let is_leftmost_table = i == 0;
-            let uses_index = access_method.index.is_some();
-            let source_table_is_from_clause_subquery = matches!(
-                &joined_tables[table_idx].table,
-                Table::FromClauseSubquery(_)
-            );
+            #[cfg(feature = "index_experimental")]
+            let try_to_build_ephemeral_index = {
+                let is_leftmost_table = i == 0;
+                let uses_index = access_method.index.is_some();
+                let source_table_is_from_clause_subquery = matches!(
+                    &joined_tables[table_idx].table,
+                    Table::FromClauseSubquery(_)
+                );
+                !is_leftmost_table && !uses_index && !source_table_is_from_clause_subquery
+            };
+            #[cfg(not(feature = "index_experimental"))]
+            let try_to_build_ephemeral_index = false;
 
-            let try_to_build_ephemeral_index =
-                !is_leftmost_table && !uses_index && !source_table_is_from_clause_subquery;
             if !try_to_build_ephemeral_index {
                 joined_tables[table_idx].op = Operation::Scan {
                     iter_dir: access_method.iter_dir,
@@ -776,6 +781,7 @@ fn ephemeral_index_build(
             order: SortOrder::Asc,
             pos_in_table: i,
             collation: c.collation,
+            default: c.default.clone(),
         })
         // only include columns that are used in the query
         .filter(|c| table_reference.column_is_used(c.pos_in_table))

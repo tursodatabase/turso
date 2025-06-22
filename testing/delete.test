@@ -52,11 +52,29 @@ do_execsql_test_on_specific_db {:memory:} delete-reuse-1 {
 } {1 2 3}
 
 # Test delete works when there are indexes
-do_execsql_test_on_specific_db {:memory:} delete-all-with-indexes-1 {
-    CREATE TABLE t(a PRIMARY KEY);
-    CREATE INDEX tasc ON t(a);
-    CREATE INDEX tdesc ON t(a DESC);
-    INSERT INTO t VALUES (randomblob(1000));
-    DELETE FROM t;
-    SELECT * FROM t;
-} {}
+if {[info exists ::env(SQLITE_EXEC)] && $::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental"} {
+    do_execsql_test_on_specific_db {:memory:} delete-all-with-indexes-1 {
+        CREATE TABLE t(a PRIMARY KEY);
+        CREATE INDEX tasc ON t(a);
+        CREATE INDEX tdesc ON t(a DESC);
+        INSERT INTO t VALUES (randomblob(1000));
+        DELETE FROM t;
+        SELECT * FROM t;
+    } {}
+}
+
+do_execsql_test_on_specific_db {:memory:} delete_where_falsy {
+    CREATE TABLE resourceful_schurz (diplomatic_kaplan BLOB);
+    INSERT INTO resourceful_schurz VALUES (X'696E646570656E64656E745F6A6165636B6C65'), (X'67656E65726F75735F62617262616E65677261'), (X'73757065725F74616E6E656E6261756D'), (X'6D6F76696E675F6E616F756D6F76'), (X'7374756E6E696E675F6B62');
+    INSERT INTO resourceful_schurz VALUES (X'70617373696F6E6174655F726F62696E'), (X'666169746866756C5F74686F6D6173'), (X'76696272616E745F6D69726F736C6176'), (X'737061726B6C696E675F67726179');
+    DELETE FROM resourceful_schurz WHERE - x'666169746866756c5f74686f6d6173';
+    SELECT * FROM resourceful_schurz;
+} {independent_jaeckle
+generous_barbanegra
+super_tannenbaum
+moving_naoumov
+stunning_kb
+passionate_robin
+faithful_thomas
+vibrant_miroslav
+sparkling_gray}

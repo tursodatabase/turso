@@ -31,30 +31,34 @@ impl SimulatorFile {
         self.fault.replace(fault);
     }
 
-    pub(crate) fn print_stats(&self) {
-        tracing::info!("op           calls   faults");
-        tracing::info!("--------- -------- --------");
-        tracing::info!(
-            "pread     {:8} {:8}",
-            *self.nr_pread_calls.borrow(),
-            *self.nr_pread_faults.borrow()
-        );
-        tracing::info!(
-            "pwrite    {:8} {:8}",
-            *self.nr_pwrite_calls.borrow(),
-            *self.nr_pwrite_faults.borrow()
-        );
-        tracing::info!(
-            "sync      {:8} {:8}",
-            *self.nr_sync_calls.borrow(),
-            0 // No fault counter for sync
-        );
-        tracing::info!("--------- -------- --------");
+    pub(crate) fn stats_table(&self) -> String {
         let sum_calls = *self.nr_pread_calls.borrow()
             + *self.nr_pwrite_calls.borrow()
             + *self.nr_sync_calls.borrow();
         let sum_faults = *self.nr_pread_faults.borrow() + *self.nr_pwrite_faults.borrow();
-        tracing::info!("total     {:8} {:8}", sum_calls, sum_faults);
+        let stats_table = [
+            "op           calls   faults".to_string(),
+            "--------- -------- --------".to_string(),
+            format!(
+                "pread     {:8} {:8}",
+                *self.nr_pread_calls.borrow(),
+                *self.nr_pread_faults.borrow()
+            ),
+            format!(
+                "pwrite    {:8} {:8}",
+                *self.nr_pwrite_calls.borrow(),
+                *self.nr_pwrite_faults.borrow()
+            ),
+            format!(
+                "sync      {:8} {:8}",
+                *self.nr_sync_calls.borrow(),
+                0 // No fault counter for sync
+            ),
+            "--------- -------- --------".to_string(),
+            format!("total     {:8} {:8}", sum_calls, sum_faults),
+        ];
+        let table = stats_table.join("\n");
+        table
     }
 }
 

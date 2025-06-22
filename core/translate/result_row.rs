@@ -1,7 +1,7 @@
 use crate::{
     vdbe::{
         builder::ProgramBuilder,
-        insn::{IdxInsertFlags, Insn},
+        insn::{IdxInsertFlags, InsertFlags, Insn},
         BranchOffset,
     },
     Result,
@@ -98,6 +98,27 @@ pub fn emit_result_row_and_limit(
                 unpacked_start: None,
                 unpacked_count: None,
                 flags: IdxInsertFlags::new(),
+            });
+        }
+        QueryDestination::EphemeralTable {
+            cursor_id: table_cursor_id,
+            table,
+        } => {
+            let record_reg = program.alloc_register();
+            if plan.result_columns.len() > 1 {
+                program.emit_insn(Insn::MakeRecord {
+                    start_reg: result_columns_start_reg,
+                    count: plan.result_columns.len() - 1,
+                    dest_reg: record_reg,
+                    index_name: Some(table.name.clone()),
+                });
+            }
+            program.emit_insn(Insn::Insert {
+                cursor: *table_cursor_id,
+                key_reg: result_columns_start_reg + (plan.result_columns.len() - 1), // Rowid reg is the last register
+                record_reg,
+                flag: InsertFlags(0),
+                table_name: table.name.clone(),
             });
         }
         QueryDestination::CoroutineYield { yield_reg, .. } => {

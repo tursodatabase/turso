@@ -184,7 +184,7 @@ fn do_fuzz(expr: Expr) -> Result<Corpus, Box<dyn Error>> {
 
     let found = 'value: {
         let io = Arc::new(limbo_core::MemoryIO::new());
-        let db = limbo_core::Database::open_file(io.clone(), ":memory:", true)?;
+        let db = limbo_core::Database::open_file(io.clone(), ":memory:", false)?;
         let conn = db.connect()?;
 
         let mut stmt = conn.prepare(sql)?;

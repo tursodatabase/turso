@@ -69,6 +69,25 @@ do_execsql_test_on_specific_db {:memory:} update-null {
 } {10|1|2
 3|4|5}
 
+do_execsql_test_on_specific_db {:memory:} update-not-null-1 {
+    create table temp (a,b not null,c);
+    insert into temp values (1, 2, 3);
+    update temp set b = 999;
+    select * from temp;
+} {1|999|3}
+
+do_execsql_test_in_memory_any_error update-not-null-2 {
+    create table temp (a,b not null,c);
+    insert into temp values (1, 2, 3);
+    update temp set b = NULL;
+}
+
+do_execsql_test_on_specific_db {:memory:} update-not-null-3 {
+    create table temp (a not null, b not null, c not null);
+    update temp set a = null, b = null, c = null;
+    select * from temp;
+} {}
+
 do_execsql_test_on_specific_db {:memory:} update-mixed-types {
     create table temp (a);
     insert into temp values (1);
@@ -171,20 +190,22 @@ do_execsql_test_on_specific_db {:memory:} update_cache_full_regression_test_#162
     SELECT count(*) FROM t;
 } {1}
 
-do_execsql_test_on_specific_db {:memory:} update_index_regression_test {
-    CREATE TABLE t(x, y);
-    CREATE INDEX tx ON t (x);
-    CREATE UNIQUE INDEX tyu ON t (y);
-    INSERT INTO t VALUES (1, 1);
-    SELECT x FROM t; -- uses tx index
-    SELECT y FROM t; -- uses ty index
-    UPDATE t SET x=2, y=2;
-    SELECT x FROM t; -- uses tx index
-    SELECT y FROM t; -- uses ty index    
-} {1
-1
-2
-2}
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+    do_execsql_test_on_specific_db {:memory:} update_index_regression_test {
+        CREATE TABLE t(x, y);
+        CREATE INDEX tx ON t (x);
+        CREATE UNIQUE INDEX tyu ON t (y);
+        INSERT INTO t VALUES (1, 1);
+        SELECT x FROM t; -- uses tx index
+        SELECT y FROM t; -- uses ty index
+        UPDATE t SET x=2, y=2;
+        SELECT x FROM t; -- uses tx index
+        SELECT y FROM t; -- uses ty index    
+    } {1
+    1
+    2
+    2}
+}
 
 do_execsql_test_on_specific_db {:memory:} update_where_or_regression_test {
     CREATE TABLE t (a INTEGER);
@@ -193,3 +214,42 @@ do_execsql_test_on_specific_db {:memory:} update_where_or_regression_test {
     SELECT * from t;
 } {lovely_revolt
 lovely_revolt}
+
+do_execsql_test_in_memory_any_error update_primary_key_constraint_error {
+    CREATE TABLE eye (study REAL, spring BLOB, save TEXT, thank REAL, election INTEGER, PRIMARY KEY (election));                  
+    INSERT INTO eye VALUES (183559032.521585, x'6625d092', 'Trial six should.', 2606132742.43174, 2817);
+    INSERT INTO eye VALUES (78255586.9204539, x'651061e8', 'World perhaps.', -5815764.49018679, 1917);
+    UPDATE eye SET election = 6150;
+}
+
+do_execsql_test_in_memory_any_error update_primary_key_constraint_error_2 {
+    CREATE TABLE eye (study REAL, spring BLOB, save TEXT, thank REAL, election INTEGER, PRIMARY KEY (election));                  
+    INSERT INTO eye VALUES (183559032.521585,  x'6625d092', 'Trial six should.', 2606132742.43174, 2817); 
+    INSERT INTO eye VALUES (78255586.9204539, x'651061e8', 'World perhaps.', -5815764.49018679, 1917); 
+    INSERT INTO eye VALUES (53.3274327094467, x'f574c507', 'Senior wish degree.', -423.432750526747, 2650); 
+    INSERT INTO eye VALUES (-908148213048.983, x'6d812051', 'Possible able.', 101.171781837336, 4100); 
+    INSERT INTO eye VALUES (-572332773760.924, x'd7a4d9fb', 'Money catch expect.', -271065488.756746, 4667);
+    UPDATE eye SET election = 6150 WHERE election != 1917;
+}
+
+do_execsql_test_in_memory_any_error update_primary_key_constraint_error_3 {
+    CREATE TABLE eye (study REAL, spring BLOB, save TEXT, thank REAL, election INTEGER, PRIMARY KEY (election));                  
+    INSERT INTO eye VALUES (183559032.521585,  x'6625d092', 'Trial six should.', 2606132742.43174, 2817); 
+    INSERT INTO eye VALUES (78255586.9204539, x'651061e8', 'World perhaps.', -5815764.49018679, 1917); 
+    INSERT INTO eye VALUES (53.3274327094467, x'f574c507', 'Senior wish degree.', -423.432750526747, 2650); 
+    INSERT INTO eye VALUES (-908148213048.983, x'6d812051', 'Possible able.', 101.171781837336, 4100); 
+    INSERT INTO eye VALUES (-572332773760.924, x'd7a4d9fb', 'Money catch expect.', -271065488.756746, 4667);
+    UPDATE eye SET election = 6150 WHERE election > 1000 AND study > 1;
+}
+
+do_execsql_test_in_memory_any_error update_primary_key_constraint_error_4 {
+    CREATE TABLE t(a PRIMARY KEY INTEGER, b UNIQUE);
+    INSERT INTO t(b) VALUES (100), (200), (300);
+    UPDATE t SET a = 1;
+}
+
+do_execsql_test_in_memory_any_error update_primary_key_unique_constraint_error {
+    CREATE TABLE t(a PRIMARY KEY INTEGER, b UNIQUE);
+    INSERT INTO t(b) VALUES (100), (200), (300);
+    UPDATE t SET b = 2;
+}

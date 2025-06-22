@@ -5,7 +5,7 @@ use clap::{command, Parser};
 #[command(author, version, about, long_about = None)]
 pub struct Opts {
     /// Number of threads to run
-    #[clap(short = 't', long, help = "the number of threads", default_value_t = 8)]
+    #[clap(short = 't', long, help = "the number of threads", default_value_t = 1)]
     pub nr_threads: usize,
 
     /// Number of iterations per thread

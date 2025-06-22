@@ -2,11 +2,12 @@
 
 import argparse
 import sqlite3
+
 from faker import Faker
 
 parser = argparse.ArgumentParser()
-parser.add_argument('filename')
-parser.add_argument('-c', '--count', type=int)
+parser.add_argument("filename")
+parser.add_argument("-c", "--count", type=int)
 
 args = parser.parse_args()
 
@@ -14,7 +15,7 @@ conn = sqlite3.connect(args.filename)
 cursor = conn.cursor()
 
 # Create the user table
-cursor.execute('''
+cursor.execute("""
     CREATE TABLE IF NOT EXISTS user (
         id INTEGER PRIMARY KEY,
         first_name TEXT,
@@ -26,7 +27,7 @@ cursor.execute('''
         state TEXT,
         zipcode TEXT
     )
-''')
+""")
 
 fake = Faker()
 for _ in range(args.count):
@@ -39,10 +40,13 @@ for _ in range(args.count):
     state = fake.state_abbr()
     zipcode = fake.zipcode()
 
-    cursor.execute('''
+    cursor.execute(
+        """
         INSERT INTO user (first_name, last_name, email, phone_number, address, city, state, zipcode)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (first_name, last_name, email, phone_number, address, city, state, zipcode))
+    """,
+        (first_name, last_name, email, phone_number, address, city, state, zipcode),
+    )
 
 conn.commit()
 conn.close()

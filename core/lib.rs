@@ -209,7 +209,7 @@ impl Database {
         Ok(db)
     }
 
-    pub fn connect(self: &Arc<Database>) -> Result<Rc<Connection>> {
+    pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
         let buffer_pool = Rc::new(BufferPool::new(self.page_size as usize));
 
         let wal = Rc::new(RefCell::new(WalFile::new(
@@ -227,7 +227,7 @@ impl Database {
             Arc::new(RwLock::new(DumbLruPageCache::default())),
             buffer_pool,
         )?);
-        let conn = Rc::new(Connection {
+        let conn = Arc::new(Connection {
             _db: self.clone(),
             pager: pager.clone(),
             schema: self.schema.clone(),
@@ -345,7 +345,7 @@ pub struct Connection {
 
 impl Connection {
     #[instrument(skip_all, level = Level::TRACE)]
-    pub fn prepare(self: &Rc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
+    pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         if sql.as_ref().is_empty() {
             return Err(LimboError::InvalidArgument(
                 "The supplied SQL string contains no statements".to_string(),
@@ -372,7 +372,7 @@ impl Connection {
                     stmt,
                     self.header.clone(),
                     self.pager.clone(),
-                    Rc::downgrade(self),
+                    self.clone(),
                     &syms,
                     QueryMode::Normal,
                     &input,
@@ -389,7 +389,7 @@ impl Connection {
     }
 
     #[instrument(skip_all, level = Level::TRACE)]
-    pub fn query(self: &Rc<Connection>, sql: impl AsRef<str>) -> Result<Option<Statement>> {
+    pub fn query(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Option<Statement>> {
         let sql = sql.as_ref();
         tracing::trace!("Querying: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
@@ -406,7 +406,7 @@ impl Connection {
 
     #[instrument(skip_all, level = Level::TRACE)]
     pub(crate) fn run_cmd(
-        self: &Rc<Connection>,
+        self: &Arc<Connection>,
         cmd: Cmd,
         input: &str,
     ) -> Result<Option<Statement>> {
@@ -421,7 +421,7 @@ impl Connection {
                     stmt.clone(),
                     self.header.clone(),
                     self.pager.clone(),
-                    Rc::downgrade(self),
+                    self.clone(),
                     &syms,
                     cmd.into(),
                     input,
@@ -464,14 +464,14 @@ impl Connection {
         }
     }
 
-    pub fn query_runner<'a>(self: &'a Rc<Connection>, sql: &'a [u8]) -> QueryRunner<'a> {
+    pub fn query_runner<'a>(self: &'a Arc<Connection>, sql: &'a [u8]) -> QueryRunner<'a> {
         QueryRunner::new(self, sql)
     }
 
     /// Execute will run a query from start to finish taking ownership of I/O because it will run pending I/Os if it didn't finish.
     /// TODO: make this api async
     #[instrument(skip_all, level = Level::TRACE)]
-    pub fn execute(self: &Rc<Connection>, sql: impl AsRef<str>) -> Result<()> {
+    pub fn execute(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
         let sql = sql.as_ref();
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next()?;
@@ -491,7 +491,7 @@ impl Connection {
                         stmt,
                         self.header.clone(),
                         self.pager.clone(),
-                        Rc::downgrade(self),
+                        self.clone(),
                         &syms,
                         QueryMode::Explain,
                         &input,
@@ -508,7 +508,7 @@ impl Connection {
                         stmt,
                         self.header.clone(),
                         self.pager.clone(),
-                        Rc::downgrade(self),
+                        self.clone(),
                         &syms,
                         QueryMode::Normal,
                         &input,
@@ -566,17 +566,7 @@ impl Connection {
 
     /// Close a connection and checkpoint.
     pub fn close(&self) -> Result<()> {
-        loop {
-            // TODO: make this async?
-            match self.pager.checkpoint()? {
-                CheckpointStatus::Done(_) => {
-                    return Ok(());
-                }
-                CheckpointStatus::IO => {
-                    self.pager.io.run_once()?;
-                }
-            };
-        }
+        self.pager.checkpoint_shutdown()
     }
 
     pub fn last_insert_rowid(&self) -> i64 {
@@ -630,7 +620,7 @@ impl Connection {
         self.auto_commit.get()
     }
 
-    pub fn parse_schema_rows(self: &Rc<Connection>) -> Result<()> {
+    pub fn parse_schema_rows(self: &Arc<Connection>) -> Result<()> {
         let rows = self.query("SELECT * FROM sqlite_schema")?;
         let mut schema = self
             .schema
@@ -651,7 +641,7 @@ impl Connection {
 
     // Clearly there is something to improve here, Vec<Vec<Value>> isn't a couple of tea
     /// Query the current rows/values of `pragma_name`.
-    pub fn pragma_query(self: &Rc<Connection>, pragma_name: &str) -> Result<Vec<Vec<Value>>> {
+    pub fn pragma_query(self: &Arc<Connection>, pragma_name: &str) -> Result<Vec<Vec<Value>>> {
         let pragma = format!("PRAGMA {}", pragma_name);
         let mut stmt = self.prepare(pragma)?;
         let mut results = Vec::new();
@@ -681,7 +671,7 @@ impl Connection {
     /// Some pragmas will return the updated value which cannot be retrieved
     /// with this method.
     pub fn pragma_update<V: Display>(
-        self: &Rc<Connection>,
+        self: &Arc<Connection>,
         pragma_name: &str,
         pragma_value: V,
     ) -> Result<Vec<Vec<Value>>> {
@@ -716,7 +706,7 @@ impl Connection {
     /// (e.g. `table_info('one_tbl')`) or pragmas which returns value(s)
     /// (e.g. `integrity_check`).
     pub fn pragma<V: Display>(
-        self: &Rc<Connection>,
+        self: &Arc<Connection>,
         pragma_name: &str,
         pragma_value: V,
     ) -> Result<Vec<Vec<Value>>> {
@@ -886,13 +876,13 @@ impl SymbolTable {
 
 pub struct QueryRunner<'a> {
     parser: Parser<'a>,
-    conn: &'a Rc<Connection>,
+    conn: &'a Arc<Connection>,
     statements: &'a [u8],
     last_offset: usize,
 }
 
 impl<'a> QueryRunner<'a> {
-    pub(crate) fn new(conn: &'a Rc<Connection>, statements: &'a [u8]) -> Self {
+    pub(crate) fn new(conn: &'a Arc<Connection>, statements: &'a [u8]) -> Self {
         Self {
             parser: Parser::new(statements),
             conn,

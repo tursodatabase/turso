@@ -15,6 +15,7 @@ path = "lib.rs"
 
 [features]
 default = ["fs", "uuid", "time", "json", "static"]
+index_experimental = []
 fs = ["limbo_ext/vfs"]
 json = []
 uuid = ["limbo_uuid/static"]

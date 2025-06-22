@@ -240,6 +240,9 @@ name = "bitflags"
 version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c8214115b7bf84099f1309324e63141d4c5d7cc26862f97a0a857dbefe165bd"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "blake3"
@@ -512,7 +515,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "core_tester"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1428,6 +1431,7 @@ checksum = "3954d50fe15b02142bf25d3b8bdadb634ec3948f103d04ffe3031bc8fe9d7058"
 dependencies = [
  "equivalent",
  "hashbrown 0.15.2",
+ "serde",
 ]
 
 [[package]]
@@ -1718,7 +1722,7 @@ dependencies = [
 
 [[package]]
 name = "limbo"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "limbo_core",
  "tempfile",
@@ -1728,14 +1732,14 @@ dependencies = [
 
 [[package]]
 name = "limbo-go"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "limbo_core",
 ]
 
 [[package]]
 name = "limbo-java"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "jni",
  "limbo_core",
@@ -1744,7 +1748,7 @@ dependencies = [
 
 [[package]]
 name = "limbo-wasm"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "console_error_panic_hook",
  "getrandom 0.2.15",
@@ -1757,7 +1761,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_cli"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "anyhow",
  "cfg-if",
@@ -1787,7 +1791,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_completion"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "limbo_ext",
  "mimalloc",
@@ -1795,7 +1799,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_core"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "bitflags 2.9.0",
  "built",
@@ -1854,7 +1858,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_crypto"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -1867,7 +1871,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_csv"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "csv",
  "limbo_ext",
@@ -1877,7 +1881,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_ext"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "chrono",
  "getrandom 0.3.2",
@@ -1886,7 +1890,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_ext_tests"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "env_logger 0.11.7",
  "lazy_static",
@@ -1897,7 +1901,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_ipaddr"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "ipnetwork",
  "limbo_ext",
@@ -1906,7 +1910,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_macros"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1915,7 +1919,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_node"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "limbo_core",
  "napi",
@@ -1925,7 +1929,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_percentile"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "limbo_ext",
  "mimalloc",
@@ -1933,7 +1937,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_regexp"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "limbo_ext",
  "mimalloc",
@@ -1942,7 +1946,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_series"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "limbo_ext",
  "mimalloc",
@@ -1952,7 +1956,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sim"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "anarchist-readable-name-generator-lib",
  "anyhow",
@@ -1960,7 +1964,9 @@ dependencies = [
  "clap",
  "dirs 6.0.0",
  "env_logger 0.10.2",
+ "hex",
  "limbo_core",
+ "limbo_sqlite3_parser",
  "log",
  "notify",
  "rand 0.8.5",
@@ -1976,7 +1982,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sqlite3"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "env_logger 0.11.7",
  "libc",
@@ -1989,7 +1995,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sqlite3_parser"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "bitflags 2.9.0",
  "cc",
@@ -2009,8 +2015,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "limbo_sqlite_test_ext"
+version = "0.0.22"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "limbo_stress"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "anarchist-readable-name-generator-lib",
  "antithesis_sdk",
@@ -2026,7 +2039,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_time"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "chrono",
  "limbo_ext",
@@ -2038,7 +2051,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_uuid"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "limbo_ext",
  "mimalloc",
@@ -2697,7 +2710,7 @@ dependencies = [
 
 [[package]]
 name = "py-limbo"
-version = "0.0.22-pre.1"
+version = "0.0.22"
 dependencies = [
  "anyhow",
  "limbo_core",

@@ -9,6 +9,7 @@ use crate::{
     schema::{Affinity, BTreeTable, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
     translate::collate::CollationSeq,
+    Value,
 };
 use limbo_macros::Description;
 use limbo_sqlite3_parser::ast::SortOrder;
@@ -89,6 +90,30 @@ impl IdxInsertFlags {
             self.0 |= IdxInsertFlags::NCHANGE;
         } else {
             self.0 &= !IdxInsertFlags::NCHANGE;
+        }
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InsertFlags(pub u8);
+
+impl InsertFlags {
+    pub const UPDATE: u8 = 0x01; // Flag indicating this is part of an UPDATE statement
+
+    pub fn new() -> Self {
+        InsertFlags(0)
+    }
+
+    pub fn has(&self, flag: u8) -> bool {
+        (self.0 & flag) != 0
+    }
+
+    pub fn update(mut self, is_update: bool) -> Self {
+        if is_update {
+            self.0 |= InsertFlags::UPDATE;
+        } else {
+            self.0 &= !InsertFlags::UPDATE;
         }
         self
     }
@@ -376,6 +401,7 @@ pub enum Insn {
         cursor_id: CursorID,
         column: usize,
         dest: usize,
+        default: Option<Value>,
     },
 
     TypeCheck {
@@ -416,6 +442,13 @@ pub enum Insn {
     Halt {
         err_code: usize,
         description: String,
+    },
+
+    /// Halt the program if P3 is null.
+    HaltIfNull {
+        target_reg: usize,   // P3
+        description: String, // p4
+        err_code: usize,     // p1
     },
 
     /// Start a transaction.
@@ -474,6 +507,12 @@ pub enum Insn {
     /// Write a blob value into a register.
     Blob {
         value: Vec<u8>,
+        dest: usize,
+    },
+
+    /// Read a complete row of data from the current cursor and write it to the destination register.
+    RowData {
+        cursor_id: CursorID,
         dest: usize,
     },
 
@@ -679,7 +718,7 @@ pub enum Insn {
         cursor: CursorID,
         key_reg: usize,    // Must be int.
         record_reg: usize, // Blob of record data.
-        flag: usize,       // Flags used by insert, for now not used.
+        flag: InsertFlags, // Flags used by insert, for now not used.
         table_name: String,
     },
 
@@ -927,6 +966,18 @@ pub enum Insn {
         target_reg: usize,
         exact: bool,
     },
+
+    /// Do an analysis of the currently open database. Store in register (P1+1) the text of an error message describing any problems.
+    /// If no problems are found, store a NULL in register (P1+1).
+    /// The register (P1) contains one less than the maximum number of allowed errors.
+    /// At most reg(P1) errors will be reported. In other words, the analysis stops as soon as reg(P1) errors are seen.
+    /// Reg(P1) is updated with the number of errors remaining. The root page numbers of all tables in the database are integers
+    /// stored in P4_INTARRAY argument. If P5 is not zero, the check is done on the auxiliary database file, not the main database file. This opcode is used to implement the integrity_check pragma.
+    IntegrityCk {
+        max_errors: usize,
+        roots: Vec<usize>,
+        message_register: usize,
+    },
 }
 
 impl Insn {
@@ -978,6 +1029,7 @@ impl Insn {
             Insn::Next { .. } => execute::op_next,
             Insn::Prev { .. } => execute::op_prev,
             Insn::Halt { .. } => execute::op_halt,
+            Insn::HaltIfNull { .. } => execute::op_halt_if_null,
             Insn::Transaction { .. } => execute::op_transaction,
             Insn::AutoCommit { .. } => execute::op_auto_commit,
             Insn::Goto { .. } => execute::op_goto,
@@ -988,6 +1040,7 @@ impl Insn {
             Insn::RealAffinity { .. } => execute::op_real_affinity,
             Insn::String8 { .. } => execute::op_string8,
             Insn::Blob { .. } => execute::op_blob,
+            Insn::RowData { .. } => execute::op_row_data,
             Insn::RowId { .. } => execute::op_row_id,
             Insn::IdxRowId { .. } => execute::op_idx_row_id,
             Insn::SeekRowid { .. } => execute::op_seek_rowid,
@@ -1050,6 +1103,7 @@ impl Insn {
             Insn::Affinity { .. } => execute::op_affinity,
             Insn::IdxDelete { .. } => execute::op_idx_delete,
             Insn::Count { .. } => execute::op_count,
+            Insn::IntegrityCk { .. } => execute::op_integrity_check,
         }
     }
 }

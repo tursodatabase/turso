@@ -93,19 +93,35 @@ test-memory: limbo uv-sync
 .PHONY: test-memory
 
 test-write: limbo uv-sync
-	SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-write
+	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
+		SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-write; \
+	else \
+		echo "Skipping test-write: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
+	fi
 .PHONY: test-write
 
 test-update: limbo uv-sync
-	SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-update
+	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
+		SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-update; \
+	else \
+		echo "Skipping test-update: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
+	fi
 .PHONY: test-update
 
 test-collate: limbo uv-sync
-	SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-collate
+	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
+		SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-collate; \
+	else \
+		echo "Skipping test-collate: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
+	fi
 .PHONY: test-collate
 
 test-constraint: limbo uv-sync
-	SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-constraint
+	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
+		SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-constraint; \
+	else \
+		echo "Skipping test-constraint: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
+	fi
 .PHONY: test-constraint
 
 bench-vfs: uv-sync

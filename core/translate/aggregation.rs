@@ -41,6 +41,7 @@ pub fn emit_ungrouped_aggregation<'a>(
             .expr_to_reg_cache
             .push((&agg.original_expr, agg_start_reg + i));
     }
+    t_ctx.resolver.enable_expr_to_reg_cache();
 
     // This always emits a ResultRow because currently it can only be used for a single row result
     // Limit is None because we early exit on limit 0 and the max rows here is 1

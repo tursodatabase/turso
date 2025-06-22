@@ -199,14 +199,40 @@ do_execsql_test group_by_no_sorting_required {
 2|113
 3|97}
 
-do_execsql_test distinct_agg_functions {
-  select first_name, sum(distinct age), count(distinct age), avg(distinct age) 
-  from users 
-  group by 1 
-  limit 3;
-} {Aaron|1769|33|53.6060606060606
-Abigail|833|15|55.5333333333333
-Adam|1517|30|50.5666666666667}
+# Compile-time constants are moved to the end of the program.
+# Verify that the jump to AggStep works correctly even when the location of the ',' constant has changed.
+do_execsql_test group_by_no_sorting_required_and_const_agg_arg {
+  select group_concat(state, ',') from users group by age limit 2;
+} {CA,PW,ME,AS,LA,OH,AL,UT,WA,MO,WA,SC,AR,CO,OK,ME,FM,AR,CT,MT,TN,FL,MA,ND,LA,NE,KS,IN,RI,NH,IL,FM,WA,MH,RI,SC,AS,IL,VA,MI,ID,ME,WY,TN,IN,IN,UT,WA,AZ,VA,NM,IA,MP,WY,RI,OR,OR,FM,WA,DC,RI,GU,TX,HI,IL,TX,WY,OH,TX,CT,KY,NE,MH,AR,MN,IL,NH,HI,NV,UT,FL,MS,NM,NJ,CA,MS,GA,MT,GA,AL,IN,SC,PA,FL,CT,PA,GA,RI,HI,WV,VT,IA,PR,FM,MA,TX,MS,LA,MD,PA,TX,WY
+OR,SD,KS,MP,WA,VI,SC,SD,SD,MP,WA,MT,FM,IN,ME,OH,KY,RI,DC,MS,OK,VI,KY,MD,SC,OK,NY,WY,AK,MN,UT,NE,VA,MD,AZ,VI,SC,NV,IN,VA,HI,VI,MS,NE,WY,NY,GU,MT,AL,IA,VA,ND,MN,FM,IA,ID,IL,FL,PR,WA,AS,HI,NH,WI,FL,HI,AL,ID,DC,CT,IL,VT,AZ,VI,AK,PW,NC,SD,NV,WA,MO,MS,WY,VA,FM,MN,NH,MN,MT,TX,MS,FM,OH,GU,IN,WA,IA,PA,ID,MI,LA,GU,ND,AR,ND,WV,DC,NY,CO,CT,FM,CT,ND}
+
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+  do_execsql_test_on_specific_db {:memory:} group_by_no_sorting_required_reordered_columns {
+    create table t0 (a INT, b INT, c INT);
+    create index a_b_idx on t0 (a, b);
+    insert into t0 values
+      (1,1,1),
+      (1,1,2),
+      (2,1,3),
+      (2,2,3),
+      (2,2,5);
+
+    select c, b, a from t0 group by a, b;
+  } {1|1|1
+  3|1|2
+  3|2|2}
+}
+
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+    do_execsql_test distinct_agg_functions {
+    select first_name, sum(distinct age), count(distinct age), avg(distinct age)
+    from users
+    group by 1
+    limit 3;
+    } {Aaron|1769|33|53.6060606060606
+    Abigail|833|15|55.5333333333333
+    Adam|1517|30|50.5666666666667}
+}
 
 do_execsql_test_on_specific_db {:memory:} having_or {
   CREATE TABLE users (first_name TEXT, age INTEGER);
@@ -222,3 +248,55 @@ do_execsql_test_on_specific_db {:memory:} having_or {
   order by cnt desc
 } {Michael|2|37.5
 Sarah|1|65.0}
+
+do_execsql_test complex_result_expression_containing_aggregate {
+  select
+    case when price > 70 then group_concat(name, ',') else '<undisclosed>' end names
+  from products
+  group by price
+  order by price;
+} {<undisclosed>
+<undisclosed>
+<undisclosed>
+<undisclosed>
+<undisclosed>
+sweatshirt
+jeans
+hat
+accessories
+cap,sneakers}
+
+do_execsql_test complex_result_expression_containing_aggregate_and_rowid {
+  select
+    case when rowid >= 5 then group_concat(name, ',') else '<undisclosed>' end names
+  from products
+  group by rowid
+  order by rowid;
+} {<undisclosed>
+   <undisclosed>
+   <undisclosed>
+   <undisclosed>
+sweatshirt
+shorts
+jeans
+sneakers
+boots
+coat
+accessories}
+
+do_execsql_test complex_having_expression_containing_aggregate {
+  select group_concat(name, ',') from products group by price having (group_concat(name, ',') || price) like 'ca%';
+} {cap,sneakers}
+
+do_execsql_test complex_order_by_expression_containing_aggregate {
+  select group_concat(name, ',') from products group by price order by (group_concat(name, ',') || price);
+} {accessories
+boots
+cap,sneakers
+coat
+hat
+jeans
+shirt
+shorts
+sweater
+sweatshirt}

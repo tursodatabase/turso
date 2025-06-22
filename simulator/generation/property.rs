@@ -1,13 +1,15 @@
 use limbo_core::LimboError;
+use limbo_sqlite3_parser::ast;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     model::{
         query::{
-            select::{Distinctness, Predicate, ResultColumn},
+            predicate::Predicate,
+            select::{Distinctness, ResultColumn},
             Create, Delete, Drop, Insert, Query, Select,
         },
-        table::Value,
+        table::SimValue,
     },
     runner::env::SimulatorEnv,
 };
@@ -128,14 +130,14 @@ pub(crate) enum Property {
 }
 
 impl Property {
-    pub(crate) fn name(&self) -> String {
+    pub(crate) fn name(&self) -> &str {
         match self {
-            Property::InsertValuesSelect { .. } => "Insert-Values-Select".to_string(),
-            Property::DoubleCreateFailure { .. } => "Double-Create-Failure".to_string(),
-            Property::SelectLimit { .. } => "Select-Limit".to_string(),
-            Property::DeleteSelect { .. } => "Delete-Select".to_string(),
-            Property::DropSelect { .. } => "Drop-Select".to_string(),
-            Property::SelectSelectOptimizer { .. } => "Select-Select-Optimizer".to_string(),
+            Property::InsertValuesSelect { .. } => "Insert-Values-Select",
+            Property::DoubleCreateFailure { .. } => "Double-Create-Failure",
+            Property::SelectLimit { .. } => "Select-Limit",
+            Property::DeleteSelect { .. } => "Delete-Select",
+            Property::DropSelect { .. } => "Drop-Select",
+            Property::SelectSelectOptimizer { .. } => "Select-Select-Optimizer",
         }
     }
     /// interactions construct a list of interactions, which is an executable representation of the property.
@@ -287,20 +289,6 @@ impl Property {
                     }),
                 });
 
-                let assertion = Interaction::Assertion(Assertion {
-                    message: format!(
-                        "select '{}' should return no values for table '{}'",
-                        predicate, table,
-                    ),
-                    func: Box::new(move |stack: &Vec<ResultSet>, _: &SimulatorEnv| {
-                        let rows = stack.last().unwrap();
-                        match rows {
-                            Ok(rows) => Ok(rows.is_empty()),
-                            Err(err) => Err(LimboError::InternalError(err.to_string())),
-                        }
-                    }),
-                });
-
                 let delete = Interaction::Query(Query::Delete(Delete {
                     table: table.clone(),
                     predicate: predicate.clone(),
@@ -313,6 +301,17 @@ impl Property {
                     limit: None,
                     distinct: Distinctness::All,
                 }));
+
+                let assertion = Interaction::Assertion(Assertion {
+                    message: format!("`{}` should return no values for table `{}`", select, table,),
+                    func: Box::new(move |stack: &Vec<ResultSet>, _: &SimulatorEnv| {
+                        let rows = stack.last().unwrap();
+                        match rows {
+                            Ok(rows) => Ok(rows.is_empty()),
+                            Err(err) => Err(LimboError::InternalError(err.to_string())),
+                        }
+                    }),
+                });
 
                 let mut interactions = Vec::new();
                 interactions.push(assumption);
@@ -382,7 +381,6 @@ impl Property {
                         }
                     }),
                 });
-
                 let select1 = Interaction::Query(Query::Select(Select {
                     table: table.clone(),
                     result_columns: vec![ResultColumn::Expr(predicate.clone())],
@@ -391,13 +389,14 @@ impl Property {
                     distinct: Distinctness::All,
                 }));
 
-                let select2 = Interaction::Query(Query::Select(Select {
+                let select2_query = Query::Select(Select {
                     table: table.clone(),
                     result_columns: vec![ResultColumn::Star],
                     predicate: predicate.clone(),
                     limit: None,
                     distinct: Distinctness::All,
-                }));
+                });
+                let select2 = Interaction::Query(select2_query);
 
                 let assertion = Interaction::Assertion(Assertion {
                     message: "select queries should return the same amount of results".to_string(),
@@ -413,19 +412,14 @@ impl Property {
                                     ));
                                 }
                                 // Count the 1s in the select query without the star
-                                let rows1 = rows1
+                                let rows1_count = rows1
                                     .iter()
                                     .filter(|vs| {
                                         let v = vs.first().unwrap();
-                                        if let Value::Integer(i) = v {
-                                            *i == 1
-                                        } else {
-                                            false
-                                        }
+                                        v.into_bool()
                                     })
                                     .count();
-
-                                Ok(rows1 == rows2.len())
+                                Ok(rows1_count == rows2.len())
                             }
                             _ => Ok(false),
                         }
@@ -495,7 +489,7 @@ fn property_insert_values_select<R: rand::Rng>(
     let table = pick(&env.tables, rng);
     // Generate rows to insert
     let rows = (0..rng.gen_range(1..=5))
-        .map(|_| Vec::<Value>::arbitrary_from(rng, table))
+        .map(|_| Vec::<SimValue>::arbitrary_from(rng, table))
         .collect::<Vec<_>>();
 
     // Pick a random row to select
@@ -696,10 +690,16 @@ fn property_select_select_optimizer<R: rand::Rng>(rng: &mut R, env: &SimulatorEn
     let table = pick(&env.tables, rng);
     // Generate a random predicate
     let predicate = Predicate::arbitrary_from(rng, table);
+    // Transform into a Binary predicate to force values to be casted to a bool
+    let expr = ast::Expr::Binary(
+        Box::new(predicate.0),
+        ast::Operator::And,
+        Box::new(Predicate::true_().0),
+    );
 
     Property::SelectSelectOptimizer {
         table: table.name.clone(),
-        predicate,
+        predicate: Predicate(expr),
     }
 }
 
@@ -712,28 +712,52 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
         frequency(
             vec![
                 (
-                    f64::min(remaining_.read, remaining_.write),
+                    if !env.opts.disable_insert_values_select {
+                        f64::min(remaining_.read, remaining_.write)
+                    } else {
+                        0.0
+                    },
                     Box::new(|rng: &mut R| property_insert_values_select(rng, env, &remaining_)),
                 ),
                 (
-                    remaining_.create / 2.0,
+                    if !env.opts.disable_double_create_failure {
+                        remaining_.create / 2.0
+                    } else {
+                        0.0
+                    },
                     Box::new(|rng: &mut R| property_double_create_failure(rng, env, &remaining_)),
                 ),
                 (
-                    remaining_.read,
+                    if !env.opts.disable_select_limit {
+                        remaining_.read
+                    } else {
+                        0.0
+                    },
                     Box::new(|rng: &mut R| property_select_limit(rng, env)),
                 ),
                 (
-                    f64::min(remaining_.read, remaining_.write).min(remaining_.delete),
+                    if !env.opts.disable_delete_select {
+                        f64::min(remaining_.read, remaining_.write).min(remaining_.delete)
+                    } else {
+                        0.0
+                    },
                     Box::new(|rng: &mut R| property_delete_select(rng, env, &remaining_)),
                 ),
                 (
-                    // remaining_.drop,
-                    0.0,
+                    if !env.opts.disable_drop_select {
+                        // remaining_.drop
+                        0.0
+                    } else {
+                        0.0
+                    },
                     Box::new(|rng: &mut R| property_drop_select(rng, env, &remaining_)),
                 ),
                 (
-                    remaining_.read / 2.0,
+                    if !env.opts.disable_select_optimizer {
+                        remaining_.read / 2.0
+                    } else {
+                        0.0
+                    },
                     Box::new(|rng: &mut R| property_select_select_optimizer(rng, env)),
                 ),
             ],

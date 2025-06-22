@@ -821,6 +821,25 @@ impl Pager {
             .expect("Failed to clear page cache");
     }
 
+    pub fn checkpoint_shutdown(&self) -> Result<()> {
+        let mut attempts = 0;
+        {
+            let mut wal = self.wal.borrow_mut();
+            // fsync the wal syncronously before beginning checkpoint
+            while let Ok(WalFsyncStatus::IO) = wal.sync() {
+                if attempts >= 10 {
+                    return Err(LimboError::InternalError(
+                        "Failed to fsync WAL before final checkpoint, fd likely closed".into(),
+                    ));
+                }
+                self.io.run_once()?;
+                attempts += 1;
+            }
+        }
+        self.wal_checkpoint();
+        Ok(())
+    }
+
     pub fn wal_checkpoint(&self) -> CheckpointResult {
         let checkpoint_result: CheckpointResult;
         loop {

@@ -15,7 +15,7 @@ use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::Result;
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 
 const MAX_REAL_SIZE: u8 = 15;
 
@@ -93,6 +93,12 @@ impl Text {
     }
 }
 
+impl AsRef<str> for Text {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
 impl From<String> for Text {
     fn from(value: String) -> Self {
         Text {
@@ -153,13 +159,43 @@ pub struct RawSlice {
     len: usize,
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(PartialEq, Clone)]
 pub enum RefValue {
     Null,
     Integer(i64),
     Float(f64),
     Text(TextRef),
     Blob(RawSlice),
+}
+
+impl Debug for RefValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RefValue::Null => write!(f, "Null"),
+            RefValue::Integer(i) => f.debug_tuple("Integer").field(i).finish(),
+            RefValue::Float(float) => f.debug_tuple("Float").field(float).finish(),
+            RefValue::Text(text_ref) => {
+                // truncate string to at most 256 chars
+                let text = text_ref.as_str();
+                let max_len = text.len().min(256);
+                f.debug_struct("Text")
+                    .field("data", &&text[0..max_len])
+                    // Indicates to the developer debugging that the data is truncated for printing
+                    .field("truncated", &(text.len() > max_len))
+                    .finish()
+            }
+            RefValue::Blob(raw_slice) => {
+                // truncate blob_slice to at most 32 bytes
+                let blob = raw_slice.to_slice();
+                let max_len = blob.len().min(32);
+                f.debug_struct("Blob")
+                    .field("data", &&blob[0..max_len])
+                    // Indicates to the developer debugging that the data is truncated for printing
+                    .field("truncated", &(blob.len() > max_len))
+                    .finish()
+            }
+        }
+    }
 }
 
 impl Value {
@@ -691,7 +727,7 @@ impl<'a> TryFrom<&'a RefValue> for &'a str {
 /// A value in a record that has already been serialized can stay serialized and what this struct offsers
 /// is easy acces to each value which point to the payload.
 /// The name might be contradictory as it is immutable in the sense that you cannot modify the values without modifying the payload.
-#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
 pub struct ImmutableRecord {
     // We have to be super careful with this buffer since we make values point to the payload we need to take care reallocations
     // happen in a controlled manner. If we realocate with values that should be correct, they will now point to undefined data.
@@ -699,6 +735,15 @@ pub struct ImmutableRecord {
     payload: Vec<u8>,
     pub values: Vec<RefValue>,
     recreating: bool,
+}
+
+impl Debug for ImmutableRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImmutableRecord")
+            .field("values", &self.values)
+            .field("recreating", &self.recreating)
+            .finish()
+    }
 }
 
 #[derive(PartialEq)]
@@ -814,9 +859,12 @@ impl ImmutableRecord {
         self.values.len()
     }
 
-    pub fn from_registers(registers: &[Register]) -> Self {
-        let mut values = Vec::with_capacity(registers.len());
-        let mut serials = Vec::with_capacity(registers.len());
+    pub fn from_registers<'a>(
+        registers: impl IntoIterator<Item = &'a Register> + Copy,
+        len: usize,
+    ) -> Self {
+        let mut values = Vec::with_capacity(len);
+        let mut serials = Vec::with_capacity(len);
         let mut size_header = 0;
         let mut size_values = 0;
 

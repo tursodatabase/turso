@@ -1,8 +1,20 @@
 use crate::common::{self, maybe_setup_tracing};
 use crate::common::{compare_string, do_flush, TempDatabase};
-use limbo_core::{Connection, Row, StepResult, Value};
+use limbo_core::{Connection, Row, Statement, StepResult, Value};
 use log::debug;
-use std::rc::Rc;
+use std::sync::Arc;
+
+#[macro_export]
+macro_rules! change_state {
+    ($current:expr, $pattern:pat => $selector:expr) => {
+        let state = match std::mem::replace($current, unsafe { std::mem::zeroed() }) {
+            $pattern => $selector,
+            _ => panic!("unexpected state"),
+        };
+        #[allow(clippy::forget_non_drop)]
+        std::mem::forget(std::mem::replace($current, state));
+    };
+}
 
 #[test]
 #[ignore]
@@ -286,7 +298,7 @@ fn test_wal_restart() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY);");
     // threshold is 1000 by default
 
-    fn insert(i: usize, conn: &Rc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
+    fn insert(i: usize, conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
         debug!("inserting {}", i);
         let insert_query = format!("INSERT INTO test VALUES ({})", i);
         run_query(tmp_db, conn, &insert_query)?;
@@ -295,7 +307,7 @@ fn test_wal_restart() -> anyhow::Result<()> {
         Ok(())
     }
 
-    fn count(conn: &Rc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<usize> {
+    fn count(conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<usize> {
         debug!("counting");
         let list_query = "SELECT count(x) FROM test";
         let mut count = None;
@@ -393,6 +405,7 @@ fn test_write_delete_with_index() -> anyhow::Result<()> {
 }
 
 #[test]
+#[cfg(feature = "index_experimental")]
 fn test_update_with_index() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
 
@@ -447,13 +460,126 @@ fn test_delete_with_index() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_query(tmp_db: &TempDatabase, conn: &Rc<Connection>, query: &str) -> anyhow::Result<()> {
+enum ConnectionState {
+    PrepareQuery { query_idx: usize },
+    ExecuteQuery { query_idx: usize, stmt: Statement },
+    Done,
+}
+
+struct ConnectionPlan {
+    queries: Vec<String>,
+    conn: Arc<Connection>,
+    state: ConnectionState,
+}
+
+impl ConnectionPlan {
+    pub fn step(&mut self) -> anyhow::Result<bool> {
+        loop {
+            match &mut self.state {
+                ConnectionState::PrepareQuery { query_idx } => {
+                    if *query_idx >= self.queries.len() {
+                        self.state = ConnectionState::Done;
+                        return Ok(true);
+                    }
+                    let query = &self.queries[*query_idx];
+                    tracing::info!("preparing {}", query);
+                    let stmt = self.conn.query(query)?.unwrap();
+                    self.state = ConnectionState::ExecuteQuery {
+                        query_idx: *query_idx,
+                        stmt,
+                    };
+                }
+                ConnectionState::ExecuteQuery { stmt, query_idx } => loop {
+                    let query = &self.queries[*query_idx];
+                    tracing::info!("stepping {}", query);
+                    let current_query_idx = *query_idx;
+                    let step_result = stmt.step()?;
+                    match step_result {
+                        StepResult::IO => {
+                            return Ok(false);
+                        }
+                        StepResult::Done => {
+                            change_state!(&mut self.state, ConnectionState::ExecuteQuery { .. } => ConnectionState::PrepareQuery { query_idx: current_query_idx + 1 });
+                            return Ok(false);
+                        }
+                        StepResult::Row => {}
+                        StepResult::Busy => {
+                            return Ok(false);
+                        }
+                        _ => unreachable!(),
+                    }
+                },
+                ConnectionState::Done => {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        matches!(self.state, ConnectionState::Done)
+    }
+}
+
+#[test]
+fn test_write_concurrent_connections() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+
+    maybe_setup_tracing();
+
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t(x)");
+    let num_connections = 4;
+    let num_inserts_per_connection = 100;
+    let mut connections = vec![];
+    for connection_idx in 0..num_connections {
+        let conn = tmp_db.connect_limbo();
+        let mut queries = Vec::with_capacity(num_inserts_per_connection);
+        for query_idx in 0..num_inserts_per_connection {
+            queries.push(format!(
+                "INSERT INTO t VALUES({})",
+                (connection_idx * num_inserts_per_connection) + query_idx
+            ));
+        }
+        connections.push(ConnectionPlan {
+            queries,
+            conn,
+            state: ConnectionState::PrepareQuery { query_idx: 0 },
+        });
+    }
+
+    let mut connections_finished = 0;
+    while connections_finished != num_connections {
+        for conn in &mut connections {
+            if conn.is_finished() {
+                continue;
+            }
+            let finished = conn.step()?;
+            if finished {
+                connections_finished += 1;
+            }
+        }
+    }
+
+    let conn = tmp_db.connect_limbo();
+    run_query_on_row(&tmp_db, &conn, "SELECT count(1) from t", |row: &Row| {
+        let count = row.get::<i64>(0).unwrap();
+        assert_eq!(
+            count,
+            (num_connections * num_inserts_per_connection) as i64,
+            "received wrong number of rows"
+        );
+    })?;
+
+    Ok(())
+}
+
+fn run_query(tmp_db: &TempDatabase, conn: &Arc<Connection>, query: &str) -> anyhow::Result<()> {
     run_query_core(tmp_db, conn, query, None::<fn(&Row)>)
 }
 
 fn run_query_on_row(
     tmp_db: &TempDatabase,
-    conn: &Rc<Connection>,
+    conn: &Arc<Connection>,
     query: &str,
     on_row: impl FnMut(&Row),
 ) -> anyhow::Result<()> {
@@ -462,7 +588,7 @@ fn run_query_on_row(
 
 fn run_query_core(
     tmp_db: &TempDatabase,
-    conn: &Rc<Connection>,
+    conn: &Arc<Connection>,
     query: &str,
     mut on_row: Option<impl FnMut(&Row)>,
 ) -> anyhow::Result<()> {

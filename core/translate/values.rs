@@ -22,6 +22,7 @@ pub fn emit_values(
             emit_values_in_subquery(program, plan, resolver, yield_reg)?
         }
         QueryDestination::EphemeralIndex { .. } => unreachable!(),
+        QueryDestination::EphemeralTable { .. } => unreachable!(),
     };
     Ok(reg_result_cols_start)
 }
@@ -58,6 +59,7 @@ fn emit_values_when_single_row(
             });
         }
         QueryDestination::EphemeralIndex { .. } => unreachable!(),
+        QueryDestination::EphemeralTable { .. } => unreachable!(),
     }
     Ok(start_reg)
 }

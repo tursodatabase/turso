@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use limbo_core::{LimboError, Result};
+use tracing::instrument;
 
 use crate::generation::{
     pick_index,
@@ -173,17 +174,15 @@ pub(crate) enum ExecutionContinuation {
     NextProperty,
 }
 
+#[instrument(skip(env, interaction, stack), fields(interaction = %interaction))]
 pub(crate) fn execute_interaction(
     env: &mut SimulatorEnv,
     connection_index: usize,
     interaction: &Interaction,
     stack: &mut Vec<ResultSet>,
 ) -> Result<ExecutionContinuation> {
-    tracing::info!(
-        "execute_interaction(connection_index={}, interaction={})",
-        connection_index,
-        interaction
-    );
+    // Leave this empty info! here to print the span of the execution
+    tracing::info!("");
     match interaction {
         Interaction::Query(_) => {
             let conn = match &mut env.connections[connection_index] {
@@ -192,7 +191,6 @@ pub(crate) fn execute_interaction(
                 SimConnection::Disconnected => unreachable!(),
             };
 
-            tracing::debug!("{}", interaction);
             let results = interaction.execute_query(conn, &env.io);
             tracing::debug!("{:?}", results);
             stack.push(results);

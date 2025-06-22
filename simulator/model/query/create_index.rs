@@ -31,7 +31,7 @@ impl CreateIndex {
     pub(crate) fn shadow(
         &self,
         _env: &mut crate::runner::env::SimulatorEnv,
-    ) -> Vec<Vec<crate::model::table::Value>> {
+    ) -> Vec<Vec<crate::model::table::SimValue>> {
         // CREATE INDEX doesn't require any shadowing; we don't need to keep track
         // in the simulator what indexes exist.
         vec![]

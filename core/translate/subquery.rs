@@ -81,6 +81,7 @@ pub fn emit_subquery<'a>(
         reg_offset: None,
         reg_limit_offset_sum: None,
         resolver: Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table),
+        non_aggregate_expressions: Vec::new(),
     };
     let subquery_body_end_label = program.allocate_label();
     program.emit_insn(Insn::InitCoroutine {

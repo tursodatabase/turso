@@ -2,7 +2,6 @@ use limbo_core::{Connection, Database, PagerCacheflushStatus, IO};
 use rand::{rng, RngCore};
 use rusqlite::params;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tracing_subscriber::layer::SubscriberExt;
@@ -13,6 +12,7 @@ use tracing_subscriber::EnvFilter;
 pub struct TempDatabase {
     pub path: PathBuf,
     pub io: Arc<dyn IO + Send>,
+    pub db: Arc<Database>,
 }
 unsafe impl Send for TempDatabase {}
 
@@ -26,14 +26,29 @@ impl TempDatabase {
         let mut path = TempDir::new().unwrap().keep();
         path.push(db_name);
         let io: Arc<dyn IO + Send> = Arc::new(limbo_core::PlatformIO::new().unwrap());
-        Self { path, io }
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            path.to_str().unwrap(),
+            limbo_core::OpenFlags::default(),
+            false,
+        )
+        .unwrap();
+        Self { path, io, db }
     }
 
     pub fn new_with_existent(db_path: &Path) -> Self {
+        Self::new_with_existent_with_flags(db_path, limbo_core::OpenFlags::default())
+    }
+
+    pub fn new_with_existent_with_flags(db_path: &Path, flags: limbo_core::OpenFlags) -> Self {
         let io: Arc<dyn IO + Send> = Arc::new(limbo_core::PlatformIO::new().unwrap());
+        let db =
+            Database::open_file_with_flags(io.clone(), db_path.to_str().unwrap(), flags, false)
+                .unwrap();
         Self {
             path: db_path.to_path_buf(),
             io,
+            db,
         }
     }
 
@@ -51,28 +66,21 @@ impl TempDatabase {
             connection.execute(table_sql, ()).unwrap();
         }
         let io: Arc<dyn limbo_core::IO> = Arc::new(limbo_core::PlatformIO::new().unwrap());
-
-        Self { path, io }
-    }
-
-    pub fn connect_limbo(&self) -> Rc<limbo_core::Connection> {
-        Self::connect_limbo_with_flags(&self, limbo_core::OpenFlags::default())
-    }
-
-    pub fn connect_limbo_with_flags(
-        &self,
-        flags: limbo_core::OpenFlags,
-    ) -> Rc<limbo_core::Connection> {
-        log::debug!("conneting to limbo");
         let db = Database::open_file_with_flags(
-            self.io.clone(),
-            self.path.to_str().unwrap(),
-            flags,
+            io.clone(),
+            path.to_str().unwrap(),
+            limbo_core::OpenFlags::default(),
             false,
         )
         .unwrap();
 
-        let conn = db.connect().unwrap();
+        Self { path, io, db }
+    }
+
+    pub fn connect_limbo(&self) -> Arc<limbo_core::Connection> {
+        log::debug!("conneting to limbo");
+
+        let conn = self.db.connect().unwrap();
         log::debug!("connected to limbo");
         conn
     }
@@ -83,7 +91,7 @@ impl TempDatabase {
     }
 }
 
-pub(crate) fn do_flush(conn: &Rc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
+pub(crate) fn do_flush(conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
     loop {
         match conn.cacheflush()? {
             PagerCacheflushStatus::Done(_) => {
@@ -155,7 +163,7 @@ pub(crate) fn sqlite_exec_rows(
 
 pub(crate) fn limbo_exec_rows(
     db: &TempDatabase,
-    conn: &Rc<limbo_core::Connection>,
+    conn: &Arc<limbo_core::Connection>,
     query: &str,
 ) -> Vec<Vec<rusqlite::types::Value>> {
     let mut stmt = conn.prepare(query).unwrap();
@@ -193,7 +201,7 @@ pub(crate) fn limbo_exec_rows(
 
 pub(crate) fn limbo_exec_rows_error(
     db: &TempDatabase,
-    conn: &Rc<limbo_core::Connection>,
+    conn: &Arc<limbo_core::Connection>,
     query: &str,
 ) -> limbo_core::Result<()> {
     let mut stmt = conn.prepare(query)?;
@@ -214,6 +222,7 @@ pub(crate) fn limbo_exec_rows_error(
 mod tests {
     use std::vec;
 
+    use rand::Rng;
     use tempfile::TempDir;
 
     use super::{limbo_exec_rows, limbo_exec_rows_error, TempDatabase};
@@ -260,8 +269,9 @@ mod tests {
     #[test]
     fn test_limbo_open_read_only() -> anyhow::Result<()> {
         let path = TempDir::new().unwrap().keep().join("temp_read_only");
-        let db = TempDatabase::new_with_existent(&path);
         {
+            let db =
+                TempDatabase::new_with_existent_with_flags(&path, limbo_core::OpenFlags::default());
             let conn = db.connect_limbo();
             let ret = limbo_exec_rows(&db, &conn, "CREATE table t(a)");
             assert!(ret.is_empty(), "{:?}", ret);
@@ -270,15 +280,86 @@ mod tests {
         }
 
         {
-            let conn = db.connect_limbo_with_flags(
+            let db = TempDatabase::new_with_existent_with_flags(
+                &path,
                 limbo_core::OpenFlags::default() | limbo_core::OpenFlags::ReadOnly,
             );
+            let conn = db.connect_limbo();
             let ret = limbo_exec_rows(&db, &conn, "SELECT * from t");
             assert_eq!(ret, vec![vec![Value::Integer(1)]]);
 
             let err = limbo_exec_rows_error(&db, &conn, "INSERT INTO t values (1)").unwrap_err();
             assert!(matches!(err, limbo_core::LimboError::ReadOnly), "{:?}", err);
         }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "index_experimental")]
+    fn test_unique_index_ordering() -> anyhow::Result<()> {
+        let db = TempDatabase::new_empty();
+        let conn = db.connect_limbo();
+
+        let _ = limbo_exec_rows(&db, &conn, "CREATE TABLE t(x INTEGER UNIQUE)");
+
+        // Insert 100 random integers between -1000 and 1000
+        let mut expected = Vec::new();
+        let mut rng = rand::rng();
+        let mut i = 0;
+        while i < 100 {
+            let val = rng.random_range(-1000..1000);
+            if expected.contains(&val) {
+                continue;
+            }
+            i += 1;
+            expected.push(val);
+            let ret = limbo_exec_rows(&db, &conn, &format!("INSERT INTO t VALUES ({})", val));
+            assert!(ret.is_empty(), "Insert failed for value {}: {:?}", val, ret);
+        }
+
+        // Sort expected values to match index order
+        expected.sort();
+
+        // Query all values and verify they come back in sorted order
+        let ret = limbo_exec_rows(&db, &conn, "SELECT x FROM t");
+        let actual: Vec<i64> = ret
+            .into_iter()
+            .map(|row| match &row[0] {
+                Value::Integer(i) => *i,
+                _ => panic!("Expected integer value"),
+            })
+            .collect();
+
+        assert_eq!(actual, expected, "Values not returned in sorted order");
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "index_experimental")]
+    fn test_large_unique_blobs() -> anyhow::Result<()> {
+        let path = TempDir::new().unwrap().keep().join("temp_read_only");
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+
+        let _ = limbo_exec_rows(&db, &conn, "CREATE TABLE t(x BLOB UNIQUE)");
+
+        // Insert 11 unique 1MB blobs
+        for i in 0..11 {
+            println!("Inserting blob #{}", i);
+            let ret = limbo_exec_rows(&db, &conn, "INSERT INTO t VALUES (randomblob(1024*1024))");
+            assert!(ret.is_empty(), "Insert #{} failed: {:?}", i, ret);
+        }
+
+        // Verify we have 11 rows
+        let ret = limbo_exec_rows(&db, &conn, "SELECT count(*) FROM t");
+        assert_eq!(
+            ret,
+            vec![vec![Value::Integer(11)]],
+            "Expected 11 rows but got {:?}",
+            ret
+        );
+
         Ok(())
     }
 }

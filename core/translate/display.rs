@@ -30,17 +30,17 @@ impl Display for Plan {
         match self {
             Self::Select(select_plan) => select_plan.fmt(f),
             Self::CompoundSelect {
-                first,
-                rest,
+                left,
+                right_most,
                 limit,
                 offset,
                 order_by,
             } => {
-                first.fmt(f)?;
-                for (plan, operator) in rest {
-                    writeln!(f, "{}", operator)?;
+                for (plan, operator) in left {
                     plan.fmt(f)?;
+                    writeln!(f, "{}", operator)?;
                 }
+                right_most.fmt(f)?;
                 if let Some(limit) = limit {
                     writeln!(f, "LIMIT: {}", limit)?;
                 }
@@ -268,28 +268,24 @@ impl ToSqlString for Plan {
         match self {
             Self::Select(select) => select.to_sql_string(&PlanContext(&[&select.table_references])),
             Self::CompoundSelect {
-                first,
-                rest,
+                left,
+                right_most,
                 limit,
                 offset,
                 order_by,
             } => {
-                let all_refs = std::iter::once(&first.table_references)
-                    .chain(
-                        rest.iter()
-                            .flat_map(|(plan, _)| std::iter::once(&plan.table_references)),
-                    )
+                let all_refs = left
+                    .iter()
+                    .flat_map(|(plan, _)| std::iter::once(&plan.table_references))
+                    .chain(std::iter::once(&right_most.table_references))
                     .collect::<Vec<_>>();
                 let context = &PlanContext(all_refs.as_slice());
 
-                let mut ret = vec![first.to_sql_string(context)];
-                for (other_plan, operator) in rest {
-                    ret.push(format!(
-                        "{} {}",
-                        operator,
-                        other_plan.to_sql_string(context),
-                    ));
+                let mut ret = Vec::new();
+                for (plan, operator) in left {
+                    ret.push(format!("{} {}", plan.to_sql_string(context), operator));
                 }
+                ret.push(right_most.to_sql_string(context));
                 if let Some(order_by) = &order_by {
                     ret.push(format!(
                         "ORDER BY {}",

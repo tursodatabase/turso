@@ -1,14 +1,13 @@
 use js_sys::{Array, Object};
 use limbo_core::{maybe_init_database_file, Clock, Instant, OpenFlags, Result};
 use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 #[allow(dead_code)]
 #[wasm_bindgen]
 pub struct Database {
     db: Arc<limbo_core::Database>,
-    conn: Rc<limbo_core::Connection>,
+    conn: Arc<limbo_core::Connection>,
 }
 
 #[allow(clippy::arc_with_non_send_sync)]

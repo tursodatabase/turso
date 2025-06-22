@@ -24,6 +24,22 @@ mod tests {
         (rng, seed)
     }
 
+    /// [See this issue for more info](https://github.com/tursodatabase/limbo/issues/1763)
+    #[test]
+    pub fn fuzz_failure_issue_1763() {
+        let db = TempDatabase::new_empty();
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+        let offending_query = "SELECT ((ceil(pow((((2.0))), (-2.0 - -1.0) / log(0.5)))) - -2.0)";
+        let limbo_result = limbo_exec_rows(&db, &limbo_conn, offending_query);
+        let sqlite_result = sqlite_exec_rows(&sqlite_conn, offending_query);
+        assert_eq!(
+            limbo_result, sqlite_result,
+            "query: {}, limbo: {:?}, sqlite: {:?}",
+            offending_query, limbo_result, sqlite_result
+        );
+    }
+
     #[test]
     pub fn arithmetic_expression_fuzz_ex1() {
         let db = TempDatabase::new_empty();
@@ -165,6 +181,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "index_experimental")]
     pub fn index_scan_fuzz() {
         let db = TempDatabase::new_with_rusqlite("CREATE TABLE t(x PRIMARY KEY)");
         let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
@@ -212,6 +229,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "index_experimental")]
     /// A test for verifying that index seek+scan works correctly for compound keys
     /// on indexes with various column orderings.
     pub fn index_scan_compound_key_fuzz() {
@@ -491,6 +509,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "index_experimental")]
     pub fn compound_select_fuzz() {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time();
@@ -1356,6 +1375,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "index_experimental")]
     pub fn table_logical_expression_fuzz_run() {
         let _ = env_logger::try_init();
         let g = GrammarGenerator::new();

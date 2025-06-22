@@ -3,7 +3,7 @@
 
 mod keywords;
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use keywords::KEYWORDS;
 use limbo_ext::{
@@ -87,7 +87,7 @@ impl VTable for CompletionTable {
     type Cursor = CompletionCursor;
     type Error = ResultCode;
 
-    fn open(&self, _conn: Option<Rc<Connection>>) -> Result<Self::Cursor, Self::Error> {
+    fn open(&self, _conn: Option<Arc<Connection>>) -> Result<Self::Cursor, Self::Error> {
         Ok(CompletionCursor::default())
     }
 }

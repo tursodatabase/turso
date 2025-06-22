@@ -43,7 +43,7 @@ use crate::{
 use crate::json::JsonCacheCell;
 use crate::{Connection, MvStore, Result, TransactionState};
 use builder::CursorKey;
-use execute::{InsnFunction, InsnFunctionStepResult, OpIdxDeleteState};
+use execute::{InsnFunction, InsnFunctionStepResult, OpIdxDeleteState, OpIntegrityCheckState};
 
 use rand::{
     distributions::{Distribution, Uniform},
@@ -54,10 +54,10 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     num::NonZero,
-    ops::Deref,
-    rc::{Rc, Weak},
+    rc::Rc,
     sync::Arc,
 };
+use tracing::{instrument, Level};
 
 /// We use labels to indicate that we want to jump to whatever the instruction offset
 /// will be at runtime, because the offset cannot always be determined when the jump
@@ -202,7 +202,7 @@ impl<const N: usize> Bitfield<N> {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 /// The commit state of the program.
 /// There are two states:
 /// - Ready: The program is ready to run the next instruction, or has shut down after
@@ -248,6 +248,7 @@ pub struct ProgramState {
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
     op_idx_delete_state: Option<OpIdxDeleteState>,
+    op_integrity_check_state: OpIntegrityCheckState,
 }
 
 impl ProgramState {
@@ -272,6 +273,7 @@ impl ProgramState {
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
             op_idx_delete_state: None,
+            op_integrity_check_state: OpIntegrityCheckState::Start,
         }
     }
 
@@ -315,7 +317,7 @@ impl ProgramState {
         self.json_cache.clear()
     }
 
-    pub fn get_cursor<'a>(&'a self, cursor_id: CursorID) -> std::cell::RefMut<'a, Cursor> {
+    pub fn get_cursor(&self, cursor_id: CursorID) -> std::cell::RefMut<Cursor> {
         let cursors = self.cursors.borrow_mut();
         std::cell::RefMut::map(cursors, |c| {
             c.get_mut(cursor_id)
@@ -350,7 +352,6 @@ macro_rules! must_be_btree_cursor {
     }};
 }
 
-#[derive(Debug)]
 pub struct Program {
     pub max_registers: usize,
     pub insns: Vec<(Insn, InsnFunction)>,
@@ -358,7 +359,7 @@ pub struct Program {
     pub database_header: Arc<SpinLock<DatabaseHeader>>,
     pub comments: Option<Vec<(InsnReference, &'static str)>>,
     pub parameters: crate::parameters::Parameters,
-    pub connection: Weak<Connection>,
+    pub connection: Arc<Connection>,
     pub n_change: Cell<i64>,
     pub change_cnt_on: bool,
     pub result_columns: Vec<ResultSetColumn>,
@@ -392,6 +393,7 @@ impl Program {
         }
     }
 
+    #[instrument(skip_all, level = Level::TRACE)]
     pub fn commit_txn(
         &self,
         pager: Rc<Pager>,
@@ -399,7 +401,7 @@ impl Program {
         mv_store: Option<&Rc<MvStore>>,
     ) -> Result<StepResult> {
         if let Some(mv_store) = mv_store {
-            let conn = self.connection.upgrade().unwrap();
+            let conn = self.connection.clone();
             let auto_commit = conn.auto_commit.get();
             if auto_commit {
                 let mut mv_transactions = conn.mv_transactions.borrow_mut();
@@ -410,21 +412,18 @@ impl Program {
             }
             Ok(StepResult::Done)
         } else {
-            let connection = self
-                .connection
-                .upgrade()
-                .expect("only weak ref to connection?");
+            let connection = self.connection.clone();
             let auto_commit = connection.auto_commit.get();
             tracing::trace!("Halt auto_commit {}", auto_commit);
             if program_state.commit_state == CommitState::Committing {
-                self.step_end_write_txn(&pager, &mut program_state.commit_state, connection.deref())
+                self.step_end_write_txn(&pager, &mut program_state.commit_state, &connection)
             } else if auto_commit {
                 let current_state = connection.transaction_state.get();
                 match current_state {
                     TransactionState::Write => self.step_end_write_txn(
                         &pager,
                         &mut program_state.commit_state,
-                        connection.deref(),
+                        &connection,
                     ),
                     TransactionState::Read => {
                         connection.transaction_state.replace(TransactionState::None);
@@ -435,15 +434,14 @@ impl Program {
                 }
             } else {
                 if self.change_cnt_on {
-                    if let Some(conn) = self.connection.upgrade() {
-                        conn.set_changes(self.n_change.get());
-                    }
+                    self.connection.set_changes(self.n_change.get());
                 }
                 Ok(StepResult::Done)
             }
         }
     }
 
+    #[instrument(skip(self, pager, connection), level = Level::TRACE)]
     fn step_end_write_txn(
         &self,
         pager: &Rc<Pager>,
@@ -454,9 +452,7 @@ impl Program {
         match cacheflush_status {
             PagerCacheflushStatus::Done(_) => {
                 if self.change_cnt_on {
-                    if let Some(conn) = self.connection.upgrade() {
-                        conn.set_changes(self.n_change.get());
-                    }
+                    self.connection.set_changes(self.n_change.get());
                 }
                 connection.transaction_state.replace(TransactionState::None);
                 *commit_state = CommitState::Ready;
@@ -475,11 +471,10 @@ impl Program {
         let mut buff = String::with_capacity(1024);
         buff.push_str("addr  opcode             p1    p2    p3    p4             p5  comment\n");
         buff.push_str("----  -----------------  ----  ----  ----  -------------  --  -------\n");
-        let mut indent_count: usize = 0;
         let indent = "  ";
-        let mut prev_insn: Option<&Insn> = None;
+        let indent_counts = get_indent_counts(&self.insns);
         for (addr, (insn, _)) in self.insns.iter().enumerate() {
-            indent_count = get_indent_count(indent_count, insn, prev_insn);
+            let indent_count = indent_counts[addr];
             print_insn(
                 self,
                 addr as InsnReference,
@@ -488,7 +483,6 @@ impl Program {
                 &mut buff,
             );
             buff.push('\n');
-            prev_insn = Some(insn);
         }
         buff
     }
@@ -528,16 +522,17 @@ fn get_new_rowid<R: Rng>(cursor: &mut BTreeCursor, mut rng: R) -> Result<CursorR
 }
 
 fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> ImmutableRecord {
-    ImmutableRecord::from_registers(&registers[*start_reg..*start_reg + *count])
+    let regs = &registers[*start_reg..*start_reg + *count];
+    ImmutableRecord::from_registers(regs, regs.len())
 }
 
-#[tracing::instrument(skip(program), level = tracing::Level::TRACE)]
+#[instrument(skip(program), level = Level::TRACE)]
 fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
     if !tracing::enabled!(tracing::Level::TRACE) {
         return;
     }
     tracing::trace!(
-        "{}",
+        "\n{}",
         explain::insn_to_str(
             program,
             addr,
@@ -569,27 +564,63 @@ fn print_insn(program: &Program, addr: InsnReference, insn: &Insn, indent: Strin
     w.push_str(&s);
 }
 
-fn get_indent_count(indent_count: usize, curr_insn: &Insn, prev_insn: Option<&Insn>) -> usize {
-    let indent_count = if let Some(insn) = prev_insn {
+// The indenting rules are(from SQLite):
+//
+//  * For each "Next", "Prev", "VNext" or "VPrev" instruction, increase the ident number for
+//    all opcodes that occur between the p2 jump destination and the opcode itself.
+//
+//   * Do the previous for "Return" instructions for when P2 is positive.
+//
+//   * For each "Goto", if the jump destination is earlier in the program and ends on one of:
+//        Yield  SeekGt  SeekLt  RowSetRead  Rewind
+//     or if the P1 parameter is one instead of zero, then increase the indent number for all
+//     opcodes between the earlier instruction and "Goto"
+fn get_indent_counts(insns: &Vec<(Insn, InsnFunction)>) -> Vec<usize> {
+    let mut indents = vec![0; insns.len()];
+
+    for (i, (insn, _)) in insns.iter().enumerate() {
+        let mut start = 0;
+        let mut end = 0;
         match insn {
-            Insn::Rewind { .. }
-            | Insn::Last { .. }
-            | Insn::SorterSort { .. }
-            | Insn::SeekGE { .. }
-            | Insn::SeekGT { .. }
-            | Insn::SeekLE { .. }
-            | Insn::SeekLT { .. } => indent_count + 1,
+            Insn::Next { pc_if_next, .. } | Insn::VNext { pc_if_next, .. } => {
+                let dest = pc_if_next.to_debug_int() as usize;
+                if dest < i {
+                    start = dest;
+                    end = i;
+                }
+            }
+            Insn::Prev { pc_if_prev, .. } => {
+                let dest = pc_if_prev.to_debug_int() as usize;
+                if dest < i {
+                    start = dest;
+                    end = i;
+                }
+            }
 
-            _ => indent_count,
+            Insn::Goto { target_pc } => {
+                let dest = target_pc.to_debug_int() as usize;
+                if dest < i
+                    && matches!(
+                        insns.get(dest).map(|(insn, _)| insn),
+                        Some(Insn::Yield { .. })
+                            | Some(Insn::SeekGT { .. })
+                            | Some(Insn::SeekLT { .. })
+                            | Some(Insn::Rewind { .. })
+                    )
+                {
+                    start = dest;
+                    end = i;
+                }
+            }
+
+            _ => {}
         }
-    } else {
-        indent_count
-    };
-
-    match curr_insn {
-        Insn::Next { .. } | Insn::SorterNext { .. } | Insn::Prev { .. } => indent_count - 1,
-        _ => indent_count,
+        for i in start..end {
+            indents[i] += 1;
+        }
     }
+
+    indents
 }
 
 pub trait FromValueRow<'a> {

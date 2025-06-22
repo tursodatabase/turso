@@ -555,6 +555,21 @@ impl Display for MathFunc {
 }
 
 #[derive(Debug)]
+pub enum AlterTableFunc {
+    RenameTable,
+    RenameColumn,
+}
+
+impl Display for AlterTableFunc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AlterTableFunc::RenameTable => write!(f, "limbo_rename_table"),
+            AlterTableFunc::RenameColumn => write!(f, "limbo_rename_column"),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum Func {
     Agg(AggFunc),
     Scalar(ScalarFunc),
@@ -562,6 +577,7 @@ pub enum Func {
     Vector(VectorFunc),
     #[cfg(feature = "json")]
     Json(JsonFunc),
+    AlterTable(AlterTableFunc),
     External(Rc<ExternalFunc>),
 }
 
@@ -575,6 +591,7 @@ impl Display for Func {
             #[cfg(feature = "json")]
             Self::Json(json_func) => write!(f, "{}", json_func),
             Self::External(generic_func) => write!(f, "{}", generic_func),
+            Self::AlterTable(alter_func) => write!(f, "{}", alter_func),
         }
     }
 }
@@ -595,6 +612,7 @@ impl Func {
             #[cfg(feature = "json")]
             Self::Json(json_func) => json_func.is_deterministic(),
             Self::External(external_func) => external_func.is_deterministic(),
+            Self::AlterTable(_) => true,
         }
     }
     pub fn resolve_function(name: &str, arg_count: usize) -> Result<Self, LimboError> {

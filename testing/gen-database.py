@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 
 import sqlite3
+
 from faker import Faker
 
-conn = sqlite3.connect('database.db')
+conn = sqlite3.connect("database.db")
 cursor = conn.cursor()
 
 # Create the user table
-cursor.execute('''
+cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY,
         first_name TEXT,
@@ -20,18 +21,29 @@ cursor.execute('''
         zipcode TEXT,
         age INTEGER
     )
-''')
+""")
 
-cursor.execute('''
+cursor.execute("""
     CREATE TABLE IF NOT EXISTS products (
         id INTEGER PRIMARY KEY,
         name TEXT,
         price REAL
     )
-''')
+""")
 
-product_list = ["hat", "cap", "shirt", "sweater", "sweatshirt",
-    "shorts", "jeans", "sneakers", "boots", "coat", "accessories"]
+product_list = [
+    "hat",
+    "cap",
+    "shirt",
+    "sweater",
+    "sweatshirt",
+    "shorts",
+    "jeans",
+    "sneakers",
+    "boots",
+    "coat",
+    "accessories",
+]
 
 fake = Faker()
 for _ in range(10000):
@@ -45,18 +57,23 @@ for _ in range(10000):
     zipcode = fake.zipcode()
     age = fake.random_int(min=1, max=100)
 
-    cursor.execute('''
+    cursor.execute(
+        """
         INSERT INTO users (first_name, last_name, email, phone_number, address, city, state, zipcode, age)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (first_name, last_name, email, phone_number, address, city, state, zipcode, age))
+    """,
+        (first_name, last_name, email, phone_number, address, city, state, zipcode, age),
+    )
 
 for product in product_list:
     price = fake.random_int(min=1, max=100)
-    cursor.execute('''
+    cursor.execute(
+        """
         INSERT INTO products (name, price)
         VALUES (?, ?)
-    ''', (product, price))
-
+    """,
+        (product, price),
+    )
 
 
 conn.commit()

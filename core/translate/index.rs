@@ -23,6 +23,9 @@ pub fn translate_create_index(
     schema: &Schema,
     mut program: ProgramBuilder,
 ) -> crate::Result<ProgramBuilder> {
+    if cfg!(not(feature = "index_experimental")) {
+        crate::bail_parse_error!("CREATE INDEX enabled only with index_experimental feature");
+    }
     let idx_name = normalize_ident(idx_name);
     let tbl_name = normalize_ident(tbl_name);
     let opts = crate::vdbe::builder::ProgramBuilderOpts {
@@ -57,6 +60,7 @@ pub fn translate_create_index(
                 order: *order,
                 pos_in_table: *pos_in_table,
                 collation: col.collation,
+                default: col.default.clone(),
             })
             .collect(),
         unique: unique_if_not_exists.0,
@@ -142,11 +146,7 @@ pub fn translate_create_index(
     // Then insert the record into the sorter
     let start_reg = program.alloc_registers(columns.len() + 1);
     for (i, (col, _)) in columns.iter().enumerate() {
-        program.emit_insn(Insn::Column {
-            cursor_id: table_cursor_id,
-            column: col.0,
-            dest: start_reg + i,
-        });
+        program.emit_column(table_cursor_id, col.0, start_reg + i);
     }
     let rowid_reg = start_reg + columns.len();
     program.emit_insn(Insn::RowId {
@@ -299,6 +299,9 @@ pub fn translate_drop_index(
     schema: &Schema,
     mut program: ProgramBuilder,
 ) -> crate::Result<ProgramBuilder> {
+    if cfg!(not(feature = "index_experimental")) {
+        crate::bail_parse_error!("DROP INDEX enabled only with index_experimental feature");
+    }
     let idx_name = normalize_ident(idx_name);
     let opts = crate::vdbe::builder::ProgramBuilderOpts {
         query_mode: mode,
@@ -371,11 +374,7 @@ pub fn translate_drop_index(
 
     // Read sqlite_schema.name into dest_reg
     let dest_reg = program.alloc_register();
-    program.emit_insn(Insn::Column {
-        cursor_id: sqlite_schema_cursor_id,
-        column: 1, // sqlite_schema.name
-        dest: dest_reg,
-    });
+    program.emit_column(sqlite_schema_cursor_id, 1, dest_reg);
 
     // if current column is not index_name then jump to Next
     // skip if sqlite_schema.name != index_name_reg
@@ -390,11 +389,7 @@ pub fn translate_drop_index(
 
     // read type of table
     // skip if sqlite_schema.type != 'index' (index_str_reg)
-    program.emit_insn(Insn::Column {
-        cursor_id: sqlite_schema_cursor_id,
-        column: 0,
-        dest: dest_reg,
-    });
+    program.emit_column(sqlite_schema_cursor_id, 0, dest_reg);
     // if current column is not index then jump to Next
     program.emit_insn(Insn::Ne {
         lhs: index_str_reg,

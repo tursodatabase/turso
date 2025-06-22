@@ -5,7 +5,6 @@ use std::{cell::Cell, cmp::Ordering, rc::Rc, sync::Arc};
 use crate::{
     function::AggFunc,
     schema::{BTreeTable, Column, FromClauseSubquery, Index, Table},
-    util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{IdxInsertFlags, Insn},
@@ -17,7 +16,7 @@ use crate::{schema::Type, types::SeekOp, util::can_pushdown_predicate};
 
 use limbo_sqlite3_parser::ast::TableInternalId;
 
-use super::{emitter::OperationMode, planner::determine_where_to_eval_term, schema::ParseSchema};
+use super::{emitter::OperationMode, planner::determine_where_to_eval_term};
 
 #[derive(Debug, Clone)]
 pub struct ResultSetColumn {
@@ -292,8 +291,8 @@ impl Ord for EvalAt {
 pub enum Plan {
     Select(SelectPlan),
     CompoundSelect {
-        first: SelectPlan,
-        rest: Vec<(SelectPlan, ast::CompoundOperator)>,
+        left: Vec<(SelectPlan, ast::CompoundOperator)>,
+        right_most: SelectPlan,
         limit: Option<isize>,
         offset: Option<isize>,
         order_by: Option<Vec<(ast::Expr, SortOrder)>>,
@@ -325,6 +324,14 @@ pub enum QueryDestination {
         cursor_id: CursorID,
         /// The index that will be used to store the results.
         index: Arc<Index>,
+    },
+    /// The results of the query are stored in an ephemeral table,
+    /// later used by the parent query.
+    EphemeralTable {
+        /// The cursor ID of the ephemeral table that will be used to store the results.
+        cursor_id: CursorID,
+        /// The table that will be used to store the results.
+        table: Rc<BTreeTable>,
     },
 }
 
@@ -454,35 +461,6 @@ impl SelectPlan {
         self.aggregates.iter().map(|agg| agg.args.len()).sum()
     }
 
-    pub fn group_by_col_count(&self) -> usize {
-        self.group_by
-            .as_ref()
-            .map_or(0, |group_by| group_by.exprs.len())
-    }
-
-    pub fn non_group_by_non_agg_columns(&self) -> impl Iterator<Item = &ast::Expr> {
-        self.result_columns
-            .iter()
-            .filter(|c| {
-                !c.contains_aggregates
-                    && !self.group_by.as_ref().map_or(false, |group_by| {
-                        group_by
-                            .exprs
-                            .iter()
-                            .any(|expr| exprs_are_equivalent(&c.expr, expr))
-                    })
-            })
-            .map(|c| &c.expr)
-    }
-
-    pub fn non_group_by_non_agg_column_count(&self) -> usize {
-        self.non_group_by_non_agg_columns().count()
-    }
-
-    pub fn group_by_sorter_column_count(&self) -> usize {
-        self.agg_args_count() + self.group_by_col_count() + self.non_group_by_non_agg_column_count()
-    }
-
     /// Reference: https://github.com/sqlite/sqlite/blob/5db695197b74580c777b37ab1b787531f15f7f9f/src/select.c#L8613
     ///
     /// Checks to see if the query is of the format `SELECT count(*) FROM <tbl>`
@@ -564,7 +542,8 @@ pub struct UpdatePlan {
     // whether the WHERE clause is always false
     pub contains_constant_false_condition: bool,
     pub indexes_to_update: Vec<Arc<Index>>,
-    pub parse_schema: ParseSchema,
+    // If the table's rowid alias is used, gather all the target rowids into an ephemeral table, and then use that table as the single JoinedTable for the actual UPDATE loop.
+    pub ephemeral_plan: Option<SelectPlan>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

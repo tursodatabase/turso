@@ -1,14 +1,20 @@
 #![allow(unused_variables)]
+use crate::function::AlterTableFunc;
 use crate::numeric::{NullableInteger, Numeric};
 use crate::schema::Schema;
+use crate::storage::btree::{integrity_check, IntegrityCheckError, IntegrityCheckState};
 use crate::storage::database::FileMemoryStorage;
 use crate::storage::page_cache::DumbLruPageCache;
 use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::wal::DummyWAL;
 use crate::translate::collate::CollationSeq;
-use crate::types::ImmutableRecord;
+use crate::types::{ImmutableRecord, Text};
+use crate::util::normalize_ident;
 use crate::{
-    error::{LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_PRIMARYKEY},
+    error::{
+        LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL,
+        SQLITE_CONSTRAINT_PRIMARYKEY,
+    },
     ext::ExtValue,
     function::{AggFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
     functions::{
@@ -53,6 +59,10 @@ use super::{
     insn::{Cookie, RegisterOrLiteral},
     CommitState,
 };
+use fallible_iterator::FallibleIterator;
+use limbo_sqlite3_parser::ast;
+use limbo_sqlite3_parser::ast::fmt::ToTokens;
+use limbo_sqlite3_parser::lexer::sql::Parser;
 use parking_lot::RwLock;
 use rand::thread_rng;
 
@@ -75,6 +85,7 @@ use crate::{
 };
 
 use super::{get_new_rowid, make_record, Program, ProgramState, Register};
+use crate::vdbe::insn::InsertFlags;
 use crate::{
     bail_constraint_error, must_be_btree_cursor, resolve_ext_path, MvStore, Pager, Result,
     DATABASE_VERSION,
@@ -206,10 +217,8 @@ pub fn op_drop_index(
     let Insn::DropIndex { index, db: _ } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    if let Some(conn) = program.connection.upgrade() {
-        let mut schema = conn.schema.write();
-        schema.remove_index(&index);
-    }
+    let mut schema = program.connection.schema.write();
+    schema.remove_index(&index);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -302,7 +311,7 @@ pub fn op_checkpoint(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    let result = program.connection.upgrade().unwrap().checkpoint();
+    let result = program.connection.checkpoint();
     match result {
         Ok(CheckpointResult {
             num_wal_frames: num_wal_pages,
@@ -892,7 +901,7 @@ pub fn op_open_read(
                 .replace(Cursor::new_btree(cursor));
         }
         CursorType::BTreeIndex(index) => {
-            let conn = program.connection.upgrade().unwrap();
+            let conn = program.connection.clone();
             let schema = conn.schema.try_read().ok_or(LimboError::SchemaLocked)?;
             let table = schema
                 .get_table(&index.table_name)
@@ -990,11 +999,7 @@ pub fn op_vcreate(
     } else {
         vec![]
     };
-    let Some(conn) = program.connection.upgrade() else {
-        return Err(crate::LimboError::ExtensionError(
-            "Failed to upgrade Connection".to_string(),
-        ));
-    };
+    let conn = program.connection.clone();
     let table =
         crate::VirtualTable::table(Some(&table_name), &module_name, args, &conn.syms.borrow())?;
     {
@@ -1115,9 +1120,7 @@ pub fn op_vupdate(
         Ok(Some(new_rowid)) => {
             if *conflict_action == 5 {
                 // ResolveType::Replace
-                if let Some(conn) = program.connection.upgrade() {
-                    conn.update_last_rowid(new_rowid);
-                }
+                program.connection.update_last_rowid(new_rowid);
             }
             state.pc += 1;
         }
@@ -1173,12 +1176,7 @@ pub fn op_vdestroy(
     let Insn::VDestroy { db, table_name } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    let Some(conn) = program.connection.upgrade() else {
-        return Err(crate::LimboError::ExtensionError(
-            "Failed to upgrade Connection".to_string(),
-        ));
-    };
-
+    let conn = program.connection.clone();
     {
         let Some(vtab) = conn.syms.borrow_mut().vtabs.remove(table_name) else {
             return Err(crate::LimboError::InternalError(
@@ -1288,6 +1286,7 @@ pub fn op_column(
         cursor_id,
         column,
         dest,
+        default,
     } = insn
     else {
         unreachable!("unexpected Insn {:?}", insn)
@@ -1322,38 +1321,39 @@ pub fn op_column(
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
     match cursor_type {
         CursorType::BTreeTable(_) | CursorType::BTreeIndex(_) => {
-            let value = {
+            let value = 'value: {
                 let mut cursor =
                     must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Column");
                 let cursor = cursor.as_btree_mut();
                 let record = return_if_io!(cursor.record());
-                let value = if let Some(record) = record.as_ref() {
-                    if cursor.get_null_flag() {
-                        RefValue::Null
-                    } else {
-                        match record.get_value_opt(*column) {
-                            Some(val) => val.clone(),
-                            None => RefValue::Null,
-                        }
-                    }
-                } else {
-                    RefValue::Null
+
+                let Some(record) = record.as_ref() else {
+                    break 'value Value::Null;
                 };
-                value
+
+                if cursor.get_null_flag() {
+                    break 'value Value::Null;
+                }
+
+                if let Some(value) = record.get_value_opt(*column) {
+                    break 'value value.to_owned();
+                }
+
+                default.clone().unwrap_or(Value::Null)
             };
             // If we are copying a text/blob, let's try to simply update size of text if we need to allocate more and reuse.
             match (&value, &mut state.registers[*dest]) {
-                (RefValue::Text(text_ref), Register::Value(Value::Text(text_reg))) => {
+                (Value::Text(text_ref), Register::Value(Value::Text(text_reg))) => {
                     text_reg.value.clear();
-                    text_reg.value.extend_from_slice(text_ref.value.to_slice());
+                    text_reg.value.extend_from_slice(text_ref.value.as_slice());
                 }
-                (RefValue::Blob(raw_slice), Register::Value(Value::Blob(blob_reg))) => {
+                (Value::Blob(raw_slice), Register::Value(Value::Blob(blob_reg))) => {
                     blob_reg.clear();
-                    blob_reg.extend_from_slice(raw_slice.to_slice());
+                    blob_reg.extend_from_slice(raw_slice.as_slice());
                 }
                 _ => {
                     let reg = &mut state.registers[*dest];
-                    *reg = Register::Value(value.to_owned());
+                    *reg = Register::Value(value);
                 }
             }
         }
@@ -1366,7 +1366,7 @@ pub fn op_column(
             if let Some(record) = record {
                 state.registers[*dest] = Register::Value(match record.get_value_opt(*column) {
                     Some(val) => val.to_owned(),
-                    None => Value::Null,
+                    None => default.clone().unwrap_or(Value::Null),
                 });
             } else {
                 state.registers[*dest] = Register::Value(Value::Null);
@@ -1558,6 +1558,48 @@ pub fn op_prev(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn halt(
+    program: &Program,
+    state: &mut ProgramState,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Rc<MvStore>>,
+    err_code: usize,
+    description: &str,
+) -> Result<InsnFunctionStepResult> {
+    if err_code > 0 {
+        // invalidate page cache in case of error
+        pager.clear_page_cache();
+    }
+    match err_code {
+        0 => {}
+        SQLITE_CONSTRAINT_PRIMARYKEY => {
+            return Err(LimboError::Constraint(format!(
+                "UNIQUE constraint failed: {} (19)",
+                description
+            )));
+        }
+        SQLITE_CONSTRAINT_NOTNULL => {
+            return Err(LimboError::Constraint(format!(
+                "NOT NULL constraint failed: {} (19)",
+                description
+            )));
+        }
+        _ => {
+            return Err(LimboError::Constraint(format!(
+                "undocumented halt error code {}",
+                description
+            )));
+        }
+    }
+    match program.commit_txn(pager.clone(), state, mv_store)? {
+        StepResult::Done => Ok(InsnFunctionStepResult::Done),
+        StepResult::IO => Ok(InsnFunctionStepResult::IO),
+        StepResult::Row => Ok(InsnFunctionStepResult::Row),
+        StepResult::Interrupt => Ok(InsnFunctionStepResult::Interrupt),
+        StepResult::Busy => Ok(InsnFunctionStepResult::Busy),
+    }
+}
+
 pub fn op_halt(
     program: &Program,
     state: &mut ProgramState,
@@ -1590,6 +1632,12 @@ pub fn op_halt(
                 description
             )));
         }
+        SQLITE_CONSTRAINT_NOTNULL => {
+            return Err(LimboError::Constraint(format!(
+                "NOTNULL constraint failed: {} (19)",
+                description
+            )));
+        }
         _ => {
             return Err(LimboError::Constraint(format!(
                 "undocumented halt error code {}",
@@ -1606,6 +1654,29 @@ pub fn op_halt(
     }
 }
 
+pub fn op_halt_if_null(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Rc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    let Insn::HaltIfNull {
+        target_reg,
+        err_code,
+        description,
+    } = insn
+    else {
+        unreachable!("unexpected Insn {:?}", insn)
+    };
+    if state.registers[*target_reg].get_owned_value() == &Value::Null {
+        halt(program, state, pager, mv_store, *err_code, &description)
+    } else {
+        state.pc += 1;
+        Ok(InsnFunctionStepResult::Step)
+    }
+}
+
 pub fn op_transaction(
     program: &Program,
     state: &mut ProgramState,
@@ -1616,7 +1687,7 @@ pub fn op_transaction(
     let Insn::Transaction { write } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    let connection = program.connection.upgrade().unwrap();
+    let connection = program.connection.clone();
     if *write && connection._db.open_flags.contains(OpenFlags::ReadOnly) {
         return Err(LimboError::ReadOnly);
     }
@@ -1645,6 +1716,7 @@ pub fn op_transaction(
 
         if updated && matches!(new_transaction_state, TransactionState::Write) {
             if let LimboResult::Busy = pager.begin_write_tx()? {
+                pager.end_read_tx()?;
                 tracing::trace!("begin_write_tx busy");
                 return Ok(InsnFunctionStepResult::Busy);
             }
@@ -1671,7 +1743,7 @@ pub fn op_auto_commit(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    let conn = program.connection.upgrade().unwrap();
+    let conn = program.connection.clone();
     if state.commit_state == CommitState::Committing {
         return match program.commit_txn(pager.clone(), state, mv_store)? {
             super::StepResult::Done => Ok(InsnFunctionStepResult::Done),
@@ -1848,6 +1920,36 @@ pub fn op_blob(
         unreachable!("unexpected Insn {:?}", insn)
     };
     state.registers[*dest] = Register::Value(Value::Blob(value.clone()));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_row_data(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Rc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    let Insn::RowData { cursor_id, dest } = insn else {
+        unreachable!("unexpected Insn {:?}", insn)
+    };
+
+    let record = {
+        let mut cursor_ref =
+            must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "RowData");
+        let cursor = cursor_ref.as_btree_mut();
+        let record_option = return_if_io!(cursor.record());
+
+        let ret = record_option
+            .ok_or_else(|| LimboError::InternalError("RowData: cursor has no record".to_string()))?
+            .clone();
+        ret
+    };
+
+    let reg = &mut state.registers[*dest];
+    *reg = Register::Record(record);
+
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -3312,7 +3414,7 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::Changes => {
-                let res = &program.connection.upgrade().unwrap().last_change;
+                let res = &program.connection.last_change;
                 let changes = res.get();
                 state.registers[*dest] = Register::Value(Value::Integer(changes));
             }
@@ -3360,12 +3462,8 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::LastInsertRowid => {
-                if let Some(conn) = program.connection.upgrade() {
-                    state.registers[*dest] =
-                        Register::Value(Value::Integer(conn.last_insert_rowid() as i64));
-                } else {
-                    state.registers[*dest] = Register::Value(Value::Null);
-                }
+                state.registers[*dest] =
+                    Register::Value(Value::Integer(program.connection.last_insert_rowid() as i64));
             }
             ScalarFunc::Like => {
                 let pattern = &state.registers[*start_reg];
@@ -3570,7 +3668,7 @@ pub fn op_function(
                 }
             }
             ScalarFunc::TotalChanges => {
-                let res = &program.connection.upgrade().unwrap().total_changes;
+                let res = &program.connection.total_changes;
                 let total_changes = res.get();
                 state.registers[*dest] = Register::Value(Value::Integer(total_changes));
             }
@@ -3631,9 +3729,7 @@ pub fn op_function(
             ScalarFunc::LoadExtension => {
                 let extension = &state.registers[*start_reg];
                 let ext = resolve_ext_path(&extension.get_owned_value().to_string())?;
-                if let Some(conn) = program.connection.upgrade() {
-                    conn.load_extension(ext)?;
-                }
+                program.connection.load_extension(ext)?;
             }
             ScalarFunc::StrfTime => {
                 let result = exec_strftime(&state.registers[*start_reg..*start_reg + arg_count]);
@@ -3765,6 +3861,275 @@ pub fn op_function(
                 ),
             },
         },
+        crate::function::Func::AlterTable(alter_func) => {
+            let r#type = &state.registers[*start_reg + 0].get_owned_value().clone();
+
+            let Value::Text(name) = &state.registers[*start_reg + 1].get_owned_value() else {
+                panic!("sqlite_schema.name should be TEXT")
+            };
+            let name = name.to_string();
+
+            let Value::Text(tbl_name) = &state.registers[*start_reg + 2].get_owned_value() else {
+                panic!("sqlite_schema.tbl_name should be TEXT")
+            };
+            let tbl_name = tbl_name.to_string();
+
+            let Value::Integer(root_page) =
+                &state.registers[*start_reg + 3].get_owned_value().clone()
+            else {
+                panic!("sqlite_schema.root_page should be INTEGER")
+            };
+
+            let sql = &state.registers[*start_reg + 4].get_owned_value().clone();
+
+            let (new_name, new_tbl_name, new_sql) = match alter_func {
+                AlterTableFunc::RenameTable => {
+                    let rename_from = {
+                        match &state.registers[*start_reg + 5].get_owned_value() {
+                            Value::Text(rename_from) => normalize_ident(rename_from.as_str()),
+                            _ => panic!("rename_from parameter should be TEXT"),
+                        }
+                    };
+
+                    let rename_to = {
+                        match &state.registers[*start_reg + 6].get_owned_value() {
+                            Value::Text(rename_to) => normalize_ident(rename_to.as_str()),
+                            _ => panic!("rename_to parameter should be TEXT"),
+                        }
+                    };
+
+                    let new_name = if let Some(column) =
+                        &name.strip_prefix(&format!("sqlite_autoindex_{rename_from}_"))
+                    {
+                        format!("sqlite_autoindex_{rename_to}_{column}")
+                    } else if name == rename_from {
+                        rename_to.clone()
+                    } else {
+                        name
+                    };
+
+                    let new_tbl_name = if tbl_name == rename_from {
+                        rename_to.clone()
+                    } else {
+                        tbl_name
+                    };
+
+                    let new_sql = 'sql: {
+                        let Value::Text(sql) = sql else {
+                            break 'sql None;
+                        };
+
+                        let mut parser = Parser::new(sql.as_str().as_bytes());
+                        let ast::Cmd::Stmt(stmt) = parser.next().unwrap().unwrap() else {
+                            todo!()
+                        };
+
+                        match stmt {
+                            ast::Stmt::CreateIndex {
+                                unique,
+                                if_not_exists,
+                                idx_name,
+                                tbl_name,
+                                columns,
+                                where_clause,
+                            } => {
+                                let table_name = normalize_ident(&tbl_name.0);
+
+                                if rename_from != table_name {
+                                    break 'sql None;
+                                }
+
+                                Some(
+                                    ast::Stmt::CreateIndex {
+                                        unique,
+                                        if_not_exists,
+                                        idx_name,
+                                        tbl_name: ast::Name(rename_to),
+                                        columns,
+                                        where_clause,
+                                    }
+                                    .format()
+                                    .unwrap(),
+                                )
+                            }
+                            ast::Stmt::CreateTable {
+                                temporary,
+                                if_not_exists,
+                                tbl_name,
+                                body,
+                            } => {
+                                let table_name = normalize_ident(&tbl_name.name.0);
+
+                                if rename_from != table_name {
+                                    break 'sql None;
+                                }
+
+                                Some(
+                                    ast::Stmt::CreateTable {
+                                        temporary,
+                                        if_not_exists,
+                                        tbl_name: ast::QualifiedName {
+                                            db_name: None,
+                                            name: ast::Name(rename_to),
+                                            alias: None,
+                                        },
+                                        body,
+                                    }
+                                    .format()
+                                    .unwrap(),
+                                )
+                            }
+                            _ => todo!(),
+                        }
+                    };
+
+                    (new_name, new_tbl_name, new_sql)
+                }
+                AlterTableFunc::RenameColumn => {
+                    let table = {
+                        match &state.registers[*start_reg + 5].get_owned_value() {
+                            Value::Text(rename_to) => normalize_ident(rename_to.as_str()),
+                            _ => panic!("table parameter should be TEXT"),
+                        }
+                    };
+
+                    let rename_from = {
+                        match &state.registers[*start_reg + 6].get_owned_value() {
+                            Value::Text(rename_from) => normalize_ident(rename_from.as_str()),
+                            _ => panic!("rename_from parameter should be TEXT"),
+                        }
+                    };
+
+                    let rename_to = {
+                        match &state.registers[*start_reg + 7].get_owned_value() {
+                            Value::Text(rename_to) => normalize_ident(rename_to.as_str()),
+                            _ => panic!("rename_to parameter should be TEXT"),
+                        }
+                    };
+
+                    let new_sql = 'sql: {
+                        if table != tbl_name {
+                            break 'sql None;
+                        }
+
+                        let Value::Text(sql) = sql else {
+                            break 'sql None;
+                        };
+
+                        let mut parser = Parser::new(sql.as_str().as_bytes());
+                        let ast::Cmd::Stmt(stmt) = parser.next().unwrap().unwrap() else {
+                            todo!()
+                        };
+
+                        match stmt {
+                            ast::Stmt::CreateIndex {
+                                unique,
+                                if_not_exists,
+                                idx_name,
+                                tbl_name,
+                                mut columns,
+                                where_clause,
+                            } => {
+                                if table != normalize_ident(&tbl_name.0) {
+                                    break 'sql None;
+                                }
+
+                                for column in &mut columns {
+                                    match &mut column.expr {
+                                        ast::Expr::Id(ast::Id(id))
+                                            if normalize_ident(&id) == rename_from =>
+                                        {
+                                            *id = rename_to.clone();
+                                        }
+                                        _ => {}
+                                    }
+                                }
+
+                                Some(
+                                    ast::Stmt::CreateIndex {
+                                        unique,
+                                        if_not_exists,
+                                        idx_name,
+                                        tbl_name,
+                                        columns,
+                                        where_clause,
+                                    }
+                                    .format()
+                                    .unwrap(),
+                                )
+                            }
+                            ast::Stmt::CreateTable {
+                                temporary,
+                                if_not_exists,
+                                tbl_name,
+                                body,
+                            } => {
+                                if table != normalize_ident(&tbl_name.name.0) {
+                                    break 'sql None;
+                                }
+
+                                let ast::CreateTableBody::ColumnsAndConstraints {
+                                    mut columns,
+                                    constraints,
+                                    options,
+                                } = *body
+                                else {
+                                    todo!()
+                                };
+
+                                let column_index = columns
+                                    .get_index_of(&ast::Name(rename_from))
+                                    .expect("column being renamed should be present");
+
+                                let mut column_definition =
+                                    columns.get_index(column_index).unwrap().1.clone();
+
+                                column_definition.col_name = ast::Name(rename_to.clone());
+
+                                assert!(columns
+                                    .insert(ast::Name(rename_to), column_definition.clone())
+                                    .is_none());
+
+                                // Swaps indexes with the last one and pops the end, effectively
+                                // replacing the entry.
+                                columns.swap_remove_index(column_index).unwrap();
+
+                                Some(
+                                    ast::Stmt::CreateTable {
+                                        temporary,
+                                        if_not_exists,
+                                        tbl_name,
+                                        body: Box::new(
+                                            ast::CreateTableBody::ColumnsAndConstraints {
+                                                columns,
+                                                constraints,
+                                                options,
+                                            },
+                                        ),
+                                    }
+                                    .format()
+                                    .unwrap(),
+                                )
+                            }
+                            _ => todo!(),
+                        }
+                    };
+
+                    (name, tbl_name, new_sql)
+                }
+            };
+
+            state.registers[*dest + 0] = Register::Value(r#type.clone());
+            state.registers[*dest + 1] = Register::Value(Value::Text(Text::from(new_name)));
+            state.registers[*dest + 2] = Register::Value(Value::Text(Text::from(new_tbl_name)));
+            state.registers[*dest + 3] = Register::Value(Value::Integer(*root_page));
+
+            if let Some(new_sql) = new_sql {
+                state.registers[*dest + 4] = Register::Value(Value::Text(Text::from(new_sql)));
+            } else {
+                state.registers[*dest + 4] = Register::Value(sql.clone());
+            }
+        }
         crate::function::Func::Agg(_) => {
             unreachable!("Aggregate functions should not be handled here")
         }
@@ -3869,7 +4234,7 @@ pub fn op_insert(
         cursor,
         key_reg,
         record_reg,
-        flag: _,
+        flag,
         table_name: _,
     } = insn
     else {
@@ -3878,23 +4243,35 @@ pub fn op_insert(
     {
         let mut cursor = state.get_cursor(*cursor);
         let cursor = cursor.as_btree_mut();
-        let record = match &state.registers[*record_reg] {
-            Register::Record(r) => r,
-            _ => unreachable!("Not a record! Cannot insert a non record value."),
-        };
+
         let key = match &state.registers[*key_reg].get_owned_value() {
             Value::Integer(i) => *i,
             _ => unreachable!("expected integer key"),
         };
-        return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(record)), true));
+
+        let record = match &state.registers[*record_reg] {
+            Register::Record(r) => std::borrow::Cow::Borrowed(r),
+            Register::Value(value) => {
+                let x = 1;
+                let regs = &state.registers[*record_reg..*record_reg + 1];
+                let new_regs = [&state.registers[*record_reg]];
+                let record = ImmutableRecord::from_registers(new_regs, new_regs.len());
+                std::borrow::Cow::Owned(record)
+            }
+            Register::Aggregate(..) => unreachable!("Cannot insert an aggregate value."),
+        };
+
+        return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(record.as_ref())), true));
         // Only update last_insert_rowid for regular table inserts, not schema modifications
         if cursor.root_page() != 1 {
             if let Some(rowid) = return_if_io!(cursor.rowid()) {
-                if let Some(conn) = program.connection.upgrade() {
-                    conn.update_last_rowid(rowid);
+                program.connection.update_last_rowid(rowid);
+
+                // n_change is increased when Insn::Delete is executed, so we can skip for Insn::Insert
+                if !flag.has(InsertFlags::UPDATE) {
+                    let prev_changes = program.n_change.get();
+                    program.n_change.set(prev_changes + 1);
                 }
-                let prev_changes = program.n_change.get();
-                program.n_change.set(prev_changes + 1);
             }
         }
     }
@@ -4077,7 +4454,18 @@ pub fn op_idx_insert(
                         CursorResult::IO => return Ok(InsnFunctionStepResult::IO),
                         CursorResult::Ok(false) => {}
                     };
-                    false
+                    // uniqueness check already moved us to the correct place in the index.
+                    // the uniqueness check uses SeekOp::GE, which means a non-matching entry
+                    // will now be positioned at the insertion point where there currently is
+                    // a) nothing, or
+                    // b) the first entry greater than the key we are inserting.
+                    // In both cases, we can insert the new entry without moving again.
+                    //
+                    // This is re-entrant, because once we call cursor.insert() with moved_before=true,
+                    // we will immediately set BTreeCursor::state to CursorState::Write(WriteInfo::new()),
+                    // in BTreeCursor::insert_into_page; thus, if this function is called again,
+                    // moved_before will again be true due to cursor.is_write_in_progress() returning true.
+                    true
                 } else {
                     flags.has(IdxInsertFlags::USE_SEEK)
                 }
@@ -4342,7 +4730,7 @@ pub fn op_open_write(
         None => None,
     };
     if let Some(index) = maybe_index {
-        let conn = program.connection.upgrade().unwrap();
+        let conn = program.connection.clone();
         let schema = conn.schema.try_read().ok_or(LimboError::SchemaLocked)?;
         let table = schema
             .get_table(&index.table_name)
@@ -4468,7 +4856,8 @@ pub fn op_drop_table(
     if *db > 0 {
         todo!("temp databases not implemented yet");
     }
-    if let Some(conn) = program.connection.upgrade() {
+    let conn = program.connection.clone();
+    {
         let mut schema = conn.schema.write();
         schema.remove_indices_for_table(table_name);
         schema.remove_table(table_name);
@@ -4545,8 +4934,7 @@ pub fn op_parse_schema(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    let conn = program.connection.upgrade();
-    let conn = conn.as_ref().unwrap();
+    let conn = program.connection.clone();
 
     if let Some(where_clause) = where_clause {
         let stmt = conn.prepare(format!(
@@ -4832,7 +5220,7 @@ pub fn op_open_ephemeral(
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
 
-    let conn = program.connection.upgrade().unwrap();
+    let conn = program.connection.clone();
     let io = conn.pager.io.get_memory_io();
 
     let file = io.open_file("", OpenFlags::Create, true)?;
@@ -5065,6 +5453,68 @@ pub fn op_count(
     state.registers[*target_reg] = Register::Value(Value::Integer(count as i64));
 
     state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+#[derive(Debug)]
+pub enum OpIntegrityCheckState {
+    Start,
+    Checking {
+        errors: Vec<IntegrityCheckError>,
+        current_root_idx: usize,
+        state: IntegrityCheckState,
+    },
+}
+pub fn op_integrity_check(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Rc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    let Insn::IntegrityCk {
+        max_errors,
+        roots,
+        message_register,
+    } = insn
+    else {
+        unreachable!("unexpected Insn {:?}", insn)
+    };
+    match &mut state.op_integrity_check_state {
+        OpIntegrityCheckState::Start => {
+            state.op_integrity_check_state = OpIntegrityCheckState::Checking {
+                errors: Vec::new(),
+                current_root_idx: 0,
+                state: IntegrityCheckState::new(roots[0]),
+            };
+        }
+        OpIntegrityCheckState::Checking {
+            errors,
+            current_root_idx,
+            state: integrity_check_state,
+        } => {
+            return_if_io!(integrity_check(integrity_check_state, errors, pager));
+            *current_root_idx += 1;
+            if *current_root_idx < roots.len() {
+                *integrity_check_state = IntegrityCheckState::new(roots[*current_root_idx]);
+                return Ok(InsnFunctionStepResult::Step);
+            } else {
+                let message = if errors.is_empty() {
+                    "ok".to_string()
+                } else {
+                    errors
+                        .iter()
+                        .map(|e| e.to_string())
+                        .collect::<Vec<String>>()
+                        .join("\n")
+                };
+                state.registers[*message_register] = Register::Value(Value::build_text(message));
+                state.op_integrity_check_state = OpIntegrityCheckState::Start;
+                state.pc += 1;
+            }
+        }
+    }
+
     Ok(InsnFunctionStepResult::Step)
 }
 
@@ -5390,10 +5840,11 @@ impl Value {
 
     pub fn exec_hex(&self) -> Value {
         match self {
-            Value::Text(_) | Value::Integer(_) | Value::Float(_) | Value::Blob(_) => {
+            Value::Text(_) | Value::Integer(_) | Value::Float(_) => {
                 let text = self.to_string();
                 Value::build_text(&hex::encode_upper(text))
             }
+            Value::Blob(blob_bytes) => Value::build_text(&hex::encode_upper(blob_bytes)),
             _ => Value::Null,
         }
     }
@@ -5527,12 +5978,10 @@ impl Value {
 
     // exec_if returns whether you should jump
     pub fn exec_if(&self, jump_if_null: bool, not: bool) -> bool {
-        match self {
-            Value::Integer(0) | Value::Float(0.0) => not,
-            Value::Integer(_) | Value::Float(_) => !not,
-            Value::Null => jump_if_null,
-            _ => false,
-        }
+        Numeric::from(self)
+            .try_into_bool()
+            .map(|jump| if not { !jump } else { jump })
+            .unwrap_or(jump_if_null)
     }
 
     pub fn exec_cast(&self, datatype: &str) -> Value {
@@ -5729,6 +6178,12 @@ impl Value {
                 None => return Value::Null,
             },
             None => 10.0,
+        };
+
+        if base == 2.0 {
+            return Value::Float(libm::log2(f));
+        } else if base == 10.0 {
+            return Value::Float(libm::log10(f));
         };
 
         if f <= 0.0 || base <= 0.0 || base == 1.0 {
@@ -7148,6 +7603,10 @@ mod tests {
         let input_float = Value::Float(12.34);
         let expected_val = Value::build_text("31322E3334");
         assert_eq!(input_float.exec_hex(), expected_val);
+
+        let input_blob = Value::Blob(vec![0xff]);
+        let expected_val = Value::build_text("FF");
+        assert_eq!(input_blob.exec_hex(), expected_val);
     }
 
     #[test]

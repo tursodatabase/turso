@@ -17,6 +17,8 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
+use tracing_subscriber::field::MakeExt;
+use tracing_subscriber::fmt::format;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -166,9 +168,10 @@ fn testing_main(cli_opts: &SimulatorCLI) -> anyhow::Result<()> {
     };
 
     if let Err(err) = integrity_check(&paths.db) {
-        tracing::error!("Integrity Check failed:\n{}", err);
+        tracing::error!("simulation failed: integrity check failed:\n{}", err);
         if result.is_err() {
-            result = result.with_context(|| anyhow!("Integrity Check failed:\n{}", err));
+            result = result
+                .with_context(|| anyhow!("simulation failed: integrity check failed:\n{}", err));
         } else {
             result = Err(err);
         }
@@ -359,6 +362,8 @@ fn run_simulator(
                     ) => {
                         if e1 != e2 {
                             tracing::error!(
+                                ?shrunk,
+                                ?result,
                                 "shrinking failed, the error was not properly reproduced"
                             );
                             if let Some(bugbase) = bugbase {
@@ -391,7 +396,11 @@ fn run_simulator(
                         unreachable!("shrinking should never be called on a correct simulation")
                     }
                     _ => {
-                        tracing::error!("shrinking failed, the error was not properly reproduced");
+                        tracing::error!(
+                            ?shrunk,
+                            ?result,
+                            "shrinking failed, the error was not properly reproduced"
+                        );
                         if let Some(bugbase) = bugbase {
                             bugbase
                                 .add_bug(seed, plans[0].clone(), Some(error.clone()), cli_opts)
@@ -688,6 +697,7 @@ fn run_simulation(
     result
 }
 
+#[allow(deprecated)]
 fn init_logger() {
     let file = OpenOptions::new()
         .create(true)
@@ -708,9 +718,11 @@ fn init_logger() {
             tracing_subscriber::fmt::layer()
                 .with_writer(file)
                 .with_ansi(false)
+                .fmt_fields(format::PrettyFields::new().with_ansi(false)) // with_ansi is deprecated, but I cannot find another way to remove ansi codes
                 .with_line_number(true)
                 .without_time()
-                .with_thread_ids(false),
+                .with_thread_ids(false)
+                .map_fmt_fields(|f| f.debug_alt()),
         )
         .try_init();
 }
@@ -752,14 +764,14 @@ fn integrity_check(db_path: &Path) -> anyhow::Result<()> {
         result.push(row.get(0)?);
     }
     if result.is_empty() {
-        anyhow::bail!("integrity_check should return `ok` or a list of problems")
+        anyhow::bail!("simulation failed: integrity_check should return `ok` or a list of problems")
     }
     if !result[0].eq_ignore_ascii_case("ok") {
         // Build a list of problems
         result
             .iter_mut()
             .for_each(|row| *row = format!("- {}", row));
-        anyhow::bail!(result.join("\n"))
+        anyhow::bail!("simulation failed: {}", result.join("\n"))
     }
     Ok(())
 }

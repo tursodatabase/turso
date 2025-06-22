@@ -58,6 +58,30 @@ pub struct SimulatorCLI {
     pub disable_create_index: bool,
     #[clap(long, help = "disable DROP Statement", default_value_t = false)]
     pub disable_drop: bool,
+    #[clap(
+        long,
+        help = "disable Insert-Values-Select Property",
+        default_value_t = false
+    )]
+    pub disable_insert_values_select: bool,
+    #[clap(
+        long,
+        help = "disable Double-Create-Failure Property",
+        default_value_t = false
+    )]
+    pub disable_double_create_failure: bool,
+    #[clap(long, help = "disable Select-Limit Property", default_value_t = false)]
+    pub disable_select_limit: bool,
+    #[clap(long, help = "disable Delete-Select Property", default_value_t = false)]
+    pub disable_delete_select: bool,
+    #[clap(long, help = "disable Drop-Select Property", default_value_t = false)]
+    pub disable_drop_select: bool,
+    #[clap(
+        long,
+        help = "disable Select-Select-Optimizer Property",
+        default_value_t = false
+    )]
+    pub disable_select_optimizer: bool,
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]

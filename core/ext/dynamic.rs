@@ -6,7 +6,6 @@ use libloading::{Library, Symbol};
 use limbo_ext::{ExtensionApi, ExtensionApiRef, ExtensionEntryPoint, ResultCode, VfsImpl};
 use std::{
     ffi::{c_char, CString},
-    rc::Rc,
     sync::{Arc, Mutex, OnceLock},
 };
 
@@ -31,7 +30,7 @@ unsafe impl Sync for VfsMod {}
 
 impl Connection {
     pub fn load_extension<P: AsRef<std::ffi::OsStr>>(
-        self: &Rc<Connection>,
+        self: &Arc<Connection>,
         path: P,
     ) -> crate::Result<()> {
         use limbo_ext::ExtensionApiRef;

@@ -66,44 +66,41 @@ impl LoopLabels {
     }
 }
 
-pub fn init_distinct(program: &mut ProgramBuilder, plan: &mut SelectPlan) {
-    if let Distinctness::Distinct { ctx } = &mut plan.distinctness {
-        assert!(
-            ctx.is_none(),
-            "distinctness context should not be allocated yet"
-        );
-        let index_name = format!("distinct_{}", program.offset().to_offset_int()); // we don't really care about the name that much, just enough that we don't get name collisions
-        let index = Arc::new(Index {
-            name: index_name.clone(),
-            table_name: String::new(),
-            ephemeral: true,
-            root_page: 0,
-            columns: plan
-                .result_columns
-                .iter()
-                .enumerate()
-                .map(|(i, col)| IndexColumn {
-                    name: col.expr.to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: i,
-                    collation: None, // FIXME: this should be determined based on the result column expression!
-                })
-                .collect(),
-            unique: false,
-            has_rowid: false,
-        });
-        let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
-        *ctx = Some(DistinctCtx {
-            cursor_id,
-            ephemeral_index_name: index_name,
-            label_on_conflict: program.allocate_label(),
-        });
+pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> DistinctCtx {
+    let index_name = format!("distinct_{}", program.offset().to_offset_int()); // we don't really care about the name that much, just enough that we don't get name collisions
+    let index = Arc::new(Index {
+        name: index_name.clone(),
+        table_name: String::new(),
+        ephemeral: true,
+        root_page: 0,
+        columns: plan
+            .result_columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| IndexColumn {
+                name: col.expr.to_string(),
+                order: SortOrder::Asc,
+                pos_in_table: i,
+                collation: None, // FIXME: this should be determined based on the result column expression!
+                default: None, // FIXME: this should be determined based on the result column expression!
+            })
+            .collect(),
+        unique: false,
+        has_rowid: false,
+    });
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+    let ctx = DistinctCtx {
+        cursor_id,
+        ephemeral_index_name: index_name,
+        label_on_conflict: program.allocate_label(),
+    };
 
-        program.emit_insn(Insn::OpenEphemeral {
-            cursor_id,
-            is_table: false,
-        });
-    }
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id,
+        is_table: false,
+    });
+
+    return ctx;
 }
 
 /// Initialize resources needed for the source operators (tables, joins, etc)
@@ -114,6 +111,7 @@ pub fn init_loop(
     aggregates: &mut [Aggregate],
     group_by: Option<&GroupBy>,
     mode: OperationMode,
+    where_clause: &[WhereTerm],
 ) -> Result<()> {
     assert!(
         t_ctx.meta_left_joins.len() == tables.joined_tables().len(),
@@ -140,6 +138,7 @@ pub fn init_loop(
                 order: SortOrder::Asc,
                 pos_in_table: 0,
                 collation: None, // FIXME: this should be inferred from the expression
+                default: None,   // FIXME: this should be inferred from the expression
             }],
             has_rowid: false,
             unique: false,
@@ -262,12 +261,16 @@ pub fn init_loop(
                         }
                     }
                     OperationMode::DELETE | OperationMode::UPDATE => {
-                        let table_cursor_id = table_cursor_id.expect("table cursor is always opened in OperationMode::DELETE or OperationMode::UPDATE");
+                        let table_cursor_id = table_cursor_id.expect(
+                                        "table cursor is always opened in OperationMode::DELETE or OperationMode::UPDATE",
+                                    );
+
                         program.emit_insn(Insn::OpenWrite {
                             cursor_id: table_cursor_id,
                             root_page: table.table.get_root_page().into(),
                             name: table.table.get_name().to_string(),
                         });
+
                         // For DELETE, we need to open all the indexes for writing
                         // UPDATE opens these in emit_program_for_update() separately
                         if mode == OperationMode::DELETE {
@@ -332,6 +335,20 @@ pub fn init_loop(
         }
     }
 
+    for cond in where_clause
+        .iter()
+        .filter(|c| c.should_eval_before_loop(&[JoinOrderMember::default()]))
+    {
+        let jump_target = program.allocate_label();
+        let meta = ConditionMetadata {
+            jump_if_condition_is_true: false,
+            jump_target_when_true: jump_target,
+            jump_target_when_false: t_ctx.label_main_loop_end.unwrap(),
+        };
+        translate_condition_expr(program, &tables, &cond.expr, meta, &t_ctx.resolver)?;
+        program.preassign_label_to_next_insn(jump_target);
+    }
+
     Ok(())
 }
 
@@ -344,6 +361,7 @@ pub fn open_loop(
     table_references: &TableReferences,
     join_order: &[JoinOrderMember],
     predicates: &[WhereTerm],
+    temp_cursor_id: Option<CursorID>,
 ) -> Result<()> {
     for (join_index, join) in join_order.iter().enumerate() {
         let joined_table_index = join.original_idx;
@@ -376,8 +394,12 @@ pub fn open_loop(
             Operation::Scan { iter_dir, .. } => {
                 match &table.table {
                     Table::BTree(_) => {
-                        let iteration_cursor_id = index_cursor_id.unwrap_or_else(|| {
-                            table_cursor_id.expect("Either index or table cursor must be opened")
+                        let iteration_cursor_id = temp_cursor_id.unwrap_or_else(|| {
+                            index_cursor_id.unwrap_or_else(|| {
+                                table_cursor_id.expect(
+                                    "Either ephemeral or index or table cursor must be opened",
+                                )
+                            })
                         });
                         if *iter_dir == IterationDirection::Backwards {
                             program.emit_insn(Insn::Last {
@@ -624,8 +646,11 @@ pub fn open_loop(
                     };
 
                     let is_index = index_cursor_id.is_some();
-                    let seek_cursor_id = index_cursor_id.unwrap_or_else(|| {
-                        table_cursor_id.expect("Either index or table cursor must be opened")
+                    let seek_cursor_id = temp_cursor_id.unwrap_or_else(|| {
+                        index_cursor_id.unwrap_or_else(|| {
+                            table_cursor_id
+                                .expect("Either ephemeral or index or table cursor must be opened")
+                        })
                     });
                     let Search::Seek { seek_def, .. } = search else {
                         unreachable!("Rowid equality point lookup should have been handled above");
@@ -725,7 +750,7 @@ enum LoopEmitTarget {
 pub fn emit_loop<'a>(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx<'a>,
-    plan: &'a SelectPlan,
+    plan: &SelectPlan,
 ) -> Result<()> {
     // if we have a group by, we emit a record into the group by sorter,
     // or if the rows are already sorted, we do the group by aggregation phase directly.
@@ -751,7 +776,7 @@ pub fn emit_loop<'a>(
 fn emit_loop_source<'a>(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx<'a>,
-    plan: &'a SelectPlan,
+    plan: &SelectPlan,
     emit_target: LoopEmitTarget,
 ) -> Result<()> {
     match emit_target {
@@ -763,7 +788,6 @@ fn emit_loop_source<'a>(
             // 3) aggregate function arguments
             // - or if the rows produced by the loop are already sorted in the order required by the GROUP BY keys,
             // the group by comparisons are done directly inside the main loop.
-            let group_by = plan.group_by.as_ref().unwrap();
             let aggregates = &plan.aggregates;
 
             let GroupByMetadata {
@@ -775,9 +799,15 @@ fn emit_loop_source<'a>(
             let start_reg = registers.reg_group_by_source_cols_start;
             let mut cur_reg = start_reg;
 
-            // Step 1: Process GROUP BY columns first
-            // These will be the first columns in the sorter and serve as sort keys
-            for expr in group_by.exprs.iter() {
+            // Collect all non-aggregate expressions in the following order:
+            // 1. GROUP BY expressions. These serve as sort keys.
+            // 2. Remaining non-aggregate expressions that are not in GROUP BY.
+            //
+            // Example:
+            //   SELECT col1, col2, SUM(col3) FROM table GROUP BY col1
+            //   - col1 is added first (from GROUP BY)
+            //   - col2 is added second (non-aggregate, in SELECT, not in GROUP BY)
+            for (expr, _) in t_ctx.non_aggregate_expressions.iter() {
                 let key_reg = cur_reg;
                 cur_reg += 1;
                 translate_expr(
@@ -789,22 +819,7 @@ fn emit_loop_source<'a>(
                 )?;
             }
 
-            // Step 2: Process columns that aren't part of GROUP BY and don't contain aggregates
-            // Example: SELECT col1, col2, SUM(col3) FROM table GROUP BY col1
-            // Here col2 would be processed in this loop if it's in the result set
-            for expr in plan.non_group_by_non_agg_columns() {
-                let key_reg = cur_reg;
-                cur_reg += 1;
-                translate_expr(
-                    program,
-                    Some(&plan.table_references),
-                    expr,
-                    key_reg,
-                    &t_ctx.resolver,
-                )?;
-            }
-
-            // Step 3: Process arguments for all aggregate functions
+            // Step 2: Process arguments for all aggregate functions
             // For each aggregate, translate all its argument expressions
             for agg in aggregates.iter() {
                 // For a query like: SELECT group_col, SUM(val1), AVG(val2) FROM table GROUP BY group_col
@@ -968,6 +983,7 @@ pub fn close_loop(
     t_ctx: &mut TranslateCtx,
     tables: &TableReferences,
     join_order: &[JoinOrderMember],
+    temp_cursor_id: Option<CursorID>,
 ) -> Result<()> {
     // We close the loops for all tables in reverse order, i.e. innermost first.
     // OPEN t1
@@ -992,8 +1008,12 @@ pub fn close_loop(
                 program.resolve_label(loop_labels.next, program.offset());
                 match &table.table {
                     Table::BTree(_) => {
-                        let iteration_cursor_id = index_cursor_id.unwrap_or_else(|| {
-                            table_cursor_id.expect("Either index or table cursor must be opened")
+                        let iteration_cursor_id = temp_cursor_id.unwrap_or_else(|| {
+                            index_cursor_id.unwrap_or_else(|| {
+                                table_cursor_id.expect(
+                                    "Either ephemeral or index or table cursor must be opened",
+                                )
+                            })
                         });
                         if *iter_dir == IterationDirection::Backwards {
                             program.emit_insn(Insn::Prev {
@@ -1032,8 +1052,11 @@ pub fn close_loop(
                     "Subqueries do not support index seeks"
                 );
                 program.resolve_label(loop_labels.next, program.offset());
-                let iteration_cursor_id = index_cursor_id.unwrap_or_else(|| {
-                    table_cursor_id.expect("Either index or table cursor must be opened")
+                let iteration_cursor_id = temp_cursor_id.unwrap_or_else(|| {
+                    index_cursor_id.unwrap_or_else(|| {
+                        table_cursor_id
+                            .expect("Either ephemeral or index or table cursor must be opened")
+                    })
                 });
                 // Rowid equality point lookups are handled with a SeekRowid instruction which does not loop, so there is no need to emit a Next instruction.
                 if !matches!(search, Search::RowidEq { .. }) {
@@ -1405,11 +1428,7 @@ fn emit_autoindex(
     let ephemeral_cols_start_reg = program.alloc_registers(num_regs_to_reserve);
     for (i, col) in index.columns.iter().enumerate() {
         let reg = ephemeral_cols_start_reg + i;
-        program.emit_insn(Insn::Column {
-            cursor_id: table_cursor_id,
-            column: col.pos_in_table,
-            dest: reg,
-        });
+        program.emit_column(table_cursor_id, col.pos_in_table, reg);
     }
     if table_has_rowid {
         program.emit_insn(Insn::RowId {

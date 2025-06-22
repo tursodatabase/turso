@@ -1,15 +1,11 @@
-use std::{
-    cell::Cell,
-    cmp::Ordering,
-    rc::{Rc, Weak},
-    sync::Arc,
-};
+use std::{cell::Cell, cmp::Ordering, rc::Rc, sync::Arc};
 
 use limbo_sqlite3_parser::ast::{self, TableInternalId};
 use tracing::{instrument, Level};
 
 use crate::{
     fast_lock::SpinLock,
+    numeric::Numeric,
     parameters::Parameters,
     schema::{BTreeTable, Index, PseudoTable, Table},
     storage::sqlite3_ondisk::DatabaseHeader,
@@ -18,7 +14,8 @@ use crate::{
         emitter::TransactionMode,
         plan::{ResultSetColumn, TableReferences},
     },
-    Connection, VirtualTable,
+    types::Text,
+    Connection, Value, VirtualTable,
 };
 pub struct TableRefIdCounter {
     next_free: TableInternalId,
@@ -771,10 +768,90 @@ impl ProgramBuilder {
         self.table_references.contains_table(table)
     }
 
+    #[inline]
+    pub fn cursor_loop(&mut self, cursor_id: CursorID, f: impl Fn(&mut ProgramBuilder, usize)) {
+        let loop_start = self.allocate_label();
+        let loop_end = self.allocate_label();
+
+        self.emit_insn(Insn::Rewind {
+            cursor_id,
+            pc_if_empty: loop_end,
+        });
+        self.preassign_label_to_next_insn(loop_start);
+
+        let rowid = self.alloc_register();
+
+        self.emit_insn(Insn::RowId {
+            cursor_id,
+            dest: rowid,
+        });
+
+        self.emit_insn(Insn::IsNull {
+            reg: rowid,
+            target_pc: loop_end,
+        });
+
+        f(self, rowid);
+
+        self.emit_insn(Insn::Next {
+            cursor_id,
+            pc_if_next: loop_start,
+        });
+        self.preassign_label_to_next_insn(loop_end);
+    }
+
+    pub fn emit_column(&mut self, cursor_id: CursorID, column: usize, out: usize) {
+        let (_, cursor_type) = self.cursor_ref.get(cursor_id).unwrap();
+
+        use crate::translate::expr::sanitize_string;
+
+        let default = 'value: {
+            let default = match cursor_type {
+                CursorType::BTreeTable(btree) => &btree.columns[column].default,
+                CursorType::BTreeIndex(index) => &index.columns[column].default,
+                _ => break 'value None,
+            };
+
+            let Some(ast::Expr::Literal(ref literal)) = default else {
+                break 'value None;
+            };
+
+            Some(match literal {
+                ast::Literal::Numeric(s) => match Numeric::from(s) {
+                    Numeric::Null => Value::Null,
+                    Numeric::Integer(v) => Value::Integer(v),
+                    Numeric::Float(v) => Value::Float(v.into()),
+                },
+                ast::Literal::Null => Value::Null,
+                ast::Literal::String(s) => Value::Text(Text::from_str(sanitize_string(s))),
+                ast::Literal::Blob(s) => Value::Blob(
+                    // Taken from `translate_expr`
+                    s.as_bytes()
+                        .chunks_exact(2)
+                        .map(|pair| {
+                            // We assume that sqlite3-parser has already validated that
+                            // the input is valid hex string, thus unwrap is safe.
+                            let hex_byte = std::str::from_utf8(pair).unwrap();
+                            u8::from_str_radix(hex_byte, 16).unwrap()
+                        })
+                        .collect(),
+                ),
+                _ => break 'value None,
+            })
+        };
+
+        self.emit_insn(Insn::Column {
+            cursor_id,
+            column,
+            dest: out,
+            default,
+        });
+    }
+
     pub fn build(
         mut self,
         database_header: Arc<SpinLock<DatabaseHeader>>,
-        connection: Weak<Connection>,
+        connection: Arc<Connection>,
         change_cnt_on: bool,
     ) -> Program {
         self.resolve_labels();

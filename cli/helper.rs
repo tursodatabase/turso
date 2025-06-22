@@ -8,7 +8,6 @@ use rustyline::{Completer, Helper, Hinter, Validator};
 use shlex::Shlex;
 use std::cell::RefCell;
 use std::marker::PhantomData;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::{ffi::OsString, path::PathBuf, str::FromStr as _};
 use syntect::dumps::from_uncompressed_data;
@@ -42,7 +41,7 @@ pub struct LimboHelper {
 
 impl LimboHelper {
     pub fn new(
-        conn: Rc<Connection>,
+        conn: Arc<Connection>,
         io: Arc<dyn limbo_core::IO>,
         syntax_config: Option<HighlightConfig>,
     ) -> Self {
@@ -141,7 +140,7 @@ impl Highlighter for LimboHelper {
 }
 
 pub struct SqlCompleter<C: Parser + Send + Sync + 'static> {
-    conn: Rc<Connection>,
+    conn: Arc<Connection>,
     io: Arc<dyn limbo_core::IO>,
     // Has to be a ref cell as Rustyline takes immutable reference to self
     // This problem would be solved with Reedline as it uses &mut self for completions
@@ -150,7 +149,7 @@ pub struct SqlCompleter<C: Parser + Send + Sync + 'static> {
 }
 
 impl<C: Parser + Send + Sync + 'static> SqlCompleter<C> {
-    pub fn new(conn: Rc<Connection>, io: Arc<dyn limbo_core::IO>) -> Self {
+    pub fn new(conn: Arc<Connection>, io: Arc<dyn limbo_core::IO>) -> Self {
         Self {
             conn,
             io,

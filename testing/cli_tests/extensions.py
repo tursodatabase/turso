@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 import os
-from cli_tests.test_limbo_cli import TestLimboShell
+
 from cli_tests import console
+from cli_tests.test_limbo_cli import TestLimboShell
 
 sqlite_exec = "./scripts/limbo-sqlite3"
 sqlite_flags = os.getenv("SQLITE_FLAGS", "-q").split(" ")
@@ -40,14 +41,10 @@ def test_uuid():
     )
     limbo.run_test_fn("SELECT uuid4_str();", lambda res: len(res) == 36)
     limbo.run_test_fn("SELECT hex(uuid7());", lambda res: int(res, 16) is not None)
-    limbo.run_test_fn(
-        "SELECT uuid7_timestamp_ms(uuid7()) / 1000;", lambda res: res.isdigit()
-    )
+    limbo.run_test_fn("SELECT uuid7_timestamp_ms(uuid7()) / 1000;", lambda res: res.isdigit())
     limbo.run_test_fn("SELECT uuid7_str();", validate_string_uuid)
     limbo.run_test_fn("SELECT uuid_str(uuid7());", validate_string_uuid)
-    limbo.run_test_fn(
-        "SELECT hex(uuid_blob(uuid7_str()));", lambda res: int(res, 16) is not None
-    )
+    limbo.run_test_fn("SELECT hex(uuid_blob(uuid7_str()));", lambda res: int(res, 16) is not None)
     limbo.run_test_fn("SELECT uuid_str(uuid_blob(uuid7_str()));", validate_string_uuid)
     limbo.run_test_fn(
         f"SELECT uuid7_timestamp_ms('{specific_time}') / 1000;",
@@ -160,12 +157,8 @@ def test_aggregates():
         validate_percentile2,
         "test aggregate percentile function with 1 argument works",
     )
-    limbo.run_test_fn(
-        "SELECT percentile_cont(value, 0.25) from test;", validate_percentile1
-    )
-    limbo.run_test_fn(
-        "SELECT percentile_disc(value, 0.55) from test;", validate_percentile_disc
-    )
+    limbo.run_test_fn("SELECT percentile_cont(value, 0.25) from test;", validate_percentile1)
+    limbo.run_test_fn("SELECT percentile_disc(value, 0.55) from test;", validate_percentile_disc)
     limbo.quit()
 
 
@@ -223,8 +216,7 @@ def test_crypto():
     # Hashing and Decode
     limbo.run_test_fn(
         "SELECT crypto_encode(crypto_blake3('abc'), 'hex');",
-        lambda res: res
-        == "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
+        lambda res: res == "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
         "blake3 should encrypt correctly",
     )
     limbo.run_test_fn(
@@ -239,8 +231,7 @@ def test_crypto():
     )
     limbo.run_test_fn(
         "SELECT crypto_encode(crypto_sha256('abc'), 'hex');",
-        lambda a: a
-        == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        lambda a: a == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         "sha256 should encrypt correctly",
     )
     limbo.run_test_fn(
@@ -252,7 +243,7 @@ def test_crypto():
     limbo.run_test_fn(
         "SELECT crypto_encode(crypto_sha512('abc'), 'hex');",
         lambda a: a
-        == "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+        == "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",  # noqa: E501
         "sha512 should encrypt correctly",
     )
 
@@ -311,6 +302,7 @@ def test_crypto():
 
 
 def test_series():
+    console.info("Running test_series for Limbo")
     limbo = TestLimboShell()
     ext_path = "./target/debug/liblimbo_series"
     limbo.run_test_fn(
@@ -318,6 +310,14 @@ def test_series():
         lambda res: "No such table-valued function: generate_series" in res,
     )
     limbo.execute_dot(f".load {ext_path}")
+    _test_series(limbo)
+
+    console.info("Running test_series for SQLite")
+    limbo = TestLimboShell(exec_name="sqlite3")
+    _test_series(limbo)
+
+
+def _test_series(limbo: TestLimboShell):
     limbo.run_test_fn(
         "SELECT * FROM generate_series(1, 10);",
         lambda res: res == "1\n2\n3\n4\n5\n6\n7\n8\n9\n10",
@@ -328,7 +328,7 @@ def test_series():
     )
     limbo.run_test_fn(
         "SELECT * FROM generate_series(1, 10, 2, 3);",
-        lambda res: "Invalid Argument" in res,
+        lambda res: "Invalid Argument" in res or "too many arguments" in res,
     )
     limbo.run_test_fn(
         "SELECT * FROM generate_series(10, 1, -2);",
@@ -344,14 +344,22 @@ def test_series():
 
 
 def test_kv():
-    ext_path = "target/debug/liblimbo_ext_tests"
-    limbo = TestLimboShell()
+    _test_kv(exec_name=None, ext_path="target/debug/liblimbo_ext_tests")
+    _test_kv(exec_name="sqlite3", ext_path="target/debug/liblimbo_sqlite_test_ext")
+
+
+def _test_kv(exec_name, ext_path):
+    console.info(f"Running test_kv for {ext_path}")
+
+    limbo = TestLimboShell(
+        exec_name=exec_name,
+    )
     # first, create a normal table to ensure no issues
     limbo.execute_dot("CREATE TABLE other (a,b,c);")
     limbo.execute_dot("INSERT INTO other values (23,32,23);")
     limbo.run_test_fn(
         "create virtual table t using kv_store;",
-        lambda res: "Parse error: no such module: kv_store" in res,
+        lambda res: "no such module: kv_store" in res,
     )
     limbo.execute_dot(f".load {ext_path}")
     limbo.execute_dot(
@@ -401,9 +409,7 @@ def test_kv():
     )
     for i in range(100):
         limbo.execute_dot(f"insert into t values ('key{i}', 'val{i}');")
-    limbo.run_test_fn(
-        "select count(*) from t;", lambda res: "100" == res, "can insert 100 rows"
-    )
+    limbo.run_test_fn("select count(*) from t;", lambda res: "100" == res, "can insert 100 rows")
     limbo.run_test_fn("update t set value = 'updated' where key = 'key33';", null)
     limbo.run_test_fn(
         "select * from t where key = 'key33';",
@@ -421,13 +427,12 @@ def test_kv():
         lambda res: res == "100",
         "can update all rows",
     )
-    limbo.run_test_fn("delete from t limit 96;", null, "can delete 96 rows")
-    limbo.run_test_fn(
-        "select count(*) from t;", lambda res: "4" == res, "four rows remain"
-    )
-    limbo.run_test_fn(
-        "update t set key = '100' where 1;", null, "where clause evaluates properly"
-    )
+    if exec_name is None:
+        # Test only on Limbo, since SQLite supports the DELETE ... LIMIT syntax only when compiled
+        # with the SQLITE_ENABLE_UPDATE_DELETE_LIMIT option: https://www.sqlite.org/lang_delete.html
+        limbo.run_test_fn("delete from t limit 96;", null, "can delete 96 rows")
+        limbo.run_test_fn("select count(*) from t;", lambda res: "4" == res, "four rows remain")
+    limbo.run_test_fn("update t set key = '100' where 1;", null, "where clause evaluates properly")
     limbo.run_test_fn(
         "select * from t where key = '100';",
         lambda res: res == "100|updated2",
@@ -509,9 +514,7 @@ def test_vfs():
     ext_path = "target/debug/liblimbo_ext_tests"
     limbo.run_test_fn(".vfslist", lambda x: "testvfs" not in x, "testvfs not loaded")
     limbo.execute_dot(f".load {ext_path}")
-    limbo.run_test_fn(
-        ".vfslist", lambda res: "testvfs" in res, "testvfs extension loaded"
-    )
+    limbo.run_test_fn(".vfslist", lambda res: "testvfs" in res, "testvfs extension loaded")
     limbo.execute_dot(".open testing/vfs.db testvfs")
     limbo.execute_dot("create table test (id integer primary key, value float);")
     limbo.execute_dot("create table vfs (id integer primary key, value blob);")
@@ -742,8 +745,7 @@ def test_tablestats():
 
     limbo.run_test_fn(
         "SELECT * FROM stats ORDER BY name;",
-        lambda res: sorted(_split(res))
-        == sorted(["logs|1", "people|3", "products|11", "users|10000"]),
+        lambda res: sorted(_split(res)) == sorted(["logs|1", "people|3", "products|11", "users|10000"]),
         "stats shows correct initial counts (and skips itself)",
     )
 

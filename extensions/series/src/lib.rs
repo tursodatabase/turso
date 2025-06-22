@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use limbo_ext::{
     register_extension, Connection, ResultCode, VTabCursor, VTabKind, VTabModule, VTabModuleDerive,
@@ -45,7 +45,7 @@ impl VTable for GenerateSeriesTable {
     type Cursor = GenerateSeriesCursor;
     type Error = ResultCode;
 
-    fn open(&self, _conn: Option<Rc<Connection>>) -> Result<Self::Cursor, Self::Error> {
+    fn open(&self, _conn: Option<Arc<Connection>>) -> Result<Self::Cursor, Self::Error> {
         Ok(GenerateSeriesCursor {
             start: 0,
             stop: 0,

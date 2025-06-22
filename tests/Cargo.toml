@@ -14,6 +14,9 @@ path = "lib.rs"
 name = "integration_tests"
 path = "integration/mod.rs"
 
+[features]
+index_experimental = ["limbo_core/index_experimental"]
+
 [dependencies]
 anyhow.workspace = true
 env_logger = "0.10.1"

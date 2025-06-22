@@ -27,31 +27,32 @@ members = [
     "stress",
     "tests",
     "vendored/sqlite3-parser/sqlparser_bench",
+    "testing/sqlite_test_ext",
 ]
 exclude = ["perf/latency/limbo"]
 
 [workspace.package]
-version = "0.0.22-pre.1"
+version = "0.0.22"
 authors = ["the Limbo authors"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/tursodatabase/limbo"
 
 [workspace.dependencies]
-limbo_completion = { path = "extensions/completion", version = "0.0.22-pre.1" }
-limbo_core = { path = "core", version = "0.0.22-pre.1" }
-limbo_crypto = { path = "extensions/crypto", version = "0.0.22-pre.1" }
-limbo_csv = { path = "extensions/csv", version = "0.0.22-pre.1" }
-limbo_ext = { path = "extensions/core", version = "0.0.22-pre.1" }
-limbo_ext_tests = { path = "extensions/tests", version = "0.0.22-pre.1" }
-limbo_ipaddr = { path = "extensions/ipaddr", version = "0.0.22-pre.1" }
-limbo_macros = { path = "macros", version = "0.0.22-pre.1" }
-limbo_percentile = { path = "extensions/percentile", version = "0.0.22-pre.1" }
-limbo_regexp = { path = "extensions/regexp", version = "0.0.22-pre.1" }
-limbo_series = { path = "extensions/series", version = "0.0.22-pre.1" }
-limbo_sqlite3_parser = { path = "vendored/sqlite3-parser", version = "0.0.22-pre.1" }
-limbo_time = { path = "extensions/time", version = "0.0.22-pre.1" }
-limbo_uuid = { path = "extensions/uuid", version = "0.0.22-pre.1" }
+limbo_completion = { path = "extensions/completion", version = "0.0.22" }
+limbo_core = { path = "core", version = "0.0.22" }
+limbo_crypto = { path = "extensions/crypto", version = "0.0.22" }
+limbo_csv = { path = "extensions/csv", version = "0.0.22" }
+limbo_ext = { path = "extensions/core", version = "0.0.22" }
+limbo_ext_tests = { path = "extensions/tests", version = "0.0.22" }
+limbo_ipaddr = { path = "extensions/ipaddr", version = "0.0.22" }
+limbo_macros = { path = "macros", version = "0.0.22" }
+limbo_percentile = { path = "extensions/percentile", version = "0.0.22" }
+limbo_regexp = { path = "extensions/regexp", version = "0.0.22" }
+limbo_series = { path = "extensions/series", version = "0.0.22" }
+limbo_sqlite3_parser = { path = "vendored/sqlite3-parser", version = "0.0.22" }
+limbo_time = { path = "extensions/time", version = "0.0.22" }
+limbo_uuid = { path = "extensions/uuid", version = "0.0.22" }
 strum = { version = "0.26", features = ["derive"] }
 strum_macros = "0.26"
 serde = "1.0"

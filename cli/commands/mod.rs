@@ -27,10 +27,10 @@ pub struct CommandParser {
 #[command(disable_help_flag(false), disable_version_flag(true))]
 pub enum Command {
     /// Exit this program with return-code CODE
-    #[command(display_name = ".exit")]
+    #[command(display_name = ".exit", alias = "ex", alias = "exi")]
     Exit(ExitArgs),
     /// Quit the shell
-    #[command(display_name = ".quit")]
+    #[command(display_name = ".quit", alias = "q", alias = "qu", alias = "qui")]
     Quit,
     /// Open a database file
     #[command(display_name = ".open")]

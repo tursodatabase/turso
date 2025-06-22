@@ -46,6 +46,45 @@ impl TokenStream for FmtTokenStream<'_, '_> {
     }
 }
 
+struct WriteTokenStream<'a, T: fmt::Write> {
+    write: &'a mut T,
+    spaced: bool,
+}
+
+impl<T: fmt::Write> TokenStream for WriteTokenStream<'_, T> {
+    type Error = fmt::Error;
+
+    fn append(&mut self, ty: TokenType, value: Option<&str>) -> fmt::Result {
+        if !self.spaced {
+            match ty {
+                TK_COMMA | TK_SEMI | TK_RP | TK_DOT => {}
+                _ => {
+                    self.write.write_char(' ')?;
+                    self.spaced = true;
+                }
+            };
+        }
+        if ty == TK_BLOB {
+            self.write.write_char('X')?;
+            self.write.write_char('\'')?;
+            if let Some(str) = value {
+                self.write.write_str(str)?;
+            }
+            return self.write.write_char('\'');
+        } else if let Some(str) = ty.as_str() {
+            self.write.write_str(str)?;
+            self.spaced = ty == TK_LP || ty == TK_DOT; // str should not be whitespace
+        }
+        if let Some(str) = value {
+            // trick for pretty-print
+            self.spaced = str.bytes().all(|b| b.is_ascii_whitespace());
+            self.write.write_str(str)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Stream of token
 pub trait TokenStream {
     /// Potential error raised
@@ -63,6 +102,19 @@ pub trait ToTokens {
         let mut s = FmtTokenStream { f, spaced: true };
         self.to_tokens(&mut s)
     }
+    /// Format AST node to string
+    fn format(&self) -> Result<String, fmt::Error> {
+        let mut s = String::new();
+
+        let mut w = WriteTokenStream {
+            write: &mut s,
+            spaced: true,
+        };
+
+        self.to_tokens(&mut w)?;
+
+        Ok(s)
+    }
 }
 
 impl<T: ?Sized + ToTokens> ToTokens for &T {
@@ -76,18 +128,6 @@ impl ToTokens for String {
         s.append(TK_ANY, Some(self.as_ref()))
     }
 }
-
-/* FIXME: does not work, find why
-impl Display for dyn ToTokens {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let mut s = FmtTokenStream { f, spaced: true };
-        match self.to_tokens(&mut s) {
-            Err(_) => Err(fmt::Error),
-            Ok(()) => Ok(()),
-        }
-    }
-}
-*/
 
 impl ToTokens for Cmd {
     fn to_tokens<S: TokenStream>(&self, s: &mut S) -> Result<(), S::Error> {

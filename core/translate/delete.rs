@@ -18,6 +18,16 @@ pub fn translate_delete(
     syms: &SymbolTable,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
+    #[cfg(not(feature = "index_experimental"))]
+    {
+        if schema.table_has_indexes(&tbl_name.name.to_string()) {
+            // Let's disable altering a table with indices altogether instead of checking column by
+            // column to be extra safe.
+            crate::bail_parse_error!(
+                "DELETE into table disabled for table with indexes and without index_experimental feature flag"
+            );
+        }
+    }
     let mut delete_plan = prepare_delete_plan(
         schema,
         tbl_name,
@@ -36,7 +46,7 @@ pub fn translate_delete(
         approx_num_labels: 0,
     };
     program.extend(&opts);
-    emit_program(&mut program, delete_plan, schema, syms)?;
+    emit_program(&mut program, delete_plan, schema, syms, |_| {})?;
     Ok(program)
 }
 
@@ -49,14 +59,14 @@ pub fn prepare_delete_plan(
 ) -> Result<Plan> {
     let table = match schema.get_table(tbl_name.name.0.as_str()) {
         Some(table) => table,
-        None => crate::bail_corrupt_error!("Parse error: no such table: {}", tbl_name),
+        None => crate::bail_parse_error!("no such table: {}", tbl_name),
     };
     let table = if let Some(table) = table.virtual_table() {
         Table::Virtual(table.clone())
     } else if let Some(table) = table.btree() {
         Table::BTree(table.clone())
     } else {
-        crate::bail_corrupt_error!("Table is neither a virtual table nor a btree table");
+        crate::bail_parse_error!("Table is neither a virtual table nor a btree table");
     };
     let name = tbl_name.name.0.as_str().to_string();
     let indexes = schema

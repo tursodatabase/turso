@@ -55,7 +55,7 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 }
                 let table = table as *const <#struct_name as ::limbo_ext::VTabModule>::Table;
                 let table: &<#struct_name as ::limbo_ext::VTabModule>::Table = &*table;
-                let conn = if conn.is_null() { None } else { Some(::std::rc::Rc::new(::limbo_ext::Connection::new(conn)))};
+                let conn = if conn.is_null() { None } else { Some(::std::sync::Arc::new(::limbo_ext::Connection::new(conn)))};
                 if let Ok(cursor) = <#struct_name as ::limbo_ext::VTabModule>::Table::open(table, conn) {
                     return ::std::boxed::Box::into_raw(::std::boxed::Box::new(cursor)) as *const ::std::ffi::c_void;
                 } else {
