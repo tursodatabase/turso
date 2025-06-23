@@ -17,7 +17,7 @@
 //! - `filename` — path to the CSV file (mutually exclusive with `data=`)
 //! - `data` — inline CSV content as a string
 //! - `header` — whether the first row contains column names;
-//!              accepts `yes`/`no`, `on`/`off`, `true`/`false`, or `1`/`0`
+//!   accepts `yes`/`no`, `on`/`off`, `true`/`false`, or `1`/`0`
 //! - `columns` — number of columns
 //! - `schema` — optional custom SQL `CREATE TABLE` schema
 use std::fs::File;

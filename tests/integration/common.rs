@@ -339,8 +339,8 @@ mod tests {
             }
             i += 1;
             expected.push(val);
-            let ret = limbo_exec_rows(&db, &conn, &format!("INSERT INTO t VALUES ({})", val));
-            assert!(ret.is_empty(), "Insert failed for value {}: {:?}", val, ret);
+            let ret = limbo_exec_rows(&db, &conn, &format!("INSERT INTO t VALUES ({val})"));
+            assert!(ret.is_empty(), "Insert failed for value {val}: {ret:?}");
         }
 
         // Sort expected values to match index order
@@ -371,9 +371,9 @@ mod tests {
 
         // Insert 11 unique 1MB blobs
         for i in 0..11 {
-            println!("Inserting blob #{}", i);
+            println!("Inserting blob #{i}");
             let ret = limbo_exec_rows(&db, &conn, "INSERT INTO t VALUES (randomblob(1024*1024))");
-            assert!(ret.is_empty(), "Insert #{} failed: {:?}", i, ret);
+            assert!(ret.is_empty(), "Insert #{i} failed: {ret:?}");
         }
 
         // Verify we have 11 rows
@@ -381,8 +381,7 @@ mod tests {
         assert_eq!(
             ret,
             vec![vec![Value::Integer(11)]],
-            "Expected 11 rows but got {:?}",
-            ret
+            "Expected 11 rows but got {ret:?}",
         );
 
         Ok(())

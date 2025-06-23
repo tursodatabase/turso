@@ -29,8 +29,7 @@ impl fmt::Display for UringIOError {
         match self {
             UringIOError::IOUringCQError(code) => write!(
                 f,
-                "IOUring completion queue error occurred with code {}",
-                code
+                "IOUring completion queue error occurred with code {code}",
             ),
         }
     }
@@ -254,7 +253,7 @@ impl File for UringFile {
                 ErrorKind::WouldBlock => {
                     "Failed locking file. File is locked by another process".to_string()
                 }
-                _ => format!("Failed locking file, {}", io_error),
+                _ => format!("Failed locking file, {io_error}"),
             };
             LimboError::LockingError(message)
         })?;

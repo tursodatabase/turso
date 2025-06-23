@@ -401,10 +401,7 @@ impl PageContent {
     }
 
     pub fn maybe_page_type(&self) -> Option<PageType> {
-        match self.read_u8(0).try_into() {
-            Ok(v) => Some(v),
-            Err(_) => None, // this could be an overflow page
-        }
+        self.read_u8(0).try_into().ok() // this could be an overflow page
     }
 
     #[allow(clippy::mut_from_ref)]

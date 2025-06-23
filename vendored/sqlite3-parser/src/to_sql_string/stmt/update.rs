@@ -9,11 +9,11 @@ impl ToSqlString for ast::Update {
                 with.to_sql_string(context)
             )),
             self.or_conflict
-                .map_or("".to_string(), |conflict| format!("OR {} ", conflict)),
+                .map_or("".to_string(), |conflict| format!("OR {conflict} ")),
             self.tbl_name.to_sql_string(context),
             self.indexed
                 .as_ref()
-                .map_or("".to_string(), |indexed| format!(" {}", indexed)),
+                .map_or("".to_string(), |indexed| format!(" {indexed}")),
             self.sets
                 .iter()
                 .map(|set| set.to_sql_string(context))

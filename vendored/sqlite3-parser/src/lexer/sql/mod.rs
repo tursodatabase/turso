@@ -690,8 +690,7 @@ fn find_end_of_number(
         if test(&b) {
             continue;
         } else if b == b'_' {
-            if j >= 1 && data.get(j - 1).map_or(false, test) && data.get(j + 1).map_or(false, test)
-            {
+            if j >= 1 && data.get(j - 1).is_some_and(test) && data.get(j + 1).is_some_and(test) {
                 continue;
             }
             return Err(Error::BadNumber(None, None, Some(j), unsafe {

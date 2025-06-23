@@ -530,8 +530,13 @@ fn check_integrity_is_ok(tmp_db: TempDatabase, conn: Arc<Connection>) -> Result<
 }
 
 enum ConnectionState {
-    PrepareQuery { query_idx: usize },
-    ExecuteQuery { query_idx: usize, stmt: Statement },
+    PrepareQuery {
+        query_idx: usize,
+    },
+    ExecuteQuery {
+        query_idx: usize,
+        stmt: Box<Statement>,
+    },
     Done,
 }
 
@@ -552,7 +557,7 @@ impl ConnectionPlan {
                     }
                     let query = &self.queries[*query_idx];
                     tracing::info!("preparing {}", query);
-                    let stmt = self.conn.query(query)?.unwrap();
+                    let stmt = Box::new(self.conn.query(query)?.unwrap());
                     self.state = ConnectionState::ExecuteQuery {
                         query_idx: *query_idx,
                         stmt,

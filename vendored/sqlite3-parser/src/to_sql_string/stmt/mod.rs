@@ -49,7 +49,7 @@ impl ToSqlString for ast::Stmt {
                     ast::TransactionType::Exclusive => " EXCLUSIVE",
                     ast::TransactionType::Immediate => " IMMEDIATE",
                 });
-                format!("BEGIN{};", t_type)
+                format!("BEGIN{t_type};")
             }
             // END or COMMIT are equivalent here, so just defaulting to COMMIT
             // TODO: again there are no names in the docs

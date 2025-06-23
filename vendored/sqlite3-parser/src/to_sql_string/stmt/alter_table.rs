@@ -94,7 +94,7 @@ impl ToSqlString for ast::ColumnConstraint {
                 // nullable should always be true here
                 format!(
                     "NOT NULL{}",
-                    conflict_clause.map_or("".to_string(), |conflict| format!(" {}", conflict))
+                    conflict_clause.map_or("".to_string(), |conflict| format!(" {conflict}"))
                 )
             }
             Self::PrimaryKey {
@@ -104,15 +104,15 @@ impl ToSqlString for ast::ColumnConstraint {
             } => {
                 format!(
                     "PRIMARY KEY{}{}{}",
-                    order.map_or("".to_string(), |order| format!(" {}", order)),
-                    conflict_clause.map_or("".to_string(), |conflict| format!(" {}", conflict)),
+                    order.map_or("".to_string(), |order| format!(" {order}")),
+                    conflict_clause.map_or("".to_string(), |conflict| format!(" {conflict}")),
                     auto_increment.then_some(" AUTOINCREMENT").unwrap_or("")
                 )
             }
             Self::Unique(conflict_clause) => {
                 format!(
                     "UNIQUE{}",
-                    conflict_clause.map_or("".to_string(), |conflict| format!(" {}", conflict))
+                    conflict_clause.map_or("".to_string(), |conflict| format!(" {conflict}"))
                 )
             }
         }
@@ -149,7 +149,7 @@ impl Display for ast::ForeignKeyClause {
                 "".to_string()
             }
         );
-        write!(f, "{}", value)
+        write!(f, "{value}")
     }
 }
 
@@ -157,13 +157,13 @@ impl Display for ast::RefArg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let value = match self {
             Self::Match(name) => format!("MATCH {}", name.0),
-            Self::OnDelete(act) => format!("ON DELETE {}", act),
-            Self::OnUpdate(act) => format!("ON UPDATE {}", act),
+            Self::OnDelete(act) => format!("ON DELETE {act}"),
+            Self::OnUpdate(act) => format!("ON UPDATE {act}"),
             Self::OnInsert(..) => unimplemented!(
                 "On Insert does not exist in SQLite: https://www.sqlite.org/lang_altertable.html"
             ),
         };
-        write!(f, "{}", value)
+        write!(f, "{value}")
     }
 }
 
@@ -176,7 +176,7 @@ impl Display for ast::RefAct {
             Self::SetDefault => "SET DEFAULT",
             Self::SetNull => "SET NULL",
         };
-        write!(f, "{}", value)
+        write!(f, "{value}")
     }
 }
 
@@ -198,7 +198,7 @@ impl Display for ast::DeferSubclause {
                 ""
             }
         );
-        write!(f, "{}", value)
+        write!(f, "{value}")
     }
 }
 #[cfg(test)]

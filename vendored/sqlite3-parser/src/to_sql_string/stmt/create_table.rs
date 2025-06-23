@@ -82,7 +82,7 @@ impl ToSqlString for ast::TableConstraint {
                     .map(|col| col.to_sql_string(context))
                     .collect::<Vec<_>>()
                     .join(", "),
-                conflict_clause.map_or("".to_string(), |conflict| format!(" {}", conflict)),
+                conflict_clause.map_or("".to_string(), |conflict| format!(" {conflict}")),
                 auto_increment.then_some(" AUTOINCREMENT").unwrap_or("")
             ),
             Self::Unique {
@@ -95,7 +95,7 @@ impl ToSqlString for ast::TableConstraint {
                     .map(|col| col.to_sql_string(context))
                     .collect::<Vec<_>>()
                     .join(", "),
-                conflict_clause.map_or("".to_string(), |conflict| format!(" {}", conflict))
+                conflict_clause.map_or("".to_string(), |conflict| format!(" {conflict}"))
             ),
         }
     }

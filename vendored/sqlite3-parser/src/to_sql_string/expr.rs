@@ -299,7 +299,7 @@ impl Display for ast::Operator {
             Self::RightShift => ">>",
             Self::Subtract => "-",
         };
-        write!(f, "{}", value)
+        write!(f, "{value}")
     }
 }
 

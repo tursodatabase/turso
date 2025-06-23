@@ -92,7 +92,9 @@ impl VirtualTable {
 
     pub(crate) fn open(&self, conn: Arc<Connection>) -> crate::Result<VirtualTableCursor> {
         match &self.vtab_type {
-            VirtualTableType::Pragma(table) => Ok(VirtualTableCursor::Pragma(table.open(conn)?)),
+            VirtualTableType::Pragma(table) => {
+                Ok(VirtualTableCursor::Pragma(Box::new(table.open(conn)?)))
+            }
             VirtualTableType::External(table) => {
                 Ok(VirtualTableCursor::External(table.open(conn)?))
             }
@@ -131,7 +133,7 @@ impl VirtualTable {
 }
 
 pub enum VirtualTableCursor {
-    Pragma(PragmaVirtualTableCursor),
+    Pragma(Box<PragmaVirtualTableCursor>),
     External(ExtVirtualTableCursor),
 }
 

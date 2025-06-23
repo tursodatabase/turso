@@ -189,9 +189,9 @@ impl Database {
         } else {
             None
         };
-        let wal_has_frames = maybe_shared_wal.as_ref().map_or(false, |wal| {
-            unsafe { &*wal.get() }.max_frame.load(Ordering::SeqCst) > 0
-        });
+        let wal_has_frames = maybe_shared_wal
+            .as_ref()
+            .is_some_and(|wal| unsafe { &*wal.get() }.max_frame.load(Ordering::SeqCst) > 0);
 
         let is_empty = if db_size == 0 && !wal_has_frames {
             DB_STATE_UNITIALIZED

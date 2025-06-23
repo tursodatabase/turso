@@ -214,9 +214,7 @@ fn unescape_singlequotes(input: &str) -> String {
             }
             assert!(
                 quote_count % 2 == 0,
-                "Expected even number of quotes, got {} in string {}",
-                quote_count,
-                input
+                "Expected even number of quotes, got {quote_count} in string {input}"
             );
             // For every pair of quotes, output one quote
             for _ in 0..(quote_count / 2) {

@@ -312,7 +312,7 @@ impl Statement {
                 turso_core::StepResult::Interrupt | turso_core::StepResult::Busy => {
                     return Err(napi::Error::new(
                         napi::Status::GenericFailure,
-                        format!("{:?}", step),
+                        format!("{step:?}"),
                     ))
                 }
             }

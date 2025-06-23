@@ -1510,7 +1510,7 @@ impl Record {
 }
 
 pub enum Cursor {
-    BTree(BTreeCursor),
+    BTree(Box<BTreeCursor>),
     Pseudo(PseudoCursor),
     Sorter(Sorter),
     Virtual(VirtualTableCursor),
@@ -1518,7 +1518,7 @@ pub enum Cursor {
 
 impl Cursor {
     pub fn new_btree(cursor: BTreeCursor) -> Self {
-        Self::BTree(cursor)
+        Self::BTree(Box::new(cursor))
     }
 
     pub fn new_pseudo(cursor: PseudoCursor) -> Self {

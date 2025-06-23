@@ -6824,7 +6824,7 @@ mod tests {
             let (pager, root_page, _db, conn) = empty_btree();
             let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page);
             let mut keys = SortedVec::new();
-            tracing::info!("seed: {}", seed);
+            tracing::info!("seed: {seed}");
             for insert_id in 0..inserts {
                 let do_validate = do_validate_btree || (insert_id % VALIDATE_INTERVAL == 0);
                 run_until_done(|| pager.begin_read_tx(), &pager).unwrap();
@@ -6958,7 +6958,7 @@ mod tests {
             };
             let mut cursor = BTreeCursor::new_table(None, pager.clone(), index_root_page);
             let mut keys = SortedVec::new();
-            tracing::info!("seed: {}", seed);
+            tracing::info!("seed: {seed}");
             for i in 0..inserts {
                 pager.begin_read_tx().unwrap();
                 pager.begin_write_tx().unwrap();
@@ -7025,7 +7025,7 @@ mod tests {
                     pager.deref(),
                 )
                 .unwrap();
-                assert!(exists, "key {:?} is not found", key);
+                assert!(exists, "key {key:?} is not found");
             }
             // Check that key count is right
             cursor.move_to_root().unwrap();
@@ -7051,13 +7051,11 @@ mod tests {
                 let cur = record.get_values().clone();
                 if let Some(prev) = prev {
                     if prev >= cur {
-                        println!("Seed: {}", seed);
+                        println!("Seed: {seed}");
                     }
                     assert!(
                         prev < cur,
-                        "keys are not in ascending order: {:?} < {:?}",
-                        prev,
-                        cur
+                        "keys are not in ascending order: {prev:?} < {cur:?}",
                     );
                 }
                 prev = Some(cur);

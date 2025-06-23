@@ -21,7 +21,7 @@ impl ToSqlString for ast::Select {
                 .map(|col| col.to_sql_string(context))
                 .collect::<Vec<_>>()
                 .join(", ");
-            ret.push(format!("ORDER BY {}", joined_cols));
+            ret.push(format!("ORDER BY {joined_cols}"));
         }
         if let Some(limit) = &self.limit {
             ret.push(limit.to_sql_string(context));
@@ -65,11 +65,11 @@ impl ToSqlString for ast::OneSelect {
                             .map(|e| e.to_sql_string(context))
                             .collect::<Vec<_>>()
                             .join(", ");
-                        format!("({})", joined_value)
+                        format!("({joined_value})")
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("VALUES {}", joined_values)
+                format!("VALUES {joined_values}")
             }
         }
     }
@@ -239,7 +239,7 @@ impl ToSqlString for ast::CommonTableExpr {
                 .collect::<Vec<_>>()
                 .join(", ");
 
-            ret.push(format!("({})", joined_cols));
+            ret.push(format!("({joined_cols})"));
         }
         ret.push(format!(
             "AS {}({})",
@@ -296,7 +296,7 @@ impl Display for ast::Materialized {
             Self::No => "NOT MATERIALIZED",
             Self::Yes => "MATERIALIZED",
         };
-        write!(f, "{}", value)
+        write!(f, "{value}")
     }
 }
 
@@ -360,7 +360,7 @@ impl Display for ast::JoinOperator {
                 Self::TypedJoin(join) => {
                     let join_keyword = "JOIN";
                     if let Some(join) = join {
-                        format!("{} {}", join, join_keyword)
+                        format!("{join} {join_keyword}")
                     } else {
                         join_keyword.to_string()
                     }
@@ -400,7 +400,7 @@ impl Display for ast::JoinType {
             }
             modifiers.join(" ")
         };
-        write!(f, "{}", value)
+        write!(f, "{value}")
     }
 }
 
@@ -416,7 +416,7 @@ impl ToSqlString for ast::JoinConstraint {
                     .map(|col| col.0.clone())
                     .collect::<Vec<_>>()
                     .join(",");
-                format!("USING ({})", joined_names)
+                format!("USING ({joined_names})")
             }
         }
     }
@@ -457,7 +457,7 @@ impl ToSqlString for ast::Window {
                 .map(|e| e.to_sql_string(context))
                 .collect::<Vec<_>>()
                 .join(",");
-            ret.push(format!("PARTITION BY {}", joined_exprs));
+            ret.push(format!("PARTITION BY {joined_exprs}"));
         }
         if let Some(order_by) = &self.order_by {
             let joined_cols = order_by
@@ -465,7 +465,7 @@ impl ToSqlString for ast::Window {
                 .map(|col| col.to_sql_string(context))
                 .collect::<Vec<_>>()
                 .join(", ");
-            ret.push(format!("ORDER BY {}", joined_cols));
+            ret.push(format!("ORDER BY {joined_cols}"));
         }
         if let Some(frame_claue) = &self.frame_clause {
             ret.push(frame_claue.to_sql_string(context));
@@ -523,7 +523,7 @@ impl Display for ast::FrameExclude {
                 Self::NoOthers => "NO OTHERS",
                 Self::Ties => "TIES",
             };
-            format!("EXCLUDE {}", clause)
+            format!("EXCLUDE {clause}")
         })
     }
 }

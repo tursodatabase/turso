@@ -16,8 +16,7 @@ impl ToSqlString for ast::CreateTrigger {
                 ""
             },
             self.trigger_name.to_sql_string(context),
-            self.time
-                .map_or("".to_string(), |time| format!(" {}", time)),
+            self.time.map_or("".to_string(), |time| format!(" {time}")),
             self.event,
             self.tbl_name.to_sql_string(context),
             if self.for_each_row {
@@ -106,7 +105,7 @@ impl ToSqlString for ast::TriggerCmdInsert {
         format!(
             "INSERT {}INTO {} {}{}{}{}",
             self.or_conflict
-                .map_or("".to_string(), |conflict| format!("OR {} ", conflict)),
+                .map_or("".to_string(), |conflict| format!("OR {conflict} ")),
             self.tbl_name.0,
             self.col_names
                 .as_ref()
@@ -223,7 +222,7 @@ impl ToSqlString for ast::TriggerCmdUpdate {
         format!(
             "UPDATE {}{} SET {}{}{}",
             self.or_conflict
-                .map_or("".to_string(), |conflict| format!("OR {}", conflict)),
+                .map_or("".to_string(), |conflict| format!("OR {conflict}")),
             self.tbl_name.0, // TODO: should be a qualified table name,
             self.sets
                 .iter()

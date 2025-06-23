@@ -1035,9 +1035,10 @@ impl Pager {
             }
         }
         // TODO: only clear cache of things that are really invalidated
-        self.page_cache.write().clear().map_err(|e| {
-            LimboError::InternalError(format!("Failed to clear page cache: {:?}", e))
-        })?;
+        self.page_cache
+            .write()
+            .clear()
+            .map_err(|e| LimboError::InternalError(format!("Failed to clear page cache: {e:?}")))?;
         Ok(checkpoint_result)
     }
 
@@ -1164,10 +1165,7 @@ impl Pager {
                 let page_key = PageCacheKey::new(page1_ref.get().id);
                 let mut cache = self.page_cache.write();
                 cache.insert(page_key, page1_ref.clone()).map_err(|e| {
-                    LimboError::InternalError(format!(
-                        "Failed to insert page 1 into cache: {:?}",
-                        e
-                    ))
+                    LimboError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
                 })?;
                 self.is_empty.store(DB_STATE_INITIALIZED, Ordering::SeqCst);
                 self.allocate_page1_state.replace(AllocatePage1State::Done);
