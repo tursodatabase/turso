@@ -364,6 +364,8 @@ pub struct Program {
     pub change_cnt_on: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
+    #[cfg(feature = "debug_integrity_check")]
+    pub integrity_check: Cell<bool>,
 }
 
 impl Program {
@@ -380,10 +382,36 @@ impl Program {
             // invalidate row
             let _ = state.result_row.take();
             let (insn, insn_function) = &self.insns[state.pc as usize];
-            trace_insn(self, state.pc as InsnReference, insn);
-            let res = insn_function(self, state, insn, &pager, mv_store.as_ref())?;
+
+            #[cfg(not(feature = "debug_integrity_check"))]
+            let res = {
+                trace_insn(self, state.pc as InsnReference, insn);
+                insn_function(self, state, insn, &pager, mv_store.as_ref())?
+            };
+            #[cfg(feature = "debug_integrity_check")]
+            let res = if !self.integrity_check.get() {
+                trace_insn(self, state.pc as InsnReference, insn);
+                insn_function(self, state, insn, &pager, mv_store.as_ref())?
+            } else {
+                let schema = self.connection.schema.try_read();
+                if schema.is_none() {
+                    // Skip integrity check if schema is locked
+                    InsnFunctionStepResult::Step
+                } else {
+                    tracing::debug!("Start Debug Integrity Check");
+                    let res = self.integrity_check(state, &pager, &schema.unwrap())?;
+                    if matches!(res, InsnFunctionStepResult::Step) {
+                        tracing::debug!("End Debug Integrity Check");
+                    }
+                    res
+                }
+            };
+
             match res {
-                InsnFunctionStepResult::Step => {}
+                InsnFunctionStepResult::Step => {
+                    #[cfg(feature = "debug_integrity_check")]
+                    self.integrity_check.set(!self.integrity_check.get());
+                }
                 InsnFunctionStepResult::Done => return Ok(StepResult::Done),
                 InsnFunctionStepResult::IO => return Ok(StepResult::IO),
                 InsnFunctionStepResult::Row => return Ok(StepResult::Row),
@@ -485,6 +513,63 @@ impl Program {
             buff.push('\n');
         }
         buff
+    }
+
+    #[cfg(feature = "debug_integrity_check")]
+    fn integrity_check(
+        &self,
+        state: &mut ProgramState,
+        pager: &Rc<Pager>,
+        schema: &crate::schema::Schema,
+    ) -> Result<InsnFunctionStepResult> {
+        use crate::storage::btree::{integrity_check, IntegrityCheckState};
+        let mut roots = Vec::with_capacity(schema.tables.len() + schema.indexes.len());
+        // Collect root pages to run integrity check on
+        for table in schema.tables.values() {
+            if let crate::schema::Table::BTree(table) = table.as_ref() {
+                roots.push(table.root_page);
+            };
+        }
+        match &mut state.op_integrity_check_state {
+            OpIntegrityCheckState::Start => {
+                state.op_integrity_check_state = OpIntegrityCheckState::Checking {
+                    errors: Vec::new(),
+                    current_root_idx: 0,
+                    state: IntegrityCheckState::new(roots[0]),
+                };
+            }
+            OpIntegrityCheckState::Checking {
+                errors,
+                current_root_idx,
+                state: integrity_check_state,
+            } => {
+                match integrity_check(integrity_check_state, errors, pager)? {
+                    CursorResult::Ok(v) => v,
+                    CursorResult::IO => return Ok(InsnFunctionStepResult::IO),
+                }
+                *current_root_idx += 1;
+                if *current_root_idx < roots.len() {
+                    *integrity_check_state = IntegrityCheckState::new(roots[*current_root_idx]);
+                    return Ok(InsnFunctionStepResult::Step);
+                } else {
+                    if !errors.is_empty() {
+                        let message = errors
+                            .iter()
+                            .map(|e| e.to_string())
+                            .collect::<Vec<String>>()
+                            .join("\n");
+                        return Err(LimboError::InternalError(format!(
+                            "Integrity Check Failed: {}",
+                            message
+                        )));
+                    };
+
+                    state.op_integrity_check_state = OpIntegrityCheckState::Start;
+                }
+            }
+        }
+
+        Ok(InsnFunctionStepResult::Step)
     }
 }
 

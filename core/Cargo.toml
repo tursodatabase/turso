@@ -34,6 +34,7 @@ csv = ["limbo_csv/static"]
 omit_autovacuum = []
 simulator = ["fuzz", "serde"]
 serde = ["dep:serde"]
+debug_integrity_check = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7.5", optional = true }

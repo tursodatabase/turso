@@ -873,6 +873,8 @@ impl ProgramBuilder {
             change_cnt_on,
             result_columns: self.result_columns,
             table_references: self.table_references,
+            #[cfg(feature = "debug_integrity_check")]
+            integrity_check: Cell::new(false),
         }
     }
 }
