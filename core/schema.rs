@@ -1656,6 +1656,8 @@ mod tests {
             name: "t1".to_string(),
             has_rowid: true,
             is_strict: false,
+            column_check_constraints: vec![],
+            table_check_constraints: vec![],
             primary_key_columns: vec![("nonexistent".to_string(), SortOrder::Asc)],
             columns: vec![Column {
                 name: Some("a".to_string()),
@@ -1876,13 +1878,27 @@ mod tests {
 
     #[test]
     fn test_check_contraint() -> Result<()> {
-        let sql = r#"CREATE TABLE t1 (a int check (a % 2 == 0));"#;
+        let sql = r#"CREATE TABLE t1 (a int check (a % 2 == 0), b int constraint isOdd check (b % 2 == 1), constraint maxSum check (a + b <= 255), check (a > 0));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
-        assert!(table.columns[0].check_constraint.is_some());
+
+        assert_eq!(table.column_check_constraints.len(), 2);
+        assert_eq!(table.table_check_constraints.len(), 2);
+
+        let names = vec![None, Some("isOdd".to_string())];
+        for (check, name) in table.column_check_constraints.iter().zip(names.iter()) {
+            assert_eq!(&check.name, name);
+        }
+
+        let names = vec![Some("maxSum".to_string()), None];
+        for (check, name) in table.table_check_constraints.iter().zip(names.iter()) {
+            assert_eq!(&check.name, name);
+        }
 
         let sql = r#"CREATE TABLE t1 (a int);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
-        assert!(table.columns[0].check_constraint.is_none());
+
+        assert_eq!(table.column_check_constraints.len(), 0);
+        assert_eq!(table.table_check_constraints.len(), 0);
         Ok(())
     }
 }
