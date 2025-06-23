@@ -136,9 +136,9 @@ dependencies = [
 
 [[package]]
 name = "antithesis_sdk"
-version = "0.2.5"
+version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "201eba73b76341631014baf9c0018e703af204a1e0f15d7664d8a0947f6be74d"
+checksum = "dafc0460f582169b1414074fd82bedbda60456fb4df0a78dc7fef1306e732ea3"
 dependencies = [
  "libc",
  "libloading",

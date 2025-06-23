@@ -10,8 +10,8 @@ repository.workspace = true
 path = "lib.rs"
 
 [features]
-default = ["running_in_antithesis"]
-running_in_antithesis = ["antithesis_sdk/full"]
+default = []
+antithesis = ["dep:antithesis_sdk", "antithesis_sdk/full"]
 
 [dependencies]
-antithesis_sdk = { workspace = true }
+antithesis_sdk = { workspace = true, optional = true }
