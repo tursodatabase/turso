@@ -65,15 +65,15 @@ fn main() -> anyhow::Result<()> {
         Some(SimulatorCommand::Loop { n, short_circuit }) => {
             banner();
             for i in 0..n {
-                println!("iteration {}", i);
+                println!("iteration {i}");
                 let result = testing_main(&cli_opts);
                 if result.is_err() && short_circuit {
-                    println!("short circuiting after {} iterations", i);
+                    println!("short circuiting after {i} iterations");
                     return result;
                 } else if result.is_err() {
-                    println!("iteration {} failed", i);
+                    println!("iteration {i} failed");
                 } else {
-                    println!("iteration {} succeeded", i);
+                    println!("iteration {i} succeeded");
                 }
             }
             Ok(())
@@ -180,7 +180,7 @@ fn testing_main(cli_opts: &SimulatorCLI) -> anyhow::Result<()> {
     };
 
     // Print the seed, the locations of the database and the plan file at the end again for easily accessing them.
-    println!("seed: {}", seed);
+    println!("seed: {seed}");
     println!("path: {}", paths.base.display());
 
     result
@@ -237,7 +237,7 @@ fn watch_mode(
                     }
                 }
             }
-            Err(e) => println!("watch error: {:?}", e),
+            Err(e) => println!("watch error: {e:?}"),
         }
     }
 
@@ -557,7 +557,7 @@ impl SandboxedResult {
         match result {
             Ok(ExecutionResult { error: None, .. }) => SandboxedResult::Correct,
             Ok(ExecutionResult { error: Some(e), .. }) => {
-                let error = format!("{:?}", e);
+                let error = format!("{e:?}");
                 let last_execution = last_execution.lock().unwrap();
                 SandboxedResult::Panicked {
                     error,
@@ -600,7 +600,7 @@ fn setup_simulation(
         tracing::info!("seed={}", seed);
         let bug = bugbase
             .get_bug(seed)
-            .unwrap_or_else(|| panic!("bug '{}' not found in bug base", seed));
+            .unwrap_or_else(|| panic!("bug '{seed}' not found in bug base"));
 
         let paths = bugbase.paths(seed);
         if !paths.base.exists() {
@@ -614,7 +614,7 @@ fn setup_simulation(
                 let seed = *seed;
                 bugbase
                     .load_bug(seed)
-                    .unwrap_or_else(|_| panic!("could not load bug '{}' in bug base", seed))
+                    .unwrap_or_else(|_| panic!("could not load bug '{seed}' in bug base"))
                     .plan
                     .clone()
             }
@@ -640,7 +640,7 @@ fn setup_simulation(
             // Create the output directory if it doesn't exist
             if !paths.base.exists() {
                 std::fs::create_dir_all(&paths.base)
-                    .map_err(|e| format!("{:?}", e))
+                    .map_err(|e| format!("{e:?}"))
                     .unwrap();
             }
             paths
@@ -731,7 +731,7 @@ fn init_logger() {
 }
 
 fn banner() {
-    println!("{}", BANNER);
+    println!("{BANNER}");
 }
 
 const BANNER: &str = r#"
@@ -771,9 +771,7 @@ fn integrity_check(db_path: &Path) -> anyhow::Result<()> {
     }
     if !result[0].eq_ignore_ascii_case("ok") {
         // Build a list of problems
-        result
-            .iter_mut()
-            .for_each(|row| *row = format!("- {}", row));
+        result.iter_mut().for_each(|row| *row = format!("- {row}"));
         anyhow::bail!("simulation failed: {}", result.join("\n"))
     }
     Ok(())

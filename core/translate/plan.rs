@@ -562,7 +562,7 @@ pub fn select_star(tables: &[JoinedTable], out_columns: &mut Vec<ResultSetColumn
                         !using_cols.iter().any(|using_col| {
                             col.name
                                 .as_ref()
-                                .map_or(false, |name| name.eq_ignore_ascii_case(&using_col.0))
+                                .is_some_and(|name| name.eq_ignore_ascii_case(&using_col.0))
                         })
                     } else {
                         true
@@ -811,10 +811,7 @@ impl TableReferences {
         {
             outer_query_ref.mark_column_used(column_index);
         } else {
-            panic!(
-                "table with internal id {} not found in table references",
-                internal_id
-            );
+            panic!("table with internal id {internal_id} not found in table references");
         }
     }
 
@@ -964,7 +961,7 @@ impl JoinedTable {
         match &self.table {
             Table::BTree(btree) => {
                 let use_covering_index = self.utilizes_covering_index();
-                let index_is_ephemeral = index.map_or(false, |index| index.ephemeral);
+                let index_is_ephemeral = index.is_some_and(|index| index.ephemeral);
                 let table_not_required =
                     OperationMode::SELECT == mode && use_covering_index && !index_is_ephemeral;
                 let table_cursor_id = if table_not_required {

@@ -344,7 +344,7 @@ fn execute_interaction_rusqlite(
 
             tracing::debug!("{}", interaction);
             let results = execute_query_rusqlite(conn, query).map_err(|e| {
-                turso_core::LimboError::InternalError(format!("error executing query: {}", e))
+                turso_core::LimboError::InternalError(format!("error executing query: {e}"))
             });
             tracing::debug!("{:?}", results);
             stack.push(results);

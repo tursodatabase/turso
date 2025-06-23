@@ -274,20 +274,13 @@ mod tests {
         let stop = series.stop;
         let step = series.step;
         let values = collect_series(series.clone()).unwrap_or_else(|e| {
-            panic!(
-                "Failed to generate series for start={}, stop={}, step={}: {:?}",
-                start, stop, step, e
-            )
+            panic!("Failed to generate series for start={start}, stop={stop}, step={step}: {e:?}")
         });
 
         if series_is_invalid_or_empty(&series) {
             assert!(
                 values.is_empty(),
-                "Series should be empty for invalid range: start={}, stop={}, step={}, got {:?}",
-                start,
-                stop,
-                step,
-                values
+                "Series should be empty for invalid range: start={start}, stop={stop}, step={step}, got {values:?}"
             );
         } else {
             let expected_len = series_expected_length(&series);
@@ -316,19 +309,13 @@ mod tests {
         let step = series.step;
 
         let values = collect_series(series.clone()).unwrap_or_else(|e| {
-            panic!(
-                "Failed to generate series for start={}, stop={}, step={}: {:?}",
-                start, stop, step, e
-            )
+            panic!("Failed to generate series for start={start}, stop={stop}, step={step}: {e:?}")
         });
 
         if series_is_invalid_or_empty(&series) {
             assert!(
                 values.is_empty(),
-                "Series should be empty for invalid range: start={}, stop={}, step={}",
-                start,
-                stop,
-                step
+                "Series should be empty for invalid range: start={start}, stop={stop}, step={step}"
             );
         } else {
             assert!(
@@ -356,19 +343,13 @@ mod tests {
         let step = series.step;
 
         let values = collect_series(series.clone()).unwrap_or_else(|e| {
-            panic!(
-                "Failed to generate series for start={}, stop={}, step={}: {:?}",
-                start, stop, step, e
-            )
+            panic!("Failed to generate series for start={start}, stop={stop}, step={step}: {e:?}")
         });
 
         if series_is_invalid_or_empty(&series) {
             assert!(
                 values.is_empty(),
-                "Series should be empty for invalid range: start={}, stop={}, step={}",
-                start,
-                stop,
-                step
+                "Series should be empty for invalid range: start={start}, stop={stop}, step={step}"
             );
         } else if !values.is_empty() {
             assert!(
@@ -396,37 +377,27 @@ mod tests {
         let step = series.step;
 
         let values = collect_series(series.clone()).unwrap_or_else(|e| {
-            panic!(
-                "Failed to generate series for start={}, stop={}, step={}: {:?}",
-                start, stop, step, e
-            )
+            panic!("Failed to generate series for start={start}, stop={stop}, step={step}: {e:?}")
         });
 
         if series_is_invalid_or_empty(&series) {
             assert!(
                 values.is_empty(),
-                "Series should be empty for invalid range: start={}, stop={}, step={}",
-                start,
-                stop,
-                step
+                "Series should be empty for invalid range: start={start}, stop={stop}, step={step}"
             );
         } else if !values.is_empty() {
             assert_eq!(
                 values.first(),
                 Some(&start),
-                "Series doesn't start with start value: {:?} (expected start: {})",
-                values,
-                start
+                "Series doesn't start with start value: {values:?} (expected start: {start})"
             );
             assert!(
-                values.last().map_or(true, |&last| if step > 0 {
+                values.last().is_none_or(|&last| if step > 0 {
                     last <= stop
                 } else {
                     last >= stop
                 }),
-                "Series exceeds stop value: {:?} (stop: {})",
-                values,
-                stop
+                "Series exceeds stop value: {values:?} (stop: {stop})"
             );
         }
     }
@@ -501,8 +472,7 @@ mod tests {
         .expect("Failed to generate series");
         assert!(
             values.is_empty(),
-            "Invalid positive range should return empty series, got {:?}",
-            values
+            "Invalid positive range should return empty series, got {values:?}"
         );
 
         let values = collect_series(Series {
@@ -564,20 +534,15 @@ mod tests {
             match cursor.next() {
                 ResultCode::OK => rowids.push(cur_rowid),
                 ResultCode::EOF => break,
-                err => panic!(
-                    "Unexpected error {:?} for start={}, stop={}, step={}",
-                    err, start, stop, step
-                ),
+                err => {
+                    panic!("Unexpected error {err:?} for start={start}, stop={stop}, step={step}")
+                }
             }
         }
 
         assert!(
             rowids.windows(2).all(|w| w[1] == w[0] + 1),
-            "Rowids not monotonically increasing: {:?} (start={}, stop={}, step={})",
-            rowids,
-            start,
-            stop,
-            step
+            "Rowids not monotonically increasing: {rowids:?} (start={start}, stop={stop}, step={step})"
         );
     }
 
@@ -589,19 +554,13 @@ mod tests {
         let step = series.step;
 
         let values = collect_series(series.clone()).unwrap_or_else(|e| {
-            panic!(
-                "Failed to generate series for start={}, stop={}, step={}: {:?}",
-                start, stop, step, e
-            )
+            panic!("Failed to generate series for start={start}, stop={stop}, step={step}: {e:?}")
         });
 
         if series_is_invalid_or_empty(&series) {
             assert!(
                 values.is_empty(),
-                "Series should be empty for invalid range: start={}, stop={}, step={}",
-                start,
-                stop,
-                step
+                "Series should be empty for invalid range: start={start}, stop={stop}, step={step}"
             );
         } else if start == stop {
             assert_eq!(

@@ -682,7 +682,7 @@ fn resolve_columns_for_insert<'a>(
         let table_index = table_columns.iter().position(|c| {
             c.name
                 .as_ref()
-                .map_or(false, |name| name.eq_ignore_ascii_case(&column_name))
+                .is_some_and(|name| name.eq_ignore_ascii_case(&column_name))
         });
 
         let Some(table_index) = table_index else {
@@ -743,7 +743,7 @@ fn resolve_indicies_for_insert(
                     .column
                     .name
                     .as_ref()
-                    .map_or(false, |name| name.eq_ignore_ascii_case(&target_name))
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&target_name))
             }) {
                 idx_map.columns.push((i, idx_col.clone()));
                 idx_map.value_indicies.push(col_mapping.value_index);

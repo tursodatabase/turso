@@ -102,10 +102,7 @@ impl Database {
             other => match get_vfs_modules().iter().find(|v| v.0 == vfs) {
                 Some((_, vfs)) => vfs.clone(),
                 None => {
-                    return Err(LimboError::InvalidArgument(format!(
-                        "no such VFS: {}",
-                        other
-                    )));
+                    return Err(LimboError::InvalidArgument(format!("no such VFS: {other}")));
                 }
             },
         };

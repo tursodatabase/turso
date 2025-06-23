@@ -37,7 +37,7 @@ impl<'a> ImportFile<'a> {
         let file = match File::open(args.file) {
             Ok(file) => file,
             Err(e) => {
-                let _ = self.writer.write_all(format!("{:?}\n", e).as_bytes());
+                let _ = self.writer.write_all(format!("{e:?}\n").as_bytes());
                 return;
             }
         };

@@ -144,8 +144,7 @@ impl PragmaVirtualTable {
 
     fn no_such_pragma(pragma_name: &str) -> LimboError {
         LimboError::ParseError(format!(
-            "No such table-valued function: pragma_{}",
-            pragma_name
+            "No such table-valued function: pragma_{pragma_name}"
         ))
     }
 
@@ -246,7 +245,7 @@ impl PragmaVirtualTableCursor {
 
         let mut sql = format!("PRAGMA {}", self.pragma_name);
         if let Some(arg) = &self.arg {
-            sql.push_str(&format!("=\"{}\"", arg));
+            sql.push_str(&format!("=\"{arg}\""));
         }
 
         self.stmt = Some(self.conn.prepare(sql)?);

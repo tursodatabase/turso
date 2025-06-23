@@ -371,8 +371,7 @@ impl Pager {
             Some(content) => content,
             None => {
                 return Err(LimboError::InternalError(format!(
-                    "Ptrmap page {} content not loaded",
-                    ptrmap_pg_no
+                    "Ptrmap page {ptrmap_pg_no} content not loaded"
                 )))
             }
         };
@@ -394,8 +393,7 @@ impl Pager {
         // Check if the calculated offset for the entry is within the bounds of the actual page data length.
         if offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE > actual_data_length {
             return Err(LimboError::InternalError(format!(
-                "Ptrmap offset {} + entry size {} out of bounds for page {} (actual data len {})",
-                offset_in_ptrmap_page, PTRMAP_ENTRY_SIZE, ptrmap_pg_no, actual_data_length
+                "Ptrmap offset {offset_in_ptrmap_page} + entry size {PTRMAP_ENTRY_SIZE} out of bounds for page {ptrmap_pg_no} (actual data len {actual_data_length})"
             )));
         }
 
@@ -404,8 +402,7 @@ impl Pager {
         match PtrmapEntry::deserialize(entry_slice) {
             Some(entry) => Ok(CursorResult::Ok(Some(entry))),
             None => Err(LimboError::Corrupt(format!(
-                "Failed to deserialize ptrmap entry for page {} from ptrmap page {}",
-                target_page_num, ptrmap_pg_no
+                "Failed to deserialize ptrmap entry for page {target_page_num} from ptrmap page {ptrmap_pg_no}"
             ))),
         }
     }
@@ -433,8 +430,7 @@ impl Pager {
             || is_ptrmap_page(db_page_no_to_update, page_size)
         {
             return Err(LimboError::InternalError(format!(
-                "Cannot set ptrmap entry for page {}: it's a header/ptrmap page or invalid.",
-                db_page_no_to_update
+                "Cannot set ptrmap entry for page {db_page_no_to_update}: it's a header/ptrmap page or invalid."
             )));
         }
 
@@ -463,8 +459,7 @@ impl Pager {
             Some(content) => content,
             None => {
                 return Err(LimboError::InternalError(format!(
-                    "Ptrmap page {} content not loaded",
-                    ptrmap_pg_no
+                    "Ptrmap page {ptrmap_pg_no} content not loaded"
                 )))
             }
         };
@@ -552,7 +547,7 @@ impl Pager {
 
                     //  For now map allocated_page_id since we are not swapping it with root_page_num
                     match self.ptrmap_put(allocated_page_id, PtrmapType::RootPage, 0)? {
-                        CursorResult::Ok(_) => Ok(CursorResult::Ok(allocated_page_id as u32)),
+                        CursorResult::Ok(_) => Ok(CursorResult::Ok(allocated_page_id)),
                         CursorResult::IO => Ok(CursorResult::IO),
                     }
                 }
@@ -736,8 +731,7 @@ impl Pager {
                 }
                 Err(e) => {
                     return Err(LimboError::InternalError(format!(
-                        "Failed to insert page into cache: {:?}",
-                        e
+                        "Failed to insert page into cache: {e:?}"
                     )))
                 }
             }
@@ -758,8 +752,7 @@ impl Pager {
             }
             Err(e) => {
                 return Err(LimboError::InternalError(format!(
-                    "Failed to insert page into cache: {:?}",
-                    e
+                    "Failed to insert page into cache: {e:?}"
                 )))
             }
         }
@@ -1038,7 +1031,7 @@ impl Pager {
                     checkpoint_result = res;
                     break;
                 }
-                Err(err) => panic!("error while clearing cache {}", err),
+                Err(err) => panic!("error while clearing cache {err}"),
             }
         }
         // TODO: only clear cache of things that are really invalidated
@@ -1062,8 +1055,7 @@ impl Pager {
 
         if page_id < 2 || page_id > header_accessor::get_database_size(self)? as usize {
             return Err(LimboError::Corrupt(format!(
-                "Invalid page number {} for free operation",
-                page_id
+                "Invalid page number {page_id} for free operation"
             )));
         }
 
@@ -1269,8 +1261,7 @@ impl Pager {
             .insert_ignore_existing(page_key, page.clone())
             .map_err(|e| {
                 LimboError::InternalError(format!(
-                    "Failed to insert loaded page {} into cache: {:?}",
-                    id, e
+                    "Failed to insert loaded page {id} into cache: {e:?}"
                 ))
             })?;
         page.set_loaded();
@@ -1505,14 +1496,12 @@ mod ptrmap {
             || db_page_no_to_query > last_data_page_mapped
         {
             return Err(LimboError::InternalError(format!(
-                "Page {} is not mapped by the data page range [{}, {}] of ptrmap page {}",
-                db_page_no_to_query, first_data_page_mapped, last_data_page_mapped, ptrmap_page_no
+                "Page {db_page_no_to_query} is not mapped by the data page range [{first_data_page_mapped}, {last_data_page_mapped}] of ptrmap page {ptrmap_page_no}"
             )));
         }
         if is_ptrmap_page(db_page_no_to_query, page_size) {
             return Err(LimboError::InternalError(format!(
-                "Page {} is a pointer map page and should not have an entry calculated this way.",
-                db_page_no_to_query
+                "Page {db_page_no_to_query} is a pointer map page and should not have an entry calculated this way."
             )));
         }
 
@@ -1629,12 +1618,12 @@ mod ptrmap_tests {
                     panic!("test_pager_setup: btree_create returned CursorResult::IO unexpectedly");
                 }
                 Err(e) => {
-                    panic!("test_pager_setup: btree_create failed: {:?}", e);
+                    panic!("test_pager_setup: btree_create failed: {e:?}");
                 }
             }
         }
 
-        return pager;
+        pager
     }
 
     #[test]
@@ -1714,7 +1703,7 @@ mod ptrmap_tests {
         assert_eq!(get_ptrmap_offset_in_page(3, 2, page_size).unwrap(), 0);
         assert_eq!(
             get_ptrmap_offset_in_page(4, 2, page_size).unwrap(),
-            1 * PTRMAP_ENTRY_SIZE
+            PTRMAP_ENTRY_SIZE
         );
         assert_eq!(
             get_ptrmap_offset_in_page(5, 2, page_size).unwrap(),
@@ -1728,7 +1717,7 @@ mod ptrmap_tests {
         assert_eq!(get_ptrmap_offset_in_page(106, 105, page_size).unwrap(), 0);
         assert_eq!(
             get_ptrmap_offset_in_page(107, 105, page_size).unwrap(),
-            1 * PTRMAP_ENTRY_SIZE
+            PTRMAP_ENTRY_SIZE
         );
         assert_eq!(
             get_ptrmap_offset_in_page(108, 105, page_size).unwrap(),

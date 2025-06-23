@@ -449,11 +449,8 @@ mod tests {
             let predicate = Predicate::true_binary(&mut rng, &table, row);
             let value = expr_to_value(&predicate.0, row, &table);
             assert!(
-                value.as_ref().map_or(false, |value| value.as_bool()),
-                "Predicate: {:#?}\nValue: {:#?}\nSeed: {}",
-                predicate,
-                value,
-                seed
+                value.as_ref().is_some_and(|value| value.as_bool()),
+                "Predicate: {predicate:#?}\nValue: {value:#?}\nSeed: {seed}"
             )
         }
     }
@@ -478,11 +475,8 @@ mod tests {
             let predicate = Predicate::false_binary(&mut rng, &table, row);
             let value = expr_to_value(&predicate.0, row, &table);
             assert!(
-                !value.as_ref().map_or(false, |value| value.as_bool()),
-                "Predicate: {:#?}\nValue: {:#?}\nSeed: {}",
-                predicate,
-                value,
-                seed
+                !value.as_ref().is_some_and(|value| value.as_bool()),
+                "Predicate: {predicate:#?}\nValue: {value:#?}\nSeed: {seed}"
             )
         }
     }
@@ -511,7 +505,7 @@ mod tests {
                 .map(|row| predicate.0.test(row, &table))
                 .reduce(|accum, curr| accum || curr)
                 .unwrap_or(false);
-            assert!(result, "Predicate: {:#?}\nSeed: {}", predicate, seed)
+            assert!(result, "Predicate: {predicate:#?}\nSeed: {seed}")
         }
     }
 
@@ -538,7 +532,7 @@ mod tests {
                 .iter()
                 .map(|row| predicate.0.test(row, &table))
                 .any(|res| !res);
-            assert!(result, "Predicate: {:#?}\nSeed: {}", predicate, seed)
+            assert!(result, "Predicate: {predicate:#?}\nSeed: {seed}")
         }
     }
 }

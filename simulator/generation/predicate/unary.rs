@@ -263,7 +263,7 @@ mod tests {
                 .map(|row| predicate.0.test(row, &table))
                 .reduce(|accum, curr| accum || curr)
                 .unwrap_or(false);
-            assert!(result, "Predicate: {:#?}\nSeed: {}", predicate, seed)
+            assert!(result, "Predicate: {predicate:#?}\nSeed: {seed}")
         }
     }
 
@@ -290,7 +290,7 @@ mod tests {
                 .iter()
                 .map(|row| predicate.0.test(row, &table))
                 .any(|res| !res);
-            assert!(result, "Predicate: {:#?}\nSeed: {}", predicate, seed)
+            assert!(result, "Predicate: {predicate:#?}\nSeed: {seed}")
         }
     }
 }

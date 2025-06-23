@@ -24,7 +24,7 @@ pub enum CollationSeq {
 impl CollationSeq {
     pub fn new(collation: &str) -> crate::Result<Self> {
         CollationSeq::from_str(collation).map_err(|_| {
-            crate::LimboError::ParseError(format!("no such collation sequence: {}", collation))
+            crate::LimboError::ParseError(format!("no such collation sequence: {collation}"))
         })
     }
 

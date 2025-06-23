@@ -39,7 +39,7 @@ impl Display for ValueType {
             Self::Text => "TEXT",
             Self::Error => "ERROR",
         };
-        write!(f, "{}", value)
+        write!(f, "{value}")
     }
 }
 
@@ -132,7 +132,7 @@ fn float_to_string<S>(float: &f64, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
-    serializer.serialize_str(&format!("{}", float))
+    serializer.serialize_str(&format!("{float}"))
 }
 
 #[cfg(feature = "serde")]
@@ -317,7 +317,7 @@ impl Display for Value {
         match self {
             Self::Null => write!(f, ""),
             Self::Integer(i) => {
-                write!(f, "{}", i)
+                write!(f, "{i}")
             }
             Self::Float(fl) => {
                 let fl = *fl;
@@ -337,7 +337,7 @@ impl Display for Value {
 
                 // handle scientific notation without trailing zeros
                 if (fl.abs() < 1e-4 || fl.abs() >= 1e15) && fl != 0.0 {
-                    let sci_notation = format!("{:.14e}", fl);
+                    let sci_notation = format!("{fl:.14e}");
                     let parts: Vec<&str> = sci_notation.split('e').collect();
 
                     if parts.len() == 2 {
@@ -358,7 +358,7 @@ impl Display for Value {
                             let trimmed_mantissa = if fraction.is_empty() {
                                 whole.to_string()
                             } else {
-                                format!("{}.{}", whole, fraction)
+                                format!("{whole}.{fraction}")
                             };
                             let (prefix, exponent) =
                                 if let Some(stripped_exponent) = exponent.strip_prefix('-') {
@@ -366,12 +366,12 @@ impl Display for Value {
                                 } else {
                                     ("+", exponent)
                                 };
-                            return write!(f, "{}e{}{}", trimmed_mantissa, prefix, exponent);
+                            return write!(f, "{trimmed_mantissa}e{prefix}{exponent}");
                         }
                     }
 
                     // fallback
-                    return write!(f, "{}", sci_notation);
+                    return write!(f, "{sci_notation}");
                 }
 
                 // handle floating point max size is 15.
@@ -381,15 +381,15 @@ impl Display for Value {
                 if (fl - rounded).abs() < 1e-14 {
                     // if we very close to integer trim decimal part to 1 digit
                     if rounded == rounded as i64 as f64 {
-                        return write!(f, "{:.1}", fl);
+                        return write!(f, "{fl:.1}");
                     }
                 }
 
-                let fl_str = format!("{}", fl);
+                let fl_str = format!("{fl}");
                 let splitted = fl_str.split('.').collect::<Vec<&str>>();
                 // fallback
                 if splitted.len() != 2 {
-                    return write!(f, "{:.14e}", fl);
+                    return write!(f, "{fl:.14e}");
                 }
 
                 let first_part = if fl < 0.0 {
@@ -411,7 +411,7 @@ impl Display for Value {
                 };
                 // float that have integer part > 15 converted to sci notation
                 if reminder < 0 {
-                    return write!(f, "{:.14e}", fl);
+                    return write!(f, "{fl:.14e}");
                 }
                 // trim decimal part to reminder or self len so total digits is 15;
                 let mut fl = format!("{:.*}", second.len().min(reminder as usize), fl);
@@ -419,7 +419,7 @@ impl Display for Value {
                 while fl.ends_with('0') {
                     fl.pop();
                 }
-                write!(f, "{}", fl)
+                write!(f, "{fl}")
             }
             Self::Text(s) => {
                 write!(f, "{}", s.as_str())
@@ -969,7 +969,7 @@ impl ImmutableRecord {
                         SerialTypeKind::I32 => writer.extend_from_slice(&(*i as i32).to_be_bytes()),
                         SerialTypeKind::I48 => writer.extend_from_slice(&i.to_be_bytes()[2..]), // remove 2 most significant bytes
                         SerialTypeKind::I64 => writer.extend_from_slice(&i.to_be_bytes()),
-                        other => panic!("Serial type is not an integer: {:?}", other),
+                        other => panic!("Serial type is not an integer: {other:?}"),
                     }
                 }
                 Value::Float(f) => {
@@ -1134,8 +1134,8 @@ impl Display for RefValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Null => write!(f, "NULL"),
-            Self::Integer(i) => write!(f, "{}", i),
-            Self::Float(fl) => write!(f, "{:?}", fl),
+            Self::Integer(i) => write!(f, "{i}"),
+            Self::Float(fl) => write!(f, "{fl:?}"),
             Self::Text(s) => write!(f, "{}", s.as_str()),
             Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b.to_slice())),
         }
@@ -1198,7 +1198,7 @@ pub struct IndexKeySortOrder(u64);
 
 impl IndexKeySortOrder {
     pub fn get_sort_order_for_col(&self, column_idx: usize) -> SortOrder {
-        assert!(column_idx < 64, "column index out of range: {}", column_idx);
+        assert!(column_idx < 64, "column index out of range: {column_idx}");
         match self.0 & (1 << column_idx) {
             0 => SortOrder::Asc,
             _ => SortOrder::Desc,
@@ -1442,10 +1442,7 @@ impl TryFrom<u64> for SerialType {
 
     fn try_from(uint: u64) -> Result<Self> {
         if uint == 10 || uint == 11 {
-            return Err(LimboError::Corrupt(format!(
-                "Invalid serial type: {}",
-                uint
-            )));
+            return Err(LimboError::Corrupt(format!("Invalid serial type: {uint}")));
         }
         Ok(SerialType(uint))
     }
@@ -1505,7 +1502,7 @@ impl Record {
             // if( nVarint<sqlite3VarintLen(nHdr) ) nHdr++;
         }
         assert!(header_size <= 126);
-        header_bytes_buf.extend(std::iter::repeat(0).take(9));
+        header_bytes_buf.extend(std::iter::repeat_n(0, 9));
         let n = write_varint(header_bytes_buf.as_mut_slice(), header_size as u64);
         header_bytes_buf.truncate(n);
         buf.splice(initial_i..initial_i, header_bytes_buf.iter().cloned());

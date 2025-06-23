@@ -231,7 +231,7 @@ fn optimize_table_access(
             is_outer: joined_tables[table_number]
                 .join_info
                 .as_ref()
-                .map_or(false, |join_info| join_info.outer),
+                .is_some_and(|join_info| join_info.outer),
         })
         .collect();
 
@@ -334,8 +334,7 @@ fn optimize_table_access(
             }
             assert!(
                 constraint_refs.len() == 1,
-                "expected exactly one constraint for rowid seek, got {:?}",
-                constraint_refs
+                "expected exactly one constraint for rowid seek, got {constraint_refs:?}"
             );
             let constraint = &constraints_per_table[table_idx].constraints
                 [constraint_refs[0].constraint_vec_pos];
@@ -467,14 +466,10 @@ pub trait Optimizable {
     // return a [ConstantPredicate].
     fn check_always_true_or_false(&self) -> Result<Option<AlwaysTrueOrFalse>>;
     fn is_always_true(&self) -> Result<bool> {
-        Ok(self
-            .check_always_true_or_false()?
-            .map_or(false, |c| c == AlwaysTrueOrFalse::AlwaysTrue))
+        Ok(self.check_always_true_or_false()? == Some(AlwaysTrueOrFalse::AlwaysTrue))
     }
     fn is_always_false(&self) -> Result<bool> {
-        Ok(self
-            .check_always_true_or_false()?
-            .map_or(false, |c| c == AlwaysTrueOrFalse::AlwaysFalse))
+        Ok(self.check_always_true_or_false()? == Some(AlwaysTrueOrFalse::AlwaysFalse))
     }
     fn is_constant(&self, resolver: &Resolver<'_>) -> bool;
     fn is_nonnull(&self, tables: &TableReferences) -> bool;
@@ -499,13 +494,13 @@ impl Optimizable for ast::Expr {
                 else_expr,
                 ..
             } => {
-                base.as_ref().map_or(true, |base| base.is_nonnull(tables))
+                base.as_ref().is_none_or(|base| base.is_nonnull(tables))
                     && when_then_pairs
                         .iter()
                         .all(|(_, then)| then.is_nonnull(tables))
                     && else_expr
                         .as_ref()
-                        .map_or(true, |else_expr| else_expr.is_nonnull(tables))
+                        .is_none_or(|else_expr| else_expr.is_nonnull(tables))
             }
             Expr::Cast { expr, .. } => expr.is_nonnull(tables),
             Expr::Collate(expr, _) => expr.is_nonnull(tables),
@@ -536,7 +531,7 @@ impl Optimizable for ast::Expr {
                 lhs.is_nonnull(tables)
                     && rhs
                         .as_ref()
-                        .map_or(true, |rhs| rhs.iter().all(|rhs| rhs.is_nonnull(tables)))
+                        .is_none_or(|rhs| rhs.iter().all(|rhs| rhs.is_nonnull(tables)))
             }
             Expr::InSelect { .. } => false,
             Expr::InTable { .. } => false,
@@ -582,14 +577,13 @@ impl Optimizable for ast::Expr {
                 when_then_pairs,
                 else_expr,
             } => {
-                base.as_ref()
-                    .map_or(true, |base| base.is_constant(resolver))
+                base.as_ref().is_none_or(|base| base.is_constant(resolver))
                     && when_then_pairs.iter().all(|(when, then)| {
                         when.is_constant(resolver) && then.is_constant(resolver)
                     })
                     && else_expr
                         .as_ref()
-                        .map_or(true, |else_expr| else_expr.is_constant(resolver))
+                        .is_none_or(|else_expr| else_expr.is_constant(resolver))
             }
             Expr::Cast { expr, .. } => expr.is_constant(resolver),
             Expr::Collate(expr, _) => expr.is_constant(resolver),
@@ -604,9 +598,9 @@ impl Optimizable for ast::Expr {
                     return false;
                 };
                 func.is_deterministic()
-                    && args.as_ref().map_or(true, |args| {
-                        args.iter().all(|arg| arg.is_constant(resolver))
-                    })
+                    && args
+                        .as_ref()
+                        .is_none_or(|args| args.iter().all(|arg| arg.is_constant(resolver)))
             }
             Expr::FunctionCallStar { .. } => false,
             Expr::Id(_) => panic!("Id should have been rewritten as Column"),
@@ -616,7 +610,7 @@ impl Optimizable for ast::Expr {
                 lhs.is_constant(resolver)
                     && rhs
                         .as_ref()
-                        .map_or(true, |rhs| rhs.iter().all(|rhs| rhs.is_constant(resolver)))
+                        .is_none_or(|rhs| rhs.iter().all(|rhs| rhs.is_constant(resolver)))
             }
             Expr::InSelect { .. } => {
                 false // might be constant, too annoying to check subqueries etc. implement later
@@ -630,7 +624,7 @@ impl Optimizable for ast::Expr {
                     && rhs.is_constant(resolver)
                     && escape
                         .as_ref()
-                        .map_or(true, |escape| escape.is_constant(resolver))
+                        .is_none_or(|escape| escape.is_constant(resolver))
             }
             Expr::Literal(_) => true,
             Expr::Name(_) => false,
@@ -639,9 +633,7 @@ impl Optimizable for ast::Expr {
             Expr::Qualified(_, _) => {
                 panic!("Qualified should have been rewritten as Column")
             }
-            Expr::Raise(_, expr) => expr
-                .as_ref()
-                .map_or(true, |expr| expr.is_constant(resolver)),
+            Expr::Raise(_, expr) => expr.as_ref().is_none_or(|expr| expr.is_constant(resolver)),
             Expr::Subquery(_) => false,
             Expr::Unary(_, expr) => expr.is_constant(resolver),
             Expr::Variable(_) => false,
@@ -816,7 +808,7 @@ fn ephemeral_index_build(
         has_rowid: table_reference
             .table
             .btree()
-            .map_or(false, |btree| btree.has_rowid),
+            .is_some_and(|btree| btree.has_rowid),
     };
 
     ephemeral_index
@@ -1322,7 +1314,7 @@ pub fn rewrite_expr(top_level_expr: &mut ast::Expr, param_idx: &mut usize) -> Re
                 if var.is_empty() {
                     // rewrite anonymous variables only, ensure that the `param_idx` starts at 1 and
                     // all the expressions are rewritten in the order they come in the statement
-                    *expr = ast::Expr::Variable(format!("{}{param_idx}", PARAM_PREFIX));
+                    *expr = ast::Expr::Variable(format!("{PARAM_PREFIX}{param_idx}"));
                     *param_idx += 1;
                 }
             }

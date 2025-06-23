@@ -48,7 +48,7 @@ impl Display for Update {
             if i != 0 {
                 write!(f, ", ")?;
             }
-            write!(f, "{} = {}", name, value)?;
+            write!(f, "{name} = {value}")?;
         }
         write!(f, " WHERE {}", self.predicate)?;
         Ok(())

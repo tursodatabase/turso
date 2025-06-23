@@ -398,7 +398,7 @@ mod tests {
 
     fn write_csv(content: &str) -> NamedTempFile {
         let mut tmp = NamedTempFile::new().expect("Failed to create temp file");
-        write!(tmp, "{}", content).unwrap();
+        write!(tmp, "{content}").unwrap();
         tmp
     }
 
@@ -681,19 +681,19 @@ mod tests {
         for &val in &true_values {
             let result = try_new_table(vec![
                 "data=id,name\n1,Alice\n2,Bob\n",
-                &format!("header={}", val),
+                &format!("header={val}"),
             ]);
-            assert!(result.is_ok(), "Expected Ok for header='{}'", val);
-            assert!(result.unwrap().1.header, "Expected true for '{}'", val);
+            assert!(result.is_ok(), "Expected Ok for header='{val}'");
+            assert!(result.unwrap().1.header, "Expected true for '{val}'");
         }
 
         for &val in &false_values {
             let result = try_new_table(vec![
                 "data=id,name\n1,Alice\n2,Bob\n",
-                &format!("header={}", val),
+                &format!("header={val}"),
             ]);
-            assert!(result.is_ok(), "Expected Ok for header='{}'", val);
-            assert!(!result.unwrap().1.header, "Expected false for '{}'", val);
+            assert!(result.is_ok(), "Expected Ok for header='{val}'");
+            assert!(!result.unwrap().1.header, "Expected false for '{val}'");
         }
     }
 
@@ -704,7 +704,7 @@ mod tests {
         for &val in &invalid_values {
             let result = try_new_table(vec![
                 "data=id,name\n1,Alice\n2,Bob\n",
-                &format!("header={}", val),
+                &format!("header={val}"),
             ]);
             assert!(matches!(result, Err(ResultCode::InvalidArgs)));
         }
@@ -747,13 +747,10 @@ mod tests {
         let quotes = ["'", "\""];
 
         for &quote in &quotes {
-            let table = new_table(vec![&format!(
-                "data={}aa{}{}bb{}",
-                quote, quote, quote, quote
-            )]);
+            let table = new_table(vec![&format!("data={quote}aa{quote}{quote}bb{quote}")]);
             let cursor = table.open(None).unwrap();
             let rows = read_rows(cursor, 1);
-            assert_eq!(rows, vec![vec![cell!(format!("aa{}bb", quote))]]);
+            assert_eq!(rows, vec![vec![cell!(format!("aa{quote}bb"))]]);
         }
     }
 
@@ -763,13 +760,10 @@ mod tests {
 
         for &case in &cases {
             let (outer, inner) = case;
-            let table = new_table(vec![&format!(
-                "data={}aa{}{}bb{}",
-                outer, inner, inner, outer
-            )]);
+            let table = new_table(vec![&format!("data={outer}aa{inner}{inner}bb{outer}")]);
             let cursor = table.open(None).unwrap();
             let rows = read_rows(cursor, 1);
-            assert_eq!(rows, vec![vec![cell!(format!("aa{}{}bb", inner, inner))]]);
+            assert_eq!(rows, vec![vec![cell!(format!("aa{inner}{inner}bb"))]]);
         }
     }
 
@@ -786,7 +780,7 @@ mod tests {
         for &val in &invalid_values {
             let result = try_new_table(vec![
                 "data=id,name\n1,Alice\n2,Bob\n",
-                &format!("columns={}", val),
+                &format!("columns={val}"),
             ]);
             assert!(matches!(result, Err(ResultCode::InvalidArgs)));
         }

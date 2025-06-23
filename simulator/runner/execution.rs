@@ -282,8 +282,7 @@ fn limbo_integrity_check(conn: &Arc<Connection>) -> Result<()> {
     let message = result.join("\n");
     if message != "ok" {
         return Err(LimboError::InternalError(format!(
-            "Integrity Check Failed: {}",
-            message
+            "Integrity Check Failed: {message}"
         )));
     }
     Ok(())

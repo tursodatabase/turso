@@ -177,7 +177,7 @@ impl Database {
         enable_mvcc: bool,
         enable_indexes: bool,
     ) -> Result<Arc<Database>> {
-        let wal_path = format!("{}-wal", path);
+        let wal_path = format!("{path}-wal");
         let maybe_shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path.as_str())?;
         let db_size = db_file.size()?;
 
@@ -233,7 +233,7 @@ impl Database {
             {
                 // this means that a vtab exists and we no longer have the module loaded. we print
                 // a warning to the user to load the module
-                eprintln!("Warning: {}", e);
+                eprintln!("Warning: {e}");
             }
         }
         Ok(db)
@@ -847,7 +847,7 @@ impl Connection {
             {
                 // this means that a vtab exists and we no longer have the module loaded. we print
                 // a warning to the user to load the module
-                eprintln!("Warning: {}", e);
+                eprintln!("Warning: {e}");
             }
         }
         Ok(())
@@ -1048,7 +1048,7 @@ impl std::fmt::Debug for SymbolTable {
 
 fn is_shared_library(path: &std::path::Path) -> bool {
     path.extension()
-        .map_or(false, |ext| ext == "so" || ext == "dylib" || ext == "dll")
+        .is_some_and(|ext| ext == "so" || ext == "dylib" || ext == "dll")
 }
 
 pub fn resolve_ext_path(extpath: &str) -> Result<std::path::PathBuf> {
@@ -1056,8 +1056,7 @@ pub fn resolve_ext_path(extpath: &str) -> Result<std::path::PathBuf> {
     if !path.exists() {
         if is_shared_library(path) {
             return Err(LimboError::ExtensionError(format!(
-                "Extension file not found: {}",
-                extpath
+                "Extension file not found: {extpath}"
             )));
         };
         let maybe = path.with_extension(std::env::consts::DLL_EXTENSION);
@@ -1065,8 +1064,7 @@ pub fn resolve_ext_path(extpath: &str) -> Result<std::path::PathBuf> {
             .exists()
             .then_some(maybe)
             .ok_or(LimboError::ExtensionError(format!(
-                "Extension file not found: {}",
-                extpath
+                "Extension file not found: {extpath}"
             )))
     } else {
         Ok(path.to_path_buf())

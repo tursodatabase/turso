@@ -64,7 +64,7 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
     let writer_thread = std::thread::spawn(move || {
         let conn = tmp_db_w.connect().unwrap();
         for i in 0..ROWS_WRITE {
-            conn.execute(format!("INSERT INTO t values({})", i).as_str())
+            conn.execute(format!("INSERT INTO t values({i})").as_str())
                 .unwrap();
             let mut rows = rows_.lock().unwrap();
             *rows += 1;
@@ -95,7 +95,7 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
                 },
                 Ok(None) => {}
                 Err(err) => {
-                    eprintln!("{}", err);
+                    eprintln!("{err}");
                 }
             }
             if rows == ROWS_WRITE {

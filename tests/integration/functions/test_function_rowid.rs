@@ -57,7 +57,7 @@ fn test_last_insert_rowid_basic() -> anyhow::Result<()> {
             }
         },
         Ok(None) => {}
-        Err(err) => eprintln!("{}", err),
+        Err(err) => eprintln!("{err}"),
     };
 
     // Check last_insert_rowid after explicit id
@@ -80,7 +80,7 @@ fn test_last_insert_rowid_basic() -> anyhow::Result<()> {
             }
         },
         Ok(None) => {}
-        Err(err) => eprintln!("{}", err),
+        Err(err) => eprintln!("{err}"),
     };
     assert_eq!(last_id, 5, "Explicit insert should have rowid 5");
     do_flush(&conn, &tmp_db)?;

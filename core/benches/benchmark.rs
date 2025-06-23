@@ -69,7 +69,7 @@ fn bench_prepare_query(criterion: &mut Criterion) {
     ];
 
     for query in queries.iter() {
-        let mut group = criterion.benchmark_group(format!("Prepare `{}`", query));
+        let mut group = criterion.benchmark_group(format!("Prepare `{query}`"));
 
         group.bench_with_input(
             BenchmarkId::new("limbo_parse_query", query),

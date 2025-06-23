@@ -356,7 +356,7 @@ impl TryFrom<u8> for PageType {
             5 => Ok(Self::TableInterior),
             10 => Ok(Self::IndexLeaf),
             13 => Ok(Self::TableLeaf),
-            _ => Err(LimboError::Corrupt(format!("Invalid page type: {}", value))),
+            _ => Err(LimboError::Corrupt(format!("Invalid page type: {value}"))),
         }
     }
 }
@@ -545,9 +545,7 @@ impl PageContent {
         let ncells = self.cell_count();
         assert!(
             idx < ncells,
-            "cell_get: idx out of bounds: idx={}, ncells={}",
-            idx,
-            ncells
+            "cell_get: idx out of bounds: idx={idx}, ncells={ncells}"
         );
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
@@ -708,7 +706,7 @@ impl PageContent {
         let mut pc = self.first_freeblock() as usize;
         let mut block_num = 0;
         println!("---- Free List Blocks ----");
-        println!("first freeblock pointer: {}", pc);
+        println!("first freeblock pointer: {pc}");
         println!("cell content area: {}", self.cell_content_area());
         println!("fragmented bytes: {}", self.num_frag_free_bytes());
 
@@ -716,10 +714,7 @@ impl PageContent {
             let next = self.read_u16_no_offset(pc);
             let size = self.read_u16_no_offset(pc + 2);
 
-            println!(
-                "block {}: position={}, size={}, next={}",
-                block_num, pc, size, next
-            );
+            println!("block {block_num}: position={pc}, size={size}, next={next}");
             pc = next as usize;
             block_num += 1;
         }
@@ -1379,7 +1374,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
         if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&page_size_u32)
             || page_size_u32.count_ones() != 1
         {
-            panic!("Invalid page size in WAL header: {}", page_size_u32);
+            panic!("Invalid page size in WAL header: {page_size_u32}");
         }
         let page_size = page_size_u32 as usize;
 

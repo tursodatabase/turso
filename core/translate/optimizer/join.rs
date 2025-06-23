@@ -217,7 +217,7 @@ pub fn compute_best_join_order<'a>(
     let left_join_illegal_map = {
         let left_join_count = joined_tables
             .iter()
-            .filter(|t| t.join_info.as_ref().map_or(false, |j| j.outer))
+            .filter(|t| t.join_info.as_ref().is_some_and(|j| j.outer))
             .count();
         if left_join_count == 0 {
             None
@@ -227,7 +227,7 @@ pub fn compute_best_join_order<'a>(
                 HashMap::with_capacity(left_join_count);
             for (i, _) in joined_tables.iter().enumerate() {
                 for (j, joined_table) in joined_tables.iter().enumerate().skip(i + 1) {
-                    if joined_table.join_info.as_ref().map_or(false, |j| j.outer) {
+                    if joined_table.join_info.as_ref().is_some_and(|j| j.outer) {
                         // bitwise OR the masks
                         if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&i) {
                             illegal_lhs.add_table(j);
@@ -296,7 +296,7 @@ pub fn compute_best_join_order<'a>(
                         is_outer: joined_tables[table_no]
                             .join_info
                             .as_ref()
-                            .map_or(false, |j| j.outer),
+                            .is_some_and(|j| j.outer),
                     });
                 }
                 join_order.push(JoinOrderMember {
@@ -305,7 +305,7 @@ pub fn compute_best_join_order<'a>(
                     is_outer: joined_tables[rhs_idx]
                         .join_info
                         .as_ref()
-                        .map_or(false, |j| j.outer),
+                        .is_some_and(|j| j.outer),
                 });
                 assert!(join_order.len() == subset_size);
 
@@ -406,7 +406,7 @@ pub fn compute_naive_left_deep_plan<'a>(
         .map(|(i, t)| JoinOrderMember {
             table_id: t.internal_id,
             original_idx: i,
-            is_outer: t.join_info.as_ref().map_or(false, |j| j.outer),
+            is_outer: t.join_info.as_ref().is_some_and(|j| j.outer),
         })
         .collect::<Vec<_>>();
 
@@ -828,7 +828,7 @@ mod tests {
             .iter()
             .for_each(|table_name| {
                 // add primary key index called sqlite_autoindex_<tablename>_1
-                let index_name = format!("sqlite_autoindex_{}_1", table_name);
+                let index_name = format!("sqlite_autoindex_{table_name}_1");
                 let index = Arc::new(Index {
                     name: index_name,
                     table_name: table_name.to_string(),
@@ -1063,10 +1063,7 @@ mod tests {
         // Create fact table with foreign keys to all dimension tables
         let mut fact_columns = vec![_create_column_rowid_alias("id")];
         for i in 0..NUM_DIM_TABLES {
-            fact_columns.push(_create_column_of_type(
-                &format!("dim{}_id", i),
-                Type::Integer,
-            ));
+            fact_columns.push(_create_column_of_type(&format!("dim{i}_id"), Type::Integer));
         }
         let fact_table = _create_btree_table("fact", fact_columns);
 
@@ -1074,7 +1071,7 @@ mod tests {
         let dim_tables: Vec<_> = (0..NUM_DIM_TABLES)
             .map(|i| {
                 _create_btree_table(
-                    &format!("dim{}", i),
+                    &format!("dim{i}"),
                     vec![
                         _create_column_rowid_alias("id"),
                         _create_column_of_type("value", Type::Integer),

@@ -44,8 +44,7 @@ impl VirtualTable {
                 .map(|(vtab, columns)| (VirtualTableType::Pragma(vtab), columns))?
         } else {
             return Err(LimboError::ParseError(format!(
-                "No such table-valued function: {}",
-                name
+                "No such table-valued function: {name}"
             )));
         };
 
@@ -216,8 +215,7 @@ impl ExtVirtualTable {
         kind: VTabKind,
     ) -> crate::Result<(Self, String)> {
         let module = module.ok_or(LimboError::ExtensionError(format!(
-            "Virtual table module not found: {}",
-            module_name
+            "Virtual table module not found: {module_name}"
         )))?;
         if kind != module.module_kind {
             let expected = match kind {
@@ -225,8 +223,7 @@ impl ExtVirtualTable {
                 VTabKind::TableValuedFunction => "table-valued function",
             };
             return Err(LimboError::ExtensionError(format!(
-                "{} is not a {} module",
-                module_name, expected
+                "{module_name} is not a {expected} module"
             )));
         }
         let (schema, table_ptr) = module.implementation.create(args)?;

@@ -418,15 +418,13 @@ impl DumbLruPageCache {
 
             if forward_count > map_len + 5 {
                 panic!(
-                    "Infinite loop suspected in forward integrity check. Size {}, count {}",
-                    map_len, forward_count
+                    "Infinite loop suspected in forward integrity check. Size {map_len}, count {forward_count}"
                 );
             }
         }
         assert_eq!(
             forward_count, map_len,
-            "Forward count mismatch (counted {}, map has {})",
-            forward_count, map_len
+            "Forward count mismatch (counted {forward_count}, map has {map_len})"
         );
         assert_eq!(
             tail_ptr, last_ptr,
@@ -457,15 +455,13 @@ impl DumbLruPageCache {
             }
             if backward_count > map_len + 5 {
                 panic!(
-                    "Infinite loop suspected in backward integrity check. Size {}, count {}",
-                    map_len, backward_count
+                    "Infinite loop suspected in backward integrity check. Size {map_len}, count {backward_count}"
                 );
             }
         }
         assert_eq!(
             backward_count, map_len,
-            "Backward count mismatch (counted {}, map has {})",
-            backward_count, map_len
+            "Backward count mismatch (counted {backward_count}, map has {map_len})"
         );
         assert_eq!(
             head_ptr, last_ptr,
@@ -1018,7 +1014,7 @@ mod tests {
                         Err(CacheError::Full | CacheError::ActiveRefs) => {} // Ignore
                         Err(err) => {
                             // Any other error should fail the test
-                            panic!("Cache insertion failed: {:?}", err);
+                            panic!("Cache insertion failed: {err:?}");
                         }
                         Ok(_) => {
                             lru.push(key, page);
@@ -1051,7 +1047,7 @@ mod tests {
             }
             cache.verify_list_integrity();
             for (key, page) in &lru {
-                println!("getting page {:?}", key);
+                println!("getting page {key:?}");
                 cache.peek(key, false).unwrap();
                 assert_eq!(page.get().id, key.pgno);
             }

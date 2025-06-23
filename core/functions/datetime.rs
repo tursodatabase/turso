@@ -29,7 +29,7 @@ pub fn exec_strftime(values: &[Register]) -> Value {
 
     let value = &values[0].get_owned_value();
     let format_str = if matches!(value, Value::Text(_) | Value::Integer(_) | Value::Float(_)) {
-        format!("{}", value)
+        format!("{value}")
     } else {
         return Value::Null;
     };
@@ -416,8 +416,8 @@ fn get_date_time_from_time_value_string(value: &str) -> Option<NaiveDateTime> {
             // For time-only formats, assume date 2000-01-01
             // Ref: https://sqlite.org/lang_datefunc.html#tmval
             parse_datetime_with_optional_tz(
-                &format!("2000-01-01 {}", value),
-                &format!("%Y-%m-%d {}", format),
+                &format!("2000-01-01 {value}"),
+                &format!("%Y-%m-%d {format}"),
             )
         } else {
             parse_datetime_with_optional_tz(value, format)
@@ -463,10 +463,7 @@ fn get_date_time_from_time_value_float(value: f64) -> Option<NaiveDateTime> {
     if value.is_infinite() || value.is_nan() || !is_julian_day_value(value) {
         return None;
     }
-    match julian_day_converter::julian_day_to_datetime(value) {
-        Ok(dt) => Some(dt),
-        Err(_) => None,
-    }
+    julian_day_converter::julian_day_to_datetime(value).ok()
 }
 
 fn is_leap_second(dt: &NaiveDateTime) -> bool {
@@ -521,7 +518,7 @@ enum Modifier {
 fn parse_modifier_number(s: &str) -> Result<i64> {
     s.trim()
         .parse::<i64>()
-        .map_err(|_| InvalidModifier(format!("Invalid number: {}", s)))
+        .map_err(|_| InvalidModifier(format!("Invalid number: {s}")))
 }
 
 /// supports YYYY-MM-DD format for time shift modifiers
@@ -539,9 +536,9 @@ fn parse_modifier_time(s: &str) -> Result<NaiveTime> {
         5 => NaiveTime::parse_from_str(s, "%H:%M"),
         8 => NaiveTime::parse_from_str(s, "%H:%M:%S"),
         12 => NaiveTime::parse_from_str(s, "%H:%M:%S.%3f"),
-        _ => return Err(InvalidModifier(format!("Invalid time format: {}", s))),
+        _ => return Err(InvalidModifier(format!("Invalid time format: {s}"))),
     }
-    .map_err(|_| InvalidModifier(format!("Invalid time format: {}", s)))
+    .map_err(|_| InvalidModifier(format!("Invalid time format: {s}")))
 }
 
 fn parse_modifier(modifier: &str) -> Result<Modifier> {
@@ -811,8 +808,7 @@ mod tests {
             assert_eq!(
                 result,
                 Value::build_text(expected),
-                "Failed for input: {:?}",
-                input
+                "Failed for input: {input:?}"
             );
         }
     }
@@ -851,10 +847,7 @@ mod tests {
             let result = exec_date(&[Register::Value(case.clone())]);
             match result {
                 Value::Text(ref result_str) if result_str.value.is_empty() => (),
-                _ => panic!(
-                    "Expected empty string for input: {:?}, but got: {:?}",
-                    case, result
-                ),
+                _ => panic!("Expected empty string for input: {case:?}, but got: {result:?}"),
             }
         }
     }
@@ -947,7 +940,7 @@ mod tests {
             if let Value::Text(result_str) = result {
                 assert_eq!(result_str.as_str(), expected);
             } else {
-                panic!("Expected Value::Text, but got: {:?}", result);
+                panic!("Expected Value::Text, but got: {result:?}");
             }
         }
     }
@@ -986,10 +979,7 @@ mod tests {
             let result = exec_time(&[Register::Value(case.clone())]);
             match result {
                 Value::Text(ref result_str) if result_str.value.is_empty() => (),
-                _ => panic!(
-                    "Expected empty string for input: {:?}, but got: {:?}",
-                    case, result
-                ),
+                _ => panic!("Expected empty string for input: {case:?}, but got: {result:?}"),
             }
         }
     }

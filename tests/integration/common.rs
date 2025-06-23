@@ -172,7 +172,7 @@ pub(crate) fn sqlite_exec_rows(
             let column: rusqlite::types::Value = match row.get(i) {
                 Ok(column) => column,
                 Err(rusqlite::Error::InvalidColumnIndex(_)) => break,
-                Err(err) => panic!("unexpected rusqlite error: {}", err),
+                Err(err) => panic!("unexpected rusqlite error: {err}"),
             };
             result.push(column);
         }
@@ -201,8 +201,9 @@ pub(crate) fn limbo_exec_rows(
                     stmt.run_once().unwrap();
                     continue;
                 }
+
                 turso_core::StepResult::Done => break 'outer,
-                r => panic!("unexpected result {:?}: expecting single row", r),
+                r => panic!("unexpected result {r:?}: expecting single row"),
             }
         };
         let row = row
@@ -234,7 +235,7 @@ pub(crate) fn limbo_exec_rows_error(
                 continue;
             }
             turso_core::StepResult::Done => return Ok(()),
-            r => panic!("unexpected result {:?}: expecting single row", r),
+            r => panic!("unexpected result {r:?}: expecting single row"),
         }
     }
 }
@@ -297,7 +298,7 @@ mod tests {
             );
             let conn = db.connect_limbo();
             let ret = limbo_exec_rows(&db, &conn, "CREATE table t(a)");
-            assert!(ret.is_empty(), "{:?}", ret);
+            assert!(ret.is_empty(), "{ret:?}");
             limbo_exec_rows(&db, &conn, "INSERT INTO t values (1)");
             conn.close().unwrap()
         }
@@ -313,7 +314,7 @@ mod tests {
             assert_eq!(ret, vec![vec![Value::Integer(1)]]);
 
             let err = limbo_exec_rows_error(&db, &conn, "INSERT INTO t values (1)").unwrap_err();
-            assert!(matches!(err, turso_core::LimboError::ReadOnly), "{:?}", err);
+            assert!(matches!(err, turso_core::LimboError::ReadOnly), "{err:?}");
         }
         Ok(())
     }

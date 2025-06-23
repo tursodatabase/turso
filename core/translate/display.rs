@@ -38,14 +38,14 @@ impl Display for Plan {
             } => {
                 for (plan, operator) in left {
                     plan.fmt(f)?;
-                    writeln!(f, "{}", operator)?;
+                    writeln!(f, "{operator}")?;
                 }
                 right_most.fmt(f)?;
                 if let Some(limit) = limit {
-                    writeln!(f, "LIMIT: {}", limit)?;
+                    writeln!(f, "LIMIT: {limit}")?;
                 }
                 if let Some(offset) = offset {
-                    writeln!(f, "OFFSET: {}", offset)?;
+                    writeln!(f, "OFFSET: {offset}")?;
                 }
                 if let Some(order_by) = order_by {
                     writeln!(f, "ORDER BY:")?;
@@ -95,7 +95,7 @@ impl Display for SelectPlan {
                         format!("{} AS {}", reference.table.get_name(), reference.identifier)
                     };
 
-                    writeln!(f, "{}SCAN {}", indent, table_name)?;
+                    writeln!(f, "{indent}SCAN {table_name}")?;
                 }
                 Operation::Search(search) => match search {
                     Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
@@ -137,7 +137,7 @@ impl Display for DeletePlan {
                         format!("{} AS {}", reference.table.get_name(), reference.identifier)
                     };
 
-                    writeln!(f, "{}DELETE FROM {}", indent, table_name)?;
+                    writeln!(f, "{indent}DELETE FROM {table_name}")?;
                 }
                 Operation::Search { .. } => {
                     panic!("DELETE plans should not contain search operations");
@@ -173,9 +173,9 @@ impl fmt::Display for UpdatePlan {
                     };
 
                     if i == 0 {
-                        writeln!(f, "{}UPDATE {}", indent, table_name)?;
+                        writeln!(f, "{indent}UPDATE {table_name}")?;
                     } else {
-                        writeln!(f, "{}SCAN {}", indent, table_name)?;
+                        writeln!(f, "{indent}SCAN {table_name}")?;
                     }
                 }
                 Operation::Search(search) => match search {
@@ -214,7 +214,7 @@ impl fmt::Display for UpdatePlan {
             }
         }
         if let Some(limit) = self.limit {
-            writeln!(f, "LIMIT: {}", limit)?;
+            writeln!(f, "LIMIT: {limit}")?;
         }
         if let Some(ret) = &self.returning {
             writeln!(f, "RETURNING:")?;
@@ -301,10 +301,10 @@ impl ToSqlString for Plan {
                     ));
                 }
                 if let Some(limit) = &limit {
-                    ret.push(format!("LIMIT {}", limit));
+                    ret.push(format!("LIMIT {limit}"));
                 }
                 if let Some(offset) = &offset {
-                    ret.push(format!("OFFSET {}", offset));
+                    ret.push(format!("OFFSET {offset}"));
                 }
                 ret.join(" ")
             }
@@ -364,7 +364,7 @@ impl ToSqlString for SelectPlan {
                             .map(|e| e.to_sql_string(context))
                             .collect::<Vec<_>>()
                             .join(", ");
-                        format!("({})", joined_value)
+                        format!("({joined_value})")
                     })
                     .collect::<Vec<_>>()
                     .join(", ")
@@ -384,7 +384,7 @@ impl ToSqlString for SelectPlan {
                             cols.expr.to_sql_string(context),
                             cols.alias
                                 .as_ref()
-                                .map_or("".to_string(), |alias| format!(" AS {}", alias))
+                                .map_or("".to_string(), |alias| format!(" AS {alias}"))
                         )
                     })
                     .collect::<Vec<_>>()
@@ -450,10 +450,10 @@ impl ToSqlString for SelectPlan {
             ));
         }
         if let Some(limit) = &self.limit {
-            ret.push(format!("LIMIT {}", limit));
+            ret.push(format!("LIMIT {limit}"));
         }
         if let Some(offset) = &self.offset {
-            ret.push(format!("OFFSET {}", offset));
+            ret.push(format!("OFFSET {offset}"));
         }
         ret.join(" ")
     }
@@ -493,10 +493,10 @@ impl ToSqlString for DeletePlan {
             ));
         }
         if let Some(limit) = &self.limit {
-            ret.push(format!("LIMIT {}", limit));
+            ret.push(format!("LIMIT {limit}"));
         }
         if let Some(offset) = &self.offset {
-            ret.push(format!("OFFSET {}", offset));
+            ret.push(format!("OFFSET {offset}"));
         }
         ret.join(" ")
     }
@@ -560,10 +560,10 @@ impl ToSqlString for UpdatePlan {
             ));
         }
         if let Some(limit) = &self.limit {
-            ret.push(format!("LIMIT {}", limit));
+            ret.push(format!("LIMIT {limit}"));
         }
         if let Some(offset) = &self.offset {
-            ret.push(format!("OFFSET {}", offset));
+            ret.push(format!("OFFSET {offset}"));
         }
         ret.join(" ")
     }

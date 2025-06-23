@@ -443,7 +443,7 @@ fn bench(criterion: &mut Criterion) {
     for (size_name, json_payload) in json_sizes.iter() {
         let query = format!("SELECT jsonb('{}')", json_payload.replace("'", "\\'"));
 
-        let mut group = criterion.benchmark_group(format!("JSONB Size - {}", size_name));
+        let mut group = criterion.benchmark_group(format!("JSONB Size - {size_name}"));
 
         group.bench_function("Limbo", |b| {
             let mut stmt = limbo_conn.prepare(&query).unwrap();
@@ -893,7 +893,7 @@ fn bench_json_patch(criterion: &mut Criterion) {
             patch_json.replace("'", "''")
         );
 
-        let mut group = criterion.benchmark_group(format!("JSON Patch - {}", case_name));
+        let mut group = criterion.benchmark_group(format!("JSON Patch - {case_name}"));
 
         group.bench_function("Limbo", |b| {
             let mut stmt = limbo_conn.prepare(&query).unwrap();

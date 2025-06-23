@@ -314,7 +314,7 @@ impl File for UnixFile<'_> {
                 ErrorKind::WouldBlock => {
                     "Failed locking file. File is locked by another process".to_string()
                 }
-                _ => format!("Failed locking file, {}", io_error),
+                _ => format!("Failed locking file, {io_error}"),
             };
             LimboError::LockingError(message)
         })?;

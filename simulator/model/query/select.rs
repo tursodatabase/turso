@@ -30,9 +30,9 @@ pub enum ResultColumn {
 impl Display for ResultColumn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ResultColumn::Expr(expr) => write!(f, "({})", expr),
+            ResultColumn::Expr(expr) => write!(f, "({expr})"),
             ResultColumn::Star => write!(f, "*"),
-            ResultColumn::Column(name) => write!(f, "{}", name),
+            ResultColumn::Column(name) => write!(f, "{name}"),
         }
     }
 }
@@ -73,8 +73,7 @@ impl Display for Select {
                 .join(", "),
             self.table,
             self.predicate,
-            self.limit
-                .map_or("".to_string(), |l| format!(" LIMIT {}", l))
+            self.limit.map_or("".to_string(), |l| format!(" LIMIT {l}"))
         )
     }
 }

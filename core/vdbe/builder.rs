@@ -225,7 +225,7 @@ impl ProgramBuilder {
     pub fn constant_span_is_open(&self) -> bool {
         self.constant_spans
             .last()
-            .map_or(false, |(_, end)| *end == usize::MAX)
+            .is_some_and(|(_, end)| *end == usize::MAX)
     }
 
     /// Get the index of the next constant span.
@@ -272,7 +272,7 @@ impl ProgramBuilder {
             !self
                 .cursor_ref
                 .iter()
-                .any(|(k, _)| k.as_ref().map_or(false, |k| k.equals(&key))),
+                .any(|(k, _)| k.as_ref().is_some_and(|k| k.equals(&key))),
             "duplicate cursor key"
         );
         self._alloc_cursor_id(Some(key), cursor_type)
@@ -456,7 +456,7 @@ impl ProgramBuilder {
     /// reordering the emitted instructions.
     #[inline]
     pub fn preassign_label_to_next_insn(&mut self, label: BranchOffset) {
-        assert!(label.is_label(), "BranchOffset {:?} is not a label", label);
+        assert!(label.is_label(), "BranchOffset {label:?} is not a label");
         self._resolve_label(label, self.offset().sub(1u32), JumpTarget::AfterThisInsn);
     }
 
@@ -492,10 +492,7 @@ impl ProgramBuilder {
                 let Some(Some((to_offset, target))) =
                     self.label_to_resolved_offset.get(*label as usize)
                 else {
-                    panic!(
-                        "Reference to undefined or unresolved label in {}: {}",
-                        insn_name, label
-                    );
+                    panic!("Reference to undefined or unresolved label in {insn_name}: {label}");
                 };
                 *pc = BranchOffset::Offset(
                     to_offset
@@ -707,12 +704,12 @@ impl ProgramBuilder {
     pub fn resolve_cursor_id_safe(&self, key: &CursorKey) -> Option<CursorID> {
         self.cursor_ref
             .iter()
-            .position(|(k, _)| k.as_ref().map_or(false, |k| k.equals(key)))
+            .position(|(k, _)| k.as_ref().is_some_and(|k| k.equals(key)))
     }
 
     pub fn resolve_cursor_id(&self, key: &CursorKey) -> CursorID {
         self.resolve_cursor_id_safe(key)
-            .unwrap_or_else(|| panic!("Cursor not found: {:?}", key))
+            .unwrap_or_else(|| panic!("Cursor not found: {key:?}"))
     }
 
     pub fn set_collation(&mut self, c: Option<(CollationSeq, bool)>) {

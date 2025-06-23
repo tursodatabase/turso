@@ -36,8 +36,7 @@ mod tests {
         let sqlite_result = sqlite_exec_rows(&sqlite_conn, offending_query);
         assert_eq!(
             limbo_result, sqlite_result,
-            "query: {}, limbo: {:?}, sqlite: {:?}",
-            offending_query, limbo_result, sqlite_result
+            "query: {offending_query}, limbo: {limbo_result:?}, sqlite: {sqlite_result:?}"
         );
     }
 
@@ -55,8 +54,7 @@ mod tests {
             let sqlite = sqlite_exec_rows(&sqlite_conn, query);
             assert_eq!(
                 limbo, sqlite,
-                "query: {}, limbo: {:?}, sqlite: {:?}",
-                query, limbo, sqlite
+                "query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?}"
             );
         }
     }
@@ -69,7 +67,7 @@ mod tests {
         let insert = format!(
             "INSERT INTO t VALUES {}",
             (1..100)
-                .map(|x| format!("({})", x))
+                .map(|x| format!("({x})"))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -104,13 +102,12 @@ mod tests {
                             order_by.unwrap_or("")
                         );
 
-                        log::trace!("query: {}", query);
+                        log::trace!("query: {query}");
                         let limbo_result = limbo_exec_rows(&db, &limbo_conn, &query);
                         let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
                         assert_eq!(
                             limbo_result, sqlite_result,
-                            "query: {}, limbo: {:?}, sqlite: {:?}, seed: {}",
-                            query, limbo_result, sqlite_result, seed
+                            "query: {query}, limbo: {limbo_result:?}, sqlite: {sqlite_result:?}, seed: {seed}"
                         );
                     }
                 }
@@ -673,15 +670,14 @@ mod tests {
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
         let (mut rng, seed) = rng_from_time();
-        log::info!("seed: {}", seed);
+        log::info!("seed: {seed}");
         for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
             let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
             assert_eq!(
                 limbo, sqlite,
-                "query: {}, limbo: {:?}, sqlite: {:?} seed: {}",
-                query, limbo, sqlite, seed
+                "query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?} seed: {seed}"
             );
         }
     }
@@ -708,8 +704,7 @@ mod tests {
             let sqlite = sqlite_exec_rows(&sqlite_conn, query);
             assert_eq!(
                 limbo, sqlite,
-                "query: {}, limbo: {:?}, sqlite: {:?}",
-                query, limbo, sqlite
+                "query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?}"
             );
         }
     }
@@ -794,10 +789,10 @@ mod tests {
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
         let (mut rng, seed) = rng_from_time();
-        log::info!("seed: {}", seed);
+        log::info!("seed: {seed}");
         for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
-            log::info!("query: {}", query);
+            log::info!("query: {query}");
             let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
             match (&limbo[0][0], &sqlite[0][0]) {
@@ -808,11 +803,7 @@ mod tests {
                     assert!(
                         (limbo - sqlite).abs() < 1e-9
                             || (limbo - sqlite) / (limbo.abs().max(sqlite.abs())) < 1e-9,
-                        "query: {}, limbo: {:?}, sqlite: {:?} seed: {}",
-                        query,
-                        limbo,
-                        sqlite,
-                        seed
+                        "query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?} seed: {seed}"
                     )
                 }
                 _ => {}
@@ -958,16 +949,15 @@ mod tests {
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
         let (mut rng, seed) = rng_from_time();
-        log::info!("seed: {}", seed);
+        log::info!("seed: {seed}");
         for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
-            log::info!("query: {}", query);
+            log::info!("query: {query}");
             let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
             assert_eq!(
                 limbo, sqlite,
-                "query: {}, limbo: {:?}, sqlite: {:?} seed: {}",
-                query, limbo, sqlite, seed
+                "query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?} seed: {seed}"
             );
         }
     }
@@ -1328,16 +1318,15 @@ mod tests {
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
         let (mut rng, seed) = rng_from_time();
-        log::info!("seed: {}", seed);
+        log::info!("seed: {seed}");
         for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
-            log::info!("query: {}", query);
+            log::info!("query: {query}");
             let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
             assert_eq!(
                 limbo, sqlite,
-                "query: {}, limbo: {:?}, sqlite: {:?} seed: {}",
-                query, limbo, sqlite, seed
+                "query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?} seed: {seed}"
             );
         }
     }
@@ -1366,8 +1355,7 @@ mod tests {
                 let sqlite = sqlite_exec_rows(&sqlite_conn, query);
                 assert_eq!(
                     limbo, sqlite,
-                    "queries: {:?}, query: {}, limbo: {:?}, sqlite: {:?}",
-                    queries, query, limbo, sqlite
+                    "queries: {queries:?}, query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?}"
                 );
             }
         }

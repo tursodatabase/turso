@@ -173,7 +173,7 @@ impl Display for VectorFunc {
             Self::VectorExtract => "vector_extract".to_string(),
             Self::VectorDistanceCos => "vector_distance_cos".to_string(),
         };
-        write!(f, "{}", str)
+        write!(f, "{str}")
     }
 }
 
@@ -435,7 +435,7 @@ impl Display for ScalarFunc {
             Self::TimeDiff => "timediff".to_string(),
             Self::Likelihood => "likelihood".to_string(),
         };
-        write!(f, "{}", str)
+        write!(f, "{str}")
     }
 }
 
@@ -550,7 +550,7 @@ impl Display for MathFunc {
             Self::Tanh => "tanh".to_string(),
             Self::Trunc => "trunc".to_string(),
         };
-        write!(f, "{}", str)
+        write!(f, "{str}")
     }
 }
 
@@ -585,13 +585,13 @@ impl Display for Func {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Agg(agg_func) => write!(f, "{}", agg_func.to_string()),
-            Self::Scalar(scalar_func) => write!(f, "{}", scalar_func),
-            Self::Math(math_func) => write!(f, "{}", math_func),
-            Self::Vector(vector_func) => write!(f, "{}", vector_func),
+            Self::Scalar(scalar_func) => write!(f, "{scalar_func}"),
+            Self::Math(math_func) => write!(f, "{math_func}"),
+            Self::Vector(vector_func) => write!(f, "{vector_func}"),
             #[cfg(feature = "json")]
-            Self::Json(json_func) => write!(f, "{}", json_func),
-            Self::External(generic_func) => write!(f, "{}", generic_func),
-            Self::AlterTable(alter_func) => write!(f, "{}", alter_func),
+            Self::Json(json_func) => write!(f, "{json_func}"),
+            Self::External(generic_func) => write!(f, "{generic_func}"),
+            Self::AlterTable(alter_func) => write!(f, "{alter_func}"),
         }
     }
 }
@@ -636,7 +636,7 @@ impl Func {
             }
             "group_concat" => {
                 if arg_count != 1 && arg_count != 2 {
-                    println!("{}", arg_count);
+                    println!("{arg_count}");
                     crate::bail_parse_error!("wrong number of arguments to function {}()", name)
                 }
                 Ok(Self::Agg(AggFunc::GroupConcat))

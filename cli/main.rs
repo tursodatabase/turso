@@ -51,7 +51,7 @@ fn main() -> anyhow::Result<()> {
             Ok(line) => match app.handle_input_line(line.trim()) {
                 Ok(_) => {}
                 Err(e) => {
-                    eprintln!("{}", e);
+                    eprintln!("{e}");
                 }
             },
             Err(ReadlineError::Interrupted) => {

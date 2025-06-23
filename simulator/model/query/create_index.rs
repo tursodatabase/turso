@@ -47,7 +47,7 @@ impl std::fmt::Display for CreateIndex {
             self.table_name,
             self.columns
                 .iter()
-                .map(|(name, order)| format!("{} {}", name, order))
+                .map(|(name, order)| format!("{name} {order}"))
                 .collect::<Vec<String>>()
                 .join(", ")
         )

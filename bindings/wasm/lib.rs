@@ -68,8 +68,9 @@ impl RowIterator {
             Ok(turso_core::StepResult::Done) | Ok(turso_core::StepResult::Interrupt) => {
                 JsValue::UNDEFINED
             }
+
             Ok(turso_core::StepResult::Busy) => JsValue::UNDEFINED,
-            Err(e) => panic!("Error: {:?}", e),
+            Err(e) => panic!("Error: {e:?}"),
         }
     }
 }
@@ -104,11 +105,12 @@ impl Statement {
                 }
                 JsValue::from(row_array)
             }
+
             Ok(turso_core::StepResult::IO)
             | Ok(turso_core::StepResult::Done)
             | Ok(turso_core::StepResult::Interrupt)
             | Ok(turso_core::StepResult::Busy) => JsValue::UNDEFINED,
-            Err(e) => panic!("Error: {:?}", e),
+            Err(e) => panic!("Error: {e:?}"),
         }
     }
 
@@ -130,7 +132,7 @@ impl Statement {
                 Ok(turso_core::StepResult::Interrupt) => break,
                 Ok(turso_core::StepResult::Done) => break,
                 Ok(turso_core::StepResult::Busy) => break,
-                Err(e) => panic!("Error: {:?}", e),
+                Err(e) => panic!("Error: {e:?}"),
             }
         }
         array

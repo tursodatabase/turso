@@ -737,7 +737,7 @@ mod tests {
         let binary_json: Vec<u8> = vec![0xA2, 0x62, 0x6B, 0x31, 0x62, 0x76]; // Incomplete binary JSON
         let input = Value::Blob(binary_json);
         let result = get_json(&input, None);
-        println!("{:?}", result);
+        println!("{result:?}");
         match result {
             Ok(_) => panic!("Expected error for malformed JSON"),
             Err(e) => assert!(e.to_string().contains("malformed JSON")),
@@ -923,7 +923,7 @@ mod tests {
 
         match result {
             Ok(Value::Null) => (),
-            _ => panic!("Expected null result, got: {:?}", result),
+            _ => panic!("Expected null result, got: {result:?}"),
         }
     }
     #[test]
@@ -937,7 +937,7 @@ mod tests {
 
         match result {
             Ok(Value::Null) => (),
-            _ => panic!("Expected null result, got: {:?}", result),
+            _ => panic!("Expected null result, got: {result:?}"),
         }
     }
 

@@ -36,5 +36,5 @@ async fn main() {
 
     let value = row.get_value(0).unwrap();
 
-    println!("Row: {:?}", value);
+    println!("Row: {value:?}");
 }

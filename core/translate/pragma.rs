@@ -263,7 +263,7 @@ fn query_pragma(
                 Some(ast::Expr::Name(name)) => {
                     let mode_name = normalize_ident(&name.0);
                     CheckpointMode::from_str(&mode_name).map_err(|e| {
-                        LimboError::ParseError(format!("Unknown Checkpoint Mode: {}", e))
+                        LimboError::ParseError(format!("Unknown Checkpoint Mode: {e}"))
                     })?
                 }
                 _ => CheckpointMode::Passive,

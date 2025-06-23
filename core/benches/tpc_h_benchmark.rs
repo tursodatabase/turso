@@ -81,7 +81,7 @@ fn bench_tpc_h_queries(criterion: &mut Criterion) {
     ];
 
     for (idx, query) in queries.iter() {
-        let mut group = criterion.benchmark_group(format!("Query `{}` ", idx));
+        let mut group = criterion.benchmark_group(format!("Query `{idx}` "));
         group.sampling_mode(SamplingMode::Flat);
         group.sample_size(10);
 

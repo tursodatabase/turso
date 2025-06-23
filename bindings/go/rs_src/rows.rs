@@ -34,7 +34,7 @@ impl<'conn> LimboRows<'conn> {
 
     fn get_error(&mut self) -> *const c_char {
         if let Some(err) = &self.err {
-            let err = format!("{}", err);
+            let err = format!("{err}");
             let c_str = std::ffi::CString::new(err).unwrap();
             self.err = None;
             c_str.into_raw() as *const c_char

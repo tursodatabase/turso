@@ -34,8 +34,8 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 let value = &values[args_index].get_owned_value();
                 match value {
-                    Value::Integer(_) => result.push_str(&format!("{}", value)),
-                    Value::Float(_) => result.push_str(&format!("{}", value)),
+                    Value::Integer(_) => result.push_str(&format!("{value}")),
+                    Value::Float(_) => result.push_str(&format!("{value}")),
                     _ => result.push('0'),
                 }
                 args_index += 1;
@@ -47,7 +47,7 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 match &values[args_index].get_owned_value() {
                     Value::Text(t) => result.push_str(t.as_str()),
                     Value::Null => result.push_str("(null)"),
-                    v => result.push_str(&format!("{}", v)),
+                    v => result.push_str(&format!("{v}")),
                 }
                 args_index += 1;
             }
@@ -57,7 +57,7 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 let value = &values[args_index].get_owned_value();
                 match value {
-                    Value::Float(f) => result.push_str(&format!("{:.6}", f)),
+                    Value::Float(f) => result.push_str(&format!("{f:.6}")),
                     Value::Integer(i) => result.push_str(&format!("{:.6}", *i as f64)),
                     _ => result.push_str("0.0"),
                 }

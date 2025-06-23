@@ -96,7 +96,7 @@ impl TryFrom<&str> for LimboColor {
             "dark-cyan" => Color::Fixed(6),
             "grey" => Color::Fixed(7),
             "dark-grey" => Color::Fixed(8),
-            _ => return Err(format!("Could not parse color in string: {}", value)),
+            _ => return Err(format!("Could not parse color in string: {value}")),
         };
 
         trace!("Read predefined color: {}", value);

@@ -67,7 +67,7 @@ fn float_to_string<S>(float: &f64, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
-    serializer.serialize_str(&format!("{}", float))
+    serializer.serialize_str(&format!("{float}"))
 }
 
 fn string_to_float<'de, D>(deserializer: D) -> Result<f64, D::Error>
@@ -86,7 +86,7 @@ fn to_sqlite_blob(bytes: &[u8]) -> String {
         "X'{}'",
         bytes
             .iter()
-            .fold(String::new(), |acc, b| acc + &format!("{:02X}", b))
+            .fold(String::new(), |acc, b| acc + &format!("{b:02X}"))
     )
 }
 
@@ -94,9 +94,9 @@ impl Display for SimValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.0 {
             types::Value::Null => write!(f, "NULL"),
-            types::Value::Integer(i) => write!(f, "{}", i),
-            types::Value::Float(fl) => write!(f, "{}", fl),
-            value @ types::Value::Text(..) => write!(f, "'{}'", value),
+            types::Value::Integer(i) => write!(f, "{i}"),
+            types::Value::Float(fl) => write!(f, "{fl}"),
+            value @ types::Value::Text(..) => write!(f, "'{value}'"),
             types::Value::Blob(b) => write!(f, "{}", to_sqlite_blob(b)),
         }
     }

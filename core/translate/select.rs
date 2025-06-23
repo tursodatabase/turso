@@ -74,7 +74,7 @@ pub fn translate_select(
                         .sum::<usize>(),
             }
         }
-        other => panic!("plan is not a SelectPlan: {:?}", other),
+        other => panic!("plan is not a SelectPlan: {other:?}"),
     };
 
     program.extend(&opts);
@@ -148,7 +148,7 @@ pub fn prepare_select_plan(
             let (limit, offset) = select.limit.map_or(Ok((None, None)), |l| parse_limit(&l))?;
 
             // FIXME: handle OFFSET for compound selects
-            if offset.map_or(false, |o| o > 0) {
+            if offset.is_some_and(|o| o > 0) {
                 crate::bail_parse_error!("OFFSET is not supported for compound SELECTs yet");
             }
             // FIXME: handle ORDER BY for compound selects
@@ -257,7 +257,7 @@ fn prepare_one_select_plan(
                     .map(|(i, t)| JoinOrderMember {
                         table_id: t.internal_id,
                         original_idx: i,
-                        is_outer: t.join_info.as_ref().map_or(false, |j| j.outer),
+                        is_outer: t.join_info.as_ref().is_some_and(|j| j.outer),
                     })
                     .collect(),
                 table_references,

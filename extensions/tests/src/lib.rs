@@ -59,7 +59,7 @@ impl VTabCursor for KVStoreCursor {
                     .first()
                     .and_then(|v| v.to_text())
                     .map(|s| s.to_string());
-                log::debug!("idx_str found: key_eq\n value: {:?}", key);
+                log::debug!("idx_str found: key_eq\n value: {key:?}");
                 if let Some(key) = key {
                     let rowid = hash_key(&key);
                     let store = GLOBAL_STORE.lock().unwrap();
@@ -251,7 +251,7 @@ impl VfsExtension for TestFS {
     type File = TestFile;
     fn open_file(&self, path: &str, flags: i32, _direct: bool) -> ExtResult<Self::File> {
         let _ = env_logger::try_init();
-        log::debug!("opening file with testing VFS: {} flags: {}", path, flags);
+        log::debug!("opening file with testing VFS: {path} flags: {flags}");
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -372,7 +372,7 @@ impl VTabCursor for StatsCursor {
         master.close();
         for tbl in tables {
             // count rows for each table
-            if let Ok(mut count_stmt) = conn.prepare(&format!("SELECT COUNT(*) FROM {};", tbl)) {
+            if let Ok(mut count_stmt) = conn.prepare(&format!("SELECT COUNT(*) FROM {tbl};")) {
                 let count = match count_stmt.step() {
                     StepResult::Row => count_stmt.get_row()[0].to_integer().unwrap_or(0),
                     _ => 0,

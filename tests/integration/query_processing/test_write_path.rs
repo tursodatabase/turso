@@ -50,7 +50,7 @@ fn test_simple_overflow_page() -> anyhow::Result<()> {
         },
         Ok(None) => {}
         Err(err) => {
-            eprintln!("{}", err);
+            eprintln!("{err}");
         }
     };
 
@@ -77,7 +77,7 @@ fn test_simple_overflow_page() -> anyhow::Result<()> {
         },
         Ok(None) => {}
         Err(err) => {
-            eprintln!("{}", err);
+            eprintln!("{err}");
         }
     }
     do_flush(&conn, &tmp_db)?;
@@ -118,7 +118,7 @@ fn test_sequential_overflow_page() -> anyhow::Result<()> {
             },
             Ok(None) => {}
             Err(err) => {
-                eprintln!("{}", err);
+                eprintln!("{err}");
             }
         };
     }
@@ -147,7 +147,7 @@ fn test_sequential_overflow_page() -> anyhow::Result<()> {
         },
         Ok(None) => {}
         Err(err) => {
-            eprintln!("{}", err);
+            eprintln!("{err}");
         }
     }
     do_flush(&conn, &tmp_db)?;
@@ -167,12 +167,12 @@ fn test_sequential_write() -> anyhow::Result<()> {
     let list_query = "SELECT * FROM test";
     let max_iterations = 10000;
     for i in 0..max_iterations {
-        println!("inserting {} ", i);
+        println!("inserting {i} ");
         if (i % 100) == 0 {
             let progress = (i as f64 / max_iterations as f64) * 100.0;
-            println!("progress {:.1}%", progress);
+            println!("progress {progress:.1}%");
         }
-        let insert_query = format!("INSERT INTO test VALUES ({})", i);
+        let insert_query = format!("INSERT INTO test VALUES ({i})");
         run_query(&tmp_db, &conn, &insert_query)?;
 
         let mut current_read_index = 0;
@@ -283,7 +283,7 @@ fn test_wal_checkpoint() -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
     for i in 0..iterations {
-        let insert_query = format!("INSERT INTO test VALUES ({})", i);
+        let insert_query = format!("INSERT INTO test VALUES ({i})");
         do_flush(&conn, &tmp_db)?;
         conn.checkpoint()?;
         run_query(&tmp_db, &conn, &insert_query)?;
@@ -309,10 +309,10 @@ fn test_wal_restart() -> anyhow::Result<()> {
     // threshold is 1000 by default
 
     fn insert(i: usize, conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
-        debug!("inserting {}", i);
-        let insert_query = format!("INSERT INTO test VALUES ({})", i);
+        debug!("inserting {i}");
+        let insert_query = format!("INSERT INTO test VALUES ({i})");
         run_query(tmp_db, conn, &insert_query)?;
-        debug!("inserted {}", i);
+        debug!("inserted {i}");
         tmp_db.io.run_once()?;
         Ok(())
     }
@@ -324,7 +324,7 @@ fn test_wal_restart() -> anyhow::Result<()> {
         run_query_on_row(tmp_db, conn, list_query, |row: &Row| {
             assert!(count.is_none());
             count = Some(row.get::<i64>(0).unwrap() as usize);
-            debug!("counted {:?}", count);
+            debug!("counted {count:?}");
         })?;
         Ok(count.unwrap())
     }
@@ -372,15 +372,15 @@ fn test_write_delete_with_index() -> anyhow::Result<()> {
     let list_query = "SELECT * FROM test";
     let max_iterations = 1000;
     for i in 0..max_iterations {
-        println!("inserting {} ", i);
-        let insert_query = format!("INSERT INTO test VALUES ({})", i);
+        println!("inserting {i} ");
+        let insert_query = format!("INSERT INTO test VALUES ({i})");
         run_query(&tmp_db, &conn, &insert_query)?;
     }
     for i in 0..max_iterations {
-        println!("deleting {} ", i);
-        let delete_query = format!("delete from test where x={}", i);
+        println!("deleting {i} ");
+        let delete_query = format!("delete from test where x={i}");
         run_query(&tmp_db, &conn, &delete_query)?;
-        println!("listing after deleting {} ", i);
+        println!("listing after deleting {i} ");
         let mut current_read_index = i + 1;
         run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
             let first_value = row.get::<&Value>(0).expect("missing id");
@@ -397,7 +397,7 @@ fn test_write_delete_with_index() -> anyhow::Result<()> {
             run_query_on_row(
                 &tmp_db,
                 &conn,
-                &format!("select * from test where x = {}", i),
+                &format!("select * from test where x = {i}"),
                 |row| {
                     let first_value = row.get::<&Value>(0).expect("missing id");
                     let id = match first_value {
@@ -798,7 +798,7 @@ fn run_query_core(
         },
         Ok(None) => {}
         Err(err) => {
-            eprintln!("{}", err);
+            eprintln!("{err}");
         }
     };
     Ok(())

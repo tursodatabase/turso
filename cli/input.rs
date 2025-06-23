@@ -29,7 +29,7 @@ impl Display for Io {
             Io::Syscall => write!(f, "syscall"),
             #[cfg(all(target_os = "linux", feature = "io_uring"))]
             Io::IoUring => write!(f, "io_uring"),
-            Io::External(str) => write!(f, "{}", str),
+            Io::External(str) => write!(f, "{str}"),
         }
     }
 }
@@ -144,7 +144,7 @@ pub fn get_writer(output: &str) -> Box<dyn Write> {
         _ => match std::fs::File::create(output) {
             Ok(file) => Box::new(file),
             Err(e) => {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e}");
                 Box::new(io::stdout())
             }
         },
