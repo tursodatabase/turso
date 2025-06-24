@@ -22,7 +22,7 @@ impl Predicate {
 
     pub(crate) fn test(&self, row: &[SimValue], table: &Table) -> bool {
         let value = expr_to_value(&self.0, row, table);
-        value.map_or(false, |value| value.into_bool())
+        value.map_or(false, |value| value.as_bool())
     }
 }
 

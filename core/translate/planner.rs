@@ -10,6 +10,7 @@ use super::{
     select::prepare_select_plan,
     SymbolTable,
 };
+use crate::translate::expr::WalkControl;
 use crate::{
     function::Func,
     schema::{Schema, Table},
@@ -26,13 +27,13 @@ pub const ROWID: &str = "rowid";
 
 pub fn resolve_aggregates(top_level_expr: &Expr, aggs: &mut Vec<Aggregate>) -> Result<bool> {
     let mut contains_aggregates = false;
-    walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<()> {
+    walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
         if aggs
             .iter()
             .any(|a| exprs_are_equivalent(&a.original_expr, expr))
         {
             contains_aggregates = true;
-            return Ok(());
+            return Ok(WalkControl::Continue);
         }
         match expr {
             Expr::FunctionCall {
@@ -97,7 +98,7 @@ pub fn resolve_aggregates(top_level_expr: &Expr, aggs: &mut Vec<Aggregate>) -> R
             _ => {}
         }
 
-        Ok(())
+        Ok(WalkControl::Continue)
     })?;
 
     Ok(contains_aggregates)
@@ -239,7 +240,7 @@ pub fn bind_column_references(
     })
 }
 
-fn parse_from_clause_table<'a>(
+fn parse_from_clause_table(
     schema: &Schema,
     table: ast::SelectTable,
     table_references: &mut TableReferences,
@@ -287,7 +288,7 @@ fn parse_from_clause_table<'a>(
                     identifier: alias.unwrap_or(normalized_qualified_name),
                     internal_id: table_ref_counter.next(),
                     join_info: None,
-                    col_used_mask: ColumnUsedMask::new(),
+                    col_used_mask: ColumnUsedMask::default(),
                 });
                 return Ok(());
             };
@@ -312,7 +313,7 @@ fn parse_from_clause_table<'a>(
                         identifier: outer_ref.identifier.clone(),
                         internal_id: table_ref_counter.next(),
                         join_info: None,
-                        col_used_mask: ColumnUsedMask::new(),
+                        col_used_mask: ColumnUsedMask::default(),
                     });
                     return Ok(());
                 }
@@ -370,7 +371,7 @@ fn parse_from_clause_table<'a>(
                 table: Table::Virtual(vtab),
                 identifier: alias,
                 internal_id: table_ref_counter.next(),
-                col_used_mask: ColumnUsedMask::new(),
+                col_used_mask: ColumnUsedMask::default(),
             });
 
             Ok(())
@@ -379,7 +380,7 @@ fn parse_from_clause_table<'a>(
     }
 }
 
-pub fn parse_from<'a>(
+pub fn parse_from(
     schema: &Schema,
     mut from: Option<FromClause>,
     syms: &SymbolTable,
@@ -434,7 +435,7 @@ pub fn parse_from<'a>(
                     identifier: t.identifier.clone(),
                     internal_id: t.internal_id,
                     table: t.table.clone(),
-                    col_used_mask: ColumnUsedMask::new(),
+                    col_used_mask: ColumnUsedMask::default(),
                 }
             }));
 
@@ -534,7 +535,7 @@ pub fn determine_where_to_eval_term(
         ));
     }
 
-    return determine_where_to_eval_expr(&term.expr, join_order);
+    determine_where_to_eval_expr(&term.expr, join_order)
 }
 
 /// A bitmask representing a set of tables in a query plan.
@@ -639,7 +640,7 @@ pub fn table_mask_from_expr(
     table_references: &TableReferences,
 ) -> Result<TableMask> {
     let mut mask = TableMask::new();
-    walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<()> {
+    walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
         match expr {
             Expr::Column { table, .. } | Expr::RowId { table, .. } => {
                 if let Some(table_idx) = table_references
@@ -660,18 +661,18 @@ pub fn table_mask_from_expr(
             }
             _ => {}
         }
-        Ok(())
+        Ok(WalkControl::Continue)
     })?;
 
     Ok(mask)
 }
 
-pub fn determine_where_to_eval_expr<'a>(
-    top_level_expr: &'a Expr,
+pub fn determine_where_to_eval_expr(
+    top_level_expr: &Expr,
     join_order: &[JoinOrderMember],
 ) -> Result<EvalAt> {
     let mut eval_at: EvalAt = EvalAt::BeforeLoop;
-    walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<()> {
+    walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
         match expr {
             Expr::Column { table, .. } | Expr::RowId { table, .. } => {
                 let join_idx = join_order
@@ -682,13 +683,13 @@ pub fn determine_where_to_eval_expr<'a>(
             }
             _ => {}
         }
-        Ok(())
+        Ok(WalkControl::Continue)
     })?;
 
     Ok(eval_at)
 }
 
-fn parse_join<'a>(
+fn parse_join(
     schema: &Schema,
     join: ast::JoinedSelectTable,
     syms: &SymbolTable,

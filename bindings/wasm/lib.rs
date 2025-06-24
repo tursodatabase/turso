@@ -1,8 +1,12 @@
+#[cfg(all(feature = "web", feature = "nodejs"))]
+compile_error!("Features 'web' and 'nodejs' cannot be enabled at the same time");
+
 use js_sys::{Array, Object};
 use limbo_core::{maybe_init_database_file, Clock, Instant, OpenFlags, Result};
 use std::cell::RefCell;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
+
 #[allow(dead_code)]
 #[wasm_bindgen]
 pub struct Database {
@@ -48,6 +52,7 @@ impl RowIterator {
     }
 
     #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> JsValue {
         let mut stmt = self.inner.borrow_mut();
         match stmt.step() {
@@ -364,10 +369,7 @@ impl limbo_core::DatabaseStorage for DatabaseFile {
     }
 }
 
-#[cfg(all(feature = "web", feature = "nodejs"))]
-compile_error!("Features 'web' and 'nodejs' cannot be enabled at the same time");
-
-#[cfg(feature = "web")]
+#[cfg(all(feature = "web", not(feature = "nodejs")))]
 #[wasm_bindgen(module = "/web/src/web-vfs.js")]
 extern "C" {
     type VFS;
@@ -393,7 +395,7 @@ extern "C" {
     fn sync(this: &VFS, fd: i32);
 }
 
-#[cfg(feature = "nodejs")]
+#[cfg(all(feature = "nodejs", not(feature = "web")))]
 #[wasm_bindgen(module = "/node/src/vfs.cjs")]
 extern "C" {
     type VFS;

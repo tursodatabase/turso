@@ -154,7 +154,7 @@ impl<C: Parser + Send + Sync + 'static> SqlCompleter<C> {
             conn,
             io,
             cmd: C::command().into(),
-            _cmd_phantom: PhantomData::default(),
+            _cmd_phantom: PhantomData,
         }
     }
 
@@ -165,7 +165,7 @@ impl<C: Parser + Send + Sync + 'static> SqlCompleter<C> {
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
         // TODO maybe check to see if the line is empty and then just output the command names
         line = &line[1..];
-        pos = pos - 1;
+        pos -= 1;
 
         let (prefix_pos, _) = extract_word(line, pos, ESCAPE_CHAR, default_break_chars);
 

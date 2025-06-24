@@ -721,7 +721,7 @@ fn test_lazy_scan_cursor_basic() {
     assert_eq!(count, 5);
 
     // After the last row, is_empty should return true
-    assert!(cursor.forward() == false);
+    assert!(!cursor.forward());
     assert!(cursor.is_empty());
 }
 
@@ -840,7 +840,7 @@ fn test_scan_cursor_basic() {
     assert_eq!(count, 5);
 
     // After the last row, is_empty should return true
-    assert!(cursor.forward() == false);
+    assert!(!cursor.forward());
     assert!(cursor.is_empty());
 }
 

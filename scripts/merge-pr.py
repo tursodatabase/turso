@@ -9,28 +9,32 @@
 # ```
 # pip install PyGithub
 # ```
-import sys
-import re
-from github import Github
+import json
 import os
+import re
 import subprocess
+import sys
 import tempfile
 import textwrap
-import json
+
+from github import Github
+
 
 def run_command(command):
-    process = subprocess.Popen(
-        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
     output, error = process.communicate()
-    return output.decode('utf-8').strip(), error.decode('utf-8').strip(), process.returncode
+    return output.decode("utf-8").strip(), error.decode("utf-8").strip(), process.returncode
 
-def load_user_mapping(file_path='.github.json'):
+
+def load_user_mapping(file_path=".github.json"):
     if os.path.exists(file_path):
-        with open(file_path, 'r') as f:
+        with open(file_path, "r") as f:
             return json.load(f)
     return {}
 
+
 user_mapping = load_user_mapping()
+
 
 def get_user_email(g, username):
     if username in user_mapping:
@@ -48,6 +52,7 @@ def get_user_email(g, username):
     # If we couldn't find an email, return a noreply address
     return f"{username} <{username}@users.noreply.github.com>"
 
+
 def get_pr_info(g, repo, pr_number):
     pr = repo.get_pull(int(pr_number))
     author = pr.user
@@ -57,41 +62,43 @@ def get_pr_info(g, repo, pr_number):
     reviewed_by = []
     reviews = pr.get_reviews()
     for review in reviews:
-        if review.state == 'APPROVED':
+        if review.state == "APPROVED":
             reviewer = review.user
             reviewed_by.append(get_user_email(g, reviewer.login))
 
     return {
-        'number': pr.number,
-        'title': pr.title,
-        'author': author_name,
-        'head': pr.head.ref,
-        'head_sha': pr.head.sha,
-        'body': pr.body.strip() if pr.body else '',
-        'reviewed_by': reviewed_by
+        "number": pr.number,
+        "title": pr.title,
+        "author": author_name,
+        "head": pr.head.ref,
+        "head_sha": pr.head.sha,
+        "body": pr.body.strip() if pr.body else "",
+        "reviewed_by": reviewed_by,
     }
 
+
 def wrap_text(text, width=72):
-    lines = text.split('\n')
+    lines = text.split("\n")
     wrapped_lines = []
     in_code_block = False
     for line in lines:
-        if line.strip().startswith('```'):
+        if line.strip().startswith("```"):
             in_code_block = not in_code_block
             wrapped_lines.append(line)
         elif in_code_block:
             wrapped_lines.append(line)
         else:
             wrapped_lines.extend(textwrap.wrap(line, width=width))
-    return '\n'.join(wrapped_lines)
+    return "\n".join(wrapped_lines)
+
 
 def merge_pr(pr_number):
     # GitHub authentication
-    token = os.getenv('GITHUB_TOKEN')
+    token = os.getenv("GITHUB_TOKEN")
     g = Github(token)
 
     # Get the repository
-    repo_name = os.getenv('GITHUB_REPOSITORY')
+    repo_name = os.getenv("GITHUB_REPOSITORY")
     if not repo_name:
         print("Error: GITHUB_REPOSITORY environment variable not set")
         sys.exit(1)
@@ -102,19 +109,19 @@ def merge_pr(pr_number):
 
     # Format commit message
     commit_title = f"Merge '{pr_info['title']}' from {pr_info['author']}"
-    commit_body = wrap_text(pr_info['body'])
+    commit_body = wrap_text(pr_info["body"])
 
     commit_message = f"{commit_title}\n\n{commit_body}\n"
 
     # Add Reviewed-by lines
-    for approver in pr_info['reviewed_by']:
+    for approver in pr_info["reviewed_by"]:
         commit_message += f"\nReviewed-by: {approver}"
 
     # Add Closes line
     commit_message += f"\n\nCloses #{pr_info['number']}"
 
     # Create a temporary file for the commit message
-    with tempfile.NamedTemporaryFile(mode='w', delete=False) as temp_file:
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
         temp_file.write(commit_message)
         temp_file_path = temp_file.name
 
@@ -147,13 +154,14 @@ def merge_pr(pr_number):
         # Clean up the temporary file
         os.unlink(temp_file_path)
 
+
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         print("Usage: python merge_pr.py <pr_number>")
         sys.exit(1)
 
     pr_number = sys.argv[1]
-    if not re.match(r'^\d+$', pr_number):
+    if not re.match(r"^\d+$", pr_number):
         print("Error: PR number must be a positive integer")
         sys.exit(1)
 

@@ -106,7 +106,7 @@ impl SimValue {
     pub const FALSE: Self = SimValue(types::Value::Integer(0));
     pub const TRUE: Self = SimValue(types::Value::Integer(1));
 
-    pub fn into_bool(&self) -> bool {
+    pub fn as_bool(&self) -> bool {
         Numeric::from(&self.0).try_into_bool().unwrap_or_default()
     }
 
@@ -197,7 +197,7 @@ impl From<&ast::Literal> for SimValue {
             ast::Literal::Null => types::Value::Null,
             ast::Literal::Numeric(number) => Numeric::from(number).into(),
             // TODO: see how to avoid sanitizing here
-            ast::Literal::String(string) => types::Value::build_text(sanitize_string(&string)),
+            ast::Literal::String(string) => types::Value::build_text(sanitize_string(string)),
             ast::Literal::Blob(blob) => types::Value::Blob(
                 blob.as_bytes()
                     .chunks_exact(2)
@@ -235,7 +235,11 @@ impl From<&SimValue> for ast::Literal {
 
 impl From<bool> for SimValue {
     fn from(value: bool) -> Self {
-        value.then_some(SimValue::TRUE).unwrap_or(SimValue::FALSE)
+        if value {
+            SimValue::TRUE
+        } else {
+            SimValue::FALSE
+        }
     }
 }
 

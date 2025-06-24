@@ -168,6 +168,7 @@ fn handle_after_root(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_in_key<'a>(
     ch: (usize, char),
     parser_state: &mut PPState,

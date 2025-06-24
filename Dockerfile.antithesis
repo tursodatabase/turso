@@ -27,6 +27,7 @@ COPY ./sqlite3 ./sqlite3/
 COPY ./tests ./tests/
 COPY ./stress ./stress/
 COPY ./vendored ./vendored/
+COPY ./testing/sqlite_test_ext ./testing/sqlite_test_ext/
 RUN cargo chef prepare --bin limbo_stress --recipe-path recipe.json
 
 #
@@ -65,6 +66,7 @@ COPY --from=planner /app/extensions ./extensions/
 COPY --from=planner /app/macros ./macros/
 COPY --from=planner /app/stress ./stress/
 COPY --from=planner /app/vendored ./vendored/
+COPY --from=planner /app/testing/sqlite_test_ext ./testing/sqlite_test_ext/
 
 RUN if [ "$antithesis" = "true" ]; then \
         cp /opt/antithesis/libvoidstar.so /usr/lib/libvoidstar.so && \

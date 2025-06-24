@@ -1,7 +1,6 @@
 #!/usr/bin/env -S python3 -u
 
 import limbo
-from antithesis.random import get_random
 from antithesis.assertions import always
 
 try:
@@ -12,20 +11,16 @@ except Exception as e:
 
 cur = con.cursor()
 
-initial_state = cur.execute(f'''
+initial_state = cur.execute("""
     SELECT * FROM initial_state
-''').fetchone()
+""").fetchone()
 
-curr_total = cur.execute(f'''
+curr_total = cur.execute("""
     SELECT SUM(balance) AS total FROM accounts;
-''').fetchone()
+""").fetchone()
 
 always(
-    initial_state[1] == curr_total[0], 
-    '[Anytime] Initial balance always equals current balance',
-    {
-        'init_bal': initial_state[1],
-        'curr_bal': curr_total[0]
-    }
+    initial_state[1] == curr_total[0],
+    "[Anytime] Initial balance always equals current balance",
+    {"init_bal": initial_state[1], "curr_bal": curr_total[0]},
 )
-

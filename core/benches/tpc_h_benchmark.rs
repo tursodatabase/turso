@@ -4,7 +4,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use limbo_core::{Database, PlatformIO, IO as _};
 use pprof::criterion::{Output, PProfProfiler};
 
-const TPC_H_PATH: &'static str = "../perf/tpc-h/TPC-H.db";
+const TPC_H_PATH: &str = "../perf/tpc-h/TPC-H.db";
 
 macro_rules! tpc_query {
     ($num:literal) => {

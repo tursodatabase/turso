@@ -2,9 +2,12 @@ pub mod grammar_generator;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "index_experimental")]
+    use rand::seq::IndexedRandom;
+    #[cfg(feature = "index_experimental")]
     use std::collections::HashSet;
 
-    use rand::{seq::IndexedRandom, Rng, SeedableRng};
+    use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
     use rusqlite::params;
 
@@ -22,6 +25,22 @@ mod tests {
             .as_secs();
         let rng = ChaCha8Rng::seed_from_u64(seed);
         (rng, seed)
+    }
+
+    /// [See this issue for more info](https://github.com/tursodatabase/limbo/issues/1763)
+    #[test]
+    pub fn fuzz_failure_issue_1763() {
+        let db = TempDatabase::new_empty();
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+        let offending_query = "SELECT ((ceil(pow((((2.0))), (-2.0 - -1.0) / log(0.5)))) - -2.0)";
+        let limbo_result = limbo_exec_rows(&db, &limbo_conn, offending_query);
+        let sqlite_result = sqlite_exec_rows(&sqlite_conn, offending_query);
+        assert_eq!(
+            limbo_result, sqlite_result,
+            "query: {}, limbo: {:?}, sqlite: {:?}",
+            offending_query, limbo_result, sqlite_result
+        );
     }
 
     #[test]
@@ -384,7 +403,7 @@ mod tests {
                 comp3.map(|x| format!("z {} {}", x, col_val_third.unwrap())),
             ]
             .into_iter()
-            .filter_map(|x| x)
+            .flatten()
             .collect::<Vec<_>>();
             let where_clause = if where_clause_components.is_empty() {
                 "".to_string()
@@ -399,7 +418,7 @@ mod tests {
                 order_by3.map(|x| format!("z {}", x)),
             ]
             .into_iter()
-            .filter_map(|x| x)
+            .flatten()
             .collect::<Vec<_>>();
             let order_by = if order_by_components.is_empty() {
                 "".to_string()
@@ -420,7 +439,7 @@ mod tests {
             // Execute the query on all databases and compare the results
             for (i, sqlite_conn) in sqlite_conns.iter().enumerate() {
                 let limbo = limbo_exec_rows(&dbs[i], &limbo_conns[i], &query);
-                let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
+                let sqlite = sqlite_exec_rows(sqlite_conn, &query);
                 if limbo != sqlite {
                     // if the order by contains exclusively components that are constrained by an equality (=),
                     // sqlite sometimes doesn't bother with ASC/DESC because it doesn't semantically matter
@@ -441,7 +460,7 @@ mod tests {
                     let query_no_limit =
                         format!("SELECT * FROM t {} {} {}", where_clause, order_by, "");
                     let limbo_no_limit = limbo_exec_rows(&dbs[i], &limbo_conns[i], &query_no_limit);
-                    let sqlite_no_limit = sqlite_exec_rows(&sqlite_conn, &query_no_limit);
+                    let sqlite_no_limit = sqlite_exec_rows(sqlite_conn, &query_no_limit);
                     let limbo_rev = limbo_no_limit.iter().cloned().rev().collect::<Vec<_>>();
                     if limbo_rev == sqlite_no_limit && order_by_only_equalities {
                         continue;
@@ -972,6 +991,7 @@ mod tests {
         pub cast_expr: SymbolHandle,
         pub case_expr: SymbolHandle,
         pub cmp_op: SymbolHandle,
+        #[cfg(feature = "index_experimental")]
         pub number: SymbolHandle,
     }
 
@@ -1206,10 +1226,12 @@ mod tests {
             cast_expr,
             case_expr,
             cmp_op,
+            #[cfg(feature = "index_experimental")]
             number,
         }
     }
 
+    #[cfg(feature = "index_experimental")]
     fn predicate_builders(g: &GrammarGenerator, tables: Option<&[TestTable]>) -> PredicateBuilders {
         let (in_op, in_op_builder) = g.create_handle();
         let (column, column_builder) = g.create_handle();
@@ -1423,7 +1445,7 @@ mod tests {
             i += 1;
         }
         // verify the same number of rows in both tables
-        let query = format!("SELECT COUNT(*) FROM t");
+        let query = "SELECT COUNT(*) FROM t".to_string();
         let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
         let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
         assert_eq!(limbo, sqlite, "seed: {}", seed);

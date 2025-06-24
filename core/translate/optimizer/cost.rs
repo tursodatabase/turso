@@ -33,7 +33,7 @@ pub const ESTIMATED_HARDCODED_ROWS_PER_TABLE: usize = 1000000;
 pub const ESTIMATED_HARDCODED_ROWS_PER_PAGE: usize = 50; // roughly 80 bytes per 4096 byte page
 
 pub fn estimate_page_io_cost(rowcount: f64) -> Cost {
-    Cost((rowcount as f64 / ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).ceil())
+    Cost((rowcount / ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).ceil())
 }
 
 /// Estimate the cost of a scan or seek operation.

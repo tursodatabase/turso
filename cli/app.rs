@@ -509,8 +509,8 @@ impl Limbo {
             if line.is_empty() {
                 return Ok(());
             }
-            if line.starts_with('.') {
-                self.handle_dot_command(&line[1..]);
+            if let Some(command) = line.strip_prefix('.') {
+                self.handle_dot_command(command);
                 let _ = self.reset_line(line);
                 return Ok(());
             }
@@ -747,7 +747,7 @@ impl Limbo {
                                 let name = rows.get_column_name(i);
                                 Cell::new(name)
                                     .add_attribute(Attribute::Bold)
-                                    .fg(config.table.header_color.into_comfy_table_color())
+                                    .fg(config.table.header_color.as_comfy_table_color())
                             })
                             .collect::<Vec<_>>();
                         table.set_header(header);
@@ -785,7 +785,7 @@ impl Limbo {
                                             .set_alignment(alignment)
                                             .fg(config.table.column_colors
                                                 [idx % config.table.column_colors.len()]
-                                            .into_comfy_table_color()),
+                                            .as_comfy_table_color()),
                                     );
                                 }
                                 table.add_row(row);
@@ -1060,10 +1060,9 @@ impl Limbo {
             Ok(rl.readline(&self.prompt)?)
         } else {
             let mut input = String::new();
-            println!("");
             let mut reader = std::io::stdin().lock();
             if reader.read_line(&mut input)? == 0 {
-                return Err(ReadlineError::Eof.into());
+                return Err(ReadlineError::Eof);
             }
             // Remove trailing newline
             if input.ends_with('\n') {

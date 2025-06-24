@@ -44,10 +44,10 @@ pub fn emit_subqueries(
 ///
 /// Since a subquery has its own SelectPlan, it can contain nested subqueries,
 /// which can contain even more nested subqueries, etc.
-pub fn emit_subquery<'a>(
+pub fn emit_subquery(
     program: &mut ProgramBuilder,
     plan: &mut SelectPlan,
-    t_ctx: &mut TranslateCtx<'a>,
+    t_ctx: &mut TranslateCtx,
 ) -> Result<usize> {
     let yield_reg = program.alloc_register();
     let coroutine_implementation_start_offset = program.allocate_label();
@@ -81,6 +81,7 @@ pub fn emit_subquery<'a>(
         reg_offset: None,
         reg_limit_offset_sum: None,
         resolver: Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table),
+        non_aggregate_expressions: Vec::new(),
     };
     let subquery_body_end_label = program.allocate_label();
     program.emit_insn(Insn::InitCoroutine {

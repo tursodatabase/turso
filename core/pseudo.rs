@@ -1,14 +1,11 @@
 use crate::types::ImmutableRecord;
 
+#[derive(Default)]
 pub struct PseudoCursor {
     current: Option<ImmutableRecord>,
 }
 
 impl PseudoCursor {
-    pub fn new() -> Self {
-        Self { current: None }
-    }
-
     pub fn record(&self) -> Option<&ImmutableRecord> {
         self.current.as_ref()
     }

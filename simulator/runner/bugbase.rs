@@ -338,7 +338,7 @@ impl BugBase {
     }
 
     pub(crate) fn load_bugs(&mut self) -> anyhow::Result<Vec<LoadedBug>> {
-        let seeds = self.bugs.keys().map(|seed| *seed).collect::<Vec<_>>();
+        let seeds = self.bugs.keys().copied().collect::<Vec<_>>();
 
         seeds
             .iter()

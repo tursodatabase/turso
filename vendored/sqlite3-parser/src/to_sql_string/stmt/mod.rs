@@ -26,7 +26,7 @@ impl ToSqlString for ast::Stmt {
                 if let Some(name) = name {
                     format!("ANALYZE {};", name.to_sql_string(context))
                 } else {
-                    format!("ANALYZE;")
+                    "ANALYZE;".to_string()
                 }
             }
             Self::Attach {
@@ -211,15 +211,15 @@ mod tests {
         ($test_name:ident, $input:expr) => {
             #[test]
             fn $test_name() {
-                let context = crate::to_sql_string::stmt::tests::TestContext;
+                let context = $crate::to_sql_string::stmt::tests::TestContext;
                 let input = $input.split_whitespace().collect::<Vec<&str>>().join(" ");
-                let mut parser = crate::lexer::sql::Parser::new(input.as_bytes());
+                let mut parser = $crate::lexer::sql::Parser::new(input.as_bytes());
                 let cmd = fallible_iterator::FallibleIterator::next(&mut parser)
                     .unwrap()
                     .unwrap();
                 assert_eq!(
                     input,
-                    crate::to_sql_string::ToSqlString::to_sql_string(cmd.stmt(), &context)
+                    $crate::to_sql_string::ToSqlString::to_sql_string(cmd.stmt(), &context)
                 );
             }
         };
@@ -227,15 +227,15 @@ mod tests {
             #[test]
             $(#[$attribute])*
             fn $test_name() {
-                let context = crate::to_sql_string::stmt::tests::TestContext;
+                let context = $crate::to_sql_string::stmt::tests::TestContext;
                 let input = $input.split_whitespace().collect::<Vec<&str>>().join(" ");
-                let mut parser = crate::lexer::sql::Parser::new(input.as_bytes());
+                let mut parser = $crate::lexer::sql::Parser::new(input.as_bytes());
                 let cmd = fallible_iterator::FallibleIterator::next(&mut parser)
                     .unwrap()
                     .unwrap();
                 assert_eq!(
                     input,
-                    crate::to_sql_string::ToSqlString::to_sql_string(cmd.stmt(), &context)
+                    $crate::to_sql_string::ToSqlString::to_sql_string(cmd.stmt(), &context)
                 );
             }
         }

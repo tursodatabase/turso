@@ -62,7 +62,7 @@ pub fn vector_extract(args: &[Register]) -> Result<Value> {
 
     let vector_type = vector_type(blob)?;
     let vector = vector_deserialize(vector_type, blob)?;
-    Ok(Value::build_text(&vector_to_text(&vector)))
+    Ok(Value::build_text(vector_to_text(&vector)))
 }
 
 pub fn vector_distance_cos(args: &[Register]) -> Result<Value> {

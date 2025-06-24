@@ -1095,14 +1095,13 @@ pub struct SmallVecIter<'a, T, const N: usize> {
     pos: usize,
 }
 
-impl<'a, T: Default + Copy, const N: usize> Iterator for SmallVecIter<'a, T, N> {
+impl<T: Default + Copy, const N: usize> Iterator for SmallVecIter<'_, T, N> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.vec.get(self.pos).map(|item| {
-            self.pos += 1;
-            item
-        })
+        let next = self.vec.get(self.pos)?;
+        self.pos += 1;
+        Some(next)
     }
 }
 
@@ -1401,7 +1400,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
 
         let calculated_header_checksum = checksum_wal(
             &buf_slice[0..24],
-            &*header_locked,
+            &header_locked,
             (0, 0),
             use_native_endian_checksum,
         );
@@ -1419,8 +1418,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
         let mut cumulative_checksum = (header_locked.checksum_1, header_locked.checksum_2);
         let page_size_u32 = header_locked.page_size;
 
-        if page_size_u32 < MIN_PAGE_SIZE
-            || page_size_u32 > MAX_PAGE_SIZE
+        if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&page_size_u32)
             || page_size_u32.count_ones() != 1
         {
             panic!("Invalid page size in WAL header: {}", page_size_u32);
@@ -1462,13 +1460,13 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
 
             let checksum_after_fh_meta = checksum_wal(
                 &frame_header_slice[0..8],
-                &*header_locked,
+                &header_locked,
                 cumulative_checksum,
                 use_native_endian_checksum,
             );
             let calculated_frame_checksum = checksum_wal(
                 page_data_slice,
-                &*header_locked,
+                &header_locked,
                 checksum_after_fh_meta,
                 use_native_endian_checksum,
             );
@@ -1516,7 +1514,7 @@ pub fn begin_read_wal_frame(
     io: &Arc<dyn File>,
     offset: usize,
     buffer_pool: Rc<BufferPool>,
-    complete: Box<dyn Fn(Arc<RefCell<Buffer>>) -> ()>,
+    complete: Box<dyn Fn(Arc<RefCell<Buffer>>)>,
 ) -> Result<Arc<Completion>> {
     tracing::trace!("begin_read_wal_frame(offset={})", offset);
     let buf = buffer_pool.get();
@@ -1532,6 +1530,7 @@ pub fn begin_read_wal_frame(
 }
 
 #[instrument(skip(io, page, write_counter, wal_header, checksums), level = Level::TRACE)]
+#[allow(clippy::too_many_arguments)]
 pub fn begin_write_wal_frame(
     io: &Arc<dyn File>,
     offset: usize,
@@ -1752,8 +1751,8 @@ mod tests {
     #[case(&[0x40, 0x09, 0x21, 0xFB, 0x54, 0x44, 0x2D, 0x18], SerialType::f64(), Value::Float(std::f64::consts::PI))]
     #[case(&[1, 2], SerialType::const_int0(), Value::Integer(0))]
     #[case(&[65, 66], SerialType::const_int1(), Value::Integer(1))]
-    #[case(&[1, 2, 3], SerialType::blob(3), Value::Blob(vec![1, 2, 3].into()))]
-    #[case(&[], SerialType::blob(0), Value::Blob(vec![].into()))] // empty blob
+    #[case(&[1, 2, 3], SerialType::blob(3), Value::Blob(vec![1, 2, 3]))]
+    #[case(&[], SerialType::blob(0), Value::Blob(vec![]))] // empty blob
     #[case(&[65, 66, 67], SerialType::text(3), Value::build_text("ABC"))]
     #[case(&[0x80], SerialType::i8(), Value::Integer(-128))]
     #[case(&[0x80, 0], SerialType::i16(), Value::Integer(-32768))]

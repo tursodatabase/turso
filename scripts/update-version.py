@@ -6,22 +6,21 @@ updates the JavaScript and WebAssembly bindings package.json and package-lock.js
 uses cargo update to update Cargo.lock, creates a git commit, and adds a version tag.
 """
 
-import re
 import argparse
-import sys
 import json
-import subprocess
 import os
+import re
+import subprocess
+import sys
 from pathlib import Path
-
 
 # Define all npm package paths in one place
 NPM_PACKAGES = [
     "bindings/javascript",
     "bindings/javascript/npm/darwin-universal",
-    "bindings/javascript/npm/linux-x64-gnu", 
+    "bindings/javascript/npm/linux-x64-gnu",
     "bindings/javascript/npm/win32-x64-msvc",
-    "bindings/wasm"
+    "bindings/wasm",
 ]
 
 
@@ -29,10 +28,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Update version in project files")
 
     # Version argument
-    parser.add_argument(
-        "version",
-        help="The new version to set (e.g., 0.1.0)"
-    )
+    parser.add_argument("version", help="The new version to set (e.g., 0.1.0)")
 
     return parser.parse_args()
 
@@ -58,7 +54,7 @@ def update_cargo_toml(new_version):
 
         # Pattern to match version in various contexts while maintaining the quotes
         pattern = r'(version\s*=\s*)"' + re.escape(current_version) + r'"'
-        updated_content = re.sub(pattern, fr'\1"{new_version}"', content)
+        updated_content = re.sub(pattern, rf'\1"{new_version}"', content)
 
         cargo_path.write_text(updated_content)
         return True
@@ -66,7 +62,7 @@ def update_cargo_toml(new_version):
         sys.exit(1)
 
 
-def update_package_json(dir_path, new_version):
+def update_package_json(dir_path, new_version):  # noqa: C901
     """Update version in package.json and package-lock.json files."""
     dir_path = Path(dir_path)
 
@@ -77,14 +73,14 @@ def update_package_json(dir_path, new_version):
             return False
 
         # Read and parse the package.json file
-        with open(package_path, 'r') as f:
+        with open(package_path, "r") as f:
             package_data = json.load(f)
 
         # Update version regardless of current value
-        package_data['version'] = new_version
+        package_data["version"] = new_version
 
         # Write updated package.json
-        with open(package_path, 'w') as f:
+        with open(package_path, "w") as f:
             json.dump(package_data, f, indent=2)
     except Exception:
         return False
@@ -96,27 +92,27 @@ def update_package_json(dir_path, new_version):
             return True  # package.json was updated successfully
 
         # Read and parse the package-lock.json file
-        with open(lock_path, 'r') as f:
+        with open(lock_path, "r") as f:
             lock_data = json.load(f)
 
         # Update version in multiple places in package-lock.json
-        if 'version' in lock_data:
-            lock_data['version'] = new_version
+        if "version" in lock_data:
+            lock_data["version"] = new_version
 
         # Update version in packages section if it exists (npm >= 7)
-        if 'packages' in lock_data:
-            if '' in lock_data['packages']:  # Root package
-                if 'version' in lock_data['packages']['']:
-                    lock_data['packages']['']['version'] = new_version
+        if "packages" in lock_data:
+            if "" in lock_data["packages"]:  # Root package
+                if "version" in lock_data["packages"][""]:
+                    lock_data["packages"][""]["version"] = new_version
 
         # Update version in dependencies section if it exists (older npm)
-        package_name = package_data.get('name', '')
-        if 'dependencies' in lock_data and package_name in lock_data['dependencies']:
-            if 'version' in lock_data['dependencies'][package_name]:
-                lock_data['dependencies'][package_name]['version'] = new_version
+        package_name = package_data.get("name", "")
+        if "dependencies" in lock_data and package_name in lock_data["dependencies"]:
+            if "version" in lock_data["dependencies"][package_name]:
+                lock_data["dependencies"][package_name]["version"] = new_version
 
         # Write updated package-lock.json
-        with open(lock_path, 'w') as f:
+        with open(lock_path, "w") as f:
             json.dump(lock_data, f, indent=2)
 
         return True
@@ -137,10 +133,7 @@ def run_cargo_update():
     """Run cargo update to update the Cargo.lock file."""
     try:
         # Run cargo update showing its output with verbose flag
-        subprocess.run(
-            ["cargo", "update", "--workspace", "--verbose"],
-            check=True
-        )
+        subprocess.run(["cargo", "update", "--workspace", "--verbose"], check=True)
         return True
     except Exception:
         return False
@@ -156,7 +149,7 @@ def create_git_commit_and_tag(version):
         for package_path in NPM_PACKAGES:
             package_json = f"{package_path}/package.json"
             package_lock = f"{package_path}/package-lock.json"
-            
+
             if os.path.exists(package_json):
                 files_to_add.append(package_json)
             if os.path.exists(package_lock):
@@ -165,26 +158,17 @@ def create_git_commit_and_tag(version):
         # Add each file individually
         for file in files_to_add:
             try:
-                subprocess.run(
-                    ["git", "add", file],
-                    check=True
-                )
+                subprocess.run(["git", "add", file], check=True)
             except subprocess.CalledProcessError:
                 print(f"Warning: Could not add {file} to git")
 
         # Create commit
         commit_message = f"Limbo {version}"
-        subprocess.run(
-            ["git", "commit", "-m", commit_message],
-            check=True
-        )
+        subprocess.run(["git", "commit", "-m", commit_message], check=True)
 
         # Create tag
         tag_name = f"v{version}"
-        subprocess.run(
-            ["git", "tag", "-a", tag_name, "-m", f"Version {version}"],
-            check=True
-        )
+        subprocess.run(["git", "tag", "-a", tag_name, "-m", f"Version {version}"], check=True)
 
         return True
     except Exception as e:

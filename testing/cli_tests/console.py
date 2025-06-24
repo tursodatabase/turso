@@ -1,8 +1,8 @@
 from typing import Any, Optional, Union
-from rich.console import Console, JustifyMethod
-from rich.theme import Theme
-from rich.style import Style
 
+from rich.console import Console, JustifyMethod
+from rich.style import Style
+from rich.theme import Theme
 
 custom_theme = Theme(
     {
@@ -94,6 +94,7 @@ def debug(
         log_locals=log_locals,
         _stack_offset=_stack_offset + 1,
     )
+
 
 def test(
     *objects: Any,

@@ -29,6 +29,7 @@ fn list_pragmas(program: &mut ProgramBuilder) {
     program.epilogue(crate::translate::emitter::TransactionMode::None);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn translate_pragma(
     query_mode: QueryMode,
     schema: &Schema,

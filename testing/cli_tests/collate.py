@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import os
+
+from cli_tests import console
 from cli_tests.test_limbo_cli import TestLimboShell
 from pydantic import BaseModel
-from cli_tests import console
-
 
 sqlite_flags = os.getenv("SQLITE_FLAGS", "-q").split(" ")
 
@@ -81,13 +81,13 @@ class CollateTest(BaseModel):
         )
 
         limbo.run_test(
-            "Grouping is performed using the NOCASE collating sequence (Values 'abc', 'ABC', and 'Abc' are placed in the same group).",
+            "Grouping is performed using the NOCASE collating sequence (Values 'abc', 'ABC', and 'Abc' are placed in the same group).",  # noqa: E501
             "SELECT count(*) FROM t1 GROUP BY d ORDER BY 1;",
             "\n".join(map(lambda x: str(x), [4])),
         )
 
         limbo.run_test(
-            "Grouping is performed using the BINARY collating sequence. 'abc' and 'ABC' and 'Abc' form different groups",
+            "Grouping is performed using the BINARY collating sequence. 'abc' and 'ABC' and 'Abc' form different groups",  # noqa: E501
             "SELECT count(*) FROM t1 GROUP BY (d || '') ORDER BY 1;",
             "\n".join(map(lambda x: str(x), [1, 1, 2])),
         )

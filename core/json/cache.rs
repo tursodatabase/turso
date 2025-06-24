@@ -90,7 +90,7 @@ impl JsonCacheCell {
 
     #[cfg(test)]
     pub fn lookup(&self, key: &Value) -> Option<Jsonb> {
-        assert_eq!(self.accessed.get(), false);
+        assert!(!self.accessed.get());
 
         self.accessed.set(true);
 
@@ -116,7 +116,7 @@ impl JsonCacheCell {
         key: &Value,
         value: impl Fn(&Value) -> crate::Result<Jsonb>,
     ) -> crate::Result<Jsonb> {
-        assert_eq!(self.accessed.get(), false);
+        assert!(!self.accessed.get());
 
         self.accessed.set(true);
         let result = unsafe {
@@ -139,8 +139,7 @@ impl JsonCacheCell {
                     }
                 }
             } else {
-                let result = value(key);
-                result
+                value(key)
             }
         };
         self.accessed.set(false);
@@ -149,7 +148,7 @@ impl JsonCacheCell {
     }
 
     pub fn clear(&mut self) {
-        assert_eq!(self.accessed.get(), false);
+        assert!(!self.accessed.get());
         self.accessed.set(true);
         unsafe {
             let cache_ptr = self.inner.get();
@@ -325,7 +324,7 @@ mod tests {
         let cache_cell = JsonCacheCell::new();
 
         // Access flag should be false initially
-        assert_eq!(cache_cell.accessed.get(), false);
+        assert!(!cache_cell.accessed.get());
 
         // Inner cache should be None initially
         unsafe {
@@ -350,7 +349,7 @@ mod tests {
         }
 
         // Access flag should be reset to false
-        assert_eq!(cache_cell.accessed.get(), false);
+        assert!(!cache_cell.accessed.get());
 
         // Insert the value using get_or_insert_with
         let insert_result = cache_cell.get_or_insert_with(&key, |k| {
@@ -363,7 +362,7 @@ mod tests {
         assert_eq!(insert_result.unwrap(), value);
 
         // Access flag should be reset to false
-        assert_eq!(cache_cell.accessed.get(), false);
+        assert!(!cache_cell.accessed.get());
 
         // Lookup should now return the value
         let lookup_result = cache_cell.lookup(&key);
@@ -426,7 +425,7 @@ mod tests {
         assert!(error_result.is_err());
 
         // Access flag should be reset to false
-        assert_eq!(cache_cell.accessed.get(), false);
+        assert!(!cache_cell.accessed.get());
 
         // The entry should not be cached
         let lookup_result = cache_cell.lookup(&key);

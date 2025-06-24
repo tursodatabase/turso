@@ -1,9 +1,8 @@
 import os
 import sqlite3
 
-import pytest
-
 import limbo
+import pytest
 
 
 @pytest.fixture(autouse=True)

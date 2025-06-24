@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 
 # vfs benchmarking/comparison
-import os
-from pathlib import Path
-import subprocess
-import statistics
 import argparse
+import os
+import statistics
+import subprocess
+from pathlib import Path
 from time import perf_counter, sleep
 from typing import Dict
 
+from cli_tests.console import error, info, test
 from cli_tests.test_limbo_cli import TestLimboShell
-from cli_tests.console import info, error, test
 
 LIMBO_BIN = Path("./target/release/limbo")
 DB_FILE = Path("testing/temp.db")
@@ -37,9 +37,7 @@ def bench_one(vfs: str, sql: str, iterations: int) -> list[float]:
 
     for i in range(1, iterations + 1):
         start = perf_counter()
-        _ = shell.run_test_fn(
-            sql, lambda x: x is not None and append_time(times, start, perf_counter)
-        )
+        _ = shell.run_test_fn(sql, lambda x: x is not None and append_time(times, start, perf_counter))
         test(f"  {vfs} | run {i:>3}: {times[-1]:.6f}s")
 
     shell.quit()
@@ -60,9 +58,7 @@ def cleanup_temp_db() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Benchmark a SQL statement against all Limbo VFS back‑ends."
-    )
+    parser = argparse.ArgumentParser(description="Benchmark a SQL statement against all Limbo VFS back‑ends.")
     parser.add_argument("sql", help="SQL statement to execute (quote it)")
     parser.add_argument("iterations", type=int, help="number of repetitions")
     args = parser.parse_args()
@@ -105,9 +101,7 @@ def main() -> None:
         else:
             pct = (avg - baseline_avg) / baseline_avg * 100.0
             faster_slower = "slower" if pct > 0 else "faster"
-            info(
-                f"{vfs:<{name_pad}} : {avg:.6f}  ({abs(pct):.1f}% {faster_slower} than {baseline})"
-            )
+            info(f"{vfs:<{name_pad}} : {avg:.6f}  ({abs(pct):.1f}% {faster_slower} than {baseline})")
         info("-" * 60)
     cleanup_temp_db()
 

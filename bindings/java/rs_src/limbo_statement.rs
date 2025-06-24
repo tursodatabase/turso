@@ -26,6 +26,7 @@ impl LimboStatement {
         LimboStatement { stmt, connection }
     }
 
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_ptr(self) -> jlong {
         Box::into_raw(Box::new(self)) as jlong
     }
@@ -66,7 +67,7 @@ pub extern "system" fn Java_tech_turso_core_LimboStatement_step<'local>(
         match step_result {
             StepResult::Row => {
                 let row = stmt.stmt.row().unwrap();
-                return match row_to_obj_array(&mut env, &row) {
+                return match row_to_obj_array(&mut env, row) {
                     Ok(row) => to_limbo_step_result(&mut env, STEP_RESULT_ID_ROW, Some(row)),
                     Err(e) => {
                         set_err_msg_and_throw_exception(&mut env, obj, LIMBO_ETC, e.to_string());
@@ -114,7 +115,7 @@ fn row_to_obj_array<'local>(
                 env.new_object("java/lang/Double", "(D)V", &[JValue::Double(*f)])?
             }
             limbo_core::Value::Text(s) => env.new_string(s.as_str())?.into(),
-            limbo_core::Value::Blob(b) => env.byte_array_from_slice(&b.as_slice())?.into(),
+            limbo_core::Value::Blob(b) => env.byte_array_from_slice(b.as_slice())?.into(),
         };
         if let Err(e) = env.set_object_array_element(&obj_array, i as i32, obj) {
             eprintln!("Error on parsing row: {:?}", e);

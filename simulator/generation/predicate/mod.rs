@@ -268,7 +268,7 @@ mod tests {
             let predicate = SimplePredicate::arbitrary_from(&mut rng, (&table, row, true)).0;
             let value = expr_to_value(&predicate.0, row, &table);
             assert!(
-                value.as_ref().map_or(false, |value| value.into_bool()),
+                value.as_ref().map_or(false, |value| value.as_bool()),
                 "Predicate: {:#?}\nValue: {:#?}\nSeed: {}",
                 predicate,
                 value,
@@ -297,7 +297,7 @@ mod tests {
             let predicate = SimplePredicate::arbitrary_from(&mut rng, (&table, row, false)).0;
             let value = expr_to_value(&predicate.0, row, &table);
             assert!(
-                !value.as_ref().map_or(false, |value| value.into_bool()),
+                !value.as_ref().map_or(false, |value| value.as_bool()),
                 "Predicate: {:#?}\nValue: {:#?}\nSeed: {}",
                 predicate,
                 value,
@@ -326,7 +326,7 @@ mod tests {
             let predicate = Predicate::arbitrary_from(&mut rng, (&table, row));
             let value = expr_to_value(&predicate.0, row, &table);
             assert!(
-                value.as_ref().map_or(false, |value| value.into_bool()),
+                value.as_ref().map_or(false, |value| value.as_bool()),
                 "Predicate: {:#?}\nValue: {:#?}\nSeed: {}",
                 predicate,
                 value,

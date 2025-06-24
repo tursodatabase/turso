@@ -2211,6 +2211,7 @@ pub fn translate_expr(
     Ok(target_register)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_binary_insn(
     program: &mut ProgramBuilder,
     op: &ast::Operator,
@@ -2490,7 +2491,7 @@ fn translate_like_base(
     };
     match op {
         ast::LikeOperator::Like | ast::LikeOperator::Glob => {
-            let arg_count = if matches!(escape, Some(_)) { 3 } else { 2 };
+            let arg_count = if escape.is_some() { 3 } else { 2 };
             let start_reg = program.alloc_registers(arg_count);
             let mut constant_mask = 0;
             translate_expr(program, referenced_tables, lhs, start_reg + 1, resolver)?;
@@ -2661,186 +2662,195 @@ pub fn unwrap_parens_owned(expr: ast::Expr) -> Result<(ast::Expr, usize)> {
     }
 }
 
-/// Recursively walks an immutable expression, applying a function to each sub-expression.
-pub fn walk_expr<'a, F>(expr: &'a ast::Expr, func: &mut F) -> Result<()>
-where
-    F: FnMut(&'a ast::Expr) -> Result<()>,
-{
-    func(expr)?;
-    match expr {
-        ast::Expr::Between {
-            lhs, start, end, ..
-        } => {
-            walk_expr(lhs, func)?;
-            walk_expr(start, func)?;
-            walk_expr(end, func)?;
-        }
-        ast::Expr::Binary(lhs, _, rhs) => {
-            walk_expr(lhs, func)?;
-            walk_expr(rhs, func)?;
-        }
-        ast::Expr::Case {
-            base,
-            when_then_pairs,
-            else_expr,
-        } => {
-            if let Some(base_expr) = base {
-                walk_expr(base_expr, func)?;
-            }
-            for (when_expr, then_expr) in when_then_pairs {
-                walk_expr(when_expr, func)?;
-                walk_expr(then_expr, func)?;
-            }
-            if let Some(else_expr) = else_expr {
-                walk_expr(else_expr, func)?;
-            }
-        }
-        ast::Expr::Cast { expr, .. } => {
-            walk_expr(expr, func)?;
-        }
-        ast::Expr::Collate(expr, _) => {
-            walk_expr(expr, func)?;
-        }
-        ast::Expr::Exists(_select) | ast::Expr::Subquery(_select) => {
-            // TODO: Walk through select statements if needed
-        }
-        ast::Expr::FunctionCall {
-            args,
-            order_by,
-            filter_over,
-            ..
-        } => {
-            if let Some(args) = args {
-                for arg in args {
-                    walk_expr(arg, func)?;
-                }
-            }
-            if let Some(order_by) = order_by {
-                for sort_col in order_by {
-                    walk_expr(&sort_col.expr, func)?;
-                }
-            }
-            if let Some(filter_over) = filter_over {
-                if let Some(filter_clause) = &filter_over.filter_clause {
-                    walk_expr(filter_clause, func)?;
-                }
-                if let Some(over_clause) = &filter_over.over_clause {
-                    match over_clause.as_ref() {
-                        ast::Over::Window(window) => {
-                            if let Some(partition_by) = &window.partition_by {
-                                for part_expr in partition_by {
-                                    walk_expr(part_expr, func)?;
-                                }
-                            }
-                            if let Some(order_by_clause) = &window.order_by {
-                                for sort_col in order_by_clause {
-                                    walk_expr(&sort_col.expr, func)?;
-                                }
-                            }
-                            if let Some(frame_clause) = &window.frame_clause {
-                                walk_expr_frame_bound(&frame_clause.start, func)?;
-                                if let Some(end_bound) = &frame_clause.end {
-                                    walk_expr_frame_bound(end_bound, func)?;
-                                }
-                            }
-                        }
-                        ast::Over::Name(_) => {}
-                    }
-                }
-            }
-        }
-        ast::Expr::FunctionCallStar { filter_over, .. } => {
-            if let Some(filter_over) = filter_over {
-                if let Some(filter_clause) = &filter_over.filter_clause {
-                    walk_expr(filter_clause, func)?;
-                }
-                if let Some(over_clause) = &filter_over.over_clause {
-                    match over_clause.as_ref() {
-                        ast::Over::Window(window) => {
-                            if let Some(partition_by) = &window.partition_by {
-                                for part_expr in partition_by {
-                                    walk_expr(part_expr, func)?;
-                                }
-                            }
-                            if let Some(order_by_clause) = &window.order_by {
-                                for sort_col in order_by_clause {
-                                    walk_expr(&sort_col.expr, func)?;
-                                }
-                            }
-                            if let Some(frame_clause) = &window.frame_clause {
-                                walk_expr_frame_bound(&frame_clause.start, func)?;
-                                if let Some(end_bound) = &frame_clause.end {
-                                    walk_expr_frame_bound(end_bound, func)?;
-                                }
-                            }
-                        }
-                        ast::Over::Name(_) => {}
-                    }
-                }
-            }
-        }
-        ast::Expr::InList { lhs, rhs, .. } => {
-            walk_expr(lhs, func)?;
-            if let Some(rhs_exprs) = rhs {
-                for expr in rhs_exprs {
-                    walk_expr(expr, func)?;
-                }
-            }
-        }
-        ast::Expr::InSelect { lhs, rhs: _, .. } => {
-            walk_expr(lhs, func)?;
-            // TODO: Walk through select statements if needed
-        }
-        ast::Expr::InTable { lhs, args, .. } => {
-            walk_expr(lhs, func)?;
-            if let Some(arg_exprs) = args {
-                for expr in arg_exprs {
-                    walk_expr(expr, func)?;
-                }
-            }
-        }
-        ast::Expr::IsNull(expr) | ast::Expr::NotNull(expr) => {
-            walk_expr(expr, func)?;
-        }
-        ast::Expr::Like {
-            lhs, rhs, escape, ..
-        } => {
-            walk_expr(lhs, func)?;
-            walk_expr(rhs, func)?;
-            if let Some(esc_expr) = escape {
-                walk_expr(esc_expr, func)?;
-            }
-        }
-        ast::Expr::Parenthesized(exprs) => {
-            for expr in exprs {
-                walk_expr(expr, func)?;
-            }
-        }
-        ast::Expr::Raise(_, expr) => {
-            if let Some(raise_expr) = expr {
-                walk_expr(raise_expr, func)?;
-            }
-        }
-        ast::Expr::Unary(_, expr) => {
-            walk_expr(expr, func)?;
-        }
-        ast::Expr::Id(_)
-        | ast::Expr::Column { .. }
-        | ast::Expr::RowId { .. }
-        | ast::Expr::Literal(_)
-        | ast::Expr::DoublyQualified(..)
-        | ast::Expr::Name(_)
-        | ast::Expr::Qualified(..)
-        | ast::Expr::Variable(_) => {
-            // No nested expressions
-        }
-    }
-    Ok(())
+pub enum WalkControl {
+    Continue,     // Visit children
+    SkipChildren, // Skip children but continue walking siblings
 }
 
-fn walk_expr_frame_bound<'a, F>(bound: &'a ast::FrameBound, func: &mut F) -> Result<()>
+/// Recursively walks an immutable expression, applying a function to each sub-expression.
+pub fn walk_expr<'a, F>(expr: &'a ast::Expr, func: &mut F) -> Result<WalkControl>
 where
-    F: FnMut(&'a ast::Expr) -> Result<()>,
+    F: FnMut(&'a ast::Expr) -> Result<WalkControl>,
+{
+    match func(expr)? {
+        WalkControl::Continue => {
+            match expr {
+                ast::Expr::Between {
+                    lhs, start, end, ..
+                } => {
+                    walk_expr(lhs, func)?;
+                    walk_expr(start, func)?;
+                    walk_expr(end, func)?;
+                }
+                ast::Expr::Binary(lhs, _, rhs) => {
+                    walk_expr(lhs, func)?;
+                    walk_expr(rhs, func)?;
+                }
+                ast::Expr::Case {
+                    base,
+                    when_then_pairs,
+                    else_expr,
+                } => {
+                    if let Some(base_expr) = base {
+                        walk_expr(base_expr, func)?;
+                    }
+                    for (when_expr, then_expr) in when_then_pairs {
+                        walk_expr(when_expr, func)?;
+                        walk_expr(then_expr, func)?;
+                    }
+                    if let Some(else_expr) = else_expr {
+                        walk_expr(else_expr, func)?;
+                    }
+                }
+                ast::Expr::Cast { expr, .. } => {
+                    walk_expr(expr, func)?;
+                }
+                ast::Expr::Collate(expr, _) => {
+                    walk_expr(expr, func)?;
+                }
+                ast::Expr::Exists(_select) | ast::Expr::Subquery(_select) => {
+                    // TODO: Walk through select statements if needed
+                }
+                ast::Expr::FunctionCall {
+                    args,
+                    order_by,
+                    filter_over,
+                    ..
+                } => {
+                    if let Some(args) = args {
+                        for arg in args {
+                            walk_expr(arg, func)?;
+                        }
+                    }
+                    if let Some(order_by) = order_by {
+                        for sort_col in order_by {
+                            walk_expr(&sort_col.expr, func)?;
+                        }
+                    }
+                    if let Some(filter_over) = filter_over {
+                        if let Some(filter_clause) = &filter_over.filter_clause {
+                            walk_expr(filter_clause, func)?;
+                        }
+                        if let Some(over_clause) = &filter_over.over_clause {
+                            match over_clause.as_ref() {
+                                ast::Over::Window(window) => {
+                                    if let Some(partition_by) = &window.partition_by {
+                                        for part_expr in partition_by {
+                                            walk_expr(part_expr, func)?;
+                                        }
+                                    }
+                                    if let Some(order_by_clause) = &window.order_by {
+                                        for sort_col in order_by_clause {
+                                            walk_expr(&sort_col.expr, func)?;
+                                        }
+                                    }
+                                    if let Some(frame_clause) = &window.frame_clause {
+                                        walk_expr_frame_bound(&frame_clause.start, func)?;
+                                        if let Some(end_bound) = &frame_clause.end {
+                                            walk_expr_frame_bound(end_bound, func)?;
+                                        }
+                                    }
+                                }
+                                ast::Over::Name(_) => {}
+                            }
+                        }
+                    }
+                }
+                ast::Expr::FunctionCallStar { filter_over, .. } => {
+                    if let Some(filter_over) = filter_over {
+                        if let Some(filter_clause) = &filter_over.filter_clause {
+                            walk_expr(filter_clause, func)?;
+                        }
+                        if let Some(over_clause) = &filter_over.over_clause {
+                            match over_clause.as_ref() {
+                                ast::Over::Window(window) => {
+                                    if let Some(partition_by) = &window.partition_by {
+                                        for part_expr in partition_by {
+                                            walk_expr(part_expr, func)?;
+                                        }
+                                    }
+                                    if let Some(order_by_clause) = &window.order_by {
+                                        for sort_col in order_by_clause {
+                                            walk_expr(&sort_col.expr, func)?;
+                                        }
+                                    }
+                                    if let Some(frame_clause) = &window.frame_clause {
+                                        walk_expr_frame_bound(&frame_clause.start, func)?;
+                                        if let Some(end_bound) = &frame_clause.end {
+                                            walk_expr_frame_bound(end_bound, func)?;
+                                        }
+                                    }
+                                }
+                                ast::Over::Name(_) => {}
+                            }
+                        }
+                    }
+                }
+                ast::Expr::InList { lhs, rhs, .. } => {
+                    walk_expr(lhs, func)?;
+                    if let Some(rhs_exprs) = rhs {
+                        for expr in rhs_exprs {
+                            walk_expr(expr, func)?;
+                        }
+                    }
+                }
+                ast::Expr::InSelect { lhs, rhs: _, .. } => {
+                    walk_expr(lhs, func)?;
+                    // TODO: Walk through select statements if needed
+                }
+                ast::Expr::InTable { lhs, args, .. } => {
+                    walk_expr(lhs, func)?;
+                    if let Some(arg_exprs) = args {
+                        for expr in arg_exprs {
+                            walk_expr(expr, func)?;
+                        }
+                    }
+                }
+                ast::Expr::IsNull(expr) | ast::Expr::NotNull(expr) => {
+                    walk_expr(expr, func)?;
+                }
+                ast::Expr::Like {
+                    lhs, rhs, escape, ..
+                } => {
+                    walk_expr(lhs, func)?;
+                    walk_expr(rhs, func)?;
+                    if let Some(esc_expr) = escape {
+                        walk_expr(esc_expr, func)?;
+                    }
+                }
+                ast::Expr::Parenthesized(exprs) => {
+                    for expr in exprs {
+                        walk_expr(expr, func)?;
+                    }
+                }
+                ast::Expr::Raise(_, expr) => {
+                    if let Some(raise_expr) = expr {
+                        walk_expr(raise_expr, func)?;
+                    }
+                }
+                ast::Expr::Unary(_, expr) => {
+                    walk_expr(expr, func)?;
+                }
+                ast::Expr::Id(_)
+                | ast::Expr::Column { .. }
+                | ast::Expr::RowId { .. }
+                | ast::Expr::Literal(_)
+                | ast::Expr::DoublyQualified(..)
+                | ast::Expr::Name(_)
+                | ast::Expr::Qualified(..)
+                | ast::Expr::Variable(_) => {
+                    // No nested expressions
+                }
+            }
+        }
+        WalkControl::SkipChildren => return Ok(WalkControl::Continue),
+    };
+    Ok(WalkControl::Continue)
+}
+
+fn walk_expr_frame_bound<'a, F>(bound: &'a ast::FrameBound, func: &mut F) -> Result<WalkControl>
+where
+    F: FnMut(&'a ast::Expr) -> Result<WalkControl>,
 {
     match bound {
         ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) => {
@@ -2851,7 +2861,7 @@ where
         | ast::FrameBound::UnboundedPreceding => {}
     }
 
-    Ok(())
+    Ok(WalkControl::Continue)
 }
 
 /// Recursively walks a mutable expression, applying a function to each sub-expression.

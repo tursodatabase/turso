@@ -2015,6 +2015,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "limbo_sqlite_test_ext"
+version = "0.0.22"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "limbo_stress"
 version = "0.0.22"
 dependencies = [

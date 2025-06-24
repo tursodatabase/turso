@@ -5,7 +5,6 @@ use antithesis_sdk::random::{get_random, AntithesisRng};
 use antithesis_sdk::*;
 use clap::Parser;
 use core::panic;
-use hex;
 use limbo::Builder;
 use opts::Opts;
 use std::collections::HashSet;
@@ -322,7 +321,14 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
     plan.ddl_statements = ddl_statements;
     for _ in 0..opts.nr_threads {
         let mut queries = vec![];
-        for _ in 0..opts.nr_iterations {
+        for i in 0..opts.nr_iterations {
+            if !opts.silent && !opts.verbose && i % 100 == 0 {
+                print!(
+                    "\r{} %",
+                    (i as f64 / opts.nr_iterations as f64 * 100.0) as usize
+                );
+                std::io::stdout().flush().unwrap();
+            }
             let sql = generate_random_statement(&schema);
             if !opts.skip_log {
                 writeln!(log_file, "{}", sql)?;
@@ -398,16 +404,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _g = init_tracing()?;
     antithesis_init();
 
-    let mut opts = Opts::parse();
-
+    let opts = Opts::parse();
     if opts.nr_threads > 1 {
         println!("ERROR: Multi-threaded data access is not yet supported: https://github.com/tursodatabase/limbo/issues/1552");
         return Ok(());
     }
 
     let plan = if opts.load_log {
-        read_plan_from_log_file(&mut opts)?
+        println!("Loading plan from log file...");
+        read_plan_from_log_file(&opts)?
     } else {
+        println!("Generating plan...");
         generate_plan(&opts)?
     };
 
@@ -428,7 +435,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         // Apply each DDL statement individually
         for stmt in &plan.ddl_statements {
-            println!("executing ddl {}", stmt);
+            if opts.verbose {
+                println!("executing ddl {}", stmt);
+            }
             if let Err(e) = conn.execute(stmt, ()).await {
                 match e {
                     limbo::Error::SqlExecutionFailure(e) => {
@@ -448,10 +457,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         let handle = tokio::spawn(async move {
             let conn = db.connect()?;
+            println!("\rExecuting queries...");
             for query_index in 0..nr_iterations {
                 let sql = &plan.queries_per_thread[thread][query_index];
-                println!("executing: {}", sql);
-                if let Err(e) = conn.execute(&sql, ()).await {
+                if !opts.silent {
+                    if opts.verbose {
+                        println!("executing query {}", sql);
+                    } else if query_index % 100 == 0 {
+                        print!(
+                            "\r{:.2} %",
+                            (query_index as f64 / nr_iterations as f64 * 100.0)
+                        );
+                        std::io::stdout().flush().unwrap();
+                    }
+                }
+                if let Err(e) = conn.execute(sql, ()).await {
                     match e {
                         limbo::Error::SqlExecutionFailure(e) => {
                             if e.contains("Corrupt database") {
@@ -465,14 +485,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         _ => panic!("Error executing query: {}", e),
                     }
                 }
-                let mut res = conn.query("PRAGMA integrity_check", ()).await.unwrap();
-                if let Some(row) = res.next().await? {
-                    let value = row.get_value(0).unwrap();
-                    if value != "ok".into() {
-                        panic!("integrity check failed: {:?}", value);
+                const INTEGRITY_CHECK_INTERVAL: usize = 100;
+                if query_index % INTEGRITY_CHECK_INTERVAL == 0 {
+                    let mut res = conn.query("PRAGMA integrity_check", ()).await.unwrap();
+                    if let Some(row) = res.next().await? {
+                        let value = row.get_value(0).unwrap();
+                        if value != "ok".into() {
+                            panic!("integrity check failed: {:?}", value);
+                        }
+                    } else {
+                        panic!("integrity check failed: no rows");
                     }
-                } else {
-                    panic!("integrity check failed: no rows");
                 }
             }
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())

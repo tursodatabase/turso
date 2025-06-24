@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 import os
 import select
-from time import sleep
 import subprocess
 from pathlib import Path
+from time import sleep
 from typing import Callable, List, Optional
-from cli_tests import console
 
+from cli_tests import console
 
 PIPE_BUF = 4096
 
@@ -54,8 +54,7 @@ class LimboShell:
             return ""
         self._write_to_pipe(f"SELECT '{end_marker}';")
         output = ""
-        done = False
-        while not done:
+        while True:
             ready, _, errors = select.select(
                 [self.pipe.stdout, self.pipe.stderr],
                 [],
@@ -63,26 +62,23 @@ class LimboShell:
             )
             ready_or_errors = set(ready + errors)
             if self.pipe.stderr in ready_or_errors:
-                done = self._handle_error()
+                fragment = self.pipe.stderr.read(PIPE_BUF).decode()
+                if not fragment:
+                    console.error(output, end="", _stack_offset=2)
+                    raise RuntimeError("Error encountered in Limbo shell.")
+                output += fragment
             if self.pipe.stdout in ready_or_errors:
                 fragment = self.pipe.stdout.read(PIPE_BUF).decode()
                 output += fragment
                 if output.rstrip().endswith(end_marker):
-                    return self._clean_output(output, end_marker)
+                    break
+        return self._clean_output(output, end_marker)
 
     def _write_to_pipe(self, command: str) -> None:
         if not self.pipe.stdin:
             raise RuntimeError("Failed to start Limbo REPL")
         self.pipe.stdin.write((command + "\n").encode())
         self.pipe.stdin.flush()
-
-    def _handle_error(self) -> None:
-        while True:
-            chunk = self.pipe.stderr.read(PIPE_BUF).decode()
-            if not chunk:
-                break  # EOF
-            console.error(chunk, end="", _stack_offset=2)
-        raise RuntimeError("Error encountered in Limbo shell.")
 
     @staticmethod
     def _clean_output(output: str, marker: str) -> str:
@@ -107,7 +103,7 @@ class TestLimboShell:
         flags="",
     ):
         if exec_name is None:
-            exec_name = os.environ.get('SQLITE_EXEC')
+            exec_name = os.environ.get("SQLITE_EXEC")
             if exec_name is None:
                 exec_name = "./scripts/limbo-sqlite3"
             if flags == "":
@@ -142,10 +138,7 @@ INSERT INTO t VALUES (zeroblob(1024 - 1), zeroblob(1024 - 2), zeroblob(1024 - 3)
         console.test(f"Running test: {name}", _stack_offset=2)
         actual = self.shell.execute(sql)
         assert actual == expected, (
-            f"Test failed: {name}\n"
-            f"SQL: {sql}\n"
-            f"Expected:\n{repr(expected)}\n"
-            f"Actual:\n{repr(actual)}"
+            f"Test failed: {name}\nSQL: {sql}\nExpected:\n{repr(expected)}\nActual:\n{repr(actual)}"
         )
 
     def run_debug(self, sql: str):
@@ -153,9 +146,7 @@ INSERT INTO t VALUES (zeroblob(1024 - 1), zeroblob(1024 - 2), zeroblob(1024 - 3)
         actual = self.shell.execute(sql)
         console.debug(f"OUTPUT:\n{repr(actual)}", _stack_offset=2)
 
-    def run_test_fn(
-        self, sql: str, validate: Callable[[str], bool], desc: str = ""
-    ) -> None:
+    def run_test_fn(self, sql: str, validate: Callable[[str], bool], desc: str = "") -> None:
         # Print the test that is executing before executing the sql command
         # Printing later confuses the user of the code what test has actually failed
         if desc:

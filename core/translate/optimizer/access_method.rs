@@ -31,7 +31,7 @@ pub struct AccessMethod<'a> {
     pub constraint_refs: &'a [ConstraintRef],
 }
 
-impl<'a> AccessMethod<'a> {
+impl AccessMethod<'_> {
     pub fn is_scan(&self) -> bool {
         self.constraint_refs.is_empty()
     }
@@ -81,7 +81,7 @@ pub fn find_best_access_method_for_join_order<'a>(
         let cost = estimate_cost_for_scan_or_seek(
             Some(index_info),
             &rhs_constraints.constraints,
-            &usable_constraint_refs,
+            usable_constraint_refs,
             input_cardinality,
         );
 
@@ -139,7 +139,7 @@ pub fn find_best_access_method_for_join_order<'a>(
                 cost,
                 index: candidate.index.clone(),
                 iter_dir,
-                constraint_refs: &usable_constraint_refs,
+                constraint_refs: usable_constraint_refs,
             };
         }
     }

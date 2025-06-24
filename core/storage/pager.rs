@@ -449,7 +449,7 @@ impl Pager {
         {
             let page = self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any);
             let page_id = page.get().get().id;
-            return Ok(CursorResult::Ok(page_id as u32));
+            Ok(CursorResult::Ok(page_id as u32))
         }
 
         //  If autovacuum is enabled, we need to allocate a new page number that is greater than the largest root page number
@@ -460,7 +460,7 @@ impl Pager {
                 AutoVacuumMode::None => {
                     let page = self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any);
                     let page_id = page.get().get().id;
-                    return Ok(CursorResult::Ok(page_id as u32));
+                    Ok(CursorResult::Ok(page_id as u32))
                 }
                 AutoVacuumMode::Full => {
                     let mut root_page_num = self.db_header.lock().vacuum_mode_largest_root_page;
@@ -560,14 +560,14 @@ impl Pager {
 
     pub fn end_tx(&self) -> Result<PagerCacheflushStatus> {
         let cacheflush_status = self.cacheflush()?;
-        return match cacheflush_status {
+        match cacheflush_status {
             PagerCacheflushStatus::IO => Ok(PagerCacheflushStatus::IO),
             PagerCacheflushStatus::Done(_) => {
                 self.wal.borrow().end_write_tx()?;
                 self.wal.borrow().end_read_tx()?;
                 Ok(cacheflush_status)
             }
-        };
+        }
     }
 
     pub fn end_read_tx(&self) -> Result<()> {
@@ -645,7 +645,7 @@ impl Pager {
         self.add_dirty(DATABASE_HEADER_PAGE_ID);
 
         let contents = header_page.get().contents.as_ref().unwrap();
-        contents.write_database_header(&header);
+        contents.write_database_header(header);
 
         Ok(())
     }
@@ -756,12 +756,12 @@ impl Pager {
         frame_len: u32,
     ) -> Result<Arc<Completion>> {
         let wal = self.wal.borrow();
-        return wal.read_frame_raw(
+        wal.read_frame_raw(
             frame_no.into(),
             self.buffer_pool.clone(),
             p_frame,
             frame_len,
-        );
+        )
     }
 
     pub fn checkpoint(&self) -> Result<CheckpointStatus> {
@@ -978,7 +978,7 @@ impl Pager {
         }
 
         // update database size
-        self.write_database_header(&mut header)?;
+        self.write_database_header(&header)?;
 
         // FIXME: should reserve page cache entry before modifying the database
         let page = allocate_page(header.database_size as usize, &self.buffer_pool, 0);
@@ -1190,7 +1190,7 @@ mod ptrmap {
         if db_page_no == FIRST_PTRMAP_PAGE_NO {
             return true;
         }
-        return get_ptrmap_page_no_for_db_page(db_page_no, page_size) == db_page_no;
+        get_ptrmap_page_no_for_db_page(db_page_no, page_size) == db_page_no
     }
 
     /// Calculates which pointer map page (1-indexed) contains the entry for `db_page_no_to_query` (1-indexed).

@@ -6,7 +6,6 @@ use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use limbo_core::types::Text;
 use limbo_core::{maybe_init_database_file, LimboError, StepResult};
 use napi::iterator::Generator;
 use napi::{bindgen_prelude::ObjectFinalize, Env, JsUnknown};
@@ -542,9 +541,7 @@ fn from_js_value(value: JsUnknown) -> napi::Result<limbo_core::Value> {
         }
         napi::ValueType::String => {
             let s = value.coerce_to_string()?;
-            Ok(limbo_core::Value::Text(Text::from_str(
-                s.into_utf8()?.as_str()?,
-            )))
+            Ok(limbo_core::Value::Text(s.into_utf8()?.as_str()?.into()))
         }
         napi::ValueType::Symbol
         | napi::ValueType::Object

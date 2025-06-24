@@ -237,7 +237,7 @@ impl Database {
             mv_transactions: RefCell::new(Vec::new()),
             transaction_state: Cell::new(TransactionState::None),
             last_change: Cell::new(0),
-            syms: RefCell::new(SymbolTable::new()),
+            syms: RefCell::new(SymbolTable::default()),
             total_changes: Cell::new(0),
             _shared_cache: false,
             cache_size: Cell::new(self.header.lock().default_page_cache_size),
@@ -375,7 +375,7 @@ impl Connection {
                     self.clone(),
                     &syms,
                     QueryMode::Normal,
-                    &input,
+                    input,
                 )?);
                 Ok(Statement::new(
                     program,
@@ -494,7 +494,7 @@ impl Connection {
                         self.clone(),
                         &syms,
                         QueryMode::Explain,
-                        &input,
+                        input,
                     )?;
                     let _ = std::io::stdout().write_all(program.explain().as_bytes());
                 }
@@ -511,7 +511,7 @@ impl Connection {
                         self.clone(),
                         &syms,
                         QueryMode::Normal,
-                        &input,
+                        input,
                     )?;
 
                     let mut state =
@@ -648,12 +648,7 @@ impl Connection {
         loop {
             match stmt.step()? {
                 vdbe::StepResult::Row => {
-                    let row: Vec<Value> = stmt
-                        .row()
-                        .unwrap()
-                        .get_values()
-                        .map(|v| v.clone())
-                        .collect();
+                    let row: Vec<Value> = stmt.row().unwrap().get_values().cloned().collect();
                     results.push(row);
                 }
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
@@ -681,12 +676,7 @@ impl Connection {
         loop {
             match stmt.step()? {
                 vdbe::StepResult::Row => {
-                    let row: Vec<Value> = stmt
-                        .row()
-                        .unwrap()
-                        .get_values()
-                        .map(|v| v.clone())
-                        .collect();
+                    let row: Vec<Value> = stmt.row().unwrap().get_values().cloned().collect();
                     results.push(row);
                 }
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
@@ -716,12 +706,7 @@ impl Connection {
         loop {
             match stmt.step()? {
                 vdbe::StepResult::Row => {
-                    let row: Vec<Value> = stmt
-                        .row()
-                        .unwrap()
-                        .get_values()
-                        .map(|v| v.clone())
-                        .collect();
+                    let row: Vec<Value> = stmt.row().unwrap().get_values().cloned().collect();
                     results.push(row);
                 }
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
@@ -815,6 +800,7 @@ pub type Row = vdbe::Row;
 
 pub type StepResult = vdbe::StepResult;
 
+#[derive(Default)]
 pub struct SymbolTable {
     pub functions: HashMap<String, Rc<function::ExternalFunc>>,
     pub vtabs: HashMap<String, Rc<VirtualTable>>,
@@ -857,14 +843,6 @@ pub fn resolve_ext_path(extpath: &str) -> Result<std::path::PathBuf> {
 }
 
 impl SymbolTable {
-    pub fn new() -> Self {
-        Self {
-            functions: HashMap::new(),
-            vtabs: HashMap::new(),
-            vtab_modules: HashMap::new(),
-        }
-    }
-
     pub fn resolve_function(
         &self,
         name: &str,
@@ -903,7 +881,7 @@ impl Iterator for QueryRunner<'_> {
                     .unwrap()
                     .trim();
                 self.last_offset = byte_offset_end;
-                Some(self.conn.run_cmd(cmd, &input))
+                Some(self.conn.run_cmd(cmd, input))
             }
             Ok(None) => None,
             Err(err) => {

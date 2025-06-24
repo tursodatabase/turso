@@ -142,7 +142,7 @@ pub(crate) fn sqlite_exec_rows(
     conn: &rusqlite::Connection,
     query: &str,
 ) -> Vec<Vec<rusqlite::types::Value>> {
-    let mut stmt = conn.prepare(&query).unwrap();
+    let mut stmt = conn.prepare(query).unwrap();
     let mut rows = stmt.query(params![]).unwrap();
     let mut results = Vec::new();
     while let Some(row) = rows.next().unwrap() {
@@ -221,8 +221,6 @@ pub(crate) fn limbo_exec_rows_error(
 #[cfg(test)]
 mod tests {
     use std::vec;
-
-    use rand::Rng;
     use tempfile::TempDir;
 
     use super::{limbo_exec_rows, limbo_exec_rows_error, TempDatabase};
@@ -297,6 +295,8 @@ mod tests {
     #[test]
     #[cfg(feature = "index_experimental")]
     fn test_unique_index_ordering() -> anyhow::Result<()> {
+        use rand::Rng;
+
         let db = TempDatabase::new_empty();
         let conn = db.connect_limbo();
 

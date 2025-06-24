@@ -50,10 +50,7 @@ where
 {
     fn arbitrary_from<R: rand::Rng>(rng: &mut R, t: A) -> Self {
         let size = rng.gen_range(0..5);
-        (0..size)
-            .into_iter()
-            .map(|_| T::arbitrary_from(rng, t))
-            .collect()
+        (0..size).map(|_| T::arbitrary_from(rng, t)).collect()
     }
 }
 
@@ -61,7 +58,8 @@ where
 impl ArbitraryFrom<&SimulatorEnv> for Expr {
     fn arbitrary_from<R: rand::Rng>(rng: &mut R, t: &SimulatorEnv) -> Self {
         let choice = rng.gen_range(0..13);
-        let expr = match choice {
+
+        match choice {
             0 => Expr::Between {
                 lhs: Box::arbitrary_from(rng, t),
                 not: rng.gen_bool(0.5),
@@ -78,7 +76,6 @@ impl ArbitraryFrom<&SimulatorEnv> for Expr {
                 when_then_pairs: {
                     let size = rng.gen_range(0..5);
                     (0..size)
-                        .into_iter()
                         .map(|_| (Self::arbitrary_from(rng, t), Self::arbitrary_from(rng, t)))
                         .collect()
                 },
@@ -136,8 +133,7 @@ impl ArbitraryFrom<&SimulatorEnv> for Expr {
             // TODO: skip Raise
             // TODO: skip subquery
             _ => unreachable!(),
-        };
-        expr
+        }
     }
 }
 
@@ -257,7 +253,7 @@ impl ArbitraryFrom<&Vec<&SimValue>> for ast::Expr {
             return Self::Literal(ast::Literal::Null);
         }
         // TODO: for now just convert the value to an ast::Literal
-        let value = pick(&values, rng);
+        let value = pick(values, rng);
         Expr::Literal((*value).into())
     }
 }

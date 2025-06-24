@@ -1,0 +1,12 @@
+[project]
+dependencies = [
+    "antithesis>=0.1.17",
+    "pylimbo"
+]
+description = "Add your description here"
+name = "antithesis-tests"
+requires-python = ">=3.13"
+version = "0.1.0"
+
+[tool.uv.sources]
+pylimbo = { workspace = true }

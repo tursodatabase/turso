@@ -6,7 +6,7 @@
 /// 2. Symbol -> [Int]: generate terminals which form integer from specified range
 /// 3. Symbol -> (Inner)?: generate expansion for Inner symbol with some probability
 /// 4. Symbol -> (Inner){n..m}: generate k expansions for Inner symbol where k \in [n..m) with uniform distribution
-/// (note, that every repetition will be expanded independently)
+///    (note, that every repetition will be expanded independently)
 /// 5. Symbol -> Inner1 Inner2 .. Inner[n]: concatenate expansions from inner symbols and insert separator string between them
 /// 6. Symbol -> Choice1 | Choice2 | .. | Choice[n]: pick random choice according to their weights randomly and generate expansion for it
 ///
@@ -123,7 +123,7 @@ impl GrammarGenerator {
         root: SymbolHandle,
         is_recursive: &mut HashMap<SymbolHandle, bool>,
     ) -> bool {
-        if let Some(_) = is_recursive.get(&root) {
+        if is_recursive.get(&root).is_some() {
             is_recursive.insert(root, true);
             return true;
         }
@@ -233,10 +233,10 @@ impl GrammarGenerator {
                             values
                                 .iter()
                                 .filter(|x| is_recursive.get(&x.0) != Some(&true))
-                                .map(|x| *x)
+                                .copied()
                                 .collect::<Vec<_>>()
                         };
-                        if handles.len() == 0 {
+                        if handles.is_empty() {
                             handles = values.clone();
                         }
 

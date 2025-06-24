@@ -54,6 +54,7 @@ use transaction::{translate_tx_begin, translate_tx_commit};
 use update::translate_update;
 
 #[instrument(skip_all, level = Level::TRACE)]
+#[allow(clippy::too_many_arguments)]
 pub fn translate(
     schema: &Schema,
     stmt: ast::Stmt,
@@ -151,7 +152,7 @@ pub fn translate_inner(
         ast::Stmt::CreateTrigger { .. } => bail_parse_error!("CREATE TRIGGER not supported yet"),
         ast::Stmt::CreateView { .. } => bail_parse_error!("CREATE VIEW not supported yet"),
         ast::Stmt::CreateVirtualTable(vtab) => {
-            translate_create_virtual_table(*vtab, schema, query_mode, &syms, program)?
+            translate_create_virtual_table(*vtab, schema, query_mode, syms, program)?
         }
         ast::Stmt::Delete(delete) => {
             let Delete {

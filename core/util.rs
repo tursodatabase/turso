@@ -1,3 +1,4 @@
+use crate::translate::expr::WalkControl;
 use crate::{
     schema::{self, Column, Schema, Type},
     translate::{collate::CollationSeq, expr::walk_expr, plan::JoinOrderMember},
@@ -146,7 +147,7 @@ pub fn parse_schema_rows(
                     .unwrap();
                 let index = schema::Index::from_sql(
                     &unparsed_sql_from_index.sql,
-                    unparsed_sql_from_index.root_page as usize,
+                    unparsed_sql_from_index.root_page,
                     table.as_ref(),
                 )?;
                 schema.add_index(Arc::new(index));
@@ -431,7 +432,7 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
         }
         // Variables that are not bound to a specific value, are treated as NULL
         // https://sqlite.org/lang_expr.html#varparam
-        (Expr::Variable(var), Expr::Variable(var2)) if var == "" && var2 == "" => false,
+        (Expr::Variable(var), Expr::Variable(var2)) if var.is_empty() && var2.is_empty() => false,
         // Named variables can be compared by their name
         (Expr::Variable(val), Expr::Variable(val2)) => val == val2,
         (Expr::Parenthesized(exprs1), Expr::Parenthesized(exprs2)) => {
@@ -589,7 +590,7 @@ pub fn can_pushdown_predicate(
     join_order: &[JoinOrderMember],
 ) -> Result<bool> {
     let mut can_pushdown = true;
-    walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<()> {
+    walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
         match expr {
             Expr::Column { table, .. } | Expr::RowId { table, .. } => {
                 let join_idx = join_order
@@ -608,7 +609,7 @@ pub fn can_pushdown_predicate(
             }
             _ => {}
         };
-        Ok(())
+        Ok(WalkControl::Continue)
     })?;
 
     Ok(can_pushdown)
@@ -1365,7 +1366,7 @@ pub mod tests {
         assert_eq!(opts.path, "/home/user/db.sqlite");
         assert_eq!(opts.vfs, Some("unix".to_string()));
         assert_eq!(opts.mode, OpenMode::ReadOnly);
-        assert_eq!(opts.immutable, true);
+        assert!(opts.immutable);
     }
 
     #[test]
@@ -1447,7 +1448,7 @@ pub mod tests {
         assert_eq!(opts.vfs, Some("unix".to_string()));
         assert_eq!(opts.mode, OpenMode::ReadWrite);
         assert_eq!(opts.cache, CacheMode::Private);
-        assert_eq!(opts.immutable, false);
+        assert!(!opts.immutable);
     }
 
     #[test]
@@ -2011,12 +2012,12 @@ pub mod tests {
         // > i64::MAX, convert to float
         assert_eq!(
             parse_numeric_literal("9223372036854775808").unwrap(),
-            Value::Float(9.223372036854775808e+18)
+            Value::Float(9.223_372_036_854_776e18)
         );
         // < i64::MIN, convert to float
         assert_eq!(
             parse_numeric_literal("-9223372036854775809").unwrap(),
-            Value::Float(-9.223372036854775809e+18)
+            Value::Float(-9.223_372_036_854_776e18)
         );
     }
 }

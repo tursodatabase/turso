@@ -5,7 +5,6 @@ use std::{cell::Cell, cmp::Ordering, rc::Rc, sync::Arc};
 use crate::{
     function::AggFunc,
     schema::{BTreeTable, Column, FromClauseSubquery, Index, Table},
-    util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{IdxInsertFlags, Insn},
@@ -115,7 +114,7 @@ impl WhereTerm {
     }
 
     fn eval_at(&self, join_order: &[JoinOrderMember]) -> Result<EvalAt> {
-        determine_where_to_eval_term(&self, join_order)
+        determine_where_to_eval_term(self, join_order)
     }
 }
 
@@ -326,9 +325,17 @@ pub enum QueryDestination {
         /// The index that will be used to store the results.
         index: Arc<Index>,
     },
+    /// The results of the query are stored in an ephemeral table,
+    /// later used by the parent query.
+    EphemeralTable {
+        /// The cursor ID of the ephemeral table that will be used to store the results.
+        cursor_id: CursorID,
+        /// The table that will be used to store the results.
+        table: Rc<BTreeTable>,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct JoinOrderMember {
     /// The internal ID of the[TableReference]
     pub table_id: TableInternalId,
@@ -337,16 +344,6 @@ pub struct JoinOrderMember {
     pub original_idx: usize,
     /// Whether this member is the right side of an OUTER JOIN
     pub is_outer: bool,
-}
-
-impl Default for JoinOrderMember {
-    fn default() -> Self {
-        Self {
-            table_id: TableInternalId::default(),
-            original_idx: 0,
-            is_outer: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -407,7 +404,7 @@ impl DistinctCtx {
         });
         program.emit_insn(Insn::IdxInsert {
             cursor_id: self.cursor_id,
-            record_reg: record_reg,
+            record_reg,
             unpacked_start: None,
             unpacked_count: None,
             flags: IdxInsertFlags::new(),
@@ -454,35 +451,6 @@ impl SelectPlan {
         self.aggregates.iter().map(|agg| agg.args.len()).sum()
     }
 
-    pub fn group_by_col_count(&self) -> usize {
-        self.group_by
-            .as_ref()
-            .map_or(0, |group_by| group_by.exprs.len())
-    }
-
-    pub fn non_group_by_non_agg_columns(&self) -> impl Iterator<Item = &ast::Expr> {
-        self.result_columns
-            .iter()
-            .filter(|c| {
-                !c.contains_aggregates
-                    && !self.group_by.as_ref().map_or(false, |group_by| {
-                        group_by
-                            .exprs
-                            .iter()
-                            .any(|expr| exprs_are_equivalent(&c.expr, expr))
-                    })
-            })
-            .map(|c| &c.expr)
-    }
-
-    pub fn non_group_by_non_agg_column_count(&self) -> usize {
-        self.non_group_by_non_agg_columns().count()
-    }
-
-    pub fn group_by_sorter_column_count(&self) -> usize {
-        self.agg_args_count() + self.group_by_col_count() + self.non_group_by_non_agg_column_count()
-    }
-
     /// Reference: https://github.com/sqlite/sqlite/blob/5db695197b74580c777b37ab1b787531f15f7f9f/src/select.c#L8613
     ///
     /// Checks to see if the query is of the format `SELECT count(*) FROM <tbl>`
@@ -494,7 +462,7 @@ impl SelectPlan {
                 QueryDestination::CoroutineYield { .. }
             )
             || self.table_references.joined_tables().len() != 1
-            || self.table_references.outer_query_refs().len() != 0
+            || self.table_references.outer_query_refs().is_empty()
             || self.result_columns.len() != 1
             || self.group_by.is_some()
             || self.contains_constant_false_condition
@@ -564,6 +532,8 @@ pub struct UpdatePlan {
     // whether the WHERE clause is always false
     pub contains_constant_false_condition: bool,
     pub indexes_to_update: Vec<Arc<Index>>,
+    // If the table's rowid alias is used, gather all the target rowids into an ephemeral table, and then use that table as the single JoinedTable for the actual UPDATE loop.
+    pub ephemeral_plan: Option<SelectPlan>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -857,15 +827,11 @@ impl TableReferences {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct ColumnUsedMask(u128);
 
 impl ColumnUsedMask {
-    pub fn new() -> Self {
-        Self(0)
-    }
-
     pub fn set(&mut self, index: usize) {
         assert!(
             index < 128,
@@ -970,7 +936,7 @@ impl JoinedTable {
             identifier,
             internal_id,
             join_info,
-            col_used_mask: ColumnUsedMask::new(),
+            col_used_mask: ColumnUsedMask::default(),
         }
     }
 
@@ -1007,14 +973,12 @@ impl JoinedTable {
                         CursorType::BTreeTable(btree.clone()),
                     ))
                 };
-                let index_cursor_id = if let Some(index) = index {
-                    Some(program.alloc_cursor_id_keyed(
+                let index_cursor_id = index.map(|index| {
+                    program.alloc_cursor_id_keyed(
                         CursorKey::index(self.internal_id, index.clone()),
                         CursorType::BTreeIndex(index.clone()),
-                    ))
-                } else {
-                    None
-                };
+                    )
+                });
                 Ok((table_cursor_id, index_cursor_id))
             }
             Table::Virtual(virtual_table) => {
@@ -1051,7 +1015,7 @@ impl JoinedTable {
         if self.col_used_mask.is_empty() {
             return false;
         }
-        let mut index_cols_mask = ColumnUsedMask::new();
+        let mut index_cols_mask = ColumnUsedMask::default();
         for col in index.columns.iter() {
             index_cols_mask.set(col.pos_in_table);
         }
@@ -1060,7 +1024,7 @@ impl JoinedTable {
         if btree.has_rowid {
             if let Some(pos_of_rowid_alias_col) = btree.get_rowid_alias_column().map(|(pos, _)| pos)
             {
-                let mut empty_mask = ColumnUsedMask::new();
+                let mut empty_mask = ColumnUsedMask::default();
                 empty_mask.set(pos_of_rowid_alias_col);
                 if self.col_used_mask == empty_mask {
                     // However if the index would be ONLY used for the rowid, then let's not bother using it to cover the query.
@@ -1099,6 +1063,7 @@ pub struct SeekDef {
     /// For example, given:
     /// - CREATE INDEX i ON t (x, y desc)
     /// - SELECT * FROM t WHERE x = 1 AND y >= 30
+    ///
     /// The key is [(1, ASC), (30, DESC)]
     pub key: Vec<(ast::Expr, SortOrder)>,
     /// The condition to use when seeking. See [SeekKey] for more details.
@@ -1120,6 +1085,7 @@ pub struct SeekKey {
     /// For example, given:
     /// - CREATE INDEX i ON t (x, y)
     /// - SELECT * FROM t WHERE x = 1 AND y < 30
+    ///
     /// We want to seek to the first row where x = 1, and then iterate forwards.
     /// In this case, the seek key is GT(1, NULL) since NULL is always LT in index key comparisons.
     /// We can't use just GT(1) because in index key comparisons, only the given number of columns are compared,

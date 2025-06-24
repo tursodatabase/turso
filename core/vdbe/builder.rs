@@ -14,9 +14,10 @@ use crate::{
         emitter::TransactionMode,
         plan::{ResultSetColumn, TableReferences},
     },
-    types::Text,
     Connection, Value, VirtualTable,
 };
+
+#[derive(Default)]
 pub struct TableRefIdCounter {
     next_free: TableInternalId,
 }
@@ -356,7 +357,7 @@ impl ProgramBuilder {
 
     pub fn add_comment(&mut self, insn_index: BranchOffset, comment: &'static str) {
         if let Some(comments) = &mut self.comments {
-            comments.push((insn_index.to_offset_int(), comment));
+            comments.push((insn_index.as_offset_int(), comment));
         }
     }
 
@@ -387,8 +388,8 @@ impl ProgramBuilder {
                 .constant_spans
                 .iter()
                 .find(|span| span.0 <= *index_b && span.1 >= *index_b);
-            if a_span.is_some() && b_span.is_some() {
-                a_span.unwrap().0.cmp(&b_span.unwrap().0)
+            if let (Some(a_span), Some(b_span)) = (a_span, b_span) {
+                a_span.0.cmp(&b_span.0)
             } else if a_span.is_some() {
                 Ordering::Greater
             } else if b_span.is_some() {
@@ -466,7 +467,7 @@ impl ProgramBuilder {
             unreachable!("Label is not a label");
         };
         self.label_to_resolved_offset[label_number as usize] =
-            Some((to_offset.to_offset_int(), target));
+            Some((to_offset.as_offset_int(), target));
     }
 
     /// Resolve unresolved labels to a specific offset in the instruction list.
@@ -730,7 +731,7 @@ impl ProgramBuilder {
     }
 
     /// Initialize the program with basic setup and return initial metadata and labels
-    pub fn prologue<'a>(&mut self) {
+    pub fn prologue(&mut self) {
         if self.nested_level == 0 {
             self.init_label = self.allocate_label();
 
@@ -823,7 +824,7 @@ impl ProgramBuilder {
                     Numeric::Float(v) => Value::Float(v.into()),
                 },
                 ast::Literal::Null => Value::Null,
-                ast::Literal::String(s) => Value::Text(Text::from_str(sanitize_string(s))),
+                ast::Literal::String(s) => Value::Text(sanitize_string(s).into()),
                 ast::Literal::Blob(s) => Value::Blob(
                     // Taken from `translate_expr`
                     s.as_bytes()

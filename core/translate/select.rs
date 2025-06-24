@@ -88,7 +88,7 @@ pub fn translate_select(
     })
 }
 
-pub fn prepare_select_plan<'a>(
+pub fn prepare_select_plan(
     schema: &Schema,
     mut select: ast::Select,
     syms: &SymbolTable,
@@ -181,7 +181,8 @@ pub fn prepare_select_plan<'a>(
     }
 }
 
-fn prepare_one_select_plan<'a>(
+#[allow(clippy::too_many_arguments)]
+fn prepare_one_select_plan(
     schema: &Schema,
     select: ast::OneSelect,
     limit: Option<&ast::Limit>,
@@ -284,7 +285,7 @@ fn prepare_one_select_plan<'a>(
                 match column {
                     ResultColumn::Star => {
                         select_star(
-                            &plan.table_references.joined_tables(),
+                            plan.table_references.joined_tables(),
                             &mut plan.result_columns,
                         );
                         for table in plan.table_references.joined_tables_mut() {
@@ -574,7 +575,7 @@ fn prepare_one_select_plan<'a>(
             }
 
             // Parse the LIMIT/OFFSET clause
-            (plan.limit, plan.offset) = limit.map_or(Ok((None, None)), |l| parse_limit(l))?;
+            (plan.limit, plan.offset) = limit.map_or(Ok((None, None)), parse_limit)?;
 
             // Return the unoptimized query plan
             Ok(plan)
@@ -676,13 +677,7 @@ fn estimate_num_instructions(select: &SelectPlan) -> usize {
     let order_by_instructions = select.order_by.is_some() as usize * 10;
     let condition_instructions = select.where_clause.len() * 3;
 
-    let num_instructions = 20
-        + table_instructions
-        + group_by_instructions
-        + order_by_instructions
-        + condition_instructions;
-
-    num_instructions
+    20 + table_instructions + group_by_instructions + order_by_instructions + condition_instructions
 }
 
 fn estimate_num_labels(select: &SelectPlan) -> usize {
@@ -706,20 +701,17 @@ fn estimate_num_labels(select: &SelectPlan) -> usize {
     let order_by_labels = select.order_by.is_some() as usize * 10;
     let condition_labels = select.where_clause.len() * 2;
 
-    let num_labels =
-        init_halt_labels + table_labels + group_by_labels + order_by_labels + condition_labels;
-
-    num_labels
+    init_halt_labels + table_labels + group_by_labels + order_by_labels + condition_labels
 }
 
-pub fn emit_simple_count<'a>(
+pub fn emit_simple_count(
     program: &mut ProgramBuilder,
-    _t_ctx: &mut TranslateCtx<'a>,
-    plan: &'a SelectPlan,
+    _t_ctx: &mut TranslateCtx,
+    plan: &SelectPlan,
 ) -> Result<()> {
     let cursors = plan
         .joined_tables()
-        .get(0)
+        .first()
         .unwrap()
         .resolve_cursors(program)?;
 

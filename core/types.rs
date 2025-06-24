@@ -58,6 +58,12 @@ pub struct Text {
     pub subtype: TextSubtype,
 }
 
+impl Display for Text {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextRef {
     pub value: RawSlice,
@@ -65,10 +71,6 @@ pub struct TextRef {
 }
 
 impl Text {
-    pub fn from_str<S: Into<String>>(value: S) -> Self {
-        Self::new(&value.into())
-    }
-
     pub fn new(value: &str) -> Self {
         Self {
             value: value.as_bytes().to_vec(),
@@ -84,10 +86,6 @@ impl Text {
         }
     }
 
-    pub fn to_string(&self) -> String {
-        self.as_str().to_string()
-    }
-
     pub fn as_str(&self) -> &str {
         unsafe { std::str::from_utf8_unchecked(self.value.as_ref()) }
     }
@@ -96,6 +94,15 @@ impl Text {
 impl AsRef<str> for Text {
     fn as_ref(&self) -> &str {
         self.as_str()
+    }
+}
+
+impl From<&str> for Text {
+    fn from(value: &str) -> Self {
+        Text {
+            value: value.as_bytes().to_vec(),
+            subtype: TextSubtype::Text,
+        }
     }
 }
 
@@ -108,13 +115,15 @@ impl From<String> for Text {
     }
 }
 
+impl Display for TextRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 impl TextRef {
     pub fn as_str(&self) -> &str {
         unsafe { std::str::from_utf8_unchecked(self.value.to_slice()) }
-    }
-
-    pub fn to_string(&self) -> String {
-        self.as_str().to_string()
     }
 }
 
@@ -331,11 +340,12 @@ impl Display for Value {
                             } else {
                                 format!("{}.{}", whole, fraction)
                             };
-                            let (prefix, exponent) = if exponent.starts_with('-') {
-                                ("-0", &exponent[1..])
-                            } else {
-                                ("+", exponent)
-                            };
+                            let (prefix, exponent) =
+                                if let Some(stripped_exponent) = exponent.strip_prefix('-') {
+                                    ("-0", &stripped_exponent[1..])
+                                } else {
+                                    ("+", exponent)
+                                };
                             return write!(f, "{}e{}{}", trimmed_mantissa, prefix, exponent);
                         }
                     }
@@ -513,10 +523,6 @@ impl PartialEq<Value> for Value {
             (Self::Null, Self::Null) => true,
             _ => false,
         }
-    }
-
-    fn ne(&self, other: &Value) -> bool {
-        !self.eq(other)
     }
 }
 
@@ -782,6 +788,10 @@ impl Record {
     pub fn len(&self) -> usize {
         self.values.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
 }
 struct AppendWriter<'a> {
     buf: &'a mut Vec<u8>,
@@ -859,9 +869,16 @@ impl ImmutableRecord {
         self.values.len()
     }
 
-    pub fn from_registers(registers: &[Register]) -> Self {
-        let mut values = Vec::with_capacity(registers.len());
-        let mut serials = Vec::with_capacity(registers.len());
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    pub fn from_registers<'a>(
+        registers: impl IntoIterator<Item = &'a Register> + Copy,
+        len: usize,
+    ) -> Self {
+        let mut values = Vec::with_capacity(len);
+        let mut serials = Vec::with_capacity(len);
         let mut size_header = 0;
         let mut size_values = 0;
 
@@ -1149,7 +1166,7 @@ impl PartialOrd<RefValue> for RefValue {
 /// A bitfield that represents the comparison spec for index keys.
 /// Since indexed columns can individually specify ASC/DESC, each key must
 /// be compared differently.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct IndexKeySortOrder(u64);
 
@@ -1176,16 +1193,6 @@ impl IndexKeySortOrder {
             spec |= ((*order == SortOrder::Desc) as u64) << i;
         }
         IndexKeySortOrder(spec)
-    }
-
-    pub fn default() -> Self {
-        Self(0)
-    }
-}
-
-impl Default for IndexKeySortOrder {
-    fn default() -> Self {
-        Self::default()
     }
 }
 
@@ -1712,8 +1719,6 @@ mod tests {
         assert_eq!(
             buf.len(),
             header_length  // 9 bytes (header size + 8 serial types)
-                + 0        // ConstInt0: 0 bytes
-                + 0        // ConstInt1: 0 bytes  
                 + size_of::<i8>()        // I8: 1 byte
                 + size_of::<i16>()        // I16: 2 bytes
                 + (size_of::<i32>() - 1)        // I24: 3 bytes
