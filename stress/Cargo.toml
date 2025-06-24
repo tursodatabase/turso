@@ -20,7 +20,7 @@ antithesis = ["turso/antithesis"]
 
 [dependencies]
 anarchist-readable-name-generator-lib = "0.1.0"
-antithesis_sdk = "0.2.5"
+antithesis_sdk = { workspace = true, features = ["full"] }
 clap = { version = "4.5", features = ["derive"] }
 hex = "0.4"
 tempfile = "3.20.0"
