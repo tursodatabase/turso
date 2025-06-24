@@ -12,7 +12,7 @@ use crate::schema::BTreeTable;
 pub fn translate_check_constraint(
     program: &mut ProgramBuilder,
     table: &BTreeTable,
-    column_registers_start: usize,
+    column_registers: &[(usize, &Column)],
     resolver: &Resolver,
 ) {
     let check_constraints = table
@@ -25,13 +25,7 @@ pub fn translate_check_constraint(
         inner_translate_check_constraint(
             program,
             &check_constraint.expr,
-            table
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(i, column)| (column_registers_start + i, column))
-                .collect::<Vec<_>>()
-                .as_ref(),
+            column_registers.as_ref(),
             Some(jump_if_true),
             &resolver,
         );

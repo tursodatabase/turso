@@ -415,12 +415,19 @@ pub fn translate_insert(
         program.preassign_label_to_next_insn(make_record_label);
     }
 
-    translate_check_constraint(
-        &mut program,
-        &btree_table,
-        column_registers_start,
-        &resolver,
-    );
+    let column_registers: Vec<_> = column_mappings
+        .iter()
+        .enumerate()
+        .map(|(i, mapping)| {
+            let reg = if mapping.column.is_rowid_alias {
+                rowid_reg
+            } else {
+                column_registers_start + i
+            };
+            (reg, mapping.column)
+        })
+        .collect();
+    translate_check_constraint(&mut program, &btree_table, &column_registers, &resolver);
 
     match table.btree() {
         Some(t) if t.is_strict => {
