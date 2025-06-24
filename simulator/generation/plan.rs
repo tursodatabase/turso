@@ -353,6 +353,12 @@ impl InteractionPlan {
     }
 }
 
+impl Default for InteractionPlan {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<E: SimulatorEnv> ArbitraryFrom<&mut E> for InteractionPlan {
     fn arbitrary_from<R: rand::Rng>(rng: &mut R, env: &mut E) -> Self {
         let mut plan = InteractionPlan::new();

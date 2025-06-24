@@ -548,7 +548,7 @@ fn property_insert_values_select<R: rand::Rng, E: SimulatorEnv>(
     remaining: &Remaining,
 ) -> Property {
     // Get a random table
-    let table = pick(&env.tables(), rng);
+    let table = pick(env.tables(), rng);
     // Generate rows to insert
     let rows = (0..rng.gen_range(1..=5))
         .map(|_| Vec::<SimValue>::arbitrary_from(rng, table))
@@ -613,7 +613,7 @@ fn property_insert_values_select<R: rand::Rng, E: SimulatorEnv>(
 
 fn property_select_limit<R: rand::Rng, E: SimulatorEnv>(rng: &mut R, env: &E) -> Property {
     // Get a random table
-    let table = pick(&env.tables(), rng);
+    let table = pick(env.tables(), rng);
     // Select the table
     let select = Select {
         table: table.name.clone(),
@@ -631,7 +631,7 @@ fn property_double_create_failure<R: rand::Rng, E: SimulatorEnv>(
     remaining: &Remaining,
 ) -> Property {
     // Get a random table
-    let table = pick(&env.tables(), rng);
+    let table = pick(env.tables(), rng);
     // Create the table
     let create_query = Create {
         table: table.clone(),
@@ -666,7 +666,7 @@ fn property_delete_select<R: rand::Rng, E: SimulatorEnv>(
     remaining: &Remaining,
 ) -> Property {
     // Get a random table
-    let table = pick(&env.tables(), rng);
+    let table = pick(env.tables(), rng);
     // Generate a random predicate
     let predicate = Predicate::arbitrary_from(rng, table);
 
@@ -709,7 +709,7 @@ fn property_drop_select<R: rand::Rng, E: SimulatorEnv>(
     remaining: &Remaining,
 ) -> Property {
     // Get a random table
-    let table = pick(&env.tables(), rng);
+    let table = pick(env.tables(), rng);
 
     // Create random queries respecting the constraints
     let mut queries = Vec::new();
@@ -746,7 +746,7 @@ fn property_select_select_optimizer<R: rand::Rng, E: SimulatorEnv>(
     env: &E,
 ) -> Property {
     // Get a random table
-    let table = pick(&env.tables(), rng);
+    let table = pick(env.tables(), rng);
     // Generate a random predicate
     let predicate = Predicate::arbitrary_from(rng, table);
     // Transform into a Binary predicate to force values to be casted to a bool

@@ -44,11 +44,7 @@ pub trait ArbitraryFromMaybe<T> {
 /// the operations we require for the implementation.
 // todo: switch to a simpler type signature that can accommodate all integer and float types, which
 //       should be enough for our purposes.
-pub fn frequency<
-    T,
-    R: Rng,
-    N: Sum + PartialOrd + Copy + Default + SampleUniform + SubAssign,
->(
+pub fn frequency<T, R: Rng, N: Sum + PartialOrd + Copy + Default + SampleUniform + SubAssign>(
     choices: Vec<(N, ArbitraryFromFunc<R, T>)>,
     rng: &mut R,
 ) -> T {
