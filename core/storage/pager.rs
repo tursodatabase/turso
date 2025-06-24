@@ -8,6 +8,7 @@ use crate::storage::wal::{CheckpointResult, Wal, WalFsyncStatus};
 use crate::types::CursorResult;
 use crate::{Buffer, LimboError, Result};
 use crate::{Completion, WalFile};
+use assertion::{assert_always, assert_always_eq};
 use parking_lot::RwLock;
 use std::cell::{OnceCell, RefCell, UnsafeCell};
 use std::collections::HashSet;
@@ -495,11 +496,21 @@ impl Pager {
                     Ok(CursorResult::Ok(page_id as u32))
                 }
                 AutoVacuumMode::Full => {
+                    use assertion::{
+                        assert_always_greater_than, assert_always_greater_than_or_equal_to,
+                    };
+
                     let mut root_page_num =
                         header_accessor::get_vacuum_mode_largest_root_page(self)?;
-                    assert!(root_page_num > 0); //  Largest root page number cannot be 0 because that is set to 1 when creating the database with autovacuum enabled
+                    //  Largest root page number cannot be 0 because that is set to 1 when creating the database with autovacuum enabled
+                    assert_always_greater_than!(root_page_num, 0, "[Pager - btree_create] Largest root page number cannot be 0 because that is set to 1 when creating the database with autovacuum enabled");
                     root_page_num += 1;
-                    assert!(root_page_num >= FIRST_PTRMAP_PAGE_NO); //  can never be less than 2 because we have already incremented
+                    //  can never be less than 2 because we have already incremented
+                    assert_always_greater_than_or_equal_to!(
+                        root_page_num,
+                        FIRST_PTRMAP_PAGE_NO,
+                        "[Pager - btree_create] root_page can never be less than 2 because we have already incremented"
+                    );
 
                     while is_ptrmap_page(
                         root_page_num,
@@ -507,7 +518,11 @@ impl Pager {
                     ) {
                         root_page_num += 1;
                     }
-                    assert!(root_page_num >= 3); //  the very first root page is page 3
+                    assert_always_greater_than_or_equal_to!(
+                        root_page_num,
+                        3,
+                        "[Pager - btree_create] root page must be at least 3"
+                    ); //  the very first root page is page 3
 
                     //  root_page_num here is the desired root page
                     let page = self.do_allocate_page(
@@ -960,7 +975,11 @@ impl Pager {
 
         let page = match page {
             Some(page) => {
-                assert_eq!(page.get().id, page_id, "Page id mismatch");
+                assert_always_eq!(
+                    page.get().id,
+                    page_id,
+                    "[Pager - free_page] Page id mismatch"
+                );
                 page
             }
             None => self.read_page(page_id)?,
@@ -1153,7 +1172,10 @@ impl Pager {
         let page_key = PageCacheKey::new(id);
 
         // FIXME: use specific page key for writer instead of max frame, this will make readers not conflict
-        assert!(page.is_dirty());
+        assert_always!(
+            page.is_dirty(),
+            "[Pager - update_dirty_loaded_page_in_cache] page should be dirty"
+        );
         cache
             .insert_ignore_existing(page_key, page.clone())
             .map_err(|e| {
@@ -1258,6 +1280,8 @@ impl CreateBTreeFlags {
 */
 #[cfg(not(feature = "omit_autovacuum"))]
 mod ptrmap {
+    use assertion::assert_always_greater_than_or_equal_to;
+
     use crate::{storage::sqlite3_ondisk::MIN_PAGE_SIZE, LimboError, Result};
 
     // Constants
@@ -1326,14 +1350,22 @@ mod ptrmap {
     /// Calculates how many database pages are mapped by a single pointer map page.
     /// This is based on the total page size, as ptrmap pages are filled with entries.
     pub fn entries_per_ptrmap_page(page_size: usize) -> usize {
-        assert!(page_size >= MIN_PAGE_SIZE as usize);
+        assert_always_greater_than_or_equal_to!(
+            page_size,
+            MIN_PAGE_SIZE as usize,
+            "[PtrmapEntry - entries_per_ptrmap_page] page_size should be bigger than minimum"
+        );
         page_size / PTRMAP_ENTRY_SIZE
     }
 
     /// Calculates the cycle length of pointer map pages
     /// The cycle length is the number of database pages that are mapped by a single pointer map page.
     pub fn ptrmap_page_cycle_length(page_size: usize) -> usize {
-        assert!(page_size >= MIN_PAGE_SIZE as usize);
+        assert_always_greater_than_or_equal_to!(
+            page_size,
+            MIN_PAGE_SIZE as usize,
+            "[PtrmapEntry - ptrmap_page_cycle_length] page_size should be bigger than minimum"
+        );
         (page_size / PTRMAP_ENTRY_SIZE) + 1
     }
 

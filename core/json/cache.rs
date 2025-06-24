@@ -1,5 +1,7 @@
 use std::cell::{Cell, UnsafeCell};
 
+use assertion::assert_always;
+
 use crate::Value;
 
 use super::jsonb::Jsonb;
@@ -116,7 +118,10 @@ impl JsonCacheCell {
         key: &Value,
         value: impl Fn(&Value) -> crate::Result<Jsonb>,
     ) -> crate::Result<Jsonb> {
-        assert!(!self.accessed.get());
+        assert_always!(
+            !self.accessed.get(),
+            "[JsonCacheCell - get_or_insert_with] must not have accesed cache"
+        );
 
         self.accessed.set(true);
         let result = unsafe {
@@ -148,7 +153,10 @@ impl JsonCacheCell {
     }
 
     pub fn clear(&mut self) {
-        assert!(!self.accessed.get());
+        assert_always!(
+            !self.accessed.get(),
+            "[JsonCacheCell - clear] must not have accesed cache"
+        );
         self.accessed.set(true);
         unsafe {
             let cache_ptr = self.inner.get();

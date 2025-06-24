@@ -19,6 +19,7 @@ use crate::{
     vdbe::{builder::TableRefIdCounter, BranchOffset},
     Result,
 };
+use assertion::{assert_always, assert_always_greater_than_or_equal_to, assert_always_less_than};
 use turso_sqlite3_parser::ast::{
     self, Expr, FromClause, JoinType, Limit, Materialized, TableInternalId, UnaryOperator, With,
 };
@@ -586,7 +587,11 @@ impl TableMask {
 
     /// Creates a new mask that is the same as this one but without the specified table.
     pub fn without_table(&self, table_no: usize) -> Self {
-        assert!(table_no < 127, "table_no must be less than 127");
+        assert_always_less_than!(
+            table_no,
+            127,
+            "[TableMask - without_table] table_no must be less than 127"
+        );
         Self(self.0 ^ (1 << (table_no + 1)))
     }
 
@@ -600,7 +605,11 @@ impl TableMask {
     /// Creates a table mask from an iterator of table numbers.
     pub fn from_table_number_iter(iter: impl Iterator<Item = usize>) -> Self {
         iter.fold(Self::new(), |mut mask, table_no| {
-            assert!(table_no < 127, "table_no must be less than 127");
+            assert_always_less_than!(
+                table_no,
+                127,
+                "[TableMask - from_table_number_iter] table_no must be less than 127"
+            );
             mask.add_table(table_no);
             mask
         })
@@ -608,13 +617,21 @@ impl TableMask {
 
     /// Adds a table to the mask.
     pub fn add_table(&mut self, table_no: usize) {
-        assert!(table_no < 127, "table_no must be less than 127");
+        assert_always_less_than!(
+            table_no,
+            127,
+            "[TableMask - add_table] table_no must be less than 127"
+        );
         self.0 |= 1 << (table_no + 1);
     }
 
     /// Returns true if the mask contains the specified table.
     pub fn contains_table(&self, table_no: usize) -> bool {
-        assert!(table_no < 127, "table_no must be less than 127");
+        assert_always_less_than!(
+            table_no,
+            127,
+            "[TableMask - contains_table] table_no must be less than 127"
+        );
         self.0 & (1 << (table_no + 1)) != 0
     }
 
@@ -730,7 +747,11 @@ fn parse_join(
     }
 
     let constraint = if natural {
-        assert!(table_references.joined_tables().len() >= 2);
+        assert_always_greater_than_or_equal_to!(
+            table_references.joined_tables().len(),
+            2,
+            "[parse_join] - Natural: should have more than 1 joined table"
+        );
         let rightmost_table = table_references.joined_tables().last().unwrap();
         // NATURAL JOIN is first transformed into a USING join with the common columns
         let right_cols = rightmost_table.columns();
@@ -800,7 +821,10 @@ fn parse_join(
                     let name_normalized = normalize_ident(distinct_name.0.as_str());
                     let cur_table_idx = table_references.joined_tables().len() - 1;
                     let left_tables = &table_references.joined_tables()[..cur_table_idx];
-                    assert!(!left_tables.is_empty());
+                    assert_always!(
+                        !left_tables.is_empty(),
+                        "[parse_join] - left_tables should not be empty"
+                    );
                     let right_table = table_references.joined_tables().last().unwrap();
                     let mut left_col = None;
                     for (left_table_idx, left_table) in left_tables.iter().enumerate() {
@@ -878,7 +902,11 @@ fn parse_join(
         }
     }
 
-    assert!(table_references.joined_tables().len() >= 2);
+    assert_always_greater_than_or_equal_to!(
+        table_references.joined_tables().len(),
+        2,
+        "[parse_join] - should have more than 1 joined table"
+    );
     let last_idx = table_references.joined_tables().len() - 1;
     let rightmost_table = table_references
         .joined_tables_mut()

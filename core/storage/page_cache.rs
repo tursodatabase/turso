@@ -1,5 +1,6 @@
 use std::{cell::RefCell, ptr::NonNull};
 
+use assertion::{assert_always, assert_always_greater_than};
 use std::sync::Arc;
 use tracing::{debug, trace};
 
@@ -65,7 +66,11 @@ impl PageCacheKey {
 }
 impl DumbLruPageCache {
     pub fn new(capacity: usize) -> Self {
-        assert!(capacity > 0, "capacity of cache should be at least 1");
+        assert_always_greater_than!(
+            capacity,
+            0,
+            "[DumbLruPageCache - new] capacity of cache should be at least 1"
+        );
         Self {
             capacity,
             map: RefCell::new(PageHashMap::new(capacity)),
@@ -100,11 +105,15 @@ impl DumbLruPageCache {
         // Check first if page already exists in cache
         if !ignore_exists {
             if let Some(existing_page_ref) = self.get(&key) {
-                assert!(
+                assert_always!(
                     Arc::ptr_eq(&value, &existing_page_ref),
-                    "Attempted to insert different page with same key: {:?}",
-                    key
+                    "[DumbLruPageCache - _insert] Attempted to insert different page with same key"
                 );
+                // assert!(
+                //     Arc::ptr_eq(&value, &existing_page_ref),
+                //     "Attempted to insert different page with same key: {:?}",
+                //     key
+                // );
                 return Err(CacheError::KeyExists);
             }
         }
@@ -297,7 +306,10 @@ impl DumbLruPageCache {
             let next = unsafe { current_entry.as_ref().next };
             self.detach(current_entry, true)?;
             unsafe {
-                assert!(!current_entry.as_ref().page.is_dirty());
+                assert_always!(
+                    !current_entry.as_ref().page.is_dirty(),
+                    "[DumbLruPageCache - clear] page should not be dirty"
+                );
             }
             unsafe { std::ptr::drop_in_place(current_entry.as_ptr()) };
             current = next;
@@ -305,9 +317,18 @@ impl DumbLruPageCache {
         let _ = self.head.take();
         let _ = self.tail.take();
 
-        assert!(self.head.borrow().is_none());
-        assert!(self.tail.borrow().is_none());
-        assert!(self.map.borrow().is_empty());
+        assert_always!(
+            self.head.borrow().is_none(),
+            "[DumbLruPageCache - clear] head should be None"
+        );
+        assert_always!(
+            self.tail.borrow().is_none(),
+            "[DumbLruPageCache - clear] tail should be None"
+        );
+        assert_always!(
+            self.map.borrow().is_empty(),
+            "[DumbLruPageCache - clear] map should be empty"
+        );
         Ok(())
     }
 

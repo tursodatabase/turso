@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "assertion"
-version = "0.0.22"
+version = "0.1.0-pre.5"
 dependencies = [
  "antithesis_sdk",
 ]

@@ -1,5 +1,6 @@
 use std::{cell::RefCell, cmp::Ordering, collections::HashMap, sync::Arc};
 
+use assertion::{assert_always, assert_always_eq};
 use constraints::{
     constraints_from_where_clause, usable_constraints_for_join_order, Constraint, ConstraintRef,
 };
@@ -307,15 +308,22 @@ fn optimize_table_access(
             });
         } else {
             let constraint_refs = access_method.constraint_refs;
-            assert!(!constraint_refs.is_empty());
+            assert_always!(
+                !constraint_refs.is_empty(),
+                "[optimize_table_access] constraints should not be empty"
+            );
             for cref in constraint_refs.iter() {
                 let constraint =
                     &constraints_per_table[table_idx].constraints[cref.constraint_vec_pos];
-                assert!(
+                assert_always!(
                     !where_clause[constraint.where_clause_pos.0].consumed.get(),
-                    "trying to consume a where clause term twice: {:?}",
-                    where_clause[constraint.where_clause_pos.0]
+                    "trying to consume a where clause term twice"
                 );
+                // assert!(
+                //     !where_clause[constraint.where_clause_pos.0].consumed.get(),
+                //     "trying to consume a where clause term twice: {:?}",
+                //     where_clause[constraint.where_clause_pos.0]
+                // );
                 where_clause[constraint.where_clause_pos.0]
                     .consumed
                     .set(true);
@@ -332,11 +340,16 @@ fn optimize_table_access(
                 });
                 continue;
             }
-            assert!(
-                constraint_refs.len() == 1,
-                "expected exactly one constraint for rowid seek, got {:?}",
-                constraint_refs
+            assert_always_eq!(
+                constraint_refs.len(),
+                1,
+                "[optimize_table_access] expected exactly one constraint for rowid seek"
             );
+            // assert!(
+            //     constraint_refs.len() == 1,
+            //     "expected exactly one constraint for rowid seek, got {:?}",
+            //     constraint_refs
+            // );
             let constraint = &constraints_per_table[table_idx].constraints
                 [constraint_refs[0].constraint_vec_pos];
             joined_tables[table_idx].op = match constraint.operator {
@@ -829,9 +842,9 @@ pub fn build_seek_def_from_constraints(
     iter_dir: IterationDirection,
     where_clause: &[WhereTerm],
 ) -> Result<SeekDef> {
-    assert!(
+    assert_always!(
         !constraint_refs.is_empty(),
-        "cannot build seek def from empty list of constraint refs"
+        "[build_seek_def_from_constraints] - cannot build seek def from empty list of constraint refs"
     );
     // Extract the key values and operators
     let key = constraint_refs

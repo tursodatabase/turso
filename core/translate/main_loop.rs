@@ -1,3 +1,4 @@
+use assertion::{assert_always, assert_always_eq};
 use turso_ext::VTabKind;
 use turso_sqlite3_parser::ast::{self, SortOrder};
 
@@ -113,9 +114,10 @@ pub fn init_loop(
     mode: OperationMode,
     where_clause: &[WhereTerm],
 ) -> Result<()> {
-    assert!(
-        t_ctx.meta_left_joins.len() == tables.joined_tables().len(),
-        "meta_left_joins length does not match tables length"
+    assert_always_eq!(
+        t_ctx.meta_left_joins.len(),
+        tables.joined_tables().len(),
+        "[init_loop] meta_left_joins length does not match tables length"
     );
     // Initialize ephemeral indexes for distinct aggregates
     for (i, agg) in aggregates
@@ -123,9 +125,10 @@ pub fn init_loop(
         .enumerate()
         .filter(|(_, agg)| agg.is_distinct())
     {
-        assert!(
-            agg.args.len() == 1,
-            "DISTINCT aggregate functions must have exactly one argument"
+        assert_always_eq!(
+            agg.args.len(),
+            1,
+            "[init_loop] DISTINCT aggregate functions must have exactly one argument"
         );
         let index_name = format!("distinct_agg_{}_{}", i, agg.args[0]);
         let index = Arc::new(Index {
@@ -595,9 +598,9 @@ pub fn open_loop(
                 }
             }
             Operation::Search(search) => {
-                assert!(
+                assert_always!(
                     !matches!(table.table, Table::FromClauseSubquery(_)),
-                    "Subqueries do not support index seeks"
+                    "[open_loop] Subqueries do not support index seeks"
                 );
                 // Open the loop for the index search.
                 // Rowid equality point lookups are handled with a SeekRowid instruction which does not loop, since it is a single row lookup.
@@ -943,9 +946,9 @@ fn emit_loop_source(
             Ok(())
         }
         LoopEmitTarget::QueryResult => {
-            assert!(
+            assert_always!(
                 plan.aggregates.is_empty(),
-                "We should not get here with aggregates"
+                "[emit_loop_source] We should not get here with aggregates"
             );
             let offset_jump_to = t_ctx
                 .labels_main_loop
@@ -1045,9 +1048,9 @@ pub fn close_loop(
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
             }
             Operation::Search(search) => {
-                assert!(
+                assert_always!(
                     !matches!(table.table, Table::FromClauseSubquery(_)),
-                    "Subqueries do not support index seeks"
+                    "[close_loop] Subqueries do not support index seeks"
                 );
                 program.resolve_label(loop_labels.next, program.offset());
                 let iteration_cursor_id = temp_cursor_id.unwrap_or_else(|| {
@@ -1404,7 +1407,8 @@ fn emit_autoindex(
     index_cursor_id: CursorID,
     table_has_rowid: bool,
 ) -> Result<CursorID> {
-    assert!(index.ephemeral, "Index {} is not ephemeral", index.name);
+    assert_always!(index.ephemeral, "[emit_autoindex] index is not ephemeral");
+    // assert!(index.ephemeral, "Index {} is not ephemeral", index.name);
     let label_ephemeral_build_end = program.allocate_label();
     // Since this typically happens in an inner loop, we only build it once.
     program.emit_insn(Insn::Once {

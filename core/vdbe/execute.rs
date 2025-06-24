@@ -60,6 +60,7 @@ use super::{
     insn::{Cookie, RegisterOrLiteral},
     CommitState,
 };
+use assertion::assert_always;
 use fallible_iterator::FallibleIterator;
 use parking_lot::RwLock;
 use rand::thread_rng;
@@ -125,7 +126,10 @@ pub fn op_init(
     let Insn::Init { target_pc } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert!(target_pc.is_offset());
+    assert_always!(
+        target_pc.is_offset(),
+        "[op_init] BranchOffset should be an offset"
+    );
     state.pc = target_pc.as_offset_int();
     Ok(InsnFunctionStepResult::Step)
 }
@@ -435,9 +439,18 @@ pub fn op_jump(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert!(target_pc_lt.is_offset());
-    assert!(target_pc_eq.is_offset());
-    assert!(target_pc_gt.is_offset());
+    assert_always!(
+        target_pc_lt.is_offset(),
+        "[op_jump] lt BranchOffset should be an offset"
+    );
+    assert_always!(
+        target_pc_eq.is_offset(),
+        "[op_jump] eq BranchOffset should be an offset"
+    );
+    assert_always!(
+        target_pc_gt.is_offset(),
+        "[op_jump] gt BranchOffset should be an offset"
+    );
     let cmp = state.last_compare.take();
     if cmp.is_none() {
         return Err(LimboError::InternalError(
@@ -496,7 +509,10 @@ pub fn op_if_pos(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert!(target_pc.is_offset());
+    assert_always!(
+        target_pc.is_offset(),
+        "[op_if_pos] BranchOffset should be an offset"
+    );
     let reg = *reg;
     let target_pc = *target_pc;
     match state.registers[reg].get_owned_value() {
@@ -526,7 +542,10 @@ pub fn op_not_null(
     let Insn::NotNull { reg, target_pc } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert!(target_pc.is_offset());
+    assert_always!(
+        target_pc.is_offset(),
+        "[op_not_null] BranchOffset should be an offset"
+    );
     let reg = *reg;
     let target_pc = *target_pc;
     match &state.registers[reg].get_owned_value() {
@@ -698,7 +717,10 @@ pub fn op_comparison(
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
 
-    assert!(target_pc.is_offset());
+    assert_always!(
+        target_pc.is_offset(),
+        "[op_comparison] BranchOffset should be an offset"
+    );
 
     let nulleq = flags.has_nulleq();
     let jump_if_null = flags.has_jump_if_null();
@@ -825,7 +847,10 @@ pub fn op_if(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert!(target_pc.is_offset());
+    assert_always!(
+        target_pc.is_offset(),
+        "[op_if] BranchOffset should be an offset"
+    );
     if state.registers[*reg]
         .get_owned_value()
         .exec_if(*jump_if_null, false)
@@ -852,7 +877,10 @@ pub fn op_if_not(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert!(target_pc.is_offset());
+    assert_always!(
+        target_pc.is_offset(),
+        "[op_if_not] BranchOffset should be an offset"
+    );
     if state.registers[*reg]
         .get_owned_value()
         .exec_if(*jump_if_null, true)
@@ -1029,6 +1057,10 @@ pub fn op_vfilter(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
+    assert_always!(
+        pc_if_empty.is_offset(),
+        "[op_vfilter] BranchOffset should be an offset"
+    );
     let has_rows = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_virtual_mut();
@@ -1152,6 +1184,10 @@ pub fn op_vnext(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
+    assert_always!(
+        pc_if_next.is_offset(),
+        "[op_vnext] BranchOffset should be an offset"
+    );
     let has_more = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_virtual_mut();
@@ -1230,7 +1266,10 @@ pub fn op_rewind(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert!(pc_if_empty.is_offset());
+    assert_always!(
+        pc_if_empty.is_offset(),
+        "[op_rewind] BranchOffset should be an offset"
+    );
     let is_empty = {
         let mut cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Rewind");
         let cursor = cursor.as_btree_mut();
@@ -1259,7 +1298,10 @@ pub fn op_last(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert!(pc_if_empty.is_offset());
+    assert_always!(
+        pc_if_empty.is_offset(),
+        "[op_last] BranchOffset should be an offset"
+    );
     let is_empty = {
         let mut cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Last");
         let cursor = cursor.as_btree_mut();
@@ -1408,7 +1450,10 @@ pub fn op_type_check(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert!(table_reference.is_strict);
+    assert_always!(
+        table_reference.is_strict,
+        "[op_type_check] table should be strict"
+    );
     state.registers[*start_reg..*start_reg + *count]
         .iter_mut()
         .zip(table_reference.columns.iter())
@@ -1509,7 +1554,10 @@ pub fn op_next(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert!(pc_if_next.is_offset());
+    assert_always!(
+        pc_if_next.is_offset(),
+        "[op_next] BranchOffset should be an offset"
+    );
     let is_empty = {
         let mut cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Next");
         let cursor = cursor.as_btree_mut();
@@ -1540,7 +1588,10 @@ pub fn op_prev(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert!(pc_if_prev.is_offset());
+    assert_always!(
+        pc_if_prev.is_offset(),
+        "[op_prev] BranchOffset should be an offset"
+    );
     let is_empty = {
         let mut cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Prev");
         let cursor = cursor.as_btree_mut();
@@ -1794,7 +1845,10 @@ pub fn op_goto(
     let Insn::Goto { target_pc } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert!(target_pc.is_offset());
+    assert_always!(
+        target_pc.is_offset(),
+        "[op_goto] BranchOffset should be an offset"
+    );
     state.pc = target_pc.as_offset_int();
     Ok(InsnFunctionStepResult::Step)
 }
@@ -1813,7 +1867,10 @@ pub fn op_gosub(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert!(target_pc.is_offset());
+    assert_always!(
+        target_pc.is_offset(),
+        "[op_gosub] BranchOffset should be an offset"
+    );
     state.registers[*return_reg] = Register::Value(Value::Integer((state.pc + 1) as i64));
     state.pc = target_pc.as_offset_int();
     Ok(InsnFunctionStepResult::Step)
@@ -2057,7 +2114,10 @@ pub fn op_seek_rowid(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert!(target_pc.is_offset());
+    assert_always!(
+        target_pc.is_offset(),
+        "[op_seek_rowid] BranchOffset should be an offset"
+    );
     let pc = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
@@ -2157,10 +2217,9 @@ pub fn op_seek(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert!(
+    assert_always!(
         target_pc.is_offset(),
-        "target_pc should be an offset, is: {:?}",
-        target_pc
+        "[op_seek] BranchOffset should be an offset"
     );
     let eq_only = match insn {
         Insn::SeekGE { eq_only, .. } | Insn::SeekLE { eq_only, .. } => *eq_only,
@@ -2305,7 +2364,10 @@ pub fn op_idx_ge(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert!(target_pc.is_offset());
+    assert_always!(
+        target_pc.is_offset(),
+        "[op_idx_ge] BranchOffset should be an offset"
+    );
     let pc = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
@@ -2369,7 +2431,10 @@ pub fn op_idx_le(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert!(target_pc.is_offset());
+    assert_always!(
+        target_pc.is_offset(),
+        "[op_idx_le] BranchOffset should be an offset"
+    );
     let pc = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
@@ -2415,7 +2480,10 @@ pub fn op_idx_gt(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert!(target_pc.is_offset());
+    assert_always!(
+        target_pc.is_offset(),
+        "[op_idx_gt] BranchOffset should be an offset"
+    );
     let pc = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
@@ -2461,7 +2529,10 @@ pub fn op_idx_lt(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert!(target_pc.is_offset());
+    assert_always!(
+        target_pc.is_offset(),
+        "[op_idx_lt] BranchOffset should be an offset"
+    );
     let pc = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
@@ -2501,7 +2572,10 @@ pub fn op_decr_jump_zero(
     let Insn::DecrJumpZero { reg, target_pc } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert!(target_pc.is_offset());
+    assert_always!(
+        target_pc.is_offset(),
+        "[op_decr_jump_zero] BranchOffset should be an offset"
+    );
     match state.registers[*reg].get_owned_value() {
         Value::Integer(n) => {
             let n = n - 1;
@@ -3058,6 +3132,10 @@ pub fn op_sorter_sort(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
+    assert_always!(
+        pc_if_empty.is_offset(),
+        "[op_sorter_sort] BranchOffset should be an offset"
+    );
     let is_empty = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_sorter_mut();
@@ -3089,7 +3167,10 @@ pub fn op_sorter_next(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert!(pc_if_next.is_offset());
+    assert_always!(
+        pc_if_next.is_offset(),
+        "[op_sorter_next] BranchOffset should be an offset"
+    );
     let has_more = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_sorter_mut();
@@ -4151,7 +4232,10 @@ pub fn op_init_coroutine(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert!(jump_on_definition.is_offset());
+    assert_always!(
+        jump_on_definition.is_offset(),
+        "[op_init_coroutine] BranchOffset should be an offset"
+    );
     let start_offset = start_offset.as_offset_int();
     state.registers[*yield_reg] = Register::Value(Value::Integer(start_offset as i64));
     state.ended_coroutine.unset(*yield_reg);
@@ -4883,6 +4967,10 @@ pub fn op_is_null(
     let Insn::IsNull { reg, target_pc } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
+    assert_always!(
+        target_pc.is_offset(),
+        "[op_is_null] BranchOffset should be an offset"
+    );
     if matches!(state.registers[*reg], Register::Value(Value::Null)) {
         state.pc = target_pc.as_offset_int();
     } else {
@@ -5337,7 +5425,10 @@ pub fn op_once(
     else {
         unreachable!("unexpected Insn: {:?}", insn)
     };
-    assert!(target_pc_when_reentered.is_offset());
+    assert_always!(
+        target_pc_when_reentered.is_offset(),
+        "[op_once] BranchOffset should be an offset"
+    );
     let offset = state.pc;
     if state.once.iter().any(|o| o == offset) {
         state.pc = target_pc_when_reentered.as_offset_int();

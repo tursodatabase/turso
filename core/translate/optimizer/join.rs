@@ -1,5 +1,6 @@
 use std::{cell::RefCell, collections::HashMap};
 
+use assertion::{assert_always_eq, assert_always_greater_than};
 use turso_sqlite3_parser::ast::TableInternalId;
 
 use crate::{
@@ -194,7 +195,11 @@ pub fn compute_best_join_order<'a>(
             original_idx: i,
             is_outer: false,
         };
-        assert!(join_order.len() == 1);
+        assert_always_eq!(
+            join_order.len(),
+            1,
+            "[compute_best_join_order] - there should only be 1 join order"
+        );
         let rel = join_lhs_and_rhs(
             None,
             table_ref,
@@ -307,7 +312,7 @@ pub fn compute_best_join_order<'a>(
                         .as_ref()
                         .map_or(false, |j| j.outer),
                 });
-                assert!(join_order.len() == subset_size);
+                assert_always_eq!(join_order.len(), subset_size, "[compute_best_join_order] - join order size should be equal to the subset size");
 
                 // Calculate the best way to join LHS with RHS.
                 let rel = join_lhs_and_rhs(
@@ -398,7 +403,11 @@ pub fn compute_naive_left_deep_plan<'a>(
     constraints: &'a [TableConstraints],
 ) -> Result<JoinN> {
     let n = joined_tables.len();
-    assert!(n > 0);
+    assert_always_greater_than!(
+        n,
+        0,
+        "[compute_naive_left_deep_plan] - joined tables should not be empty"
+    );
 
     let join_order = joined_tables
         .iter()

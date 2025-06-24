@@ -1,3 +1,8 @@
+use assertion::{
+    assert_always, assert_always_eq, assert_always_less_than, assert_always_less_than_or_equal_to,
+};
+use limbo_ext::{AggCtx, FinalizeFunction, StepFunction};
+use limbo_sqlite3_parser::ast::SortOrder;
 #[cfg(feature = "serde")]
 use serde::Deserialize;
 use turso_ext::{AggCtx, FinalizeFunction, StepFunction};
@@ -820,8 +825,16 @@ impl<'a> AppendWriter<'a> {
 
     fn assert_finish_capacity(&self) {
         // let's make sure we didn't reallocate anywhere else
-        assert_eq!(self.buf_capacity_start, self.buf.capacity());
-        assert_eq!(self.buf_ptr_start, self.buf.as_ptr());
+        assert_always_eq!(
+            self.buf_capacity_start,
+            self.buf.capacity(),
+            "Initial Capacity Equal to Current Capacity"
+        );
+        assert_always_eq!(
+            self.buf_ptr_start,
+            self.buf.as_ptr(),
+            "Inital Ptr Equal to Current Pointer"
+        );
     }
 }
 
@@ -914,7 +927,11 @@ impl ImmutableRecord {
         let mut buf = Vec::new();
         buf.reserve_exact(header_size + size_values);
         assert_eq!(buf.capacity(), header_size + size_values);
-        assert!(header_size <= 126);
+        assert_always_less_than_or_equal_to!(
+            header_size,
+            MIN_HEADER_SIZE,
+            "[ImmutableRecord - from_registers] header size smaller than minimum size"
+        );
         let n = write_varint(&mut serial_type_buf, header_size as u64);
 
         buf.resize(buf.capacity(), 0);
@@ -988,12 +1005,18 @@ impl ImmutableRecord {
         self.payload.extend_from_slice(payload);
     }
     pub fn end_serialization(&mut self) {
-        assert!(self.recreating);
+        assert_always!(
+            self.recreating,
+            "[ImmutableRecord - end_serialization] should be recreating"
+        );
         self.recreating = false;
     }
 
     pub fn add_value(&mut self, value: RefValue) {
-        assert!(self.recreating);
+        assert_always!(
+            self.recreating,
+            "[ImmutableRecord - add_value] should be recreating"
+        );
         self.values.push(value);
     }
 
@@ -1172,7 +1195,11 @@ pub struct IndexKeySortOrder(u64);
 
 impl IndexKeySortOrder {
     pub fn get_sort_order_for_col(&self, column_idx: usize) -> SortOrder {
-        assert!(column_idx < 64, "column index out of range: {}", column_idx);
+        assert_always_less_than!(
+            column_idx,
+            64,
+            "[IndexKeySortOrder - get_sort_order_for_col] column index out of range"
+        );
         match self.0 & (1 << column_idx) {
             0 => SortOrder::Asc,
             _ => SortOrder::Desc,
@@ -1227,7 +1254,11 @@ pub fn compare_immutable(
     index_key_sort_order: IndexKeySortOrder,
     collations: &[CollationSeq],
 ) -> std::cmp::Ordering {
-    assert_eq!(l.len(), r.len());
+    assert_always_eq!(
+        l.len(),
+        r.len(),
+        "[compare_immutable] same number of arguments to compare on both sides"
+    );
     for (i, (l, r)) in l.iter().zip(r).enumerate() {
         let column_order = index_key_sort_order.get_sort_order_for_col(i);
         let collation = collations.get(i).copied().unwrap_or_default();
@@ -1478,7 +1509,11 @@ impl Record {
             // header_size += n;
             // if( nVarint<sqlite3VarintLen(nHdr) ) nHdr++;
         }
-        assert!(header_size <= 126);
+        assert_always_less_than_or_equal_to!(
+            header_size,
+            126,
+            "[Record - serialize] header size smaller than minimum size"
+        );
         header_bytes_buf.extend(std::iter::repeat(0).take(9));
         let n = write_varint(header_bytes_buf.as_mut_slice(), header_size as u64);
         header_bytes_buf.truncate(n);

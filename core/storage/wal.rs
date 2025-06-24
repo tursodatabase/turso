@@ -1,6 +1,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use assertion::{assert_always, assert_always_greater_than, assert_always_less_than_or_equal_to};
 use std::array;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
@@ -179,14 +180,20 @@ impl LimboRwLock {
                         Ordering::SeqCst,
                         Ordering::SeqCst,
                     );
-                    assert!(res.is_ok());
+                    assert_always!(
+                        res.is_ok(),
+                        "[LimboRwLock - unlock] SHARED_LOCK: result should be ok"
+                    );
                 }
             }
             WRITE_LOCK => {
                 let res =
                     self.lock
                         .compare_exchange(lock, NO_LOCK, Ordering::SeqCst, Ordering::SeqCst);
-                assert!(res.is_ok());
+                assert_always!(
+                    res.is_ok(),
+                    "[LimboRwLock - unlock] WRITE_LOCK: result should be ok"
+                );
             }
             _ => unreachable!(),
         }
@@ -712,9 +719,9 @@ impl Wal for WalFile {
         write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<CheckpointStatus> {
-        assert!(
+        assert_always!(
             matches!(mode, CheckpointMode::Passive),
-            "only passive mode supported for now"
+            "[WalFile - checkpoint] only passive mode supported for now"
         );
         'checkpoint_loop: loop {
             let state = self.ongoing_checkpoint.state;
@@ -760,7 +767,11 @@ impl Wal for WalFile {
 
                     let frame_cache = shared.frame_cache.clone();
                     let frame_cache = frame_cache.lock();
-                    assert!(self.ongoing_checkpoint.current_page as usize <= pages_in_frames.len());
+                    assert_always_less_than_or_equal_to!(
+                        self.ongoing_checkpoint.current_page as usize,
+                        pages_in_frames.len(),
+                        "[WalFile - checkpoint] Current page index should be less than all pages in frames"
+                    );
                     if self.ongoing_checkpoint.current_page as usize == pages_in_frames.len() {
                         self.ongoing_checkpoint.state = CheckpointState::Done;
                         continue 'checkpoint_loop;
@@ -998,7 +1009,11 @@ impl WalFile {
     }
 
     fn frame_offset(&self, frame_id: u64) -> usize {
-        assert!(frame_id > 0, "Frame ID must be 1-based");
+        assert_always_greater_than!(
+            frame_id,
+            0,
+            "[WalFile - frame_offset] Frame ID must be 1-based"
+        );
         let page_offset = (frame_id - 1) * (self.page_size() + WAL_FRAME_HEADER_SIZE as u32) as u64;
         let offset = WAL_HEADER_SIZE as u64 + page_offset;
         offset as usize

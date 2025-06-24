@@ -9,6 +9,38 @@
 
 #[macro_export]
 #[cfg(not(feature = "antithesis"))]
+macro_rules! assert_always_eq {
+    ($left:expr, $right:expr, $message:literal) => {
+        ::core::assert_eq!($left, $right, $message);
+    };
+}
+
+#[macro_export]
+#[cfg(feature = "antithesis")]
+macro_rules! assert_always_eq {
+    ($left:expr, $right:expr, $message:literal) => {
+        $crate::antithesis_sdk::assert_always!($left == $right, $message);
+    };
+}
+
+#[macro_export]
+#[cfg(not(feature = "antithesis"))]
+macro_rules! assert_always_ne {
+    ($left:expr, $right:expr, $message:literal) => {
+        ::core::assert_ne!($left, $right, $message);
+    };
+}
+
+#[macro_export]
+#[cfg(feature = "antithesis")]
+macro_rules! assert_always_ne {
+    ($left:expr, $right:expr, $message:literal) => {
+        $crate::antithesis_sdk::assert_always!($left != $right, $message);
+    };
+}
+
+#[macro_export]
+#[cfg(not(feature = "antithesis"))]
 macro_rules! assert_always {
     ($condition:expr, $message:literal) => {
         ::core::assert!($condition, $message);
@@ -55,6 +87,7 @@ macro_rules! assert_always_greater_than_or_equal_to {
     };
 }
 
+#[macro_export]
 #[cfg(not(feature = "antithesis"))]
 macro_rules! assert_always_less_than {
     ($left:expr, $right:expr, $message:literal) => {
@@ -70,6 +103,7 @@ macro_rules! assert_always_less_than {
     };
 }
 
+#[macro_export]
 #[cfg(not(feature = "antithesis"))]
 macro_rules! assert_always_less_than_or_equal_to {
     ($left:expr, $right:expr, $message:literal) => {
@@ -239,6 +273,8 @@ mod tests {
 
     #[test]
     fn test_compiles() {
+        assert_always_eq!(100, 100, "always eq");
+        assert_always_ne!(1, 2, "always not eq");
         assert_always!(true, "hi");
         assert_always_greater_than!(2, 1, "always greater than");
         assert_always_greater_than_or_equal_to!(2, 2, "always greater than or equal to");

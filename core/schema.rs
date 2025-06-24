@@ -2,6 +2,7 @@ use crate::translate::collate::CollationSeq;
 use crate::translate::plan::SelectPlan;
 use crate::{util::normalize_ident, Result};
 use crate::{LimboError, VirtualTable};
+use assertion::assert_always;
 use core::fmt;
 use fallible_iterator::FallibleIterator;
 use std::collections::{BTreeSet, HashMap};
@@ -1012,7 +1013,7 @@ impl Index {
         table: &BTreeTable,
         auto_indices: Vec<(String, usize)>,
     ) -> Result<Vec<Index>> {
-        assert!(!auto_indices.is_empty());
+        assert_always!(!auto_indices.is_empty(), "Auto Indices is not empty");
 
         let mut indices = Vec::with_capacity(auto_indices.len());
 

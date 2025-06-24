@@ -1,5 +1,6 @@
 use std::{cell::Cell, cmp::Ordering, rc::Rc, sync::Arc};
 
+use assertion::{assert_always, assert_always_eq};
 use tracing::{instrument, Level};
 use turso_sqlite3_parser::ast::{self, TableInternalId};
 
@@ -259,12 +260,12 @@ impl ProgramBuilder {
     }
 
     pub fn alloc_cursor_id_keyed(&mut self, key: CursorKey, cursor_type: CursorType) -> usize {
-        assert!(
+        assert_always!(
             !self
                 .cursor_ref
                 .iter()
                 .any(|(k, _)| k.as_ref().map_or(false, |k| k.equals(&key))),
-            "duplicate cursor key"
+            "[ProgramBuilder - alloc_cursor_id_keyed] duplicate cursor key"
         );
         self._alloc_cursor_id(Some(key), cursor_type)
     }
@@ -277,7 +278,11 @@ impl ProgramBuilder {
         let cursor = self.next_free_cursor_id;
         self.next_free_cursor_id += 1;
         self.cursor_ref.push((key, cursor_type));
-        assert_eq!(self.cursor_ref.len(), self.next_free_cursor_id);
+        assert_always_eq!(
+            self.cursor_ref.len(),
+            self.next_free_cursor_id,
+            "[ProgramBuilder - _alloc_cursor_id] next cursor id mismatch"
+        );
         cursor
     }
 
@@ -447,7 +452,11 @@ impl ProgramBuilder {
     /// reordering the emitted instructions.
     #[inline]
     pub fn preassign_label_to_next_insn(&mut self, label: BranchOffset) {
-        assert!(label.is_label(), "BranchOffset {:?} is not a label", label);
+        assert_always!(
+            label.is_label(),
+            "[ProgramBuilder - preassign_label_to_next_insn] BranchOffset is not a label"
+        );
+        // assert!(label.is_label(), "BranchOffset {:?} is not a label", label);
         self._resolve_label(label, self.offset().sub(1u32), JumpTarget::AfterThisInsn);
     }
 
@@ -463,8 +472,14 @@ impl ProgramBuilder {
     }
 
     fn _resolve_label(&mut self, label: BranchOffset, to_offset: BranchOffset, target: JumpTarget) {
-        assert!(matches!(label, BranchOffset::Label(_)));
-        assert!(matches!(to_offset, BranchOffset::Offset(_)));
+        assert_always!(
+            matches!(label, BranchOffset::Label(_)),
+            "[ProgramBuilder - _resolve_label] should be a label"
+        );
+        assert_always!(
+            matches!(to_offset, BranchOffset::Offset(_)),
+            "[ProgramBuilder - _resolve_label] should be an offset"
+        );
         let BranchOffset::Label(label_number) = label else {
             unreachable!("Label is not a label");
         };

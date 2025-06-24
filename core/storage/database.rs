@@ -1,6 +1,10 @@
 use crate::error::LimboError;
 use crate::io::CompletionType;
 use crate::{io::Completion, Buffer, Result};
+use assertion::{
+    assert_always_eq, assert_always_greater_than, assert_always_greater_than_or_equal_to,
+    assert_always_less_than_or_equal_to,
+};
 use std::{cell::RefCell, sync::Arc};
 
 /// DatabaseStorage is an interface a database file that consists of pages.
@@ -35,7 +39,11 @@ impl DatabaseStorage for DatabaseFile {
     fn read_page(&self, page_idx: usize, c: Completion) -> Result<()> {
         let r = c.as_read();
         let size = r.buf().len();
-        assert!(page_idx > 0);
+        assert_always_greater_than!(
+            page_idx,
+            0,
+            "[DatabaseFile - read_page] page_idx is positive"
+        );
         if !(512..=65536).contains(&size) || size & (size - 1) != 0 {
             return Err(LimboError::NotADB);
         }
@@ -51,10 +59,26 @@ impl DatabaseStorage for DatabaseFile {
         c: Completion,
     ) -> Result<()> {
         let buffer_size = buffer.borrow().len();
-        assert!(page_idx > 0);
-        assert!(buffer_size >= 512);
-        assert!(buffer_size <= 65536);
-        assert_eq!(buffer_size & (buffer_size - 1), 0);
+        assert_always_greater_than!(
+            page_idx,
+            0,
+            "[DatabaseFile - write_page] page_idx is positive"
+        );
+        assert_always_greater_than_or_equal_to!(
+            buffer_size,
+            512,
+            "[DatabaseFile - write_page] buffer should be bigger or equal to 512"
+        );
+        assert_always_less_than_or_equal_to!(
+            buffer_size,
+            65536,
+            "[DatabaseFile - write_page] buffer should be less or equal to 65536"
+        );
+        assert_always_eq!(
+            buffer_size & (buffer_size - 1),
+            0,
+            "[DatabaseFile - write_page] buffer size should pass check"
+        );
         let pos = (page_idx - 1) * buffer_size;
         self.file.pwrite(pos, buffer, c)?;
         Ok(())
@@ -91,7 +115,11 @@ impl DatabaseStorage for FileMemoryStorage {
             _ => unreachable!(),
         };
         let size = r.buf().len();
-        assert!(page_idx > 0);
+        assert_always_greater_than!(
+            page_idx,
+            0,
+            "[FileMemoryStorage - read_page] page_idx is positive"
+        );
         if !(512..=65536).contains(&size) || size & (size - 1) != 0 {
             return Err(LimboError::NotADB);
         }
@@ -107,9 +135,21 @@ impl DatabaseStorage for FileMemoryStorage {
         c: Completion,
     ) -> Result<()> {
         let buffer_size = buffer.borrow().len();
-        assert!(buffer_size >= 512);
-        assert!(buffer_size <= 65536);
-        assert_eq!(buffer_size & (buffer_size - 1), 0);
+        assert_always_greater_than_or_equal_to!(
+            buffer_size,
+            512,
+            "[FileMemoryStorage - write_page] buffer should be bigger or equal to 512"
+        );
+        assert_always_less_than_or_equal_to!(
+            buffer_size,
+            65536,
+            "[FileMemoryStorage - write_page] buffer should be less or equal to 65536"
+        );
+        assert_always_eq!(
+            buffer_size & (buffer_size - 1),
+            0,
+            "[FileMemoryStorage - write_page] buffer size should pass check"
+        );
         let pos = (page_idx - 1) * buffer_size;
         self.file.pwrite(pos, buffer, c)?;
         Ok(())

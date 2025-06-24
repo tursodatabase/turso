@@ -1,3 +1,8 @@
+use assertion::{
+    assert_always, assert_always_eq, assert_always_greater_than,
+    assert_always_greater_than_or_equal_to, assert_always_less_than,
+    assert_always_less_than_or_equal_to, assert_always_ne, assert_reachable,
+};
 use tracing::{instrument, Level};
 
 use crate::{
@@ -723,6 +728,7 @@ impl BTreeCursor {
         start_next_page: u32,
         payload_size: u64,
     ) -> Result<CursorResult<()>> {
+        assert_reachable!("[BTreeCursor - process_overflow_read] reached");
         if self.read_overflow_state.borrow().is_none() {
             let page = self.read_page(start_next_page as usize)?;
             *self.read_overflow_state.borrow_mut() = Some(ReadPayloadOverflow {
@@ -765,9 +771,9 @@ impl BTreeCursor {
             *next_page = next;
             return Ok(CursorResult::IO);
         }
-        assert!(
+        assert_always!(
             *remaining_to_read == 0 && next == 0,
-            "we can't have more pages to read while also have read everything"
+            "[BTreeCursor - process_overflow_read] we can't have more pages to read while also have read everything"
         );
         let mut payload_swap = Vec::new();
         std::mem::swap(payload, &mut payload_swap);
@@ -887,7 +893,7 @@ impl BTreeCursor {
                 ));
             }
         };
-        assert!(offset + amount <= payload_size as u32);
+        assert_always_less_than_or_equal_to!(offset + amount, payload_size as u32, "[BTreeCursor - read_write_payload_with_offset] `offset + amount` smallert than `payload_size`");
 
         let (local_size, _) =
             self.parse_cell_info(payload_size as usize, contents.page_type(), usable_size)?;
@@ -1200,7 +1206,11 @@ impl BTreeCursor {
                     return Ok(CursorResult::Ok(false));
                 }
             }
-            assert!(cell_idx < contents.cell_count());
+            assert_always_less_than!(
+                cell_idx,
+                contents.cell_count(),
+                "[BTreeCursor - get_next_record] cell index smaller than page contents cell count"
+            );
 
             let cell = contents.cell_get(
                 cell_idx,
@@ -1639,7 +1649,10 @@ impl BTreeCursor {
     /// of iterating cells in order.
     #[instrument(skip_all, level = Level::TRACE)]
     fn tablebtree_seek(&mut self, rowid: i64, seek_op: SeekOp) -> Result<CursorResult<bool>> {
-        assert!(self.mv_cursor.is_none());
+        assert_always!(
+            self.mv_cursor.is_none(),
+            "[BTreeCursor - tablebtree_seek] Mv Cursor is None"
+        );
         let iter_dir = seek_op.iteration_direction();
 
         if matches!(
@@ -1654,9 +1667,9 @@ impl BTreeCursor {
             return_if_locked_maybe_load!(self.pager, page);
             let page = page.get();
             let contents = page.get().contents.as_ref().unwrap();
-            assert!(
+            assert_always!(
                 contents.is_leaf(),
-                "tablebtree_seek() called on non-leaf page"
+                "[BTreeCursor - tablebtree_seek] tablebtree_seek() called on non-leaf page"
             );
 
             let cell_count = contents.cell_count();
@@ -2027,7 +2040,10 @@ impl BTreeCursor {
 
     #[instrument(skip_all, level = Level::TRACE)]
     pub fn move_to(&mut self, key: SeekKey<'_>, cmp: SeekOp) -> Result<CursorResult<()>> {
-        assert!(self.mv_cursor.is_none());
+        assert_always!(
+            self.mv_cursor.is_none(),
+            "[BtreeCursor - move_to] Mv Cursor is None"
+        );
         tracing::trace!(?key, ?cmp);
         // For a table with N rows, we can find any row by row id in O(log(N)) time by starting at the root page and following the B-tree pointers.
         // B-trees consist of interior pages and leaf pages. Interior pages contain pointers to other pages, while leaf pages contain the actual row data.
@@ -2106,10 +2122,10 @@ impl BTreeCursor {
                         self.pager.add_dirty(page.get().id);
 
                         let page = page.get().contents.as_mut().unwrap();
-                        assert!(matches!(
-                            page.page_type(),
-                            PageType::TableLeaf | PageType::IndexLeaf
-                        ));
+                        assert_always!(
+                            matches!(page.page_type(), PageType::TableLeaf | PageType::IndexLeaf),
+                            "[BtreeCursor - insert_into_page] page is a leaf page"
+                        );
 
                         // find cell
                         (return_if_io!(self.find_cell(page, bkey)), page.page_type())
@@ -2258,22 +2274,22 @@ impl BTreeCursor {
     /// Sqlite tries to have a page at least 40% full.
     #[instrument(skip(self), level = Level::TRACE)]
     fn balance(&mut self) -> Result<CursorResult<()>> {
-        assert!(
+        assert_always!(
             matches!(self.state, CursorState::Write(_)),
-            "Cursor must be in balancing state"
+            "[BtreeCursor - balance] Cursor must be in balancing state"
         );
         loop {
             let state = self.state.write_info().expect("must be balancing").state;
             match state {
                 WriteState::BalanceStart => {
-                    assert!(
+                    assert_always!(
                         self.state
                             .write_info()
                             .unwrap()
                             .balance_info
                             .borrow()
                             .is_none(),
-                        "BalanceInfo should be empty on start"
+                        "[BtreeCursor - balance] BalanceInfo should be empty on start"
                     );
                     let current_page = self.stack.top();
                     {
@@ -2319,9 +2335,9 @@ impl BTreeCursor {
 
     /// Balance a non root page by trying to balance cells between a maximum of 3 siblings that should be neighboring the page that overflowed/underflowed.
     fn balance_non_root(&mut self) -> Result<CursorResult<()>> {
-        assert!(
+        assert_always!(
             matches!(self.state, CursorState::Write(_)),
-            "Cursor must be in balancing state"
+            "[BtreeCursor - balance_non_root] Cursor must be in balancing state"
         );
         let state = self.state.write_info().expect("must be balancing").state;
         tracing::debug!("balance_non_root(state={:?})", state);
@@ -2353,25 +2369,39 @@ impl BTreeCursor {
                     parent_page.get().id,
                     page_to_balance_idx
                 );
-                assert!(matches!(
-                    parent_contents.page_type(),
-                    PageType::IndexInterior | PageType::TableInterior
-                ));
+                assert_always!(
+                    matches!(
+                        parent_contents.page_type(),
+                        PageType::IndexInterior | PageType::TableInterior
+                    ),
+                    "[BtreeCursor - balance_non_root] page is an interior page"
+                );
                 // Part 1: Find the sibling pages to balance
                 let mut pages_to_balance: [Option<BTreePage>; 3] = [const { None }; 3];
                 let number_of_cells_in_parent =
                     parent_contents.cell_count() + parent_contents.overflow_cells.len();
 
-                assert!(
+                assert_always!(
                     parent_contents.overflow_cells.is_empty(),
-                    "balancing child page with overflowed parent not yet implemented"
+                    "[BtreeCursor - balance_non_root] balancing child page with overflowed parent not yet implemented"
                 );
-                assert!(
-                    page_to_balance_idx <= parent_contents.cell_count(),
-                    "page_to_balance_idx={} is out of bounds for parent cell count {}",
+
+                // TODO: current limitation of macro here is that passing extra context to print requires
+                // the use of serde_json for antithesis_sdk. I want to have the assertion macros behave similarly
+                // to tracing structured logging. Its just that the plumbing required for it, is not a priority at the moment.
+                // For this reason, I'm leaving the original commented out assertion below
+                assert_always_less_than_or_equal_to!(
                     page_to_balance_idx,
-                    number_of_cells_in_parent
+                    parent_contents.cell_count(),
+                    "[BtreeCursor - balance_non_root] page_to_balance_idx is out of bounds for parent cell count"
                 );
+                // assert!(
+                //     page_to_balance_idx <= parent_contents.cell_count(),
+                //     "page_to_balance_idx={} is out of bounds for parent cell count {}",
+                //     page_to_balance_idx,
+                //     number_of_cells_in_parent
+                // );
+
                 // As there will be at maximum 3 pages used to balance:
                 // sibling_pointer is the index represeneting one of those 3 pages, and we initialize it to the last possible page.
                 // next_divider is the first divider that contains the first page of the 3 pages.
@@ -2441,10 +2471,10 @@ impl BTreeCursor {
                         );
                     }
                     pages_to_balance[i].replace(page);
-                    assert_eq!(
+                    assert_always_eq!(
                         parent_contents.overflow_cells.len(),
                         0,
-                        "overflow in parent is not yet implented while balancing it"
+                        "[BtreeCursor - balance_non_root] overflow in parent is not yet implented while balancing it"
                     );
                     if i == 0 {
                         break;
@@ -2487,7 +2517,11 @@ impl BTreeCursor {
                         let page = page.as_ref().unwrap().get();
                         let contents = page.get_contents();
                         debug_validate_cells!(&contents, self.usable_space() as u16);
-                        assert_eq!(contents.page_type(), page_type_of_siblings);
+                        assert_always_eq!(
+                            contents.page_type(),
+                            page_type_of_siblings,
+                            "[BtreeCursor - balance_non_root] current page and sibling pages have same page type"
+                        );
                     }
                 }
                 self.state
@@ -2525,9 +2559,9 @@ impl BTreeCursor {
                 let parent_contents = parent_page.get_contents();
                 let parent_is_root = !self.stack.has_parent();
 
-                assert!(
+                assert_always!(
                     parent_contents.overflow_cells.is_empty(),
-                    "overflow parent not yet implemented"
+                    "[BtreeCursor - balance_non_root] overflow parent not yet implemented"
                 );
 
                 /* 1. Get divider cells and max_cells */
@@ -2537,7 +2571,10 @@ impl BTreeCursor {
                 for i in (0..balance_info.sibling_count).rev() {
                     let sibling_page = balance_info.pages_to_balance[i].as_ref().unwrap();
                     let sibling_page = sibling_page.get();
-                    assert!(sibling_page.is_loaded());
+                    assert_always!(
+                        sibling_page.is_loaded(),
+                        "[BtreeCursor - balance_non_root] sibling page is loaded"
+                    );
                     let sibling_contents = sibling_page.get_contents();
                     max_cells += sibling_contents.cell_count();
                     max_cells += sibling_contents.overflow_cells.len();
@@ -2659,7 +2696,7 @@ impl BTreeCursor {
                             divider_cell[..4].copy_from_slice(&right_pointer.to_be_bytes());
                         } else {
                             // index leaf
-                            assert!(divider_cell.len() >= 4);
+                            assert_always_greater_than_or_equal_to!(divider_cell.len(), 4, "[BtreeCursor - balance_non_root] divider_cell greater or equal to 4");
                             // let's strip the page pointer
                             divider_cell = &mut divider_cell[4..];
                         }
@@ -2668,10 +2705,10 @@ impl BTreeCursor {
                     total_cells_inserted += cells_inserted;
                 }
 
-                assert_eq!(
+                assert_always_eq!(
                     cell_array.cells.capacity(),
                     cells_capacity_start,
-                    "calculation of max cells was wrong"
+                    "[BtreeCursor - balance_non_root] calculation of max cells was wrong"
                 );
 
                 // Let's copy all cells for later checks
@@ -2682,7 +2719,10 @@ impl BTreeCursor {
                     for cell in &cell_array.cells {
                         cells_debug.push(cell.to_vec());
                         if leaf {
-                            assert!(cell[0] != 0)
+                            assert_always!(
+                                cell[0] != 0,
+                                "[BtreeCursor - balance_non_root] debug cell is not zero"
+                            );
                         }
                     }
                 }
@@ -2733,9 +2773,9 @@ impl BTreeCursor {
                         let needs_new_page = i + 1 >= sibling_count_new;
                         if needs_new_page {
                             sibling_count_new = i + 2;
-                            assert!(
+                            assert_always!(
                                 sibling_count_new <= 5,
-                                "it is corrupt to require more than 5 pages to balance 3 siblings"
+                                "[BtreeCursor - balance_non_root] it is corrupt to require more than 5 pages to balance 3 siblings"
                             );
 
                             new_page_sizes[sibling_count_new - 1] = 0;
@@ -2856,13 +2896,14 @@ impl BTreeCursor {
 
                     new_page_sizes[i] = size_right_page;
                     new_page_sizes[i - 1] = size_left_page;
-                    assert!(
+                    assert_always!(
                         cell_array.number_of_cells_per_page[i - 1]
                             > if i > 1 {
                                 cell_array.number_of_cells_per_page[i - 2]
                             } else {
                                 0
-                            }
+                            },
+                        "[BtreeCursor - balance_non_root] incorrect number of cells per page"
                     );
                 }
 
@@ -3015,7 +3056,11 @@ impl BTreeCursor {
                     }
 
                     let left_pointer = read_u32(&new_divider_cell[..4], 0);
-                    assert!(left_pointer != parent_page.get().id as u32);
+                    assert_always_ne!(
+                        left_pointer,
+                        parent_page.get().id as u32,
+                        "[BtreeCursor - balance_non_root] left_pointer should not equal to parent page id"
+                    );
                     #[cfg(debug_assertions)]
                     pages_pointed_to.insert(left_pointer);
                     tracing::debug!(
@@ -3024,13 +3069,18 @@ impl BTreeCursor {
                         i,
                         left_pointer
                     );
-                    assert_eq!(left_pointer, page.get().get().id as u32);
+                    assert_always_eq!(left_pointer, page.get().get().id as u32, "[BtreeCursor - balance_non_root] left_pointer should equal to parent page id");
                     // FIXME: remove this lock
-                    assert!(
-                        left_pointer <= header_accessor::get_database_size(&self.pager)?,
-                        "invalid page number divider left pointer {} > database number of pages",
+                    assert_always_less_than_or_equal_to!(
                         left_pointer,
+                        header_accessor::get_database_size(&self.pager)?,
+                        "[BtreeCursor - balance_non_root] invalid page number divider left pointer > database number of pages"
                     );
+                    // assert!(
+                    //     left_pointer <= header_accessor::get_database_size(&self.pager)?,
+                    //     "invalid page number divider left pointer {} > database number of pages",
+                    //     left_pointer,
+                    // );
                     // FIXME: defragment shouldn't be needed
                     // defragment_page(parent_contents, self.usable_space() as u16);
                     insert_into_cell(
@@ -3058,11 +3108,15 @@ impl BTreeCursor {
                     // Let's ensure every page is pointed to by the divider cell or the rightmost pointer.
                     for page in pages_to_balance_new.iter().take(sibling_count_new) {
                         let page = page.as_ref().unwrap();
-                        assert!(
+                        assert_always!(
                             pages_pointed_to.contains(&(page.get().get().id as u32)),
-                            "page {} not pointed to by divider cell or rightmost pointer",
-                            page.get().get().id
+                            "[BtreeCursor - balance_non_root] page not pointed to by divider cell or rightmost pointer"
                         );
+                        // assert!(
+                        //     pages_pointed_to.contains(&(page.get().get().id as u32)),
+                        //     "page {} not pointed to by divider cell or rightmost pointer",
+                        //     page.get().get().id
+                        // );
                     }
                 }
                 /* 7. Start real movement of cells. Next comment is borrowed from SQLite: */
@@ -3160,7 +3214,11 @@ impl BTreeCursor {
                     // child page into the parent, decreasing the overall height of the
                     // b-tree structure by one. This is described as the "balance-shallower"
                     // sub-algorithm in some documentation.
-                    assert!(sibling_count_new == 1);
+                    assert_always_eq!(
+                        sibling_count_new,
+                        1,
+                        "[BtreeCursor - balance_non_root] sibling count should equal 1"
+                    );
                     let parent_offset = if parent_page.get().id == 1 {
                         DATABASE_HEADER_SIZE
                     } else {
@@ -3196,7 +3254,7 @@ impl BTreeCursor {
 
                     self.stack.set_cell_index(0); // reset cell index, top is already parent
                     sibling_count_new -= 1; // decrease sibling count for debugging and free at the end
-                    assert!(sibling_count_new < balance_info.sibling_count);
+                    assert_always_less_than!(sibling_count_new, balance_info.sibling_count, "[BtreeCursor - balance_non_root] new sibling count should be less than number of sibling being used to balance");
                 }
 
                 #[cfg(debug_assertions)]
@@ -3272,10 +3330,15 @@ impl BTreeCursor {
             }
             left_pointer.expect("overflow cell with divider cell was not found")
         };
-        assert_eq!(left_pointer, page.get().id as u32, "the cell we just inserted doesn't point to the correct page. points to {}, should point to {}",
-           left_pointer,
-            page.get().id as u32
-         );
+        assert_always_eq!(
+            left_pointer,
+            page.get().id as u32,
+            "[BtreeCursor - validate_balance_non_root_divider_cell_insertion] the cell we just inserted doesn't point to the correct page"
+        );
+        //  assert_eq!(left_pointer, page.get().id as u32, "the cell we just inserted doesn't point to the correct page. points to {}, should point to {}",
+        //    left_pointer,
+        //     page.get().id as u32
+        //  );
     }
 
     #[cfg(debug_assertions)]
@@ -3757,7 +3820,7 @@ impl BTreeCursor {
                 }
             }
         }
-        assert!(valid, "corrupted database, cells were to balanced properly");
+        assert_always!(valid, "[BtreeCursor - post_balance_non_root_validation] corrupted database, cells were to balanced properly");
     }
 
     /// Balance the root page.
@@ -3851,7 +3914,11 @@ impl BTreeCursor {
         }
         let cell_count = page.cell_count();
         while self.find_cell_state.get_cell_idx() < cell_count as isize {
-            assert!(self.find_cell_state.get_cell_idx() >= 0);
+            assert_always_greater_than_or_equal_to!(
+                self.find_cell_state.get_cell_idx(),
+                0,
+                "[BtreeCursor - find_cell] cell_idx should be non-negative"
+            );
             let cell_idx = self.find_cell_state.get_cell_idx() as usize;
             match page
                 .cell_get(
@@ -3912,15 +3979,26 @@ impl BTreeCursor {
             self.find_cell_state.set(cell_idx + 1);
         }
         let cell_idx = self.find_cell_state.get_cell_idx();
-        assert!(cell_idx >= 0);
+        assert_always_greater_than_or_equal_to!(
+            cell_idx,
+            0,
+            "[BtreeCursor - find_cell] found cell_idx should be non-negative"
+        );
         let cell_idx = cell_idx as usize;
-        assert!(cell_idx <= cell_count);
+        assert_always_less_than_or_equal_to!(
+            cell_idx,
+            cell_count,
+            "[BtreeCursor - find_cell] cell_idx should be smaller than or equal_to cell_count"
+        );
         self.find_cell_state.reset();
         Ok(CursorResult::Ok(cell_idx))
     }
 
     pub fn seek_end(&mut self) -> Result<CursorResult<()>> {
-        assert!(self.mv_cursor.is_none()); // unsure about this -_-
+        assert_always!(
+            self.mv_cursor.is_none(),
+            "[BtreeCursor - seek_end] Mv Cursor should be None"
+        ); // unsure about this -_-
         self.move_to_root();
         loop {
             let mem_page = self.stack.top();
@@ -3953,7 +4031,7 @@ impl BTreeCursor {
         self.has_record.replace(has_record);
         if !has_record {
             let is_empty = return_if_io!(self.is_empty_table());
-            assert!(is_empty);
+            assert_always!(is_empty, "[BtreeCursor - seek_to_last] table is not empty");
             return Ok(CursorResult::Ok(()));
         }
         Ok(CursorResult::Ok(()))
@@ -3983,7 +4061,10 @@ impl BTreeCursor {
     }
 
     pub fn last(&mut self) -> Result<CursorResult<()>> {
-        assert!(self.mv_cursor.is_none());
+        assert_always!(
+            self.mv_cursor.is_none(),
+            "[BtreeCursor - last] Mv Cursor should be None"
+        );
         let cursor_has_record = return_if_io!(self.move_to_rightmost());
         self.has_record.replace(cursor_has_record);
         self.invalidate_record();
@@ -4006,7 +4087,10 @@ impl BTreeCursor {
     }
 
     pub fn prev(&mut self) -> Result<CursorResult<bool>> {
-        assert!(self.mv_cursor.is_none());
+        assert_always!(
+            self.mv_cursor.is_none(),
+            "[BtreeCursor - prev] Mv Cursor should be None"
+        );
         return_if_io!(self.restore_context());
         let cursor_has_record = return_if_io!(self.get_prev_record());
         self.has_record.replace(cursor_has_record);
@@ -4058,7 +4142,10 @@ impl BTreeCursor {
 
     #[instrument(skip(self), level = Level::TRACE)]
     pub fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<CursorResult<bool>> {
-        assert!(self.mv_cursor.is_none());
+        assert_always!(
+            self.mv_cursor.is_none(),
+            "[BtreeCursor - seek] Mv Cursor should be None"
+        );
         // Empty trace to capture the span information
         tracing::trace!("");
         // We need to clear the null flag for the table cursor before seeking,
@@ -4217,7 +4304,10 @@ impl BTreeCursor {
     /// 9. Finish -> Delete operation is done. Return CursorResult(Ok())
     #[instrument(skip(self), level = Level::TRACE)]
     pub fn delete(&mut self) -> Result<CursorResult<()>> {
-        assert!(self.mv_cursor.is_none());
+        assert_always!(
+            self.mv_cursor.is_none(),
+            "[BtreeCursor - delete] Mv Cursor should be None"
+        );
 
         if let CursorState::None = &self.state {
             self.state = CursorState::Delete(DeleteInfo {
@@ -4394,8 +4484,15 @@ impl BTreeCursor {
                         let leaf_page_ref = self.stack.top();
                         let leaf_page = leaf_page_ref.get();
                         let leaf_contents = leaf_page.get().contents.as_ref().unwrap();
-                        assert!(leaf_contents.is_leaf());
-                        assert!(leaf_contents.cell_count() > 0);
+                        assert_always!(
+                            leaf_contents.is_leaf(),
+                            "[BtreeCursor - delete] page should be leaf"
+                        );
+                        assert_always_greater_than!(
+                            leaf_contents.cell_count(),
+                            0,
+                            "[BtreeCursor - delete] cell_count should be positive"
+                        );
                         let leaf_cell_idx = leaf_contents.cell_count() - 1;
                         let last_cell_on_child_page = leaf_contents.cell_get(
                             leaf_cell_idx,
@@ -4622,7 +4719,10 @@ impl BTreeCursor {
     }
 
     pub fn exists(&mut self, key: &Value) -> Result<CursorResult<bool>> {
-        assert!(self.mv_cursor.is_none());
+        assert_always!(
+            self.mv_cursor.is_none(),
+            "[BtreeCursor - exists] Mv Cursor should be None"
+        );
         let int_key = match key {
             Value::Integer(i) => i,
             _ => unreachable!("btree tables are indexed by integers!"),
@@ -4744,7 +4844,10 @@ impl BTreeCursor {
                 DestroyState::ProcessPage => {
                     let page = self.stack.top();
                     self.stack.advance();
-                    assert!(page.get().is_loaded()); //  page should be loaded at this time
+                    assert_always!(
+                        page.get().is_loaded(),
+                        "[BtreeCursor - btree_destroy] page should be loaded"
+                    ); //  page should be loaded at this time
                     let page = page.get();
                     let contents = page.get().contents.as_ref().unwrap();
                     let cell_idx = self.stack.current_cell_index();
@@ -5040,8 +5143,15 @@ impl BTreeCursor {
 
             let cell_idx = self.stack.current_cell_index() as usize;
 
-            assert!(cell_idx <= contents.cell_count(),);
-            assert!(!contents.is_leaf());
+            assert_always_less_than_or_equal_to!(
+                cell_idx,
+                contents.cell_count(),
+                "[BtreeCursor - count] cell_idx should less than or equal to cell_count"
+            );
+            assert_always!(
+                !contents.is_leaf(),
+                "[BtreeCursor - count] should be a leaf page"
+            );
 
             if cell_idx == contents.cell_count() {
                 // Move to right child
@@ -5426,10 +5536,19 @@ impl PartialOrd for IntegrityCheckCellRange {
 #[cfg(debug_assertions)]
 fn validate_cells_after_insertion(cell_array: &CellArray, leaf_data: bool) {
     for cell in &cell_array.cells {
-        assert!(cell.len() >= 4);
+        assert_always_greater_than_or_equal_to!(
+            cell.len(),
+            4,
+            "[validate_cells_after_insertion] cell should be greater or equal to 4"
+        );
 
         if leaf_data {
-            assert!(cell[0] != 0, "payload is {:?}", cell);
+            assert_always_ne!(
+                cell[0],
+                0,
+                "[validate_cells_after_insertion] leaf data should be non zero"
+            );
+            // assert!(cell[0] != 0, "payload is {:?}", cell);
         }
     }
 }
@@ -5523,7 +5642,11 @@ impl PageStack {
         self.current_page.set(self.current_page.get() + 1);
     }
     fn decrement_current(&self) {
-        assert!(self.current_page.get() > 0);
+        assert_always_greater_than!(
+            self.current_page.get(),
+            0,
+            "[PageStack - decrement_current] current page should be positive"
+        );
         self.current_page.set(self.current_page.get() - 1);
     }
     /// Push a new page onto the stack.
@@ -5536,11 +5659,16 @@ impl PageStack {
         );
         self.increment_current();
         let current = self.current_page.get();
-        assert!(
-            current < BTCURSOR_MAX_DEPTH as i32,
-            "corrupted database, stack is bigger than expected"
+        assert_always_less_than!(
+            current,
+            BTCURSOR_MAX_DEPTH as i32,
+            "[PageStack - _push] corrupted database, stack is bigger than expected"
         );
-        assert!(current >= 0);
+        assert_always_greater_than_or_equal_to!(
+            current,
+            0,
+            "[PageStack - _push] current page should be non-negative"
+        );
         self.stack.borrow_mut()[current as usize] = Some(page);
         self.cell_indices.borrow_mut()[current as usize] = starting_cell_idx;
     }
@@ -5558,7 +5686,11 @@ impl PageStack {
     #[instrument(skip_all, level = Level::TRACE, name = "pagestack::pop")]
     fn pop(&self) {
         let current = self.current_page.get();
-        assert!(current >= 0);
+        assert_always_greater_than_or_equal_to!(
+            current,
+            0,
+            "[PageStack - pop] current page should be non-negative"
+        );
         tracing::trace!(current);
         self.cell_indices.borrow_mut()[current as usize] = 0;
         self.stack.borrow_mut()[current as usize] = None;
@@ -5580,7 +5712,11 @@ impl PageStack {
     /// Current page pointer being used
     fn current(&self) -> usize {
         let current = self.current_page.get() as usize;
-        assert!(self.current_page.get() >= 0);
+        assert_always_greater_than_or_equal_to!(
+            self.current_page.get(),
+            0,
+            "[PageStack - current] current page should be non-negative"
+        );
         current
     }
 
@@ -5789,7 +5925,11 @@ fn edit_page(
             cell_array,
             usable_space,
         )?;
-        assert!(count_cells >= number_tail_removed);
+        assert_always_greater_than_or_equal_to!(
+            count_cells,
+            number_tail_removed,
+            "[edit_page] count_cells should be greater than number of cells removed"
+        );
         count_cells -= number_tail_removed;
         debug_validate_cells!(page, usable_space);
     }
@@ -5876,14 +6016,18 @@ fn page_free_array(
         let cell_pointer = cell.as_ptr_range();
         // check if not overflow cell
         if cell_pointer.start >= buf_range.start && cell_pointer.start < buf_range.end {
-            assert!(
+            assert_always!(
                 cell_pointer.end >= buf_range.start && cell_pointer.end <= buf_range.end,
-                "whole cell should be inside the page"
+                "[page_free_array] whole cell should be inside the page"
             );
             // TODO: remove pointer too
             let offset = (cell_pointer.start as usize - buf_range.start as usize) as u16;
             let len = (cell_pointer.end as usize - cell_pointer.start as usize) as u16;
-            assert!(len > 0, "cell size should be greater than 0");
+            assert_always_greater_than!(
+                len,
+                0,
+                "[page_free_array] cell size should be greater than 0"
+            );
             let end = offset + len;
 
             /* Try to merge the current cell with a contiguous buffered cell to reduce the number of
@@ -6095,7 +6239,11 @@ fn defragment_page(page: &PageContent, usable_space: u16) {
                 unimplemented!("corrupted page");
             }
 
-            assert!(pc <= last_cell);
+            assert_always_less_than_or_equal_to!(
+                pc,
+                last_cell,
+                "[defragment_page] pc should be less than or equal to last_cell"
+            );
 
             let (_, size) = cloned_page.cell_get_raw_region(
                 i,
@@ -6108,7 +6256,10 @@ fn defragment_page(page: &PageContent, usable_space: u16) {
             if cbrk < first_cell || pc + size > usable_space {
                 todo!("corrupt");
             }
-            assert!(cbrk + size <= usable_space && cbrk >= first_cell);
+            assert_always!(
+                cbrk + size <= usable_space && cbrk >= first_cell,
+                "[defragment_page] offset to content of first cell in parent should be in range"
+            );
             // set new pointer
             page.write_u16_no_offset(cell_idx, cbrk);
             // copy payload
@@ -6121,7 +6272,7 @@ fn defragment_page(page: &PageContent, usable_space: u16) {
     // if( data[hdr+7]+cbrk-iCellFirst!=pPage->nFree ){
     //   return SQLITE_CORRUPT_PAGE(pPage);
     // }
-    assert!(cbrk >= first_cell);
+    assert_always_greater_than_or_equal_to!(cbrk, first_cell, "[defragment_page] offset to content of first cell in parent should be greater or equal than the region start");
 
     // set new first byte of cell content
     page.write_u16(offset::BTREE_CELL_CONTENT_AREA, cbrk);
@@ -6198,7 +6349,11 @@ fn insert_into_cell(
         new_cell_data_pointer,
         payload.len()
     );
-    assert!(new_cell_data_pointer + payload.len() as u16 <= usable_space);
+    assert_always_less_than_or_equal_to!(
+        new_cell_data_pointer + payload.len() as u16,
+        usable_space,
+        "[intert_into_cell] payload + pointer should fit in usable space"
+    );
     let buf = page.as_ptr();
 
     // copy data
@@ -6290,20 +6445,23 @@ fn compute_free_space(page: &PageContent, usable_space: u16) -> u16 {
         }
 
         // Next should always be 0 (NULL) at this point since we have reached the end of the freeblocks linked list
-        assert!(
-            next == 0,
-            "corrupted page: freeblocks list not in ascending order"
+        assert_always_eq!(
+            next,
+            0,
+            "[compute_free_space] corrupted page: freeblocks list not in ascending order"
         );
 
-        assert!(
-            cur_freeblock_ptr + size <= usable_space,
-            "corrupted page: last freeblock extends last page end"
+        assert_always_less_than_or_equal_to!(
+            cur_freeblock_ptr + size,
+            usable_space,
+            "[compute_free_space] corrupted page: last freeblock extends last page end"
         );
     }
 
-    assert!(
-        free_space_bytes <= usable_space,
-        "corrupted page: free space is greater than usable space"
+    assert_always_less_than_or_equal_to!(
+        free_space_bytes,
+        usable_space,
+        "[compute_free_space] corrupted page: free space is greater than usable space"
     );
 
     // if( nFree>usableSize || nFree<iCellFirst ){
@@ -6341,7 +6499,11 @@ fn allocate_cell_space(page_ref: &PageContent, amount: u16, usable_space: u16) -
 
     page_ref.write_u16(offset::BTREE_CELL_CONTENT_AREA, top as u16);
 
-    assert!(top + amount <= usable_space as usize);
+    assert_always_less_than_or_equal_to!(
+        top + amount,
+        usable_space as usize,
+        "[allocate_cell_space] available space should less than or equal to usable_space"
+    );
     Ok(top as u16)
 }
 
@@ -6355,10 +6517,10 @@ fn fill_cell_payload(
     usable_space: u16,
     pager: Rc<Pager>,
 ) {
-    assert!(matches!(
-        page_type,
-        PageType::TableLeaf | PageType::IndexLeaf
-    ));
+    assert_always!(
+        matches!(page_type, PageType::TableLeaf | PageType::IndexLeaf),
+        "[fill_cell_payload] page should be a leaf page"
+    );
     // TODO: make record raw from start, having to serialize is not good
     let record_buf = record.get_payload().to_vec();
 
@@ -6433,7 +6595,11 @@ fn fill_cell_payload(
         to_copy_buffer = &to_copy_buffer[to_copy..];
     }
 
-    assert_eq!(cell_size, cell_payload.len());
+    assert_always_eq!(
+        cell_size,
+        cell_payload.len(),
+        "[fill_cell_payload] cell size should equal cell payload size"
+    );
 }
 
 /// Returns the maximum payload size (X) that can be stored directly on a b-tree page without spilling to overflow pages.
@@ -6497,7 +6663,11 @@ fn drop_cell(page: &mut PageContent, cell_idx: usize, usable_space: u16) -> Resu
 /// This is useful when we remove a cell and we want to move left the cells from the right to fill
 /// the empty space that's not needed
 fn shift_pointers_left(page: &mut PageContent, cell_idx: usize) {
-    assert!(page.cell_count() > 0);
+    assert_always_greater_than!(
+        page.cell_count(),
+        0,
+        "[shift_pointers_left] cell count should be positive"
+    );
     let buf = page.as_ptr();
     let (start, _) = page.cell_pointer_array_offset_and_size();
     let start = start + (cell_idx * 2) + 2;
