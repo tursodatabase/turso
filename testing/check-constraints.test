@@ -175,3 +175,14 @@ do_execsql_test_in_memory_any_error update_table_constraint_checks_12 {
   insert into t values (1, 2, 2);
   update t set b = 5;
 }
+
+do_execsql_test_in_memory_any_error update_table_constraint_checks_primary_key_13 {
+  CREATE TABLE t (c int, a integer primary key, b int, constraint check_is_even check ((a + b) % 2 = 0));
+  insert into t values (1, 2, 2);
+  update t set b = 5;
+}
+
+do_execsql_test_in_memory_any_error insert_table_constraint_with_primary_key_14 {
+  CREATE TABLE t (c int, a integer primary key, b int, constraint check_is_even check ((a + b) % 2 = 0));
+  insert into t values (1, 1, 2);
+}
