@@ -38,10 +38,10 @@ use crate::{
     vdbe::{builder::CursorType, insn::Insn},
 };
 
+use crate::assert_always_less_than;
 #[cfg(feature = "json")]
 use crate::json::JsonCacheCell;
 use crate::{Connection, MvStore, Result, TransactionState};
-use assertion::assert_always_less_than;
 use builder::CursorKey;
 use execute::{
     InsnFunction, InsnFunctionStepResult, OpIdxDeleteState, OpIntegrityCheckState,

@@ -1,9 +1,9 @@
 use std::{cell::RefCell, collections::HashMap};
 
-use assertion::{assert_always_eq, assert_always_greater_than};
 use turso_sqlite3_parser::ast::TableInternalId;
 
 use crate::{
+    assert_always_eq, assert_always_greater_than,
     translate::{
         optimizer::{cost::Cost, order::plan_satisfies_order_target},
         plan::{JoinOrderMember, JoinedTable},

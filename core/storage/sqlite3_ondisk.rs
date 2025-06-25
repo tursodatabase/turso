@@ -43,10 +43,6 @@
 
 #![allow(clippy::arc_with_non_send_sync)]
 
-use assertion::{
-    assert_always, assert_always_eq, assert_always_greater_than_or_equal_to,
-    assert_always_less_than,
-};
 use tracing::{instrument, Level};
 
 use crate::error::LimboError;
@@ -59,6 +55,10 @@ use crate::storage::database::DatabaseStorage;
 use crate::storage::pager::Pager;
 use crate::types::{
     ImmutableRecord, RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype,
+};
+use crate::{
+    assert_always, assert_always_eq, assert_always_greater_than_or_equal_to,
+    assert_always_less_than,
 };
 use crate::{File, Result, WalFileShared};
 use std::cell::{RefCell, UnsafeCell};

@@ -1,10 +1,10 @@
 use std::{cell::Cell, cmp::Ordering, rc::Rc, sync::Arc};
 
-use assertion::{assert_always, assert_always_eq};
 use tracing::{instrument, Level};
 use turso_sqlite3_parser::ast::{self, TableInternalId};
 
 use crate::{
+    assert_always, assert_always_eq,
     numeric::Numeric,
     parameters::Parameters,
     schema::{BTreeTable, Index, PseudoCursorType, Table},

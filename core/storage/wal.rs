@@ -1,7 +1,6 @@
 #![allow(clippy::arc_with_non_send_sync)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use assertion::{assert_always, assert_always_greater_than, assert_always_less_than_or_equal_to};
 use std::array;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
@@ -24,6 +23,7 @@ use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_write_wal_frame, finish_read_page, WAL_FRAME_HEADER_SIZE,
     WAL_HEADER_SIZE,
 };
+use crate::{assert_always, assert_always_greater_than, assert_always_less_than_or_equal_to};
 use crate::{Buffer, Result};
 use crate::{Completion, Page};
 

@@ -1,6 +1,5 @@
 use std::{cell::RefCell, cmp::Ordering, collections::HashMap, sync::Arc};
 
-use assertion::{assert_always, assert_always_eq};
 use constraints::{
     constraints_from_where_clause, usable_constraints_for_join_order, Constraint, ConstraintRef,
 };
@@ -14,6 +13,7 @@ use turso_sqlite3_parser::{
 };
 
 use crate::{
+    assert_always, assert_always_eq,
     parameters::PARAM_PREFIX,
     schema::{Index, IndexColumn, Schema, Table},
     translate::{expr::walk_expr_mut, plan::TerminationKey},

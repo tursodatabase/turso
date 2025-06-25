@@ -1,8 +1,7 @@
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::SelectPlan;
+use crate::{assert_always, LimboError, VirtualTable};
 use crate::{util::normalize_ident, Result};
-use crate::{LimboError, VirtualTable};
-use assertion::assert_always;
 use core::fmt;
 use fallible_iterator::FallibleIterator;
 use std::collections::{BTreeSet, HashMap};

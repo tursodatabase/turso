@@ -1,10 +1,10 @@
 use std::rc::Rc;
 
-use assertion::assert_always_eq;
 use turso_sqlite3_parser::ast::{
     DistinctNames, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, With,
 };
 
+use crate::assert_always_eq;
 use crate::error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY};
 use crate::schema::{IndexColumn, Table};
 use crate::util::normalize_ident;

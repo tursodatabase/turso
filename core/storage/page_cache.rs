@@ -1,6 +1,6 @@
 use std::{cell::RefCell, ptr::NonNull};
 
-use assertion::{assert_always, assert_always_greater_than};
+use crate::{assert_always, assert_always_greater_than};
 use std::sync::Arc;
 use tracing::{debug, trace};
 

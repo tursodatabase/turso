@@ -1,11 +1,9 @@
-use assertion::{
-    assert_always, assert_always_eq, assert_always_greater_than,
-    assert_always_greater_than_or_equal_to, assert_always_less_than,
-    assert_always_less_than_or_equal_to, assert_always_ne, assert_reachable,
-};
 use tracing::{instrument, Level};
 
 use crate::{
+    assert_always, assert_always_eq, assert_always_greater_than,
+    assert_always_greater_than_or_equal_to, assert_always_less_than,
+    assert_always_less_than_or_equal_to, assert_always_ne, assert_reachable,
     schema::Index,
     storage::{
         header_accessor,

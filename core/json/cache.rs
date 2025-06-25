@@ -1,7 +1,6 @@
 use std::cell::{Cell, UnsafeCell};
 
-use assertion::assert_always;
-
+use crate::assert_always;
 use crate::Value;
 
 use super::jsonb::Jsonb;

@@ -1,9 +1,9 @@
-use assertion::assert_always_less_than;
 use std::{cell::Cell, cmp::Ordering, rc::Rc, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_sqlite3_parser::ast::{self, SortOrder};
 
 use crate::{
+    assert_always_less_than,
     function::AggFunc,
     schema::{BTreeTable, Column, FromClauseSubquery, Index, Table},
     vdbe::{

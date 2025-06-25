@@ -19,7 +19,7 @@ macro_rules! assert_always_eq {
 #[cfg(feature = "antithesis")]
 macro_rules! assert_always_eq {
     ($left:expr, $right:expr, $message:literal) => {
-        $crate::antithesis_sdk::assert_always!($left == $right, $message);
+        $crate::assertion::antithesis_sdk::assert_always!($left == $right, $message);
     };
 }
 
@@ -35,7 +35,7 @@ macro_rules! assert_always_ne {
 #[cfg(feature = "antithesis")]
 macro_rules! assert_always_ne {
     ($left:expr, $right:expr, $message:literal) => {
-        $crate::antithesis_sdk::assert_always!($left != $right, $message);
+        $crate::assertion::antithesis_sdk::assert_always!($left != $right, $message);
     };
 }
 
@@ -51,7 +51,7 @@ macro_rules! assert_always {
 #[cfg(feature = "antithesis")]
 macro_rules! assert_always {
     ($condition:expr, $message:literal) => {
-        $crate::antithesis_sdk::assert_always!($condition, $message);
+        $crate::assertion::antithesis_sdk::assert_always!($condition, $message);
     };
 }
 
@@ -67,7 +67,7 @@ macro_rules! assert_always_greater_than {
 #[cfg(feature = "antithesis")]
 macro_rules! assert_always_greater_than {
     ($left:expr, $right:expr, $message:literal) => {
-        $crate::antithesis_sdk::assert_always_greater_than!($left, $right, $message);
+        $crate::assertion::antithesis_sdk::assert_always_greater_than!($left, $right, $message);
     };
 }
 
@@ -83,7 +83,9 @@ macro_rules! assert_always_greater_than_or_equal_to {
 #[cfg(feature = "antithesis")]
 macro_rules! assert_always_greater_than_or_equal_to {
     ($left:expr, $right:expr, $message:literal) => {
-        $crate::antithesis_sdk::assert_always_greater_than_or_equal_to!($left, $right, $message);
+        $crate::assertion::antithesis_sdk::assert_always_greater_than_or_equal_to!(
+            $left, $right, $message
+        );
     };
 }
 
@@ -99,7 +101,7 @@ macro_rules! assert_always_less_than {
 #[cfg(feature = "antithesis")]
 macro_rules! assert_always_less_than {
     ($left:expr, $right:expr, $message:literal) => {
-        $crate::antithesis_sdk::assert_always_less_than!($left, $right, $message);
+        $crate::assertion::antithesis_sdk::assert_always_less_than!($left, $right, $message);
     };
 }
 
@@ -115,7 +117,9 @@ macro_rules! assert_always_less_than_or_equal_to {
 #[cfg(feature = "antithesis")]
 macro_rules! assert_always_less_than_or_equal_to {
     ($left:expr, $right:expr, $message:literal) => {
-        $crate::antithesis_sdk::assert_always_less_than_or_equal_to!($left, $right, $message);
+        $crate::assertion::antithesis_sdk::assert_always_less_than_or_equal_to!(
+            $left, $right, $message
+        );
     };
 }
 
@@ -131,7 +135,7 @@ macro_rules! assert_always_or_unreachable {
 #[cfg(feature = "antithesis")]
 macro_rules! assert_always_or_unreachable {
     ($condition:expr, $message:literal) => {
-        $crate::antithesis_sdk::assert_always_or_unreachable!($condition, $message);
+        $crate::assertion::antithesis_sdk::assert_always_or_unreachable!($condition, $message);
     };
 }
 
@@ -147,7 +151,7 @@ macro_rules! assert_always_some {
 #[cfg(feature = "antithesis")]
 macro_rules! assert_always_some {
     ({$($($name:ident: $cond:expr),+ $(,)?)?}, $message:literal) => {
-        $crate::antithesis_sdk::assert_always_some!({$($($name: $cond),+)?}, $message);
+        $crate::assertion::antithesis_sdk::assert_always_some!({$($($name: $cond),+)?}, $message);
     };
 }
 
@@ -161,7 +165,7 @@ macro_rules! assert_reachable {
 #[cfg(feature = "antithesis")]
 macro_rules! assert_reachable {
     ($message:literal) => {
-        $crate::antithesis_sdk::assert_reachable!($message);
+        $crate::assertion::antithesis_sdk::assert_reachable!($message);
     };
 }
 
@@ -175,7 +179,7 @@ macro_rules! assert_sometimes {
 #[cfg(feature = "antithesis")]
 macro_rules! assert_sometimes {
     ($condition:expr, $message:literal) => {
-        $crate::antithesis_sdk::assert_sometimes!($condition, $message);
+        $crate::assertion::antithesis_sdk::assert_sometimes!($condition, $message);
     };
 }
 
@@ -189,7 +193,7 @@ macro_rules! assert_sometimes_all {
 #[cfg(feature = "antithesis")]
 macro_rules! assert_sometimes_all {
     ({$($($name:ident: $cond:expr),+ $(,)?)?}, $message:literal) => {
-        $crate::antithesis_sdk::assert_sometimes_all!({$($($name: $cond),+)?}, $message);
+        $crate::assertion::antithesis_sdk::assert_sometimes_all!({$($($name: $cond),+)?}, $message);
     };
 }
 
@@ -203,7 +207,7 @@ macro_rules! assert_sometimes_greater_than {
 #[cfg(feature = "antithesis")]
 macro_rules! assert_sometimes_greater_than {
     ($left:expr, $right:expr, $message:literal) => {
-        $crate::antithesis_sdk::assert_sometimes_greater_than!($left, $right, $message);
+        $crate::assertion::antithesis_sdk::assert_sometimes_greater_than!($left, $right, $message);
     };
 }
 
@@ -217,7 +221,9 @@ macro_rules! assert_sometimes_greater_than_or_equal_to {
 #[cfg(feature = "antithesis")]
 macro_rules! assert_sometimes_greater_than_or_equal_to {
     ($left:expr, $right:expr, $message:literal) => {
-        $crate::antithesis_sdk::assert_sometimes_greater_than_or_equal_to!($left, $right, $message);
+        $crate::assertion::antithesis_sdk::assert_sometimes_greater_than_or_equal_to!(
+            $left, $right, $message
+        );
     };
 }
 
@@ -231,7 +237,7 @@ macro_rules! assert_sometimes_less_than {
 #[cfg(feature = "antithesis")]
 macro_rules! assert_sometimes_less_than {
     ($left:expr, $right:expr, $message:literal) => {
-        $crate::antithesis_sdk::assert_sometimes_less_than!($left, $right, $message);
+        $crate::assertion::antithesis_sdk::assert_sometimes_less_than!($left, $right, $message);
     };
 }
 
@@ -245,7 +251,9 @@ macro_rules! assert_sometimes_less_than_or_equal_to {
 #[cfg(feature = "antithesis")]
 macro_rules! assert_sometimes_less_than_or_equal_to {
     ($left:expr, $right:expr, $message:literal) => {
-        $crate::antithesis_sdk::assert_sometimes_less_than_or_equal_to!($left, $right, $message);
+        $crate::assertion::antithesis_sdk::assert_sometimes_less_than_or_equal_to!(
+            $left, $right, $message
+        );
     };
 }
 
@@ -261,7 +269,7 @@ macro_rules! assert_unreachable {
 #[cfg(feature = "antithesis")]
 macro_rules! assert_unreachable {
     ($message:literal) => {
-        $crate::antithesis_sdk::assert_unreachable!($message);
+        $crate::assertion::antithesis_sdk::assert_unreachable!($message);
     };
 }
 

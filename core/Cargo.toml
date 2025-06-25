@@ -14,7 +14,6 @@ name = "turso_core"
 path = "lib.rs"
 
 [features]
-antithesis = ["dep:antithesis_sdk"]
 default = ["fs", "uuid", "time", "json", "series"]
 fs = ["turso_ext/vfs"]
 json = []
@@ -26,6 +25,7 @@ omit_autovacuum = []
 simulator = ["fuzz", "serde"]
 serde = ["dep:serde"]
 series = []
+antithesis = ["dep:antithesis_sdk", "antithesis_sdk/full"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7.5", optional = true }
@@ -39,7 +39,6 @@ mimalloc = { version = "0.1.46", default-features = false }
 libloading = "0.8.6"
 
 [dependencies]
-antithesis_sdk = { version = "0.2.5", optional = true }
 turso_ext = { workspace = true, features = ["core_only"] }
 cfg_block = "0.1.1"
 fallible-iterator = "0.3.0"
@@ -69,6 +68,7 @@ bitflags = "2.9.0"
 serde = { workspace = true , optional = true, features = ["derive"] }
 paste = "1.0.15"
 uuid = { version = "1.11.0", features = ["v4", "v7"], optional = true }
+antithesis_sdk = { workspace = true, optional = true }
 
 [build-dependencies]
 chrono = { version = "0.4.38", default-features = false }

@@ -1,10 +1,10 @@
 use crate::error::LimboError;
 use crate::io::CompletionType;
-use crate::{io::Completion, Buffer, Result};
-use assertion::{
+use crate::{
     assert_always_eq, assert_always_greater_than, assert_always_greater_than_or_equal_to,
     assert_always_less_than_or_equal_to,
 };
+use crate::{io::Completion, Buffer, Result};
 use std::{cell::RefCell, sync::Arc};
 
 /// DatabaseStorage is an interface a database file that consists of pages.

@@ -60,7 +60,9 @@ use super::{
     insn::{Cookie, RegisterOrLiteral},
     CommitState,
 };
-use assertion::assert_always;
+
+use crate::assert_always;
+
 use fallible_iterator::FallibleIterator;
 use parking_lot::RwLock;
 use rand::thread_rng;

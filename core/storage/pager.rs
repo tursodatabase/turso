@@ -6,9 +6,9 @@ use crate::storage::header_accessor;
 use crate::storage::sqlite3_ondisk::{self, DatabaseHeader, PageContent, PageType};
 use crate::storage::wal::{CheckpointResult, Wal, WalFsyncStatus};
 use crate::types::CursorResult;
+use crate::{assert_always, assert_always_eq};
 use crate::{Buffer, LimboError, Result};
 use crate::{Completion, WalFile};
-use assertion::{assert_always, assert_always_eq};
 use parking_lot::RwLock;
 use std::cell::{OnceCell, RefCell, UnsafeCell};
 use std::collections::HashSet;
@@ -496,7 +496,7 @@ impl Pager {
                     Ok(CursorResult::Ok(page_id as u32))
                 }
                 AutoVacuumMode::Full => {
-                    use assertion::{
+                    use crate::{
                         assert_always_greater_than, assert_always_greater_than_or_equal_to,
                     };
 
@@ -1280,7 +1280,7 @@ impl CreateBTreeFlags {
 */
 #[cfg(not(feature = "omit_autovacuum"))]
 mod ptrmap {
-    use assertion::assert_always_greater_than_or_equal_to;
+    use crate::assert_always_greater_than_or_equal_to;
 
     use crate::{storage::sqlite3_ondisk::MIN_PAGE_SIZE, LimboError, Result};
 

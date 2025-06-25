@@ -1,9 +1,9 @@
 use std::cell::RefCell;
 
-use assertion::assert_always_greater_than_or_equal_to;
 use turso_sqlite3_parser::ast::{self, SortOrder, TableInternalId};
 
 use crate::{
+    assert_always_greater_than_or_equal_to,
     translate::plan::{GroupBy, IterationDirection, JoinedTable},
     util::exprs_are_equivalent,
 };

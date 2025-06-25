@@ -12,6 +12,7 @@ use super::{
 };
 use crate::translate::expr::WalkControl;
 use crate::{
+    assert_always, assert_always_greater_than_or_equal_to, assert_always_less_than,
     function::Func,
     schema::{Schema, Table},
     translate::expr::walk_expr_mut,
@@ -19,7 +20,6 @@ use crate::{
     vdbe::{builder::TableRefIdCounter, BranchOffset},
     Result,
 };
-use assertion::{assert_always, assert_always_greater_than_or_equal_to, assert_always_less_than};
 use turso_sqlite3_parser::ast::{
     self, Expr, FromClause, JoinType, Limit, Materialized, TableInternalId, UnaryOperator, With,
 };

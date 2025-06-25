@@ -1,10 +1,10 @@
-use assertion::{assert_always, assert_always_eq};
 use turso_ext::VTabKind;
 use turso_sqlite3_parser::ast::{self, SortOrder};
 
 use std::sync::Arc;
 
 use crate::{
+    assert_always, assert_always_eq,
     schema::{Affinity, Index, IndexColumn, Table},
     translate::{
         plan::{DistinctCtx, Distinctness},

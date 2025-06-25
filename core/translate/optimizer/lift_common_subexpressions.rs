@@ -1,9 +1,9 @@
 use std::cell::Cell;
 
-use assertion::{assert_always, assert_always_greater_than};
 use turso_sqlite3_parser::ast::{Expr, Operator};
 
 use crate::{
+    assert_always, assert_always_greater_than,
     translate::{expr::unwrap_parens_owned, plan::WhereTerm},
     util::exprs_are_equivalent,
     Result,

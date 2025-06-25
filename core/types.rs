@@ -1,6 +1,3 @@
-use assertion::{
-    assert_always, assert_always_eq, assert_always_less_than, assert_always_less_than_or_equal_to,
-};
 use limbo_ext::{AggCtx, FinalizeFunction, StepFunction};
 use limbo_sqlite3_parser::ast::SortOrder;
 #[cfg(feature = "serde")]
@@ -20,6 +17,9 @@ use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::Result;
+use crate::{
+    assert_always, assert_always_eq, assert_always_less_than, assert_always_less_than_or_equal_to,
+};
 use std::fmt::{Debug, Display};
 
 const MAX_REAL_SIZE: u8 = 15;

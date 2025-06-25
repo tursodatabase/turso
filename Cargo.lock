@@ -185,13 +185,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "assertion"
-version = "0.1.0-pre.5"
-dependencies = [
- "antithesis_sdk",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1752,6 +1745,66 @@ version = "0.1.1"
 dependencies = [
  "mimalloc",
  "turso_ext",
+]
+
+[[package]]
+name = "limbo_core"
+version = "0.1.0-pre.2"
+dependencies = [
+ "antithesis_sdk",
+ "bitflags 2.9.0",
+ "built",
+ "cfg_block",
+ "chrono",
+ "criterion",
+ "crossbeam-skiplist",
+ "env_logger 0.11.7",
+ "fallible-iterator",
+ "getrandom 0.2.15",
+ "hex",
+ "io-uring",
+ "julian_day_converter",
+ "libc",
+ "libloading",
+ "libm",
+ "limbo_completion",
+ "limbo_crypto",
+ "limbo_csv",
+ "limbo_ext",
+ "limbo_ipaddr",
+ "limbo_macros",
+ "limbo_percentile",
+ "limbo_regexp",
+ "limbo_series",
+ "limbo_sqlite3_parser",
+ "limbo_time",
+ "limbo_uuid",
+ "lru",
+ "miette",
+ "mimalloc",
+ "parking_lot",
+ "paste",
+ "polling",
+ "pprof",
+ "quickcheck",
+ "quickcheck_macros",
+ "rand 0.8.5",
+ "rand_chacha 0.9.0",
+ "regex",
+ "regex-syntax 0.8.5",
+ "rstest",
+ "rusqlite",
+ "rustix 1.0.7",
+ "ryu",
+ "serde",
+ "sorted-vec",
+ "strum",
+ "strum_macros",
+ "tempfile",
+ "test-log",
+ "thiserror 1.0.69",
+ "tracing",
+ "uncased",
 ]
 
 [[package]]

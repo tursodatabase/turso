@@ -1,8 +1,8 @@
-use assertion::{assert_always_eq, assert_always_ne};
 use fallible_iterator::FallibleIterator as _;
 use turso_sqlite3_parser::{ast, lexer::sql::Parser};
 
 use crate::{
+    assert_always_eq, assert_always_ne,
     function::{AlterTableFunc, Func},
     schema::{Column, Schema},
     util::normalize_ident,
