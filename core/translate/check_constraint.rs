@@ -25,9 +25,9 @@ pub fn translate_check_constraint(
         inner_translate_check_constraint(
             program,
             &check_constraint.expr,
-            column_registers.as_ref(),
+            column_registers,
             Some(jump_if_true),
-            &resolver,
+            resolver,
         );
 
         use crate::error::SQLITE_CONSTRAINT_CHECK;
@@ -50,8 +50,8 @@ fn inner_translate_check_constraint(
     match check_constraint_expr {
         ast::Expr::Literal(_) => {
             let reg = program.alloc_register();
-            let _ = translate_expr(program, None, &check_constraint_expr, reg, resolver);
-            return reg;
+            let _ = translate_expr(program, None, check_constraint_expr, reg, resolver);
+            reg
         }
         ast::Expr::Id(id) => {
             for (reg, col) in registers_by_columns.iter() {
@@ -85,7 +85,7 @@ fn inner_translate_check_constraint(
                     collation: program.curr_collation(),
                 });
             }
-            return rhs_reg;
+            rhs_reg
         }
         ast::Expr::Binary(lhs, ast::Operator::Greater, rhs) => {
             let lhs_reg = inner_translate_check_constraint(
@@ -111,7 +111,7 @@ fn inner_translate_check_constraint(
                     collation: program.curr_collation(),
                 });
             }
-            return rhs_reg;
+            rhs_reg
         }
         ast::Expr::Binary(lhs, ast::Operator::GreaterEquals, rhs) => {
             let lhs_reg = inner_translate_check_constraint(
@@ -137,7 +137,7 @@ fn inner_translate_check_constraint(
                     collation: program.curr_collation(),
                 });
             }
-            return rhs_reg;
+            rhs_reg
         }
         ast::Expr::Binary(lhs, ast::Operator::Less, rhs) => {
             let lhs_reg = inner_translate_check_constraint(
@@ -163,7 +163,7 @@ fn inner_translate_check_constraint(
                     collation: program.curr_collation(),
                 });
             }
-            return rhs_reg;
+            rhs_reg
         }
         ast::Expr::Binary(lhs, ast::Operator::LessEquals, rhs) => {
             let lhs_reg = inner_translate_check_constraint(
@@ -189,7 +189,7 @@ fn inner_translate_check_constraint(
                     collation: program.curr_collation(),
                 });
             }
-            return rhs_reg;
+            rhs_reg
         }
         ast::Expr::Binary(lhs, ast::Operator::Add, rhs) => {
             let lhs_reg = inner_translate_check_constraint(
@@ -219,7 +219,7 @@ fn inner_translate_check_constraint(
                     jump_if_null: true,
                 });
             }
-            return dest_reg;
+            dest_reg
         }
         ast::Expr::Binary(lhs, ast::Operator::Subtract, rhs) => {
             let lhs_reg = inner_translate_check_constraint(
@@ -249,7 +249,7 @@ fn inner_translate_check_constraint(
                     jump_if_null: true,
                 });
             }
-            return dest_reg;
+            dest_reg
         }
         ast::Expr::Binary(lhs, ast::Operator::Multiply, rhs) => {
             let lhs_reg = inner_translate_check_constraint(
@@ -279,7 +279,7 @@ fn inner_translate_check_constraint(
                     jump_if_null: true,
                 });
             }
-            return dest_reg;
+            dest_reg
         }
         ast::Expr::Binary(lhs, ast::Operator::Divide, rhs) => {
             let lhs_reg = inner_translate_check_constraint(
@@ -309,7 +309,7 @@ fn inner_translate_check_constraint(
                     jump_if_null: true,
                 });
             }
-            return dest_reg;
+            dest_reg
         }
         ast::Expr::Binary(lhs, ast::Operator::Modulus, rhs) => {
             let lhs_reg = inner_translate_check_constraint(
@@ -339,7 +339,7 @@ fn inner_translate_check_constraint(
                     jump_if_null: true,
                 });
             }
-            return dest_reg;
+            dest_reg
         }
         ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
             let lhs_reg = inner_translate_check_constraint(
@@ -369,7 +369,7 @@ fn inner_translate_check_constraint(
                     jump_if_null: true,
                 });
             }
-            return dest_reg;
+            dest_reg
         }
         ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
             let lhs_reg = inner_translate_check_constraint(
@@ -399,12 +399,12 @@ fn inner_translate_check_constraint(
                     jump_if_null: true,
                 });
             }
-            return dest_reg;
+            dest_reg
         }
         ast::Expr::Parenthesized(expr) => {
             let dest_reg = inner_translate_check_constraint(
                 program,
-                expr.get(0).expect("Expr should exist"),
+                expr.first().expect("Expr should exist"),
                 registers_by_columns,
                 None,
                 resolver,
@@ -416,7 +416,7 @@ fn inner_translate_check_constraint(
                     jump_if_null: true,
                 });
             }
-            return dest_reg;
+            dest_reg
         }
         e => todo!("{}", &e),
     }

@@ -540,7 +540,7 @@ fn create_table(
                             collation = Some(CollationSeq::new(collation_name.0.as_str())?);
                         }
                         // Collate
-                        e => {}
+                        _ => {}
                     }
                 }
 
@@ -1882,12 +1882,12 @@ mod tests {
         assert_eq!(table.column_check_constraints.len(), 2);
         assert_eq!(table.table_check_constraints.len(), 2);
 
-        let names = vec![None, Some("isOdd".to_string())];
+        let names = [None, Some("isOdd".to_string())];
         for (check, name) in table.column_check_constraints.iter().zip(names.iter()) {
             assert_eq!(&check.name, name);
         }
 
-        let names = vec![Some("maxSum".to_string()), None];
+        let names = [Some("maxSum".to_string()), None];
         for (check, name) in table.table_check_constraints.iter().zip(names.iter()) {
             assert_eq!(&check.name, name);
         }
