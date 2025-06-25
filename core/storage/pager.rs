@@ -1325,7 +1325,7 @@ impl Pager {
         }
         // subjounalPageIfRequired
 
-        let db_size = self.db_header.lock().database_size;
+        let db_size = header_accessor::get_database_size(self)?;
         self.wal.borrow_mut().append_frame(
             page.clone(),
             db_size,
