@@ -655,7 +655,7 @@ impl Interaction {
                         let db_path = env.db_path();
                         let db = match limbo_core::Database::open_file(
                             env.io().clone(),
-                            &db_path,
+                            db_path,
                             false,
                             false,
                         ) {
