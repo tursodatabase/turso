@@ -280,10 +280,11 @@ impl DumbLruPageCache {
             }
         }
 
-        match need_to_evict > 0 {
-            true => Err(CacheError::Full),
-            false => Ok(()),
+        if need_to_evict > 0 {
+            return Err(CacheError::Full);
         }
+
+        Ok(())
     }
 
     pub fn clear(&mut self) -> Result<(), CacheError> {
