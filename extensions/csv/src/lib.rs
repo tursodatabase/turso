@@ -182,10 +182,7 @@ impl VTabModule for CsvVTabModule {
             if table.header {
                 let headers = reader.headers().map_err(|_| ResultCode::Error)?;
                 if column_count.is_none() && schema.is_none() {
-                    columns = headers
-                        .into_iter()
-                        .map(|header| Self::escape_double_quote(header))
-                        .collect();
+                    columns = headers.into_iter().map(Self::escape_double_quote).collect();
                 }
                 if columns.is_empty() {
                     columns.push("(NULL)".to_owned());

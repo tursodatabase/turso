@@ -2211,6 +2211,7 @@ pub fn translate_expr(
     Ok(target_register)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_binary_insn(
     program: &mut ProgramBuilder,
     op: &ast::Operator,
@@ -2490,7 +2491,7 @@ fn translate_like_base(
     };
     match op {
         ast::LikeOperator::Like | ast::LikeOperator::Glob => {
-            let arg_count = if matches!(escape, Some(_)) { 3 } else { 2 };
+            let arg_count = if escape.is_some() { 3 } else { 2 };
             let start_reg = program.alloc_registers(arg_count);
             let mut constant_mask = 0;
             translate_expr(program, referenced_tables, lhs, start_reg + 1, resolver)?;

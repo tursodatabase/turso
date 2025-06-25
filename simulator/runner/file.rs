@@ -57,8 +57,8 @@ impl SimulatorFile {
             "--------- -------- --------".to_string(),
             format!("total     {:8} {:8}", sum_calls, sum_faults),
         ];
-        let table = stats_table.join("\n");
-        table
+
+        stats_table.join("\n")
     }
 }
 

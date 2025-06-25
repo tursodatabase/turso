@@ -103,6 +103,12 @@ pub enum TimeRoundField {
     Micro,
 }
 
+impl Default for Time {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Time {
     /// Returns a new instance of Time with tracking UTC::now
     pub fn new() -> Self {

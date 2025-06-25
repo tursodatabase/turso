@@ -144,7 +144,7 @@ pub fn prepare_update_plan(
             index: None,
         },
         join_info: None,
-        col_used_mask: ColumnUsedMask::new(),
+        col_used_mask: ColumnUsedMask::default(),
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
     let set_clauses = body
@@ -229,7 +229,7 @@ pub fn prepare_update_plan(
                 index: None,
             },
             join_info: None,
-            col_used_mask: ColumnUsedMask::new(),
+            col_used_mask: ColumnUsedMask::default(),
         }];
         let mut table_references = TableReferences::new(joined_tables, vec![]);
 

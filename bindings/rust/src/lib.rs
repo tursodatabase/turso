@@ -148,6 +148,12 @@ impl Connection {
     }
 }
 
+impl Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Connection").finish()
+    }
+}
+
 pub struct Statement {
     inner: Arc<Mutex<limbo_core::Statement>>,
 }
@@ -445,14 +451,14 @@ mod tests {
             .query("SELECT data FROM test_large_persistence ORDER BY id;", ())
             .await?;
 
-        for i in 0..NUM_INSERTS {
+        for (i, value) in original_data.iter().enumerate().take(NUM_INSERTS) {
             let row = rows
                 .next()
                 .await?
                 .unwrap_or_else(|| panic!("Expected row {} but found None", i));
             assert_eq!(
                 row.get_value(0)?,
-                Value::Text(original_data[i].clone()),
+                Value::Text(value.clone()),
                 "Mismatch in retrieved data for row {}",
                 i
             );

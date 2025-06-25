@@ -110,7 +110,7 @@ pub fn translate_create_index(
     );
 
     // determine the order of the columns in the index for the sorter
-    let order = idx.columns.iter().map(|c| c.order.clone()).collect();
+    let order = idx.columns.iter().map(|c| c.order).collect();
     // open the sorter and the pseudo table
     program.emit_insn(Insn::SorterOpen {
         cursor_id: sorter_cursor_id,

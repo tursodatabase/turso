@@ -20,6 +20,7 @@ use crate::{
 /// 1. (c AND d) OR (e AND f)
 /// 2. a,
 /// 3. b,
+///
 /// where `a` and `b` become separate WhereTerms, and the original WhereTerm
 /// is updated to `(c AND d) OR (e AND f)`.
 ///

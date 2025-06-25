@@ -46,7 +46,7 @@ impl CmpInsFlags {
     }
 
     pub fn with_affinity(mut self, affinity: Affinity) -> Self {
-        let aff_code = affinity.to_char_code() as usize;
+        let aff_code = affinity.as_char_code() as usize;
         self.0 = (self.0 & !Self::AFFINITY_MASK) | aff_code;
         self
     }

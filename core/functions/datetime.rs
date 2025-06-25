@@ -664,11 +664,7 @@ pub fn exec_timediff(values: &[Register]) -> Value {
 fn format_time_duration(duration: &chrono::Duration) -> Value {
     let is_negative = duration.num_seconds() < 0;
 
-    let abs_duration = if is_negative {
-        -duration.clone()
-    } else {
-        duration.clone()
-    };
+    let abs_duration = if is_negative { -*duration } else { *duration };
 
     let total_seconds = abs_duration.num_seconds();
     let hours = (total_seconds % 86400) / 3600;
@@ -695,7 +691,7 @@ fn format_time_duration(duration: &chrono::Duration) -> Value {
         millis
     );
 
-    Value::build_text(&result)
+    Value::build_text(result)
 }
 
 #[cfg(test)]
@@ -839,7 +835,7 @@ mod tests {
             Value::Float(f64::NAN),                   // NaN
             Value::Float(f64::INFINITY),              // Infinity
             Value::Null,                              // Null value
-            Value::Blob(vec![1, 2, 3].into()),        // Blob (unsupported type)
+            Value::Blob(vec![1, 2, 3]),               // Blob (unsupported type)
             // Invalid timezone tests
             Value::build_text("2024-07-21T12:00:00+24:00"), // Invalid timezone offset (too large)
             Value::build_text("2024-07-21T12:00:00-24:00"), // Invalid timezone offset (too small)
@@ -974,7 +970,7 @@ mod tests {
             Value::Float(f64::NAN),                   // NaN
             Value::Float(f64::INFINITY),              // Infinity
             Value::Null,                              // Null value
-            Value::Blob(vec![1, 2, 3].into()),        // Blob (unsupported type)
+            Value::Blob(vec![1, 2, 3]),               // Blob (unsupported type)
             // Invalid timezone tests
             Value::build_text("2024-07-21T12:00:00+24:00"), // Invalid timezone offset (too large)
             Value::build_text("2024-07-21T12:00:00-24:00"), // Invalid timezone offset (too small)

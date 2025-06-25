@@ -38,3 +38,4 @@ source $testdir/collate.test
 source $testdir/values.test
 source $testdir/integrity_check.test
 source $testdir/check-constraints.test
+source $testdir/rollback.test

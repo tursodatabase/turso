@@ -69,11 +69,7 @@ pub fn prepare_delete_plan(
         crate::bail_parse_error!("Table is neither a virtual table nor a btree table");
     };
     let name = tbl_name.name.0.as_str().to_string();
-    let indexes = schema
-        .get_indices(table.get_name())
-        .iter()
-        .cloned()
-        .collect();
+    let indexes = schema.get_indices(table.get_name()).to_vec();
     let joined_tables = vec![JoinedTable {
         table,
         identifier: name,
@@ -83,7 +79,7 @@ pub fn prepare_delete_plan(
             index: None,
         },
         join_info: None,
-        col_used_mask: ColumnUsedMask::new(),
+        col_used_mask: ColumnUsedMask::default(),
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
 

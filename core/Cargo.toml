@@ -84,6 +84,7 @@ uncased = "0.9.10"
 strum_macros = { workspace = true }
 bitflags = "2.9.0"
 serde = { workspace = true , optional = true, features = ["derive"] }
+paste = "1.0.15"
 
 [build-dependencies]
 chrono = { version = "0.4.38", default-features = false }

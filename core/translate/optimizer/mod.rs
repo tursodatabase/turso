@@ -10,7 +10,7 @@ use limbo_sqlite3_parser::{
     ast::{self, Expr, SortOrder},
     to_sql_string::ToSqlString as _,
 };
-use order::{compute_order_target, plan_satisfies_order_target, EliminatesSort};
+use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy};
 
 use crate::{
     parameters::PARAM_PREFIX,
@@ -152,14 +152,14 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
 fn optimize_table_access(
     table_references: &mut TableReferences,
     available_indexes: &HashMap<String, Vec<Arc<Index>>>,
-    where_clause: &mut Vec<WhereTerm>,
+    where_clause: &mut [WhereTerm],
     order_by: &mut Option<Vec<(ast::Expr, SortOrder)>>,
     group_by: &mut Option<GroupBy>,
 ) -> Result<Option<Vec<JoinOrderMember>>> {
     let access_methods_arena = RefCell::new(Vec::new());
     let maybe_order_target = compute_order_target(order_by, group_by.as_mut());
     let constraints_per_table =
-        constraints_from_where_clause(where_clause, &table_references, available_indexes)?;
+        constraints_from_where_clause(where_clause, table_references, available_indexes)?;
     let Some(best_join_order_result) = compute_best_join_order(
         table_references.joined_tables_mut(),
         maybe_order_target.as_ref(),
@@ -204,13 +204,13 @@ fn optimize_table_access(
         );
         if satisfies_order_target {
             match order_target.1 {
-                EliminatesSort::GroupBy => {
+                EliminatesSortBy::Group => {
                     let _ = group_by.as_mut().and_then(|g| g.sort_order.take());
                 }
-                EliminatesSort::OrderBy => {
+                EliminatesSortBy::Order => {
                     let _ = order_by.take();
                 }
-                EliminatesSort::GroupByAndOrderBy => {
+                EliminatesSortBy::GroupByAndOrder => {
                     let _ = group_by.as_mut().and_then(|g| g.sort_order.take());
                     let _ = order_by.take();
                 }
@@ -294,14 +294,14 @@ fn optimize_table_access(
             let ephemeral_index = ephemeral_index_build(
                 &joined_tables[table_idx],
                 &table_constraints.constraints,
-                &usable_constraint_refs,
+                usable_constraint_refs,
             );
             let ephemeral_index = Arc::new(ephemeral_index);
             joined_tables[table_idx].op = Operation::Search(Search::Seek {
                 index: Some(ephemeral_index),
                 seek_def: build_seek_def_from_constraints(
                     &table_constraints.constraints,
-                    &usable_constraint_refs,
+                    usable_constraint_refs,
                     access_method.iter_dir,
                     where_clause,
                 )?,
@@ -326,7 +326,7 @@ fn optimize_table_access(
                     index: Some(index.clone()),
                     seek_def: build_seek_def_from_constraints(
                         &constraints_per_table[table_idx].constraints,
-                        &constraint_refs,
+                        constraint_refs,
                         access_method.iter_dir,
                         where_clause,
                     )?,
@@ -348,7 +348,7 @@ fn optimize_table_access(
                     index: None,
                     seek_def: build_seek_def_from_constraints(
                         &constraints_per_table[table_idx].constraints,
-                        &constraint_refs,
+                        constraint_refs,
                         access_method.iter_dir,
                         where_clause,
                     )?,
@@ -370,7 +370,7 @@ enum ConstantConditionEliminationResult {
 /// Returns a ConstantEliminationResult indicating whether any predicates are always false.
 /// This is used to determine whether the query can be aborted early.
 fn eliminate_constant_conditions(
-    where_clause: &mut Vec<WhereTerm>,
+    where_clause: &mut [WhereTerm],
 ) -> Result<ConstantConditionEliminationResult> {
     let mut i = 0;
     while i < where_clause.len() {
@@ -530,7 +530,7 @@ impl Optimizable for ast::Expr {
                 let table_ref = tables.find_joined_table_by_internal_id(*table).unwrap();
                 let columns = table_ref.columns();
                 let column = &columns[*column];
-                return column.primary_key || column.notnull;
+                column.primary_key || column.notnull
             }
             Expr::RowId { .. } => true,
             Expr::InList { lhs, rhs, .. } => {
@@ -864,11 +864,11 @@ pub fn build_seek_def_from_constraints(
 /// But to illustrate the general idea, consider the following examples:
 ///
 /// 1. For example, having two conditions like (x>10 AND y>20) cannot be used as a valid [SeekKey] GT(x:10, y:20)
-/// because the first row greater than (x:10, y:20) might be (x:10, y:21), which does not satisfy the where clause.
-/// In this case, only GT(x:10) must be used as the [SeekKey], and rows with y <= 20 must be filtered as a regular condition expression for each value of x.
+///    because the first row greater than (x:10, y:20) might be (x:10, y:21), which does not satisfy the where clause.
+///    In this case, only GT(x:10) must be used as the [SeekKey], and rows with y <= 20 must be filtered as a regular condition expression for each value of x.
 ///
 /// 2. In contrast, having (x=10 AND y>20) forms a valid index key GT(x:10, y:20) because after the seek, we can simply terminate as soon as x > 10,
-/// i.e. use GT(x:10, y:20) as the [SeekKey] and GT(x:10) as the [TerminationKey].
+///    i.e. use GT(x:10, y:20) as the [SeekKey] and GT(x:10) as the [TerminationKey].
 ///
 /// The preceding examples are for an ascending index. The logic is similar for descending indexes, but an important distinction is that
 /// since a descending index is laid out in reverse order, the comparison operators are reversed, e.g. LT becomes GT, LE becomes GE, etc.

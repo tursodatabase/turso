@@ -86,7 +86,7 @@ pub fn init_group_by<'a>(
     t_ctx: &mut TranslateCtx<'a>,
     group_by: &'a GroupBy,
     plan: &SelectPlan,
-    result_columns: &'a Vec<ResultSetColumn>,
+    result_columns: &'a [ResultSetColumn],
     order_by: &'a Option<Vec<(ast::Expr, ast::SortOrder)>>,
 ) -> Result<()> {
     collect_non_aggregate_expressions(
@@ -239,7 +239,7 @@ fn collect_non_aggregate_expressions<'a>(
     non_aggregate_expressions: &mut Vec<(&'a ast::Expr, bool)>,
     group_by: &'a GroupBy,
     plan: &SelectPlan,
-    root_result_columns: &'a Vec<ResultSetColumn>,
+    root_result_columns: &'a [ResultSetColumn],
     order_by: &'a Option<Vec<(ast::Expr, ast::SortOrder)>>,
 ) -> Result<()> {
     let mut result_columns = Vec::new();
@@ -512,11 +512,11 @@ impl<'a> GroupByAggArgumentSource<'a> {
 }
 
 /// Emits bytecode for processing a single GROUP BY group.
-pub fn group_by_process_single_group<'a>(
+pub fn group_by_process_single_group(
     program: &mut ProgramBuilder,
     group_by: &GroupBy,
     plan: &SelectPlan,
-    t_ctx: &mut TranslateCtx<'a>,
+    t_ctx: &mut TranslateCtx,
 ) -> Result<()> {
     let GroupByMetadata {
         registers,
@@ -663,16 +663,16 @@ pub fn group_by_process_single_group<'a>(
             start_reg_dest,
             ..
         } => {
-            let mut sorter_column_index = 0;
             let mut next_reg = *start_reg_dest;
 
-            for (expr, in_result) in t_ctx.non_aggregate_expressions.iter() {
+            for (sorter_column_index, (expr, in_result)) in
+                t_ctx.non_aggregate_expressions.iter().enumerate()
+            {
                 if *in_result {
                     program.emit_column(*pseudo_cursor, sorter_column_index, next_reg);
                     t_ctx.resolver.expr_to_reg_cache.push((expr, next_reg));
                     next_reg += 1;
                 }
-                sorter_column_index += 1;
             }
         }
         GroupByRowSource::MainLoop { start_reg_dest, .. } => {
@@ -712,12 +712,12 @@ pub fn group_by_process_single_group<'a>(
 /// Emits the bytecode for processing the aggregation phase of a GROUP BY clause.
 /// This is called either when:
 /// 1. the main query execution loop has finished processing,
-/// and we now have data in the GROUP BY sorter.
+///    and we now have data in the GROUP BY sorter.
 /// 2. the rows are already sorted in the order that the GROUP BY keys are defined,
-/// and we can start aggregating inside the main loop.
-pub fn group_by_agg_phase<'a>(
+///    and we can start aggregating inside the main loop.
+pub fn group_by_agg_phase(
     program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx<'a>,
+    t_ctx: &mut TranslateCtx,
     plan: &SelectPlan,
 ) -> Result<()> {
     let GroupByMetadata {

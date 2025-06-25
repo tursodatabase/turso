@@ -36,7 +36,7 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 match value {
                     Value::Integer(_) => result.push_str(&format!("{}", value)),
                     Value::Float(_) => result.push_str(&format!("{}", value)),
-                    _ => result.push_str("0".into()),
+                    _ => result.push('0'),
                 }
                 args_index += 1;
             }
@@ -59,7 +59,7 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 match value {
                     Value::Float(f) => result.push_str(&format!("{:.6}", f)),
                     Value::Integer(i) => result.push_str(&format!("{:.6}", *i as f64)),
-                    _ => result.push_str("0.0".into()),
+                    _ => result.push_str("0.0"),
                 }
                 args_index += 1;
             }
@@ -75,7 +75,7 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
             }
         }
     }
-    Ok(Value::build_text(&result))
+    Ok(Value::build_text(result))
 }
 
 #[cfg(test)]

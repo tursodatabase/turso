@@ -14,7 +14,7 @@ pub struct SpinLockGuard<'a, T> {
     lock: &'a SpinLock<T>,
 }
 
-impl<'a, T> Drop for SpinLockGuard<'a, T> {
+impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Ordering::Release);
     }

@@ -32,7 +32,7 @@ impl VirtualTable {
         syms: &SymbolTable,
     ) -> crate::Result<Rc<VirtualTable>> {
         let module = syms.vtab_modules.get(name);
-        let (vtab_type, schema) = if let Some(_) = module {
+        let (vtab_type, schema) = if module.is_some() {
             let ext_args = match args {
                 Some(ref args) => vtable_args(args),
                 None => vec![],

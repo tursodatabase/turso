@@ -70,7 +70,7 @@ use super::wal::LimboRwLock;
 pub const DATABASE_HEADER_SIZE: usize = 100;
 // DEFAULT_CACHE_SIZE negative values mean that we store the amount of pages a XKiB of memory can hold.
 // We can calculate "real" cache size by diving by page size.
-const DEFAULT_CACHE_SIZE: i32 = -2000;
+pub const DEFAULT_CACHE_SIZE: i32 = -2000;
 
 // Minimum number of pages that cache can hold.
 pub const MIN_PAGE_CACHE_SIZE: usize = 10;
@@ -82,7 +82,7 @@ pub const MIN_PAGE_SIZE: u32 = 512;
 const MAX_PAGE_SIZE: u32 = 65536;
 
 /// The default page size in bytes.
-const DEFAULT_PAGE_SIZE: u16 = 4096;
+pub const DEFAULT_PAGE_SIZE: u16 = 4096;
 
 pub const DATABASE_HEADER_PAGE_ID: usize = 1;
 
@@ -93,17 +93,17 @@ pub const DATABASE_HEADER_PAGE_ID: usize = 1;
 #[derive(Debug, Clone)]
 pub struct DatabaseHeader {
     /// The header string: "SQLite format 3\0"
-    magic: [u8; 16],
+    pub magic: [u8; 16],
 
     /// The database page size in bytes. Must be a power of two between 512 and 32768 inclusive,
     /// or the value 1 representing a page size of 65536.
-    page_size: u16,
+    pub page_size: u16,
 
     /// File format write version. 1 for legacy; 2 for WAL.
-    write_version: u8,
+    pub write_version: u8,
 
     /// File format read version. 1 for legacy; 2 for WAL.
-    read_version: u8,
+    pub read_version: u8,
 
     /// Bytes of unused "reserved" space at the end of each page. Usually 0.
     /// SQLite has the ability to set aside a small number of extra bytes at the end of every page for use by extensions.
@@ -112,16 +112,16 @@ pub struct DatabaseHeader {
     pub reserved_space: u8,
 
     /// Maximum embedded payload fraction. Must be 64.
-    max_embed_frac: u8,
+    pub max_embed_frac: u8,
 
     /// Minimum embedded payload fraction. Must be 32.
-    min_embed_frac: u8,
+    pub min_embed_frac: u8,
 
     /// Leaf payload fraction. Must be 32.
-    min_leaf_frac: u8,
+    pub min_leaf_frac: u8,
 
     /// File change counter, incremented when database is modified.
-    change_counter: u32,
+    pub change_counter: u32,
 
     /// Size of the database file in pages. The "in-header database size".
     pub database_size: u32,
@@ -136,7 +136,7 @@ pub struct DatabaseHeader {
     pub schema_cookie: u32,
 
     /// The schema format number. Supported formats are 1, 2, 3, and 4.
-    schema_format: u32,
+    pub schema_format: u32,
 
     /// Default page cache size.
     pub default_page_cache_size: i32,
@@ -146,7 +146,7 @@ pub struct DatabaseHeader {
     pub vacuum_mode_largest_root_page: u32,
 
     /// The database text encoding. 1=UTF-8, 2=UTF-16le, 3=UTF-16be.
-    text_encoding: u32,
+    pub text_encoding: u32,
 
     /// The "user version" as read and set by the user_version pragma.
     pub user_version: i32,
@@ -155,13 +155,13 @@ pub struct DatabaseHeader {
     pub incremental_vacuum_enabled: u32,
 
     /// The "Application ID" set by PRAGMA application_id.
-    application_id: u32,
+    pub application_id: u32,
 
     /// Reserved for expansion. Must be zero.
-    reserved_for_expansion: [u8; 20],
+    pub reserved_for_expansion: [u8; 20],
 
     /// The version-valid-for number.
-    version_valid_for: u32,
+    pub version_valid_for: u32,
 
     /// SQLITE_VERSION_NUMBER
     pub version_number: u32,
@@ -247,7 +247,7 @@ impl Default for DatabaseHeader {
             min_embed_frac: 32,
             min_leaf_frac: 32,
             change_counter: 1,
-            database_size: 1,
+            database_size: 0,
             freelist_trunk_page: 0,
             freelist_pages: 0,
             schema_cookie: 0,
@@ -285,60 +285,6 @@ impl DatabaseHeader {
             self.page_size as u32
         }
     }
-}
-
-pub fn begin_read_database_header(
-    db_file: Arc<dyn DatabaseStorage>,
-) -> Result<Arc<SpinLock<DatabaseHeader>>> {
-    let drop_fn = Rc::new(|_buf| {});
-    #[allow(clippy::arc_with_non_send_sync)]
-    let buf = Arc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
-    let result = Arc::new(SpinLock::new(DatabaseHeader::default()));
-    let header = result.clone();
-    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
-        let header = header.clone();
-        finish_read_database_header(buf, header).unwrap();
-    });
-    let c = Completion::Read(ReadCompletion::new(buf, complete));
-    #[allow(clippy::arc_with_non_send_sync)]
-    db_file.read_page(DATABASE_HEADER_PAGE_ID, Arc::new(c))?;
-    Ok(result)
-}
-
-fn finish_read_database_header(
-    buf: Arc<RefCell<Buffer>>,
-    header: Arc<SpinLock<DatabaseHeader>>,
-) -> Result<()> {
-    let buf = buf.borrow();
-    let buf = buf.as_slice();
-    let mut header = header.lock();
-    header.magic.copy_from_slice(&buf[0..16]);
-    header.page_size = u16::from_be_bytes([buf[16], buf[17]]);
-    header.write_version = buf[18];
-    header.read_version = buf[19];
-    header.reserved_space = buf[20];
-    header.max_embed_frac = buf[21];
-    header.min_embed_frac = buf[22];
-    header.min_leaf_frac = buf[23];
-    header.change_counter = u32::from_be_bytes([buf[24], buf[25], buf[26], buf[27]]);
-    header.database_size = u32::from_be_bytes([buf[28], buf[29], buf[30], buf[31]]);
-    header.freelist_trunk_page = u32::from_be_bytes([buf[32], buf[33], buf[34], buf[35]]);
-    header.freelist_pages = u32::from_be_bytes([buf[36], buf[37], buf[38], buf[39]]);
-    header.schema_cookie = u32::from_be_bytes([buf[40], buf[41], buf[42], buf[43]]);
-    header.schema_format = u32::from_be_bytes([buf[44], buf[45], buf[46], buf[47]]);
-    header.default_page_cache_size = i32::from_be_bytes([buf[48], buf[49], buf[50], buf[51]]);
-    if header.default_page_cache_size == 0 {
-        header.default_page_cache_size = DEFAULT_CACHE_SIZE;
-    }
-    header.vacuum_mode_largest_root_page = u32::from_be_bytes([buf[52], buf[53], buf[54], buf[55]]);
-    header.text_encoding = u32::from_be_bytes([buf[56], buf[57], buf[58], buf[59]]);
-    header.user_version = i32::from_be_bytes([buf[60], buf[61], buf[62], buf[63]]);
-    header.incremental_vacuum_enabled = u32::from_be_bytes([buf[64], buf[65], buf[66], buf[67]]);
-    header.application_id = u32::from_be_bytes([buf[68], buf[69], buf[70], buf[71]]);
-    header.reserved_for_expansion.copy_from_slice(&buf[72..92]);
-    header.version_valid_for = u32::from_be_bytes([buf[92], buf[93], buf[94], buf[95]]);
-    header.version_number = u32::from_be_bytes([buf[96], buf[97], buf[98], buf[99]]);
-    Ok(())
 }
 
 pub fn write_header_to_buf(buf: &mut [u8], header: &DatabaseHeader) {
@@ -1095,14 +1041,13 @@ pub struct SmallVecIter<'a, T, const N: usize> {
     pos: usize,
 }
 
-impl<'a, T: Default + Copy, const N: usize> Iterator for SmallVecIter<'a, T, N> {
+impl<T: Default + Copy, const N: usize> Iterator for SmallVecIter<'_, T, N> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.vec.get(self.pos).map(|item| {
-            self.pos += 1;
-            item
-        })
+        let next = self.vec.get(self.pos)?;
+        self.pos += 1;
+        Some(next)
     }
 }
 
@@ -1401,7 +1346,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
 
         let calculated_header_checksum = checksum_wal(
             &buf_slice[0..24],
-            &*header_locked,
+            &header_locked,
             (0, 0),
             use_native_endian_checksum,
         );
@@ -1419,8 +1364,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
         let mut cumulative_checksum = (header_locked.checksum_1, header_locked.checksum_2);
         let page_size_u32 = header_locked.page_size;
 
-        if page_size_u32 < MIN_PAGE_SIZE
-            || page_size_u32 > MAX_PAGE_SIZE
+        if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&page_size_u32)
             || page_size_u32.count_ones() != 1
         {
             panic!("Invalid page size in WAL header: {}", page_size_u32);
@@ -1462,13 +1406,13 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
 
             let checksum_after_fh_meta = checksum_wal(
                 &frame_header_slice[0..8],
-                &*header_locked,
+                &header_locked,
                 cumulative_checksum,
                 use_native_endian_checksum,
             );
             let calculated_frame_checksum = checksum_wal(
                 page_data_slice,
-                &*header_locked,
+                &header_locked,
                 checksum_after_fh_meta,
                 use_native_endian_checksum,
             );
@@ -1516,7 +1460,7 @@ pub fn begin_read_wal_frame(
     io: &Arc<dyn File>,
     offset: usize,
     buffer_pool: Rc<BufferPool>,
-    complete: Box<dyn Fn(Arc<RefCell<Buffer>>) -> ()>,
+    complete: Box<dyn Fn(Arc<RefCell<Buffer>>)>,
 ) -> Result<Arc<Completion>> {
     tracing::trace!("begin_read_wal_frame(offset={})", offset);
     let buf = buffer_pool.get();
@@ -1532,6 +1476,7 @@ pub fn begin_read_wal_frame(
 }
 
 #[instrument(skip(io, page, write_counter, wal_header, checksums), level = Level::TRACE)]
+#[allow(clippy::too_many_arguments)]
 pub fn begin_write_wal_frame(
     io: &Arc<dyn File>,
     offset: usize,
@@ -1752,8 +1697,8 @@ mod tests {
     #[case(&[0x40, 0x09, 0x21, 0xFB, 0x54, 0x44, 0x2D, 0x18], SerialType::f64(), Value::Float(std::f64::consts::PI))]
     #[case(&[1, 2], SerialType::const_int0(), Value::Integer(0))]
     #[case(&[65, 66], SerialType::const_int1(), Value::Integer(1))]
-    #[case(&[1, 2, 3], SerialType::blob(3), Value::Blob(vec![1, 2, 3].into()))]
-    #[case(&[], SerialType::blob(0), Value::Blob(vec![].into()))] // empty blob
+    #[case(&[1, 2, 3], SerialType::blob(3), Value::Blob(vec![1, 2, 3]))]
+    #[case(&[], SerialType::blob(0), Value::Blob(vec![]))] // empty blob
     #[case(&[65, 66, 67], SerialType::text(3), Value::build_text("ABC"))]
     #[case(&[0x80], SerialType::i8(), Value::Integer(-128))]
     #[case(&[0x80, 0], SerialType::i16(), Value::Integer(-32768))]

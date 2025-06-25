@@ -20,6 +20,7 @@ pub(crate) struct SimulatorEnv {
     pub(crate) io: Arc<SimulatorIO>,
     pub(crate) db: Arc<Database>,
     pub(crate) rng: ChaCha8Rng,
+    pub(crate) db_path: String,
 }
 
 impl SimulatorEnv {
@@ -33,6 +34,7 @@ impl SimulatorEnv {
             io: self.io.clone(),
             db: self.db.clone(),
             rng: self.rng.clone(),
+            db_path: self.db_path.clone(),
         }
     }
 }
@@ -118,6 +120,7 @@ impl SimulatorEnv {
             page_size: 4096, // TODO: randomize this too
             max_interactions: rng.gen_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
             max_time_simulation: cli_opts.maximum_time,
+            disable_reopen_database: cli_opts.disable_reopen_database,
         };
 
         let io = Arc::new(SimulatorIO::new(seed, opts.page_size).unwrap());
@@ -150,6 +153,7 @@ impl SimulatorEnv {
             rng,
             io,
             db,
+            db_path: db_path.to_str().unwrap().to_string(),
         }
     }
 }
@@ -227,6 +231,7 @@ pub(crate) struct SimulatorOpts {
     pub(crate) disable_select_limit: bool,
     pub(crate) disable_delete_select: bool,
     pub(crate) disable_drop_select: bool,
+    pub(crate) disable_reopen_database: bool,
 
     pub(crate) max_interactions: usize,
     pub(crate) page_size: usize,

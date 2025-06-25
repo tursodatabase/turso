@@ -22,7 +22,7 @@ cols = ", ".join([f"col_{col}" for col in range(tbl_schema["colCount"])])
 
 try:
     con = limbo.connect("stress_composer.db")
-except limbo.OperationalError as e:
+except Exception as e:
     print(f"Failed to open stress_composer.db. Exiting... {e}")
     exit(0)
 cur = con.cursor()

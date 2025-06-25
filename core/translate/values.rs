@@ -39,7 +39,7 @@ fn emit_values_when_single_row(
         translate_expr_no_constant_opt(
             program,
             None,
-            &v,
+            v,
             start_reg + i,
             resolver,
             NoConstantOptReason::RegisterReuse,
@@ -131,7 +131,7 @@ fn emit_values_in_subquery(
             translate_expr_no_constant_opt(
                 program,
                 None,
-                &v,
+                v,
                 start_reg + i,
                 resolver,
                 NoConstantOptReason::RegisterReuse,

@@ -6,12 +6,12 @@ use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use limbo_core::types::Text;
-use limbo_core::{maybe_init_database_file, LimboError, StepResult};
+use limbo_core::{LimboError, StepResult};
 use napi::iterator::Generator;
 use napi::{bindgen_prelude::ObjectFinalize, Env, JsUnknown};
 use napi_derive::napi;
 
+#[derive(Default)]
 #[napi(object)]
 pub struct OpenDatabaseOptions {
     pub readonly: bool,
@@ -31,9 +31,8 @@ pub struct Database {
     #[napi(writable = false)]
     pub memory: bool,
 
-    // TODO: implement each property
-    // #[napi(writable = false)]
-    // pub readonly: bool,
+    #[napi(writable = false)]
+    pub readonly: bool,
     // #[napi(writable = false)]
     // pub in_transaction: bool,
     // #[napi(writable = false)]
@@ -56,23 +55,28 @@ impl ObjectFinalize for Database {
 #[napi]
 impl Database {
     #[napi(constructor)]
-    pub fn new(path: String, _options: Option<OpenDatabaseOptions>) -> napi::Result<Self> {
+    pub fn new(path: String, options: Option<OpenDatabaseOptions>) -> napi::Result<Self> {
         let memory = path == ":memory:";
         let io: Arc<dyn limbo_core::IO> = if memory {
             Arc::new(limbo_core::MemoryIO::new())
         } else {
             Arc::new(limbo_core::PlatformIO::new().map_err(into_napi_error)?)
         };
-        let file = io
-            .open_file(&path, limbo_core::OpenFlags::Create, false)
-            .map_err(into_napi_error)?;
-        maybe_init_database_file(&file, &io).map_err(into_napi_error)?;
+        let opts = options.unwrap_or_default();
+        let flag = if opts.readonly {
+            limbo_core::OpenFlags::ReadOnly
+        } else {
+            limbo_core::OpenFlags::Create
+        };
+        let file = io.open_file(&path, flag, false).map_err(into_napi_error)?;
+
         let db_file = Arc::new(DatabaseFile::new(file));
         let db = limbo_core::Database::open(io.clone(), &path, db_file, false)
             .map_err(into_napi_error)?;
         let conn = db.connect().map_err(into_napi_error)?;
 
         Ok(Self {
+            readonly: opts.readonly,
             memory,
             _db: db,
             conn,
@@ -115,6 +119,11 @@ impl Database {
             }
             _ => stmt.run(env, None),
         }
+    }
+
+    #[napi]
+    pub fn readonly(&self) -> bool {
+        self.readonly
     }
 
     #[napi]
@@ -529,9 +538,7 @@ fn from_js_value(value: JsUnknown) -> napi::Result<limbo_core::Value> {
         }
         napi::ValueType::String => {
             let s = value.coerce_to_string()?;
-            Ok(limbo_core::Value::Text(Text::from_str(
-                s.into_utf8()?.as_str()?,
-            )))
+            Ok(limbo_core::Value::Text(s.into_utf8()?.as_str()?.into()))
         }
         napi::ValueType::Symbol
         | napi::ValueType::Object
@@ -586,6 +593,10 @@ impl limbo_core::DatabaseStorage for DatabaseFile {
 
     fn sync(&self, c: Arc<limbo_core::Completion>) -> limbo_core::Result<()> {
         self.file.sync(c)
+    }
+
+    fn size(&self) -> limbo_core::Result<u64> {
+        self.file.size()
     }
 }
 

@@ -20,7 +20,7 @@ impl ArbitraryFromMaybe<&SimValue> for TrueValue {
         Self: Sized,
     {
         // If the Value is a true value return it else you cannot return a true Value
-        value.into_bool().then_some(Self(value.clone()))
+        value.as_bool().then_some(Self(value.clone()))
     }
 }
 
@@ -46,7 +46,7 @@ impl ArbitraryFromMaybe<&SimValue> for FalseValue {
         Self: Sized,
     {
         // If the Value is a false value return it else you cannot return a false Value
-        (!value.into_bool()).then_some(Self(value.clone()))
+        (!value.as_bool()).then_some(Self(value.clone()))
     }
 }
 
@@ -76,7 +76,7 @@ impl ArbitraryFromMaybe<(&SimValue, bool)> for BitNotValue {
     {
         let bit_not_val = value.unary_exec(ast::UnaryOperator::BitwiseNot);
         // If you bit not the Value and it meets the predicate return Some, else None
-        (bit_not_val.into_bool() == predicate).then_some(BitNotValue(value.clone()))
+        (bit_not_val.as_bool() == predicate).then_some(BitNotValue(value.clone()))
     }
 }
 
@@ -115,7 +115,7 @@ impl SimplePredicate {
                     num_retries,
                     Box::new(|rng| {
                         TrueValue::arbitrary_from_maybe(rng, column_value).map(|value| {
-                            assert!(value.0.into_bool());
+                            assert!(value.0.as_bool());
                             // Positive is a no-op in Sqlite
                             Expr::unary(ast::UnaryOperator::Positive, Expr::Literal(value.0.into()))
                         })
@@ -125,7 +125,7 @@ impl SimplePredicate {
                     num_retries,
                     Box::new(|rng| {
                         TrueValue::arbitrary_from_maybe(rng, column_value).map(|value| {
-                            assert!(value.0.into_bool());
+                            assert!(value.0.as_bool());
                             // True Value with negative is still True
                             Expr::unary(ast::UnaryOperator::Negative, Expr::Literal(value.0.into()))
                         })
@@ -146,7 +146,7 @@ impl SimplePredicate {
                     num_retries,
                     Box::new(|rng| {
                         FalseValue::arbitrary_from_maybe(rng, column_value).map(|value| {
-                            assert!(!value.0.into_bool());
+                            assert!(!value.0.as_bool());
                             Expr::unary(ast::UnaryOperator::Not, Expr::Literal(value.0.into()))
                         })
                     }),
@@ -176,7 +176,7 @@ impl SimplePredicate {
                     num_retries,
                     Box::new(|rng| {
                         FalseValue::arbitrary_from_maybe(rng, column_value).map(|value| {
-                            assert!(!value.0.into_bool());
+                            assert!(!value.0.as_bool());
                             // Positive is a no-op in Sqlite
                             Expr::unary(ast::UnaryOperator::Positive, Expr::Literal(value.0.into()))
                         })
@@ -186,7 +186,7 @@ impl SimplePredicate {
                     num_retries,
                     Box::new(|rng| {
                         FalseValue::arbitrary_from_maybe(rng, column_value).map(|value| {
-                            assert!(!value.0.into_bool());
+                            assert!(!value.0.as_bool());
                             // True Value with negative is still True
                             Expr::unary(ast::UnaryOperator::Negative, Expr::Literal(value.0.into()))
                         })
@@ -207,7 +207,7 @@ impl SimplePredicate {
                     num_retries,
                     Box::new(|rng| {
                         TrueValue::arbitrary_from_maybe(rng, column_value).map(|value| {
-                            assert!(value.0.into_bool());
+                            assert!(value.0.as_bool());
                             Expr::unary(ast::UnaryOperator::Not, Expr::Literal(value.0.into()))
                         })
                     }),

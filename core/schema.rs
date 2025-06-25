@@ -67,7 +67,7 @@ impl Schema {
 
     pub fn get_table(&self, name: &str) -> Option<Arc<Table>> {
         let name = normalize_ident(name);
-        let name = if name.eq_ignore_ascii_case(&SCHEMA_TABLE_NAME_ALT) {
+        let name = if name.eq_ignore_ascii_case(SCHEMA_TABLE_NAME_ALT) {
             SCHEMA_TABLE_NAME
         } else {
             &name
@@ -514,7 +514,7 @@ fn create_table(
                         } => {
                             primary_key = true;
                             if let Some(o) = o {
-                                order = o.clone();
+                                order = *o;
                             }
                         }
                         limbo_sqlite3_parser::ast::ColumnConstraint::NotNull { .. } => {
@@ -921,7 +921,7 @@ impl Affinity {
         }
     }
 
-    pub fn to_char_code(&self) -> u8 {
+    pub fn as_char_code(&self) -> u8 {
         self.aff_mask() as u8
     }
 
@@ -1232,7 +1232,7 @@ impl Index {
                             .all(|col| set.contains(col))
                     {
                         // skip unique columns that are satisfied with pk constraint
-                        return false;
+                        false
                     } else {
                         true
                     }
@@ -1527,7 +1527,7 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER NOT NULL);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert_eq!(column.notnull, true);
+        assert!(column.notnull);
         Ok(())
     }
 
@@ -1536,7 +1536,7 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert_eq!(column.notnull, false);
+        assert!(!column.notnull);
         Ok(())
     }
 

@@ -263,7 +263,7 @@ pub fn emit_query<'a>(
     t_ctx: &mut TranslateCtx<'a>,
 ) -> Result<usize> {
     if !plan.values.is_empty() {
-        let reg_result_cols_start = emit_values(program, &plan, &t_ctx.resolver)?;
+        let reg_result_cols_start = emit_values(program, plan, &t_ctx.resolver)?;
         return Ok(reg_result_cols_start);
     }
 
@@ -310,7 +310,7 @@ pub fn emit_query<'a>(
             program,
             t_ctx,
             group_by,
-            &plan,
+            plan,
             &plan.result_columns,
             &plan.order_by,
         )?;
@@ -349,7 +349,7 @@ pub fn emit_query<'a>(
         t_ctx,
         &plan.table_references,
         &plan.join_order,
-        &mut plan.where_clause,
+        &plan.where_clause,
         None,
     )?;
 
@@ -399,7 +399,7 @@ pub fn emit_query<'a>(
 #[instrument(skip_all, level = Level::TRACE)]
 fn emit_program_for_delete(
     program: &mut ProgramBuilder,
-    mut plan: DeletePlan,
+    plan: DeletePlan,
     schema: &Schema,
     syms: &SymbolTable,
 ) -> Result<()> {
@@ -447,7 +447,7 @@ fn emit_program_for_delete(
         &mut t_ctx,
         &plan.table_references,
         &[JoinOrderMember::default()],
-        &mut plan.where_clause,
+        &plan.where_clause,
         None,
     )?;
 
@@ -502,7 +502,7 @@ fn emit_delete_insns(
         dest: key_reg,
     });
 
-    if let Some(_) = table_reference.virtual_table() {
+    if table_reference.virtual_table().is_some() {
         let conflict_action = 0u16;
         let start_reg = key_reg;
 
@@ -673,7 +673,7 @@ fn emit_program_for_update(
         &mut t_ctx,
         &plan.table_references,
         &[JoinOrderMember::default()],
-        &mut plan.where_clause,
+        &plan.where_clause,
         temp_cursor_id,
     )?;
 
@@ -942,7 +942,7 @@ fn emit_update_insns(
                 if idx > 0 {
                     accum.push_str(", ");
                 }
-                accum.push_str(&table_ref.table.get_name());
+                accum.push_str(table_ref.table.get_name());
                 accum.push('.');
                 accum.push_str(&col.name);
 
@@ -1069,14 +1069,12 @@ fn emit_update_insns(
             // Insert new index key (filled further above with values from set_clauses)
             program.emit_insn(Insn::IdxInsert {
                 cursor_id: idx_cursor_id,
-                record_reg: record_reg,
+                record_reg,
                 unpacked_start: Some(start),
                 unpacked_count: Some((index.columns.len() + 1) as u16),
                 flags: IdxInsertFlags::new(),
             });
         }
-
-        program.emit_insn(Insn::Delete { cursor_id });
 
         program.emit_insn(Insn::Insert {
             cursor: cursor_id,
@@ -1085,7 +1083,7 @@ fn emit_update_insns(
             flag: InsertFlags::new().update(true),
             table_name: table_ref.identifier.clone(),
         });
-    } else if let Some(_) = table_ref.virtual_table() {
+    } else if table_ref.virtual_table().is_some() {
         let arg_count = table_ref.columns().len() + 2;
         program.emit_insn(Insn::VUpdate {
             cursor_id,

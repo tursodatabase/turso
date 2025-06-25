@@ -80,7 +80,7 @@ fn test_statement_bind() -> anyhow::Result<()> {
                 }
 
                 if let limbo_core::Value::Blob(v) = row.get::<&Value>(3).unwrap() {
-                    assert_eq!(v.as_slice(), &vec![0x1 as u8, 0x2, 0x3])
+                    assert_eq!(v.as_slice(), &vec![0x1_u8, 0x2, 0x3])
                 }
 
                 if let limbo_core::Value::Float(f) = row.get::<&Value>(4).unwrap() {

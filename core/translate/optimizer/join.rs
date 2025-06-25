@@ -60,7 +60,7 @@ pub fn join_lhs_and_rhs<'a>(
     let best_access_method = find_best_access_method_for_join_order(
         rhs_table_reference,
         rhs_constraints,
-        &join_order,
+        join_order,
         maybe_order_target,
         input_cardinality as f64,
     )?;
@@ -135,17 +135,17 @@ pub fn compute_best_join_order<'a>(
         joined_tables,
         maybe_order_target,
         access_methods_arena,
-        &constraints,
+        constraints,
     )?;
 
     // Keep track of both 1. the best plan overall (not considering sorting), and 2. the best ordered plan (which might not be the same).
     // We assign Some Cost (tm) to any required sort operation, so the best ordered plan may end up being
     // the one we choose, if the cost reduction from avoiding sorting brings it below the cost of the overall best one.
     let mut best_ordered_plan: Option<JoinN> = None;
-    let mut best_plan_is_also_ordered = if let Some(ref order_target) = maybe_order_target {
+    let mut best_plan_is_also_ordered = if let Some(order_target) = maybe_order_target {
         plan_satisfies_order_target(
             &naive_plan,
-            &access_methods_arena,
+            access_methods_arena,
             joined_tables,
             order_target,
         )
@@ -226,12 +226,8 @@ pub fn compute_best_join_order<'a>(
             let mut left_join_illegal_map: HashMap<usize, TableMask> =
                 HashMap::with_capacity(left_join_count);
             for (i, _) in joined_tables.iter().enumerate() {
-                for j in i + 1..joined_tables.len() {
-                    if joined_tables[j]
-                        .join_info
-                        .as_ref()
-                        .map_or(false, |j| j.outer)
-                    {
+                for (j, joined_table) in joined_tables.iter().enumerate().skip(i + 1) {
+                    if joined_table.join_info.as_ref().map_or(false, |j| j.outer) {
                         // bitwise OR the masks
                         if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&i) {
                             illegal_lhs.add_table(j);
@@ -329,10 +325,10 @@ pub fn compute_best_join_order<'a>(
                     continue;
                 };
 
-                let satisfies_order_target = if let Some(ref order_target) = maybe_order_target {
+                let satisfies_order_target = if let Some(order_target) = maybe_order_target {
                     plan_satisfies_order_target(
                         &rel,
-                        &access_methods_arena,
+                        access_methods_arena,
                         joined_tables,
                         order_target,
                     )
@@ -1039,7 +1035,7 @@ mod tests {
         .unwrap();
 
         // Verify that t2 is chosen first due to its equality filter
-        assert_eq!(best_plan.table_numbers().nth(0).unwrap(), 1);
+        assert_eq!(best_plan.table_numbers().next().unwrap(), 1);
         // Verify table scan is used since there are no indexes
         let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
         assert!(access_method.is_scan());
@@ -1148,11 +1144,11 @@ mod tests {
         // Expected optimal order: fact table as outer, with rowid seeks in any order on each dimension table
         // Verify fact table is selected as the outer table as all the other tables can use SeekRowid
         assert_eq!(
-            best_plan.table_numbers().nth(0).unwrap(),
+            best_plan.table_numbers().next().unwrap(),
             FACT_TABLE_IDX,
             "First table should be fact (table {}) due to available index, got table {} instead",
             FACT_TABLE_IDX,
-            best_plan.table_numbers().nth(0).unwrap()
+            best_plan.table_numbers().next().unwrap()
         );
 
         // Verify access methods
@@ -1187,7 +1183,7 @@ mod tests {
         for i in 0..NUM_TABLES {
             let mut columns = vec![_create_column_rowid_alias("id")];
             if i < NUM_TABLES - 1 {
-                columns.push(_create_column_of_type(&format!("next_id"), Type::Integer));
+                columns.push(_create_column_of_type("next_id", Type::Integer));
             }
             tables.push(_create_btree_table(&format!("t{}", i + 1), columns));
         }
@@ -1250,14 +1246,19 @@ mod tests {
         assert!(access_method.constraint_refs.is_empty());
 
         // all of the rest should use rowid equality
-        for i in 1..NUM_TABLES {
+        for (i, table_constraints) in table_constraints
+            .iter()
+            .enumerate()
+            .take(NUM_TABLES)
+            .skip(1)
+        {
             let access_method = &access_methods_arena.borrow()[best_plan.data[i].1];
             assert!(!access_method.is_scan());
             assert!(access_method.iter_dir == IterationDirection::Forwards);
             assert!(access_method.index.is_none());
             assert!(access_method.constraint_refs.len() == 1);
-            let constraint = &table_constraints[i].constraints
-                [access_method.constraint_refs[0].constraint_vec_pos];
+            let constraint =
+                &table_constraints.constraints[access_method.constraint_refs[0].constraint_vec_pos];
             assert!(constraint.lhs_mask.contains_table(i - 1));
             assert!(constraint.operator == ast::Operator::Equals);
         }
@@ -1311,7 +1312,7 @@ mod tests {
             },
             identifier: "t1".to_string(),
             join_info: None,
-            col_used_mask: ColumnUsedMask::new(),
+            col_used_mask: ColumnUsedMask::default(),
         });
 
         // Create where clause that only references second column
@@ -1402,7 +1403,7 @@ mod tests {
             },
             identifier: "t1".to_string(),
             join_info: None,
-            col_used_mask: ColumnUsedMask::new(),
+            col_used_mask: ColumnUsedMask::default(),
         });
 
         // Create where clause that references first and third columns
@@ -1518,7 +1519,7 @@ mod tests {
             },
             identifier: "t1".to_string(),
             join_info: None,
-            col_used_mask: ColumnUsedMask::new(),
+            col_used_mask: ColumnUsedMask::default(),
         });
 
         // Create where clause: c1 = 5 AND c2 > 10 AND c3 = 7
@@ -1668,7 +1669,7 @@ mod tests {
             identifier: name,
             internal_id,
             join_info,
-            col_used_mask: ColumnUsedMask::new(),
+            col_used_mask: ColumnUsedMask::default(),
         }
     }
 

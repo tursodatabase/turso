@@ -22,11 +22,7 @@ jobs:
     steps:
       - id: gen-matrix
         run: |
-          if [ ${{ github.event_name }} == "pull_request" ]; then
-            echo "python-versions=[\"3.13\"]" >> $GITHUB_OUTPUT
-          else
-            echo "python-versions=[\"3.9\",\"3.10\",\"3.11\",\"3.12\",\"3.13\"]" >> $GITHUB_OUTPUT
-          fi
+          echo "python-versions=[\"3.9\",\"3.10\",\"3.11\",\"3.12\",\"3.13\"]" >> $GITHUB_OUTPUT
 
   test:
     needs: configure-strategy
@@ -61,10 +57,10 @@ jobs:
           enable-cache: true
 
       - name: Install the project
-        run: uv sync --all-extras --dev
+        run: uv sync --all-extras --dev --all-packages
 
       - name: Run Pytest
-        run: uvx pytest tests
+        run: uv run pytest tests
 
   lint:
     runs-on: blacksmith-4vcpu-ubuntu-2404

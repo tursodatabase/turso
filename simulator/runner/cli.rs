@@ -82,6 +82,8 @@ pub struct SimulatorCLI {
         default_value_t = false
     )]
     pub disable_select_optimizer: bool,
+    #[clap(long, help = "disable Reopen-Database fault", default_value_t = false)]
+    pub disable_reopen_database: bool,
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]

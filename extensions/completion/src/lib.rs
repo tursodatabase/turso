@@ -41,10 +41,10 @@ enum CompletionPhase {
     Eof = 11,
 }
 
-impl Into<i64> for CompletionPhase {
-    fn into(self) -> i64 {
+impl From<CompletionPhase> for i64 {
+    fn from(val: CompletionPhase) -> Self {
         use self::CompletionPhase::*;
-        match self {
+        match val {
             Keywords => 1,
             // Pragmas => 2,
             // Functions => 3,

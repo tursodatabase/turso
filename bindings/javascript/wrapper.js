@@ -11,11 +11,20 @@ class Database {
    *
    * @constructor
    * @param {string} path - Path to the database file.
+   * @param {Object} opts - Options for database behavior.
+   * @param {boolean} [opts.readonly=false] - Open the database in read-only mode.
+   * @param {boolean} [opts.fileMustExist=false] - If true, throws if database file does not exist.
+   * @param {number} [opts.timeout=0] - Timeout duration in milliseconds for database operations. Defaults to 0 (no timeout).
    */
-  constructor(path, opts) {
+  constructor(path, opts = {}) {
+    opts.readonly = opts.readonly === undefined ? false : opts.readonly;
+    opts.fileMustExist = opts.fileMustExist === undefined ? false : opts.fileMustExist;
+    opts.timeout = opts.timeout === undefined ? 0 : opts.timeout;
+
     this.db = new NativeDB(path, opts);
     this.memory = this.db.memory;
     const db = this.db;
+
     Object.defineProperties(this, {
       inTransaction: {
         get() {
@@ -25,6 +34,11 @@ class Database {
       name: {
         get() {
           return path;
+        },
+      },
+      readonly: {
+        get() {
+          return opts.readonly;
         },
       },
     });

@@ -114,7 +114,7 @@ impl WhereTerm {
     }
 
     fn eval_at(&self, join_order: &[JoinOrderMember]) -> Result<EvalAt> {
-        determine_where_to_eval_term(&self, join_order)
+        determine_where_to_eval_term(self, join_order)
     }
 }
 
@@ -335,7 +335,7 @@ pub enum QueryDestination {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct JoinOrderMember {
     /// The internal ID of the[TableReference]
     pub table_id: TableInternalId,
@@ -344,16 +344,6 @@ pub struct JoinOrderMember {
     pub original_idx: usize,
     /// Whether this member is the right side of an OUTER JOIN
     pub is_outer: bool,
-}
-
-impl Default for JoinOrderMember {
-    fn default() -> Self {
-        Self {
-            table_id: TableInternalId::default(),
-            original_idx: 0,
-            is_outer: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -414,7 +404,7 @@ impl DistinctCtx {
         });
         program.emit_insn(Insn::IdxInsert {
             cursor_id: self.cursor_id,
-            record_reg: record_reg,
+            record_reg,
             unpacked_start: None,
             unpacked_count: None,
             flags: IdxInsertFlags::new(),
@@ -472,7 +462,7 @@ impl SelectPlan {
                 QueryDestination::CoroutineYield { .. }
             )
             || self.table_references.joined_tables().len() != 1
-            || self.table_references.outer_query_refs().len() != 0
+            || self.table_references.outer_query_refs().is_empty()
             || self.result_columns.len() != 1
             || self.group_by.is_some()
             || self.contains_constant_false_condition
@@ -837,15 +827,11 @@ impl TableReferences {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct ColumnUsedMask(u128);
 
 impl ColumnUsedMask {
-    pub fn new() -> Self {
-        Self(0)
-    }
-
     pub fn set(&mut self, index: usize) {
         assert!(
             index < 128,
@@ -950,7 +936,7 @@ impl JoinedTable {
             identifier,
             internal_id,
             join_info,
-            col_used_mask: ColumnUsedMask::new(),
+            col_used_mask: ColumnUsedMask::default(),
         }
     }
 
@@ -987,14 +973,12 @@ impl JoinedTable {
                         CursorType::BTreeTable(btree.clone()),
                     ))
                 };
-                let index_cursor_id = if let Some(index) = index {
-                    Some(program.alloc_cursor_id_keyed(
+                let index_cursor_id = index.map(|index| {
+                    program.alloc_cursor_id_keyed(
                         CursorKey::index(self.internal_id, index.clone()),
                         CursorType::BTreeIndex(index.clone()),
-                    ))
-                } else {
-                    None
-                };
+                    )
+                });
                 Ok((table_cursor_id, index_cursor_id))
             }
             Table::Virtual(virtual_table) => {
@@ -1031,7 +1015,7 @@ impl JoinedTable {
         if self.col_used_mask.is_empty() {
             return false;
         }
-        let mut index_cols_mask = ColumnUsedMask::new();
+        let mut index_cols_mask = ColumnUsedMask::default();
         for col in index.columns.iter() {
             index_cols_mask.set(col.pos_in_table);
         }
@@ -1040,7 +1024,7 @@ impl JoinedTable {
         if btree.has_rowid {
             if let Some(pos_of_rowid_alias_col) = btree.get_rowid_alias_column().map(|(pos, _)| pos)
             {
-                let mut empty_mask = ColumnUsedMask::new();
+                let mut empty_mask = ColumnUsedMask::default();
                 empty_mask.set(pos_of_rowid_alias_col);
                 if self.col_used_mask == empty_mask {
                     // However if the index would be ONLY used for the rowid, then let's not bother using it to cover the query.
@@ -1079,6 +1063,7 @@ pub struct SeekDef {
     /// For example, given:
     /// - CREATE INDEX i ON t (x, y desc)
     /// - SELECT * FROM t WHERE x = 1 AND y >= 30
+    ///
     /// The key is [(1, ASC), (30, DESC)]
     pub key: Vec<(ast::Expr, SortOrder)>,
     /// The condition to use when seeking. See [SeekKey] for more details.
@@ -1100,6 +1085,7 @@ pub struct SeekKey {
     /// For example, given:
     /// - CREATE INDEX i ON t (x, y)
     /// - SELECT * FROM t WHERE x = 1 AND y < 30
+    ///
     /// We want to seek to the first row where x = 1, and then iterate forwards.
     /// In this case, the seek key is GT(1, NULL) since NULL is always LT in index key comparisons.
     /// We can't use just GT(1) because in index key comparisons, only the given number of columns are compared,
