@@ -57,6 +57,8 @@ pub enum LimboError {
     ReadOnly,
     #[error("Database is busy")]
     Busy,
+    #[error("Spill not allowed")]
+    SpillNotAllowed,
 }
 
 #[macro_export]

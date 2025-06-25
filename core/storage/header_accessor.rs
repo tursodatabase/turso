@@ -41,6 +41,7 @@ fn get_header_page(pager: &Pager) -> Result<PageRef> {
     }
     let page = pager.read_page(DATABASE_HEADER_PAGE_ID)?;
     while !page.is_loaded() || page.is_locked() {
+        tracing::trace!("Waiting for header page to be loaded");
         // FIXME: LETS STOP DOING THESE SYNCHRONOUS IO HACKS
         pager.io.run_once()?;
     }
