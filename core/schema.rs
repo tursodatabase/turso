@@ -540,9 +540,7 @@ fn create_table(
                             collation = Some(CollationSeq::new(collation_name.0.as_str())?);
                         }
                         // Collate
-                        e => {
-                            dbg!(&e);
-                        }
+                        e => {}
                     }
                 }
 
