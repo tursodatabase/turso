@@ -21,8 +21,6 @@ struct PageCacheEntry {
 pub struct DumbLruPageCache {
     capacity: usize,
     map: RefCell<PageHashMap>,
-    /// size before spilling occurs
-    size_spill: usize,
     head: RefCell<Option<NonNull<PageCacheEntry>>>,
     tail: RefCell<Option<NonNull<PageCacheEntry>>>,
 }
@@ -66,7 +64,6 @@ impl DumbLruPageCache {
             map: RefCell::new(PageHashMap::new(capacity)),
             head: RefCell::new(None),
             tail: RefCell::new(None),
-            size_spill: 0,
         }
     }
 
@@ -127,6 +124,7 @@ impl DumbLruPageCache {
     // Returns Ok if key is not found
     pub fn _delete(&mut self, key: PageCacheKey, clean_page: bool) -> Result<(), CacheError> {
         if !self.contains_key(&key) {
+            tracing::trace!("Skipping delete for key {:?}", key);
             return Ok(());
         }
 
@@ -265,7 +263,6 @@ impl DumbLruPageCache {
         })?;
 
         // Handle len > capacity, too
-        let available = self.capacity.saturating_sub(len);
         let x = n.saturating_sub(available);
         let mut need_to_evict = x.saturating_add(len.saturating_sub(self.capacity));
 
@@ -274,13 +271,17 @@ impl DumbLruPageCache {
             let current = current_opt.unwrap();
             let entry = unsafe { current.as_ref() };
             current_opt = entry.prev; // Pick prev before modifying entry
-            match self.delete(entry.key.clone()) {
-                Err(_) => {}
-                Ok(_) => need_to_evict -= 1,
+            if let Ok(_) = self.delete(entry.key.clone()) {
+                need_to_evict -= 1;
             }
         }
 
         if need_to_evict > 0 {
+            tracing::trace!(
+                "make_room_for({}): Cache is full, {} pages still need to be evicted",
+                n,
+                need_to_evict
+            );
             return Err(CacheError::Full);
         }
 
@@ -478,10 +479,6 @@ impl DumbLruPageCache {
             };
         }
     }
-
-    fn fetch_stress(&self) {
-        if self.map.borrow().size > self.size_spill {}
-    }
 }
 
 impl Default for DumbLruPageCache {
@@ -576,9 +573,9 @@ impl PageHashMap {
 
     fn hash(&self, key: &PageCacheKey) -> usize {
         if self.capacity.is_power_of_two() {
-            key.pgno & (self.capacity - 1)
+            key.0 & (self.capacity - 1)
         } else {
-            key.pgno % self.capacity
+            key.0 % self.capacity
         }
     }
 
