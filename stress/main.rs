@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -126,6 +127,10 @@ fn generate_random_table() -> Table {
     columns[pk_index].constraints.push(Constraint::PrimaryKey);
 
     Table { name, columns }
+}
+
+pub fn gen_bool(probability_true: f64) -> bool {
+    (get_random() as f64 / u64::MAX as f64) < probability_true
 }
 
 pub fn gen_schema() -> ArbitrarySchema {
@@ -429,9 +434,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     for thread in 0..opts.nr_threads {
-        let db = Arc::new(Builder::new_local(&db_file).build().await?);
+        let db_file = db_file.clone();
+        let db = Arc::new(Mutex::new(Builder::new_local(&db_file).build().await?));
         let plan = plan.clone();
-        let conn = db.connect()?;
+        let conn = db.lock().await.connect()?;
 
         // Apply each DDL statement individually
         for stmt in &plan.ddl_statements {
@@ -456,9 +462,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let db = db.clone();
 
         let handle = tokio::spawn(async move {
-            let conn = db.connect()?;
+            let mut conn = db.lock().await.connect()?;
             println!("\rExecuting queries...");
             for query_index in 0..nr_iterations {
+                if gen_bool(0.001) {
+                    // Reopen the database
+                    let mut db_guard = db.lock().await;
+                    *db_guard = Builder::new_local(&db_file).build().await?;
+                    conn = db_guard.connect()?;
+                } else if gen_bool(0.01) {
+                    // Reconnect to the database
+                    let db_guard = db.lock().await;
+                    conn = db_guard.connect()?;
+                }
                 let sql = &plan.queries_per_thread[thread][query_index];
                 if !opts.silent {
                     if opts.verbose {

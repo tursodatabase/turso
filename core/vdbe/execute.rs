@@ -7,6 +7,7 @@ use crate::storage::database::FileMemoryStorage;
 use crate::storage::page_cache::DumbLruPageCache;
 use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::wal::DummyWAL;
+use crate::storage::{self, header_accessor};
 use crate::translate::collate::CollationSeq;
 use crate::types::{ImmutableRecord, Text};
 use crate::util::normalize_ident;
@@ -24,6 +25,7 @@ use crate::{
     },
     types::compare_immutable,
 };
+use std::sync::atomic::AtomicBool;
 use std::{borrow::BorrowMut, rc::Rc, sync::Arc};
 
 use crate::{pseudo::PseudoCursor, result::LimboResult};
@@ -50,8 +52,7 @@ use crate::{
 };
 
 use crate::{
-    info, maybe_init_database_file, BufferPool, MvCursor, OpenFlags, RefValue, Row, StepResult,
-    TransactionState, IO,
+    info, BufferPool, MvCursor, OpenFlags, RefValue, Row, StepResult, TransactionState, IO,
 };
 
 use super::{
@@ -86,7 +87,6 @@ use crate::{
 use super::{get_new_rowid, make_record, Program, ProgramState, Register};
 use crate::{
     bail_constraint_error, must_be_btree_cursor, resolve_ext_path, MvStore, Pager, Result,
-    DATABASE_VERSION,
 };
 
 macro_rules! return_if_io {
@@ -1679,18 +1679,19 @@ pub fn op_transaction(
     let Insn::Transaction { write } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    let connection = program.connection.clone();
-    if *write && connection._db.open_flags.contains(OpenFlags::ReadOnly) {
+    let conn = program.connection.clone();
+    if *write && conn._db.open_flags.contains(OpenFlags::ReadOnly) {
         return Err(LimboError::ReadOnly);
     }
+
     if let Some(mv_store) = &mv_store {
         if state.mv_tx_id.is_none() {
             let tx_id = mv_store.begin_tx();
-            connection.mv_transactions.borrow_mut().push(tx_id);
+            conn.mv_transactions.borrow_mut().push(tx_id);
             state.mv_tx_id = Some(tx_id);
         }
     } else {
-        let current_state = connection.transaction_state.get();
+        let current_state = conn.transaction_state.get();
         let (new_transaction_state, updated) = match (current_state, write) {
             (TransactionState::Write, true) => (TransactionState::Write, false),
             (TransactionState::Write, false) => (TransactionState::Write, false),
@@ -1714,7 +1715,7 @@ pub fn op_transaction(
             }
         }
         if updated {
-            connection.transaction_state.replace(new_transaction_state);
+            conn.transaction_state.replace(new_transaction_state);
         }
     }
     state.pc += 1;
@@ -3690,7 +3691,7 @@ pub fn op_function(
                 }
             }
             ScalarFunc::SqliteVersion => {
-                let version_integer: i64 = DATABASE_VERSION.get().unwrap().parse()?;
+                let version_integer: i64 = header_accessor::get_version_number(pager)? as i64;
                 let version = execute_sqlite_version(version_integer);
                 state.registers[*dest] = Register::Value(Value::build_text(version));
             }
@@ -4895,7 +4896,7 @@ pub fn op_page_count(
         // TODO: implement temp databases
         todo!("temp databases not implemented yet");
     }
-    let count = pager.db_header.lock().database_size.into();
+    let count = header_accessor::get_database_size(pager)?.into();
     state.registers[*dest] = Register::Value(Value::Integer(count));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -4972,10 +4973,10 @@ pub fn op_read_cookie(
         todo!("temp databases not implemented yet");
     }
     let cookie_value = match cookie {
-        Cookie::UserVersion => pager.db_header.lock().user_version.into(),
-        Cookie::SchemaVersion => pager.db_header.lock().schema_cookie.into(),
+        Cookie::UserVersion => header_accessor::get_user_version(pager)?.into(),
+        Cookie::SchemaVersion => header_accessor::get_schema_cookie(pager)?.into(),
         Cookie::LargestRootPageNumber => {
-            pager.db_header.lock().vacuum_mode_largest_root_page.into()
+            header_accessor::get_vacuum_mode_largest_root_page(pager)?.into()
         }
         cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
     };
@@ -5005,19 +5006,13 @@ pub fn op_set_cookie(
     }
     match cookie {
         Cookie::UserVersion => {
-            let mut header_guard = pager.db_header.lock();
-            header_guard.user_version = *value;
-            pager.write_database_header(&header_guard)?;
+            header_accessor::set_user_version(pager, *value)?;
         }
         Cookie::LargestRootPageNumber => {
-            let mut header_guard = pager.db_header.lock();
-            header_guard.vacuum_mode_largest_root_page = *value as u32;
-            pager.write_database_header(&header_guard)?;
+            header_accessor::set_vacuum_mode_largest_root_page(pager, *value as u32)?;
         }
         Cookie::IncrementalVacuum => {
-            let mut header_guard = pager.db_header.lock();
-            header_guard.incremental_vacuum_enabled = *value as u32;
-            pager.write_database_header(&header_guard)?;
+            header_accessor::set_incremental_vacuum_enabled(pager, *value as u32)?;
         }
         cookie => todo!("{cookie:?} is not yet implement for SetCookie"),
     }
@@ -5205,27 +5200,31 @@ pub fn op_open_ephemeral(
     let io = conn.pager.io.get_memory_io();
 
     let file = io.open_file("", OpenFlags::Create, true)?;
-    maybe_init_database_file(&file, &(io.clone() as Arc<dyn IO>))?;
     let db_file = Arc::new(FileMemoryStorage::new(file));
 
-    let db_header = Pager::begin_open(db_file.clone())?;
-    let buffer_pool = Rc::new(BufferPool::new(db_header.lock().get_page_size() as usize));
+    let buffer_pool = Rc::new(BufferPool::new(None));
     let page_cache = Arc::new(RwLock::new(DumbLruPageCache::default()));
 
-    let pager = Rc::new(Pager::finish_open(
-        db_header,
+    let pager = Rc::new(Pager::new(
         db_file,
         Rc::new(RefCell::new(DummyWAL)),
         io,
         page_cache,
-        buffer_pool,
+        buffer_pool.clone(),
+        Arc::new(AtomicBool::new(true)),
     )?);
+
+    let page_size = header_accessor::get_page_size(&pager)
+        .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as usize;
+    buffer_pool.set_page_size(page_size);
 
     let flag = if is_table {
         &CreateBTreeFlags::new_table()
     } else {
         &CreateBTreeFlags::new_index()
     };
+
+    pager.begin_write_tx()?;
 
     // FIXME: handle page cache is full
     let root_page = return_if_io!(pager.btree_create(flag));

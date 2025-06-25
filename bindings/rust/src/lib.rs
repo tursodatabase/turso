@@ -148,6 +148,12 @@ impl Connection {
     }
 }
 
+impl Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Connection").finish()
+    }
+}
+
 pub struct Statement {
     inner: Arc<Mutex<limbo_core::Statement>>,
 }

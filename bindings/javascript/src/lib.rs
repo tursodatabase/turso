@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use limbo_core::{maybe_init_database_file, LimboError, StepResult};
+use limbo_core::{LimboError, StepResult};
 use napi::iterator::Generator;
 use napi::{bindgen_prelude::ObjectFinalize, Env, JsUnknown};
 use napi_derive::napi;
@@ -62,7 +62,7 @@ impl Database {
         } else {
             Arc::new(limbo_core::PlatformIO::new().map_err(into_napi_error)?)
         };
-
+      
         let opts = options.unwrap_or_default();
 
         let flag = if opts.readonly {
@@ -70,9 +70,11 @@ impl Database {
         } else {
             limbo_core::OpenFlags::Create
         };
+      
+        let file = io
+            .open_file(&path, limbo_core::OpenFlags::Create, false)
+            .map_err(into_napi_error)?;
 
-        let file = io.open_file(&path, flag, false).map_err(into_napi_error)?;
-        maybe_init_database_file(&file, &io).map_err(into_napi_error)?;
         let db_file = Arc::new(DatabaseFile::new(file));
         let db = limbo_core::Database::open(io.clone(), &path, db_file, false)
             .map_err(into_napi_error)?;
@@ -596,6 +598,10 @@ impl limbo_core::DatabaseStorage for DatabaseFile {
 
     fn sync(&self, c: Arc<limbo_core::Completion>) -> limbo_core::Result<()> {
         self.file.sync(c)
+    }
+
+    fn size(&self) -> limbo_core::Result<u64> {
+        self.file.size()
     }
 }
 

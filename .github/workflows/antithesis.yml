@@ -13,7 +13,7 @@ env:
   ANTITHESIS_PASSWD: ${{ secrets.ANTITHESIS_PASSWD }}
   ANTITHESIS_DOCKER_HOST: us-central1-docker.pkg.dev
   ANTITHESIS_DOCKER_REPO: ${{ secrets.ANTITHESIS_DOCKER_REPO }}
-  ANTITHESIS_EMAIL: "penberg@turso.tech"
+  ANTITHESIS_EMAIL: "penberg@turso.tech;pmuniz@turso.tech"
   ANTITHESIS_REGISTRY_KEY: ${{ secrets.ANTITHESIS_REGISTRY_KEY }}
 
 jobs:

@@ -33,10 +33,8 @@ pub(crate) mod transaction;
 pub(crate) mod update;
 mod values;
 
-use crate::fast_lock::SpinLock;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
-use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::translate::delete::translate_delete;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::Program;
@@ -58,7 +56,6 @@ use update::translate_update;
 pub fn translate(
     schema: &Schema,
     stmt: ast::Stmt,
-    database_header: Arc<SpinLock<DatabaseHeader>>,
     pager: Rc<Pager>,
     connection: Arc<Connection>,
     syms: &SymbolTable,
@@ -90,7 +87,6 @@ pub fn translate(
             schema,
             &name,
             body.map(|b| *b),
-            database_header.clone(),
             pager,
             connection.clone(),
             program,
@@ -100,7 +96,7 @@ pub fn translate(
 
     // TODO: bring epilogue here when I can sort out what instructions correspond to a Write or a Read transaction
 
-    Ok(program.build(database_header, connection, change_cnt_on))
+    Ok(program.build(connection, change_cnt_on))
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty

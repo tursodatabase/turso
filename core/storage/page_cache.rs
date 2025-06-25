@@ -46,7 +46,7 @@ struct HashMapNode {
 pub enum CacheError {
     InternalError(String),
     Locked,
-    Dirty,
+    Dirty { pgno: usize },
     ActiveRefs,
     Full,
     KeyExists,
@@ -102,7 +102,8 @@ impl DumbLruPageCache {
             if let Some(existing_page_ref) = self.get(&key) {
                 assert!(
                     Arc::ptr_eq(&value, &existing_page_ref),
-                    "Attempted to insert different page with same key"
+                    "Attempted to insert different page with same key: {:?}",
+                    key
                 );
                 return Err(CacheError::KeyExists);
             }
@@ -185,7 +186,9 @@ impl DumbLruPageCache {
             return Err(CacheError::Locked);
         }
         if entry_mut.page.is_dirty() {
-            return Err(CacheError::Dirty);
+            return Err(CacheError::Dirty {
+                pgno: entry_mut.page.get().id,
+            });
         }
 
         if clean_page {
@@ -877,7 +880,10 @@ mod tests {
         let (key, mut entry) = insert_and_get_entry(&mut cache, 1);
         cache.get(&key).expect("Page should exist");
         unsafe { entry.as_mut().page.set_dirty() };
-        assert_eq!(cache.detach(entry, false), Err(CacheError::Dirty));
+        assert_eq!(
+            cache.detach(entry, false),
+            Err(CacheError::Dirty { pgno: 1 })
+        );
         cache.verify_list_integrity();
     }
 

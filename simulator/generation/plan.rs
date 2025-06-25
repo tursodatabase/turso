@@ -273,12 +273,14 @@ impl Debug for Assertion {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum Fault {
     Disconnect,
+    ReopenDatabase,
 }
 
 impl Display for Fault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Fault::Disconnect => write!(f, "DISCONNECT"),
+            Fault::ReopenDatabase => write!(f, "REOPEN_DATABASE"),
         }
     }
 }
@@ -634,6 +636,31 @@ impl Interaction {
                         }
                         env.connections[conn_index] = SimConnection::Disconnected;
                     }
+                    Fault::ReopenDatabase => {
+                        // 1. Close all connections without default checkpoint-on-close behavior
+                        // to expose bugs related to how we handle WAL
+                        let num_conns = env.connections.len();
+                        env.connections.clear();
+
+                        // 2. Re-open database
+                        let db_path = env.db_path.clone();
+                        let db = match limbo_core::Database::open_file(
+                            env.io.clone(),
+                            &db_path,
+                            false,
+                        ) {
+                            Ok(db) => db,
+                            Err(e) => {
+                                panic!("error opening simulator test file {:?}: {:?}", db_path, e);
+                            }
+                        };
+                        env.db = db;
+
+                        for _ in 0..num_conns {
+                            env.connections
+                                .push(SimConnection::LimboConnection(env.db.connect().unwrap()));
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -674,8 +701,14 @@ fn random_create_index<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Option<
     )))
 }
 
-fn random_fault<R: rand::Rng>(_rng: &mut R, _env: &SimulatorEnv) -> Interactions {
-    Interactions::Fault(Fault::Disconnect)
+fn random_fault<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
+    let faults = if env.opts.disable_reopen_database {
+        vec![Fault::Disconnect]
+    } else {
+        vec![Fault::Disconnect, Fault::ReopenDatabase]
+    };
+    let fault = faults[rng.gen_range(0..faults.len())].clone();
+    Interactions::Fault(fault)
 }
 
 impl ArbitraryFrom<(&SimulatorEnv, InteractionStats)> for Interactions {
