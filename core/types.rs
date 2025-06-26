@@ -860,9 +860,12 @@ impl ImmutableRecord {
         }
     }
 
-    pub fn from_registers(registers: &[Register]) -> Self {
-        let mut values = Vec::with_capacity(registers.len());
-        let mut serials = Vec::with_capacity(registers.len());
+    pub fn from_registers<'a>(
+        registers: impl IntoIterator<Item = &'a Register> + Copy,
+        len: usize,
+    ) -> Self {
+        let mut values = Vec::with_capacity(len);
+        let mut serials = Vec::with_capacity(len);
         let mut size_header = 0;
         let mut size_values = 0;
 
@@ -1615,7 +1618,7 @@ fn compare_records_string(
     }
 }
 
-fn compare_records_generic(
+pub fn compare_records_generic(
     serialized: &ImmutableRecord,
     unpacked: &[RefValue],
     index_info: &IndexKeyInfo,
@@ -2139,7 +2142,7 @@ mod tests {
 
     fn create_record(values: Vec<Value>) -> ImmutableRecord {
         let registers: Vec<Register> = values.into_iter().map(Register::Value).collect();
-        ImmutableRecord::from_registers(&registers)
+        ImmutableRecord::from_registers(&registers, registers.len())
     }
 
     fn create_index_info(num_cols: usize, sort_orders: Vec<SortOrder>) -> IndexKeyInfo {

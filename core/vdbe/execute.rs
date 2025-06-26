@@ -8,7 +8,7 @@ use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::wal::DummyWAL;
 use crate::storage::{self, header_accessor};
 use crate::translate::collate::CollationSeq;
-use crate::types::{ImmutableRecord, Text};
+use crate::types::{compare_immutable_for_testing, ImmutableRecord, Text};
 use crate::util::normalize_ident;
 use crate::{
     error::{
@@ -2339,7 +2339,7 @@ pub fn op_idx_ge(
             let idx_values = &idx_values[..record_values.len()];
             let ord = compare_immutable(
                 idx_values,
-                record_values,
+                record_values.as_slice(),
                 cursor.key_sort_order(),
                 cursor.collations(),
             );
@@ -2403,7 +2403,7 @@ pub fn op_idx_le(
             let idx_values = &idx_values[..record_values.len()];
             let ord = compare_immutable(
                 idx_values,
-                record_values,
+                record_values.as_slice(),
                 cursor.key_sort_order(),
                 cursor.collations(),
             );
@@ -2442,6 +2442,7 @@ pub fn op_idx_gt(
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
         let record_from_regs = make_record(&state.registers, start_reg, num_regs);
+        dbg!("here");
         let pc = if let Some(ref idx_record) = return_if_io!(cursor.record()) {
             // Compare against the same number of values
             let idx_values = idx_record.get_values();
@@ -2449,16 +2450,26 @@ pub fn op_idx_gt(
             let idx_values = &idx_values[..record_values.len()];
             let ord = compare_immutable(
                 idx_values,
-                record_values,
+                record_values.as_slice(),
                 cursor.key_sort_order(),
                 cursor.collations(),
             );
+
+            let ord_debug = compare_immutable_for_testing(
+                idx_values,
+                record_values.as_slice(),
+                cursor.key_sort_order(),
+                cursor.collations(),
+            );
+
+            println!("idx_gt== old={:?}, debug={:?}", ord, ord_debug);
             if ord.is_gt() {
                 target_pc.as_offset_int()
             } else {
                 state.pc + 1
             }
         } else {
+            println!("we are taking the else branch");
             target_pc.as_offset_int()
         };
         pc
@@ -2495,7 +2506,7 @@ pub fn op_idx_lt(
             let idx_values = &idx_values[..record_values.len()];
             let ord = compare_immutable(
                 idx_values,
-                record_values,
+                record_values.as_slice(),
                 cursor.key_sort_order(),
                 cursor.collations(),
             );
