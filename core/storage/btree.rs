@@ -3027,7 +3027,10 @@ impl BTreeCursor {
                     assert_eq!(left_pointer, page.get().get().id as u32);
                     // FIXME: remove this lock
                     assert!(
-                        left_pointer <= header_accessor::get_database_size(&self.pager)?,
+                        left_pointer
+                            <= header_accessor::get_database_size(
+                                &self.pager.inner.lock().unwrap()
+                            )? as u32,
                         "invalid page number divider left pointer {} > database number of pages",
                         left_pointer,
                     );
@@ -4662,7 +4665,8 @@ impl BTreeCursor {
                 OverflowState::ProcessPage { next_page } => {
                     if next_page < 2
                         || next_page as usize
-                            > header_accessor::get_database_size(&self.pager)? as usize
+                            > header_accessor::get_database_size(&self.pager.inner.lock().unwrap())?
+                                as usize
                     {
                         self.overflow_state = None;
                         return Err(LimboError::Corrupt("Invalid overflow page number".into()));
@@ -6684,7 +6688,7 @@ mod tests {
         let cursor = BTreeCursor::new_table(None, pager.clone(), page_idx);
         let page = cursor.read_page(page_idx).unwrap();
         while page.get().is_locked() {
-            pager.io.run_once().unwrap();
+            pager.io_run_once().unwrap();
         }
         let page = page.get();
         // Pin page in order to not drop it in between
@@ -6712,7 +6716,7 @@ mod tests {
                 }) => {
                     let child_page = cursor.read_page(_left_child_page as usize).unwrap();
                     while child_page.get().is_locked() {
-                        pager.io.run_once().unwrap();
+                        pager.io_run_once().unwrap();
                     }
                     child_pages.push(child_page);
                     if _left_child_page == page.get().id as u32 {
@@ -6771,7 +6775,7 @@ mod tests {
                 p.page.replace(new_page);
             }
             while p.get().is_locked() {
-                pager.io.run_once().unwrap();
+                pager.io_run_once().unwrap();
             }
             p.get().get_contents().page_type()
         });
@@ -6782,7 +6786,7 @@ mod tests {
                     page.page.replace(new_page);
                 }
                 while page.get().is_locked() {
-                    pager.io.run_once().unwrap();
+                    pager.io_run_once().unwrap();
                 }
                 if page.get().get_contents().page_type() != child_type {
                     tracing::error!("child pages have different types");
@@ -6801,7 +6805,7 @@ mod tests {
         let cursor = BTreeCursor::new_table(None, pager.clone(), page_idx);
         let page = cursor.read_page(page_idx).unwrap();
         while page.get().is_locked() {
-            pager.io.run_once().unwrap();
+            pager.io_run_once().unwrap();
         }
         let page = page.get();
         // Pin page in order to not drop it in between loading of different pages. If not contents will be a dangling reference.
@@ -7064,7 +7068,7 @@ mod tests {
                     match pager.end_tx(false).unwrap() {
                         crate::PagerCacheflushStatus::Done(_) => break,
                         crate::PagerCacheflushStatus::IO => {
-                            pager.io.run_once().unwrap();
+                            pager.io_run_once().unwrap();
                         }
                     }
                 }
@@ -7190,7 +7194,7 @@ mod tests {
                     match pager.end_tx(false).unwrap() {
                         crate::PagerCacheflushStatus::Done(_) => break,
                         crate::PagerCacheflushStatus::IO => {
-                            pager.io.run_once().unwrap();
+                            pager.io_run_once().unwrap();
                         }
                     }
                 }
@@ -7410,7 +7414,7 @@ mod tests {
             .unwrap(),
         );
 
-        pager.io.run_once().unwrap();
+        pager.io_run_once().unwrap();
 
         pager.allocate_page1().unwrap();
 
@@ -7418,7 +7422,7 @@ mod tests {
             pager.allocate_page().unwrap();
         }
 
-        header_accessor::set_page_size(&pager, page_size as u16).unwrap();
+        header_accessor::set_page_size(&pager.inner.lock().unwrap(), page_size as u16).unwrap();
 
         pager
     }
@@ -7441,20 +7445,23 @@ mod tests {
             let drop_fn = Rc::new(|_buf| {});
             #[allow(clippy::arc_with_non_send_sync)]
             let buf = Arc::new(RefCell::new(Buffer::allocate(
-                header_accessor::get_page_size(&pager)? as usize,
+                header_accessor::get_page_size(&pager.inner.lock().unwrap())? as usize,
                 drop_fn,
             )));
             let write_complete = Box::new(|_| {});
             let c = Completion::Write(WriteCompletion::new(write_complete));
             #[allow(clippy::arc_with_non_send_sync)]
             pager
+                .inner
+                .lock()
+                .unwrap()
                 .db_file
                 .write_page(current_page as usize, buf.clone(), Arc::new(c))?;
-            pager.io.run_once()?;
+            pager.io_run_once()?;
 
             let page = cursor.read_page(current_page as usize)?;
             while page.get().is_locked() {
-                cursor.pager.io.run_once()?;
+                cursor.pager.io_run_once()?;
             }
 
             {
@@ -7474,7 +7481,7 @@ mod tests {
 
             current_page += 1;
         }
-        pager.io.run_once()?;
+        pager.io_run_once()?;
 
         // Create leaf cell pointing to start of overflow chain
         let leaf_cell = BTreeCell::TableLeafCell(TableLeafCell {
@@ -7484,20 +7491,20 @@ mod tests {
             payload_size: large_payload.len() as u64,
         });
 
-        let initial_freelist_pages = header_accessor::get_freelist_pages(&pager)?;
+        let initial_freelist_pages = header_accessor::get_freelist_pages(&pager.inner.lock().unwrap())?;
         // Clear overflow pages
         let clear_result = cursor.clear_overflow_pages(&leaf_cell)?;
         match clear_result {
             CursorResult::Ok(_) => {
                 // Verify proper number of pages were added to freelist
                 assert_eq!(
-                    header_accessor::get_freelist_pages(&pager)?,
+                    header_accessor::get_freelist_pages(&pager.inner.lock().unwrap())?,
                     initial_freelist_pages + 3,
                     "Expected 3 pages to be added to freelist"
                 );
 
                 // If this is first trunk page
-                let trunk_page_id = header_accessor::get_freelist_trunk_page(&pager)?;
+                let trunk_page_id = header_accessor::get_freelist_trunk_page(&pager.inner.lock().unwrap())?;
                 if trunk_page_id > 0 {
                     // Verify trunk page structure
                     let trunk_page = cursor.read_page(trunk_page_id as usize)?;
@@ -7518,7 +7525,7 @@ mod tests {
                 }
             }
             CursorResult::IO => {
-                cursor.pager.io.run_once()?;
+                cursor.pager.io_run_once()?;
             }
         }
 
@@ -7540,7 +7547,7 @@ mod tests {
             payload_size: small_payload.len() as u64,
         });
 
-        let initial_freelist_pages = header_accessor::get_freelist_pages(&pager)?;
+        let initial_freelist_pages = header_accessor::get_freelist_pages(&pager.inner.lock().unwrap())?;
 
         // Try to clear non-existent overflow pages
         let clear_result = cursor.clear_overflow_pages(&leaf_cell)?;
@@ -7548,20 +7555,20 @@ mod tests {
             CursorResult::Ok(_) => {
                 // Verify freelist was not modified
                 assert_eq!(
-                    header_accessor::get_freelist_pages(&pager)?,
+                    header_accessor::get_freelist_pages(&pager.inner.lock().unwrap())?,
                     initial_freelist_pages,
                     "Freelist should not change when no overflow pages exist"
                 );
 
                 // Verify trunk page wasn't created
                 assert_eq!(
-                    header_accessor::get_freelist_trunk_page(&pager)?,
+                    header_accessor::get_freelist_trunk_page(&pager.inner.lock().unwrap())?,
                     0,
                     "No trunk page should be created when no overflow pages exist"
                 );
             }
             CursorResult::IO => {
-                cursor.pager.io.run_once()?;
+                cursor.pager.io_run_once()?;
             }
         }
 
@@ -7625,18 +7632,18 @@ mod tests {
 
         // Verify structure before destruction
         assert_eq!(
-            header_accessor::get_database_size(&pager)?,
+            header_accessor::get_database_size(&pager.inner.lock().unwrap())?,
             4, // We should have pages 1-4
             "Database should have 4 pages total"
         );
 
         // Track freelist state before destruction
-        let initial_free_pages = header_accessor::get_freelist_pages(&pager)?;
+        let initial_free_pages = header_accessor::get_freelist_pages(&pager.inner.lock().unwrap())?;
         assert_eq!(initial_free_pages, 0, "should start with no free pages");
 
         run_until_done(|| cursor.btree_destroy(), pager.deref())?;
 
-        let pages_freed = header_accessor::get_freelist_pages(&pager)? - initial_free_pages;
+        let pages_freed = header_accessor::get_freelist_pages(&pager.inner.lock().unwrap())? - initial_free_pages;
         assert_eq!(pages_freed, 3, "should free 3 pages (root + 2 leaves)");
 
         Ok(())
@@ -8615,7 +8622,7 @@ mod tests {
                 CursorResult::Ok(res) => {
                     return Ok(res);
                 }
-                CursorResult::IO => pager.io.run_once().unwrap(),
+                CursorResult::IO => pager.io_run_once().unwrap(),
             }
         }
     }

@@ -65,7 +65,7 @@ pub unsafe extern "C" fn execute(
                         return ResultCode::OK;
                     }
                     Ok(StepResult::IO) => {
-                        let _ = conn.pager.io.run_once();
+                        let _ = conn.pager.io_run_once();
                         continue;
                     }
                     Ok(StepResult::Interrupt) => return ResultCode::Interrupt,
@@ -162,7 +162,7 @@ pub unsafe extern "C" fn stmt_step(stmt: *mut Stmt) -> ResultCode {
             StepResult::Done => return ResultCode::EOF,
             StepResult::IO => {
                 // always handle IO step result internally.
-                let _ = conn.pager.io.run_once();
+                let _ = conn.pager.io_run_once();
                 continue;
             }
             StepResult::Interrupt => return ResultCode::Interrupt,

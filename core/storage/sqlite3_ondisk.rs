@@ -50,7 +50,7 @@ use crate::fast_lock::SpinLock;
 use crate::io::{Buffer, Complete, Completion, ReadCompletion, SyncCompletion, WriteCompletion};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
-use crate::storage::pager::Pager;
+use crate::storage::pager::PagerInner;
 use crate::types::{
     ImmutableRecord, RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype,
 };
@@ -772,7 +772,7 @@ pub fn finish_read_page(
 }
 
 pub fn begin_write_btree_page(
-    pager: &Pager,
+    pager: &PagerInner,
     page: &PageRef,
     write_counter: Rc<RefCell<usize>>,
 ) -> Result<()> {

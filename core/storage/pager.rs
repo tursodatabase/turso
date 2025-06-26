@@ -195,6 +195,210 @@ pub enum AutoVacuumMode {
 /// to pages of the database file, including caching, concurrency control, and
 /// transaction management.
 pub struct Pager {
+    pub(crate) inner: Arc<Mutex<PagerInner>>,
+}
+
+impl Pager {
+    pub fn new(
+        db_file: Arc<dyn DatabaseStorage>,
+        wal: Rc<RefCell<dyn Wal>>,
+        io: Arc<dyn crate::io::IO>,
+        page_cache: Arc<RwLock<DumbLruPageCache>>,
+        buffer_pool: Rc<BufferPool>,
+        is_empty: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        let inner = PagerInner::new(db_file, wal, io, page_cache, buffer_pool, is_empty)?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(inner)),
+        })
+    }
+
+    pub fn begin_read_tx(&self) -> Result<LimboResult> {
+        let inner = self.inner.lock().unwrap();
+        inner.begin_read_tx()
+    }
+
+    pub fn end_read_tx(&self) -> Result<()> {
+        let inner = self.inner.lock().unwrap();
+        inner.end_read_tx()
+    }
+
+    pub fn begin_write_tx(&self) -> Result<LimboResult> {
+        let inner = self.inner.lock().unwrap();
+        inner.begin_write_tx()
+    }
+
+    pub fn end_tx(&self, rollback: bool) -> Result<PagerCacheflushStatus> {
+        let inner = self.inner.lock().unwrap();
+        inner.end_tx(rollback)
+    }
+
+    pub fn rollback(&self) -> Result<(), LimboError> {
+        let inner = self.inner.lock().unwrap();
+        inner.rollback()
+    }
+
+    pub fn checkpoint(&self) -> Result<CheckpointStatus> {
+        let inner = self.inner.lock().unwrap();
+        inner.checkpoint()
+    }
+
+    pub fn checkpoint_shutdown(&self) -> Result<()> {
+        let inner = self.inner.lock().unwrap();
+        inner.checkpoint_shutdown()
+    }
+
+    pub fn wal_checkpoint(&self) -> Result<CheckpointResult> {
+        let inner = self.inner.lock().unwrap();
+        inner.wal_checkpoint()
+    }
+
+    pub fn add_dirty(&self, page_id: usize) {
+        let inner = self.inner.lock().unwrap();
+        inner.add_dirty(page_id)
+    }
+
+    pub fn update_dirty_loaded_page_in_cache(
+        &self,
+        id: usize,
+        page: PageRef,
+    ) -> Result<(), LimboError> {
+        let inner = self.inner.lock().unwrap();
+        inner.update_dirty_loaded_page_in_cache(id, page)
+    }
+
+    pub fn clear_page_cache(&self) {
+        let inner = self.inner.lock().unwrap();
+        inner.clear_page_cache()
+    }
+
+    pub fn cacheflush(&self) -> Result<PagerCacheflushStatus> {
+        let inner = self.inner.lock().unwrap();
+        inner.cacheflush()
+    }
+
+    pub fn wal_frame_count(&self) -> Result<u64> {
+        let inner = self.inner.lock().unwrap();
+        inner.wal_frame_count()
+    }
+
+    pub fn wal_get_frame(
+        &self,
+        frame_no: u32,
+        p_frame: *mut u8,
+        frame_len: u32,
+    ) -> Result<Arc<Completion>> {
+        let inner = self.inner.lock().unwrap();
+        inner.wal_get_frame(frame_no, p_frame, frame_len)
+    }
+
+    pub fn cache_get(&self, page_idx: usize) -> Option<PageRef> {
+        let inner = self.inner.lock().unwrap();
+        inner.cache_get(page_idx)
+    }
+
+    pub fn read_page(&self, page_idx: usize) -> Result<PageRef, LimboError> {
+        let inner = self.inner.lock().unwrap();
+        inner.read_page(page_idx)
+    }
+
+    pub fn do_allocate_page(
+        &self,
+        page_type: PageType,
+        offset: usize,
+        alloc_mode: BtreePageAllocMode,
+    ) -> BTreePage {
+        let inner = self.inner.lock().unwrap();
+        inner.do_allocate_page(page_type, offset, alloc_mode)
+    }
+
+    pub fn allocate_page1(&self) -> Result<PageRef> {
+        let inner = self.inner.lock().unwrap();
+        inner.allocate_page1()
+    }
+
+    pub fn allocate_page(&self) -> Result<PageRef> {
+        let inner = self.inner.lock().unwrap();
+        inner.allocate_page()
+    }
+
+    pub fn allocate_overflow_page(&self) -> PageRef {
+        let inner = self.inner.lock().unwrap();
+        inner.allocate_overflow_page()
+    }
+
+    pub fn free_page(&self, page: Option<PageRef>, page_id: usize) -> Result<()> {
+        let inner = self.inner.lock().unwrap();
+        inner.free_page(page, page_id)
+    }
+
+    pub fn btree_create(&self, flags: &CreateBTreeFlags) -> Result<CursorResult<u32>> {
+        let inner = self.inner.lock().unwrap();
+        inner.btree_create(flags)
+    }
+
+    pub fn usable_space(&self) -> usize {
+        let inner = self.inner.lock().unwrap();
+        inner.usable_space()
+    }
+
+    pub fn set_wal(&mut self, wal: Rc<RefCell<WalFile>>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.set_wal(wal)
+    }
+
+    pub fn change_page_cache_size(&self, cache_size: usize) -> Result<CacheResizeResult> {
+        let inner = self.inner.lock().unwrap();
+        inner.change_page_cache_size(cache_size)
+    }
+
+    pub fn set_page_size(&self, page_size: usize) {
+        let inner = self.inner.lock().unwrap();
+        inner.buffer_pool.set_page_size(page_size)
+    }
+
+    pub fn set_auto_vacuum_mode(&self, mode: AutoVacuumMode) {
+        let inner = self.inner.lock().unwrap();
+        inner.set_auto_vacuum_mode(mode)
+    }
+
+    pub fn get_auto_vacuum_mode(&self) -> AutoVacuumMode {
+        let inner = self.inner.lock().unwrap();
+        inner.get_auto_vacuum_mode()
+    }
+
+    pub fn ptrmap_get(&self, target_page_num: u32) -> Result<CursorResult<Option<PtrmapEntry>>> {
+        let inner = self.inner.lock().unwrap();
+        inner.ptrmap_get(target_page_num)
+    }
+
+    pub fn ptrmap_put(
+        &self,
+        db_page_no_to_update: u32,
+        entry_type: PtrmapType,
+        parent_page_no: u32,
+    ) -> Result<CursorResult<()>> {
+        let inner = self.inner.lock().unwrap();
+        inner.ptrmap_put(db_page_no_to_update, entry_type, parent_page_no)
+    }
+
+    pub fn io_run_once(&self) -> Result<()> {
+        let inner = self.inner.lock().unwrap();
+        inner.io.run_once()
+    }
+
+    pub fn get_memory_io(&self) -> Arc<crate::io::MemoryIO> {
+        let inner = self.inner.lock().unwrap();
+        inner.io.get_memory_io()
+    }
+
+    pub fn clone_io(&self) -> Arc<dyn crate::io::IO> {
+        let inner = self.inner.lock().unwrap();
+        inner.io.clone()
+    }
+}
+
+pub struct PagerInner {
     /// Source of the database pages.
     pub db_file: Arc<dyn DatabaseStorage>,
     /// The write-ahead log (WAL) for the database.
@@ -214,8 +418,6 @@ pub struct Pager {
     auto_vacuum_mode: RefCell<AutoVacuumMode>,
     /// Is the db empty? This is signified by 0-sized database and nonexistent WAL.
     pub is_empty: Arc<AtomicBool>,
-    /// Mutex for synchronizing database initialization to prevent race conditions
-    init_lock: Mutex<()>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -237,7 +439,7 @@ pub enum PagerCacheflushResult {
     Rollback,
 }
 
-impl Pager {
+impl PagerInner {
     pub fn new(
         db_file: Arc<dyn DatabaseStorage>,
         wal: Rc<RefCell<dyn Wal>>,
@@ -262,7 +464,6 @@ impl Pager {
             buffer_pool,
             auto_vacuum_mode: RefCell::new(AutoVacuumMode::None),
             is_empty,
-            init_lock: Mutex::new(()),
         })
     }
 
@@ -556,7 +757,6 @@ impl Pager {
     pub fn begin_read_tx(&self) -> Result<LimboResult> {
         // We allocate the first page lazily in the first transaction
         if self.is_empty.load(Ordering::SeqCst) {
-            let _lock = self.init_lock.lock().unwrap();
             if self.is_empty.load(Ordering::SeqCst) {
                 self.allocate_page1()?;
             }
@@ -569,7 +769,6 @@ impl Pager {
         // TODO(Diego): The only possibly allocate page1 here is because OpenEphemeral needs a write transaction
         // we should have a unique API to begin transactions, something like sqlite3BtreeBeginTrans
         if self.is_empty.load(Ordering::SeqCst) {
-            let _lock = self.init_lock.lock().unwrap();
             if self.is_empty.load(Ordering::SeqCst) {
                 self.allocate_page1()?;
             }
@@ -1391,7 +1590,7 @@ mod ptrmap_tests {
         )
         .unwrap();
         pager.allocate_page1().unwrap();
-        header_accessor::set_vacuum_mode_largest_root_page(&pager, 1).unwrap();
+        header_accessor::set_vacuum_mode_largest_root_page(&pager.inner.lock().unwrap(), 1).unwrap();
         pager.set_auto_vacuum_mode(AutoVacuumMode::Full);
 
         //  Allocate all the pages as btree root pages
@@ -1428,7 +1627,7 @@ mod ptrmap_tests {
 
         //  Ensure that the database header size is correctly reflected
         assert_eq!(
-            header_accessor::get_database_size(&pager).unwrap(),
+            header_accessor::get_database_size(&pager.inner.lock().unwrap()).unwrap(),
             initial_db_pages + 2
         ); // (1+1) -> (header + ptrmap)
 

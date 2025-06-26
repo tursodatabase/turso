@@ -1,7 +1,7 @@
 use crate::{
     storage::{
         self,
-        pager::{PageRef, Pager},
+        pager::{PageRef, PagerInner},
         sqlite3_ondisk::DATABASE_HEADER_PAGE_ID,
     },
     LimboError, Result,
@@ -33,7 +33,7 @@ const HEADER_OFFSET_VERSION_VALID_FOR: usize = 92;
 const HEADER_OFFSET_VERSION_NUMBER: usize = 96;
 
 // Helper to get a read-only reference to the header page.
-fn get_header_page(pager: &Pager) -> Result<PageRef> {
+fn get_header_page(pager: &PagerInner) -> Result<PageRef> {
     if pager.is_empty.load(Ordering::SeqCst) {
         return Err(LimboError::InternalError(
             "Database is empty, header does not exist - page 1 should've been allocated before this".to_string(),
@@ -48,7 +48,7 @@ fn get_header_page(pager: &Pager) -> Result<PageRef> {
 }
 
 // Helper to get a writable reference to the header page and mark it dirty.
-fn get_header_page_for_write(pager: &Pager) -> Result<PageRef> {
+fn get_header_page_for_write(pager: &PagerInner) -> Result<PageRef> {
     if pager.is_empty.load(Ordering::SeqCst) {
         // This should not be called on an empty DB for writing, as page 1 is allocated on first transaction.
         return Err(LimboError::InternalError(
@@ -87,7 +87,7 @@ macro_rules! impl_header_field_accessor {
     ($field_name:ident, $type:ty, $offset:expr $(, $ifzero:expr)?) => {
         paste::paste! {
             #[allow(dead_code)]
-            pub fn [<get_ $field_name>](pager: &Pager) -> Result<$type> {
+            pub fn [<get_ $field_name>](pager: &PagerInner) -> Result<$type> {
                 if pager.is_empty.load(Ordering::SeqCst) {
                     return Err(LimboError::InternalError(format!("Database is empty, header does not exist - page 1 should've been allocated before this")));
                 }
@@ -108,7 +108,7 @@ macro_rules! impl_header_field_accessor {
             }
 
             #[allow(dead_code)]
-            pub fn [<set_ $field_name>](pager: &Pager, value: $type) -> Result<()> {
+            pub fn [<set_ $field_name>](pager: &PagerInner, value: $type) -> Result<()> {
                 let page = get_header_page_for_write(pager)?;
                 let page_inner = page.get();
                 let page_content = page_inner.contents.as_ref().unwrap();

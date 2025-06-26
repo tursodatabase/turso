@@ -237,12 +237,14 @@ impl Database {
                 is_empty,
             )?);
 
-            let page_size = header_accessor::get_page_size(&pager)
+            let pager_inner = pager.inner.lock().unwrap();
+            let page_size = header_accessor::get_page_size(&pager_inner)
                 .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE)
                 as u32;
-            let default_cache_size = header_accessor::get_default_page_cache_size(&pager)
+            let default_cache_size = header_accessor::get_default_page_cache_size(&pager_inner)
                 .unwrap_or(storage::sqlite3_ondisk::DEFAULT_CACHE_SIZE);
-            pager.buffer_pool.set_page_size(page_size as usize);
+            drop(pager_inner);
+            pager.set_page_size(page_size as usize);
             let conn = Arc::new(Connection {
                 _db: self.clone(),
                 pager: pager.clone(),
@@ -275,11 +277,12 @@ impl Database {
             buffer_pool.clone(),
             is_empty,
         )?;
-        let page_size = header_accessor::get_page_size(&pager)
+        let pager_inner = pager.inner.lock().unwrap();
+        let page_size = header_accessor::get_page_size(&pager_inner)
             .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as u32;
-        let default_cache_size = header_accessor::get_default_page_cache_size(&pager)
+        let default_cache_size = header_accessor::get_default_page_cache_size(&pager_inner)
             .unwrap_or(storage::sqlite3_ondisk::DEFAULT_CACHE_SIZE);
-
+        drop(pager_inner);
         let wal_path = format!("{}-wal", self.path);
         let file = self.io.open_file(&wal_path, OpenFlags::Create, false)?;
         let real_shared_wal = WalFileShared::new_shared(page_size, &self.io, file)?;
@@ -636,7 +639,7 @@ impl Connection {
         {
             let syms = self.syms.borrow();
             if let Err(LimboError::ExtensionError(e)) =
-                parse_schema_rows(rows, &mut schema, self.pager.io.clone(), &syms, None)
+                parse_schema_rows(rows, &mut schema, self.pager.clone_io(), &syms, None)
             {
                 // this means that a vtab exists and we no longer have the module loaded. we print
                 // a warning to the user to load the module
@@ -763,7 +766,7 @@ impl Statement {
     }
 
     pub fn run_once(&self) -> Result<()> {
-        self.pager.io.run_once()
+        self.pager.io_run_once()
     }
 
     pub fn num_columns(&self) -> usize {

@@ -342,11 +342,13 @@ fn query_pragma(
             program.emit_result_row(register, 1);
         }
         PragmaName::PageSize => {
+            let pager_inner = pager.inner.lock().unwrap();
             program.emit_int(
-                header_accessor::get_page_size(&pager)
+                header_accessor::get_page_size(&pager_inner)
                     .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as i64,
                 register,
             );
+            drop(pager_inner);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
         }
@@ -379,7 +381,9 @@ fn update_auto_vacuum_mode(
     largest_root_page_number: u32,
     pager: Rc<Pager>,
 ) -> crate::Result<()> {
-    header_accessor::set_vacuum_mode_largest_root_page(&pager, largest_root_page_number)?;
+    let pager_inner = pager.inner.lock().unwrap();
+    header_accessor::set_vacuum_mode_largest_root_page(&pager_inner, largest_root_page_number)?;
+    drop(pager_inner);
     pager.set_auto_vacuum_mode(auto_vacuum_mode);
     Ok(())
 }
@@ -392,7 +396,8 @@ fn update_cache_size(
     let mut cache_size_unformatted: i64 = value;
     let mut cache_size = if cache_size_unformatted < 0 {
         let kb = cache_size_unformatted.abs() * 1024;
-        let page_size = header_accessor::get_page_size(&pager)
+        let pager_inner = pager.inner.lock().unwrap();
+        let page_size = header_accessor::get_page_size(&pager_inner)
             .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as i64;
         kb / page_size as i64
     } else {

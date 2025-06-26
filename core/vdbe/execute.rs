@@ -3699,7 +3699,10 @@ pub fn op_function(
                 }
             }
             ScalarFunc::SqliteVersion => {
-                let version_integer: i64 = header_accessor::get_version_number(pager)? as i64;
+                let pager_inner = pager.inner.lock().unwrap();
+                let version_integer: i64 =
+                    header_accessor::get_version_number(&pager_inner)? as i64;
+                drop(pager_inner);
                 let version = execute_sqlite_version(version_integer);
                 state.registers[*dest] = Register::Value(Value::build_text(version));
             }
@@ -4904,7 +4907,9 @@ pub fn op_page_count(
         // TODO: implement temp databases
         todo!("temp databases not implemented yet");
     }
-    let count = header_accessor::get_database_size(pager)?.into();
+    let pager_inner = pager.inner.lock().unwrap();
+    let count = header_accessor::get_database_size(&pager_inner)?.into();
+    drop(pager_inner);
     state.registers[*dest] = Register::Value(Value::Integer(count));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -4939,7 +4944,7 @@ pub fn op_parse_schema(
             parse_schema_rows(
                 Some(stmt),
                 &mut schema,
-                conn.pager.io.clone(),
+                conn.pager.clone_io(),
                 &conn.syms.borrow(),
                 state.mv_tx_id,
             )?;
@@ -4953,7 +4958,7 @@ pub fn op_parse_schema(
             parse_schema_rows(
                 Some(stmt),
                 &mut new,
-                conn.pager.io.clone(),
+                conn.pager.clone_io(),
                 &conn.syms.borrow(),
                 state.mv_tx_id,
             )?;
@@ -4980,14 +4985,16 @@ pub fn op_read_cookie(
         // TODO: implement temp databases
         todo!("temp databases not implemented yet");
     }
+    let pager_inner = pager.inner.lock().unwrap();
     let cookie_value = match cookie {
-        Cookie::UserVersion => header_accessor::get_user_version(pager)?.into(),
-        Cookie::SchemaVersion => header_accessor::get_schema_cookie(pager)?.into(),
+        Cookie::UserVersion => header_accessor::get_user_version(&pager_inner)?.into(),
+        Cookie::SchemaVersion => header_accessor::get_schema_cookie(&pager_inner)?.into(),
         Cookie::LargestRootPageNumber => {
-            header_accessor::get_vacuum_mode_largest_root_page(pager)?.into()
+            header_accessor::get_vacuum_mode_largest_root_page(&pager_inner)?.into()
         }
         cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
     };
+    drop(pager_inner);
     state.registers[*dest] = Register::Value(Value::Integer(cookie_value));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -5012,15 +5019,16 @@ pub fn op_set_cookie(
     if *db > 0 {
         todo!("temp databases not implemented yet");
     }
+    let pager_inner = pager.inner.lock().unwrap();
     match cookie {
         Cookie::UserVersion => {
-            header_accessor::set_user_version(pager, *value)?;
+            header_accessor::set_user_version(&pager_inner, *value)?;
         }
         Cookie::LargestRootPageNumber => {
-            header_accessor::set_vacuum_mode_largest_root_page(pager, *value as u32)?;
+            header_accessor::set_vacuum_mode_largest_root_page(&pager_inner, *value as u32)?;
         }
         Cookie::IncrementalVacuum => {
-            header_accessor::set_incremental_vacuum_enabled(pager, *value as u32)?;
+            header_accessor::set_incremental_vacuum_enabled(&pager_inner, *value as u32)?;
         }
         cookie => todo!("{cookie:?} is not yet implement for SetCookie"),
     }
@@ -5205,7 +5213,7 @@ pub fn op_open_ephemeral(
     };
 
     let conn = program.connection.clone();
-    let io = conn.pager.io.get_memory_io();
+    let io = conn.pager.get_memory_io();
 
     let file = io.open_file("", OpenFlags::Create, true)?;
     let db_file = Arc::new(FileMemoryStorage::new(file));
@@ -5222,8 +5230,10 @@ pub fn op_open_ephemeral(
         Arc::new(AtomicBool::new(true)),
     )?);
 
-    let page_size = header_accessor::get_page_size(&pager)
+    let pager_inner = pager.inner.lock().unwrap();
+    let page_size = header_accessor::get_page_size(&pager_inner)
         .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as usize;
+    drop(pager_inner);
     buffer_pool.set_page_size(page_size);
 
     let flag = if is_table {

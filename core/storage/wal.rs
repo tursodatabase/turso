@@ -29,7 +29,7 @@ use crate::{Completion, Page};
 use self::sqlite3_ondisk::{checksum_wal, PageContent, WAL_MAGIC_BE, WAL_MAGIC_LE};
 
 use super::buffer_pool::BufferPool;
-use super::pager::{PageRef, Pager};
+use super::pager::{PageRef, PagerInner};
 use super::sqlite3_ondisk::{self, begin_write_btree_page, WalHeader};
 
 pub const READMARK_NOT_USED: u32 = 0xffffffff;
@@ -237,7 +237,7 @@ pub trait Wal {
     fn should_checkpoint(&self) -> bool;
     fn checkpoint(
         &mut self,
-        pager: &Pager,
+        pager: &PagerInner,
         write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<CheckpointStatus>;
@@ -309,7 +309,7 @@ impl Wal for DummyWAL {
 
     fn checkpoint(
         &mut self,
-        _pager: &Pager,
+        _pager: &PagerInner,
         _write_counter: Rc<RefCell<usize>>,
         _mode: crate::CheckpointMode,
     ) -> Result<crate::CheckpointStatus> {
@@ -704,7 +704,7 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::TRACE)]
     fn checkpoint(
         &mut self,
-        pager: &Pager,
+        pager: &PagerInner,
         write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<CheckpointStatus> {
