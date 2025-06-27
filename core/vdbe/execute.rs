@@ -8,7 +8,7 @@ use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::wal::DummyWAL;
 use crate::storage::{self, header_accessor};
 use crate::translate::collate::CollationSeq;
-use crate::types::{compare_immutable_for_testing, ImmutableRecord, Text};
+use crate::types::{ImmutableRecord, Text};
 use crate::util::normalize_ident;
 use crate::{
     error::{
@@ -2455,21 +2455,12 @@ pub fn op_idx_gt(
                 cursor.collations(),
             );
 
-            let ord_debug = compare_immutable_for_testing(
-                idx_values,
-                record_values.as_slice(),
-                cursor.key_sort_order(),
-                cursor.collations(),
-            );
-
-            println!("idx_gt== old={:?}, debug={:?}", ord, ord_debug);
             if ord.is_gt() {
                 target_pc.as_offset_int()
             } else {
                 state.pc + 1
             }
         } else {
-            println!("we are taking the else branch");
             target_pc.as_offset_int()
         };
         pc
