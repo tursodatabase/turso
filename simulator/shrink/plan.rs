@@ -80,7 +80,7 @@ impl InteractionPlan {
                         temp_plan =
                             InteractionPlan::iterative_shrink(temp_plan, failing_execution, result);
                         temp_plan = Self::shrink_queries(temp_plan, failing_execution, result, env);
-                        
+
                         *queries = temp_plan
                             .plan
                             .into_iter()
@@ -139,79 +139,72 @@ impl InteractionPlan {
         env: &SimulatorEnv,
     ) -> InteractionPlan {
         for i in 0..plan.plan.len() {
-            match &plan.plan[i] {
-                Interactions::Query(query) => {
-                    match query {
-                        Query::Select(Select {
-                            table,
-                            result_columns,
-                            ..
-                        }) => {
-                            let mut current_cols =
-                                if let crate::model::query::select::ResultColumn::Star =
-                                    &result_columns[0]
+            if let Interactions::Query(query) = &plan.plan[i] {
+                match query {
+                    Query::Select(Select {
+                        table,
+                        result_columns,
+                        ..
+                    }) => {
+                        let mut current_cols =
+                            if let crate::model::query::select::ResultColumn::Star =
+                                &result_columns[0]
+                            {
+                                let column_names = Self::get_table_column_names(table, env);
+                                column_names
+                                    .into_iter()
+                                    .map(|name| {
+                                        crate::model::query::select::ResultColumn::Column(name)
+                                    })
+                                    .collect::<Vec<_>>()
+                            } else {
+                                result_columns.clone()
+                            };
+
+                        // try removing columns one by one while preserving the bug
+                        while current_cols.len() > 1 {
+                            let mut found_shrink = false;
+                            for remove_idx in 0..current_cols.len() {
+                                let mut candidate = current_cols.clone();
+                                candidate.remove(remove_idx);
+
+                                let mut test_plan = plan.clone();
+                                if let Interactions::Query(Query::Select(Select {
+                                    result_columns: test_columns,
+                                    ..
+                                })) = &mut test_plan.plan[i]
                                 {
-                                    let column_names = Self::get_table_column_names(&table, env);
-                                    column_names
-                                        .into_iter()
-                                        .map(|name| {
-                                            crate::model::query::select::ResultColumn::Column(name)
-                                        })
-                                        .collect::<Vec<_>>()
-                                } else {
-                                    result_columns.clone()
-                                };
-
-                            // try removing columns one by one while preserving the bug
-                            while current_cols.len() > 1 {
-                                let mut found_shrink = false;
-                                for remove_idx in 0..current_cols.len() {
-                                    let mut candidate = current_cols.clone();
-                                    candidate.remove(remove_idx);
-
-                                    let mut test_plan = plan.clone();
-                                    if let Interactions::Query(Query::Select(Select {
-                                        result_columns: test_columns,
-                                        ..
-                                    })) = &mut test_plan.plan[i]
-                                    {
-                                        *test_columns = candidate.clone();
-                                    }
-                                    if Self::test_shrunk_plan(
-                                        &test_plan,
-                                        failing_execution,
-                                        old_result,
-                                    ) {
-                                        current_cols = candidate;
-                                        found_shrink = true;
-                                        break;
-                                    }
+                                    *test_columns = candidate.clone();
                                 }
-                                if !found_shrink {
+                                if Self::test_shrunk_plan(&test_plan, failing_execution, old_result)
+                                {
+                                    current_cols = candidate;
+                                    found_shrink = true;
                                     break;
                                 }
                             }
-
-                            // update the plan with the shrunk columns
-                            if let Interactions::Query(Query::Select(Select {
-                                result_columns,
-                                ..
-                            })) = &mut plan.plan[i]
-                            {
-                                tracing::info!("Shrunk query {} to {:?}", i, current_cols);
-                                *result_columns = current_cols;
+                            if !found_shrink {
+                                break;
                             }
                         }
-                        Query::Insert { .. } => {
-                            // todo: shrink insert queries
+
+                        // update the plan with the shrunk columns
+                        if let Interactions::Query(Query::Select(Select {
+                            result_columns, ..
+                        })) = &mut plan.plan[i]
+                        {
+                            tracing::info!("Shrunk query {} to {:?}", i, current_cols);
+                            *result_columns = current_cols;
                         }
-                        Query::Update { .. } => {
-                            // todo: shrink update queries
-                        }
-                        _ => {}
                     }
+                    Query::Insert { .. } => {
+                        // todo: shrink insert queries
+                    }
+                    Query::Update { .. } => {
+                        // todo: shrink update queries
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
 
