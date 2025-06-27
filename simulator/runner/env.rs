@@ -10,7 +10,7 @@ use crate::runner::io::SimulatorIO;
 
 use super::cli::SimulatorCLI;
 
-pub(crate) struct LimboSimulatorEnv {
+pub(crate) struct TursoSimulatorEnv {
     pub(crate) opts: SimulatorOpts,
     pub(crate) tables: Vec<Table>,
     pub(crate) connections: Vec<SimConnection>,
@@ -20,7 +20,7 @@ pub(crate) struct LimboSimulatorEnv {
     pub(crate) db_path: String,
 }
 
-impl SimulatorEnv for LimboSimulatorEnv {
+impl SimulatorEnv for TursoSimulatorEnv {
     fn tables(&self) -> &[Table] {
         &self.tables
     }
@@ -66,7 +66,7 @@ impl SimulatorEnv for LimboSimulatorEnv {
     }
 }
 
-impl LimboSimulatorEnv {
+impl TursoSimulatorEnv {
     pub(crate) fn new(seed: u64, cli_opts: &SimulatorCLI, db_path: &Path) -> Self {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
@@ -176,7 +176,7 @@ impl LimboSimulatorEnv {
             .map(|_| SimConnection::Disconnected)
             .collect::<Vec<_>>();
 
-        LimboSimulatorEnv {
+        TursoSimulatorEnv {
             opts,
             tables: Vec::new(),
             connections,
@@ -188,7 +188,7 @@ impl LimboSimulatorEnv {
     }
 
     pub(crate) fn clone_without_connections(&self) -> Self {
-        LimboSimulatorEnv {
+        TursoSimulatorEnv {
             opts: self.opts.clone(),
             tables: self.tables.clone(),
             connections: (0..self.connections.len())

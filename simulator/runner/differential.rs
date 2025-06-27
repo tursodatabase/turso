@@ -12,13 +12,13 @@ use limbo_sim::{
 use crate::runner::execution::ExecutionContinuation;
 
 use super::{
-    env::LimboSimulatorEnv,
+    env::TursoSimulatorEnv,
     execution::{execute_interaction, Execution, ExecutionHistory, ExecutionResult},
 };
 
 pub(crate) fn run_simulation(
-    env: Arc<Mutex<LimboSimulatorEnv>>,
-    rusqlite_env: Arc<Mutex<LimboSimulatorEnv>>,
+    env: Arc<Mutex<TursoSimulatorEnv>>,
+    rusqlite_env: Arc<Mutex<TursoSimulatorEnv>>,
     rusqlite_conn: &dyn Fn() -> rusqlite::Connection,
     plans: &mut [InteractionPlan],
     last_execution: Arc<Mutex<Execution>>,
@@ -115,8 +115,8 @@ fn execute_query_rusqlite(
 }
 
 pub(crate) fn execute_plans(
-    env: Arc<Mutex<LimboSimulatorEnv>>,
-    rusqlite_env: Arc<Mutex<LimboSimulatorEnv>>,
+    env: Arc<Mutex<TursoSimulatorEnv>>,
+    rusqlite_env: Arc<Mutex<TursoSimulatorEnv>>,
     rusqlite_conn: &dyn Fn() -> rusqlite::Connection,
     plans: &mut [InteractionPlan],
     states: &mut [InteractionPlanState],
@@ -173,8 +173,8 @@ pub(crate) fn execute_plans(
 }
 
 fn execute_plan(
-    env: &mut LimboSimulatorEnv,
-    rusqlite_env: &mut LimboSimulatorEnv,
+    env: &mut TursoSimulatorEnv,
+    rusqlite_env: &mut TursoSimulatorEnv,
     rusqlite_conn: &dyn Fn() -> rusqlite::Connection,
     connection_index: usize,
     plans: &mut [InteractionPlan],
@@ -311,7 +311,7 @@ fn execute_plan(
 }
 
 fn execute_interaction_rusqlite(
-    env: &mut LimboSimulatorEnv,
+    env: &mut TursoSimulatorEnv,
     connection_index: usize,
     interaction: &Interaction,
     stack: &mut Vec<ResultSet>,

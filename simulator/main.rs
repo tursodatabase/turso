@@ -22,7 +22,7 @@ use tracing_subscriber::fmt::format;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::runner::env::LimboSimulatorEnv;
+use crate::runner::env::TursoSimulatorEnv;
 use crate::shrink::plan::shrink_interaction_plan;
 
 mod runner;
@@ -215,7 +215,7 @@ fn watch_mode(
                         std::panic::catch_unwind(|| {
                             let plan: Vec<Vec<Interaction>> =
                                 InteractionPlan::compute_via_diff(&paths.plan);
-                            let mut env = LimboSimulatorEnv::new(seed, cli_opts, &paths.db);
+                            let mut env = TursoSimulatorEnv::new(seed, cli_opts, &paths.db);
                             plan.iter().for_each(|is| {
                                 is.iter().for_each(|i| {
                                     i.shadow(&mut env);
@@ -250,7 +250,7 @@ fn run_simulator(
     bugbase: Option<&mut BugBase>,
     cli_opts: &SimulatorCLI,
     paths: &Paths,
-    env: LimboSimulatorEnv,
+    env: TursoSimulatorEnv,
     plans: Vec<InteractionPlan>,
     last_execution: Arc<Mutex<Execution>>,
 ) -> anyhow::Result<()> {
@@ -338,7 +338,7 @@ fn run_simulator(
                 f.write_all(shrunk_plans[0].to_string().as_bytes()).unwrap();
 
                 let last_execution = Arc::new(Mutex::new(*last_execution));
-                let env = LimboSimulatorEnv::new(seed, cli_opts, &paths.shrunk_db);
+                let env = TursoSimulatorEnv::new(seed, cli_opts, &paths.shrunk_db);
 
                 let env = Arc::new(Mutex::new(env));
                 let shrunk = SandboxedResult::from(
@@ -424,7 +424,7 @@ fn doublecheck(
     last_execution: Arc<Mutex<Execution>>,
     result: SandboxedResult,
 ) -> anyhow::Result<()> {
-    let env = LimboSimulatorEnv::new(seed, cli_opts, &paths.doublecheck_db);
+    let env = TursoSimulatorEnv::new(seed, cli_opts, &paths.doublecheck_db);
     let env = Arc::new(Mutex::new(env));
 
     // Run the simulation again
@@ -497,10 +497,10 @@ fn differential_testing(
     plans: Vec<InteractionPlan>,
     last_execution: Arc<Mutex<Execution>>,
 ) -> anyhow::Result<()> {
-    let env = Arc::new(Mutex::new(LimboSimulatorEnv::new(
+    let env = Arc::new(Mutex::new(TursoSimulatorEnv::new(
         seed, cli_opts, &paths.db,
     )));
-    let rusqlite_env = Arc::new(Mutex::new(LimboSimulatorEnv::new(
+    let rusqlite_env = Arc::new(Mutex::new(TursoSimulatorEnv::new(
         seed,
         cli_opts,
         &paths.diff_db,
@@ -596,7 +596,7 @@ fn setup_simulation(
     cli_opts: &SimulatorCLI,
     plan_path: fn(&Paths) -> &Path,
     db_path: fn(&Paths) -> &Path,
-) -> (u64, LimboSimulatorEnv, Vec<InteractionPlan>, Paths) {
+) -> (u64, TursoSimulatorEnv, Vec<InteractionPlan>, Paths) {
     if let Some(seed) = &cli_opts.load {
         let seed = seed.parse::<u64>().expect("seed should be a number");
         let bugbase = bugbase.expect("BugBase must be enabled to load a bug");
@@ -609,7 +609,7 @@ fn setup_simulation(
         if !paths.base.exists() {
             std::fs::create_dir_all(&paths.base).unwrap();
         }
-        let env = LimboSimulatorEnv::new(bug.seed(), cli_opts, db_path(&paths));
+        let env = TursoSimulatorEnv::new(bug.seed(), cli_opts, db_path(&paths));
 
         let plan = match bug {
             Bug::Loaded(LoadedBug { plan, .. }) => plan.clone(),
@@ -653,7 +653,7 @@ fn setup_simulation(
             Paths::new(&dir)
         };
 
-        let mut env = LimboSimulatorEnv::new(seed, cli_opts, &paths.db);
+        let mut env = TursoSimulatorEnv::new(seed, cli_opts, &paths.db);
 
         tracing::info!("Generating database interaction plan...");
 
@@ -676,7 +676,7 @@ fn setup_simulation(
 }
 
 fn run_simulation(
-    env: Arc<Mutex<LimboSimulatorEnv>>,
+    env: Arc<Mutex<TursoSimulatorEnv>>,
     plans: &mut [InteractionPlan],
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {

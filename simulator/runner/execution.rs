@@ -10,7 +10,7 @@ use limbo_sim::{
 use tracing::instrument;
 use turso_core::{Connection, LimboError, Result, StepResult};
 
-use crate::runner::env::LimboSimulatorEnv;
+use crate::runner::env::TursoSimulatorEnv;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Execution {
@@ -58,7 +58,7 @@ impl ExecutionResult {
 }
 
 pub(crate) fn execute_plans(
-    env: Arc<Mutex<LimboSimulatorEnv>>,
+    env: Arc<Mutex<TursoSimulatorEnv>>,
     plans: &mut [InteractionPlan],
     states: &mut [InteractionPlanState],
     last_execution: Arc<Mutex<Execution>>,
@@ -108,7 +108,7 @@ pub(crate) fn execute_plans(
 }
 
 fn execute_plan(
-    env: &mut LimboSimulatorEnv,
+    env: &mut TursoSimulatorEnv,
     connection_index: usize,
     plans: &mut [InteractionPlan],
     states: &mut [InteractionPlanState],
@@ -178,7 +178,7 @@ pub(crate) enum ExecutionContinuation {
 
 #[instrument(skip(env, interaction, stack), fields(interaction = %interaction))]
 pub(crate) fn execute_interaction(
-    env: &mut LimboSimulatorEnv,
+    env: &mut TursoSimulatorEnv,
     connection_index: usize,
     interaction: &Interaction,
     stack: &mut Vec<ResultSet>,
