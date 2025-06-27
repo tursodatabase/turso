@@ -1,6 +1,7 @@
 name: Rust Benchmarks+Nyrkiö
 
 on:
+  workflow_dispatch:
   push:
     branches: ["main", "master", "notmain"]
   pull_request:
@@ -10,7 +11,40 @@ env:
   CARGO_TERM_COLOR: never
 
 jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.detect-changes.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get all changed rust files from current PR
+        uses: tj-actions/changed-files@v46
+        id: changed-files
+        with:
+          files: |
+            **/*.rs
+            **/Cargo.toml
+      
+      - name: Detect Changes
+        id: detect-changes
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            # manual workflow trigger, always run
+            echo "Manual event detected, skipping change detection"
+            echo "changed=1" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" == "push" ]; then
+            # always run on push to main
+              echo "changed=1" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.changed-files.outputs.any_changed }}" == "true" ]; then
+              echo "changed=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "No Rust files changed"
+            echo "changed=0" >> "$GITHUB_OUTPUT"
+          fi
+
   bench:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.changed == '1'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v3
@@ -54,6 +88,8 @@ jobs:
           nyrkio-settings-threshold: 0%
 
   clickbench:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.changed == '1'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v3
@@ -101,6 +137,8 @@ jobs:
           nyrkio-public: true
 
   tpc-h-criterion:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.changed == '1'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     env:
       DB_FILE: "perf/tpc-h/TPC-H.db"
@@ -155,6 +193,8 @@ jobs:
           nyrkio-settings-threshold: 0%
 
   tpc-h:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.changed == '1'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v3
