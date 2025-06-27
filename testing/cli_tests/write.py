@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 import os
 import tempfile
-from cli_tests.test_limbo_cli import TestLimboShell
-from pydantic import BaseModel
-from cli_tests import console
 from time import sleep
 
+from cli_tests import console
+from cli_tests.test_limbo_cli import TestLimboShell
+from pydantic import BaseModel
 
 sqlite_flags = os.getenv("SQLITE_FLAGS", "-q").split(" ")
 
@@ -46,9 +46,7 @@ class InsertTest(BaseModel):
         big_stmt = "".join(big_stmt)
         expected = "\n".join(expected)
 
-        limbo.run_test_fn(
-            big_stmt, lambda res: validate_with_expected(res, expected), self.name
-        )
+        limbo.run_test_fn(big_stmt, lambda res: validate_with_expected(res, expected), self.name)
 
     def test_compat(self):
         console.info("Testing in SQLite\n")

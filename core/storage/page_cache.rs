@@ -46,7 +46,7 @@ struct HashMapNode {
 pub enum CacheError {
     InternalError(String),
     Locked,
-    Dirty,
+    Dirty { pgno: usize },
     ActiveRefs,
     Full,
     KeyExists,
@@ -102,7 +102,8 @@ impl DumbLruPageCache {
             if let Some(existing_page_ref) = self.get(&key) {
                 assert!(
                     Arc::ptr_eq(&value, &existing_page_ref),
-                    "Attempted to insert different page with same key"
+                    "Attempted to insert different page with same key: {:?}",
+                    key
                 );
                 return Err(CacheError::KeyExists);
             }
@@ -185,7 +186,9 @@ impl DumbLruPageCache {
             return Err(CacheError::Locked);
         }
         if entry_mut.page.is_dirty() {
-            return Err(CacheError::Dirty);
+            return Err(CacheError::Dirty {
+                pgno: entry_mut.page.get().id,
+            });
         }
 
         if clean_page {
@@ -514,12 +517,12 @@ impl PageHashMap {
     }
 
     pub fn contains_key(&self, key: &PageCacheKey) -> bool {
-        let bucket = self.hash(&key);
+        let bucket = self.hash(key);
         self.buckets[bucket].iter().any(|node| node.key == *key)
     }
 
     pub fn get(&self, key: &PageCacheKey) -> Option<&NonNull<PageCacheEntry>> {
-        let bucket = self.hash(&key);
+        let bucket = self.hash(key);
         let bucket = &self.buckets[bucket];
         let mut idx = 0;
         while let Some(node) = bucket.get(idx) {
@@ -532,7 +535,7 @@ impl PageHashMap {
     }
 
     pub fn remove(&mut self, key: &PageCacheKey) -> Option<NonNull<PageCacheEntry>> {
-        let bucket = self.hash(&key);
+        let bucket = self.hash(key);
         let bucket = &mut self.buckets[bucket];
         let mut idx = 0;
         while let Some(node) = bucket.get(idx) {
@@ -877,7 +880,10 @@ mod tests {
         let (key, mut entry) = insert_and_get_entry(&mut cache, 1);
         cache.get(&key).expect("Page should exist");
         unsafe { entry.as_mut().page.set_dirty() };
-        assert_eq!(cache.detach(entry, false), Err(CacheError::Dirty));
+        assert_eq!(
+            cache.detach(entry, false),
+            Err(CacheError::Dirty { pgno: 1 })
+        );
         cache.verify_list_integrity();
     }
 
@@ -996,7 +1002,7 @@ mod tests {
                     let key = PageCacheKey::new(id_page as usize);
                     #[allow(clippy::arc_with_non_send_sync)]
                     let page = Arc::new(Page::new(id_page as usize));
-                    if let Some(_) = cache.peek(&key, false) {
+                    if cache.peek(&key, false).is_some() {
                         continue; // skip duplicate page ids
                     }
                     tracing::debug!("inserting page {:?}", key);
@@ -1017,11 +1023,11 @@ mod tests {
                     let random = rng.next_u64() % 2 == 0;
                     let key = if random || lru.is_empty() {
                         let id_page: u64 = rng.next_u64() % max_pages;
-                        let key = PageCacheKey::new(id_page as usize);
-                        key
+
+                        PageCacheKey::new(id_page as usize)
                     } else {
                         let i = rng.next_u64() as usize % lru.len();
-                        let key: PageCacheKey = lru.iter().skip(i).next().unwrap().0.clone();
+                        let key: PageCacheKey = lru.iter().nth(i).unwrap().0.clone();
                         key
                     };
                     tracing::debug!("removing page {:?}", key);
@@ -1038,7 +1044,7 @@ mod tests {
             cache.verify_list_integrity();
             for (key, page) in &lru {
                 println!("getting page {:?}", key);
-                cache.peek(&key, false).unwrap();
+                cache.peek(key, false).unwrap();
                 assert_eq!(page.get().id, key.pgno);
             }
         }

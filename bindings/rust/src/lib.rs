@@ -1,3 +1,37 @@
+//! # Limbo bindings for Rust
+//!
+//! Limbo is an in-process SQL database engine, compatible with SQLite.
+//!
+//! ## Getting Started
+//!
+//! To get started, you first need to create a [`Database`] object and then open a [`Connection`] to it, which you use to query:
+//!
+//! ```rust,no_run
+//! # async fn run() {
+//! use limbo::Builder;
+//!
+//! let db = Builder::new_local(":memory:").build().await.unwrap();
+//! let conn = db.connect().unwrap();
+//! conn.execute("CREATE TABLE IF NOT EXISTS users (email TEXT)", ()).await.unwrap();
+//! conn.execute("INSERT INTO users (email) VALUES ('alice@example.org')", ()).await.unwrap();
+//! # }
+//! ```
+//!
+//! You can also prepare statements with the [`Connection`] object and then execute the [`Statement`] objects:
+//!
+//! ```rust,no_run
+//! # async fn run() {
+//! # use limbo::Builder;
+//! # let db = Builder::new_local(":memory:").build().await.unwrap();
+//! # let conn = db.connect().unwrap();
+//! let mut stmt = conn.prepare("SELECT * FROM users WHERE email = ?1").await.unwrap();
+//! let mut rows = stmt.query(["foo@example.com"]).await.unwrap();
+//! let row = rows.next().await.unwrap().unwrap();
+//! let value = row.get_value(0).unwrap();
+//! println!("Row: {:?}", value);
+//! # }
+//! ```
+
 pub mod params;
 pub mod value;
 
@@ -29,34 +63,41 @@ impl From<limbo_core::LimboError> for Error {
 pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// A builder for `Database`.
 pub struct Builder {
     path: String,
 }
 
 impl Builder {
+    /// Create a new local database.
     pub fn new_local(path: &str) -> Self {
         Self {
             path: path.to_string(),
         }
     }
 
+    /// Build the database.
     #[allow(unused_variables, clippy::arc_with_non_send_sync)]
     pub async fn build(self) -> Result<Database> {
         match self.path.as_str() {
             ":memory:" => {
                 let io: Arc<dyn limbo_core::IO> = Arc::new(limbo_core::MemoryIO::new());
-                let db = limbo_core::Database::open_file(io, self.path.as_str(), false)?;
+                let db = limbo_core::Database::open_file(io, self.path.as_str(), false, false)?;
                 Ok(Database { inner: db })
             }
             path => {
                 let io: Arc<dyn limbo_core::IO> = Arc::new(limbo_core::PlatformIO::new()?);
-                let db = limbo_core::Database::open_file(io, path, false)?;
+                let db = limbo_core::Database::open_file(io, path, false, false)?;
                 Ok(Database { inner: db })
             }
         }
     }
 }
 
+/// A database.
+///
+/// The `Database` object points to a database and allows you to connect to it
 #[derive(Clone)]
 pub struct Database {
     inner: Arc<limbo_core::Database>,
@@ -72,6 +113,7 @@ impl Debug for Database {
 }
 
 impl Database {
+    /// Connect to the database.
     pub fn connect(&self) -> Result<Connection> {
         let conn = self.inner.connect()?;
         #[allow(clippy::arc_with_non_send_sync)]
@@ -82,6 +124,7 @@ impl Database {
     }
 }
 
+/// A database connection.
 pub struct Connection {
     inner: Arc<Mutex<Arc<limbo_core::Connection>>>,
 }
@@ -98,16 +141,19 @@ unsafe impl Send for Connection {}
 unsafe impl Sync for Connection {}
 
 impl Connection {
+    /// Query the database with SQL.
     pub async fn query(&self, sql: &str, params: impl IntoParams) -> Result<Rows> {
         let mut stmt = self.prepare(sql).await?;
         stmt.query(params).await
     }
 
+    /// Execute SQL statement on the database.
     pub async fn execute(&self, sql: &str, params: impl IntoParams) -> Result<u64> {
         let mut stmt = self.prepare(sql).await?;
         stmt.execute(params).await
     }
 
+    /// Prepare a SQL statement for later execution.
     pub async fn prepare(&self, sql: &str) -> Result<Statement> {
         let conn = self
             .inner
@@ -123,6 +169,7 @@ impl Connection {
         Ok(statement)
     }
 
+    /// Query a pragma.
     pub fn pragma_query<F>(&self, pragma_name: &str, mut f: F) -> Result<()>
     where
         F: FnMut(&Row) -> limbo_core::Result<()>,
@@ -148,6 +195,13 @@ impl Connection {
     }
 }
 
+impl Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Connection").finish()
+    }
+}
+
+/// A prepared statement.
 pub struct Statement {
     inner: Arc<Mutex<limbo_core::Statement>>,
 }
@@ -164,6 +218,7 @@ unsafe impl Send for Statement {}
 unsafe impl Sync for Statement {}
 
 impl Statement {
+    /// Query the database with this prepared statement.
     pub async fn query(&mut self, params: impl IntoParams) -> Result<Rows> {
         let params = params.into_params()?;
         match params {
@@ -183,6 +238,7 @@ impl Statement {
         Ok(rows)
     }
 
+    /// Execute this prepared statement.
     pub async fn execute(&mut self, params: impl IntoParams) -> Result<u64> {
         {
             // Reset the statement before executing
@@ -226,6 +282,7 @@ impl Statement {
         }
     }
 
+    /// Returns columns of the result of this prepared statement.
     pub fn columns(&self) -> Vec<Column> {
         let stmt = self.inner.lock().unwrap();
 
@@ -245,16 +302,19 @@ impl Statement {
     }
 }
 
+/// Column information.
 pub struct Column {
     name: String,
     decl_type: Option<String>,
 }
 
 impl Column {
+    /// Return the name of the column.
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// Returns the type of the column.
     pub fn decl_type(&self) -> Option<&str> {
         self.decl_type.as_deref()
     }
@@ -270,8 +330,10 @@ pub enum Params {
     Positional(Vec<Value>),
     Named(Vec<(String, Value)>),
 }
+
 pub struct Transaction {}
 
+/// Results of a prepared statement query.
 pub struct Rows {
     inner: Arc<Mutex<limbo_core::Statement>>,
 }
@@ -288,6 +350,7 @@ unsafe impl Send for Rows {}
 unsafe impl Sync for Rows {}
 
 impl Rows {
+    /// Fetch the next row of this result set.
     pub async fn next(&mut self) -> Result<Option<Row>> {
         loop {
             let mut stmt = self
@@ -316,6 +379,7 @@ impl Rows {
     }
 }
 
+/// Query result row.
 #[derive(Debug)]
 pub struct Row {
     values: Vec<limbo_core::Value>,
@@ -445,14 +509,14 @@ mod tests {
             .query("SELECT data FROM test_large_persistence ORDER BY id;", ())
             .await?;
 
-        for i in 0..NUM_INSERTS {
+        for (i, value) in original_data.iter().enumerate().take(NUM_INSERTS) {
             let row = rows
                 .next()
                 .await?
                 .unwrap_or_else(|| panic!("Expected row {} but found None", i));
             assert_eq!(
                 row.get_value(0)?,
-                Value::Text(original_data[i].clone()),
+                Value::Text(value.clone()),
                 "Mismatch in retrieved data for row {}",
                 i
             );

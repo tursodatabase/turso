@@ -110,9 +110,9 @@ impl Value {
     }
 }
 
-impl Into<limbo_core::Value> for Value {
-    fn into(self) -> limbo_core::Value {
-        match self {
+impl From<Value> for limbo_core::Value {
+    fn from(val: Value) -> Self {
+        match val {
             Value::Null => limbo_core::Value::Null,
             Value::Integer(n) => limbo_core::Value::Integer(n),
             Value::Real(n) => limbo_core::Value::Float(n),

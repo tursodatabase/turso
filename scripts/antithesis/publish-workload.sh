@@ -14,6 +14,6 @@ export DOCKERFILE=Dockerfile.antithesis
 
 export DOCKER_DIR=.
 
-cat turso.key.json | docker login -u _json_key https://$ANTITHESIS_DOCKER_HOST --password-stdin
+docker login -u _json_key https://$ANTITHESIS_DOCKER_HOST --password "$ANTITHESIS_REGISTRY_KEY"
 
 ${BASH_SOURCE%/*}/publish-docker.sh

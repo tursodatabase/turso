@@ -10,6 +10,9 @@ pub mod property;
 pub mod query;
 pub mod table;
 
+type ArbitraryFromFunc<'a, R, T> = Box<dyn Fn(&mut R) -> T + 'a>;
+type Choice<'a, R, T> = (usize, Box<dyn Fn(&mut R) -> Option<T> + 'a>);
+
 /// Arbitrary trait for generating random values
 /// An implementation of arbitrary is assumed to be a uniform sampling of
 /// the possible values of the type, with a bias towards smaller values for
@@ -42,12 +45,11 @@ pub trait ArbitraryFromMaybe<T> {
 // todo: switch to a simpler type signature that can accommodate all integer and float types, which
 //       should be enough for our purposes.
 pub(crate) fn frequency<
-    'a,
     T,
     R: Rng,
     N: Sum + PartialOrd + Copy + Default + SampleUniform + SubAssign,
 >(
-    choices: Vec<(N, Box<dyn Fn(&mut R) -> T + 'a>)>,
+    choices: Vec<(N, ArbitraryFromFunc<R, T>)>,
     rng: &mut R,
 ) -> T {
     let total = choices.iter().map(|(weight, _)| *weight).sum::<N>();
@@ -64,7 +66,7 @@ pub(crate) fn frequency<
 }
 
 /// one_of is a helper function for composing different generators with equal probability of occurrence.
-pub(crate) fn one_of<'a, T, R: Rng>(choices: Vec<Box<dyn Fn(&mut R) -> T + 'a>>, rng: &mut R) -> T {
+pub(crate) fn one_of<T, R: Rng>(choices: Vec<ArbitraryFromFunc<R, T>>, rng: &mut R) -> T {
     let index = rng.gen_range(0..choices.len());
     choices[index](rng)
 }
@@ -72,10 +74,7 @@ pub(crate) fn one_of<'a, T, R: Rng>(choices: Vec<Box<dyn Fn(&mut R) -> T + 'a>>,
 /// backtrack is a helper function for composing different "failable" generators.
 /// The function takes a list of functions that return an Option<T>, along with number of retries
 /// to make before giving up.
-pub(crate) fn backtrack<'a, T, R: Rng>(
-    mut choices: Vec<(usize, Box<dyn Fn(&mut R) -> Option<T> + 'a>)>,
-    rng: &mut R,
-) -> Option<T> {
+pub(crate) fn backtrack<T, R: Rng>(mut choices: Vec<Choice<R, T>>, rng: &mut R) -> Option<T> {
     loop {
         // If there are no more choices left, we give up
         let choices_ = choices

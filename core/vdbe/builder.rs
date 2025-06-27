@@ -4,19 +4,18 @@ use limbo_sqlite3_parser::ast::{self, TableInternalId};
 use tracing::{instrument, Level};
 
 use crate::{
-    fast_lock::SpinLock,
     numeric::Numeric,
     parameters::Parameters,
     schema::{BTreeTable, Index, PseudoTable, Table},
-    storage::sqlite3_ondisk::DatabaseHeader,
     translate::{
         collate::CollationSeq,
         emitter::TransactionMode,
         plan::{ResultSetColumn, TableReferences},
     },
-    types::Text,
     Connection, Value, VirtualTable,
 };
+
+#[derive(Default)]
 pub struct TableRefIdCounter {
     next_free: TableInternalId,
 }
@@ -336,10 +335,14 @@ impl ProgramBuilder {
         self.emit_insn(Insn::ResultRow { start_reg, count });
     }
 
-    fn emit_halt(&mut self) {
+    fn emit_halt(&mut self, rollback: bool) {
         self.emit_insn(Insn::Halt {
             err_code: 0,
-            description: String::new(),
+            description: if rollback {
+                "rollback".to_string()
+            } else {
+                String::new()
+            },
         });
     }
 
@@ -356,7 +359,7 @@ impl ProgramBuilder {
 
     pub fn add_comment(&mut self, insn_index: BranchOffset, comment: &'static str) {
         if let Some(comments) = &mut self.comments {
-            comments.push((insn_index.to_offset_int(), comment));
+            comments.push((insn_index.as_offset_int(), comment));
         }
     }
 
@@ -387,8 +390,8 @@ impl ProgramBuilder {
                 .constant_spans
                 .iter()
                 .find(|span| span.0 <= *index_b && span.1 >= *index_b);
-            if a_span.is_some() && b_span.is_some() {
-                a_span.unwrap().0.cmp(&b_span.unwrap().0)
+            if let (Some(a_span), Some(b_span)) = (a_span, b_span) {
+                a_span.0.cmp(&b_span.0)
             } else if a_span.is_some() {
                 Ordering::Greater
             } else if b_span.is_some() {
@@ -466,7 +469,7 @@ impl ProgramBuilder {
             unreachable!("Label is not a label");
         };
         self.label_to_resolved_offset[label_number as usize] =
-            Some((to_offset.to_offset_int(), target));
+            Some((to_offset.as_offset_int(), target));
     }
 
     /// Resolve unresolved labels to a specific offset in the instruction list.
@@ -730,7 +733,7 @@ impl ProgramBuilder {
     }
 
     /// Initialize the program with basic setup and return initial metadata and labels
-    pub fn prologue<'a>(&mut self) {
+    pub fn prologue(&mut self) {
         if self.nested_level == 0 {
             self.init_label = self.allocate_label();
 
@@ -746,8 +749,16 @@ impl ProgramBuilder {
     /// Note that although these are the final instructions, typically an SQLite
     /// query will jump to the Transaction instruction via init_label.
     pub fn epilogue(&mut self, txn_mode: TransactionMode) {
+        self.epilogue_maybe_rollback(txn_mode, false);
+    }
+
+    /// Clean up and finalize the program, resolving any remaining labels
+    /// Note that although these are the final instructions, typically an SQLite
+    /// query will jump to the Transaction instruction via init_label.
+    /// "rollback" flag is used to determine if halt should rollback the transaction.
+    pub fn epilogue_maybe_rollback(&mut self, txn_mode: TransactionMode, rollback: bool) {
         if self.nested_level == 0 {
-            self.emit_halt();
+            self.emit_halt(rollback);
             self.preassign_label_to_next_insn(self.init_label);
 
             match txn_mode {
@@ -823,7 +834,7 @@ impl ProgramBuilder {
                     Numeric::Float(v) => Value::Float(v.into()),
                 },
                 ast::Literal::Null => Value::Null,
-                ast::Literal::String(s) => Value::Text(Text::from_str(sanitize_string(s))),
+                ast::Literal::String(s) => Value::Text(sanitize_string(s).into()),
                 ast::Literal::Blob(s) => Value::Blob(
                     // Taken from `translate_expr`
                     s.as_bytes()
@@ -848,12 +859,7 @@ impl ProgramBuilder {
         });
     }
 
-    pub fn build(
-        mut self,
-        database_header: Arc<SpinLock<DatabaseHeader>>,
-        connection: Arc<Connection>,
-        change_cnt_on: bool,
-    ) -> Program {
+    pub fn build(mut self, connection: Arc<Connection>, change_cnt_on: bool) -> Program {
         self.resolve_labels();
 
         self.parameters.list.dedup();
@@ -865,7 +871,6 @@ impl ProgramBuilder {
                 .map(|(insn, function, _)| (insn, function))
                 .collect(),
             cursor_ref: self.cursor_ref,
-            database_header,
             comments: self.comments,
             connection,
             parameters: self.parameters,

@@ -34,8 +34,9 @@ mod numeric;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use crate::storage::{header_accessor, wal::DummyWAL};
+use crate::translate::optimizer::optimize_plan;
 use crate::vtab::VirtualTable;
-use crate::{fast_lock::SpinLock, translate::optimizer::optimize_plan};
 use core::str;
 pub use error::LimboError;
 use fallible_iterator::FallibleIterator;
@@ -50,6 +51,8 @@ pub use io::{
 use limbo_sqlite3_parser::{ast, ast::Cmd, lexer::sql::Parser};
 use parking_lot::RwLock;
 use schema::Schema;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell, UnsafeCell},
@@ -59,23 +62,19 @@ use std::{
     num::NonZero,
     ops::Deref,
     rc::Rc,
-    sync::{Arc, OnceLock},
+    sync::Arc,
 };
-use storage::btree::{btree_init_page, BTreePageInner};
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
+use storage::page_cache::DumbLruPageCache;
 pub use storage::pager::PagerCacheflushStatus;
+use storage::pager::{DB_STATE_INITIALIZED, DB_STATE_UNITIALIZED};
 pub use storage::{
     buffer_pool::BufferPool,
     database::DatabaseStorage,
     pager::PageRef,
     pager::{Page, Pager},
     wal::{CheckpointMode, CheckpointResult, CheckpointStatus, Wal, WalFile, WalFileShared},
-};
-use storage::{
-    page_cache::DumbLruPageCache,
-    pager::allocate_page,
-    sqlite3_ondisk::{DatabaseHeader, DATABASE_HEADER_SIZE},
 };
 use tracing::{instrument, Level};
 use translate::select::prepare_select_plan;
@@ -86,9 +85,8 @@ use vdbe::builder::QueryMode;
 use vdbe::builder::TableRefIdCounter;
 
 pub type Result<T, E = LimboError> = std::result::Result<T, E>;
-pub static DATABASE_VERSION: OnceLock<String> = OnceLock::new();
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TransactionState {
     Write,
     Read,
@@ -102,15 +100,16 @@ pub(crate) type MvCursor = mvcc::cursor::ScanCursor<mvcc::LocalClock>;
 pub struct Database {
     mv_store: Option<Rc<MvStore>>,
     schema: Arc<RwLock<Schema>>,
-    // TODO: make header work without lock
-    header: Arc<SpinLock<DatabaseHeader>>,
     db_file: Arc<dyn DatabaseStorage>,
+    path: String,
     io: Arc<dyn IO>,
-    page_size: u32,
     // Shared structures of a Database are the parts that are common to multiple threads that might
     // create DB connections.
     _shared_page_cache: Arc<RwLock<DumbLruPageCache>>,
-    shared_wal: Arc<UnsafeCell<WalFileShared>>,
+    maybe_shared_wal: RwLock<Option<Arc<UnsafeCell<WalFileShared>>>>,
+    is_empty: Arc<AtomicUsize>,
+    init_lock: Arc<Mutex<()>>,
+
     open_flags: OpenFlags,
 }
 
@@ -119,8 +118,13 @@ unsafe impl Sync for Database {}
 
 impl Database {
     #[cfg(feature = "fs")]
-    pub fn open_file(io: Arc<dyn IO>, path: &str, enable_mvcc: bool) -> Result<Arc<Database>> {
-        Self::open_file_with_flags(io, path, OpenFlags::default(), enable_mvcc)
+    pub fn open_file(
+        io: Arc<dyn IO>,
+        path: &str,
+        enable_mvcc: bool,
+        enable_indexes: bool,
+    ) -> Result<Arc<Database>> {
+        Self::open_file_with_flags(io, path, OpenFlags::default(), enable_mvcc, enable_indexes)
     }
 
     #[cfg(feature = "fs")]
@@ -129,11 +133,11 @@ impl Database {
         path: &str,
         flags: OpenFlags,
         enable_mvcc: bool,
+        enable_indexes: bool,
     ) -> Result<Arc<Database>> {
         let file = io.open_file(path, flags, true)?;
-        maybe_init_database_file(&file, &io)?;
         let db_file = Arc::new(DatabaseFile::new(file));
-        Self::open_with_flags(io, path, db_file, flags, enable_mvcc)
+        Self::open_with_flags(io, path, db_file, flags, enable_mvcc, enable_indexes)
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -142,8 +146,16 @@ impl Database {
         path: &str,
         db_file: Arc<dyn DatabaseStorage>,
         enable_mvcc: bool,
+        enable_indexes: bool,
     ) -> Result<Arc<Database>> {
-        Self::open_with_flags(io, path, db_file, OpenFlags::default(), enable_mvcc)
+        Self::open_with_flags(
+            io,
+            path,
+            db_file,
+            OpenFlags::default(),
+            enable_mvcc,
+            enable_indexes,
+        )
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -153,19 +165,11 @@ impl Database {
         db_file: Arc<dyn DatabaseStorage>,
         flags: OpenFlags,
         enable_mvcc: bool,
+        enable_indexes: bool,
     ) -> Result<Arc<Database>> {
-        let db_header = Pager::begin_open(db_file.clone())?;
-        // ensure db header is there
-        io.run_once()?;
-
-        let page_size = db_header.lock().get_page_size();
         let wal_path = format!("{}-wal", path);
-        let shared_wal = WalFileShared::open_shared(&io, wal_path.as_str(), page_size)?;
-
-        DATABASE_VERSION.get_or_init(|| {
-            let version = db_header.lock().version_number;
-            version.to_string()
-        });
+        let maybe_shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path.as_str())?;
+        let db_size = db_file.size()?;
 
         let mv_store = if enable_mvcc {
             Some(Rc::new(MvStore::new(
@@ -175,22 +179,34 @@ impl Database {
         } else {
             None
         };
+        let wal_has_frames = maybe_shared_wal.as_ref().map_or(false, |wal| {
+            unsafe { &*wal.get() }.max_frame.load(Ordering::SeqCst) > 0
+        });
+
+        let is_empty = if db_size == 0 && !wal_has_frames {
+            DB_STATE_UNITIALIZED
+        } else {
+            DB_STATE_INITIALIZED
+        };
 
         let shared_page_cache = Arc::new(RwLock::new(DumbLruPageCache::default()));
-        let schema = Arc::new(RwLock::new(Schema::new()));
+        let schema = Arc::new(RwLock::new(Schema::new(enable_indexes)));
         let db = Database {
             mv_store,
+            path: path.to_string(),
             schema: schema.clone(),
-            header: db_header.clone(),
             _shared_page_cache: shared_page_cache.clone(),
-            shared_wal: shared_wal.clone(),
+            maybe_shared_wal: RwLock::new(maybe_shared_wal),
             db_file,
             io: io.clone(),
-            page_size,
             open_flags: flags,
+            is_empty: Arc::new(AtomicUsize::new(is_empty)),
+            init_lock: Arc::new(Mutex::new(())),
         };
         let db = Arc::new(db);
-        {
+
+        // Check: https://github.com/tursodatabase/limbo/pull/1761#discussion_r2154013123
+        if is_empty == 2 {
             // parse schema
             let conn = db.connect()?;
             let rows = conn.query("SELECT * FROM sqlite_schema")?;
@@ -210,38 +226,98 @@ impl Database {
     }
 
     pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
-        let buffer_pool = Rc::new(BufferPool::new(self.page_size as usize));
+        let buffer_pool = Rc::new(BufferPool::new(None));
 
-        let wal = Rc::new(RefCell::new(WalFile::new(
-            self.io.clone(),
-            self.page_size,
-            self.shared_wal.clone(),
-            buffer_pool.clone(),
-        )));
-        // For now let's open database without shared cache by default.
-        let pager = Rc::new(Pager::finish_open(
-            self.header.clone(),
+        // Open existing WAL file if present
+        if let Some(shared_wal) = self.maybe_shared_wal.read().clone() {
+            // No pages in DB file or WAL -> empty database
+            let is_empty = self.is_empty.clone();
+            let wal = Rc::new(RefCell::new(WalFile::new(
+                self.io.clone(),
+                shared_wal,
+                buffer_pool.clone(),
+            )));
+            let pager = Rc::new(Pager::new(
+                self.db_file.clone(),
+                wal,
+                self.io.clone(),
+                Arc::new(RwLock::new(DumbLruPageCache::default())),
+                buffer_pool,
+                is_empty,
+                self.init_lock.clone(),
+            )?);
+
+            let page_size = header_accessor::get_page_size(&pager)
+                .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE)
+                as u32;
+            let default_cache_size = header_accessor::get_default_page_cache_size(&pager)
+                .unwrap_or(storage::sqlite3_ondisk::DEFAULT_CACHE_SIZE);
+            pager.buffer_pool.set_page_size(page_size as usize);
+            let conn = Arc::new(Connection {
+                _db: self.clone(),
+                pager: pager.clone(),
+                schema: self.schema.clone(),
+                last_insert_rowid: Cell::new(0),
+                auto_commit: Cell::new(true),
+                mv_transactions: RefCell::new(Vec::new()),
+                transaction_state: Cell::new(TransactionState::None),
+                last_change: Cell::new(0),
+                syms: RefCell::new(SymbolTable::new()),
+                total_changes: Cell::new(0),
+                _shared_cache: false,
+                cache_size: Cell::new(default_cache_size),
+            });
+            if let Err(e) = conn.register_builtins() {
+                return Err(LimboError::ExtensionError(e));
+            }
+            return Ok(conn);
+        };
+
+        // No existing WAL; create one.
+        // TODO: currently Pager needs to be instantiated with some implementation of trait Wal, so here's a workaround.
+        let dummy_wal = Rc::new(RefCell::new(DummyWAL {}));
+        let is_empty = self.is_empty.clone();
+        let mut pager = Pager::new(
             self.db_file.clone(),
-            wal,
+            dummy_wal,
             self.io.clone(),
             Arc::new(RwLock::new(DumbLruPageCache::default())),
+            buffer_pool.clone(),
+            is_empty,
+            Arc::new(Mutex::new(())),
+        )?;
+        let page_size = header_accessor::get_page_size(&pager)
+            .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as u32;
+        let default_cache_size = header_accessor::get_default_page_cache_size(&pager)
+            .unwrap_or(storage::sqlite3_ondisk::DEFAULT_CACHE_SIZE);
+
+        let wal_path = format!("{}-wal", self.path);
+        let file = self.io.open_file(&wal_path, OpenFlags::Create, false)?;
+        let real_shared_wal = WalFileShared::new_shared(page_size, &self.io, file)?;
+        // Modify Database::maybe_shared_wal to point to the new WAL file so that other connections
+        // can open the existing WAL.
+        *self.maybe_shared_wal.write() = Some(real_shared_wal.clone());
+        let wal = Rc::new(RefCell::new(WalFile::new(
+            self.io.clone(),
+            real_shared_wal,
             buffer_pool,
-        )?);
+        )));
+        pager.set_wal(wal);
         let conn = Arc::new(Connection {
             _db: self.clone(),
-            pager: pager.clone(),
+            pager: Rc::new(pager),
             schema: self.schema.clone(),
-            header: self.header.clone(),
-            last_insert_rowid: Cell::new(0),
             auto_commit: Cell::new(true),
             mv_transactions: RefCell::new(Vec::new()),
             transaction_state: Cell::new(TransactionState::None),
+            last_insert_rowid: Cell::new(0),
             last_change: Cell::new(0),
-            syms: RefCell::new(SymbolTable::new()),
             total_changes: Cell::new(0),
+            syms: RefCell::new(SymbolTable::new()),
             _shared_cache: false,
-            cache_size: Cell::new(self.header.lock().default_page_cache_size),
+            cache_size: Cell::new(default_cache_size),
         });
+
         if let Err(e) = conn.register_builtins() {
             return Err(LimboError::ExtensionError(e));
         }
@@ -269,69 +345,16 @@ impl Database {
                 }
             },
         };
-        let db = Self::open_file(io.clone(), path, false)?;
+        let db = Self::open_file(io.clone(), path, false, false)?;
         Ok((io, db))
     }
-}
-
-pub fn maybe_init_database_file(file: &Arc<dyn File>, io: &Arc<dyn IO>) -> Result<()> {
-    if file.size()? == 0 {
-        // init db
-        let db_header = DatabaseHeader::default();
-        let page1 = allocate_page(
-            1,
-            &Rc::new(BufferPool::new(db_header.get_page_size() as usize)),
-            DATABASE_HEADER_SIZE,
-        );
-        let page1 = Arc::new(BTreePageInner {
-            page: RefCell::new(page1),
-        });
-        {
-            // Create the sqlite_schema table, for this we just need to create the btree page
-            // for the first page of the database which is basically like any other btree page
-            // but with a 100 byte offset, so we just init the page so that sqlite understands
-            // this is a correct page.
-            btree_init_page(
-                &page1,
-                storage::sqlite3_ondisk::PageType::TableLeaf,
-                DATABASE_HEADER_SIZE,
-                (db_header.get_page_size() - db_header.reserved_space as u32) as u16,
-            );
-
-            let page1 = page1.get();
-            let contents = page1.get().contents.as_mut().unwrap();
-            contents.write_database_header(&db_header);
-            // write the first page to disk synchronously
-            let flag_complete = Rc::new(RefCell::new(false));
-            {
-                let flag_complete = flag_complete.clone();
-                let completion = Completion::Write(WriteCompletion::new(Box::new(move |_| {
-                    *flag_complete.borrow_mut() = true;
-                })));
-                #[allow(clippy::arc_with_non_send_sync)]
-                file.pwrite(0, contents.buffer.clone(), Arc::new(completion))?;
-            }
-            let mut limit = 100;
-            loop {
-                io.run_once()?;
-                if *flag_complete.borrow() {
-                    break;
-                }
-                limit -= 1;
-                if limit == 0 {
-                    panic!("Database file couldn't be initialized, io loop run for {} iterations and write didn't finish", limit);
-                }
-            }
-        }
-    };
-    Ok(())
 }
 
 pub struct Connection {
     _db: Arc<Database>,
     pager: Rc<Pager>,
     schema: Arc<RwLock<Schema>>,
-    header: Arc<SpinLock<DatabaseHeader>>,
+    /// Whether to automatically commit transaction
     auto_commit: Cell<bool>,
     mv_transactions: RefCell<Vec<crate::mvcc::database::TxID>>,
     transaction_state: Cell<TransactionState>,
@@ -370,12 +393,11 @@ impl Connection {
                         .ok_or(LimboError::SchemaLocked)?
                         .deref(),
                     stmt,
-                    self.header.clone(),
                     self.pager.clone(),
                     self.clone(),
                     &syms,
                     QueryMode::Normal,
-                    &input,
+                    input,
                 )?);
                 Ok(Statement::new(
                     program,
@@ -419,7 +441,6 @@ impl Connection {
                         .ok_or(LimboError::SchemaLocked)?
                         .deref(),
                     stmt.clone(),
-                    self.header.clone(),
                     self.pager.clone(),
                     self.clone(),
                     &syms,
@@ -489,12 +510,11 @@ impl Connection {
                             .ok_or(LimboError::SchemaLocked)?
                             .deref(),
                         stmt,
-                        self.header.clone(),
                         self.pager.clone(),
                         self.clone(),
                         &syms,
                         QueryMode::Explain,
-                        &input,
+                        input,
                     )?;
                     let _ = std::io::stdout().write_all(program.explain().as_bytes());
                 }
@@ -506,12 +526,11 @@ impl Connection {
                             .ok_or(LimboError::SchemaLocked)?
                             .deref(),
                         stmt,
-                        self.header.clone(),
                         self.pager.clone(),
                         self.clone(),
                         &syms,
                         QueryMode::Normal,
-                        &input,
+                        input,
                     )?;
 
                     let mut state =
@@ -560,8 +579,7 @@ impl Connection {
     }
 
     pub fn checkpoint(&self) -> Result<CheckpointResult> {
-        let checkpoint_result = self.pager.wal_checkpoint();
-        Ok(checkpoint_result)
+        self.pager.wal_checkpoint()
     }
 
     /// Close a connection and checkpoint.
@@ -648,12 +666,7 @@ impl Connection {
         loop {
             match stmt.step()? {
                 vdbe::StepResult::Row => {
-                    let row: Vec<Value> = stmt
-                        .row()
-                        .unwrap()
-                        .get_values()
-                        .map(|v| v.clone())
-                        .collect();
+                    let row: Vec<Value> = stmt.row().unwrap().get_values().cloned().collect();
                     results.push(row);
                 }
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
@@ -681,12 +694,7 @@ impl Connection {
         loop {
             match stmt.step()? {
                 vdbe::StepResult::Row => {
-                    let row: Vec<Value> = stmt
-                        .row()
-                        .unwrap()
-                        .get_values()
-                        .map(|v| v.clone())
-                        .collect();
+                    let row: Vec<Value> = stmt.row().unwrap().get_values().cloned().collect();
                     results.push(row);
                 }
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
@@ -716,12 +724,7 @@ impl Connection {
         loop {
             match stmt.step()? {
                 vdbe::StepResult::Row => {
-                    let row: Vec<Value> = stmt
-                        .row()
-                        .unwrap()
-                        .get_values()
-                        .map(|v| v.clone())
-                        .collect();
+                    let row: Vec<Value> = stmt.row().unwrap().get_values().cloned().collect();
                     results.push(row);
                 }
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
@@ -815,6 +818,7 @@ pub type Row = vdbe::Row;
 
 pub type StepResult = vdbe::StepResult;
 
+#[derive(Default)]
 pub struct SymbolTable {
     pub functions: HashMap<String, Rc<function::ExternalFunc>>,
     pub vtabs: HashMap<String, Rc<VirtualTable>>,
@@ -864,7 +868,6 @@ impl SymbolTable {
             vtab_modules: HashMap::new(),
         }
     }
-
     pub fn resolve_function(
         &self,
         name: &str,
@@ -903,7 +906,7 @@ impl Iterator for QueryRunner<'_> {
                     .unwrap()
                     .trim();
                 self.last_offset = byte_offset_end;
-                Some(self.conn.run_cmd(cmd, &input))
+                Some(self.conn.run_cmd(cmd, input))
             }
             Ok(None) => None,
             Err(err) => {

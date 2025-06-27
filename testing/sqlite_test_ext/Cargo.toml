@@ -1,0 +1,15 @@
+[package]
+name = "limbo_sqlite_test_ext"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQLite test extensions"
+build = "build.rs"
+
+[build-dependencies]
+cc = "1.0"
+
+[lib]
+crate-type = ["cdylib"]

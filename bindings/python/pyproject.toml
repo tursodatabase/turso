@@ -53,19 +53,6 @@ strip-extras = true
 header = false
 upgrade = false
 
-[tool.ruff]
-line-length = 120
-
-[tool.ruff.lint]
-extend-select = [
-    "E",   # pycodestyle errors
-    "W",   # pycodestyle warings
-    "F",   # pyflakes
-    'Q',   # flake8-quotes
-    'C90', # mccabe
-    'I',   # isort
-]
-
 [tool.pytest.ini_options]
 testpaths = 'tests'
 log_format = '%(name)s %(levelname)s: %(message)s'
@@ -81,4 +68,18 @@ exclude_lines = [
     'raise NotImplementedError',
     'if TYPE_CHECKING:',
     '@overload',
+]
+
+[dependency-groups]
+dev = [
+    "coverage>=7.6.1",
+    "iniconfig>=2.1.0",
+    "maturin>=1.7.8",
+    "mypy>=1.11.0",
+    "mypy-extensions>=1.1.0",
+    "pluggy>=1.6.0",
+    "pytest>=8.3.1",
+    "pytest-cov>=5.0.0",
+    "ruff>=0.5.4",
+    "typing-extensions>=4.13.0",
 ]

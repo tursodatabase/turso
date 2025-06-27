@@ -4,7 +4,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use limbo_core::{Database, PlatformIO, IO as _};
 use pprof::criterion::{Output, PProfProfiler};
 
-const TPC_H_PATH: &'static str = "../perf/tpc-h/TPC-H.db";
+const TPC_H_PATH: &str = "../perf/tpc-h/TPC-H.db";
 
 macro_rules! tpc_query {
     ($num:literal) => {
@@ -30,7 +30,7 @@ fn bench_tpc_h_queries(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), TPC_H_PATH, false).unwrap();
+    let db = Database::open_file(io.clone(), TPC_H_PATH, false, true).unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let queries = [

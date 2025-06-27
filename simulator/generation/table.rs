@@ -122,8 +122,8 @@ impl ArbitraryFrom<&SimValue> for LTValue {
                     let index = rng.gen_range(0..t.len());
                     t[index] -= 1;
                     // Mutate the rest of the string
-                    for i in (index + 1)..t.len() {
-                        t[i] = rng.gen_range('a' as u32..='z' as u32);
+                    for val in t.iter_mut().skip(index + 1) {
+                        *val = rng.gen_range('a' as u32..='z' as u32);
                     }
                     let t = t
                         .into_iter()
@@ -142,8 +142,8 @@ impl ArbitraryFrom<&SimValue> for LTValue {
                     let index = rng.gen_range(0..b.len());
                     b[index] -= 1;
                     // Mutate the rest of the blob
-                    for i in (index + 1)..b.len() {
-                        b[i] = rng.gen_range(0..=255);
+                    for val in b.iter_mut().skip(index + 1) {
+                        *val = rng.gen_range(0..=255);
                     }
                     Value::Blob(b)
                 }
@@ -184,8 +184,8 @@ impl ArbitraryFrom<&SimValue> for GTValue {
                     let index = rng.gen_range(0..t.len());
                     t[index] += 1;
                     // Mutate the rest of the string
-                    for i in (index + 1)..t.len() {
-                        t[i] = rng.gen_range('a' as u32..='z' as u32);
+                    for val in t.iter_mut().skip(index + 1) {
+                        *val = rng.gen_range('a' as u32..='z' as u32);
                     }
                     let t = t
                         .into_iter()
@@ -204,8 +204,8 @@ impl ArbitraryFrom<&SimValue> for GTValue {
                     let index = rng.gen_range(0..b.len());
                     b[index] += 1;
                     // Mutate the rest of the blob
-                    for i in (index + 1)..b.len() {
-                        b[i] = rng.gen_range(0..=255);
+                    for val in b.iter_mut().skip(index + 1) {
+                        *val = rng.gen_range(0..=255);
                     }
                     Value::Blob(b)
                 }

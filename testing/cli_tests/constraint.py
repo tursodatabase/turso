@@ -2,15 +2,16 @@
 
 # Eventually extract these tests to be in the fuzzing integration tests
 import os
-import tempfile
-from faker import Faker
-from faker.providers.lorem.en_US import Provider as P
-from cli_tests.test_limbo_cli import TestLimboShell
-from pydantic import BaseModel
-from cli_tests import console
-from enum import Enum
 import random
 import sqlite3
+import tempfile
+from enum import Enum
+
+from cli_tests import console
+from cli_tests.test_limbo_cli import TestLimboShell
+from faker import Faker
+from faker.providers.lorem.en_US import Provider as P
+from pydantic import BaseModel
 
 sqlite_flags = os.getenv("SQLITE_FLAGS", "-q").split(" ")
 
@@ -233,11 +234,7 @@ class Table(BaseModel):
 
     # These statements should always cause a constraint error as there is no where clause here
     def generate_update(self) -> str:
-        vals = [
-            f"{col.name} = {col.col_type.generate(fake)}"
-            for col in self.columns
-            if col.primary_key
-        ]
+        vals = [f"{col.name} = {col.col_type.generate(fake)}" for col in self.columns if col.primary_key]
         vals = ", ".join(vals)
 
         return f"UPDATE {self.name} SET {vals};"
@@ -374,7 +371,7 @@ def main():
     tests = all_tests()
     for test in tests:
         console.info(test.table)
-        with tempfile.NamedTemporaryFile(suffix='.db') as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
             try:
                 # Use with syntax to automatically close shell on error
                 with TestLimboShell("") as limbo:
@@ -387,7 +384,7 @@ def main():
 
     tests = [custom_test_2, regression_test_update_single_key]
     for test in tests:
-        with tempfile.NamedTemporaryFile(suffix='.db') as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
             try:
                 with TestLimboShell("") as limbo:
                     limbo.execute_dot(f".open {tmp.name}")

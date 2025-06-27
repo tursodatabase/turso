@@ -413,7 +413,7 @@ impl std::ops::Mul for DoubleDouble {
 
 impl std::ops::MulAssign for DoubleDouble {
     fn mul_assign(&mut self, rhs: Self) {
-        *self = self.clone() * rhs;
+        *self = *self * rhs;
     }
 }
 
@@ -539,7 +539,7 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
     if exponent > 0 {
         while exponent >= 100 {
             exponent -= 100;
-            result *= DoubleDouble(1.0e+100, -1.5902891109759918046e+83);
+            result *= DoubleDouble(1.0e+100, -1.590_289_110_975_991_8e83);
         }
         while exponent >= 10 {
             exponent -= 10;
@@ -552,15 +552,15 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
     } else {
         while exponent <= -100 {
             exponent += 100;
-            result *= DoubleDouble(1.0e-100, -1.99918998026028836196e-117);
+            result *= DoubleDouble(1.0e-100, -1.999_189_980_260_288_3e-117);
         }
         while exponent <= -10 {
             exponent += 10;
-            result *= DoubleDouble(1.0e-10, -3.6432197315497741579e-27);
+            result *= DoubleDouble(1.0e-10, -3.643_219_731_549_774e-27);
         }
         while exponent <= -1 {
             exponent += 1;
-            result *= DoubleDouble(1.0e-01, -5.5511151231257827021e-18);
+            result *= DoubleDouble(1.0e-01, -5.551_115_123_125_783e-18);
         }
     }
 

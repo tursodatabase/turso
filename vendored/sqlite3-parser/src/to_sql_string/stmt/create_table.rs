@@ -44,7 +44,7 @@ impl ToSqlString for ast::NamedTableConstraint {
                 self.constraint.to_sql_string(context)
             )
         } else {
-            format!("{}", self.constraint.to_sql_string(context))
+            self.constraint.to_sql_string(context).to_string()
         }
     }
 }

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-from cli_tests.test_limbo_cli import TestLimboShell
-from pathlib import Path
-import time
 import os
+import time
+from pathlib import Path
+
 from cli_tests import console
+from cli_tests.test_limbo_cli import TestLimboShell
 
 
 def test_basic_queries():
@@ -62,7 +63,7 @@ def test_joins():
     shell.run_test(
         "file-cross-join",
         "select * from users, products limit 1;",
-        "1|Jamie|Foster|dylan00@example.com|496-522-9493|62375 Johnson Rest Suite 322|West Lauriestad|IL|35865|94|1|hat|79.0",
+        "1|Jamie|Foster|dylan00@example.com|496-522-9493|62375 Johnson Rest Suite 322|West Lauriestad|IL|35865|94|1|hat|79.0",  # noqa: E501
     )
     shell.quit()
 
@@ -76,7 +77,7 @@ def test_left_join_self():
 
     shell.run_test(
         "file-left-join-self",
-        "select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 left join users as u2 on u1.id = u2.id + 1 limit 2;",
+        "select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 left join users as u2 on u1.id = u2.id + 1 limit 2;",  # noqa: E501
         "Jamie|\nCindy|Jamie",
     )
     shell.quit()
@@ -99,9 +100,7 @@ def test_switch_back_to_in_memory():
     shell.run_test("open-testing-db-file", ".open testing/testing.db", "")
     # Then switch back to :memory:
     shell.run_test("switch-back", ".open :memory:", "")
-    shell.run_test(
-        "schema-in-memory", ".schema users", "-- Error: Table 'users' not found."
-    )
+    shell.run_test("schema-in-memory", ".schema users", "-- Error: Table 'users' not found.")
     shell.quit()
 
 
@@ -172,9 +171,7 @@ SELECT 2;"""
 def test_comments():
     shell = TestLimboShell()
     shell.run_test("single-line-comment", "-- this is a comment\nSELECT 1;", "1")
-    shell.run_test(
-        "multi-line-comments", "-- First comment\n-- Second comment\nSELECT 2;", "2"
-    )
+    shell.run_test("multi-line-comments", "-- First comment\n-- Second comment\nSELECT 2;", "2")
     shell.run_test("block-comment", "/*\nMulti-line block comment\n*/\nSELECT 3;", "3")
     shell.run_test(
         "inline-comments",
@@ -187,9 +184,7 @@ def test_comments():
 def test_import_csv():
     shell = TestLimboShell()
     shell.run_test("memory-db", ".open :memory:", "")
-    shell.run_test(
-        "create-csv-table", "CREATE TABLE csv_table (c1 INT, c2 REAL, c3 String);", ""
-    )
+    shell.run_test("create-csv-table", "CREATE TABLE csv_table (c1 INT, c2 REAL, c3 String);", "")
     shell.run_test(
         "import-csv-no-options",
         ".import --csv ./testing/test_files/test.csv csv_table",
@@ -206,9 +201,7 @@ def test_import_csv():
 def test_import_csv_verbose():
     shell = TestLimboShell()
     shell.run_test("open-memory", ".open :memory:", "")
-    shell.run_test(
-        "create-csv-table", "CREATE TABLE csv_table (c1 INT, c2 REAL, c3 String);", ""
-    )
+    shell.run_test("create-csv-table", "CREATE TABLE csv_table (c1 INT, c2 REAL, c3 String);", "")
     shell.run_test(
         "import-csv-verbose",
         ".import --csv -v ./testing/test_files/test.csv csv_table",
@@ -225,9 +218,7 @@ def test_import_csv_verbose():
 def test_import_csv_skip():
     shell = TestLimboShell()
     shell.run_test("open-memory", ".open :memory:", "")
-    shell.run_test(
-        "create-csv-table", "CREATE TABLE csv_table (c1 INT, c2 REAL, c3 String);", ""
-    )
+    shell.run_test("create-csv-table", "CREATE TABLE csv_table (c1 INT, c2 REAL, c3 String);", "")
     shell.run_test(
         "import-csv-skip",
         ".import --csv --skip 1 ./testing/test_files/test.csv csv_table",
@@ -250,20 +241,13 @@ def test_update_with_limit():
     limbo.run_test("update-limit", "UPDATE t SET a = 10 LIMIT 1;", "")
     limbo.run_test("update-limit-result", "SELECT COUNT(*) from t WHERE a = 10;", "1")
     limbo.run_test("update-limit-zero", "UPDATE t SET a = 100 LIMIT 0;", "")
-    limbo.run_test(
-        "update-limit-zero-result", "SELECT COUNT(*) from t WHERE a = 100;", "0"
-    )
+    limbo.run_test("update-limit-zero-result", "SELECT COUNT(*) from t WHERE a = 100;", "0")
     limbo.run_test("update-limit-all", "UPDATE t SET a = 100 LIMIT -1;", "")
     # negative limit is treated as no limit in sqlite due to check for --val = 0
     limbo.run_test("update-limit-result", "SELECT COUNT(*) from t WHERE a = 100;", "6")
-    limbo.run_test(
-        "udpate-limit-where", "UPDATE t SET a = 333 WHERE b = 5 LIMIT 1;", ""
-    )
-    limbo.run_test(
-        "update-limit-where-result", "SELECT COUNT(*) from t WHERE a = 333;", "1"
-    )
+    limbo.run_test("udpate-limit-where", "UPDATE t SET a = 333 WHERE b = 5 LIMIT 1;", "")
+    limbo.run_test("update-limit-where-result", "SELECT COUNT(*) from t WHERE a = 333;", "1")
     limbo.quit()
-
 
 
 def test_update_with_limit_and_offset():
@@ -271,30 +255,19 @@ def test_update_with_limit_and_offset():
         "CREATE TABLE t (a,b,c); insert into t values (1,2,3), (4,5,6), (7,8,9), (1,2,3),(4,5,6), (7,8,9);"
     )
     limbo.run_test("update-limit-offset", "UPDATE t SET a = 10 LIMIT 1 OFFSET 3;", "")
-    limbo.run_test(
-        "update-limit-offset-result", "SELECT COUNT(*) from t WHERE a = 10;", "1"
-    )
+    limbo.run_test("update-limit-offset-result", "SELECT COUNT(*) from t WHERE a = 10;", "1")
     limbo.run_test("update-limit-result", "SELECT a from t LIMIT 4;", "1\n4\n7\n10")
-    limbo.run_test(
-        "update-limit-offset-zero", "UPDATE t SET a = 100 LIMIT 0 OFFSET 0;", ""
-    )
-    limbo.run_test(
-        "update-limit-zero-result", "SELECT COUNT(*) from t WHERE a = 100;", "0"
-    )
+    limbo.run_test("update-limit-offset-zero", "UPDATE t SET a = 100 LIMIT 0 OFFSET 0;", "")
+    limbo.run_test("update-limit-zero-result", "SELECT COUNT(*) from t WHERE a = 100;", "0")
     limbo.run_test("update-limit-all", "UPDATE t SET a = 100 LIMIT -1 OFFSET 1;", "")
     limbo.run_test("update-limit-result", "SELECT COUNT(*) from t WHERE a = 100;", "5")
-    limbo.run_test(
-        "udpate-limit-where", "UPDATE t SET a = 333 WHERE b = 5 LIMIT 1 OFFSET 2;", ""
-    )
-    limbo.run_test(
-        "update-limit-where-result", "SELECT COUNT(*) from t WHERE a = 333;", "0"
-    )
+    limbo.run_test("udpate-limit-where", "UPDATE t SET a = 333 WHERE b = 5 LIMIT 1 OFFSET 2;", "")
+    limbo.run_test("update-limit-where-result", "SELECT COUNT(*) from t WHERE a = 333;", "0")
     limbo.quit()
-    
+
+
 def test_insert_default_values():
-    limbo = TestLimboShell(
-        "CREATE TABLE t (a integer default(42),b integer default (43),c integer default(44));"
-    )
+    limbo = TestLimboShell("CREATE TABLE t (a integer default(42),b integer default (43),c integer default(44));")
     for _ in range(1, 10):
         limbo.execute_dot("INSERT INTO t DEFAULT VALUES;")
     limbo.run_test("insert-default-values", "SELECT * FROM t;", "42|43|44\n" * 9)

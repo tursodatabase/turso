@@ -16,6 +16,7 @@ pub trait DatabaseStorage: Send + Sync {
         c: Arc<Completion>,
     ) -> Result<()>;
     fn sync(&self, c: Arc<Completion>) -> Result<()>;
+    fn size(&self) -> Result<u64>;
 }
 
 #[cfg(feature = "fs")]
@@ -60,6 +61,10 @@ impl DatabaseStorage for DatabaseFile {
 
     fn sync(&self, c: Arc<Completion>) -> Result<()> {
         self.file.sync(c)
+    }
+
+    fn size(&self) -> Result<u64> {
+        self.file.size()
     }
 }
 
@@ -110,6 +115,10 @@ impl DatabaseStorage for FileMemoryStorage {
 
     fn sync(&self, c: Arc<Completion>) -> Result<()> {
         self.file.sync(c)
+    }
+
+    fn size(&self) -> Result<u64> {
+        self.file.size()
     }
 }
 

@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use limbo_core::{LimboError, Result};
+use limbo_core::{Connection, LimboError, Result, StepResult};
 use tracing::instrument;
 
 use crate::generation::{
@@ -194,6 +194,7 @@ pub(crate) fn execute_interaction(
             let results = interaction.execute_query(conn, &env.io);
             tracing::debug!("{:?}", results);
             stack.push(results);
+            limbo_integrity_check(conn)?;
         }
         Interaction::Assertion(_) => {
             interaction.execute_assertion(stack, env)?;
@@ -214,4 +215,45 @@ pub(crate) fn execute_interaction(
     }
 
     Ok(ExecutionContinuation::NextInteraction)
+}
+
+fn limbo_integrity_check(conn: &mut Arc<Connection>) -> Result<()> {
+    let mut rows = conn.query("PRAGMA integrity_check;")?.unwrap();
+    let mut result = Vec::new();
+
+    while let Ok(row) = rows.step() {
+        match row {
+            StepResult::Row => {
+                let row = rows.row().unwrap();
+
+                let val = match row.get_value(0) {
+                    limbo_core::Value::Text(text) => text.as_str().to_string(),
+                    _ => unreachable!(),
+                };
+                result.push(val);
+            }
+            StepResult::IO => {
+                rows.run_once()?;
+            }
+            StepResult::Interrupt => {}
+            StepResult::Done => {
+                break;
+            }
+            StepResult::Busy => {}
+        }
+    }
+
+    if result.is_empty() {
+        return Err(LimboError::InternalError(
+            "PRAGMA integrity_check did not return a value".to_string(),
+        ));
+    }
+    let message = result.join("\n");
+    if message != "ok" {
+        return Err(LimboError::InternalError(format!(
+            "Integrity Check Failed: {}",
+            message
+        )));
+    }
+    Ok(())
 }

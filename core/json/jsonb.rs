@@ -179,6 +179,7 @@ pub struct Jsonb {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names, clippy::upper_case_acronyms)]
 pub enum ElementType {
     NULL = 0,
     TRUE = 1,
@@ -203,7 +204,7 @@ pub enum JsonIndentation<'a> {
     None,
 }
 
-impl<'a> JsonIndentation<'a> {
+impl JsonIndentation<'_> {
     pub fn is_pretty(&self) -> bool {
         match self {
             Self::Indentation(_) => true,
@@ -2067,10 +2068,10 @@ impl Jsonb {
             return Ok(pos);
         }
 
-        return Err(PError::Message {
+        Err(PError::Message {
             msg: "Expected null or nan".to_string(),
             location: Some(pos),
-        });
+        })
     }
 
     fn write_element_header(
@@ -2108,13 +2109,17 @@ impl Jsonb {
 
         let new_len = header_bytes.len();
 
-        if new_len > old_len {
-            self.data.splice(
-                cursor + old_len..cursor + old_len,
-                std::iter::repeat(0).take(new_len - old_len),
-            );
-        } else if new_len < old_len {
-            self.data.drain(cursor + new_len..cursor + old_len);
+        match new_len.cmp(&old_len) {
+            std::cmp::Ordering::Greater => {
+                self.data.splice(
+                    cursor + old_len..cursor + old_len,
+                    std::iter::repeat(0).take(new_len - old_len),
+                );
+            }
+            std::cmp::Ordering::Less => {
+                self.data.drain(cursor + new_len..cursor + old_len);
+            }
+            std::cmp::Ordering::Equal => {}
         }
 
         for (i, &byte) in header_bytes.iter().enumerate() {
@@ -2365,7 +2370,7 @@ impl Jsonb {
                 } else {
                     if root_type == ElementType::OBJECT
                         && root_size == 0
-                        && (*idx == Some(0) || *idx == None)
+                        && (*idx == Some(0) || idx.is_none())
                         && mode.allows_insert()
                     {
                         let array = JsonbHeader::new(ElementType::ARRAY, 0).into_bytes();
@@ -3093,7 +3098,7 @@ mod tests {
 
         // Test round-trip
         let reparsed = Jsonb::from_str("null").unwrap();
-        assert_eq!(reparsed.data[0] as u8, ElementType::NULL as u8);
+        assert_eq!(reparsed.data[0], ElementType::NULL as u8);
     }
 
     #[test]
@@ -3110,10 +3115,10 @@ mod tests {
 
         // Round-trip
         let true_parsed = Jsonb::from_str("true").unwrap();
-        assert_eq!(true_parsed.data[0] as u8, ElementType::TRUE as u8);
+        assert_eq!(true_parsed.data[0], ElementType::TRUE as u8);
 
         let false_parsed = Jsonb::from_str("false").unwrap();
-        assert_eq!(false_parsed.data[0] as u8, ElementType::FALSE as u8);
+        assert_eq!(false_parsed.data[0], ElementType::FALSE as u8);
     }
 
     #[test]
@@ -3398,12 +3403,12 @@ world""#,
         // Create a JSON string that exceeds MAX_JSON_DEPTH
         let mut deep_json = String::from("[");
         for _ in 0..MAX_JSON_DEPTH + 1 {
-            deep_json.push_str("[");
+            deep_json.push('[');
         }
         for _ in 0..MAX_JSON_DEPTH + 1 {
-            deep_json.push_str("]");
+            deep_json.push(']');
         }
-        deep_json.push_str("]");
+        deep_json.push(']');
 
         // Should fail due to exceeding depth limit
         assert!(Jsonb::from_str(&deep_json).is_err());
@@ -3559,10 +3564,10 @@ world""#,
         for i in 0..1000 {
             large_array.push_str(&format!("{}", i));
             if i < 999 {
-                large_array.push_str(",");
+                large_array.push(',');
             }
         }
-        large_array.push_str("]");
+        large_array.push(']');
 
         let parsed = Jsonb::from_str(&large_array).unwrap();
         assert!(parsed.to_string().unwrap().starts_with("[0,1,2,"));

@@ -2,9 +2,10 @@ pub mod grammar_generator;
 
 #[cfg(test)]
 mod tests {
+    use rand::seq::IndexedRandom;
     use std::collections::HashSet;
 
-    use rand::{seq::IndexedRandom, Rng, SeedableRng};
+    use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
     use rusqlite::params;
 
@@ -24,9 +25,25 @@ mod tests {
         (rng, seed)
     }
 
+    /// [See this issue for more info](https://github.com/tursodatabase/limbo/issues/1763)
+    #[test]
+    pub fn fuzz_failure_issue_1763() {
+        let db = TempDatabase::new_empty(false);
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+        let offending_query = "SELECT ((ceil(pow((((2.0))), (-2.0 - -1.0) / log(0.5)))) - -2.0)";
+        let limbo_result = limbo_exec_rows(&db, &limbo_conn, offending_query);
+        let sqlite_result = sqlite_exec_rows(&sqlite_conn, offending_query);
+        assert_eq!(
+            limbo_result, sqlite_result,
+            "query: {}, limbo: {:?}, sqlite: {:?}",
+            offending_query, limbo_result, sqlite_result
+        );
+    }
+
     #[test]
     pub fn arithmetic_expression_fuzz_ex1() {
-        let db = TempDatabase::new_empty();
+        let db = TempDatabase::new_empty(false);
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -46,7 +63,7 @@ mod tests {
 
     #[test]
     pub fn rowid_seek_fuzz() {
-        let db = TempDatabase::new_with_rusqlite("CREATE TABLE t(x INTEGER PRIMARY KEY)"); // INTEGER PRIMARY KEY is a rowid alias, so an index is not created
+        let db = TempDatabase::new_with_rusqlite("CREATE TABLE t(x INTEGER PRIMARY KEY)", false); // INTEGER PRIMARY KEY is a rowid alias, so an index is not created
         let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
 
         let insert = format!(
@@ -165,9 +182,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "index_experimental")]
     pub fn index_scan_fuzz() {
-        let db = TempDatabase::new_with_rusqlite("CREATE TABLE t(x PRIMARY KEY)");
+        let db = TempDatabase::new_with_rusqlite("CREATE TABLE t(x PRIMARY KEY)", true);
         let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
 
         let insert = format!(
@@ -213,7 +229,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "index_experimental")]
     /// A test for verifying that index seek+scan works correctly for compound keys
     /// on indexes with various column orderings.
     pub fn index_scan_compound_key_fuzz() {
@@ -235,14 +250,14 @@ mod tests {
         ];
         // Create all different 3-column primary key permutations
         let dbs = [
-            TempDatabase::new_with_rusqlite(table_defs[0]),
-            TempDatabase::new_with_rusqlite(table_defs[1]),
-            TempDatabase::new_with_rusqlite(table_defs[2]),
-            TempDatabase::new_with_rusqlite(table_defs[3]),
-            TempDatabase::new_with_rusqlite(table_defs[4]),
-            TempDatabase::new_with_rusqlite(table_defs[5]),
-            TempDatabase::new_with_rusqlite(table_defs[6]),
-            TempDatabase::new_with_rusqlite(table_defs[7]),
+            TempDatabase::new_with_rusqlite(table_defs[0], true),
+            TempDatabase::new_with_rusqlite(table_defs[1], true),
+            TempDatabase::new_with_rusqlite(table_defs[2], true),
+            TempDatabase::new_with_rusqlite(table_defs[3], true),
+            TempDatabase::new_with_rusqlite(table_defs[4], true),
+            TempDatabase::new_with_rusqlite(table_defs[5], true),
+            TempDatabase::new_with_rusqlite(table_defs[6], true),
+            TempDatabase::new_with_rusqlite(table_defs[7], true),
         ];
         let mut pk_tuples = HashSet::new();
         while pk_tuples.len() < 100000 {
@@ -384,7 +399,7 @@ mod tests {
                 comp3.map(|x| format!("z {} {}", x, col_val_third.unwrap())),
             ]
             .into_iter()
-            .filter_map(|x| x)
+            .flatten()
             .collect::<Vec<_>>();
             let where_clause = if where_clause_components.is_empty() {
                 "".to_string()
@@ -399,7 +414,7 @@ mod tests {
                 order_by3.map(|x| format!("z {}", x)),
             ]
             .into_iter()
-            .filter_map(|x| x)
+            .flatten()
             .collect::<Vec<_>>();
             let order_by = if order_by_components.is_empty() {
                 "".to_string()
@@ -420,7 +435,7 @@ mod tests {
             // Execute the query on all databases and compare the results
             for (i, sqlite_conn) in sqlite_conns.iter().enumerate() {
                 let limbo = limbo_exec_rows(&dbs[i], &limbo_conns[i], &query);
-                let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
+                let sqlite = sqlite_exec_rows(sqlite_conn, &query);
                 if limbo != sqlite {
                     // if the order by contains exclusively components that are constrained by an equality (=),
                     // sqlite sometimes doesn't bother with ASC/DESC because it doesn't semantically matter
@@ -441,7 +456,7 @@ mod tests {
                     let query_no_limit =
                         format!("SELECT * FROM t {} {} {}", where_clause, order_by, "");
                     let limbo_no_limit = limbo_exec_rows(&dbs[i], &limbo_conns[i], &query_no_limit);
-                    let sqlite_no_limit = sqlite_exec_rows(&sqlite_conn, &query_no_limit);
+                    let sqlite_no_limit = sqlite_exec_rows(sqlite_conn, &query_no_limit);
                     let limbo_rev = limbo_no_limit.iter().cloned().rev().collect::<Vec<_>>();
                     if limbo_rev == sqlite_no_limit && order_by_only_equalities {
                         continue;
@@ -493,7 +508,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "index_experimental")]
     pub fn compound_select_fuzz() {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time();
@@ -509,7 +523,7 @@ mod tests {
         const MAX_SELECTS_IN_UNION_EXTRA: usize = 2;
         const MAX_LIMIT_VALUE: usize = 50;
 
-        let db = TempDatabase::new_empty();
+        let db = TempDatabase::new_empty(true);
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -653,7 +667,7 @@ mod tests {
 
         let sql = g.create().concat(" ").push_str("SELECT").push(expr).build();
 
-        let db = TempDatabase::new_empty();
+        let db = TempDatabase::new_empty(false);
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -674,7 +688,7 @@ mod tests {
     #[test]
     pub fn fuzz_ex() {
         let _ = env_logger::try_init();
-        let db = TempDatabase::new_empty();
+        let db = TempDatabase::new_empty(false);
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -774,7 +788,7 @@ mod tests {
 
         let sql = g.create().concat(" ").push_str("SELECT").push(expr).build();
 
-        let db = TempDatabase::new_empty();
+        let db = TempDatabase::new_empty(false);
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -938,7 +952,7 @@ mod tests {
 
         let sql = g.create().concat(" ").push_str("SELECT").push(expr).build();
 
-        let db = TempDatabase::new_empty();
+        let db = TempDatabase::new_empty(false);
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -1308,7 +1322,7 @@ mod tests {
             .push(expr)
             .build();
 
-        let db = TempDatabase::new_empty();
+        let db = TempDatabase::new_empty(false);
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -1343,7 +1357,7 @@ mod tests {
                 "SELECT * FROM t",
             ],
         ] {
-            let db = TempDatabase::new_empty();
+            let db = TempDatabase::new_empty(false);
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
             for query in queries.iter() {
@@ -1359,7 +1373,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "index_experimental")]
     pub fn table_logical_expression_fuzz_run() {
         let _ = env_logger::try_init();
         let g = GrammarGenerator::new();
@@ -1371,7 +1384,7 @@ mod tests {
         let predicate = predicate_builders(&g, Some(&tables));
         let expr = build_logical_expr(&g, &builders, Some(&predicate));
 
-        let db = TempDatabase::new_empty();
+        let db = TempDatabase::new_empty(true);
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
         for table in tables.iter() {
@@ -1423,7 +1436,7 @@ mod tests {
             i += 1;
         }
         // verify the same number of rows in both tables
-        let query = format!("SELECT COUNT(*) FROM t");
+        let query = "SELECT COUNT(*) FROM t".to_string();
         let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
         let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
         assert_eq!(limbo, sqlite, "seed: {}", seed);

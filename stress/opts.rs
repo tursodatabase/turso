@@ -4,8 +4,16 @@ use clap::{command, Parser};
 #[command(name = "limbo_stress")]
 #[command(author, version, about, long_about = None)]
 pub struct Opts {
+    /// Verbose mode
+    #[clap(short = 'v', long, help = "verbose mode")]
+    pub verbose: bool,
+
+    /// Silent mode
+    #[clap(long, help = "silent mode")]
+    pub silent: bool,
+
     /// Number of threads to run
-    #[clap(short = 't', long, help = "the number of threads", default_value_t = 8)]
+    #[clap(short = 't', long, help = "the number of threads", default_value_t = 1)]
     pub nr_threads: usize,
 
     /// Number of iterations per thread

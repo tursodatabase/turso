@@ -71,7 +71,7 @@ impl ToSqlString for Expr {
             Expr::Collate(expr, name) => {
                 ret.push_str(&expr.to_sql_string(context));
                 ret.push_str(" COLLATE ");
-                ret.push_str(&name);
+                ret.push_str(name);
             }
             Expr::DoublyQualified(name, name1, name2) => {
                 ret.push_str(&name.0);

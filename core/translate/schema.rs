@@ -93,7 +93,7 @@ pub fn translate_create_table(
 
     let index_regs = check_automatic_pk_index_required(&body, &mut program, &tbl_name.name.0)?;
     if let Some(index_regs) = index_regs.as_ref() {
-        if cfg!(not(feature = "index_experimental")) {
+        if !schema.indexes_enabled() {
             bail_parse_error!("Constraints UNIQUE and PRIMARY KEY (unless INTEGER PRIMARY KEY) on table are not supported without indexes");
         }
         for index_reg in index_regs.clone() {
@@ -613,13 +613,10 @@ pub fn translate_drop_table(
     schema: &Schema,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
-    #[cfg(not(feature = "index_experimental"))]
-    {
-        if schema.table_has_indexes(&tbl_name.name.to_string()) {
-            bail_parse_error!(
-                "DROP Table with indexes on the table enabled only with index_experimental feature"
-            );
-        }
+    if !schema.indexes_enabled() && schema.table_has_indexes(&tbl_name.name.to_string()) {
+        bail_parse_error!(
+            "DROP TABLE with indexes on the table is disabled by default. Run with `--experimental-indexes` to enable this feature."
+        );
     }
     let opts = ProgramBuilderOpts {
         query_mode,
@@ -800,7 +797,7 @@ pub fn translate_drop_table(
         });
         program.emit_insn(Insn::OpenRead {
             cursor_id: sqlite_schema_cursor_id_1,
-            root_page: 1usize.into(),
+            root_page: 1usize,
         });
 
         let schema_column_0_register = program.alloc_register();

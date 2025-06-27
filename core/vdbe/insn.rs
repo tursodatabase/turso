@@ -46,7 +46,7 @@ impl CmpInsFlags {
     }
 
     pub fn with_affinity(mut self, affinity: Affinity) -> Self {
-        let aff_code = affinity.to_char_code() as usize;
+        let aff_code = affinity.as_char_code() as usize;
         self.0 = (self.0 & !Self::AFFINITY_MASK) | aff_code;
         self
     }
@@ -507,6 +507,12 @@ pub enum Insn {
     /// Write a blob value into a register.
     Blob {
         value: Vec<u8>,
+        dest: usize,
+    },
+
+    /// Read a complete row of data from the current cursor and write it to the destination register.
+    RowData {
+        cursor_id: CursorID,
         dest: usize,
     },
 
@@ -1034,6 +1040,7 @@ impl Insn {
             Insn::RealAffinity { .. } => execute::op_real_affinity,
             Insn::String8 { .. } => execute::op_string8,
             Insn::Blob { .. } => execute::op_blob,
+            Insn::RowData { .. } => execute::op_row_data,
             Insn::RowId { .. } => execute::op_row_id,
             Insn::IdxRowId { .. } => execute::op_idx_row_id,
             Insn::SeekRowid { .. } => execute::op_seek_rowid,

@@ -26,6 +26,7 @@ pub(crate) mod plan;
 pub(crate) mod planner;
 pub(crate) mod pragma;
 pub(crate) mod result_row;
+pub(crate) mod rollback;
 pub(crate) mod schema;
 pub(crate) mod select;
 pub(crate) mod subquery;
@@ -33,10 +34,8 @@ pub(crate) mod transaction;
 pub(crate) mod update;
 mod values;
 
-use crate::fast_lock::SpinLock;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
-use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::translate::delete::translate_delete;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::Program;
@@ -45,6 +44,7 @@ use alter::translate_alter_table;
 use index::{translate_create_index, translate_drop_index};
 use insert::translate_insert;
 use limbo_sqlite3_parser::ast::{self, Delete, Insert};
+use rollback::translate_rollback;
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
 use select::translate_select;
 use std::rc::Rc;
@@ -54,16 +54,17 @@ use transaction::{translate_tx_begin, translate_tx_commit};
 use update::translate_update;
 
 #[instrument(skip_all, level = Level::TRACE)]
+#[allow(clippy::too_many_arguments)]
 pub fn translate(
     schema: &Schema,
     stmt: ast::Stmt,
-    database_header: Arc<SpinLock<DatabaseHeader>>,
     pager: Rc<Pager>,
     connection: Arc<Connection>,
     syms: &SymbolTable,
     query_mode: QueryMode,
     _input: &str, // TODO: going to be used for CREATE VIEW
 ) -> Result<Program> {
+    tracing::trace!("querying {}", _input);
     let change_cnt_on = matches!(
         stmt,
         ast::Stmt::CreateIndex { .. }
@@ -89,7 +90,6 @@ pub fn translate(
             schema,
             &name,
             body.map(|b| *b),
-            database_header.clone(),
             pager,
             connection.clone(),
             program,
@@ -99,7 +99,7 @@ pub fn translate(
 
     // TODO: bring epilogue here when I can sort out what instructions correspond to a Write or a Read transaction
 
-    Ok(program.build(database_header, connection, change_cnt_on))
+    Ok(program.build(connection, change_cnt_on))
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
@@ -151,7 +151,7 @@ pub fn translate_inner(
         ast::Stmt::CreateTrigger { .. } => bail_parse_error!("CREATE TRIGGER not supported yet"),
         ast::Stmt::CreateView { .. } => bail_parse_error!("CREATE VIEW not supported yet"),
         ast::Stmt::CreateVirtualTable(vtab) => {
-            translate_create_virtual_table(*vtab, schema, query_mode, &syms, program)?
+            translate_create_virtual_table(*vtab, schema, query_mode, syms, program)?
         }
         ast::Stmt::Delete(delete) => {
             let Delete {
@@ -186,7 +186,10 @@ pub fn translate_inner(
         }
         ast::Stmt::Reindex { .. } => bail_parse_error!("REINDEX not supported yet"),
         ast::Stmt::Release(_) => bail_parse_error!("RELEASE not supported yet"),
-        ast::Stmt::Rollback { .. } => bail_parse_error!("ROLLBACK not supported yet"),
+        ast::Stmt::Rollback {
+            tx_name,
+            savepoint_name,
+        } => translate_rollback(query_mode, schema, syms, program, tx_name, savepoint_name)?,
         ast::Stmt::Savepoint(_) => bail_parse_error!("SAVEPOINT not supported yet"),
         ast::Stmt::Select(select) => {
             translate_select(

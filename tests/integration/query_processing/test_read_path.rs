@@ -3,7 +3,7 @@ use limbo_core::{StepResult, Value};
 
 #[test]
 fn test_statement_reset_bind() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite("create table test (i integer);");
+    let tmp_db = TempDatabase::new_with_rusqlite("create table test (i integer);", false);
     let conn = tmp_db.connect_limbo();
 
     let mut stmt = conn.prepare("select ?")?;
@@ -47,7 +47,7 @@ fn test_statement_reset_bind() -> anyhow::Result<()> {
 
 #[test]
 fn test_statement_bind() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite("create table test (i integer);");
+    let tmp_db = TempDatabase::new_with_rusqlite("create table test (i integer);", false);
     let conn = tmp_db.connect_limbo();
 
     let mut stmt = conn.prepare("select ?, ?1, :named, ?3, ?4")?;
@@ -80,7 +80,7 @@ fn test_statement_bind() -> anyhow::Result<()> {
                 }
 
                 if let limbo_core::Value::Blob(v) = row.get::<&Value>(3).unwrap() {
-                    assert_eq!(v.as_slice(), &vec![0x1 as u8, 0x2, 0x3])
+                    assert_eq!(v.as_slice(), &vec![0x1_u8, 0x2, 0x3])
                 }
 
                 if let limbo_core::Value::Float(f) = row.get::<&Value>(4).unwrap() {
@@ -112,6 +112,7 @@ fn test_insert_parameter_remap() -> anyhow::Result<()> {
 
     let tmp_db = TempDatabase::new_with_rusqlite(
         "create table test (a integer, b integer, c integer, d integer);",
+        false,
     );
     let conn = tmp_db.connect_limbo();
 
@@ -176,6 +177,7 @@ fn test_insert_parameter_remap_all_params() -> anyhow::Result<()> {
 
     let tmp_db = TempDatabase::new_with_rusqlite(
         "create table test (a integer, b integer, c integer, d integer);",
+        false,
     );
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (d, a, c, b) values (?, ?, ?, ?);")?;
@@ -243,6 +245,7 @@ fn test_insert_parameter_multiple_remap_backwards() -> anyhow::Result<()> {
 
     let tmp_db = TempDatabase::new_with_rusqlite(
         "create table test (a integer, b integer, c integer, d integer);",
+        false,
     );
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (d,c,b,a) values (?, ?, ?, ?);")?;
@@ -309,6 +312,7 @@ fn test_insert_parameter_multiple_no_remap() -> anyhow::Result<()> {
 
     let tmp_db = TempDatabase::new_with_rusqlite(
         "create table test (a integer, b integer, c integer, d integer);",
+        false,
     );
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (a,b,c,d) values (?, ?, ?, ?);")?;
@@ -375,6 +379,7 @@ fn test_insert_parameter_multiple_row() -> anyhow::Result<()> {
 
     let tmp_db = TempDatabase::new_with_rusqlite(
         "create table test (a integer, b integer, c integer, d integer);",
+        false,
     );
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (b,a,d,c) values (?, ?, ?, ?), (?, ?, ?, ?);")?;
@@ -440,7 +445,7 @@ fn test_insert_parameter_multiple_row() -> anyhow::Result<()> {
 
 #[test]
 fn test_bind_parameters_update_query() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite("create table test (a integer, b text);");
+    let tmp_db = TempDatabase::new_with_rusqlite("create table test (a integer, b text);", false);
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (a, b) values (3, 'test1');")?;
     loop {
@@ -484,6 +489,7 @@ fn test_bind_parameters_update_query() -> anyhow::Result<()> {
 fn test_bind_parameters_update_query_multiple_where() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_with_rusqlite(
         "create table test (a integer, b text, c integer, d integer);",
+        false,
     );
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (a, b, c, d) values (3, 'test1', 4, 5);")?;
@@ -529,8 +535,10 @@ fn test_bind_parameters_update_query_multiple_where() -> anyhow::Result<()> {
 
 #[test]
 fn test_bind_parameters_update_rowid_alias() -> anyhow::Result<()> {
-    let tmp_db =
-        TempDatabase::new_with_rusqlite("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT);");
+    let tmp_db = TempDatabase::new_with_rusqlite(
+        "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT);",
+        false,
+    );
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (id, name) values (1, 'test');")?;
     loop {
@@ -588,6 +596,7 @@ fn test_bind_parameters_update_rowid_alias() -> anyhow::Result<()> {
 fn test_bind_parameters_update_rowid_alias_seek_rowid() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_with_rusqlite(
         "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT, age integer);",
+        false,
     );
     let conn = tmp_db.connect_limbo();
     conn.execute("insert into test (id, name, age) values (1, 'test', 4);")?;
@@ -655,6 +664,7 @@ fn test_bind_parameters_update_rowid_alias_seek_rowid() -> anyhow::Result<()> {
 fn test_bind_parameters_delete_rowid_alias_seek_out_of_order() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_with_rusqlite(
         "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT, age integer);",
+        false,
     );
     let conn = tmp_db.connect_limbo();
     conn.execute("insert into test (id, name, age) values (1, 'correct', 4);")?;

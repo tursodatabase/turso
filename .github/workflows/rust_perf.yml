@@ -100,63 +100,63 @@ jobs:
           never-fail: true
           nyrkio-public: true
 
-#  tpc-h-criterion:
-#    runs-on: blacksmith-4vcpu-ubuntu-2404
-#    env:
-#      DB_FILE: "perf/tpc-h/TPC-H.db"
-#    steps:
-#      - uses: actions/checkout@v3
-#      - uses: useblacksmith/rust-cache@v3
-#        with:
-#          prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
-#
-#      - name: Cache TPC-H
-#        id: cache-primes
-#        uses: useblacksmith/cache@v5
-#        with:
-#          path: ${{ env.DB_FILE }}
-#          key: tpc-h
-#      - name: Download TPC-H
-#        if: steps.cache-primes.outputs.cache-hit != 'true'
-#        env:
-#          DB_URL: "https://github.com/lovasoa/TPCH-sqlite/releases/download/v1.0/TPC-H.db"
-#        run: wget -O $DB_FILE --no-verbose $DB_URL
-#
-#      - name: Bench
-#        run: cargo bench --bench tpc_h_benchmark  2>&1 | tee output.txt
-#      - name: Analyze benchmark result with Nyrkiö
-#        uses: nyrkio/change-detection@HEAD
-#        with:
-#          name: tpc-h
-#          tool: criterion
-#          output-file-path: output.txt
-#
-#          # What to do if a change is immediately detected by Nyrkiö.
-#          # Note that smaller changes are only detected with delay, usually after a change
-#          # persisted over 2-7 commits. Go to nyrkiö.com to view those or configure alerts.
-#          # Note that Nyrkiö will find all changes, also improvements. This means fail-on-alert
-#          # on pull events isn't compatible with this workflow being required to pass branch protection.
-#          fail-on-alert: false
-#          comment-on-alert: true
-#          comment-always: false
-#          # Nyrkiö configuration
-#          # Get yours from https://nyrkio.com/docs/getting-started
-#          nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
-#          # HTTP requests will fail for all non-core contributors that don't have their own token.
-#          # Don't want that to spoil the build, so:
-#          never-fail: true
-#          # Make results and change points public, so that any oss contributor can see them
-#          nyrkio-public: true
-#
-#          # parameters of the algorithm. Note: These are global, so we only set them once and for all.
-#          # Smaller p-value = less change points found. Larger p-value = more, but also more false positives.
-#          nyrkio-settings-pvalue: 0.0001
-#          # Ignore changes smaller than this.
-#          nyrkio-settings-threshold: 0%
-#
-#  tpc-h:
-#    runs-on: blacksmith-4vcpu-ubuntu-2404
-#    steps:
-#      - uses: actions/checkout@v3
-#      - name: TPC-H
-#        run: ./perf/tpc-h/benchmark.sh
+  tpc-h-criterion:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    env:
+      DB_FILE: "perf/tpc-h/TPC-H.db"
+    steps:
+      - uses: actions/checkout@v3
+      - uses: useblacksmith/rust-cache@v3
+        with:
+          prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
+
+      - name: Cache TPC-H
+        id: cache-primes
+        uses: useblacksmith/cache@v5
+        with:
+          path: ${{ env.DB_FILE }}
+          key: tpc-h
+      - name: Download TPC-H
+        if: steps.cache-primes.outputs.cache-hit != 'true'
+        env:
+          DB_URL: "https://github.com/lovasoa/TPCH-sqlite/releases/download/v1.0/TPC-H.db"
+        run: wget -O $DB_FILE --no-verbose $DB_URL
+
+      - name: Bench
+        run: cargo bench --bench tpc_h_benchmark  2>&1 | tee output.txt
+      - name: Analyze benchmark result with Nyrkiö
+        uses: nyrkio/change-detection@HEAD
+        with:
+          name: tpc-h
+          tool: criterion
+          output-file-path: output.txt
+
+          # What to do if a change is immediately detected by Nyrkiö.
+          # Note that smaller changes are only detected with delay, usually after a change
+          # persisted over 2-7 commits. Go to nyrkiö.com to view those or configure alerts.
+          # Note that Nyrkiö will find all changes, also improvements. This means fail-on-alert
+          # on pull events isn't compatible with this workflow being required to pass branch protection.
+          fail-on-alert: false
+          comment-on-alert: true
+          comment-always: false
+          # Nyrkiö configuration
+          # Get yours from https://nyrkio.com/docs/getting-started
+          nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
+          # HTTP requests will fail for all non-core contributors that don't have their own token.
+          # Don't want that to spoil the build, so:
+          never-fail: true
+          # Make results and change points public, so that any oss contributor can see them
+          nyrkio-public: true
+
+          # parameters of the algorithm. Note: These are global, so we only set them once and for all.
+          # Smaller p-value = less change points found. Larger p-value = more, but also more false positives.
+          nyrkio-settings-pvalue: 0.0001
+          # Ignore changes smaller than this.
+          nyrkio-settings-threshold: 0%
+
+  tpc-h:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v3
+      - name: TPC-H
+        run: ./perf/tpc-h/benchmark.sh

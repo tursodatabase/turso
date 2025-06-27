@@ -416,7 +416,7 @@ impl Property {
                                     .iter()
                                     .filter(|vs| {
                                         let v = vs.first().unwrap();
-                                        v.into_bool()
+                                        v.as_bool()
                                     })
                                     .count();
                                 Ok(rows1_count == rows2.len())
@@ -582,15 +582,12 @@ fn property_double_create_failure<R: rand::Rng>(
     // - [ ] Table `t` will not be renamed or dropped.(todo: add this constraint once ALTER or DROP is implemented)
     for _ in 0..rng.gen_range(0..3) {
         let query = Query::arbitrary_from(rng, (env, remaining));
-        match &query {
-            Query::Create(Create { table: t }) => {
-                // There will be no errors in the middle interactions.
-                // - Creating the same table is an error
-                if t.name == table.name {
-                    continue;
-                }
+        if let Query::Create(Create { table: t }) = &query {
+            // There will be no errors in the middle interactions.
+            // - Creating the same table is an error
+            if t.name == table.name {
+                continue;
             }
-            _ => (),
         }
         queries.push(query);
     }
@@ -658,14 +655,11 @@ fn property_drop_select<R: rand::Rng>(
     // - [-] The table `t` will not be created, no table will be renamed to `t`. (todo: update this constraint once ALTER is implemented)
     for _ in 0..rng.gen_range(0..3) {
         let query = Query::arbitrary_from(rng, (env, remaining));
-        match &query {
-            Query::Create(Create { table: t }) => {
-                // - The table `t` will not be created
-                if t.name == table.name {
-                    continue;
-                }
+        if let Query::Create(Create { table: t }) = &query {
+            // - The table `t` will not be created
+            if t.name == table.name {
+                continue;
             }
-            _ => (),
         }
         queries.push(query);
     }

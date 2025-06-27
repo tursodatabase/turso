@@ -9,14 +9,22 @@ impl ToSqlString for ast::CreateTrigger {
     fn to_sql_string<C: crate::to_sql_string::ToSqlContext>(&self, context: &C) -> String {
         format!(
             "CREATE{} TRIGGER {}{}{} {} ON {}{}{} BEGIN {} END;",
-            self.temporary.then_some(" TEMP").unwrap_or(""),
-            self.if_not_exists.then_some("IF NOT EXISTS ").unwrap_or(""),
+            if self.temporary { " TEMP" } else { "" },
+            if self.if_not_exists {
+                "IF NOT EXISTS "
+            } else {
+                ""
+            },
             self.trigger_name.to_sql_string(context),
             self.time
                 .map_or("".to_string(), |time| format!(" {}", time)),
             self.event,
             self.tbl_name.to_sql_string(context),
-            self.for_each_row.then_some(" FOR EACH ROW").unwrap_or(""),
+            if self.for_each_row {
+                " FOR EACH ROW"
+            } else {
+                ""
+            },
             self.when_clause
                 .as_ref()
                 .map_or("".to_string(), |expr| format!(

@@ -52,12 +52,12 @@ Limbo aims to be fully compatible with SQLite, with opt-in features not supporte
 
 | Statement                 | Status  | Comment                                                                           |
 |---------------------------|---------|-----------------------------------------------------------------------------------|
-| ALTER TABLE               | No      |                                                                                   |
+| ALTER TABLE               | Yes     |                                                                                   |
 | ANALYZE                   | No      |                                                                                   |
 | ATTACH DATABASE           | No      |                                                                                   |
 | BEGIN TRANSACTION         | Partial | Transaction names are not supported.                                              |
 | COMMIT TRANSACTION        | Partial | Transaction names are not supported.                                              |
-| CREATE INDEX              | Yes     |                                                                                   |
+| CREATE INDEX              | Partial | Disabled by default.                                                              |
 | CREATE TABLE              | Partial |                                                                                   |
 | CREATE TABLE ... STRICT   | Yes     |                                                                                   |
 | CREATE TRIGGER            | No      |                                                                                   |
@@ -65,7 +65,7 @@ Limbo aims to be fully compatible with SQLite, with opt-in features not supporte
 | CREATE VIRTUAL TABLE      | Yes     |                                                                                   |
 | DELETE                    | Yes     |                                                                                   |
 | DETACH DATABASE           | No      |                                                                                   |
-| DROP INDEX                | No      |                                                                                   |
+| DROP INDEX                | Partial | Disabled by default.                                                              |
 | DROP TABLE                | Yes     |                                                                                   |
 | DROP TRIGGER              | No      |                                                                                   |
 | DROP VIEW                 | No      |                                                                                   |
@@ -78,7 +78,7 @@ Limbo aims to be fully compatible with SQLite, with opt-in features not supporte
 | RELEASE SAVEPOINT         | No      |                                                                                   |
 | REPLACE                   | No      |                                                                                   |
 | RETURNING clause          | No      |                                                                                   |
-| ROLLBACK TRANSACTION      | No      |                                                                                   |
+| ROLLBACK TRANSACTION      | Yes     |                                                                                   |
 | SAVEPOINT                 | No      |                                                                                   |
 | SELECT                    | Yes     |                                                                                   |
 | SELECT ... WHERE          | Yes     |                                                                                   |

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 import os
-from cli_tests.test_limbo_cli import TestLimboShell
+
 from cli_tests import console
+from cli_tests.test_limbo_cli import TestLimboShell
 
 sqlite_flags = os.getenv("SQLITE_FLAGS", "-q").split(" ")
 

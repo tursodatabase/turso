@@ -26,16 +26,15 @@ pub mod sorter;
 
 use crate::{
     error::LimboError,
-    fast_lock::SpinLock,
     function::{AggFunc, FuncCtx},
     storage::{pager::PagerCacheflushStatus, sqlite3_ondisk::SmallVec},
     translate::plan::TableReferences,
 };
 
 use crate::{
-    storage::{btree::BTreeCursor, pager::Pager, sqlite3_ondisk::DatabaseHeader},
+    storage::{btree::BTreeCursor, pager::Pager},
     translate::plan::ResultSetColumn,
-    types::{AggContext, Cursor, CursorResult, ImmutableRecord, SeekKey, SeekOp, Value},
+    types::{AggContext, Cursor, CursorResult, ImmutableRecord, Value},
     vdbe::{builder::CursorType, insn::Insn},
 };
 
@@ -43,12 +42,12 @@ use crate::{
 use crate::json::JsonCacheCell;
 use crate::{Connection, MvStore, Result, TransactionState};
 use builder::CursorKey;
-use execute::{InsnFunction, InsnFunctionStepResult, OpIdxDeleteState, OpIntegrityCheckState};
-
-use rand::{
-    distributions::{Distribution, Uniform},
-    Rng,
+use execute::{
+    InsnFunction, InsnFunctionStepResult, OpIdxDeleteState, OpIntegrityCheckState,
+    OpOpenEphemeralState,
 };
+
+use rand::Rng;
 use regex::Regex;
 use std::{
     cell::{Cell, RefCell},
@@ -65,10 +64,11 @@ use tracing::{instrument, Level};
 ///
 /// In some cases, we want to jump to EXACTLY a specific instruction.
 /// - Example: a condition is not met, so we want to jump to wherever Halt is.
+///
 /// In other cases, we don't care what the exact instruction is, but we know that we
 /// want to jump to whatever comes AFTER a certain instruction.
 /// - Example: a Next instruction will want to jump to "whatever the start of the loop is",
-/// but it doesn't care what instruction that is.
+///   but it doesn't care what instruction that is.
 ///
 /// The reason this distinction is important is that we might reorder instructions that are
 /// constant at compile time, and when we do that, we need to change the offsets of any impacted
@@ -106,7 +106,7 @@ impl BranchOffset {
     }
 
     /// Returns the offset value. Panics if the branch offset is a label or placeholder.
-    pub fn to_offset_int(&self) -> InsnReference {
+    pub fn as_offset_int(&self) -> InsnReference {
         match self {
             BranchOffset::Label(v) => unreachable!("Unresolved label: {}", v),
             BranchOffset::Offset(v) => *v,
@@ -117,7 +117,7 @@ impl BranchOffset {
     /// Returns the branch offset as a signed integer.
     /// Used in explain output, where we don't want to panic in case we have an unresolved
     /// label or placeholder.
-    pub fn to_debug_int(&self) -> i32 {
+    pub fn as_debug_int(&self) -> i32 {
         match self {
             BranchOffset::Label(v) => *v as i32,
             BranchOffset::Offset(v) => *v as i32,
@@ -129,11 +129,11 @@ impl BranchOffset {
     /// Returns a new branch offset.
     /// Panics if the branch offset is a label or placeholder.
     pub fn add<N: Into<u32>>(self, n: N) -> BranchOffset {
-        BranchOffset::Offset(self.to_offset_int() + n.into())
+        BranchOffset::Offset(self.as_offset_int() + n.into())
     }
 
     pub fn sub<N: Into<u32>>(self, n: N) -> BranchOffset {
-        BranchOffset::Offset(self.to_offset_int() - n.into())
+        BranchOffset::Offset(self.as_offset_int() - n.into())
     }
 }
 
@@ -206,9 +206,9 @@ impl<const N: usize> Bitfield<N> {
 /// The commit state of the program.
 /// There are two states:
 /// - Ready: The program is ready to run the next instruction, or has shut down after
-/// the last instruction.
+///   the last instruction.
 /// - Committing: The program is committing a write transaction. It is waiting for the pager to finish flushing the cache to disk,
-/// primarily to the WAL, but also possibly checkpointing the WAL to the database file.
+///   primarily to the WAL, but also possibly checkpointing the WAL to the database file.
 enum CommitState {
     Ready,
     Committing,
@@ -249,6 +249,7 @@ pub struct ProgramState {
     json_cache: JsonCacheCell,
     op_idx_delete_state: Option<OpIdxDeleteState>,
     op_integrity_check_state: OpIntegrityCheckState,
+    op_open_ephemeral_state: OpOpenEphemeralState,
 }
 
 impl ProgramState {
@@ -274,6 +275,7 @@ impl ProgramState {
             json_cache: JsonCacheCell::new(),
             op_idx_delete_state: None,
             op_integrity_check_state: OpIntegrityCheckState::Start,
+            op_open_ephemeral_state: OpOpenEphemeralState::Start,
         }
     }
 
@@ -317,7 +319,7 @@ impl ProgramState {
         self.json_cache.clear()
     }
 
-    pub fn get_cursor<'a>(&'a self, cursor_id: CursorID) -> std::cell::RefMut<'a, Cursor> {
+    pub fn get_cursor(&self, cursor_id: CursorID) -> std::cell::RefMut<Cursor> {
         let cursors = self.cursors.borrow_mut();
         std::cell::RefMut::map(cursors, |c| {
             c.get_mut(cursor_id)
@@ -356,7 +358,6 @@ pub struct Program {
     pub max_registers: usize,
     pub insns: Vec<(Insn, InsnFunction)>,
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
-    pub database_header: Arc<SpinLock<DatabaseHeader>>,
     pub comments: Option<Vec<(InsnReference, &'static str)>>,
     pub parameters: crate::parameters::Parameters,
     pub connection: Arc<Connection>,
@@ -399,6 +400,7 @@ impl Program {
         pager: Rc<Pager>,
         program_state: &mut ProgramState,
         mv_store: Option<&Rc<MvStore>>,
+        rollback: bool,
     ) -> Result<StepResult> {
         if let Some(mv_store) = mv_store {
             let conn = self.connection.clone();
@@ -414,16 +416,27 @@ impl Program {
         } else {
             let connection = self.connection.clone();
             let auto_commit = connection.auto_commit.get();
-            tracing::trace!("Halt auto_commit {}", auto_commit);
+            tracing::trace!(
+                "Halt auto_commit {}, state={:?}",
+                auto_commit,
+                program_state.commit_state
+            );
             if program_state.commit_state == CommitState::Committing {
-                self.step_end_write_txn(&pager, &mut program_state.commit_state, &connection)
+                self.step_end_write_txn(
+                    &pager,
+                    &mut program_state.commit_state,
+                    &connection,
+                    rollback,
+                )
             } else if auto_commit {
                 let current_state = connection.transaction_state.get();
+                tracing::trace!("Auto-commit state: {:?}", current_state);
                 match current_state {
                     TransactionState::Write => self.step_end_write_txn(
                         &pager,
                         &mut program_state.commit_state,
                         &connection,
+                        rollback,
                     ),
                     TransactionState::Read => {
                         connection.transaction_state.replace(TransactionState::None);
@@ -447,8 +460,9 @@ impl Program {
         pager: &Rc<Pager>,
         commit_state: &mut CommitState,
         connection: &Connection,
+        rollback: bool,
     ) -> Result<StepResult> {
-        let cacheflush_status = pager.end_tx()?;
+        let cacheflush_status = pager.end_tx(rollback)?;
         match cacheflush_status {
             PagerCacheflushStatus::Done(_) => {
                 if self.change_cnt_on {
@@ -471,11 +485,10 @@ impl Program {
         let mut buff = String::with_capacity(1024);
         buff.push_str("addr  opcode             p1    p2    p3    p4             p5  comment\n");
         buff.push_str("----  -----------------  ----  ----  ----  -------------  --  -------\n");
-        let mut indent_count: usize = 0;
         let indent = "  ";
-        let mut prev_insn: Option<&Insn> = None;
+        let indent_counts = get_indent_counts(&self.insns);
         for (addr, (insn, _)) in self.insns.iter().enumerate() {
-            indent_count = get_indent_count(indent_count, insn, prev_insn);
+            let indent_count = indent_counts[addr];
             print_insn(
                 self,
                 addr as InsnReference,
@@ -484,47 +497,48 @@ impl Program {
                 &mut buff,
             );
             buff.push('\n');
-            prev_insn = Some(insn);
         }
         buff
     }
 }
 
-fn get_new_rowid<R: Rng>(cursor: &mut BTreeCursor, mut rng: R) -> Result<CursorResult<i64>> {
+fn get_new_rowid<R: Rng>(cursor: &mut BTreeCursor, mut _rng: R) -> Result<CursorResult<i64>> {
     match cursor.seek_to_last()? {
         CursorResult::Ok(()) => {}
         CursorResult::IO => return Ok(CursorResult::IO),
     }
-    let mut rowid = match cursor.rowid()? {
+    let rowid = match cursor.rowid()? {
         CursorResult::Ok(Some(rowid)) => rowid.checked_add(1).unwrap_or(i64::MAX), // add 1 but be careful with overflows, in case of overflow - use i64::MAX
         CursorResult::Ok(None) => 1,
         CursorResult::IO => return Ok(CursorResult::IO),
     };
-    if rowid > i64::MAX.try_into().unwrap() {
-        let distribution = Uniform::from(1..=i64::MAX);
-        let max_attempts = 100;
-        for count in 0..max_attempts {
-            rowid = distribution.sample(&mut rng).try_into().unwrap();
-            match cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })? {
-                CursorResult::Ok(false) => break, // Found a non-existing rowid
-                CursorResult::Ok(true) => {
-                    if count == max_attempts - 1 {
-                        return Err(LimboError::InternalError(
-                            "Failed to generate a new rowid".to_string(),
-                        ));
-                    } else {
-                        continue; // Try next random rowid
-                    }
-                }
-                CursorResult::IO => return Ok(CursorResult::IO),
-            }
-        }
-    }
-    Ok(CursorResult::Ok(rowid.try_into().unwrap()))
+    // NOTE(nilskch): I commented this part out because this condition will never be true.
+    // if rowid > i64::MAX {
+    //     let distribution = Uniform::from(1..=i64::MAX);
+    //     let max_attempts = 100;
+    //     for count in 0..max_attempts {
+    //         rowid = distribution.sample(&mut rng);
+    //         match cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })? {
+    //             CursorResult::Ok(false) => break, // Found a non-existing rowid
+    //             CursorResult::Ok(true) => {
+    //                 if count == max_attempts - 1 {
+    //                     return Err(LimboError::InternalError(
+    //                         "Failed to generate a new rowid".to_string(),
+    //                     ));
+    //                 } else {
+    //                     continue; // Try next random rowid
+    //                 }
+    //             }
+    //             CursorResult::IO => return Ok(CursorResult::IO),
+    //         }
+    //     }
+    // }
+    Ok(CursorResult::Ok(rowid))
 }
 
 fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> ImmutableRecord {
-    ImmutableRecord::from_registers(&registers[*start_reg..*start_reg + *count])
+    let regs = &registers[*start_reg..*start_reg + *count];
+    ImmutableRecord::from_registers(regs, regs.len())
 }
 
 #[instrument(skip(program), level = Level::TRACE)]
@@ -565,27 +579,63 @@ fn print_insn(program: &Program, addr: InsnReference, insn: &Insn, indent: Strin
     w.push_str(&s);
 }
 
-fn get_indent_count(indent_count: usize, curr_insn: &Insn, prev_insn: Option<&Insn>) -> usize {
-    let indent_count = if let Some(insn) = prev_insn {
+// The indenting rules are(from SQLite):
+//
+//  * For each "Next", "Prev", "VNext" or "VPrev" instruction, increase the ident number for
+//    all opcodes that occur between the p2 jump destination and the opcode itself.
+//
+//   * Do the previous for "Return" instructions for when P2 is positive.
+//
+//   * For each "Goto", if the jump destination is earlier in the program and ends on one of:
+//        Yield  SeekGt  SeekLt  RowSetRead  Rewind
+//     or if the P1 parameter is one instead of zero, then increase the indent number for all
+//     opcodes between the earlier instruction and "Goto"
+fn get_indent_counts(insns: &[(Insn, InsnFunction)]) -> Vec<usize> {
+    let mut indents = vec![0; insns.len()];
+
+    for (i, (insn, _)) in insns.iter().enumerate() {
+        let mut start = 0;
+        let mut end = 0;
         match insn {
-            Insn::Rewind { .. }
-            | Insn::Last { .. }
-            | Insn::SorterSort { .. }
-            | Insn::SeekGE { .. }
-            | Insn::SeekGT { .. }
-            | Insn::SeekLE { .. }
-            | Insn::SeekLT { .. } => indent_count + 1,
+            Insn::Next { pc_if_next, .. } | Insn::VNext { pc_if_next, .. } => {
+                let dest = pc_if_next.as_debug_int() as usize;
+                if dest < i {
+                    start = dest;
+                    end = i;
+                }
+            }
+            Insn::Prev { pc_if_prev, .. } => {
+                let dest = pc_if_prev.as_debug_int() as usize;
+                if dest < i {
+                    start = dest;
+                    end = i;
+                }
+            }
 
-            _ => indent_count,
+            Insn::Goto { target_pc } => {
+                let dest = target_pc.as_debug_int() as usize;
+                if dest < i
+                    && matches!(
+                        insns.get(dest).map(|(insn, _)| insn),
+                        Some(Insn::Yield { .. })
+                            | Some(Insn::SeekGT { .. })
+                            | Some(Insn::SeekLT { .. })
+                            | Some(Insn::Rewind { .. })
+                    )
+                {
+                    start = dest;
+                    end = i;
+                }
+            }
+
+            _ => {}
         }
-    } else {
-        indent_count
-    };
-
-    match curr_insn {
-        Insn::Next { .. } | Insn::SorterNext { .. } | Insn::Prev { .. } => indent_count - 1,
-        _ => indent_count,
+        for indent in indents.iter_mut().take(end).skip(start) {
+            *indent += 1;
+        }
     }
+
+    indents
 }
 
 pub trait FromValueRow<'a> {
@@ -646,7 +696,7 @@ impl Row {
         T::from_value(value)
     }
 
-    pub fn get_value<'a>(&'a self, idx: usize) -> &'a Value {
+    pub fn get_value(&self, idx: usize) -> &Value {
         let value = unsafe { self.values.add(idx).as_ref().unwrap() };
         match value {
             Register::Value(owned_value) => owned_value,

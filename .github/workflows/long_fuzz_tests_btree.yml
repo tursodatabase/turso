@@ -29,7 +29,7 @@ jobs:
       env:
         RUST_BACKTRACE: 1
     - name: Run ignored long tests with index
-      run: cargo test --features index_experimental -- --ignored fuzz_long
+      run: cargo test -- --ignored fuzz_long
       env:
         RUST_BACKTRACE: 1
 

@@ -88,7 +88,7 @@ pub fn translate_select(
     })
 }
 
-pub fn prepare_select_plan<'a>(
+pub fn prepare_select_plan(
     schema: &Schema,
     mut select: ast::Select,
     syms: &SymbolTable,
@@ -181,7 +181,8 @@ pub fn prepare_select_plan<'a>(
     }
 }
 
-fn prepare_one_select_plan<'a>(
+#[allow(clippy::too_many_arguments)]
+fn prepare_one_select_plan(
     schema: &Schema,
     select: ast::OneSelect,
     limit: Option<&ast::Limit>,
@@ -202,13 +203,10 @@ fn prepare_one_select_plan<'a>(
                 distinctness,
                 ..
             } = *select_inner;
-            #[cfg(not(feature = "index_experimental"))]
-            {
-                if distinctness.is_some() {
-                    crate::bail_parse_error!(
-                        "SELECT with DISTINCT is not allowed without indexes enabled"
-                    );
-                }
+            if !schema.indexes_enabled() && distinctness.is_some() {
+                crate::bail_parse_error!(
+                    "SELECT with DISTINCT is not allowed without indexes enabled"
+                );
             }
             let col_count = columns.len();
             if col_count == 0 {
@@ -284,7 +282,7 @@ fn prepare_one_select_plan<'a>(
                 match column {
                     ResultColumn::Star => {
                         select_star(
-                            &plan.table_references.joined_tables(),
+                            plan.table_references.joined_tables(),
                             &mut plan.result_columns,
                         );
                         for table in plan.table_references.joined_tables_mut() {
@@ -345,13 +343,10 @@ fn prepare_one_select_plan<'a>(
                                 };
                                 let distinctness = Distinctness::from_ast(distinctness.as_ref());
 
-                                #[cfg(not(feature = "index_experimental"))]
-                                {
-                                    if distinctness.is_distinct() {
-                                        crate::bail_parse_error!(
-                                            "SELECT with DISTINCT is not allowed without indexes enabled"
-                                        );
-                                    }
+                                if !schema.indexes_enabled() && distinctness.is_distinct() {
+                                    crate::bail_parse_error!(
+                                       "SELECT with DISTINCT is not allowed without indexes enabled"
+                                   );
                                 }
                                 if distinctness.is_distinct() && args_count != 1 {
                                     crate::bail_parse_error!("DISTINCT aggregate functions must have exactly one argument");
@@ -392,8 +387,11 @@ fn prepare_one_select_plan<'a>(
                                         });
                                     }
                                     Ok(_) => {
-                                        let contains_aggregates =
-                                            resolve_aggregates(expr, &mut aggregate_expressions)?;
+                                        let contains_aggregates = resolve_aggregates(
+                                            schema,
+                                            expr,
+                                            &mut aggregate_expressions,
+                                        )?;
                                         plan.result_columns.push(ResultSetColumn {
                                             alias: maybe_alias.as_ref().map(|alias| match alias {
                                                 ast::As::Elided(alias) => alias.0.clone(),
@@ -408,6 +406,7 @@ fn prepare_one_select_plan<'a>(
                                         {
                                             if let ExtFunc::Scalar(_) = f.as_ref().func {
                                                 let contains_aggregates = resolve_aggregates(
+                                                    schema,
                                                     expr,
                                                     &mut aggregate_expressions,
                                                 )?;
@@ -485,7 +484,7 @@ fn prepare_one_select_plan<'a>(
                             }
                             expr => {
                                 let contains_aggregates =
-                                    resolve_aggregates(expr, &mut aggregate_expressions)?;
+                                    resolve_aggregates(schema, expr, &mut aggregate_expressions)?;
                                 plan.result_columns.push(ResultSetColumn {
                                     alias: maybe_alias.as_ref().map(|alias| match alias {
                                         ast::As::Elided(alias) => alias.0.clone(),
@@ -531,7 +530,7 @@ fn prepare_one_select_plan<'a>(
                                 Some(&plan.result_columns),
                             )?;
                             let contains_aggregates =
-                                resolve_aggregates(expr, &mut aggregate_expressions)?;
+                                resolve_aggregates(schema, expr, &mut aggregate_expressions)?;
                             if !contains_aggregates {
                                 // TODO: sqlite allows HAVING clauses with non aggregate expressions like
                                 // HAVING id = 5. We should support this too eventually (I guess).
@@ -566,7 +565,7 @@ fn prepare_one_select_plan<'a>(
                         &mut plan.table_references,
                         Some(&plan.result_columns),
                     )?;
-                    resolve_aggregates(&o.expr, &mut plan.aggregates)?;
+                    resolve_aggregates(schema, &o.expr, &mut plan.aggregates)?;
 
                     key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc)));
                 }
@@ -574,7 +573,7 @@ fn prepare_one_select_plan<'a>(
             }
 
             // Parse the LIMIT/OFFSET clause
-            (plan.limit, plan.offset) = limit.map_or(Ok((None, None)), |l| parse_limit(l))?;
+            (plan.limit, plan.offset) = limit.map_or(Ok((None, None)), parse_limit)?;
 
             // Return the unoptimized query plan
             Ok(plan)
@@ -676,13 +675,7 @@ fn estimate_num_instructions(select: &SelectPlan) -> usize {
     let order_by_instructions = select.order_by.is_some() as usize * 10;
     let condition_instructions = select.where_clause.len() * 3;
 
-    let num_instructions = 20
-        + table_instructions
-        + group_by_instructions
-        + order_by_instructions
-        + condition_instructions;
-
-    num_instructions
+    20 + table_instructions + group_by_instructions + order_by_instructions + condition_instructions
 }
 
 fn estimate_num_labels(select: &SelectPlan) -> usize {
@@ -706,20 +699,17 @@ fn estimate_num_labels(select: &SelectPlan) -> usize {
     let order_by_labels = select.order_by.is_some() as usize * 10;
     let condition_labels = select.where_clause.len() * 2;
 
-    let num_labels =
-        init_halt_labels + table_labels + group_by_labels + order_by_labels + condition_labels;
-
-    num_labels
+    init_halt_labels + table_labels + group_by_labels + order_by_labels + condition_labels
 }
 
-pub fn emit_simple_count<'a>(
+pub fn emit_simple_count(
     program: &mut ProgramBuilder,
-    _t_ctx: &mut TranslateCtx<'a>,
-    plan: &'a SelectPlan,
+    _t_ctx: &mut TranslateCtx,
+    plan: &SelectPlan,
 ) -> Result<()> {
     let cursors = plan
         .joined_tables()
-        .get(0)
+        .first()
         .unwrap()
         .resolve_cursors(program)?;
 

@@ -126,7 +126,7 @@ pub unsafe extern "C" fn sqlite3_open(
             Err(_) => return SQLITE_CANTOPEN,
         },
     };
-    match limbo_core::Database::open_file(io.clone(), filename, false) {
+    match limbo_core::Database::open_file(io.clone(), filename, false, false) {
         Ok(db) => {
             let conn = db.connect().unwrap();
             *db_out = Box::leak(Box::new(sqlite3::new(io, db, conn)));

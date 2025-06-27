@@ -64,7 +64,7 @@ fn regexp_replace(&self, args: &[Value]) -> Value {
         None => "", // If args[2] does not exist, use an empty string
     };
 
-    match (args.get(0), args.get(1)) {
+    match (args.first(), args.get(1)) {
         (Some(haystack), Some(pattern)) => {
             let Some(haystack_text) = haystack.to_text() else {
                 return Value::from_text("".to_string()); // Return an empty string if haystack is not valid
@@ -73,11 +73,11 @@ fn regexp_replace(&self, args: &[Value]) -> Value {
                 return Value::from_text("".to_string()); // Return an empty string if pattern is not valid
             };
 
-            let re = match Regex::new(&pattern_text) {
+            let re = match Regex::new(pattern_text) {
                 Ok(re) => re,
                 Err(_) => return Value::from_text("".to_string()), // Return an empty string if regex compilation fails
             };
-            Value::from_text(re.replace(&haystack_text, replacement).to_string())
+            Value::from_text(re.replace(haystack_text, replacement).to_string())
         }
         _ => Value::from_text("".to_string()), // Return an empty string for invalid value types
     }

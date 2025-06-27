@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="limbo.png" alt="Limbo" width="800"/>
-  <h1 align="center">Project Limbo</h1>
+  <img src="turso.png" alt="Turso Database" width="800"/>
+  <h1 align="center">Turso Database</h1>
 </p>
 
 <p align="center">
-  <i>Limbo</i> is a project to build the next evolution of SQLite.
+  <i>Turso Database</i> is an in-process SQL database, compatible with SQLite.
 </p>
 
 <p align="center">
@@ -27,7 +27,7 @@
 
 ## Features and Roadmap
 
-Limbo is a _work-in-progress_, in-process OLTP database engine library written in Rust that has:
+Turso Database is a _work-in-progress_, in-process OLTP database engine library written in Rust that has:
 
 * **SQLite compatibility** [[doc](COMPAT.md)] for SQL dialect, file formats, and the C API
 * **Language bindings** for JavaScript/WebAssembly, Rust, Go, Python, and [Java](bindings/java)
@@ -57,7 +57,7 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 Then launch the shell to execute SQL statements:
 
 ```console
-Limbo
+Turso
 Enter ".help" for usage hints.
 Connected to a transient in-memory database.
 Use ".open FILENAME" to reopen on a persistent database
@@ -179,25 +179,25 @@ for rows.Next() {
 <summary>☕️ Java</summary>
 <br>
 
-We integrated Limbo into JDBC. For detailed instructions on how to use Limbo with java, please refer to
+We integrated Turso Database into JDBC. For detailed instructions on how to use Turso Database with java, please refer to
 the [README.md under bindings/java](bindings/java/README.md).
 </details>
 
 ## Contributing
 
-We'd love to have you contribute to Limbo! Please check out the [contribution guide] to get started.
+We'd love to have you contribute to Turso Database! Please check out the [contribution guide] to get started.
 
 ## FAQ
 
-### Is Limbo ready for production use?
+### Is Turso Database ready for production use?
 
-Limbo is currently under heavy development and is **not** ready for production use.
+Turso Database is currently under heavy development and is **not** ready for production use.
 
-### How is Limbo different from Turso's libSQL?
+### How is Turso Database different from Turso's libSQL?
 
-Limbo is a project to build the next evolution of SQLite in Rust, with a strong open contribution focus and features like native async support, vector search, and more. The libSQL project is also an attempt to evolve SQLite in a similar direction, but through a fork rather than a rewrite.
+Turso Database is a project to build the next evolution of SQLite in Rust, with a strong open contribution focus and features like native async support, vector search, and more. The libSQL project is also an attempt to evolve SQLite in a similar direction, but through a fork rather than a rewrite.
 
-Rewriting SQLite in Rust started as an unassuming experiment, and due to its incredible success, replaces libSQL as our intended direction. At this point, libSQL is production ready, Limbo is not - although it is evolving rapidly. As the project starts to near production readiness, we plan to rename it to just "Turso". More details [here](https://turso.tech/blog/we-will-rewrite-sqlite-and-we-are-going-all-in).
+Rewriting SQLite in Rust started as an unassuming experiment, and due to its incredible success, replaces libSQL as our intended direction. At this point, libSQL is production ready, Turso Database is not - although it is evolving rapidly. More details [here](https://turso.tech/blog/we-will-rewrite-sqlite-and-we-are-going-all-in).
 
 ## Publications
 
@@ -211,7 +211,7 @@ This project is licensed under the [MIT license].
 ### Contribution
 
 Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in Limbo by you, shall be licensed as MIT, without any additional
+for inclusion in Turso Database by you, shall be licensed as MIT, without any additional
 terms or conditions.
 
 [contribution guide]: https://github.com/tursodatabase/limbo/blob/main/CONTRIBUTING.md
@@ -221,11 +221,13 @@ terms or conditions.
 
 Thanks to all the partners of Limbo!
 
-<a href="https://blacksmith.sh"><img src="assets/blacksmith.svg"></a>
+<a href="https://blacksmith.sh"><img src="assets/blacksmith.svg" width="400"></a>
+
+<a href="https://antithesis.com/"><img src="assets/antithesis.jpg" width="400"></a>
 
 ## Contributors
 
-Thanks to all the contributors to Limbo!
+Thanks to all the contributors to Turso Database!
 
 <a href="https://github.com/tursodatabase/limbo/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=tursodatabase/limbo" />

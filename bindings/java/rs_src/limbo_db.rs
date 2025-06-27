@@ -17,6 +17,7 @@ impl LimboDB {
         LimboDB { db, io }
     }
 
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_ptr(self) -> jlong {
         Box::into_raw(Box::new(self)) as jlong
     }
@@ -67,7 +68,7 @@ pub extern "system" fn Java_tech_turso_core_LimboDB_openUtf8<'local>(
         }
     };
 
-    let db = match Database::open_file(io.clone(), &path, false) {
+    let db = match Database::open_file(io.clone(), &path, false, false) {
         Ok(db) => db,
         Err(e) => {
             set_err_msg_and_throw_exception(&mut env, obj, LIMBO_ETC, e.to_string());

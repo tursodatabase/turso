@@ -1,5 +1,8 @@
-use crate::translate::plan::Operation;
-use crate::vdbe::builder::TableRefIdCounter;
+use std::rc::Rc;
+
+use crate::schema::{BTreeTable, Column, Type};
+use crate::translate::plan::{Operation, QueryDestination, SelectPlan};
+use crate::vdbe::builder::CursorType;
 use crate::{
     bail_parse_error,
     schema::{Schema, Table},
@@ -53,7 +56,7 @@ pub fn translate_update(
     syms: &SymbolTable,
     mut program: ProgramBuilder,
 ) -> crate::Result<ProgramBuilder> {
-    let mut plan = prepare_update_plan(schema, body, &mut program.table_reference_counter)?;
+    let mut plan = prepare_update_plan(&mut program, schema, body)?;
     optimize_plan(&mut plan, schema)?;
     // TODO: freestyling these numbers
     let opts = ProgramBuilderOpts {
@@ -75,7 +78,7 @@ pub fn translate_update_with_after(
     mut program: ProgramBuilder,
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> crate::Result<ProgramBuilder> {
-    let mut plan = prepare_update_plan(schema, body, &mut program.table_reference_counter)?;
+    let mut plan = prepare_update_plan(&mut program, schema, body)?;
     optimize_plan(&mut plan, schema)?;
     // TODO: freestyling these numbers
     let opts = ProgramBuilderOpts {
@@ -90,9 +93,9 @@ pub fn translate_update_with_after(
 }
 
 pub fn prepare_update_plan(
+    program: &mut ProgramBuilder,
     schema: &Schema,
     body: &mut Update,
-    table_ref_counter: &mut TableRefIdCounter,
 ) -> crate::Result<Plan> {
     if body.with.is_some() {
         bail_parse_error!("WITH clause is not supported");
@@ -101,15 +104,12 @@ pub fn prepare_update_plan(
         bail_parse_error!("ON CONFLICT clause is not supported");
     }
     let table_name = &body.tbl_name.name;
-    #[cfg(not(feature = "index_experimental"))]
-    {
-        if schema.table_has_indexes(&table_name.to_string()) {
-            // Let's disable altering a table with indices altogether instead of checking column by
-            // column to be extra safe.
-            bail_parse_error!(
-                "UPDATE table disabled for table with indexes and without index_experimental feature flag"
-            );
-        }
+    if schema.table_has_indexes(&table_name.to_string()) && !schema.indexes_enabled() {
+        // Let's disable altering a table with indices altogether instead of checking column by
+        // column to be extra safe.
+        bail_parse_error!(
+            "UPDATE table disabled for table with indexes is disabled by default. Run with `--experimental-indexes` to enable this feature."
+        );
     }
     let table = match schema.get_table(table_name.0.as_str()) {
         Some(table) => table,
@@ -127,6 +127,7 @@ pub fn prepare_update_plan(
             })
         })
         .unwrap_or(IterationDirection::Forwards);
+
     let joined_tables = vec![JoinedTable {
         table: match table.as_ref() {
             Table::Virtual(vtab) => Table::Virtual(vtab.clone()),
@@ -134,13 +135,13 @@ pub fn prepare_update_plan(
             _ => unreachable!(),
         },
         identifier: table_name.0.clone(),
-        internal_id: table_ref_counter.next(),
+        internal_id: program.table_reference_counter.next(),
         op: Operation::Scan {
             iter_dir,
             index: None,
         },
         join_info: None,
-        col_used_mask: ColumnUsedMask::new(),
+        col_used_mask: ColumnUsedMask::default(),
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
     let set_clauses = body
@@ -198,13 +199,103 @@ pub fn prepare_update_plan(
             .map(|o| (o.expr.clone(), o.order.unwrap_or(SortOrder::Asc)))
             .collect()
     });
-    // Parse the WHERE clause
-    parse_where(
-        body.where_clause.as_ref().map(|w| *w.clone()),
-        &mut table_references,
-        Some(&result_columns),
-        &mut where_clause,
-    )?;
+
+    // Sqlite determines we should create an ephemeral table if we do not have a FROM clause
+    // Difficult to say what items from the plan can be checked for this so currently just checking if a RowId Alias is referenced
+    // https://github.com/sqlite/sqlite/blob/master/src/update.c#L395
+    // https://github.com/sqlite/sqlite/blob/master/src/update.c#L670
+    let columns = table.columns();
+
+    let rowid_alias_used = set_clauses.iter().fold(false, |accum, (idx, _)| {
+        accum || columns[*idx].is_rowid_alias
+    });
+
+    let (ephemeral_plan, where_clause) = if rowid_alias_used {
+        let internal_id = program.table_reference_counter.next();
+
+        let joined_tables = vec![JoinedTable {
+            table: match table.as_ref() {
+                Table::Virtual(vtab) => Table::Virtual(vtab.clone()),
+                Table::BTree(btree_table) => Table::BTree(btree_table.clone()),
+                _ => unreachable!(),
+            },
+            identifier: table_name.0.clone(),
+            internal_id,
+            op: Operation::Scan {
+                iter_dir,
+                index: None,
+            },
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+        }];
+        let mut table_references = TableReferences::new(joined_tables, vec![]);
+
+        // Parse the WHERE clause
+        parse_where(
+            body.where_clause.as_ref().map(|w| *w.clone()),
+            &mut table_references,
+            Some(&result_columns),
+            &mut where_clause,
+        )?;
+
+        let table = Rc::new(BTreeTable {
+            root_page: 0, // Not relevant for ephemeral table definition
+            name: "ephemeral_scratch".to_string(),
+            has_rowid: true,
+            primary_key_columns: vec![],
+            columns: vec![Column {
+                name: Some("rowid".to_string()),
+                ty: Type::Integer,
+                ty_str: "INTEGER".to_string(),
+                primary_key: true,
+                is_rowid_alias: false,
+                notnull: true,
+                default: None,
+                unique: false,
+                collation: None,
+            }],
+            is_strict: false,
+            unique_sets: None,
+        });
+
+        let temp_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+
+        let ephemeral_plan = SelectPlan {
+            table_references,
+            result_columns: vec![ResultSetColumn {
+                expr: Expr::RowId {
+                    database: None,
+                    table: internal_id,
+                },
+                alias: None,
+                contains_aggregates: false,
+            }],
+            where_clause,       // original WHERE terms from the UPDATE clause
+            group_by: None,     // N/A
+            order_by: None,     // N/A
+            aggregates: vec![], // N/A
+            limit: None,        // N/A
+            query_destination: QueryDestination::EphemeralTable {
+                cursor_id: temp_cursor_id,
+                table,
+            },
+            join_order: vec![],
+            offset: None,
+            contains_constant_false_condition: false,
+            distinctness: super::plan::Distinctness::NonDistinct,
+            values: vec![],
+        };
+        (Some(ephemeral_plan), vec![])
+    } else {
+        // Parse the WHERE clause
+        parse_where(
+            body.where_clause.as_ref().map(|w| *w.clone()),
+            &mut table_references,
+            Some(&result_columns),
+            &mut where_clause,
+        )?;
+        (None, where_clause)
+    };
 
     // Parse the LIMIT/OFFSET clause
     let (limit, offset) = body
@@ -238,5 +329,6 @@ pub fn prepare_update_plan(
         offset,
         contains_constant_false_condition: false,
         indexes_to_update,
+        ephemeral_plan,
     }))
 }

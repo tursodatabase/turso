@@ -24,15 +24,12 @@ pub fn translate_alter_table(
 ) -> Result<ProgramBuilder> {
     let (table_name, alter_table) = alter;
     let ast::Name(table_name) = table_name.name;
-    #[cfg(not(feature = "index_experimental"))]
-    {
-        if schema.table_has_indexes(&table_name) && cfg!(not(feature = "index_experimental")) {
-            // Let's disable altering a table with indices altogether instead of checking column by
-            // column to be extra safe.
-            crate::bail_parse_error!(
-                "Alter table disabled for table with indexes without index_experimental feature flag"
-            );
-        }
+    if schema.table_has_indexes(&table_name) && !schema.indexes_enabled() {
+        // Let's disable altering a table with indices altogether instead of checking column by
+        // column to be extra safe.
+        crate::bail_parse_error!(
+            "ALTER TABLE for table with indexes is disabled by default. Run with `--experimental-indexes` to enable this feature."
+        );
     }
 
     let Some(original_btree) = schema

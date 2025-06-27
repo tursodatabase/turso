@@ -23,7 +23,7 @@ pub trait ToSqlString {
 
 impl<T: ToSqlString> ToSqlString for Box<T> {
     fn to_sql_string<C: ToSqlContext>(&self, context: &C) -> String {
-        T::to_sql_string(&self, context)
+        T::to_sql_string(self, context)
     }
 }
 

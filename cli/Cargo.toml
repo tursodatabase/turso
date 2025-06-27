@@ -2,8 +2,8 @@
 
 [package]
 authors.workspace = true
-default-run = "limbo"
-description = "The Limbo interactive SQL shell"
+default-run = "tursodb"
+description = "The Turso interactive SQL shell"
 edition.workspace = true
 license.workspace = true
 name = "limbo_cli"
@@ -14,14 +14,8 @@ version.workspace = true
 dist = true
 
 [[bin]]
-name = "limbo"
+name = "tursodb"
 path = "main.rs"
-
-[[bin]]
-name = "limbo_index_experimental"
-path = "main.rs"
-required-features = ["index_experimental"]
-
 
 [dependencies]
 anyhow.workspace = true
@@ -56,7 +50,6 @@ toml_edit = {version = "0.22.24", features = ["serde"]}
 [features]
 default = ["io_uring"]
 io_uring = ["limbo_core/io_uring"]
-index_experimental = ["limbo_core/index_experimental"]
 
 [build-dependencies]
 syntect = "5.2.0"

@@ -54,7 +54,7 @@ impl Predicate {
     }
 
     /// Produces a true [ast::Expr::Binary] [Predicate] that is true for the provided row in the given table
-    pub fn true_binary<R: rand::Rng>(rng: &mut R, t: &Table, row: &Vec<SimValue>) -> Predicate {
+    pub fn true_binary<R: rand::Rng>(rng: &mut R, t: &Table, row: &[SimValue]) -> Predicate {
         // Pick a column
         let column_index = rng.gen_range(0..t.columns.len());
         let column = &t.columns[column_index];
@@ -146,7 +146,7 @@ impl Predicate {
     }
 
     /// Produces an [ast::Expr::Binary] [Predicate] that is false for the provided row in the given table
-    pub fn false_binary<R: rand::Rng>(rng: &mut R, t: &Table, row: &Vec<SimValue>) -> Predicate {
+    pub fn false_binary<R: rand::Rng>(rng: &mut R, t: &Table, row: &[SimValue]) -> Predicate {
         // Pick a column
         let column_index = rng.gen_range(0..t.columns.len());
         let column = &t.columns[column_index];
@@ -321,11 +321,11 @@ impl CompoundPredicate {
     ) -> Self {
         // Cannot pick a row if the table is empty
         if table.rows.is_empty() {
-            return Self(
-                predicate_value
-                    .then_some(Predicate::true_())
-                    .unwrap_or(Predicate::false_()),
-            );
+            return Self(if predicate_value {
+                Predicate::true_()
+            } else {
+                Predicate::false_()
+            });
         }
         let row = pick(&table.rows, rng);
         let predicate = if rng.gen_bool(0.7) {
@@ -449,7 +449,7 @@ mod tests {
             let predicate = Predicate::true_binary(&mut rng, &table, row);
             let value = expr_to_value(&predicate.0, row, &table);
             assert!(
-                value.as_ref().map_or(false, |value| value.into_bool()),
+                value.as_ref().map_or(false, |value| value.as_bool()),
                 "Predicate: {:#?}\nValue: {:#?}\nSeed: {}",
                 predicate,
                 value,
@@ -478,7 +478,7 @@ mod tests {
             let predicate = Predicate::false_binary(&mut rng, &table, row);
             let value = expr_to_value(&predicate.0, row, &table);
             assert!(
-                !value.as_ref().map_or(false, |value| value.into_bool()),
+                !value.as_ref().map_or(false, |value| value.as_bool()),
                 "Predicate: {:#?}\nValue: {:#?}\nSeed: {}",
                 predicate,
                 value,

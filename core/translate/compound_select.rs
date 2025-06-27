@@ -154,7 +154,7 @@ fn emit_compound_select(
                         (cursor_id, index.clone())
                     }
                     _ => {
-                        if cfg!(not(feature = "index_experimental")) {
+                        if !schema.indexes_enabled() {
                             crate::bail_parse_error!("UNION not supported without indexes");
                         } else {
                             new_dedupe_index = true;
