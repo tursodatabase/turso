@@ -281,7 +281,7 @@ pub unsafe extern "C" fn sqlite3_exec(
     sql: *const ffi::c_char,
     _callback: exec_callback,
     _context: *mut ffi::c_void,
-    _err: *mut *mut ffi::c_char,
+    err: *mut *mut ffi::c_char,
 ) -> ffi::c_int {
     if db.is_null() || sql.is_null() {
         return SQLITE_MISUSE;
@@ -294,10 +294,23 @@ pub unsafe extern "C" fn sqlite3_exec(
         Err(_) => return SQLITE_MISUSE,
     };
     trace!("sqlite3_exec(sql={})", sql);
-    match db.conn.execute(sql) {
-        Ok(_) => SQLITE_OK,
-        Err(_) => SQLITE_ERROR,
+
+    let stmts = sql.split(';').map(str::trim).filter(|s| !s.is_empty());
+
+    for stmt in stmts {
+        match db.conn.execute(stmt) {
+            Ok(_) => continue,
+            Err(_) => {
+                if !err.is_null() {
+                    *err = CString::new(format!("failed to execute statement: {}", stmt))
+                        .unwrap()
+                        .into_raw();
+                }
+                return SQLITE_ERROR;
+            }
+        }
     }
+    SQLITE_OK
 }
 
 #[no_mangle]
