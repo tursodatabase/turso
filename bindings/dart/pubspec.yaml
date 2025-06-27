@@ -1,9 +1,8 @@
-name: dart
-description: "A new Flutter project."
+name: turso_dart
+description: "Dart language binding for Turso."
+version: 0.0.1
 
-publish_to: "none"
-
-version: 1.0.0+1
+publish_to: none
 
 environment:
   sdk: ^3.8.1
@@ -14,14 +13,16 @@ dependencies:
   rust_lib_dart:
     path: rust_builder
   flutter_rust_bridge: 2.10.0
+  freezed_annotation: ^2.4.4
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
-
   flutter_lints: ^5.0.0
   integration_test:
     sdk: flutter
+  freezed: ^2.5.7
+  build_runner: ^2.4.12
 
 flutter:
   uses-material-design: true

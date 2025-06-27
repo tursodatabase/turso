@@ -3,12 +3,19 @@
 
 // ignore_for_file: unused_import, unused_element, unnecessary_import, duplicate_ignore, invalid_use_of_internal_member, annotate_overrides, non_constant_identifier_names, curly_braces_in_flow_control_structures, prefer_const_literals_to_create_immutables, unused_field
 
-import 'api/simple.dart';
+import 'api/connect.dart';
+import 'api/connection.dart';
+import 'api/statement.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'frb_generated.dart';
 import 'frb_generated.io.dart'
     if (dart.library.js_interop) 'frb_generated.web.dart';
+import 'helpers/params.dart';
+import 'helpers/result.dart';
+import 'helpers/return_value.dart';
+import 'helpers/value.dart';
+import 'helpers/wrapper.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
 /// Main entrypoint of the Rust API
@@ -53,7 +60,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
 
   @override
   Future<void> executeRustInitializers() async {
-    await api.crateApiSimpleInitApp();
+    await api.crateApiInitInitApp();
   }
 
   @override
@@ -64,20 +71,106 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.10.0';
 
   @override
-  int get rustContentHash => -1918914929;
+  int get rustContentHash => -691987803;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
-        stem: 'rust_lib_dart',
+        stem: 'limbo_dart',
         ioDirectory: 'rust/target/release/',
         webPrefix: 'pkg/',
       );
 }
 
 abstract class RustLibApi extends BaseApi {
-  String crateApiSimpleGreet({required String name});
+  Future<ExecuteResult> crateApiConnectionLibsqlConnectionExecute({
+    required LibsqlConnection that,
+    required String sql,
+    required Params params,
+  });
 
-  Future<void> crateApiSimpleInitApp();
+  Future<LibsqlConnection> crateApiConnectionLibsqlConnectionNew({
+    required WrapperArcConnection connection,
+    required WrapperArcDatabase database,
+  });
+
+  Future<LibsqlStatement> crateApiConnectionLibsqlConnectionPrepare({
+    required LibsqlConnection that,
+    required String sql,
+  });
+
+  Future<QueryResult> crateApiConnectionLibsqlConnectionQuery({
+    required LibsqlConnection that,
+    required String sql,
+    required Params params,
+  });
+
+  Future<ExecuteResult> crateApiStatementLibsqlStatementExecute({
+    required LibsqlStatement that,
+    required Params params,
+  });
+
+  Future<LibsqlStatement> crateApiStatementLibsqlStatementNew({
+    required WrapperStatement statement,
+    required WrapperArcConnection connection,
+  });
+
+  Future<QueryResult> crateApiStatementLibsqlStatementQuery({
+    required LibsqlStatement that,
+    required Params params,
+  });
+
+  Future<void> crateApiStatementLibsqlStatementReset({
+    required LibsqlStatement that,
+  });
+
+  Future<LibsqlConnection> crateApiConnectConnect({required ConnectArgs args});
+
+  Future<void> crateApiInitInitApp();
+
+  RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_LibsqlConnection;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_LibsqlConnection;
+
+  CrossPlatformFinalizerArg
+  get rust_arc_decrement_strong_count_LibsqlConnectionPtr;
+
+  RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_LibsqlStatement;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_LibsqlStatement;
+
+  CrossPlatformFinalizerArg
+  get rust_arc_decrement_strong_count_LibsqlStatementPtr;
+
+  RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_WrapperArcConnection;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_WrapperArcConnection;
+
+  CrossPlatformFinalizerArg
+  get rust_arc_decrement_strong_count_WrapperArcConnectionPtr;
+
+  RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_WrapperArcDatabase;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_WrapperArcDatabase;
+
+  CrossPlatformFinalizerArg
+  get rust_arc_decrement_strong_count_WrapperArcDatabasePtr;
+
+  RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_WrapperStatement;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_WrapperStatement;
+
+  CrossPlatformFinalizerArg
+  get rust_arc_decrement_strong_count_WrapperStatementPtr;
 }
 
 class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
@@ -89,34 +182,62 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   });
 
   @override
-  String crateApiSimpleGreet({required String name}) {
-    return handler.executeSync(
-      SyncTask(
-        callFfi: () {
+  Future<ExecuteResult> crateApiConnectionLibsqlConnectionExecute({
+    required LibsqlConnection that,
+    required String sql,
+    required Params params,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
           final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_String(name, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 1)!;
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlConnection(
+            that,
+            serializer,
+          );
+          sse_encode_String(sql, serializer);
+          sse_encode_box_autoadd_params(params, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 1,
+            port: port_,
+          );
         },
         codec: SseCodec(
-          decodeSuccessData: sse_decode_String,
+          decodeSuccessData: sse_decode_execute_result,
           decodeErrorData: null,
         ),
-        constMeta: kCrateApiSimpleGreetConstMeta,
-        argValues: [name],
+        constMeta: kCrateApiConnectionLibsqlConnectionExecuteConstMeta,
+        argValues: [that, sql, params],
         apiImpl: this,
       ),
     );
   }
 
-  TaskConstMeta get kCrateApiSimpleGreetConstMeta =>
-      const TaskConstMeta(debugName: "greet", argNames: ["name"]);
+  TaskConstMeta get kCrateApiConnectionLibsqlConnectionExecuteConstMeta =>
+      const TaskConstMeta(
+        debugName: "LibsqlConnection_execute",
+        argNames: ["that", "sql", "params"],
+      );
 
   @override
-  Future<void> crateApiSimpleInitApp() {
+  Future<LibsqlConnection> crateApiConnectionLibsqlConnectionNew({
+    required WrapperArcConnection connection,
+    required WrapperArcDatabase database,
+  }) {
     return handler.executeNormal(
       NormalTask(
         callFfi: (port_) {
           final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperArcConnection(
+            connection,
+            serializer,
+          );
+          sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperArcDatabase(
+            database,
+            serializer,
+          );
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -125,18 +246,471 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           );
         },
         codec: SseCodec(
+          decodeSuccessData:
+              sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlConnection,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiConnectionLibsqlConnectionNewConstMeta,
+        argValues: [connection, database],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiConnectionLibsqlConnectionNewConstMeta =>
+      const TaskConstMeta(
+        debugName: "LibsqlConnection_new",
+        argNames: ["connection", "database"],
+      );
+
+  @override
+  Future<LibsqlStatement> crateApiConnectionLibsqlConnectionPrepare({
+    required LibsqlConnection that,
+    required String sql,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlConnection(
+            that,
+            serializer,
+          );
+          sse_encode_String(sql, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 3,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData:
+              sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlStatement,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiConnectionLibsqlConnectionPrepareConstMeta,
+        argValues: [that, sql],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiConnectionLibsqlConnectionPrepareConstMeta =>
+      const TaskConstMeta(
+        debugName: "LibsqlConnection_prepare",
+        argNames: ["that", "sql"],
+      );
+
+  @override
+  Future<QueryResult> crateApiConnectionLibsqlConnectionQuery({
+    required LibsqlConnection that,
+    required String sql,
+    required Params params,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlConnection(
+            that,
+            serializer,
+          );
+          sse_encode_String(sql, serializer);
+          sse_encode_box_autoadd_params(params, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 4,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_query_result,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiConnectionLibsqlConnectionQueryConstMeta,
+        argValues: [that, sql, params],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiConnectionLibsqlConnectionQueryConstMeta =>
+      const TaskConstMeta(
+        debugName: "LibsqlConnection_query",
+        argNames: ["that", "sql", "params"],
+      );
+
+  @override
+  Future<ExecuteResult> crateApiStatementLibsqlStatementExecute({
+    required LibsqlStatement that,
+    required Params params,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_RefMut_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlStatement(
+            that,
+            serializer,
+          );
+          sse_encode_box_autoadd_params(params, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 5,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_execute_result,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiStatementLibsqlStatementExecuteConstMeta,
+        argValues: [that, params],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiStatementLibsqlStatementExecuteConstMeta =>
+      const TaskConstMeta(
+        debugName: "LibsqlStatement_execute",
+        argNames: ["that", "params"],
+      );
+
+  @override
+  Future<LibsqlStatement> crateApiStatementLibsqlStatementNew({
+    required WrapperStatement statement,
+    required WrapperArcConnection connection,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperStatement(
+            statement,
+            serializer,
+          );
+          sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperArcConnection(
+            connection,
+            serializer,
+          );
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 6,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData:
+              sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlStatement,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiStatementLibsqlStatementNewConstMeta,
+        argValues: [statement, connection],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiStatementLibsqlStatementNewConstMeta =>
+      const TaskConstMeta(
+        debugName: "LibsqlStatement_new",
+        argNames: ["statement", "connection"],
+      );
+
+  @override
+  Future<QueryResult> crateApiStatementLibsqlStatementQuery({
+    required LibsqlStatement that,
+    required Params params,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_RefMut_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlStatement(
+            that,
+            serializer,
+          );
+          sse_encode_box_autoadd_params(params, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 7,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_query_result,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiStatementLibsqlStatementQueryConstMeta,
+        argValues: [that, params],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiStatementLibsqlStatementQueryConstMeta =>
+      const TaskConstMeta(
+        debugName: "LibsqlStatement_query",
+        argNames: ["that", "params"],
+      );
+
+  @override
+  Future<void> crateApiStatementLibsqlStatementReset({
+    required LibsqlStatement that,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_RefMut_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlStatement(
+            that,
+            serializer,
+          );
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 8,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
           decodeSuccessData: sse_decode_unit,
           decodeErrorData: null,
         ),
-        constMeta: kCrateApiSimpleInitAppConstMeta,
+        constMeta: kCrateApiStatementLibsqlStatementResetConstMeta,
+        argValues: [that],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiStatementLibsqlStatementResetConstMeta =>
+      const TaskConstMeta(
+        debugName: "LibsqlStatement_reset",
+        argNames: ["that"],
+      );
+
+  @override
+  Future<LibsqlConnection> crateApiConnectConnect({required ConnectArgs args}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_box_autoadd_connect_args(args, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 9,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData:
+              sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlConnection,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiConnectConnectConstMeta,
+        argValues: [args],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiConnectConnectConstMeta =>
+      const TaskConstMeta(debugName: "connect", argNames: ["args"]);
+
+  @override
+  Future<void> crateApiInitInitApp() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 10,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiInitInitAppConstMeta,
         argValues: [],
         apiImpl: this,
       ),
     );
   }
 
-  TaskConstMeta get kCrateApiSimpleInitAppConstMeta =>
+  TaskConstMeta get kCrateApiInitInitAppConstMeta =>
       const TaskConstMeta(debugName: "init_app", argNames: []);
+
+  RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_LibsqlConnection => wire
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlConnection;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_LibsqlConnection => wire
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlConnection;
+
+  RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_LibsqlStatement => wire
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlStatement;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_LibsqlStatement => wire
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlStatement;
+
+  RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_WrapperArcConnection => wire
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperArcConnection;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_WrapperArcConnection => wire
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperArcConnection;
+
+  RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_WrapperArcDatabase => wire
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperArcDatabase;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_WrapperArcDatabase => wire
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperArcDatabase;
+
+  RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_WrapperStatement => wire
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperStatement;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_WrapperStatement => wire
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperStatement;
+
+  @protected
+  LibsqlConnection
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlConnection(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return LibsqlConnectionImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
+  LibsqlStatement
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlStatement(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return LibsqlStatementImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
+  WrapperArcConnection
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperArcConnection(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return WrapperArcConnectionImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
+  WrapperArcDatabase
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperArcDatabase(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return WrapperArcDatabaseImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
+  WrapperStatement
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperStatement(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return WrapperStatementImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
+  LibsqlStatement
+  dco_decode_Auto_RefMut_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlStatement(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return LibsqlStatementImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
+  LibsqlConnection
+  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlConnection(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return LibsqlConnectionImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
+  Map<String, ReturnValue> dco_decode_Map_String_return_value_None(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return Map.fromEntries(
+      dco_decode_list_record_string_return_value(
+        raw,
+      ).map((e) => MapEntry(e.$1, e.$2)),
+    );
+  }
+
+  @protected
+  LibsqlConnection
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlConnection(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return LibsqlConnectionImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
+  LibsqlStatement
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlStatement(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return LibsqlStatementImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
+  WrapperArcConnection
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperArcConnection(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return WrapperArcConnectionImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
+  WrapperArcDatabase
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperArcDatabase(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return WrapperArcDatabaseImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
+  WrapperStatement
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperStatement(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return WrapperStatementImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
 
   @protected
   String dco_decode_String(dynamic raw) {
@@ -145,9 +719,232 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  bool dco_decode_bool(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as bool;
+  }
+
+  @protected
+  bool dco_decode_box_autoadd_bool(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as bool;
+  }
+
+  @protected
+  ConnectArgs dco_decode_box_autoadd_connect_args(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_connect_args(raw);
+  }
+
+  @protected
+  LibsqlOpenFlags dco_decode_box_autoadd_libsql_open_flags(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_libsql_open_flags(raw);
+  }
+
+  @protected
+  Params dco_decode_box_autoadd_params(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_params(raw);
+  }
+
+  @protected
+  BigInt dco_decode_box_autoadd_u_64(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_u_64(raw);
+  }
+
+  @protected
+  ConnectArgs dco_decode_connect_args(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 8)
+      throw Exception('unexpected arr length: expect 8 but see ${arr.length}');
+    return ConnectArgs(
+      url: dco_decode_String(arr[0]),
+      authToken: dco_decode_opt_String(arr[1]),
+      syncUrl: dco_decode_opt_String(arr[2]),
+      syncIntervalSeconds: dco_decode_opt_box_autoadd_u_64(arr[3]),
+      encryptionKey: dco_decode_opt_String(arr[4]),
+      readYourWrites: dco_decode_opt_box_autoadd_bool(arr[5]),
+      openFlags: dco_decode_opt_box_autoadd_libsql_open_flags(arr[6]),
+      offline: dco_decode_opt_box_autoadd_bool(arr[7]),
+    );
+  }
+
+  @protected
+  ExecuteResult dco_decode_execute_result(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 1)
+      throw Exception('unexpected arr length: expect 1 but see ${arr.length}');
+    return ExecuteResult(rowsAffected: dco_decode_u_64(arr[0]));
+  }
+
+  @protected
+  double dco_decode_f_64(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as double;
+  }
+
+  @protected
+  int dco_decode_i_32(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as int;
+  }
+
+  @protected
+  PlatformInt64 dco_decode_i_64(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dcoDecodeI64(raw);
+  }
+
+  @protected
+  LibsqlOpenFlags dco_decode_libsql_open_flags(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return LibsqlOpenFlags.values[raw as int];
+  }
+
+  @protected
+  List<Map<String, ReturnValue>> dco_decode_list_Map_String_return_value_None(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>)
+        .map(dco_decode_Map_String_return_value_None)
+        .toList();
+  }
+
+  @protected
+  List<String> dco_decode_list_String(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_String).toList();
+  }
+
+  @protected
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as Uint8List;
+  }
+
+  @protected
+  List<(String, ReturnValue)> dco_decode_list_record_string_return_value(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>)
+        .map(dco_decode_record_string_return_value)
+        .toList();
+  }
+
+  @protected
+  List<(String, Value)> dco_decode_list_record_string_value(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_record_string_value).toList();
+  }
+
+  @protected
+  List<Value> dco_decode_list_value(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_value).toList();
+  }
+
+  @protected
+  String? dco_decode_opt_String(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_String(raw);
+  }
+
+  @protected
+  bool? dco_decode_opt_box_autoadd_bool(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_box_autoadd_bool(raw);
+  }
+
+  @protected
+  LibsqlOpenFlags? dco_decode_opt_box_autoadd_libsql_open_flags(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_box_autoadd_libsql_open_flags(raw);
+  }
+
+  @protected
+  BigInt? dco_decode_opt_box_autoadd_u_64(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_box_autoadd_u_64(raw);
+  }
+
+  @protected
+  Params dco_decode_params(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    switch (raw[0]) {
+      case 0:
+        return Params_None();
+      case 1:
+        return Params_Positional(dco_decode_list_value(raw[1]));
+      case 2:
+        return Params_Named(dco_decode_list_record_string_value(raw[1]));
+      default:
+        throw Exception("unreachable");
+    }
+  }
+
+  @protected
+  QueryResult dco_decode_query_result(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 4)
+      throw Exception('unexpected arr length: expect 4 but see ${arr.length}');
+    return QueryResult(
+      rows: dco_decode_list_Map_String_return_value_None(arr[0]),
+      columns: dco_decode_list_String(arr[1]),
+      rowsAffected: dco_decode_u_64(arr[2]),
+      lastInsertRowid: dco_decode_i_64(arr[3]),
+    );
+  }
+
+  @protected
+  (String, ReturnValue) dco_decode_record_string_return_value(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 2) {
+      throw Exception('Expected 2 elements, got ${arr.length}');
+    }
+    return (dco_decode_String(arr[0]), dco_decode_return_value(arr[1]));
+  }
+
+  @protected
+  (String, Value) dco_decode_record_string_value(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 2) {
+      throw Exception('Expected 2 elements, got ${arr.length}');
+    }
+    return (dco_decode_String(arr[0]), dco_decode_value(arr[1]));
+  }
+
+  @protected
+  ReturnValue dco_decode_return_value(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    switch (raw[0]) {
+      case 0:
+        return ReturnValue_Integer(dco_decode_i_64(raw[1]));
+      case 1:
+        return ReturnValue_Real(dco_decode_f_64(raw[1]));
+      case 2:
+        return ReturnValue_Text(dco_decode_String(raw[1]));
+      case 3:
+        return ReturnValue_Blob(dco_decode_list_prim_u_8_strict(raw[1]));
+      case 4:
+        return ReturnValue_Null();
+      default:
+        throw Exception("unreachable");
+    }
+  }
+
+  @protected
+  BigInt dco_decode_u_64(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dcoDecodeU64(raw);
   }
 
   @protected
@@ -163,6 +960,184 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  BigInt dco_decode_usize(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dcoDecodeU64(raw);
+  }
+
+  @protected
+  Value dco_decode_value(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    switch (raw[0]) {
+      case 0:
+        return Value_Integer(dco_decode_i_64(raw[1]));
+      case 1:
+        return Value_Real(dco_decode_f_64(raw[1]));
+      case 2:
+        return Value_Text(dco_decode_String(raw[1]));
+      case 3:
+        return Value_Blob(dco_decode_list_prim_u_8_strict(raw[1]));
+      case 4:
+        return Value_Null();
+      default:
+        throw Exception("unreachable");
+    }
+  }
+
+  @protected
+  LibsqlConnection
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlConnection(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return LibsqlConnectionImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
+  LibsqlStatement
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlStatement(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return LibsqlStatementImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
+  WrapperArcConnection
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperArcConnection(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return WrapperArcConnectionImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
+  WrapperArcDatabase
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperArcDatabase(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return WrapperArcDatabaseImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
+  WrapperStatement
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperStatement(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return WrapperStatementImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
+  LibsqlStatement
+  sse_decode_Auto_RefMut_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlStatement(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return LibsqlStatementImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
+  LibsqlConnection
+  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlConnection(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return LibsqlConnectionImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
+  Map<String, ReturnValue> sse_decode_Map_String_return_value_None(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var inner = sse_decode_list_record_string_return_value(deserializer);
+    return Map.fromEntries(inner.map((e) => MapEntry(e.$1, e.$2)));
+  }
+
+  @protected
+  LibsqlConnection
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlConnection(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return LibsqlConnectionImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
+  LibsqlStatement
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlStatement(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return LibsqlStatementImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
+  WrapperArcConnection
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperArcConnection(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return WrapperArcConnectionImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
+  WrapperArcDatabase
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperArcDatabase(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return WrapperArcDatabaseImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
+  WrapperStatement
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperStatement(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return WrapperStatementImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
   String sse_decode_String(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var inner = sse_decode_list_prim_u_8_strict(deserializer);
@@ -170,10 +1145,302 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  bool sse_decode_bool(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getUint8() != 0;
+  }
+
+  @protected
+  bool sse_decode_box_autoadd_bool(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_bool(deserializer));
+  }
+
+  @protected
+  ConnectArgs sse_decode_box_autoadd_connect_args(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_connect_args(deserializer));
+  }
+
+  @protected
+  LibsqlOpenFlags sse_decode_box_autoadd_libsql_open_flags(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_libsql_open_flags(deserializer));
+  }
+
+  @protected
+  Params sse_decode_box_autoadd_params(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_params(deserializer));
+  }
+
+  @protected
+  BigInt sse_decode_box_autoadd_u_64(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_u_64(deserializer));
+  }
+
+  @protected
+  ConnectArgs sse_decode_connect_args(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_url = sse_decode_String(deserializer);
+    var var_authToken = sse_decode_opt_String(deserializer);
+    var var_syncUrl = sse_decode_opt_String(deserializer);
+    var var_syncIntervalSeconds = sse_decode_opt_box_autoadd_u_64(deserializer);
+    var var_encryptionKey = sse_decode_opt_String(deserializer);
+    var var_readYourWrites = sse_decode_opt_box_autoadd_bool(deserializer);
+    var var_openFlags = sse_decode_opt_box_autoadd_libsql_open_flags(
+      deserializer,
+    );
+    var var_offline = sse_decode_opt_box_autoadd_bool(deserializer);
+    return ConnectArgs(
+      url: var_url,
+      authToken: var_authToken,
+      syncUrl: var_syncUrl,
+      syncIntervalSeconds: var_syncIntervalSeconds,
+      encryptionKey: var_encryptionKey,
+      readYourWrites: var_readYourWrites,
+      openFlags: var_openFlags,
+      offline: var_offline,
+    );
+  }
+
+  @protected
+  ExecuteResult sse_decode_execute_result(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_rowsAffected = sse_decode_u_64(deserializer);
+    return ExecuteResult(rowsAffected: var_rowsAffected);
+  }
+
+  @protected
+  double sse_decode_f_64(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getFloat64();
+  }
+
+  @protected
+  int sse_decode_i_32(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getInt32();
+  }
+
+  @protected
+  PlatformInt64 sse_decode_i_64(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getPlatformInt64();
+  }
+
+  @protected
+  LibsqlOpenFlags sse_decode_libsql_open_flags(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var inner = sse_decode_i_32(deserializer);
+    return LibsqlOpenFlags.values[inner];
+  }
+
+  @protected
+  List<Map<String, ReturnValue>> sse_decode_list_Map_String_return_value_None(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <Map<String, ReturnValue>>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_Map_String_return_value_None(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
+  List<String> sse_decode_list_String(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <String>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_String(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var len_ = sse_decode_i_32(deserializer);
     return deserializer.buffer.getUint8List(len_);
+  }
+
+  @protected
+  List<(String, ReturnValue)> sse_decode_list_record_string_return_value(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <(String, ReturnValue)>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_record_string_return_value(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
+  List<(String, Value)> sse_decode_list_record_string_value(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <(String, Value)>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_record_string_value(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
+  List<Value> sse_decode_list_value(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <Value>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_value(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
+  String? sse_decode_opt_String(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_String(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
+  bool? sse_decode_opt_box_autoadd_bool(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_box_autoadd_bool(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
+  LibsqlOpenFlags? sse_decode_opt_box_autoadd_libsql_open_flags(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_box_autoadd_libsql_open_flags(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
+  BigInt? sse_decode_opt_box_autoadd_u_64(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_box_autoadd_u_64(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
+  Params sse_decode_params(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var tag_ = sse_decode_i_32(deserializer);
+    switch (tag_) {
+      case 0:
+        return Params_None();
+      case 1:
+        var var_field0 = sse_decode_list_value(deserializer);
+        return Params_Positional(var_field0);
+      case 2:
+        var var_field0 = sse_decode_list_record_string_value(deserializer);
+        return Params_Named(var_field0);
+      default:
+        throw UnimplementedError('');
+    }
+  }
+
+  @protected
+  QueryResult sse_decode_query_result(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_rows = sse_decode_list_Map_String_return_value_None(deserializer);
+    var var_columns = sse_decode_list_String(deserializer);
+    var var_rowsAffected = sse_decode_u_64(deserializer);
+    var var_lastInsertRowid = sse_decode_i_64(deserializer);
+    return QueryResult(
+      rows: var_rows,
+      columns: var_columns,
+      rowsAffected: var_rowsAffected,
+      lastInsertRowid: var_lastInsertRowid,
+    );
+  }
+
+  @protected
+  (String, ReturnValue) sse_decode_record_string_return_value(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_field0 = sse_decode_String(deserializer);
+    var var_field1 = sse_decode_return_value(deserializer);
+    return (var_field0, var_field1);
+  }
+
+  @protected
+  (String, Value) sse_decode_record_string_value(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_field0 = sse_decode_String(deserializer);
+    var var_field1 = sse_decode_value(deserializer);
+    return (var_field0, var_field1);
+  }
+
+  @protected
+  ReturnValue sse_decode_return_value(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var tag_ = sse_decode_i_32(deserializer);
+    switch (tag_) {
+      case 0:
+        var var_field0 = sse_decode_i_64(deserializer);
+        return ReturnValue_Integer(var_field0);
+      case 1:
+        var var_field0 = sse_decode_f_64(deserializer);
+        return ReturnValue_Real(var_field0);
+      case 2:
+        var var_field0 = sse_decode_String(deserializer);
+        return ReturnValue_Text(var_field0);
+      case 3:
+        var var_field0 = sse_decode_list_prim_u_8_strict(deserializer);
+        return ReturnValue_Blob(var_field0);
+      case 4:
+        return ReturnValue_Null();
+      default:
+        throw UnimplementedError('');
+    }
+  }
+
+  @protected
+  BigInt sse_decode_u_64(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getBigUint64();
   }
 
   @protected
@@ -188,21 +1455,317 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  int sse_decode_i_32(SseDeserializer deserializer) {
+  BigInt sse_decode_usize(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
-    return deserializer.buffer.getInt32();
+    return deserializer.buffer.getBigUint64();
   }
 
   @protected
-  bool sse_decode_bool(SseDeserializer deserializer) {
+  Value sse_decode_value(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
-    return deserializer.buffer.getUint8() != 0;
+
+    var tag_ = sse_decode_i_32(deserializer);
+    switch (tag_) {
+      case 0:
+        var var_field0 = sse_decode_i_64(deserializer);
+        return Value_Integer(var_field0);
+      case 1:
+        var var_field0 = sse_decode_f_64(deserializer);
+        return Value_Real(var_field0);
+      case 2:
+        var var_field0 = sse_decode_String(deserializer);
+        return Value_Text(var_field0);
+      case 3:
+        var var_field0 = sse_decode_list_prim_u_8_strict(deserializer);
+        return Value_Blob(var_field0);
+      case 4:
+        return Value_Null();
+      default:
+        throw UnimplementedError('');
+    }
+  }
+
+  @protected
+  void
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlConnection(
+    LibsqlConnection self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as LibsqlConnectionImpl).frbInternalSseEncode(move: true),
+      serializer,
+    );
+  }
+
+  @protected
+  void
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlStatement(
+    LibsqlStatement self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as LibsqlStatementImpl).frbInternalSseEncode(move: true),
+      serializer,
+    );
+  }
+
+  @protected
+  void
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperArcConnection(
+    WrapperArcConnection self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as WrapperArcConnectionImpl).frbInternalSseEncode(move: true),
+      serializer,
+    );
+  }
+
+  @protected
+  void
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperArcDatabase(
+    WrapperArcDatabase self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as WrapperArcDatabaseImpl).frbInternalSseEncode(move: true),
+      serializer,
+    );
+  }
+
+  @protected
+  void
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperStatement(
+    WrapperStatement self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as WrapperStatementImpl).frbInternalSseEncode(move: true),
+      serializer,
+    );
+  }
+
+  @protected
+  void
+  sse_encode_Auto_RefMut_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlStatement(
+    LibsqlStatement self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as LibsqlStatementImpl).frbInternalSseEncode(move: false),
+      serializer,
+    );
+  }
+
+  @protected
+  void
+  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlConnection(
+    LibsqlConnection self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as LibsqlConnectionImpl).frbInternalSseEncode(move: false),
+      serializer,
+    );
+  }
+
+  @protected
+  void sse_encode_Map_String_return_value_None(
+    Map<String, ReturnValue> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_list_record_string_return_value(
+      self.entries.map((e) => (e.key, e.value)).toList(),
+      serializer,
+    );
+  }
+
+  @protected
+  void
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlConnection(
+    LibsqlConnection self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as LibsqlConnectionImpl).frbInternalSseEncode(move: null),
+      serializer,
+    );
+  }
+
+  @protected
+  void
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerLibsqlStatement(
+    LibsqlStatement self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as LibsqlStatementImpl).frbInternalSseEncode(move: null),
+      serializer,
+    );
+  }
+
+  @protected
+  void
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperArcConnection(
+    WrapperArcConnection self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as WrapperArcConnectionImpl).frbInternalSseEncode(move: null),
+      serializer,
+    );
+  }
+
+  @protected
+  void
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperArcDatabase(
+    WrapperArcDatabase self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as WrapperArcDatabaseImpl).frbInternalSseEncode(move: null),
+      serializer,
+    );
+  }
+
+  @protected
+  void
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWrapperStatement(
+    WrapperStatement self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as WrapperStatementImpl).frbInternalSseEncode(move: null),
+      serializer,
+    );
   }
 
   @protected
   void sse_encode_String(String self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_list_prim_u_8_strict(utf8.encoder.convert(self), serializer);
+  }
+
+  @protected
+  void sse_encode_bool(bool self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putUint8(self ? 1 : 0);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_bool(bool self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_bool(self, serializer);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_connect_args(
+    ConnectArgs self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_connect_args(self, serializer);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_libsql_open_flags(
+    LibsqlOpenFlags self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_libsql_open_flags(self, serializer);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_params(Params self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_params(self, serializer);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_u_64(BigInt self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_u_64(self, serializer);
+  }
+
+  @protected
+  void sse_encode_connect_args(ConnectArgs self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.url, serializer);
+    sse_encode_opt_String(self.authToken, serializer);
+    sse_encode_opt_String(self.syncUrl, serializer);
+    sse_encode_opt_box_autoadd_u_64(self.syncIntervalSeconds, serializer);
+    sse_encode_opt_String(self.encryptionKey, serializer);
+    sse_encode_opt_box_autoadd_bool(self.readYourWrites, serializer);
+    sse_encode_opt_box_autoadd_libsql_open_flags(self.openFlags, serializer);
+    sse_encode_opt_box_autoadd_bool(self.offline, serializer);
+  }
+
+  @protected
+  void sse_encode_execute_result(ExecuteResult self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_u_64(self.rowsAffected, serializer);
+  }
+
+  @protected
+  void sse_encode_f_64(double self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putFloat64(self);
+  }
+
+  @protected
+  void sse_encode_i_32(int self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putInt32(self);
+  }
+
+  @protected
+  void sse_encode_i_64(PlatformInt64 self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putPlatformInt64(self);
+  }
+
+  @protected
+  void sse_encode_libsql_open_flags(
+    LibsqlOpenFlags self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.index, serializer);
+  }
+
+  @protected
+  void sse_encode_list_Map_String_return_value_None(
+    List<Map<String, ReturnValue>> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_Map_String_return_value_None(item, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_list_String(List<String> self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_String(item, serializer);
+    }
   }
 
   @protected
@@ -213,6 +1776,153 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.length, serializer);
     serializer.buffer.putUint8List(self);
+  }
+
+  @protected
+  void sse_encode_list_record_string_return_value(
+    List<(String, ReturnValue)> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_record_string_return_value(item, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_list_record_string_value(
+    List<(String, Value)> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_record_string_value(item, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_list_value(List<Value> self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_value(item, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_opt_String(String? self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_String(self, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_opt_box_autoadd_bool(bool? self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_box_autoadd_bool(self, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_opt_box_autoadd_libsql_open_flags(
+    LibsqlOpenFlags? self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_box_autoadd_libsql_open_flags(self, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_opt_box_autoadd_u_64(BigInt? self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_box_autoadd_u_64(self, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_params(Params self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    switch (self) {
+      case Params_None():
+        sse_encode_i_32(0, serializer);
+      case Params_Positional(field0: final field0):
+        sse_encode_i_32(1, serializer);
+        sse_encode_list_value(field0, serializer);
+      case Params_Named(field0: final field0):
+        sse_encode_i_32(2, serializer);
+        sse_encode_list_record_string_value(field0, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_query_result(QueryResult self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_list_Map_String_return_value_None(self.rows, serializer);
+    sse_encode_list_String(self.columns, serializer);
+    sse_encode_u_64(self.rowsAffected, serializer);
+    sse_encode_i_64(self.lastInsertRowid, serializer);
+  }
+
+  @protected
+  void sse_encode_record_string_return_value(
+    (String, ReturnValue) self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.$1, serializer);
+    sse_encode_return_value(self.$2, serializer);
+  }
+
+  @protected
+  void sse_encode_record_string_value(
+    (String, Value) self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.$1, serializer);
+    sse_encode_value(self.$2, serializer);
+  }
+
+  @protected
+  void sse_encode_return_value(ReturnValue self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    switch (self) {
+      case ReturnValue_Integer(field0: final field0):
+        sse_encode_i_32(0, serializer);
+        sse_encode_i_64(field0, serializer);
+      case ReturnValue_Real(field0: final field0):
+        sse_encode_i_32(1, serializer);
+        sse_encode_f_64(field0, serializer);
+      case ReturnValue_Text(field0: final field0):
+        sse_encode_i_32(2, serializer);
+        sse_encode_String(field0, serializer);
+      case ReturnValue_Blob(field0: final field0):
+        sse_encode_i_32(3, serializer);
+        sse_encode_list_prim_u_8_strict(field0, serializer);
+      case ReturnValue_Null():
+        sse_encode_i_32(4, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_u_64(BigInt self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putBigUint64(self);
   }
 
   @protected
@@ -227,14 +1937,180 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  void sse_encode_i_32(int self, SseSerializer serializer) {
+  void sse_encode_usize(BigInt self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
-    serializer.buffer.putInt32(self);
+    serializer.buffer.putBigUint64(self);
   }
 
   @protected
-  void sse_encode_bool(bool self, SseSerializer serializer) {
+  void sse_encode_value(Value self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
-    serializer.buffer.putUint8(self ? 1 : 0);
+    switch (self) {
+      case Value_Integer(field0: final field0):
+        sse_encode_i_32(0, serializer);
+        sse_encode_i_64(field0, serializer);
+      case Value_Real(field0: final field0):
+        sse_encode_i_32(1, serializer);
+        sse_encode_f_64(field0, serializer);
+      case Value_Text(field0: final field0):
+        sse_encode_i_32(2, serializer);
+        sse_encode_String(field0, serializer);
+      case Value_Blob(field0: final field0):
+        sse_encode_i_32(3, serializer);
+        sse_encode_list_prim_u_8_strict(field0, serializer);
+      case Value_Null():
+        sse_encode_i_32(4, serializer);
+    }
   }
+}
+
+@sealed
+class LibsqlConnectionImpl extends RustOpaque implements LibsqlConnection {
+  // Not to be used by end users
+  LibsqlConnectionImpl.frbInternalDcoDecode(List<dynamic> wire)
+    : super.frbInternalDcoDecode(wire, _kStaticData);
+
+  // Not to be used by end users
+  LibsqlConnectionImpl.frbInternalSseDecode(
+    BigInt ptr,
+    int externalSizeOnNative,
+  ) : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
+
+  static final _kStaticData = RustArcStaticData(
+    rustArcIncrementStrongCount:
+        RustLib.instance.api.rust_arc_increment_strong_count_LibsqlConnection,
+    rustArcDecrementStrongCount:
+        RustLib.instance.api.rust_arc_decrement_strong_count_LibsqlConnection,
+    rustArcDecrementStrongCountPtr: RustLib
+        .instance
+        .api
+        .rust_arc_decrement_strong_count_LibsqlConnectionPtr,
+  );
+
+  Future<ExecuteResult> execute({
+    required String sql,
+    required Params params,
+  }) => RustLib.instance.api.crateApiConnectionLibsqlConnectionExecute(
+    that: this,
+    sql: sql,
+    params: params,
+  );
+
+  Future<LibsqlStatement> prepare({required String sql}) => RustLib.instance.api
+      .crateApiConnectionLibsqlConnectionPrepare(that: this, sql: sql);
+
+  Future<QueryResult> query({required String sql, required Params params}) =>
+      RustLib.instance.api.crateApiConnectionLibsqlConnectionQuery(
+        that: this,
+        sql: sql,
+        params: params,
+      );
+}
+
+@sealed
+class LibsqlStatementImpl extends RustOpaque implements LibsqlStatement {
+  // Not to be used by end users
+  LibsqlStatementImpl.frbInternalDcoDecode(List<dynamic> wire)
+    : super.frbInternalDcoDecode(wire, _kStaticData);
+
+  // Not to be used by end users
+  LibsqlStatementImpl.frbInternalSseDecode(BigInt ptr, int externalSizeOnNative)
+    : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
+
+  static final _kStaticData = RustArcStaticData(
+    rustArcIncrementStrongCount:
+        RustLib.instance.api.rust_arc_increment_strong_count_LibsqlStatement,
+    rustArcDecrementStrongCount:
+        RustLib.instance.api.rust_arc_decrement_strong_count_LibsqlStatement,
+    rustArcDecrementStrongCountPtr:
+        RustLib.instance.api.rust_arc_decrement_strong_count_LibsqlStatementPtr,
+  );
+
+  Future<ExecuteResult> execute({required Params params}) => RustLib
+      .instance
+      .api
+      .crateApiStatementLibsqlStatementExecute(that: this, params: params);
+
+  Future<QueryResult> query({required Params params}) => RustLib.instance.api
+      .crateApiStatementLibsqlStatementQuery(that: this, params: params);
+
+  Future<void> reset() =>
+      RustLib.instance.api.crateApiStatementLibsqlStatementReset(that: this);
+}
+
+@sealed
+class WrapperArcConnectionImpl extends RustOpaque
+    implements WrapperArcConnection {
+  // Not to be used by end users
+  WrapperArcConnectionImpl.frbInternalDcoDecode(List<dynamic> wire)
+    : super.frbInternalDcoDecode(wire, _kStaticData);
+
+  // Not to be used by end users
+  WrapperArcConnectionImpl.frbInternalSseDecode(
+    BigInt ptr,
+    int externalSizeOnNative,
+  ) : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
+
+  static final _kStaticData = RustArcStaticData(
+    rustArcIncrementStrongCount: RustLib
+        .instance
+        .api
+        .rust_arc_increment_strong_count_WrapperArcConnection,
+    rustArcDecrementStrongCount: RustLib
+        .instance
+        .api
+        .rust_arc_decrement_strong_count_WrapperArcConnection,
+    rustArcDecrementStrongCountPtr: RustLib
+        .instance
+        .api
+        .rust_arc_decrement_strong_count_WrapperArcConnectionPtr,
+  );
+}
+
+@sealed
+class WrapperArcDatabaseImpl extends RustOpaque implements WrapperArcDatabase {
+  // Not to be used by end users
+  WrapperArcDatabaseImpl.frbInternalDcoDecode(List<dynamic> wire)
+    : super.frbInternalDcoDecode(wire, _kStaticData);
+
+  // Not to be used by end users
+  WrapperArcDatabaseImpl.frbInternalSseDecode(
+    BigInt ptr,
+    int externalSizeOnNative,
+  ) : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
+
+  static final _kStaticData = RustArcStaticData(
+    rustArcIncrementStrongCount:
+        RustLib.instance.api.rust_arc_increment_strong_count_WrapperArcDatabase,
+    rustArcDecrementStrongCount:
+        RustLib.instance.api.rust_arc_decrement_strong_count_WrapperArcDatabase,
+    rustArcDecrementStrongCountPtr: RustLib
+        .instance
+        .api
+        .rust_arc_decrement_strong_count_WrapperArcDatabasePtr,
+  );
+}
+
+@sealed
+class WrapperStatementImpl extends RustOpaque implements WrapperStatement {
+  // Not to be used by end users
+  WrapperStatementImpl.frbInternalDcoDecode(List<dynamic> wire)
+    : super.frbInternalDcoDecode(wire, _kStaticData);
+
+  // Not to be used by end users
+  WrapperStatementImpl.frbInternalSseDecode(
+    BigInt ptr,
+    int externalSizeOnNative,
+  ) : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
+
+  static final _kStaticData = RustArcStaticData(
+    rustArcIncrementStrongCount:
+        RustLib.instance.api.rust_arc_increment_strong_count_WrapperStatement,
+    rustArcDecrementStrongCount:
+        RustLib.instance.api.rust_arc_decrement_strong_count_WrapperStatement,
+    rustArcDecrementStrongCountPtr: RustLib
+        .instance
+        .api
+        .rust_arc_decrement_strong_count_WrapperStatementPtr,
+  );
 }
