@@ -44,10 +44,10 @@ pub fn emit_subqueries(
 ///
 /// Since a subquery has its own SelectPlan, it can contain nested subqueries,
 /// which can contain even more nested subqueries, etc.
-pub fn emit_subquery<'a>(
+pub fn emit_subquery(
     program: &mut ProgramBuilder,
     plan: &mut SelectPlan,
-    t_ctx: &mut TranslateCtx<'a>,
+    t_ctx: &mut TranslateCtx,
 ) -> Result<usize> {
     let yield_reg = program.alloc_register();
     let coroutine_implementation_start_offset = program.allocate_label();

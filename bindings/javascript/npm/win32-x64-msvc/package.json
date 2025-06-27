@@ -1,6 +1,6 @@
 {
-  "name": "@tursodatabase/limbo-win32-x64-msvc",
-  "version": "0.0.22",
+  "name": "@tursodatabase/turso-win32-x64-msvc",
+  "version": "0.1.0-pre.2",
   "repository": {
     "type": "git",
     "url": "https://github.com/tursodatabase/limbo"
@@ -11,9 +11,9 @@
   "cpu": [
     "x64"
   ],
-  "main": "turso-limbo.win32-x64-msvc.node",
+  "main": "turso.win32-x64-msvc.node",
   "files": [
-    "turso-limbo.win32-x64-msvc.node"
+    "turso.win32-x64-msvc.node"
   ],
   "license": "MIT",
   "engines": {

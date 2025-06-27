@@ -2,13 +2,13 @@
 
 import json
 
-import limbo
+import turso
 from antithesis.random import get_random
 from utils import generate_random_value
 
 # Get initial state
 try:
-    con_init = limbo.connect("init_state.db")
+    con_init = turso.connect("init_state.db")
 except Exception as e:
     print(f"Error connecting to database: {e}")
     exit(0)
@@ -25,8 +25,8 @@ pk = tbl_schema["pk"]
 cols = [f"col_{col}" for col in range(tbl_schema["colCount"]) if col != pk]
 
 try:
-    con = limbo.connect("stress_composer.db")
-except limbo.OperationalError as e:
+    con = turso.connect("stress_composer.db")
+except Exception as e:
     print(f"Failed to open stress_composer.db. Exiting... {e}")
     exit(0)
 cur = con.cursor()

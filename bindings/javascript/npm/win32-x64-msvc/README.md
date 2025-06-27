@@ -1,3 +1,3 @@
-# `turso-limbo-win32-x64-msvc`
+# `turso-win32-x64-msvc`
 
-This is the **x86_64-pc-windows-msvc** binary for `@tursodatabase/limbo`
+This is the **x86_64-pc-windows-msvc** binary for `@tursodatabase/turso`

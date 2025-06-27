@@ -61,7 +61,7 @@ pub unsafe extern "C" fn execute(
                         return ResultCode::Error;
                     }
                     Ok(StepResult::Done) => {
-                        *last_insert_rowid = conn.last_insert_rowid() as i64;
+                        *last_insert_rowid = conn.last_insert_rowid();
                         return ResultCode::OK;
                     }
                     Ok(StepResult::IO) => {

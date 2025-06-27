@@ -21,10 +21,10 @@ Examples of contributing
 
 * [How to contribute a SQL function implementation](docs/contributing/contributing_functions.md)
 
-To build and run `limbo` cli: 
+To build and run `tursodb` CLI: 
 
 ```shell 
-cargo run --package limbo_cli --bin limbo database.db
+cargo run --package turso_cli --bin tursodb database.db
 ```
 
 Run tests:

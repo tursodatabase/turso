@@ -3,7 +3,7 @@
 import logging
 from logging.handlers import RotatingFileHandler
 
-import limbo
+import turso
 from antithesis.random import get_random
 
 handler = RotatingFileHandler(
@@ -17,7 +17,7 @@ logger.setLevel(logging.INFO)
 logger.addHandler(handler)
 
 try:
-    con = limbo.connect("bank_test.db")
+    con = turso.connect("bank_test.db")
 except Exception as e:
     print(f"Error connecting to database: {e}")
     exit(0)

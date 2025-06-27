@@ -119,7 +119,7 @@ pub fn decode(data: &Value, format: &Value) -> Result<Value, Error> {
                     ))
                 }
                 "base85" => {
-                    let decoded = decode_ascii85(&input_text).map_err(|_| Error::DecodeFailed)?;
+                    let decoded = decode_ascii85(input_text).map_err(|_| Error::DecodeFailed)?;
 
                     Ok(Value::from_text(
                         String::from_utf8(decoded).map_err(|_| Error::InvalidUtf8)?,
@@ -157,7 +157,7 @@ fn decode_ascii85(input: &str) -> Result<Vec<u8>, Box<dyn StdError>> {
             }
         }
 
-        if digit < 33 || digit > 117 {
+        if !(33..=117).contains(&digit) {
             return Err("Input char is out of range for Ascii85".into());
         }
 
@@ -205,8 +205,8 @@ fn encode_ascii85(input: &[u8]) -> String {
 
         let number = u32::from_be_bytes(chunk.as_ref().try_into().expect("Internal Error"));
 
-        for i in 0..count {
-            let digit = (((number / TABLE[i]) % 85) + 33) as u8;
+        for value in TABLE.iter().take(count) {
+            let digit = (((number / value) % 85) + 33) as u8;
             result.push(digit as char);
         }
     }

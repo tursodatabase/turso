@@ -83,18 +83,19 @@ impl File for MemoryFile {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: Arc<Completion>) -> Result<()> {
+    fn pread(&self, pos: usize, c: Completion) -> Result<Arc<Completion>> {
+        let c = Arc::new(c);
         let r = c.as_read();
         let buf_len = r.buf().len();
         if buf_len == 0 {
             c.complete(0);
-            return Ok(());
+            return Ok(c);
         }
 
         let file_size = self.size.get();
         if pos >= file_size {
             c.complete(0);
-            return Ok(());
+            return Ok(c);
         }
 
         let read_len = buf_len.min(file_size - pos);
@@ -121,15 +122,21 @@ impl File for MemoryFile {
             }
         }
         c.complete(read_len as i32);
-        Ok(())
+        Ok(c)
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<Buffer>>, c: Arc<Completion>) -> Result<()> {
+    fn pwrite(
+        &self,
+        pos: usize,
+        buffer: Arc<RefCell<Buffer>>,
+        c: Completion,
+    ) -> Result<Arc<Completion>> {
+        let c = Arc::new(c);
         let buf = buffer.borrow();
         let buf_len = buf.len();
         if buf_len == 0 {
             c.complete(0);
-            return Ok(());
+            return Ok(c);
         }
 
         let mut offset = pos;
@@ -157,13 +164,13 @@ impl File for MemoryFile {
             .set(core::cmp::max(pos + buf_len, self.size.get()));
 
         c.complete(buf_len as i32);
-        Ok(())
+        Ok(c)
     }
 
-    fn sync(&self, c: Arc<Completion>) -> Result<()> {
+    fn sync(&self, c: Completion) -> Result<Arc<Completion>> {
         // no-op
         c.complete(0);
-        Ok(())
+        Ok(Arc::new(c))
     }
 
     fn size(&self) -> Result<u64> {

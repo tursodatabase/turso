@@ -21,6 +21,7 @@ impl LimboConnection {
         LimboConnection { conn, io }
     }
 
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_ptr(self) -> jlong {
         Box::into_raw(Box::new(self)) as jlong
     }

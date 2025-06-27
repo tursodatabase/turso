@@ -86,7 +86,7 @@ pub fn handle_distinct(program: &mut ProgramBuilder, agg: &Aggregate, agg_arg_re
     });
     program.emit_insn(Insn::IdxInsert {
         cursor_id: distinct_ctx.cursor_id,
-        record_reg: record_reg,
+        record_reg,
         unpacked_start: None,
         unpacked_count: None,
         flags: IdxInsertFlags::new(),

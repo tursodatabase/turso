@@ -27,11 +27,11 @@ pub fn insn_to_str(
             Insn::Init { target_pc } => (
                 "Init",
                 0,
-                target_pc.to_debug_int(),
+                target_pc.as_debug_int(),
                 0,
                 Value::build_text(""),
                 0,
-                format!("Start at {}", target_pc.to_debug_int()),
+                format!("Start at {}", target_pc.as_debug_int()),
             ),
             Insn::Add { lhs, rhs, dest } => (
                 "Add",
@@ -141,11 +141,11 @@ pub fn insn_to_str(
             Insn::NotNull { reg, target_pc } => (
                 "NotNull",
                 *reg as i32,
-                target_pc.to_debug_int(),
+                target_pc.as_debug_int(),
                 0,
                 Value::build_text(""),
                 0,
-                format!("r[{}]!=NULL -> goto {}", reg, target_pc.to_debug_int()),
+                format!("r[{}]!=NULL -> goto {}", reg, target_pc.as_debug_int()),
             ),
             Insn::Compare {
                 start_reg_a,
@@ -157,7 +157,7 @@ pub fn insn_to_str(
                 *start_reg_a as i32,
                 *start_reg_b as i32,
                 *count as i32,
-                Value::build_text(&format!("k({count}, {})", collation.unwrap_or_default())),
+                Value::build_text(format!("k({count}, {})", collation.unwrap_or_default())),
                 0,
                 format!(
                     "r[{}..{}]==r[{}..{}]",
@@ -173,9 +173,9 @@ pub fn insn_to_str(
                 target_pc_gt,
             } => (
                 "Jump",
-                target_pc_lt.to_debug_int(),
-                target_pc_eq.to_debug_int(),
-                target_pc_gt.to_debug_int(),
+                target_pc_lt.as_debug_int(),
+                target_pc_eq.as_debug_int(),
+                target_pc_gt.as_debug_int(),
                 Value::build_text(""),
                 0,
                 "".to_string(),
@@ -206,7 +206,7 @@ pub fn insn_to_str(
             } => (
                 "IfPos",
                 *reg as i32,
-                target_pc.to_debug_int(),
+                target_pc.as_debug_int(),
                 0,
                 Value::build_text(""),
                 0,
@@ -215,7 +215,7 @@ pub fn insn_to_str(
                     reg,
                     reg,
                     decrement_by,
-                    target_pc.to_debug_int()
+                    target_pc.as_debug_int()
                 ),
             ),
             Insn::Eq {
@@ -228,14 +228,14 @@ pub fn insn_to_str(
                 "Eq",
                 *lhs as i32,
                 *rhs as i32,
-                target_pc.to_debug_int(),
-                Value::build_text(&collation.map_or("".to_string(), |c| c.to_string())),
+                target_pc.as_debug_int(),
+                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
                 0,
                 format!(
                     "if r[{}]==r[{}] goto {}",
                     lhs,
                     rhs,
-                    target_pc.to_debug_int()
+                    target_pc.as_debug_int()
                 ),
             ),
             Insn::Ne {
@@ -248,14 +248,14 @@ pub fn insn_to_str(
                 "Ne",
                 *lhs as i32,
                 *rhs as i32,
-                target_pc.to_debug_int(),
-                Value::build_text(&collation.map_or("".to_string(), |c| c.to_string())),
+                target_pc.as_debug_int(),
+                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
                 0,
                 format!(
                     "if r[{}]!=r[{}] goto {}",
                     lhs,
                     rhs,
-                    target_pc.to_debug_int()
+                    target_pc.as_debug_int()
                 ),
             ),
             Insn::Lt {
@@ -268,10 +268,10 @@ pub fn insn_to_str(
                 "Lt",
                 *lhs as i32,
                 *rhs as i32,
-                target_pc.to_debug_int(),
-                Value::build_text(&collation.map_or("".to_string(), |c| c.to_string())),
+                target_pc.as_debug_int(),
+                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
                 0,
-                format!("if r[{}]<r[{}] goto {}", lhs, rhs, target_pc.to_debug_int()),
+                format!("if r[{}]<r[{}] goto {}", lhs, rhs, target_pc.as_debug_int()),
             ),
             Insn::Le {
                 lhs,
@@ -283,14 +283,14 @@ pub fn insn_to_str(
                 "Le",
                 *lhs as i32,
                 *rhs as i32,
-                target_pc.to_debug_int(),
-                Value::build_text(&collation.map_or("".to_string(), |c| c.to_string())),
+                target_pc.as_debug_int(),
+                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
                 0,
                 format!(
                     "if r[{}]<=r[{}] goto {}",
                     lhs,
                     rhs,
-                    target_pc.to_debug_int()
+                    target_pc.as_debug_int()
                 ),
             ),
             Insn::Gt {
@@ -303,10 +303,10 @@ pub fn insn_to_str(
                 "Gt",
                 *lhs as i32,
                 *rhs as i32,
-                target_pc.to_debug_int(),
-                Value::build_text(&collation.map_or("".to_string(), |c| c.to_string())),
+                target_pc.as_debug_int(),
+                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
                 0,
-                format!("if r[{}]>r[{}] goto {}", lhs, rhs, target_pc.to_debug_int()),
+                format!("if r[{}]>r[{}] goto {}", lhs, rhs, target_pc.as_debug_int()),
             ),
             Insn::Ge {
                 lhs,
@@ -318,14 +318,14 @@ pub fn insn_to_str(
                 "Ge",
                 *lhs as i32,
                 *rhs as i32,
-                target_pc.to_debug_int(),
-                Value::build_text(&collation.map_or("".to_string(), |c| c.to_string())),
+                target_pc.as_debug_int(),
+                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
                 0,
                 format!(
                     "if r[{}]>=r[{}] goto {}",
                     lhs,
                     rhs,
-                    target_pc.to_debug_int()
+                    target_pc.as_debug_int()
                 ),
             ),
             Insn::If {
@@ -335,11 +335,11 @@ pub fn insn_to_str(
             } => (
                 "If",
                 *reg as i32,
-                target_pc.to_debug_int(),
+                target_pc.as_debug_int(),
                 *jump_if_null as i32,
                 Value::build_text(""),
                 0,
-                format!("if r[{}] goto {}", reg, target_pc.to_debug_int()),
+                format!("if r[{}] goto {}", reg, target_pc.as_debug_int()),
             ),
             Insn::IfNot {
                 reg,
@@ -348,11 +348,11 @@ pub fn insn_to_str(
             } => (
                 "IfNot",
                 *reg as i32,
-                target_pc.to_debug_int(),
+                target_pc.as_debug_int(),
                 *jump_if_null as i32,
                 Value::build_text(""),
                 0,
-                format!("if !r[{}] goto {}", reg, target_pc.to_debug_int()),
+                format!("if !r[{}] goto {}", reg, target_pc.as_debug_int()),
             ),
             Insn::OpenRead {
                 cursor_id,
@@ -427,7 +427,7 @@ pub fn insn_to_str(
             } => (
                 "VFilter",
                 *cursor_id as i32,
-                pc_if_empty.to_debug_int(),
+                pc_if_empty.as_debug_int(),
                 *arg_count as i32,
                 Value::build_text(""),
                 0,
@@ -466,7 +466,7 @@ pub fn insn_to_str(
             } => (
                 "VNext",
                 *cursor_id as i32,
-                pc_if_next.to_debug_int(),
+                pc_if_next.as_debug_int(),
                 0,
                 Value::build_text(""),
                 0,
@@ -500,7 +500,7 @@ pub fn insn_to_str(
             } => (
                 "Rewind",
                 *cursor_id as i32,
-                pc_if_empty.to_debug_int(),
+                pc_if_empty.as_debug_int(),
                 0,
                 Value::build_text(""),
                 0,
@@ -617,7 +617,7 @@ pub fn insn_to_str(
             } => (
                 "Next",
                 *cursor_id as i32,
-                pc_if_next.to_debug_int(),
+                pc_if_next.as_debug_int(),
                 0,
                 Value::build_text(""),
                 0,
@@ -631,7 +631,7 @@ pub fn insn_to_str(
                 *err_code as i32,
                 0,
                 0,
-                Value::build_text(&description),
+                Value::build_text(description),
                 0,
                 "".to_string(),
             ),
@@ -644,7 +644,7 @@ pub fn insn_to_str(
                 *err_code as i32,
                 0,
                 *target_reg as i32,
-                Value::build_text(&description),
+                Value::build_text(description),
                 0,
                 "".to_string(),
             ),
@@ -660,7 +660,7 @@ pub fn insn_to_str(
             Insn::Goto { target_pc } => (
                 "Goto",
                 0,
-                target_pc.to_debug_int(),
+                target_pc.as_debug_int(),
                 0,
                 Value::build_text(""),
                 0,
@@ -672,7 +672,7 @@ pub fn insn_to_str(
             } => (
                 "Gosub",
                 *return_reg as i32,
-                target_pc.to_debug_int(),
+                target_pc.as_debug_int(),
                 0,
                 Value::build_text(""),
                 0,
@@ -779,7 +779,7 @@ pub fn insn_to_str(
                 "SeekRowid",
                 *cursor_id as i32,
                 *src_reg as i32,
-                target_pc.to_debug_int(),
+                target_pc.as_debug_int(),
                 Value::build_text(""),
                 0,
                 format!(
@@ -795,7 +795,7 @@ pub fn insn_to_str(
                             get_table_or_index_name(*cursor_id),
                         ))
                         .unwrap_or(format!("cursor {}", cursor_id)),
-                    target_pc.to_debug_int()
+                    target_pc.as_debug_int()
                 ),
             ),
             Insn::DeferredSeek {
@@ -848,7 +848,7 @@ pub fn insn_to_str(
                     _ => unreachable!(),
                 },
                 *cursor_id as i32,
-                target_pc.to_debug_int(),
+                target_pc.as_debug_int(),
                 *start_reg as i32,
                 Value::build_text(""),
                 0,
@@ -910,7 +910,7 @@ pub fn insn_to_str(
                     _ => unreachable!(),
                 },
                 *cursor_id as i32,
-                target_pc.to_debug_int(),
+                target_pc.as_debug_int(),
                 *start_reg as i32,
                 Value::build_text(""),
                 0,
@@ -919,11 +919,11 @@ pub fn insn_to_str(
             Insn::DecrJumpZero { reg, target_pc } => (
                 "DecrJumpZero",
                 *reg as i32,
-                target_pc.to_debug_int(),
+                target_pc.as_debug_int(),
                 0,
                 Value::build_text(""),
                 0,
-                format!("if (--r[{}]==0) goto {}", reg, target_pc.to_debug_int()),
+                format!("if (--r[{}]==0) goto {}", reg, target_pc.as_debug_int()),
             ),
             Insn::AggStep {
                 func,
@@ -975,7 +975,7 @@ pub fn insn_to_str(
                     *cursor_id as i32,
                     *columns as i32,
                     0,
-                    Value::build_text(&(format!("k({},{})", order.len(), to_print.join(",")))),
+                    Value::build_text(format!("k({},{})", order.len(), to_print.join(","))),
                     0,
                     format!("cursor={}", cursor_id),
                 )
@@ -1011,7 +1011,7 @@ pub fn insn_to_str(
             } => (
                 "SorterSort",
                 *cursor_id as i32,
-                pc_if_empty.to_debug_int(),
+                pc_if_empty.as_debug_int(),
                 0,
                 Value::build_text(""),
                 0,
@@ -1023,7 +1023,7 @@ pub fn insn_to_str(
             } => (
                 "SorterNext",
                 *cursor_id as i32,
-                pc_if_next.to_debug_int(),
+                pc_if_next.as_debug_int(),
                 0,
                 Value::build_text(""),
                 0,
@@ -1045,7 +1045,7 @@ pub fn insn_to_str(
                     } else {
                         func.func.to_string()
                     };
-                    Value::build_text(&s)
+                    Value::build_text(s)
                 },
                 0,
                 if func.arg_count == 0 {
@@ -1068,8 +1068,8 @@ pub fn insn_to_str(
             } => (
                 "InitCoroutine",
                 *yield_reg as i32,
-                jump_on_definition.to_debug_int(),
-                start_offset.to_debug_int(),
+                jump_on_definition.as_debug_int(),
+                start_offset.as_debug_int(),
                 Value::build_text(""),
                 0,
                 "".to_string(),
@@ -1089,7 +1089,7 @@ pub fn insn_to_str(
             } => (
                 "Yield",
                 *yield_reg as i32,
-                end_offset.to_debug_int(),
+                end_offset.as_debug_int(),
                 0,
                 Value::build_text(""),
                 0,
@@ -1106,7 +1106,7 @@ pub fn insn_to_str(
                 *cursor as i32,
                 *record_reg as i32,
                 *key_reg as i32,
-                Value::build_text(&table_name),
+                Value::build_text(table_name),
                 flag.0 as u16,
                 format!("intkey=r[{}] data=r[{}]", key_reg, record_reg),
             ),
@@ -1177,9 +1177,9 @@ pub fn insn_to_str(
                 (
                     "NoConflict",
                     *cursor_id as i32,
-                    target_pc.to_debug_int(),
+                    target_pc.as_debug_int(),
                     *record_reg as i32,
-                    Value::build_text(&format!("{num_regs}")),
+                    Value::build_text(format!("{num_regs}")),
                     0,
                     key,
                 )
@@ -1191,7 +1191,7 @@ pub fn insn_to_str(
             } => (
                 "NotExists",
                 *cursor as i32,
-                target_pc.to_debug_int(),
+                target_pc.as_debug_int(),
                 *rowid_reg as i32,
                 Value::build_text(""),
                 0,
@@ -1306,7 +1306,7 @@ pub fn insn_to_str(
             } => (
                 "Last",
                 *cursor_id as i32,
-                pc_if_empty.to_debug_int(),
+                pc_if_empty.as_debug_int(),
                 0,
                 Value::build_text(""),
                 0,
@@ -1315,11 +1315,11 @@ pub fn insn_to_str(
             Insn::IsNull { reg, target_pc } => (
                 "IsNull",
                 *reg as i32,
-                target_pc.to_debug_int(),
+                target_pc.as_debug_int(),
                 0,
                 Value::build_text(""),
                 0,
-                format!("if (r[{}]==NULL) goto {}", reg, target_pc.to_debug_int()),
+                format!("if (r[{}]==NULL) goto {}", reg, target_pc.as_debug_int()),
             ),
             Insn::ParseSchema { db, where_clause } => (
                 "ParseSchema",
@@ -1336,7 +1336,7 @@ pub fn insn_to_str(
             } => (
                 "Prev",
                 *cursor_id as i32,
-                pc_if_prev.to_debug_int(),
+                pc_if_prev.as_debug_int(),
                 0,
                 Value::build_text(""),
                 0,
@@ -1491,12 +1491,12 @@ pub fn insn_to_str(
                 target_pc_when_reentered,
             } => (
                 "Once",
-                target_pc_when_reentered.to_debug_int(),
+                target_pc_when_reentered.as_debug_int(),
                 0,
                 0,
                 Value::build_text(""),
                 0,
-                format!("goto {}", target_pc_when_reentered.to_debug_int()),
+                format!("goto {}", target_pc_when_reentered.as_debug_int()),
             ),
             Insn::BeginSubrtn { dest, dest_end } => (
                 "BeginSubrtn",
@@ -1527,7 +1527,7 @@ pub fn insn_to_str(
                     "Found"
                 },
                 *cursor_id as i32,
-                target_pc.to_debug_int(),
+                target_pc.as_debug_int(),
                 *record_reg as i32,
                 Value::build_text(""),
                 0,
@@ -1538,7 +1538,7 @@ pub fn insn_to_str(
                     } else {
                         ""
                     },
-                    target_pc.to_debug_int()
+                    target_pc.as_debug_int()
                 ),
             ),
             Insn::Affinity {

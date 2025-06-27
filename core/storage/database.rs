@@ -1,4 +1,5 @@
 use crate::error::LimboError;
+use crate::io::CompletionType;
 use crate::{io::Completion, Buffer, Result};
 use std::{cell::RefCell, sync::Arc};
 
@@ -8,14 +9,15 @@ use std::{cell::RefCell, sync::Arc};
 /// the storage medium. A database can either be a file on disk, like in SQLite,
 /// or something like a remote page server service.
 pub trait DatabaseStorage: Send + Sync {
-    fn read_page(&self, page_idx: usize, c: Arc<Completion>) -> Result<()>;
+    fn read_page(&self, page_idx: usize, c: Completion) -> Result<()>;
     fn write_page(
         &self,
         page_idx: usize,
         buffer: Arc<RefCell<Buffer>>,
-        c: Arc<Completion>,
+        c: Completion,
     ) -> Result<()>;
-    fn sync(&self, c: Arc<Completion>) -> Result<()>;
+    fn sync(&self, c: Completion) -> Result<()>;
+    fn size(&self) -> Result<u64>;
 }
 
 #[cfg(feature = "fs")]
@@ -30,7 +32,7 @@ unsafe impl Sync for DatabaseFile {}
 
 #[cfg(feature = "fs")]
 impl DatabaseStorage for DatabaseFile {
-    fn read_page(&self, page_idx: usize, c: Arc<Completion>) -> Result<()> {
+    fn read_page(&self, page_idx: usize, c: Completion) -> Result<()> {
         let r = c.as_read();
         let size = r.buf().len();
         assert!(page_idx > 0);
@@ -46,7 +48,7 @@ impl DatabaseStorage for DatabaseFile {
         &self,
         page_idx: usize,
         buffer: Arc<RefCell<Buffer>>,
-        c: Arc<Completion>,
+        c: Completion,
     ) -> Result<()> {
         let buffer_size = buffer.borrow().len();
         assert!(page_idx > 0);
@@ -58,8 +60,13 @@ impl DatabaseStorage for DatabaseFile {
         Ok(())
     }
 
-    fn sync(&self, c: Arc<Completion>) -> Result<()> {
-        self.file.sync(c)
+    fn sync(&self, c: Completion) -> Result<()> {
+        let _ = self.file.sync(c)?;
+        Ok(())
+    }
+
+    fn size(&self) -> Result<u64> {
+        self.file.size()
     }
 }
 
@@ -78,9 +85,9 @@ unsafe impl Send for FileMemoryStorage {}
 unsafe impl Sync for FileMemoryStorage {}
 
 impl DatabaseStorage for FileMemoryStorage {
-    fn read_page(&self, page_idx: usize, c: Arc<Completion>) -> Result<()> {
-        let r = match *c {
-            Completion::Read(ref r) => r,
+    fn read_page(&self, page_idx: usize, c: Completion) -> Result<()> {
+        let r = match c.completion_type {
+            CompletionType::Read(ref r) => r,
             _ => unreachable!(),
         };
         let size = r.buf().len();
@@ -97,7 +104,7 @@ impl DatabaseStorage for FileMemoryStorage {
         &self,
         page_idx: usize,
         buffer: Arc<RefCell<Buffer>>,
-        c: Arc<Completion>,
+        c: Completion,
     ) -> Result<()> {
         let buffer_size = buffer.borrow().len();
         assert!(buffer_size >= 512);
@@ -108,8 +115,13 @@ impl DatabaseStorage for FileMemoryStorage {
         Ok(())
     }
 
-    fn sync(&self, c: Arc<Completion>) -> Result<()> {
-        self.file.sync(c)
+    fn sync(&self, c: Completion) -> Result<()> {
+        let _ = self.file.sync(c)?;
+        Ok(())
+    }
+
+    fn size(&self) -> Result<u64> {
+        self.file.size()
     }
 }
 

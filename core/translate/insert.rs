@@ -58,15 +58,12 @@ pub fn translate_insert(
         crate::bail_parse_error!("ON CONFLICT clause is not supported");
     }
 
-    #[cfg(not(feature = "index_experimental"))]
-    {
-        if schema.table_has_indexes(&tbl_name.name.to_string()) {
-            // Let's disable altering a table with indices altogether instead of checking column by
-            // column to be extra safe.
-            crate::bail_parse_error!(
-                "INSERT table disabled for table with indexes and without index_experimental feature flag"
-            );
-        }
+    if schema.table_has_indexes(&tbl_name.name.to_string()) && !schema.indexes_enabled() {
+        // Let's disable altering a table with indices altogether instead of checking column by
+        // column to be extra safe.
+        crate::bail_parse_error!(
+            "INSERT to table with indexes is disabled by default. Run with `--experimental-indexes` to enable this feature."
+        );
     }
     let table_name = &tbl_name.name;
     let table = match schema.get_table(table_name.0.as_str()) {

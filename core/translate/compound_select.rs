@@ -154,12 +154,8 @@ fn emit_compound_select(
                         (cursor_id, index.clone())
                     }
                     _ => {
-                        if cfg!(not(feature = "index_experimental")) {
-                            crate::bail_parse_error!("UNION not supported without indexes");
-                        } else {
-                            new_dedupe_index = true;
-                            create_union_dedupe_index(program, &right_most)
-                        }
+                        new_dedupe_index = true;
+                        create_dedupe_index(program, &right_most, schema)?
                     }
                 };
                 plan.query_destination = QueryDestination::EphemeralIndex {
@@ -202,6 +198,54 @@ fn emit_compound_select(
                     program.preassign_label_to_next_insn(label_jump_over_dedupe);
                 }
             }
+            CompoundOperator::Intersect => {
+                let mut target_cursor_id = None;
+                if let QueryDestination::EphemeralIndex { cursor_id, .. } =
+                    right_most.query_destination
+                {
+                    target_cursor_id = Some(cursor_id);
+                }
+
+                let (left_cursor_id, left_index) =
+                    create_dedupe_index(program, &right_most, schema)?;
+                plan.query_destination = QueryDestination::EphemeralIndex {
+                    cursor_id: left_cursor_id,
+                    index: left_index.clone(),
+                };
+                let compound_select = Plan::CompoundSelect {
+                    left,
+                    right_most: plan,
+                    limit,
+                    offset,
+                    order_by,
+                };
+                emit_compound_select(
+                    program,
+                    compound_select,
+                    schema,
+                    syms,
+                    None,
+                    yield_reg,
+                    reg_result_cols_start,
+                )?;
+
+                let (right_cursor_id, right_index) =
+                    create_dedupe_index(program, &right_most, schema)?;
+                right_most.query_destination = QueryDestination::EphemeralIndex {
+                    cursor_id: right_cursor_id,
+                    index: right_index,
+                };
+                emit_query(program, &mut right_most, &mut right_most_ctx)?;
+                read_intersect_rows(
+                    program,
+                    left_cursor_id,
+                    &left_index,
+                    right_cursor_id,
+                    target_cursor_id,
+                    limit_ctx,
+                    yield_reg,
+                );
+            }
             _ => {
                 crate::bail_parse_error!("unimplemented compound select operator: {:?}", operator);
             }
@@ -218,19 +262,23 @@ fn emit_compound_select(
     Ok(())
 }
 
-/// Creates an ephemeral index that will be used to deduplicate the results of any sub-selects
-/// that appear before the last UNION operator.
-fn create_union_dedupe_index(
+// Creates an ephemeral index that will be used to deduplicate the results of any sub-selects
+fn create_dedupe_index(
     program: &mut ProgramBuilder,
-    first_select_in_compound: &SelectPlan,
-) -> (usize, Arc<Index>) {
+    select: &SelectPlan,
+    schema: &Schema,
+) -> crate::Result<(usize, Arc<Index>)> {
+    if !schema.indexes_enabled {
+        crate::bail_parse_error!("UNION OR INTERSECT is not supported without indexes");
+    }
+
     let dedupe_index = Arc::new(Index {
-        columns: first_select_in_compound
+        columns: select
             .result_columns
             .iter()
             .map(|c| IndexColumn {
                 name: c
-                    .name(&first_select_in_compound.table_references)
+                    .name(&select.table_references)
                     .map(|n| n.to_string())
                     .unwrap_or_default(),
                 order: SortOrder::Asc,
@@ -239,7 +287,7 @@ fn create_union_dedupe_index(
                 collation: None, // FIXME: this should be inferred
             })
             .collect(),
-        name: "union_dedupe".to_string(),
+        name: "compound_dedupe".to_string(),
         root_page: 0,
         ephemeral: true,
         table_name: String::new(),
@@ -251,7 +299,7 @@ fn create_union_dedupe_index(
         cursor_id,
         is_table: false,
     });
-    (cursor_id, dedupe_index.clone())
+    Ok((cursor_id, dedupe_index.clone()))
 }
 
 /// Emits the bytecode for reading deduplicated rows from the ephemeral index created for UNION operators.
@@ -310,5 +358,95 @@ fn read_deduplicated_union_rows(
     });
     program.emit_insn(Insn::Close {
         cursor_id: dedupe_cursor_id,
+    });
+}
+
+// Emits the bytecode for Reading rows from the intersection of two cursors.
+fn read_intersect_rows(
+    program: &mut ProgramBuilder,
+    left_cursor_id: usize,
+    index: &Index,
+    right_cursor_id: usize,
+    target_cursor: Option<usize>,
+    limit_ctx: Option<LimitCtx>,
+    yield_reg: Option<usize>,
+) {
+    let label_close = program.allocate_label();
+    let label_loop_start = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: left_cursor_id,
+        pc_if_empty: label_close,
+    });
+
+    program.preassign_label_to_next_insn(label_loop_start);
+    let row_content_reg = program.alloc_register();
+    program.emit_insn(Insn::RowData {
+        cursor_id: left_cursor_id,
+        dest: row_content_reg,
+    });
+    let label_next = program.allocate_label();
+    program.emit_insn(Insn::NotFound {
+        cursor_id: right_cursor_id,
+        target_pc: label_next,
+        record_reg: row_content_reg,
+        num_regs: 0,
+    });
+    let column_count = index.columns.len();
+    let cols_start_reg = if let Some(yield_reg) = yield_reg {
+        yield_reg + 1
+    } else {
+        program.alloc_registers(column_count)
+    };
+    for i in 0..column_count {
+        program.emit_insn(Insn::Column {
+            cursor_id: left_cursor_id,
+            column: i,
+            dest: cols_start_reg + i,
+            default: None,
+        });
+    }
+    if let Some(target_cursor_id) = target_cursor {
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: cols_start_reg,
+            count: column_count,
+            dest_reg: row_content_reg,
+            index_name: None,
+        });
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: target_cursor_id,
+            record_reg: row_content_reg,
+            unpacked_start: Some(cols_start_reg),
+            unpacked_count: Some(column_count as u16),
+            flags: Default::default(),
+        });
+    } else if let Some(yield_reg) = yield_reg {
+        program.emit_insn(Insn::Yield {
+            yield_reg,
+            end_offset: BranchOffset::Offset(0),
+        })
+    } else {
+        program.emit_insn(Insn::ResultRow {
+            start_reg: cols_start_reg,
+            count: column_count,
+        });
+    }
+    if let Some(limit_ctx) = limit_ctx {
+        program.emit_insn(Insn::DecrJumpZero {
+            reg: limit_ctx.reg_limit,
+            target_pc: label_close,
+        });
+    }
+    program.preassign_label_to_next_insn(label_next);
+    program.emit_insn(Insn::Next {
+        cursor_id: left_cursor_id,
+        pc_if_next: label_loop_start,
+    });
+
+    program.preassign_label_to_next_insn(label_close);
+    program.emit_insn(Insn::Close {
+        cursor_id: right_cursor_id,
+    });
+    program.emit_insn(Insn::Close {
+        cursor_id: left_cursor_id,
     });
 }

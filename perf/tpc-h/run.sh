@@ -6,7 +6,7 @@ RELEASE_BUILD_DIR="$REPO_ROOT/target/release"
 TPCH_DIR="$REPO_ROOT/perf/tpc-h"
 DB_FILE="$TPCH_DIR/TPC-H.db"
 QUERIES_DIR="$TPCH_DIR/queries"
-LIMBO_BIN="$RELEASE_BUILD_DIR/limbo"
+LIMBO_BIN="$RELEASE_BUILD_DIR/tursodb"
 SQLITE_BIN="sqlite3" # Assuming sqlite3 is in PATH
 
 # Function to clear system caches based on OS
@@ -27,7 +27,7 @@ clear_caches() {
 # Ensure the Limbo binary exists
 if [ ! -f "$LIMBO_BIN" ]; then
     echo "Error: Limbo binary not found at $LIMBO_BIN"
-    echo "Please build Limbo first (e.g., by running benchmark.sh or 'cargo build --bin limbo --release')"
+    echo "Please build Limbo first (e.g., by running benchmark.sh or 'cargo build --bin tursodb --release')"
     exit 1
 fi
 
@@ -66,7 +66,7 @@ for query_file in $(ls "$QUERIES_DIR"/*.sql | sort -V); do
         # Clear caches before Limbo run
         clear_caches
         # Run Limbo
-        limbo_output=$( { time -p "$LIMBO_BIN" "$DB_FILE" --quiet --output-mode list "$(cat $query_file)" 2>&1; } 2>&1)
+        limbo_output=$( { time -p "$LIMBO_BIN" "$DB_FILE" --experimental-indexes --quiet --output-mode list "$(cat $query_file)" 2>&1; } 2>&1)
         limbo_non_time_lines=$(echo "$limbo_output" | grep -v -e "^real" -e "^user" -e "^sys")
         limbo_real_time=$(echo "$limbo_output" | grep "^real" | awk '{print $2}')
         echo "Running $query_name with SQLite3..." >&2

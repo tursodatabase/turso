@@ -41,12 +41,6 @@ jobs:
         RUST_LOG: ${{ runner.debug && 'limbo_core::storage=trace' || '' }}
       run: cargo test --verbose
       timeout-minutes: 20
-    - name: Tests with indexes
-      env:
-        RUST_LOG: ${{ runner.debug && 'limbo_core::storage=trace' || '' }}
-      run: cargo test --verbose --features index_experimental
-      timeout-minutes: 20
-
 
   clippy:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -54,7 +48,7 @@ jobs:
       - uses: actions/checkout@v3
       - name: Clippy
         run: |
-          cargo clippy --workspace --all-features --all-targets --exclude limbo-wasm --exclude limbo_sqlite3_parser -- -A clippy::all -W clippy::correctness -W clippy::perf -W clippy::suspicious --deny=warnings
+          cargo clippy --workspace --all-features --all-targets --exclude limbo-wasm -- --deny=warnings
       - name: Clippy `limbo-wasm` crate `nodejs` feature
         run: |
           cargo clippy --package limbo-wasm --features nodejs --all-targets --no-deps -- -A clippy::all -W clippy::correctness -W clippy::perf -W clippy::suspicious --deny=warnings

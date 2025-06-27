@@ -1,2 +1,2 @@
 typing-extensions==4.12.2
-    # via pylimbo (pyproject.toml)
+    # via pyturso (pyproject.toml)

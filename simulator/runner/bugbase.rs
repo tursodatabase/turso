@@ -279,12 +279,11 @@ impl BugBase {
                         })?;
                 let plan: InteractionPlan = serde_json::from_str(&plan)
                     .with_context(|| "should be able to deserialize plan")?;
-
                 let runs =
                     std::fs::read_to_string(self.path.join(seed.to_string()).join("runs.json"))
-                        .with_context(|| "should be able to read runs file")?;
-                let runs: Vec<BugRun> = serde_json::from_str(&runs)
-                    .with_context(|| "should be able to deserialize runs")?;
+                        .with_context(|| "should be able to read runs file")
+                        .and_then(|runs| serde_json::from_str(&runs).map_err(|e| anyhow!("{}", e)))
+                        .unwrap_or_default();
 
                 let bug = LoadedBug {
                     seed,
@@ -338,7 +337,7 @@ impl BugBase {
     }
 
     pub(crate) fn load_bugs(&mut self) -> anyhow::Result<Vec<LoadedBug>> {
-        let seeds = self.bugs.keys().map(|seed| *seed).collect::<Vec<_>>();
+        let seeds = self.bugs.keys().copied().collect::<Vec<_>>();
 
         seeds
             .iter()

@@ -1,4 +1,4 @@
-from ._limbo import (
+from ._turso import (
     Connection,
     Cursor,
     DatabaseError,

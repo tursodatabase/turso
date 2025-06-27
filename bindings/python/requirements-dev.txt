@@ -1,13 +1,13 @@
 coverage==7.6.1
     # via
-    #   pylimbo (pyproject.toml)
+    #   pyturso (pyproject.toml)
     #   pytest-cov
 iniconfig==2.0.0
     # via pytest
 maturin==1.7.8
-    # via pylimbo (pyproject.toml)
+    # via pyturso (pyproject.toml)
 mypy==1.11.0
-    # via pylimbo (pyproject.toml)
+    # via pyturso (pyproject.toml)
 mypy-extensions==1.0.0
     # via mypy
 packaging==24.2
@@ -16,13 +16,13 @@ pluggy==1.5.0
     # via pytest
 pytest==8.3.1
     # via
-    #   pylimbo (pyproject.toml)
+    #   pyturso (pyproject.toml)
     #   pytest-cov
 pytest-cov==5.0.0
-    # via pylimbo (pyproject.toml)
+    # via pyturso (pyproject.toml)
 ruff==0.5.4
-    # via pylimbo (pyproject.toml)
+    # via pyturso (pyproject.toml)
 typing-extensions==4.12.2
     # via
     #   mypy
-    #   pylimbo (pyproject.toml)
+    #   pyturso (pyproject.toml)

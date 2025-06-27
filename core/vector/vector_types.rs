@@ -116,7 +116,7 @@ pub fn parse_vector(value: &Register, vec_ty: Option<VectorType>) -> Result<Vect
                     "Invalid vector value".to_string(),
                 ));
             };
-            let vector_type = vector_type(&blob)?;
+            let vector_type = vector_type(blob)?;
             if let Some(vec_ty) = vec_ty {
                 if vec_ty != vector_type {
                     return Err(LimboError::ConversionError(
@@ -124,7 +124,7 @@ pub fn parse_vector(value: &Register, vec_ty: Option<VectorType>) -> Result<Vect
                     ));
                 }
             }
-            vector_deserialize(vector_type, &blob)
+            vector_deserialize(vector_type, blob)
         }
         _ => Err(LimboError::ConversionError(
             "Invalid vector type".to_string(),
@@ -138,8 +138,8 @@ pub fn vector_to_text(vector: &Vector) -> String {
     match vector.vector_type {
         VectorType::Float32 => {
             let data = vector.as_f32_slice();
-            for i in 0..vector.dims {
-                text.push_str(&data[i].to_string());
+            for (i, value) in data.iter().enumerate().take(vector.dims) {
+                text.push_str(&value.to_string());
                 if i < vector.dims - 1 {
                     text.push(',');
                 }
@@ -147,8 +147,8 @@ pub fn vector_to_text(vector: &Vector) -> String {
         }
         VectorType::Float64 => {
             let data = vector.as_f64_slice();
-            for i in 0..vector.dims {
-                text.push_str(&data[i].to_string());
+            for (i, value) in data.iter().enumerate().take(vector.dims) {
+                text.push_str(&value.to_string());
                 if i < vector.dims - 1 {
                     text.push(',');
                 }
@@ -555,7 +555,7 @@ mod tests {
             // Skip test if types are different
             return true;
         }
-        match do_vector_distance_cos(&v1, &v2) {
+        match do_vector_distance_cos(v1, v2) {
             Ok(distance) => {
                 // Cosine distance is always between 0 and 2
                 (0.0..=2.0).contains(&distance)

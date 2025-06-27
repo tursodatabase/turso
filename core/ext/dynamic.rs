@@ -144,12 +144,10 @@ pub fn add_builtin_vfs_extensions(
     Ok(vfslist)
 }
 
+#[allow(dead_code)]
 #[cfg(feature = "fs")]
 fn register_static_vfs_modules(_api: &mut ExtensionApi) {
-    #[cfg(feature = "testvfs")]
-    unsafe {
-        limbo_ext_tests::register_extension_static(_api);
-    }
+    /* Placeholder for any VFS modules to build in at compile time */
 }
 
 pub fn add_vfs_module(name: String, vfs: Arc<VfsMod>) {

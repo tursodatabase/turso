@@ -62,8 +62,16 @@ do_execsql_test where-clause-isnull {
     select count(1) from users where last_name isnull;
 } {0}
 
+do_execsql_test where-clause-isnull-or-false {
+    select count(1) from users where null isnull or 1 != 1;
+} {10000}
+
 do_execsql_test where-clause-notnull {
     select count(1) from users where last_name not null;
+} {10000}
+
+do_execsql_test where-clause-notnull-or-false {
+    select count(1) from users where last_name not null or 1 != 1;
 } {10000}
 
 do_execsql_test where-clause-ne {

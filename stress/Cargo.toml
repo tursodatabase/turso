@@ -14,8 +14,6 @@ publish = false
 name = "limbo_stress"
 path = "main.rs"
 
-[features]
-index_experimental = ["limbo/index_experimental"]
 [dependencies]
 antithesis_sdk = "0.2.5"
 clap = { version = "4.5", features = ["derive"] }

@@ -67,7 +67,7 @@ impl LoopLabels {
 }
 
 pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> DistinctCtx {
-    let index_name = format!("distinct_{}", program.offset().to_offset_int()); // we don't really care about the name that much, just enough that we don't get name collisions
+    let index_name = format!("distinct_{}", program.offset().as_offset_int()); // we don't really care about the name that much, just enough that we don't get name collisions
     let index = Arc::new(Index {
         name: index_name.clone(),
         table_name: String::new(),
@@ -100,7 +100,7 @@ pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> Distinc
         is_table: false,
     });
 
-    return ctx;
+    ctx
 }
 
 /// Initialize resources needed for the source operators (tables, joins, etc)
@@ -345,7 +345,7 @@ pub fn init_loop(
             jump_target_when_true: jump_target,
             jump_target_when_false: t_ctx.label_main_loop_end.unwrap(),
         };
-        translate_condition_expr(program, &tables, &cond.expr, meta, &t_ctx.resolver)?;
+        translate_condition_expr(program, tables, &cond.expr, meta, &t_ctx.resolver)?;
         program.preassign_label_to_next_insn(jump_target);
     }
 
@@ -631,7 +631,7 @@ pub fn open_loop(
                             };
                             Some(emit_autoindex(
                                 program,
-                                &index,
+                                index,
                                 table_cursor_id
                                     .expect("an ephemeral index must have a source table cursor"),
                                 index_cursor_id
@@ -747,9 +747,9 @@ enum LoopEmitTarget {
 
 /// Emits the bytecode for the inner loop of a query.
 /// At this point the cursors for all tables have been opened and rewound.
-pub fn emit_loop<'a>(
+pub fn emit_loop(
     program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx<'a>,
+    t_ctx: &mut TranslateCtx,
     plan: &SelectPlan,
 ) -> Result<()> {
     // if we have a group by, we emit a record into the group by sorter,
@@ -773,9 +773,9 @@ pub fn emit_loop<'a>(
 /// This is a helper function for inner_loop_emit,
 /// which does a different thing depending on the emit target.
 /// See the InnerLoopEmitTarget enum for more details.
-fn emit_loop_source<'a>(
+fn emit_loop_source(
     program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx<'a>,
+    t_ctx: &mut TranslateCtx,
     plan: &SelectPlan,
     emit_target: LoopEmitTarget,
 ) -> Result<()> {
@@ -1182,7 +1182,7 @@ fn emit_seek(
             translate_expr_no_constant_opt(
                 program,
                 Some(tables),
-                &expr,
+                expr,
                 reg,
                 &t_ctx.resolver,
                 NoConstantOptReason::RegisterReuse,

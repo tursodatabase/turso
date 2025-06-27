@@ -9,9 +9,6 @@ license.workspace = true
 repository.workspace = true
 description = "Limbo Rust API"
 
-[features]
-index_experimental = ["limbo_core/index_experimental"]
-
 [dependencies]
 limbo_core = { workspace = true, features = ["io_uring"] }
 thiserror = "2.0.9"

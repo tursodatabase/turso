@@ -1,10 +1,10 @@
 #!/usr/bin/env -S python3 -u
 
-import limbo
+import turso
 from antithesis.assertions import always
 
 try:
-    con = limbo.connect("bank_test.db")
+    con = turso.connect("bank_test.db")
 except Exception as e:
     print(f"Error connecting to database: {e}")
     exit(0)

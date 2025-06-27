@@ -22,6 +22,16 @@ test("Property .name of database", async (t) => {
   t.is(db.name,name);
 });
 
+test("Property .readonly of database if set", async (t) => {
+  const db = new Database("foobar.db", { readonly: true });
+  t.is(db.readonly, true);
+});
+
+test("Property .readonly of database if not set", async (t) => {
+  const db = new Database("foobar.db");
+  t.is(db.readonly, false);
+});
+
 test("Statement.get() returns data", async (t) => {
   const [db] = await connect(":memory:");
   const stmt = db.prepare("SELECT 1");

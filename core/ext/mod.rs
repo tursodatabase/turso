@@ -109,7 +109,7 @@ impl Database {
                 }
             },
         };
-        let db = Self::open_file(io.clone(), path, false)?;
+        let db = Self::open_file(io.clone(), path, false, false)?;
         Ok((io, db))
     }
 }

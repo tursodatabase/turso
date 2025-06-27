@@ -208,13 +208,13 @@ pub fn json_set(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(&args[0].get_owned_value(), make_jsonb_fn)?;
+    let mut json = json_cache.get_or_insert_with(args[0].get_owned_value(), make_jsonb_fn)?;
     let other = args[1..].chunks_exact(2);
 
     for chunk in other {
-        let path = json_path_from_owned_value(&chunk[0].get_owned_value(), true)?;
+        let path = json_path_from_owned_value(chunk[0].get_owned_value(), true)?;
 
-        let value = convert_dbtype_to_jsonb(&chunk[1].get_owned_value(), Conv::NotStrict)?;
+        let value = convert_dbtype_to_jsonb(chunk[1].get_owned_value(), Conv::NotStrict)?;
         let mut op = SetOperation::new(value);
         if let Some(path) = path {
             let _ = json.operate_on_path(&path, &mut op);
@@ -232,13 +232,13 @@ pub fn jsonb_set(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(&args[0].get_owned_value(), make_jsonb_fn)?;
+    let mut json = json_cache.get_or_insert_with(args[0].get_owned_value(), make_jsonb_fn)?;
     let other = args[1..].chunks_exact(2);
 
     for chunk in other {
-        let path = json_path_from_owned_value(&chunk[0].get_owned_value(), true)?;
+        let path = json_path_from_owned_value(chunk[0].get_owned_value(), true)?;
 
-        let value = convert_dbtype_to_jsonb(&chunk[1].get_owned_value(), Conv::NotStrict)?;
+        let value = convert_dbtype_to_jsonb(chunk[1].get_owned_value(), Conv::NotStrict)?;
         let mut op = SetOperation::new(value);
         if let Some(path) = path {
             let _ = json.operate_on_path(&path, &mut op);
@@ -360,7 +360,7 @@ pub fn jsonb_extract(
 fn jsonb_extract_internal(value: Jsonb, paths: &[Register]) -> crate::Result<(Jsonb, ElementType)> {
     let null = Jsonb::from_raw_data(JsonbHeader::make_null().into_bytes().as_bytes());
     if paths.len() == 1 {
-        if let Some(path) = json_path_from_owned_value(&paths[0].get_owned_value(), true)? {
+        if let Some(path) = json_path_from_owned_value(paths[0].get_owned_value(), true)? {
             let mut json = value;
 
             let mut op = SearchOperation::new(json.len());
@@ -559,9 +559,9 @@ pub fn json_object(values: &[Register]) -> crate::Result<Value> {
         if chunk[0].get_owned_value().value_type() != ValueType::Text {
             bail_constraint_error!("json_object() labels must be TEXT")
         }
-        let key = convert_dbtype_to_jsonb(&chunk[0].get_owned_value(), Conv::ToString)?;
+        let key = convert_dbtype_to_jsonb(chunk[0].get_owned_value(), Conv::ToString)?;
         json.append_jsonb_to_end(key.data());
-        let value = convert_dbtype_to_jsonb(&chunk[1].get_owned_value(), Conv::NotStrict)?;
+        let value = convert_dbtype_to_jsonb(chunk[1].get_owned_value(), Conv::NotStrict)?;
         json.append_jsonb_to_end(value.data());
     }
 
@@ -580,9 +580,9 @@ pub fn jsonb_object(values: &[Register]) -> crate::Result<Value> {
         if chunk[0].get_owned_value().value_type() != ValueType::Text {
             bail_constraint_error!("json_object() labels must be TEXT")
         }
-        let key = convert_dbtype_to_jsonb(&chunk[0].get_owned_value(), Conv::ToString)?;
+        let key = convert_dbtype_to_jsonb(chunk[0].get_owned_value(), Conv::ToString)?;
         json.append_jsonb_to_end(key.data());
-        let value = convert_dbtype_to_jsonb(&chunk[1].get_owned_value(), Conv::NotStrict)?;
+        let value = convert_dbtype_to_jsonb(chunk[1].get_owned_value(), Conv::NotStrict)?;
         json.append_jsonb_to_end(value.data());
     }
 
@@ -624,7 +624,7 @@ pub fn json_quote(value: &Value) -> crate::Result<Value> {
             }
             escaped_value.push('"');
 
-            Ok(Value::build_text(&escaped_value))
+            Ok(Value::build_text(escaped_value))
         }
         // Numbers are unquoted in json
         Value::Integer(ref int) => Ok(Value::Integer(int.to_owned())),

@@ -18,7 +18,7 @@ fn bench_prepare_query(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/testing.db", false).unwrap();
+    let db = Database::open_file(io.clone(), "../testing/testing.db", false, false).unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let queries = [
@@ -65,7 +65,7 @@ fn bench_execute_select_rows(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/testing.db", false).unwrap();
+    let db = Database::open_file(io.clone(), "../testing/testing.db", false, false).unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let mut group = criterion.benchmark_group("Execute `SELECT * FROM users LIMIT ?`");
@@ -134,7 +134,7 @@ fn bench_execute_select_1(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/testing.db", false).unwrap();
+    let db = Database::open_file(io.clone(), "../testing/testing.db", false, false).unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let mut group = criterion.benchmark_group("Execute `SELECT 1`");
@@ -187,7 +187,7 @@ fn bench_execute_select_count(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/testing.db", false).unwrap();
+    let db = Database::open_file(io.clone(), "../testing/testing.db", false, false).unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let mut group = criterion.benchmark_group("Execute `SELECT count() FROM users`");

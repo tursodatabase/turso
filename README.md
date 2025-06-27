@@ -1,18 +1,18 @@
 <p align="center">
-  <img src="limbo.png" alt="Limbo" width="800"/>
-  <h1 align="center">Project Limbo</h1>
+  <img src="turso.png" alt="Turso Database" width="800"/>
+  <h1 align="center">Turso Database</h1>
 </p>
 
 <p align="center">
-  <i>Limbo</i> is a project to build the next evolution of SQLite.
+  <i>Turso Database</i> is an in-process SQL database, compatible with SQLite.
 </p>
 
 <p align="center">
   <a title="Build Status" target="_blank" href="https://github.com/tursodatabase/limbo/actions/workflows/rust.yml"><img src="https://img.shields.io/github/actions/workflow/status/tursodatabase/limbo/rust.yml?style=flat-square"></a>
   <a title="Releases" target="_blank" href="https://github.com/tursodatabase/limbo/releases"><img src="https://img.shields.io/github/release/tursodatabase/limbo?style=flat-square&color=9CF"></a>
   <a title="Rust" target="_blank" href="https://crates.io/crates/limbo"><img alt="PyPI" src="https://img.shields.io/crates/v/limbo"></a>
-  <a title="JavaScript" target="_blank" href="https://www.npmjs.com/package/@tursodatabase/limbo"><img alt="PyPI" src="https://img.shields.io/npm/v/@tursodatabase/limbo"></a>
-  <a title="Python" target="_blank" href="https://pypi.org/project/pylimbo/"><img alt="PyPI" src="https://img.shields.io/pypi/v/pylimbo"></a>
+  <a title="JavaScript" target="_blank" href="https://www.npmjs.com/package/@tursodatabase/turso"><img alt="PyPI" src="https://img.shields.io/npm/v/@tursodatabase/turso"></a>
+  <a title="Python" target="_blank" href="https://pypi.org/project/pyturso/"><img alt="PyPI" src="https://img.shields.io/pypi/v/pyturso"></a>
   <a title="MIT" target="_blank" href="https://github.com/tursodatabase/limbo/blob/main/LICENSE.md"><img src="http://img.shields.io/badge/license-MIT-orange.svg?style=flat-square"></a>
   <br>
   <a title="GitHub Pull Requests" target="_blank" href="https://github.com/tursodatabase/limbo/pulls"><img src="https://img.shields.io/github/issues-pr-closed/tursodatabase/limbo.svg?style=flat-square&color=FF9966"></a>
@@ -27,7 +27,7 @@
 
 ## Features and Roadmap
 
-Limbo is a _work-in-progress_, in-process OLTP database engine library written in Rust that has:
+Turso Database is a _work-in-progress_, in-process OLTP database engine library written in Rust that has:
 
 * **SQLite compatibility** [[doc](COMPAT.md)] for SQL dialect, file formats, and the C API
 * **Language bindings** for JavaScript/WebAssembly, Rust, Go, Python, and [Java](bindings/java)
@@ -51,13 +51,13 @@ You can install the latest `limbo` release with:
 
 ```shell
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/tursodatabase/limbo/releases/latest/download/limbo_cli-installer.sh | sh
+  https://github.com/tursodatabase/limbo/releases/latest/download/turso_cli-installer.sh | sh
 ```
 
 Then launch the shell to execute SQL statements:
 
 ```console
-Limbo
+Turso
 Enter ".help" for usage hints.
 Connected to a transient in-memory database.
 Use ".open FILENAME" to reopen on a persistent database
@@ -125,9 +125,9 @@ pip install pylimbo
 Example usage:
 
 ```python
-import limbo
+import turso
 
-con = limbo.connect("sqlite.db")
+con = turso.connect("sqlite.db")
 cur = con.cursor()
 res = cur.execute("SELECT * FROM users")
 print(res.fetchone())
@@ -179,25 +179,25 @@ for rows.Next() {
 <summary>☕️ Java</summary>
 <br>
 
-We integrated Limbo into JDBC. For detailed instructions on how to use Limbo with java, please refer to
+We integrated Turso Database into JDBC. For detailed instructions on how to use Turso Database with java, please refer to
 the [README.md under bindings/java](bindings/java/README.md).
 </details>
 
 ## Contributing
 
-We'd love to have you contribute to Limbo! Please check out the [contribution guide] to get started.
+We'd love to have you contribute to Turso Database! Please check out the [contribution guide] to get started.
 
 ## FAQ
 
-### Is Limbo ready for production use?
+### Is Turso Database ready for production use?
 
-Limbo is currently under heavy development and is **not** ready for production use.
+Turso Database is currently under heavy development and is **not** ready for production use.
 
-### How is Limbo different from Turso's libSQL?
+### How is Turso Database different from Turso's libSQL?
 
-Limbo is a project to build the next evolution of SQLite in Rust, with a strong open contribution focus and features like native async support, vector search, and more. The libSQL project is also an attempt to evolve SQLite in a similar direction, but through a fork rather than a rewrite.
+Turso Database is a project to build the next evolution of SQLite in Rust, with a strong open contribution focus and features like native async support, vector search, and more. The libSQL project is also an attempt to evolve SQLite in a similar direction, but through a fork rather than a rewrite.
 
-Rewriting SQLite in Rust started as an unassuming experiment, and due to its incredible success, replaces libSQL as our intended direction. At this point, libSQL is production ready, Limbo is not - although it is evolving rapidly. As the project starts to near production readiness, we plan to rename it to just "Turso". More details [here](https://turso.tech/blog/we-will-rewrite-sqlite-and-we-are-going-all-in).
+Rewriting SQLite in Rust started as an unassuming experiment, and due to its incredible success, replaces libSQL as our intended direction. At this point, libSQL is production ready, Turso Database is not - although it is evolving rapidly. More details [here](https://turso.tech/blog/we-will-rewrite-sqlite-and-we-are-going-all-in).
 
 ## Publications
 
@@ -211,7 +211,7 @@ This project is licensed under the [MIT license].
 ### Contribution
 
 Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in Limbo by you, shall be licensed as MIT, without any additional
+for inclusion in Turso Database by you, shall be licensed as MIT, without any additional
 terms or conditions.
 
 [contribution guide]: https://github.com/tursodatabase/limbo/blob/main/CONTRIBUTING.md
@@ -227,7 +227,7 @@ Thanks to all the partners of Limbo!
 
 ## Contributors
 
-Thanks to all the contributors to Limbo!
+Thanks to all the contributors to Turso Database!
 
 <a href="https://github.com/tursodatabase/limbo/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=tursodatabase/limbo" />

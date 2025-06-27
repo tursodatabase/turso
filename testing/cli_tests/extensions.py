@@ -304,12 +304,6 @@ def test_crypto():
 def test_series():
     console.info("Running test_series for Limbo")
     limbo = TestLimboShell()
-    ext_path = "./target/debug/liblimbo_series"
-    limbo.run_test_fn(
-        "SELECT * FROM generate_series(1, 10);",
-        lambda res: "No such table-valued function: generate_series" in res,
-    )
-    limbo.execute_dot(f".load {ext_path}")
     _test_series(limbo)
 
     console.info("Running test_series for SQLite")

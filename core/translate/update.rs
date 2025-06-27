@@ -104,15 +104,12 @@ pub fn prepare_update_plan(
         bail_parse_error!("ON CONFLICT clause is not supported");
     }
     let table_name = &body.tbl_name.name;
-    #[cfg(not(feature = "index_experimental"))]
-    {
-        if schema.table_has_indexes(&table_name.to_string()) {
-            // Let's disable altering a table with indices altogether instead of checking column by
-            // column to be extra safe.
-            bail_parse_error!(
-                "UPDATE table disabled for table with indexes and without index_experimental feature flag"
-            );
-        }
+    if schema.table_has_indexes(&table_name.to_string()) && !schema.indexes_enabled() {
+        // Let's disable altering a table with indices altogether instead of checking column by
+        // column to be extra safe.
+        bail_parse_error!(
+            "UPDATE table disabled for table with indexes is disabled by default. Run with `--experimental-indexes` to enable this feature."
+        );
     }
     let table = match schema.get_table(table_name.0.as_str()) {
         Some(table) => table,
@@ -144,7 +141,7 @@ pub fn prepare_update_plan(
             index: None,
         },
         join_info: None,
-        col_used_mask: ColumnUsedMask::new(),
+        col_used_mask: ColumnUsedMask::default(),
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
     let set_clauses = body
@@ -229,7 +226,7 @@ pub fn prepare_update_plan(
                 index: None,
             },
             join_info: None,
-            col_used_mask: ColumnUsedMask::new(),
+            col_used_mask: ColumnUsedMask::default(),
         }];
         let mut table_references = TableReferences::new(joined_tables, vec![]);
 

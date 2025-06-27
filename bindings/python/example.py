@@ -1,7 +1,7 @@
-import limbo
+import turso
 
 # Use the context manager to automatically close the connection
-with limbo.connect("sqlite.db") as con:
+with turso.connect("sqlite.db") as con:
     cur = con.cursor()
     cur.execute("""
             CREATE TABLE IF NOT EXISTS users (

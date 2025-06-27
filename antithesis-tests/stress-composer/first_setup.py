@@ -4,7 +4,7 @@ import glob
 import json
 import os
 
-import limbo
+import turso
 from antithesis.random import get_random, random_choice
 
 constraints = ["NOT NULL", ""]
@@ -25,7 +25,7 @@ for f in glob.glob("*.db-wal"):
 
 # store initial states in a separate db
 try:
-    con_init = limbo.connect("init_state.db")
+    con_init = turso.connect("init_state.db")
 except Exception as e:
     print(f"Error connecting to database: {e}")
     exit(0)
@@ -35,7 +35,7 @@ cur_init.execute("CREATE TABLE schemas (schema TEXT, tbl INT)")
 cur_init.execute("CREATE TABLE tables (count INT)")
 
 try:
-    con = limbo.connect("stress_composer.db")
+    con = turso.connect("stress_composer.db")
 except Exception as e:
     print(f"Error connecting to database: {e}")
     exit(0)

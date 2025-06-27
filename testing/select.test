@@ -359,5 +359,94 @@ if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-s
     y|y
     x|x
     y|y}
-}
 
+    do_execsql_test_on_specific_db {:memory:} select-intersect-1 {
+      CREATE TABLE t(x TEXT, y TEXT);
+      CREATE TABLE u(x TEXT, y TEXT);
+      INSERT INTO t VALUES('x','x'),('y','y');
+      INSERT INTO u VALUES('x','x'),('z','y');
+
+      select * from t INTERSECT select * from u;
+    } {x|x}
+
+    do_execsql_test_on_specific_db {:memory:} select-intersect-2 {
+      CREATE TABLE t(x TEXT, y TEXT);
+      CREATE TABLE u(x TEXT, y TEXT);
+      CREATE TABLE v(x TEXT, y TEXT);
+      INSERT INTO t VALUES('x','x'),('y','y');
+      INSERT INTO u VALUES('x','x'),('y','y');
+      INSERT INTO v VALUES('a','x'),('y','y');
+
+      select * from t INTERSECT select * from u INTERSECT select * from v INTERSECT select * from t;
+    } {y|y}
+
+    do_execsql_test_on_specific_db {:memory:} select-intersect-union {
+      CREATE TABLE t(x TEXT, y TEXT);
+      CREATE TABLE u(x TEXT, y TEXT);
+      CREATE TABLE v(x TEXT, y TEXT);
+      INSERT INTO t VALUES('x','x'),('y','y');
+      INSERT INTO u VALUES('x','x'),('z','y');
+      INSERT INTO v VALUES('x','x'),('z','z');
+
+      select * from t INTERSECT select * from u UNION select * from v;
+    } {x|x
+    z|z}
+
+    do_execsql_test_on_specific_db {:memory:} select-union-intersect {
+      CREATE TABLE t(x TEXT, y TEXT);
+      CREATE TABLE u(x TEXT, y TEXT);
+      CREATE TABLE v(x TEXT, y TEXT);
+      INSERT INTO t VALUES('x','x'),('y','y');
+      INSERT INTO u VALUES('x','x'),('z','y');
+      INSERT INTO v VALUES('x','x'),('z','z');
+
+      select * from t UNION select * from u INTERSECT select * from v;
+    } {x|x}
+
+    do_execsql_test_on_specific_db {:memory:} select-union-all-intersect {
+      CREATE TABLE t(x TEXT, y TEXT);
+      CREATE TABLE u(x TEXT, y TEXT);
+      CREATE TABLE v(x TEXT, y TEXT);
+      INSERT INTO t VALUES('x','x'),('y','y');
+      INSERT INTO u VALUES('x','x'),('z','y');
+      INSERT INTO v VALUES('x','x'),('z','z');
+
+      select * from t UNION ALL select * from u INTERSECT select * from v;
+    } {x|x}
+
+    do_execsql_test_on_specific_db {:memory:} select-intersect-union-all {
+      CREATE TABLE t(x TEXT, y TEXT);
+      CREATE TABLE u(x TEXT, y TEXT);
+      CREATE TABLE v(x TEXT, y TEXT);
+      INSERT INTO t VALUES('x','x'),('y','y');
+      INSERT INTO u VALUES('x','x'),('z','y');
+      INSERT INTO v VALUES('x','x'),('z','z');
+
+      select * from t INTERSECT select * from u UNION ALL select * from v;
+    } {x|x
+    x|x
+    z|z}
+
+    do_execsql_test_on_specific_db {:memory:} select-intersect-with-limit {
+      CREATE TABLE t(x TEXT, y TEXT);
+      CREATE TABLE u(x TEXT, y TEXT);
+      INSERT INTO t VALUES('x','x'),('y','y'), ('z','z');
+      INSERT INTO u VALUES('x','x'),('y','y'), ('z','z');
+
+      select * from t INTERSECT select * from u limit 2;
+    } {x|x
+    y|y}
+
+    do_execsql_test_on_specific_db {:memory:} select-intersect-union-with-limit {
+      CREATE TABLE t(x TEXT, y TEXT);
+      CREATE TABLE u(x TEXT, y TEXT);
+      CREATE TABLE v(x TEXT, y TEXT);
+      INSERT INTO t VALUES('x','x'),('y','y'), ('z','z');
+      INSERT INTO u VALUES('d','d'),('e','e'), ('z','z');
+      INSERT INTO v VALUES('a','a'),('b','b');
+
+      select * from t INTERSECT select * from u UNION select * from v limit 3;
+    } {a|a
+    b|b
+    z|z}
+}

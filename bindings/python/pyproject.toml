@@ -3,7 +3,7 @@ requires = ['maturin>=1,<2', 'typing_extensions']
 build-backend = 'maturin'
 
 [project]
-name = 'pylimbo'
+name = 'pyturso'
 description = "Limbo is a work-in-progress, in-process OLTP database management system, compatible with SQLite."
 requires-python = '>=3.9'
 classifiers = [
@@ -45,7 +45,7 @@ Source = "https://github.com/tursodatabase/limbo"
 
 [tool.maturin]
 bindings = 'pyo3'
-module-name = "limbo._limbo"
+module-name = "turso._turso"
 features = ["pyo3/extension-module"]
 
 [tool.pip-tools]
@@ -58,7 +58,7 @@ testpaths = 'tests'
 log_format = '%(name)s %(levelname)s: %(message)s'
 
 [tool.coverage.run]
-source = ['limbo']
+source = ['turso']
 branch = true
 
 [tool.coverage.report]

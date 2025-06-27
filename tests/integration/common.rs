@@ -18,11 +18,11 @@ unsafe impl Send for TempDatabase {}
 
 #[allow(dead_code, clippy::arc_with_non_send_sync)]
 impl TempDatabase {
-    pub fn new_empty() -> Self {
-        Self::new(&format!("test-{}.db", rng().next_u32()))
+    pub fn new_empty(enable_indexes: bool) -> Self {
+        Self::new(&format!("test-{}.db", rng().next_u32()), enable_indexes)
     }
 
-    pub fn new(db_name: &str) -> Self {
+    pub fn new(db_name: &str, enable_indexes: bool) -> Self {
         let mut path = TempDir::new().unwrap().keep();
         path.push(db_name);
         let io: Arc<dyn IO + Send> = Arc::new(limbo_core::PlatformIO::new().unwrap());
@@ -31,20 +31,34 @@ impl TempDatabase {
             path.to_str().unwrap(),
             limbo_core::OpenFlags::default(),
             false,
+            enable_indexes,
         )
         .unwrap();
         Self { path, io, db }
     }
 
-    pub fn new_with_existent(db_path: &Path) -> Self {
-        Self::new_with_existent_with_flags(db_path, limbo_core::OpenFlags::default())
+    pub fn new_with_existent(db_path: &Path, enable_indexes: bool) -> Self {
+        Self::new_with_existent_with_flags(
+            db_path,
+            limbo_core::OpenFlags::default(),
+            enable_indexes,
+        )
     }
 
-    pub fn new_with_existent_with_flags(db_path: &Path, flags: limbo_core::OpenFlags) -> Self {
+    pub fn new_with_existent_with_flags(
+        db_path: &Path,
+        flags: limbo_core::OpenFlags,
+        enable_indexes: bool,
+    ) -> Self {
         let io: Arc<dyn IO + Send> = Arc::new(limbo_core::PlatformIO::new().unwrap());
-        let db =
-            Database::open_file_with_flags(io.clone(), db_path.to_str().unwrap(), flags, false)
-                .unwrap();
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path.to_str().unwrap(),
+            flags,
+            false,
+            enable_indexes,
+        )
+        .unwrap();
         Self {
             path: db_path.to_path_buf(),
             io,
@@ -52,7 +66,7 @@ impl TempDatabase {
         }
     }
 
-    pub fn new_with_rusqlite(table_sql: &str) -> Self {
+    pub fn new_with_rusqlite(table_sql: &str, enable_indexes: bool) -> Self {
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
             .finish();
@@ -71,6 +85,7 @@ impl TempDatabase {
             path.to_str().unwrap(),
             limbo_core::OpenFlags::default(),
             false,
+            enable_indexes,
         )
         .unwrap();
 
@@ -85,9 +100,15 @@ impl TempDatabase {
         conn
     }
 
-    pub fn limbo_database(&self) -> Arc<limbo_core::Database> {
+    pub fn limbo_database(&self, enable_indexes: bool) -> Arc<limbo_core::Database> {
         log::debug!("conneting to limbo");
-        Database::open_file(self.io.clone(), self.path.to_str().unwrap(), false).unwrap()
+        Database::open_file(
+            self.io.clone(),
+            self.path.to_str().unwrap(),
+            false,
+            enable_indexes,
+        )
+        .unwrap()
     }
 }
 
@@ -142,7 +163,7 @@ pub(crate) fn sqlite_exec_rows(
     conn: &rusqlite::Connection,
     query: &str,
 ) -> Vec<Vec<rusqlite::types::Value>> {
-    let mut stmt = conn.prepare(&query).unwrap();
+    let mut stmt = conn.prepare(query).unwrap();
     let mut rows = stmt.query(params![]).unwrap();
     let mut results = Vec::new();
     while let Some(row) = rows.next().unwrap() {
@@ -221,8 +242,6 @@ pub(crate) fn limbo_exec_rows_error(
 #[cfg(test)]
 mod tests {
     use std::vec;
-
-    use rand::Rng;
     use tempfile::TempDir;
 
     use super::{limbo_exec_rows, limbo_exec_rows_error, TempDatabase};
@@ -233,6 +252,7 @@ mod tests {
         let _ = env_logger::try_init();
         let tmp_db = TempDatabase::new_with_rusqlite(
             "create table test (foo integer, bar integer, baz integer);",
+            false,
         );
         let conn = tmp_db.connect_limbo();
 
@@ -270,8 +290,11 @@ mod tests {
     fn test_limbo_open_read_only() -> anyhow::Result<()> {
         let path = TempDir::new().unwrap().keep().join("temp_read_only");
         {
-            let db =
-                TempDatabase::new_with_existent_with_flags(&path, limbo_core::OpenFlags::default());
+            let db = TempDatabase::new_with_existent_with_flags(
+                &path,
+                limbo_core::OpenFlags::default(),
+                false,
+            );
             let conn = db.connect_limbo();
             let ret = limbo_exec_rows(&db, &conn, "CREATE table t(a)");
             assert!(ret.is_empty(), "{:?}", ret);
@@ -283,6 +306,7 @@ mod tests {
             let db = TempDatabase::new_with_existent_with_flags(
                 &path,
                 limbo_core::OpenFlags::default() | limbo_core::OpenFlags::ReadOnly,
+                false,
             );
             let conn = db.connect_limbo();
             let ret = limbo_exec_rows(&db, &conn, "SELECT * from t");
@@ -295,9 +319,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "index_experimental")]
     fn test_unique_index_ordering() -> anyhow::Result<()> {
-        let db = TempDatabase::new_empty();
+        use rand::Rng;
+
+        let db = TempDatabase::new_empty(true);
         let conn = db.connect_limbo();
 
         let _ = limbo_exec_rows(&db, &conn, "CREATE TABLE t(x INTEGER UNIQUE)");
@@ -336,10 +361,9 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "index_experimental")]
     fn test_large_unique_blobs() -> anyhow::Result<()> {
         let path = TempDir::new().unwrap().keep().join("temp_read_only");
-        let db = TempDatabase::new_with_existent(&path);
+        let db = TempDatabase::new_with_existent(&path, true);
         let conn = db.connect_limbo();
 
         let _ = limbo_exec_rows(&db, &conn, "CREATE TABLE t(x BLOB UNIQUE)");

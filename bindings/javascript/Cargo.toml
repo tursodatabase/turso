@@ -1,11 +1,11 @@
 [package]
-name = "limbo_node"
+name = "turso_node"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Limbo Rust API"
+description = "The Turso database library Node bindings"
 
 [lib]
 crate-type = ["cdylib"]

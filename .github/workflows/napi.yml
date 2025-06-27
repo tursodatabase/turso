@@ -12,7 +12,7 @@ on:
 
 env:
   DEBUG: napi:*
-  APP_NAME: turso-limbo
+  APP_NAME: turso
   MACOSX_DEPLOYMENT_TARGET: '10.13'
 
 defaults:
@@ -220,11 +220,11 @@ jobs:
       - name: Publish
         run: |
           npm config set provenance true
-          if git log -1 --pretty=%B | grep "^Limbo [0-9]\+\.[0-9]\+\.[0-9]\+$";
+          if git log -1 --pretty=%B | grep "^Turso [0-9]\+\.[0-9]\+\.[0-9]\+$";
           then
             echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
             npm publish --access public
-          elif git log -1 --pretty=%B | grep "^Limbo [0-9]\+\.[0-9]\+\.[0-9]\+";
+          elif git log -1 --pretty=%B | grep "^Turso [0-9]\+\.[0-9]\+\.[0-9]\+";
           then
             echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
             npm publish --tag next --access public

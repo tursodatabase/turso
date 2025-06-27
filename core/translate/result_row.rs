@@ -17,6 +17,7 @@ use super::{
 /// - all result columns
 /// - result row (or if a subquery, yields to the parent query)
 /// - limit
+#[allow(clippy::too_many_arguments)]
 pub fn emit_select_result(
     program: &mut ProgramBuilder,
     resolver: &Resolver,

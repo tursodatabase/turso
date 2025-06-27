@@ -1,5 +1,5 @@
 use super::MemoryIO;
-use crate::{Clock, Completion, File, Instant, LimboError, OpenFlags, Result, IO};
+use crate::{Clock, Completion, CompletionType, File, Instant, LimboError, OpenFlags, Result, IO};
 use std::cell::RefCell;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
@@ -86,12 +86,12 @@ impl File for GenericFile {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: Arc<Completion>) -> Result<()> {
+    fn pread(&self, pos: usize, c: Completion) -> Result<Arc<Completion>> {
         let mut file = self.file.borrow_mut();
         file.seek(std::io::SeekFrom::Start(pos as u64))?;
         {
-            let r = match *c {
-                Completion::Read(ref r) => r,
+            let r = match c.completion_type {
+                CompletionType::Read(ref r) => r,
                 _ => unreachable!(),
             };
             let mut buf = r.buf_mut();
@@ -99,24 +99,29 @@ impl File for GenericFile {
             file.read_exact(buf)?;
         }
         c.complete(0);
-        Ok(())
+        Ok(Arc::new(c))
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<crate::Buffer>>, c: Arc<Completion>) -> Result<()> {
+    fn pwrite(
+        &self,
+        pos: usize,
+        buffer: Arc<RefCell<crate::Buffer>>,
+        c: Completion,
+    ) -> Result<Arc<Completion>> {
         let mut file = self.file.borrow_mut();
         file.seek(std::io::SeekFrom::Start(pos as u64))?;
         let buf = buffer.borrow();
         let buf = buf.as_slice();
         file.write_all(buf)?;
         c.complete(buf.len() as i32);
-        Ok(())
+        Ok(Arc::new(c))
     }
 
-    fn sync(&self, c: Arc<Completion>) -> Result<()> {
+    fn sync(&self, c: Completion) -> Result<Arc<Completion>> {
         let mut file = self.file.borrow_mut();
         file.sync_all().map_err(|err| LimboError::IOError(err))?;
         c.complete(0);
-        Ok(())
+        Ok(Arc::new(c))
     }
 
     fn size(&self) -> Result<u64> {

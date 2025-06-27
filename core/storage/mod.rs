@@ -13,6 +13,7 @@
 pub(crate) mod btree;
 pub(crate) mod buffer_pool;
 pub(crate) mod database;
+pub(crate) mod header_accessor;
 pub(crate) mod page_cache;
 #[allow(clippy::arc_with_non_send_sync)]
 pub(crate) mod pager;

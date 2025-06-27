@@ -1,18 +1,24 @@
 use crate::io::BufferData;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::pin::Pin;
 
 pub struct BufferPool {
     pub free_buffers: RefCell<Vec<BufferData>>,
-    page_size: usize,
+    page_size: Cell<usize>,
 }
 
+const DEFAULT_PAGE_SIZE: usize = 4096;
+
 impl BufferPool {
-    pub fn new(page_size: usize) -> Self {
+    pub fn new(page_size: Option<usize>) -> Self {
         Self {
             free_buffers: RefCell::new(Vec::new()),
-            page_size,
+            page_size: Cell::new(page_size.unwrap_or(DEFAULT_PAGE_SIZE)),
         }
+    }
+
+    pub fn set_page_size(&self, page_size: usize) {
+        self.page_size.set(page_size);
     }
 
     pub fn get(&self) -> BufferData {
@@ -20,7 +26,7 @@ impl BufferPool {
         if let Some(buffer) = free_buffers.pop() {
             buffer
         } else {
-            Pin::new(vec![0; self.page_size])
+            Pin::new(vec![0; self.page_size.get()])
         }
     }
 

@@ -1,8 +1,12 @@
+#[cfg(all(feature = "web", feature = "nodejs"))]
+compile_error!("Features 'web' and 'nodejs' cannot be enabled at the same time");
+
 use js_sys::{Array, Object};
-use limbo_core::{maybe_init_database_file, Clock, Instant, OpenFlags, Result};
+use limbo_core::{Clock, Instant, OpenFlags, Result};
 use std::cell::RefCell;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
+
 #[allow(dead_code)]
 #[wasm_bindgen]
 pub struct Database {
@@ -17,9 +21,8 @@ impl Database {
     pub fn new(path: &str) -> Database {
         let io: Arc<dyn limbo_core::IO> = Arc::new(PlatformIO { vfs: VFS::new() });
         let file = io.open_file(path, OpenFlags::Create, false).unwrap();
-        maybe_init_database_file(&file, &io).unwrap();
         let db_file = Arc::new(DatabaseFile::new(file));
-        let db = limbo_core::Database::open(io, path, db_file, false).unwrap();
+        let db = limbo_core::Database::open(io, path, db_file, false, false).unwrap();
         let conn = db.connect().unwrap();
         Database { db, conn }
     }
@@ -48,6 +51,7 @@ impl RowIterator {
     }
 
     #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> JsValue {
         let mut stmt = self.inner.borrow_mut();
         match stmt.step() {
@@ -207,9 +211,9 @@ impl limbo_core::File for File {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: Arc<limbo_core::Completion>) -> Result<()> {
-        let r = match *c {
-            limbo_core::Completion::Read(ref r) => r,
+    fn pread(&self, pos: usize, c: limbo_core::Completion) -> Result<Arc<limbo_core::Completion>> {
+        let r = match c.completion_type {
+            limbo_core::CompletionType::Read(ref r) => r,
             _ => unreachable!(),
         };
         {
@@ -219,30 +223,33 @@ impl limbo_core::File for File {
             assert!(nr >= 0);
         }
         r.complete();
-        Ok(())
+        #[allow(clippy::arc_with_non_send_sync)]
+        Ok(Arc::new(c))
     }
 
     fn pwrite(
         &self,
         pos: usize,
         buffer: Arc<std::cell::RefCell<limbo_core::Buffer>>,
-        c: Arc<limbo_core::Completion>,
-    ) -> Result<()> {
-        let w = match *c {
-            limbo_core::Completion::Write(ref w) => w,
+        c: limbo_core::Completion,
+    ) -> Result<Arc<limbo_core::Completion>> {
+        let w = match c.completion_type {
+            limbo_core::CompletionType::Write(ref w) => w,
             _ => unreachable!(),
         };
         let buf = buffer.borrow();
         let buf: &[u8] = buf.as_slice();
         self.vfs.pwrite(self.fd, buf, pos);
         w.complete(buf.len() as i32);
-        Ok(())
+        #[allow(clippy::arc_with_non_send_sync)]
+        Ok(Arc::new(c))
     }
 
-    fn sync(&self, c: Arc<limbo_core::Completion>) -> Result<()> {
+    fn sync(&self, c: limbo_core::Completion) -> Result<Arc<limbo_core::Completion>> {
         self.vfs.sync(self.fd);
         c.complete(0);
-        Ok(())
+        #[allow(clippy::arc_with_non_send_sync)]
+        Ok(Arc::new(c))
     }
 
     fn size(&self) -> Result<u64> {
@@ -332,9 +339,9 @@ impl DatabaseFile {
 }
 
 impl limbo_core::DatabaseStorage for DatabaseFile {
-    fn read_page(&self, page_idx: usize, c: Arc<limbo_core::Completion>) -> Result<()> {
-        let r = match *c {
-            limbo_core::Completion::Read(ref r) => r,
+    fn read_page(&self, page_idx: usize, c: limbo_core::Completion) -> Result<()> {
+        let r = match c.completion_type {
+            limbo_core::CompletionType::Read(ref r) => r,
             _ => unreachable!(),
         };
         let size = r.buf().len();
@@ -351,7 +358,7 @@ impl limbo_core::DatabaseStorage for DatabaseFile {
         &self,
         page_idx: usize,
         buffer: Arc<std::cell::RefCell<limbo_core::Buffer>>,
-        c: Arc<limbo_core::Completion>,
+        c: limbo_core::Completion,
     ) -> Result<()> {
         let size = buffer.borrow().len();
         let pos = (page_idx - 1) * size;
@@ -359,15 +366,17 @@ impl limbo_core::DatabaseStorage for DatabaseFile {
         Ok(())
     }
 
-    fn sync(&self, _c: Arc<limbo_core::Completion>) -> Result<()> {
-        todo!()
+    fn sync(&self, c: limbo_core::Completion) -> Result<()> {
+        let _ = self.file.sync(c)?;
+        Ok(())
+    }
+
+    fn size(&self) -> Result<u64> {
+        self.file.size()
     }
 }
 
-#[cfg(all(feature = "web", feature = "nodejs"))]
-compile_error!("Features 'web' and 'nodejs' cannot be enabled at the same time");
-
-#[cfg(feature = "web")]
+#[cfg(all(feature = "web", not(feature = "nodejs")))]
 #[wasm_bindgen(module = "/web/src/web-vfs.js")]
 extern "C" {
     type VFS;
@@ -393,7 +402,7 @@ extern "C" {
     fn sync(this: &VFS, fd: i32);
 }
 
-#[cfg(feature = "nodejs")]
+#[cfg(all(feature = "nodejs", not(feature = "web")))]
 #[wasm_bindgen(module = "/node/src/vfs.cjs")]
 extern "C" {
     type VFS;

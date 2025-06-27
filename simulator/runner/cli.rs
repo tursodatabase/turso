@@ -82,6 +82,14 @@ pub struct SimulatorCLI {
         default_value_t = false
     )]
     pub disable_select_optimizer: bool,
+    #[clap(long, help = "disable Reopen-Database fault", default_value_t = false)]
+    pub disable_reopen_database: bool,
+    #[clap(
+        long = "latency_prob",
+        help = "added IO latency probability",
+        default_value_t = 0
+    )]
+    pub latency_probability: usize,
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
@@ -137,6 +145,13 @@ impl SimulatorCLI {
 
         if self.seed.is_some() && self.load.is_some() {
             anyhow::bail!("Cannot set seed and load plan at the same time");
+        }
+
+        if self.latency_probability > 100 {
+            anyhow::bail!(
+                "latency probability must be a number between 0 and 100. Got `{}`",
+                self.latency_probability
+            );
         }
 
         Ok(())

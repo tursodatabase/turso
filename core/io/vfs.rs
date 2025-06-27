@@ -1,6 +1,7 @@
 use super::{Buffer, Completion, File, MemoryIO, OpenFlags, IO};
 use crate::ext::VfsMod;
 use crate::io::clock::{Clock, Instant};
+use crate::io::CompletionType;
 use crate::{LimboError, Result};
 use limbo_ext::{VfsFileImpl, VfsImpl};
 use std::cell::RefCell;
@@ -97,9 +98,9 @@ impl File for VfsFileImpl {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: Arc<Completion>) -> Result<()> {
-        let r = match &*c {
-            Completion::Read(ref r) => r,
+    fn pread(&self, pos: usize, c: Completion) -> Result<Arc<Completion>> {
+        let r = match c.completion_type {
+            CompletionType::Read(ref r) => r,
             _ => unreachable!(),
         };
         let result = {
@@ -112,11 +113,16 @@ impl File for VfsFileImpl {
             Err(LimboError::ExtensionError("pread failed".to_string()))
         } else {
             c.complete(result);
-            Ok(())
+            Ok(Arc::new(c))
         }
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<Buffer>>, c: Arc<Completion>) -> Result<()> {
+    fn pwrite(
+        &self,
+        pos: usize,
+        buffer: Arc<RefCell<Buffer>>,
+        c: Completion,
+    ) -> Result<Arc<Completion>> {
         let buf = buffer.borrow();
         let count = buf.as_slice().len();
         if self.vfs.is_null() {
@@ -136,18 +142,18 @@ impl File for VfsFileImpl {
             Err(LimboError::ExtensionError("pwrite failed".to_string()))
         } else {
             c.complete(result);
-            Ok(())
+            Ok(Arc::new(c))
         }
     }
 
-    fn sync(&self, c: Arc<Completion>) -> Result<()> {
+    fn sync(&self, c: Completion) -> Result<Arc<Completion>> {
         let vfs = unsafe { &*self.vfs };
         let result = unsafe { (vfs.sync)(self.file) };
         if result < 0 {
             Err(LimboError::ExtensionError("sync failed".to_string()))
         } else {
             c.complete(0);
-            Ok(())
+            Ok(Arc::new(c))
         }
     }
 

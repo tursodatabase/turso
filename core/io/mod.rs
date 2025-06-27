@@ -14,9 +14,14 @@ use std::{
 pub trait File: Send + Sync {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
-    fn pread(&self, pos: usize, c: Arc<Completion>) -> Result<()>;
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<Buffer>>, c: Arc<Completion>) -> Result<()>;
-    fn sync(&self, c: Arc<Completion>) -> Result<()>;
+    fn pread(&self, pos: usize, c: Completion) -> Result<Arc<Completion>>;
+    fn pwrite(
+        &self,
+        pos: usize,
+        buffer: Arc<RefCell<Buffer>>,
+        c: Completion,
+    ) -> Result<Arc<Completion>>;
+    fn sync(&self, c: Completion) -> Result<Arc<Completion>>;
     fn size(&self) -> Result<u64>;
 }
 
@@ -53,7 +58,12 @@ pub type Complete = dyn Fn(Arc<RefCell<Buffer>>);
 pub type WriteComplete = dyn Fn(i32);
 pub type SyncComplete = dyn Fn(i32);
 
-pub enum Completion {
+pub struct Completion {
+    pub completion_type: CompletionType,
+    is_completed: Cell<bool>,
+}
+
+pub enum CompletionType {
     Read(ReadCompletion),
     Write(WriteCompletion),
     Sync(SyncCompletion),
@@ -62,31 +72,34 @@ pub enum Completion {
 pub struct ReadCompletion {
     pub buf: Arc<RefCell<Buffer>>,
     pub complete: Box<Complete>,
-    pub is_completed: Cell<bool>,
 }
 
 impl Completion {
-    pub fn is_completed(&self) -> bool {
-        match self {
-            Self::Read(r) => r.is_completed.get(),
-            Self::Write(w) => w.is_completed.get(),
-            Self::Sync(s) => s.is_completed.get(),
+    pub fn new(completion_type: CompletionType) -> Self {
+        Self {
+            completion_type,
+            is_completed: Cell::new(false),
         }
     }
 
+    pub fn is_completed(&self) -> bool {
+        self.is_completed.get()
+    }
+
     pub fn complete(&self, result: i32) {
-        match self {
-            Self::Read(r) => r.complete(),
-            Self::Write(w) => w.complete(result),
-            Self::Sync(s) => s.complete(result), // fix
-        }
+        match &self.completion_type {
+            CompletionType::Read(r) => r.complete(),
+            CompletionType::Write(w) => w.complete(result),
+            CompletionType::Sync(s) => s.complete(result), // fix
+        };
+        self.is_completed.set(true);
     }
 
     /// only call this method if you are sure that the completion is
     /// a ReadCompletion, panics otherwise
     pub fn as_read(&self) -> &ReadCompletion {
-        match self {
-            Self::Read(ref r) => r,
+        match self.completion_type {
+            CompletionType::Read(ref r) => r,
             _ => unreachable!(),
         }
     }
@@ -94,21 +107,15 @@ impl Completion {
 
 pub struct WriteCompletion {
     pub complete: Box<WriteComplete>,
-    pub is_completed: Cell<bool>,
 }
 
 pub struct SyncCompletion {
     pub complete: Box<SyncComplete>,
-    pub is_completed: Cell<bool>,
 }
 
 impl ReadCompletion {
     pub fn new(buf: Arc<RefCell<Buffer>>, complete: Box<Complete>) -> Self {
-        Self {
-            buf,
-            complete,
-            is_completed: Cell::new(false),
-        }
+        Self { buf, complete }
     }
 
     pub fn buf(&self) -> Ref<'_, Buffer> {
@@ -121,35 +128,26 @@ impl ReadCompletion {
 
     pub fn complete(&self) {
         (self.complete)(self.buf.clone());
-        self.is_completed.set(true);
     }
 }
 
 impl WriteCompletion {
     pub fn new(complete: Box<WriteComplete>) -> Self {
-        Self {
-            complete,
-            is_completed: Cell::new(false),
-        }
+        Self { complete }
     }
 
     pub fn complete(&self, bytes_written: i32) {
         (self.complete)(bytes_written);
-        self.is_completed.set(true);
     }
 }
 
 impl SyncCompletion {
     pub fn new(complete: Box<SyncComplete>) -> Self {
-        Self {
-            complete,
-            is_completed: Cell::new(false),
-        }
+        Self { complete }
     }
 
     pub fn complete(&self, res: i32) {
         (self.complete)(res);
-        self.is_completed.set(true);
     }
 }
 

@@ -1,8 +1,8 @@
 import os
 import sqlite3
 
-import limbo
 import pytest
+import turso
 
 
 @pytest.fixture(autouse=True)
@@ -48,7 +48,7 @@ def setup_database():
         print(f"Failed to clean up: {e}")
 
 
-@pytest.mark.parametrize("provider", ["sqlite3", "limbo"])
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_fetchall_select_all_users(provider, setup_database):
     conn = connect(provider, setup_database)
     cursor = conn.cursor()
@@ -61,7 +61,7 @@ def test_fetchall_select_all_users(provider, setup_database):
     assert users == [(1, "alice"), (2, "bob")]
 
 
-@pytest.mark.parametrize("provider", ["sqlite3", "limbo"])
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_fetchall_select_user_ids(provider):
     conn = connect(provider, "tests/database.db")
     cursor = conn.cursor()
@@ -74,7 +74,7 @@ def test_fetchall_select_user_ids(provider):
     assert user_ids == [(1,), (2,)]
 
 
-@pytest.mark.parametrize("provider", ["sqlite3", "limbo"])
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_in_memory_fetchone_select_all_users(provider):
     conn = connect(provider, ":memory:")
     cursor = conn.cursor()
@@ -90,7 +90,7 @@ def test_in_memory_fetchone_select_all_users(provider):
     assert alice == (1, "alice")
 
 
-@pytest.mark.parametrize("provider", ["sqlite3", "limbo"])
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_fetchone_select_all_users(provider):
     conn = connect(provider, "tests/database.db")
     cursor = conn.cursor()
@@ -107,7 +107,7 @@ def test_fetchone_select_all_users(provider):
     assert bob == (2, "bob")
 
 
-@pytest.mark.parametrize("provider", ["sqlite3", "limbo"])
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_fetchone_select_max_user_id(provider):
     conn = connect(provider, "tests/database.db")
     cursor = conn.cursor()
@@ -120,8 +120,8 @@ def test_fetchone_select_max_user_id(provider):
     assert max_id == (2,)
 
 
-# Test case for: https://github.com/tursodatabase/limbo/issues/494
-@pytest.mark.parametrize("provider", ["sqlite3", "limbo"])
+# Test case for: https://github.com/tursodatabase/turso/issues/494
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_commit(provider):
     conn = connect(provider, "tests/database.db")
     cur = conn.cursor()
@@ -158,7 +158,7 @@ def test_commit(provider):
     assert record
 
 
-@pytest.mark.parametrize("provider", ["sqlite3", "limbo"])
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_with_statement(provider):
     with connect(provider, "tests/database.db") as conn:
         cursor = conn.cursor()
@@ -171,8 +171,8 @@ def test_with_statement(provider):
 
 
 def connect(provider, database):
-    if provider == "limbo":
-        return limbo.connect(database)
+    if provider == "turso":
+        return turso.connect(database)
     if provider == "sqlite3":
         return sqlite3.connect(database)
     raise Exception(f"Provider `{provider}` is not supported")

@@ -1,6 +1,6 @@
 {
-  "name": "@tursodatabase/limbo-linux-x64-gnu",
-  "version": "0.0.22",
+  "name": "@tursodatabase/turso-linux-x64-gnu",
+  "version": "0.1.0-pre.2",
   "repository": {
     "type": "git",
     "url": "https://github.com/tursodatabase/limbo"
@@ -11,9 +11,9 @@
   "cpu": [
     "x64"
   ],
-  "main": "turso-limbo.linux-x64-gnu.node",
+  "main": "turso.linux-x64-gnu.node",
   "files": [
-    "turso-limbo.linux-x64-gnu.node"
+    "turso.linux-x64-gnu.node"
   ],
   "license": "MIT",
   "engines": {

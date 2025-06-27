@@ -46,3 +46,6 @@ for i in range(insertions):
         else:
             # Re-raise other operational errors
             raise
+
+print("Rolling back...")
+con.rollback()

@@ -57,11 +57,13 @@ pub struct Opts {
     pub vfs: Option<String>,
     #[clap(long, help = "Enable experimental MVCC feature")]
     pub experimental_mvcc: bool,
+    #[clap(long, help = "Enable experimental indexing feature")]
+    pub experimental_indexes: bool,
     #[clap(short = 't', long, help = "specify output file for log traces")]
     pub tracing_output: Option<String>,
 }
 
-const PROMPT: &str = "limbo> ";
+const PROMPT: &str = "turso> ";
 
 pub struct Limbo {
     pub prompt: String,
@@ -129,7 +131,12 @@ impl Limbo {
             };
             (
                 io.clone(),
-                Database::open_file(io.clone(), &db_file, opts.experimental_mvcc)?,
+                Database::open_file(
+                    io.clone(),
+                    &db_file,
+                    opts.experimental_mvcc,
+                    opts.experimental_indexes,
+                )?,
             )
         };
         let conn = db.connect()?;
@@ -180,8 +187,11 @@ impl Limbo {
             self.handle_first_input(&sql)?;
         }
         if !quiet {
-            self.write_fmt(format_args!("Limbo v{}", env!("CARGO_PKG_VERSION")))?;
+            self.write_fmt(format_args!("Turso v{}", env!("CARGO_PKG_VERSION")))?;
             self.writeln("Enter \".help\" for usage hints.")?;
+            self.writeln(
+                "This software is ALPHA, only use for development, testing, and experimentation.",
+            )?;
             self.display_in_memory()?;
         }
         Ok(())
@@ -356,7 +366,10 @@ impl Limbo {
                     _path => get_io(DbLocation::Path, &self.opts.io.to_string())?,
                 }
             };
-            (io.clone(), Database::open_file(io.clone(), path, false)?)
+            (
+                io.clone(),
+                Database::open_file(io.clone(), path, false, false)?,
+            )
         };
         self.io = io;
         self.conn = db.connect()?;
@@ -509,8 +522,8 @@ impl Limbo {
             if line.is_empty() {
                 return Ok(());
             }
-            if line.starts_with('.') {
-                self.handle_dot_command(&line[1..]);
+            if let Some(command) = line.strip_prefix('.') {
+                self.handle_dot_command(command);
                 let _ = self.reset_line(line);
                 return Ok(());
             }
@@ -747,7 +760,7 @@ impl Limbo {
                                 let name = rows.get_column_name(i);
                                 Cell::new(name)
                                     .add_attribute(Attribute::Bold)
-                                    .fg(config.table.header_color.into_comfy_table_color())
+                                    .fg(config.table.header_color.as_comfy_table_color())
                             })
                             .collect::<Vec<_>>();
                         table.set_header(header);
@@ -785,7 +798,7 @@ impl Limbo {
                                             .set_alignment(alignment)
                                             .fg(config.table.column_colors
                                                 [idx % config.table.column_colors.len()]
-                                            .into_comfy_table_color()),
+                                            .as_comfy_table_color()),
                                     );
                                 }
                                 table.add_row(row);
@@ -840,8 +853,6 @@ impl Limbo {
                 anyhow::bail!("We have to throw here, even if we printed error");
             }
         }
-        // for now let's cache flush always
-        self.conn.cacheflush()?;
         Ok(())
     }
 
@@ -1060,10 +1071,9 @@ impl Limbo {
             Ok(rl.readline(&self.prompt)?)
         } else {
             let mut input = String::new();
-            println!("");
             let mut reader = std::io::stdin().lock();
             if reader.read_line(&mut input)? == 0 {
-                return Err(ReadlineError::Eof.into());
+                return Err(ReadlineError::Eof);
             }
             // Remove trailing newline
             if input.ends_with('\n') {

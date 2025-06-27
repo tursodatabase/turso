@@ -13,9 +13,9 @@ if ! command -v sqlite3 >/dev/null 2>&1; then
 fi
 
 # Build Limbo in release mode if it's not already built
-if [ ! -f "$RELEASE_BUILD_DIR/limbo" ]; then
+if [ ! -f "$RELEASE_BUILD_DIR/tursodb" ]; then
     echo "Building Limbo..."
-    cargo build --bin limbo --release
+    cargo build --bin tursodb --release
 fi
 
 # Download the TPC-H database if it doesn't exist

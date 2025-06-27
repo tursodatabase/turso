@@ -333,19 +333,20 @@ impl File for UnixFile<'_> {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: Arc<Completion>) -> Result<()> {
+    fn pread(&self, pos: usize, c: Completion) -> Result<Arc<Completion>> {
         let file = self.file.borrow();
         let result = {
             let r = c.as_read();
             let mut buf = r.buf_mut();
             rustix::io::pread(file.as_fd(), buf.as_mut_slice(), pos as u64)
         };
+        let c = Arc::new(c);
         match result {
             Ok(n) => {
                 trace!("pread n: {}", n);
                 // Read succeeded immediately
                 c.complete(0);
-                Ok(())
+                Ok(c)
             }
             Err(Errno::AGAIN) => {
                 trace!("pread blocks");
@@ -356,27 +357,33 @@ impl File for UnixFile<'_> {
                 {
                     self.callbacks.insert(
                         fd as usize,
-                        CompletionCallback::Read(self.file.clone(), c, pos),
+                        CompletionCallback::Read(self.file.clone(), c.clone(), pos),
                     );
                 }
-                Ok(())
+                Ok(c)
             }
             Err(e) => Err(e.into()),
         }
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<crate::Buffer>>, c: Arc<Completion>) -> Result<()> {
+    fn pwrite(
+        &self,
+        pos: usize,
+        buffer: Arc<RefCell<crate::Buffer>>,
+        c: Completion,
+    ) -> Result<Arc<Completion>> {
         let file = self.file.borrow();
         let result = {
             let buf = buffer.borrow();
             rustix::io::pwrite(file.as_fd(), buf.as_slice(), pos as u64)
         };
+        let c = Arc::new(c);
         match result {
             Ok(n) => {
                 trace!("pwrite n: {}", n);
                 // Read succeeded immediately
                 c.complete(n as i32);
-                Ok(())
+                Ok(c)
             }
             Err(Errno::AGAIN) => {
                 trace!("pwrite blocks");
@@ -386,22 +393,23 @@ impl File for UnixFile<'_> {
                     .add(&file.as_fd(), Event::readable(fd as usize))?;
                 self.callbacks.insert(
                     fd as usize,
-                    CompletionCallback::Write(self.file.clone(), c, buffer.clone(), pos),
+                    CompletionCallback::Write(self.file.clone(), c.clone(), buffer.clone(), pos),
                 );
-                Ok(())
+                Ok(c)
             }
             Err(e) => Err(e.into()),
         }
     }
 
-    fn sync(&self, c: Arc<Completion>) -> Result<()> {
+    fn sync(&self, c: Completion) -> Result<Arc<Completion>> {
         let file = self.file.borrow();
         let result = fs::fsync(file.as_fd());
+        let c = Arc::new(c);
         match result {
             Ok(()) => {
                 trace!("fsync");
                 c.complete(0);
-                Ok(())
+                Ok(c)
             }
             Err(e) => Err(e.into()),
         }

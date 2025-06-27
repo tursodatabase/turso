@@ -81,7 +81,7 @@ impl File for WindowsFile {
         unimplemented!()
     }
 
-    fn pread(&self, pos: usize, c: Arc<Completion>) -> Result<()> {
+    fn pread(&self, pos: usize, c: Completion) -> Result<Arc<Completion>> {
         let mut file = self.file.borrow_mut();
         file.seek(std::io::SeekFrom::Start(pos as u64))?;
         {
@@ -91,24 +91,29 @@ impl File for WindowsFile {
             file.read_exact(buf)?;
         }
         c.complete(0);
-        Ok(())
+        Ok(Arc::new(c))
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<crate::Buffer>>, c: Arc<Completion>) -> Result<()> {
+    fn pwrite(
+        &self,
+        pos: usize,
+        buffer: Arc<RefCell<crate::Buffer>>,
+        c: Completion,
+    ) -> Result<Arc<Completion>> {
         let mut file = self.file.borrow_mut();
         file.seek(std::io::SeekFrom::Start(pos as u64))?;
         let buf = buffer.borrow();
         let buf = buf.as_slice();
         file.write_all(buf)?;
         c.complete(buffer.borrow().len() as i32);
-        Ok(())
+        Ok(Arc::new(c))
     }
 
-    fn sync(&self, c: Arc<Completion>) -> Result<()> {
+    fn sync(&self, c: Completion) -> Result<Arc<Completion>> {
         let file = self.file.borrow_mut();
         file.sync_all().map_err(LimboError::IOError)?;
         c.complete(0);
-        Ok(())
+        Ok(Arc::new(c))
     }
 
     fn size(&self) -> Result<u64> {

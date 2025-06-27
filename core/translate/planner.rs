@@ -25,7 +25,11 @@ use limbo_sqlite3_parser::ast::{
 
 pub const ROWID: &str = "rowid";
 
-pub fn resolve_aggregates(top_level_expr: &Expr, aggs: &mut Vec<Aggregate>) -> Result<bool> {
+pub fn resolve_aggregates(
+    schema: &Schema,
+    top_level_expr: &Expr,
+    aggs: &mut Vec<Aggregate>,
+) -> Result<bool> {
     let mut contains_aggregates = false;
     walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
         if aggs
@@ -51,13 +55,10 @@ pub fn resolve_aggregates(top_level_expr: &Expr, aggs: &mut Vec<Aggregate>) -> R
                 {
                     Ok(Func::Agg(f)) => {
                         let distinctness = Distinctness::from_ast(distinctness.as_ref());
-                        #[cfg(not(feature = "index_experimental"))]
-                        {
-                            if distinctness.is_distinct() {
-                                crate::bail_parse_error!(
-                                    "SELECT with DISTINCT is not allowed without indexes enabled"
-                                );
-                            }
+                        if !schema.indexes_enabled() && distinctness.is_distinct() {
+                            crate::bail_parse_error!(
+                                "SELECT with DISTINCT is not allowed without indexes enabled"
+                            );
                         }
                         let num_args = args.as_ref().map_or(0, |args| args.len());
                         if distinctness.is_distinct() && num_args != 1 {
@@ -76,7 +77,7 @@ pub fn resolve_aggregates(top_level_expr: &Expr, aggs: &mut Vec<Aggregate>) -> R
                     _ => {
                         if let Some(args) = args {
                             for arg in args.iter() {
-                                contains_aggregates |= resolve_aggregates(arg, aggs)?;
+                                contains_aggregates |= resolve_aggregates(schema, arg, aggs)?;
                             }
                         }
                     }
@@ -240,7 +241,7 @@ pub fn bind_column_references(
     })
 }
 
-fn parse_from_clause_table<'a>(
+fn parse_from_clause_table(
     schema: &Schema,
     table: ast::SelectTable,
     table_references: &mut TableReferences,
@@ -288,7 +289,7 @@ fn parse_from_clause_table<'a>(
                     identifier: alias.unwrap_or(normalized_qualified_name),
                     internal_id: table_ref_counter.next(),
                     join_info: None,
-                    col_used_mask: ColumnUsedMask::new(),
+                    col_used_mask: ColumnUsedMask::default(),
                 });
                 return Ok(());
             };
@@ -313,7 +314,7 @@ fn parse_from_clause_table<'a>(
                         identifier: outer_ref.identifier.clone(),
                         internal_id: table_ref_counter.next(),
                         join_info: None,
-                        col_used_mask: ColumnUsedMask::new(),
+                        col_used_mask: ColumnUsedMask::default(),
                     });
                     return Ok(());
                 }
@@ -371,7 +372,7 @@ fn parse_from_clause_table<'a>(
                 table: Table::Virtual(vtab),
                 identifier: alias,
                 internal_id: table_ref_counter.next(),
-                col_used_mask: ColumnUsedMask::new(),
+                col_used_mask: ColumnUsedMask::default(),
             });
 
             Ok(())
@@ -380,7 +381,7 @@ fn parse_from_clause_table<'a>(
     }
 }
 
-pub fn parse_from<'a>(
+pub fn parse_from(
     schema: &Schema,
     mut from: Option<FromClause>,
     syms: &SymbolTable,
@@ -435,7 +436,7 @@ pub fn parse_from<'a>(
                     identifier: t.identifier.clone(),
                     internal_id: t.internal_id,
                     table: t.table.clone(),
-                    col_used_mask: ColumnUsedMask::new(),
+                    col_used_mask: ColumnUsedMask::default(),
                 }
             }));
 
@@ -535,7 +536,7 @@ pub fn determine_where_to_eval_term(
         ));
     }
 
-    return determine_where_to_eval_expr(&term.expr, join_order);
+    determine_where_to_eval_expr(&term.expr, join_order)
 }
 
 /// A bitmask representing a set of tables in a query plan.
@@ -667,8 +668,8 @@ pub fn table_mask_from_expr(
     Ok(mask)
 }
 
-pub fn determine_where_to_eval_expr<'a>(
-    top_level_expr: &'a Expr,
+pub fn determine_where_to_eval_expr(
+    top_level_expr: &Expr,
     join_order: &[JoinOrderMember],
 ) -> Result<EvalAt> {
     let mut eval_at: EvalAt = EvalAt::BeforeLoop;
@@ -689,7 +690,7 @@ pub fn determine_where_to_eval_expr<'a>(
     Ok(eval_at)
 }
 
-fn parse_join<'a>(
+fn parse_join(
     schema: &Schema,
     join: ast::JoinedSelectTable,
     syms: &SymbolTable,

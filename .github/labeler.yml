@@ -1,110 +1,108 @@
-Simulator:
+simulator:
   - changed-files:
       - any-glob-to-any-file: 'simulator/**/*'
-Docs:
+docs:
   - changed-files:
       - any-glob-to-any-file: 'docs/**/*'
 
-ExtensionLib:
+extensionlib:
   - changed-files:
       - any-glob-to-any-file: ['extensions/core/**/*', 'macros/src/ext/*', 'core/ext/*']
 
-Macros:
+macros:
   - changed-files:
       - any-glob-to-any-file: ['macros/**/*']
 
-Extensions-Other:
+extensions-other:
 - all:
   - changed-files:
     - any-glob-to-any-file: 'extensions/**/*'
     - all-globs-to-all-files: '!extensions/core/**/*'
 
-Fuzzing:
+fuzzing:
   - changed-files:
       - any-glob-to-any-file: 'fuzz/**/*'
 
-Perf/Benchmarks:
+perf/benchmarks:
   - changed-files:
       - any-glob-to-any-file: ['perf/**/*', 'core/benches/*']
 
-Go-Bindings:
+go-bindings:
   - changed-files:
     - any-glob-to-any-file: 'bindings/go/**/*'
 
-
-WASM-Bindings:
+wasm-bindings:
   - changed-files:
     - any-glob-to-any-file: 'bindings/wasm/**/*'
 
-
-Python-Bindings:
+python-bindings:
   - changed-files:
     - any-glob-to-any-file: 'bindings/python/**/*'
 
-JS-Bindings:
+js-bindings:
   - changed-files:
     - any-glob-to-any-file: 'bindings/javascript/**/*'
 
-Rust-Bindings:
+rust-bindings:
   - changed-files:
     - any-glob-to-any-file: 'bindings/rust/**/*'
 
-Java-Bindings:
+java-bindings:
   - changed-files:
     - any-glob-to-any-file: 'bindings/java/**/*'
 
-Parser:
+parser:
   - changed-files:
     - any-glob-to-any-file: "vendored/sqlite3-parser/*"
 
-Cli:
+cli:
   - changed-files:
     - any-glob-to-any-file: "cli/**/*"
 
-Sqlite3:
+sqlite3:
   - changed-files:
     - any-glob-to-any-file: "sqlite3/**/*"
 
-Core:
+core:
   - changed-files:
     - any-glob-to-any-file: 'core/**/*'
 
-Optimizer:
+optimizer:
   - changed-files:
     - any-glob-to-any-file: 'core/translate/optimizer/*'
 
-Translation/Planning:
+translation/planning:
   - changed-files:
     - any-glob-to-any-file: 'core/translate/*.rs'
 
-IO:
+io:
   - changed-files:
     - any-glob-to-any-file: 'core/io/*'
 
-MVCC:
+mvcc:
   - changed-files:
     - any-glob-to-any-file: 'core/mvcc/**/*'
 
-VDBE:
+vdbe:
   - changed-files:
     - any-glob-to-any-file: 'core/vdbe/*'
 
-Json:
+json:
   - changed-files:
     - any-glob-to-any-file: 'core/json/*'
 
-Storage:
+storage:
   - changed-files:
     - any-glob-to-any-file: 'core/storage/*'
 
-Vector:
+vector:
   - changed-files:
     - any-glob-to-any-file: 'core/vector/*'
 
-Antithesis:
+antithesis:
   - changed-files:
     - any-glob-to-any-file: ['antithesis-tests/**/*', 'scripts/antithesis/*', 'stress/**/*']
 
-CI-Actions:
+ci-actions:
   - changed-files:
     - any-glob-to-any-file: '.github/workflows/*.yml'

@@ -6,19 +6,20 @@ use limbo_sqlite3_parser::ast::{self, Expr};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::fast_lock::SpinLock;
 use crate::schema::Schema;
 use crate::storage::pager::AutoVacuumMode;
-use crate::storage::sqlite3_ondisk::{DatabaseHeader, MIN_PAGE_CACHE_SIZE};
+use crate::storage::sqlite3_ondisk::MIN_PAGE_CACHE_SIZE;
 use crate::storage::wal::CheckpointMode;
 use crate::util::{normalize_ident, parse_signed_number};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, LimboError, Pager, Value};
+use crate::{bail_parse_error, storage, LimboError, Value};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
 use super::integrity_check::translate_integrity_check;
+use crate::storage::header_accessor;
+use crate::storage::pager::Pager;
 
 fn list_pragmas(program: &mut ProgramBuilder) {
     for x in PragmaName::iter() {
@@ -29,12 +30,12 @@ fn list_pragmas(program: &mut ProgramBuilder) {
     program.epilogue(crate::translate::emitter::TransactionMode::None);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn translate_pragma(
     query_mode: QueryMode,
     schema: &Schema,
     name: &ast::QualifiedName,
     body: Option<ast::PragmaBody>,
-    database_header: Arc<SpinLock<DatabaseHeader>>,
     pager: Rc<Pager>,
     connection: Arc<crate::Connection>,
     mut program: ProgramBuilder,
@@ -60,39 +61,15 @@ pub fn translate_pragma(
 
     match body {
         None => {
-            query_pragma(
-                pragma,
-                schema,
-                None,
-                database_header.clone(),
-                pager,
-                connection,
-                &mut program,
-            )?;
+            query_pragma(pragma, schema, None, pager, connection, &mut program)?;
         }
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
             PragmaName::TableInfo => {
-                query_pragma(
-                    pragma,
-                    schema,
-                    Some(value),
-                    database_header.clone(),
-                    pager,
-                    connection,
-                    &mut program,
-                )?;
+                query_pragma(pragma, schema, Some(value), pager, connection, &mut program)?;
             }
             _ => {
                 write = true;
-                update_pragma(
-                    pragma,
-                    schema,
-                    value,
-                    database_header.clone(),
-                    pager,
-                    connection,
-                    &mut program,
-                )?;
+                update_pragma(pragma, schema, value, pager, connection, &mut program)?;
             }
         },
     };
@@ -108,7 +85,6 @@ fn update_pragma(
     pragma: PragmaName,
     schema: &Schema,
     value: ast::Expr,
-    header: Arc<SpinLock<DatabaseHeader>>,
     pager: Rc<Pager>,
     connection: Arc<crate::Connection>,
     program: &mut ProgramBuilder,
@@ -120,7 +96,7 @@ fn update_pragma(
                 Value::Float(size) => size as i64,
                 _ => bail_parse_error!("Invalid value for cache size pragma"),
             };
-            update_cache_size(cache_size, header, pager, connection)?;
+            update_cache_size(cache_size, pager, connection)?;
             Ok(())
         }
         PragmaName::JournalMode => {
@@ -128,7 +104,6 @@ fn update_pragma(
                 PragmaName::JournalMode,
                 schema,
                 None,
-                header,
                 pager,
                 connection,
                 program,
@@ -141,7 +116,6 @@ fn update_pragma(
                 PragmaName::WalCheckpoint,
                 schema,
                 Some(value),
-                header,
                 pager,
                 connection,
                 program,
@@ -153,7 +127,6 @@ fn update_pragma(
                 PragmaName::PageCount,
                 schema,
                 None,
-                header,
                 pager,
                 connection,
                 program,
@@ -187,7 +160,7 @@ fn update_pragma(
             unreachable!();
         }
         PragmaName::PageSize => {
-            todo!("updating page_size is not yet implemented")
+            bail_parse_error!("Updating database page size is not supported.");
         }
         PragmaName::AutoVacuum => {
             let auto_vacuum_mode = match value {
@@ -211,9 +184,9 @@ fn update_pragma(
                 }
             };
             match auto_vacuum_mode {
-                0 => update_auto_vacuum_mode(AutoVacuumMode::None, 0, header, pager)?,
-                1 => update_auto_vacuum_mode(AutoVacuumMode::Full, 1, header, pager)?,
-                2 => update_auto_vacuum_mode(AutoVacuumMode::Incremental, 1, header, pager)?,
+                0 => update_auto_vacuum_mode(AutoVacuumMode::None, 0, pager)?,
+                1 => update_auto_vacuum_mode(AutoVacuumMode::Full, 1, pager)?,
+                2 => update_auto_vacuum_mode(AutoVacuumMode::Incremental, 1, pager)?,
                 _ => {
                     return Err(LimboError::InvalidArgument(
                         "invalid auto vacuum mode".to_string(),
@@ -253,7 +226,6 @@ fn query_pragma(
     pragma: PragmaName,
     schema: &Schema,
     value: Option<ast::Expr>,
-    database_header: Arc<SpinLock<DatabaseHeader>>,
     pager: Rc<Pager>,
     connection: Arc<crate::Connection>,
     program: &mut ProgramBuilder,
@@ -370,7 +342,11 @@ fn query_pragma(
             program.emit_result_row(register, 1);
         }
         PragmaName::PageSize => {
-            program.emit_int(database_header.lock().get_page_size().into(), register);
+            program.emit_int(
+                header_accessor::get_page_size(&pager)
+                    .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as i64,
+                register,
+            );
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
         }
@@ -401,26 +377,23 @@ fn query_pragma(
 fn update_auto_vacuum_mode(
     auto_vacuum_mode: AutoVacuumMode,
     largest_root_page_number: u32,
-    header: Arc<SpinLock<DatabaseHeader>>,
     pager: Rc<Pager>,
 ) -> crate::Result<()> {
-    let mut header_guard = header.lock();
-    header_guard.vacuum_mode_largest_root_page = largest_root_page_number;
+    header_accessor::set_vacuum_mode_largest_root_page(&pager, largest_root_page_number)?;
     pager.set_auto_vacuum_mode(auto_vacuum_mode);
-    pager.write_database_header(&header_guard)?;
     Ok(())
 }
 
 fn update_cache_size(
     value: i64,
-    header: Arc<SpinLock<DatabaseHeader>>,
     pager: Rc<Pager>,
     connection: Arc<crate::Connection>,
 ) -> crate::Result<()> {
     let mut cache_size_unformatted: i64 = value;
     let mut cache_size = if cache_size_unformatted < 0 {
         let kb = cache_size_unformatted.abs() * 1024;
-        let page_size = header.lock().get_page_size();
+        let page_size = header_accessor::get_page_size(&pager)
+            .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as i64;
         kb / page_size as i64
     } else {
         value

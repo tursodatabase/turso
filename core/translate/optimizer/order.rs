@@ -19,22 +19,22 @@ pub struct ColumnOrder {
 
 #[derive(Debug, PartialEq, Clone)]
 /// If an [OrderTarget] is satisfied, then [EliminatesSort] describes which part of the query no longer requires sorting.
-pub enum EliminatesSort {
-    GroupBy,
-    OrderBy,
-    GroupByAndOrderBy,
+pub enum EliminatesSortBy {
+    Group,
+    Order,
+    GroupByAndOrder,
 }
 
 #[derive(Debug, PartialEq, Clone)]
 /// An [OrderTarget] is considered in join optimization and index selection,
 /// so that if a given join ordering and its access methods satisfy the [OrderTarget],
 /// then the join ordering and its access methods are preferred, all other things being equal.
-pub struct OrderTarget(pub Vec<ColumnOrder>, pub EliminatesSort);
+pub struct OrderTarget(pub Vec<ColumnOrder>, pub EliminatesSortBy);
 
 impl OrderTarget {
     fn maybe_from_iterator<'a>(
         list: impl Iterator<Item = (&'a ast::Expr, SortOrder)> + Clone,
-        eliminates_sort: EliminatesSort,
+        eliminates_sort: EliminatesSortBy,
     ) -> Option<Self> {
         if list.clone().count() == 0 {
             return None;
@@ -79,12 +79,12 @@ pub fn compute_order_target(
         // Only ORDER BY - we would like the joined result rows to be in the order specified by the ORDER BY
         (Some(order_by), None) => OrderTarget::maybe_from_iterator(
             order_by.iter().map(|(expr, order)| (expr, *order)),
-            EliminatesSort::OrderBy,
+            EliminatesSortBy::Order,
         ),
         // Only GROUP BY - we would like the joined result rows to be in the order specified by the GROUP BY
         (None, Some(group_by)) => OrderTarget::maybe_from_iterator(
             group_by.exprs.iter().map(|expr| (expr, SortOrder::Asc)),
-            EliminatesSort::GroupBy,
+            EliminatesSortBy::Group,
         ),
         // Both ORDER BY and GROUP BY:
         // If the GROUP BY does not contain all the expressions in the ORDER BY,
@@ -107,7 +107,7 @@ pub fn compute_order_target(
             if !group_by_contains_all {
                 return OrderTarget::maybe_from_iterator(
                     group_by.exprs.iter().map(|expr| (expr, SortOrder::Asc)),
-                    EliminatesSort::GroupBy,
+                    EliminatesSortBy::Group,
                 );
             }
             // If yes, let's try to target an ordering that matches the GROUP BY columns,
@@ -146,7 +146,7 @@ pub fn compute_order_target(
                             .iter(),
                     )
                     .map(|(expr, dir)| (expr, *dir)),
-                EliminatesSort::GroupByAndOrderBy,
+                EliminatesSortBy::GroupByAndOrder,
             )
         }
     }

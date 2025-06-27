@@ -13,9 +13,9 @@ if ! command -v sqlite3 >/dev/null 2>&1; then
 fi
 
 # Build Limbo in release mode if it's not already built
-if [ ! -f "$RELEASE_BUILD_DIR/limbo" ]; then
+if [ ! -f "$RELEASE_BUILD_DIR/tursodb" ]; then
     echo "Building Limbo..."
-    cargo build --bin limbo --release
+    cargo build --bin tursodb --release
 fi
 
 # Clean up any existing DB
@@ -23,7 +23,7 @@ rm "$CLICKBENCH_DIR/mydb"* || true
 
 # Create DB using Limbo
 echo "Creating DB..."
-"$RELEASE_BUILD_DIR/limbo" --quiet "$CLICKBENCH_DIR/mydb" < "$CLICKBENCH_DIR/create.sql"
+"$RELEASE_BUILD_DIR/tursodb" --quiet "$CLICKBENCH_DIR/mydb" < "$CLICKBENCH_DIR/create.sql"
 
 # Download a subset of the clickbench dataset if it doesn't exist
 NUM_ROWS=1000000

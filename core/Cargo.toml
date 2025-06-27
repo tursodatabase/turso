@@ -14,8 +14,7 @@ name = "limbo_core"
 path = "lib.rs"
 
 [features]
-default = ["fs", "uuid", "time", "json", "static"]
-index_experimental = []
+default = ["fs", "uuid", "time", "json", "static", "series"]
 fs = ["limbo_ext/vfs"]
 json = []
 uuid = ["limbo_uuid/static"]
@@ -27,7 +26,6 @@ crypto = ["limbo_crypto/static"]
 series = ["limbo_series/static"]
 ipaddr = ["limbo_ipaddr/static"]
 completion = ["limbo_completion/static"]
-testvfs = ["limbo_ext_tests/static"]
 static = ["limbo_ext/static"]
 fuzz = []
 csv = ["limbo_csv/static"]
@@ -72,7 +70,6 @@ limbo_crypto = { workspace = true, optional = true, features = ["static"] }
 limbo_series = { workspace = true, optional = true, features = ["static"] }
 limbo_ipaddr = { workspace = true, optional = true, features = ["static"] }
 limbo_completion = { workspace = true, optional = true, features = ["static"] }
-limbo_ext_tests = { workspace = true, optional = true, features = ["static"] }
 limbo_csv = { workspace = true, optional = true, features = ["static"] }
 miette = "7.6.0"
 strum = { workspace = true }
@@ -84,6 +81,7 @@ uncased = "0.9.10"
 strum_macros = { workspace = true }
 bitflags = "2.9.0"
 serde = { workspace = true , optional = true, features = ["derive"] }
+paste = "1.0.15"
 
 [build-dependencies]
 chrono = { version = "0.4.38", default-features = false }

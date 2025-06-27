@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Script to update version in Cargo.toml, package.json, and package-lock.json files for the Limbo project.
+Script to update version in Cargo.toml, package.json, and package-lock.json files for the Turso project.
 This script updates all occurrences of the version in the workspace configuration,
 updates the JavaScript and WebAssembly bindings package.json and package-lock.json files,
 uses cargo update to update Cargo.lock, creates a git commit, and adds a version tag.
@@ -163,7 +163,7 @@ def create_git_commit_and_tag(version):
                 print(f"Warning: Could not add {file} to git")
 
         # Create commit
-        commit_message = f"Limbo {version}"
+        commit_message = f"Turso {version}"
         subprocess.run(["git", "commit", "-m", commit_message], check=True)
 
         # Create tag

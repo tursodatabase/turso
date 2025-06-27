@@ -387,8 +387,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             if let Some(rv) = row_versions
                 .iter()
                 .rev()
-                .filter(|rv| rv.is_visible_to(&tx, &self.txs))
-                .next()
+                .find(|rv| rv.is_visible_to(&tx, &self.txs))
             {
                 tx.insert_to_read_set(id);
                 return Ok(Some(rv.row.clone()));
