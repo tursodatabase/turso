@@ -1,13 +1,15 @@
 use crate::result::LimboResult;
-use crate::storage::btree::BTreePageInner;
+use crate::storage::btree::{
+    payload_overflow_threshold_max, payload_overflow_threshold_min, BTreePageInner,
+};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::header_accessor;
 use crate::storage::sqlite3_ondisk::{
-    self, parse_wal_frame_header, DatabaseHeader, PageContent, PageType,
+    self, parse_wal_frame_header, BTreeCell, DatabaseHeader, PageContent, PageType,
 };
 use crate::storage::wal::{CheckpointResult, Wal};
-use crate::types::{IOResult, WalInsertInfo};
+use crate::types::{Cursor, IOResult, WalInsertInfo};
 use crate::util::IOExt as _;
 use crate::{return_if_io, Completion};
 use crate::{turso_assert, Buffer, Connection, LimboError, Result};
@@ -253,7 +255,7 @@ struct FlushInfo {
 }
 
 /// Track the state of the auto-vacuum mode.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AutoVacuumMode {
     None,
     Full,
@@ -325,6 +327,9 @@ pub struct Pager {
     pub buffer_pool: Arc<BufferPool>,
     /// I/O interface for input/output operations.
     pub io: Arc<dyn crate::io::IO>,
+    /// Indicates whether the database is running as transient or persistent
+    database_mode: DatabaseMode,
+
     dirty_pages: Rc<RefCell<HashSet<usize, hash::BuildHasherDefault<hash::DefaultHasher>>>>,
 
     commit_info: RefCell<CommitInfo>,
@@ -416,6 +421,7 @@ impl Pager {
         buffer_pool: Arc<BufferPool>,
         db_state: Arc<AtomicDbState>,
         init_lock: Arc<Mutex<()>>,
+        database_mode: DatabaseMode,
     ) -> Result<Self> {
         let allocate_page1_state = if !db_state.is_initialized() {
             RefCell::new(AllocatePage1State::Start)
@@ -635,7 +641,11 @@ impl Pager {
     /// This method is used to allocate a new root page for a btree, both for tables and indexes
     /// FIXME: handle no room in page cache
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn btree_create(&self, flags: &CreateBTreeFlags) -> Result<IOResult<u32>> {
+    pub fn btree_create(
+        &self,
+        flags: &CreateBTreeFlags,
+        cursors: &mut Vec<Option<Cursor>>,
+    ) -> Result<IOResult<u32>> {
         let page_type = match flags {
             _ if flags.is_table() => PageType::TableLeaf,
             _ if flags.is_index() => PageType::IndexLeaf,
@@ -685,7 +695,38 @@ impl Pager {
                     ));
                     let allocated_page_id = page.get().get().id as u32;
                     if allocated_page_id != root_page_num {
-                        //  TODO(Zaid): Handle swapping the allocated page with the desired root page
+                        let ptrmap_entry = match self.ptrmap_get(root_page_num)? {
+                            CursorResult::Ok(result) => match result {
+                                Some(entry) => entry,
+                                None => panic!("something went wrong"),
+                            },
+                            CursorResult::IO => return Ok(CursorResult::IO),
+                        };
+
+                        //  These conditions shouldn't be possible because:
+                        //  1. If the root_page_num is a RootPage then it should have already been allocated. Something is broken in database header
+                        //  2. If the root_page_num is a FreePage, then it should have been allocated by `allocate_page` (this doesn't currently hold since that function doesn't look at the free list)
+                        assert!(ptrmap_entry.entry_type != PtrmapType::RootPage);
+                        assert!(ptrmap_entry.entry_type != PtrmapType::FreePage);
+
+                        //  now do the actual page relocation
+                        //  first save all the btree cursors, so they can be restored later
+                        for cursor in cursors {
+                            if let Some(cursor) = cursor {
+                                use crate::storage::btree::SaveCursorsMode;
+
+                                let Cursor::BTree(c) = cursor else {
+                                    continue;
+                                };
+                                c.save_context_external_invalidation(
+                                    SaveCursorsMode::SaveAllCursors,
+                                )?;
+                            }
+                        }
+
+                        //  Call the relocate_page subroutine to actually move pages around
+                        let root_page = self.read_page(root_page_num as usize)?;
+                        self.relocate_page(root_page, allocated_page_id, ptrmap_entry)?;
                     }
 
                     //  TODO(Zaid): Update the header metadata to reflect the new root page number
@@ -701,6 +742,271 @@ impl Pager {
                 }
             }
         }
+    }
+
+    /// This method is responsible for relocating source_page to dest_page. This will also update all the relevant pointers
+    /// situated in the pointer map pages and elsewhere after the move
+    #[cfg(not(feature = "omit_autovacuum"))]
+    fn relocate_page(
+        &self,
+        source_page: Arc<Page>,
+        dest_page_num: u32,
+        source_ptr_map_entry: PtrmapEntry,
+    ) -> Result<()> {
+        //  The source page can be one of the following pages
+        assert!(
+            source_ptr_map_entry.entry_type == PtrmapType::RootPage
+                || source_ptr_map_entry.entry_type == PtrmapType::BTreeNode
+                || source_ptr_map_entry.entry_type == PtrmapType::Overflow1
+                || source_ptr_map_entry.entry_type == PtrmapType::Overflow2
+        );
+        assert!(source_page.get().id >= 3); //  No root page in autovacuum can have a root page less than 3
+
+        //  Swap the two pages source_page and dest_page
+        let mut cache = self.page_cache.write();
+        let dest_key = PageCacheKey::new(dest_page_num as usize);
+        let mut temp_page_opt: Option<u32> = None;
+        if let Some(dest_page) = cache.peek(&dest_key, false) {
+            //  The destination page already exists in the page cache
+            //  Since we invalidated all cursors earlier, this page should no longer be referenced anywhere
+            let ref_count = Arc::strong_count(&dest_page);
+            assert!(
+                ref_count <= 2,
+                "Page {} is referenced outside of cache and relocate_page. Found {} ref counts",
+                dest_page_num,
+                ref_count
+            );
+            if matches!(self.database_mode, DatabaseMode::Memory) {
+                //  this is a temporary database, so move the page out of the way
+                let temp_page_num = header_accessor::get_database_size(self)? + 1;
+                cache
+                    .move_page(dest_page_num as usize, temp_page_num as usize)
+                    .map_err(|e| LimboError::InternalError(format!("{:?}", e)))?;
+                temp_page_opt = Some(temp_page_num);
+            } else {
+                //  this is a persistent database, so drop the entry from the cache
+                drop(dest_page);
+                cache
+                    .delete(dest_key)
+                    .map_err(|e| LimboError::InternalError(format!("{:?}", e)))?;
+            }
+        }
+
+        let orig_page_num = source_page.get().id;
+        cache
+            .move_page(orig_page_num, dest_page_num as usize)
+            .map_err(|e| LimboError::InternalError(format!("{:?}", e)))?;
+        source_page.set_dirty();
+
+        if matches!(self.database_mode, DatabaseMode::Memory) {
+            if let Some(temp_page_num) = temp_page_opt {
+                cache
+                    .move_page(temp_page_num as usize, orig_page_num)
+                    .map_err(|e| LimboError::InternalError(format!("{:?}", e)))?;
+            }
+        }
+        //  End swap the two pages source_page and dest_page
+
+        //  Update the pointer map pages for the source_page since the page id has changed
+        source_page.get().id = dest_page_num as usize;
+        match source_ptr_map_entry.entry_type {
+            PtrmapType::RootPage => self.set_child_ptrmaps(source_page)?,
+            PtrmapType::BTreeNode => self.set_child_ptrmaps(source_page)?,
+            PtrmapType::Overflow1 => self.update_overflow_pointer(source_page)?,
+            PtrmapType::Overflow2 => self.update_overflow_pointer(source_page)?,
+            PtrmapType::FreePage => unreachable!(),
+        };
+
+        //  For non-root pages update the pointers on the parent page and also update the pointer map of the source page
+        //  to point to the destination page
+        if source_ptr_map_entry.entry_type != PtrmapType::RootPage {
+            let parent_page = self.read_page(source_ptr_map_entry.parent_page_no as usize)?;
+            self.modify_parent_page_pointers(
+                parent_page,
+                orig_page_num,
+                dest_page_num as usize,
+                source_ptr_map_entry.entry_type,
+            )?;
+            self.ptrmap_put(
+                dest_page_num,
+                source_ptr_map_entry.entry_type,
+                source_ptr_map_entry.parent_page_no,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Update all the child pointer maps of this page to point to the new page number of this page
+    /// Called after pages have been relocated as part of autovacuum
+    #[cfg(not(feature = "omit_autovacuum"))]
+    fn set_child_ptrmaps(&self, page: Arc<Page>) -> Result<CursorResult<()>> {
+        let contents = page.get_contents();
+
+        //  Iterate through all the children cells and update their pointer map entries
+        for cell_idx in 0..contents.cell_count() {
+            use crate::storage::{
+                btree::{payload_overflow_threshold_max, payload_overflow_threshold_min},
+                sqlite3_ondisk::BTreeCell,
+            };
+
+            let cell = contents.cell_get(
+                cell_idx,
+                payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
+                payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
+                self.usable_space(),
+            )?;
+
+            match cell {
+                BTreeCell::TableInteriorCell(table_interior_cell) => {
+                    self.ptrmap_put(
+                        table_interior_cell._left_child_page,
+                        PtrmapType::BTreeNode,
+                        page.get().id as u32,
+                    )?;
+                }
+                BTreeCell::TableLeafCell(table_leaf_cell) => {
+                    if let Some(overflow_page) = table_leaf_cell.first_overflow_page {
+                        self.ptrmap_put(
+                            overflow_page,
+                            PtrmapType::BTreeNode,
+                            page.get().id as u32,
+                        )?;
+                    }
+                }
+                BTreeCell::IndexInteriorCell(index_interior_cell) => {
+                    self.ptrmap_put(
+                        index_interior_cell.left_child_page,
+                        PtrmapType::BTreeNode,
+                        page.get().id as u32,
+                    )?;
+                }
+                BTreeCell::IndexLeafCell(index_leaf_cell) => {
+                    if let Some(overflow_page) = index_leaf_cell.first_overflow_page {
+                        self.ptrmap_put(
+                            overflow_page,
+                            PtrmapType::Overflow1,
+                            page.get().id as u32,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        if !contents.is_leaf() {
+            if let Some(right_child) = contents.rightmost_pointer() {
+                self.ptrmap_put(right_child, PtrmapType::BTreeNode, page.get().id as u32)?;
+            }
+        }
+        Ok(CursorResult::Ok(()))
+    }
+
+    /// The page is an overflow page so check if this page has a chained overflow pointer and update
+    /// the pointer map entry over that chained overflow page
+    fn update_overflow_pointer(&self, page: Arc<Page>) -> Result<CursorResult<()>> {
+        let contents = page.get_contents();
+        let overflow_ptr = contents.read_u32_no_offset(0);
+        if overflow_ptr == 0 {
+            return Ok(CursorResult::Ok(()));
+        }
+        self.ptrmap_put(overflow_ptr, PtrmapType::Overflow2, page.get().id as u32)
+    }
+
+    /// This function takes a [Page] and finds the cell with a reference to prev_child_page_num and changes that to new_child_page_num
+    /// Also accepts a [PtrmapType] parameter for some optimizations
+    fn modify_parent_page_pointers(
+        &self,
+        parent_page: Arc<Page>,
+        prev_child_page_num: usize,
+        new_child_page_num: usize,
+        ptrmap_type: PtrmapType,
+    ) -> Result<()> {
+        let contents = parent_page.get_contents();
+        //  This page is an overflow page which is not at the start of the overflow chain
+        //  This means that the first 4 bytes of the parent page must contain the pointer to this page
+        if ptrmap_type == PtrmapType::Overflow2 {
+            let overflow_ptr = contents.read_u32_no_offset(0);
+            assert_eq!(overflow_ptr, prev_child_page_num as u32);
+            contents.write_u32(0, new_child_page_num as u32);
+            parent_page.set_dirty();
+            self.add_dirty(parent_page.get().id);
+            return Ok(());
+        }
+
+        for cell_idx in 0..contents.cell_count() {
+            let cell = contents.cell_get(
+                cell_idx,
+                payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
+                payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
+                self.usable_space(),
+            )?;
+
+            match cell {
+                BTreeCell::TableInteriorCell(table_interior_cell) => {
+                    assert!(ptrmap_type != PtrmapType::Overflow1);
+                    if table_interior_cell._left_child_page == prev_child_page_num as u32 {
+                        contents.write_u32(0, new_child_page_num as u32);
+                        parent_page.set_dirty();
+                        self.add_dirty(parent_page.get().id);
+                        return Ok(());
+                    }
+                }
+                BTreeCell::TableLeafCell(table_leaf_cell) => {
+                    if ptrmap_type == PtrmapType::Overflow1 {
+                        if let Some(overflow_page) = table_leaf_cell.first_overflow_page {
+                            if overflow_page == prev_child_page_num as u32 {
+                                contents.write_u32(0, new_child_page_num as u32);
+                                parent_page.set_dirty();
+                                self.add_dirty(parent_page.get().id);
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                BTreeCell::IndexInteriorCell(index_interior_cell) => {
+                    if ptrmap_type == PtrmapType::Overflow1 {
+                        if let Some(overflow_page) = index_interior_cell.first_overflow_page {
+                            if overflow_page == prev_child_page_num as u32 {
+                                contents.write_u32(0, new_child_page_num as u32);
+                                parent_page.set_dirty();
+                                self.add_dirty(parent_page.get().id);
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        if index_interior_cell.left_child_page == prev_child_page_num as u32 {
+                            contents.write_u32(0, new_child_page_num as u32);
+                            parent_page.set_dirty();
+                            self.add_dirty(parent_page.get().id);
+                            return Ok(());
+                        }
+                    }
+                }
+                BTreeCell::IndexLeafCell(index_leaf_cell) => {
+                    if ptrmap_type == PtrmapType::Overflow1 {
+                        if let Some(overflow_page) = index_leaf_cell.first_overflow_page {
+                            if overflow_page == prev_child_page_num as u32 {
+                                contents.write_u32(0, new_child_page_num as u32);
+                                parent_page.set_dirty();
+                                self.add_dirty(parent_page.get().id);
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        //  If we go through all the cells and don't find the page number, then we need to update the rightmost pointer of this page
+        //  The rightmost pointer has to exist in the page at this point and it must equal the page number we are looking for
+        assert!(ptrmap_type == PtrmapType::BTreeNode);
+        assert!(contents.rightmost_pointer().is_some());
+        let rightmost_pointer = contents.rightmost_pointer().unwrap();
+        assert!(rightmost_pointer == prev_child_page_num as u32);
+        contents.write_u32(0, new_child_page_num as u32);
+        parent_page.set_dirty();
+        self.add_dirty(parent_page.get().id);
+
+        Ok(())
     }
 
     /// Allocate a new overflow page.
@@ -2116,6 +2422,7 @@ mod ptrmap_tests {
             buffer_pool,
             Arc::new(AtomicDbState::new(DbState::Uninitialized)),
             Arc::new(Mutex::new(())),
+            DatabaseMode::Memory,
         )
         .unwrap();
         run_until_done(|| pager.allocate_page1(), &pager).unwrap();
@@ -2126,7 +2433,7 @@ mod ptrmap_tests {
         const EXPECTED_FIRST_ROOT_PAGE_ID: u32 = 3; // page1 = 1,  first ptrmap page = 2, root page = 3
         for i in 0..initial_db_pages {
             match run_until_done(
-                || pager.btree_create(&CreateBTreeFlags::new_table()),
+                || pager.btree_create(&CreateBTreeFlags::new_table(), &mut Vec::new()),
                 &pager,
             ) {
                 Ok(root_page_id) => {
