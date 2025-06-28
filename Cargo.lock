@@ -1889,15 +1889,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "limbo-dart"
-version = "0.1.0-pre.2"
-dependencies = [
- "flutter_rust_bridge",
- "lazy_static",
- "limbo_core",
-]
-
-[[package]]
 name = "limbo-go"
 version = "0.1.0-pre.2"
 dependencies = [
@@ -3983,6 +3974,14 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "turso-dart"
+version = "0.1.0-pre.2"
+dependencies = [
+ "flutter_rust_bridge",
+ "limbo_core",
 ]
 
 [[package]]
