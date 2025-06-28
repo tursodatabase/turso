@@ -66,10 +66,7 @@ struct ColumnDef {
 
 impl fmt::Display for ColumnDef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let ColumnDef {
-            name,
-            r#type,
-        } = self;
+        let ColumnDef { name, r#type } = self;
         write!(f, "{name} {type}",)?;
 
         Ok(())
@@ -338,7 +335,7 @@ fn do_fuzz(Ops(ops): Ops) -> Result<Corpus, Box<dyn Error>> {
     let rusqlite_conn = rusqlite::Connection::open_in_memory()?;
 
     let io = Arc::new(turso_core::MemoryIO::new());
-    let db = turso_core::Database::open_file(io.clone(), ":memory:", false)?;
+    let db = turso_core::Database::open_file(io.clone(), ":memory:", false, true)?;
     let limbo_conn = db.connect()?;
 
     for op in ops {
