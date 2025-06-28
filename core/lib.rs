@@ -108,6 +108,15 @@ pub(crate) type MvStore = mvcc::MvStore<mvcc::LocalClock>;
 
 pub(crate) type MvCursor = mvcc::cursor::ScanCursor<mvcc::LocalClock>;
 
+/// The different modes that a database can run in
+#[derive(Clone, Copy)]
+pub enum DatabaseMode {
+    /// The database is a trasient database, running in in-memory mode
+    Memory,
+    /// The database is a persistent database, which will write its changes to disk
+    File,
+}
+
 pub struct Database {
     mv_store: Option<Rc<MvStore>>,
     schema: Mutex<Arc<Schema>>,
@@ -121,6 +130,7 @@ pub struct Database {
     db_state: Arc<AtomicUsize>,
     init_lock: Arc<Mutex<()>>,
     open_flags: OpenFlags,
+    database_mode: DatabaseMode,
 }
 
 unsafe impl Send for Database {}
@@ -314,6 +324,7 @@ impl Database {
             buffer_pool.clone(),
             db_state,
             Arc::new(Mutex::new(())),
+            DatabaseMode::File,
         )?;
 
         let size = match page_size {

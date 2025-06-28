@@ -131,7 +131,7 @@ impl DumbLruPageCache {
     }
 
     // Returns Ok if key is not found
-    pub fn _delete(&mut self, key: PageCacheKey, clean_page: bool) -> Result<(), CacheError> {
+    fn _delete(&mut self, key: PageCacheKey, clean_page: bool) -> Result<(), CacheError> {
         if !self.contains_key(&key) {
             return Ok(());
         }
@@ -338,6 +338,33 @@ impl DumbLruPageCache {
         assert!(self.head.borrow().is_none());
         assert!(self.tail.borrow().is_none());
         assert!(self.map.borrow().is_empty());
+        Ok(())
+    }
+
+    /// This method renumbers the from_page to the to_page
+    /// The from_page needs to exist. If the to_page exists, assert that no other part of the system has a reference to it and delete the entry and clear the page
+    /// Change the number of the from_page and remap it in the cache
+    pub fn move_page(
+        &mut self,
+        from_page_num: usize,
+        to_page_num: usize,
+    ) -> Result<(), CacheError> {
+        let from_key = PageCacheKey::new(from_page_num);
+        let to_key = PageCacheKey::new(to_page_num);
+
+        let from_page = self.get(&from_key).ok_or_else(|| {
+            CacheError::InternalError(format!("Page {:?} not found in page cache", from_key))
+        })?;
+        if let Some(existing_to_page) = self.peek(&to_key, false) {
+            let ref_count = Arc::strong_count(&existing_to_page);
+            assert!(ref_count <= 2);
+            self._delete(to_key.clone(), true)?;
+        }
+
+        self._delete(from_key, false)?;
+        from_page.get().id = to_page_num;
+        self.insert(to_key, from_page)?;
+
         Ok(())
     }
 
