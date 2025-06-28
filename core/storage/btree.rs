@@ -485,6 +485,14 @@ impl FindCellState {
     }
 }
 
+/// Used to decide which cursors to save
+pub enum SaveCursorsMode {
+    /// Save all cursors in the database file
+    SaveAllCursors,
+    /// Save only cursors for a specific table identified by the root page passed in
+    SaveCursorForTable(usize),
+}
+
 pub struct BTreeCursor {
     /// The multi-version cursor that is used to read and write to the database file.
     mv_cursor: Option<Rc<RefCell<MvCursor>>>,
@@ -4981,6 +4989,60 @@ impl BTreeCursor {
         }
     }
 
+    /// This method is used to save a cursor when external invalidation occurs (an example being autovacuum inserts)
+    /// The [BTreeCursor] will look up its own internal state, save that to a context and mark its state as requiring a seek
+    /// This will also force all cursors to drop all their references to pages, making it safe to move pages around
+    pub fn save_context_external_invalidation(
+        &mut self,
+        save_cursors_mode: SaveCursorsMode,
+    ) -> Result<CursorResult<()>> {
+        assert!(!matches!(self.valid_state, CursorValidState::RequireSeek));
+        if !self.has_record.get() {
+            return Ok(CursorResult::Ok(()));
+        }
+
+        if let SaveCursorsMode::SaveCursorForTable(root_page) = save_cursors_mode {
+            if self.root_page != root_page {
+                return Ok(CursorResult::Ok(()));
+            }
+        }
+
+        let page = self.stack.top();
+        return_if_locked_maybe_load!(self.pager, page);
+
+        let page_ref = page.get();
+        let contents = page_ref.get_contents();
+
+        let context_to_save = if self.index_key_info.is_none() {
+            //  This is a table btree page to save
+            let cell_idx = self.stack.current_cell_index() as usize;
+            let cell = contents.cell_get(
+                cell_idx,
+                payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
+                payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
+                self.usable_space(),
+            )?;
+
+            match cell {
+                BTreeCell::TableLeafCell(table_leaf_cell) => CursorContext::TableRowId(table_leaf_cell._rowid),
+                BTreeCell::TableInteriorCell(table_int_cell) => CursorContext::TableRowId(table_int_cell._rowid),
+                BTreeCell::IndexLeafCell(_) => return Err(LimboError::InternalError("save_context_external_invalidation called for an index cell without invariants set correctly".into())),
+                BTreeCell::IndexInteriorCell(_) => return Err(LimboError::InternalError("save_context_external_invalidation called for an index cell without invariants set correctly".into())),
+            }
+        } else {
+            //  This is an index btree page to save
+            let record = return_if_io!(self.record()).ok_or_else(|| {
+                LimboError::InternalError("Cannot save context for a cursor with no record".into())
+            })?;
+            CursorContext::IndexKeyRowId(record.clone())
+        };
+
+        self.save_context(context_to_save);
+        self.stack.clear();
+        self.has_record.set(false);
+        Ok(CursorResult::Ok(()))
+    }
+
     // Save cursor context, to be restored later
     pub fn save_context(&mut self, cursor_context: CursorContext) {
         self.valid_state = CursorValidState::RequireSeek;
@@ -6956,8 +7018,9 @@ mod tests {
         tracing::info!("super seed: {}", seed);
         for _ in 0..attempts {
             let (pager, _, _db, conn) = empty_btree();
-            let index_root_page_result =
-                pager.btree_create(&CreateBTreeFlags::new_index()).unwrap();
+            let index_root_page_result = pager
+                .btree_create(&CreateBTreeFlags::new_index(), &mut Vec::new())
+                .unwrap();
             let index_root_page = match index_root_page_result {
                 crate::types::CursorResult::Ok(id) => id as usize,
                 crate::types::CursorResult::IO => {
@@ -7225,6 +7288,7 @@ mod tests {
                 buffer_pool,
                 Arc::new(AtomicUsize::new(0)),
                 Arc::new(Mutex::new(())),
+                crate::DatabaseMode::Memory,
             )
             .unwrap(),
         );
