@@ -151,6 +151,7 @@ pub struct Database {
     init_lock: Arc<Mutex<()>>,
     open_flags: OpenFlags,
     builtin_syms: RefCell<SymbolTable>,
+    #[allow(dead_code)]
     database_mode: DatabaseMode,
 }
 

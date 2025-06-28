@@ -693,23 +693,10 @@ impl Pager {
                         0,
                         BtreePageAllocMode::Exact(root_page_num),
                     ));
+
+                    //  Check if we got the page id we wanted. If we didn't, do relocation so we get the page we want
                     let allocated_page_id = page.get().get().id as u32;
                     if allocated_page_id != root_page_num {
-                        let ptrmap_entry = match self.ptrmap_get(root_page_num)? {
-                            CursorResult::Ok(result) => match result {
-                                Some(entry) => entry,
-                                None => panic!("something went wrong"),
-                            },
-                            CursorResult::IO => return Ok(CursorResult::IO),
-                        };
-
-                        //  These conditions shouldn't be possible because:
-                        //  1. If the root_page_num is a RootPage then it should have already been allocated. Something is broken in database header
-                        //  2. If the root_page_num is a FreePage, then it should have been allocated by `allocate_page` (this doesn't currently hold since that function doesn't look at the free list)
-                        assert!(ptrmap_entry.entry_type != PtrmapType::RootPage);
-                        assert!(ptrmap_entry.entry_type != PtrmapType::FreePage);
-
-                        //  now do the actual page relocation
                         //  first save all the btree cursors, so they can be restored later
                         for cursor in cursors {
                             if let Some(cursor) = cursor {
@@ -724,16 +711,29 @@ impl Pager {
                             }
                         }
 
+                        let ptrmap_entry = match self.ptrmap_get(root_page_num)? {
+                            CursorResult::Ok(result) => match result {
+                                Some(entry) => entry,
+                                None => panic!("something went wrong"),
+                            },
+                            CursorResult::IO => return Ok(CursorResult::IO),
+                        };
+
+                        //  These conditions shouldn't be possible because:
+                        //  1. If the root_page_num is a RootPage then it should have already been allocated and vacuum_mode_largest_root_page should have been updated appropriately. Something is broken in the header
+                        //  2. If the root_page_num is a FreePage, then it should have been allocated by `allocate_page` (this doesn't currently hold since that function doesn't look at the free list)
+                        assert!(ptrmap_entry.entry_type != PtrmapType::RootPage);
+                        assert!(ptrmap_entry.entry_type != PtrmapType::FreePage);
+
                         //  Call the relocate_page subroutine to actually move pages around
                         let root_page = self.read_page(root_page_num as usize)?;
                         self.relocate_page(root_page, allocated_page_id, ptrmap_entry)?;
                     }
 
-                    //  TODO(Zaid): Update the header metadata to reflect the new root page number
-
-                    //  For now map allocated_page_id since we are not swapping it with root_page_num
-                    match self.ptrmap_put(allocated_page_id, PtrmapType::RootPage, 0)? {
-                        IOResult::Done(_) => Ok(IOResult::Done(allocated_page_id)),
+                    //  Update the header metadata to reflect the new root page number and map the new root page in pointer pages
+                    header_accessor::set_vacuum_mode_largest_root_page(self, root_page_num)?;
+                    match self.ptrmap_put(root_page_num, PtrmapType::RootPage, 0)? {
+                        IOResult::Done(_) => Ok(IOResult::Done(allocated_page_id as u32)),
                         IOResult::IO => Ok(IOResult::IO),
                     }
                 }
@@ -745,20 +745,20 @@ impl Pager {
     }
 
     /// This method is responsible for relocating source_page to dest_page. This will also update all the relevant pointers
-    /// situated in the pointer map pages and elsewhere after the move
+    /// situated in the pointer map pages and parent page after the move
     #[cfg(not(feature = "omit_autovacuum"))]
     fn relocate_page(
         &self,
         source_page: Arc<Page>,
         dest_page_num: u32,
-        source_ptr_map_entry: PtrmapEntry,
+        source_page_ptr_map_entry: PtrmapEntry,
     ) -> Result<()> {
         //  The source page can be one of the following pages
         assert!(
-            source_ptr_map_entry.entry_type == PtrmapType::RootPage
-                || source_ptr_map_entry.entry_type == PtrmapType::BTreeNode
-                || source_ptr_map_entry.entry_type == PtrmapType::Overflow1
-                || source_ptr_map_entry.entry_type == PtrmapType::Overflow2
+            source_page_ptr_map_entry.entry_type == PtrmapType::RootPage
+                || source_page_ptr_map_entry.entry_type == PtrmapType::BTreeNode
+                || source_page_ptr_map_entry.entry_type == PtrmapType::Overflow1
+                || source_page_ptr_map_entry.entry_type == PtrmapType::Overflow2
         );
         assert!(source_page.get().id >= 3); //  No root page in autovacuum can have a root page less than 3
 
@@ -809,7 +809,7 @@ impl Pager {
 
         //  Update the pointer map pages for the source_page since the page id has changed
         source_page.get().id = dest_page_num as usize;
-        match source_ptr_map_entry.entry_type {
+        match source_page_ptr_map_entry.entry_type {
             PtrmapType::RootPage => self.set_child_ptrmaps(source_page)?,
             PtrmapType::BTreeNode => self.set_child_ptrmaps(source_page)?,
             PtrmapType::Overflow1 => self.update_overflow_pointer(source_page)?,
@@ -819,18 +819,18 @@ impl Pager {
 
         //  For non-root pages update the pointers on the parent page and also update the pointer map of the source page
         //  to point to the destination page
-        if source_ptr_map_entry.entry_type != PtrmapType::RootPage {
-            let parent_page = self.read_page(source_ptr_map_entry.parent_page_no as usize)?;
+        if source_page_ptr_map_entry.entry_type != PtrmapType::RootPage {
+            let parent_page = self.read_page(source_page_ptr_map_entry.parent_page_no as usize)?;
             self.modify_parent_page_pointers(
                 parent_page,
                 orig_page_num,
                 dest_page_num as usize,
-                source_ptr_map_entry.entry_type,
+                source_page_ptr_map_entry.entry_type,
             )?;
             self.ptrmap_put(
                 dest_page_num,
-                source_ptr_map_entry.entry_type,
-                source_ptr_map_entry.parent_page_no,
+                source_page_ptr_map_entry.entry_type,
+                source_page_ptr_map_entry.parent_page_no,
             )?;
         }
         Ok(())
