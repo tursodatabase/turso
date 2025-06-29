@@ -19,6 +19,11 @@ use std::fmt::{Debug, Display};
 
 const MAX_REAL_SIZE: u8 = 15;
 
+/// SQLite by default uses 2000 as maximum numbers in a row.
+/// It controlld by the constant called SQLITE_MAX_COLUMN
+/// But the hard limit of number of columns is 32,767 columns i16::MAX
+const MAX_COLUMN: usize = 2000;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ValueType {
     Null,
@@ -1030,139 +1035,122 @@ impl ImmutableRecord {
 
 #[derive(Debug, Default)]
 pub struct RecordCursor {
-    header_offsets: Vec<u32>,
-    serial_types: Vec<u32>,
-    header_parsed_count: usize,
-    header_offset: usize,
+    serial_types: Vec<u64>, // Parsed serial types
+    offsets: Vec<usize>,    // Offsets into payload (one per column + final end)
+    header_size: usize,     // Total header size in bytes
+    header_offset: usize,   // Cursor position while parsing header
 }
 
 impl RecordCursor {
     pub fn new() -> Self {
-        RecordCursor {
-            header_offsets: Vec::new(),
+        Self {
             serial_types: Vec::new(),
-            header_parsed_count: 0,
+            offsets: Vec::new(),
+            header_size: 0,
+            header_offset: 0,
+        }
+    }
+
+    pub fn with_capacity(num_columns: usize) -> Self {
+        Self {
+            serial_types: Vec::with_capacity(num_columns),
+            offsets: Vec::with_capacity(num_columns),
+            header_size: 0,
             header_offset: 0,
         }
     }
 
     pub fn invalidate(&mut self) {
-        self.header_offsets.clear();
         self.serial_types.clear();
-        self.header_parsed_count = 0;
+        self.offsets.clear();
+        self.header_size = 0;
         self.header_offset = 0;
     }
 
     pub fn is_invalidated(&self) -> bool {
-        self.header_offsets.is_empty() && self.serial_types.is_empty()
+        self.serial_types.is_empty() && self.offsets.is_empty()
     }
 
     pub fn parse_full_header(&mut self, record: &ImmutableRecord) -> Result<()> {
-        let payload = record.get_payload();
-        if payload.is_empty() {
-            return Ok(());
-        }
-
-        if self.header_parsed_count == 0 && self.header_offsets.is_empty() {
-            let (header_size, bytes_read) = read_varint(payload)?;
-            self.header_offset = bytes_read;
-            self.header_offsets.push(header_size as u32);
-
-            let mut current_offset = header_size as u32;
-
-            while self.header_offset < header_size as usize && self.header_offset < payload.len() {
-                let (serial_type, bytes_read) = read_varint(&payload[self.header_offset..])?;
-                self.header_offset += bytes_read;
-                self.serial_types.push(serial_type as u32);
-
-                let serial_type_obj = SerialType::try_from(serial_type)?;
-                let column_data_size = serial_type_obj.size();
-
-                self.header_offsets.push(current_offset);
-                current_offset += column_data_size as u32;
-
-                self.header_parsed_count += 1;
-            }
-
-            self.header_offsets.push(current_offset);
-        }
-
-        Ok(())
+        self.ensure_parsed_upto(record, MAX_COLUMN)
     }
 
+    #[inline(always)]
     pub fn ensure_parsed_upto(
         &mut self,
         record: &ImmutableRecord,
         target_idx: usize,
     ) -> Result<()> {
-        let _ = target_idx;
-        self.parse_full_header(record)
+        let payload = record.get_payload();
+        if payload.is_empty() {
+            return Ok(());
+        }
+
+        // Parse header size and initialize parsing
+        if self.serial_types.is_empty() && self.offsets.is_empty() {
+            let (header_size, bytes_read) = read_varint(payload)?;
+            self.header_size = header_size as usize;
+            self.header_offset = bytes_read;
+            self.offsets.push(self.header_size); // First column starts after header
+        }
+
+        // Parse serial types incrementally
+        while self.serial_types.len() <= target_idx
+            && self.header_offset < self.header_size
+            && self.header_offset < payload.len()
+        {
+            let (serial_type, read_bytes) = read_varint(&payload[self.header_offset..])?;
+            self.serial_types.push(serial_type);
+            self.header_offset += read_bytes;
+
+            let serial_type_obj = SerialType::try_from(serial_type)?;
+            let data_size = serial_type_obj.size();
+            let prev_offset = *self.offsets.last().unwrap();
+            self.offsets.push(prev_offset + data_size);
+        }
+
+        Ok(())
     }
 
     pub fn deserialize_column(&self, record: &ImmutableRecord, idx: usize) -> Result<RefValue> {
-        // SQLite returns NULL for out-of-bounds column access
         if idx >= self.serial_types.len() {
             return Ok(RefValue::Null);
         }
 
         let serial_type = self.serial_types[idx];
-        let serial_type_obj = SerialType::try_from(serial_type as u64)?;
+        let serial_type_obj = SerialType::try_from(serial_type)?;
 
         match serial_type_obj.kind() {
-            SerialTypeKind::Null => {
-                return Ok(RefValue::Null);
-            }
-            SerialTypeKind::ConstInt0 => {
-                return Ok(RefValue::Integer(0));
-            }
-            SerialTypeKind::ConstInt1 => {
-                return Ok(RefValue::Integer(1));
-            }
-            _ => {} // Continue to read from payload
+            SerialTypeKind::Null => return Ok(RefValue::Null),
+            SerialTypeKind::ConstInt0 => return Ok(RefValue::Integer(0)),
+            SerialTypeKind::ConstInt1 => return Ok(RefValue::Integer(1)),
+            _ => {} // continue
         }
 
-        // Check if we have enough header_offsets for non-constant types
-        // We need header_size (index 0) + column_offsets (index 1..n) + end_offset (index n+1)
-        if idx + 2 >= self.header_offsets.len() {
+        if idx + 1 >= self.offsets.len() {
             return Ok(RefValue::Null);
         }
 
-        let start_offset = self.header_offsets[idx + 1] as usize;
-        let end_offset = self.header_offsets[idx + 2] as usize;
+        let start = self.offsets[idx];
+        let end = self.offsets[idx + 1];
         let payload = record.get_payload();
 
-        if start_offset >= payload.len() {
+        if end > payload.len() || start >= end {
             return Ok(RefValue::Null);
         }
 
-        // If end_offset is beyond payload, we might still be able to read the column
-        // But we need at least enough bytes for the serial type
-        let expected_size = serial_type_obj.size();
-        let available_bytes = payload.len().saturating_sub(start_offset);
-
-        if available_bytes < expected_size {
-            return Ok(RefValue::Null);
-        }
-
-        // Use the minimum of end_offset and what's actually available
-        let actual_end_offset = end_offset.min(payload.len());
-        let column_data = &payload[start_offset..actual_end_offset];
-
-        let (value, _) = crate::storage::sqlite3_ondisk::read_value(column_data, serial_type_obj)?;
+        let slice = &payload[start..end];
+        let (value, _) = crate::storage::sqlite3_ondisk::read_value(slice, serial_type_obj)?;
         Ok(value)
     }
 
+    #[inline(always)]
     pub fn get_value(&mut self, record: &ImmutableRecord, idx: usize) -> Result<RefValue> {
         if record.is_invalidated() {
             return Err(LimboError::InternalError("Record not initialized".into()));
         }
 
         self.ensure_parsed_upto(record, idx)?;
-
-        if idx >= self.serial_types.len() {
-            return Ok(RefValue::Null);
-        }
-
         self.deserialize_column(record, idx)
     }
 
@@ -1175,15 +1163,11 @@ impl RecordCursor {
             return None;
         }
 
-        match self.ensure_parsed_upto(record, idx) {
-            Ok(()) => {
-                if idx >= self.serial_types.len() {
-                    return None;
-                }
-                Some(self.get_value(record, idx))
-            }
-            Err(e) => Some(Err(e)),
+        if let Err(e) = self.ensure_parsed_upto(record, idx) {
+            return Some(Err(e));
         }
+
+        Some(self.deserialize_column(record, idx))
     }
 
     pub fn count(&mut self, record: &ImmutableRecord) -> usize {
@@ -1191,11 +1175,12 @@ impl RecordCursor {
             return 0;
         }
 
-        if let Ok(()) = self.parse_full_header(record) {
-            self.serial_types.len()
-        } else {
-            0
-        }
+        let _ = self.parse_full_header(record);
+        self.serial_types.len()
+    }
+
+    pub fn len(&mut self, record: &ImmutableRecord) -> usize {
+        self.count(record)
     }
 
     pub fn get_values(&mut self, record: &ImmutableRecord) -> Result<Vec<RefValue>> {
@@ -1204,16 +1189,13 @@ impl RecordCursor {
         }
 
         self.parse_full_header(record)?;
+        let mut result = Vec::with_capacity(self.serial_types.len());
 
-        let mut values = Vec::with_capacity(self.serial_types.len());
         for i in 0..self.serial_types.len() {
-            values.push(self.get_value(record, i)?);
+            result.push(self.deserialize_column(record, i)?);
         }
-        Ok(values)
-    }
 
-    pub fn len(&mut self, record: &ImmutableRecord) -> usize {
-        self.count(record)
+        Ok(result)
     }
 }
 
@@ -2674,6 +2656,78 @@ mod tests {
     }
 
     #[test]
+    fn test_record_parsing() {
+        let values = vec![
+            Value::Integer(42),
+            Value::Text(Text::new("hello")),
+            Value::Float(3.14159),
+            Value::Null,
+            Value::Integer(1000000),
+            Value::Blob(vec![1, 2, 3, 4, 5]),
+        ];
+
+        let registers: Vec<Register> = values.iter().cloned().map(Register::Value).collect();
+        let record = ImmutableRecord::from_registers(&registers, registers.len());
+
+        // Full Parsing
+        let mut cursor1 = RecordCursor::new();
+        cursor1
+            .parse_full_header(&record)
+            .expect("Failed to parse full header");
+
+        assert_eq!(
+            cursor1.offsets.len(),
+            cursor1.serial_types.len() + 1,
+            "offsets should be one longer than serial_types"
+        );
+
+        for i in 0..values.len() {
+            cursor1
+                .deserialize_column(&record, i)
+                .expect("Failed to deserialize column");
+        }
+
+        // Incremental Parsing
+        let mut cursor2 = RecordCursor::new();
+        cursor2
+            .ensure_parsed_upto(&record, 2)
+            .expect("Failed to parse up to column 2");
+
+        assert_eq!(
+            cursor2.offsets.len(),
+            cursor2.serial_types.len() + 1,
+            "offsets should be one longer than serial_types"
+        );
+
+        cursor2.get_value(&record, 2).expect("Column 2 failed");
+
+        // Access column 0 (already parsed)
+        let before = cursor2.serial_types.len();
+        cursor2.get_value(&record, 0).expect("Column 0 failed");
+        let after = cursor2.serial_types.len();
+        assert_eq!(before, after, "Should not parse more");
+
+        // Access column 5 (forces full parse)
+        cursor2
+            .ensure_parsed_upto(&record, 5)
+            .expect("Column 5 parse failed");
+        cursor2.get_value(&record, 5).expect("Column 5 failed");
+
+        // Compare both parsing strategies
+        for i in 0..values.len() {
+            let full = cursor1.get_value(&record, i).expect("full failed");
+            let incr = cursor2.get_value(&record, i).expect("incr failed");
+            assert_eq!(full, incr, "Mismatch at column {}", i);
+        }
+
+        assert_eq!(
+            cursor1.serial_types, cursor2.serial_types,
+            "serial_types must match"
+        );
+        assert_eq!(cursor1.offsets, cursor2.offsets, "offsets must match");
+    }
+
+    #[test]
     fn test_serialize_null() {
         let record = Record::new(vec![Value::Null]);
         let mut buf = Vec::new();
@@ -2829,7 +2883,6 @@ mod tests {
 
         let header_length = record.values.len() + 1;
         let header = &buf[0..header_length];
-        // First byte should be header size
         assert_eq!(header[0], header_length as u8);
         // Second byte should be serial type for FLOAT
         assert_eq!(header[1] as u64, u64::from(SerialType::f64()));

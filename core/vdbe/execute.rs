@@ -891,9 +891,15 @@ pub fn op_open_read(
         None => None,
     };
     let mut cursors = state.cursors.borrow_mut();
+    let num_columns = match cursor_type {
+        CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
+        CursorType::BTreeIndex(index_arc) => index_arc.columns.len(),
+        _ => unreachable!("This should not have happened"),
+    };
+
     match cursor_type {
         CursorType::BTreeTable(_) => {
-            let cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), *root_page);
+            let cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), *root_page, num_columns);
             cursors
                 .get_mut(*cursor_id)
                 .unwrap()
@@ -925,6 +931,7 @@ pub fn op_open_read(
                 *root_page,
                 index.as_ref(),
                 collations,
+                num_columns,
             );
             cursors
                 .get_mut(*cursor_id)
@@ -1319,6 +1326,12 @@ pub fn op_column(
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
     match cursor_type {
         CursorType::BTreeTable(_) | CursorType::BTreeIndex(_) => {
+            // let num_columns = match cursor_type {
+            //     CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
+            //     CursorType::BTreeIndex(index_arc) => index_arc.columns.len(),
+            //     _ => unreachable!("This should not have happened"),
+            // };
+
             let value = 'value: {
                 let mut cursor =
                     must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Column");
@@ -4797,6 +4810,8 @@ pub fn op_open_write(
         let table = schema
             .get_table(&index.table_name)
             .and_then(|table| table.btree());
+
+        let num_columns = index.columns.len();
         let collations = table.map_or(Vec::new(), |table| {
             index
                 .columns
@@ -4811,19 +4826,27 @@ pub fn op_open_write(
                 })
                 .collect()
         });
+
         let cursor = BTreeCursor::new_index(
             mv_cursor,
             pager.clone(),
             root_page as usize,
             index.as_ref(),
             collations,
+            num_columns,
         );
         cursors
             .get_mut(*cursor_id)
             .unwrap()
             .replace(Cursor::new_btree(cursor));
     } else {
-        let cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), root_page as usize);
+        let num_columns = match cursor_type {
+            CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
+            _ => unreachable!("Expected BTreeTable. This should not have happened."),
+        };
+
+        let cursor =
+            BTreeCursor::new_table(mv_cursor, pager.clone(), root_page as usize, num_columns);
         cursors
             .get_mut(*cursor_id)
             .unwrap()
@@ -4898,7 +4921,7 @@ pub fn op_destroy(
         todo!("temp databases not implemented yet.");
     }
     // TODO not sure if should be BTreeCursor::new_table or BTreeCursor::new_index here or neither and just pass an emtpy vec
-    let mut cursor = BTreeCursor::new(None, pager.clone(), *root, Vec::new());
+    let mut cursor = BTreeCursor::new(None, pager.clone(), *root, Vec::new(), 0);
     let former_root_page_result = cursor.btree_destroy()?;
     if let CursorResult::Ok(former_root_page) = former_root_page_result {
         state.registers[*former_root_reg] =
@@ -5354,6 +5377,13 @@ pub fn op_open_ephemeral(
                 }
                 None => None,
             };
+
+            let num_columns = match cursor_type {
+                CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
+                CursorType::BTreeIndex(index_arc) => index_arc.columns.len(),
+                _ => unreachable!("This should not have happened"),
+            };
+
             let mut cursor = if let CursorType::BTreeIndex(index) = cursor_type {
                 BTreeCursor::new_index(
                     mv_cursor,
@@ -5365,9 +5395,10 @@ pub fn op_open_ephemeral(
                         .iter()
                         .map(|c| c.collation.unwrap_or_default())
                         .collect(),
+                    num_columns,
                 )
             } else {
-                BTreeCursor::new_table(mv_cursor, pager.clone(), root_page as usize)
+                BTreeCursor::new_table(mv_cursor, pager.clone(), root_page as usize, num_columns)
             };
             cursor.rewind()?; // Will never return io
 
