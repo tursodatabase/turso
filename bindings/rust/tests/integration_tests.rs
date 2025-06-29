@@ -1,4 +1,20 @@
+#[cfg(feature = "futures")]
+use futures_util::TryStreamExt;
 use turso::{Builder, Value};
+
+#[cfg(not(feature = "futures"))]
+macro_rules! rows_next {
+    ($rows:expr) => {
+        $rows.next()
+    };
+}
+
+#[cfg(feature = "futures")]
+macro_rules! rows_next {
+    ($rows:expr) => {
+        $rows.try_next()
+    };
+}
 
 #[tokio::test]
 async fn test_rows_next() {
@@ -34,24 +50,49 @@ async fn test_rows_next() {
     .unwrap();
     let mut res = conn.query("SELECT * FROM test", ()).await.unwrap();
     assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        rows_next!(res)
+            .await
+            .unwrap()
+            .unwrap()
+            .get_value(0)
+            .unwrap(),
         1.into()
     );
     assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        rows_next!(res)
+            .await
+            .unwrap()
+            .unwrap()
+            .get_value(0)
+            .unwrap(),
         2.into()
     );
     assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        rows_next!(res)
+            .await
+            .unwrap()
+            .unwrap()
+            .get_value(0)
+            .unwrap(),
         3.into()
     );
     assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        rows_next!(res)
+            .await
+            .unwrap()
+            .unwrap()
+            .get_value(0)
+            .unwrap(),
         4.into()
     );
     assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        rows_next!(res)
+            .await
+            .unwrap()
+            .unwrap()
+            .get_value(0)
+            .unwrap(),
         5.into()
     );
-    assert!(res.next().await.unwrap().is_none());
+    assert!(rows_next!(res).await.unwrap().is_none());
 }

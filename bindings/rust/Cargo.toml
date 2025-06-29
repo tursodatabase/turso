@@ -10,13 +10,15 @@ repository.workspace = true
 description = "Turso Rust API"
 
 [features]
-default = []
+default = ["futures"]
 experimental_indexes = []
 antithesis = ["turso_core/antithesis"]
+futures = ["dep:futures-util"]
 
 [dependencies]
 turso_core = { workspace = true, features = ["io_uring"] }
 thiserror = "2.0.9"
+futures-util = { version = "0.3.31", optional = true, default-features = false, features = ["std", "async-await"] }
 
 [dev-dependencies]
 tempfile = "3.20.0"

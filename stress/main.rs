@@ -15,6 +15,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
+use turso::futures_util::TryStreamExt;
 use turso::Builder;
 
 pub struct Plan {
@@ -526,7 +527,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 const INTEGRITY_CHECK_INTERVAL: usize = 100;
                 if query_index % INTEGRITY_CHECK_INTERVAL == 0 {
                     let mut res = conn.query("PRAGMA integrity_check", ()).await.unwrap();
-                    if let Some(row) = res.next().await? {
+                    if let Some(row) = res.try_next().await? {
                         let value = row.get_value(0).unwrap();
                         if value != "ok".into() {
                             panic!("integrity check failed: {:?}", value);

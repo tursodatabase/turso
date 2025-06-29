@@ -20,28 +20,33 @@
 //! You can also prepare statements with the [`Connection`] object and then execute the [`Statement`] objects:
 //!
 //! ```rust,no_run
+//! # use crate::turso::futures_util::TryStreamExt;
 //! # async fn run() {
 //! # use turso::Builder;
 //! # let db = Builder::new_local(":memory:").build().await.unwrap();
 //! # let conn = db.connect().unwrap();
 //! let mut stmt = conn.prepare("SELECT * FROM users WHERE email = ?1").await.unwrap();
 //! let mut rows = stmt.query(["foo@example.com"]).await.unwrap();
-//! let row = rows.next().await.unwrap().unwrap();
+//! let row = rows.try_next().await.unwrap().unwrap();
 //! let value = row.get_value(0).unwrap();
 //! println!("Row: {:?}", value);
 //! # }
 //! ```
 
 pub mod params;
+pub mod row;
+pub mod statement;
 pub mod value;
 
+#[cfg(feature = "futures")]
+pub use futures_util;
+pub use params::params_from_iter;
 pub use value::Value;
 
-pub use params::params_from_iter;
-
 use crate::params::*;
+use crate::row::{Row, Rows};
+use crate::statement::Statement;
 use std::fmt::Debug;
-use std::num::NonZero;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, thiserror::Error)]
@@ -62,7 +67,7 @@ impl From<turso_core::LimboError> for Error {
 
 pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A builder for `Database`.
 pub struct Builder {
@@ -213,119 +218,6 @@ impl Debug for Connection {
     }
 }
 
-/// A prepared statement.
-pub struct Statement {
-    inner: Arc<Mutex<turso_core::Statement>>,
-}
-
-impl Clone for Statement {
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
-
-unsafe impl Send for Statement {}
-unsafe impl Sync for Statement {}
-
-impl Statement {
-    /// Query the database with this prepared statement.
-    pub async fn query(&mut self, params: impl IntoParams) -> Result<Rows> {
-        let params = params.into_params()?;
-        match params {
-            params::Params::None => (),
-            params::Params::Positional(values) => {
-                for (i, value) in values.into_iter().enumerate() {
-                    let mut stmt = self.inner.lock().unwrap();
-                    stmt.bind_at(NonZero::new(i + 1).unwrap(), value.into());
-                }
-            }
-            params::Params::Named(values) => {
-                for (name, value) in values.into_iter() {
-                    let mut stmt = self.inner.lock().unwrap();
-                    let i = stmt.parameters().index(name).unwrap();
-                    stmt.bind_at(i, value.into());
-                }
-            }
-        }
-        #[allow(clippy::arc_with_non_send_sync)]
-        let rows = Rows {
-            inner: Arc::clone(&self.inner),
-        };
-        Ok(rows)
-    }
-
-    /// Execute this prepared statement.
-    pub async fn execute(&mut self, params: impl IntoParams) -> Result<u64> {
-        {
-            // Reset the statement before executing
-            self.inner.lock().unwrap().reset();
-        }
-        let params = params.into_params()?;
-        match params {
-            params::Params::None => (),
-            params::Params::Positional(values) => {
-                for (i, value) in values.into_iter().enumerate() {
-                    let mut stmt = self.inner.lock().unwrap();
-                    stmt.bind_at(NonZero::new(i + 1).unwrap(), value.into());
-                }
-            }
-            params::Params::Named(values) => {
-                for (name, value) in values.into_iter() {
-                    let mut stmt = self.inner.lock().unwrap();
-                    let i = stmt.parameters().index(name).unwrap();
-                    stmt.bind_at(i, value.into());
-                }
-            }
-        }
-        loop {
-            let mut stmt = self.inner.lock().unwrap();
-            match stmt.step() {
-                Ok(turso_core::StepResult::Row) => {
-                    // unexpected row during execution, error out.
-                    return Ok(2);
-                }
-                Ok(turso_core::StepResult::Done) => {
-                    return Ok(0);
-                }
-                Ok(turso_core::StepResult::IO) => {
-                    let _ = stmt.run_once();
-                    //return Ok(1);
-                }
-                Ok(turso_core::StepResult::Busy) => {
-                    return Ok(4);
-                }
-                Ok(turso_core::StepResult::Interrupt) => {
-                    return Ok(3);
-                }
-                Err(err) => {
-                    return Err(err.into());
-                }
-            }
-        }
-    }
-
-    /// Returns columns of the result of this prepared statement.
-    pub fn columns(&self) -> Vec<Column> {
-        let stmt = self.inner.lock().unwrap();
-
-        let n = stmt.num_columns();
-
-        let mut cols = Vec::with_capacity(n);
-
-        for i in 0..n {
-            let name = stmt.get_column_name(i).into_owned();
-            cols.push(Column {
-                name,
-                decl_type: None, // TODO
-            });
-        }
-
-        cols
-    }
-}
-
 /// Column information.
 pub struct Column {
     name: String,
@@ -357,99 +249,26 @@ pub enum Params {
 
 pub struct Transaction {}
 
-/// Results of a prepared statement query.
-pub struct Rows {
-    inner: Arc<Mutex<turso_core::Statement>>,
-}
-
-impl Clone for Rows {
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
-
-unsafe impl Send for Rows {}
-unsafe impl Sync for Rows {}
-
-impl Rows {
-    /// Fetch the next row of this result set.
-    pub async fn next(&mut self) -> Result<Option<Row>> {
-        loop {
-            let mut stmt = self
-                .inner
-                .lock()
-                .map_err(|e| Error::MutexError(e.to_string()))?;
-            match stmt.step() {
-                Ok(turso_core::StepResult::Row) => {
-                    let row = stmt.row().unwrap();
-                    return Ok(Some(Row {
-                        values: row.get_values().map(|v| v.to_owned()).collect(),
-                    }));
-                }
-                Ok(turso_core::StepResult::Done) => return Ok(None),
-                Ok(turso_core::StepResult::IO) => {
-                    if let Err(e) = stmt.run_once() {
-                        return Err(e.into());
-                    }
-                    continue;
-                }
-                Ok(turso_core::StepResult::Busy) => return Ok(None),
-                Ok(turso_core::StepResult::Interrupt) => return Ok(None),
-                _ => return Ok(None),
-            }
-        }
-    }
-}
-
-/// Query result row.
-#[derive(Debug)]
-pub struct Row {
-    values: Vec<turso_core::Value>,
-}
-
-unsafe impl Send for Row {}
-unsafe impl Sync for Row {}
-
-impl Row {
-    pub fn get_value(&self, index: usize) -> Result<Value> {
-        let value = &self.values[index];
-        match value {
-            turso_core::Value::Integer(i) => Ok(Value::Integer(*i)),
-            turso_core::Value::Null => Ok(Value::Null),
-            turso_core::Value::Float(f) => Ok(Value::Real(*f)),
-            turso_core::Value::Text(text) => Ok(Value::Text(text.to_string())),
-            turso_core::Value::Blob(items) => Ok(Value::Blob(items.to_vec())),
-        }
-    }
-
-    pub fn column_count(&self) -> usize {
-        self.values.len()
-    }
-}
-
-impl<'a> FromIterator<&'a turso_core::Value> for Row {
-    fn from_iter<T: IntoIterator<Item = &'a turso_core::Value>>(iter: T) -> Self {
-        let values = iter
-            .into_iter()
-            .map(|v| match v {
-                turso_core::Value::Integer(i) => turso_core::Value::Integer(*i),
-                turso_core::Value::Null => turso_core::Value::Null,
-                turso_core::Value::Float(f) => turso_core::Value::Float(*f),
-                turso_core::Value::Text(s) => turso_core::Value::Text(s.clone()),
-                turso_core::Value::Blob(b) => turso_core::Value::Blob(b.clone()),
-            })
-            .collect();
-
-        Row { values }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "futures")]
+    use futures_util::TryStreamExt;
     use tempfile::NamedTempFile;
+
+    #[cfg(not(feature = "futures"))]
+    macro_rules! rows_next {
+        ($rows:expr) => {
+            $rows.next()
+        };
+    }
+
+    #[cfg(feature = "futures")]
+    macro_rules! rows_next {
+        ($rows:expr) => {
+            $rows.try_next()
+        };
+    }
 
     #[tokio::test]
     async fn test_database_persistence() -> Result<()> {
@@ -479,13 +298,13 @@ mod tests {
             .query("SELECT name FROM test_persistence ORDER BY id;", ())
             .await?;
 
-        let row1 = rows.next().await?.expect("Expected first row");
+        let row1 = rows_next!(rows).await?.expect("Expected first row");
         assert_eq!(row1.get_value(0)?, Value::Text("Alice".to_string()));
 
-        let row2 = rows.next().await?.expect("Expected second row");
+        let row2 = rows_next!(rows).await?.expect("Expected second row");
         assert_eq!(row2.get_value(0)?, Value::Text("Bob".to_string()));
 
-        assert!(rows.next().await?.is_none(), "Expected no more rows");
+        assert!(rows_next!(rows).await?.is_none(), "Expected no more rows");
 
         Ok(())
     }
@@ -534,8 +353,7 @@ mod tests {
             .await?;
 
         for (i, value) in original_data.iter().enumerate().take(NUM_INSERTS) {
-            let row = rows
-                .next()
+            let row = rows_next!(rows)
                 .await?
                 .unwrap_or_else(|| panic!("Expected row {} but found None", i));
             assert_eq!(
@@ -547,7 +365,7 @@ mod tests {
         }
 
         assert!(
-            rows.next().await?.is_none(),
+            rows_next!(rows).await?.is_none(),
             "Expected no more rows after retrieving all inserted data"
         );
 
@@ -604,9 +422,9 @@ mod tests {
                 let mut rows_iter = conn
                     .query("SELECT count(*) FROM test_persistence;", ())
                     .await?;
-                let rows = rows_iter.next().await?.unwrap();
+                let rows = rows_next!(rows_iter).await?.unwrap();
                 assert_eq!(rows.get_value(0)?, Value::Integer(i as i64 + 1));
-                assert!(rows_iter.next().await?.is_none());
+                assert!(rows_next!(rows_iter).await?.is_none());
             }
         }
 

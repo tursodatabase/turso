@@ -11,7 +11,7 @@ pub enum Value {
     Blob(Vec<u8>),
 }
 
-/// The possible types a column can be in libsql.
+/// The possible types a column can be in Turso.
 #[derive(Debug, Copy, Clone)]
 pub enum ValueType {
     Integer = 1,
