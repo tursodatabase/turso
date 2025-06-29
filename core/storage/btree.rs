@@ -6120,7 +6120,7 @@ fn debug_validate_cells_core(page: &PageContent, usable_space: u16) {
 /// insert_into_cell() is called from insert_into_page(),
 /// and the overflow cell count is used to determine if the page overflows,
 /// i.e. whether we need to balance the btree after the insert.
-fn insert_into_cell(
+pub fn insert_into_cell(
     page: &mut PageContent,
     payload: &[u8],
     cell_idx: usize,
