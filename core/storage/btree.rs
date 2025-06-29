@@ -5436,7 +5436,7 @@ impl BTreeCursor {
 
             match cell {
                 BTreeCell::TableLeafCell(table_leaf_cell) => CursorContext::TableRowId(table_leaf_cell._rowid),
-                BTreeCell::TableInteriorCell(table_int_cell) => CursorContext::TableRowId(table_int_cell._rowid),
+                BTreeCell::TableInteriorCell(table_int_cell) => CursorContext::TableRowId(table_int_cell._rowid), // TODO (Zaid): is it valid to save the state of an interior cell?
                 BTreeCell::IndexLeafCell(_) => return Err(LimboError::InternalError("save_context_external_invalidation called for an index cell without invariants set correctly".into())),
                 BTreeCell::IndexInteriorCell(_) => return Err(LimboError::InternalError("save_context_external_invalidation called for an index cell without invariants set correctly".into())),
             }
