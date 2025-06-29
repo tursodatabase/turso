@@ -167,7 +167,7 @@ impl DumbLruPageCache {
         self.free_list.borrow_mut().push(index_to_free);
 
         unsafe {
-            let _ = Box::from_raw(ptr.as_ptr());
+            drop(Box::from_raw(ptr.as_ptr()));
         };
         Ok(())
     }
@@ -278,7 +278,7 @@ impl DumbLruPageCache {
             }
 
             unsafe {
-                let _ = Box::from_raw(ptr.as_ptr());
+                drop(Box::from_raw(ptr.as_ptr()));
             }
         }
 
