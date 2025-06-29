@@ -11,7 +11,7 @@ const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES_MAKE_ME_SMALLER_ONCE_WAL_SPILL_IS_IMPLEME
 
 #[derive(Debug, Eq, Hash, PartialEq, Clone)]
 pub struct PageCacheKey {
-    pgno: usize,
+    pub pgno: usize,
 }
 
 #[allow(dead_code)]
@@ -341,7 +341,7 @@ impl DumbLruPageCache {
         Ok(())
     }
 
-    /// This method renumbers the from_page to the to_page
+    /// This method re-numbers the from_page to the to_page
     /// The from_page needs to exist. If the to_page exists, assert that no other part of the system has a reference to it and delete the entry and clear the page
     /// Change the number of the from_page and remap it in the cache
     pub fn move_page(
@@ -1274,5 +1274,52 @@ mod tests {
             growth < 10_000_000,
             "Memory grew by {growth} bytes over 10 cycles"
         );
+    }
+
+    #[test]
+    fn test_move_page_simple() {
+        // Rename a page to an unused page-number.
+        let mut cache = DumbLruPageCache::default();
+        let key_from = insert_page(&mut cache, 1);
+
+        // Move page 1 → 10.
+        assert!(cache.move_page(1, 10).is_ok());
+
+        // Old key should be gone.
+        assert!(cache.get(&key_from).is_none());
+
+        // New key should exist and have the updated id.
+        let key_to = create_key(10);
+        let moved_page = cache.get(&key_to).expect("page 10 should exist");
+        assert_eq!(moved_page.get().id, 10);
+
+        cache.verify_list_integrity();
+    }
+
+    #[test]
+    fn test_move_page_overwrite_destination() {
+        // Destination already exists – it must be replaced.
+        let mut cache = DumbLruPageCache::default();
+
+        let key_from = insert_page(&mut cache, 1); // source page
+        let _key_dest = insert_page(&mut cache, 2); // page that will be overwritten
+
+        // Keep a handle to the source page so we can check identity later.
+        let source_page_arc = cache.get(&key_from).unwrap();
+
+        // Move page 1 → 2, overwriting the old page-2 entry.
+        assert!(cache.move_page(1, 2).is_ok());
+
+        // Cache should now contain exactly one entry (key 2).
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get(&key_from).is_none());
+
+        // New key 2 should point to the former source page.
+        let key_to = create_key(2);
+        let new_page_arc = cache.get(&key_to).expect("page 2 should exist");
+        assert!(std::sync::Arc::ptr_eq(&source_page_arc, &new_page_arc));
+        assert_eq!(new_page_arc.get().id, 2);
+
+        cache.verify_list_integrity();
     }
 }
