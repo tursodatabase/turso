@@ -24,7 +24,8 @@ pub struct DumbLruPageCache {
     capacity: usize,
     map: RefCell<PageHashMap>,
     clock_hand: RefCell<usize>,
-    pages: RefCell<Vec<NonNull<PageCacheEntry>>>,
+    pages: RefCell<Vec<Option<NonNull<PageCacheEntry>>>>,
+    free_list: RefCell<Vec<usize>>,
 }
 unsafe impl Send for DumbLruPageCache {}
 unsafe impl Sync for DumbLruPageCache {}
@@ -41,6 +42,7 @@ struct PageHashMap {
 struct HashMapNode {
     key: PageCacheKey,
     value: NonNull<PageCacheEntry>,
+    idx: usize,
 }
 
 #[derive(Debug, PartialEq)]
@@ -73,6 +75,7 @@ impl DumbLruPageCache {
             map: RefCell::new(PageHashMap::new(capacity)),
             clock_hand: RefCell::new(0),
             pages: RefCell::new(Vec::with_capacity(capacity)),
+            free_list: RefCell::new(Vec::new()),
         }
     }
 
@@ -119,8 +122,16 @@ impl DumbLruPageCache {
         let ptr_raw = Box::into_raw(entry);
         let ptr = unsafe { NonNull::new_unchecked(ptr_raw) };
 
-        self.pages.borrow_mut().push(ptr);
-        self.map.borrow_mut().insert(key, ptr);
+        let index_to_insert = if let Some(free_index) = self.free_list.borrow_mut().pop() {
+            self.pages.borrow_mut()[free_index] = Some(ptr);
+            free_index
+        } else {
+            let pages_len = self.pages.borrow().len();
+            self.pages.borrow_mut().push(Some(ptr));
+            pages_len
+        };
+
+        self.map.borrow_mut().insert(key, ptr, index_to_insert);
         Ok(())
     }
 
@@ -131,18 +142,16 @@ impl DumbLruPageCache {
 
     // Returns Ok if key is not found
     pub fn _delete(&mut self, key: PageCacheKey, clean_page: bool) -> Result<(), CacheError> {
-        let mut ptr = match self.map.borrow_mut().remove(&key) {
-            Some(ptr) => ptr,
-            None => return Ok(()), // Key not in cache, success.
+        let Some((mut ptr, index_to_free)) = self.map.borrow_mut().remove_with_index(&key) else {
+            return Ok(());
         };
-
         let entry_mut = unsafe { ptr.as_mut() };
         if entry_mut.page.is_locked() {
-            self.map.borrow_mut().insert(key, ptr);
+            self.map.borrow_mut().insert(key, ptr, index_to_free);
             return Err(CacheError::Locked);
         }
         if entry_mut.page.is_dirty() {
-            self.map.borrow_mut().insert(key, ptr);
+            self.map.borrow_mut().insert(key, ptr, index_to_free);
             return Err(CacheError::Dirty {
                 pgno: entry_mut.page.get().id,
             });
@@ -153,14 +162,13 @@ impl DumbLruPageCache {
             let _ = entry_mut.page.get().contents.take();
         }
 
-        self.pages
-            .borrow_mut()
-            .retain(|p| !std::ptr::eq(p.as_ptr(), ptr.as_ptr()));
+        self.pages.borrow_mut()[index_to_free] = None;
+
+        self.free_list.borrow_mut().push(index_to_free);
 
         unsafe {
             let _ = Box::from_raw(ptr.as_ptr());
         };
-
         Ok(())
     }
 
@@ -216,7 +224,12 @@ impl DumbLruPageCache {
 
                 for _ in 0..(len * 2) {
                     *clock_hand %= len;
-                    let entry = unsafe { pages[*clock_hand].as_ref() };
+                    let Some(pointer) = &pages[*clock_hand] else {
+                        *clock_hand = *clock_hand + 1;
+                        continue;
+                    };
+
+                    let entry = unsafe { pointer.as_ref() };
 
                     if entry.use_bit.get() {
                         entry.use_bit.set(false);
@@ -252,6 +265,7 @@ impl DumbLruPageCache {
     pub fn clear(&mut self) -> Result<(), CacheError> {
         self.map.borrow_mut().clear();
         for ptr in self.pages.borrow_mut().drain(..) {
+            let Some(ptr) = ptr else { continue };
             let entry = unsafe { ptr.as_ref() };
 
             if entry.page.is_locked() {
@@ -317,6 +331,7 @@ impl PageHashMap {
         &mut self,
         key: PageCacheKey,
         value: NonNull<PageCacheEntry>,
+        clock_idx: usize,
     ) -> Option<NonNull<PageCacheEntry>> {
         let bucket = self.hash(&key);
         let bucket = &mut self.buckets[bucket];
@@ -329,8 +344,28 @@ impl PageHashMap {
             }
             idx += 1;
         }
-        bucket.push(HashMapNode { key, value });
+        bucket.push(HashMapNode {
+            key,
+            value,
+            idx: clock_idx,
+        });
         self.size += 1;
+        None
+    }
+
+    pub fn remove_with_index(
+        &mut self,
+        key: &PageCacheKey,
+    ) -> Option<(NonNull<PageCacheEntry>, usize)> {
+        let bucket = self.hash(key);
+        let bucket = &mut self.buckets[bucket];
+        for i in 0..bucket.len() {
+            if bucket[i].key == *key {
+                let removed_node = bucket.remove(i);
+                self.size -= 1;
+                return Some((removed_node.value, removed_node.idx));
+            }
+        }
         None
     }
 
@@ -350,25 +385,6 @@ impl PageHashMap {
             idx += 1;
         }
         None
-    }
-
-    pub fn remove(&mut self, key: &PageCacheKey) -> Option<NonNull<PageCacheEntry>> {
-        let bucket = self.hash(key);
-        let bucket = &mut self.buckets[bucket];
-        let mut idx = 0;
-        while let Some(node) = bucket.get(idx) {
-            if node.key == *key {
-                break;
-            }
-            idx += 1;
-        }
-        if idx == bucket.len() {
-            None
-        } else {
-            let v = bucket.remove(idx);
-            self.size -= 1;
-            Some(v.value)
-        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -394,7 +410,7 @@ impl PageHashMap {
     pub fn rehash(&self, new_capacity: usize) -> PageHashMap {
         let mut new_hash_map = PageHashMap::new(new_capacity);
         for node in self.iter() {
-            new_hash_map.insert(node.key.clone(), node.value);
+            new_hash_map.insert(node.key.clone(), node.value, node.idx);
         }
         new_hash_map
     }
@@ -444,13 +460,6 @@ mod tests {
 
     fn page_has_content(page: &PageRef) -> bool {
         page.is_loaded() && page.get().contents.is_some()
-    }
-
-    fn get_entry_ptr(
-        cache: &DumbLruPageCache,
-        key: &PageCacheKey,
-    ) -> Option<NonNull<PageCacheEntry>> {
-        cache.map.borrow().get(key).copied()
     }
 
     // --- Basic Tests ---
@@ -719,13 +728,6 @@ mod tests {
                 "Cache length {} exceeded capacity {}",
                 cache.len(),
                 cache.capacity
-            );
-
-            // Check consistency between map and pages vector
-            assert_eq!(
-                cache.len(),
-                cache.pages.borrow().len(),
-                "Map and pages vector have different lengths"
             );
         }
     }
