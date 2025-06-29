@@ -695,7 +695,7 @@ impl Pager {
                         BtreePageAllocMode::Exact(root_page_num),
                     ));
 
-                    //  We want to use root_page_num but we got allocated allocated_page_id. We need to swap these two pages so that
+                    //  We want to be allocated root_page_num but we got allocated allocated_page_id. We need to swap these two pages so that
                     //  root pages remain clustered at the beginning of the file
                     let allocated_page_id = page.get().get().id as u32;
                     if allocated_page_id != root_page_num {
