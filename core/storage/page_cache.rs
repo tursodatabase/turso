@@ -639,7 +639,6 @@ mod tests {
         assert!(cache.get(&create_key(1)).is_some());
         assert!(cache.get(&create_key(2)).is_some());
 
-        // Can now insert more pages without eviction
         for i in 3..=5 {
             let _ = insert_page(&mut cache, i);
         }
@@ -658,12 +657,9 @@ mod tests {
         assert_eq!(cache.len(), 3);
         assert_eq!(cache.capacity, 3);
 
-        // Eviction should still happen on next insert
         let _ = insert_page(&mut cache, 4);
         assert_eq!(cache.len(), 3);
     }
-
-    // --- Fuzzing and Stress Tests ---
 
     #[test]
     fn test_page_cache_insert_sequential() {
@@ -693,7 +689,6 @@ mod tests {
 
             match op {
                 0 => {
-                    // Insert
                     let id = (rng.next_u64() % max_page_id) as usize;
                     let key = create_key(id);
                     if !cache.contains_key(&key) {
@@ -701,7 +696,6 @@ mod tests {
                     }
                 }
                 1 => {
-                    // Get (touch)
                     if cache.len() == 0 {
                         continue;
                     }
@@ -710,19 +704,16 @@ mod tests {
                     let _ = cache.get(&key);
                 }
                 2 => {
-                    // Delete
                     if cache.len() == 0 {
                         continue;
                     }
                     let id = (rng.next_u64() % max_page_id) as usize;
                     let key = create_key(id);
-                    // We don't care about the result, just that it doesn't panic
                     let _ = cache.delete(key);
                 }
                 _ => unreachable!(),
             }
 
-            // The most important invariant: cache length must not exceed capacity
             assert!(
                 cache.len() <= cache.capacity,
                 "Cache length {} exceeded capacity {}",
@@ -730,5 +721,145 @@ mod tests {
                 cache.capacity
             );
         }
+    }
+
+    #[test]
+    fn test_hot_and_cold_eviction() {
+        let mut cache = DumbLruPageCache::new(10);
+
+        for i in 1..=10 {
+            insert_page(&mut cache, i);
+        }
+
+        assert!(cache.get(&create_key(5)).is_some());
+        assert!(cache.get(&create_key(6)).is_some());
+
+        insert_page(&mut cache, 11);
+        insert_page(&mut cache, 12);
+        insert_page(&mut cache, 13);
+
+        assert_eq!(cache.len(), 10, "Cache should remain at full capacity");
+
+        assert!(
+            cache.get(&create_key(5)).is_some(),
+            "Hot page 5 should still be in cache"
+        );
+        assert!(
+            cache.get(&create_key(6)).is_some(),
+            "Hot page 6 should still be in cache"
+        );
+
+        assert!(
+            cache.get(&create_key(1)).is_none()
+                || cache.get(&create_key(2)).is_none()
+                || cache.get(&create_key(3)).is_none(),
+            "At least one of the cold pages should have been evicted"
+        );
+    }
+
+    #[test]
+    fn test_pinned_pages_are_skipped_during_eviction() {
+        let mut cache = DumbLruPageCache::new(5);
+
+        for i in 1..=5 {
+            insert_page(&mut cache, i);
+        }
+
+        cache.peek(&create_key(1)).unwrap().set_dirty();
+        cache.peek(&create_key(2)).unwrap().set_dirty();
+        cache.peek(&create_key(3)).unwrap().set_dirty();
+
+        insert_page(&mut cache, 6);
+        insert_page(&mut cache, 7);
+
+        assert_eq!(cache.len(), 5, "Cache should be at full capacity");
+
+        assert!(
+            cache.get(&create_key(1)).is_some(),
+            "Pinned page 1 should not be evicted"
+        );
+        assert!(
+            cache.get(&create_key(2)).is_some(),
+            "Pinned page 2 should not be evicted"
+        );
+        assert!(
+            cache.get(&create_key(3)).is_some(),
+            "Pinned page 3 should not be evicted"
+        );
+
+        assert!(
+            cache.get(&create_key(4)).is_none(),
+            "Page 4 should have been evicted"
+        );
+        assert!(
+            cache.get(&create_key(5)).is_none(),
+            "Page 5 should have been evicted"
+        );
+
+        assert!(
+            cache.get(&create_key(6)).is_some(),
+            "New page 6 should be in cache"
+        );
+        assert!(
+            cache.get(&create_key(7)).is_some(),
+            "New page 7 should be in cache"
+        );
+    }
+
+    #[test]
+    fn test_delete_and_reinsert_reuses_slots() {
+        let mut cache = DumbLruPageCache::new(5);
+
+        for i in 1..=5 {
+            insert_page(&mut cache, i);
+        }
+        assert_eq!(cache.len(), 5);
+        assert!(
+            cache.free_list.borrow().is_empty(),
+            "Free list should be empty initially"
+        );
+
+        assert!(cache.delete(create_key(2)).is_ok());
+        assert!(cache.delete(create_key(3)).is_ok());
+        assert!(cache.delete(create_key(4)).is_ok());
+
+        assert_eq!(cache.len(), 2, "Cache length should be 2 after deletions");
+        assert_eq!(
+            cache.free_list.borrow().len(),
+            3,
+            "Free list should contain 3 reusable slots"
+        );
+
+        insert_page(&mut cache, 6);
+        insert_page(&mut cache, 7);
+        insert_page(&mut cache, 8);
+
+        assert_eq!(cache.len(), 5, "Cache should be full again");
+        assert!(
+            cache.free_list.borrow().is_empty(),
+            "Free list should be empty after reuse"
+        );
+
+        assert!(
+            cache.get(&create_key(1)).is_some(),
+            "Original page 1 should still exist"
+        );
+        assert!(
+            cache.get(&create_key(5)).is_some(),
+            "Original page 5 should still exist"
+        );
+
+        assert!(
+            cache.get(&create_key(6)).is_some(),
+            "New page 6 should have been added"
+        );
+        assert!(
+            cache.get(&create_key(7)).is_some(),
+            "New page 7 should have been added"
+        );
+        assert!(
+            cache.get(&create_key(8)).is_some(),
+            "New page 8 should have been added"
+        );
     }
 }
