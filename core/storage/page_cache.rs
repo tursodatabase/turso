@@ -102,7 +102,7 @@ impl DumbLruPageCache {
         ignore_exists: bool,
     ) -> Result<(), CacheError> {
         trace!("insert(key={:?})", key);
-        // Check first if page already exists in cache
+
         if !ignore_exists {
             if let Some(existing_page_ref) = self.get(&key) {
                 assert!(
@@ -225,7 +225,7 @@ impl DumbLruPageCache {
                 for _ in 0..(len * 2) {
                     *clock_hand %= len;
                     let Some(pointer) = &pages[*clock_hand] else {
-                        *clock_hand = *clock_hand + 1;
+                        *clock_hand += 1;
                         continue;
                     };
 
@@ -233,13 +233,13 @@ impl DumbLruPageCache {
 
                     if entry.use_bit.get() {
                         entry.use_bit.set(false);
-                        *clock_hand = *clock_hand + 1;
+                        *clock_hand += 1;
                     } else {
                         key_to_delete = Some(entry.key.clone());
                         break;
                     }
                 }
-            } // All borrows on clock_hand and pages are dropped here
+            }
 
             if let Some(key) = key_to_delete {
                 let delete_res = self._delete(key, true);
@@ -247,7 +247,7 @@ impl DumbLruPageCache {
                     need_to_evict -= 1;
                 } else {
                     let mut clock_hand = self.clock_hand.borrow_mut();
-                    *clock_hand = *clock_hand + 1;
+                    *clock_hand += 1;
                     evict_failed = true;
                 }
             } else {
