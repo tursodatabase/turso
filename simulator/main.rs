@@ -1,9 +1,6 @@
 #![allow(clippy::arc_with_non_send_sync, dead_code)]
 use anyhow::{anyhow, Context};
 use clap::Parser;
-use limbo_sim::generation::plan::{Interaction, InteractionPlan, InteractionPlanState};
-use limbo_sim::generation::ArbitraryFrom as _;
-use limbo_sim::model::Shadow as _;
 use notify::event::{DataChange, ModifyKind};
 use notify::{EventKind, RecursiveMode, Watcher};
 use rand::prelude::*;
@@ -21,6 +18,9 @@ use tracing_subscriber::field::MakeExt;
 use tracing_subscriber::fmt::format;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use turso_sim::generation::plan::{Interaction, InteractionPlan, InteractionPlanState};
+use turso_sim::generation::ArbitraryFrom as _;
+use turso_sim::model::Shadow as _;
 
 use crate::runner::env::TursoSimulatorEnv;
 use crate::shrink::plan::shrink_interaction_plan;

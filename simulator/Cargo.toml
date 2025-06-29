@@ -1,21 +1,21 @@
-# Copyright 2024 the Limbo authors. All rights reserved. MIT license.
+# Copyright 2024 the Turso authors. All rights reserved. MIT license.
 
 [package]
-name = "limbo_sim"
+name = "turso_sim"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The Limbo deterministic simulator"
+description = "The Turso deterministic simulator"
 publish = false
 
 [[bin]]
-name = "limbo_sim"
+name = "turso_sim"
 path = "main.rs"
 
 [lib]
-name = "limbo_sim"
+name = "turso_sim"
 path = "lib.rs"
 
 [dependencies]

@@ -1797,32 +1797,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "limbo_sim"
-version = "0.1.1"
-dependencies = [
- "anarchist-readable-name-generator-lib",
- "anyhow",
- "chrono",
- "clap",
- "dirs 6.0.0",
- "env_logger 0.10.2",
- "hex",
- "log",
- "notify",
- "rand 0.8.5",
- "rand_chacha 0.3.1",
- "regex",
- "regex-syntax 0.8.5",
- "rusqlite",
- "serde",
- "serde_json",
- "tracing",
- "tracing-subscriber",
- "turso_core",
- "turso_sqlite3_parser",
-]
-
-[[package]]
 name = "limbo_sqlite3"
 version = "0.1.1"
 dependencies = [
@@ -3747,6 +3721,32 @@ dependencies = [
  "napi-build",
  "napi-derive",
  "turso_core",
+]
+
+[[package]]
+name = "turso_sim"
+version = "0.1.1"
+dependencies = [
+ "anarchist-readable-name-generator-lib",
+ "anyhow",
+ "chrono",
+ "clap",
+ "dirs 6.0.0",
+ "env_logger 0.10.2",
+ "hex",
+ "log",
+ "notify",
+ "rand 0.8.5",
+ "rand_chacha 0.3.1",
+ "regex",
+ "regex-syntax 0.8.5",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "turso_core",
+ "turso_sqlite3_parser",
 ]
 
 [[package]]

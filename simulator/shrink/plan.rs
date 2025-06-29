@@ -1,4 +1,4 @@
-use limbo_sim::{
+use turso_sim::{
     generation::{
         plan::{Interaction, InteractionPlan, Interactions},
         property::Property,

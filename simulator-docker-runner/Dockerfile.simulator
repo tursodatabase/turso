@@ -23,7 +23,7 @@ COPY sqlite3 ./sqlite3/
 COPY stress ./stress/
 COPY tests ./tests/
 COPY testing/sqlite_test_ext ./testing/sqlite_test_ext
-RUN cargo chef prepare --bin limbo_sim --recipe-path recipe.json
+RUN cargo chef prepare --bin turso_sim --recipe-path recipe.json
 
 #
 # Build the project.
@@ -32,14 +32,14 @@ RUN cargo chef prepare --bin limbo_sim --recipe-path recipe.json
 FROM chef AS builder 
 
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --bin limbo_sim --release --recipe-path recipe.json
+RUN cargo chef cook --bin turso_sim --release --recipe-path recipe.json
 COPY --from=planner /app/core ./core/
 COPY --from=planner /app/vendored ./vendored/
 COPY --from=planner /app/extensions ./extensions/
 COPY --from=planner /app/macros ./macros/
 COPY --from=planner /app/simulator ./simulator/
 
-RUN cargo build --bin limbo_sim --release
+RUN cargo build --bin turso_sim --release
 
 #
 # The final image.
@@ -62,13 +62,13 @@ ARG GIT_HASH
 ENV GIT_HASH=${GIT_HASH:-unknown}
 
 WORKDIR /app
-COPY --from=builder /app/target/release/limbo_sim /app/limbo_sim
+COPY --from=builder /app/target/release/turso_sim /app/turso_sim
 COPY simulator-docker-runner/package.json simulator-docker-runner/bun.lock simulator-docker-runner/tsconfig.json ./
 RUN bun install
 COPY simulator-docker-runner/* ./
 
 RUN chmod +x /app/docker-entrypoint.simulator.ts
-RUN chmod +x /app/limbo_sim
+RUN chmod +x /app/turso_sim
 
 ENTRYPOINT ["bun", "/app/docker-entrypoint.simulator.ts"]
 # Arguments can be passed at runtime

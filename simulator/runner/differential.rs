@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use turso_core::Value;
-use limbo_sim::{
+use turso_sim::{
     generation::{
         pick_index,
         plan::{Interaction, InteractionPlan, InteractionPlanState, ResultSet},

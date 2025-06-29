@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use limbo_sim::{
+use turso_sim::{
     generation::{
         pick_index,
         plan::{Interaction, InteractionPlanState},

@@ -1,10 +1,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use limbo_sim::model::{table::Table, SimConnection, SimulatorEnv, SimulatorOpts};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::{Database, IO};
+use turso_sim::model::{table::Table, SimConnection, SimulatorEnv, SimulatorOpts};
 
 use crate::runner::io::SimulatorIO;
 
