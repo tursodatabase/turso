@@ -15,9 +15,6 @@ experimental_indexes = []
 antithesis = ["turso_core/antithesis"]
 futures = ["dep:futures-util"]
 
-[features]
-antithesis = ["limbo_core/antithesis"]
-
 [dependencies]
 turso_core = { workspace = true, features = ["io_uring"] }
 thiserror = "2.0.9"
