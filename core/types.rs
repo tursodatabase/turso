@@ -1035,10 +1035,10 @@ impl ImmutableRecord {
 
 #[derive(Debug, Default)]
 pub struct RecordCursor {
-    serial_types: Vec<u64>, // Parsed serial types
-    offsets: Vec<usize>,    // Offsets into payload (one per column + final end)
-    header_size: usize,     // Total header size in bytes
-    header_offset: usize,   // Cursor position while parsing header
+    pub serial_types: Vec<u64>,
+    pub offsets: Vec<usize>,
+    pub header_size: usize,
+    pub header_offset: usize,
 }
 
 impl RecordCursor {
@@ -1054,7 +1054,7 @@ impl RecordCursor {
     pub fn with_capacity(num_columns: usize) -> Self {
         Self {
             serial_types: Vec::with_capacity(num_columns),
-            offsets: Vec::with_capacity(num_columns),
+            offsets: Vec::with_capacity(num_columns + 1),
             header_size: 0,
             header_offset: 0,
         }
@@ -1694,22 +1694,22 @@ pub fn compare_records_generic(
         return Ok(std::cmp::Ordering::Less);
     }
 
-    let (header_size, mut pos) = read_varint(payload)?;
+    let (header_size, mut header_pos) = read_varint(payload)?;
     let header_end = header_size as usize;
     debug_assert!(header_end <= payload.len());
 
-    let mut serial_types = Vec::new();
-    while pos < header_end {
-        let (serial_type, bytes_read) = read_varint(&payload[pos..])?;
-        serial_types.push(serial_type);
-        pos += bytes_read;
-    }
-
     let mut data_pos = header_size as usize;
 
-    // Skip over `skip` fields
-    for i in 0..skip {
-        let serial_type = SerialType::try_from(serial_types[i])?;
+    // Skip over `skip` number of fields
+    for _ in 0..skip {
+        if header_pos >= header_end {
+            break;
+        }
+
+        let (serial_type_raw, bytes_read) = read_varint(&payload[header_pos..])?;
+        header_pos += bytes_read;
+
+        let serial_type = SerialType::try_from(serial_type_raw)?;
         if !matches!(
             serial_type.kind(),
             SerialTypeKind::ConstInt0 | SerialTypeKind::ConstInt1 | SerialTypeKind::Null
@@ -1718,12 +1718,15 @@ pub fn compare_records_generic(
         }
     }
 
-    for i in skip..unpacked.len().min(serial_types.len()) {
-        let serial_type = SerialType::try_from(serial_types[i])?;
-        let rhs_value = &unpacked[i]; // key value
+    let mut field_idx = skip;
+    while field_idx < unpacked.len() && header_pos < header_end {
+        let (serial_type_raw, bytes_read) = read_varint(&payload[header_pos..])?;
+        header_pos += bytes_read;
+
+        let serial_type = SerialType::try_from(serial_type_raw)?;
+        let rhs_value = &unpacked[field_idx];
 
         let lhs_value = match serial_type.kind() {
-            // record value
             SerialTypeKind::ConstInt0 => RefValue::Integer(0),
             SerialTypeKind::ConstInt1 => RefValue::Integer(1),
             SerialTypeKind::Null => RefValue::Null,
@@ -1734,19 +1737,15 @@ pub fn compare_records_generic(
             }
         };
 
-        // Use the existing partial_cmp implementation for type ordering and basic comparison
         let comparison = match (&lhs_value, rhs_value) {
-            // Special case: Text comparison with collation support
             (RefValue::Text(lhs_text), RefValue::Text(rhs_text)) => {
-                if let Some(collation) = collations.get(i) {
+                if let Some(collation) = collations.get(field_idx) {
                     collation.compare_strings(lhs_text.as_str(), rhs_text.as_str())
                 } else {
-                    // Use existing partial_cmp for binary text comparison
-                    lhs_value.partial_cmp(rhs_value).unwrap()
+                    lhs_text.value.to_slice().cmp(rhs_text.value.to_slice())
                 }
             }
 
-            // Special case: Integer vs Float comparison using sqlite_int_float_compare
             (RefValue::Integer(lhs_int), RefValue::Float(rhs_float)) => {
                 sqlite_int_float_compare(*lhs_int, *rhs_float)
             }
@@ -1758,18 +1757,18 @@ pub fn compare_records_generic(
             _ => lhs_value.partial_cmp(rhs_value).unwrap(),
         };
 
-        let final_comparison = match index_info.sort_order.get_sort_order_for_col(i) {
+        let final_comparison = match index_info.sort_order.get_sort_order_for_col(field_idx) {
             SortOrder::Asc => comparison,
             SortOrder::Desc => comparison.reverse(),
         };
 
-        // Early exit if fields are not equal
         if final_comparison != std::cmp::Ordering::Equal {
             return Ok(final_comparison);
         }
+
+        field_idx += 1;
     }
 
-    // All compared fields equal: use caller-provided tie_breaker
     Ok(tie_breaker)
 }
 
