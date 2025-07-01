@@ -23,8 +23,7 @@ use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_write_wal_frame, finish_read_page, WAL_FRAME_HEADER_SIZE,
     WAL_HEADER_SIZE,
 };
-use crate::{assert_always, assert_always_greater_than, assert_always_less_than_or_equal_to};
-use crate::{Buffer, Result};
+use crate::{turso_assert, Buffer, Result};
 use crate::{Completion, Page};
 
 use self::sqlite3_ondisk::{checksum_wal, PageContent, WAL_MAGIC_BE, WAL_MAGIC_LE};
@@ -180,7 +179,7 @@ impl LimboRwLock {
                         Ordering::SeqCst,
                         Ordering::SeqCst,
                     );
-                    assert_always!(
+                    turso_assert!(
                         res.is_ok(),
                         "[LimboRwLock - unlock] SHARED_LOCK: result should be ok"
                     );
@@ -190,7 +189,7 @@ impl LimboRwLock {
                 let res =
                     self.lock
                         .compare_exchange(lock, NO_LOCK, Ordering::SeqCst, Ordering::SeqCst);
-                assert_always!(
+                turso_assert!(
                     res.is_ok(),
                     "[LimboRwLock - unlock] WRITE_LOCK: result should be ok"
                 );
@@ -719,7 +718,7 @@ impl Wal for WalFile {
         write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<CheckpointStatus> {
-        assert_always!(
+        turso_assert!(
             matches!(mode, CheckpointMode::Passive),
             "[WalFile - checkpoint] only passive mode supported for now"
         );
@@ -767,9 +766,8 @@ impl Wal for WalFile {
 
                     let frame_cache = shared.frame_cache.clone();
                     let frame_cache = frame_cache.lock();
-                    assert_always_less_than_or_equal_to!(
-                        self.ongoing_checkpoint.current_page as usize,
-                        pages_in_frames.len(),
+                    turso_assert!(
+                        self.ongoing_checkpoint.current_page as usize <= pages_in_frames.len(),
                         "[WalFile - checkpoint] Current page index should be less than all pages in frames"
                     );
                     if self.ongoing_checkpoint.current_page as usize == pages_in_frames.len() {
@@ -1009,9 +1007,8 @@ impl WalFile {
     }
 
     fn frame_offset(&self, frame_id: u64) -> usize {
-        assert_always_greater_than!(
-            frame_id,
-            0,
+        turso_assert!(
+            frame_id > 0,
             "[WalFile - frame_offset] Frame ID must be 1-based"
         );
         let page_offset = (frame_id - 1) * (self.page_size() + WAL_FRAME_HEADER_SIZE as u32) as u64;

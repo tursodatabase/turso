@@ -1,7 +1,6 @@
 use std::cell::{Cell, UnsafeCell};
 
-use crate::assert_always;
-use crate::Value;
+use crate::{turso_assert, Value};
 
 use super::jsonb::Jsonb;
 
@@ -117,7 +116,7 @@ impl JsonCacheCell {
         key: &Value,
         value: impl Fn(&Value) -> crate::Result<Jsonb>,
     ) -> crate::Result<Jsonb> {
-        assert_always!(
+        turso_assert!(
             !self.accessed.get(),
             "[JsonCacheCell - get_or_insert_with] must not have accesed cache"
         );
@@ -152,7 +151,7 @@ impl JsonCacheCell {
     }
 
     pub fn clear(&mut self) {
-        assert_always!(
+        turso_assert!(
             !self.accessed.get(),
             "[JsonCacheCell - clear] must not have accesed cache"
         );

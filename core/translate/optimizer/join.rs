@@ -3,13 +3,12 @@ use std::{cell::RefCell, collections::HashMap};
 use turso_sqlite3_parser::ast::TableInternalId;
 
 use crate::{
-    assert_always_eq, assert_always_greater_than,
     translate::{
         optimizer::{cost::Cost, order::plan_satisfies_order_target},
         plan::{JoinOrderMember, JoinedTable},
         planner::TableMask,
     },
-    Result,
+    turso_assert, turso_assert_eq, Result,
 };
 
 use super::{
@@ -195,7 +194,7 @@ pub fn compute_best_join_order<'a>(
             original_idx: i,
             is_outer: false,
         };
-        assert_always_eq!(
+        turso_assert_eq!(
             join_order.len(),
             1,
             "[compute_best_join_order] - there should only be 1 join order"
@@ -312,7 +311,7 @@ pub fn compute_best_join_order<'a>(
                         .as_ref()
                         .map_or(false, |j| j.outer),
                 });
-                assert_always_eq!(join_order.len(), subset_size, "[compute_best_join_order] - join order size should be equal to the subset size");
+                turso_assert_eq!(join_order.len(), subset_size, "[compute_best_join_order] - join order size should be equal to the subset size");
 
                 // Calculate the best way to join LHS with RHS.
                 let rel = join_lhs_and_rhs(
@@ -403,9 +402,8 @@ pub fn compute_naive_left_deep_plan<'a>(
     constraints: &'a [TableConstraints],
 ) -> Result<JoinN> {
     let n = joined_tables.len();
-    assert_always_greater_than!(
-        n,
-        0,
+    turso_assert!(
+        n > 0,
         "[compute_naive_left_deep_plan] - joined tables should not be empty"
     );
 

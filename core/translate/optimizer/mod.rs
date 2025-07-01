@@ -13,10 +13,10 @@ use turso_sqlite3_parser::{
 };
 
 use crate::{
-    assert_always, assert_always_eq,
     parameters::PARAM_PREFIX,
     schema::{Index, IndexColumn, Schema, Table},
     translate::{expr::walk_expr_mut, plan::TerminationKey},
+    turso_assert, turso_assert_eq,
     types::SeekOp,
     Result,
 };
@@ -308,14 +308,14 @@ fn optimize_table_access(
             });
         } else {
             let constraint_refs = access_method.constraint_refs;
-            assert_always!(
+            turso_assert!(
                 !constraint_refs.is_empty(),
                 "[optimize_table_access] constraints should not be empty"
             );
             for cref in constraint_refs.iter() {
                 let constraint =
                     &constraints_per_table[table_idx].constraints[cref.constraint_vec_pos];
-                assert_always!(
+                turso_assert!(
                     !where_clause[constraint.where_clause_pos.0].consumed.get(),
                     "trying to consume a where clause term twice"
                 );
@@ -340,7 +340,7 @@ fn optimize_table_access(
                 });
                 continue;
             }
-            assert_always_eq!(
+            turso_assert_eq!(
                 constraint_refs.len(),
                 1,
                 "[optimize_table_access] expected exactly one constraint for rowid seek"
@@ -842,7 +842,7 @@ pub fn build_seek_def_from_constraints(
     iter_dir: IterationDirection,
     where_clause: &[WhereTerm],
 ) -> Result<SeekDef> {
-    assert_always!(
+    turso_assert!(
         !constraint_refs.is_empty(),
         "[build_seek_def_from_constraints] - cannot build seek def from empty list of constraint refs"
     );

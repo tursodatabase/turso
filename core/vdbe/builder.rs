@@ -4,7 +4,6 @@ use tracing::{instrument, Level};
 use turso_sqlite3_parser::ast::{self, TableInternalId};
 
 use crate::{
-    assert_always, assert_always_eq,
     numeric::Numeric,
     parameters::Parameters,
     schema::{BTreeTable, Index, PseudoCursorType, Table},
@@ -13,7 +12,7 @@ use crate::{
         emitter::TransactionMode,
         plan::{ResultSetColumn, TableReferences},
     },
-    Connection, Value, VirtualTable,
+    turso_assert, turso_assert_eq, Connection, Value, VirtualTable,
 };
 
 #[derive(Default)]
@@ -260,7 +259,7 @@ impl ProgramBuilder {
     }
 
     pub fn alloc_cursor_id_keyed(&mut self, key: CursorKey, cursor_type: CursorType) -> usize {
-        assert_always!(
+        turso_assert!(
             !self
                 .cursor_ref
                 .iter()
@@ -278,7 +277,7 @@ impl ProgramBuilder {
         let cursor = self.next_free_cursor_id;
         self.next_free_cursor_id += 1;
         self.cursor_ref.push((key, cursor_type));
-        assert_always_eq!(
+        turso_assert_eq!(
             self.cursor_ref.len(),
             self.next_free_cursor_id,
             "[ProgramBuilder - _alloc_cursor_id] next cursor id mismatch"
@@ -452,7 +451,7 @@ impl ProgramBuilder {
     /// reordering the emitted instructions.
     #[inline]
     pub fn preassign_label_to_next_insn(&mut self, label: BranchOffset) {
-        assert_always!(
+        turso_assert!(
             label.is_label(),
             "[ProgramBuilder - preassign_label_to_next_insn] BranchOffset is not a label"
         );
@@ -472,11 +471,11 @@ impl ProgramBuilder {
     }
 
     fn _resolve_label(&mut self, label: BranchOffset, to_offset: BranchOffset, target: JumpTarget) {
-        assert_always!(
+        turso_assert!(
             matches!(label, BranchOffset::Label(_)),
             "[ProgramBuilder - _resolve_label] should be a label"
         );
-        assert_always!(
+        turso_assert!(
             matches!(to_offset, BranchOffset::Offset(_)),
             "[ProgramBuilder - _resolve_label] should be an offset"
         );

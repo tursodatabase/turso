@@ -6,8 +6,7 @@ use crate::storage::header_accessor;
 use crate::storage::sqlite3_ondisk::{self, DatabaseHeader, PageContent, PageType};
 use crate::storage::wal::{CheckpointResult, Wal, WalFsyncStatus};
 use crate::types::CursorResult;
-use crate::{assert_always, assert_always_eq};
-use crate::{Buffer, LimboError, Result};
+use crate::{turso_assert, turso_assert_eq, Buffer, LimboError, Result};
 use crate::{Completion, WalFile};
 use parking_lot::RwLock;
 use std::cell::{OnceCell, RefCell, UnsafeCell};
@@ -496,18 +495,14 @@ impl Pager {
                     Ok(CursorResult::Ok(page_id as u32))
                 }
                 AutoVacuumMode::Full => {
-                    use crate::{
-                        assert_always_greater_than, assert_always_greater_than_or_equal_to,
-                    };
-
                     let mut root_page_num =
                         header_accessor::get_vacuum_mode_largest_root_page(self)?;
                     //  Largest root page number cannot be 0 because that is set to 1 when creating the database with autovacuum enabled
-                    assert_always_greater_than!(root_page_num, 0, "[Pager - btree_create] Largest root page number cannot be 0 because that is set to 1 when creating the database with autovacuum enabled");
+                    turso_assert!(root_page_num > 0, "[Pager - btree_create] Largest root page number cannot be 0 because that is set to 1 when creating the database with autovacuum enabled");
                     root_page_num += 1;
                     //  can never be less than 2 because we have already incremented
-                    assert_always_greater_than_or_equal_to!(
-                        root_page_num,
+                    turso_assert!(
+                        root_page_num >=
                         FIRST_PTRMAP_PAGE_NO,
                         "[Pager - btree_create] root_page can never be less than 2 because we have already incremented"
                     );
@@ -518,9 +513,8 @@ impl Pager {
                     ) {
                         root_page_num += 1;
                     }
-                    assert_always_greater_than_or_equal_to!(
-                        root_page_num,
-                        3,
+                    turso_assert!(
+                        root_page_num >= 3,
                         "[Pager - btree_create] root page must be at least 3"
                     ); //  the very first root page is page 3
 
@@ -975,7 +969,7 @@ impl Pager {
 
         let page = match page {
             Some(page) => {
-                assert_always_eq!(
+                turso_assert_eq!(
                     page.get().id,
                     page_id,
                     "[Pager - free_page] Page id mismatch"
@@ -1172,7 +1166,7 @@ impl Pager {
         let page_key = PageCacheKey::new(id);
 
         // FIXME: use specific page key for writer instead of max frame, this will make readers not conflict
-        assert_always!(
+        turso_assert!(
             page.is_dirty(),
             "[Pager - update_dirty_loaded_page_in_cache] page should be dirty"
         );
@@ -1280,9 +1274,7 @@ impl CreateBTreeFlags {
 */
 #[cfg(not(feature = "omit_autovacuum"))]
 mod ptrmap {
-    use crate::assert_always_greater_than_or_equal_to;
-
-    use crate::{storage::sqlite3_ondisk::MIN_PAGE_SIZE, LimboError, Result};
+    use crate::{storage::sqlite3_ondisk::MIN_PAGE_SIZE, turso_assert, LimboError, Result};
 
     // Constants
     pub const PTRMAP_ENTRY_SIZE: usize = 5;
@@ -1350,9 +1342,8 @@ mod ptrmap {
     /// Calculates how many database pages are mapped by a single pointer map page.
     /// This is based on the total page size, as ptrmap pages are filled with entries.
     pub fn entries_per_ptrmap_page(page_size: usize) -> usize {
-        assert_always_greater_than_or_equal_to!(
-            page_size,
-            MIN_PAGE_SIZE as usize,
+        turso_assert!(
+            page_size >= MIN_PAGE_SIZE as usize,
             "[PtrmapEntry - entries_per_ptrmap_page] page_size should be bigger than minimum"
         );
         page_size / PTRMAP_ENTRY_SIZE
@@ -1361,9 +1352,8 @@ mod ptrmap {
     /// Calculates the cycle length of pointer map pages
     /// The cycle length is the number of database pages that are mapped by a single pointer map page.
     pub fn ptrmap_page_cycle_length(page_size: usize) -> usize {
-        assert_always_greater_than_or_equal_to!(
-            page_size,
-            MIN_PAGE_SIZE as usize,
+        turso_assert!(
+            page_size >= MIN_PAGE_SIZE as usize,
             "[PtrmapEntry - ptrmap_page_cycle_length] page_size should be bigger than minimum"
         );
         (page_size / PTRMAP_ENTRY_SIZE) + 1

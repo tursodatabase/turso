@@ -2,9 +2,9 @@ use fallible_iterator::FallibleIterator as _;
 use turso_sqlite3_parser::{ast, lexer::sql::Parser};
 
 use crate::{
-    assert_always_eq, assert_always_ne,
     function::{AlterTableFunc, Func},
     schema::{Column, Schema},
+    turso_assert_eq, turso_assert_ne,
     util::normalize_ident,
     vdbe::{
         builder::{ProgramBuilder, QueryMode},
@@ -49,7 +49,7 @@ pub fn translate_alter_table(
             let ast::Name(column_name) = column_name;
 
             // Tables always have at least one column.
-            assert_always_ne!(
+            turso_assert_ne!(
                 btree.columns.len(),
                 0,
                 "[translate_alter_table] Tables always have at least one column"
@@ -254,7 +254,7 @@ pub fn translate_alter_table(
 
             program.cursor_loop(cursor_id, |program, rowid| {
                 let sqlite_schema_column_len = sqlite_schema.columns.len();
-                assert_always_eq!(
+                turso_assert_eq!(
                     sqlite_schema_column_len,
                     5,
                     "[translate_alter_table] RenameColumn: sqlite schema should have 5 columns"
@@ -339,7 +339,7 @@ pub fn translate_alter_table(
 
             program.cursor_loop(cursor_id, |program, rowid| {
                 let sqlite_schema_column_len = sqlite_schema.columns.len();
-                assert_always_eq!(
+                turso_assert_eq!(
                     sqlite_schema_column_len,
                     5,
                     "[translate_alter_table] RenameTo: sqlite schema should have 5 columns"

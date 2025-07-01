@@ -1,6 +1,6 @@
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::SelectPlan;
-use crate::{assert_always, LimboError, VirtualTable};
+use crate::{turso_assert, LimboError, VirtualTable};
 use crate::{util::normalize_ident, Result};
 use core::fmt;
 use fallible_iterator::FallibleIterator;
@@ -1012,7 +1012,7 @@ impl Index {
         table: &BTreeTable,
         auto_indices: Vec<(String, usize)>,
     ) -> Result<Vec<Index>> {
-        assert_always!(!auto_indices.is_empty(), "Auto Indices is not empty");
+        turso_assert!(!auto_indices.is_empty(), "Auto Indices is not empty");
 
         let mut indices = Vec::with_capacity(auto_indices.len());
 

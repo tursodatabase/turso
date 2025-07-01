@@ -4,12 +4,12 @@ use turso_sqlite3_parser::ast::{self, SortOrder};
 use std::sync::Arc;
 
 use crate::{
-    assert_always, assert_always_eq,
     schema::{Affinity, Index, IndexColumn, Table},
     translate::{
         plan::{DistinctCtx, Distinctness},
         result_row::emit_select_result,
     },
+    turso_assert, turso_assert_eq,
     types::SeekOp,
     vdbe::{
         builder::{CursorKey, CursorType, ProgramBuilder},
@@ -114,7 +114,7 @@ pub fn init_loop(
     mode: OperationMode,
     where_clause: &[WhereTerm],
 ) -> Result<()> {
-    assert_always_eq!(
+    turso_assert_eq!(
         t_ctx.meta_left_joins.len(),
         tables.joined_tables().len(),
         "[init_loop] meta_left_joins length does not match tables length"
@@ -125,7 +125,7 @@ pub fn init_loop(
         .enumerate()
         .filter(|(_, agg)| agg.is_distinct())
     {
-        assert_always_eq!(
+        turso_assert_eq!(
             agg.args.len(),
             1,
             "[init_loop] DISTINCT aggregate functions must have exactly one argument"
@@ -598,7 +598,7 @@ pub fn open_loop(
                 }
             }
             Operation::Search(search) => {
-                assert_always!(
+                turso_assert!(
                     !matches!(table.table, Table::FromClauseSubquery(_)),
                     "[open_loop] Subqueries do not support index seeks"
                 );
@@ -946,7 +946,7 @@ fn emit_loop_source(
             Ok(())
         }
         LoopEmitTarget::QueryResult => {
-            assert_always!(
+            turso_assert!(
                 plan.aggregates.is_empty(),
                 "[emit_loop_source] We should not get here with aggregates"
             );
@@ -1048,7 +1048,7 @@ pub fn close_loop(
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
             }
             Operation::Search(search) => {
-                assert_always!(
+                turso_assert!(
                     !matches!(table.table, Table::FromClauseSubquery(_)),
                     "[close_loop] Subqueries do not support index seeks"
                 );
@@ -1407,7 +1407,7 @@ fn emit_autoindex(
     index_cursor_id: CursorID,
     table_has_rowid: bool,
 ) -> Result<CursorID> {
-    assert_always!(index.ephemeral, "[emit_autoindex] index is not ephemeral");
+    turso_assert!(index.ephemeral, "[emit_autoindex] index is not ephemeral");
     // assert!(index.ephemeral, "Index {} is not ephemeral", index.name);
     let label_ephemeral_build_end = program.allocate_label();
     // Since this typically happens in an inner loop, we only build it once.

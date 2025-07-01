@@ -56,11 +56,7 @@ use crate::storage::pager::Pager;
 use crate::types::{
     ImmutableRecord, RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype,
 };
-use crate::{
-    assert_always, assert_always_eq, assert_always_greater_than_or_equal_to,
-    assert_always_less_than,
-};
-use crate::{File, Result, WalFileShared};
+use crate::{turso_assert, turso_assert_eq, File, Result, WalFileShared};
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
@@ -547,7 +543,7 @@ impl PageContent {
         // the page header is 12 bytes for interior pages, 8 bytes for leaf pages
         // this is because the 4 last bytes in the interior page's header are used for the rightmost pointer.
         let cell_pointer_array_start = self.header_size();
-        assert_always_less_than!(idx, ncells, "[PageContent - cell_get] idx out of bounds");
+        turso_assert!(idx < ncells, "[PageContent - cell_get] idx out of bounds");
         // assert!(
         //     idx < ncells,
         //     "cell_get: idx out of bounds: idx={}, ncells={}",
@@ -639,9 +635,8 @@ impl PageContent {
         let buf = self.as_ptr();
         let ncells = self.cell_count();
         let (cell_pointer_array_start, _) = self.cell_pointer_array_offset_and_size();
-        assert_always_less_than!(
-            idx,
-            ncells,
+        turso_assert!(
+            idx < ncells,
             "[PageContent - cell_get_raw_region] idx out of bounds"
         );
         let cell_pointer = cell_pointer_array_start + (idx * 2); // pointers are 2 bytes each
@@ -820,7 +815,7 @@ pub fn begin_write_btree_page(
 }
 
 pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>, syncing: Rc<RefCell<bool>>) -> Result<()> {
-    assert_always!(!*syncing.borrow(), "[begin_sync] should not be syncing");
+    turso_assert!(!*syncing.borrow(), "[begin_sync] should not be syncing");
     *syncing.borrow_mut() = true;
     let completion = Completion::new(CompletionType::Sync(SyncCompletion {
         complete: Box::new(move |_| {
@@ -1018,19 +1013,18 @@ impl<T: Default + Copy, const N: usize> SmallVec<T, N> {
     }
 
     fn get_from_heap(&self, index: usize) -> T {
-        assert_always!(
+        turso_assert!(
             self.extra_data.is_some(),
             "[SmallVec - get_from_heap] heap data should exist"
         );
-        assert_always_greater_than_or_equal_to!(
-            index,
-            self.data.len(),
+        turso_assert!(
+            index >= self.data.len(),
             "[SmallVec - get_from_heap] index should not reference stack allocated data"
         );
         let extra_data_index = index - self.data.len();
         let extra_data = self.extra_data.as_ref().unwrap();
-        assert_always_less_than!(
-            extra_data_index,
+        turso_assert!(
+            extra_data_index <
             extra_data.len(),
             "[SmallVec - get_from_heap] extra_data_index is smaller than the size of extra data on the heap"
         );
@@ -1081,9 +1075,8 @@ pub fn read_record(payload: &[u8], reuse_immutable: &mut ImmutableRecord) -> Res
 
     let mut pos = 0;
     let (header_size, nr) = read_varint(payload)?;
-    assert_always_greater_than_or_equal_to!(
-        header_size as usize,
-        nr,
+    turso_assert!(
+        header_size as usize >= nr,
         "[read_record] header size should be greater than or equal to nr"
     );
     let mut header_size = (header_size as usize) - nr;
@@ -1095,9 +1088,8 @@ pub fn read_record(payload: &[u8], reuse_immutable: &mut ImmutableRecord) -> Res
         validate_serial_type(serial_type)?;
         serial_types.push(serial_type);
         pos += nr;
-        assert_always_greater_than_or_equal_to!(
-            header_size,
-            nr,
+        turso_assert!(
+            header_size >= nr,
             "[read_record] loop_validation: header size should be greater than or equal to nr"
         );
         header_size -= nr;
@@ -1678,7 +1670,7 @@ pub fn checksum_wal(
     input: (u32, u32),
     native_endian: bool, // Sqlite interprets big endian as "native"
 ) -> (u32, u32) {
-    assert_always_eq!(
+    turso_assert_eq!(
         buf.len() % 8,
         0,
         "[checksum_wal] buffer must be a multiple of 8"

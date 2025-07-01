@@ -3,8 +3,8 @@ use std::cell::RefCell;
 use turso_sqlite3_parser::ast::{self, SortOrder, TableInternalId};
 
 use crate::{
-    assert_always_greater_than_or_equal_to,
     translate::plan::{GroupBy, IterationDirection, JoinedTable},
+    turso_assert,
     util::exprs_are_equivalent,
 };
 
@@ -124,9 +124,8 @@ pub fn compute_order_target(
             // we know that we don't need ORDER BY sorting anyway, because the GROUP BY will sort the result since
             // it contains all the necessary columns required for the ORDER BY, and the GROUP BY columns are now in the correct order.
             // First, however, we need to make sure the GROUP BY sorter's column sort directions match the ORDER BY requirements.
-            assert_always_greater_than_or_equal_to!(
-                group_by.exprs.len(),
-                order_by.len(),
+            turso_assert!(
+                group_by.exprs.len() >= order_by.len(),
                 "[compute_order_target] - should have more or equal group_by's than order_by's"
             );
             for (i, (_, order_by_dir)) in order_by.iter().enumerate() {

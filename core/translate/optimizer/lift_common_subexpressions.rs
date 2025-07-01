@@ -3,8 +3,8 @@ use std::cell::Cell;
 use turso_sqlite3_parser::ast::{Expr, Operator};
 
 use crate::{
-    assert_always, assert_always_greater_than,
     translate::{expr::unwrap_parens_owned, plan::WhereTerm},
+    turso_assert,
     util::exprs_are_equivalent,
     Result,
 };
@@ -48,9 +48,8 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
         // e.g. a OR b OR c becomes effectively OR [a,b,c].
         let or_operands = flatten_or_expr_owned(term_expr_owned)?;
 
-        assert_always_greater_than!(
-            or_operands.len(),
-            1,
+        turso_assert!(
+            or_operands.len() > 1,
             "[lift_common_subexpressions_from_binary_or_terms] should have more than 1 or expression"
         );
 
@@ -122,7 +121,7 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
             // E.g. (a AND b) OR (a) OR (a AND c) just becomes a.
             where_clause[i].consumed.set(true);
         } else {
-            assert_always_greater_than!(new_or_operands_for_original_term.len(), 1, "[lift_common_subexpressions_from_binary_or_terms] - new or operands contains more than 1 expression");
+            turso_assert!(new_or_operands_for_original_term.len() > 1, "[lift_common_subexpressions_from_binary_or_terms] - new or operands contains more than 1 expression");
             // Update the original WhereTerm's expression with the new OR structure (without common parts).
             where_clause[i].expr = rebuild_or_expr_from_list(new_or_operands_for_original_term);
         }
@@ -164,7 +163,7 @@ fn flatten_and_expr_owned(expr: Expr) -> Result<Vec<Expr>> {
 
 /// Rebuild an ast::Expr::Binary(lhs, AND, rhs) for a list of conjuncts.
 fn rebuild_and_expr_from_list(mut conjuncts: Vec<Expr>) -> Expr {
-    assert_always!(
+    turso_assert!(
         !conjuncts.is_empty(),
         "[rebuild_and_expr_from_list] conjuncts should not be empty"
     );
@@ -182,7 +181,7 @@ fn rebuild_and_expr_from_list(mut conjuncts: Vec<Expr>) -> Expr {
 
 /// Rebuild an ast::Expr::Binary(lhs, OR, rhs) for a list of operands.
 fn rebuild_or_expr_from_list(mut operands: Vec<Expr>) -> Expr {
-    assert_always!(
+    turso_assert!(
         !operands.is_empty(),
         "[rebuild_or_expr_from_list] - operands should not be empty"
     );

@@ -14,10 +14,8 @@ use crate::translate::plan::IterationDirection;
 use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
-use crate::Result;
-use crate::{
-    assert_always, assert_always_eq, assert_always_less_than, assert_always_less_than_or_equal_to,
-};
+use crate::{turso_assert, turso_assert_eq, Result};
+
 use std::fmt::{Debug, Display};
 
 const MAX_REAL_SIZE: u8 = 15;
@@ -823,12 +821,12 @@ impl<'a> AppendWriter<'a> {
 
     fn assert_finish_capacity(&self) {
         // let's make sure we didn't reallocate anywhere else
-        assert_always_eq!(
+        turso_assert_eq!(
             self.buf_capacity_start,
             self.buf.capacity(),
             "Initial Capacity Equal to Current Capacity"
         );
-        assert_always_eq!(
+        turso_assert_eq!(
             self.buf_ptr_start,
             self.buf.as_ptr(),
             "Inital Ptr Equal to Current Pointer"
@@ -925,9 +923,8 @@ impl ImmutableRecord {
         let mut buf = Vec::new();
         buf.reserve_exact(header_size + size_values);
         assert_eq!(buf.capacity(), header_size + size_values);
-        assert_always_less_than_or_equal_to!(
-            header_size,
-            MIN_HEADER_SIZE,
+        turso_assert!(
+            header_size <= MIN_HEADER_SIZE,
             "[ImmutableRecord - from_registers] header size smaller than minimum size"
         );
         let n = write_varint(&mut serial_type_buf, header_size as u64);
@@ -1003,7 +1000,7 @@ impl ImmutableRecord {
         self.payload.extend_from_slice(payload);
     }
     pub fn end_serialization(&mut self) {
-        assert_always!(
+        turso_assert!(
             self.recreating,
             "[ImmutableRecord - end_serialization] should be recreating"
         );
@@ -1011,7 +1008,7 @@ impl ImmutableRecord {
     }
 
     pub fn add_value(&mut self, value: RefValue) {
-        assert_always!(
+        turso_assert!(
             self.recreating,
             "[ImmutableRecord - add_value] should be recreating"
         );
@@ -1193,9 +1190,8 @@ pub struct IndexKeySortOrder(u64);
 
 impl IndexKeySortOrder {
     pub fn get_sort_order_for_col(&self, column_idx: usize) -> SortOrder {
-        assert_always_less_than!(
-            column_idx,
-            64,
+        turso_assert!(
+            column_idx < 64,
             "[IndexKeySortOrder - get_sort_order_for_col] column index out of range"
         );
         match self.0 & (1 << column_idx) {
@@ -1252,7 +1248,7 @@ pub fn compare_immutable(
     index_key_sort_order: IndexKeySortOrder,
     collations: &[CollationSeq],
 ) -> std::cmp::Ordering {
-    assert_always_eq!(
+    turso_assert_eq!(
         l.len(),
         r.len(),
         "[compare_immutable] same number of arguments to compare on both sides"
@@ -1507,9 +1503,8 @@ impl Record {
             // header_size += n;
             // if( nVarint<sqlite3VarintLen(nHdr) ) nHdr++;
         }
-        assert_always_less_than_or_equal_to!(
-            header_size,
-            126,
+        turso_assert!(
+            header_size <= 126,
             "[Record - serialize] header size smaller than minimum size"
         );
         header_bytes_buf.extend(std::iter::repeat(0).take(9));

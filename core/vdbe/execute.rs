@@ -53,15 +53,14 @@ use crate::{
 };
 
 use crate::{
-    info, BufferPool, MvCursor, OpenFlags, RefValue, Row, StepResult, TransactionState, IO,
+    info, turso_assert, BufferPool, MvCursor, OpenFlags, RefValue, Row, StepResult,
+    TransactionState, IO,
 };
 
 use super::{
     insn::{Cookie, RegisterOrLiteral},
     CommitState,
 };
-
-use crate::assert_always;
 
 use fallible_iterator::FallibleIterator;
 use parking_lot::RwLock;
@@ -128,7 +127,7 @@ pub fn op_init(
     let Insn::Init { target_pc } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         target_pc.is_offset(),
         "[op_init] BranchOffset should be an offset"
     );
@@ -441,15 +440,15 @@ pub fn op_jump(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         target_pc_lt.is_offset(),
         "[op_jump] lt BranchOffset should be an offset"
     );
-    assert_always!(
+    turso_assert!(
         target_pc_eq.is_offset(),
         "[op_jump] eq BranchOffset should be an offset"
     );
-    assert_always!(
+    turso_assert!(
         target_pc_gt.is_offset(),
         "[op_jump] gt BranchOffset should be an offset"
     );
@@ -511,7 +510,7 @@ pub fn op_if_pos(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         target_pc.is_offset(),
         "[op_if_pos] BranchOffset should be an offset"
     );
@@ -544,7 +543,7 @@ pub fn op_not_null(
     let Insn::NotNull { reg, target_pc } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         target_pc.is_offset(),
         "[op_not_null] BranchOffset should be an offset"
     );
@@ -719,7 +718,7 @@ pub fn op_comparison(
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
 
-    assert_always!(
+    turso_assert!(
         target_pc.is_offset(),
         "[op_comparison] BranchOffset should be an offset"
     );
@@ -849,7 +848,7 @@ pub fn op_if(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         target_pc.is_offset(),
         "[op_if] BranchOffset should be an offset"
     );
@@ -879,7 +878,7 @@ pub fn op_if_not(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         target_pc.is_offset(),
         "[op_if_not] BranchOffset should be an offset"
     );
@@ -1059,7 +1058,7 @@ pub fn op_vfilter(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         pc_if_empty.is_offset(),
         "[op_vfilter] BranchOffset should be an offset"
     );
@@ -1186,7 +1185,7 @@ pub fn op_vnext(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         pc_if_next.is_offset(),
         "[op_vnext] BranchOffset should be an offset"
     );
@@ -1268,7 +1267,7 @@ pub fn op_rewind(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         pc_if_empty.is_offset(),
         "[op_rewind] BranchOffset should be an offset"
     );
@@ -1300,7 +1299,7 @@ pub fn op_last(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         pc_if_empty.is_offset(),
         "[op_last] BranchOffset should be an offset"
     );
@@ -1452,7 +1451,7 @@ pub fn op_type_check(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         table_reference.is_strict,
         "[op_type_check] table should be strict"
     );
@@ -1556,7 +1555,7 @@ pub fn op_next(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         pc_if_next.is_offset(),
         "[op_next] BranchOffset should be an offset"
     );
@@ -1590,7 +1589,7 @@ pub fn op_prev(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         pc_if_prev.is_offset(),
         "[op_prev] BranchOffset should be an offset"
     );
@@ -1847,7 +1846,7 @@ pub fn op_goto(
     let Insn::Goto { target_pc } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         target_pc.is_offset(),
         "[op_goto] BranchOffset should be an offset"
     );
@@ -1869,7 +1868,7 @@ pub fn op_gosub(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         target_pc.is_offset(),
         "[op_gosub] BranchOffset should be an offset"
     );
@@ -2116,7 +2115,7 @@ pub fn op_seek_rowid(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         target_pc.is_offset(),
         "[op_seek_rowid] BranchOffset should be an offset"
     );
@@ -2219,7 +2218,7 @@ pub fn op_seek(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         target_pc.is_offset(),
         "[op_seek] BranchOffset should be an offset"
     );
@@ -2366,7 +2365,7 @@ pub fn op_idx_ge(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         target_pc.is_offset(),
         "[op_idx_ge] BranchOffset should be an offset"
     );
@@ -2433,7 +2432,7 @@ pub fn op_idx_le(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         target_pc.is_offset(),
         "[op_idx_le] BranchOffset should be an offset"
     );
@@ -2482,7 +2481,7 @@ pub fn op_idx_gt(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         target_pc.is_offset(),
         "[op_idx_gt] BranchOffset should be an offset"
     );
@@ -2531,7 +2530,7 @@ pub fn op_idx_lt(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         target_pc.is_offset(),
         "[op_idx_lt] BranchOffset should be an offset"
     );
@@ -2574,7 +2573,7 @@ pub fn op_decr_jump_zero(
     let Insn::DecrJumpZero { reg, target_pc } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         target_pc.is_offset(),
         "[op_decr_jump_zero] BranchOffset should be an offset"
     );
@@ -3134,7 +3133,7 @@ pub fn op_sorter_sort(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         pc_if_empty.is_offset(),
         "[op_sorter_sort] BranchOffset should be an offset"
     );
@@ -3169,7 +3168,7 @@ pub fn op_sorter_next(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         pc_if_next.is_offset(),
         "[op_sorter_next] BranchOffset should be an offset"
     );
@@ -4234,7 +4233,7 @@ pub fn op_init_coroutine(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         jump_on_definition.is_offset(),
         "[op_init_coroutine] BranchOffset should be an offset"
     );
@@ -4969,7 +4968,7 @@ pub fn op_is_null(
     let Insn::IsNull { reg, target_pc } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         target_pc.is_offset(),
         "[op_is_null] BranchOffset should be an offset"
     );
@@ -5427,7 +5426,7 @@ pub fn op_once(
     else {
         unreachable!("unexpected Insn: {:?}", insn)
     };
-    assert_always!(
+    turso_assert!(
         target_pc_when_reentered.is_offset(),
         "[op_once] BranchOffset should be an offset"
     );

@@ -1,8 +1,9 @@
 use std::{cell::RefCell, ptr::NonNull};
 
-use crate::{assert_always, assert_always_greater_than};
 use std::sync::Arc;
 use tracing::{debug, trace};
+
+use crate::turso_assert;
 
 use super::pager::PageRef;
 
@@ -66,9 +67,8 @@ impl PageCacheKey {
 }
 impl DumbLruPageCache {
     pub fn new(capacity: usize) -> Self {
-        assert_always_greater_than!(
-            capacity,
-            0,
+        turso_assert!(
+            capacity > 0,
             "[DumbLruPageCache - new] capacity of cache should be at least 1"
         );
         Self {
@@ -105,7 +105,7 @@ impl DumbLruPageCache {
         // Check first if page already exists in cache
         if !ignore_exists {
             if let Some(existing_page_ref) = self.get(&key) {
-                assert_always!(
+                turso_assert!(
                     Arc::ptr_eq(&value, &existing_page_ref),
                     "[DumbLruPageCache - _insert] Attempted to insert different page with same key"
                 );
@@ -306,7 +306,7 @@ impl DumbLruPageCache {
             let next = unsafe { current_entry.as_ref().next };
             self.detach(current_entry, true)?;
             unsafe {
-                assert_always!(
+                turso_assert!(
                     !current_entry.as_ref().page.is_dirty(),
                     "[DumbLruPageCache - clear] page should not be dirty"
                 );
@@ -317,15 +317,15 @@ impl DumbLruPageCache {
         let _ = self.head.take();
         let _ = self.tail.take();
 
-        assert_always!(
+        turso_assert!(
             self.head.borrow().is_none(),
             "[DumbLruPageCache - clear] head should be None"
         );
-        assert_always!(
+        turso_assert!(
             self.tail.borrow().is_none(),
             "[DumbLruPageCache - clear] tail should be None"
         );
-        assert_always!(
+        turso_assert!(
             self.map.borrow().is_empty(),
             "[DumbLruPageCache - clear] map should be empty"
         );
