@@ -77,7 +77,11 @@ test("Empty prepared statement should throw", async (t) => {
     () => {
       db.prepare("");
     },
-    { instanceOf: Error },
+    {
+      instanceOf: Error,
+      code: "GenericFailure",
+      message: "Invalid argument supplied: The supplied SQL string contains no statements",
+    },
   );
 });
 

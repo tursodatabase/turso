@@ -84,7 +84,10 @@ test("Empty prepared statement should throw", async (t) => {
     () => {
       db.prepare("");
     },
-    { instanceOf: Error },
+    {
+      instanceOf: RangeError,
+      message: "The supplied SQL string contains no statements",
+    },
   );
 });
 

@@ -50,11 +50,7 @@ class Database {
    * @param {string} sql - The SQL statement string to prepare.
    */
   prepare(sql) {
-    try {
-      return new Statement(this.db.prepare(sql), this);
-    } catch (err) {
-      throw convertError(err);
-    }
+    return new Statement(this.db.prepare(sql), this);
   }
 
   /**
