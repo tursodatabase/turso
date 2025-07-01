@@ -1543,16 +1543,6 @@ fn compare_records_int(
     }
 
     let data_start = header_size;
-    if data_start >= payload.len() {
-        return compare_records_generic(
-            serialized,
-            unpacked,
-            index_info,
-            collations,
-            0,
-            tie_breaker,
-        );
-    }
 
     let lhs_int = read_integer(&payload[data_start..], first_serial_type)?;
     let RefValue::Integer(rhs_int) = unpacked[0] else {
