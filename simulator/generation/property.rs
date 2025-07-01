@@ -416,7 +416,7 @@ impl Property {
 
                 let assertion = Interaction::Assertion(Assertion {
                     message: "select queries should return the same amount of results".to_string(),
-                    func: Box::new(move |stack: &Vec<ResultSet>, _: &dyn SimulatorEnv| {
+                    func: Box::new(move |stack: &Vec<ResultSet>, _| {
                         let select_star = stack.last().unwrap();
                         let select_predicate = stack.get(stack.len() - 2).unwrap();
                         match (select_predicate, select_star) {
@@ -475,10 +475,14 @@ fn assert_all_table_values(tables: &[String]) -> impl Iterator<Item = Interactio
             ),
             func: Box::new({
                 let table = table.clone();
-                move |stack: &Vec<ResultSet>, env: &LimboSimulatorEnv| {
-                    let table = env.tables.iter().find(|t| t.name == table).ok_or_else(|| {
-                        LimboError::InternalError(format!("table {} should exist", table))
-                    })?;
+                move |stack: &Vec<ResultSet>, env: &dyn SimulatorEnv| {
+                    let table = env
+                        .tables()
+                        .iter()
+                        .find(|t| t.name == table)
+                        .ok_or_else(|| {
+                            LimboError::InternalError(format!("table {} should exist", table))
+                        })?;
                     let last = stack.last().unwrap();
                     match last {
                         Ok(vals) => Ok(*vals == table.rows),
@@ -762,25 +766,25 @@ fn property_select_select_optimizer<R: rand::Rng, E: SimulatorEnv>(
     }
 }
 
-fn property_fsync_no_wait<R: rand::Rng>(
+fn property_fsync_no_wait<R: rand::Rng, E: SimulatorEnv>(
     rng: &mut R,
-    env: &LimboSimulatorEnv,
+    env: &E,
     remaining: &Remaining,
 ) -> Property {
     Property::FsyncNoWait {
         query: Query::arbitrary_from(rng, (env, remaining)),
-        tables: env.tables.iter().map(|t| t.name.clone()).collect(),
+        tables: env.tables().iter().map(|t| t.name.clone()).collect(),
     }
 }
 
-fn property_faulty_query<R: rand::Rng>(
+fn property_faulty_query<R: rand::Rng, E: SimulatorEnv>(
     rng: &mut R,
-    env: &LimboSimulatorEnv,
+    env: &E,
     remaining: &Remaining,
 ) -> Property {
     Property::FaultyQuery {
         query: Query::arbitrary_from(rng, (env, remaining)),
-        tables: env.tables.iter().map(|t| t.name.clone()).collect(),
+        tables: env.tables().iter().map(|t| t.name.clone()).collect(),
     }
 }
 

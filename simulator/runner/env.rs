@@ -64,6 +64,44 @@ impl SimulatorEnv for TursoSimulatorEnv {
     fn set_db(&mut self, db: Arc<Database>) {
         self.db = db;
     }
+
+    fn reopen_database(&mut self) {
+        // 1. Close all connections without default checkpoint-on-close behavior
+        // to expose bugs related to how we handle WAL
+        let num_conns = self.connections().len();
+        self.connections_mut().clear();
+
+        // Clear all open files
+        self.io.files.borrow_mut().clear();
+
+        // 2. Re-open database
+        let db_path = self.db_path();
+        let db = match turso_core::Database::open_file(self.io().clone(), db_path, false, false) {
+            Ok(db) => db,
+            Err(e) => {
+                panic!("error opening simulator test file {:?}: {:?}", db_path, e);
+            }
+        };
+        self.set_db(db);
+        let db = self.get_db();
+
+        let connections = self.connections_mut();
+        for _ in 0..num_conns {
+            connections.push(SimConnection::LimboConnection(db.connect().unwrap()));
+        }
+    }
+
+    fn syncing(&self) -> bool {
+        let files = self.io.files.borrow();
+        // TODO: currently assuming we only have 1 file that is syncing
+        files
+            .iter()
+            .any(|file| file.sync_completion.borrow().is_some())
+    }
+
+    fn inject_fault(&self, fault: bool) {
+        self.io.inject_fault(fault);
+    }
 }
 
 impl TursoSimulatorEnv {

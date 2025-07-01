@@ -236,7 +236,7 @@ pub(crate) fn execute_interaction(
                 SimConnection::Disconnected => unreachable!(),
             };
 
-            let results = interaction.execute_faulty_query(&conn, env);
+            let results = interaction.execute_faulty_query(&conn, env, &mut env.rng.clone());
             tracing::debug!(?results);
             stack.push(results);
             // Reset fault injection

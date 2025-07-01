@@ -24,6 +24,9 @@ pub trait SimulatorEnv {
     fn io(&self) -> Arc<dyn IO>;
     fn get_db(&self) -> Arc<Database>;
     fn set_db(&mut self, db: Arc<Database>);
+    fn reopen_database(&mut self);
+    fn syncing(&self) -> bool;
+    fn inject_fault(&self, fault: bool);
 }
 
 pub trait ConnectionTrait

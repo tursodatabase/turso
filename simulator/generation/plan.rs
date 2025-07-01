@@ -10,12 +10,7 @@ use serde::{Deserialize, Serialize};
 use turso_core::{Connection, Result, StepResult};
 
 use crate::model::{
-    query::{
-        predicate::Predicate,
-        select::{Distinctness, ResultColumn},
-        update::Update,
-        Create, CreateIndex, Delete, Drop, Insert, Query, Select,
-    },
+    query::{update::Update, Create, CreateIndex, Delete, Drop, Insert, Query, Select},
     table::SimValue,
     Shadow, SimConnection, SimulatorEnv,
 };
@@ -516,7 +511,7 @@ impl Interaction {
                         connections[conn_index] = SimConnection::Disconnected;
                     }
                     Fault::ReopenDatabase => {
-                        reopen_database(env);
+                        env.reopen_database();
                     }
                 }
                 Ok(())
@@ -527,10 +522,10 @@ impl Interaction {
         }
     }
 
-    pub(crate) fn execute_fsync_query<E: SimulatorEnv>(
+    pub fn execute_fsync_query<E: SimulatorEnv>(
         &self,
         conn: Arc<Connection>,
-        env: &mut LimboSimulatorEnv,
+        env: &mut E,
     ) -> ResultSet {
         if let Self::FsyncQuery(query) = self {
             let query_str = query.to_string();
@@ -558,15 +553,8 @@ impl Interaction {
                         out.push(r);
                     }
                     StepResult::IO => {
-                        let syncing = {
-                            let files = env.io.files.borrow();
-                            // TODO: currently assuming we only have 1 file that is syncing
-                            files
-                                .iter()
-                                .any(|file| file.sync_completion.borrow().is_some())
-                        };
-                        if syncing {
-                            reopen_database(env);
+                        if env.syncing() {
+                            env.reopen_database();
                         } else {
                             rows.run_once().unwrap();
                         }
@@ -584,12 +572,12 @@ impl Interaction {
         }
     }
 
-    pub(crate) fn execute_faulty_query(
+    pub fn execute_faulty_query<R: rand::Rng, E: SimulatorEnv>(
         &self,
         conn: &Arc<Connection>,
-        env: &mut LimboSimulatorEnv,
+        env: &mut E,
+        rng: &mut R,
     ) -> ResultSet {
-        use rand::Rng;
         if let Self::FaultyQuery(query) = self {
             let query_str = query.to_string();
             let rows = conn.query(&query_str);
@@ -607,16 +595,9 @@ impl Interaction {
             let mut current_prob = 0.05;
             let mut incr = 0.001;
             loop {
-                let syncing = {
-                    let files = env.io.files.borrow();
-                    // TODO: currently assuming we only have 1 file that is syncing
-                    files
-                        .iter()
-                        .any(|file| file.sync_completion.borrow().is_some())
-                };
-                let inject_fault = env.rng.gen_bool(current_prob);
-                if inject_fault || syncing {
-                    env.io.inject_fault(true);
+                let inject_fault = rng.gen_bool(current_prob);
+                if inject_fault || env.syncing() {
+                    env.inject_fault(true);
                 }
 
                 match rows.step()? {
@@ -649,32 +630,6 @@ impl Interaction {
         } else {
             unreachable!("unexpected: this function should only be called on queries")
         }
-    }
-}
-
-fn reopen_database(env: &mut LimboSimulatorEnv) {
-    // 1. Close all connections without default checkpoint-on-close behavior
-    // to expose bugs related to how we handle WAL
-    let num_conns = env.connections().len();
-    env.connections_mut().clear();
-
-    // Clear all open files
-    env.io.files.borrow_mut().clear();
-
-    // 2. Re-open database
-    let db_path = env.db_path();
-    let db = match turso_core::Database::open_file(env.io().clone(), &db_path, false, false) {
-        Ok(db) => db,
-        Err(e) => {
-            panic!("error opening simulator test file {:?}: {:?}", db_path, e);
-        }
-    };
-    env.set_db(db);
-    let db = env.get_db();
-
-    let connections = env.connections_mut();
-    for _ in 0..num_conns {
-        connections.push(SimConnection::LimboConnection(db.connect().unwrap()));
     }
 }
 
