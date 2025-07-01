@@ -40,7 +40,7 @@ pub fn translate_insert(
     tbl_name: QualifiedName,
     columns: Option<DistinctNames>,
     mut body: InsertBody,
-    _returning: Option<Vec<ResultColumn>>,
+    returning: Option<Vec<ResultColumn>>,
     syms: &SymbolTable,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
@@ -72,6 +72,73 @@ pub fn translate_insert(
     };
 
     let resolver = Resolver::new(schema, syms);
+
+    // ---------- Handle RETURNING clause ----------
+    use crate::translate::plan::ResultSetColumn;
+    use turso_sqlite3_parser::ast::{As as AstAs, Id};
+
+    let mut returning_indexes: Option<Vec<usize>> = None;
+    let mut returning_result_columns: Vec<ResultSetColumn> = Vec::new();
+
+    if let Some(ret_cols) = &returning {
+        let tbl_cols = table.columns();
+
+        // Helper to push column info
+        let mut push_column = |idx: usize, alias_opt: Option<String>| {
+            let col_name = tbl_cols[idx].name.clone().unwrap_or_default();
+            returning_result_columns.push(ResultSetColumn {
+                expr: turso_sqlite3_parser::ast::Expr::Id(Id(col_name.clone())),
+                alias: alias_opt.or(Some(col_name)),
+                contains_aggregates: false,
+            });
+        };
+
+        let mut col_idxs = Vec::<usize>::new();
+
+        for rc in ret_cols {
+            match rc {
+                ResultColumn::Star => {
+                    // RETURNING * expands to all columns
+                    for (i, _) in tbl_cols.iter().enumerate() {
+                        col_idxs.push(i);
+                        push_column(i, None);
+                    }
+                    break; // '*' consumes rest
+                }
+                ResultColumn::Expr(expr, alias) => {
+                    if let turso_sqlite3_parser::ast::Expr::Id(id) = expr {
+                        let ident = crate::util::normalize_ident(&id.0);
+                        if let Some(idx) = tbl_cols.iter().position(|c| {
+                            c.name
+                                .as_ref()
+                                .map_or(false, |n| n.eq_ignore_ascii_case(&ident))
+                        }) {
+                            col_idxs.push(idx);
+                            let alias_str = alias.as_ref().map(|a| match a {
+                                AstAs::As(name) => name.to_string(),
+                                AstAs::Elided(name) => name.to_string(),
+                            });
+                            push_column(idx, alias_str);
+                        } else {
+                            crate::bail_parse_error!(
+                                "Unknown column '{}' in RETURNING clause",
+                                ident
+                            );
+                        }
+                    } else {
+                        crate::bail_parse_error!(
+                            "Only simple column names are supported in RETURNING clause for INSERT"
+                        );
+                    }
+                }
+                ResultColumn::TableStar(_) => {
+                    crate::bail_parse_error!("table.* in RETURNING clause is not supported yet");
+                }
+            }
+        }
+
+        returning_indexes = Some(col_idxs);
+    }
 
     if let Some(virtual_table) = &table.virtual_table() {
         program = translate_virtual_table_insert(
@@ -550,6 +617,32 @@ pub fn translate_insert(
         table_name: table_name.to_string(),
     });
 
+    // Emit rows for RETURNING if requested
+    if let Some(idx_list) = &returning_indexes {
+        if !idx_list.is_empty() {
+            if idx_list.len() == table.columns().len() {
+                // RETURNING * : use contiguous column registers
+                program.emit_insn(Insn::ResultRow {
+                    start_reg: column_registers_start,
+                    count: idx_list.len(),
+                });
+            } else {
+                let dest_start = program.alloc_registers(idx_list.len());
+                for (offset, col_idx) in idx_list.iter().enumerate() {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: column_registers_start + *col_idx,
+                        dst_reg: dest_start + offset,
+                        amount: 0,
+                    });
+                }
+                program.emit_insn(Insn::ResultRow {
+                    start_reg: dest_start,
+                    count: idx_list.len(),
+                });
+            }
+        }
+    }
+
     if inserting_multiple_rows {
         if let Some(temp_table_ctx) = temp_table_ctx {
             program.emit_insn(Insn::Next {
@@ -571,6 +664,11 @@ pub fn translate_insert(
 
     program.resolve_label(halt_label, program.offset());
     program.epilogue(super::emitter::TransactionMode::Write);
+
+    // Attach result column metadata if RETURNING was used
+    if !returning_result_columns.is_empty() {
+        program.result_columns = returning_result_columns;
+    }
 
     Ok(program)
 }
