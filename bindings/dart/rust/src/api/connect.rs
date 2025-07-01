@@ -22,11 +22,11 @@ pub struct ConnectArgs {
 
 pub async fn connect(args: ConnectArgs) -> LibsqlConnection {
     let database = if args.url == ":memory:" {
-        let io: Arc<dyn limbo_core::IO> = Arc::new(limbo_core::MemoryIO::new());
-        limbo_core::Database::open_file(io, args.url.as_str(), false, false)
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+        turso_core::Database::open_file(io, args.url.as_str(), false, false)
     } else {
-        let io: Arc<dyn limbo_core::IO> = Arc::new(limbo_core::PlatformIO::new().unwrap());
-        limbo_core::Database::open_file(io, args.url.as_str(), false, false)
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        turso_core::Database::open_file(io, args.url.as_str(), false, false)
     }
     .unwrap();
     let connection = database.connect().unwrap();

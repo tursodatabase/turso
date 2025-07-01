@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use flutter_rust_bridge::{frb, RustAutoOpaqueNom};
-pub use limbo_core::{Connection, Database};
+pub use turso_core::{Connection, Database};
 
 use crate::{
     api::statement::LibsqlStatement,

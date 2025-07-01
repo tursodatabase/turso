@@ -6,14 +6,14 @@ pub enum ReturnValue {
     Null,
 }
 
-impl From<limbo_core::Value> for ReturnValue {
-    fn from(value: limbo_core::Value) -> Self {
+impl From<turso_core::Value> for ReturnValue {
+    fn from(value: turso_core::Value) -> Self {
         match value {
-            limbo_core::Value::Integer(i) => ReturnValue::Integer(i),
-            limbo_core::Value::Float(f) => ReturnValue::Real(f),
-            limbo_core::Value::Text(t) => ReturnValue::Text(t.as_str().to_string()),
-            limbo_core::Value::Blob(b) => ReturnValue::Blob(b),
-            limbo_core::Value::Null => ReturnValue::Null,
+            turso_core::Value::Integer(i) => ReturnValue::Integer(i),
+            turso_core::Value::Float(f) => ReturnValue::Real(f),
+            turso_core::Value::Text(t) => ReturnValue::Text(t.as_str().to_string()),
+            turso_core::Value::Blob(b) => ReturnValue::Blob(b),
+            turso_core::Value::Null => ReturnValue::Null,
         }
     }
 }

@@ -3,9 +3,9 @@ use std::num::NonZero;
 use std::sync::Arc;
 
 use flutter_rust_bridge::{frb, RustAutoOpaqueNom};
-pub use limbo_core::Connection;
-pub use limbo_core::Statement;
-use limbo_core::Value;
+pub use turso_core::Connection;
+pub use turso_core::Statement;
+use turso_core::Value;
 
 use crate::helpers::result::ExecuteResult;
 use crate::helpers::return_value::ReturnValue;
@@ -91,14 +91,14 @@ impl LibsqlStatement {
         loop {
             let mut inner = self.inner.try_write().unwrap();
             match inner.inner.step() {
-                Ok(limbo_core::StepResult::Row) => {
+                Ok(turso_core::StepResult::Row) => {
                     let row = inner.row().unwrap();
                     rows.push(row.get_values().cloned().collect());
                 }
-                Ok(limbo_core::StepResult::Done) => {
+                Ok(turso_core::StepResult::Done) => {
                     break;
                 }
-                Ok(limbo_core::StepResult::IO) => {
+                Ok(turso_core::StepResult::IO) => {
                     self.inner.try_read().unwrap().run_once().unwrap();
                 }
                 _ => break,
