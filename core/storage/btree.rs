@@ -1449,106 +1449,299 @@ impl BTreeCursor {
         }
     }
 
-    fn compare_with_current_record_debug(
-        &self,
-        key: &ImmutableRecord,
-        seek_op: SeekOp,
-        record_comparer: &RecordCompare,
-        index_info: &IndexKeyInfo,
-    ) -> (Ordering, bool) {
-        let record = self.get_immutable_record();
-        let record = record.as_ref().unwrap();
+    // // /// Specialized version of move_to() for index btrees.
+    // #[instrument(skip(self, index_key), level = Level::TRACE)]
+    // fn indexbtree_move_to(
+    //     &mut self,
+    //     index_key: &ImmutableRecord,
+    //     cmp: SeekOp,
+    // ) -> Result<CursorResult<()>> {
+    //     let iter_dir = cmp.iteration_direction();
 
-        let key_values = key.get_values();
-        let tie_breaker = get_tie_breaker_from_seek_op(seek_op);
-        // OLD WAY - compare_immutable
-        let old_cmp = {
-            let record_values = record.get_values();
-            let record_slice_equal_number_of_cols = &record_values[..key_values.len()];
-            compare_immutable(
-                record_slice_equal_number_of_cols,
-                key_values.as_slice(),
-                self.key_sort_order(),
-                &self.collations,
-            )
-        };
+    //     let key_values = index_key.get_values();
+    //     let index_info_default = IndexKeyInfo::default();
+    //     let index_info = self
+    //         .index_key_info
+    //         .as_ref()
+    //         .unwrap_or(&index_info_default)
+    //         .clone();
+    //     let record_comparer = find_compare(&key_values, &index_info, &self.collations);
+    //     tracing::debug!("Using record comparison strategy: {:?}", record_comparer);
+    //     let tie_breaker = get_tie_breaker_from_seek_op(cmp);
+    //     println!("tie_breaker = {:?}", tie_breaker);
+    //     'outer: loop {
+    //         let page = self.stack.top();
+    //         return_if_locked_maybe_load!(self.pager, page);
+    //         let page = page.get();
+    //         let contents = page.get().contents.as_ref().unwrap();
+    //         if contents.is_leaf() {
+    //             let eq_seen = match &self.seek_state {
+    //                 CursorSeekState::MovingBetweenPages { eq_seen } => eq_seen.get(),
+    //                 _ => false,
+    //             };
+    //             self.seek_state = CursorSeekState::FoundLeaf {
+    //                 eq_seen: Cell::new(eq_seen),
+    //             };
+    //             return Ok(CursorResult::Ok(()));
+    //         }
 
-        // NEW WAY - optimized comparison
-        let new_cmp = match record_comparer.compare(
-            record,
-            &key_values,
-            index_info,
-            &self.collations,
-            0,
-            tie_breaker,
-        ) {
-            Ok(ordering) => ordering,
-            Err(e) => {
-                println!("Optimized record comparison failed: {:?}", e);
-                // For debugging, let's also try generic comparison
-                match compare_records_generic(
-                    record,
-                    &key_values,
-                    index_info,
-                    &self.collations,
-                    0,
-                    tie_breaker,
-                ) {
-                    Ok(ordering) => {
-                        println!("Generic comparison succeeded where optimized failed");
-                        ordering
-                    }
-                    Err(fallback_err) => {
-                        println!("Generic comparison also failed: {:?}", fallback_err);
-                        old_cmp // Use old comparison as final fallback
-                    }
-                }
-            }
-        };
+    //         if matches!(
+    //             self.seek_state,
+    //             CursorSeekState::Start | CursorSeekState::MovingBetweenPages { .. }
+    //         ) {
+    //             let eq_seen = match &self.seek_state {
+    //                 CursorSeekState::MovingBetweenPages { eq_seen } => eq_seen.get(),
+    //                 _ => false,
+    //             };
+    //             let cell_count = contents.cell_count();
+    //             let min_cell_idx = Cell::new(0);
+    //             let max_cell_idx = Cell::new(cell_count as isize - 1);
+    //             let nearest_matching_cell = Cell::new(None);
 
-        // COMPARE RESULTS
-        if old_cmp != new_cmp {
-            println!(
-                "COMPARISON MISMATCH! Old: {:?}, New: {:?}, Strategy: {:?}, Key: {:?}",
-                old_cmp, new_cmp, record_comparer, key_values
-            );
+    //             self.seek_state = CursorSeekState::InteriorPageBinarySearch {
+    //                 min_cell_idx,
+    //                 max_cell_idx,
+    //                 nearest_matching_cell,
+    //                 eq_seen: Cell::new(eq_seen),
+    //             };
+    //         }
 
-            // Log more details for debugging
-            let record_values = record.get_values();
-            println!(
-                "Record values: {:?}, Key values: {:?}, Index info: {:?}",
-                record_values, key_values, index_info
-            );
+    //         let CursorSeekState::InteriorPageBinarySearch {
+    //             min_cell_idx,
+    //             max_cell_idx,
+    //             nearest_matching_cell,
+    //             eq_seen,
+    //         } = &self.seek_state
+    //         else {
+    //             unreachable!(
+    //                 "we must be in an interior binary search state, got {:?}",
+    //                 self.seek_state
+    //             );
+    //         };
 
-            // For now, use the old comparison to maintain correctness while debugging
-            let cmp = old_cmp;
+    //         loop {
+    //             let min = min_cell_idx.get();
+    //             let max = max_cell_idx.get();
+    //             if min > max {
+    //                 let Some(leftmost_matching_cell) = nearest_matching_cell.get() else {
+    //                     self.stack.set_cell_index(contents.cell_count() as i32 + 1);
+    //                     match contents.rightmost_pointer() {
+    //                         Some(right_most_pointer) => {
+    //                             let mem_page = self.read_page(right_most_pointer as usize)?;
+    //                             self.stack.push(mem_page);
+    //                             self.seek_state = CursorSeekState::MovingBetweenPages {
+    //                                 eq_seen: Cell::new(eq_seen.get()),
+    //                             };
+    //                             continue 'outer;
+    //                         }
+    //                         None => {
+    //                             unreachable!(
+    //                                 "we shall not go back up! The only way is down the slope"
+    //                             );
+    //                         }
+    //                     }
+    //                 };
+    //                 let matching_cell = contents.cell_get(
+    //                     leftmost_matching_cell,
+    //                     payload_overflow_threshold_max(
+    //                         contents.page_type(),
+    //                         self.usable_space() as u16,
+    //                     ),
+    //                     payload_overflow_threshold_min(
+    //                         contents.page_type(),
+    //                         self.usable_space() as u16,
+    //                     ),
+    //                     self.usable_space(),
+    //                 )?;
+    //                 self.stack.set_cell_index(leftmost_matching_cell as i32);
+    //                 // we don't advance in case of forward iteration and index tree internal nodes because we will visit this node going up.
+    //                 // in backwards iteration, we must retreat because otherwise we would unnecessarily visit this node again.
+    //                 // Example:
+    //                 // this parent: key 666, and we found the target key in the left child.
+    //                 // left child has: key 663, key 664, key 665
+    //                 // we need to move to the previous parent (with e.g. key 662) when iterating backwards so that we don't end up back here again.
+    //                 if iter_dir == IterationDirection::Backwards {
+    //                     self.stack.retreat();
+    //                 }
+    //                 let BTreeCell::IndexInteriorCell(IndexInteriorCell {
+    //                     left_child_page, ..
+    //                 }) = &matching_cell
+    //                 else {
+    //                     unreachable!("unexpected cell type: {:?}", matching_cell);
+    //                 };
 
-            let found = match seek_op {
-                SeekOp::GT => cmp.is_gt(),
-                SeekOp::GE { eq_only: true } => cmp.is_eq(),
-                SeekOp::GE { eq_only: false } => cmp.is_ge(),
-                SeekOp::LE { eq_only: true } => cmp.is_eq(),
-                SeekOp::LE { eq_only: false } => cmp.is_le(),
-                SeekOp::LT => cmp.is_lt(),
-            };
+    //                 let mem_page = self.read_page(*left_child_page as usize)?;
+    //                 self.stack.push(mem_page);
+    //                 self.seek_state = CursorSeekState::MovingBetweenPages {
+    //                     eq_seen: Cell::new(eq_seen.get()),
+    //                 };
+    //                 continue 'outer;
+    //             }
 
-            return (cmp, found);
-        }
+    //             let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
+    //             self.stack.set_cell_index(cur_cell_idx as i32);
+    //             let cell = contents.cell_get(
+    //                 cur_cell_idx as usize,
+    //                 payload_overflow_threshold_max(
+    //                     contents.page_type(),
+    //                     self.usable_space() as u16,
+    //                 ),
+    //                 payload_overflow_threshold_min(
+    //                     contents.page_type(),
+    //                     self.usable_space() as u16,
+    //                 ),
+    //                 self.usable_space(),
+    //             )?;
+    //             let BTreeCell::IndexInteriorCell(IndexInteriorCell {
+    //                 payload,
+    //                 payload_size,
+    //                 first_overflow_page,
+    //                 ..
+    //             }) = &cell
+    //             else {
+    //                 unreachable!("unexpected cell type: {:?}", cell);
+    //             };
 
-        // Results match, use the new comparison
-        let cmp = new_cmp;
-        let found = match seek_op {
-            SeekOp::GT => cmp.is_gt(),
-            SeekOp::GE { eq_only: true } => cmp.is_eq(),
-            SeekOp::GE { eq_only: false } => cmp.is_ge(),
-            SeekOp::LE { eq_only: true } => cmp.is_eq(),
-            SeekOp::LE { eq_only: false } => cmp.is_le(),
-            SeekOp::LT => cmp.is_lt(),
-        };
-        (cmp, found)
-    }
+    //             if let Some(next_page) = first_overflow_page {
+    //                 return_if_io!(self.process_overflow_read(payload, *next_page, *payload_size))
+    //             } else {
+    //                 self.get_immutable_record_or_create()
+    //                     .as_mut()
+    //                     .unwrap()
+    //                     .invalidate();
+    //                 self.get_immutable_record_or_create()
+    //                     .as_mut()
+    //                     .unwrap()
+    //                     .start_serialization(payload);
+    //                 self.record_cursor.borrow_mut().invalidate();
+    //             };
+    //             let (target_leaf_page_is_in_left_subtree, is_eq) = {
+    //                 let record = self.get_immutable_record();
+    //                 let record = record.as_ref().unwrap();
 
-    // /// Specialized version of move_to() for index btrees.
+    //                 // DEBUG COMPARISON - Compare old vs new method
+    //                 let old_cmp = {
+    //                     let record_values = record.get_values();
+    //                     let record_slice_equal_number_of_cols = &record_values[..key_values.len()];
+    //                     compare_immutable(
+    //                         record_slice_equal_number_of_cols,
+    //                         key_values.as_slice(),
+    //                         self.key_sort_order(),
+    //                         &self.collations,
+    //                     )
+    //                 };
+
+    //                 let new_cmp = match record_comparer.compare(
+    //                     record,
+    //                     &key_values,
+    //                     &index_info,
+    //                     &self.collations,
+    //                     0,
+    //                     tie_breaker,
+    //                 ) {
+    //                     Ok(ordering) => ordering,
+    //                     Err(e) => {
+    //                         println!("Optimized record comparison failed: {:?}", e);
+    //                         match compare_records_generic(
+    //                             record,
+    //                             &key_values,
+    //                             &index_info,
+    //                             &self.collations,
+    //                             0,
+    //                             tie_breaker,
+    //                         ) {
+    //                             Ok(ordering) => {
+    //                                 println!("Generic comparison succeeded where optimized failed");
+    //                                 ordering
+    //                             }
+    //                             Err(fallback_err) => {
+    //                                 println!("Generic comparison also failed: {:?}", fallback_err);
+    //                                 old_cmp // Use old comparison as final fallback
+    //                             }
+    //                         }
+    //                     }
+    //                 };
+
+    //                 println!("old_cmp: {:?}, new_cmp: {:?}", old_cmp, new_cmp);
+
+    //                 // Check for mismatches
+    //                 if old_cmp != new_cmp {
+    //                     println!(
+    //                     "COMPARISON MISMATCH in indexbtree_move_to! Old: {:?}, New: {:?}, Strategy: {:?}",
+    //                     old_cmp, new_cmp, record_comparer);
+
+    //                     let record_values = record.get_values();
+    //                     println!(
+    //                         "Record values: {:?}, Key values: {:?}, Index info: {:?}",
+    //                         record_values, key_values, index_info
+    //                     );
+
+    //                     // Use old comparison for correctness while debugging
+    //                     let interior_cell_vs_index_key = old_cmp;
+    //                 } else {
+    //                     // Use new comparison if they match
+    //                     let interior_cell_vs_index_key = new_cmp;
+    //                 }
+
+    //                 let interior_cell_vs_index_key =
+    //                     if old_cmp != new_cmp { old_cmp } else { new_cmp };
+
+    //                 // in sqlite btrees left child pages have <= keys.
+    //                 // in general, in forwards iteration we want to find the first key that matches the seek condition.
+    //                 // in backwards iteration we want to find the last key that matches the seek condition.
+    //                 //
+    //                 // Logic table for determining if target leaf page is in left subtree.
+    //                 // For index b-trees this is a bit more complicated since the interior cells contain payloads (the key is the payload).
+    //                 // and for non-unique indexes there might be several cells with the same key.
+    //                 //
+    //                 // Forwards iteration (looking for first match in tree):
+    //                 // OP  | Current Cell vs Seek Key  | Action?  | Explanation
+    //                 // GT  | >                         | go left  | First > key could be exactly this one, or in left subtree
+    //                 // GT  | = or <                    | go right | First > key must be in right subtree
+    //                 // GE  | >                         | go left  | First >= key could be exactly this one, or in left subtree
+    //                 // GE  | =                         | go left  | First >= key could be exactly this one, or in left subtree
+    //                 // GE  | <                         | go right | First >= key must be in right subtree
+    //                 //
+    //                 // Backwards iteration (looking for last match in tree):
+    //                 // OP  | Current Cell vs Seek Key  | Action?  | Explanation
+    //                 // LE  | >                         | go left  | Last <= key must be in left subtree
+    //                 // LE  | =                         | go right | Last <= key is either this one, or somewhere to the right of this one. So we need to go right to make sure
+    //                 // LE  | <                         | go right | Last <= key must be in right subtree
+    //                 // LT  | >                         | go left  | Last < key must be in left subtree
+    //                 // LT  | =                         | go left  | Last < key must be in left subtree since we want strictly less than
+    //                 // LT  | <                         | go right | Last < key could be exactly this one, or in right subtree
+    //                 //
+    //                 // No iteration (point query):
+    //                 // EQ  | >                         | go left  | First = key must be in left subtree
+    //                 // EQ  | =                         | go left  | First = key could be exactly this one, or in left subtree
+    //                 // EQ  | <                         | go right | First = key must be in right subtree
+
+    //                 (
+    //                     match cmp {
+    //                         SeekOp::GT => interior_cell_vs_index_key.is_gt(),
+    //                         SeekOp::GE { .. } => interior_cell_vs_index_key.is_ge(),
+    //                         SeekOp::LE { .. } => interior_cell_vs_index_key.is_gt(),
+    //                         SeekOp::LT => interior_cell_vs_index_key.is_ge(),
+    //                     },
+    //                     interior_cell_vs_index_key.is_eq(),
+    //                 )
+    //             };
+
+    //             if is_eq {
+    //                 eq_seen.set(true);
+    //             }
+
+    //             if target_leaf_page_is_in_left_subtree {
+    //                 nearest_matching_cell.set(Some(cur_cell_idx as usize));
+    //                 max_cell_idx.set(cur_cell_idx - 1);
+    //             } else {
+    //                 min_cell_idx.set(cur_cell_idx + 1);
+    //             }
+    //         }
+    //     }
+    // }
+
+    /// Specialized version of move_to() for index btrees.
     // #[instrument(skip(self, index_key), level = Level::TRACE)]
     // fn indexbtree_move_to(
     //     &mut self,
@@ -1848,7 +2041,7 @@ impl BTreeCursor {
         let record_comparer = find_compare(&key_values, &index_info, &self.collations);
         tracing::debug!("Using record comparison strategy: {:?}", record_comparer);
         let tie_breaker = get_tie_breaker_from_seek_op(cmp);
-        println!("tie_breaker = {:?}", tie_breaker);
+
         'outer: loop {
             let page = self.stack.top();
             return_if_locked_maybe_load!(self.pager, page);
@@ -1978,19 +2171,7 @@ impl BTreeCursor {
                     let record = self.get_immutable_record();
                     let record = record.as_ref().unwrap();
 
-                    // DEBUG COMPARISON - Compare old vs new method
-                    let old_cmp = {
-                        let record_values = record.get_values();
-                        let record_slice_equal_number_of_cols = &record_values[..key_values.len()];
-                        compare_immutable(
-                            record_slice_equal_number_of_cols,
-                            key_values.as_slice(),
-                            self.key_sort_order(),
-                            &self.collations,
-                        )
-                    };
-
-                    let new_cmp = match record_comparer.compare(
+                    let interior_cell_vs_index_key = match record_comparer.compare(
                         record,
                         &key_values,
                         &index_info,
@@ -2015,35 +2196,14 @@ impl BTreeCursor {
                                 }
                                 Err(fallback_err) => {
                                     println!("Generic comparison also failed: {:?}", fallback_err);
-                                    old_cmp // Use old comparison as final fallback
+                                    panic!(
+                                        "Both optimized and generic comparisons failed: {:?}",
+                                        fallback_err
+                                    );
                                 }
                             }
                         }
                     };
-
-                    println!("old_cmp: {:?}, new_cmp: {:?}", old_cmp, new_cmp);
-
-                    // Check for mismatches
-                    if old_cmp != new_cmp {
-                        println!(
-                        "COMPARISON MISMATCH in indexbtree_move_to! Old: {:?}, New: {:?}, Strategy: {:?}",
-                        old_cmp, new_cmp, record_comparer);
-
-                        let record_values = record.get_values();
-                        println!(
-                            "Record values: {:?}, Key values: {:?}, Index info: {:?}",
-                            record_values, key_values, index_info
-                        );
-
-                        // Use old comparison for correctness while debugging
-                        let interior_cell_vs_index_key = old_cmp;
-                    } else {
-                        // Use new comparison if they match
-                        let interior_cell_vs_index_key = new_cmp;
-                    }
-
-                    let interior_cell_vs_index_key =
-                        if old_cmp != new_cmp { old_cmp } else { new_cmp };
 
                     // in sqlite btrees left child pages have <= keys.
                     // in general, in forwards iteration we want to find the first key that matches the seek condition.
@@ -2099,250 +2259,6 @@ impl BTreeCursor {
             }
         }
     }
-
-    // /// Specialized version of move_to() for index btrees.
-    // #[instrument(skip(self, index_key), level = Level::TRACE)]
-    // fn indexbtree_move_to(
-    //     &mut self,
-    //     index_key: &ImmutableRecord,
-    //     cmp: SeekOp,
-    // ) -> Result<CursorResult<()>> {
-    //     let iter_dir = cmp.iteration_direction();
-
-    //     let key_values = index_key.get_values();
-    //     let index_info_default = IndexKeyInfo::default();
-    //     let index_info = self
-    //         .index_key_info
-    //         .as_ref()
-    //         .unwrap_or(&index_info_default)
-    //         .clone();
-    //     let record_comparer = find_compare(&key_values, &index_info, &self.collations);
-    //     println!("=== INDEXBTREE_MOVE_TO START ===");
-    //     println!("Searching for: {:?}", key_values);
-    //     println!("record_comparer: {:?}", record_comparer);
-    //     tracing::debug!("Using record comparison strategy: {:?}", record_comparer);
-
-    //     'outer: loop {
-    //         let page = self.stack.top();
-    //         return_if_locked_maybe_load!(self.pager, page);
-    //         let page = page.get();
-    //         let contents = page.get().contents.as_ref().unwrap();
-
-    //         println!(
-    //             "Current page: {}, is_leaf: {}",
-    //             page.get().id,
-    //             contents.is_leaf()
-    //         );
-
-    //         if contents.is_leaf() {
-    //             let eq_seen = match &self.seek_state {
-    //                 CursorSeekState::MovingBetweenPages { eq_seen } => eq_seen.get(),
-    //                 _ => false,
-    //             };
-    //             self.seek_state = CursorSeekState::FoundLeaf {
-    //                 eq_seen: Cell::new(eq_seen),
-    //             };
-    //             println!("=== REACHED LEAF PAGE ===");
-    //             return Ok(CursorResult::Ok(()));
-    //         }
-
-    //         println!(
-    //             "Processing interior page with {} cells",
-    //             contents.cell_count()
-    //         );
-
-    //         if matches!(
-    //             self.seek_state,
-    //             CursorSeekState::Start | CursorSeekState::MovingBetweenPages { .. }
-    //         ) {
-    //             let eq_seen = match &self.seek_state {
-    //                 CursorSeekState::MovingBetweenPages { eq_seen } => eq_seen.get(),
-    //                 _ => false,
-    //             };
-    //             let cell_count = contents.cell_count();
-    //             let min_cell_idx = Cell::new(0);
-    //             let max_cell_idx = Cell::new(cell_count as isize - 1);
-    //             let nearest_matching_cell = Cell::new(None);
-
-    //             self.seek_state = CursorSeekState::InteriorPageBinarySearch {
-    //                 min_cell_idx,
-    //                 max_cell_idx,
-    //                 nearest_matching_cell,
-    //                 eq_seen: Cell::new(eq_seen),
-    //             };
-    //         }
-
-    //         let CursorSeekState::InteriorPageBinarySearch {
-    //             min_cell_idx,
-    //             max_cell_idx,
-    //             nearest_matching_cell,
-    //             eq_seen,
-    //         } = &self.seek_state
-    //         else {
-    //             unreachable!(
-    //                 "we must be in an interior binary search state, got {:?}",
-    //                 self.seek_state
-    //             );
-    //         };
-
-    //         loop {
-    //             let min = min_cell_idx.get();
-    //             let max = max_cell_idx.get();
-    //             println!("Binary search: min={}, max={}", min, max);
-
-    //             if min > max {
-    //                 println!("Binary search complete");
-    //                 let Some(leftmost_matching_cell) = nearest_matching_cell.get() else {
-    //                     println!("No matching cell found, going to rightmost child");
-    //                     self.stack.set_cell_index(contents.cell_count() as i32 + 1);
-    //                     match contents.rightmost_pointer() {
-    //                         Some(right_most_pointer) => {
-    //                             println!("Going to rightmost child page: {}", right_most_pointer);
-    //                             let mem_page = self.read_page(right_most_pointer as usize)?;
-    //                             self.stack.push(mem_page);
-    //                             self.seek_state = CursorSeekState::MovingBetweenPages {
-    //                                 eq_seen: Cell::new(eq_seen.get()),
-    //                             };
-    //                             continue 'outer;
-    //                         }
-    //                         None => {
-    //                             unreachable!(
-    //                                 "we shall not go back up! The only way is down the slope"
-    //                             );
-    //                         }
-    //                     }
-    //                 };
-
-    //                 println!("Found matching cell at index: {}", leftmost_matching_cell);
-    //                 let matching_cell = contents.cell_get(
-    //                     leftmost_matching_cell,
-    //                     payload_overflow_threshold_max(
-    //                         contents.page_type(),
-    //                         self.usable_space() as u16,
-    //                     ),
-    //                     payload_overflow_threshold_min(
-    //                         contents.page_type(),
-    //                         self.usable_space() as u16,
-    //                     ),
-    //                     self.usable_space(),
-    //                 )?;
-    //                 self.stack.set_cell_index(leftmost_matching_cell as i32);
-
-    //                 if iter_dir == IterationDirection::Backwards {
-    //                     self.stack.retreat();
-    //                 }
-    //                 let BTreeCell::IndexInteriorCell(IndexInteriorCell {
-    //                     left_child_page, ..
-    //                 }) = &matching_cell
-    //                 else {
-    //                     unreachable!("unexpected cell type: {:?}", matching_cell);
-    //                 };
-
-    //                 println!("Going to left child page: {}", left_child_page);
-    //                 let mem_page = self.read_page(*left_child_page as usize)?;
-    //                 self.stack.push(mem_page);
-    //                 self.seek_state = CursorSeekState::MovingBetweenPages {
-    //                     eq_seen: Cell::new(eq_seen.get()),
-    //                 };
-    //                 continue 'outer;
-    //             }
-
-    //             let cur_cell_idx = (min + max) >> 1;
-    //             println!("Examining cell at index: {}", cur_cell_idx);
-    //             self.stack.set_cell_index(cur_cell_idx as i32);
-    //             let cell = contents.cell_get(
-    //                 cur_cell_idx as usize,
-    //                 payload_overflow_threshold_max(
-    //                     contents.page_type(),
-    //                     self.usable_space() as u16,
-    //                 ),
-    //                 payload_overflow_threshold_min(
-    //                     contents.page_type(),
-    //                     self.usable_space() as u16,
-    //                 ),
-    //                 self.usable_space(),
-    //             )?;
-    //             let BTreeCell::IndexInteriorCell(IndexInteriorCell {
-    //                 payload,
-    //                 payload_size,
-    //                 first_overflow_page,
-    //                 ..
-    //             }) = &cell
-    //             else {
-    //                 unreachable!("unexpected cell type: {:?}", cell);
-    //             };
-
-    //             if let Some(next_page) = first_overflow_page {
-    //                 return_if_io!(self.process_overflow_read(payload, *next_page, *payload_size))
-    //             } else {
-    //                 self.get_immutable_record_or_create()
-    //                     .as_mut()
-    //                     .unwrap()
-    //                     .invalidate();
-    //                 self.get_immutable_record_or_create()
-    //                     .as_mut()
-    //                     .unwrap()
-    //                     .start_serialization(payload);
-    //                 self.record_cursor.borrow_mut().invalidate();
-    //             };
-
-    //             let (target_leaf_page_is_in_left_subtree, is_eq) = {
-    //                 let record = self.get_immutable_record();
-    //                 let record = record.as_ref().unwrap();
-
-    //                 // USE OLD COMPARISON ONLY (temporarily disable optimization)
-    //                 let interior_cell_vs_index_key = {
-    //                     let record_values = record.get_values();
-    //                     let record_slice_equal_number_of_cols = &record_values[..key_values.len()];
-    //                     compare_immutable(
-    //                         record_slice_equal_number_of_cols,
-    //                         key_values.as_slice(),
-    //                         self.key_sort_order(),
-    //                         &self.collations,
-    //                     )
-    //                 };
-
-    //                 println!(
-    //                     "Interior cell comparison: key={:?} vs record={:?} => {:?}",
-    //                     key_values,
-    //                     record.get_values(),
-    //                     interior_cell_vs_index_key
-    //                 );
-
-    //                 let target_is_left = match cmp {
-    //                     SeekOp::GT => interior_cell_vs_index_key.is_gt(),
-    //                     SeekOp::GE { .. } => interior_cell_vs_index_key.is_ge(),
-    //                     SeekOp::LE { .. } => interior_cell_vs_index_key.is_gt(),
-    //                     SeekOp::LT => interior_cell_vs_index_key.is_ge(),
-    //                 };
-
-    //                 println!(
-    //                     "Navigation decision: seek_op={:?}, cell_vs_key={:?}, go_left={}",
-    //                     cmp, interior_cell_vs_index_key, target_is_left
-    //                 );
-
-    //                 (target_is_left, interior_cell_vs_index_key.is_eq())
-    //             };
-
-    //             if is_eq {
-    //                 eq_seen.set(true);
-    //             }
-
-    //             if target_leaf_page_is_in_left_subtree {
-    //                 println!(
-    //                     "Going left: setting nearest_matching_cell={}, max={}",
-    //                     cur_cell_idx,
-    //                     cur_cell_idx - 1
-    //                 );
-    //                 nearest_matching_cell.set(Some(cur_cell_idx as usize));
-    //                 max_cell_idx.set(cur_cell_idx - 1);
-    //             } else {
-    //                 println!("Going right: setting min={}", cur_cell_idx + 1);
-    //                 min_cell_idx.set(cur_cell_idx + 1);
-    //             }
-    //         }
-    //     }
-    // }
 
     /// Specialized version of do_seek() for table btrees that uses binary search instead
     /// of iterating cells in order.
@@ -2472,7 +2388,6 @@ impl BTreeCursor {
         key: &ImmutableRecord,
         seek_op: SeekOp,
     ) -> Result<CursorResult<bool>> {
-        println!("###we are in index btree seek###");
         let key_values = key.get_values();
         let index_info_default = IndexKeyInfo::default();
         let index_info = self
@@ -2720,7 +2635,7 @@ impl BTreeCursor {
 
     fn compare_with_current_record(
         &self,
-        key_unpacked: &[RefValue],
+        key_values: &[RefValue],
         seek_op: SeekOp,
         record_comparer: &RecordCompare,
         index_info: &IndexKeyInfo,
@@ -2729,11 +2644,10 @@ impl BTreeCursor {
         let record = record.as_ref().unwrap();
 
         let tie_breaker = get_tie_breaker_from_seek_op(seek_op);
-
         let cmp = record_comparer
             .compare(
                 record,
-                key_unpacked,
+                &key_values,
                 index_info,
                 &self.collations,
                 0,
@@ -2743,11 +2657,11 @@ impl BTreeCursor {
 
         let found = match seek_op {
             SeekOp::GT => cmp.is_gt(),
-            SeekOp::GE { eq_only: false } => cmp.is_ge(),
             SeekOp::GE { eq_only: true } => cmp.is_eq(),
-            SeekOp::LT => cmp.is_lt(),
-            SeekOp::LE { eq_only: false } => cmp.is_le(),
+            SeekOp::GE { eq_only: false } => cmp.is_ge(),
             SeekOp::LE { eq_only: true } => cmp.is_eq(),
+            SeekOp::LE { eq_only: false } => cmp.is_le(),
+            SeekOp::LT => cmp.is_lt(),
         };
 
         (cmp, found)
@@ -5800,12 +5714,13 @@ impl BTreeCursor {
 
     #[inline(always)]
     pub fn get_column(&self, idx: usize) -> Result<RefValue> {
+        let mut record_cursor_ref = self.record_cursor.borrow_mut();
         let record_ref = self.reusable_immutable_record.borrow();
         let record = record_ref
             .as_ref()
             .ok_or_else(|| LimboError::InternalError("No record available".into()))?;
 
-        self.record_cursor.borrow_mut().get_value(record, idx)
+        record_cursor_ref.get_value(record, idx)
     }
 }
 

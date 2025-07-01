@@ -8,7 +8,7 @@ use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::wal::DummyWAL;
 use crate::storage::{self, header_accessor};
 use crate::translate::collate::CollationSeq;
-use crate::types::{ImmutableRecord, Text};
+use crate::types::{compare_records_generic, ImmutableRecord, Text};
 use crate::util::normalize_ident;
 use crate::{
     error::{
@@ -22,7 +22,6 @@ use crate::{
         },
         printf::exec_printf,
     },
-    types::compare_immutable,
 };
 use std::ops::DerefMut;
 use std::sync::atomic::AtomicUsize;
@@ -2324,6 +2323,15 @@ pub fn op_seek(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[inline(always)]
+fn get_tie_breaker_from_idx_comp_op(insn: &Insn) -> std::cmp::Ordering {
+    match insn {
+        Insn::IdxLE { .. } | Insn::IdxGT { .. } => std::cmp::Ordering::Less,
+        Insn::IdxGE { .. } | Insn::IdxLT { .. } => std::cmp::Ordering::Equal,
+        _ => panic!("Invalid instruction for index comparison"),
+    }
+}
+
 pub fn op_idx_ge(
     program: &Program,
     state: &mut ProgramState,
@@ -2341,31 +2349,38 @@ pub fn op_idx_ge(
         unreachable!("unexpected Insn {:?}", insn)
     };
     assert!(target_pc.is_offset());
+
     let pc = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
-        let record_from_regs = make_record(&state.registers, start_reg, num_regs);
+
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
-            // Compare against the same number of values
-            let idx_values = idx_record.get_values();
-            let record_values = record_from_regs.get_values();
-            let idx_values = &idx_values[..record_values.len()];
-            let ord = compare_immutable(
-                idx_values,
-                record_values.as_slice(),
-                cursor.key_sort_order(),
-                cursor.collations(),
-            );
+            // Create the comparison record from registers
+            let record_from_regs = make_record(&state.registers, start_reg, num_regs);
+            let record_from_regs_values = record_from_regs.get_values();
+
+            let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
+            let ord = compare_records_generic(
+                &idx_record,                     // The serialized record from the index
+                &record_from_regs_values,        // The record built from registers
+                &cursor.index_key_info.unwrap(), // Sort order flags
+                cursor.collations(),             // Collation sequences
+                0,
+                tie_breaker,
+            )?;
+
             if ord.is_ge() {
                 target_pc.as_offset_int()
             } else {
                 state.pc + 1
             }
         } else {
+            // No record at cursor position, jump to target
             target_pc.as_offset_int()
         };
         pc
     };
+
     state.pc = pc;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2405,31 +2420,37 @@ pub fn op_idx_le(
         unreachable!("unexpected Insn {:?}", insn)
     };
     assert!(target_pc.is_offset());
+
     let pc = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
-        let record_from_regs = make_record(&state.registers, start_reg, num_regs);
-        let pc = if let Some(ref idx_record) = return_if_io!(cursor.record()) {
-            // Compare against the same number of values
-            let idx_values = idx_record.get_values();
-            let record_values = record_from_regs.get_values();
-            let idx_values = &idx_values[..record_values.len()];
-            let ord = compare_immutable(
-                idx_values,
-                record_values.as_slice(),
-                cursor.key_sort_order(),
+
+        let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
+            let record_from_regs = make_record(&state.registers, start_reg, num_regs);
+            let record_from_regs_values = record_from_regs.get_values();
+
+            let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
+            let ord = compare_records_generic(
+                &idx_record,
+                &record_from_regs_values,
+                &cursor.index_key_info.unwrap(),
                 cursor.collations(),
-            );
+                0,
+                tie_breaker,
+            )?;
+
             if ord.is_le() {
                 target_pc.as_offset_int()
             } else {
                 state.pc + 1
             }
         } else {
+            // No record at cursor position, jump to target
             target_pc.as_offset_int()
         };
         pc
     };
+
     state.pc = pc;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2451,22 +2472,24 @@ pub fn op_idx_gt(
         unreachable!("unexpected Insn {:?}", insn)
     };
     assert!(target_pc.is_offset());
+
     let pc = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
-        let record_from_regs = make_record(&state.registers, start_reg, num_regs);
-        dbg!("here");
-        let pc = if let Some(ref idx_record) = return_if_io!(cursor.record()) {
-            // Compare against the same number of values
-            let idx_values = idx_record.get_values();
-            let record_values = record_from_regs.get_values();
-            let idx_values = &idx_values[..record_values.len()];
-            let ord = compare_immutable(
-                idx_values,
-                record_values.as_slice(),
-                cursor.key_sort_order(),
+
+        let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
+            let record_from_regs = make_record(&state.registers, start_reg, num_regs);
+            let record_from_regs_values = record_from_regs.get_values();
+
+            let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
+            let ord = compare_records_generic(
+                &idx_record,
+                &record_from_regs_values,
+                &cursor.index_key_info.unwrap(),
                 cursor.collations(),
-            );
+                0,
+                tie_breaker,
+            )?;
 
             if ord.is_gt() {
                 target_pc.as_offset_int()
@@ -2474,10 +2497,12 @@ pub fn op_idx_gt(
                 state.pc + 1
             }
         } else {
+            // No record at cursor position, jump to target
             target_pc.as_offset_int()
         };
         pc
     };
+
     state.pc = pc;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2499,31 +2524,37 @@ pub fn op_idx_lt(
         unreachable!("unexpected Insn {:?}", insn)
     };
     assert!(target_pc.is_offset());
+
     let pc = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
-        let record_from_regs = make_record(&state.registers, start_reg, num_regs);
-        let pc = if let Some(ref idx_record) = return_if_io!(cursor.record()) {
-            // Compare against the same number of values
-            let idx_values = idx_record.get_values();
-            let record_values = record_from_regs.get_values();
-            let idx_values = &idx_values[..record_values.len()];
-            let ord = compare_immutable(
-                idx_values,
-                record_values.as_slice(),
-                cursor.key_sort_order(),
+
+        let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
+            let record_from_regs = make_record(&state.registers, start_reg, num_regs);
+            let record_from_regs_values = record_from_regs.get_values();
+
+            let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
+            let ord = compare_records_generic(
+                &idx_record,
+                &record_from_regs_values,
+                &cursor.index_key_info.unwrap(),
                 cursor.collations(),
-            );
+                0,
+                tie_breaker,
+            )?;
+
             if ord.is_lt() {
                 target_pc.as_offset_int()
             } else {
                 state.pc + 1
             }
         } else {
+            // No record at cursor position, jump to target
             target_pc.as_offset_int()
         };
         pc
     };
+
     state.pc = pc;
     Ok(InsnFunctionStepResult::Step)
 }
