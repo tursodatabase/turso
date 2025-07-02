@@ -5,9 +5,9 @@ RUSTUP := $(shell command -v rustup 2> /dev/null)
 UNAME_S := $(shell uname -s)
 
 # Executable used to execute the compatibility tests.
-SQLITE_EXEC ?= scripts/limbo-sqlite3
+SQLITE_EXEC ?= scripts/turso-sqlite3
 
-all: check-rust-version check-wasm-target limbo limbo-wasm
+all: check-rust-version check-wasm-target turso turso-wasm
 .PHONY: all
 
 check-rust-version:
@@ -34,32 +34,32 @@ check-wasm-target:
 	fi
 .PHONY: check-wasm-target
 
-limbo:
+turso:
 	cargo build
-.PHONY: limbo
+.PHONY: turso
 
-limbo-c:
+turso-c:
 	cargo cbuild
-.PHONY: limbo-c
+.PHONY: turso-c
 
-limbo-wasm:
+turso-wasm:
 	rustup target add wasm32-wasi
-	cargo build --package limbo-wasm --target wasm32-wasi
-.PHONY: limbo-wasm
+	cargo build --package turso-wasm --target wasm32-wasi
+.PHONY: turso-wasm
 
 uv-sync:
 	uv sync --all-packages
 .PHONE: uv-sync
 
-test: limbo uv-sync test-compat test-vector test-sqlite3 test-shell test-extensions test-memory test-write test-update test-constraint test-collate
+test: turso uv-sync test-compat test-vector test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions
 .PHONY: test
 
-test-extensions: limbo uv-sync
-	uv run --project limbo_test test-extensions
+test-extensions: turso uv-sync
+	uv run --project turso_test test-extensions
 .PHONY: test-extensions
 
-test-shell: limbo uv-sync
-	SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-shell
+test-shell: turso uv-sync
+	SQLITE_EXEC=$(SQLITE_EXEC) uv run --project turso_test test-shell
 .PHONY: test-shell
 
 test-compat:
@@ -79,54 +79,54 @@ reset-db:
 .PHONY: reset-db
 
 test-sqlite3: reset-db
-	cargo test -p limbo_sqlite3 --test compat
+	cargo test -p turso_sqlite3 --test compat
 	./scripts/clone_test_db.sh
-	cargo test -p limbo_sqlite3 --test compat --features sqlite3
+	cargo test -p turso_sqlite3 --test compat --features sqlite3
 .PHONY: test-sqlite3
 
 test-json:
 	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/json.test
 .PHONY: test-json
 
-test-memory: limbo uv-sync
-	SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-memory
+test-memory: turso uv-sync
+	SQLITE_EXEC=$(SQLITE_EXEC) uv run --project turso_test test-memory
 .PHONY: test-memory
 
-test-write: limbo uv-sync
-	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
-		SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-write; \
+test-write: turso uv-sync
+	@if [ "$(SQLITE_EXEC)" != "scripts/turso-sqlite3" ]; then \
+		SQLITE_EXEC=$(SQLITE_EXEC) uv run --project turso_test test-write; \
 	else \
-		echo "Skipping test-write: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
+		echo "Skipping test-write: SQLITE_EXEC does not have indexes scripts/turso-sqlite3"; \
 	fi
 .PHONY: test-write
 
-test-update: limbo uv-sync
-	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
-		SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-update; \
+test-update: turso uv-sync
+	@if [ "$(SQLITE_EXEC)" != "scripts/turso-sqlite3" ]; then \
+		SQLITE_EXEC=$(SQLITE_EXEC) uv run --project turso_test test-update; \
 	else \
-		echo "Skipping test-update: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
+		echo "Skipping test-update: SQLITE_EXEC does not have indexes scripts/turso-sqlite3"; \
 	fi
 .PHONY: test-update
 
-test-collate: limbo uv-sync
-	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
-		SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-collate; \
+test-collate: turso uv-sync
+	@if [ "$(SQLITE_EXEC)" != "scripts/turso-sqlite3" ]; then \
+		SQLITE_EXEC=$(SQLITE_EXEC) uv run --project turso_test test-collate; \
 	else \
-		echo "Skipping test-collate: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
+		echo "Skipping test-collate: SQLITE_EXEC does not have indexes scripts/turso-sqlite3"; \
 	fi
 .PHONY: test-collate
 
-test-constraint: limbo uv-sync
-	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
-		SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-constraint; \
+test-constraint: turso uv-sync
+	@if [ "$(SQLITE_EXEC)" != "scripts/turso-sqlite3" ]; then \
+		SQLITE_EXEC=$(SQLITE_EXEC) uv run --project turso_test test-constraint; \
 	else \
-		echo "Skipping test-constraint: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
+		echo "Skipping test-constraint: SQLITE_EXEC does not have indexes scripts/turso-sqlite3"; \
 	fi
 .PHONY: test-constraint
 
 bench-vfs: uv-sync
 	cargo build --release
-	uv run --project limbo_test bench-vfs "$(SQL)" "$(N)"
+	uv run --project turso_test bench-vfs "$(SQL)" "$(N)"
 
 clickbench:
 	./perf/clickbench/benchmark.sh

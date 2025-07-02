@@ -285,7 +285,7 @@ do_execsql_test_on_specific_db {:memory:} select-union-all-with-filters {
 6
 10}
 
-if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/turso-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
     do_execsql_test_on_specific_db {:memory:} select-union-1 {
     CREATE TABLE t(x TEXT, y TEXT);
     CREATE TABLE u(x TEXT, y TEXT);

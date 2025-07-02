@@ -25,7 +25,7 @@ do_execsql_test_on_specific_db {:memory:} drop-table-if-exists-2 {
     SELECT 'success';
 } {success}
 
-if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/turso-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
     # Test dropping table with index
     do_execsql_test_on_specific_db {:memory:} drop-table-with-index-1 {
         CREATE TABLE t3(x INTEGER PRIMARY KEY, y TEXT);

@@ -52,7 +52,7 @@ export PYO3_PYTHON=$(which python3)
 ```
 4. Build Cargo 
 ```console
-cargo build -p limbo_sqlite3 --features capi
+cargo build -p turso_sqlite3 --features capi
 ```
 5. Run tests
 ```console

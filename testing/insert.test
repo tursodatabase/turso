@@ -181,7 +181,7 @@ do_execsql_test_on_specific_db {:memory:} multi-rows {
 } {1|1
 2|1}
 
-if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/turso-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
     do_execsql_test_on_specific_db {:memory:} unique_insert_no_pkey {
         CREATE TABLE t2 (x INTEGER, y INTEGER UNIQUE);
         INSERT INTO t2 (y) VALUES (1);
@@ -326,7 +326,7 @@ do_execsql_test_on_specific_db {:memory:} insert_from_select_same_table_2 {
 5|2|200
 6|3|300}
 
-if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/turso-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
     do_execsql_test_on_specific_db {:memory:} insert_from_select_union {
         CREATE TABLE t(a, b); 
         CREATE TABLE t2(b, c);

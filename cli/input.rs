@@ -83,6 +83,8 @@ pub struct Settings {
     pub io: Io,
     pub tracing_output: Option<String>,
     pub timer: bool,
+    pub enable_mvcc: bool,
+    pub enable_indexes: bool,
 }
 
 impl From<Opts> for Settings {
@@ -107,6 +109,8 @@ impl From<Opts> for Settings {
             },
             tracing_output: opts.tracing_output,
             timer: false,
+            enable_mvcc: opts.experimental_mvcc,
+            enable_indexes: opts.experimental_indexes,
         }
     }
 }

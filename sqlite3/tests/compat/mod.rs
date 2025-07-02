@@ -13,7 +13,7 @@ struct sqlite3_stmt {
     _private: [u8; 0],
 }
 
-#[cfg_attr(not(feature = "sqlite3"), link(name = "limbo_sqlite3"))]
+#[cfg_attr(not(feature = "sqlite3"), link(name = "turso_sqlite3"))]
 #[cfg_attr(feature = "sqlite3", link(name = "sqlite3"))]
 extern "C" {
     fn sqlite3_libversion() -> *const libc::c_char;

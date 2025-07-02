@@ -52,7 +52,7 @@ do_execsql_test_on_specific_db {:memory:} delete-reuse-1 {
 } {1 2 3}
 
 # Test delete works when there are indexes
-if {[info exists ::env(SQLITE_EXEC)] && $::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental"} {
+if {[info exists ::env(SQLITE_EXEC)] && $::env(SQLITE_EXEC) eq "scripts/turso-sqlite3-index-experimental"} {
     do_execsql_test_on_specific_db {:memory:} delete-all-with-indexes-1 {
         CREATE TABLE t(a PRIMARY KEY);
         CREATE INDEX tasc ON t(a);

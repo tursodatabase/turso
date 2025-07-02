@@ -3,7 +3,7 @@
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 
-if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/turso-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
     do_execsql_test_in_memory_any_error create_table_one_unique_set {
         CREATE TABLE t4(a, unique(b));
     }
