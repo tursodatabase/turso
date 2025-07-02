@@ -859,10 +859,7 @@ impl ImmutableRecord {
 
     pub fn get_values(&self) -> Vec<RefValue> {
         let mut cursor = RecordCursor::new();
-        match cursor.get_values(self) {
-            Ok(values) => values,
-            Err(_) => Vec::new(),
-        }
+        cursor.get_values(self).unwrap_or_default()
     }
 
     pub fn from_registers<'a>(
@@ -1483,7 +1480,7 @@ pub fn find_compare(
     index_info: &IndexKeyInfo,
     collations: &[CollationSeq],
 ) -> RecordCompare {
-    if unpacked.len() > 0 && index_info.num_cols <= 13 {
+    if !unpacked.is_empty() && index_info.num_cols <= 13 {
         match &unpacked[0] {
             RefValue::Integer(_) => RecordCompare::Int,
             RefValue::Text(_) if is_binary_collation(collations, 0) => RecordCompare::String,
@@ -1642,7 +1639,7 @@ fn compare_records_string(
         );
     };
 
-    let comparison = if let Some(collation) = collations.get(0) {
+    let comparison = if let Some(collation) = collations.first() {
         collation.compare_strings(lhs_text.as_str(), rhs_text.as_str())
     } else {
         // No collation case
@@ -2197,17 +2194,15 @@ mod tests {
     ) {
         let serialized = create_record(serialized_values.clone());
 
-        let serialized_ref_values: Vec<RefValue> = serialized_values
-            .iter()
-            .map(|v| value_to_ref_value(v))
-            .collect();
+        let serialized_ref_values: Vec<RefValue> =
+            serialized_values.iter().map(value_to_ref_value).collect();
 
         let tie_breaker = std::cmp::Ordering::Equal;
 
         let gold_result = compare_immutable_for_testing(
             &serialized_ref_values,
             &unpacked_values,
-            index_info.sort_order.clone(),
+            index_info.sort_order,
             collations,
             tie_breaker,
         );
@@ -2392,7 +2387,7 @@ mod tests {
             ),
             (
                 vec![Value::Null],
-                vec![RefValue::Float(3.14)],
+                vec![RefValue::Float(64.4)],
                 "null_vs_float",
             ),
             (
@@ -2412,7 +2407,7 @@ mod tests {
                 "integer_vs_text",
             ),
             (
-                vec![Value::Float(3.14)],
+                vec![Value::Float(64.4)],
                 vec![RefValue::Text(TextRef::from_str("hello"))],
                 "float_vs_text",
             ),
@@ -2422,7 +2417,7 @@ mod tests {
                 "integer_vs_blob",
             ),
             (
-                vec![Value::Float(3.14)],
+                vec![Value::Float(64.4)],
                 vec![RefValue::Blob(RawSlice::from_slice(b"blob"))],
                 "float_vs_blob",
             ),
@@ -2526,8 +2521,8 @@ mod tests {
             (vec![], vec![], "both_empty"),
             (vec![], vec![RefValue::Integer(42)], "empty_serialized"),
             (
-                (0..15).map(|i| Value::Integer(i)).collect(),
-                (0..15).map(|i| RefValue::Integer(i)).collect(),
+                (0..15).map(Value::Integer).collect(),
+                (0..15).map(RefValue::Integer).collect(),
                 "large_field_count",
             ),
             (
@@ -2631,7 +2626,7 @@ mod tests {
             RecordCompare::String
         ));
 
-        let large_values: Vec<RefValue> = (0..15).map(|i| RefValue::Integer(i)).collect();
+        let large_values: Vec<RefValue> = (0..15).map(RefValue::Integer).collect();
         assert!(matches!(
             find_compare(&large_values, &index_info_large, &collations),
             RecordCompare::Generic
@@ -2646,10 +2641,10 @@ mod tests {
 
     #[test]
     fn test_record_parsing() {
-        let values = vec![
+        let values = [
             Value::Integer(42),
             Value::Text(Text::new("hello")),
-            Value::Float(3.14159),
+            Value::Float(64.4),
             Value::Null,
             Value::Integer(1000000),
             Value::Blob(vec![1, 2, 3, 4, 5]),
@@ -2819,8 +2814,6 @@ mod tests {
         assert_eq!(
             buf.len(),
             header_length  // 9 bytes (header size + 8 serial types)
-                + 0        // ConstInt0: 0 bytes
-                + 0        // ConstInt1: 0 bytes
                 + size_of::<i8>()        // I8: 1 byte
                 + size_of::<i16>()        // I16: 2 bytes
                 + (size_of::<i32>() - 1)        // I24: 3 bytes

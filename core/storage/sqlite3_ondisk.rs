@@ -1225,7 +1225,7 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
 pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
     match serial_type {
         1 => {
-            if buf.len() < 1 {
+            if buf.is_empty() {
                 crate::bail_corrupt_error!("Invalid 1-byte int");
             }
             Ok(buf[0] as i8 as i64)
