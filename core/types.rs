@@ -857,6 +857,8 @@ impl ImmutableRecord {
         }
     }
 
+    // TODO: inline the complete record parsing code here.
+    // Its probably more efficient.
     pub fn get_values(&self) -> Vec<RefValue> {
         let mut cursor = RecordCursor::new();
         cursor.get_values(self).unwrap_or_default()
@@ -991,7 +993,9 @@ impl ImmutableRecord {
         &self.payload.as_blob()
     }
 
-    pub fn debug_string(&mut self) -> String {
+    // TODO: its probably better to not instantiate the RecordCurosr. Instead do the deserialization
+    // inside the function.
+    pub fn last_value(&self, record_cursor: &mut RecordCursor) -> Option<Result<RefValue>> {
         if self.is_invalidated() {
             return Some(Err(LimboError::InternalError(
                 "Record is invalidated".into(),
@@ -1506,6 +1510,46 @@ pub fn get_tie_breaker_from_seek_op(seek_op: SeekOp) -> std::cmp::Ordering {
     }
 }
 
+/// Optimized integer-first record comparison function.
+///
+/// This function is an optimized version of `compare_records_generic()` for the
+/// common case where:
+/// - (a) The first field of the unpacked record is an integer
+/// - (b) The serialized record's first field is also an integer
+/// - (c) The header size varint fits in a single byte and is ≤ 63 bytes
+///
+/// The 63-byte header limit prevents buffer overreads and ensures safe direct
+/// memory access patterns. This optimization avoids generic parsing overhead
+/// by directly extracting and comparing integer values using known layouts.
+///
+/// # Fast Path Conditions
+///
+/// The function uses the optimized path when ALL of these conditions are met:
+/// - Payload is at least 2 bytes (header size + first serial type)
+/// - Header size ≤ 63 bytes (`payload[0] <= 63`) - safety constraint
+/// - First serial type indicates integer (`1-6`, `8`, or `9`)
+/// - First unpacked field is a `RefValue::Integer`
+///
+/// If any condition fails, it falls back to `compare_records_generic()`.
+///
+/// # Arguments
+///
+/// * `serialized` - The left-hand side record in serialized format
+/// * `unpacked` - The right-hand side record as an array of parsed values
+/// * `index_info` - Contains sort order information for each field
+/// * `collations` - Array of collation sequences (unused for integers)
+/// * `tie_breaker` - Result to return when all compared fields are equal
+///
+/// /// # Comparison Logic
+///
+/// The function follows optimized integer comparison semantics:
+///
+/// 1. **Type validation**: Ensures both sides are integers, otherwise falls back
+/// 2. **Direct extraction**: Reads integer value using specialized decoder
+/// 3. **Native comparison**: Uses Rust's built-in `i64::cmp()` for speed
+/// 4. **Sort order**: Applies ascending/descending order to comparison result
+/// 5. **Remaining fields**: If first field is equal and more fields exist,
+///    delegates to `compare_records_generic()` with `skip=1`
 fn compare_records_int(
     serialized: &ImmutableRecord,
     unpacked: &[RefValue],
@@ -1575,6 +1619,44 @@ fn compare_records_int(
     }
 }
 
+/// This function is an optimized version of `compare_records_generic()` for the
+/// common case where:
+/// - (a) The first field of the unpacked record is a string
+/// - (b) The serialized record's first field is also a string  
+/// - (c) The header size varint fits in a single byte (most records)
+///
+/// This optimization avoids the overhead of generic field parsing by directly
+/// accessing the first string field using known offsets, then falling back to
+/// the generic comparison for remaining fields if needed.
+///
+/// # Fast Path Conditions
+///
+/// The function uses the optimized path when ALL of these conditions are met:
+/// - Payload is at least 2 bytes (header size + first serial type)
+/// - Header size fits in single byte (`payload[0] < 0x80`)
+/// - First serial type indicates string (`>= 13` and odd number)
+/// - First unpacked field is a `RefValue::Text`
+///
+/// If any condition fails, it falls back to `compare_records_generic()`.
+///
+/// # Arguments
+///
+/// * `serialized` - The left-hand side record in serialized format
+/// * `unpacked` - The right-hand side record as an array of parsed values
+/// * `index_info` - Contains sort order information for each field
+/// * `collations` - Array of collation sequences for string comparisons
+/// * `tie_breaker` - Result to return when all compared fields are equal
+///
+/// # Comparison Logic
+///
+/// The function follows SQLite's string comparison semantics:
+///
+/// 1. **Type checking**: Ensures both sides are strings, otherwise falls back
+/// 2. **String comparison**: Uses collation if provided, binary otherwise  
+/// 3. **Sort order**: Applies ascending/descending order to comparison result
+/// 4. **Length comparison**: If strings are equal, compares lengths
+/// 5. **Remaining fields**: If first field is equal and more fields exist,
+///    delegates to `compare_records_generic()` with `skip=1`
 fn compare_records_string(
     serialized: &ImmutableRecord,
     unpacked: &[RefValue],
@@ -1678,6 +1760,38 @@ fn compare_records_string(
     }
 }
 
+/// Compare two table rows or index records.
+///
+/// This function compares a serialized record (`serialized`) with an unpacked
+/// record (`unpacked`) and returns a comparison result. It returns `Less`, `Equal`,
+/// or `Greater` if the serialized record is less than, equal to, or greater than
+/// the unpacked record.
+///
+/// The `serialized` record must be a blob created by the record serialization
+/// process (equivalent to SQLite's OP_MakeRecord opcode). The `unpacked` record
+/// must be a parsed key array of `RefValue` objects.
+///
+/// # Arguments
+///
+/// * `serialized` - The left-hand side record in serialized format
+/// * `unpacked` - The right-hand side record as an array of parsed values  
+/// * `index_info` - Contains sort order information for each field
+/// * `collations` - Array of collation sequences for string comparisons
+/// * `skip` - Number of initial fields to skip (assumes caller verified equality)
+/// * `tie_breaker` - Result to return when all compared fields are equal
+///
+/// # Skipping Fields
+///
+/// If `skip` is non-zero, it is assumed that the caller has already determined
+/// that the first `skip` fields of the records are equal. This function will
+/// begin comparing at field index `skip`, skipping over the header and data
+/// portions of the already-verified fields.
+///
+/// # Field Count Differences
+///
+/// The serialized and unpacked records do not have to contain the same number
+/// of fields. If all fields that appear in both records are equal, then
+/// `tie_breaker` is returned.
 pub fn compare_records_generic(
     serialized: &ImmutableRecord,
     unpacked: &[RefValue],
