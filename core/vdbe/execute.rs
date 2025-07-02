@@ -5,11 +5,13 @@ use crate::storage::btree::{integrity_check, IntegrityCheckError, IntegrityCheck
 use crate::storage::database::FileMemoryStorage;
 use crate::storage::page_cache::DumbLruPageCache;
 use crate::storage::pager::CreateBTreeFlags;
+use crate::storage::sqlite3_ondisk::read_varint;
 use crate::storage::wal::DummyWAL;
 use crate::storage::{self, header_accessor};
 use crate::translate::collate::CollationSeq;
-use crate::types::{compare_records_generic, ImmutableRecord, Text};
+use crate::types::{compare_records_generic, ImmutableRecord, Text, TextSubtype};
 use crate::util::normalize_ident;
+use crate::vdbe::registers_to_ref_values;
 use crate::{
     error::{
         LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
@@ -1279,6 +1281,58 @@ pub fn op_last(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[inline(always)]
+fn read_varint_fast(buf: &[u8]) -> Result<(u64, usize)> {
+    if let Some(&first_byte) = buf.get(0) {
+        if first_byte & 0x80 == 0 {
+            return Ok((first_byte as u64, 1));
+        }
+    } else {
+        crate::bail_corrupt_error!("Invalid varint");
+    }
+
+    if let Some(&second_byte) = buf.get(1) {
+        if second_byte & 0x80 == 0 {
+            let v = (((buf[0] & 0x7f) as u64) << 7) + (second_byte as u64);
+            return Ok((v, 2));
+        }
+    } else {
+        crate::bail_corrupt_error!("Invalid varint");
+    }
+
+    read_varint(buf)
+}
+
+#[inline(always)]
+fn read_integer_fast(buf: &[u8], len: usize) -> i64 {
+    match len {
+        1 => buf[0] as i8 as i64,
+        2 => i16::from_be_bytes([buf[0], buf[1]]) as i64,
+        3 => {
+            let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
+            i32::from_be_bytes([sign_extension, buf[0], buf[1], buf[2]]) as i64
+        }
+        4 => i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64,
+        6 => {
+            let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
+            i64::from_be_bytes([
+                sign_extension,
+                sign_extension,
+                buf[0],
+                buf[1],
+                buf[2],
+                buf[3],
+                buf[4],
+                buf[5],
+            ])
+        }
+        8 => i64::from_be_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]),
+        _ => 0,
+    }
+}
+
 pub fn op_column(
     program: &Program,
     state: &mut ProgramState,
@@ -1322,56 +1376,216 @@ pub fn op_column(
             return Ok(InsnFunctionStepResult::IO);
         }
     }
+
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
     match cursor_type {
         CursorType::BTreeTable(_) | CursorType::BTreeIndex(_) => {
-            // let num_columns = match cursor_type {
-            //     CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
-            //     CursorType::BTreeIndex(index_arc) => index_arc.columns.len(),
-            //     _ => unreachable!("This should not have happened"),
-            // };
-
             let value = 'value: {
                 let mut cursor =
                     must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Column");
                 let cursor = cursor.as_btree_mut();
 
-                // Check if cursor has a null flag set
                 if cursor.get_null_flag() {
                     break 'value Value::Null;
                 }
 
-                // Get the record from the cursor
                 let record_result = return_if_io!(cursor.record());
                 let Some(record) = record_result.as_ref() else {
-                    break 'value Value::Null;
+                    break 'value default.clone().unwrap_or(Value::Null);
                 };
 
-                // Use the record cursor to get just the specified column
-                let result = cursor.get_column(*column);
-                match result {
-                    Ok(ref_value) => ref_value.to_owned(),
-                    Err(_) => {
-                        // If column index is out of bounds or any other error,
-                        // use the default value or Null
-                        default.clone().unwrap_or(Value::Null)
+                let payload = record.get_payload();
+
+                if payload.is_empty() {
+                    break 'value default.clone().unwrap_or(Value::Null);
+                }
+
+                let mut record_cursor = cursor.record_cursor.borrow_mut();
+
+                if record_cursor.serial_types.is_empty() && record_cursor.offsets.is_empty() {
+                    let (header_size, header_len_bytes) = match read_varint_fast(payload) {
+                        Ok(result) => result,
+                        Err(_) => break 'value default.clone().unwrap_or(Value::Null),
+                    };
+
+                    let header_size = header_size as usize;
+
+                    if header_size > payload.len() || header_size > 98307 {
+                        break 'value default.clone().unwrap_or(Value::Null);
                     }
+
+                    record_cursor.header_size = header_size;
+                    record_cursor.header_offset = header_len_bytes;
+
+                    record_cursor.offsets.push(header_size);
+                }
+
+                let target_column = *column;
+                let mut parse_pos = record_cursor.header_offset;
+                let mut data_offset = record_cursor
+                    .offsets
+                    .last()
+                    .copied()
+                    .unwrap_or(record_cursor.header_size);
+
+                // Adjust data_offset if we already have some columns parsed
+                if !record_cursor.serial_types.is_empty() && !record_cursor.offsets.is_empty() {
+                    data_offset = *record_cursor.offsets.last().unwrap();
+                }
+
+                // Parse the header for serial types incrementally until we have the target column
+                while record_cursor.serial_types.len() <= target_column
+                    && parse_pos < record_cursor.header_size
+                    && parse_pos < payload.len()
+                {
+                    let (serial_type, varint_len) = match read_varint_fast(&payload[parse_pos..]) {
+                        Ok(result) => result,
+                        Err(_) => break 'value default.clone().unwrap_or(Value::Null),
+                    };
+
+                    record_cursor.serial_types.push(serial_type);
+                    parse_pos += varint_len;
+
+                    let data_size = match serial_type {
+                        0 => 0,
+                        1 => 1,
+                        2 => 2,
+                        3 => 3,
+                        4 => 4,
+                        5 => 6,
+                        6 => 8,
+                        7 => 8,
+                        8 => 0,
+                        9 => 0,
+                        n if n >= 12 && n % 2 == 0 => (n - 12) / 2, // BLOB
+                        n if n >= 13 && n % 2 == 1 => (n - 13) / 2, // TEXT
+                        _ => break 'value default.clone().unwrap_or(Value::Null),
+                    } as usize;
+
+                    data_offset += data_size;
+                    record_cursor.offsets.push(data_offset);
+                }
+
+                record_cursor.header_offset = parse_pos;
+
+                if parse_pos > record_cursor.header_size || data_offset > payload.len() {
+                    record_cursor.serial_types.clear();
+                    record_cursor.offsets.clear();
+                    record_cursor.header_offset = 0;
+                    record_cursor.header_size = 0;
+                    break 'value default.clone().unwrap_or(Value::Null);
+                }
+
+                if target_column >= record_cursor.serial_types.len() {
+                    break 'value default.clone().unwrap_or(Value::Null);
+                }
+
+                let serial_type = record_cursor.serial_types[target_column];
+
+                // Fast path for common constant cases
+                match serial_type {
+                    0 => break 'value Value::Null,
+                    8 => break 'value Value::Integer(0),
+                    9 => break 'value Value::Integer(1),
+                    _ => {}
+                }
+
+                if target_column + 1 >= record_cursor.offsets.len() {
+                    break 'value default.clone().unwrap_or(Value::Null);
+                }
+
+                let start_offset = record_cursor.offsets[target_column];
+                let end_offset = record_cursor.offsets[target_column + 1];
+
+                if start_offset >= payload.len()
+                    || start_offset > end_offset
+                    || end_offset > payload.len()
+                {
+                    break 'value default.clone().unwrap_or(Value::Null);
+                }
+
+                let data_slice = &payload[start_offset..end_offset];
+                let data_len = end_offset - start_offset;
+
+                match serial_type {
+                    1..=6 => {
+                        let expected_len = match serial_type {
+                            1 => 1,
+                            2 => 2,
+                            3 => 3,
+                            4 => 4,
+                            5 => 6,
+                            6 => 8,
+                            _ => 0,
+                        };
+
+                        if data_len >= expected_len {
+                            Value::Integer(read_integer_fast(data_slice, expected_len))
+                        } else {
+                            default.clone().unwrap_or(Value::Null)
+                        }
+                    }
+                    7 => {
+                        if data_len >= 8 {
+                            let bytes = [
+                                data_slice[0],
+                                data_slice[1],
+                                data_slice[2],
+                                data_slice[3],
+                                data_slice[4],
+                                data_slice[5],
+                                data_slice[6],
+                                data_slice[7],
+                            ];
+                            Value::Float(f64::from_be_bytes(bytes))
+                        } else {
+                            default.clone().unwrap_or(Value::Null)
+                        }
+                    }
+                    n if n >= 12 && n % 2 == 0 => {
+                        let expected_len = ((n - 12) / 2) as usize;
+                        if data_len == expected_len {
+                            Value::Blob(data_slice.to_vec())
+                        } else {
+                            default.clone().unwrap_or(Value::Null)
+                        }
+                    }
+                    n if n >= 13 && n % 2 == 1 => {
+                        let expected_len = ((n - 13) / 2) as usize;
+                        if data_len == expected_len {
+                            Value::Text(Text {
+                                value: data_slice.to_vec(),
+                                subtype: TextSubtype::Text,
+                            })
+                        } else {
+                            default.clone().unwrap_or(Value::Null)
+                        }
+                    }
+                    _ => default.clone().unwrap_or(Value::Null),
                 }
             };
 
-            // If we are copying a text/blob, let's try to simply update size of text if we need to allocate more and reuse.
+            // Try to reuse the registers when allocation is not needed.
             match (&value, &mut state.registers[*dest]) {
-                (Value::Text(text_ref), Register::Value(Value::Text(text_reg))) => {
-                    text_reg.value.clear();
-                    text_reg.value.extend_from_slice(text_ref.value.as_slice());
+                (Value::Text(new_text), Register::Value(Value::Text(existing_text))) => {
+                    if existing_text.value.capacity() >= new_text.value.len() {
+                        existing_text.value.clear();
+                        existing_text.value.extend_from_slice(&new_text.value);
+                        existing_text.subtype = new_text.subtype.clone();
+                    } else {
+                        state.registers[*dest] = Register::Value(value);
+                    }
                 }
-                (Value::Blob(raw_slice), Register::Value(Value::Blob(blob_reg))) => {
-                    blob_reg.clear();
-                    blob_reg.extend_from_slice(raw_slice.as_slice());
+                (Value::Blob(new_blob), Register::Value(Value::Blob(existing_blob))) => {
+                    if existing_blob.capacity() >= new_blob.len() {
+                        existing_blob.clear();
+                        existing_blob.extend_from_slice(new_blob);
+                    } else {
+                        state.registers[*dest] = Register::Value(value);
+                    }
                 }
                 _ => {
-                    let reg = &mut state.registers[*dest];
-                    *reg = Register::Value(value);
+                    state.registers[*dest] = Register::Value(value);
                 }
             }
         }
@@ -2356,13 +2570,12 @@ pub fn op_idx_ge(
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
             // Create the comparison record from registers
-            let record_from_regs = make_record(&state.registers, start_reg, num_regs);
-            let record_from_regs_values = record_from_regs.get_values();
-
+            let values =
+                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
                 &idx_record,                     // The serialized record from the index
-                &record_from_regs_values,        // The record built from registers
+                &values,                         // The record built from registers
                 &cursor.index_key_info.unwrap(), // Sort order flags
                 cursor.collations(),             // Collation sequences
                 0,
@@ -2426,13 +2639,12 @@ pub fn op_idx_le(
         let cursor = cursor.as_btree_mut();
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
-            let record_from_regs = make_record(&state.registers, start_reg, num_regs);
-            let record_from_regs_values = record_from_regs.get_values();
-
+            let values =
+                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
                 &idx_record,
-                &record_from_regs_values,
+                &values,
                 &cursor.index_key_info.unwrap(),
                 cursor.collations(),
                 0,
@@ -2478,13 +2690,12 @@ pub fn op_idx_gt(
         let cursor = cursor.as_btree_mut();
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
-            let record_from_regs = make_record(&state.registers, start_reg, num_regs);
-            let record_from_regs_values = record_from_regs.get_values();
-
+            let values =
+                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
                 &idx_record,
-                &record_from_regs_values,
+                &values,
                 &cursor.index_key_info.unwrap(),
                 cursor.collations(),
                 0,
@@ -2530,13 +2741,13 @@ pub fn op_idx_lt(
         let cursor = cursor.as_btree_mut();
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
-            let record_from_regs = make_record(&state.registers, start_reg, num_regs);
-            let record_from_regs_values = record_from_regs.get_values();
+            let values =
+                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
 
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
                 &idx_record,
-                &record_from_regs_values,
+                &values,
                 &cursor.index_key_info.unwrap(),
                 cursor.collations(),
                 0,

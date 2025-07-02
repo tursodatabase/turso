@@ -29,8 +29,10 @@ use crate::{
     function::{AggFunc, FuncCtx},
     storage::{pager::PagerCacheCommitStatus, sqlite3_ondisk::SmallVec},
     translate::plan::TableReferences,
+    types::{RawSlice, TextRef},
     vdbe::execute::OpIdxInsertState,
     vdbe::execute::OpInsertState,
+    RefValue,
 };
 
 use crate::{
@@ -583,6 +585,44 @@ fn get_new_rowid<R: Rng>(cursor: &mut BTreeCursor, mut _rng: R) -> Result<Cursor
 fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> ImmutableRecord {
     let regs = &registers[*start_reg..*start_reg + *count];
     ImmutableRecord::from_registers(regs, regs.len())
+}
+
+pub fn registers_to_ref_values(registers: &[Register]) -> Vec<RefValue> {
+    registers
+        .iter()
+        .map(|reg| {
+            let value = reg.get_owned_value();
+            match value {
+                Value::Null => RefValue::Null,
+                Value::Integer(i) => RefValue::Integer(*i),
+                Value::Float(f) => RefValue::Float(*f),
+                Value::Text(t) => RefValue::Text(TextRef {
+                    value: RawSlice::new(t.value.as_ptr(), t.value.len()),
+                    subtype: t.subtype.clone(),
+                }),
+                Value::Blob(b) => RefValue::Blob(RawSlice::new(b.as_ptr(), b.len())),
+            }
+        })
+        .collect()
+}
+
+pub fn registers_to_ref_values(registers: &[Register]) -> Vec<RefValue> {
+    registers
+        .iter()
+        .map(|reg| {
+            let value = reg.get_owned_value();
+            match value {
+                Value::Null => RefValue::Null,
+                Value::Integer(i) => RefValue::Integer(*i),
+                Value::Float(f) => RefValue::Float(*f),
+                Value::Text(t) => RefValue::Text(TextRef {
+                    value: RawSlice::new(t.value.as_ptr(), t.value.len()),
+                    subtype: t.subtype.clone(),
+                }),
+                Value::Blob(b) => RefValue::Blob(RawSlice::new(b.as_ptr(), b.len())),
+            }
+        })
+        .collect()
 }
 
 #[instrument(skip(program), level = Level::INFO)]

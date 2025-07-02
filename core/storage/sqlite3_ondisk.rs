@@ -969,6 +969,7 @@ fn read_payload(unread: &'static [u8], payload_size: usize) -> (&'static [u8], O
 }
 
 #[inline(always)]
+#[allow(dead_code)]
 pub fn validate_serial_type(value: u64) -> Result<()> {
     if !SerialType::u64_is_valid_serial_type(value) {
         crate::bail_corrupt_error!("Invalid serial type: {}", value);
