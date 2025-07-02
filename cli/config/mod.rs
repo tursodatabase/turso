@@ -107,7 +107,6 @@ impl TableConfig {
     fn default_column_colors() -> Vec<LimboColor> {
         vec![
             LimboColor(Color::Green),
-            LimboColor(Color::Black),
             // Comfy Table Color::Grey
             LimboColor(Color::Fixed(7)),
         ]
