@@ -1283,7 +1283,7 @@ pub fn op_last(
 
 #[inline(always)]
 fn read_varint_fast(buf: &[u8]) -> Result<(u64, usize)> {
-    if let Some(&first_byte) = buf.get(0) {
+    if let Some(&first_byte) = buf.first() {
         if first_byte & 0x80 == 0 {
             return Ok((first_byte as u64, 1));
         }
@@ -1445,7 +1445,6 @@ pub fn op_column(
 
                     record_cursor.serial_types.push(serial_type);
                     parse_pos += varint_len;
-
                     let data_size = match serial_type {
                         0 => 0,
                         1 => 1,
@@ -1497,7 +1496,7 @@ pub fn op_column(
                 let start_offset = record_cursor.offsets[target_column];
                 let end_offset = record_cursor.offsets[target_column + 1];
 
-                if start_offset >= payload.len()
+                if start_offset > payload.len()
                     || start_offset > end_offset
                     || end_offset > payload.len()
                 {
@@ -1544,22 +1543,14 @@ pub fn op_column(
                     }
                     n if n >= 12 && n % 2 == 0 => {
                         let expected_len = ((n - 12) / 2) as usize;
-                        if data_len == expected_len {
-                            Value::Blob(data_slice.to_vec())
-                        } else {
-                            default.clone().unwrap_or(Value::Null)
-                        }
+                        Value::Blob(data_slice.to_vec())
                     }
                     n if n >= 13 && n % 2 == 1 => {
                         let expected_len = ((n - 13) / 2) as usize;
-                        if data_len == expected_len {
-                            Value::Text(Text {
-                                value: data_slice.to_vec(),
-                                subtype: TextSubtype::Text,
-                            })
-                        } else {
-                            default.clone().unwrap_or(Value::Null)
-                        }
+                        Value::Text(Text {
+                            value: data_slice.to_vec(),
+                            subtype: TextSubtype::Text,
+                        })
                     }
                     _ => default.clone().unwrap_or(Value::Null),
                 }
