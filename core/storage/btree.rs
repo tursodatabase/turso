@@ -619,7 +619,7 @@ impl BTreeCursor {
             .unwrap()
             .last_value(record_cursor)
         {
-            Some(Ok(RefValue::Integer(rowid))) => rowid as i64,
+            Some(Ok(RefValue::Integer(rowid))) => rowid,
             _ => unreachable!(
                 "index where has_rowid() is true should have an integer rowid as the last value"
             ),
@@ -1741,11 +1741,7 @@ impl BTreeCursor {
 
         let key_values = index_key.get_values();
         let index_info_default = IndexKeyInfo::default();
-        let index_info = self
-            .index_key_info
-            .as_ref()
-            .unwrap_or(&index_info_default)
-            .clone();
+        let index_info = *self.index_key_info.as_ref().unwrap_or(&index_info_default);
         let record_comparer = find_compare(&key_values, &index_info, &self.collations);
         tracing::debug!("Using record comparison strategy: {:?}", record_comparer);
         let tie_breaker = get_tie_breaker_from_seek_op(cmp);
@@ -2075,11 +2071,7 @@ impl BTreeCursor {
     ) -> Result<CursorResult<bool>> {
         let key_values = key.get_values();
         let index_info_default = IndexKeyInfo::default();
-        let index_info = self
-            .index_key_info
-            .as_ref()
-            .unwrap_or(&index_info_default)
-            .clone();
+        let index_info = *self.index_key_info.as_ref().unwrap_or(&index_info_default);
         let record_comparer = find_compare(&key_values, &index_info, &self.collations);
 
         tracing::debug!(
@@ -2332,7 +2324,7 @@ impl BTreeCursor {
         let cmp = record_comparer
             .compare(
                 record,
-                &key_values,
+                key_values,
                 index_info,
                 &self.collations,
                 0,

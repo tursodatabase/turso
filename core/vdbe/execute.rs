@@ -2545,6 +2545,7 @@ fn get_tie_breaker_from_idx_comp_op(insn: &Insn) -> std::cmp::Ordering {
     }
 }
 
+#[allow(clippy::let_and_return)]
 pub fn op_idx_ge(
     program: &Program,
     state: &mut ProgramState,
@@ -2615,6 +2616,7 @@ pub fn op_seek_end(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[allow(clippy::let_and_return)]
 pub fn op_idx_le(
     program: &Program,
     state: &mut ProgramState,
@@ -2666,6 +2668,7 @@ pub fn op_idx_le(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[allow(clippy::let_and_return)]
 pub fn op_idx_gt(
     program: &Program,
     state: &mut ProgramState,
@@ -2717,6 +2720,7 @@ pub fn op_idx_gt(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[allow(clippy::let_and_return)]
 pub fn op_idx_lt(
     program: &Program,
     state: &mut ProgramState,
