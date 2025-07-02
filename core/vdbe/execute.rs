@@ -1305,6 +1305,7 @@ fn read_varint_fast(buf: &[u8]) -> Result<(u64, usize)> {
 
 #[inline(always)]
 fn read_integer_fast(buf: &[u8], len: usize) -> i64 {
+    debug_assert!(buf.len() >= len, "Buffer too short for requested length");
     match len {
         1 => buf[0] as i8 as i64,
         2 => i16::from_be_bytes([buf[0], buf[1]]) as i64,
@@ -1403,15 +1404,11 @@ pub fn op_column(
                 let mut record_cursor = cursor.record_cursor.borrow_mut();
 
                 if record_cursor.serial_types.is_empty() && record_cursor.offsets.is_empty() {
-                    let (header_size, header_len_bytes) = match read_varint_fast(payload) {
-                        Ok(result) => result,
-                        Err(_) => break 'value default.clone().unwrap_or(Value::Null),
-                    };
-
+                    let (header_size, header_len_bytes) = read_varint_fast(payload)?;
                     let header_size = header_size as usize;
 
                     if header_size > payload.len() || header_size > 98307 {
-                        break 'value default.clone().unwrap_or(Value::Null);
+                        return Err(LimboError::Corrupt("Header size exceeds bounds".into()));
                     }
 
                     record_cursor.header_size = header_size;
@@ -1456,11 +1453,21 @@ pub fn op_column(
                         7 => 8,
                         8 => 0,
                         9 => 0,
-                        n if n >= 12 && n % 2 == 0 => (n - 12) / 2, // BLOB
-                        n if n >= 13 && n % 2 == 1 => (n - 13) / 2, // TEXT
-                        _ => break 'value default.clone().unwrap_or(Value::Null),
+                        n if n >= 12 && n % 2 == 0 => (n - 12) / 2,
+                        n if n >= 13 && n % 2 == 1 => (n - 13) / 2,
+                        10 | 11 => {
+                            return Err(LimboError::Corrupt(format!(
+                                "Reserved serial type: {}",
+                                serial_type
+                            )))
+                        }
+                        _ => {
+                            return Err(LimboError::Corrupt(format!(
+                                "Invalid serial type: {}",
+                                serial_type
+                            )))
+                        }
                     } as usize;
-
                     data_offset += data_size;
                     record_cursor.offsets.push(data_offset);
                 }
@@ -1521,7 +1528,10 @@ pub fn op_column(
                         if data_len >= expected_len {
                             Value::Integer(read_integer_fast(data_slice, expected_len))
                         } else {
-                            default.clone().unwrap_or(Value::Null)
+                            return Err(LimboError::Corrupt(format!(
+                                "Insufficient data for integer type {}: expected {}, got {}",
+                                serial_type, expected_len, data_len
+                            )));
                         }
                     }
                     7 => {
@@ -1541,17 +1551,11 @@ pub fn op_column(
                             default.clone().unwrap_or(Value::Null)
                         }
                     }
-                    n if n >= 12 && n % 2 == 0 => {
-                        let expected_len = ((n - 12) / 2) as usize;
-                        Value::Blob(data_slice.to_vec())
-                    }
-                    n if n >= 13 && n % 2 == 1 => {
-                        let expected_len = ((n - 13) / 2) as usize;
-                        Value::Text(Text {
-                            value: data_slice.to_vec(),
-                            subtype: TextSubtype::Text,
-                        })
-                    }
+                    n if n >= 12 && n % 2 == 0 => Value::Blob(data_slice.to_vec()),
+                    n if n >= 13 && n % 2 == 1 => Value::Text(Text {
+                        value: data_slice.to_vec(),
+                        subtype: TextSubtype::Text,
+                    }),
                     _ => default.clone().unwrap_or(Value::Null),
                 }
             };
