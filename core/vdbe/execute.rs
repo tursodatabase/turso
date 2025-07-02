@@ -1436,10 +1436,7 @@ pub fn op_column(
                     && parse_pos < record_cursor.header_size
                     && parse_pos < payload.len()
                 {
-                    let (serial_type, varint_len) = match read_varint_fast(&payload[parse_pos..]) {
-                        Ok(result) => result,
-                        Err(_) => break 'value default.clone().unwrap_or(Value::Null),
-                    };
+                    let (serial_type, varint_len) = read_varint_fast(&payload[parse_pos..])?;
 
                     record_cursor.serial_types.push(serial_type);
                     parse_pos += varint_len;
@@ -1503,13 +1500,6 @@ pub fn op_column(
 
                 let start_offset = record_cursor.offsets[target_column];
                 let end_offset = record_cursor.offsets[target_column + 1];
-
-                if start_offset > payload.len()
-                    || start_offset > end_offset
-                    || end_offset > payload.len()
-                {
-                    break 'value default.clone().unwrap_or(Value::Null);
-                }
 
                 let data_slice = &payload[start_offset..end_offset];
                 let data_len = end_offset - start_offset;

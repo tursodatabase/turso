@@ -1136,10 +1136,6 @@ impl RecordCursor {
         let end = self.offsets[idx + 1];
         let payload = record.get_payload();
 
-        if end > payload.len() || start >= end {
-            return Ok(RefValue::Null);
-        }
-
         let slice = &payload[start..end];
         let (value, _) = crate::storage::sqlite3_ondisk::read_value(slice, serial_type_obj)?;
         Ok(value)
