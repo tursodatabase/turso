@@ -62,7 +62,7 @@ impl futures_util::Stream for Rows {
 
     fn poll_next(
         self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         use std::task::Poll;
         let stmt = self
@@ -91,6 +91,7 @@ impl futures_util::Stream for Rows {
                         return Poll::Ready(Some(Err(e.into())));
                     }
                     // TODO: see correct way to signal for this task to wake up
+                    cx.waker().wake_by_ref();
                     Poll::Pending
                 }
                 // TODO: Busy and Interrupt should probably return errors

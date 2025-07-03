@@ -527,12 +527,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 const INTEGRITY_CHECK_INTERVAL: usize = 100;
                 if query_index % INTEGRITY_CHECK_INTERVAL == 0 {
                     let mut res = conn.query("PRAGMA integrity_check", ()).await.unwrap();
-                    if let Some(row) = res.try_next().await? {
+                    let mut count = 0;
+                    while let Some(row) = res.try_next().await? {
                         let value = row.get_value(0).unwrap();
                         if value != "ok".into() {
                             panic!("integrity check failed: {:?}", value);
                         }
-                    } else {
+                        count += 1;
+                    }
+                    if count == 0 {
                         panic!("integrity check failed: no rows");
                     }
                 }
