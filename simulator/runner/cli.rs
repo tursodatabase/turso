@@ -91,7 +91,7 @@ pub struct SimulatorCLI {
     #[clap(
         long = "latency_prob",
         help = "added IO latency probability",
-        default_value_t = 0
+        default_value_t = 1
     )]
     pub latency_probability: usize,
     #[clap(long, help = "Enable experimental MVCC feature")]
