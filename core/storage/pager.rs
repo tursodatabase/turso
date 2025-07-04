@@ -2937,7 +2937,7 @@ mod ptrmap_tests {
 
         // Flush all dirty pages so they are clean prior to relocation
         loop {
-            match pager.cacheflush().unwrap() {
+            match pager.cacheflush(true).unwrap() {
                 PagerCacheflushStatus::Done(_) => break,
                 PagerCacheflushStatus::IO => pager.io.run_once().unwrap(),
             }
