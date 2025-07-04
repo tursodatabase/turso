@@ -646,6 +646,7 @@ fn reopen_database(env: &mut SimulatorEnv) {
     env.connections.clear();
 
     // Clear all open files
+    // TODO: for correct reporting of faults we should get all the recorded numbers and transfer to the new file
     env.io.files.borrow_mut().clear();
 
     // 2. Re-open database

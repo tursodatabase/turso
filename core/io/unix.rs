@@ -419,6 +419,7 @@ impl File for UnixFile<'_> {
         }
     }
 
+    #[instrument(err, skip_all, level = Level::TRACE)]
     fn size(&self) -> Result<u64> {
         let file = self.file.borrow();
         Ok(file.metadata()?.len())

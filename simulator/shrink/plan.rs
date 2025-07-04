@@ -60,6 +60,7 @@ impl InteractionPlan {
                     .uses()
                     .iter()
                     .any(|t| depending_tables.contains(t));
+
                 if has_table {
                     // Remove the extensional parts of the properties
                     if let Interactions::Property(p) = interactions {
@@ -82,13 +83,15 @@ impl InteractionPlan {
                         .iter()
                         .any(|t| depending_tables.contains(t));
                 }
-                has_table
-                    && !matches!(
-                        interactions,
-                        Interactions::Query(Query::Select(_))
-                            | Interactions::Property(Property::SelectLimit { .. })
-                            | Interactions::Property(Property::SelectSelectOptimizer { .. })
-                    )
+                let is_fault = matches!(interactions, Interactions::Fault(..));
+                is_fault
+                    || (has_table
+                        && !matches!(
+                            interactions,
+                            Interactions::Query(Query::Select(_))
+                                | Interactions::Property(Property::SelectLimit { .. })
+                                | Interactions::Property(Property::SelectSelectOptimizer { .. })
+                        ))
             };
             idx += 1;
             retain

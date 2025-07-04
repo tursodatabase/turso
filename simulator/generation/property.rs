@@ -463,6 +463,7 @@ impl Property {
                     message: "fault occured".to_string(),
                     func: Box::new(move |stack, env| {
                         let last = stack.last().unwrap();
+                        dbg!(&last);
                         match last {
                             Ok(_) => {
                                 query_clone.shadow(env);
@@ -501,14 +502,14 @@ fn assert_all_table_values(tables: &[String]) -> impl Iterator<Item = Interactio
         }));
         let assertion = Interaction::Assertion(Assertion {
             message: format!(
-                "table {} should contain all of its values after the wal reopened",
+                "table {} should contain all of its values",
                 table
             ),
             func: Box::new({
                 let table = table.clone();
                 move |stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
                     let table = env.tables.iter().find(|t| t.name == table).ok_or_else(|| {
-                        LimboError::InternalError(format!("table {} should exist", table))
+                        LimboError::InternalError(format!("table {} should exist in simulator env", table))
                     })?;
                     let last = stack.last().unwrap();
                     match last {

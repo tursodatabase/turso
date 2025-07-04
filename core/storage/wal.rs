@@ -499,6 +499,7 @@ impl fmt::Debug for WalFileShared {
 
 impl Wal for WalFile {
     /// Begin a read transaction.
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn begin_read_tx(&mut self) -> Result<LimboResult> {
         let max_frame_in_wal = self.get_shared().max_frame.load(Ordering::SeqCst);
 
@@ -564,6 +565,7 @@ impl Wal for WalFile {
 
     /// End a read transaction.
     #[inline(always)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn end_read_tx(&self) -> Result<LimboResult> {
         tracing::debug!("end_read_tx(lock={})", self.max_frame_read_lock_index);
         let read_lock = &mut self.get_shared().read_locks[self.max_frame_read_lock_index];
@@ -572,6 +574,7 @@ impl Wal for WalFile {
     }
 
     /// Begin a write transaction
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn begin_write_tx(&mut self) -> Result<LimboResult> {
         let busy = !self.get_shared().write_lock.write();
         tracing::debug!("begin_write_transaction(busy={})", busy);
@@ -582,6 +585,7 @@ impl Wal for WalFile {
     }
 
     /// End a write transaction
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn end_write_tx(&self) -> Result<LimboResult> {
         tracing::debug!("end_write_txn");
         self.get_shared().write_lock.unlock();
@@ -589,6 +593,7 @@ impl Wal for WalFile {
     }
 
     /// Find the latest frame containing a page.
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn find_frame(&self, page_id: u64) -> Result<Option<u64>> {
         let shared = self.get_shared();
         let frames = shared.frame_cache.lock();
@@ -606,6 +611,7 @@ impl Wal for WalFile {
     }
 
     /// Read a frame from the WAL.
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Arc<BufferPool>) -> Result<()> {
         tracing::debug!("read_frame({})", frame_id);
         let offset = self.frame_offset(frame_id);
@@ -624,6 +630,7 @@ impl Wal for WalFile {
         Ok(())
     }
 
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn read_frame_raw(
         &self,
         frame_id: u64,
@@ -650,6 +657,7 @@ impl Wal for WalFile {
     }
 
     /// Write a frame to the WAL.
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn append_frame(
         &mut self,
         page: PageRef,
@@ -660,12 +668,7 @@ impl Wal for WalFile {
         let max_frame = self.max_frame;
         let frame_id = if max_frame == 0 { 1 } else { max_frame + 1 };
         let offset = self.frame_offset(frame_id);
-        tracing::debug!(
-            "append_frame(frame={}, offset={}, page_id={})",
-            frame_id,
-            offset,
-            page_id
-        );
+        tracing::debug!(frame_id, offset, page_id);
         let checksums = {
             let shared = self.get_shared();
             let header = shared.wal_header.clone();
@@ -699,13 +702,14 @@ impl Wal for WalFile {
         Ok(())
     }
 
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn should_checkpoint(&self) -> bool {
         let shared = self.get_shared();
         let frame_id = shared.max_frame.load(Ordering::SeqCst) as usize;
         frame_id >= self.checkpoint_threshold
     }
 
-    #[instrument(skip_all, level = Level::TRACE)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn checkpoint(
         &mut self,
         pager: &Pager,
@@ -869,7 +873,7 @@ impl Wal for WalFile {
         }
     }
 
-    #[instrument(skip_all, level = Level::DEBUG)]
+    #[instrument(err, skip_all, level = Level::DEBUG)]
     fn sync(&mut self) -> Result<WalFsyncStatus> {
         match self.sync_state.get() {
             SyncState::NotSyncing => {
@@ -911,6 +915,7 @@ impl Wal for WalFile {
         self.min_frame
     }
 
+    #[instrument(err, skip_all, level = Level::DEBUG)]
     fn rollback(&mut self) -> Result<()> {
         // TODO(pere): have to remove things from frame_cache because they are no longer valid.
         // TODO(pere): clear page cache in pager.
@@ -918,7 +923,7 @@ impl Wal for WalFile {
             // TODO(pere): implement proper hashmap, this sucks :).
             let shared = self.get_shared();
             let max_frame = shared.max_frame.load(Ordering::SeqCst);
-            tracing::trace!("rollback(to_max_frame={})", max_frame);
+            tracing::trace!(to_max_frame = max_frame);
             let mut frame_cache = shared.frame_cache.lock();
             for (_, frames) in frame_cache.iter_mut() {
                 let mut last_valid_frame = frames.len();
@@ -936,14 +941,11 @@ impl Wal for WalFile {
         Ok(())
     }
 
+    #[instrument(skip_all, level = Level::TRACE)]
     fn finish_append_frames_commit(&mut self) -> Result<()> {
         let shared = self.get_shared();
         shared.max_frame.store(self.max_frame, Ordering::SeqCst);
-        tracing::trace!(
-            "finish_append_frames_commit(max_frame={}, last_checksum={:?})",
-            self.max_frame,
-            self.last_checksum
-        );
+        tracing::trace!(self.max_frame, ?self.last_checksum);
         shared.last_checksum = self.last_checksum;
         Ok(())
     }
