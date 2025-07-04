@@ -995,15 +995,20 @@ pub fn translate_expr(
                                     srf.to_string()
                                 );
                             };
-                            let mut start_reg = None;
-                            for arg in args.iter() {
-                                let reg = program.alloc_register();
-                                start_reg = Some(start_reg.unwrap_or(reg));
-                                translate_expr(program, referenced_tables, arg, reg, resolver)?;
+                            // Allocate a contiguous block of registers for all arguments
+                            let start_reg = program.alloc_registers(args.len());
+                            for (i, arg) in args.iter().enumerate() {
+                                translate_expr(
+                                    program,
+                                    referenced_tables,
+                                    arg,
+                                    start_reg + i,
+                                    resolver,
+                                )?;
                             }
                             program.emit_insn(Insn::Function {
                                 constant_mask: 0,
-                                start_reg: start_reg.unwrap(),
+                                start_reg,
                                 dest: target_register,
                                 func: func_ctx,
                             });
@@ -1011,23 +1016,29 @@ pub fn translate_expr(
                         }
                         ScalarFunc::ConcatWs => {
                             let args = expect_arguments_min!(args, 2, srf);
-
-                            let temp_register = program.alloc_register();
-                            for arg in args.iter() {
-                                let reg = program.alloc_register();
-                                translate_expr(program, referenced_tables, arg, reg, resolver)?;
+                            // Allocate contiguous registers for all arguments
+                            let start_reg = program.alloc_registers(args.len());
+                            for (i, arg) in args.iter().enumerate() {
+                                translate_expr(
+                                    program,
+                                    referenced_tables,
+                                    arg,
+                                    start_reg + i,
+                                    resolver,
+                                )?;
                             }
+                            // Allocate a temporary register for the function result
+                            let temp_register = program.alloc_register();
                             program.emit_insn(Insn::Function {
                                 constant_mask: 0,
-                                start_reg: temp_register + 1,
+                                start_reg,
                                 dest: temp_register,
                                 func: func_ctx,
                             });
-
                             program.emit_insn(Insn::Copy {
                                 src_reg: temp_register,
                                 dst_reg: target_register,
-                                amount: 1,
+                                amount: 0,
                             });
                             Ok(target_register)
                         }

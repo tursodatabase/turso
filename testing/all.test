@@ -9,6 +9,7 @@ source $testdir/delete.test
 source $testdir/glob.test
 source $testdir/join.test
 source $testdir/insert.test
+source $testdir/returning.test
 source $testdir/json.test
 source $testdir/like.test
 source $testdir/math.test

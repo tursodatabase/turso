@@ -1,0 +1,40 @@
+#!/usr/bin/env tclsh
+# Test cases for INSERT ... RETURNING support in Limbo / SQLite compatibility layer
+# Follows the same harness style as other .test files (uses tester.tcl helpers).
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+# ------------------------------------------------------------------------------
+# Basic: single-row insert with RETURNING single column
+# ------------------------------------------------------------------------------
+do_execsql_test_on_specific_db {:memory:} insert-returning-single {
+    CREATE TABLE t (x INTEGER);
+    INSERT INTO t VALUES (1) RETURNING x;
+} {1}
+
+# ------------------------------------------------------------------------------
+# Multi-row VALUES list, RETURNING list column order preserved
+# ------------------------------------------------------------------------------
+do_execsql_test_on_specific_db {:memory:} insert-returning-multi {
+    CREATE TABLE t2 (x INTEGER);
+    INSERT INTO t2 VALUES (2), (3) RETURNING x;
+} {2
+3}
+
+# ------------------------------------------------------------------------------
+# RETURNING * should echo back full row (single column in this schema)
+# ------------------------------------------------------------------------------
+do_execsql_test_on_specific_db {:memory:} insert-returning-star {
+    CREATE TABLE t3 (x INTEGER);
+    INSERT INTO t3 VALUES (4), (5) RETURNING *;
+} {4
+5}
+
+# ------------------------------------------------------------------------------
+# Unsupported syntax: table.* inside RETURNING should raise an error
+# ------------------------------------------------------------------------------
+do_execsql_test_in_memory_any_error insert-returning-table-star {
+    CREATE TABLE t4 (x INTEGER);
+    INSERT INTO t4 VALUES (1) RETURNING t4.*;
+} 
