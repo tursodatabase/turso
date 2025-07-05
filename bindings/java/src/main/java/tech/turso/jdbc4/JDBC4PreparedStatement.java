@@ -152,7 +152,8 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
 
   @Override
   public void clearParameters() throws SQLException {
-    // TODO
+    requireNonNull(this.statement);
+    statement.clearParameters();
   }
 
   @Override

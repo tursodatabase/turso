@@ -268,6 +268,24 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_bindBlob<'local>(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_tech_turso_core_TursoStatement_clearParameters<'local>(
+    mut env: JNIEnv<'local>,
+    obj: JObject<'local>,
+    stmt_ptr: jlong,
+) -> jint {
+    let stmt = match to_turso_statement(stmt_ptr) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            set_err_msg_and_throw_exception(&mut env, obj, SQLITE_ERROR, e.to_string());
+            return SQLITE_ERROR;
+        }
+    };
+    
+    stmt.stmt.clear_parameters(); 
+    SQLITE_OK
+}
+
+#[no_mangle]
 pub extern "system" fn Java_tech_turso_core_TursoStatement_totalChanges<'local>(
     mut env: JNIEnv<'local>,
     obj: JObject<'local>,

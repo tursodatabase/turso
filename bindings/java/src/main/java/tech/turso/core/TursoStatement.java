@@ -215,6 +215,13 @@ public final class TursoStatement {
   private native int bindBlob(long statementPointer, int position, byte[] value)
       throws SQLException;
 
+  /** TODO */
+  public void clearParameters() throws SQLException {
+    clearParameters(statementPointer);
+  }
+
+  private native int clearParameters(long statementPointer) throws SQLException;
+
   /**
    * Returns total number of changes.
    *

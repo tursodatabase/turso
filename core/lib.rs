@@ -909,6 +909,10 @@ impl Statement {
     pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) {
         self.state.bind_at(index, value);
     }
+    
+    pub fn clear_parameters(&mut self) {
+        self.state.clear_parameters(); 
+    }
 
     pub fn reset(&mut self) {
         self.state.reset();

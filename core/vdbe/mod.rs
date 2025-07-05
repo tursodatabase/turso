@@ -302,6 +302,10 @@ impl ProgramState {
     pub fn get_parameter(&self, index: NonZero<usize>) -> Value {
         self.parameters.get(&index).cloned().unwrap_or(Value::Null)
     }
+    
+    pub fn clear_parameters(&mut self) { 
+        self.parameters.clear(); 
+    }
 
     pub fn reset(&mut self) {
         self.pc = 0;
