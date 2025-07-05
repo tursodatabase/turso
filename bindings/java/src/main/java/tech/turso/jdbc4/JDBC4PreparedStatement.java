@@ -47,11 +47,11 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
   @Override
   public int executeUpdate() throws SQLException {
     requireNonNull(this.statement);
+    final long previousTotalChanges = statement.totalChanges();
     final TursoResultSet resultSet = statement.getResultSet();
     resultSet.consumeAll();
 
-    // TODO: return updated count
-    return 0;
+    return (int) (statement.totalChanges() - previousTotalChanges);
   }
 
   @Override
