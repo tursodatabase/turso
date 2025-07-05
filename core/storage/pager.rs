@@ -768,7 +768,7 @@ impl Pager {
     #[instrument(skip_all, level = Level::INFO)]
     pub fn cacheflush(&self, wal_checkpoint_disabled: bool) -> Result<PagerCacheflushStatus> {
         let mut checkpoint_result = CheckpointResult::default();
-        loop {
+        let res = loop {
             let state = self.flush_info.borrow().state;
             trace!(?state);
             match state {
@@ -811,13 +811,9 @@ impl Pager {
                         return Ok(PagerCacheflushStatus::IO);
                     }
 
-                    // We should only signal that we finished appenind frames after wal sync to avoid inconsistencies when sync fails
-                    self.wal.borrow_mut().finish_append_frames_commit()?;
                     if wal_checkpoint_disabled || !self.wal.borrow().should_checkpoint() {
                         self.flush_info.borrow_mut().state = FlushState::Start;
-                        return Ok(PagerCacheflushStatus::Done(
-                            PagerCacheflushResult::WalWritten,
-                        ));
+                        break PagerCacheflushResult::WalWritten;
                     }
                     self.flush_info.borrow_mut().state = FlushState::Checkpoint;
                 }
@@ -839,14 +835,14 @@ impl Pager {
                         return Ok(PagerCacheflushStatus::IO);
                     } else {
                         self.flush_info.borrow_mut().state = FlushState::Start;
-                        break;
+                        break PagerCacheflushResult::Checkpointed(checkpoint_result);
                     }
                 }
             }
-        }
-        Ok(PagerCacheflushStatus::Done(
-            PagerCacheflushResult::Checkpointed(checkpoint_result),
-        ))
+        };
+        // We should only signal that we finished appenind frames after wal sync to avoid inconsistencies when sync fails
+        self.wal.borrow_mut().finish_append_frames_commit()?;
+        Ok(PagerCacheflushStatus::Done(res))
     }
 
     #[instrument(skip_all, level = Level::INFO)]

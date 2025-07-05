@@ -923,7 +923,7 @@ impl Wal for WalFile {
             // TODO(pere): implement proper hashmap, this sucks :).
             let shared = self.get_shared();
             let max_frame = shared.max_frame.load(Ordering::SeqCst);
-            tracing::trace!(to_max_frame = max_frame);
+            tracing::debug!(to_max_frame = max_frame);
             let mut frame_cache = shared.frame_cache.lock();
             for (_, frames) in frame_cache.iter_mut() {
                 let mut last_valid_frame = frames.len();
