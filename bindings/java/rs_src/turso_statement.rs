@@ -280,8 +280,8 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_clearParameters<'loca
             return SQLITE_ERROR;
         }
     };
-    
-    stmt.stmt.clear_parameters(); 
+
+    stmt.stmt.clear_parameters();
     SQLITE_OK
 }
 
