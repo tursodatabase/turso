@@ -11,7 +11,7 @@ use turso_sqlite3_parser::ast::{CompoundOperator, SortOrder};
 
 use tracing::Level;
 
-#[instrument(skip_all, level = Level::TRACE)]
+#[instrument(skip_all, level = Level::INFO)]
 pub fn emit_program_for_compound_select(
     program: &mut ProgramBuilder,
     plan: Plan,

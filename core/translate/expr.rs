@@ -27,7 +27,7 @@ pub struct ConditionMetadata {
     pub jump_target_when_false: BranchOffset,
 }
 
-#[instrument(skip_all, level = Level::TRACE)]
+#[instrument(skip_all, level = Level::INFO)]
 fn emit_cond_jump(program: &mut ProgramBuilder, cond_meta: ConditionMetadata, reg: usize) {
     if cond_meta.jump_if_condition_is_true {
         program.emit_insn(Insn::If {
@@ -131,7 +131,7 @@ macro_rules! expect_arguments_even {
     }};
 }
 
-#[instrument(skip(program, referenced_tables, expr, resolver), level = Level::TRACE)]
+#[instrument(skip(program, referenced_tables, expr, resolver), level = Level::INFO)]
 pub fn translate_condition_expr(
     program: &mut ProgramBuilder,
     referenced_tables: &TableReferences,

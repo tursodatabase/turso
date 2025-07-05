@@ -368,7 +368,7 @@ pub struct Program {
 }
 
 impl Program {
-    #[instrument(skip_all, level = Level::TRACE)]
+    #[instrument(skip_all, level = Level::INFO)]
     pub fn step(
         &self,
         state: &mut ProgramState,
@@ -399,7 +399,7 @@ impl Program {
         }
     }
 
-    #[instrument(skip_all, level = Level::TRACE)]
+    #[instrument(skip_all, level = Level::INFO)]
     pub fn commit_txn(
         &self,
         pager: Rc<Pager>,
@@ -465,7 +465,7 @@ impl Program {
         }
     }
 
-    #[instrument(skip(self, pager, connection), level = Level::TRACE)]
+    #[instrument(skip(self, pager, connection), level = Level::INFO)]
     fn step_end_write_txn(
         &self,
         pager: &Rc<Pager>,
@@ -564,7 +564,7 @@ fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> Immu
     ImmutableRecord::from_registers(regs, regs.len())
 }
 
-#[instrument(skip(program), level = Level::TRACE)]
+#[instrument(skip(program), level = Level::INFO)]
 fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
     if !tracing::enabled!(tracing::Level::TRACE) {
         return;

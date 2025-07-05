@@ -727,7 +727,7 @@ impl PageContent {
     }
 }
 
-#[instrument(skip_all, level = Level::TRACE)]
+#[instrument(skip_all, level = Level::INFO)]
 pub fn begin_read_page(
     db_file: Arc<dyn DatabaseStorage>,
     buffer_pool: Arc<BufferPool>,
@@ -774,7 +774,7 @@ pub fn finish_read_page(
     Ok(())
 }
 
-#[instrument(skip_all, level = Level::TRACE)]
+#[instrument(skip_all, level = Level::INFO)]
 pub fn begin_write_btree_page(
     pager: &Pager,
     page: &PageRef,
@@ -817,7 +817,7 @@ pub fn begin_write_btree_page(
     res
 }
 
-#[instrument(skip_all, level = Level::TRACE)]
+#[instrument(skip_all, level = Level::INFO)]
 pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>, syncing: Rc<RefCell<bool>>) -> Result<()> {
     assert!(!*syncing.borrow());
     *syncing.borrow_mut() = true;
@@ -1489,7 +1489,7 @@ pub fn begin_read_wal_frame(
     Ok(c)
 }
 
-#[instrument(err,skip(io, page, write_counter, wal_header, checksums), level = Level::TRACE)]
+#[instrument(err,skip(io, page, write_counter, wal_header, checksums), level = Level::INFO)]
 #[allow(clippy::too_many_arguments)]
 pub fn begin_write_wal_frame(
     io: &Arc<dyn File>,

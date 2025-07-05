@@ -463,7 +463,6 @@ impl Property {
                     message: "fault occured".to_string(),
                     func: Box::new(move |stack, env| {
                         let last = stack.last().unwrap();
-                        dbg!(&last);
                         match last {
                             Ok(_) => {
                                 query_clone.shadow(env);

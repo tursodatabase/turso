@@ -291,7 +291,7 @@ impl ProgramBuilder {
         });
     }
 
-    #[instrument(skip(self), level = Level::TRACE)]
+    #[instrument(skip(self), level = Level::INFO)]
     pub fn emit_insn(&mut self, insn: Insn) {
         let function = insn.to_function();
         // This seemingly empty trace here is needed so that a function span is emmited with it
