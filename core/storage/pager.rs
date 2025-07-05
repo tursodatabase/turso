@@ -965,6 +965,7 @@ impl Pager {
         new_child_page_num: usize,
         ptrmap_type: PtrmapType,
     ) -> Result<()> {
+        use crate::storage::btree::offset;
         use crate::storage::btree::payload_overflow_threshold_max;
         use crate::storage::btree::payload_overflow_threshold_min;
         use crate::storage::sqlite3_ondisk::BTreeCell;
@@ -1066,14 +1067,10 @@ impl Pager {
         //  If we go through all the cells and don't find the page number, then we need to update the rightmost pointer of this page
         //  The rightmost pointer has to exist in the page at this point and it must equal the page number we are looking for
         assert!(ptrmap_type == PtrmapType::BTreeNode);
-        assert!(contents.rightmost_pointer_raw().is_some());
-        let rightmost_ptr = contents.rightmost_pointer_raw().unwrap();
-        unsafe {
-            let slice = std::slice::from_raw_parts_mut(rightmost_ptr, 4);
-            let current = u32::from_be_bytes(slice.try_into().unwrap());
-            assert_eq!(current, prev_child_page_num as u32);
-            slice.copy_from_slice(&(new_child_page_num as u32).to_be_bytes());
-        }
+        assert!(contents.rightmost_pointer().is_some());
+        let current = contents.read_u32(offset::BTREE_RIGHTMOST_PTR);
+        assert_eq!(current, prev_child_page_num as u32);
+        contents.write_u32(offset::BTREE_RIGHTMOST_PTR, new_child_page_num as u32);
         parent_page.set_dirty();
         self.add_dirty(parent_page.get().id);
 
