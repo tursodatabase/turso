@@ -5581,6 +5581,9 @@ impl PageStack {
     }
 
     fn clear(&self) {
+        for slot in self.stack.borrow_mut().iter_mut() {
+            *slot = None;
+        }
         self.current_page.set(-1);
     }
     pub fn parent_page(&self) -> Option<BTreePage> {
