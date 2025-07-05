@@ -341,7 +341,10 @@ impl Pager {
     #[cfg(not(feature = "omit_autovacuum"))]
     pub fn ptrmap_get(&self, target_page_num: u32) -> Result<CursorResult<Option<PtrmapEntry>>> {
         tracing::trace!("ptrmap_get(page_idx = {})", target_page_num);
-        let configured_page_size = header_accessor::get_page_size(self)? as usize;
+        let configured_page_size = match header_accessor::get_page_size_async(self)? {
+            CursorResult::Ok(size) => size as usize,
+            CursorResult::IO => return Ok(CursorResult::IO),
+        };
 
         if target_page_num < FIRST_PTRMAP_PAGE_NO
             || is_ptrmap_page(target_page_num, configured_page_size)
@@ -424,7 +427,10 @@ impl Pager {
             parent_page_no
         );
 
-        let page_size = header_accessor::get_page_size(self)? as usize;
+        let page_size = match header_accessor::get_page_size_async(self)? {
+            CursorResult::Ok(size) => size as usize,
+            CursorResult::IO => return Ok(CursorResult::IO),
+        };
 
         if db_page_no_to_update < FIRST_PTRMAP_PAGE_NO
             || is_ptrmap_page(db_page_no_to_update, page_size)
@@ -519,15 +525,20 @@ impl Pager {
                 }
                 AutoVacuumMode::Full => {
                     let mut root_page_num =
-                        header_accessor::get_vacuum_mode_largest_root_page(self)?;
+                        match header_accessor::get_vacuum_mode_largest_root_page_async(self)? {
+                            CursorResult::Ok(value) => value,
+                            CursorResult::IO => return Ok(CursorResult::IO),
+                        };
                     assert!(root_page_num > 0); //  Largest root page number cannot be 0 because that is set to 1 when creating the database with autovacuum enabled
                     root_page_num += 1;
                     assert!(root_page_num >= FIRST_PTRMAP_PAGE_NO); //  can never be less than 2 because we have already incremented
 
-                    while is_ptrmap_page(
-                        root_page_num,
-                        header_accessor::get_page_size(self)? as usize,
-                    ) {
+                    let page_size = match header_accessor::get_page_size_async(self)? {
+                        CursorResult::Ok(size) => size as usize,
+                        CursorResult::IO => return Ok(CursorResult::IO),
+                    };
+
+                    while is_ptrmap_page(root_page_num, page_size) {
                         root_page_num += 1;
                     }
                     assert!(root_page_num >= 3); //  the very first root page is page 3
