@@ -215,7 +215,11 @@ public final class TursoStatement {
   private native int bindBlob(long statementPointer, int position, byte[] value)
       throws SQLException;
 
-  /** TODO */
+  /**
+   * Clears all parameters that were previously bound to this prepared statement.
+   *
+   * @throws SQLException If a database access error occurs while clearing the parameters
+   */
   public void clearParameters() throws SQLException {
     clearParameters(statementPointer);
   }

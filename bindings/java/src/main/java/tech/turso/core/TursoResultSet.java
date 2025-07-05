@@ -80,7 +80,7 @@ public final class TursoResultSet {
     }
 
     lastStepResult = this.statement.step();
-    log.debug("lastStepResult: {}", lastStepResult);
+    log.debug("lastStepResult: " + lastStepResult);
     if (lastStepResult.isRow()) {
       row++;
     }

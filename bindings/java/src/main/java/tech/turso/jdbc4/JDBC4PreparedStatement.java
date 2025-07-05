@@ -46,7 +46,7 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
 
   @Override
   public int executeUpdate() throws SQLException {
-    requireNonNull(this.statement);
+    requireNonNull(this.statement, "statement is null");
     final long previousTotalChanges = statement.totalChanges();
     final TursoResultSet resultSet = statement.getResultSet();
     resultSet.consumeAll();
@@ -56,67 +56,67 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
 
   @Override
   public void setNull(int parameterIndex, int sqlType) throws SQLException {
-    requireNonNull(this.statement);
+    requireNonNull(this.statement, "statement is null");
     this.statement.bindNull(parameterIndex);
   }
 
   @Override
   public void setBoolean(int parameterIndex, boolean x) throws SQLException {
-    requireNonNull(this.statement);
+    requireNonNull(this.statement, "statement is null");
     this.statement.bindInt(parameterIndex, x ? 1 : 0);
   }
 
   @Override
   public void setByte(int parameterIndex, byte x) throws SQLException {
-    requireNonNull(this.statement);
+    requireNonNull(this.statement, "statement is null");
     this.statement.bindInt(parameterIndex, x);
   }
 
   @Override
   public void setShort(int parameterIndex, short x) throws SQLException {
-    requireNonNull(this.statement);
+    requireNonNull(this.statement, "statement is null");
     this.statement.bindInt(parameterIndex, x);
   }
 
   @Override
   public void setInt(int parameterIndex, int x) throws SQLException {
-    requireNonNull(this.statement);
+    requireNonNull(this.statement, "statement is null");
     this.statement.bindInt(parameterIndex, x);
   }
 
   @Override
   public void setLong(int parameterIndex, long x) throws SQLException {
-    requireNonNull(this.statement);
+    requireNonNull(this.statement, "statement is null");
     this.statement.bindLong(parameterIndex, x);
   }
 
   @Override
   public void setFloat(int parameterIndex, float x) throws SQLException {
-    requireNonNull(this.statement);
+    requireNonNull(this.statement, "statement is null");
     this.statement.bindDouble(parameterIndex, x);
   }
 
   @Override
   public void setDouble(int parameterIndex, double x) throws SQLException {
-    requireNonNull(this.statement);
+    requireNonNull(this.statement, "statement is null");
     this.statement.bindDouble(parameterIndex, x);
   }
 
   @Override
   public void setBigDecimal(int parameterIndex, BigDecimal x) throws SQLException {
-    requireNonNull(this.statement);
+    requireNonNull(this.statement, "statement is null");
     this.statement.bindText(parameterIndex, x.toString());
   }
 
   @Override
   public void setString(int parameterIndex, String x) throws SQLException {
-    requireNonNull(this.statement);
+    requireNonNull(this.statement, "statement is null");
     this.statement.bindText(parameterIndex, x);
   }
 
   @Override
   public void setBytes(int parameterIndex, byte[] x) throws SQLException {
-    requireNonNull(this.statement);
+    requireNonNull(this.statement, "statement is null");
     this.statement.bindBlob(parameterIndex, x);
   }
 
@@ -152,7 +152,7 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
 
   @Override
   public void clearParameters() throws SQLException {
-    requireNonNull(this.statement);
+    requireNonNull(this.statement, "statement is null");
     statement.clearParameters();
   }
 
@@ -169,7 +169,7 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
   @Override
   public boolean execute() throws SQLException {
     // TODO: check whether this is sufficient
-    requireNonNull(this.statement);
+    requireNonNull(this.statement, "statement is null");
     return statement.execute();
   }
 
