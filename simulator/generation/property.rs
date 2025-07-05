@@ -501,15 +501,15 @@ fn assert_all_table_values(tables: &[String]) -> impl Iterator<Item = Interactio
             distinct: Distinctness::All,
         }));
         let assertion = Interaction::Assertion(Assertion {
-            message: format!(
-                "table {} should contain all of its values",
-                table
-            ),
+            message: format!("table {} should contain all of its values", table),
             func: Box::new({
                 let table = table.clone();
                 move |stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
                     let table = env.tables.iter().find(|t| t.name == table).ok_or_else(|| {
-                        LimboError::InternalError(format!("table {} should exist in simulator env", table))
+                        LimboError::InternalError(format!(
+                            "table {} should exist in simulator env",
+                            table
+                        ))
                     })?;
                     let last = stack.last().unwrap();
                     match last {

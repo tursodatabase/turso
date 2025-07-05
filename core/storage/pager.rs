@@ -802,7 +802,6 @@ impl Pager {
                     let in_flight = *self.flush_info.borrow().in_flight_writes.borrow();
                     if in_flight == 0 {
                         self.flush_info.borrow_mut().state = FlushState::SyncWal;
-                        self.wal.borrow_mut().finish_append_frames_commit()?;
                     } else {
                         return Ok(PagerCacheflushStatus::IO);
                     }
@@ -812,6 +811,8 @@ impl Pager {
                         return Ok(PagerCacheflushStatus::IO);
                     }
 
+                    // We should only signal that we finished appenind frames after wal sync to avoid inconsistencies when sync fails
+                    self.wal.borrow_mut().finish_append_frames_commit()?;
                     if wal_checkpoint_disabled || !self.wal.borrow().should_checkpoint() {
                         self.flush_info.borrow_mut().state = FlushState::Start;
                         return Ok(PagerCacheflushStatus::Done(
