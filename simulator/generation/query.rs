@@ -6,7 +6,7 @@ use crate::model::query::select::{Distinctness, ResultColumn};
 use crate::model::query::update::Update;
 use crate::model::query::{Create, Delete, Drop, Insert, Query, Select};
 use crate::model::table::{SimValue, Table};
-use crate::SimulatorEnv;
+use crate::model::SimulatorEnv;
 use rand::Rng;
 
 use super::property::Remaining;
@@ -20,9 +20,9 @@ impl Arbitrary for Create {
     }
 }
 
-impl ArbitraryFrom<&SimulatorEnv> for Select {
-    fn arbitrary_from<R: Rng>(rng: &mut R, env: &SimulatorEnv) -> Self {
-        let table = pick(&env.tables, rng);
+impl<E: SimulatorEnv> ArbitraryFrom<&E> for Select {
+    fn arbitrary_from<R: Rng>(rng: &mut R, env: &E) -> Self {
+        let table = pick(env.tables(), rng);
         Self {
             table: table.name.clone(),
             result_columns: vec![ResultColumn::Star],
@@ -33,10 +33,10 @@ impl ArbitraryFrom<&SimulatorEnv> for Select {
     }
 }
 
-impl ArbitraryFrom<&SimulatorEnv> for Insert {
-    fn arbitrary_from<R: Rng>(rng: &mut R, env: &SimulatorEnv) -> Self {
+impl<E: SimulatorEnv> ArbitraryFrom<&E> for Insert {
+    fn arbitrary_from<R: Rng>(rng: &mut R, env: &E) -> Self {
         let gen_values = |rng: &mut R| {
-            let table = pick(&env.tables, rng);
+            let table = pick(env.tables(), rng);
             let num_rows = rng.gen_range(1..10);
             let values: Vec<Vec<SimValue>> = (0..num_rows)
                 .map(|_| {
@@ -55,7 +55,7 @@ impl ArbitraryFrom<&SimulatorEnv> for Insert {
 
         let _gen_select = |rng: &mut R| {
             // Find a non-empty table
-            let select_table = env.tables.iter().find(|t| !t.rows.is_empty())?;
+            let select_table = env.tables().iter().find(|t| !t.rows.is_empty())?;
             let row = pick(&select_table.rows, rng);
             let predicate = Predicate::arbitrary_from(rng, (select_table, row));
             // Pick another table to insert into
@@ -66,7 +66,7 @@ impl ArbitraryFrom<&SimulatorEnv> for Insert {
                 limit: None,
                 distinct: Distinctness::All,
             };
-            let table = pick(&env.tables, rng);
+            let table = pick(env.tables(), rng);
             Some(Insert::Select {
                 table: table.name.clone(),
                 select: Box::new(select),
@@ -86,9 +86,9 @@ impl ArbitraryFrom<&SimulatorEnv> for Insert {
     }
 }
 
-impl ArbitraryFrom<&SimulatorEnv> for Delete {
-    fn arbitrary_from<R: Rng>(rng: &mut R, env: &SimulatorEnv) -> Self {
-        let table = pick(&env.tables, rng);
+impl<E: SimulatorEnv> ArbitraryFrom<&E> for Delete {
+    fn arbitrary_from<R: Rng>(rng: &mut R, env: &E) -> Self {
+        let table = pick(env.tables(), rng);
         Self {
             table: table.name.clone(),
             predicate: Predicate::arbitrary_from(rng, table),
@@ -96,17 +96,17 @@ impl ArbitraryFrom<&SimulatorEnv> for Delete {
     }
 }
 
-impl ArbitraryFrom<&SimulatorEnv> for Drop {
-    fn arbitrary_from<R: Rng>(rng: &mut R, env: &SimulatorEnv) -> Self {
-        let table = pick(&env.tables, rng);
+impl<E: SimulatorEnv> ArbitraryFrom<&E> for Drop {
+    fn arbitrary_from<R: Rng>(rng: &mut R, env: &E) -> Self {
+        let table = pick(env.tables(), rng);
         Self {
             table: table.name.clone(),
         }
     }
 }
 
-impl ArbitraryFrom<(&SimulatorEnv, &Remaining)> for Query {
-    fn arbitrary_from<R: Rng>(rng: &mut R, (env, remaining): (&SimulatorEnv, &Remaining)) -> Self {
+impl<E: SimulatorEnv> ArbitraryFrom<(&E, &Remaining)> for Query {
+    fn arbitrary_from<R: Rng>(rng: &mut R, (env, remaining): (&E, &Remaining)) -> Self {
         frequency(
             vec![
                 (
@@ -131,9 +131,9 @@ impl ArbitraryFrom<(&SimulatorEnv, &Remaining)> for Query {
     }
 }
 
-impl ArbitraryFrom<&SimulatorEnv> for Update {
-    fn arbitrary_from<R: Rng>(rng: &mut R, env: &SimulatorEnv) -> Self {
-        let table = pick(&env.tables, rng);
+impl<E: SimulatorEnv> ArbitraryFrom<&E> for Update {
+    fn arbitrary_from<R: Rng>(rng: &mut R, env: &E) -> Self {
+        let table = pick(env.tables(), rng);
         let mut seen = HashSet::new();
         let num_cols = rng.gen_range(1..=table.columns.len());
         let set_values: Vec<(String, SimValue)> = (0..num_cols)

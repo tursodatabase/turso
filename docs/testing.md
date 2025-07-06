@@ -109,15 +109,15 @@ breaking the property invariants to reach more diverse states and respect the co
 To run the simulator, you can use the following command:
 
 ```bash
-RUST_LOG=limbo_sim=debug cargo run --bin limbo_sim
+RUST_LOG=turso_sim=debug cargo run --bin turso_sim
 ```
 
 The simulator CLI has a few configuration options that you can explore via `--help` flag.
 
 ```txt
-The Limbo deterministic simulator
+The Turso deterministic simulator
 
-Usage: limbo_sim [OPTIONS]
+Usage: turso_sim [OPTIONS]
 
 Options:
   -s, --seed <SEED>                  set seed for reproducible runs

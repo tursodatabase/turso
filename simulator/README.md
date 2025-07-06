@@ -1,6 +1,6 @@
-# Limbo Simulator
+# Turso Simulator
 
-Limbo simulator uses randomized deterministic simulations to test the Limbo database behaviors.
+Turso simulator uses randomized deterministic simulations to test the Turso database behaviors.
 
 Each simulation begins with a random configurations:
 
@@ -42,15 +42,15 @@ The simulator code is broken into 4 main parts:
 To run the simulator, you can use the following command:
 
 ```bash
-RUST_LOG=limbo_sim=debug cargo run --bin limbo_sim
+RUST_LOG=turso_sim=debug cargo run --bin turso_sim
 ```
 
 The simulator CLI has a few configuration options that you can explore via `--help` flag.
 
 ```txt
-The Limbo deterministic simulator
+The Turso deterministic simulator
 
-Usage: limbo_sim [OPTIONS]
+Usage: turso_sim [OPTIONS]
 
 Options:
   -s, --seed <SEED>                  set seed for reproducible runs
@@ -60,7 +60,7 @@ Options:
   -t, --maximum-time <MAXIMUM_TIME>  change the maximum time of the simulation(in seconds) [default: 3600]
   -l, --load <LOAD>                  load plan from the bug base
   -w, --watch                        enable watch mode that reruns the simulation on file changes
-      --differential                 run differential testing between sqlite and Limbo
+      --differential                 run differential testing between sqlite and Turso
   -h, --help                         Print help
   -V, --version                      Print version
 ```
@@ -104,7 +104,7 @@ it should generate the necessary queries and assertions for the property.
 
 ## Automatic Compatibility Testing with SQLite
 
-You can use the `--differential` flag to run the simulator in differential testing mode. This mode will run the same interaction plan on both Limbo and SQLite, and compare the results. It will also check for any panics or errors in either database.
+You can use the `--differential` flag to run the simulator in differential testing mode. This mode will run the same interaction plan on both Turso and SQLite, and compare the results. It will also check for any panics or errors in either database.
 
 ## Resources
 

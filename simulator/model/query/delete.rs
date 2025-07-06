@@ -2,20 +2,20 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{model::table::SimValue, SimulatorEnv};
+use crate::model::{table::SimValue, Shadow, SimulatorEnv};
 
 use super::predicate::Predicate;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Delete {
-    pub(crate) table: String,
-    pub(crate) predicate: Predicate,
+pub struct Delete {
+    pub table: String,
+    pub predicate: Predicate,
 }
 
-impl Delete {
-    pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<SimValue>> {
+impl Shadow for Delete {
+    fn shadow<E: SimulatorEnv>(&self, env: &mut E) -> Vec<Vec<SimValue>> {
         let table = env
-            .tables
+            .tables_mut()
             .iter_mut()
             .find(|t| t.name == self.table)
             .unwrap();

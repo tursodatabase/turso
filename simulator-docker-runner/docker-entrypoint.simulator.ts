@@ -15,7 +15,7 @@ const github = new GithubClient();
 
 process.env.RUST_BACKTRACE = "1";
 
-console.log("Starting limbo_sim in a loop...");
+console.log("Starting turso_sim in a loop...");
 console.log(`Git hash: ${github.GIT_HASH}`);
 console.log(`GitHub issues enabled: ${github.mode === 'real'}`);
 console.log(`Time limit: ${TIME_LIMIT_MINUTES} minutes`);
@@ -159,8 +159,8 @@ while (new Date().getTime() - startTime.getTime() < TIME_LIMIT_MINUTES * 60 * 10
   const loop = args.includes("loop") ? [] : ["loop", "-n", "10", "--short-circuit"]
   args.push(...loop);
 
-  console.log(`[${timestamp}]: Running "limbo_sim ${args.join(" ")}" - (seed ${seed}, run number ${runNumber})`);
-  await run(seed, "limbo_sim", args);
+  console.log(`[${timestamp}]: Running "turso_sim ${args.join(" ")}" - (seed ${seed}, run number ${runNumber})`);
+  await run(seed, "turso_sim", args);
 
   runNumber++;
 

@@ -1,6 +1,6 @@
 use crate::{
     generation::{gen_random_text, pick, pick_n_unique, ArbitraryFrom},
-    runner::env::SimulatorEnv,
+    model::{Shadow, SimulatorEnv},
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -21,17 +21,14 @@ impl std::fmt::Display for SortOrder {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub(crate) struct CreateIndex {
-    pub(crate) index_name: String,
-    pub(crate) table_name: String,
-    pub(crate) columns: Vec<(String, SortOrder)>,
+pub struct CreateIndex {
+    pub index_name: String,
+    pub table_name: String,
+    pub columns: Vec<(String, SortOrder)>,
 }
 
-impl CreateIndex {
-    pub(crate) fn shadow(
-        &self,
-        _env: &mut crate::runner::env::SimulatorEnv,
-    ) -> Vec<Vec<crate::model::table::SimValue>> {
+impl Shadow for CreateIndex {
+    fn shadow<E: SimulatorEnv>(&self, _env: &mut E) -> Vec<Vec<crate::model::table::SimValue>> {
         // CREATE INDEX doesn't require any shadowing; we don't need to keep track
         // in the simulator what indexes exist.
         vec![]
@@ -54,14 +51,15 @@ impl std::fmt::Display for CreateIndex {
     }
 }
 
-impl ArbitraryFrom<&SimulatorEnv> for CreateIndex {
-    fn arbitrary_from<R: Rng>(rng: &mut R, env: &SimulatorEnv) -> Self {
+impl<E: SimulatorEnv> ArbitraryFrom<&E> for CreateIndex {
+    fn arbitrary_from<R: Rng>(rng: &mut R, env: &E) -> Self {
+        let tables = env.tables();
         assert!(
-            !env.tables.is_empty(),
+            !tables.is_empty(),
             "Cannot create an index when no tables exist in the environment."
         );
 
-        let table = pick(&env.tables, rng);
+        let table = pick(tables, rng);
 
         if table.columns.is_empty() {
             panic!(

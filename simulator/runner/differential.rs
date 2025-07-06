@@ -1,25 +1,24 @@
 use std::sync::{Arc, Mutex};
 
 use turso_core::Value;
-
-use crate::{
+use turso_sim::{
     generation::{
         pick_index,
-        plan::{Interaction, InteractionPlanState, ResultSet},
+        plan::{Interaction, InteractionPlan, InteractionPlanState, ResultSet},
     },
-    model::{query::Query, table::SimValue},
-    runner::execution::ExecutionContinuation,
-    InteractionPlan,
+    model::{query::Query, table::SimValue, SimConnection},
 };
 
+use crate::runner::execution::ExecutionContinuation;
+
 use super::{
-    env::{SimConnection, SimulatorEnv},
+    env::TursoSimulatorEnv,
     execution::{execute_interaction, Execution, ExecutionHistory, ExecutionResult},
 };
 
 pub(crate) fn run_simulation(
-    env: Arc<Mutex<SimulatorEnv>>,
-    rusqlite_env: Arc<Mutex<SimulatorEnv>>,
+    env: Arc<Mutex<TursoSimulatorEnv>>,
+    rusqlite_env: Arc<Mutex<TursoSimulatorEnv>>,
     rusqlite_conn: &dyn Fn() -> rusqlite::Connection,
     plans: &mut [InteractionPlan],
     last_execution: Arc<Mutex<Execution>>,
@@ -116,8 +115,8 @@ fn execute_query_rusqlite(
 }
 
 pub(crate) fn execute_plans(
-    env: Arc<Mutex<SimulatorEnv>>,
-    rusqlite_env: Arc<Mutex<SimulatorEnv>>,
+    env: Arc<Mutex<TursoSimulatorEnv>>,
+    rusqlite_env: Arc<Mutex<TursoSimulatorEnv>>,
     rusqlite_conn: &dyn Fn() -> rusqlite::Connection,
     plans: &mut [InteractionPlan],
     states: &mut [InteractionPlanState],
@@ -174,8 +173,8 @@ pub(crate) fn execute_plans(
 }
 
 fn execute_plan(
-    env: &mut SimulatorEnv,
-    rusqlite_env: &mut SimulatorEnv,
+    env: &mut TursoSimulatorEnv,
+    rusqlite_env: &mut TursoSimulatorEnv,
     rusqlite_conn: &dyn Fn() -> rusqlite::Connection,
     connection_index: usize,
     plans: &mut [InteractionPlan],
@@ -312,7 +311,7 @@ fn execute_plan(
 }
 
 fn execute_interaction_rusqlite(
-    env: &mut SimulatorEnv,
+    env: &mut TursoSimulatorEnv,
     connection_index: usize,
     interaction: &Interaction,
     stack: &mut Vec<ResultSet>,

@@ -1,20 +1,19 @@
 use std::sync::{Arc, Mutex};
 
-use crate::{
+use turso_sim::{
     generation::{
         pick_index,
         plan::{Interaction, InteractionPlanState},
     },
-    runner::execution::ExecutionContinuation,
+    model::SimConnection,
 };
 
-use super::{
-    env::{SimConnection, SimulatorEnv},
-    execution::{execute_interaction, Execution, ExecutionHistory, ExecutionResult},
-};
+use crate::runner::{env::TursoSimulatorEnv, execution::ExecutionContinuation};
+
+use super::execution::{execute_interaction, Execution, ExecutionHistory, ExecutionResult};
 
 pub(crate) fn run_simulation(
-    env: Arc<Mutex<SimulatorEnv>>,
+    env: Arc<Mutex<TursoSimulatorEnv>>,
     plans: &mut [Vec<Vec<Interaction>>],
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
@@ -37,7 +36,7 @@ pub(crate) fn run_simulation(
 }
 
 pub(crate) fn execute_plans(
-    env: Arc<Mutex<SimulatorEnv>>,
+    env: Arc<Mutex<TursoSimulatorEnv>>,
     plans: &mut [Vec<Vec<Interaction>>],
     states: &mut [InteractionPlanState],
     last_execution: Arc<Mutex<Execution>>,
@@ -81,7 +80,7 @@ pub(crate) fn execute_plans(
 }
 
 fn execute_plan(
-    env: &mut SimulatorEnv,
+    env: &mut TursoSimulatorEnv,
     connection_index: usize,
     plans: &mut [Vec<Vec<Interaction>>],
     states: &mut [InteractionPlanState],

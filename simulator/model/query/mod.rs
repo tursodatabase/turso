@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use turso_sqlite3_parser::to_sql_string::ToSqlContext;
 use update::Update;
 
-use crate::{model::table::SimValue, runner::env::SimulatorEnv};
+use crate::model::{table::SimValue, Shadow, SimulatorEnv};
 
 pub mod create;
 pub mod create_index;
@@ -23,7 +23,7 @@ pub mod update;
 
 // This type represents the potential queries on the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum Query {
+pub enum Query {
     Create(Create),
     Select(Select),
     Insert(Insert),
@@ -34,7 +34,7 @@ pub(crate) enum Query {
 }
 
 impl Query {
-    pub(crate) fn dependencies(&self) -> HashSet<String> {
+    pub fn dependencies(&self) -> HashSet<String> {
         match self {
             Query::Create(_) => HashSet::new(),
             Query::Select(Select { table, .. })
@@ -48,7 +48,7 @@ impl Query {
             }
         }
     }
-    pub(crate) fn uses(&self) -> Vec<String> {
+    pub fn uses(&self) -> Vec<String> {
         match self {
             Query::Create(Create { table }) => vec![table.name.clone()],
             Query::Select(Select { table, .. })
@@ -60,8 +60,10 @@ impl Query {
             Query::CreateIndex(CreateIndex { table_name, .. }) => vec![table_name.clone()],
         }
     }
+}
 
-    pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<SimValue>> {
+impl Shadow for Query {
+    fn shadow<E: SimulatorEnv>(&self, env: &mut E) -> Vec<Vec<SimValue>> {
         match self {
             Query::Create(create) => create.shadow(env),
             Query::Insert(insert) => insert.shadow(env),

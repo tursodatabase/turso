@@ -2,21 +2,21 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{model::table::SimValue, SimulatorEnv};
+use crate::model::{table::SimValue, Shadow, SimulatorEnv};
 
 use super::predicate::Predicate;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Update {
-    pub(crate) table: String,
-    pub(crate) set_values: Vec<(String, SimValue)>, // Pair of value for set expressions => SET name=value
-    pub(crate) predicate: Predicate,
+pub struct Update {
+    pub table: String,
+    pub set_values: Vec<(String, SimValue)>, // Pair of value for set expressions => SET name=value
+    pub predicate: Predicate,
 }
 
-impl Update {
-    pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<SimValue>> {
+impl Shadow for Update {
+    fn shadow<E: SimulatorEnv>(&self, env: &mut E) -> Vec<Vec<SimValue>> {
         let table = env
-            .tables
+            .tables_mut()
             .iter_mut()
             .find(|t| t.name == self.table)
             .unwrap();

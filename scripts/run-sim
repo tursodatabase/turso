@@ -18,15 +18,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -n "$iterations" ]]; then
-    echo "Running limbo_sim for $iterations iterations..."
+    echo "Running turso_sim for $iterations iterations..."
     for ((i=1; i<=iterations; i++)); do
         echo "Iteration $i of $iterations"
-        cargo run -p limbo_sim
+        cargo run -p turso_sim
     done
     echo "Completed $iterations iterations"
 else
-    echo "Running limbo_sim in infinite loop..."
+    echo "Running turso_sim in infinite loop..."
     while true; do
-        cargo run -p limbo_sim
+        cargo run -p turso_sim
     done
 fi
