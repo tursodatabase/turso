@@ -515,7 +515,7 @@ impl Optimizable for ast::Expr {
             Expr::Exists(..) => false,
             Expr::FunctionCall { .. } => false,
             Expr::FunctionCallStar { .. } => false,
-            Expr::Id(..) => panic!("Do not call is_nonnull before Id has been rewritten as Column"),
+            Expr::Id(..) => false,
             Expr::Column {
                 table,
                 column,
@@ -609,7 +609,7 @@ impl Optimizable for ast::Expr {
                     })
             }
             Expr::FunctionCallStar { .. } => false,
-            Expr::Id(_) => panic!("Id should have been rewritten as Column"),
+            Expr::Id(_) => false,
             Expr::Column { .. } => false,
             Expr::RowId { .. } => false,
             Expr::InList { lhs, rhs, .. } => {

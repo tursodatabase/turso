@@ -39,7 +39,7 @@ pub fn translate_insert(
     tbl_name: QualifiedName,
     columns: Option<DistinctNames>,
     mut body: InsertBody,
-    _returning: Option<Vec<ResultColumn>>,
+    returning: Option<Vec<ResultColumn>>,
     syms: &SymbolTable,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
@@ -69,7 +69,95 @@ pub fn translate_insert(
         None => crate::bail_parse_error!("no such table: {}", table_name),
     };
 
-    let resolver = Resolver::new(schema, syms);
+    let mut resolver = Resolver::new(schema, syms);
+
+    // ---------- Handle RETURNING clause ----------
+    use crate::translate::plan::ResultSetColumn;
+    use turso_sqlite3_parser::ast::{As as AstAs, Id};
+
+    // RETURNING clause processing
+    // We collect the list of expressions that appear in the RETURNING clause as-is in
+    // `returning_result_columns`.  In addition, we keep track of the column indexes that
+    // correspond to plain column references (this is an optimisation for the common case
+    // of simple `RETURNING col1, col2` or `RETURNING *`).
+    //
+    // IMPORTANT: We intentionally allow arbitrary expressions here.  The earlier
+    // implementation rejected anything that was not a plain identifier, but SQLite allows
+    // full expressions inside a RETURNING clause.  We will later evaluate those
+    // expressions for every inserted row by translating them with the normal expression
+    // translator.
+    // The fast-path optimisation for copying registers directly (when the RETURNING list
+    // contains only simple column references) used to rely on a separate `returning_indexes`
+    // vector.  The new, more general implementation no longer needs that, so we remove the
+    // variable entirely to avoid an unused-variable warning.
+    let mut returning_result_columns: Vec<ResultSetColumn> = Vec::new();
+    // keep Id expressions alive so we can safely store references to them in the resolver
+    let mut column_id_exprs: Vec<Expr> = Vec::new();
+
+    if let Some(ret_cols) = &returning {
+        let tbl_cols = table.columns();
+
+        // Helper to push column info
+        let push_column =
+            |cols: &mut Vec<ResultSetColumn>, idx: usize, alias_opt: Option<String>| {
+                let col_name = tbl_cols[idx].name.clone().unwrap_or_default();
+                cols.push(ResultSetColumn {
+                    expr: turso_sqlite3_parser::ast::Expr::Id(Id(col_name.clone())),
+                    alias: alias_opt.or(Some(col_name)),
+                    contains_aggregates: false,
+                });
+            };
+
+        for rc in ret_cols {
+            match rc {
+                ResultColumn::Star => {
+                    // RETURNING * expands to all columns
+                    for (i, _) in tbl_cols.iter().enumerate() {
+                        push_column(&mut returning_result_columns, i, None);
+                    }
+                    // IMPORTANT: Do NOT break here – SQLite allows additional expressions
+                    //   after the '*' wildcard (e.g. "RETURNING *, a").  We therefore
+                    //   continue parsing the rest of the RETURNING list.
+                }
+                ResultColumn::Expr(expr, alias) => {
+                    // If the expression is a simple identifier, we can still take the fast-path
+                    // optimisation described above (copying registers directly).  Otherwise we
+                    // defer evaluation until after the row has been inserted.
+
+                    if let turso_sqlite3_parser::ast::Expr::Id(id) = expr {
+                        let ident = crate::util::normalize_ident(&id.0);
+                        if let Some(idx) = tbl_cols.iter().position(|c| {
+                            c.name
+                                .as_ref()
+                                .map_or(false, |n| n.eq_ignore_ascii_case(&ident))
+                        }) {
+                            let alias_str = alias.as_ref().map(|a| match a {
+                                AstAs::As(name) => name.to_string(),
+                                AstAs::Elided(name) => name.to_string(),
+                            });
+                            push_column(&mut returning_result_columns, idx, alias_str);
+                            // Simple identifier handled – continue to next result column.
+                            continue;
+                        }
+                    }
+
+                    // For arbitrary expressions (or identifiers that didn't match a column),
+                    // store them as-is.
+                    returning_result_columns.push(ResultSetColumn {
+                        expr: (*expr).clone(),
+                        alias: alias.as_ref().map(|a| match a {
+                            AstAs::As(name) => name.to_string(),
+                            AstAs::Elided(name) => name.to_string(),
+                        }),
+                        contains_aggregates: false,
+                    });
+                }
+                ResultColumn::TableStar(_) => {
+                    crate::bail_parse_error!("table.* in RETURNING clause is not supported");
+                }
+            }
+        }
+    }
 
     if let Some(virtual_table) = &table.virtual_table() {
         program = translate_virtual_table_insert(
@@ -541,6 +629,52 @@ pub fn translate_insert(
         table_name: table_name.to_string(),
     });
 
+    // ---------------------------------------------------------------
+    // Emit rows for RETURNING if requested.  We support arbitrary expressions by
+    // translating each expression with the normal expression translator.  In
+    // order for bare identifiers inside those expressions (e.g. `a` or `b+1`) to
+    // resolve correctly, we populate the resolver's expression-to-register cache
+    // with mappings from every column identifier to the corresponding register
+    // that currently holds the inserted value.
+    // ---------------------------------------------------------------
+
+    if !returning_result_columns.is_empty() {
+        // Enable the expression -> register cache so that translate_expr can
+        // resolve bare identifiers quickly without requiring a table cursor.
+        resolver.enable_expr_to_reg_cache();
+        // First collect all column Id expressions
+        for col in table.columns().iter() {
+            let col_name = col
+                .name
+                .as_ref()
+                .expect("Column name must be present")
+                .clone();
+            column_id_exprs.push(Expr::Id(Id(col_name)));
+        }
+        // Then populate the expression-to-register cache
+        for (i, expr_ref) in column_id_exprs.iter().enumerate() {
+            resolver
+                .expr_to_reg_cache
+                .push((expr_ref, column_registers_start + i));
+        }
+        let dest_start = program.alloc_registers(returning_result_columns.len());
+        for (offset, col) in returning_result_columns.iter().enumerate() {
+            translate_expr_no_constant_opt(
+                &mut program,
+                None,
+                &col.expr,
+                dest_start + offset,
+                &resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
+        }
+
+        program.emit_insn(Insn::ResultRow {
+            start_reg: dest_start,
+            count: returning_result_columns.len(),
+        });
+    }
+
     if inserting_multiple_rows {
         if let Some(temp_table_ctx) = temp_table_ctx {
             program.emit_insn(Insn::Next {
@@ -562,6 +696,11 @@ pub fn translate_insert(
 
     program.resolve_label(halt_label, program.offset());
     program.epilogue(super::emitter::TransactionMode::Write);
+
+    // Attach result column metadata if RETURNING was used
+    if !returning_result_columns.is_empty() {
+        program.result_columns = returning_result_columns;
+    }
 
     Ok(program)
 }
