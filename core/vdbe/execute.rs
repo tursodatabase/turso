@@ -6217,7 +6217,7 @@ impl Value {
         let result = match function {
             MathFunc::Atan2 => libm::atan2(lhs, rhs),
             MathFunc::Mod => libm::fmod(lhs, rhs),
-            MathFunc::Pow | MathFunc::Power => libm::pow(lhs, rhs),
+            MathFunc::Pow | MathFunc::Power => lhs.powf(rhs),
             _ => unreachable!("Unexpected mathematical binary function {:?}", function),
         };
 

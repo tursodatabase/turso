@@ -8,6 +8,11 @@ do_execsql_test fuzz-test-failure {
   SELECT mod(atanh(tanh(-1.0)), ((1.0))) / ((asinh(-1.0) / 2.0 * 1.0) + pow(0.0, 1.0) + 0.5);
 } {-16.8596516555675}
 
+# math_expression_fuzz_run failure with seed 1751638920
+do_execsql_test fuzz-test-failure-power {
+  SELECT sin(power((((degrees(1.0) + 1.0 + 2.0))), power(2.0 + 1.0 - 0.5 - 2.0, power(0.0, 0.0) * (-2.0))));
+} {0.547449893492228}
+
 do_execsql_test add-int-1 {
   SELECT 10 + 1
 } {11}
