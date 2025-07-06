@@ -38,3 +38,5 @@ source $testdir/collate.test
 source $testdir/values.test
 source $testdir/integrity_check.test
 source $testdir/rollback.test
+source $testdir/update-multiple-set.test
+source $testdir/duplicate-columns.test

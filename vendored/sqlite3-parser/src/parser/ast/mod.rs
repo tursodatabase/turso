@@ -1310,6 +1310,52 @@ impl Deref for DistinctNames {
     }
 }
 
+/// Ordered list of column names (allows duplicates)
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct NameList(Vec<Name>);
+
+impl NameList {
+    /// Initialize with a single name
+    pub fn new(name: Name) -> Self {
+        Self(vec![name])
+    }
+    
+    /// Add a name to the list (duplicates allowed)
+    pub fn push(&mut self, name: Name) {
+        self.0.push(name);
+    }
+    
+    /// Get the length of the list
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    
+    /// Check if the list is empty
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    
+    /// Get an iterator over the names
+    pub fn iter(&self) -> std::slice::Iter<'_, Name> {
+        self.0.iter()
+    }
+}
+
+impl Deref for NameList {
+    type Target = Vec<Name>;
+
+    fn deref(&self) -> &Vec<Name> {
+        &self.0
+    }
+}
+
+impl From<Vec<Name>> for NameList {
+    fn from(names: Vec<Name>) -> Self {
+        Self(names)
+    }
+}
+
 /// `ALTER TABLE` body
 // https://sqlite.org/lang_altertable.html
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1701,7 +1747,7 @@ pub enum InsertBody {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Set {
     /// column name(s)
-    pub col_names: DistinctNames,
+    pub col_names: NameList,
     /// expression
     pub expr: Expr,
 }

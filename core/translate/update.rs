@@ -141,20 +141,42 @@ pub fn prepare_update_plan(
         col_used_mask: ColumnUsedMask::default(),
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
-    let set_clauses = body
-        .sets
-        .iter_mut()
-        .map(|set| {
-            let ident = normalize_ident(set.col_names[0].0.as_str());
+    // Use HashMap to implement "last wins" semantics for duplicate columns
+    let mut set_clauses_map = std::collections::HashMap::new();
+    
+    for set in body.sets.iter_mut() {
+        let single_expr_storage;
+        let exprs_slice: &mut [Expr] = if set.col_names.len() > 1 {
+            if let ast::Expr::Parenthesized(exprs) = &mut set.expr {
+                if exprs.len() != set.col_names.len() {
+                    return Err(crate::LimboError::ParseError(format!(
+                        "number of columns ({}) does not match number of values ({})",
+                        set.col_names.len(),
+                        exprs.len(),
+                    )));
+                }
+                exprs.as_mut_slice()
+            } else {
+                return Err(crate::LimboError::ParseError(
+                    "right side of multi-column SET should be a list of expressions".into(),
+                ));
+            }
+        } else {
+            single_expr_storage = std::slice::from_mut(&mut set.expr);
+            single_expr_storage
+        };
+
+        for (i, col_name) in set.col_names.iter().enumerate() {
+            let ident = normalize_ident(col_name.0.as_str());
             let col_index = table
                 .columns()
                 .iter()
                 .enumerate()
-                .find_map(|(i, col)| {
+                .find_map(|(j, col)| {
                     col.name
                         .as_ref()
                         .filter(|name| name.eq_ignore_ascii_case(&ident))
-                        .map(|_| i)
+                        .map(|_| j)
                 })
                 .ok_or_else(|| {
                     crate::LimboError::ParseError(format!(
@@ -163,10 +185,16 @@ pub fn prepare_update_plan(
                     ))
                 })?;
 
-            let _ = bind_column_references(&mut set.expr, &mut table_references, None);
-            Ok((col_index, set.expr.clone()))
-        })
-        .collect::<Result<Vec<(usize, Expr)>, crate::LimboError>>()?;
+            let expr = &mut exprs_slice[i];
+            bind_column_references(expr, &mut table_references, None)?;
+            
+            // Last assignment wins for duplicate columns
+            set_clauses_map.insert(col_index, expr.clone());
+        }
+    }
+    
+    // Convert HashMap to Vec for compatibility with existing code
+    let set_clauses: Vec<(usize, Expr)> = set_clauses_map.into_iter().collect();
 
     let mut result_columns = vec![];
     if let Some(returning) = &mut body.returning {

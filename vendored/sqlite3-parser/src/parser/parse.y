@@ -807,17 +807,17 @@ cmd ::= with(C) UPDATE orconf(R) xfullname(X) indexed_opt(I) SET setlist(Y) from
 %type setlist {Vec<Set>}
 
 setlist(A) ::= setlist(A) COMMA nm(X) EQ expr(Y). {
-  let s = Set{ col_names: DistinctNames::single(X), expr: Y };
+  let s = Set{ col_names: NameList::new(X), expr: Y };
   A.push(s);
 }
-setlist(A) ::= setlist(A) COMMA LP idlist(X) RP EQ expr(Y). {
+setlist(A) ::= setlist(A) COMMA LP namelist(X) RP EQ expr(Y). {
   let s = Set{ col_names: X, expr: Y };
   A.push(s);
 }
 setlist(A) ::= nm(X) EQ expr(Y). {
-  A = vec![Set{ col_names: DistinctNames::single(X), expr: Y }];
+  A = vec![Set{ col_names: NameList::new(X), expr: Y }];
 }
-setlist(A) ::= LP idlist(X) RP EQ expr(Y). {
+setlist(A) ::= LP namelist(X) RP EQ expr(Y). {
   A = vec![Set{ col_names: X, expr: Y }];
 }
 
@@ -872,12 +872,17 @@ insert_cmd(A) ::= REPLACE.            {A = Some(ResolveType::Replace);}
 
 %type idlist_opt {Option<DistinctNames>}
 %type idlist {DistinctNames}
+%type namelist {NameList}
 idlist_opt(A) ::= .                       {A = None;}
 idlist_opt(A) ::= LP idlist(X) RP.    {A = Some(X);}
 idlist(A) ::= idlist(A) COMMA nm(Y).
     {let id = Y; A.insert(id)?;}
 idlist(A) ::= nm(Y).
     { A = DistinctNames::new(Y); /*A-overwrites-Y*/}
+namelist(A) ::= namelist(A) COMMA nm(Y).
+    {let name = Y; A.push(name);}
+namelist(A) ::= nm(Y).
+    { A = NameList::new(Y); /*A-overwrites-Y*/}
 
 /////////////////////////// Expression Processing /////////////////////////////
 //

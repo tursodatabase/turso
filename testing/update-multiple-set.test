@@ -1,0 +1,38 @@
+# tests for UPDATE with multiple columns in SET clause
+
+# Test swapping two columns using tuple assignment
+# Expected result: row values are swapped
+
+do_execsql_test_on_specific_db {:memory:} update-multiple-set-1.1 {
+    CREATE TABLE t1(a, b);
+    INSERT INTO t1 VALUES(1, 2);
+    UPDATE t1 SET (a, b) = (b, a);
+    SELECT a, b FROM t1;
+} {2|1}
+
+# Same swap operation expressed with individual assignments
+
+do_execsql_test_on_specific_db {:memory:} update-multiple-set-1.2 {
+    CREATE TABLE t2(a, b);
+    INSERT INTO t2 VALUES(1, 2);
+    UPDATE t2 SET a = b, b = a;
+    SELECT a, b FROM t2;
+} {2|1}
+
+# Duplicate column appearing twice inside tuple assignment – last write wins
+
+do_execsql_test_on_specific_db {:memory:} update-multiple-set-2.1 {
+    CREATE TABLE t3(c0, c1);
+    INSERT INTO t3 VALUES(1, 2);
+    UPDATE t3 SET (c0, c0) = (3, 4);
+    SELECT c0, c1 FROM t3;
+} {4|2}
+
+# Regression tests for issue #1948 – duplicate column using blob and NULL values
+
+do_execsql_test_on_specific_db {:memory:} update-multiple-set-3 {
+    CREATE TABLE IF NOT EXISTS t0 (c0 BLOB);
+    INSERT INTO t0 VALUES (x'00');
+    UPDATE t0 SET (c0, c0) = (x'e715', NULL);
+    SELECT typeof(c0) FROM t0;
+} {null}
