@@ -183,7 +183,7 @@ pub(crate) fn sqlite_exec_rows(
 }
 
 pub(crate) fn limbo_exec_rows(
-    db: &TempDatabase,
+    _db: &TempDatabase,
     conn: &Arc<turso_core::Connection>,
     query: &str,
 ) -> Vec<Vec<rusqlite::types::Value>> {
@@ -198,7 +198,7 @@ pub(crate) fn limbo_exec_rows(
                     break row;
                 }
                 turso_core::StepResult::IO => {
-                    db.io.run_once().unwrap();
+                    stmt.run_once().unwrap();
                     continue;
                 }
                 turso_core::StepResult::Done => break 'outer,
@@ -221,7 +221,7 @@ pub(crate) fn limbo_exec_rows(
 }
 
 pub(crate) fn limbo_exec_rows_error(
-    db: &TempDatabase,
+    _db: &TempDatabase,
     conn: &Arc<turso_core::Connection>,
     query: &str,
 ) -> turso_core::Result<()> {
@@ -230,7 +230,7 @@ pub(crate) fn limbo_exec_rows_error(
         let result = stmt.step()?;
         match result {
             turso_core::StepResult::IO => {
-                db.io.run_once()?;
+                stmt.run_once()?;
                 continue;
             }
             turso_core::StepResult::Done => return Ok(()),

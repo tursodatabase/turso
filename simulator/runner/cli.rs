@@ -54,7 +54,7 @@ pub struct SimulatorCLI {
     pub disable_delete: bool,
     #[clap(long, help = "disable CREATE Statement", default_value_t = false)]
     pub disable_create: bool,
-    #[clap(long, help = "disable CREATE INDEX Statement", default_value_t = false)]
+    #[clap(long, help = "disable CREATE INDEX Statement", default_value_t = true)]
     pub disable_create_index: bool,
     #[clap(long, help = "disable DROP Statement", default_value_t = false)]
     pub disable_drop: bool,
@@ -84,7 +84,7 @@ pub struct SimulatorCLI {
     pub disable_select_optimizer: bool,
     #[clap(long, help = "disable FsyncNoWait Property", default_value_t = true)]
     pub disable_fsync_no_wait: bool,
-    #[clap(long, help = "disable FaultyQuery Property", default_value_t = true)]
+    #[clap(long, help = "disable FaultyQuery Property", default_value_t = false)]
     pub disable_faulty_query: bool,
     #[clap(long, help = "disable Reopen-Database fault", default_value_t = false)]
     pub disable_reopen_database: bool,

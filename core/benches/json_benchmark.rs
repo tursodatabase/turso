@@ -4,7 +4,7 @@ use pprof::{
     flamegraph::Options,
 };
 use std::sync::Arc;
-use turso_core::{Database, PlatformIO, IO};
+use turso_core::{Database, PlatformIO};
 
 // Title: JSONB Function Benchmarking
 
@@ -447,13 +447,12 @@ fn bench(criterion: &mut Criterion) {
 
         group.bench_function("Limbo", |b| {
             let mut stmt = limbo_conn.prepare(&query).unwrap();
-            let io = io.clone();
             b.iter(|| {
                 loop {
                     match stmt.step().unwrap() {
                         turso_core::StepResult::Row => {}
                         turso_core::StepResult::IO => {
-                            let _ = io.run_once();
+                            stmt.run_once().unwrap();
                         }
                         turso_core::StepResult::Done => {
                             break;
@@ -606,13 +605,12 @@ fn bench_sequential_jsonb(criterion: &mut Criterion) {
 
     group.bench_function("Limbo - Sequential", |b| {
         let mut stmt = limbo_conn.prepare(&query).unwrap();
-        let io = io.clone();
         b.iter(|| {
             loop {
                 match stmt.step().unwrap() {
                     turso_core::StepResult::Row => {}
                     turso_core::StepResult::IO => {
-                        let _ = io.run_once();
+                        stmt.run_once().unwrap();
                     }
                     turso_core::StepResult::Done => {
                         break;
@@ -899,13 +897,12 @@ fn bench_json_patch(criterion: &mut Criterion) {
 
         group.bench_function("Limbo", |b| {
             let mut stmt = limbo_conn.prepare(&query).unwrap();
-            let io = io.clone();
             b.iter(|| {
                 loop {
                     match stmt.step().unwrap() {
                         turso_core::StepResult::Row => {}
                         turso_core::StepResult::IO => {
-                            let _ = io.run_once();
+                            stmt.run_once().unwrap();
                         }
                         turso_core::StepResult::Done => {
                             break;

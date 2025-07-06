@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::{trace, Level};
+use tracing::{instrument, trace, Level};
 
 use super::btree::{btree_init_page, BTreePage};
 use super::page_cache::{CacheError, CacheResizeResult, DumbLruPageCache, PageCacheKey};
@@ -471,6 +471,7 @@ impl Pager {
 
     /// This method is used to allocate a new root page for a btree, both for tables and indexes
     /// FIXME: handle no room in page cache
+    #[instrument(skip_all, level = Level::INFO)]
     pub fn btree_create(&self, flags: &CreateBTreeFlags) -> Result<CursorResult<u32>> {
         let page_type = match flags {
             _ if flags.is_table() => PageType::TableLeaf,
@@ -479,7 +480,7 @@ impl Pager {
         };
         #[cfg(feature = "omit_autovacuum")]
         {
-            let page = self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any);
+            let page = self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any)?;
             let page_id = page.get().get().id;
             Ok(CursorResult::Ok(page_id as u32))
         }
@@ -490,7 +491,7 @@ impl Pager {
             let auto_vacuum_mode = self.auto_vacuum_mode.borrow();
             match *auto_vacuum_mode {
                 AutoVacuumMode::None => {
-                    let page = self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any);
+                    let page = self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any)?;
                     let page_id = page.get().get().id;
                     Ok(CursorResult::Ok(page_id as u32))
                 }
@@ -514,7 +515,7 @@ impl Pager {
                         page_type,
                         0,
                         BtreePageAllocMode::Exact(root_page_num),
-                    );
+                    )?;
                     let allocated_page_id = page.get().get().id as u32;
                     if allocated_page_id != root_page_num {
                         //  TODO(Zaid): Handle swapping the allocated page with the desired root page
@@ -558,8 +559,8 @@ impl Pager {
         page_type: PageType,
         offset: usize,
         _alloc_mode: BtreePageAllocMode,
-    ) -> BTreePage {
-        let page = self.allocate_page().unwrap();
+    ) -> Result<BTreePage> {
+        let page = self.allocate_page()?;
         let page = Arc::new(BTreePageInner {
             page: RefCell::new(page),
         });
@@ -569,7 +570,7 @@ impl Pager {
             page.get().get().id,
             page.get().get_contents().page_type()
         );
-        page
+        Ok(page)
     }
 
     /// The "usable size" of a database page is the page size specified by the 2-byte integer at offset 16
@@ -589,6 +590,7 @@ impl Pager {
     }
 
     #[inline(always)]
+    #[instrument(skip_all, level = Level::INFO)]
     pub fn begin_read_tx(&self) -> Result<CursorResult<LimboResult>> {
         // We allocate the first page lazily in the first transaction
         match self.maybe_allocate_page1()? {
@@ -598,6 +600,7 @@ impl Pager {
         Ok(CursorResult::Ok(self.wal.borrow_mut().begin_read_tx()?))
     }
 
+    #[instrument(skip_all, level = Level::INFO)]
     fn maybe_allocate_page1(&self) -> Result<CursorResult<()>> {
         if self.is_empty.load(Ordering::SeqCst) < DB_STATE_INITIALIZED {
             if let Ok(_lock) = self.init_lock.try_lock() {
@@ -621,6 +624,7 @@ impl Pager {
     }
 
     #[inline(always)]
+    #[instrument(skip_all, level = Level::INFO)]
     pub fn begin_write_tx(&self) -> Result<CursorResult<LimboResult>> {
         // TODO(Diego): The only possibly allocate page1 here is because OpenEphemeral needs a write transaction
         // we should have a unique API to begin transactions, something like sqlite3BtreeBeginTrans
@@ -631,6 +635,7 @@ impl Pager {
         Ok(CursorResult::Ok(self.wal.borrow_mut().begin_write_tx()?))
     }
 
+    #[instrument(skip_all, level = Level::INFO)]
     pub fn end_tx(
         &self,
         rollback: bool,
@@ -666,13 +671,14 @@ impl Pager {
         }
     }
 
+    #[instrument(skip_all, level = Level::INFO)]
     pub fn end_read_tx(&self) -> Result<()> {
         self.wal.borrow().end_read_tx()?;
         Ok(())
     }
 
     /// Reads a page from the database.
-    #[tracing::instrument(skip_all, level = Level::DEBUG)]
+    #[tracing::instrument(skip_all, level = Level::INFO)]
     pub fn read_page(&self, page_idx: usize) -> Result<PageRef, LimboError> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
@@ -759,11 +765,12 @@ impl Pager {
     /// In the base case, it will write the dirty pages to the WAL and then fsync the WAL.
     /// If the WAL size is over the checkpoint threshold, it will checkpoint the WAL to
     /// the database file and then fsync the database file.
+    #[instrument(skip_all, level = Level::INFO)]
     pub fn cacheflush(&self, wal_checkpoint_disabled: bool) -> Result<PagerCacheflushStatus> {
         let mut checkpoint_result = CheckpointResult::default();
-        loop {
+        let res = loop {
             let state = self.flush_info.borrow().state;
-            trace!("cacheflush {:?}", state);
+            trace!(?state);
             match state {
                 FlushState::Start => {
                     let db_size = header_accessor::get_database_size(self)?;
@@ -795,7 +802,6 @@ impl Pager {
                     let in_flight = *self.flush_info.borrow().in_flight_writes.borrow();
                     if in_flight == 0 {
                         self.flush_info.borrow_mut().state = FlushState::SyncWal;
-                        self.wal.borrow_mut().finish_append_frames_commit()?;
                     } else {
                         return Ok(PagerCacheflushStatus::IO);
                     }
@@ -807,9 +813,7 @@ impl Pager {
 
                     if wal_checkpoint_disabled || !self.wal.borrow().should_checkpoint() {
                         self.flush_info.borrow_mut().state = FlushState::Start;
-                        return Ok(PagerCacheflushStatus::Done(
-                            PagerCacheflushResult::WalWritten,
-                        ));
+                        break PagerCacheflushResult::WalWritten;
                     }
                     self.flush_info.borrow_mut().state = FlushState::Checkpoint;
                 }
@@ -831,16 +835,17 @@ impl Pager {
                         return Ok(PagerCacheflushStatus::IO);
                     } else {
                         self.flush_info.borrow_mut().state = FlushState::Start;
-                        break;
+                        break PagerCacheflushResult::Checkpointed(checkpoint_result);
                     }
                 }
             }
-        }
-        Ok(PagerCacheflushStatus::Done(
-            PagerCacheflushResult::Checkpointed(checkpoint_result),
-        ))
+        };
+        // We should only signal that we finished appenind frames after wal sync to avoid inconsistencies when sync fails
+        self.wal.borrow_mut().finish_append_frames_commit()?;
+        Ok(PagerCacheflushStatus::Done(res))
     }
 
+    #[instrument(skip_all, level = Level::INFO)]
     pub fn wal_get_frame(
         &self,
         frame_no: u32,
@@ -856,11 +861,12 @@ impl Pager {
         )
     }
 
+    #[instrument(skip_all, level = Level::INFO, target = "pager_checkpoint",)]
     pub fn checkpoint(&self) -> Result<CheckpointStatus> {
         let mut checkpoint_result = CheckpointResult::default();
         loop {
             let state = *self.checkpoint_state.borrow();
-            trace!("pager_checkpoint(state={:?})", state);
+            trace!(?state);
             match state {
                 CheckpointState::Checkpoint => {
                     let in_flight = self.checkpoint_inflight.clone();
@@ -932,6 +938,7 @@ impl Pager {
         Ok(())
     }
 
+    #[instrument(skip_all, level = Level::INFO)]
     pub fn wal_checkpoint(&self, wal_checkpoint_disabled: bool) -> Result<CheckpointResult> {
         if wal_checkpoint_disabled {
             return Ok(CheckpointResult {
@@ -947,7 +954,7 @@ impl Pager {
                 CheckpointMode::Passive,
             ) {
                 Ok(CheckpointStatus::IO) => {
-                    let _ = self.io.run_once();
+                    self.io.run_once()?;
                 }
                 Ok(CheckpointStatus::Done(res)) => {
                     checkpoint_result = res;
@@ -965,6 +972,7 @@ impl Pager {
 
     // Providing a page is optional, if provided it will be used to avoid reading the page from disk.
     // This is implemented in accordance with sqlite freepage2() function.
+    #[instrument(skip_all, level = Level::INFO)]
     pub fn free_page(&self, page: Option<PageRef>, page_id: usize) -> Result<()> {
         tracing::trace!("free_page(page_id={})", page_id);
         const TRUNK_PAGE_HEADER_SIZE: usize = 8;
@@ -1036,6 +1044,7 @@ impl Pager {
         Ok(())
     }
 
+    #[instrument(skip_all, level = Level::INFO)]
     pub fn allocate_page1(&self) -> Result<CursorResult<PageRef>> {
         let state = self.allocate_page1_state.borrow().clone();
         match state {
@@ -1111,6 +1120,7 @@ impl Pager {
     */
     // FIXME: handle no room in page cache
     #[allow(clippy::readonly_write_lock)]
+    #[instrument(skip_all, level = Level::INFO)]
     pub fn allocate_page(&self) -> Result<PageRef> {
         let old_db_size = header_accessor::get_database_size(self)?;
         #[allow(unused_mut)]
@@ -1195,7 +1205,9 @@ impl Pager {
         (page_size - reserved_space) as usize
     }
 
+    #[instrument(skip_all, level = Level::INFO)]
     pub fn rollback(&self, change_schema: bool, connection: &Connection) -> Result<(), LimboError> {
+        tracing::debug!(change_schema);
         self.dirty_pages.borrow_mut().clear();
         let mut cache = self.page_cache.write();
         cache.unset_dirty_all_pages();

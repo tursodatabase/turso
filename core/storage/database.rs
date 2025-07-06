@@ -2,6 +2,7 @@ use crate::error::LimboError;
 use crate::io::CompletionType;
 use crate::{io::Completion, Buffer, Result};
 use std::{cell::RefCell, sync::Arc};
+use tracing::{instrument, Level};
 
 /// DatabaseStorage is an interface a database file that consists of pages.
 ///
@@ -32,6 +33,7 @@ unsafe impl Sync for DatabaseFile {}
 
 #[cfg(feature = "fs")]
 impl DatabaseStorage for DatabaseFile {
+    #[instrument(skip_all, level = Level::INFO)]
     fn read_page(&self, page_idx: usize, c: Completion) -> Result<()> {
         let r = c.as_read();
         let size = r.buf().len();
@@ -44,6 +46,7 @@ impl DatabaseStorage for DatabaseFile {
         Ok(())
     }
 
+    #[instrument(skip_all, level = Level::INFO)]
     fn write_page(
         &self,
         page_idx: usize,
@@ -60,11 +63,13 @@ impl DatabaseStorage for DatabaseFile {
         Ok(())
     }
 
+    #[instrument(skip_all, level = Level::INFO)]
     fn sync(&self, c: Completion) -> Result<()> {
         let _ = self.file.sync(c)?;
         Ok(())
     }
 
+    #[instrument(skip_all, level = Level::INFO)]
     fn size(&self) -> Result<u64> {
         self.file.size()
     }
@@ -85,6 +90,7 @@ unsafe impl Send for FileMemoryStorage {}
 unsafe impl Sync for FileMemoryStorage {}
 
 impl DatabaseStorage for FileMemoryStorage {
+    #[instrument(skip_all, level = Level::INFO)]
     fn read_page(&self, page_idx: usize, c: Completion) -> Result<()> {
         let r = match c.completion_type {
             CompletionType::Read(ref r) => r,
@@ -100,6 +106,7 @@ impl DatabaseStorage for FileMemoryStorage {
         Ok(())
     }
 
+    #[instrument(skip_all, level = Level::INFO)]
     fn write_page(
         &self,
         page_idx: usize,
@@ -115,11 +122,13 @@ impl DatabaseStorage for FileMemoryStorage {
         Ok(())
     }
 
+    #[instrument(skip_all, level = Level::INFO)]
     fn sync(&self, c: Completion) -> Result<()> {
         let _ = self.file.sync(c)?;
         Ok(())
     }
 
+    #[instrument(skip_all, level = Level::INFO)]
     fn size(&self) -> Result<u64> {
         self.file.size()
     }

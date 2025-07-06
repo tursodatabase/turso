@@ -42,7 +42,7 @@ fn test_simple_overflow_page() -> anyhow::Result<()> {
         Ok(Some(ref mut rows)) => loop {
             match rows.step()? {
                 StepResult::IO => {
-                    tmp_db.io.run_once()?;
+                    rows.run_once()?;
                 }
                 StepResult::Done => break,
                 _ => unreachable!(),
@@ -68,7 +68,7 @@ fn test_simple_overflow_page() -> anyhow::Result<()> {
                     compare_string(&huge_text, text);
                 }
                 StepResult::IO => {
-                    tmp_db.io.run_once()?;
+                    rows.run_once()?;
                 }
                 StepResult::Interrupt => break,
                 StepResult::Done => break,
@@ -110,7 +110,7 @@ fn test_sequential_overflow_page() -> anyhow::Result<()> {
             Ok(Some(ref mut rows)) => loop {
                 match rows.step()? {
                     StepResult::IO => {
-                        tmp_db.io.run_once()?;
+                        rows.run_once()?;
                     }
                     StepResult::Done => break,
                     _ => unreachable!(),
@@ -138,7 +138,7 @@ fn test_sequential_overflow_page() -> anyhow::Result<()> {
                     current_index += 1;
                 }
                 StepResult::IO => {
-                    tmp_db.io.run_once()?;
+                    rows.run_once()?;
                 }
                 StepResult::Interrupt => break,
                 StepResult::Done => break,
@@ -247,7 +247,7 @@ fn test_statement_reset() -> anyhow::Result<()> {
                 );
                 break;
             }
-            StepResult::IO => tmp_db.io.run_once()?,
+            StepResult::IO => stmt.run_once()?,
             _ => break,
         }
     }
@@ -264,7 +264,7 @@ fn test_statement_reset() -> anyhow::Result<()> {
                 );
                 break;
             }
-            StepResult::IO => tmp_db.io.run_once()?,
+            StepResult::IO => stmt.run_once()?,
             _ => break,
         }
     }
@@ -748,7 +748,7 @@ fn run_query_on_row(
 }
 
 fn run_query_core(
-    tmp_db: &TempDatabase,
+    _tmp_db: &TempDatabase,
     conn: &Arc<Connection>,
     query: &str,
     mut on_row: Option<impl FnMut(&Row)>,
@@ -757,7 +757,7 @@ fn run_query_core(
         Ok(Some(ref mut rows)) => loop {
             match rows.step()? {
                 StepResult::IO => {
-                    tmp_db.io.run_once()?;
+                    rows.run_once()?;
                 }
                 StepResult::Done => break,
                 StepResult::Row => {

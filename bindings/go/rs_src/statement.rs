@@ -64,7 +64,10 @@ pub extern "C" fn stmt_execute(
                 return ResultCode::Done;
             }
             Ok(StepResult::IO) => {
-                let _ = stmt.conn.io.run_once();
+                let res = statement.run_once();
+                if res.is_err() {
+                    return ResultCode::Error;
+                }
             }
             Ok(StepResult::Busy) => {
                 return ResultCode::Busy;

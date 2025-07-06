@@ -247,12 +247,11 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let stmt = &mut *stmt;
     let db = &mut *stmt.db;
     loop {
-        let db = db.inner.lock().unwrap();
+        let _db = db.inner.lock().unwrap();
         if let Ok(result) = stmt.stmt.step() {
             match result {
                 turso_core::StepResult::IO => {
-                    let io = db.io.clone();
-                    io.run_once().unwrap();
+                    stmt.stmt.run_once().unwrap();
                     continue;
                 }
                 turso_core::StepResult::Done => return SQLITE_DONE,

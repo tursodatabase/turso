@@ -7,7 +7,7 @@ use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::{Clock, Instant, OpenFlags, PlatformIO, Result, IO};
 
-use crate::runner::file::SimulatorFile;
+use crate::{model::FAULT_ERROR_MSG, runner::file::SimulatorFile};
 
 pub(crate) struct SimulatorIO {
     pub(crate) inner: Box<dyn IO>,
@@ -104,7 +104,7 @@ impl IO for SimulatorIO {
             self.nr_run_once_faults
                 .replace(self.nr_run_once_faults.get() + 1);
             return Err(turso_core::LimboError::InternalError(
-                "Injected fault".into(),
+                FAULT_ERROR_MSG.into(),
             ));
         }
         self.inner.run_once()?;

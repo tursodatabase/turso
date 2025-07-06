@@ -21,17 +21,12 @@ pub struct ImportArgs {
 
 pub struct ImportFile<'a> {
     conn: Arc<Connection>,
-    io: Arc<dyn turso_core::IO>,
     writer: &'a mut dyn Write,
 }
 
 impl<'a> ImportFile<'a> {
-    pub fn new(
-        conn: Arc<Connection>,
-        io: Arc<dyn turso_core::IO>,
-        writer: &'a mut dyn Write,
-    ) -> Self {
-        Self { conn, io, writer }
+    pub fn new(conn: Arc<Connection>, writer: &'a mut dyn Write) -> Self {
+        Self { conn, writer }
     }
 
     pub fn import(&mut self, args: ImportArgs) {
@@ -79,7 +74,7 @@ impl<'a> ImportFile<'a> {
                             while let Ok(x) = rows.step() {
                                 match x {
                                     turso_core::StepResult::IO => {
-                                        self.io.run_once().unwrap();
+                                        rows.run_once().unwrap();
                                     }
                                     turso_core::StepResult::Done => break,
                                     turso_core::StepResult::Interrupt => break,

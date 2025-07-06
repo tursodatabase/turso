@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
 use pprof::criterion::{Output, PProfProfiler};
-use turso_core::{Database, PlatformIO, IO as _};
+use turso_core::{Database, PlatformIO};
 
 const TPC_H_PATH: &str = "../perf/tpc-h/TPC-H.db";
 
@@ -97,7 +97,7 @@ fn bench_tpc_h_queries(criterion: &mut Criterion) {
                                 black_box(stmt.row());
                             }
                             turso_core::StepResult::IO => {
-                                let _ = io.run_once();
+                                stmt.run_once().unwrap();
                             }
                             turso_core::StepResult::Done => {
                                 break;

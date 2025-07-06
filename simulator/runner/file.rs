@@ -7,6 +7,8 @@ use rand::Rng as _;
 use rand_chacha::ChaCha8Rng;
 use tracing::{instrument, Level};
 use turso_core::{CompletionType, File, Result};
+
+use crate::model::FAULT_ERROR_MSG;
 pub(crate) struct SimulatorFile {
     pub(crate) inner: Arc<dyn File>,
     pub(crate) fault: Cell<bool>,
@@ -88,7 +90,7 @@ impl File for SimulatorFile {
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         if self.fault.get() {
             return Err(turso_core::LimboError::InternalError(
-                "Injected fault".into(),
+                FAULT_ERROR_MSG.into(),
             ));
         }
         self.inner.lock_file(exclusive)
@@ -97,7 +99,7 @@ impl File for SimulatorFile {
     fn unlock_file(&self) -> Result<()> {
         if self.fault.get() {
             return Err(turso_core::LimboError::InternalError(
-                "Injected fault".into(),
+                FAULT_ERROR_MSG.into(),
             ));
         }
         self.inner.unlock_file()
@@ -113,7 +115,7 @@ impl File for SimulatorFile {
             tracing::debug!("pread fault");
             self.nr_pread_faults.set(self.nr_pread_faults.get() + 1);
             return Err(turso_core::LimboError::InternalError(
-                "Injected fault".into(),
+                FAULT_ERROR_MSG.into(),
             ));
         }
         if let Some(latency) = self.generate_latency_duration() {
@@ -148,7 +150,7 @@ impl File for SimulatorFile {
             tracing::debug!("pwrite fault");
             self.nr_pwrite_faults.set(self.nr_pwrite_faults.get() + 1);
             return Err(turso_core::LimboError::InternalError(
-                "Injected fault".into(),
+                FAULT_ERROR_MSG.into(),
             ));
         }
         if let Some(latency) = self.generate_latency_duration() {
@@ -178,7 +180,7 @@ impl File for SimulatorFile {
             tracing::debug!("sync fault");
             self.nr_sync_faults.set(self.nr_sync_faults.get() + 1);
             return Err(turso_core::LimboError::InternalError(
-                "Injected fault".into(),
+                FAULT_ERROR_MSG.into(),
             ));
         }
         if let Some(latency) = self.generate_latency_duration() {

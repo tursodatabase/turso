@@ -13,7 +13,7 @@ fn test_wal_checkpoint_result() -> Result<()> {
     let conn = tmp_db.connect_limbo();
     conn.execute("CREATE TABLE t1 (id text);")?;
 
-    let res = execute_and_get_strings(&tmp_db, &conn, "pragma journal_mode;")?;
+    let res = execute_and_get_strings(&conn, "pragma journal_mode;")?;
     assert_eq!(res, vec!["wal"]);
 
     conn.execute("insert into t1(id) values (1), (2);")?;
@@ -22,7 +22,7 @@ fn test_wal_checkpoint_result() -> Result<()> {
     do_flush(&conn, &tmp_db).unwrap();
 
     // checkpoint result should return > 0 num pages now as database has data
-    let res = execute_and_get_ints(&tmp_db, &conn, "pragma wal_checkpoint;")?;
+    let res = execute_and_get_ints(&conn, "pragma wal_checkpoint;")?;
     println!("'pragma wal_checkpoint;' returns: {res:?}");
     assert_eq!(res.len(), 3);
     assert_eq!(res[0], 0); // checkpoint successfully
@@ -46,7 +46,7 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
                 match rows.step().unwrap() {
                     StepResult::Row => {}
                     StepResult::IO => {
-                        tmp_db.lock().unwrap().io.run_once().unwrap();
+                        rows.run_once().unwrap();
                     }
                     StepResult::Interrupt => break,
                     StepResult::Done => break,
@@ -86,7 +86,7 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
                             i += 1;
                         }
                         StepResult::IO => {
-                            tmp_db.lock().unwrap().io.run_once().unwrap();
+                            rows.run_once().unwrap();
                         }
                         StepResult::Interrupt => break,
                         StepResult::Done => break,
@@ -110,11 +110,7 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
 }
 
 /// Execute a statement and get strings result
-pub(crate) fn execute_and_get_strings(
-    tmp_db: &TempDatabase,
-    conn: &Arc<Connection>,
-    sql: &str,
-) -> Result<Vec<String>> {
+pub(crate) fn execute_and_get_strings(conn: &Arc<Connection>, sql: &str) -> Result<Vec<String>> {
     let statement = conn.prepare(sql)?;
     let stmt = Rc::new(RefCell::new(statement));
     let mut result = Vec::new();
@@ -130,19 +126,15 @@ pub(crate) fn execute_and_get_strings(
             }
             StepResult::Done => break,
             StepResult::Interrupt => break,
-            StepResult::IO => tmp_db.io.run_once()?,
-            StepResult::Busy => tmp_db.io.run_once()?,
+            StepResult::IO => stmt.run_once()?,
+            StepResult::Busy => stmt.run_once()?,
         }
     }
     Ok(result)
 }
 
 /// Execute a statement and get integers
-pub(crate) fn execute_and_get_ints(
-    tmp_db: &TempDatabase,
-    conn: &Arc<Connection>,
-    sql: &str,
-) -> Result<Vec<i64>> {
+pub(crate) fn execute_and_get_ints(conn: &Arc<Connection>, sql: &str) -> Result<Vec<i64>> {
     let statement = conn.prepare(sql)?;
     let stmt = Rc::new(RefCell::new(statement));
     let mut result = Vec::new();
@@ -166,8 +158,8 @@ pub(crate) fn execute_and_get_ints(
             }
             StepResult::Done => break,
             StepResult::Interrupt => break,
-            StepResult::IO => tmp_db.io.run_once()?,
-            StepResult::Busy => tmp_db.io.run_once()?,
+            StepResult::IO => stmt.run_once()?,
+            StepResult::Busy => stmt.run_once()?,
         }
     }
     Ok(result)

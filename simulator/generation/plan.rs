@@ -7,14 +7,14 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use turso_core::{Connection, Result, StepResult, IO};
+use turso_core::{Connection, Result, StepResult};
 
 use crate::{
     model::{
         query::{update::Update, Create, CreateIndex, Delete, Drop, Insert, Query, Select},
         table::SimValue,
     },
-    runner::{env::SimConnection, io::SimulatorIO},
+    runner::env::SimConnection,
     SimulatorEnv,
 };
 
@@ -260,7 +260,7 @@ impl Display for Interaction {
     }
 }
 
-type AssertionFunc = dyn Fn(&Vec<ResultSet>, &SimulatorEnv) -> Result<bool>;
+type AssertionFunc = dyn Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<bool>;
 
 enum AssertionAST {
     Pick(),
@@ -393,7 +393,7 @@ impl Interaction {
             }
         }
     }
-    pub(crate) fn execute_query(&self, conn: &mut Arc<Connection>, io: &SimulatorIO) -> ResultSet {
+    pub(crate) fn execute_query(&self, conn: &mut Arc<Connection>) -> ResultSet {
         if let Self::Query(query) = self {
             let query_str = query.to_string();
             let rows = conn.query(&query_str);
@@ -422,7 +422,7 @@ impl Interaction {
                         out.push(r);
                     }
                     StepResult::IO => {
-                        io.run_once().unwrap();
+                        rows.run_once().unwrap();
                     }
                     StepResult::Interrupt => {}
                     StepResult::Done => {
@@ -441,7 +441,7 @@ impl Interaction {
     pub(crate) fn execute_assertion(
         &self,
         stack: &Vec<ResultSet>,
-        env: &SimulatorEnv,
+        env: &mut SimulatorEnv,
     ) -> Result<()> {
         match self {
             Self::Assertion(assertion) => {
@@ -466,7 +466,7 @@ impl Interaction {
     pub(crate) fn execute_assumption(
         &self,
         stack: &Vec<ResultSet>,
-        env: &SimulatorEnv,
+        env: &mut SimulatorEnv,
     ) -> Result<()> {
         match self {
             Self::Assumption(assumption) => {
@@ -646,6 +646,7 @@ fn reopen_database(env: &mut SimulatorEnv) {
     env.connections.clear();
 
     // Clear all open files
+    // TODO: for correct reporting of faults we should get all the recorded numbers and transfer to the new file
     env.io.files.borrow_mut().clear();
 
     // 2. Re-open database

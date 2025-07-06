@@ -6,6 +6,7 @@ UNAME_S := $(shell uname -s)
 
 # Executable used to execute the compatibility tests.
 SQLITE_EXEC ?= scripts/limbo-sqlite3
+RUST_LOG := off
 
 all: check-rust-version check-wasm-target limbo limbo-wasm
 .PHONY: all
@@ -55,23 +56,23 @@ test: limbo uv-sync test-compat test-vector test-sqlite3 test-shell test-extensi
 .PHONY: test
 
 test-extensions: limbo uv-sync
-	uv run --project limbo_test test-extensions
+	RUST_LOG=$(RUST_LOG) uv run --project limbo_test test-extensions
 .PHONY: test-extensions
 
 test-shell: limbo uv-sync
-	SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-shell
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-shell
 .PHONY: test-shell
 
 test-compat:
-	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/all.test
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/all.test
 .PHONY: test-compat
 
 test-vector:
-	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/vector.test
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/vector.test
 .PHONY: test-vector
 
 test-time:
-	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/time.test
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/time.test
 .PHONY: test-time
 
 reset-db:
@@ -85,16 +86,16 @@ test-sqlite3: reset-db
 .PHONY: test-sqlite3
 
 test-json:
-	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/json.test
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/json.test
 .PHONY: test-json
 
 test-memory: limbo uv-sync
-	SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-memory
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-memory
 .PHONY: test-memory
 
 test-write: limbo uv-sync
 	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
-		SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-write; \
+		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-write; \
 	else \
 		echo "Skipping test-write: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
 	fi
@@ -102,7 +103,7 @@ test-write: limbo uv-sync
 
 test-update: limbo uv-sync
 	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
-		SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-update; \
+		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-update; \
 	else \
 		echo "Skipping test-update: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
 	fi
@@ -110,7 +111,7 @@ test-update: limbo uv-sync
 
 test-collate: limbo uv-sync
 	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
-		SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-collate; \
+		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-collate; \
 	else \
 		echo "Skipping test-collate: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
 	fi
@@ -118,7 +119,7 @@ test-collate: limbo uv-sync
 
 test-constraint: limbo uv-sync
 	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
-		SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-constraint; \
+		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-constraint; \
 	else \
 		echo "Skipping test-constraint: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
 	fi
@@ -126,7 +127,7 @@ test-constraint: limbo uv-sync
 
 bench-vfs: uv-sync
 	cargo build --release
-	uv run --project limbo_test bench-vfs "$(SQL)" "$(N)"
+	RUST_LOG=$(RUST_LOG) uv run --project limbo_test bench-vfs "$(SQL)" "$(N)"
 
 clickbench:
 	./perf/clickbench/benchmark.sh

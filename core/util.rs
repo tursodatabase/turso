@@ -3,7 +3,7 @@ use crate::{
     schema::{self, Column, Schema, Type},
     translate::{collate::CollationSeq, expr::walk_expr, plan::JoinOrderMember},
     types::{Value, ValueType},
-    LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable, IO,
+    LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable,
 };
 use std::{rc::Rc, sync::Arc};
 use turso_sqlite3_parser::ast::{
@@ -51,7 +51,6 @@ struct UnparsedFromSqlIndex {
 pub fn parse_schema_rows(
     rows: Option<Statement>,
     schema: &mut Schema,
-    io: Arc<dyn IO>,
     syms: &SymbolTable,
     mv_tx_id: Option<u64>,
 ) -> Result<()> {
@@ -130,7 +129,7 @@ pub fn parse_schema_rows(
                 StepResult::IO => {
                     // TODO: How do we ensure that the I/O we submitted to
                     // read the schema is actually complete?
-                    io.run_once()?;
+                    rows.run_once()?;
                 }
                 StepResult::Interrupt => break,
                 StepResult::Done => break,

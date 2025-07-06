@@ -41,7 +41,7 @@ pub struct Database {
     pub name: String,
     _db: Arc<turso_core::Database>,
     conn: Arc<turso_core::Connection>,
-    io: Arc<dyn turso_core::IO>,
+    _io: Arc<dyn turso_core::IO>,
 }
 
 impl ObjectFinalize for Database {
@@ -82,7 +82,7 @@ impl Database {
             conn,
             open: true,
             name: path,
-            io,
+            _io: io,
         })
     }
 
@@ -114,7 +114,7 @@ impl Database {
                             return Ok(env.get_undefined()?.into_unknown())
                         }
                         turso_core::StepResult::IO => {
-                            self.io.run_once().map_err(into_napi_error)?;
+                            stmt.run_once().map_err(into_napi_error)?;
                             continue;
                         }
                         step @ turso_core::StepResult::Interrupt
@@ -185,7 +185,7 @@ impl Database {
                 Ok(Some(mut stmt)) => loop {
                     match stmt.step() {
                         Ok(StepResult::Row) => continue,
-                        Ok(StepResult::IO) => self.io.run_once().map_err(into_napi_error)?,
+                        Ok(StepResult::IO) => stmt.run_once().map_err(into_napi_error)?,
                         Ok(StepResult::Done) => break,
                         Ok(StepResult::Interrupt | StepResult::Busy) => {
                             return Err(napi::Error::new(
@@ -308,7 +308,7 @@ impl Statement {
                 }
                 turso_core::StepResult::Done => return Ok(env.get_undefined()?.into_unknown()),
                 turso_core::StepResult::IO => {
-                    self.database.io.run_once().map_err(into_napi_error)?;
+                    stmt.run_once().map_err(into_napi_error)?;
                     continue;
                 }
                 turso_core::StepResult::Interrupt | turso_core::StepResult::Busy => {
@@ -338,7 +338,7 @@ impl Statement {
         self.check_and_bind(args)?;
         Ok(IteratorStatement {
             stmt: Rc::clone(&self.inner),
-            database: self.database.clone(),
+            _database: self.database.clone(),
             env,
             presentation_mode: self.presentation_mode.clone(),
         })
@@ -401,7 +401,7 @@ impl Statement {
                     break;
                 }
                 turso_core::StepResult::IO => {
-                    self.database.io.run_once().map_err(into_napi_error)?;
+                    stmt.run_once().map_err(into_napi_error)?;
                 }
                 turso_core::StepResult::Interrupt | turso_core::StepResult::Busy => {
                     return Err(napi::Error::new(
@@ -480,7 +480,7 @@ impl Statement {
 #[napi(iterator)]
 pub struct IteratorStatement {
     stmt: Rc<RefCell<turso_core::Statement>>,
-    database: Database,
+    _database: Database,
     env: Env,
     presentation_mode: PresentationMode,
 }
@@ -528,7 +528,7 @@ impl Generator for IteratorStatement {
                 }
                 turso_core::StepResult::Done => return None,
                 turso_core::StepResult::IO => {
-                    self.database.io.run_once().ok()?;
+                    stmt.run_once().ok()?;
                     continue;
                 }
                 turso_core::StepResult::Interrupt | turso_core::StepResult::Busy => return None,

@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use pprof::criterion::{Output, PProfProfiler};
 use std::sync::Arc;
-use turso_core::{Database, PlatformIO, IO};
+use turso_core::{Database, PlatformIO};
 
 fn rusqlite_open() -> rusqlite::Connection {
     let sqlite_conn = rusqlite::Connection::open("../testing/testing.db").unwrap();
@@ -79,7 +79,6 @@ fn bench_execute_select_rows(criterion: &mut Criterion) {
                 let mut stmt = limbo_conn
                     .prepare(format!("SELECT * FROM users LIMIT {}", *i))
                     .unwrap();
-                let io = io.clone();
                 b.iter(|| {
                     loop {
                         match stmt.step().unwrap() {
@@ -87,7 +86,7 @@ fn bench_execute_select_rows(criterion: &mut Criterion) {
                                 black_box(stmt.row());
                             }
                             turso_core::StepResult::IO => {
-                                let _ = io.run_once();
+                                stmt.run_once().unwrap();
                             }
                             turso_core::StepResult::Done => {
                                 break;
@@ -141,7 +140,6 @@ fn bench_execute_select_1(criterion: &mut Criterion) {
 
     group.bench_function("limbo_execute_select_1", |b| {
         let mut stmt = limbo_conn.prepare("SELECT 1").unwrap();
-        let io = io.clone();
         b.iter(|| {
             loop {
                 match stmt.step().unwrap() {
@@ -149,7 +147,7 @@ fn bench_execute_select_1(criterion: &mut Criterion) {
                         black_box(stmt.row());
                     }
                     turso_core::StepResult::IO => {
-                        let _ = io.run_once();
+                        stmt.run_once().unwrap();
                     }
                     turso_core::StepResult::Done => {
                         break;
@@ -194,7 +192,6 @@ fn bench_execute_select_count(criterion: &mut Criterion) {
 
     group.bench_function("limbo_execute_select_count", |b| {
         let mut stmt = limbo_conn.prepare("SELECT count() FROM users").unwrap();
-        let io = io.clone();
         b.iter(|| {
             loop {
                 match stmt.step().unwrap() {
@@ -202,7 +199,7 @@ fn bench_execute_select_count(criterion: &mut Criterion) {
                         black_box(stmt.row());
                     }
                     turso_core::StepResult::IO => {
-                        let _ = io.run_once();
+                        stmt.run_once().unwrap();
                     }
                     turso_core::StepResult::Done => {
                         break;

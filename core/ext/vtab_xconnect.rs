@@ -65,7 +65,10 @@ pub unsafe extern "C" fn execute(
                         return ResultCode::OK;
                     }
                     Ok(StepResult::IO) => {
-                        let _ = conn.pager.io.run_once();
+                        let res = stmt.run_once();
+                        if res.is_err() {
+                            return ResultCode::Error;
+                        }
                         continue;
                     }
                     Ok(StepResult::Interrupt) => return ResultCode::Interrupt,
@@ -154,7 +157,6 @@ pub unsafe extern "C" fn stmt_step(stmt: *mut Stmt) -> ResultCode {
         tracing::error!("stmt_step: null connection or context");
         return ResultCode::Error;
     }
-    let conn: &Connection = unsafe { &*(stmt._conn as *const Connection) };
     let stmt_ctx: &mut Statement = unsafe { &mut *(stmt._ctx as *mut Statement) };
     while let Ok(res) = stmt_ctx.step() {
         match res {
@@ -162,7 +164,10 @@ pub unsafe extern "C" fn stmt_step(stmt: *mut Stmt) -> ResultCode {
             StepResult::Done => return ResultCode::EOF,
             StepResult::IO => {
                 // always handle IO step result internally.
-                let _ = conn.pager.io.run_once();
+                let res = stmt_ctx.run_once();
+                if res.is_err() {
+                    return ResultCode::Error;
+                }
                 continue;
             }
             StepResult::Interrupt => return ResultCode::Interrupt,

@@ -7,7 +7,7 @@ use turso_core::{LimboError, Statement, StepResult, Value};
 
 pub struct LimboRows<'conn> {
     stmt: Box<Statement>,
-    conn: &'conn mut LimboConn,
+    _conn: &'conn mut LimboConn,
     err: Option<LimboError>,
 }
 
@@ -15,7 +15,7 @@ impl<'conn> LimboRows<'conn> {
     pub fn new(stmt: Statement, conn: &'conn mut LimboConn) -> Self {
         LimboRows {
             stmt: Box::new(stmt),
-            conn,
+            _conn: conn,
             err: None,
         }
     }
@@ -55,8 +55,12 @@ pub extern "C" fn rows_next(ctx: *mut c_void) -> ResultCode {
         Ok(StepResult::Row) => ResultCode::Row,
         Ok(StepResult::Done) => ResultCode::Done,
         Ok(StepResult::IO) => {
-            let _ = ctx.conn.io.run_once();
-            ResultCode::Io
+            let res = ctx.stmt.run_once();
+            if res.is_err() {
+                ResultCode::Error
+            } else {
+                ResultCode::Io
+            }
         }
         Ok(StepResult::Busy) => ResultCode::Busy,
         Ok(StepResult::Interrupt) => ResultCode::Interrupt,

@@ -40,11 +40,7 @@ pub struct LimboHelper {
 }
 
 impl LimboHelper {
-    pub fn new(
-        conn: Arc<Connection>,
-        io: Arc<dyn turso_core::IO>,
-        syntax_config: Option<HighlightConfig>,
-    ) -> Self {
+    pub fn new(conn: Arc<Connection>, syntax_config: Option<HighlightConfig>) -> Self {
         // Load only predefined syntax
         let ps = from_uncompressed_data(include_bytes!(concat!(
             env!("OUT_DIR"),
@@ -59,7 +55,7 @@ impl LimboHelper {
             }
         }
         LimboHelper {
-            completer: SqlCompleter::new(conn, io),
+            completer: SqlCompleter::new(conn),
             syntax_set: ps,
             theme_set: ts,
             syntax_config: syntax_config.unwrap_or_default(),
@@ -141,7 +137,6 @@ impl Highlighter for LimboHelper {
 
 pub struct SqlCompleter<C: Parser + Send + Sync + 'static> {
     conn: Arc<Connection>,
-    io: Arc<dyn turso_core::IO>,
     // Has to be a ref cell as Rustyline takes immutable reference to self
     // This problem would be solved with Reedline as it uses &mut self for completions
     cmd: RefCell<clap::Command>,
@@ -149,10 +144,9 @@ pub struct SqlCompleter<C: Parser + Send + Sync + 'static> {
 }
 
 impl<C: Parser + Send + Sync + 'static> SqlCompleter<C> {
-    pub fn new(conn: Arc<Connection>, io: Arc<dyn turso_core::IO>) -> Self {
+    pub fn new(conn: Arc<Connection>) -> Self {
         Self {
             conn,
-            io,
             cmd: C::command().into(),
             _cmd_phantom: PhantomData,
         }
@@ -228,7 +222,7 @@ impl<C: Parser + Send + Sync + 'static> SqlCompleter<C> {
                         candidates.push(pair);
                     }
                     StepResult::IO => {
-                        try_result!(self.io.run_once(), (prefix_pos, candidates));
+                        try_result!(rows.run_once(), (prefix_pos, candidates));
                     }
                     StepResult::Interrupt => break,
                     StepResult::Done => break,
