@@ -1,0 +1,115 @@
+#!/usr/bin/env tclsh
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+# Test for duplicate column handling in UPDATE and INSERT statements
+# Issue: https://github.com/tursodatabase/turso/issues/1948
+
+# Test UPDATE with duplicate columns - should work with "last wins" semantics
+do_execsql_test_on_specific_db {:memory:} update-duplicate-single-cols {
+    CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t VALUES (1, 2, 3);
+    UPDATE t SET a = 10, a = 20;
+    SELECT * FROM t;
+} {20|2|3}
+
+do_execsql_test_on_specific_db {:memory:} update-duplicate-mixed-cols {
+    CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t VALUES (1, 2, 3);
+    UPDATE t SET a = 10, b = 20, a = 30, c = 40;
+    SELECT * FROM t;
+} {30|20|40}
+
+do_execsql_test_on_specific_db {:memory:} update-duplicate-multi-cols {
+    CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t VALUES (1, 2, 3);
+    UPDATE t SET (a, b) = (10, 20), (a, b) = (30, 40);
+    SELECT * FROM t;
+} {30|40|3}
+
+do_execsql_test_on_specific_db {:memory:} update-duplicate-mixed-single-multi {
+    CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t VALUES (1, 2, 3);
+    UPDATE t SET a = 10, (a, b) = (20, 30), a = 40;
+    SELECT * FROM t;
+} {40|30|3}
+
+do_execsql_test_on_specific_db {:memory:} update-duplicate-three-times {
+    CREATE TABLE t (a INTEGER, b INTEGER);
+    INSERT INTO t VALUES (1, 2);
+    UPDATE t SET a = 10, a = 20, a = 30;
+    SELECT * FROM t;
+} {30|2}
+
+do_execsql_test_on_specific_db {:memory:} update-duplicate-with-where {
+    CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t VALUES (1, 2, 3), (4, 5, 6);
+    UPDATE t SET a = 10, a = 20 WHERE b = 2;
+    SELECT * FROM t ORDER BY b;
+} {20|2|3
+4|5|6}
+
+do_execsql_test_on_specific_db {:memory:} update-duplicate-with-expressions {
+    CREATE TABLE t (a INTEGER, b INTEGER);
+    INSERT INTO t VALUES (1, 2);
+    UPDATE t SET a = b + 1, a = b * 2;
+    SELECT * FROM t;
+} {4|2}
+
+# Test that UPDATE with duplicate columns works like SQLite
+# SQLite reference behavior:
+# sqlite> CREATE TABLE t(a,b,c);
+# sqlite> INSERT INTO t VALUES(1,2,3);
+# sqlite> UPDATE t SET a=10, a=20;
+# sqlite> SELECT * FROM t;
+# 20|2|3
+
+# Test INSERT with duplicate columns - should fail  
+# Note: These tests verify that INSERT still rejects duplicate columns
+# while UPDATE now allows them with "last wins" semantics
+
+do_execsql_test_in_memory_any_error insert-duplicate-single-cols {
+    CREATE TABLE t2 (a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t2 (a, a, b) VALUES (1, 2, 3);
+}
+
+do_execsql_test_in_memory_any_error insert-duplicate-multi-position {
+    CREATE TABLE t3 (a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t3 (a, b, a) VALUES (1, 2, 3);
+}
+
+do_execsql_test_in_memory_any_error insert-duplicate-case-insensitive {
+    CREATE TABLE t4 (a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t4 (a, B, A) VALUES (1, 2, 3);
+}
+
+# Test that normal INSERT (without duplicates) still works
+do_execsql_test_on_specific_db {:memory:} insert-normal {
+    CREATE TABLE t5 (a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t5 (a, b, c) VALUES (1, 2, 3);
+    SELECT * FROM t5;
+} {1|2|3}
+
+# Test UPDATE with complex column references
+do_execsql_test_on_specific_db {:memory:} update-duplicate-complex {
+    CREATE TABLE t6 (x INTEGER, y INTEGER, z INTEGER);
+    INSERT INTO t6 VALUES (1, 2, 3);
+    UPDATE t6 SET x = y, x = z, y = x + z;
+    SELECT * FROM t6;
+} {3|4|3}
+
+# Test edge case: UPDATE with same column multiple times in parentheses
+do_execsql_test_on_specific_db {:memory:} update-duplicate-parentheses {
+    CREATE TABLE t7 (a INTEGER, b INTEGER);
+    INSERT INTO t7 VALUES (1, 2);
+    UPDATE t7 SET (a, a) = (10, 20);
+    SELECT * FROM t7;
+} {20|2}
+
+# Test that UPDATE preserves order of operations for expressions
+do_execsql_test_on_specific_db {:memory:} update-duplicate-expression-order {
+    CREATE TABLE t8 (a INTEGER, b INTEGER);
+    INSERT INTO t8 VALUES (5, 10);
+    UPDATE t8 SET a = a + 1, a = a * 2;
+    SELECT * FROM t8;
+} {10|10}
