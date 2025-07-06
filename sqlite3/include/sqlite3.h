@@ -1,5 +1,5 @@
-#ifndef LIMBO_SQLITE3_H
-#define LIMBO_SQLITE3_H
+#ifndef TURSO_SQLITE3_H
+#define TURSO_SQLITE3_H
 
 #include <stdint.h>
 
@@ -292,4 +292,4 @@ int libsql_wal_frame_count(sqlite3 *db, uint32_t *p_frame_count);
 }  // extern "C"
 #endif  // __cplusplus
 
-#endif  /* LIMBO_SQLITE3_H */
+#endif  /* TURSO_SQLITE3_H */

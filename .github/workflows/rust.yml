@@ -2,9 +2,9 @@ name: Rust
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,10 +13,10 @@ jobs:
   cargo-fmt-check:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-    - uses: actions/checkout@v3
-    - uses: dtolnay/rust-toolchain@stable
-    - name: Check formatting
-      run: cargo fmt --check
+      - uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check formatting
+        run: cargo fmt --check
 
   build-native:
     strategy:
@@ -26,21 +26,21 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-    - uses: actions/checkout@v3
-    - uses: useblacksmith/rust-cache@v3
-      with:
-        prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
-    - name: Set up Python 3.10
-      uses: useblacksmith/setup-python@v6
-      with:
-        python-version: "3.10"
-    - name: Build
-      run: cargo build --verbose
-    - name: Test
-      env:
-        RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
-      run: cargo test --verbose
-      timeout-minutes: 20
+      - uses: actions/checkout@v3
+      - uses: useblacksmith/rust-cache@v3
+        with:
+          prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
+      - name: Set up Python 3.10
+        uses: useblacksmith/setup-python@v6
+        with:
+          python-version: "3.10"
+      - name: Build
+        run: cargo build --verbose
+      - name: Test
+        env:
+          RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
+        run: cargo test --verbose
+        timeout-minutes: 20
 
   clippy:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -103,10 +103,10 @@ jobs:
       - name: Test
         run: make test
         timeout-minutes: 20
-#      - uses: "./.github/shared/install_sqlite"
-#      - name: Test with index enabled
-#        run: SQLITE_EXEC="scripts/limbo-sqlite3-index-experimental" make test
-#        timeout-minutes: 20
+  #      - uses: "./.github/shared/install_sqlite"
+  #      - name: Test with index enabled
+  #        run: SQLITE_EXEC="scripts/turso-sqlite3-index-experimental" make test
+  #        timeout-minutes: 20
   test-sqlite:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
@@ -115,3 +115,40 @@ jobs:
       - name: Test
         run: SQLITE_EXEC="sqlite3" make test-compat
 
+  test-indexes:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
+    steps:
+      - name: Install cargo-c
+        env:
+          LINK: https://github.com/lu-zero/cargo-c/releases/download/v0.10.7
+          CARGO_C_FILE: cargo-c-x86_64-unknown-linux-musl.tar.gz
+        run: |
+          curl -L $LINK/$CARGO_C_FILE | tar xz -C ~/.cargo/bin
+
+      - uses: actions/checkout@v3
+
+      - uses: useblacksmith/rust-cache@v3
+        with:
+          prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
+
+      - name: Install uv
+        uses: useblacksmith/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install the project
+        run: uv sync --all-extras --dev --all-packages
+      
+      - uses: "./.github/shared/install_sqlite"
+      - name: Test with index enabled
+        continue-on-error: true
+        run: SQLITE_EXEC="scripts/turso-sqlite3-index-experimental" make test
+        timeout-minutes: 20
+
+      - name: Notify error
+        if: ${{ failure() }}
+        run: echo "::warning ::{test indexes failed}"

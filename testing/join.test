@@ -228,7 +228,7 @@ do_execsql_test left-join-constant-condition-true-inner-join-constant-condition-
     select u.first_name, p.name, u2.first_name from users u left join products as p on 1 join users u2 on 0 limit 5;
 } {}
 
-if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/turso-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
     do_execsql_test join-utilizing-both-seekrowid-and-secondary-index {
     select u.first_name, p.name from users u join products p on u.id = p.id and u.age > 70;
     } {Matthew|boots

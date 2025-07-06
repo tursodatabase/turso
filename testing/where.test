@@ -163,7 +163,7 @@ do_execsql_test where-clause-no-table-constant-condition-false-7 {
     select 1 where 'hamburger';
 } {}
 
-if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/turso-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
     # this test functions as an assertion that the index on users.age is being used, since the results are ordered by age without an order by.
     do_execsql_test select-where-and {
         select first_name, age from users where first_name = 'Jamie' and age > 80
@@ -414,7 +414,7 @@ do_execsql_test where-age-index-seek-regression-test-2 {
     select count(1) from users where age > 0;
 } {10000}
 
-if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/turso-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
     do_execsql_test where-age-index-seek-regression-test-3 {
         select age from users where age > 90 limit 1;
     } {91}

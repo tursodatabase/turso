@@ -21,12 +21,12 @@ class InsertTest(BaseModel):
     def run(self, limbo: TestTursoShell):
         zero_blob = "0" * self.blob_size * 2
         big_stmt = [self.db_schema, "CREATE INDEX test_index ON test(t1);"]
-        big_stmt = big_stmt + [
-            f"INSERT INTO test (t1) VALUES (zeroblob({self.blob_size}));"
-            if i % 2 == 0 and self.has_blob
-            else f"INSERT INTO test (t2) VALUES ({i});"
-            for i in range(self.vals * 2)
-        ]
+        for i in range(self.vals * 2):
+            if i % 2 == 0 and self.has_blob:
+                big_stmt.append(f"INSERT INTO test (t1) VALUES (zeroblob({self.blob_size}));")
+            else:
+                big_stmt.append(f"INSERT INTO test (t2) VALUES ({i});")
+
         expected = []
         for i in range(self.vals * 2):
             if i % 2 == 0 and self.has_blob:
@@ -39,6 +39,14 @@ class InsertTest(BaseModel):
         big_stmt.append("SELECT count(*) FROM test;")
         expected.append(str(self.vals * 2))
 
+        big_stmt = "".join(big_stmt)
+        expected = "\n".join(expected)
+
+        limbo.run_test_fn(big_stmt, lambda res: validate_with_expected(res, expected), self.name)
+
+    def delete(self, limbo: TestTursoShell):
+        expected = []
+        big_stmt = []
         big_stmt.append("DELETE FROM test;")
         big_stmt.append("SELECT count(*) FROM test;")
         expected.append(str(0))
@@ -46,7 +54,7 @@ class InsertTest(BaseModel):
         big_stmt = "".join(big_stmt)
         expected = "\n".join(expected)
 
-        limbo.run_test_fn(big_stmt, lambda res: validate_with_expected(res, expected), self.name)
+        limbo.run_test_fn(big_stmt, lambda res: validate_with_expected(res, expected), "Delete values in table")
 
     def test_compat(self):
         console.info("Testing in SQLite\n")
@@ -54,16 +62,16 @@ class InsertTest(BaseModel):
         with TestTursoShell(
             init_commands="",
             exec_name="sqlite3",
-            flags=f"{self.db_path}",
         ) as sqlite:
+            sqlite.execute_dot(f".open {self.db_path}")
             sqlite.run_test_fn(
                 ".show",
-                lambda res: f"filename: {self.db_path}" in res,
+                lambda res: validate_with_expected(res, f"filename: {self.db_path}"),
                 "Opened db file created with Limbo in sqlite3",
             )
             sqlite.run_test_fn(
                 ".schema",
-                lambda res: self.db_schema in res,
+                lambda res: validate_with_expected(res, self.db_schema),
                 "Tables created by previous Limbo test exist in db file",
             )
             sqlite.run_test_fn(
@@ -73,7 +81,7 @@ class InsertTest(BaseModel):
             )
             sqlite.run_test_fn(
                 "PRAGMA integrity_check;",
-                lambda res: res == "ok",
+                lambda res: validate_with_expected(res, "ok"),
                 "Integrity Check",
             )
         console.info()
@@ -153,6 +161,9 @@ def main():
                     test.run(limbo)
                 sleep(0.3)
                 test.test_compat()
+                with TestTursoShell("") as limbo:
+                    limbo.execute_dot(f".open {test.db_path}")
+                    test.delete(limbo)
 
             except Exception as e:
                 console.error(f"Test FAILED: {e}")

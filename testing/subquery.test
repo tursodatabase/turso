@@ -412,7 +412,7 @@ do_execsql_test subquery-ignore-unused-cte {
     select * from sub;
 } {Jamie}
 
-if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/turso-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
     # Test verifying that select distinct works (distinct ages are 1-100)
     do_execsql_test subquery-count-distinct-age {
         select count(1) from (select distinct age from users);

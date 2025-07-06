@@ -142,7 +142,7 @@ do_execsql_test case-insensitive-alias {
     select u.first_name as fF, count(1) > 0 as cC from users u where fF = 'Jamie' group by fF order by cC;
 } {Jamie|1}
 
-if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/turso-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
     do_execsql_test age_idx_order_desc {
         select first_name from users order by age desc limit 3;
     } {Robert
@@ -165,7 +165,7 @@ do_execsql_test orderby_desc_verify_rows {
     select count(1) from (select * from users order by age desc)
 } {10000}
 
-if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/turso-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
     do_execsql_test orderby_desc_with_offset {
         select first_name, age from users order by age desc limit 3 offset 666;
     } {Francis|94

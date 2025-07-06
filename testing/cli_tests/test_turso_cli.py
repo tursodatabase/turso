@@ -104,7 +104,7 @@ class TestTursoShell:
         flags="",
     ):
         if exec_name is None:
-            exec_name = os.environ.get("SQLITE_EXEC", "./scripts/limbo-sqlite3")
+            exec_name = os.environ.get("SQLITE_EXEC", "./scripts/turso-sqlite3")
             if flags == "":
                 flags = "-q"
         self.config = ShellConfig(exe_name=exec_name, flags=flags)
@@ -137,9 +137,9 @@ INSERT INTO t VALUES (zeroblob(1024 - 1), zeroblob(1024 - 2), zeroblob(1024 - 3)
     def run_test(self, name: str, sql: str, expected: str) -> None:
         console.test(f"Running test: {name}", _stack_offset=2)
         actual = self.shell.execute(sql)
-        assert actual == expected, (
-            f"Test failed: {name}\nSQL: {sql}\nExpected:\n{repr(expected)}\nActual:\n{repr(actual)}"
-        )
+        assert (
+            actual == expected
+        ), f"Test failed: {name}\nSQL: {sql}\nExpected:\n{repr(expected)}\nActual:\n{repr(actual)}"
 
     def run_debug(self, sql: str):
         console.debug(f"debugging: {sql}", _stack_offset=2)

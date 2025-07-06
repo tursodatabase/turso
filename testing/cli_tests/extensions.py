@@ -4,7 +4,7 @@ import os
 from cli_tests import console
 from cli_tests.test_turso_cli import TestTursoShell
 
-sqlite_exec = "./scripts/limbo-sqlite3"
+sqlite_exec = "./scripts/turso-sqlite3"
 sqlite_flags = os.getenv("SQLITE_FLAGS", "-q").split(" ")
 
 test_data = """CREATE TABLE numbers ( id INTEGER PRIMARY KEY, value FLOAT NOT NULL);

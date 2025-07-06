@@ -206,7 +206,7 @@ do_execsql_test group_by_no_sorting_required_and_const_agg_arg {
 } {CA,PW,ME,AS,LA,OH,AL,UT,WA,MO,WA,SC,AR,CO,OK,ME,FM,AR,CT,MT,TN,FL,MA,ND,LA,NE,KS,IN,RI,NH,IL,FM,WA,MH,RI,SC,AS,IL,VA,MI,ID,ME,WY,TN,IN,IN,UT,WA,AZ,VA,NM,IA,MP,WY,RI,OR,OR,FM,WA,DC,RI,GU,TX,HI,IL,TX,WY,OH,TX,CT,KY,NE,MH,AR,MN,IL,NH,HI,NV,UT,FL,MS,NM,NJ,CA,MS,GA,MT,GA,AL,IN,SC,PA,FL,CT,PA,GA,RI,HI,WV,VT,IA,PR,FM,MA,TX,MS,LA,MD,PA,TX,WY
 OR,SD,KS,MP,WA,VI,SC,SD,SD,MP,WA,MT,FM,IN,ME,OH,KY,RI,DC,MS,OK,VI,KY,MD,SC,OK,NY,WY,AK,MN,UT,NE,VA,MD,AZ,VI,SC,NV,IN,VA,HI,VI,MS,NE,WY,NY,GU,MT,AL,IA,VA,ND,MN,FM,IA,ID,IL,FL,PR,WA,AS,HI,NH,WI,FL,HI,AL,ID,DC,CT,IL,VT,AZ,VI,AK,PW,NC,SD,NV,WA,MO,MS,WY,VA,FM,MN,NH,MN,MT,TX,MS,FM,OH,GU,IN,WA,IA,PA,ID,MI,LA,GU,ND,AR,ND,WV,DC,NY,CO,CT,FM,CT,ND}
 
-if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/turso-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
   do_execsql_test_on_specific_db {:memory:} group_by_no_sorting_required_reordered_columns {
     create table t0 (a INT, b INT, c INT);
     create index a_b_idx on t0 (a, b);
@@ -223,7 +223,7 @@ if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-s
   3|2|2}
 }
 
-if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/turso-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
     do_execsql_test distinct_agg_functions {
     select first_name, sum(distinct age), count(distinct age), avg(distinct age)
     from users
