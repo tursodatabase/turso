@@ -7378,7 +7378,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     pub fn test_clear_overflow_pages() -> Result<()> {
         let pager = setup_test_env(5);
         let num_columns = 5;
