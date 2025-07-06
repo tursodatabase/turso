@@ -21,7 +21,7 @@ if [[ -n "$iterations" ]]; then
     echo "Running limbo_sim for $iterations iterations..."
     for ((i=1; i<=iterations; i++)); do
         echo "Iteration $i of $iterations"
-        cargo run -p limbo_sim
+        cargo run -p limbo_sim -- --maximum-tests 2000
     done
     echo "Completed $iterations iterations"
 else
