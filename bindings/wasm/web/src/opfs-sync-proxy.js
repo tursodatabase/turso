@@ -60,10 +60,7 @@ function handleCommand(msg) {
 async function handleOpen(path) {
   if (pathToFd.has(path)) {
     log(`returning from cache: ${path} -> ${pathToFd.get(path)}`);
-    return {
-      fd: pathToFd.get(path),
-      syncHandle: fdToHandle.get(pathToFd.get(path)),
-    };
+    return { fd: pathToFd.get(path) };
   }
 
   const fd = nextFd++;
