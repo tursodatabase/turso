@@ -1,5 +1,6 @@
 use crate::types::Value;
 use crate::vdbe::Register;
+use crate::vector::distance::{euclidean::Euclidean, DistanceCalculator};
 use crate::LimboError;
 use crate::Result;
 
@@ -76,5 +77,18 @@ pub fn vector_distance_cos(args: &[Register]) -> Result<Value> {
     let x = parse_vector(&args[0], None)?;
     let y = parse_vector(&args[1], None)?;
     let dist = do_vector_distance_cos(&x, &y)?;
+    Ok(Value::Float(dist))
+}
+
+pub fn vector_distance_l2(args: &[Register]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(LimboError::ConversionError(
+            "distance_l2 requires exactly two arguments".to_string(),
+        ));
+    }
+
+    let x = parse_vector(&args[0], None)?;
+    let y = parse_vector(&args[1], None)?;
+    let dist = Euclidean::calculate(&[x], &[y])?;
     Ok(Value::Float(dist))
 }

@@ -919,6 +919,19 @@ pub fn translate_expr(
                         });
                         Ok(target_register)
                     }
+                    VectorFunc::VectorDistanceEuclidean => {
+                        let args = expect_arguments_exact!(args, 2, vector_func);
+                        let regs = program.alloc_registers(2);
+                        translate_expr(program, referenced_tables, &args[0], regs, resolver)?;
+                        translate_expr(program, referenced_tables, &args[1], regs + 1, resolver)?;
+                        program.emit_insn(Insn::Function {
+                            constant_mask: 0,
+                            start_reg: regs,
+                            dest: target_register,
+                            func: func_ctx,
+                        });
+                        Ok(target_register)
+                    }
                 },
                 Func::Scalar(srf) => {
                     match srf {

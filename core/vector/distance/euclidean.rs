@@ -42,7 +42,7 @@ impl DistanceCalculator for Euclidean {
         _v1: &'a [Vector],
         _v2: &'a [Vector],
     ) -> Box<dyn Iterator<Item = Result<f64>> + 'a> {
-        unimplemented!();
+        todo!()
     }
 }
 
