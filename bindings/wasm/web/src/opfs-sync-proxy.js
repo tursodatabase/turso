@@ -147,7 +147,7 @@ function sendResult(result) {
 // 1 = only errors
 // 2 = warnings and errors
 // 3 = debug, warnings, and errors
-const logLevel = 3;
+const logLevel = 1;
 
 const loggers = {
   0: console.error.bind(console),
