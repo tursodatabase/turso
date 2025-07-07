@@ -3714,6 +3714,11 @@ impl BTreeCursor {
             root.get_contents().page_type()
         );
 
+        turso_assert!(root.is_dirty(), "Root page should be dirty");
+        turso_assert!(
+            child_btree.get().is_dirty(),
+            "Child btree page should be dirty"
+        );
         self.pager.add_dirty(root.get().id);
         self.pager.add_dirty(child_btree.get().get().id);
 
