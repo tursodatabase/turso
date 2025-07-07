@@ -10,6 +10,8 @@ pub enum LimboError {
     InternalError(String),
     #[error("Page cache is full")]
     CacheFull,
+    #[error("Database is full: {0}")]
+    DatabaseFull(String),
     #[error("Parse error: {0}")]
     ParseError(String),
     #[error(transparent)]

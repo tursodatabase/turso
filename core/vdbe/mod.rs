@@ -29,7 +29,7 @@ use crate::{
     function::{AggFunc, FuncCtx},
     storage::{pager::PagerCacheCommitStatus, sqlite3_ondisk::SmallVec},
     translate::plan::TableReferences,
-    types::{RawSlice, TextRef},
+    types::{RawSlice, SeekKey, SeekOp, TextRef},
     vdbe::execute::OpIdxInsertState,
     vdbe::execute::OpInsertState,
     RefValue,
@@ -548,38 +548,54 @@ impl Program {
     }
 }
 
-fn get_new_rowid<R: Rng>(cursor: &mut BTreeCursor, mut _rng: R) -> Result<CursorResult<i64>> {
+fn get_new_rowid<R: Rng>(cursor: &mut BTreeCursor, mut rng: R) -> Result<CursorResult<i64>> {
+    const MAX_ROWID: i64 = i64::MAX;
+
     match cursor.seek_to_last()? {
         CursorResult::Ok(()) => {}
         CursorResult::IO => return Ok(CursorResult::IO),
     }
-    let rowid = match cursor.rowid()? {
-        CursorResult::Ok(Some(rowid)) => rowid.checked_add(1).unwrap_or(i64::MAX), // add 1 but be careful with overflows, in case of overflow - use i64::MAX
-        CursorResult::Ok(None) => 1,
+
+    let current_max_rowid = match cursor.rowid()? {
+        CursorResult::Ok(Some(rowid)) => rowid,
+        CursorResult::Ok(None) => {
+            return Ok(CursorResult::Ok(1));
+        }
         CursorResult::IO => return Ok(CursorResult::IO),
     };
-    // NOTE(nilskch): I commented this part out because this condition will never be true.
-    // if rowid > i64::MAX {
-    //     let distribution = Uniform::from(1..=i64::MAX);
-    //     let max_attempts = 100;
-    //     for count in 0..max_attempts {
-    //         rowid = distribution.sample(&mut rng);
-    //         match cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })? {
-    //             CursorResult::Ok(false) => break, // Found a non-existing rowid
-    //             CursorResult::Ok(true) => {
-    //                 if count == max_attempts - 1 {
-    //                     return Err(LimboError::InternalError(
-    //                         "Failed to generate a new rowid".to_string(),
-    //                     ));
-    //                 } else {
-    //                     continue; // Try next random rowid
-    //                 }
-    //             }
-    //             CursorResult::IO => return Ok(CursorResult::IO),
-    //         }
-    //     }
-    // }
-    Ok(CursorResult::Ok(rowid))
+
+    if current_max_rowid < MAX_ROWID {
+        return Ok(CursorResult::Ok(current_max_rowid + 1));
+    }
+
+    // Current max rowid == i64::MAX, so we need to generate random rowids
+    let max_attempts = 100;
+
+    for _ in 0..max_attempts {
+        // Generate a random i64 and constrain it to the lower half of the rowid range.
+        // We use the lower half (1 to MAX_ROWID/2) because we're in random mode only
+        // when sequential allocation reached MAX_ROWID, meaning the upper range is full.
+        let mut random_rowid: i64 = rng.gen();
+        random_rowid &= MAX_ROWID >> 1; // Mask to keep value in range [0, MAX_ROWID/2]
+        random_rowid += 1; // Ensure positive
+
+        match cursor.seek(
+            SeekKey::TableRowId(random_rowid),
+            SeekOp::GE { eq_only: true },
+        )? {
+            CursorResult::Ok(false) => {
+                return Ok(CursorResult::Ok(random_rowid));
+            }
+            CursorResult::Ok(true) => {
+                continue;
+            }
+            CursorResult::IO => return Ok(CursorResult::IO),
+        }
+    }
+
+    Err(LimboError::DatabaseFull(
+        "Unable to find an unused rowid after 100 attempts - database is probably full".to_string(),
+    ))
 }
 
 fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> ImmutableRecord {
