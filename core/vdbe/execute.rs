@@ -1774,7 +1774,7 @@ pub fn op_auto_commit(
     if *auto_commit != conn.auto_commit.get() {
         if *rollback {
             // TODO(pere): add rollback I/O logic once we implement rollback journal
-            btree.pager.rollback(change_schema, &conn)?;
+            btree.pager.rollback(schema_did_change, &conn)?;
             conn.auto_commit.replace(true);
         } else {
             conn.auto_commit.replace(*auto_commit);

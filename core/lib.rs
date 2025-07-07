@@ -653,7 +653,7 @@ impl Connection {
         if res.is_err() {
             let state = self.transaction_state.get();
             if let TransactionState::Write { schema_did_change } = state {
-                self.pager.rollback(schema_did_change, self)?
+                self.btree.pager.rollback(schema_did_change, self)?
             }
         }
         res

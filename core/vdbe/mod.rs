@@ -405,7 +405,7 @@ impl Program {
             if res.is_err() {
                 let state = self.connection.transaction_state.get();
                 if let TransactionState::Write { schema_did_change } = state {
-                    pager.rollback(schema_did_change, &self.connection)?
+                    btree.pager.rollback(schema_did_change, &self.connection)?
                 }
             }
             match res? {
