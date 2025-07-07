@@ -504,7 +504,7 @@ impl Connection {
                 Ok(Statement::new(
                     program,
                     self._db.mv_store.clone(),
-                    self.btree.pager.clone(),
+                    self.btree.clone(),
                 ))
             }
             Cmd::Explain(_stmt) => todo!(),
@@ -555,7 +555,7 @@ impl Connection {
                 let stmt = Statement::new(
                     program.into(),
                     self._db.mv_store.clone(),
-                    self.btree.pager.clone(),
+                    self.btree.clone(),
                 );
                 Ok(Some(stmt))
             }
@@ -632,7 +632,7 @@ impl Connection {
                         let res = program.step(
                             &mut state,
                             self._db.mv_store.clone(),
-                            self.btree.pager.clone(),
+                            self.btree.clone(),
                         )?;
                         if matches!(res, StepResult::Done) {
                             break;
@@ -925,21 +925,21 @@ pub struct Statement {
     program: Rc<vdbe::Program>,
     state: vdbe::ProgramState,
     mv_store: Option<Rc<MvStore>>,
-    pager: Rc<Pager>,
+    btree: Rc<BTree>,
 }
 
 impl Statement {
     pub fn new(
         program: Rc<vdbe::Program>,
         mv_store: Option<Rc<MvStore>>,
-        pager: Rc<Pager>,
+        btree: Rc<BTree>,
     ) -> Self {
         let state = vdbe::ProgramState::new(program.max_registers, program.cursor_ref.len());
         Self {
             program,
             state,
             mv_store,
-            pager,
+            btree,
         }
     }
 
@@ -953,7 +953,7 @@ impl Statement {
 
     pub fn step(&mut self) -> Result<StepResult> {
         self.program
-            .step(&mut self.state, self.mv_store.clone(), self.pager.clone())
+            .step(&mut self.state, self.mv_store.clone(), self.btree.clone())
     }
 
     pub fn run_once(&self) -> Result<()> {
