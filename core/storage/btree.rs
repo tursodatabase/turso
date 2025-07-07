@@ -303,14 +303,6 @@ impl BTreeKey<'_> {
             BTreeKey::IndexKey(_) => panic!("BTreeKey::to_rowid called on IndexKey"),
         }
     }
-
-    /// Assert that the key is an index key and return it.
-    fn to_index_key_values(&self) -> &'_ Vec<RefValue> {
-        match self {
-            BTreeKey::TableRowId(_) => panic!("BTreeKey::to_index_key called on TableRowId"),
-            BTreeKey::IndexKey(key) => key.get_values(),
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -465,26 +457,6 @@ pub enum CursorSeekState {
     },
 }
 
-#[derive(Debug)]
-struct FindCellState(Option<isize>);
-
-impl FindCellState {
-    #[inline]
-    fn set(&mut self, cell_idx: isize) {
-        self.0 = Some(cell_idx)
-    }
-
-    #[inline]
-    fn get_cell_idx(&mut self) -> isize {
-        self.0.expect("get can only be called after a set")
-    }
-
-    #[inline]
-    fn reset(&mut self) {
-        self.0 = None;
-    }
-}
-
 pub struct BTreeCursor {
     /// The multi-version cursor that is used to read and write to the database file.
     mv_cursor: Option<Rc<RefCell<MvCursor>>>,
@@ -526,8 +498,6 @@ pub struct BTreeCursor {
     /// Separate state to read a record with overflow pages. This separation from `state` is necessary as
     /// we can be in a function that relies on `state`, but also needs to process overflow pages
     read_overflow_state: RefCell<Option<ReadPayloadOverflow>>,
-    /// Contains the current cell_idx for `find_cell`
-    find_cell_state: FindCellState,
 }
 
 /// We store the cell index and cell count for each page in the stack.
@@ -581,7 +551,6 @@ impl BTreeCursor {
             collations,
             seek_state: CursorSeekState::Start,
             read_overflow_state: RefCell::new(None),
-            find_cell_state: FindCellState(None),
             parse_record_state: RefCell::new(ParseRecordState::Init),
         }
     }
@@ -2022,23 +1991,6 @@ impl BTreeCursor {
         (cmp, found)
     }
 
-    fn read_record_w_possible_overflow(
-        &mut self,
-        payload: &'static [u8],
-        next_page: Option<u32>,
-        payload_size: u64,
-    ) -> Result<CursorResult<()>> {
-        if let Some(next_page) = next_page {
-            self.process_overflow_read(payload, next_page, payload_size)
-        } else {
-            crate::storage::sqlite3_ondisk::read_record(
-                payload,
-                self.get_immutable_record_or_create().as_mut().unwrap(),
-            )?;
-            Ok(CursorResult::Ok(()))
-        }
-    }
-
     #[instrument(skip_all, level = Level::INFO)]
     pub fn move_to(&mut self, key: SeekKey<'_>, cmp: SeekOp) -> Result<CursorResult<()>> {
         turso_assert!(
@@ -2123,15 +2075,8 @@ impl BTreeCursor {
                         self.pager.add_dirty(page.get().id);
 
                         let page = page.get().contents.as_mut().unwrap();
-                        turso_assert!(
-                            matches!(page.page_type(), PageType::TableLeaf | PageType::IndexLeaf),
-                            "expected table or index leaf page"
-                        );
-
-                        // find cell
-                        (return_if_io!(self.find_cell(page, bkey)), page.page_type())
+                        (self.stack.current_cell_index() as usize, page.page_type())
                     };
-                    self.stack.set_cell_index(cell_idx as i32);
                     tracing::debug!(cell_idx);
 
                     // if the cell index is less than the total cells, check: if its an existing
@@ -2162,8 +2107,8 @@ impl BTreeCursor {
                                     continue;
                                 }
                             }
-                            BTreeCell::IndexLeafCell(..) => {
-                                // Not necessary to read record again here, as find_cell already does that for us
+                            BTreeCell::IndexLeafCell(..) | BTreeCell::IndexInteriorCell(..) => {
+                                // Not necessary to read record again here, as the prior seek() call already does that for us
                                 let cmp = compare_immutable(
                                     record.get_values(),
                                     self.get_immutable_record()
@@ -3859,75 +3804,6 @@ impl BTreeCursor {
         self.pager.usable_space()
     }
 
-    /// Find the index of the cell in the page that contains the given rowid.
-    #[instrument( skip_all, level = Level::INFO)]
-    fn find_cell(&mut self, page: &PageContent, key: &BTreeKey) -> Result<CursorResult<usize>> {
-        if self.find_cell_state.0.is_none() {
-            self.find_cell_state.set(0);
-        }
-        let cell_count = page.cell_count();
-        while self.find_cell_state.get_cell_idx() < cell_count as isize {
-            assert!(self.find_cell_state.get_cell_idx() >= 0);
-            let cell_idx = self.find_cell_state.get_cell_idx() as usize;
-            match page.cell_get(cell_idx, self.usable_space()).unwrap() {
-                BTreeCell::TableLeafCell(cell) => {
-                    if key.to_rowid() <= cell.rowid {
-                        break;
-                    }
-                }
-                BTreeCell::TableInteriorCell(cell) => {
-                    if key.to_rowid() <= cell.rowid {
-                        break;
-                    }
-                }
-                BTreeCell::IndexInteriorCell(IndexInteriorCell {
-                    payload,
-                    first_overflow_page,
-                    payload_size,
-                    ..
-                })
-                | BTreeCell::IndexLeafCell(IndexLeafCell {
-                    payload,
-                    first_overflow_page,
-                    payload_size,
-                }) => {
-                    // TODO: implement efficient comparison of records
-                    // e.g. https://github.com/sqlite/sqlite/blob/master/src/vdbeaux.c#L4719
-                    return_if_io!(self.read_record_w_possible_overflow(
-                        payload,
-                        first_overflow_page,
-                        payload_size,
-                    ));
-                    let key_values = key.to_index_key_values();
-                    let record = self.get_immutable_record();
-                    let record = record.as_ref().unwrap();
-                    let record_same_number_cols = &record.get_values()[..key_values.len()];
-                    let order = compare_immutable(
-                        key_values,
-                        record_same_number_cols,
-                        self.key_sort_order(),
-                        &self.collations,
-                    );
-                    match order {
-                        Ordering::Less | Ordering::Equal => {
-                            break;
-                        }
-                        Ordering::Greater => {}
-                    }
-                }
-            }
-            let cell_idx = self.find_cell_state.get_cell_idx();
-            self.find_cell_state.set(cell_idx + 1);
-        }
-        let cell_idx = self.find_cell_state.get_cell_idx();
-        assert!(cell_idx >= 0);
-        let cell_idx = cell_idx as usize;
-        assert!(cell_idx <= cell_count);
-        self.find_cell_state.reset();
-        Ok(CursorResult::Ok(cell_idx))
-    }
-
-    #[instrument(skip_all, level = Level::INFO)]
     pub fn seek_end(&mut self) -> Result<CursorResult<()>> {
         assert!(self.mv_cursor.is_none()); // unsure about this -_-
         self.move_to_root()?;
@@ -4169,20 +4045,15 @@ impl BTreeCursor {
                     moved_before = false;
                 }
                 if !moved_before {
-                    // Use move_to() so that we always end up on a leaf page. seek() might go back to an interior cell in index seeks,
-                    // which we never want. The reason we can use move_to() is that
-                    // find_cell() iterates the leaf page from left to right to find the insertion point anyway, so we don't care
-                    // which cell we are in as long as we are on the right page.
-                    // FIXME: find_cell() should not use linear search because it's slow.
                     match key {
                         BTreeKey::IndexKey(_) => {
-                            return_if_io!(self.move_to(
+                            return_if_io!(self.seek(
                                 SeekKey::IndexKey(key.get_record().unwrap()),
                                 SeekOp::GE { eq_only: true }
                             ))
                         }
                         BTreeKey::TableRowId(_) => {
-                            return_if_io!(self.move_to(
+                            return_if_io!(self.seek(
                                 SeekKey::TableRowId(key.to_rowid()),
                                 SeekOp::GE { eq_only: true }
                             ))
