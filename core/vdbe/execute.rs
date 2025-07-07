@@ -5020,6 +5020,10 @@ pub fn op_parse_schema(
             parse_schema_rows(
                 Some(stmt),
                 &mut new_schema,
+<<<<<<< HEAD
+=======
+                conn.btree.io.clone(),
+>>>>>>> b120975a (wip: Let connection only hold a reference to BTree)
                 &conn.syms.borrow(),
                 state.mv_tx_id,
             )?;
@@ -5305,7 +5309,7 @@ pub fn op_open_ephemeral(
         OpOpenEphemeralState::Start => {
             tracing::trace!("Start");
             let conn = program.connection.clone();
-            let io = conn.pager.io.get_memory_io();
+            let io = conn.btree.io.get_memory_io();
 
             let file = io.open_file("", OpenFlags::Create, true)?;
             let db_file = Arc::new(FileMemoryStorage::new(file));

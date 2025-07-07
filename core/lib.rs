@@ -238,7 +238,6 @@ impl Database {
     }
 
     pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
-        let buffer_pool = Arc::new(BufferPool::new(None));
         let is_empty = self.is_empty.clone();
 
         // Open existing WAL file if present
@@ -254,7 +253,6 @@ impl Database {
                 .unwrap_or(storage::sqlite3_ondisk::DEFAULT_CACHE_SIZE);
             let conn = Arc::new(Connection {
                 _db: self.clone(),
-                pager: btree.pager.clone(),
                 schema: RefCell::new(self.schema.read().clone()),
                 last_insert_rowid: Cell::new(0),
                 auto_commit: Cell::new(true),
@@ -297,7 +295,6 @@ impl Database {
             .unwrap_or(storage::sqlite3_ondisk::DEFAULT_CACHE_SIZE);
         let conn = Arc::new(Connection {
             _db: self.clone(),
-            pager: btree.pager.clone(),
             schema: RefCell::new(self.schema.read().clone()),
             auto_commit: Cell::new(true),
             mv_transactions: RefCell::new(Vec::new()),
@@ -452,7 +449,6 @@ impl CaptureDataChangesMode {
 
 pub struct Connection {
     _db: Arc<Database>,
-    pager: Rc<Pager>,
     btree: Rc<BTree>,
     schema: RefCell<Schema>,
     /// Whether to automatically commit transaction
@@ -499,7 +495,7 @@ impl Connection {
                 let program = Rc::new(translate::translate(
                     self.schema.borrow().deref(),
                     stmt,
-                    self.pager.clone(),
+                    self.btree.pager.clone(),
                     self.clone(),
                     &syms,
                     QueryMode::Normal,
@@ -508,7 +504,7 @@ impl Connection {
                 Ok(Statement::new(
                     program,
                     self._db.mv_store.clone(),
-                    self.pager.clone(),
+                    self.btree.pager.clone(),
                 ))
             }
             Cmd::Explain(_stmt) => todo!(),
@@ -550,7 +546,7 @@ impl Connection {
                 let program = translate::translate(
                     self.schema.borrow().deref(),
                     stmt.clone(),
-                    self.pager.clone(),
+                    self.btree.pager.clone(),
                     self.clone(),
                     &syms,
                     cmd.into(),
@@ -559,7 +555,7 @@ impl Connection {
                 let stmt = Statement::new(
                     program.into(),
                     self._db.mv_store.clone(),
-                    self.pager.clone(),
+                    self.btree.pager.clone(),
                 );
                 Ok(Some(stmt))
             }
@@ -610,7 +606,7 @@ impl Connection {
                     let program = translate::translate(
                         self.schema.borrow().deref(),
                         stmt,
-                        self.pager.clone(),
+                        self.btree.pager.clone(),
                         self.clone(),
                         &syms,
                         QueryMode::Explain,
@@ -623,7 +619,7 @@ impl Connection {
                     let program = translate::translate(
                         self.schema.borrow().deref(),
                         stmt,
-                        self.pager.clone(),
+                        self.btree.pager.clone(),
                         self.clone(),
                         &syms,
                         QueryMode::Normal,
@@ -636,7 +632,7 @@ impl Connection {
                         let res = program.step(
                             &mut state,
                             self._db.mv_store.clone(),
-                            self.pager.clone(),
+                            self.btree.pager.clone(),
                         )?;
                         if matches!(res, StepResult::Done) {
                             break;
@@ -704,7 +700,7 @@ impl Connection {
     }
 
     pub fn wal_frame_count(&self) -> Result<u64> {
-        self.pager.wal_frame_count()
+        self.btree.pager.wal_frame_count()
     }
 
     pub fn wal_get_frame(
@@ -713,7 +709,7 @@ impl Connection {
         p_frame: *mut u8,
         frame_len: u32,
     ) -> Result<Arc<Completion>> {
-        self.pager.wal_get_frame(frame_no, p_frame, frame_len)
+        self.btree.pager.wal_get_frame(frame_no, p_frame, frame_len)
     }
 
     /// Flush dirty pages to disk.
@@ -724,11 +720,13 @@ impl Connection {
         if self.closed.get() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        self.pager.cacheflush(self.wal_checkpoint_disabled.get())
+        self.btree
+            .pager
+            .cacheflush(self.wal_checkpoint_disabled.get())
     }
 
     pub fn clear_page_cache(&self) -> Result<()> {
-        self.pager.clear_page_cache();
+        self.btree.pager.clear_page_cache();
         Ok(())
     }
 
@@ -736,7 +734,8 @@ impl Connection {
         if self.closed.get() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        self.pager
+        self.btree
+            .pager
             .wal_checkpoint(self.wal_checkpoint_disabled.get())
     }
 
@@ -746,7 +745,8 @@ impl Connection {
             return Ok(());
         }
         self.closed.set(true);
-        self.pager
+        self.btree
+            .pager
             .checkpoint_shutdown(self.wal_checkpoint_disabled.get())
     }
 
@@ -957,11 +957,12 @@ impl Statement {
     }
 
     pub fn run_once(&self) -> Result<()> {
-        let res = self.pager.io.run_once();
+        let res = self.btree.io.run_once();
         if res.is_err() {
             let state = self.program.connection.transaction_state.get();
             if let TransactionState::Write { schema_did_change } = state {
-                self.pager
+                self.btree
+                    .pager
                     .rollback(schema_did_change, &self.program.connection)?
             }
         }

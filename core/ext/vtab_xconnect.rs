@@ -164,10 +164,14 @@ pub unsafe extern "C" fn stmt_step(stmt: *mut Stmt) -> ResultCode {
             StepResult::Done => return ResultCode::EOF,
             StepResult::IO => {
                 // always handle IO step result internally.
+<<<<<<< HEAD
                 let res = stmt_ctx.run_once();
                 if res.is_err() {
                     return ResultCode::Error;
                 }
+=======
+                let _ = conn.btree.io.run_once();
+>>>>>>> b120975a (wip: Let connection only hold a reference to BTree)
                 continue;
             }
             StepResult::Interrupt => return ResultCode::Interrupt,
