@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn test_euclidean_distance_f32() {
-        let vectors = vec![
+        let vectors = [
             (0..8).map(|x| x as f32).collect::<Vec<f32>>(),
             (1..9).map(|x| x as f32).collect::<Vec<f32>>(),
             (2..10).map(|x| x as f32).collect::<Vec<f32>>(),
