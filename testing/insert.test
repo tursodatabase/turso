@@ -380,3 +380,11 @@ do_execsql_test_on_specific_db {:memory:} negative-primary-integer-key {
 } {-2
 13}
 
+
+do_execsql_test_on_specific_db {:memory:} rowid-overflow-random-generation {
+    CREATE TABLE q(x INTEGER PRIMARY KEY, y);
+    INSERT INTO q VALUES (9223372036854775807, 1);
+    INSERT INTO q(y) VALUES (2);
+    INSERT INTO q(y) VALUES (3);
+    SELECT COUNT(*) FROM q;
+} {3}
