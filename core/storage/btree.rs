@@ -1,26 +1,18 @@
 use std::{
-    cell::{OnceCell, RefCell, UnsafeCell},
+    cell::{RefCell, UnsafeCell},
     rc::Rc,
     sync::{atomic::AtomicUsize, Arc, Mutex},
 };
 
 use super::{
-    btree_cursor::BTreeCursor,
-    header_accessor,
-    page_cache::DumbLruPageCache,
-    pager::AutoVacuumMode,
-    sqlite3_ondisk::{PageContent, PageType},
-    wal::DummyWAL,
+    btree_cursor::BTreeCursor, header_accessor, page_cache::DumbLruPageCache,
+    pager::AutoVacuumMode, sqlite3_ondisk::PageType, wal::DummyWAL,
 };
 use crate::{
     types::{CursorResult, ImmutableRecord},
     BufferPool, DatabaseStorage, PageRef, Pager, RefValue, Result, WalFile, WalFileShared, IO,
 };
 use parking_lot::RwLock;
-use ptrmap::{
-    get_ptrmap_offset_in_page, get_ptrmap_page_no_for_db_page, is_ptrmap_page, PtrmapEntry,
-    PtrmapType, FIRST_PTRMAP_PAGE_NO, PTRMAP_ENTRY_SIZE,
-};
 
 #[cfg(test)]
 use crate::{
@@ -29,7 +21,7 @@ use crate::{
 };
 
 #[cfg(not(feature = "omit_autovacuum"))]
-use crate::io::Buffer as IoBuffer;
+use {super::sqlite3_ondisk::PageContent, crate::io::Buffer as IoBuffer, ptrmap::*};
 
 /// The B-Tree page header is 12 bytes for interior pages and 8 bytes for leaf pages.
 ///
@@ -219,12 +211,8 @@ pub struct BTree {
     /// List of all open cursors
     _cursors: Vec<Arc<BTreeCursor>>,
     _n_pages: usize,
+    #[allow(dead_code)]
     auto_vacuum_mode: RefCell<AutoVacuumMode>,
-    /// Cache page_size and reserved_space at Pager init and reuse for subsequent
-    /// `usable_space` calls. TODO: Invalidate reserved_space when we add the functionality
-    /// to change it.
-    page_size: OnceCell<u16>,
-    reserved_space: OnceCell<u8>,
     // TODO: maybe add the double-linked list of dbs?
 }
 
@@ -267,8 +255,6 @@ impl BTree {
                 _cursors: Vec::new(),
                 _n_pages: 0,
                 auto_vacuum_mode: RefCell::new(AutoVacuumMode::None),
-                page_size: OnceCell::new(),
-                reserved_space: OnceCell::new(),
             }));
         };
 
@@ -292,8 +278,6 @@ impl BTree {
             _cursors: Vec::new(),
             _n_pages: 0,
             auto_vacuum_mode: RefCell::new(AutoVacuumMode::None),
-            page_size: OnceCell::new(),
-            reserved_space: OnceCell::new(),
         }))
     }
 
@@ -328,7 +312,7 @@ impl BTree {
         };
         #[cfg(feature = "omit_autovacuum")]
         {
-            let page = self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any);
+            let page = self.allocate_page(page_type, 0, BTreePageAllocMode::Any);
             let page_id = page.get().get().id;
             Ok(CursorResult::Ok(page_id as u32))
         }

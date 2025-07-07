@@ -81,7 +81,7 @@ macro_rules! debug_validate_cells {
     ($page_contents:expr, $usable_space:expr) => {
         #[cfg(debug_assertions)]
         {
-            crate::storage::btree_cursor::debug_validate_cells_core($page_contents, $usable_space);
+            $crate::storage::btree_cursor::debug_validate_cells_core($page_contents, $usable_space);
         }
     };
 }
