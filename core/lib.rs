@@ -444,7 +444,10 @@ fn get_schema_version(conn: &Arc<Connection>) -> Result<u32> {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum CaptureDataChangesMode {
     Off,
-    RowidOnly { table: String },
+    Id { table: String },
+    Before { table: String },
+    After { table: String },
+    Full { table: String },
 }
 
 impl CaptureDataChangesMode {
@@ -454,22 +457,43 @@ impl CaptureDataChangesMode {
             .unwrap_or((value, TURSO_CDC_DEFAULT_TABLE_NAME));
         match mode {
             "off" => Ok(CaptureDataChangesMode::Off),
-            "rowid-only" => Ok(CaptureDataChangesMode::RowidOnly { table: table.to_string() }),
+            "id" => Ok(CaptureDataChangesMode::Id { table: table.to_string() }),
+            "before" => Ok(CaptureDataChangesMode::Before { table: table.to_string() }),
+            "after" => Ok(CaptureDataChangesMode::After { table: table.to_string() }),
+            "full" => Ok(CaptureDataChangesMode::Full { table: table.to_string() }),
             _ => Err(LimboError::InvalidArgument(
-                "unexpected pragma value: expected '<mode>' or '<mode>,<cdc-table-name>' parameter where mode is one of off|rowid-only".to_string(),
+                "unexpected pragma value: expected '<mode>' or '<mode>,<cdc-table-name>' parameter where mode is one of off|id|before|after|full".to_string(),
             ))
         }
+    }
+    pub fn has_after(&self) -> bool {
+        matches!(
+            self,
+            CaptureDataChangesMode::After { .. } | CaptureDataChangesMode::Full { .. }
+        )
+    }
+    pub fn has_before(&self) -> bool {
+        matches!(
+            self,
+            CaptureDataChangesMode::Before { .. } | CaptureDataChangesMode::Full { .. }
+        )
     }
     pub fn mode_name(&self) -> &str {
         match self {
             CaptureDataChangesMode::Off => "off",
-            CaptureDataChangesMode::RowidOnly { .. } => "rowid-only",
+            CaptureDataChangesMode::Id { .. } => "id",
+            CaptureDataChangesMode::Before { .. } => "before",
+            CaptureDataChangesMode::After { .. } => "after",
+            CaptureDataChangesMode::Full { .. } => "full",
         }
     }
     pub fn table(&self) -> Option<&str> {
         match self {
             CaptureDataChangesMode::Off => None,
-            CaptureDataChangesMode::RowidOnly { table } => Some(table.as_str()),
+            CaptureDataChangesMode::Id { table }
+            | CaptureDataChangesMode::Before { table }
+            | CaptureDataChangesMode::After { table }
+            | CaptureDataChangesMode::Full { table } => Some(table.as_str()),
         }
     }
 }

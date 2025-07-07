@@ -510,5 +510,21 @@ fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
             col_type: None,
             constraints: vec![],
         },
+        ast::ColumnDefinition {
+            col_name: ast::Name("before".to_string()),
+            col_type: Some(ast::Type {
+                name: "BLOB".to_string(),
+                size: None,
+            }),
+            constraints: vec![],
+        },
+        ast::ColumnDefinition {
+            col_name: ast::Name("after".to_string()),
+            col_type: Some(ast::Type {
+                name: "BLOB".to_string(),
+                size: None,
+            }),
+            constraints: vec![],
+        },
     ]
 }
