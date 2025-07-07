@@ -1,6 +1,6 @@
 use crate::result::LimboResult;
 use crate::storage::btree::BTreePageInner;
-use crate::storage::btree_cursor::btree_init_page;
+
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::header_accessor;
@@ -560,12 +560,11 @@ impl Pager {
         page_type: PageType,
         offset: usize,
         _alloc_mode: BtreePageAllocMode,
-    ) -> Result<BTreePage> {
-        let page = self.allocate_page()?;
-        let page = Arc::new(BTreePageInner {
-            page: RefCell::new(page),
-        });
-        btree_init_page(&page, page_type, offset, self.usable_space() as u16);
+    ) -> BTreePage {
+        let page = self.allocate_page().unwrap();
+        let page = BTreePageInner::new(page);
+
+        page.init(page_type, offset, self.usable_space() as u16);
         tracing::debug!(
             "do_allocate_page(id={}, page_type={:?})",
             page.get().get().id,
@@ -1059,15 +1058,12 @@ impl Pager {
                 let contents = page.get_contents();
                 contents.write_database_header(&default_header);
 
-                let page1 = Arc::new(BTreePageInner {
-                    page: RefCell::new(page),
-                });
+                let page1 = BTreePageInner::new(page);
                 // Create the sqlite_schema table, for this we just need to create the btree page
                 // for the first page of the database which is basically like any other btree page
                 // but with a 100 byte offset, so we just init the page so that sqlite understands
                 // this is a correct page.
-                btree_init_page(
-                    &page1,
+                page1.init(
                     PageType::TableLeaf,
                     DATABASE_HEADER_SIZE,
                     (default_header.get_page_size() - default_header.reserved_space as u32) as u16,

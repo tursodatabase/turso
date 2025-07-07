@@ -31,7 +31,6 @@ use std::{
     fmt::Debug,
     pin::Pin,
     rc::Rc,
-    sync::Arc,
 };
 
 use super::{
@@ -660,11 +659,10 @@ impl BTreeCursor {
         *remaining_to_read -= to_read;
 
         if *remaining_to_read != 0 && next != 0 {
-            let new_page = self.pager.read_page(next as usize).map(|page| {
-                Arc::new(BTreePageInner {
-                    page: RefCell::new(page),
-                })
-            })?;
+            let new_page = self
+                .pager
+                .read_page(next as usize)
+                .map(|page| BTreePageInner::new(page))?;
             *page_btree = new_page;
             *next_page = next;
             return Ok(CursorResult::IO);
@@ -5316,11 +5314,9 @@ pub fn integrity_check(
 }
 
 pub fn btree_read_page(pager: &Rc<Pager>, page_idx: usize) -> Result<BTreePage> {
-    pager.read_page(page_idx).map(|page| {
-        Arc::new(BTreePageInner {
-            page: RefCell::new(page),
-        })
-    })
+    pager
+        .read_page(page_idx)
+        .map(|page| BTreePageInner::new(page))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5641,27 +5637,6 @@ fn find_free_cell(page_ref: &PageContent, usable_space: u16, amount: usize) -> R
         return_corrupt!("Free block chain extends beyond page end");
     }
     Ok(0)
-}
-
-pub fn btree_init_page(page: &BTreePage, page_type: PageType, offset: usize, usable_space: u16) {
-    // setup btree page
-    let contents = page.get();
-    tracing::debug!(
-        "btree_init_page(id={}, offset={})",
-        contents.get().id,
-        offset
-    );
-    let contents = contents.get().contents.as_mut().unwrap();
-    contents.offset = offset;
-    let id = page_type as u8;
-    contents.write_u8(offset::BTREE_PAGE_TYPE, id);
-    contents.write_u16(offset::BTREE_FIRST_FREEBLOCK, 0);
-    contents.write_u16(offset::BTREE_CELL_COUNT, 0);
-
-    contents.write_u16(offset::BTREE_CELL_CONTENT_AREA, usable_space);
-
-    contents.write_u8(offset::BTREE_FRAGMENTED_BYTES_COUNT, 0);
-    contents.write_u32(offset::BTREE_RIGHTMOST_PTR, 0);
 }
 
 fn to_static_buf(buf: &mut [u8]) -> &'static mut [u8] {
@@ -6468,7 +6443,7 @@ mod tests {
         Database, Page, Pager, PlatformIO,
     };
 
-    use super::{btree_init_page, defragment_page, drop_cell, insert_into_cell};
+    use super::{defragment_page, drop_cell, insert_into_cell};
 
     #[allow(clippy::arc_with_non_send_sync)]
     fn get_page(id: usize) -> BTreePage {
@@ -6483,11 +6458,9 @@ mod tests {
             ))),
         );
         page.get().contents.replace(inner);
-        let page = Arc::new(BTreePageInner {
-            page: RefCell::new(page),
-        });
+        let page = BTreePageInner::new(page);
 
-        btree_init_page(&page, PageType::TableLeaf, 0, 4096);
+        page.init(PageType::TableLeaf, 0, 4096);
         page
     }
 
@@ -6790,10 +6763,9 @@ mod tests {
         // FIXME: handle page cache is full
         let _ = run_until_done(|| pager.allocate_page1(), &pager);
         let page2 = pager.allocate_page().unwrap();
-        let page2 = Arc::new(BTreePageInner {
-            page: RefCell::new(page2),
-        });
-        btree_init_page(&page2, PageType::TableLeaf, 0, 4096);
+        let page2 = BTreePageInner::new(page2);
+
+        page2.init(PageType::TableLeaf, 0, 4096);
         (pager, page2.get().get().id, db, conn)
     }
 
@@ -8534,10 +8506,9 @@ mod tests {
             let (pager, _, _, _) = empty_btree();
             let page_type = PageType::TableLeaf;
             let page = pager.allocate_page().unwrap();
-            let page = Arc::new(BTreePageInner {
-                page: RefCell::new(page),
-            });
-            btree_init_page(&page, page_type, 0, pager.usable_space() as u16);
+            let page = BTreePageInner::new(page);
+
+            page.init(page_type, 0, pager.usable_space() as u16);
             let page = page.get();
             let mut size = (rng.next_u64() % 100) as u16;
             let mut i = 0;

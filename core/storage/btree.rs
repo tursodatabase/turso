@@ -13,7 +13,7 @@ use crate::{
 
 use super::{
     btree_cursor::BTreeCursor, header_accessor, page_cache::DumbLruPageCache,
-    pager::AutoVacuumMode, wal::DummyWAL,
+    pager::AutoVacuumMode, sqlite3_ondisk::PageType, wal::DummyWAL,
 };
 
 /// The B-Tree page header is 12 bytes for interior pages and 8 bytes for leaf pages.
@@ -80,6 +80,35 @@ macro_rules! return_if_io {
 /// and we need to update the reference.
 pub struct BTreePageInner {
     pub page: RefCell<PageRef>,
+}
+
+impl BTreePageInner {
+    pub fn new(page: PageRef) -> Arc<Self> {
+        Arc::new(Self {
+            page: RefCell::new(page),
+        })
+    }
+
+    pub fn init(&self, page_type: PageType, offset: usize, usable_space: u16) {
+        // setup btree page
+        let contents = self.get();
+        tracing::debug!(
+            "btree::page.init(id={}, offset={})",
+            contents.get().id,
+            offset
+        );
+        let contents = contents.get().contents.as_mut().unwrap();
+        contents.offset = offset;
+        let id = page_type as u8;
+        contents.write_u8(offset::BTREE_PAGE_TYPE, id);
+        contents.write_u16(offset::BTREE_FIRST_FREEBLOCK, 0);
+        contents.write_u16(offset::BTREE_CELL_COUNT, 0);
+
+        contents.write_u16(offset::BTREE_CELL_CONTENT_AREA, usable_space);
+
+        contents.write_u8(offset::BTREE_FRAGMENTED_BYTES_COUNT, 0);
+        contents.write_u32(offset::BTREE_RIGHTMOST_PTR, 0);
+    }
 }
 
 pub type BTreePage = Arc<BTreePageInner>;
