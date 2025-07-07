@@ -1902,7 +1902,18 @@ impl BTreeCursor {
                     // - We have seen an EQ match up in the tree in an interior node
                     // - Or, we are not looking for an exact match.
                     if seek_op.eq_only() && !eq_seen.get() {
-                        return Ok(CursorResult::Ok(false));
+                        match iter_dir {
+                            IterationDirection::Forwards => {
+                                // Set cell index beyond the last cell, so that the state looks like we scanned the entire page and found no match.
+                                self.stack.set_cell_index(cell_count as i32);
+                                return Ok(CursorResult::Ok(false));
+                            }
+                            IterationDirection::Backwards => {
+                                // Set cell index to -1, so that the state looks like we scanned the entire page backwards and found no match.
+                                self.stack.set_cell_index(-1);
+                                return Ok(CursorResult::Ok(false));
+                            }
+                        }
                     }
                     match iter_dir {
                         IterationDirection::Forwards => {
