@@ -118,6 +118,7 @@ pub fn translate_insert(
     let loop_start_label = program.allocate_label();
 
     let cdc_table = program.capture_data_changes_mode().table();
+    let cdc_has_after = program.capture_data_changes_mode().has_after();
     let cdc_table = if let Some(cdc_table) = cdc_table {
         if table.get_name() != cdc_table {
             let Some(turso_cdc_table) = schema.get_table(cdc_table) else {
@@ -444,18 +445,6 @@ pub fn translate_insert(
         _ => (),
     }
 
-    // Write record to the turso_cdc table if necessary
-    if let Some((cdc_cursor_id, _)) = &cdc_table {
-        emit_cdc_insns(
-            &mut program,
-            &resolver,
-            OperationMode::INSERT,
-            *cdc_cursor_id,
-            rowid_reg,
-            &table_name.0,
-        )?;
-    }
-
     let index_col_mappings = resolve_indicies_for_insert(schema, table.as_ref(), &column_mappings)?;
     for index_col_mapping in index_col_mappings {
         // find which cursor we opened earlier for this index
@@ -574,6 +563,25 @@ pub fn translate_insert(
         dest_reg: record_register,
         index_name: None,
     });
+
+    // Write record to the turso_cdc table if necessary
+    if let Some((cdc_cursor_id, _)) = &cdc_table {
+        let after_record_reg = if cdc_has_after {
+            Some(record_register)
+        } else {
+            None
+        };
+        emit_cdc_insns(
+            &mut program,
+            &resolver,
+            OperationMode::INSERT,
+            *cdc_cursor_id,
+            rowid_reg,
+            None,
+            after_record_reg,
+            &table_name.0,
+        )?;
+    }
 
     program.emit_insn(Insn::Insert {
         cursor: cursor_id,

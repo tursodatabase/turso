@@ -582,6 +582,8 @@ fn emit_delete_insns(
                 OperationMode::DELETE,
                 turso_cdc_cursor_id,
                 rowid_reg,
+                None,
+                None,
                 table_reference.table.get_name(),
             )?;
         }
@@ -1110,6 +1112,8 @@ fn emit_update_insns(
                     OperationMode::DELETE,
                     cdc_cursor_id,
                     rowid_reg,
+                    None,
+                    None,
                     table_ref.table.get_name(),
                 )?;
                 program.emit_insn(Insn::Copy {
@@ -1125,6 +1129,8 @@ fn emit_update_insns(
                     OperationMode::INSERT,
                     cdc_cursor_id,
                     rowid_reg,
+                    None,
+                    None,
                     table_ref.table.get_name(),
                 )?;
             } else {
@@ -1139,6 +1145,8 @@ fn emit_update_insns(
                     OperationMode::UPDATE,
                     cdc_cursor_id,
                     rowid_reg,
+                    None,
+                    None,
                     table_ref.table.get_name(),
                 )?;
             }
@@ -1189,10 +1197,12 @@ pub fn emit_cdc_insns(
     operation_mode: OperationMode,
     cdc_cursor_id: usize,
     rowid_reg: usize,
+    before_record_reg: Option<usize>,
+    after_record_reg: Option<usize>,
     table_name: &str,
 ) -> Result<()> {
-    // (operation_id INTEGER PRIMARY KEY AUTOINCREMENT, operation_time INTEGER, operation_type INTEGER, table_name TEXT, id)
-    let turso_cdc_registers = program.alloc_registers(5);
+    // (operation_id INTEGER PRIMARY KEY AUTOINCREMENT, operation_time INTEGER, operation_type INTEGER, table_name TEXT, id, before BLOB, after BLOB)
+    let turso_cdc_registers = program.alloc_registers(7);
     program.emit_insn(Insn::Null {
         dest: turso_cdc_registers,
         dest_end: None,
@@ -1231,6 +1241,28 @@ pub fn emit_cdc_insns(
         amount: 0,
     });
 
+    if let Some(before_record_reg) = before_record_reg {
+        program.emit_insn(Insn::Copy {
+            src_reg: before_record_reg,
+            dst_reg: turso_cdc_registers + 5,
+            amount: 0,
+        });
+    } else {
+        program.emit_null(turso_cdc_registers + 5, None);
+        program.mark_last_insn_constant();
+    }
+
+    if let Some(after_record_reg) = after_record_reg {
+        program.emit_insn(Insn::Copy {
+            src_reg: after_record_reg,
+            dst_reg: turso_cdc_registers + 6,
+            amount: 0,
+        });
+    } else {
+        program.emit_null(turso_cdc_registers + 6, None);
+        program.mark_last_insn_constant();
+    }
+
     let rowid_reg = program.alloc_register();
     program.emit_insn(Insn::NewRowid {
         cursor: cdc_cursor_id,
@@ -1241,7 +1273,7 @@ pub fn emit_cdc_insns(
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg: turso_cdc_registers,
-        count: 5,
+        count: 7,
         dest_reg: record_reg,
         index_name: None,
     });
