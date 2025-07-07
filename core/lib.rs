@@ -861,6 +861,10 @@ impl Statement {
         }
     }
 
+    pub fn n_change(&self) -> i64 {
+        return self.program.n_change.get();
+    }
+
     pub fn set_mv_tx_id(&mut self, mv_tx_id: Option<u64>) {
         self.state.mv_tx_id = mv_tx_id;
     }
