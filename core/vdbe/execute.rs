@@ -5,7 +5,6 @@ use crate::storage::btree::{BTree, CreateBTreeFlags};
 use crate::storage::btree_cursor::{integrity_check, IntegrityCheckError, IntegrityCheckState};
 use crate::storage::database::FileMemoryStorage;
 use crate::storage::page_cache::DumbLruPageCache;
-use crate::storage::wal::DummyWAL;
 use crate::storage::{self, header_accessor};
 use crate::translate::collate::CollationSeq;
 use crate::types::{ImmutableRecord, Text};
@@ -86,9 +85,7 @@ use crate::{
 };
 
 use super::{get_new_rowid, make_record, Program, ProgramState, Register};
-use crate::{
-    bail_constraint_error, must_be_btree_cursor, resolve_ext_path, MvStore, Pager, Result,
-};
+use crate::{bail_constraint_error, must_be_btree_cursor, resolve_ext_path, MvStore, Result};
 
 macro_rules! return_if_io {
     ($expr:expr) => {
@@ -893,7 +890,7 @@ pub fn op_open_read(
     let mut cursors = state.cursors.borrow_mut();
     match cursor_type {
         CursorType::BTreeTable(_) => {
-            let cursor = BTreeCursor::new_table(mv_cursor, btree.pager.clone(), *root_page);
+            let cursor = BTreeCursor::new_table(mv_cursor, btree.clone(), *root_page);
             cursors
                 .get_mut(*cursor_id)
                 .unwrap()
@@ -921,7 +918,7 @@ pub fn op_open_read(
             });
             let cursor = BTreeCursor::new_index(
                 mv_cursor,
-                btree.pager.clone(),
+                btree.clone(),
                 *root_page,
                 index.as_ref(),
                 collations,
@@ -4816,7 +4813,7 @@ pub fn op_open_write(
         });
         let cursor = BTreeCursor::new_index(
             mv_cursor,
-            btree.pager.clone(),
+            btree.clone(),
             root_page as usize,
             index.as_ref(),
             collations,
@@ -4826,7 +4823,7 @@ pub fn op_open_write(
             .unwrap()
             .replace(Cursor::new_btree(cursor));
     } else {
-        let cursor = BTreeCursor::new_table(mv_cursor, btree.pager.clone(), root_page as usize);
+        let cursor = BTreeCursor::new_table(mv_cursor, btree.clone(), root_page as usize);
         cursors
             .get_mut(*cursor_id)
             .unwrap()
@@ -4876,7 +4873,7 @@ pub fn op_create_btree(
         todo!("temp databases not implemented yet");
     }
     // FIXME: handle page cache is full
-    let root_page = return_if_io!(btree.pager.btree_create(flags));
+    let root_page = return_if_io!(btree.create(flags));
     state.registers[*root] = Register::Value(Value::Integer(root_page as i64));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -4901,7 +4898,7 @@ pub fn op_destroy(
         todo!("temp databases not implemented yet.");
     }
     // TODO not sure if should be BTreeCursor::new_table or BTreeCursor::new_index here or neither and just pass an emtpy vec
-    let mut cursor = BTreeCursor::new(None, btree.pager.clone(), *root, Vec::new());
+    let mut cursor = BTreeCursor::new(None, btree.clone(), *root, Vec::new());
     let former_root_page_result = cursor.btree_destroy()?;
     if let CursorResult::Ok(former_root_page) = former_root_page_result {
         state.registers[*former_root_reg] =
@@ -5284,8 +5281,8 @@ pub fn op_noop(
 
 pub enum OpOpenEphemeralState {
     Start,
-    StartingTxn { pager: Rc<Pager> },
-    CreateBtree { pager: Rc<Pager> },
+    StartingTxn { btree: Rc<BTree> },
+    CreateBtree { btree: Rc<BTree> },
 }
 pub fn op_open_ephemeral(
     program: &Program,
@@ -5314,31 +5311,29 @@ pub fn op_open_ephemeral(
             let buffer_pool = Arc::new(BufferPool::new(None));
             let page_cache = Arc::new(RwLock::new(DumbLruPageCache::default()));
 
-            let pager = Rc::new(Pager::new(
-                db_file,
-                Rc::new(RefCell::new(DummyWAL)),
-                io,
-                page_cache,
-                buffer_pool.clone(),
+            let btree = BTree::open(
+                io.clone(),
+                None,
+                db_file.clone(),
                 Arc::new(AtomicUsize::new(0)),
                 Arc::new(Mutex::new(())),
-            )?);
+            )?;
 
-            let page_size = header_accessor::get_page_size(&pager)
+            let page_size = header_accessor::get_page_size(&btree.pager)
                 .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE)
                 as usize;
             buffer_pool.set_page_size(page_size);
 
-            state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn { pager };
+            state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn { btree };
         }
-        OpOpenEphemeralState::StartingTxn { pager } => {
+        OpOpenEphemeralState::StartingTxn { btree } => {
             tracing::trace!("StartingTxn");
-            return_if_io!(pager.begin_write_tx());
+            return_if_io!(btree.pager.begin_write_tx());
             state.op_open_ephemeral_state = OpOpenEphemeralState::CreateBtree {
-                pager: pager.clone(),
+                btree: btree.clone(),
             };
         }
-        OpOpenEphemeralState::CreateBtree { pager } => {
+        OpOpenEphemeralState::CreateBtree { btree } => {
             tracing::trace!("CreateBtree");
             // FIXME: handle page cache is full
             let flag = if is_table {
@@ -5346,7 +5341,7 @@ pub fn op_open_ephemeral(
             } else {
                 &CreateBTreeFlags::new_index()
             };
-            let root_page = return_if_io!(pager.btree_create(flag));
+            let root_page = return_if_io!(btree.create(flag));
 
             let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
             let mv_cursor = match state.mv_tx_id {
@@ -5363,7 +5358,7 @@ pub fn op_open_ephemeral(
             let mut cursor = if let CursorType::BTreeIndex(index) = cursor_type {
                 BTreeCursor::new_index(
                     mv_cursor,
-                    pager.clone(),
+                    btree.clone(),
                     root_page as usize,
                     index,
                     index
@@ -5373,7 +5368,7 @@ pub fn op_open_ephemeral(
                         .collect(),
                 )
             } else {
-                BTreeCursor::new_table(mv_cursor, pager.clone(), root_page as usize)
+                BTreeCursor::new_table(mv_cursor, btree.clone(), root_page as usize)
             };
             cursor.rewind()?; // Will never return io
 
