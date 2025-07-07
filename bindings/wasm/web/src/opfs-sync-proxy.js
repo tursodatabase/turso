@@ -2,15 +2,23 @@
 let transferBuffer, statusBuffer, statusArray, statusView;
 let transferArray;
 let rootDir = null;
-const handles = new Map();
+const fdToHandle = new Map();
+const pathToFd = new Map();
+const fdToPath = new Map(); // to remove entry from pathToFd on close
 let nextFd = 1;
 
 self.postMessage("ready");
 
 onmessage = async (e) => {
   log("handle message: ", e.data);
+
   if (e.data.cmd === "init") {
     log("init");
+
+    if (!rootDir) {
+      rootDir = await navigator.storage.getDirectory();
+    }
+
     transferBuffer = e.data.transferBuffer;
     statusBuffer = e.data.statusBuffer;
 
@@ -33,7 +41,6 @@ self.onerror = (error) => {
 };
 
 function handleCommand(msg) {
-  log(`handle message: ${msg.cmd}`);
   switch (msg.cmd) {
     case "open":
       return handleOpen(msg.path);
@@ -51,27 +58,46 @@ function handleCommand(msg) {
 }
 
 async function handleOpen(path) {
-  if (!rootDir) {
-    rootDir = await navigator.storage.getDirectory();
+  if (pathToFd.has(path)) {
+    log(`returning from cache: ${path} -> ${pathToFd.get(path)}`);
+    return {
+      fd: pathToFd.get(path),
+      syncHandle: fdToHandle.get(pathToFd.get(path)),
+    };
   }
+
   const fd = nextFd++;
+  log(`new fd: ${fd} for path: ${path}`);
 
   const handle = await rootDir.getFileHandle(path, { create: true });
-  const syncHandle = await handle.createSyncAccessHandle();
+  log("file handle: ", handle);
 
-  handles.set(fd, syncHandle);
-  return { fd };
+  const syncHandle = await handle.createSyncAccessHandle({
+    mode: "readwrite-unsafe",
+  });
+  log("sync access handle: ", syncHandle);
+
+  fdToHandle.set(fd, syncHandle);
+  pathToFd.set(path, fd);
+  fdToPath.set(fd, path);
+
+  return { fd, syncHandle };
 }
 
 function handleClose(fd) {
-  const handle = handles.get(fd);
+  const handle = fdToHandle.get(fd);
+
+  fdToHandle.delete(fd);
+  pathToFd.delete(fdToPath.get(fd));
+  fdToPath.delete(fd);
+
   handle.close();
-  handles.delete(fd);
+
   return { success: true };
 }
 
 function handleRead(fd, offset, size) {
-  const handle = handles.get(fd);
+  const handle = fdToHandle.get(fd);
   const readBuffer = new ArrayBuffer(size);
   const readSize = handle.read(readBuffer, { at: offset });
   log("opfssync read: size: ", readBuffer.byteLength);
@@ -87,18 +113,18 @@ function handleRead(fd, offset, size) {
 function handleWrite(fd, buffer, offset) {
   log("opfssync buffer size:", buffer.byteLength);
   log("opfssync write buffer: ", [...buffer]);
-  const handle = handles.get(fd);
+  const handle = fdToHandle.get(fd);
   const size = handle.write(buffer, { at: offset });
   return { success: true, length: size };
 }
 
 function handleSize(fd) {
-  const handle = handles.get(fd);
+  const handle = fdToHandle.get(fd);
   return { success: true, length: handle.getSize() };
 }
 
 function handleSync(fd) {
-  const handle = handles.get(fd);
+  const handle = fdToHandle.get(fd);
   handle.flush();
   return { success: true };
 }
@@ -121,7 +147,7 @@ function sendResult(result) {
 // 1 = only errors
 // 2 = warnings and errors
 // 3 = debug, warnings, and errors
-const logLevel = 1;
+const logLevel = 3;
 
 const loggers = {
   0: console.error.bind(console),
