@@ -345,6 +345,41 @@ impl PageType {
             PageType::TableInterior | PageType::TableLeaf => true,
         }
     }
+
+    /// Returns the maximum payload size (X) that can be stored directly on a b-tree page without spilling to overflow pages.
+    ///
+    /// For table leaf pages: X = usable_size - 35
+    /// For index pages: X = ((usable_size - 12) * 64/255) - 23
+    ///
+    /// The usable size is the total page size less the reserved space at the end of each page.
+    /// These thresholds are designed to:
+    /// - Give a minimum fanout of 4 for index b-trees
+    /// - Ensure enough payload is on the b-tree page that the record header can usually be accessed
+    ///   without consulting an overflow page
+    pub fn payload_overflow_threshold_max(&self, usable_space: u16) -> usize {
+        match self {
+            PageType::IndexInterior | PageType::IndexLeaf => {
+                ((usable_space as usize - 12) * 64 / 255) - 23 // Index page formula
+            }
+            PageType::TableInterior | PageType::TableLeaf => {
+                usable_space as usize - 35 // Table leaf page formula
+            }
+        }
+    }
+
+    /// Returns the minimum payload size (M) that must be stored on the b-tree page before spilling to overflow pages is allowed.
+    ///
+    /// For all page types: M = ((usable_size - 12) * 32/255) - 23
+    ///
+    /// When payload size P exceeds max_local():
+    /// - If K = M + ((P-M) % (usable_size-4)) <= max_local(): store K bytes on page
+    /// - Otherwise: store M bytes on page
+    ///
+    /// The remaining bytes are stored on overflow pages in both cases.
+    pub fn payload_overflow_threshold_min(&self, usable_space: u16) -> usize {
+        // Same formula for all page types
+        ((usable_space as usize - 12) * 32 / 255) - 23
+    }
 }
 
 impl TryFrom<u8> for PageType {

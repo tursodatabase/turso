@@ -570,8 +570,12 @@ impl BTreeCursor {
 
             let cell = contents.cell_get(
                 cell_idx,
-                payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
-                payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
+                contents
+                    .page_type()
+                    .payload_overflow_threshold_max(self.usable_space() as u16),
+                contents
+                    .page_type()
+                    .payload_overflow_threshold_min(self.usable_space() as u16),
                 self.usable_space(),
             )?;
 
@@ -700,8 +704,8 @@ impl BTreeCursor {
         page_type: PageType,
         usable_size: usize,
     ) -> Result<(usize, usize)> {
-        let max_local = payload_overflow_threshold_max(page_type, usable_size as u16);
-        let min_local = payload_overflow_threshold_min(page_type, usable_size as u16);
+        let max_local = page_type.payload_overflow_threshold_max(usable_size as u16);
+        let min_local = page_type.payload_overflow_threshold_min(usable_size as u16);
 
         // This matches btreeParseCellAdjustSizeForOverflow logic
         let n_local = if payload_len <= max_local {
@@ -767,8 +771,12 @@ impl BTreeCursor {
         let cell = contents
             .cell_get(
                 cell_idx,
-                payload_overflow_threshold_max(contents.page_type(), usable_size as u16),
-                payload_overflow_threshold_min(contents.page_type(), usable_size as u16),
+                contents
+                    .page_type()
+                    .payload_overflow_threshold_max(usable_size as u16),
+                contents
+                    .page_type()
+                    .payload_overflow_threshold_min(usable_size as u16),
                 usable_size,
             )
             .unwrap();
@@ -1109,8 +1117,12 @@ impl BTreeCursor {
 
             let cell = contents.cell_get(
                 cell_idx,
-                payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
-                payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
+                contents
+                    .page_type()
+                    .payload_overflow_threshold_max(self.usable_space() as u16),
+                contents
+                    .page_type()
+                    .payload_overflow_threshold_min(self.usable_space() as u16),
                 self.usable_space(),
             )?;
             match &cell {
@@ -1407,14 +1419,12 @@ impl BTreeCursor {
                     };
                     let matching_cell = contents.cell_get(
                         leftmost_matching_cell,
-                        payload_overflow_threshold_max(
-                            contents.page_type(),
-                            self.usable_space() as u16,
-                        ),
-                        payload_overflow_threshold_min(
-                            contents.page_type(),
-                            self.usable_space() as u16,
-                        ),
+                        contents
+                            .page_type()
+                            .payload_overflow_threshold_max(self.usable_space() as u16),
+                        contents
+                            .page_type()
+                            .payload_overflow_threshold_min(self.usable_space() as u16),
                         self.usable_space(),
                     )?;
                     self.stack.set_cell_index(leftmost_matching_cell as i32);
@@ -1446,14 +1456,12 @@ impl BTreeCursor {
                 self.stack.set_cell_index(cur_cell_idx as i32);
                 let cell = contents.cell_get(
                     cur_cell_idx as usize,
-                    payload_overflow_threshold_max(
-                        contents.page_type(),
-                        self.usable_space() as u16,
-                    ),
-                    payload_overflow_threshold_min(
-                        contents.page_type(),
-                        self.usable_space() as u16,
-                    ),
+                    contents
+                        .page_type()
+                        .payload_overflow_threshold_max(self.usable_space() as u16),
+                    contents
+                        .page_type()
+                        .payload_overflow_threshold_min(self.usable_space() as u16),
                     self.usable_space(),
                 )?;
                 let BTreeCell::IndexInteriorCell(IndexInteriorCell {
@@ -1739,8 +1747,12 @@ impl BTreeCursor {
             let cur_cell_idx = self.stack.current_cell_index() as usize;
             let cell = contents.cell_get(
                 cur_cell_idx,
-                payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
-                payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
+                contents
+                    .page_type()
+                    .payload_overflow_threshold_max(self.usable_space() as u16),
+                contents
+                    .page_type()
+                    .payload_overflow_threshold_min(self.usable_space() as u16),
                 self.usable_space(),
             )?;
             let BTreeCell::IndexInteriorCell(IndexInteriorCell {
@@ -1838,8 +1850,12 @@ impl BTreeCursor {
 
             let cell = contents.cell_get(
                 cur_cell_idx as usize,
-                payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
-                payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
+                contents
+                    .page_type()
+                    .payload_overflow_threshold_max(self.usable_space() as u16),
+                contents
+                    .page_type()
+                    .payload_overflow_threshold_min(self.usable_space() as u16),
                 self.usable_space(),
             )?;
             let BTreeCell::IndexLeafCell(IndexLeafCell {
@@ -2033,8 +2049,8 @@ impl BTreeCursor {
                     if cell_idx < page.get().get_contents().cell_count() {
                         let cell = page.get().get_contents().cell_get(
                             cell_idx,
-                            payload_overflow_threshold_max(page_type, self.usable_space() as u16),
-                            payload_overflow_threshold_min(page_type, self.usable_space() as u16),
+                            page_type.payload_overflow_threshold_max(self.usable_space() as u16),
+                            page_type.payload_overflow_threshold_min(self.usable_space() as u16),
                             self.usable_space(),
                         )?;
                         match cell {
@@ -2320,14 +2336,12 @@ impl BTreeCursor {
                 } else {
                     let (start_of_cell, _) = parent_contents.cell_get_raw_region(
                         first_cell_divider + sibling_pointer,
-                        payload_overflow_threshold_max(
-                            parent_contents.page_type(),
-                            self.usable_space() as u16,
-                        ),
-                        payload_overflow_threshold_min(
-                            parent_contents.page_type(),
-                            self.usable_space() as u16,
-                        ),
+                        parent_contents
+                            .page_type()
+                            .payload_overflow_threshold_max(self.usable_space() as u16),
+                        parent_contents
+                            .page_type()
+                            .payload_overflow_threshold_min(self.usable_space() as u16),
                         self.usable_space(),
                     );
                     let buf = parent_contents.as_ptr().as_mut_ptr();
@@ -2365,14 +2379,12 @@ impl BTreeCursor {
                     let next_cell_divider = i + first_cell_divider - 1;
                     pgno = match parent_contents.cell_get(
                         next_cell_divider,
-                        payload_overflow_threshold_max(
-                            parent_contents.page_type(),
-                            self.usable_space() as u16,
-                        ),
-                        payload_overflow_threshold_min(
-                            parent_contents.page_type(),
-                            self.usable_space() as u16,
-                        ),
+                        parent_contents
+                            .page_type()
+                            .payload_overflow_threshold_max(self.usable_space() as u16),
+                        parent_contents
+                            .page_type()
+                            .payload_overflow_threshold_min(self.usable_space() as u16),
                         self.usable_space(),
                     )? {
                         BTreeCell::TableInteriorCell(table_interior_cell) => {
@@ -2464,14 +2476,12 @@ impl BTreeCursor {
                     let cell_idx = balance_info.first_divider_cell + i;
                     let (cell_start, cell_len) = parent_contents.cell_get_raw_region(
                         cell_idx,
-                        payload_overflow_threshold_max(
-                            parent_contents.page_type(),
-                            self.usable_space() as u16,
-                        ),
-                        payload_overflow_threshold_min(
-                            parent_contents.page_type(),
-                            self.usable_space() as u16,
-                        ),
+                        parent_contents
+                            .page_type()
+                            .payload_overflow_threshold_max(self.usable_space() as u16),
+                        parent_contents
+                            .page_type()
+                            .payload_overflow_threshold_min(self.usable_space() as u16),
                         self.usable_space(),
                     );
                     let buf = parent_contents.as_ptr();
@@ -2527,14 +2537,12 @@ impl BTreeCursor {
                     for cell_idx in 0..old_page_contents.cell_count() {
                         let (cell_start, cell_len) = old_page_contents.cell_get_raw_region(
                             cell_idx,
-                            payload_overflow_threshold_max(
-                                old_page_contents.page_type(),
-                                self.usable_space() as u16,
-                            ),
-                            payload_overflow_threshold_min(
-                                old_page_contents.page_type(),
-                                self.usable_space() as u16,
-                            ),
+                            old_page_contents
+                                .page_type()
+                                .payload_overflow_threshold_max(self.usable_space() as u16),
+                            old_page_contents
+                                .page_type()
+                                .payload_overflow_threshold_min(self.usable_space() as u16),
                             self.usable_space(),
                         );
                         let buf = old_page_contents.as_ptr();
@@ -3160,14 +3168,12 @@ impl BTreeCursor {
         let left_pointer = if parent_contents.overflow_cells.is_empty() {
             let (cell_start, cell_len) = parent_contents.cell_get_raw_region(
                 balance_info.first_divider_cell + i,
-                payload_overflow_threshold_max(
-                    parent_contents.page_type(),
-                    self.usable_space() as u16,
-                ),
-                payload_overflow_threshold_min(
-                    parent_contents.page_type(),
-                    self.usable_space() as u16,
-                ),
+                parent_contents
+                    .page_type()
+                    .payload_overflow_threshold_max(self.usable_space() as u16),
+                parent_contents
+                    .page_type()
+                    .payload_overflow_threshold_min(self.usable_space() as u16),
                 self.usable_space(),
             );
             tracing::debug!(
@@ -3216,14 +3222,12 @@ impl BTreeCursor {
             let cell = parent_contents
                 .cell_get(
                     cell_idx,
-                    payload_overflow_threshold_max(
-                        parent_contents.page_type(),
-                        self.usable_space() as u16,
-                    ),
-                    payload_overflow_threshold_min(
-                        parent_contents.page_type(),
-                        self.usable_space() as u16,
-                    ),
+                    parent_contents
+                        .page_type()
+                        .payload_overflow_threshold_max(self.usable_space() as u16),
+                    parent_contents
+                        .page_type()
+                        .payload_overflow_threshold_min(self.usable_space() as u16),
                     self.usable_space(),
                 )
                 .unwrap();
@@ -3265,14 +3269,12 @@ impl BTreeCursor {
             for cell_idx in 0..contents.cell_count() {
                 let (cell_start, cell_len) = contents.cell_get_raw_region(
                     cell_idx,
-                    payload_overflow_threshold_max(
-                        contents.page_type(),
-                        self.usable_space() as u16,
-                    ),
-                    payload_overflow_threshold_min(
-                        contents.page_type(),
-                        self.usable_space() as u16,
-                    ),
+                    contents
+                        .page_type()
+                        .payload_overflow_threshold_max(self.usable_space() as u16),
+                    contents
+                        .page_type()
+                        .payload_overflow_threshold_min(self.usable_space() as u16),
                     self.usable_space(),
                 );
                 let buf = contents.as_ptr();
@@ -3290,14 +3292,12 @@ impl BTreeCursor {
                     cell_buf,
                     &page_type,
                     0,
-                    payload_overflow_threshold_max(
-                        parent_contents.page_type(),
-                        self.usable_space() as u16,
-                    ),
-                    payload_overflow_threshold_min(
-                        parent_contents.page_type(),
-                        self.usable_space() as u16,
-                    ),
+                    parent_contents
+                        .page_type()
+                        .payload_overflow_threshold_max(self.usable_space() as u16),
+                    parent_contents
+                        .page_type()
+                        .payload_overflow_threshold_min(self.usable_space() as u16),
                     self.usable_space(),
                 )
                 .unwrap();
@@ -3433,27 +3433,23 @@ impl BTreeCursor {
                 {
                     let (parent_cell_start, parent_cell_len) = parent_contents.cell_get_raw_region(
                         parent_cell_idx,
-                        payload_overflow_threshold_max(
-                            parent_contents.page_type(),
-                            self.usable_space() as u16,
-                        ),
-                        payload_overflow_threshold_min(
-                            parent_contents.page_type(),
-                            self.usable_space() as u16,
-                        ),
+                        parent_contents
+                            .page_type()
+                            .payload_overflow_threshold_max(self.usable_space() as u16),
+                        parent_contents
+                            .page_type()
+                            .payload_overflow_threshold_min(self.usable_space() as u16),
                         self.usable_space(),
                     );
 
                     let (cell_start, cell_len) = contents.cell_get_raw_region(
                         parent_cell_idx,
-                        payload_overflow_threshold_max(
-                            contents.page_type(),
-                            self.usable_space() as u16,
-                        ),
-                        payload_overflow_threshold_min(
-                            contents.page_type(),
-                            self.usable_space() as u16,
-                        ),
+                        contents
+                            .page_type()
+                            .payload_overflow_threshold_max(self.usable_space() as u16),
+                        contents
+                            .page_type()
+                            .payload_overflow_threshold_min(self.usable_space() as u16),
                         self.usable_space(),
                     );
 
@@ -3515,14 +3511,12 @@ impl BTreeCursor {
                 // check if right pointer, this is the last page. Do we update rightmost pointer and defragment moves it?
                 let (cell_start, cell_len) = parent_contents.cell_get_raw_region(
                     cell_divider_idx,
-                    payload_overflow_threshold_max(
-                        parent_contents.page_type(),
-                        self.usable_space() as u16,
-                    ),
-                    payload_overflow_threshold_min(
-                        parent_contents.page_type(),
-                        self.usable_space() as u16,
-                    ),
+                    parent_contents
+                        .page_type()
+                        .payload_overflow_threshold_max(self.usable_space() as u16),
+                    parent_contents
+                        .page_type()
+                        .payload_overflow_threshold_min(self.usable_space() as u16),
                     self.usable_space(),
                 );
                 let cell_left_pointer = read_u32(&parent_buf[cell_start..cell_start + cell_len], 0);
@@ -3548,28 +3542,24 @@ impl BTreeCursor {
                         cell_buf,
                         &page_type,
                         0,
-                        payload_overflow_threshold_max(
-                            parent_contents.page_type(),
-                            self.usable_space() as u16,
-                        ),
-                        payload_overflow_threshold_min(
-                            parent_contents.page_type(),
-                            self.usable_space() as u16,
-                        ),
+                        parent_contents
+                            .page_type()
+                            .payload_overflow_threshold_max(self.usable_space() as u16),
+                        parent_contents
+                            .page_type()
+                            .payload_overflow_threshold_min(self.usable_space() as u16),
                         self.usable_space(),
                     )
                     .unwrap();
                     let parent_cell = parent_contents
                         .cell_get(
                             cell_divider_idx,
-                            payload_overflow_threshold_max(
-                                parent_contents.page_type(),
-                                self.usable_space() as u16,
-                            ),
-                            payload_overflow_threshold_min(
-                                parent_contents.page_type(),
-                                self.usable_space() as u16,
-                            ),
+                            parent_contents
+                                .page_type()
+                                .payload_overflow_threshold_max(self.usable_space() as u16),
+                            parent_contents
+                                .page_type()
+                                .payload_overflow_threshold_min(self.usable_space() as u16),
                             self.usable_space(),
                         )
                         .unwrap();
@@ -3620,14 +3610,12 @@ impl BTreeCursor {
                     }
                     let (parent_cell_start, parent_cell_len) = parent_contents.cell_get_raw_region(
                         cell_divider_idx,
-                        payload_overflow_threshold_max(
-                            parent_contents.page_type(),
-                            self.usable_space() as u16,
-                        ),
-                        payload_overflow_threshold_min(
-                            parent_contents.page_type(),
-                            self.usable_space() as u16,
-                        ),
+                        parent_contents
+                            .page_type()
+                            .payload_overflow_threshold_max(self.usable_space() as u16),
+                        parent_contents
+                            .page_type()
+                            .payload_overflow_threshold_min(self.usable_space() as u16),
                         self.usable_space(),
                     );
                     let cell_buf_in_array = &cells_debug[current_index_cell];
@@ -3774,8 +3762,10 @@ impl BTreeCursor {
             match page
                 .cell_get(
                     cell_idx,
-                    payload_overflow_threshold_max(page.page_type(), self.usable_space() as u16),
-                    payload_overflow_threshold_min(page.page_type(), self.usable_space() as u16),
+                    page.page_type()
+                        .payload_overflow_threshold_max(self.usable_space() as u16),
+                    page.page_type()
+                        .payload_overflow_threshold_min(self.usable_space() as u16),
                     self.usable_space(),
                 )
                 .unwrap()
@@ -3951,8 +3941,12 @@ impl BTreeCursor {
             let cell_idx = self.stack.current_cell_index();
             let cell = contents.cell_get(
                 cell_idx as usize,
-                payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
-                payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
+                contents
+                    .page_type()
+                    .payload_overflow_threshold_max(self.usable_space() as u16),
+                contents
+                    .page_type()
+                    .payload_overflow_threshold_min(self.usable_space() as u16),
                 self.usable_space(),
             )?;
             if page_type.is_table() {
@@ -4024,8 +4018,12 @@ impl BTreeCursor {
         let cell_idx = self.stack.current_cell_index();
         let cell = contents.cell_get(
             cell_idx as usize,
-            payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
-            payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
+            contents
+                .page_type()
+                .payload_overflow_threshold_max(self.usable_space() as u16),
+            contents
+                .page_type()
+                .payload_overflow_threshold_min(self.usable_space() as u16),
             self.usable_space(),
         )?;
         let (payload, payload_size, first_overflow_page) = match cell {
@@ -4237,14 +4235,12 @@ impl BTreeCursor {
 
                     let cell = contents.cell_get(
                         cell_idx,
-                        payload_overflow_threshold_max(
-                            contents.page_type(),
-                            self.usable_space() as u16,
-                        ),
-                        payload_overflow_threshold_min(
-                            contents.page_type(),
-                            self.usable_space() as u16,
-                        ),
+                        contents
+                            .page_type()
+                            .payload_overflow_threshold_max(self.usable_space() as u16),
+                        contents
+                            .page_type()
+                            .payload_overflow_threshold_min(self.usable_space() as u16),
                         self.usable_space(),
                     )?;
 
@@ -4317,14 +4313,12 @@ impl BTreeCursor {
                         let leaf_cell_idx = leaf_contents.cell_count() - 1;
                         let last_cell_on_child_page = leaf_contents.cell_get(
                             leaf_cell_idx,
-                            payload_overflow_threshold_max(
-                                leaf_contents.page_type(),
-                                self.usable_space() as u16,
-                            ),
-                            payload_overflow_threshold_min(
-                                leaf_contents.page_type(),
-                                self.usable_space() as u16,
-                            ),
+                            leaf_contents
+                                .page_type()
+                                .payload_overflow_threshold_max(self.usable_space() as u16),
+                            leaf_contents
+                                .page_type()
+                                .payload_overflow_threshold_min(self.usable_space() as u16),
                             self.usable_space(),
                         )?;
 
@@ -4711,14 +4705,12 @@ impl BTreeCursor {
                     //  Get the current cell
                     let cell = contents.cell_get(
                         cell_idx as usize,
-                        payload_overflow_threshold_max(
-                            contents.page_type(),
-                            self.usable_space() as u16,
-                        ),
-                        payload_overflow_threshold_min(
-                            contents.page_type(),
-                            self.usable_space() as u16,
-                        ),
+                        contents
+                            .page_type()
+                            .payload_overflow_threshold_max(self.usable_space() as u16),
+                        contents
+                            .page_type()
+                            .payload_overflow_threshold_min(self.usable_space() as u16),
                         self.usable_space(),
                     )?;
 
@@ -4839,8 +4831,8 @@ impl BTreeCursor {
             let page = page_ref.get().contents.as_ref().unwrap();
             page.cell_get_raw_region(
                 cell_idx,
-                payload_overflow_threshold_max(page_type, self.usable_space() as u16),
-                payload_overflow_threshold_min(page_type, self.usable_space() as u16),
+                page_type.payload_overflow_threshold_max(self.usable_space() as u16),
+                page_type.payload_overflow_threshold_min(self.usable_space() as u16),
                 self.usable_space(),
             )
         };
@@ -4972,14 +4964,12 @@ impl BTreeCursor {
                 // Move to child left page
                 let cell = contents.cell_get(
                     cell_idx,
-                    payload_overflow_threshold_max(
-                        contents.page_type(),
-                        self.usable_space() as u16,
-                    ),
-                    payload_overflow_threshold_min(
-                        contents.page_type(),
-                        self.usable_space() as u16,
-                    ),
+                    contents
+                        .page_type()
+                        .payload_overflow_threshold_max(self.usable_space() as u16),
+                    contents
+                        .page_type()
+                        .payload_overflow_threshold_min(self.usable_space() as u16),
                     self.usable_space(),
                 )?;
 
@@ -5180,8 +5170,12 @@ pub fn integrity_check(
     for cell_idx in (0..contents.cell_count()).rev() {
         let (cell_start, cell_length) = contents.cell_get_raw_region(
             cell_idx,
-            payload_overflow_threshold_max(contents.page_type(), usable_space),
-            payload_overflow_threshold_min(contents.page_type(), usable_space),
+            contents
+                .page_type()
+                .payload_overflow_threshold_max(usable_space),
+            contents
+                .page_type()
+                .payload_overflow_threshold_min(usable_space),
             usable_space as usize,
         );
         if cell_start < contents.cell_content_area() as usize
@@ -5209,8 +5203,12 @@ pub fn integrity_check(
         coverage_checker.add_cell(cell_start, cell_start + cell_length);
         let cell = contents.cell_get(
             cell_idx,
-            payload_overflow_threshold_max(contents.page_type(), usable_space),
-            payload_overflow_threshold_min(contents.page_type(), usable_space),
+            contents
+                .page_type()
+                .payload_overflow_threshold_max(usable_space),
+            contents
+                .page_type()
+                .payload_overflow_threshold_min(usable_space),
             usable_space as usize,
         )?;
         match cell {
@@ -5994,8 +5992,10 @@ fn defragment_page(page: &PageContent, usable_space: u16) {
 
             let (_, size) = cloned_page.cell_get_raw_region(
                 i,
-                payload_overflow_threshold_max(page.page_type(), usable_space),
-                payload_overflow_threshold_min(page.page_type(), usable_space),
+                page.page_type()
+                    .payload_overflow_threshold_max(usable_space),
+                page.page_type()
+                    .payload_overflow_threshold_min(usable_space),
                 usable_space as usize,
             );
             let size = size as u16;
@@ -6032,8 +6032,10 @@ fn debug_validate_cells_core(page: &PageContent, usable_space: u16) {
     for i in 0..page.cell_count() {
         let (offset, size) = page.cell_get_raw_region(
             i,
-            payload_overflow_threshold_max(page.page_type(), usable_space),
-            payload_overflow_threshold_min(page.page_type(), usable_space),
+            page.page_type()
+                .payload_overflow_threshold_max(usable_space),
+            page.page_type()
+                .payload_overflow_threshold_min(usable_space),
             usable_space as usize,
         );
         let buf = &page.as_ptr()[offset..offset + size];
@@ -6266,7 +6268,7 @@ fn fill_cell_payload(
         write_varint_to_vec(record_buf.len() as u64, cell_payload);
     }
 
-    let payload_overflow_threshold_max = payload_overflow_threshold_max(page_type, usable_space);
+    let payload_overflow_threshold_max = page_type.payload_overflow_threshold_max(usable_space);
     tracing::debug!(
         "fill_cell_payload(record_size={}, payload_overflow_threshold_max={})",
         record_buf.len(),
@@ -6278,7 +6280,7 @@ fn fill_cell_payload(
         return;
     }
 
-    let payload_overflow_threshold_min = payload_overflow_threshold_min(page_type, usable_space);
+    let payload_overflow_threshold_min = page_type.payload_overflow_threshold_min(usable_space);
     // see e.g. https://github.com/sqlite/sqlite/blob/9591d3fe93936533c8c3b0dc4d025ac999539e11/src/dbstat.c#L371
     let mut space_left = payload_overflow_threshold_min
         + (record_buf.len() - payload_overflow_threshold_min) % (usable_space as usize - 4);
@@ -6331,48 +6333,15 @@ fn fill_cell_payload(
     assert_eq!(cell_size, cell_payload.len());
 }
 
-/// Returns the maximum payload size (X) that can be stored directly on a b-tree page without spilling to overflow pages.
-///
-/// For table leaf pages: X = usable_size - 35
-/// For index pages: X = ((usable_size - 12) * 64/255) - 23
-///
-/// The usable size is the total page size less the reserved space at the end of each page.
-/// These thresholds are designed to:
-/// - Give a minimum fanout of 4 for index b-trees
-/// - Ensure enough payload is on the b-tree page that the record header can usually be accessed
-///   without consulting an overflow page
-fn payload_overflow_threshold_max(page_type: PageType, usable_space: u16) -> usize {
-    match page_type {
-        PageType::IndexInterior | PageType::IndexLeaf => {
-            ((usable_space as usize - 12) * 64 / 255) - 23 // Index page formula
-        }
-        PageType::TableInterior | PageType::TableLeaf => {
-            usable_space as usize - 35 // Table leaf page formula
-        }
-    }
-}
-
-/// Returns the minimum payload size (M) that must be stored on the b-tree page before spilling to overflow pages is allowed.
-///
-/// For all page types: M = ((usable_size - 12) * 32/255) - 23
-///
-/// When payload size P exceeds max_local():
-/// - If K = M + ((P-M) % (usable_size-4)) <= max_local(): store K bytes on page
-/// - Otherwise: store M bytes on page
-///
-/// The remaining bytes are stored on overflow pages in both cases.
-fn payload_overflow_threshold_min(_page_type: PageType, usable_space: u16) -> usize {
-    // Same formula for all page types
-    ((usable_space as usize - 12) * 32 / 255) - 23
-}
-
 /// Drop a cell from a page.
 /// This is done by freeing the range of bytes that the cell occupies.
 fn drop_cell(page: &mut PageContent, cell_idx: usize, usable_space: u16) -> Result<()> {
     let (cell_start, cell_len) = page.cell_get_raw_region(
         cell_idx,
-        payload_overflow_threshold_max(page.page_type(), usable_space),
-        payload_overflow_threshold_min(page.page_type(), usable_space),
+        page.page_type()
+            .payload_overflow_threshold_max(usable_space),
+        page.page_type()
+            .payload_overflow_threshold_min(usable_space),
         usable_space as usize,
     );
     free_cell_range(page, cell_start as u16, cell_len as u16, usable_space)?;
@@ -6433,10 +6402,7 @@ mod tests {
     use crate::{
         io::BufferData,
         storage::{
-            btree_cursor::{
-                compute_free_space, fill_cell_payload, payload_overflow_threshold_max,
-                payload_overflow_threshold_min,
-            },
+            btree_cursor::{compute_free_space, fill_cell_payload},
             sqlite3_ondisk::{BTreeCell, PageContent, PageType},
         },
         types::Value,
@@ -6483,8 +6449,8 @@ mod tests {
     fn ensure_cell(page: &mut PageContent, cell_idx: usize, payload: &Vec<u8>) {
         let cell = page.cell_get_raw_region(
             cell_idx,
-            payload_overflow_threshold_max(page.page_type(), 4096),
-            payload_overflow_threshold_min(page.page_type(), 4096),
+            page.page_type().payload_overflow_threshold_max(4096),
+            page.page_type().payload_overflow_threshold_min(4096),
             4096,
         );
         tracing::trace!("cell idx={} start={} len={}", cell_idx, cell.0, cell.1);
@@ -6592,8 +6558,8 @@ mod tests {
             let cell = contents
                 .cell_get(
                     cell_idx,
-                    payload_overflow_threshold_max(page_type, 4096),
-                    payload_overflow_threshold_min(page_type, 4096),
+                    page_type.payload_overflow_threshold_max(4096),
+                    page_type.payload_overflow_threshold_min(4096),
                     cursor.usable_space(),
                 )
                 .unwrap();
@@ -6706,8 +6672,8 @@ mod tests {
             let cell = contents
                 .cell_get(
                     cell_idx,
-                    payload_overflow_threshold_max(page_type, 4096),
-                    payload_overflow_threshold_min(page_type, 4096),
+                    page_type.payload_overflow_threshold_max(4096),
+                    page_type.payload_overflow_threshold_min(4096),
                     cursor.usable_space(),
                 )
                 .unwrap();
@@ -7300,7 +7266,7 @@ mod tests {
         let pager = setup_test_env(5);
         let mut cursor = BTreeCursor::new_table(None, pager.clone(), 1);
 
-        let max_local = payload_overflow_threshold_max(PageType::TableLeaf, 4096);
+        let max_local = PageType::TableLeaf.payload_overflow_threshold_max(4096);
         let usable_size = cursor.usable_space();
 
         // Create a large payload that will definitely trigger overflow
@@ -7652,8 +7618,8 @@ mod tests {
                     let cell_idx = rng.next_u64() as usize % page.cell_count();
                     let (_, len) = page.cell_get_raw_region(
                         cell_idx,
-                        payload_overflow_threshold_max(page.page_type(), 4096),
-                        payload_overflow_threshold_min(page.page_type(), 4096),
+                        page.page_type().payload_overflow_threshold_max(4096),
+                        page.page_type().payload_overflow_threshold_min(4096),
                         usable_space as usize,
                     );
                     drop_cell(page, cell_idx, usable_space).unwrap();
@@ -7733,8 +7699,8 @@ mod tests {
                         let cell_idx = rng.next_u64() as usize % page.cell_count();
                         let (_, len) = page.cell_get_raw_region(
                             cell_idx,
-                            payload_overflow_threshold_max(page.page_type(), 4096),
-                            payload_overflow_threshold_min(page.page_type(), 4096),
+                            page.page_type().payload_overflow_threshold_max(4096),
+                            page.page_type().payload_overflow_threshold_min(4096),
                             usable_space as usize,
                         );
                         drop_cell(page, cell_idx, usable_space).unwrap();
@@ -7888,8 +7854,8 @@ mod tests {
         assert_eq!(page.cell_count(), 1);
         let (start, len) = page.cell_get_raw_region(
             0,
-            payload_overflow_threshold_max(page.page_type(), 4096),
-            payload_overflow_threshold_min(page.page_type(), 4096),
+            page.page_type().payload_overflow_threshold_max(4096),
+            page.page_type().payload_overflow_threshold_min(4096),
             usable_space as usize,
         );
         let buf = page.as_ptr();
@@ -7924,8 +7890,8 @@ mod tests {
 
         let (start, len) = page.cell_get_raw_region(
             0,
-            payload_overflow_threshold_max(page.page_type(), 4096),
-            payload_overflow_threshold_min(page.page_type(), 4096),
+            page.page_type().payload_overflow_threshold_max(4096),
+            page.page_type().payload_overflow_threshold_min(4096),
             usable_space as usize,
         );
         let buf = page.as_ptr();
@@ -7961,8 +7927,8 @@ mod tests {
 
             let (start, len) = page.cell_get_raw_region(
                 0,
-                payload_overflow_threshold_max(page.page_type(), 4096),
-                payload_overflow_threshold_min(page.page_type(), 4096),
+                page.page_type().payload_overflow_threshold_max(4096),
+                page.page_type().payload_overflow_threshold_min(4096),
                 usable_space as usize,
             );
             let buf = page.as_ptr();
@@ -8526,8 +8492,8 @@ mod tests {
                 let buf = contents.as_ptr();
                 let (start, len) = contents.cell_get_raw_region(
                     cell_idx,
-                    payload_overflow_threshold_max(contents.page_type(), 4096),
-                    payload_overflow_threshold_min(contents.page_type(), 4096),
+                    contents.page_type().payload_overflow_threshold_max(4096),
+                    contents.page_type().payload_overflow_threshold_min(4096),
                     pager.usable_space(),
                 );
                 cell_array
@@ -8570,8 +8536,8 @@ mod tests {
                 let buf = contents.as_ptr();
                 let (start, len) = contents.cell_get_raw_region(
                     cell_idx,
-                    payload_overflow_threshold_max(contents.page_type(), 4096),
-                    payload_overflow_threshold_min(contents.page_type(), 4096),
+                    contents.page_type().payload_overflow_threshold_max(4096),
+                    contents.page_type().payload_overflow_threshold_min(4096),
                     pager.usable_space(),
                 );
                 let cell_in_page = &buf[start..start + len];
