@@ -81,7 +81,7 @@ async function handleOpen(path) {
   pathToFd.set(path, fd);
   fdToPath.set(fd, path);
 
-  return { fd, syncHandle };
+  return { fd };
 }
 
 function handleClose(fd) {
