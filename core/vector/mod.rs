@@ -3,6 +3,7 @@ use crate::vdbe::Register;
 use crate::LimboError;
 use crate::Result;
 
+pub mod distance;
 pub mod vector_types;
 use vector_types::*;
 
