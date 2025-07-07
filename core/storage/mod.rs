@@ -11,6 +11,7 @@
 //! remote. The `Wal` struct is responsible for managing the write-ahead log
 //! for the database, also either local or remote.
 pub(crate) mod btree;
+pub(crate) mod btree_cursor;
 pub(crate) mod buffer_pool;
 pub(crate) mod database;
 pub(crate) mod header_accessor;

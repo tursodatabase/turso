@@ -7,7 +7,7 @@ use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
 use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
-use crate::storage::btree::BTreeCursor;
+use crate::storage::btree_cursor::BTreeCursor;
 use crate::storage::sqlite3_ondisk::write_varint;
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;

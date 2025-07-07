@@ -1,5 +1,6 @@
 use crate::result::LimboResult;
 use crate::storage::btree::BTreePageInner;
+use crate::storage::btree_cursor::btree_init_page;
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::header_accessor;
@@ -16,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{instrument, trace, Level};
 
-use super::btree::{btree_init_page, BTreePage};
+use super::btree::BTreePage;
 use super::page_cache::{CacheError, CacheResizeResult, DumbLruPageCache, PageCacheKey};
 use super::sqlite3_ondisk::{begin_write_btree_page, DATABASE_HEADER_SIZE};
 use super::wal::{CheckpointMode, CheckpointStatus};

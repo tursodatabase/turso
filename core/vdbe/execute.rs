@@ -1,7 +1,7 @@
 #![allow(unused_variables)]
 use crate::function::AlterTableFunc;
 use crate::numeric::{NullableInteger, Numeric};
-use crate::storage::btree::{integrity_check, IntegrityCheckError, IntegrityCheckState};
+use crate::storage::btree_cursor::{integrity_check, IntegrityCheckError, IntegrityCheckState};
 use crate::storage::database::FileMemoryStorage;
 use crate::storage::page_cache::DumbLruPageCache;
 use crate::storage::pager::CreateBTreeFlags;
@@ -32,7 +32,8 @@ use crate::{pseudo::PseudoCursor, result::LimboResult};
 
 use crate::{
     schema::{affinity, Affinity},
-    storage::btree::{BTreeCursor, BTreeKey},
+    storage::btree::BTreeKey,
+    storage::btree_cursor::BTreeCursor,
 };
 
 use crate::{

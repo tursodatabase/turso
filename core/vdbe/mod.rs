@@ -34,7 +34,7 @@ use crate::{
 };
 
 use crate::{
-    storage::{btree::BTreeCursor, pager::Pager},
+    storage::{btree_cursor::BTreeCursor, pager::Pager},
     translate::plan::ResultSetColumn,
     types::{AggContext, Cursor, CursorResult, ImmutableRecord, Value},
     vdbe::{builder::CursorType, insn::Insn},
