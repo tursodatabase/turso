@@ -1803,14 +1803,7 @@ impl BTreeCursor {
             let cell_count = contents.cell_count();
             if cell_count == 0 {
                 self.stack.set_cell_index(0);
-                match seek_op.iteration_direction() {
-                    IterationDirection::Forwards => {
-                        return self.next();
-                    }
-                    IterationDirection::Backwards => {
-                        return self.prev();
-                    }
-                }
+                return Ok(CursorResult::Ok(false));
             }
 
             let min = Cell::new(0);
