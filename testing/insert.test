@@ -255,9 +255,9 @@ do_execsql_test_on_specific_db {:memory:} insert_from_select_where {
 
 do_execsql_test_on_specific_db {:memory:} insert_from_select_union_all {
     CREATE TABLE t1(x INTEGER);
-    CREATE TABLE t2(x INTEGER); 
+    CREATE TABLE t2(x INTEGER);
     CREATE TABLE t3(x INTEGER);
-    
+
     INSERT INTO t1 VALUES(1),(2),(3);
     INSERT INTO t2 VALUES(4),(5),(6);
     INSERT INTO t3 VALUES(7),(8),(9);
@@ -276,9 +276,9 @@ do_execsql_test_on_specific_db {:memory:} insert_from_select_union_all {
 
 do_execsql_test_on_specific_db {:memory:} insert_from_select_union_all_where {
     CREATE TABLE t1(x INTEGER);
-    CREATE TABLE t2(x INTEGER); 
+    CREATE TABLE t2(x INTEGER);
     CREATE TABLE t3(x INTEGER);
-    
+
     INSERT INTO t1 VALUES(1),(2),(3);
     INSERT INTO t2 VALUES(4),(5),(6);
     INSERT INTO t3 VALUES(7),(8),(9);
@@ -294,7 +294,7 @@ do_execsql_test_on_specific_db {:memory:} insert_from_select_union_all_where {
 
 do_execsql_test_on_specific_db {:memory:} insert_from_select_same_table {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b);
-    
+
     INSERT INTO t(b) VALUES (1),(2),(3);
     SELECT * FROM t;
     INSERT INTO t(b) SELECT b FROM t;
@@ -311,7 +311,7 @@ do_execsql_test_on_specific_db {:memory:} insert_from_select_same_table {
 
 do_execsql_test_on_specific_db {:memory:} insert_from_select_same_table_2 {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b, c);
-    
+
     INSERT INTO t(b, c) VALUES (1, 100),(2, 200),(3, 300);
     SELECT * FROM t;
     INSERT INTO t(b, c) SELECT b,c FROM t;
@@ -328,7 +328,7 @@ do_execsql_test_on_specific_db {:memory:} insert_from_select_same_table_2 {
 
 if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
     do_execsql_test_on_specific_db {:memory:} insert_from_select_union {
-        CREATE TABLE t(a, b); 
+        CREATE TABLE t(a, b);
         CREATE TABLE t2(b, c);
 
         INSERT INTO t2 VALUES (1, 100), (2, 200);
@@ -386,3 +386,10 @@ do_execsql_test_on_specific_db {:memory:} not-null-rowid-alias {
     select * from t;
 } {1|2}
 
+do_execsql_test_on_specific_db {:memory:} rowid-overflow-random-generation {
+    CREATE TABLE q(x INTEGER PRIMARY KEY, y);
+    INSERT INTO q VALUES (9223372036854775807, 1);
+    INSERT INTO q(y) VALUES (2);
+    INSERT INTO q(y) VALUES (3);
+    SELECT COUNT(*) FROM q;
+} {3}
