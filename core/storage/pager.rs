@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{instrument, trace, Level};
 
-use super::btree::BTreePage;
+use super::btree::{BTreePage, CreateBTreeFlags};
 use super::page_cache::{CacheError, CacheResizeResult, DumbLruPageCache, PageCacheKey};
 use super::sqlite3_ondisk::{begin_write_btree_page, DATABASE_HEADER_SIZE};
 use super::wal::{CheckpointMode, CheckpointStatus};
@@ -1240,33 +1240,6 @@ pub fn allocate_page(page_id: usize, buffer_pool: &Arc<BufferPool>, offset: usiz
         page.get().contents = Some(PageContent::new(offset, buffer));
     }
     page
-}
-
-#[derive(Debug)]
-pub struct CreateBTreeFlags(pub u8);
-impl CreateBTreeFlags {
-    pub const TABLE: u8 = 0b0001;
-    pub const INDEX: u8 = 0b0010;
-
-    pub fn new_table() -> Self {
-        Self(CreateBTreeFlags::TABLE)
-    }
-
-    pub fn new_index() -> Self {
-        Self(CreateBTreeFlags::INDEX)
-    }
-
-    pub fn is_table(&self) -> bool {
-        (self.0 & CreateBTreeFlags::TABLE) != 0
-    }
-
-    pub fn is_index(&self) -> bool {
-        (self.0 & CreateBTreeFlags::INDEX) != 0
-    }
-
-    pub fn get_flags(&self) -> u8 {
-        self.0
-    }
 }
 
 /*

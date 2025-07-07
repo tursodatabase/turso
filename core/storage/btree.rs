@@ -1,6 +1,20 @@
-use std::{cell::RefCell, sync::Arc};
+use std::{
+    cell::{OnceCell, RefCell, UnsafeCell},
+    rc::Rc,
+    sync::{atomic::AtomicUsize, Arc, Mutex},
+};
 
-use crate::{types::ImmutableRecord, PageRef, RefValue};
+use parking_lot::RwLock;
+
+use crate::{
+    types::ImmutableRecord, BufferPool, DatabaseStorage, PageRef, Pager, RefValue, Result, WalFile,
+    WalFileShared, IO,
+};
+
+use super::{
+    btree_cursor::BTreeCursor, header_accessor, page_cache::DumbLruPageCache,
+    pager::AutoVacuumMode, wal::DummyWAL,
+};
 
 /// The B-Tree page header is 12 bytes for interior pages and 8 bytes for leaf pages.
 ///
@@ -120,5 +134,122 @@ impl BTreeKey<'_> {
             BTreeKey::TableRowId(_) => panic!("BTreeKey::to_index_key called on TableRowId"),
             BTreeKey::IndexKey(key) => key.get_values(),
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct CreateBTreeFlags(pub u8);
+impl CreateBTreeFlags {
+    pub const TABLE: u8 = 0b0001;
+    pub const INDEX: u8 = 0b0010;
+
+    pub fn new_table() -> Self {
+        Self(CreateBTreeFlags::TABLE)
+    }
+
+    pub fn new_index() -> Self {
+        Self(CreateBTreeFlags::INDEX)
+    }
+
+    pub fn is_table(&self) -> bool {
+        (self.0 & CreateBTreeFlags::TABLE) != 0
+    }
+
+    pub fn is_index(&self) -> bool {
+        (self.0 & CreateBTreeFlags::INDEX) != 0
+    }
+
+    pub fn get_flags(&self) -> u8 {
+        self.0
+    }
+}
+
+/// A database connection contains a reference to an instance of this object for
+/// **every database file that it has open**.
+///
+/// NOTE: Unlike SQLite, Turso doesn't have support for shared cache since it's a
+/// obsolete feature (check: https://sqlite.org/sharedcache.html).
+pub struct BTree {
+    pub pager: Rc<Pager>,
+    pub io: Arc<dyn IO>,
+    /// List of all open cursors
+    cursors: Vec<Arc<BTreeCursor>>,
+    n_pages: usize,
+    auto_vacuum_mode: RefCell<AutoVacuumMode>,
+    /// Cache page_size and reserved_space at Pager init and reuse for subsequent
+    /// `usable_space` calls. TODO: Invalidate reserved_space when we add the functionality
+    /// to change it.
+    page_size: OnceCell<u16>,
+    reserved_space: OnceCell<u8>,
+    // TODO: maybe add the double-linked list of dbs?
+}
+
+impl BTree {
+    pub fn open(
+        io: Arc<dyn IO>,
+        wal: Option<Arc<UnsafeCell<WalFileShared>>>,
+        db_file: Arc<dyn DatabaseStorage>,
+        is_empty: Arc<AtomicUsize>,
+        init_lock: Arc<Mutex<()>>,
+    ) -> Result<Rc<Self>> {
+        let buffer_pool = Arc::new(BufferPool::new(None));
+        // Open existing WAL file if present
+        if let Some(shared_wal) = wal {
+            // No pages in DB file or WAL -> empty database
+            let wal = Rc::new(RefCell::new(WalFile::new(
+                io.clone(),
+                shared_wal,
+                buffer_pool.clone(),
+            )));
+            let pager = Rc::new(Pager::new(
+                db_file.clone(),
+                wal,
+                io.clone(),
+                Arc::new(RwLock::new(DumbLruPageCache::default())),
+                buffer_pool,
+                is_empty.clone(),
+                init_lock.clone(),
+            )?);
+
+            let page_size = header_accessor::get_page_size(&pager)
+                .unwrap_or(crate::storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE)
+                as u32;
+
+            pager.buffer_pool.set_page_size(page_size as usize);
+
+            return Ok(Rc::new(Self {
+                pager,
+                io,
+                cursors: Vec::new(),
+                n_pages: 0,
+                auto_vacuum_mode: RefCell::new(AutoVacuumMode::None),
+                page_size: OnceCell::new(),
+                reserved_space: OnceCell::new(),
+            }));
+        };
+
+        // No existing WAL; create one.
+        // TODO: currently Pager needs to be instantiated with some implementation of trait Wal, so here's a workaround.
+        let dummy_wal = Rc::new(RefCell::new(DummyWAL {}));
+
+        let pager = Rc::new(Pager::new(
+            db_file.clone(),
+            dummy_wal,
+            io.clone(),
+            Arc::new(RwLock::new(DumbLruPageCache::default())),
+            buffer_pool.clone(),
+            is_empty.clone(),
+            init_lock.clone(),
+        )?);
+
+        Ok(Rc::new(Self {
+            pager,
+            io,
+            cursors: Vec::new(),
+            n_pages: 0,
+            auto_vacuum_mode: RefCell::new(AutoVacuumMode::None),
+            page_size: OnceCell::new(),
+            reserved_space: OnceCell::new(),
+        }))
     }
 }

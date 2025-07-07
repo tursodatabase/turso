@@ -9,7 +9,7 @@ use crate::schema::Column;
 use crate::schema::Schema;
 use crate::schema::Table;
 use crate::schema::Type;
-use crate::storage::pager::CreateBTreeFlags;
+use crate::storage::btree::CreateBTreeFlags;
 use crate::translate::ProgramBuilder;
 use crate::translate::ProgramBuilderOpts;
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;

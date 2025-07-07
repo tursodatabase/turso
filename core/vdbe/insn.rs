@@ -7,7 +7,7 @@ use std::{
 use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::{
     schema::{Affinity, BTreeTable, Index},
-    storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
+    storage::{btree::CreateBTreeFlags, wal::CheckpointMode},
     translate::collate::CollationSeq,
     Value,
 };

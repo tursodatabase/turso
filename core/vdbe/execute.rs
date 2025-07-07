@@ -1,10 +1,10 @@
 #![allow(unused_variables)]
 use crate::function::AlterTableFunc;
 use crate::numeric::{NullableInteger, Numeric};
+use crate::storage::btree::CreateBTreeFlags;
 use crate::storage::btree_cursor::{integrity_check, IntegrityCheckError, IntegrityCheckState};
 use crate::storage::database::FileMemoryStorage;
 use crate::storage::page_cache::DumbLruPageCache;
-use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::wal::DummyWAL;
 use crate::storage::{self, header_accessor};
 use crate::translate::collate::CollationSeq;
