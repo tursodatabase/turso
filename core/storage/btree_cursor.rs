@@ -669,7 +669,7 @@ impl BTreeCursor {
                 .btree
                 .pager
                 .read_page(next as usize)
-                .map(|page| BTreePageInner::new(page))?;
+                .map(BTreePageInner::new)?;
             *page_btree = new_page;
             *next_page = next;
             return Ok(CursorResult::IO);
@@ -5317,9 +5317,7 @@ pub fn integrity_check(
 }
 
 pub fn btree_read_page(pager: &Rc<Pager>, page_idx: usize) -> Result<BTreePage> {
-    pager
-        .read_page(page_idx)
-        .map(|page| BTreePageInner::new(page))
+    pager.read_page(page_idx).map(BTreePageInner::new)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
