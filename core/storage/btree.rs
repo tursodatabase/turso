@@ -6978,6 +6978,15 @@ mod tests {
                 let value = ImmutableRecord::from_registers(&regs, regs.len());
                 run_until_done(
                     || {
+                        let record = ImmutableRecord::from_registers(&regs, regs.len());
+                        let key = SeekKey::IndexKey(&record);
+                        cursor.seek(key, SeekOp::GE { eq_only: true })
+                    },
+                    pager.deref(),
+                )
+                .unwrap();
+                run_until_done(
+                    || {
                         cursor.insert(
                             &BTreeKey::new_index_key(&value),
                             cursor.is_write_in_progress(),
