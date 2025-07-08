@@ -853,7 +853,7 @@ impl<'a> AppendWriter<'a> {
 impl ImmutableRecord {
     pub fn new(payload_capacity: usize) -> Self {
         Self {
-            payload: Vec::with_capacity(payload_capacity),
+            payload: Value::Blob(Vec::with_capacity(payload_capacity)),
         }
     }
 
@@ -975,22 +975,39 @@ impl ImmutableRecord {
         }
 
         writer.assert_finish_capacity();
+        Self {
             payload: Value::Blob(buf),
+        }
+    }
+
+    pub fn as_blob(&self) -> &Vec<u8> {
+        match &self.payload {
+            Value::Blob(b) => b,
+            _ => panic!("payload must be a blob"),
+        }
+    }
+
+    pub fn as_blob_mut(&mut self) -> &mut Vec<u8> {
+        match &mut self.payload {
+            Value::Blob(b) => b,
+            _ => panic!("payload must be a blob"),
+        }
     }
 
     pub fn start_serialization(&mut self, payload: &[u8]) {
-        self.payload.as_blob_mut().extend_from_slice(payload);
+        self.as_blob_mut().extend_from_slice(payload);
     }
 
     pub fn invalidate(&mut self) {
-    self.payload.as_blob_mut().clear();    }
+        self.as_blob_mut().clear();
+    }
 
     pub fn is_invalidated(&self) -> bool {
-        self.payload.as_blob_mut.is_empty() && self.header_offsets.is_empty()
+        self.as_blob().is_empty()
     }
 
     pub fn get_payload(&self) -> &[u8] {
-        &self.payload.as_blob()
+        self.as_blob()
     }
 
     // TODO: its probably better to not instantiate the RecordCurosr. Instead do the deserialization
