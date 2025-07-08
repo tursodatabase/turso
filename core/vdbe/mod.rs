@@ -606,25 +606,6 @@ pub fn registers_to_ref_values(registers: &[Register]) -> Vec<RefValue> {
         .collect()
 }
 
-pub fn registers_to_ref_values(registers: &[Register]) -> Vec<RefValue> {
-    registers
-        .iter()
-        .map(|reg| {
-            let value = reg.get_owned_value();
-            match value {
-                Value::Null => RefValue::Null,
-                Value::Integer(i) => RefValue::Integer(*i),
-                Value::Float(f) => RefValue::Float(*f),
-                Value::Text(t) => RefValue::Text(TextRef {
-                    value: RawSlice::new(t.value.as_ptr(), t.value.len()),
-                    subtype: t.subtype.clone(),
-                }),
-                Value::Blob(b) => RefValue::Blob(RawSlice::new(b.as_ptr(), b.len())),
-            }
-        })
-        .collect()
-}
-
 #[instrument(skip(program), level = Level::INFO)]
 fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
     if !tracing::enabled!(tracing::Level::TRACE) {
