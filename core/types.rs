@@ -994,6 +994,10 @@ impl ImmutableRecord {
         }
     }
 
+    pub fn as_blob_value(&self) -> &Value {
+        &self.payload
+    }
+
     pub fn start_serialization(&mut self, payload: &[u8]) {
         self.as_blob_mut().extend_from_slice(payload);
     }

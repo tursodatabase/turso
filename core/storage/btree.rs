@@ -4232,7 +4232,7 @@ impl BTreeCursor {
                     let record = record.as_ref().unwrap();
                     let record_same_number_cols = &record.get_values()[..key_values.len()];
                     compare_immutable(
-                        key_values,
+                        key_values.as_slice(),
                         record_same_number_cols,
                         self.key_sort_order(),
                         &self.collations,
