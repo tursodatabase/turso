@@ -1055,11 +1055,30 @@ impl ImmutableRecord {
     }
 }
 
+/// A cursor for lazily parsing SQLite record format data.
+///
+/// `RecordCursor` provides incremental parsing of SQLite records, which follow the format:
+/// `[header_size][serial_type1][serial_type2]...[data1][data2]...`
+///
+/// Instead of parsing the entire record upfront, this cursor parses only what's needed
+/// for the requested operations, improving performance for large records where only
+/// a few columns are accessed.
+///
+/// SQLite records consist of:
+/// - **Header size**: Varint indicating total header length
+/// - **Serial types**: Variable-length integers describing each field's type and size
+/// - **Data section**: The actual field data in the same order as serial types
 #[derive(Debug, Default)]
 pub struct RecordCursor {
+    /// Parsed serial type values for each column.
+    /// Serial types encode both the data type and size information.
     pub serial_types: Vec<u64>,
+    /// Byte offsets where each column's data begins in the record payload.
+    /// Always has one more entry than `serial_types` (the final offset marks the end).
     pub offsets: Vec<usize>,
+    /// Total size of the record header in bytes.
     pub header_size: usize,
+    /// Current parsing position within the header section.
     pub header_offset: usize,
 }
 
@@ -1097,6 +1116,29 @@ impl RecordCursor {
         self.ensure_parsed_upto(record, MAX_COLUMN)
     }
 
+    /// Ensures the header is parsed up to (and including) the target column index.
+    ///
+    /// This is the core lazy parsing method. It only parses as much of the header
+    /// as needed to access the requested column, making it efficient for sparse
+    /// column access patterns.
+    ///
+    /// # Arguments
+    ///
+    /// * `record` - The record containing the data to parse
+    /// * `target_idx` - The column index that needs to be accessible (0-based)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - Parsing completed successfully
+    /// * `Err(LimboError)` - Parsing failed due to corrupt data or I/O error
+    ///
+    /// # Behavior
+    ///
+    /// - If `target_idx` is already parsed, returns immediately
+    /// - Parses incrementally from the current position to the target
+    /// - Handles the initial header size parsing on first call
+    /// - Calculates and caches data offsets for each parsed column
+    ///
     #[inline(always)]
     pub fn ensure_parsed_upto(
         &mut self,
@@ -1134,6 +1176,25 @@ impl RecordCursor {
         Ok(())
     }
 
+    /// Deserializes a specific column without additional parsing.
+    ///
+    /// This method assumes the header has already been parsed up to the target
+    /// column index (via `ensure_parsed_upto`). It extracts the actual data
+    /// value from the record's data section.
+    ///
+    /// # Arguments
+    ///
+    /// * `record` - The record containing the data
+    /// * `idx` - The column index to deserialize (0-based)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(RefValue)` - The deserialized value (may reference record data)
+    /// * `Err(LimboError)` - Deserialization failed
+    ///
+    /// # Special Cases
+    ///
+    /// - Returns `RefValue::Null` for out-of-bounds indices
     pub fn deserialize_column(&self, record: &ImmutableRecord, idx: usize) -> Result<RefValue> {
         if idx >= self.serial_types.len() {
             return Ok(RefValue::Null);
@@ -1162,6 +1223,21 @@ impl RecordCursor {
         Ok(value)
     }
 
+    /// Gets the value at the specified column index.
+    ///
+    /// This is the primary method for accessing record data. It combines
+    /// lazy parsing with deserialization in a single call.
+    ///
+    /// # Arguments
+    ///
+    /// * `record` - The record to read from
+    /// * `idx` - The column index (0-based)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(RefValue)` - The value at the specified index
+    /// * `Err(LimboError)` - Access failed due to invalid record or parsing error
+    ///
     #[inline(always)]
     pub fn get_value(&mut self, record: &ImmutableRecord, idx: usize) -> Result<RefValue> {
         if record.is_invalidated() {
@@ -1172,6 +1248,19 @@ impl RecordCursor {
         self.deserialize_column(record, idx)
     }
 
+    /// Gets the value at the specified column index, returning `None` on any error.
+    ///
+    /// # Arguments
+    ///
+    /// * `record` - The record to read from
+    /// * `idx` - The column index (0-based)
+    ///
+    /// # Returns
+    ///
+    /// * `Some(Ok(RefValue))` - Successfully read value
+    /// * `Some(Err(LimboError))` - Parsing succeeded but deserialization failed
+    /// * `None` - Record is invalid or index is out of bounds
+    ///
     pub fn get_value_opt(
         &mut self,
         record: &ImmutableRecord,
@@ -1188,6 +1277,17 @@ impl RecordCursor {
         Some(self.deserialize_column(record, idx))
     }
 
+    /// Returns the number of columns in the record.
+    ///
+    /// This method parses the complete header to determine the total
+    /// column count. The result is cached for subsequent calls.
+    /// # Arguments
+    ///
+    /// * `record` - The record to count columns in
+    ///
+    /// # Returns
+    ///
+    /// The number of columns, or 0 if the record is invalid.
     pub fn count(&mut self, record: &ImmutableRecord) -> usize {
         if record.is_invalidated() {
             return 0;
@@ -1197,10 +1297,33 @@ impl RecordCursor {
         self.serial_types.len()
     }
 
+    /// Alias for `count()`. Returns the number of columns in the record.
+    ///
+    /// # Arguments
+    ///
+    /// * `record` - The record to get length of
+    ///
+    /// # Returns
+    ///
+    /// The number of columns, or 0 if the record is invalid.
     pub fn len(&mut self, record: &ImmutableRecord) -> usize {
         self.count(record)
     }
 
+    /// Returns all values in the record as a vector.
+    ///
+    /// This method parses the complete header and deserializes all columns.
+    /// Use this when you need access to most or all columns in the record.
+    ///
+    /// # Arguments
+    ///
+    /// * `record` - The record to extract all values from
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Vec<RefValue>)` - All values in column order
+    /// * `Err(LimboError)` - Parsing or deserialization failed
+    ///
     pub fn get_values(&mut self, record: &ImmutableRecord) -> Result<Vec<RefValue>> {
         if record.is_invalidated() {
             return Ok(Vec::new());
@@ -1427,37 +1550,6 @@ pub fn compare_immutable(
         }
     }
     std::cmp::Ordering::Equal
-}
-
-pub fn compare_immutable_for_testing(
-    l: &[RefValue],
-    r: &[RefValue],
-    index_key_sort_order: IndexKeySortOrder,
-    collations: &[CollationSeq],
-    tie_breaker: std::cmp::Ordering,
-) -> std::cmp::Ordering {
-    let min_len = l.len().min(r.len());
-
-    for i in 0..min_len {
-        let column_order = index_key_sort_order.get_sort_order_for_col(i);
-        let collation = collations.get(i).copied().unwrap_or_default();
-
-        let cmp = match (&l[i], &r[i]) {
-            (RefValue::Text(left), RefValue::Text(right)) => {
-                collation.compare_strings(left.as_str(), right.as_str())
-            }
-            _ => l[i].partial_cmp(&r[i]).unwrap_or(std::cmp::Ordering::Equal),
-        };
-
-        if cmp != std::cmp::Ordering::Equal {
-            return match column_order {
-                SortOrder::Asc => cmp,
-                SortOrder::Desc => cmp.reverse(),
-            };
-        }
-    }
-
-    tie_breaker
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2271,6 +2363,37 @@ impl RawSlice {
 mod tests {
     use super::*;
     use crate::translate::collate::CollationSeq;
+
+    pub fn compare_immutable_for_testing(
+        l: &[RefValue],
+        r: &[RefValue],
+        index_key_sort_order: IndexKeySortOrder,
+        collations: &[CollationSeq],
+        tie_breaker: std::cmp::Ordering,
+    ) -> std::cmp::Ordering {
+        let min_len = l.len().min(r.len());
+
+        for i in 0..min_len {
+            let column_order = index_key_sort_order.get_sort_order_for_col(i);
+            let collation = collations.get(i).copied().unwrap_or_default();
+
+            let cmp = match (&l[i], &r[i]) {
+                (RefValue::Text(left), RefValue::Text(right)) => {
+                    collation.compare_strings(left.as_str(), right.as_str())
+                }
+                _ => l[i].partial_cmp(&r[i]).unwrap_or(std::cmp::Ordering::Equal),
+            };
+
+            if cmp != std::cmp::Ordering::Equal {
+                return match column_order {
+                    SortOrder::Asc => cmp,
+                    SortOrder::Desc => cmp.reverse(),
+                };
+            }
+        }
+
+        tie_breaker
+    }
 
     fn create_record(values: Vec<Value>) -> ImmutableRecord {
         let registers: Vec<Register> = values.into_iter().map(Register::Value).collect();

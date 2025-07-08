@@ -532,6 +532,20 @@ pub struct BTreeCursor {
     read_overflow_state: RefCell<Option<ReadPayloadOverflow>>,
     /// Contains the current cell_idx for `find_cell`
     find_cell_state: FindCellState,
+    /// `RecordCursor` is used to parse SQLite record format data retrieved from B-tree
+    /// leaf pages. It provides incremental parsing, only deserializing the columns that are
+    /// actually accessed, which is crucial for performance when dealing with wide tables
+    /// where only a subset of columns are needed.
+    ///
+    /// - Record parsing is logically a read operation from the caller's perspective
+    /// - But internally requires updating the cursor's cached parsing state
+    /// - Multiple methods may need to access different columns from the same record
+    ///
+    /// # Lifecycle
+    ///
+    /// The cursor is invalidated and reset when:
+    /// - Moving to a different record/row
+    /// - The underlying `ImmutableRecord` is modified
     pub record_cursor: RefCell<RecordCursor>,
 }
 
