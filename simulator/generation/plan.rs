@@ -653,7 +653,7 @@ impl Interaction {
 }
 
 fn reopen_database(env: &mut SimulatorEnv) {
-    tracing::trace!("reopening database");
+    tracing::debug!("reopening database");
     // 1. Close all connections without default checkpoint-on-close behavior
     // to expose bugs related to how we handle WAL
     let num_conns = env.connections.len();

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use turso_core::LimboError;
 use turso_sqlite3_parser::ast;
@@ -132,9 +134,9 @@ pub(crate) enum Property {
     /// FsyncNoWait is a property which tests if we do not loose any data after not waiting for fsync.
     ///
     /// # Interactions
-    /// - Executes the `query` without waiting for fsync
+    /// - Executes the `query` without waiting for fsync to complete
     /// - Drop all connections and Reopen the database
-    /// - Query tables to assert that the values were inserted
+    /// - Query tables to assert that we are seeing the expected table state
     ///
     FsyncNoWait { query: Query, tables: Vec<String> },
     FaultyQuery {
@@ -477,7 +479,11 @@ impl Property {
                 vec![assumption, select1, select2, assertion]
             }
             Property::FsyncNoWait { query, tables } => {
-                let checks = assert_all_table_values(tables);
+                let mut total_tables = HashSet::with_capacity(tables.len());
+                total_tables.extend(query.uses());
+                total_tables.extend(tables.clone());
+                let iter = total_tables.iter().map(|s| s.as_str());
+                let checks = assert_all_table_values(iter);
                 Vec::from_iter(
                     std::iter::once(Interaction::FsyncQuery(query.clone())).chain(checks),
                 )
@@ -487,7 +493,11 @@ impl Property {
                 tables,
                 interactive,
             } => {
-                let checks = assert_all_table_values(tables);
+                let mut total_tables = HashSet::with_capacity(tables.len());
+                total_tables.extend(query.uses());
+                total_tables.extend(tables.clone());
+                let iter = total_tables.iter().map(|s| s.as_str());
+                let checks = assert_all_table_values(iter);
                 let query_clone = query.clone();
                 let assumption = Assertion {
                     // A fault may not occur as we first signal we want a fault injected,
@@ -543,10 +553,12 @@ impl Property {
     }
 }
 
-fn assert_all_table_values(tables: &[String]) -> impl Iterator<Item = Interaction> + use<'_> {
-    let checks = tables.iter().flat_map(|table| {
+fn assert_all_table_values<'a, T: Iterator<Item = &'a str>>(
+    tables: T,
+) -> impl Iterator<Item = Interaction> + use<'a, T> {
+    let checks = tables.flat_map(|table| {
         let select = Interaction::Query(Query::Select(Select {
-            table: table.clone(),
+            table: table.to_owned(),
             result_columns: vec![ResultColumn::Star],
             predicate: Predicate::true_(),
             limit: None,
@@ -555,7 +567,7 @@ fn assert_all_table_values(tables: &[String]) -> impl Iterator<Item = Interactio
         let assertion = Interaction::Assertion(Assertion {
             message: format!("table {} should contain all of its values", table),
             func: Box::new({
-                let table = table.clone();
+                let table = table.to_owned();
                 move |stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
                     let table = env.tables.iter().find(|t| t.name == table).ok_or_else(|| {
                         LimboError::InternalError(format!(
