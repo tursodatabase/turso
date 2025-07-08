@@ -134,7 +134,6 @@ pub(crate) enum Property {
     /// # Interactions
     /// - Executes the `query` without waiting for fsync
     /// - Drop all connections and Reopen the database
-    /// - Execute the `query` again
     /// - Query tables to assert that the values were inserted
     ///
     FsyncNoWait { query: Query, tables: Vec<String> },

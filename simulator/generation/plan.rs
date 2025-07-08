@@ -184,9 +184,7 @@ impl Display for InteractionPlan {
                             }
                             Interaction::Fault(fault) => writeln!(f, "-- FAULT '{}';", fault)?,
                             Interaction::FsyncQuery(query) => {
-                                writeln!(f, "-- FSYNC QUERY;")?;
-                                writeln!(f, "{};", query)?;
-                                writeln!(f, "{};", query)?
+                                writeln!(f, "{}; -- FSYNC QUERY", query)?;
                             }
                             Interaction::FaultyQuery(query) => {
                                 writeln!(f, "{}; --FAULTY QUERY", query)?
@@ -400,12 +398,7 @@ impl ArbitraryFrom<&mut SimulatorEnv> for InteractionPlan {
 impl Interaction {
     pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<SimValue>> {
         match self {
-            Self::Query(query) => query.shadow(env),
-            Self::FsyncQuery(query) => {
-                let mut first = query.shadow(env);
-                first.extend(query.shadow(env));
-                first
-            }
+            Self::Query(query) | Self::FsyncQuery(query) => query.shadow(env),
             Self::Assumption(_) | Self::Assertion(_) | Self::Fault(_) | Self::FaultyQuery(_) => {
                 vec![]
             }
@@ -549,7 +542,7 @@ impl Interaction {
                 );
                 return Err(err.unwrap());
             }
-            
+
             let mut out = Vec::new();
             {
                 let mut rows = rows.unwrap().unwrap();

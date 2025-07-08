@@ -196,7 +196,7 @@ pub(crate) fn execute_interaction(
             stack.push(results);
             limbo_integrity_check(conn)?;
         }
-        Interaction::FsyncQuery(query) => {
+        Interaction::FsyncQuery(_) => {
             let conn = match &env.connections[connection_index] {
                 SimConnection::LimboConnection(conn) => conn.clone(),
                 SimConnection::SQLiteConnection(_) => unreachable!(),
@@ -206,11 +206,6 @@ pub(crate) fn execute_interaction(
             let results = interaction.execute_fsync_query(conn.clone(), env);
             tracing::debug!(?results);
             stack.push(results);
-
-            let query_interaction = Interaction::Query(query.clone());
-
-            tracing::debug!("executing fsync query to completion");
-            execute_interaction(env, connection_index, &query_interaction, stack)?;
         }
         Interaction::Assertion(_) => {
             interaction.execute_assertion(stack, env)?;
