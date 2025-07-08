@@ -29,15 +29,15 @@ use crate::{
     function::{AggFunc, FuncCtx},
     storage::{pager::PagerCacheflushStatus, sqlite3_ondisk::SmallVec},
     translate::plan::TableReferences,
-    types::{SeekKey, SeekOp},
     vdbe::execute::OpIdxInsertState,
     vdbe::execute::OpInsertState,
+    vdbe::execute::OpNewRowidState,
 };
 
 use crate::{
-    storage::{btree::BTreeCursor, pager::Pager},
+    storage::pager::Pager,
     translate::plan::ResultSetColumn,
-    types::{AggContext, Cursor, CursorResult, ImmutableRecord, Value},
+    types::{AggContext, Cursor, ImmutableRecord, Value},
     vdbe::{builder::CursorType, insn::Insn},
 };
 
@@ -50,7 +50,6 @@ use execute::{
     OpOpenEphemeralState,
 };
 
-use rand::Rng;
 use regex::Regex;
 use std::{
     cell::{Cell, RefCell},
@@ -253,6 +252,7 @@ pub struct ProgramState {
     op_idx_delete_state: Option<OpIdxDeleteState>,
     op_integrity_check_state: OpIntegrityCheckState,
     op_open_ephemeral_state: OpOpenEphemeralState,
+    op_new_rowid_state: OpNewRowidState,
     op_idx_insert_state: OpIdxInsertState,
     op_insert_state: OpInsertState,
 }
@@ -281,6 +281,7 @@ impl ProgramState {
             op_idx_delete_state: None,
             op_integrity_check_state: OpIntegrityCheckState::Start,
             op_open_ephemeral_state: OpOpenEphemeralState::Start,
+            op_new_rowid_state: OpNewRowidState::Start,
             op_idx_insert_state: OpIdxInsertState::SeekIfUnique,
             op_insert_state: OpInsertState::Insert,
         }
@@ -545,56 +546,6 @@ impl Program {
         }
         buff
     }
-}
-
-fn get_new_rowid<R: Rng>(cursor: &mut BTreeCursor, mut rng: R) -> Result<CursorResult<i64>> {
-    const MAX_ROWID: i64 = i64::MAX;
-
-    match cursor.seek_to_last()? {
-        CursorResult::Ok(()) => {}
-        CursorResult::IO => return Ok(CursorResult::IO),
-    }
-
-    let current_max_rowid = match cursor.rowid()? {
-        CursorResult::Ok(Some(rowid)) => rowid,
-        CursorResult::Ok(None) => {
-            return Ok(CursorResult::Ok(1));
-        }
-        CursorResult::IO => return Ok(CursorResult::IO),
-    };
-
-    if current_max_rowid < MAX_ROWID {
-        return Ok(CursorResult::Ok(current_max_rowid + 1));
-    }
-
-    // Current max rowid == i64::MAX, so we need to generate random rowids
-    let max_attempts = 100;
-
-    for _ in 0..max_attempts {
-        // Generate a random i64 and constrain it to the lower half of the rowid range.
-        // We use the lower half (1 to MAX_ROWID/2) because we're in random mode only
-        // when sequential allocation reached MAX_ROWID, meaning the upper range is full.
-        let mut random_rowid: i64 = rng.gen();
-        random_rowid &= MAX_ROWID >> 1; // Mask to keep value in range [0, MAX_ROWID/2]
-        random_rowid += 1; // Ensure positive
-
-        match cursor.seek(
-            SeekKey::TableRowId(random_rowid),
-            SeekOp::GE { eq_only: true },
-        )? {
-            CursorResult::Ok(false) => {
-                return Ok(CursorResult::Ok(random_rowid));
-            }
-            CursorResult::Ok(true) => {
-                continue;
-            }
-            CursorResult::IO => return Ok(CursorResult::IO),
-        }
-    }
-
-    Err(LimboError::DatabaseFull(
-        "Unable to find an unused rowid after 100 attempts - database is probably full".to_string(),
-    ))
 }
 
 fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> ImmutableRecord {
