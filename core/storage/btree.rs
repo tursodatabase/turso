@@ -1900,8 +1900,11 @@ impl BTreeCursor {
                     // - We have seen an EQ match up in the tree in an interior node
                     // - Or, we are not looking for an exact match.
                     if seek_op.eq_only() && !eq_seen.get() {
-                        self.stack.set_cell_index(target_cell_when_not_found.get());
-                        return Ok(CursorResult::Ok(false));
+                        let target_cell = target_cell_when_not_found.get();
+                        self.stack.set_cell_index(target_cell);
+                        let has_record =
+                            target_cell >= 0 && target_cell < contents.cell_count() as i32;
+                        return Ok(CursorResult::Ok(has_record));
                     }
                     match iter_dir {
                         IterationDirection::Forwards => {
@@ -3979,7 +3982,7 @@ impl BTreeCursor {
         // because it might have been set to false by an unmatched left-join row during the previous iteration
         // on the outer loop.
         self.set_null_flag(false);
-        let cursor_has_record = return_if_io!(self.do_seek(key, op));
+        let cursor_has_record = return_if_io!(self.do_seek(key.clone(), op));
         self.invalidate_record();
         // Reset seek state
         self.seek_state = CursorSeekState::Start;
