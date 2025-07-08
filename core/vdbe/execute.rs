@@ -65,7 +65,7 @@ use super::{
 };
 use fallible_iterator::FallibleIterator;
 use parking_lot::RwLock;
-use rand::thread_rng;
+use rand::{thread_rng, Rng};
 use turso_sqlite3_parser::ast;
 use turso_sqlite3_parser::ast::fmt::ToTokens;
 use turso_sqlite3_parser::lexer::sql::Parser;
@@ -88,7 +88,7 @@ use crate::{
     json::jsonb_patch, json::jsonb_remove, json::jsonb_replace, json::jsonb_set,
 };
 
-use super::{get_new_rowid, make_record, Program, ProgramState, Register};
+use super::{make_record, Program, ProgramState, Register};
 use crate::{
     bail_constraint_error, must_be_btree_cursor, resolve_ext_path, MvStore, Pager, Result,
 };
@@ -4988,6 +4988,14 @@ pub fn op_idx_insert(
     }
 }
 
+#[derive(Debug)]
+pub enum OpNewRowidState {
+    Start,
+    CheckingSequential,
+    GeneratingRandom { attempts: u32 },
+    VerifyingCandidate { attempts: u32, candidate: i64 },
+}
+
 pub fn op_new_rowid(
     program: &Program,
     state: &mut ProgramState,
@@ -5001,15 +5009,97 @@ pub fn op_new_rowid(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    let rowid = {
-        let mut cursor = state.get_cursor(*cursor);
-        let cursor = cursor.as_btree_mut();
-        // TODO: make io handle rng
-        return_if_io!(get_new_rowid(cursor, thread_rng()))
-    };
-    state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid));
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
+
+    const MAX_ROWID: i64 = i64::MAX;
+    const MAX_ATTEMPTS: u32 = 100;
+
+    loop {
+        match &state.op_new_rowid_state {
+            OpNewRowidState::Start => {
+                state.op_new_rowid_state = OpNewRowidState::CheckingSequential;
+            }
+
+            OpNewRowidState::CheckingSequential => {
+                let current_max = {
+                    let mut cursor = state.get_cursor(*cursor);
+                    let cursor = cursor.as_btree_mut();
+
+                    // Move to last record
+                    return_if_io!(cursor.seek_to_last());
+
+                    return_if_io!(cursor.rowid())
+                };
+
+                match current_max {
+                    Some(rowid) if rowid < MAX_ROWID => {
+                        // Can use sequential
+                        state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid + 1));
+                        state.op_new_rowid_state = OpNewRowidState::Start;
+                        state.pc += 1;
+                        return Ok(InsnFunctionStepResult::Step);
+                    }
+                    Some(_) => {
+                        // Must use random (rowid == MAX_ROWID)
+                        state.op_new_rowid_state =
+                            OpNewRowidState::GeneratingRandom { attempts: 0 };
+                    }
+                    None => {
+                        // Empty table
+                        state.registers[*rowid_reg] = Register::Value(Value::Integer(1));
+                        state.op_new_rowid_state = OpNewRowidState::Start;
+                        state.pc += 1;
+                        return Ok(InsnFunctionStepResult::Step);
+                    }
+                }
+            }
+
+            OpNewRowidState::GeneratingRandom { attempts } => {
+                if *attempts >= MAX_ATTEMPTS {
+                    return Err(LimboError::DatabaseFull("Unable to find an unused rowid after 100 attempts - database is probably full".to_string()));
+                }
+
+                // Generate a random i64 and constrain it to the lower half of the rowid range.
+                // We use the lower half (1 to MAX_ROWID/2) because we're in random mode only
+                // when sequential allocation reached MAX_ROWID, meaning the upper range is full.
+                let mut rng = thread_rng();
+                let mut random_rowid: i64 = rng.gen();
+                random_rowid &= MAX_ROWID >> 1; // Mask to keep value in range [0, MAX_ROWID/2]
+                random_rowid += 1; // Ensure positive
+
+                state.op_new_rowid_state = OpNewRowidState::VerifyingCandidate {
+                    attempts: *attempts,
+                    candidate: random_rowid,
+                };
+            }
+
+            OpNewRowidState::VerifyingCandidate {
+                attempts,
+                candidate,
+            } => {
+                let exists = {
+                    let mut cursor = state.get_cursor(*cursor);
+                    let cursor = cursor.as_btree_mut();
+                    return_if_io!(cursor.seek(
+                        SeekKey::TableRowId(*candidate),
+                        SeekOp::GE { eq_only: true }
+                    ))
+                };
+
+                if !exists {
+                    // Found unused rowid!
+                    state.registers[*rowid_reg] = Register::Value(Value::Integer(*candidate));
+                    state.op_new_rowid_state = OpNewRowidState::Start;
+                    state.pc += 1;
+                    return Ok(InsnFunctionStepResult::Step);
+                } else {
+                    // Collision, try again
+                    state.op_new_rowid_state = OpNewRowidState::GeneratingRandom {
+                        attempts: attempts + 1,
+                    };
+                }
+            }
+        }
+    }
 }
 
 pub fn op_must_be_int(
