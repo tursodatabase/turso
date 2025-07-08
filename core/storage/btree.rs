@@ -466,16 +466,16 @@ pub enum CursorSeekState {
 }
 
 #[derive(Debug)]
-struct FindCellState(Option<(usize, usize)>); // low, high
+struct FindCellState(Option<isize>);
 
 impl FindCellState {
     #[inline]
-    fn set(&mut self, lowhigh: (usize, usize)) {
-        self.0 = Some(lowhigh);
+    fn set(&mut self, cell_idx: isize) {
+        self.0 = Some(cell_idx)
     }
 
     #[inline]
-    fn get_state(&mut self) -> (usize, usize) {
+    fn get_cell_idx(&mut self) -> isize {
         self.0.expect("get can only be called after a set")
     }
 
@@ -3858,22 +3858,24 @@ impl BTreeCursor {
     /// Find the index of the cell in the page that contains the given rowid.
     #[instrument( skip_all, level = Level::INFO)]
     fn find_cell(&mut self, page: &PageContent, key: &BTreeKey) -> Result<CursorResult<usize>> {
-        let cell_count = page.cell_count();
-        let mut low = 0;
-        let mut high = if cell_count > 0 { cell_count - 1 } else { 0 };
-        let mut result_index = cell_count;
-        if self.find_cell_state.0.is_some() {
-            (low, high) = self.find_cell_state.get_state();
+        if self.find_cell_state.0.is_none() {
+            self.find_cell_state.set(0);
         }
-
-        while low <= high && cell_count > 0 {
-            let mid = low + (high - low) / 2;
-            self.find_cell_state.set((low, high));
-            let cell = page.cell_get(mid, self.usable_space())?;
-
-            let comparison_result = match cell {
-                BTreeCell::TableLeafCell(cell) => key.to_rowid().cmp(&cell.rowid),
-                BTreeCell::TableInteriorCell(cell) => key.to_rowid().cmp(&cell.rowid),
+        let cell_count = page.cell_count();
+        while self.find_cell_state.get_cell_idx() < cell_count as isize {
+            assert!(self.find_cell_state.get_cell_idx() >= 0);
+            let cell_idx = self.find_cell_state.get_cell_idx() as usize;
+            match page.cell_get(cell_idx, self.usable_space()).unwrap() {
+                BTreeCell::TableLeafCell(cell) => {
+                    if key.to_rowid() <= cell.rowid {
+                        break;
+                    }
+                }
+                BTreeCell::TableInteriorCell(cell) => {
+                    if key.to_rowid() <= cell.rowid {
+                        break;
+                    }
+                }
                 BTreeCell::IndexInteriorCell(IndexInteriorCell {
                     payload,
                     first_overflow_page,
@@ -3884,51 +3886,41 @@ impl BTreeCursor {
                     payload,
                     first_overflow_page,
                     payload_size,
-                    ..
                 }) => {
                     // TODO: implement efficient comparison of records
                     // e.g. https://github.com/sqlite/sqlite/blob/master/src/vdbeaux.c#L4719
                     return_if_io!(self.read_record_w_possible_overflow(
                         payload,
                         first_overflow_page,
-                        payload_size
+                        payload_size,
                     ));
-
                     let key_values = key.to_index_key_values();
                     let record = self.get_immutable_record();
                     let record = record.as_ref().unwrap();
                     let record_same_number_cols = &record.get_values()[..key_values.len()];
-                    compare_immutable(
+                    let order = compare_immutable(
                         key_values,
                         record_same_number_cols,
                         self.key_sort_order(),
                         &self.collations,
-                    )
-                }
-            };
-
-            match comparison_result {
-                Ordering::Equal => {
-                    result_index = mid;
-                    break;
-                }
-                Ordering::Greater => {
-                    low = mid + 1;
-                }
-                Ordering::Less => {
-                    result_index = mid;
-                    if mid == 0 {
-                        break;
+                    );
+                    match order {
+                        Ordering::Less | Ordering::Equal => {
+                            break;
+                        }
+                        Ordering::Greater => {}
                     }
-                    high = mid - 1;
                 }
             }
+            let cell_idx = self.find_cell_state.get_cell_idx();
+            self.find_cell_state.set(cell_idx + 1);
         }
-
+        let cell_idx = self.find_cell_state.get_cell_idx();
+        assert!(cell_idx >= 0);
+        let cell_idx = cell_idx as usize;
+        assert!(cell_idx <= cell_count);
         self.find_cell_state.reset();
-        assert!(result_index <= cell_count);
-
-        Ok(CursorResult::Ok(result_index))
+        Ok(CursorResult::Ok(cell_idx))
     }
 
     #[instrument(skip_all, level = Level::INFO)]
