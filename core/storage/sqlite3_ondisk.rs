@@ -1447,6 +1447,8 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
 
             cumulative_checksum = calculated_frame_checksum;
 
+            tracing::trace!(frame_h_page_number, frame_h_db_size);
+
             wfs_data
                 .frame_cache
                 .lock()
@@ -1462,6 +1464,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
             if is_commit_record {
                 wfs_data.max_frame.store(frame_idx, Ordering::SeqCst);
             }
+            tracing::trace!(?wfs_data.max_frame);
 
             frame_idx += 1;
             current_offset += WAL_FRAME_HEADER_SIZE + page_size;

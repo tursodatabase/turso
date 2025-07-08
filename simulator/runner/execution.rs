@@ -209,6 +209,7 @@ pub(crate) fn execute_interaction(
 
             let query_interaction = Interaction::Query(query.clone());
 
+            tracing::debug!("executing fsync query to completion");
             execute_interaction(env, connection_index, &query_interaction, stack)?;
         }
         Interaction::Assertion(_) => {

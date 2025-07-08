@@ -549,6 +549,7 @@ impl Wal for WalFile {
                 shared.pages_in_frames.lock().len(),
             )
         };
+        tracing::trace!(max_frame_in_wal, max_read_mark, max_read_mark_index);
         self.min_frame = min_frame;
         self.max_frame_read_lock_index = max_read_mark_index as usize;
         self.max_frame = max_read_mark as u64;
@@ -929,11 +930,13 @@ impl Wal for WalFile {
             // TODO(pere): implement proper hashmap, this sucks :).
             let shared = self.get_shared();
             let max_frame = shared.max_frame.load(Ordering::SeqCst);
-            tracing::debug!(to_max_frame = max_frame);
+            tracing::debug!(shared_max_frame = max_frame, wal_max_frame = self.max_frame);
             let mut frame_cache = shared.frame_cache.lock();
             for (_, frames) in frame_cache.iter_mut() {
                 let mut last_valid_frame = frames.len();
+                tracing::trace!(?frames);
                 for frame in frames.iter().rev() {
+                    tracing::trace!(?last_valid_frame, frame);
                     if *frame <= max_frame {
                         break;
                     }

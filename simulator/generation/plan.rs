@@ -549,39 +549,43 @@ impl Interaction {
                 );
                 return Err(err.unwrap());
             }
-            let mut rows = rows.unwrap().unwrap();
+            
             let mut out = Vec::new();
-            while let Ok(row) = rows.step() {
-                match row {
-                    StepResult::Row => {
-                        let row = rows.row().unwrap();
-                        let mut r = Vec::new();
-                        for v in row.get_values() {
-                            let v = v.into();
-                            r.push(v);
+            {
+                let mut rows = rows.unwrap().unwrap();
+
+                while let Ok(row) = rows.step() {
+                    match row {
+                        StepResult::Row => {
+                            let row = rows.row().unwrap();
+                            let mut r = Vec::new();
+                            for v in row.get_values() {
+                                let v = v.into();
+                                r.push(v);
+                            }
+                            out.push(r);
                         }
-                        out.push(r);
-                    }
-                    StepResult::IO => {
-                        let syncing = {
-                            let files = env.io.files.borrow();
-                            // TODO: currently assuming we only have 1 file that is syncing
-                            files
-                                .iter()
-                                .any(|file| file.sync_completion.borrow().is_some())
-                        };
-                        if syncing {
-                            reopen_database(env);
-                        } else {
-                            rows.run_once().unwrap();
+                        StepResult::IO => {
+                            let syncing = {
+                                let files = env.io.files.borrow();
+                                // TODO: currently assuming we only have 1 file that is syncing
+                                files.iter().any(|file| file.is_syncing())
+                            };
+                            if syncing {
+                                tracing::debug!("stop running io for fsync query");
+                                break;
+                            } else {
+                                rows.run_once().unwrap();
+                            }
                         }
+                        StepResult::Done => {
+                            break;
+                        }
+                        StepResult::Interrupt | StepResult::Busy => {}
                     }
-                    StepResult::Done => {
-                        break;
-                    }
-                    StepResult::Interrupt | StepResult::Busy => {}
                 }
             }
+            reopen_database(env);
 
             Ok(out)
         } else {
@@ -615,9 +619,7 @@ impl Interaction {
                 let syncing = {
                     let files = env.io.files.borrow();
                     // TODO: currently assuming we only have 1 file that is syncing
-                    files
-                        .iter()
-                        .any(|file| file.sync_completion.borrow().is_some())
+                    files.iter().any(|file| file.is_syncing())
                 };
                 let inject_fault = env.rng.gen_bool(current_prob);
                 if inject_fault || syncing {
@@ -658,6 +660,7 @@ impl Interaction {
 }
 
 fn reopen_database(env: &mut SimulatorEnv) {
+    tracing::trace!("reopening database");
     // 1. Close all connections without default checkpoint-on-close behavior
     // to expose bugs related to how we handle WAL
     let num_conns = env.connections.len();
