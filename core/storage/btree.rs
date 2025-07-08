@@ -398,6 +398,13 @@ impl Debug for CursorState {
     }
 }
 
+struct SeekResult {
+    /// Whether the cursor was left pointing to a valid record.
+    cursor_has_record: bool,
+    /// Whether the seek found a record matching the [SeekOp]
+    seek_matched: bool,
+}
+
 enum OverflowState {
     Start,
     ProcessPage { next_page: u32 },
@@ -1260,7 +1267,7 @@ impl BTreeCursor {
     /// This may be used to seek to a specific record in a point query (e.g. SELECT * FROM table WHERE col = 10)
     /// or e.g. find the first record greater than the seek key in a range query (e.g. SELECT * FROM table WHERE col > 10).
     /// We don't include the rowid in the comparison and that's why the last value from the record is not included.
-    fn do_seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<CursorResult<bool>> {
+    fn do_seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<CursorResult<SeekResult>> {
         let ret = return_if_io!(match key {
             SeekKey::TableRowId(rowid) => {
                 self.tablebtree_seek(rowid, op)
@@ -1635,7 +1642,7 @@ impl BTreeCursor {
     /// Specialized version of do_seek() for table btrees that uses binary search instead
     /// of iterating cells in order.
     #[instrument(skip_all, level = Level::INFO)]
-    fn tablebtree_seek(&mut self, rowid: i64, seek_op: SeekOp) -> Result<CursorResult<bool>> {
+    fn tablebtree_seek(&mut self, rowid: i64, seek_op: SeekOp) -> Result<CursorResult<SeekResult>> {
         turso_assert!(
             self.mv_cursor.is_none(),
             "attempting to seek with MV cursor"
@@ -1662,7 +1669,10 @@ impl BTreeCursor {
             let cell_count = contents.cell_count();
             if cell_count == 0 {
                 self.stack.set_cell_index(0);
-                return Ok(CursorResult::Ok(false));
+                return Ok(CursorResult::Ok(SeekResult {
+                    cursor_has_record: false,
+                    seek_matched: false,
+                }));
             }
             let min_cell_idx = Cell::new(0);
             let max_cell_idx = Cell::new(cell_count as isize - 1);
@@ -1706,10 +1716,16 @@ impl BTreeCursor {
             if min > max {
                 if let Some(nearest_matching_cell) = nearest_matching_cell.get() {
                     self.stack.set_cell_index(nearest_matching_cell as i32);
-                    return Ok(CursorResult::Ok(true));
+                    return Ok(CursorResult::Ok(SeekResult {
+                        cursor_has_record: true,
+                        seek_matched: true,
+                    }));
                 } else {
                     self.stack.set_cell_index(target_cell_when_not_found.get());
-                    return Ok(CursorResult::Ok(false));
+                    return Ok(CursorResult::Ok(SeekResult {
+                        cursor_has_record: false,
+                        seek_matched: false,
+                    }));
                 };
             }
 
@@ -1730,7 +1746,10 @@ impl BTreeCursor {
             // rowids are unique, so we can return the rowid immediately
             if found && seek_op.eq_only() {
                 self.stack.set_cell_index(cur_cell_idx as i32);
-                return Ok(CursorResult::Ok(true));
+                return Ok(CursorResult::Ok(SeekResult {
+                    cursor_has_record: true,
+                    seek_matched: true,
+                }));
             }
 
             if found {
@@ -1773,7 +1792,7 @@ impl BTreeCursor {
         &mut self,
         key: &ImmutableRecord,
         seek_op: SeekOp,
-    ) -> Result<CursorResult<bool>> {
+    ) -> Result<CursorResult<SeekResult>> {
         if matches!(
             self.seek_state,
             CursorSeekState::Start
@@ -1797,7 +1816,10 @@ impl BTreeCursor {
             let cell_count = contents.cell_count();
             if cell_count == 0 {
                 self.stack.set_cell_index(0);
-                return Ok(CursorResult::Ok(false));
+                return Ok(CursorResult::Ok(SeekResult {
+                    cursor_has_record: false,
+                    seek_matched: false,
+                }));
             }
 
             let min = Cell::new(0);
@@ -1862,7 +1884,10 @@ impl BTreeCursor {
             };
             let (_, found) = self.compare_with_current_record(key, seek_op);
             moving_up_to_parent.set(false);
-            return Ok(CursorResult::Ok(found));
+            return Ok(CursorResult::Ok(SeekResult {
+                cursor_has_record: true,
+                seek_matched: found,
+            }));
         }
 
         let page = self.stack.top();
@@ -1878,7 +1903,10 @@ impl BTreeCursor {
             if min > max {
                 if let Some(nearest_matching_cell) = nearest_matching_cell.get() {
                     self.stack.set_cell_index(nearest_matching_cell as i32);
-                    return Ok(CursorResult::Ok(true));
+                    return Ok(CursorResult::Ok(SeekResult {
+                        cursor_has_record: true,
+                        seek_matched: true,
+                    }));
                 } else {
                     // We have now iterated over all cells in the leaf page and found no match.
                     // Unlike tables, indexes store payloads in interior cells as well. self.move_to() always moves to a leaf page, so there are cases where we need to
@@ -1904,7 +1932,10 @@ impl BTreeCursor {
                         self.stack.set_cell_index(target_cell);
                         let has_record =
                             target_cell >= 0 && target_cell < contents.cell_count() as i32;
-                        return Ok(CursorResult::Ok(has_record));
+                        return Ok(CursorResult::Ok(SeekResult {
+                            cursor_has_record: has_record,
+                            seek_matched: false,
+                        }));
                     }
                     match iter_dir {
                         IterationDirection::Forwards => {
@@ -1914,7 +1945,10 @@ impl BTreeCursor {
                             }
                             let next_res = return_if_io!(self.next());
                             if !next_res {
-                                return Ok(CursorResult::Ok(false));
+                                return Ok(CursorResult::Ok(SeekResult {
+                                    cursor_has_record: false,
+                                    seek_matched: false,
+                                }));
                             }
                             // FIXME: optimize this in case record can be read directly
                             return Ok(CursorResult::IO);
@@ -1926,7 +1960,10 @@ impl BTreeCursor {
                             }
                             let prev_res = return_if_io!(self.prev());
                             if !prev_res {
-                                return Ok(CursorResult::Ok(false));
+                                return Ok(CursorResult::Ok(SeekResult {
+                                    cursor_has_record: false,
+                                    seek_matched: false,
+                                }));
                             }
                             // FIXME: optimize this in case record can be read directly
                             return Ok(CursorResult::IO);
@@ -3982,13 +4019,16 @@ impl BTreeCursor {
         // because it might have been set to false by an unmatched left-join row during the previous iteration
         // on the outer loop.
         self.set_null_flag(false);
-        let cursor_has_record = return_if_io!(self.do_seek(key.clone(), op));
+        let SeekResult {
+            cursor_has_record,
+            seek_matched,
+        } = return_if_io!(self.do_seek(key.clone(), op));
         self.invalidate_record();
         // Reset seek state
         self.seek_state = CursorSeekState::Start;
         self.valid_state = CursorValidState::Valid;
         self.has_record.replace(cursor_has_record);
-        Ok(CursorResult::Ok(cursor_has_record))
+        Ok(CursorResult::Ok(seek_matched))
     }
 
     /// Return a reference to the record the cursor is currently pointing to.
@@ -4258,7 +4298,6 @@ impl BTreeCursor {
                             post_balancing_seek_key,
                         };
                     } else {
-                        let is_last_cell = cell_idx == contents.cell_count().saturating_sub(1);
                         drop_cell(contents, cell_idx, self.usable_space() as u16)?;
 
                         let delete_info = self.state.mut_delete_info().unwrap();
