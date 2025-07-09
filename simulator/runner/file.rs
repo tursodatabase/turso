@@ -6,7 +6,7 @@ use std::{
 use rand::Rng as _;
 use rand_chacha::ChaCha8Rng;
 use tracing::{instrument, Level};
-use turso_core::{CompletionType, File, Result};
+use turso_core::{Completion, File, Result};
 
 use crate::model::FAULT_ERROR_MSG;
 pub(crate) struct SimulatorFile {
@@ -38,6 +38,13 @@ pub(crate) struct SimulatorFile {
     pub latency_probability: usize,
 
     pub sync_completion: RefCell<Option<Arc<turso_core::Completion>>>,
+    pub queued_io: RefCell<Vec<QueuedIo>>,
+}
+
+pub struct QueuedIo {
+    pub completion: Completion,
+    pub time: std::time::Instant,
+    pub op: Box<dyn FnOnce() -> Result<Arc<turso_core::Completion>>>,
 }
 
 unsafe impl Send for SimulatorFile {}
@@ -78,11 +85,13 @@ impl SimulatorFile {
     }
 
     #[instrument(skip_all, level = Level::TRACE)]
-    fn generate_latency_duration(&self) -> Option<std::time::Duration> {
+    fn generate_latency_duration(&self) -> Option<std::time::Instant> {
         let mut rng = self.rng.borrow_mut();
         // Chance to introduce some latency
         rng.gen_bool(self.latency_probability as f64 / 100.0)
-            .then(|| std::time::Duration::from_millis(rng.gen_range(20..50)))
+            .then(|| {
+                std::time::Instant::now() + std::time::Duration::from_millis(rng.gen_range(20..50))
+            })
     }
 }
 
@@ -108,7 +117,7 @@ impl File for SimulatorFile {
     fn pread(
         &self,
         pos: usize,
-        mut c: turso_core::Completion,
+        c: Arc<turso_core::Completion>,
     ) -> Result<Arc<turso_core::Completion>> {
         self.nr_pread_calls.set(self.nr_pread_calls.get() + 1);
         if self.fault.get() {
@@ -119,31 +128,19 @@ impl File for SimulatorFile {
             ));
         }
         if let Some(latency) = self.generate_latency_duration() {
-            let CompletionType::Read(read_completion) = &mut c.completion_type else {
-                unreachable!();
-            };
-            let before = self.rng.borrow_mut().gen_bool(0.5);
-            let dummy_complete = Box::new(|_| {});
-            let prev_complete = std::mem::replace(&mut read_completion.complete, dummy_complete);
-            let new_complete = move |res| {
-                if before {
-                    std::thread::sleep(latency);
-                }
-                (prev_complete)(res);
-                if !before {
-                    std::thread::sleep(latency);
-                }
-            };
-            read_completion.complete = Box::new(new_complete);
-        };
-        self.inner.pread(pos, c)
+            let op = Box::new(|| self.inner.pread(pos, c.clone()));
+
+            Ok(c)
+        } else {
+            self.inner.pread(pos, c)
+        }
     }
 
     fn pwrite(
         &self,
         pos: usize,
         buffer: Arc<RefCell<turso_core::Buffer>>,
-        mut c: turso_core::Completion,
+        c: Arc<turso_core::Completion>,
     ) -> Result<Arc<turso_core::Completion>> {
         self.nr_pwrite_calls.set(self.nr_pwrite_calls.get() + 1);
         if self.fault.get() {
@@ -154,27 +151,15 @@ impl File for SimulatorFile {
             ));
         }
         if let Some(latency) = self.generate_latency_duration() {
-            let CompletionType::Write(write_completion) = &mut c.completion_type else {
-                unreachable!();
-            };
-            let before = self.rng.borrow_mut().gen_bool(0.5);
-            let dummy_complete = Box::new(|_| {});
-            let prev_complete = std::mem::replace(&mut write_completion.complete, dummy_complete);
-            let new_complete = move |res| {
-                if before {
-                    std::thread::sleep(latency);
-                }
-                (prev_complete)(res);
-                if !before {
-                    std::thread::sleep(latency);
-                }
-            };
-            write_completion.complete = Box::new(new_complete);
-        };
-        self.inner.pwrite(pos, buffer, c)
+            let op = Box::new(|| self.inner.pwrite(pos, buffer, c.clone()));
+
+            Ok(c)
+        } else {
+            self.inner.pwrite(pos, buffer, c)
+        }
     }
 
-    fn sync(&self, mut c: turso_core::Completion) -> Result<Arc<turso_core::Completion>> {
+    fn sync(&self, c: Arc<turso_core::Completion>) -> Result<Arc<turso_core::Completion>> {
         self.nr_sync_calls.set(self.nr_sync_calls.get() + 1);
         if self.fault.get() {
             tracing::debug!("sync fault");
@@ -183,25 +168,12 @@ impl File for SimulatorFile {
                 FAULT_ERROR_MSG.into(),
             ));
         }
-        if let Some(latency) = self.generate_latency_duration() {
-            let CompletionType::Sync(sync_completion) = &mut c.completion_type else {
-                unreachable!();
-            };
-            let before = self.rng.borrow_mut().gen_bool(0.5);
-            let dummy_complete = Box::new(|_| {});
-            let prev_complete = std::mem::replace(&mut sync_completion.complete, dummy_complete);
-            let new_complete = move |res| {
-                if before {
-                    std::thread::sleep(latency);
-                }
-                (prev_complete)(res);
-                if !before {
-                    std::thread::sleep(latency);
-                }
-            };
-            sync_completion.complete = Box::new(new_complete);
-        };
-        let c = self.inner.sync(c)?;
+        let c = if let Some(latency) = self.generate_latency_duration() {
+            let op = Box::new(|| self.inner.sync(c.clone()));
+            Ok(c)
+        } else {
+            self.inner.sync(c)
+        }?;
         *self.sync_completion.borrow_mut() = Some(c.clone());
         Ok(c)
     }

@@ -59,9 +59,10 @@ impl SimulatorIO {
 
 impl Clock for SimulatorIO {
     fn now(&self) -> Instant {
+        let now = chrono::Local::now();
         Instant {
-            secs: 1704067200, // 2024-01-01 00:00:00 UTC
-            micros: 0,
+            secs: now.timestamp(),
+            micros: now.timestamp_subsec_micros(),
         }
     }
 }
@@ -87,6 +88,7 @@ impl IO for SimulatorIO {
             rng: RefCell::new(ChaCha8Rng::seed_from_u64(self.seed)),
             latency_probability: self.latency_probability,
             sync_completion: RefCell::new(None),
+            queued_io: RefCell::new(Vec::new()),
         });
         self.files.borrow_mut().push(file.clone());
         Ok(file)
