@@ -107,7 +107,6 @@ impl SimulatorFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn run_queued_io(&self, now: std::time::Instant) -> Result<()> {
         let mut queued_io = self.queued_io.borrow_mut();
-        tracing::debug!(?queued_io);
         // TODO: as we are not in version 1.87 we cannot use `extract_if`
         // so we have to do something different to achieve the same thing
         // This code was acquired from: https://doc.rust-lang.org/beta/std/vec/struct.Vec.html#method.extract_if
