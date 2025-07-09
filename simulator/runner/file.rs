@@ -100,7 +100,7 @@ impl SimulatorFile {
         // Chance to introduce some latency
         rng.gen_bool(self.latency_probability as f64 / 100.0)
             .then(|| {
-                std::time::Instant::now() + std::time::Duration::from_millis(rng.gen_range(50..200))
+                std::time::Instant::now() + std::time::Duration::from_millis(rng.gen_range(20..50))
             })
     }
 
