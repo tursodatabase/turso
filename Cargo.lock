@@ -3758,6 +3758,7 @@ dependencies = [
 name = "turso"
 version = "0.1.2-pre.1"
 dependencies = [
+ "futures-util",
  "tempfile",
  "thiserror 2.0.12",
  "tokio",

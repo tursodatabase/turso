@@ -9,14 +9,14 @@ mod sealed {
 use sealed::Sealed;
 
 /// Converts some type into parameters that can be passed
-/// to libsql.
+/// to Turso.
 ///
 /// The trait is sealed and not designed to be implemented by hand
 /// but instead provides a few ways to use it.
 ///
-/// # Passing parameters to libsql
+/// # Passing parameters to Turso
 ///
-/// Many functions in this library let you pass parameters to libsql. Doing this
+/// Many functions in this library let you pass parameters to Turso. Doing this
 /// lets you avoid any risk of SQL injection, and is simpler than escaping
 /// things manually. These functions generally contain some parameter that generically
 /// accepts some implementation this trait.
@@ -27,7 +27,7 @@ use sealed::Sealed;
 ///
 /// - For heterogeneous parameter lists of 16 or less items a tuple syntax is supported
 ///     by doing `(1, "foo")`.
-/// - For hetergeneous parameter lists of 16 or greater, the [`turso::params!`] is supported
+/// - For hetergeneous parameter lists of 16 or greater, the [`crate::params!`] is supported
 ///     by doing `turso::params![1, "foo"]`.
 /// - For homogeneous parameter types (where they are all the same type), const arrays are
 ///     supported by doing `[1, 2, 3]`.
@@ -62,8 +62,8 @@ use sealed::Sealed;
 ///
 /// - For heterogeneous parameter lists of 16 or less items a tuple syntax is supported
 ///     by doing `(("key1", 1), ("key2", "foo"))`.
-/// - For hetergeneous parameter lists of 16 or greater, the [`turso::params!`] is supported
-///     by doing `turso::named_params!["key1": 1, "key2": "foo"]`.
+/// - For hetergeneous parameter lists of 16 or greater, the [`crate::named_params!`] is supported
+///     by doing `turso::named_params!{"key1": 1, "key2": "foo"}`.
 /// - For homogeneous parameter types (where they are all the same type), const arrays are
 ///     supported by doing `[("key1", 1), ("key2, 2), ("key3", 3)]`.
 ///
@@ -77,7 +77,7 @@ use sealed::Sealed;
 /// // Using a tuple:
 /// stmt.execute(((":key1", 0), (":key2", "foobar"))).await?;
 ///
-/// // Using `turso::named_params!`:
+/// // Using `named_params!`:
 /// stmt.execute(named_params! {":key1": 1i32, ":key2": "blah" }).await?;
 ///
 /// // const array:
@@ -106,7 +106,7 @@ pub enum Params {
 /// # Example
 ///
 /// ```rust
-/// # use turso::{Connection, params_from_iter, Rows};
+/// # use turso::{Connection, params_from_iter};
 /// # async fn run(conn: &Connection) {
 ///
 /// let iter = vec![1, 2, 3];
