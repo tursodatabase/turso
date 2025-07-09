@@ -227,6 +227,7 @@ pub struct Pager {
     /// to change it.
     page_size: OnceCell<u16>,
     reserved_space: OnceCell<u8>,
+    free_page_state: RefCell<FreePageState>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -256,6 +257,18 @@ enum AllocatePage1State {
         page: BTreePage,
     },
     Done,
+}
+
+#[derive(Debug, Clone)]
+enum FreePageState {
+    Start,
+    AddToTrunk {
+        page: Arc<Page>,
+        trunk_page: Option<Arc<Page>>,
+    },
+    NewTrunk {
+        page: Arc<Page>,
+    },
 }
 
 impl Pager {
@@ -293,6 +306,7 @@ impl Pager {
             allocate_page1_state,
             page_size: OnceCell::new(),
             reserved_space: OnceCell::new(),
+            free_page_state: RefCell::new(FreePageState::Start),
         })
     }
 
@@ -981,7 +995,7 @@ impl Pager {
     // Providing a page is optional, if provided it will be used to avoid reading the page from disk.
     // This is implemented in accordance with sqlite freepage2() function.
     #[instrument(skip_all, level = Level::INFO)]
-    pub fn free_page(&self, page: Option<PageRef>, page_id: usize) -> Result<()> {
+    pub fn free_page(&self, page: Option<PageRef>, page_id: usize) -> Result<CursorResult<()>> {
         tracing::trace!("free_page(page_id={})", page_id);
         const TRUNK_PAGE_HEADER_SIZE: usize = 8;
         const LEAF_ENTRY_SIZE: usize = 4;
@@ -990,65 +1004,101 @@ impl Pager {
         const TRUNK_PAGE_NEXT_PAGE_OFFSET: usize = 0; // Offset to next trunk page pointer
         const TRUNK_PAGE_LEAF_COUNT_OFFSET: usize = 4; // Offset to leaf count
 
-        if page_id < 2 || page_id > header_accessor::get_database_size(self)? as usize {
-            return Err(LimboError::Corrupt(format!(
-                "Invalid page number {page_id} for free operation"
-            )));
-        }
+        let mut state = self.free_page_state.borrow_mut();
+        tracing::debug!(?state);
+        loop {
+            match &mut *state {
+                FreePageState::Start => {
+                    if page_id < 2 || page_id > header_accessor::get_database_size(self)? as usize {
+                        return Err(LimboError::Corrupt(format!(
+                            "Invalid page number {} for free operation",
+                            page_id
+                        )));
+                    }
 
-        let page = match page {
-            Some(page) => {
-                assert_eq!(page.get().id, page_id, "Page id mismatch");
-                page
+                    let page = match page.clone() {
+                        Some(page) => {
+                            assert_eq!(page.get().id, page_id, "Page id mismatch");
+                            page
+                        }
+                        None => self.read_page(page_id)?,
+                    };
+                    header_accessor::set_freelist_pages(
+                        self,
+                        header_accessor::get_freelist_pages(self)? + 1,
+                    )?;
+
+                    let trunk_page_id = header_accessor::get_freelist_trunk_page(self)?;
+
+                    if trunk_page_id != 0 {
+                        *state = FreePageState::AddToTrunk {
+                            page,
+                            trunk_page: None,
+                        };
+                    } else {
+                        *state = FreePageState::NewTrunk { page };
+                    }
+                }
+                FreePageState::AddToTrunk { page, trunk_page } => {
+                    let trunk_page_id = header_accessor::get_freelist_trunk_page(self)?;
+                    if trunk_page.is_none() {
+                        // Add as leaf to current trunk
+                        trunk_page.replace(self.read_page(trunk_page_id as usize)?);
+                    }
+                    let trunk_page = trunk_page.as_ref().unwrap();
+                    if trunk_page.is_locked() || !trunk_page.is_loaded() {
+                        return Ok(CursorResult::IO);
+                    }
+
+                    let trunk_page_contents = trunk_page.get().contents.as_ref().unwrap();
+                    let number_of_leaf_pages =
+                        trunk_page_contents.read_u32(TRUNK_PAGE_LEAF_COUNT_OFFSET);
+
+                    // Reserve 2 slots for the trunk page header which is 8 bytes or 2*LEAF_ENTRY_SIZE
+                    let max_free_list_entries =
+                        (self.usable_space() / LEAF_ENTRY_SIZE) - RESERVED_SLOTS;
+
+                    if number_of_leaf_pages < max_free_list_entries as u32 {
+                        trunk_page.set_dirty();
+                        self.add_dirty(trunk_page_id as usize);
+
+                        trunk_page_contents
+                            .write_u32(TRUNK_PAGE_LEAF_COUNT_OFFSET, number_of_leaf_pages + 1);
+                        trunk_page_contents.write_u32(
+                            TRUNK_PAGE_HEADER_SIZE
+                                + (number_of_leaf_pages as usize * LEAF_ENTRY_SIZE),
+                            page_id as u32,
+                        );
+                        page.clear_uptodate();
+
+                        break;
+                    }
+                }
+                FreePageState::NewTrunk { page } => {
+                    if page.is_locked() || !page.is_loaded() {
+                        return Ok(CursorResult::IO);
+                    }
+                    // If we get here, need to make this page a new trunk
+                    page.set_dirty();
+                    self.add_dirty(page_id);
+
+                    let trunk_page_id = header_accessor::get_freelist_trunk_page(self)?;
+
+                    let contents = page.get().contents.as_mut().unwrap();
+                    // Point to previous trunk
+                    contents.write_u32(TRUNK_PAGE_NEXT_PAGE_OFFSET, trunk_page_id);
+                    // Zero leaf count
+                    contents.write_u32(TRUNK_PAGE_LEAF_COUNT_OFFSET, 0);
+                    // Update page 1 to point to new trunk
+                    header_accessor::set_freelist_trunk_page(self, page_id as u32)?;
+                    // Clear flags
+                    page.clear_uptodate();
+                    break;
+                }
             }
-            None => self.read_page(page_id)?,
-        };
-
-        header_accessor::set_freelist_pages(self, header_accessor::get_freelist_pages(self)? + 1)?;
-
-        let trunk_page_id = header_accessor::get_freelist_trunk_page(self)?;
-
-        if trunk_page_id != 0 {
-            // Add as leaf to current trunk
-            let trunk_page = self.read_page(trunk_page_id as usize)?;
-            let trunk_page_contents = trunk_page.get().contents.as_ref().unwrap();
-            let number_of_leaf_pages = trunk_page_contents.read_u32(TRUNK_PAGE_LEAF_COUNT_OFFSET);
-
-            // Reserve 2 slots for the trunk page header which is 8 bytes or 2*LEAF_ENTRY_SIZE
-            let max_free_list_entries = (self.usable_space() / LEAF_ENTRY_SIZE) - RESERVED_SLOTS;
-
-            if number_of_leaf_pages < max_free_list_entries as u32 {
-                trunk_page.set_dirty();
-                self.add_dirty(trunk_page_id as usize);
-
-                trunk_page_contents
-                    .write_u32(TRUNK_PAGE_LEAF_COUNT_OFFSET, number_of_leaf_pages + 1);
-                trunk_page_contents.write_u32(
-                    TRUNK_PAGE_HEADER_SIZE + (number_of_leaf_pages as usize * LEAF_ENTRY_SIZE),
-                    page_id as u32,
-                );
-                page.clear_uptodate();
-                page.clear_loaded();
-
-                return Ok(());
-            }
         }
-
-        // If we get here, need to make this page a new trunk
-        page.set_dirty();
-        self.add_dirty(page_id);
-
-        let contents = page.get().contents.as_mut().unwrap();
-        // Point to previous trunk
-        contents.write_u32(TRUNK_PAGE_NEXT_PAGE_OFFSET, trunk_page_id);
-        // Zero leaf count
-        contents.write_u32(TRUNK_PAGE_LEAF_COUNT_OFFSET, 0);
-        // Update page 1 to point to new trunk
-        header_accessor::set_freelist_trunk_page(self, page_id as u32)?;
-        // Clear flags
-        page.clear_uptodate();
-        page.clear_loaded();
-        Ok(())
+        *state = FreePageState::Start;
+        Ok(CursorResult::Ok(()))
     }
 
     #[instrument(skip_all, level = Level::INFO)]

@@ -747,12 +747,13 @@ pub fn begin_read_page(
     db_file.read_page(page_idx, c);
 }
 
+#[instrument(skip_all, level = Level::INFO)]
 pub fn finish_read_page(
     page_idx: usize,
     buffer_ref: Arc<RefCell<Buffer>>,
     page: PageRef,
 ) -> Result<()> {
-    tracing::trace!("finish_read_btree_page(page_idx = {})", page_idx);
+    tracing::trace!(page_idx);
     let pos = if page_idx == DATABASE_HEADER_PAGE_ID {
         DATABASE_HEADER_SIZE
     } else {

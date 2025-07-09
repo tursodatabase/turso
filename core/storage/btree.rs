@@ -228,6 +228,10 @@ struct DeleteInfo {
 enum WriteState {
     Start,
     BalanceStart,
+    BalanceFreePages {
+        curr_page: usize,
+        sibling_count_new: usize,
+    },
     /// Choose which sibling pages to balance (max 3).
     /// Generally, the siblings involved will be the page that triggered the balancing and its left and right siblings.
     /// The exceptions are:
@@ -2334,6 +2338,7 @@ impl BTreeCursor {
                     }
                 }
                 WriteState::BalanceStart
+                | WriteState::BalanceFreePages { .. }
                 | WriteState::BalanceNonRootPickSiblings
                 | WriteState::BalanceNonRootDoBalancing => {
                     return_if_io!(self.balance());
@@ -2412,7 +2417,9 @@ impl BTreeCursor {
                     self.stack.pop();
                     return_if_io!(self.balance_non_root());
                 }
-                WriteState::BalanceNonRootPickSiblings | WriteState::BalanceNonRootDoBalancing => {
+                WriteState::BalanceNonRootPickSiblings
+                | WriteState::BalanceNonRootDoBalancing
+                | WriteState::BalanceFreePages { .. } => {
                     return_if_io!(self.balance_non_root());
                 }
                 WriteState::Finish => return Ok(CursorResult::Ok(())),
@@ -2429,7 +2436,7 @@ impl BTreeCursor {
             "Cursor must be in balancing state"
         );
         let state = self.state.write_info().expect("must be balancing").state;
-        tracing::debug!("balance_non_root(state={:?})", state);
+        tracing::debug!(?state);
         let (next_write_state, result) = match state {
             WriteState::Start => todo!(),
             WriteState::BalanceStart => todo!(),
@@ -3401,13 +3408,38 @@ impl BTreeCursor {
                     right_page_id,
                 );
 
+                (
+                    WriteState::BalanceFreePages {
+                        curr_page: sibling_count_new,
+                        sibling_count_new,
+                    },
+                    Ok(CursorResult::Ok(())),
+                )
+            }
+            WriteState::BalanceFreePages {
+                curr_page,
+                sibling_count_new,
+            } => {
+                let write_info = self.state.write_info().unwrap();
+                let mut balance_info: std::cell::RefMut<'_, Option<BalanceInfo>> =
+                    write_info.balance_info.borrow_mut();
+                let balance_info = balance_info.as_mut().unwrap();
                 // We have to free pages that are not used anymore
-                for i in sibling_count_new..balance_info.sibling_count {
-                    let page = balance_info.pages_to_balance[i].as_ref().unwrap();
-                    self.pager
-                        .free_page(Some(page.get().clone()), page.get().get().id)?;
+                if !((sibling_count_new..balance_info.sibling_count).contains(&curr_page)) {
+                    (WriteState::BalanceStart, Ok(CursorResult::Ok(())))
+                } else {
+                    let page = balance_info.pages_to_balance[curr_page].as_ref().unwrap();
+                    return_if_io!(self
+                        .pager
+                        .free_page(Some(page.get().clone()), page.get().get().id));
+                    (
+                        WriteState::BalanceFreePages {
+                            curr_page: curr_page + 1,
+                            sibling_count_new,
+                        },
+                        Ok(CursorResult::Ok(())),
+                    )
                 }
-                (WriteState::BalanceStart, Ok(CursorResult::Ok(())))
             }
             WriteState::Finish => todo!(),
         };
@@ -4726,7 +4758,7 @@ impl BTreeCursor {
                     let contents = page.get().contents.as_ref().unwrap();
                     let next = contents.read_u32(0);
 
-                    self.pager.free_page(Some(page), next_page as usize)?;
+                    return_if_io!(self.pager.free_page(Some(page), next_page as usize));
 
                     if next != 0 {
                         self.overflow_state = Some(OverflowState::ProcessPage { next_page: next });
@@ -4913,7 +4945,7 @@ impl BTreeCursor {
                     let page = self.stack.top();
                     let page_id = page.get().get().id;
 
-                    self.pager.free_page(Some(page.get()), page_id)?;
+                    return_if_io!(self.pager.free_page(Some(page.get()), page_id));
 
                     if self.stack.has_parent() {
                         self.stack.pop();
