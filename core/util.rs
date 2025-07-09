@@ -6,6 +6,7 @@ use crate::{
     LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable,
 };
 use std::{rc::Rc, sync::Arc};
+use tracing::{instrument, Level};
 use turso_sqlite3_parser::ast::{
     self, CreateTableBody, Expr, FunctionTail, Literal, UnaryOperator,
 };
@@ -48,6 +49,7 @@ struct UnparsedFromSqlIndex {
     sql: String,
 }
 
+#[instrument(skip_all, level = Level::INFO)]
 pub fn parse_schema_rows(
     rows: Option<Statement>,
     schema: &mut Schema,
