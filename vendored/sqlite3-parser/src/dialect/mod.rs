@@ -222,7 +222,7 @@ impl TokenType {
             TK_LE => Some("<="),
             TK_LT => Some("<"),
             TK_MINUS => Some("-"),
-            TK_NE => Some("<>"), // or !=
+            TK_NE => Some("!="), // or <>
             TK_PLUS => Some("+"),
             TK_REM => Some("%"),
             TK_RP => Some(")"),

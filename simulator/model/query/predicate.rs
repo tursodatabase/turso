@@ -1,12 +1,9 @@
 use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
-use turso_sqlite3_parser::{ast, to_sql_string::ToSqlString};
+use turso_sqlite3_parser::ast::{self, fmt::ToTokens};
 
-use crate::model::{
-    query::EmptyContext,
-    table::{SimValue, Table},
-};
+use crate::model::table::{SimValue, Table};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Predicate(pub ast::Expr);
@@ -73,6 +70,6 @@ pub fn expr_to_value(expr: &ast::Expr, row: &[SimValue], table: &Table) -> Optio
 
 impl Display for Predicate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0.to_sql_string(&EmptyContext))
+        self.0.to_fmt(f)
     }
 }

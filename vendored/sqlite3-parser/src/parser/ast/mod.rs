@@ -14,7 +14,7 @@ use indexmap::{IndexMap, IndexSet};
 
 use crate::custom_err;
 use crate::dialect::TokenType::{self, *};
-use crate::dialect::{from_token, is_identifier, Token};
+use crate::dialect::{from_token, Token};
 use crate::parser::{parse::YYCODETYPE, ParserError};
 
 /// `?` or `$` Prepared statement arg placeholder(s)
