@@ -109,6 +109,10 @@ impl IO for SimulatorIO {
                 FAULT_ERROR_MSG.into(),
             ));
         }
+        let now = std::time::Instant::now();
+        for file in self.files.borrow().iter() {
+            file.run_queued_io(now)?;
+        }
         self.inner.run_once()?;
         Ok(())
     }
