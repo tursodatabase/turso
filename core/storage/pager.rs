@@ -8,9 +8,14 @@ use crate::storage::wal::{CheckpointResult, Wal, WalFsyncStatus};
 use crate::types::CursorResult;
 use crate::{Buffer, Connection, LimboError, Result};
 use crate::{Completion, WalFile};
+use bitflags::bitflags;
+#[cfg(test)]
+use core::fmt;
 use parking_lot::RwLock;
 use std::cell::{OnceCell, RefCell, UnsafeCell};
 use std::collections::HashSet;
+#[cfg(test)]
+use std::fmt::Display;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -33,6 +38,26 @@ pub struct PageInner {
 #[derive(Debug)]
 pub struct Page {
     pub inner: UnsafeCell<PageInner>,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct SpillFlag(u8);
+
+bitflags! {
+    impl SpillFlag: u8 {
+        /// Never spill cache. Set via pragma
+        const OFF = 0b01;
+        /// Current rolling back, so do not spill
+        const ROLLBACK = 0b10;
+        /// Spill is ok, but do not sync
+        const NO_SYNC = 0b11;
+    }
+}
+
+impl SpillFlag {
+    pub fn can_spill(&self) -> bool {
+        self.contains(SpillFlag::NO_SYNC) || self.is_empty()
+    }
 }
 
 // Concurrency control of pages will be handled by the pager, we won't wrap Page with RwLock
@@ -141,6 +166,69 @@ impl Page {
     }
 }
 
+// TODO: maybe we could use metrics to record this?
+#[cfg(test)]
+/// Total cache hits, misses, writes, spills
+pub struct PagerStats((AtomicUsize, AtomicUsize, AtomicUsize, AtomicUsize));
+
+#[cfg(test)]
+impl PagerStats {
+    pub fn new() -> Self {
+        Self((
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        ))
+    }
+
+    pub fn hit(&self) {
+        self.0 .0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn miss(&self) {
+        self.0 .1.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn write(&self) {
+        self.0 .2.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn spill(&self) {
+        self.0 .3.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn hits(&self) -> usize {
+        self.0 .0.load(Ordering::SeqCst)
+    }
+
+    pub fn misses(&self) -> usize {
+        self.0 .1.load(Ordering::SeqCst)
+    }
+
+    pub fn writes(&self) -> usize {
+        self.0 .2.load(Ordering::SeqCst)
+    }
+
+    pub fn spills(&self) -> usize {
+        self.0 .3.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+impl Display for PagerStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Hits: {}, Misses: {}, Writes: {}, Spills: {}",
+            self.hits(),
+            self.misses(),
+            self.writes(),
+            self.spills()
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 /// The state of the current pager cache flush.
 enum FlushState {
@@ -227,6 +315,10 @@ pub struct Pager {
     /// to change it.
     page_size: OnceCell<u16>,
     reserved_space: OnceCell<u8>,
+    spill_flag: SpillFlag,
+
+    #[cfg(test)]
+    stats: PagerStats,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -293,6 +385,9 @@ impl Pager {
             allocate_page1_state,
             page_size: OnceCell::new(),
             reserved_space: OnceCell::new(),
+            spill_flag: SpillFlag::empty(),
+            #[cfg(test)]
+            stats: PagerStats::new(),
         })
     }
 
@@ -682,7 +777,7 @@ impl Pager {
     pub fn read_page(&self, page_idx: usize) -> Result<PageRef, LimboError> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
-        let page_key = PageCacheKey::new(page_idx);
+        let page_key = PageCacheKey(page_idx);
         if let Some(page) = page_cache.get(&page_key) {
             tracing::trace!("read_page(page_idx = {}) = cached", page_idx);
             return Ok(page.clone());
@@ -690,7 +785,9 @@ impl Pager {
         let page = Arc::new(Page::new(page_idx));
         page.set_locked();
 
+        tracing::trace!("begin read_page(page_idx = {}) = wal", page_idx);
         if let Some(frame_id) = self.wal.borrow().find_frame(page_idx as u64)? {
+            tracing::trace!("read_page(page_idx = {}) = wal", page_idx);
             self.wal
                 .borrow()
                 .read_frame(frame_id, page.clone(), self.buffer_pool.clone())?;
@@ -701,7 +798,10 @@ impl Pager {
             // read frame or page
             match page_cache.insert(page_key, page.clone()) {
                 Ok(_) => {}
-                Err(CacheError::Full) => return Err(LimboError::CacheFull),
+                Err(CacheError::Full) => {
+                    drop(page_cache);
+                    self.stress(page.clone())?;
+                }
                 Err(CacheError::KeyExists) => {
                     unreachable!("Page should not exist in cache after get() miss")
                 }
@@ -741,7 +841,7 @@ impl Pager {
     pub fn cache_get(&self, page_idx: usize) -> Option<PageRef> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
-        let page_key = PageCacheKey::new(page_idx);
+        let page_key = PageCacheKey(page_idx);
         page_cache.get(&page_key)
     }
 
@@ -777,7 +877,7 @@ impl Pager {
                     for (dirty_page_idx, page_id) in self.dirty_pages.borrow().iter().enumerate() {
                         let is_last_frame = dirty_page_idx == self.dirty_pages.borrow().len() - 1;
                         let mut cache = self.page_cache.write();
-                        let page_key = PageCacheKey::new(*page_id);
+                        let page_key = PageCacheKey(*page_id);
                         let page = cache.get(&page_key).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
                         let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
                         trace!("cacheflush(page={}, page_type={:?}", page_id, page_type);
@@ -1091,7 +1191,7 @@ impl Pager {
                 }
                 tracing::trace!("allocate_page1(Writing done)");
                 let page1_ref = page.get();
-                let page_key = PageCacheKey::new(page1_ref.get().id);
+                let page_key = PageCacheKey(page1_ref.get().id);
                 let mut cache = self.page_cache.write();
                 cache.insert(page_key, page1_ref.clone()).map_err(|e| {
                     LimboError::InternalError(format!(
@@ -1140,11 +1240,14 @@ impl Pager {
                 page.set_dirty();
                 self.add_dirty(page.get().id);
 
-                let page_key = PageCacheKey::new(page.get().id);
+                let page_key = PageCacheKey(page.get().id);
                 let mut cache = self.page_cache.write();
                 match cache.insert(page_key, page.clone()) {
                     Ok(_) => (),
-                    Err(CacheError::Full) => return Err(LimboError::CacheFull),
+                    Err(CacheError::Full) => {
+                        drop(cache);
+                        self.stress(page)?;
+                    }
                     Err(_) => {
                         return Err(LimboError::InternalError(
                             "Unknown error inserting page to cache".into(),
@@ -1165,10 +1268,14 @@ impl Pager {
             page.set_dirty();
             self.add_dirty(page.get().id);
 
-            let page_key = PageCacheKey::new(page.get().id);
+            let page_key = PageCacheKey(page.get().id);
             let mut cache = self.page_cache.write();
             match cache.insert(page_key, page.clone()) {
-                Err(CacheError::Full) => Err(LimboError::CacheFull),
+                Err(CacheError::Full) => {
+                    drop(cache);
+                    self.stress(page.clone())?;
+                    Ok(page)
+                }
                 Err(_) => Err(LimboError::InternalError(
                     "Unknown error inserting page to cache".into(),
                 )),
@@ -1183,7 +1290,7 @@ impl Pager {
         page: PageRef,
     ) -> Result<(), LimboError> {
         let mut cache = self.page_cache.write();
-        let page_key = PageCacheKey::new(id);
+        let page_key = PageCacheKey(id);
 
         // FIXME: use specific page key for writer instead of max frame, this will make readers not conflict
         assert!(page.is_dirty());
@@ -1222,6 +1329,36 @@ impl Pager {
         }
         self.wal.borrow_mut().rollback()?;
 
+        Ok(())
+    }
+
+    // TODO: find better name for this, use as a callback like SQLite?
+    /// This function is called by the cache layer when it has reached some soft memory limit.
+    /// The pager must be purgeable (not in-memory)
+    pub fn stress(&self, page: PageRef) -> Result<()> {
+        assert!(page.is_dirty());
+        tracing::trace!("Stressing page {}", page.get().id);
+
+        // todo: improve error handling
+        if !self.spill_flag.can_spill() {
+            return Err(LimboError::SpillNotAllowed);
+        }
+
+        #[cfg(test)]
+        {
+            self.stats.spill();
+        }
+
+        tracing::trace!("Getting database size");
+        let db_size = header_accessor::get_database_size(self)?;
+        tracing::trace!("Database size is: {}", db_size);
+        self.wal.borrow_mut().append_frame(
+            page.clone(),
+            db_size,
+            self.flush_info.borrow().in_flight_writes.clone(),
+        )?;
+
+        page.clear_dirty();
         Ok(())
     }
 }
@@ -1462,13 +1599,13 @@ mod tests {
             let cache = cache.clone();
             std::thread::spawn(move || {
                 let mut cache = cache.write();
-                let page_key = PageCacheKey::new(1);
+                let page_key = PageCacheKey(1);
                 cache.insert(page_key, Arc::new(Page::new(1))).unwrap();
             })
         };
         let _ = thread.join();
         let mut cache = cache.write();
-        let page_key = PageCacheKey::new(1);
+        let page_key = PageCacheKey(1);
         let page = cache.get(&page_key);
         assert_eq!(page.unwrap().get().id, 1);
     }

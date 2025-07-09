@@ -8,9 +8,7 @@ use super::pager::PageRef;
 const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES: usize = 2000;
 
 #[derive(Debug, Eq, Hash, PartialEq, Clone)]
-pub struct PageCacheKey {
-    pgno: usize,
-}
+pub struct PageCacheKey(pub usize);
 
 #[allow(dead_code)]
 struct PageCacheEntry {
@@ -33,7 +31,7 @@ struct PageHashMap {
     // FIXME: do we prefer array buckets or list? Deletes will be slower here which I guess happens often. I will do this for now to test how well it does.
     buckets: Vec<Vec<HashMapNode>>,
     capacity: usize,
-    size: usize,
+    pub size: usize,
 }
 
 #[derive(Clone)]
@@ -58,11 +56,6 @@ pub enum CacheResizeResult {
     PendingEvictions,
 }
 
-impl PageCacheKey {
-    pub fn new(pgno: usize) -> Self {
-        Self { pgno }
-    }
-}
 impl DumbLruPageCache {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "capacity of cache should be at least 1");
@@ -131,6 +124,7 @@ impl DumbLruPageCache {
     // Returns Ok if key is not found
     pub fn _delete(&mut self, key: PageCacheKey, clean_page: bool) -> Result<(), CacheError> {
         if !self.contains_key(&key) {
+            tracing::trace!("Skipping delete for key {:?}", key);
             return Ok(());
         }
 
@@ -269,7 +263,6 @@ impl DumbLruPageCache {
         })?;
 
         // Handle len > capacity, too
-        let available = self.capacity.saturating_sub(len);
         let x = n.saturating_sub(available);
         let mut need_to_evict = x.saturating_add(len.saturating_sub(self.capacity));
 
@@ -278,16 +271,21 @@ impl DumbLruPageCache {
             let current = current_opt.unwrap();
             let entry = unsafe { current.as_ref() };
             current_opt = entry.prev; // Pick prev before modifying entry
-            match self.delete(entry.key.clone()) {
-                Err(_) => {}
-                Ok(_) => need_to_evict -= 1,
+            if let Ok(_) = self.delete(entry.key.clone()) {
+                need_to_evict -= 1;
             }
         }
 
-        match need_to_evict > 0 {
-            true => Err(CacheError::Full),
-            false => Ok(()),
+        if need_to_evict > 0 {
+            tracing::trace!(
+                "make_room_for({}): Cache is full, {} pages still need to be evicted",
+                n,
+                need_to_evict
+            );
+            return Err(CacheError::Full);
         }
+
+        Ok(())
     }
 
     pub fn clear(&mut self) -> Result<(), CacheError> {
@@ -575,9 +573,9 @@ impl PageHashMap {
 
     fn hash(&self, key: &PageCacheKey) -> usize {
         if self.capacity.is_power_of_two() {
-            key.pgno & (self.capacity - 1)
+            key.0 & (self.capacity - 1)
         } else {
-            key.pgno % self.capacity
+            key.0 % self.capacity
         }
     }
 
@@ -607,7 +605,7 @@ mod tests {
     };
 
     fn create_key(id: usize) -> PageCacheKey {
-        PageCacheKey::new(id)
+        PageCacheKey(id)
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -1007,7 +1005,7 @@ mod tests {
                 0 => {
                     // add
                     let id_page = rng.next_u64() % max_pages;
-                    let key = PageCacheKey::new(id_page as usize);
+                    let key = PageCacheKey(id_page as usize);
                     #[allow(clippy::arc_with_non_send_sync)]
                     let page = Arc::new(Page::new(id_page as usize));
                     if cache.peek(&key, false).is_some() {
@@ -1031,8 +1029,8 @@ mod tests {
                     let random = rng.next_u64() % 2 == 0;
                     let key = if random || lru.is_empty() {
                         let id_page: u64 = rng.next_u64() % max_pages;
-
-                        PageCacheKey::new(id_page as usize)
+                        let key = PageCacheKey(id_page as usize);
+                        key
                     } else {
                         let i = rng.next_u64() as usize % lru.len();
                         let key: PageCacheKey = lru.iter().nth(i).unwrap().0.clone();
@@ -1052,8 +1050,8 @@ mod tests {
             cache.verify_list_integrity();
             for (key, page) in &lru {
                 println!("getting page {:?}", key);
-                cache.peek(key, false).unwrap();
-                assert_eq!(page.get().id, key.pgno);
+                cache.peek(&key, false).unwrap();
+                assert_eq!(page.get().id, key.0);
             }
         }
     }
