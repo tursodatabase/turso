@@ -419,43 +419,38 @@ fn create_table(
                 // A column defined as exactly INTEGER PRIMARY KEY is a rowid alias, meaning that the rowid
                 // and the value of this column are the same.
                 // https://www.sqlite.org/lang_createtable.html#rowids_and_the_integer_primary_key
-                let mut typename_exactly_integer = false;
-                let (ty, ty_str) = match col_def.col_type {
-                    Some(data_type) => {
-                        let s = data_type.name.as_str();
-                        let ty_str = if matches!(
-                            s.to_uppercase().as_str(),
-                            "TEXT" | "INT" | "INTEGER" | "BLOB" | "REAL"
-                        ) {
-                            s.to_uppercase().to_string()
-                        } else {
-                            s.to_string()
-                        };
+                let ty_str = col_def
+                    .col_type
+                    .as_ref()
+                    .map(|ast::Type { name, .. }| name.clone())
+                    .unwrap_or_default();
 
+                let mut typename_exactly_integer = false;
+                let ty = match col_def.col_type {
+                    Some(data_type) => {
                         // https://www.sqlite.org/datatype3.html
-                        let type_name = ty_str.to_uppercase();
+                        let mut type_name = data_type.name;
+                        type_name.make_ascii_uppercase();
                         if type_name.contains("INT") {
                             typename_exactly_integer = type_name == "INTEGER";
-                            (Type::Integer, ty_str)
+                            Type::Integer
                         } else if type_name.contains("CHAR")
                             || type_name.contains("CLOB")
                             || type_name.contains("TEXT")
                         {
-                            (Type::Text, ty_str)
-                        } else if type_name.contains("BLOB") {
-                            (Type::Blob, ty_str)
-                        } else if type_name.is_empty() {
-                            (Type::Blob, "".to_string())
+                            Type::Text
+                        } else if type_name.contains("BLOB") || type_name.is_empty() {
+                            Type::Blob
                         } else if type_name.contains("REAL")
                             || type_name.contains("FLOA")
                             || type_name.contains("DOUB")
                         {
-                            (Type::Real, ty_str)
+                            Type::Real
                         } else {
-                            (Type::Numeric, ty_str)
+                            Type::Numeric
                         }
                     }
-                    None => (Type::Null, "".to_string()),
+                    None => Type::Null,
                 };
 
                 let mut default = None;
