@@ -17,6 +17,8 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
     - name: Check formatting
       run: cargo fmt --check
+    - name: Check formatting (fuzz)
+      run: cd fuzz && cargo fmt --check
 
   build-native:
     strategy:

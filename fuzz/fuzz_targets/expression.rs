@@ -4,7 +4,7 @@ use std::{error::Error, num::NonZero, sync::Arc};
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::{fuzz_target, Corpus};
-use turso_core::{Value, IO as _};
+use turso_core::IO as _;
 
 macro_rules! str_enum {
     ($vis:vis enum $name:ident { $($variant:ident => $value:literal),*, }) => {
@@ -63,7 +63,7 @@ str_enum! {
     }
 }
 
-#[derive(Arbitrary, Debug, Clone)]
+#[derive(Arbitrary, Debug, Clone, PartialEq)]
 enum Value {
     Null,
     Integer(i64),
@@ -184,7 +184,7 @@ fn do_fuzz(expr: Expr) -> Result<Corpus, Box<dyn Error>> {
 
     let found = 'value: {
         let io = Arc::new(turso_core::MemoryIO::new());
-        let db = turso_core::Database::open_file(io.clone(), ":memory:", false)?;
+        let db = turso_core::Database::open_file(io.clone(), ":memory:", false, true)?;
         let conn = db.connect()?;
 
         let mut stmt = conn.prepare(sql)?;
@@ -206,7 +206,7 @@ fn do_fuzz(expr: Expr) -> Result<Corpus, Box<dyn Error>> {
     };
 
     assert_eq!(
-        Value::from(expected.clone()),
+        turso_core::Value::from(Value::from(expected.clone())),
         found.clone(),
         "with expression {:?}",
         expr,
