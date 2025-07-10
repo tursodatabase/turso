@@ -6,8 +6,8 @@ use crate::storage::header_accessor;
 use crate::storage::sqlite3_ondisk::{self, DatabaseHeader, PageContent, PageType};
 use crate::storage::wal::{CheckpointResult, Wal, WalFsyncStatus};
 use crate::types::CursorResult;
+use crate::Completion;
 use crate::{Buffer, Connection, LimboError, Result};
-use crate::{Completion, WalFile};
 use parking_lot::RwLock;
 use std::cell::{OnceCell, RefCell, UnsafeCell};
 use std::collections::HashSet;
@@ -191,7 +191,7 @@ pub enum AutoVacuumMode {
     Incremental,
 }
 
-pub const DB_STATE_UNITIALIZED: usize = 0;
+pub const DB_STATE_UNINITIALIZED: usize = 0;
 pub const DB_STATE_INITIALIZING: usize = 1;
 pub const DB_STATE_INITIALIZED: usize = 2;
 /// The pager interface implements the persistence layer by providing access
@@ -218,7 +218,7 @@ pub struct Pager {
     /// 0 -> Database is empty,
     /// 1 -> Database is being initialized,
     /// 2 -> Database is initialized and ready for use.
-    pub is_empty: Arc<AtomicUsize>,
+    pub db_state: Arc<AtomicUsize>,
     /// Mutex for synchronizing database initialization to prevent race conditions
     init_lock: Arc<Mutex<()>>,
     allocate_page1_state: RefCell<AllocatePage1State>,
@@ -265,10 +265,10 @@ impl Pager {
         io: Arc<dyn crate::io::IO>,
         page_cache: Arc<RwLock<DumbLruPageCache>>,
         buffer_pool: Arc<BufferPool>,
-        is_empty: Arc<AtomicUsize>,
+        db_state: Arc<AtomicUsize>,
         init_lock: Arc<Mutex<()>>,
     ) -> Result<Self> {
-        let allocate_page1_state = if is_empty.load(Ordering::SeqCst) < DB_STATE_INITIALIZED {
+        let allocate_page1_state = if db_state.load(Ordering::SeqCst) < DB_STATE_INITIALIZED {
             RefCell::new(AllocatePage1State::Start)
         } else {
             RefCell::new(AllocatePage1State::Done)
@@ -288,7 +288,7 @@ impl Pager {
             checkpoint_inflight: Rc::new(RefCell::new(0)),
             buffer_pool,
             auto_vacuum_mode: RefCell::new(AutoVacuumMode::None),
-            is_empty,
+            db_state,
             init_lock,
             allocate_page1_state,
             page_size: OnceCell::new(),
@@ -296,7 +296,7 @@ impl Pager {
         })
     }
 
-    pub fn set_wal(&mut self, wal: Rc<RefCell<WalFile>>) {
+    pub fn set_wal(&mut self, wal: Rc<RefCell<dyn Wal>>) {
         self.wal = wal;
     }
 
@@ -602,10 +602,10 @@ impl Pager {
 
     #[instrument(skip_all, level = Level::INFO)]
     fn maybe_allocate_page1(&self) -> Result<CursorResult<()>> {
-        if self.is_empty.load(Ordering::SeqCst) < DB_STATE_INITIALIZED {
+        if self.db_state.load(Ordering::SeqCst) < DB_STATE_INITIALIZED {
             if let Ok(_lock) = self.init_lock.try_lock() {
                 match (
-                    self.is_empty.load(Ordering::SeqCst),
+                    self.db_state.load(Ordering::SeqCst),
                     self.allocating_page1(),
                 ) {
                     // In case of being empty or (allocating and this connection is performing allocation) then allocate the first page
@@ -1050,7 +1050,7 @@ impl Pager {
         match state {
             AllocatePage1State::Start => {
                 tracing::trace!("allocate_page1(Start)");
-                self.is_empty.store(DB_STATE_INITIALIZING, Ordering::SeqCst);
+                self.db_state.store(DB_STATE_INITIALIZING, Ordering::SeqCst);
                 let mut default_header = DatabaseHeader::default();
                 default_header.database_size += 1;
                 let page = allocate_page(1, &self.buffer_pool, 0);
@@ -1099,7 +1099,7 @@ impl Pager {
                         e
                     ))
                 })?;
-                self.is_empty.store(DB_STATE_INITIALIZED, Ordering::SeqCst);
+                self.db_state.store(DB_STATE_INITIALIZED, Ordering::SeqCst);
                 self.allocate_page1_state.replace(AllocatePage1State::Done);
                 Ok(CursorResult::Ok(page1_ref.clone()))
             }

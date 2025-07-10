@@ -1113,4 +1113,8 @@ impl WalFileShared {
     pub fn page_size(&self) -> u32 {
         self.wal_header.lock().page_size
     }
+
+    pub fn set_page_size(&self, page_size: u32) {
+        self.wal_header.lock().page_size = page_size;
+    }
 }

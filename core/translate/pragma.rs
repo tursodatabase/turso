@@ -9,7 +9,7 @@ use turso_sqlite3_parser::ast::{PragmaName, QualifiedName};
 use crate::pragma::pragma_for;
 use crate::schema::Schema;
 use crate::storage::pager::AutoVacuumMode;
-use crate::storage::sqlite3_ondisk::MIN_PAGE_CACHE_SIZE;
+use crate::storage::sqlite3_ondisk::{is_valid_page_size, MIN_PAGE_CACHE_SIZE};
 use crate::storage::wal::CheckpointMode;
 use crate::translate::schema::translate_create_table;
 use crate::util::{normalize_ident, parse_signed_number, parse_string};
@@ -149,7 +149,13 @@ fn update_pragma(
             unreachable!();
         }
         PragmaName::PageSize => {
-            bail_parse_error!("Updating database page size is not supported.");
+            let page_size = match parse_signed_number(&value)? {
+                Value::Integer(size) => size,
+                Value::Float(size) => size as i64,
+                _ => bail_parse_error!("Invalid value for page size pragma"),
+            };
+            update_page_size(connection, page_size as u32)?;
+            Ok(program)
         }
         PragmaName::AutoVacuum => {
             let auto_vacuum_mode = match value {
@@ -513,4 +519,12 @@ fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
             constraints: vec![],
         },
     ]
+}
+fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate::Result<()> {
+    if !is_valid_page_size(page_size) {
+        return Ok(());
+    }
+
+    connection.reset_page_size(page_size)?;
+    Ok(())
 }

@@ -85,7 +85,7 @@ pub const MIN_PAGE_CACHE_SIZE: usize = 10;
 pub const MIN_PAGE_SIZE: u32 = 512;
 
 /// The maximum page size in bytes.
-const MAX_PAGE_SIZE: u32 = 65536;
+pub const MAX_PAGE_SIZE: u32 = 65536;
 
 /// The default page size in bytes.
 pub const DEFAULT_PAGE_SIZE: u16 = 4096;
@@ -281,7 +281,7 @@ impl Default for DatabaseHeader {
 
 impl DatabaseHeader {
     pub fn update_page_size(&mut self, size: u32) {
-        if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&size) || (size & (size - 1) != 0) {
+        if !is_valid_page_size(size) {
             return;
         }
 
@@ -299,6 +299,10 @@ impl DatabaseHeader {
             self.page_size as u32
         }
     }
+}
+
+pub fn is_valid_page_size(size: u32) -> bool {
+    (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&size) && (size & (size - 1)) == 0
 }
 
 pub fn write_header_to_buf(buf: &mut [u8], header: &DatabaseHeader) {
