@@ -7,7 +7,10 @@ use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::{Clock, Instant, OpenFlags, PlatformIO, Result, IO};
 
-use crate::{model::FAULT_ERROR_MSG, runner::file::SimulatorFile};
+use crate::{
+    model::FAULT_ERROR_MSG,
+    runner::{clock::SimulatorClock, file::SimulatorFile},
+};
 
 pub(crate) struct SimulatorIO {
     pub(crate) inner: Box<dyn IO>,
@@ -18,6 +21,7 @@ pub(crate) struct SimulatorIO {
     pub(crate) page_size: usize,
     seed: u64,
     latency_probability: usize,
+    clock: Arc<SimulatorClock>,
 }
 
 unsafe impl Send for SimulatorIO {}
@@ -30,6 +34,8 @@ impl SimulatorIO {
         let files = RefCell::new(Vec::new());
         let rng = RefCell::new(ChaCha8Rng::seed_from_u64(seed));
         let nr_run_once_faults = Cell::new(0);
+        let clock = SimulatorClock::new(ChaCha8Rng::seed_from_u64(seed));
+
         Ok(Self {
             inner,
             fault,
@@ -39,6 +45,7 @@ impl SimulatorIO {
             page_size,
             seed,
             latency_probability,
+            clock: Arc::new(clock),
         })
     }
 
@@ -59,11 +66,7 @@ impl SimulatorIO {
 
 impl Clock for SimulatorIO {
     fn now(&self) -> Instant {
-        let now = chrono::Local::now();
-        Instant {
-            secs: now.timestamp(),
-            micros: now.timestamp_subsec_micros(),
-        }
+        self.clock.now().into()
     }
 }
 
@@ -89,6 +92,7 @@ impl IO for SimulatorIO {
             latency_probability: self.latency_probability,
             sync_completion: RefCell::new(None),
             queued_io: RefCell::new(Vec::new()),
+            clock: self.clock.clone(),
         });
         self.files.borrow_mut().push(file.clone());
         Ok(file)
@@ -109,7 +113,7 @@ impl IO for SimulatorIO {
                 FAULT_ERROR_MSG.into(),
             ));
         }
-        let now = std::time::Instant::now();
+        let now = self.now();
         for file in self.files.borrow().iter() {
             file.run_queued_io(now)?;
         }

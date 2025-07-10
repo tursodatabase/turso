@@ -4,12 +4,13 @@ use std::{
     sync::Arc,
 };
 
+use chrono::{DateTime, Utc};
 use rand::Rng as _;
 use rand_chacha::ChaCha8Rng;
 use tracing::{instrument, Level};
 use turso_core::{File, Result};
 
-use crate::model::FAULT_ERROR_MSG;
+use crate::{model::FAULT_ERROR_MSG, runner::clock::SimulatorClock};
 pub(crate) struct SimulatorFile {
     pub(crate) inner: Arc<dyn File>,
     pub(crate) fault: Cell<bool>,
@@ -40,12 +41,13 @@ pub(crate) struct SimulatorFile {
 
     pub sync_completion: RefCell<Option<Arc<turso_core::Completion>>>,
     pub queued_io: RefCell<Vec<DelayedIo>>,
+    pub clock: Arc<SimulatorClock>,
 }
 
 type IoOperation = Box<dyn FnOnce(&SimulatorFile) -> Result<Arc<turso_core::Completion>>>;
 
 pub struct DelayedIo {
-    pub time: std::time::Instant,
+    pub time: turso_core::Instant,
     pub op: IoOperation,
 }
 
@@ -95,17 +97,19 @@ impl SimulatorFile {
     }
 
     #[instrument(skip_all, level = Level::TRACE)]
-    fn generate_latency_duration(&self) -> Option<std::time::Instant> {
+    fn generate_latency_duration(&self) -> Option<turso_core::Instant> {
         let mut rng = self.rng.borrow_mut();
         // Chance to introduce some latency
         rng.gen_bool(self.latency_probability as f64 / 100.0)
             .then(|| {
-                std::time::Instant::now() + std::time::Duration::from_millis(rng.gen_range(5..15))
+                let now: DateTime<Utc> = self.clock.now().into();
+                let sum = now + std::time::Duration::from_millis(rng.gen_range(5..20));
+                sum.into()
             })
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn run_queued_io(&self, now: std::time::Instant) -> Result<()> {
+    pub fn run_queued_io(&self, now: turso_core::Instant) -> Result<()> {
         let mut queued_io = self.queued_io.borrow_mut();
         // TODO: as we are not in version 1.87 we cannot use `extract_if`
         // so we have to do something different to achieve the same thing
