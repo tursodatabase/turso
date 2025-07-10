@@ -1,8 +1,8 @@
 mod cache;
 mod error;
-mod jsonb;
+pub(crate) mod jsonb;
 mod ops;
-mod path;
+pub(crate) mod path;
 
 use crate::json::error::Error as JsonError;
 pub use crate::json::ops::{
@@ -10,9 +10,9 @@ pub use crate::json::ops::{
     jsonb_replace,
 };
 use crate::json::path::{json_path, JsonPath, PathElement};
-use crate::types::{Text, TextSubtype, Value, ValueType};
+use crate::types::{RawSlice, Text, TextRef, TextSubtype, Value, ValueType};
 use crate::vdbe::Register;
-use crate::{bail_constraint_error, bail_parse_error, LimboError};
+use crate::{bail_constraint_error, bail_parse_error, LimboError, RefValue};
 pub use cache::JsonCacheCell;
 use jsonb::{ElementType, Jsonb, JsonbHeader, PathOperationMode, SearchOperation, SetOperation};
 use std::borrow::Cow;
@@ -26,7 +26,7 @@ pub enum Conv {
 }
 
 #[cfg(feature = "json")]
-enum OutputVariant {
+pub enum OutputVariant {
     ElementType,
     Binary,
     String,
@@ -100,9 +100,22 @@ pub fn json_from_raw_bytes_agg(data: &[u8], raw: bool) -> crate::Result<Value> {
     }
 }
 
-fn convert_dbtype_to_jsonb(val: &Value, strict: Conv) -> crate::Result<Jsonb> {
+pub fn convert_dbtype_to_jsonb(val: &Value, strict: Conv) -> crate::Result<Jsonb> {
+    convert_ref_dbtype_to_jsonb(
+        &match val {
+            Value::Null => RefValue::Null,
+            Value::Integer(x) => RefValue::Integer(*x),
+            Value::Float(x) => RefValue::Float(*x),
+            Value::Text(text) => RefValue::Text(TextRef::create_from(text.as_str().as_bytes())),
+            Value::Blob(items) => RefValue::Blob(RawSlice::create_from(&items)),
+        },
+        strict,
+    )
+}
+
+pub fn convert_ref_dbtype_to_jsonb(val: &RefValue, strict: Conv) -> crate::Result<Jsonb> {
     match val {
-        Value::Text(text) => {
+        RefValue::Text(text) => {
             let res = if text.subtype == TextSubtype::Json || matches!(strict, Conv::Strict) {
                 // Parse directly as JSON if it's already JSON subtype or strict mode is on
                 let json = if matches!(strict, Conv::ToString) {
@@ -125,20 +138,20 @@ fn convert_dbtype_to_jsonb(val: &Value, strict: Conv) -> crate::Result<Jsonb> {
             };
             res.map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
         }
-        Value::Blob(blob) => {
-            let json = Jsonb::from_raw_data(blob);
+        RefValue::Blob(blob) => {
+            let json = Jsonb::from_raw_data(blob.to_slice());
             json.is_valid()?;
             Ok(json)
         }
-        Value::Null => Ok(Jsonb::from_raw_data(
+        RefValue::Null => Ok(Jsonb::from_raw_data(
             JsonbHeader::make_null().into_bytes().as_bytes(),
         )),
-        Value::Float(float) => {
+        RefValue::Float(float) => {
             let mut buff = ryu::Buffer::new();
             Jsonb::from_str(buff.format(*float))
                 .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
         }
-        Value::Integer(int) => Jsonb::from_str(&int.to_string())
+        RefValue::Integer(int) => Jsonb::from_str(&int.to_string())
             .map_err(|_| LimboError::ParseError("malformed JSON".to_string())),
     }
 }
@@ -405,7 +418,7 @@ fn jsonb_extract_internal(value: Jsonb, paths: &[Register]) -> crate::Result<(Js
     Ok((result, ElementType::ARRAY))
 }
 
-fn json_string_to_db_type(
+pub fn json_string_to_db_type(
     json: Jsonb,
     element_type: ElementType,
     flag: OutputVariant,

@@ -834,3 +834,47 @@ fn test_cdc_independent_connections_different_cdc_not_ignore() {
         ]
     );
 }
+
+#[test]
+fn test_cdc_table_columns() {
+    let db = TempDatabase::new_empty(true);
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b, c UNIQUE)")
+        .unwrap();
+    let rows = limbo_exec_rows(&db, &conn, "SELECT table_columns_json_array('t')");
+    assert_eq!(
+        rows,
+        vec![vec![Value::Text(r#"["a","b","c"]"#.to_string())]]
+    );
+    conn.execute("ALTER TABLE t DROP COLUMN b").unwrap();
+    let rows = limbo_exec_rows(&db, &conn, "SELECT table_columns_json_array('t')");
+    assert_eq!(rows, vec![vec![Value::Text(r#"["a","c"]"#.to_string())]]);
+}
+
+#[test]
+fn test_cdc_bin_record() {
+    let db = TempDatabase::new_empty(true);
+    let conn = db.connect_limbo();
+    let record = record([
+        Value::Null,
+        Value::Integer(1),
+        Value::Real(3.1415),
+        Value::Text("hello".to_string()),
+    ]);
+    let mut record_hex = String::new();
+    for byte in record {
+        record_hex.push_str(&format!("{:02X}", byte));
+    }
+
+    let rows = limbo_exec_rows(
+        &db,
+        &conn,
+        &format!(r#"SELECT bin_record_json_object('["a","b","c","d"]', X'{record_hex}')"#),
+    );
+    assert_eq!(
+        rows,
+        vec![vec![Value::Text(
+            r#"{"a":null,"b":1,"c":3.1415,"d":"hello"}"#.to_string()
+        )]]
+    );
+}
