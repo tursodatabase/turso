@@ -101,6 +101,9 @@ pub mod offset {
 /// assumed that the database is corrupt.
 pub const BTCURSOR_MAX_DEPTH: usize = 20;
 
+/// Maximum number of sibling pages that balancing is performed on.
+pub const MAX_SIBLING_PAGES_TO_BALANCE: usize = 3;
+
 /// We only need maximum 5 pages to balance 3 pages, because we can guarantee that cells from 3 pages will fit in 5 pages.
 pub const MAX_NEW_PAGES_AFTER_BALANCE: usize = 5;
 
@@ -313,11 +316,11 @@ impl BTreeKey<'_> {
 #[derive(Clone)]
 struct BalanceInfo {
     /// Old pages being balanced. We can have maximum 3 pages being balanced at the same time.
-    pages_to_balance: [Option<BTreePage>; 3],
+    pages_to_balance: [Option<BTreePage>; MAX_SIBLING_PAGES_TO_BALANCE],
     /// Bookkeeping of the rightmost pointer so the offset::BTREE_RIGHTMOST_PTR can be updated.
     rightmost_pointer: *mut u8,
     /// Divider cells of old pages. We can have maximum 2 divider cells because of 3 pages.
-    divider_cells: [Option<Vec<u8>>; 2],
+    divider_cells: [Option<Vec<u8>>; MAX_SIBLING_PAGES_TO_BALANCE - 1],
     /// Number of siblings being used to balance
     sibling_count: usize,
     /// First divider cell to remove that marks the first sibling
@@ -2342,7 +2345,8 @@ impl BTreeCursor {
                     "expected index or table interior page"
                 );
                 // Part 1: Find the sibling pages to balance
-                let mut pages_to_balance: [Option<BTreePage>; 3] = [const { None }; 3];
+                let mut pages_to_balance: [Option<BTreePage>; MAX_SIBLING_PAGES_TO_BALANCE] =
+                    [const { None }; MAX_SIBLING_PAGES_TO_BALANCE];
                 let number_of_cells_in_parent =
                     parent_contents.cell_count() + parent_contents.overflow_cells.len();
 
@@ -2461,7 +2465,7 @@ impl BTreeCursor {
                     .replace(Some(BalanceInfo {
                         pages_to_balance,
                         rightmost_pointer: right_pointer,
-                        divider_cells: [const { None }; 2],
+                        divider_cells: [const { None }; MAX_SIBLING_PAGES_TO_BALANCE - 1],
                         sibling_count,
                         first_divider_cell: first_cell_divider,
                     }));
