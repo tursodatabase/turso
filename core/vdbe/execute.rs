@@ -4605,7 +4605,8 @@ pub fn op_idx_insert(
 #[derive(Debug)]
 pub enum OpNewRowidState {
     Start,
-    CheckingSequential,
+    SeekingToLast,
+    ReadingMaxRowid,
     GeneratingRandom { attempts: u32 },
     VerifyingCandidate { attempts: u32, candidate: i64 },
 }
@@ -4630,10 +4631,19 @@ pub fn op_new_rowid(
     loop {
         match &state.op_new_rowid_state {
             OpNewRowidState::Start => {
-                state.op_new_rowid_state = OpNewRowidState::CheckingSequential;
+                state.op_new_rowid_state = OpNewRowidState::SeekingToLast;
             }
 
-            OpNewRowidState::CheckingSequential => {
+            OpNewRowidState::SeekingToLast => {
+                {
+                    let mut cursor = state.get_cursor(*cursor);
+                    let cursor = cursor.as_btree_mut();
+                    return_if_io!(cursor.seek_to_last());
+                }
+                state.op_new_rowid_state = OpNewRowidState::ReadingMaxRowid;
+            }
+
+            OpNewRowidState::ReadingMaxRowid => {
                 let current_max = {
                     let mut cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut();
