@@ -808,8 +808,7 @@ impl Connection {
         let schema = Arc::make_mut(&mut *schema_ref);
         {
             let syms = self.syms.borrow();
-            if let Err(LimboError::ExtensionError(e)) =
-                parse_schema_rows(rows, schema, &syms, None)
+            if let Err(LimboError::ExtensionError(e)) = parse_schema_rows(rows, schema, &syms, None)
             {
                 // this means that a vtab exists and we no longer have the module loaded. we print
                 // a warning to the user to load the module
