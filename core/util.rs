@@ -42,10 +42,10 @@ pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 /// Unparsed index that comes from a sql query, i.e not an automatic index
 ///
 /// CREATE INDEX idx ON table_name(sql)
-struct UnparsedFromSqlIndex {
-    table_name: String,
-    root_page: usize,
-    sql: String,
+pub struct UnparsedFromSqlIndex {
+    pub table_name: String,
+    pub root_page: usize,
+    pub sql: String,
 }
 
 pub fn parse_schema_rows(
@@ -188,7 +188,7 @@ pub fn check_ident_equivalency(ident1: &str, ident2: &str) -> bool {
     strip_quotes(ident1).eq_ignore_ascii_case(strip_quotes(ident2))
 }
 
-fn module_name_from_sql(sql: &str) -> Result<&str> {
+pub fn module_name_from_sql(sql: &str) -> Result<&str> {
     if let Some(start) = sql.find("USING") {
         let start = start + 6;
         // stop at the first space, semicolon, or parenthesis
@@ -206,7 +206,7 @@ fn module_name_from_sql(sql: &str) -> Result<&str> {
 
 // CREATE VIRTUAL TABLE table_name USING module_name(arg1, arg2, ...);
 // CREATE VIRTUAL TABLE table_name USING module_name;
-fn module_args_from_sql(sql: &str) -> Result<Vec<turso_ext::Value>> {
+pub fn module_args_from_sql(sql: &str) -> Result<Vec<turso_ext::Value>> {
     if !sql.contains('(') {
         return Ok(vec![]);
     }

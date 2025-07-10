@@ -1,9 +1,15 @@
+use crate::result::LimboResult;
+use crate::storage::btree::BTreeCursor;
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::SelectPlan;
+use crate::types::CursorResult;
+use crate::util::{module_args_from_sql, module_name_from_sql, UnparsedFromSqlIndex};
 use crate::{util::normalize_ident, Result};
-use crate::{LimboError, VirtualTable};
+use crate::{LimboError, MvCursor, Pager, SymbolTable, VirtualTable};
 use core::fmt;
 use fallible_iterator::FallibleIterator;
+use std::cell::RefCell;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -133,6 +139,149 @@ impl Schema {
 
     pub fn indexes_enabled(&self) -> bool {
         self.indexes_enabled
+    }
+
+    /// Update [Schema] by scanning the first root page (sqlite_schema)
+    pub fn make_from_btree(
+        &mut self,
+        mv_cursor: Option<Rc<RefCell<MvCursor>>>,
+        pager: Rc<Pager>,
+        syms: &SymbolTable,
+    ) -> Result<()> {
+        let mut cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), 1);
+
+        let mut from_sql_indexes = Vec::with_capacity(10);
+        let mut automatic_indices: HashMap<String, Vec<(String, usize)>> =
+            HashMap::with_capacity(10);
+
+        match pager.begin_read_tx()? {
+            CursorResult::Ok(v) => {
+                if matches!(v, LimboResult::Busy) {
+                    return Err(LimboError::Busy);
+                }
+            }
+            CursorResult::IO => pager.io.run_once()?,
+        }
+
+        match cursor.rewind()? {
+            CursorResult::Ok(v) => v,
+            CursorResult::IO => pager.io.run_once()?,
+        };
+
+        loop {
+            let Some(row) = (loop {
+                match cursor.record()? {
+                    CursorResult::Ok(v) => break v,
+                    CursorResult::IO => pager.io.run_once()?,
+                }
+            }) else {
+                break;
+            };
+
+            let ty = row.get::<&str>(0)?;
+            match ty {
+                "table" => {
+                    let root_page = row.get::<i64>(3)?;
+                    let sql = row.get::<&str>(4)?;
+                    let create_virtual = "create virtual";
+                    if root_page == 0
+                        && sql[0..create_virtual.len()].eq_ignore_ascii_case(create_virtual)
+                    {
+                        let name: &str = row.get::<&str>(1)?;
+                        // a virtual table is found in the sqlite_schema, but it's no
+                        // longer in the in-memory schema. We need to recreate it if
+                        // the module is loaded in the symbol table.
+                        let vtab = if let Some(vtab) = syms.vtabs.get(name) {
+                            vtab.clone()
+                        } else {
+                            let mod_name = module_name_from_sql(sql)?;
+                            crate::VirtualTable::table(
+                                Some(name),
+                                mod_name,
+                                module_args_from_sql(sql)?,
+                                syms,
+                            )?
+                        };
+                        self.add_virtual_table(vtab);
+                        continue;
+                    }
+
+                    let table = BTreeTable::from_sql(sql, root_page as usize)?;
+                    self.add_btree_table(Rc::new(table));
+                }
+                "index" => {
+                    let root_page = row.get::<i64>(3)?;
+                    match row.get::<&str>(4) {
+                        Ok(sql) => {
+                            from_sql_indexes.push(UnparsedFromSqlIndex {
+                                table_name: row.get::<&str>(2)?.to_string(),
+                                root_page: root_page as usize,
+                                sql: sql.to_string(),
+                            });
+                        }
+                        _ => {
+                            // Automatic index on primary key and/or unique constraint, e.g.
+                            // table|foo|foo|2|CREATE TABLE foo (a text PRIMARY KEY, b)
+                            // index|sqlite_autoindex_foo_1|foo|3|
+                            let index_name = row.get::<&str>(1)?.to_string();
+                            let table_name = row.get::<&str>(2)?.to_string();
+                            let root_page = row.get::<i64>(3)?;
+                            match automatic_indices.entry(table_name) {
+                                Entry::Vacant(e) => {
+                                    e.insert(vec![(index_name, root_page as usize)]);
+                                }
+                                Entry::Occupied(mut e) => {
+                                    e.get_mut().push((index_name, root_page as usize));
+                                }
+                            };
+                        }
+                    }
+                }
+                _ => {}
+            };
+
+            drop(row);
+
+            match cursor.next()? {
+                CursorResult::IO => pager.io.run_once()?,
+                _ => {}
+            };
+        }
+
+        pager.end_read_tx()?;
+
+        for unparsed_sql_from_index in from_sql_indexes {
+            if !self.indexes_enabled() {
+                self.table_set_has_index(&unparsed_sql_from_index.table_name);
+            } else {
+                let table = self
+                    .get_btree_table(&unparsed_sql_from_index.table_name)
+                    .unwrap();
+                let index = Index::from_sql(
+                    &unparsed_sql_from_index.sql,
+                    unparsed_sql_from_index.root_page,
+                    table.as_ref(),
+                )?;
+                self.add_index(Arc::new(index));
+            }
+        }
+
+        for automatic_index in automatic_indices {
+            if !self.indexes_enabled() {
+                self.table_set_has_index(&automatic_index.0);
+            } else {
+                let table = self.get_btree_table(&automatic_index.0).unwrap();
+                let ret_index = Index::automatic_from_primary_key_and_unique(
+                    table.as_ref(),
+                    automatic_index.1,
+                )?;
+                for index in ret_index {
+                    self.add_index(Arc::new(index));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

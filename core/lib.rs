@@ -221,13 +221,15 @@ impl Database {
             let conn = db.connect()?;
             let schema_version = get_schema_version(&conn)?;
             schema.write().schema_version = schema_version;
-            let rows = conn.query("SELECT * FROM sqlite_schema")?;
+
             let mut schema = schema
                 .try_write()
                 .expect("lock on schema should succeed first try");
+
             let syms = conn.syms.borrow();
+
             if let Err(LimboError::ExtensionError(e)) =
-                parse_schema_rows(rows, &mut schema, &syms, None)
+                schema.make_from_btree(None, conn.pager.clone(), &syms)
             {
                 // this means that a vtab exists and we no longer have the module loaded. we print
                 // a warning to the user to load the module
