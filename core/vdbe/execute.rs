@@ -2682,28 +2682,9 @@ pub fn op_agg_step(
                 unreachable!();
             };
 
-            match (acc.as_mut(), col.get_owned_value()) {
-                (None, value) => {
-                    *acc = Some(value.clone());
-                }
-                (Some(Value::Integer(ref mut current_max)), Value::Integer(value)) => {
-                    if *value > *current_max {
-                        *current_max = *value;
-                    }
-                }
-                (Some(Value::Float(ref mut current_max)), Value::Float(value)) => {
-                    if *value > *current_max {
-                        *current_max = *value;
-                    }
-                }
-                (Some(Value::Text(ref mut current_max)), Value::Text(value)) => {
-                    if value.value > current_max.value {
-                        *current_max = value.clone();
-                    }
-                }
-                _ => {
-                    eprintln!("Unexpected types in max aggregation");
-                }
+            let new_value = col.get_owned_value();
+            if *new_value != Value::Null && acc.as_ref().map_or(true, |acc| new_value > acc) {
+                *acc = Some(new_value.clone());
             }
         }
         AggFunc::Min => {
@@ -2718,28 +2699,10 @@ pub fn op_agg_step(
                 unreachable!();
             };
 
-            match (acc.as_mut(), col.get_owned_value()) {
-                (None, value) => {
-                    *acc.borrow_mut() = Some(value.clone());
-                }
-                (Some(Value::Integer(ref mut current_min)), Value::Integer(value)) => {
-                    if *value < *current_min {
-                        *current_min = *value;
-                    }
-                }
-                (Some(Value::Float(ref mut current_min)), Value::Float(value)) => {
-                    if *value < *current_min {
-                        *current_min = *value;
-                    }
-                }
-                (Some(Value::Text(ref mut current_min)), Value::Text(text)) => {
-                    if text.value < current_min.value {
-                        *current_min = text.clone();
-                    }
-                }
-                _ => {
-                    eprintln!("Unexpected types in min aggregation");
-                }
+            let new_value = col.get_owned_value();
+
+            if *new_value != Value::Null && acc.as_ref().map_or(true, |acc| new_value < acc) {
+                *acc = Some(new_value.clone());
             }
         }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
