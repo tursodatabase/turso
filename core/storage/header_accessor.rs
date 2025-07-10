@@ -1,3 +1,4 @@
+use crate::storage::sqlite3_ondisk::MAX_PAGE_SIZE;
 use crate::{
     storage::{
         self,
@@ -124,7 +125,7 @@ macro_rules! impl_header_field_accessor {
 }
 
 // impl_header_field_accessor!(magic, [u8; 16], HEADER_OFFSET_MAGIC);
-impl_header_field_accessor!(page_size, u16, HEADER_OFFSET_PAGE_SIZE);
+impl_header_field_accessor!(page_size_, u16, HEADER_OFFSET_PAGE_SIZE);
 impl_header_field_accessor!(write_version, u8, HEADER_OFFSET_WRITE_VERSION);
 impl_header_field_accessor!(read_version, u8, HEADER_OFFSET_READ_VERSION);
 impl_header_field_accessor!(reserved_space, u8, HEADER_OFFSET_RESERVED_SPACE);
@@ -159,3 +160,20 @@ impl_header_field_accessor!(application_id, u32, HEADER_OFFSET_APPLICATION_ID);
 //impl_header_field_accessor!(reserved_for_expansion, [u8; 20], HEADER_OFFSET_RESERVED_FOR_EXPANSION);
 impl_header_field_accessor!(version_valid_for, u32, HEADER_OFFSET_VERSION_VALID_FOR);
 impl_header_field_accessor!(version_number, u32, HEADER_OFFSET_VERSION_NUMBER);
+
+pub fn get_page_size(pager: &Pager) -> Result<u32> {
+    let size = get_page_size_(pager)?;
+    if size == 1 {
+        return Ok(MAX_PAGE_SIZE);
+    }
+    Ok(size as u32)
+}
+
+pub fn set_page_size(pager: &Pager, value: u32) -> Result<()> {
+    let page_size = if value == MAX_PAGE_SIZE {
+        1
+    } else {
+        value as u16
+    };
+    set_page_size_(pager, page_size)
+}

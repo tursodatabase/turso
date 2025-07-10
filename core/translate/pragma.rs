@@ -362,8 +362,7 @@ fn query_pragma(
         }
         PragmaName::PageSize => {
             program.emit_int(
-                header_accessor::get_page_size(&pager)
-                    .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as i64,
+                header_accessor::get_page_size(&pager).unwrap_or(connection.get_page_size()) as i64,
                 register,
             );
             program.emit_result_row(register, 1);

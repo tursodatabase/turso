@@ -225,7 +225,7 @@ pub struct Pager {
     /// Cache page_size and reserved_space at Pager init and reuse for subsequent
     /// `usable_space` calls. TODO: Invalidate reserved_space when we add the functionality
     /// to change it.
-    page_size: OnceCell<u16>,
+    page_size: OnceCell<u32>,
     reserved_space: OnceCell<u8>,
 }
 

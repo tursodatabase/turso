@@ -88,7 +88,7 @@ pub const MIN_PAGE_SIZE: u32 = 512;
 pub const MAX_PAGE_SIZE: u32 = 65536;
 
 /// The default page size in bytes.
-pub const DEFAULT_PAGE_SIZE: u16 = 4096;
+pub const DEFAULT_PAGE_SIZE: u32 = 4096;
 
 pub const DATABASE_HEADER_PAGE_ID: usize = 1;
 
@@ -253,7 +253,7 @@ impl Default for DatabaseHeader {
     fn default() -> Self {
         Self {
             magic: *b"SQLite format 3\0",
-            page_size: DEFAULT_PAGE_SIZE,
+            page_size: DEFAULT_PAGE_SIZE as u16,
             write_version: 2,
             read_version: 2,
             reserved_space: 0,

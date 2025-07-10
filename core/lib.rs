@@ -243,7 +243,7 @@ impl Database {
         let pager = self.init_pager(None)?;
 
         let page_size = header_accessor::get_page_size(&pager)
-            .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as u32;
+            .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE);
         let default_cache_size = header_accessor::get_default_page_cache_size(&pager)
             .unwrap_or(storage::sqlite3_ondisk::DEFAULT_CACHE_SIZE);
 
@@ -322,8 +322,7 @@ impl Database {
             Some(size) => size as u32,
             None => {
                 let size = header_accessor::get_page_size(&pager)
-                    .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE)
-                    as u32;
+                    .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE);
                 buffer_pool.set_page_size(size as usize);
                 size
             }
