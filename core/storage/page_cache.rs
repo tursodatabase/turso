@@ -21,6 +21,7 @@ struct PageCacheEntry {
 pub struct DumbLruPageCache {
     capacity: usize,
     map: RefCell<PageHashMap>,
+    pub spill_threshold: usize,
     head: RefCell<Option<NonNull<PageCacheEntry>>>,
     tail: RefCell<Option<NonNull<PageCacheEntry>>>,
 }
@@ -62,9 +63,19 @@ impl DumbLruPageCache {
         Self {
             capacity,
             map: RefCell::new(PageHashMap::new(capacity)),
+            spill_threshold: 483, // Same as SQLite, TODO: see if it's calculated
             head: RefCell::new(None),
             tail: RefCell::new(None),
         }
+    }
+
+    pub fn set_spill_threshold(&mut self, threshold: i64, usable_space: usize) {
+        if threshold < 0 {
+            self.spill_threshold = ((-1024 * threshold) / usable_space as i64) as usize;
+            return;
+        }
+
+        self.spill_threshold = threshold as usize;
     }
 
     pub fn contains_key(&mut self, key: &PageCacheKey) -> bool {

@@ -1576,7 +1576,7 @@ pub fn insn_to_str(
             Insn::Int64 { dest, value } => (
                 "Int64",
                 0,
-                *out_reg as i32,
+                *dest as i64,
                 0,
                 Value::Integer(*value),
                 0,

@@ -58,6 +58,18 @@ impl SpillFlag {
     pub fn can_spill(&self) -> bool {
         self.contains(SpillFlag::NO_SYNC) || self.is_empty()
     }
+
+    pub fn is_off(&self) -> bool {
+        self.contains(SpillFlag::OFF)
+    }
+
+    pub fn disable(&mut self, toggle: bool) {
+        if toggle {
+            self.remove(SpillFlag::OFF);
+        } else {
+            *self = SpillFlag::OFF;
+        }
+    }
 }
 
 // Concurrency control of pages will be handled by the pager, we won't wrap Page with RwLock
@@ -291,7 +303,7 @@ pub struct Pager {
     /// The write-ahead log (WAL) for the database.
     wal: Rc<RefCell<dyn Wal>>,
     /// A page cache for the database.
-    page_cache: Arc<RwLock<DumbLruPageCache>>,
+    pub page_cache: Arc<RwLock<DumbLruPageCache>>,
     /// Buffer pool for temporary data storage.
     pub buffer_pool: Arc<BufferPool>,
     /// I/O interface for input/output operations.
@@ -315,7 +327,7 @@ pub struct Pager {
     /// to change it.
     page_size: OnceCell<u16>,
     reserved_space: OnceCell<u8>,
-    spill_flag: SpillFlag,
+    pub spill_flag: RefCell<SpillFlag>,
 
     #[cfg(test)]
     stats: PagerStats,
@@ -385,7 +397,7 @@ impl Pager {
             allocate_page1_state,
             page_size: OnceCell::new(),
             reserved_space: OnceCell::new(),
-            spill_flag: SpillFlag::empty(),
+            spill_flag: RefCell::new(SpillFlag::empty()),
             #[cfg(test)]
             stats: PagerStats::new(),
         })
@@ -800,7 +812,7 @@ impl Pager {
                 Ok(_) => {}
                 Err(CacheError::Full) => {
                     drop(page_cache);
-                    self.stress(page.clone())?;
+                    self.spill_dirty_pages()?;
                 }
                 Err(CacheError::KeyExists) => {
                     unreachable!("Page should not exist in cache after get() miss")
@@ -823,7 +835,10 @@ impl Pager {
         )?;
         match page_cache.insert(page_key, page.clone()) {
             Ok(_) => {}
-            Err(CacheError::Full) => return Err(LimboError::CacheFull),
+            Err(CacheError::Full) => {
+                drop(page_cache);
+                self.spill_dirty_pages()?;
+            }
             Err(CacheError::KeyExists) => {
                 unreachable!("Page should not exist in cache after get() miss")
             }
@@ -1246,7 +1261,7 @@ impl Pager {
                     Ok(_) => (),
                     Err(CacheError::Full) => {
                         drop(cache);
-                        self.stress(page)?;
+                        self.spill_dirty_pages()?;
                     }
                     Err(_) => {
                         return Err(LimboError::InternalError(
@@ -1273,7 +1288,7 @@ impl Pager {
             match cache.insert(page_key, page.clone()) {
                 Err(CacheError::Full) => {
                     drop(cache);
-                    self.stress(page.clone())?;
+                    self.spill_dirty_pages()?;
                     Ok(page)
                 }
                 Err(_) => Err(LimboError::InternalError(
@@ -1332,34 +1347,41 @@ impl Pager {
         Ok(())
     }
 
-    // TODO: find better name for this, use as a callback like SQLite?
-    /// This function is called by the cache layer when it has reached some soft memory limit.
-    /// The pager must be purgeable (not in-memory)
-    pub fn stress(&self, page: PageRef) -> Result<()> {
-        assert!(page.is_dirty());
-        tracing::trace!("Stressing page {}", page.get().id);
-
-        // todo: improve error handling
-        if !self.spill_flag.can_spill() {
+    /// Spill dirty pages to WAL.
+    /// This function should be called when it has reached some soft memory limit.
+    pub fn spill_dirty_pages(&self) -> Result<()> {
+        if !self.spill_flag.borrow().can_spill() {
             return Err(LimboError::SpillNotAllowed);
         }
 
+        tracing::trace!("spill_dirty_pages()");
         #[cfg(test)]
         {
             self.stats.spill();
         }
 
-        tracing::trace!("Getting database size");
-        let db_size = header_accessor::get_database_size(self)?;
-        tracing::trace!("Database size is: {}", db_size);
-        self.wal.borrow_mut().append_frame(
-            page.clone(),
-            db_size,
-            self.flush_info.borrow().in_flight_writes.clone(),
-        )?;
+        {
+            let page_cache = self.page_cache.read();
+            for page_id in self.dirty_pages.borrow().iter() {
+                let page = match page_cache.get(&PageCacheKey(*page_id)) {
+                    Some(page) => page,
+                    None => break,
+                };
+
+                self.wal.borrow_mut().append_frame(
+                    page,
+                    0,
+                    self.flush_info.borrow().in_flight_writes.clone(),
+                )?;
+            }
+        }
 
         page.clear_dirty();
         Ok(())
+    }
+
+    pub fn disable_cache_spill(&self, toggle: bool) {
+        self.spill_flag.borrow_mut().disable(toggle);
     }
 }
 
