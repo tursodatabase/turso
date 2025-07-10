@@ -2567,28 +2567,8 @@ pub fn op_agg_step(
             AggFunc::Count | AggFunc::Count0 => {
                 Register::Aggregate(AggContext::Count(Value::Integer(0)))
             }
-            AggFunc::Max => {
-                let col = state.registers[*col].get_owned_value();
-                match col {
-                    Value::Integer(_) => Register::Aggregate(AggContext::Max(None)),
-                    Value::Float(_) => Register::Aggregate(AggContext::Max(None)),
-                    Value::Text(_) => Register::Aggregate(AggContext::Max(None)),
-                    _ => {
-                        unreachable!();
-                    }
-                }
-            }
-            AggFunc::Min => {
-                let col = state.registers[*col].get_owned_value();
-                match col {
-                    Value::Integer(_) => Register::Aggregate(AggContext::Min(None)),
-                    Value::Float(_) => Register::Aggregate(AggContext::Min(None)),
-                    Value::Text(_) => Register::Aggregate(AggContext::Min(None)),
-                    _ => {
-                        unreachable!();
-                    }
-                }
-            }
+            AggFunc::Max => Register::Aggregate(AggContext::Max(None)),
+            AggFunc::Min => Register::Aggregate(AggContext::Min(None)),
             AggFunc::GroupConcat | AggFunc::StringAgg => {
                 Register::Aggregate(AggContext::GroupConcat(Value::build_text("")))
             }
