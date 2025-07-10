@@ -7,7 +7,8 @@ use crate::{
         pager::{BtreePageAllocMode, Pager},
         sqlite3_ondisk::{
             read_u32, read_varint, BTreeCell, PageContent, PageType, TableInteriorCell,
-            TableLeafCell,
+            TableLeafCell, CELL_PTR_SIZE_BYTES, INTERIOR_PAGE_HEADER_SIZE_BYTES,
+            LEAF_PAGE_HEADER_SIZE_BYTES, LEFT_CHILD_PTR_SIZE_BYTES,
         },
     },
     translate::{collate::CollationSeq, plan::IterationDirection},
@@ -2598,12 +2599,16 @@ impl BTreeCursor {
                         if !is_leaf {
                             // This divider cell needs to be updated with new left pointer,
                             let right_pointer = old_page_contents.rightmost_pointer().unwrap();
-                            divider_cell[..4].copy_from_slice(&right_pointer.to_be_bytes());
+                            divider_cell[..LEFT_CHILD_PTR_SIZE_BYTES]
+                                .copy_from_slice(&right_pointer.to_be_bytes());
                         } else {
                             // index leaf
-                            turso_assert!(divider_cell.len() >= 4, "divider cell is too short");
+                            turso_assert!(
+                                divider_cell.len() >= LEFT_CHILD_PTR_SIZE_BYTES,
+                                "divider cell is too short"
+                            );
                             // let's strip the page pointer
-                            divider_cell = &mut divider_cell[4..];
+                            divider_cell = &mut divider_cell[LEFT_CHILD_PTR_SIZE_BYTES..];
                         }
                         cell_array.cell_payloads.push(to_static_buf(divider_cell));
                     }
@@ -2633,10 +2638,14 @@ impl BTreeCursor {
 
                 /* 3. Initiliaze current size of every page including overflow cells and divider cells that might be included. */
                 let mut new_page_sizes: [i64; 5] = [0; 5];
-                let leaf_correction = if is_leaf { 4 } else { 0 };
+                let header_size = if is_leaf {
+                    LEAF_PAGE_HEADER_SIZE_BYTES
+                } else {
+                    INTERIOR_PAGE_HEADER_SIZE_BYTES
+                };
                 // number of bytes beyond header, different from global usableSapce which includes
                 // header
-                let usable_space = self.usable_space() - 12 + leaf_correction;
+                let usable_space = self.usable_space() - header_size;
                 for i in 0..balance_info.sibling_count {
                     cell_array.cell_count_per_page_cumulative[i] =
                         old_cell_count_per_page_cumulative[i];
@@ -2695,8 +2704,9 @@ impl BTreeCursor {
                             {
                                 // This means we move to the right page the divider cell and we
                                 // promote left cell to divider
-                                2 + cell_array.cell_payloads[cell_array.cell_count_up_to_page(i)]
-                                    .len() as i64
+                                CELL_PTR_SIZE_BYTES as i64
+                                    + cell_array.cell_payloads[cell_array.cell_count_up_to_page(i)]
+                                        .len() as i64
                             } else {
                                 0
                             }
@@ -2711,8 +2721,8 @@ impl BTreeCursor {
                     while cell_array.cell_count_per_page_cumulative[i]
                         < cell_array.cell_payloads.len() as u16
                     {
-                        let size_of_cell_to_remove_from_right =
-                            2 + cell_array.cell_payloads[cell_array.cell_count_up_to_page(i)].len()
+                        let size_of_cell_to_remove_from_right = CELL_PTR_SIZE_BYTES as i64
+                            + cell_array.cell_payloads[cell_array.cell_count_up_to_page(i)].len()
                                 as i64;
                         let can_take = new_page_sizes[i] + size_of_cell_to_remove_from_right
                             > usable_space as i64;
@@ -2726,8 +2736,9 @@ impl BTreeCursor {
                             if cell_array.cell_count_per_page_cumulative[i]
                                 < cell_array.cell_payloads.len() as u16
                             {
-                                2 + cell_array.cell_payloads[cell_array.cell_count_up_to_page(i)]
-                                    .len() as i64
+                                CELL_PTR_SIZE_BYTES as i64
+                                    + cell_array.cell_payloads[cell_array.cell_count_up_to_page(i)]
+                                        .len() as i64
                             } else {
                                 0
                             }
@@ -2837,15 +2848,20 @@ impl BTreeCursor {
                             cell_array.cell_size_bytes(cell_right as usize) as i64;
                         // TODO: add assert nMaxCells
 
-                        let pointer_size = if i == sibling_count_new - 1 { 0 } else { 2 };
-                        let would_not_improve_balance = size_right_page + cell_right_size + 2
-                            > size_left_page - (cell_left_size + pointer_size);
+                        let pointer_size = if i == sibling_count_new - 1 {
+                            0
+                        } else {
+                            CELL_PTR_SIZE_BYTES as i64
+                        };
+                        let would_not_improve_balance =
+                            size_right_page + cell_right_size + (CELL_PTR_SIZE_BYTES as i64)
+                                > size_left_page - (cell_left_size + pointer_size);
                         if size_right_page != 0 && would_not_improve_balance {
                             break;
                         }
 
-                        size_left_page -= cell_left_size + 2;
-                        size_right_page += cell_right_size + 2;
+                        size_left_page -= cell_left_size + (CELL_PTR_SIZE_BYTES as i64);
+                        size_right_page += cell_right_size + (CELL_PTR_SIZE_BYTES as i64);
                         cell_array.cell_count_per_page_cumulative[i - 1] = cell_left;
 
                         if cell_left == 0 {
@@ -3018,7 +3034,7 @@ impl BTreeCursor {
                         new_divider_cell.extend_from_slice(divider_cell);
                     }
 
-                    let left_pointer = read_u32(&new_divider_cell[..4], 0);
+                    let left_pointer = read_u32(&new_divider_cell[..LEFT_CHILD_PTR_SIZE_BYTES], 0);
                     turso_assert!(
                         left_pointer != parent_page.get().id as u32,
                         "left pointer is the same as parent page id"
@@ -6012,8 +6028,7 @@ fn insert_into_cell(
         page.cell_count()
     );
     let free = compute_free_space(page, usable_space);
-    const CELL_POINTER_SIZE_BYTES: usize = 2;
-    let enough_space = payload.len() + CELL_POINTER_SIZE_BYTES <= free as usize;
+    let enough_space = payload.len() + CELL_PTR_SIZE_BYTES <= free as usize;
     if !enough_space {
         // add to overflow cell
         page.overflow_cells.push(OverflowCell {
@@ -6038,15 +6053,15 @@ fn insert_into_cell(
         .copy_from_slice(payload);
     //  memmove(pIns+2, pIns, 2*(pPage->nCell - i));
     let (cell_pointer_array_start, _) = page.cell_pointer_array_offset_and_size();
-    let cell_pointer_cur_idx = cell_pointer_array_start + (CELL_POINTER_SIZE_BYTES * cell_idx);
+    let cell_pointer_cur_idx = cell_pointer_array_start + (CELL_PTR_SIZE_BYTES * cell_idx);
 
-    // move existing pointers forward by CELL_POINTER_SIZE_BYTES...
+    // move existing pointers forward by CELL_PTR_SIZE_BYTES...
     let n_cells_forward = page.cell_count() - cell_idx;
-    let n_bytes_forward = CELL_POINTER_SIZE_BYTES * n_cells_forward;
+    let n_bytes_forward = CELL_PTR_SIZE_BYTES * n_cells_forward;
     if n_bytes_forward > 0 {
         buf.copy_within(
             cell_pointer_cur_idx..cell_pointer_cur_idx + n_bytes_forward,
-            cell_pointer_cur_idx + CELL_POINTER_SIZE_BYTES,
+            cell_pointer_cur_idx + CELL_PTR_SIZE_BYTES,
         );
     }
     // ...and insert new cell pointer at the current index
