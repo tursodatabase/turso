@@ -3,7 +3,7 @@ use crate::common::{compare_string, do_flush, TempDatabase};
 use log::debug;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
-use turso_core::{Connection, Database, Row, Statement, StepResult, Value};
+use turso_core::{Connection, Database, LimboError, Row, Statement, StepResult, Value};
 
 const WAL_HEADER_SIZE: usize = 32;
 const WAL_FRAME_HEADER_SIZE: usize = 24;
@@ -691,7 +691,7 @@ fn test_wal_bad_frame() -> anyhow::Result<()> {
         db_path
     };
     {
-        let result = std::panic::catch_unwind(|| {
+        let result = {
             let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
             let db = Database::open_file_with_flags(
                 io.clone(),
@@ -711,20 +711,21 @@ fn test_wal_bad_frame() -> anyhow::Result<()> {
                 let x = row.get::<i64>(0).unwrap();
                 assert_eq!(x, 0);
             })
-        });
+        };
 
         match result {
-            Err(panic_info) => {
-                let panic_msg = panic_info
-                    .downcast_ref::<String>()
-                    .map(|s| s.as_str())
-                    .or_else(|| panic_info.downcast_ref::<&str>().copied())
-                    .unwrap_or("Unknown panic message");
+            Err(error) => {
+                dbg!(&error);
+                let panic_msg = error.downcast_ref::<LimboError>().unwrap();
+                let msg = match panic_msg {
+                    LimboError::ParseError(message) => message,
+                    _ => panic!("Unexpected panic message: {}", panic_msg),
+                };
 
                 assert!(
-                    panic_msg.contains("WAL frame checksum mismatch."),
+                    msg.contains("Table t2 not found"),
                     "Expected panic message not found. Got: {}",
-                    panic_msg
+                    msg
                 );
             }
             Ok(_) => panic!("Expected query to panic, but it succeeded"),
@@ -753,8 +754,8 @@ fn run_query_core(
     query: &str,
     mut on_row: Option<impl FnMut(&Row)>,
 ) -> anyhow::Result<()> {
-    match conn.query(query) {
-        Ok(Some(ref mut rows)) => loop {
+    if let Some(ref mut rows) = conn.query(query)? {
+        loop {
             match rows.step()? {
                 StepResult::IO => {
                     rows.run_once()?;
@@ -768,10 +769,6 @@ fn run_query_core(
                 }
                 _ => unreachable!(),
             }
-        },
-        Ok(None) => {}
-        Err(err) => {
-            eprintln!("{}", err);
         }
     };
     Ok(())
