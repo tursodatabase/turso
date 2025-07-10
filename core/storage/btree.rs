@@ -3232,7 +3232,7 @@ impl BTreeCursor {
                     is_table_leaf,
                     cells_debug,
                     sibling_count_new,
-                    rightmost_pointer,
+                    right_page_id,
                 );
 
                 // We have to free pages that are not used anymore
@@ -3303,7 +3303,7 @@ impl BTreeCursor {
         leaf_data: bool,
         mut cells_debug: Vec<Vec<u8>>,
         sibling_count_new: usize,
-        rightmost_pointer: &mut [u8],
+        right_page_id: u32,
     ) {
         let mut valid = true;
         let mut current_index_cell = 0;
@@ -3416,7 +3416,6 @@ impl BTreeCursor {
             if sibling_count_new == 0 {
                 // Balance-shallower case
                 // We need to check data in parent page
-                let rightmost = read_u32(rightmost_pointer, 0);
                 debug_validate_cells!(parent_contents, self.usable_space() as u16);
 
                 if pages_to_balance_new[0].is_none() {
@@ -3455,32 +3454,32 @@ impl BTreeCursor {
                     valid = false;
                 }
 
-                if rightmost == page.get().id as u32
-                    || rightmost == parent_page.get().get().id as u32
+                if right_page_id == page.get().id as u32
+                    || right_page_id == parent_page.get().get().id as u32
                 {
                     tracing::error!("balance_non_root(balance_shallower_rightmost_pointer, page_id={}, parent_page_id={}, rightmost={})",
                         page.get().id,
                         parent_page.get().get().id,
-                        rightmost,
+                        right_page_id,
                     );
                     valid = false;
                 }
 
                 if let Some(rm) = contents.rightmost_pointer() {
-                    if rm != rightmost {
+                    if rm != right_page_id {
                         tracing::error!("balance_non_root(balance_shallower_rightmost_pointer, page_rightmost={}, rightmost={})",
                             rm,
-                            rightmost,
+                            right_page_id,
                         );
                         valid = false;
                     }
                 }
 
                 if let Some(rm) = parent_contents.rightmost_pointer() {
-                    if rm != rightmost {
+                    if rm != right_page_id {
                         tracing::error!("balance_non_root(balance_shallower_rightmost_pointer, parent_rightmost={}, rightmost={})",
                             rm,
-                            rightmost,
+                            right_page_id,
                         );
                         valid = false;
                     }
@@ -3521,15 +3520,14 @@ impl BTreeCursor {
                 // We will only validate rightmost pointer of parent page, we will not validate rightmost if it's a cell and not the last pointer because,
                 // insert cell could've defragmented the page and invalidated the pointer.
                 // right pointer, we just check right pointer points to this page.
-                if cell_divider_idx == parent_contents.cell_count() {
-                    let rightmost = read_u32(rightmost_pointer, 0);
-                    if rightmost != page.get().id as u32 {
-                        tracing::error!("balance_non_root(cell_divider_right_pointer, should point to {}, but points to {})",
+                if cell_divider_idx == parent_contents.cell_count()
+                    && right_page_id != page.get().id as u32
+                {
+                    tracing::error!("balance_non_root(cell_divider_right_pointer, should point to {}, but points to {})",
                         page.get().id,
-                        rightmost
+                        right_page_id
                     );
-                        valid = false;
-                    }
+                    valid = false;
                 }
             } else {
                 // divider cell might be an overflow cell
