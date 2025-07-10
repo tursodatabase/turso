@@ -2513,7 +2513,8 @@ impl BTreeCursor {
 
                     // Right pointer is not dropped, we simply update it at the end. This could be a divider cell that points
                     // to the last page in the list of pages to balance or this could be the rightmost pointer that points to a page.
-                    if i == balance_info.sibling_count - 1 {
+                    let is_last_sibling = i == balance_info.sibling_count - 1;
+                    if is_last_sibling {
                         continue;
                     }
                     // Since we know we have a left sibling, take the divider that points to left sibling of this page
@@ -2595,7 +2596,8 @@ impl BTreeCursor {
                     let mut cells_inserted =
                         old_page_contents.cell_count() + old_page_contents.overflow_cells.len();
 
-                    if i < balance_info.sibling_count - 1 && !is_table_leaf {
+                    let is_last_sibling = i == balance_info.sibling_count - 1;
+                    if !is_last_sibling && !is_table_leaf {
                         // If we are a index page or a interior table page we need to take the divider cell too.
                         // But we don't need the last divider as it will remain the same.
                         let mut divider_cell = balance_info.divider_cell_payloads[i]
@@ -2669,7 +2671,8 @@ impl BTreeCursor {
                         // 2 to account of pointer
                         new_page_sizes[i] += 2 + overflow.payload.len() as i64;
                     }
-                    if !is_leaf && i < balance_info.sibling_count - 1 {
+                    let is_last_sibling = i == balance_info.sibling_count - 1;
+                    if !is_leaf && !is_last_sibling {
                         // Account for divider cell which is included in this page.
                         new_page_sizes[i] += cell_array.cell_payloads
                             [cell_array.cell_count_up_to_page(i)]
@@ -2982,7 +2985,8 @@ impl BTreeCursor {
                 // that was originally on that place.
                 let is_leaf_page = matches!(page_type, PageType::TableLeaf | PageType::IndexLeaf);
                 if !is_leaf_page {
-                    let last_page = balance_info.pages_to_balance[balance_info.sibling_count - 1]
+                    let last_sibling_idx = balance_info.sibling_count - 1;
+                    let last_page = balance_info.pages_to_balance[last_sibling_idx]
                         .as_ref()
                         .unwrap();
                     let right_pointer = last_page.get().get_contents().rightmost_pointer().unwrap();
@@ -3599,7 +3603,8 @@ impl BTreeCursor {
                 if leaf_data {
                     // If we are in a table leaf page, we just need to check that this cell that should be a divider cell is in the parent
                     // This means we already check cell in leaf pages but not on parent so we don't advance current_index_cell
-                    if page_idx >= balance_info.sibling_count - 1 {
+                    let last_sibling_idx = balance_info.sibling_count - 1;
+                    if page_idx >= last_sibling_idx {
                         // This means we are in the last page and we don't need to check anything
                         continue;
                     }
