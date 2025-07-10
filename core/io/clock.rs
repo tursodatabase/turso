@@ -13,8 +13,6 @@ impl<T: chrono::TimeZone> From<chrono::DateTime<T>> for Instant {
     }
 }
 
-
-
 pub trait Clock {
     fn now(&self) -> Instant;
 }

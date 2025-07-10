@@ -4,7 +4,6 @@ use std::{
     sync::Arc,
 };
 
-use chrono::{DateTime, Utc};
 use rand::Rng as _;
 use rand_chacha::ChaCha8Rng;
 use tracing::{instrument, Level};
@@ -102,7 +101,7 @@ impl SimulatorFile {
         // Chance to introduce some latency
         rng.gen_bool(self.latency_probability as f64 / 100.0)
             .then(|| {
-                let now: DateTime<Utc> = self.clock.now().into();
+                let now = self.clock.now();
                 let sum = now + std::time::Duration::from_millis(rng.gen_range(5..20));
                 sum.into()
             })

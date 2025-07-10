@@ -12,7 +12,7 @@ pub struct SimulatorClock {
 
 impl SimulatorClock {
     const MIN_TICK: u64 = 1;
-    const MAX_TICK: u64 = 50;
+    const MAX_TICK: u64 = 30;
 
     pub fn new(rng: ChaCha8Rng) -> Self {
         Self {
@@ -28,7 +28,7 @@ impl SimulatorClock {
             .borrow_mut()
             .gen_range(Self::MIN_TICK..Self::MAX_TICK);
         let nanos = std::time::Duration::from_micros(nanos);
-        *time = *time + nanos;
+        *time += nanos;
         *time
     }
 }
