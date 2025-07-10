@@ -118,7 +118,6 @@ pub fn translate_insert(
     let loop_start_label = program.allocate_label();
 
     let cdc_table = program.capture_data_changes_mode().table();
-    let cdc_has_after = program.capture_data_changes_mode().has_after();
     let cdc_table = if let Some(cdc_table) = cdc_table {
         if table.get_name() != cdc_table {
             let Some(turso_cdc_table) = schema.get_table(cdc_table) else {
@@ -566,6 +565,7 @@ pub fn translate_insert(
 
     // Write record to the turso_cdc table if necessary
     if let Some((cdc_cursor_id, _)) = &cdc_table {
+        let cdc_has_after = program.capture_data_changes_mode().has_after();
         let after_record_reg = if cdc_has_after {
             Some(record_register)
         } else {
