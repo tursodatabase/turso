@@ -479,10 +479,7 @@ impl Property {
                 vec![assumption, select1, select2, assertion]
             }
             Property::FsyncNoWait { query, tables } => {
-                let mut total_tables = HashSet::with_capacity(tables.len());
-                total_tables.extend(query.uses());
-                total_tables.extend(tables.clone());
-                let iter = total_tables.iter().map(|s| s.as_str());
+                let iter = tables.iter().map(|s| s.as_str());
                 let checks = assert_all_table_values(iter);
                 Vec::from_iter(
                     std::iter::once(Interaction::FsyncQuery(query.clone())).chain(checks),
