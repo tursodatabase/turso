@@ -211,15 +211,20 @@ impl File for SimulatorFile {
         }
         let c = if let Some(latency) = self.generate_latency_duration() {
             let cloned_c = c.clone();
-            let op = Box::new(|file: &SimulatorFile| file.inner.sync(cloned_c));
+            let op = Box::new(|file: &SimulatorFile| -> Result<_> {
+                let c = file.inner.sync(cloned_c)?;
+                *file.sync_completion.borrow_mut() = Some(c.clone());
+                Ok(c)
+            });
             self.queued_io
                 .borrow_mut()
                 .push(DelayedIo { time: latency, op });
-            Ok(c)
+            c
         } else {
-            self.inner.sync(c)
-        }?;
-        *self.sync_completion.borrow_mut() = Some(c.clone());
+            let c = self.inner.sync(c)?;
+            *self.sync_completion.borrow_mut() = Some(c.clone());
+            c
+        };
         Ok(c)
     }
 
