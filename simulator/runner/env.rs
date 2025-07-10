@@ -129,8 +129,16 @@ impl SimulatorEnv {
             experimental_indexes: cli_opts.experimental_indexes,
         };
 
-        let io =
-            Arc::new(SimulatorIO::new(seed, opts.page_size, cli_opts.latency_probability).unwrap());
+        let io = Arc::new(
+            SimulatorIO::new(
+                seed,
+                opts.page_size,
+                cli_opts.latency_probability,
+                cli_opts.min_tick,
+                cli_opts.max_tick,
+            )
+            .unwrap(),
+        );
 
         // Remove existing database file if it exists
         if db_path.exists() {

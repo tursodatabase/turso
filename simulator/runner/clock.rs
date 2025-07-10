@@ -8,16 +8,17 @@ use rand_chacha::ChaCha8Rng;
 pub struct SimulatorClock {
     curr_time: RefCell<DateTime<Utc>>,
     rng: RefCell<ChaCha8Rng>,
+    min_tick: u64,
+    max_tick: u64,
 }
 
 impl SimulatorClock {
-    const MIN_TICK: u64 = 1;
-    const MAX_TICK: u64 = 30;
-
-    pub fn new(rng: ChaCha8Rng) -> Self {
+    pub fn new(rng: ChaCha8Rng, min_tick: u64, max_tick: u64) -> Self {
         Self {
             curr_time: RefCell::new(Utc::now()),
             rng: RefCell::new(rng),
+            min_tick,
+            max_tick,
         }
     }
 
@@ -26,7 +27,7 @@ impl SimulatorClock {
         let nanos = self
             .rng
             .borrow_mut()
-            .gen_range(Self::MIN_TICK..Self::MAX_TICK);
+            .gen_range(self.min_tick..self.max_tick);
         let nanos = std::time::Duration::from_micros(nanos);
         *time += nanos;
         *time

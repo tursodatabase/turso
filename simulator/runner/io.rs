@@ -28,13 +28,19 @@ unsafe impl Send for SimulatorIO {}
 unsafe impl Sync for SimulatorIO {}
 
 impl SimulatorIO {
-    pub(crate) fn new(seed: u64, page_size: usize, latency_probability: usize) -> Result<Self> {
+    pub(crate) fn new(
+        seed: u64,
+        page_size: usize,
+        latency_probability: usize,
+        min_tick: u64,
+        max_tick: u64,
+    ) -> Result<Self> {
         let inner = Box::new(PlatformIO::new()?);
         let fault = Cell::new(false);
         let files = RefCell::new(Vec::new());
         let rng = RefCell::new(ChaCha8Rng::seed_from_u64(seed));
         let nr_run_once_faults = Cell::new(0);
-        let clock = SimulatorClock::new(ChaCha8Rng::seed_from_u64(seed));
+        let clock = SimulatorClock::new(ChaCha8Rng::seed_from_u64(seed), min_tick, max_tick);
 
         Ok(Self {
             inner,
