@@ -28,6 +28,7 @@ use crate::{
     },
 };
 use std::ops::DerefMut;
+use std::str::FromStr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 use std::{borrow::BorrowMut, rc::Rc, sync::Arc};
@@ -79,8 +80,8 @@ use std::{cell::RefCell, collections::HashMap};
 
 #[cfg(feature = "json")]
 use crate::{
-    function::JsonFunc, json::convert_dbtype_to_raw_jsonb, json::get_json, json::is_json_valid,
-    json::json_array, json::json_array_length, json::json_arrow_extract,
+    function::JsonFunc, json, json::convert_dbtype_to_raw_jsonb, json::get_json,
+    json::is_json_valid, json::json_array, json::json_array_length, json::json_arrow_extract,
     json::json_arrow_shift_extract, json::json_error_position, json::json_extract,
     json::json_from_raw_bytes_agg, json::json_insert, json::json_object, json::json_patch,
     json::json_quote, json::json_remove, json::json_replace, json::json_set, json::json_type,
@@ -4039,6 +4040,105 @@ pub fn op_function(
                     .get_owned_value()
                     .exec_likelihood(probability.get_owned_value());
                 state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::TableColumnsJsonArray => {
+                assert_eq!(arg_count, 1);
+                let table = state.registers[*start_reg].get_owned_value();
+                let Value::Text(table) = table else {
+                    return Err(LimboError::InvalidArgument(
+                        "table_columns_json_array: function argument must be of type TEXT"
+                            .to_string(),
+                    ));
+                };
+                let table = {
+                    let schema = program.connection.schema.borrow();
+                    match schema.get_table(table.as_str()) {
+                        Some(table) => table,
+                        None => {
+                            return Err(LimboError::InvalidArgument(format!(
+                                "table_columns_json_array: table {} doesn't exists",
+                                table
+                            )))
+                        }
+                    }
+                };
+
+                let mut json = json::jsonb::Jsonb::make_empty_array(table.columns().len() * 10);
+                for column in table.columns() {
+                    let name = column.name.as_ref().unwrap();
+                    let name_json = json::convert_ref_dbtype_to_jsonb(
+                        &RefValue::Text(TextRef::create_from(name.as_str().as_bytes())),
+                        json::Conv::ToString,
+                    )?;
+                    json.append_jsonb_to_end(name_json.data());
+                }
+                json.finalize_unsafe(json::jsonb::ElementType::ARRAY)?;
+                state.registers[*dest] = Register::Value(json::json_string_to_db_type(
+                    json,
+                    json::jsonb::ElementType::ARRAY,
+                    json::OutputVariant::String,
+                )?);
+            }
+            ScalarFunc::BinRecordJsonObject => {
+                assert_eq!(arg_count, 2);
+                'outer: {
+                    let columns_str = state.registers[*start_reg].get_owned_value();
+                    let bin_record = state.registers[*start_reg + 1].get_owned_value();
+                    let Value::Text(columns_str) = columns_str else {
+                        return Err(LimboError::InvalidArgument(
+                            "bin_record_json_object: function arguments must be of type TEXT and BLOB correspondingly".to_string()
+                        ));
+                    };
+
+                    if let Value::Null = bin_record {
+                        state.registers[*dest] = Register::Value(Value::Null);
+                        break 'outer;
+                    }
+
+                    let Value::Blob(bin_record) = bin_record else {
+                        return Err(LimboError::InvalidArgument(
+                            "bin_record_json_object: function arguments must be of type TEXT and BLOB correspondingly".to_string()
+                        ));
+                    };
+                    let mut columns_json_array =
+                        json::jsonb::Jsonb::from_str(columns_str.as_str())?;
+                    let columns_len = columns_json_array.array_len()?;
+
+                    let mut record = ImmutableRecord::new(bin_record.len());
+                    read_record(&bin_record, &mut record)?;
+
+                    let mut json = json::jsonb::Jsonb::make_empty_obj(record.len());
+                    for i in 0..columns_len {
+                        let mut op = json::jsonb::SearchOperation::new(0);
+                        let path = json::path::JsonPath {
+                            elements: vec![
+                                json::path::PathElement::Root(),
+                                json::path::PathElement::ArrayLocator(Some(i as i32)),
+                            ],
+                        };
+
+                        columns_json_array.operate_on_path(&path, &mut op)?;
+                        let column_name = op.result();
+                        json.append_jsonb_to_end(column_name.data());
+
+                        let val = record.get_value(i);
+                        if let RefValue::Blob(..) = val {
+                            return Err(LimboError::InvalidArgument(
+                                "bin_record_json_object: formatting of BLOB values stored in binary record is not supported".to_string()
+                            ));
+                        }
+                        let val_json =
+                            json::convert_ref_dbtype_to_jsonb(val, json::Conv::NotStrict)?;
+                        json.append_jsonb_to_end(val_json.data());
+                    }
+                    json.finalize_unsafe(json::jsonb::ElementType::OBJECT)?;
+
+                    state.registers[*dest] = Register::Value(json::json_string_to_db_type(
+                        json,
+                        json::jsonb::ElementType::OBJECT,
+                        json::OutputVariant::String,
+                    )?);
+                }
             }
         },
         crate::function::Func::Vector(vector_func) => match vector_func {

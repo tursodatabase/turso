@@ -1723,6 +1723,22 @@ pub fn translate_expr(
                             }
 
                             let start_reg = program.alloc_register();
+                            program.emit_insn(Insn::Copy {
+                                src_reg: start_reg,
+                                dst_reg: target_register,
+                                amount: 0,
+                            });
+
+                            Ok(target_register)
+                        }
+                        ScalarFunc::TableColumnsJsonArray => {
+                            if args.is_none() || args.as_ref().unwrap().len() != 1 {
+                                crate::bail_parse_error!(
+                                    "table_columns_json_array() function must have exactly 1 argument",
+                                );
+                            }
+                            let args = args.as_ref().unwrap();
+                            let start_reg = program.alloc_register();
                             translate_expr(
                                 program,
                                 referenced_tables,
@@ -1730,13 +1746,42 @@ pub fn translate_expr(
                                 start_reg,
                                 resolver,
                             )?;
-
-                            program.emit_insn(Insn::Copy {
-                                src_reg: start_reg,
-                                dst_reg: target_register,
-                                amount: 0,
+                            program.emit_insn(Insn::Function {
+                                constant_mask: 0,
+                                start_reg,
+                                dest: target_register,
+                                func: func_ctx,
                             });
-
+                            Ok(target_register)
+                        }
+                        ScalarFunc::BinRecordJsonObject => {
+                            if args.is_none() || args.as_ref().unwrap().len() != 2 {
+                                crate::bail_parse_error!(
+                                    "bin_record_json_object() function must have exactly 2 arguments",
+                                );
+                            }
+                            let args = args.as_ref().unwrap();
+                            let start_reg = program.alloc_registers(2);
+                            translate_expr(
+                                program,
+                                referenced_tables,
+                                &args[0],
+                                start_reg,
+                                resolver,
+                            )?;
+                            translate_expr(
+                                program,
+                                referenced_tables,
+                                &args[1],
+                                start_reg + 1,
+                                resolver,
+                            )?;
+                            program.emit_insn(Insn::Function {
+                                constant_mask: 0,
+                                start_reg,
+                                dest: target_register,
+                                func: func_ctx,
+                            });
                             Ok(target_register)
                         }
                     }

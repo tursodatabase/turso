@@ -127,6 +127,13 @@ impl Display for TextRef {
 }
 
 impl TextRef {
+    pub fn create_from(value: &[u8]) -> Self {
+        let value = RawSlice::create_from(value);
+        Self {
+            value,
+            subtype: TextSubtype::Text,
+        }
+    }
     pub fn as_str(&self) -> &str {
         unsafe { std::str::from_utf8_unchecked(self.value.to_slice()) }
     }
@@ -2346,6 +2353,14 @@ pub enum SeekKey<'a> {
 }
 
 impl RawSlice {
+    pub fn create_from(value: &[u8]) -> Self {
+        if value.len() == 0 {
+            RawSlice::new(std::ptr::null(), 0)
+        } else {
+            let ptr = &value[0] as *const u8;
+            RawSlice::new(ptr, value.len())
+        }
+    }
     pub fn new(data: *const u8, len: usize) -> Self {
         Self { data, len }
     }
