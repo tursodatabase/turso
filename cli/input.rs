@@ -81,7 +81,6 @@ pub struct Settings {
     pub echo: bool,
     pub is_stdout: bool,
     pub io: Io,
-    pub tracing_output: Option<String>,
     pub timer: bool,
     pub headers: bool,
 }
@@ -106,7 +105,6 @@ impl From<Opts> for Settings {
                 "" => Io::default(),
                 vfs => Io::External(vfs.to_string()),
             },
-            tracing_output: opts.tracing_output,
             timer: false,
             headers: false,
         }
