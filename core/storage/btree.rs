@@ -3130,8 +3130,8 @@ impl BTreeCursor {
                  ** pass.
                  */
                 let mut done = [false; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE];
-                let rightmost_page_negative_idx = (1 - sibling_count_new as i64);
-                let rightmost_page_positive_idx = (sibling_count_new as i64) - 1;
+                let rightmost_page_negative_idx = 1 - sibling_count_new as i64;
+                let rightmost_page_positive_idx = sibling_count_new as i64 - 1;
                 for i in rightmost_page_negative_idx..=rightmost_page_positive_idx {
                     // As mentioned above, we do two passes over the pages:
                     // 1. Downward pass: Process pages in decreasing order
