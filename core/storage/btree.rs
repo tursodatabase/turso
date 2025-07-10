@@ -2867,6 +2867,9 @@ impl BTreeCursor {
                         } else {
                             CELL_PTR_SIZE_BYTES as i64
                         };
+                        // As mentioned, this step rebalances the siblings so that cells are moved from left to right, since the previous step just
+                        // packed as much as possible to the left. However, if the right-hand-side page would become larger than the left-hand-side page,
+                        // we stop.
                         let would_not_improve_balance =
                             size_right_page + cell_right_size + (CELL_PTR_SIZE_BYTES as i64)
                                 > size_left_page - (cell_left_size + pointer_size);
