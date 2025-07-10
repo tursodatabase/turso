@@ -246,7 +246,7 @@ fn query_pragma(
     let register = program.alloc_register();
     match pragma {
         PragmaName::CacheSize => {
-            program.emit_int(connection.get_cache_size() as i64, register);
+            program.emit_int_i32(connection.get_cache_size(), register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
         }
@@ -305,7 +305,7 @@ fn query_pragma(
             if let Some(table) = table {
                 for (i, column) in table.columns().iter().enumerate() {
                     // cid
-                    program.emit_int(i as i64, base_reg);
+                    program.emit_int_i32(i as i32, base_reg);
                     // name
                     program.emit_string8(column.name.clone().unwrap_or_default(), base_reg + 1);
 
@@ -357,7 +357,7 @@ fn query_pragma(
         PragmaName::PageSize => {
             program.emit_int(
                 header_accessor::get_page_size(&pager)
-                    .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as i64,
+                    .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as i32,
                 register,
             );
             program.emit_result_row(register, 1);
@@ -371,12 +371,7 @@ fn query_pragma(
                 AutoVacuumMode::Incremental => 2,
             };
             let register = program.alloc_register();
-            program.emit_insn(Insn::Int64 {
-                _p1: 0,
-                out_reg: register,
-                _p3: 0,
-                value: auto_vacuum_mode_i64,
-            });
+            program.emit_int_i64(auto_vacuum_mode_i64, register);
             program.emit_result_row(register, 1);
         }
         PragmaName::IntegrityCheck => {

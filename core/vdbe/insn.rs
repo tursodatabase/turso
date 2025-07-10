@@ -481,9 +481,9 @@ pub enum Insn {
         can_fallthrough: bool,
     },
 
-    /// Write an integer value into a register.
+    /// Write a 32-bit integer value into a register.
     Integer {
-        value: i64,
+        value: i32,
         dest: usize,
     },
 
@@ -721,12 +721,12 @@ pub enum Insn {
         flag: InsertFlags, // Flags used by insert, for now not used.
         table_name: String,
     },
-
+    /// Write a 64-bit integer value into a register.
     Int64 {
-        _p1: usize,     //  unused
-        out_reg: usize, // the output register
-        _p3: usize,     // unused
-        value: i64,     //  the value being written into the output register
+        ///  The value being written into the output register
+        value: i64,
+        /// The output register
+        dest: usize,
     },
 
     Delete {

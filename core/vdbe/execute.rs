@@ -1878,7 +1878,7 @@ pub fn op_integer(
     let Insn::Integer { value, dest } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    state.registers[*dest] = Register::Value(Value::Integer(*value));
+    state.registers[*dest] = Register::Value(Value::Integer(*value as i64));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -4310,16 +4310,10 @@ pub fn op_int_64(
     pager: &Rc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    let Insn::Int64 {
-        _p1,
-        out_reg,
-        _p3,
-        value,
-    } = insn
-    else {
+    let Insn::Int64 { dest, value } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    state.registers[*out_reg] = Register::Value(Value::Integer(*value));
+    state.registers[*dest] = Register::Value(Value::Integer(*value));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

@@ -325,8 +325,12 @@ impl ProgramBuilder {
         dest
     }
 
-    pub fn emit_int(&mut self, value: i64, dest: usize) {
+    pub fn emit_int_i32(&mut self, value: i32, dest: usize) {
         self.emit_insn(Insn::Integer { value, dest });
+    }
+
+    pub fn emit_int_i64(&mut self, value: i64, dest: usize) {
+        self.emit_insn(Insn::Int64 { value, dest });
     }
 
     pub fn emit_bool(&mut self, value: bool, dest: usize) {

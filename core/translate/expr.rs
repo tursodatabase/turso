@@ -2010,7 +2010,7 @@ pub fn translate_expr(
                 match parse_numeric_literal(val)? {
                     Value::Integer(int_value) => {
                         program.emit_insn(Insn::Integer {
-                            value: int_value,
+                            value: int_value as i32,
                             dest: target_register,
                         });
                     }
@@ -2131,7 +2131,7 @@ pub fn translate_expr(
                 match parse_numeric_literal(&numeric_value)? {
                     Value::Integer(int_value) => {
                         program.emit_insn(Insn::Integer {
-                            value: int_value,
+                            value: int_value as i32,
                             dest: target_register,
                         });
                     }
@@ -2167,13 +2167,13 @@ pub fn translate_expr(
                 match parse_numeric_literal(num_val)? {
                     Value::Integer(int_value) => {
                         program.emit_insn(Insn::Integer {
-                            value: !int_value,
+                            value: !int_value as i32,
                             dest: target_register,
                         });
                     }
                     Value::Float(real_value) => {
                         program.emit_insn(Insn::Integer {
-                            value: !(real_value as i64),
+                            value: !(real_value as i32),
                             dest: target_register,
                         });
                     }

@@ -1573,12 +1573,7 @@ pub fn insn_to_str(
                 0,
                 "".to_string(),
             ),
-            Insn::Int64 {
-                _p1,
-                out_reg,
-                _p3,
-                value,
-            } => (
+            Insn::Int64 { dest, value } => (
                 "Int64",
                 0,
                 *out_reg as i32,

@@ -44,7 +44,7 @@ pub fn emit_program_for_compound_select(
     let limit_ctx = limit.map(|limit| {
         let reg = program.alloc_register();
         program.emit_insn(Insn::Integer {
-            value: limit as i64,
+            value: limit as i32,
             dest: reg,
         });
         LimitCtx::new_shared(reg)

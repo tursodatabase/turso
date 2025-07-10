@@ -964,7 +964,7 @@ fn emit_loop_source(
             if let Some(label) = label_emit_nonagg_only_once {
                 program.resolve_label(label, program.offset());
                 let flag = t_ctx.reg_nonagg_emit_once_flag.unwrap();
-                program.emit_int(1, flag);
+                program.emit_int_i32(1, flag);
             }
 
             Ok(())

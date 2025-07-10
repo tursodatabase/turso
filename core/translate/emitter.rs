@@ -293,7 +293,7 @@ pub fn emit_query<'a>(
         && plan.result_columns.iter().any(|c| !c.contains_aggregates)
     {
         let flag = program.alloc_register();
-        program.emit_int(0, flag); // Initialize flag to 0 (not yet emitted)
+        program.emit_int_i32(0, flag); // Initialize flag to 0 (not yet emitted)
         t_ctx.reg_nonagg_emit_once_flag = Some(flag);
     }
 
@@ -1217,7 +1217,7 @@ pub fn emit_cdc_insns(
         OperationMode::UPDATE | OperationMode::SELECT => 0,
         OperationMode::DELETE => -1,
     };
-    program.emit_int(operation_type, turso_cdc_registers + 2);
+    program.emit_int_i32(operation_type, turso_cdc_registers + 2);
     program.mark_last_insn_constant();
 
     program.emit_string8(table_name.to_string(), turso_cdc_registers + 3);
@@ -1271,7 +1271,7 @@ fn init_limit(
     };
     if limit_ctx.initialize_counter {
         program.emit_insn(Insn::Integer {
-            value: limit.expect("limit must be Some if limit_ctx is Some") as i64,
+            value: limit.expect("limit must be Some if limit_ctx is Some") as i32,
             dest: limit_ctx.reg_limit,
         });
     }
@@ -1279,7 +1279,7 @@ fn init_limit(
         let reg = program.alloc_register();
         t_ctx.reg_offset = Some(reg);
         program.emit_insn(Insn::Integer {
-            value: offset.unwrap() as i64,
+            value: offset.unwrap() as i32,
             dest: reg,
         });
         let combined_reg = program.alloc_register();
