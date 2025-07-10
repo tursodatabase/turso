@@ -8,16 +8,12 @@ use polling::{Event, Events, Poller};
 use rustix::{
     fd::{AsFd, AsRawFd},
     fs::{self, FlockOperation, OFlags, OpenOptionsExt},
-    io::Errno,
 };
 use std::{
     cell::{RefCell, UnsafeCell},
     mem::MaybeUninit,
 };
-use std::{
-    io::{ErrorKind, Read, Seek, Write},
-    sync::Arc,
-};
+use std::{io::ErrorKind, sync::Arc};
 use tracing::{debug, instrument, trace, Level};
 
 struct OwnedCallbacks(UnsafeCell<Callbacks>);
@@ -79,6 +75,12 @@ impl BorrowedPollHandler<'_> {
     fn add(&self, fd: &rustix::fd::BorrowedFd, event: Event) -> Result<()> {
         let poller = unsafe { &mut *self.0.get() };
         unsafe { poller.add(fd, event)? }
+        Ok(())
+    }
+
+    fn delete(&self, fd: &rustix::fd::BorrowedFd) -> Result<()> {
+        let poller = unsafe { &mut *self.0.get() };
+        poller.delete(fd)?;
         Ok(())
     }
 }
@@ -208,15 +210,15 @@ impl IO for UnixIO {
         let file = file.open(path)?;
 
         #[allow(clippy::arc_with_non_send_sync)]
-        let unix_file = Arc::new(UnixFile {
-            file: Arc::new(RefCell::new(file)),
-            poller: BorrowedPollHandler(self.poller.as_mut().into()),
-            callbacks: BorrowedCallbacks(self.callbacks.as_mut().into()),
-        });
+        let unix_file = UnixFile::new(
+            file,
+            BorrowedPollHandler(self.poller.as_mut().into()),
+            BorrowedCallbacks(self.callbacks.as_mut().into()),
+        )?;
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err() {
             unix_file.lock_file(!flags.contains(OpenFlags::ReadOnly))?;
         }
-        Ok(unix_file)
+        Ok(Arc::new(unix_file))
     }
 
     #[instrument(err, skip_all, level = Level::INFO)]
@@ -230,27 +232,39 @@ impl IO for UnixIO {
 
         for event in self.events.iter() {
             if let Some(cf) = self.callbacks.remove(event.key) {
-                let result = match cf {
-                    CompletionCallback::Read(ref file, ref c, pos) => {
-                        let mut file = file.borrow_mut();
-                        let r = c.as_read();
+                let n = match cf {
+                    CompletionCallback::Read {
+                        ref file,
+                        ref completion,
+                        pos,
+                    } => {
+                        let file = file.borrow_mut();
+                        let r = completion.as_read();
                         let mut buf = r.buf_mut();
-                        file.seek(std::io::SeekFrom::Start(pos as u64))?;
-                        file.read(buf.as_mut_slice())
+                        rustix::io::pread(file.as_fd(), buf.as_mut_slice(), pos as u64)
                     }
-                    CompletionCallback::Write(ref file, _, ref buf, pos) => {
-                        let mut file = file.borrow_mut();
+                    CompletionCallback::Write {
+                        ref file,
+                        ref buf,
+                        pos,
+                        ..
+                    } => {
+                        let file = file.borrow_mut();
                         let buf = buf.borrow();
-                        file.seek(std::io::SeekFrom::Start(pos as u64))?;
-                        file.write(buf.as_slice())
+                        rustix::io::pwrite(file.as_fd(), buf.as_slice(), pos as u64)
                     }
-                };
-                match result {
-                    Ok(n) => match &cf {
-                        CompletionCallback::Read(_, ref c, _) => c.complete(0),
-                        CompletionCallback::Write(_, ref c, _, _) => c.complete(n as i32),
-                    },
-                    Err(e) => return Err(e.into()),
+                    CompletionCallback::Sync { ref file, .. } => {
+                        let file = file.borrow_mut();
+                        fs::fsync(file.as_fd())?;
+                        Ok(0)
+                    }
+                }?;
+                match &cf {
+                    CompletionCallback::Read { ref completion, .. }
+                    | CompletionCallback::Write { ref completion, .. }
+                    | CompletionCallback::Sync { ref completion, .. } => {
+                        completion.complete(n as i32)
+                    }
                 }
             }
         }
@@ -276,13 +290,21 @@ impl IO for UnixIO {
 }
 
 enum CompletionCallback {
-    Read(Arc<RefCell<std::fs::File>>, Arc<Completion>, usize),
-    Write(
-        Arc<RefCell<std::fs::File>>,
-        Arc<Completion>,
-        Arc<RefCell<crate::Buffer>>,
-        usize,
-    ),
+    Read {
+        file: Arc<RefCell<std::fs::File>>,
+        completion: Arc<Completion>,
+        pos: usize,
+    },
+    Write {
+        file: Arc<RefCell<std::fs::File>>,
+        completion: Arc<Completion>,
+        buf: Arc<RefCell<crate::Buffer>>,
+        pos: usize,
+    },
+    Sync {
+        file: Arc<RefCell<std::fs::File>>,
+        completion: Arc<Completion>,
+    },
 }
 
 pub struct UnixFile<'io> {
@@ -291,13 +313,36 @@ pub struct UnixFile<'io> {
     poller: BorrowedPollHandler<'io>,
     callbacks: BorrowedCallbacks<'io>,
 }
+
+impl<'io> UnixFile<'io> {
+    fn new(
+        file: std::fs::File,
+        poller: BorrowedPollHandler<'io>,
+        callbacks: BorrowedCallbacks<'io>,
+    ) -> Result<Self> {
+        let unix_file = Self {
+            file: Arc::new(RefCell::new(file)),
+            poller,
+            callbacks,
+        };
+        {
+            let file = unix_file.file.borrow();
+            let raw_fd = file.as_raw_fd();
+            unix_file
+                .poller
+                .add(&file.as_fd(), Event::all(raw_fd as usize))?;
+        }
+        Ok(unix_file)
+    }
+}
+
 unsafe impl Send for UnixFile<'_> {}
 unsafe impl Sync for UnixFile<'_> {}
 
 impl File for UnixFile<'_> {
     fn lock_file(&self, exclusive: bool) -> Result<()> {
-        let fd = self.file.borrow();
-        let fd = fd.as_fd();
+        let file = self.file.borrow();
+        let fd = file.as_fd();
         // F_SETLK is a non-blocking lock. The lock will be released when the file is closed
         // or the process exits or after an explicit unlock.
         fs::fcntl_lock(
@@ -323,8 +368,9 @@ impl File for UnixFile<'_> {
     }
 
     fn unlock_file(&self) -> Result<()> {
-        let fd = self.file.borrow();
-        let fd = fd.as_fd();
+        let file = self.file.borrow();
+        let fd = file.as_fd();
+        self.poller.delete(&file.as_fd())?;
         fs::fcntl_lock(fd, FlockOperation::NonBlockingUnlock).map_err(|e| {
             LimboError::LockingError(format!(
                 "Failed to release file lock: {}",
@@ -336,36 +382,19 @@ impl File for UnixFile<'_> {
 
     #[instrument(err, skip_all, level = Level::INFO)]
     fn pread(&self, pos: usize, c: Completion) -> Result<Arc<Completion>> {
+        tracing::trace!("");
         let file = self.file.borrow();
-        let result = {
-            let r = c.as_read();
-            let mut buf = r.buf_mut();
-            rustix::io::pread(file.as_fd(), buf.as_mut_slice(), pos as u64)
-        };
         let c = Arc::new(c);
-        match result {
-            Ok(n) => {
-                trace!("pread n: {}", n);
-                // Read succeeded immediately
-                c.complete(n as i32);
-                Ok(c)
-            }
-            Err(Errno::AGAIN) => {
-                trace!("pread blocks");
-                // Would block, set up polling
-                let fd = file.as_raw_fd();
-                self.poller
-                    .add(&file.as_fd(), Event::readable(fd as usize))?;
-                {
-                    self.callbacks.insert(
-                        fd as usize,
-                        CompletionCallback::Read(self.file.clone(), c.clone(), pos),
-                    );
-                }
-                Ok(c)
-            }
-            Err(e) => Err(e.into()),
-        }
+        let fd = file.as_raw_fd();
+        self.callbacks.insert(
+            fd as usize,
+            CompletionCallback::Read {
+                file: self.file.clone(),
+                completion: c.clone(),
+                pos,
+            },
+        );
+        Ok(c)
     }
 
     #[instrument(err, skip_all, level = Level::INFO)]
@@ -375,48 +404,36 @@ impl File for UnixFile<'_> {
         buffer: Arc<RefCell<crate::Buffer>>,
         c: Completion,
     ) -> Result<Arc<Completion>> {
+        tracing::trace!("");
         let file = self.file.borrow();
-        let result = {
-            let buf = buffer.borrow();
-            rustix::io::pwrite(file.as_fd(), buf.as_slice(), pos as u64)
-        };
         let c = Arc::new(c);
-        match result {
-            Ok(n) => {
-                trace!("pwrite n: {}", n);
-                // Read succeeded immediately
-                c.complete(n as i32);
-                Ok(c)
-            }
-            Err(Errno::AGAIN) => {
-                trace!("pwrite blocks");
-                // Would block, set up polling
-                let fd = file.as_raw_fd();
-                self.poller
-                    .add(&file.as_fd(), Event::readable(fd as usize))?;
-                self.callbacks.insert(
-                    fd as usize,
-                    CompletionCallback::Write(self.file.clone(), c.clone(), buffer.clone(), pos),
-                );
-                Ok(c)
-            }
-            Err(e) => Err(e.into()),
-        }
+        let fd = file.as_raw_fd();
+        self.callbacks.insert(
+            fd as usize,
+            CompletionCallback::Write {
+                file: self.file.clone(),
+                completion: c.clone(),
+                buf: buffer.clone(),
+                pos,
+            },
+        );
+        Ok(c)
     }
 
     #[instrument(err, skip_all, level = Level::INFO)]
     fn sync(&self, c: Completion) -> Result<Arc<Completion>> {
+        tracing::trace!("");
         let file = self.file.borrow();
-        let result = fs::fsync(file.as_fd());
         let c = Arc::new(c);
-        match result {
-            Ok(()) => {
-                trace!("fsync");
-                c.complete(0);
-                Ok(c)
-            }
-            Err(e) => Err(e.into()),
-        }
+        let fd = file.as_raw_fd();
+        self.callbacks.insert(
+            fd as usize,
+            CompletionCallback::Sync {
+                file: self.file.clone(),
+                completion: c.clone(),
+            },
+        );
+        Ok(c)
     }
 
     #[instrument(err, skip_all, level = Level::INFO)]

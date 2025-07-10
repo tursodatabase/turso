@@ -695,6 +695,7 @@ impl Pager {
         }
         let page = Arc::new(Page::new(page_idx));
         page.set_locked();
+        dbg!("here");
 
         if let Some(frame_id) = self.wal.borrow().find_frame(page_idx as u64)? {
             self.wal
