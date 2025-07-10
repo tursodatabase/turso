@@ -149,25 +149,32 @@ impl DumbLruPageCache {
         Ok(())
     }
 
-    fn get_ptr(&mut self, key: &PageCacheKey) -> Option<NonNull<PageCacheEntry>> {
-        let m = self.map.borrow_mut();
+    fn get_ptr(&self, key: &PageCacheKey) -> Option<NonNull<PageCacheEntry>> {
+        let m = self.map.borrow();
         let ptr = m.get(key);
         ptr.copied()
     }
 
-    pub fn get(&mut self, key: &PageCacheKey) -> Option<PageRef> {
-        self.peek(key, true)
+    pub fn get(&self, key: &PageCacheKey) -> Option<PageRef> {
+        self.peek(key)
     }
 
     /// Get page without promoting entry
-    pub fn peek(&mut self, key: &PageCacheKey, touch: bool) -> Option<PageRef> {
+    pub fn peek(&self, key: &PageCacheKey) -> Option<PageRef> {
         trace!("cache_get(key={:?})", key);
         let mut ptr = self.get_ptr(key)?;
         let page = unsafe { ptr.as_mut().page.clone() };
-        if touch {
-            self.unlink(ptr);
-            self.touch(ptr);
-        }
+
+        Some(page)
+    }
+
+    /// Get page without promoting entry
+    pub fn peek_touch(&mut self, key: &PageCacheKey) -> Option<PageRef> {
+        trace!("cache_get(key={:?})", key);
+        let mut ptr = self.get_ptr(key)?;
+        let page = unsafe { ptr.as_mut().page.clone() };
+        self.unlink(ptr);
+        self.touch(ptr);
         Some(page)
     }
 
@@ -945,7 +952,7 @@ mod tests {
         drop(page);
         assert!(cache.detach(entry, true).is_ok());
         // Internal testing: the page is still in map, so we use it to check content
-        let page = cache.peek(&key, false).expect("Page should exist in map");
+        let page = cache.peek(&key).expect("Page should exist in map");
         assert!(!page_has_content(&page));
         assert!(cache.map.borrow_mut().remove(&key).is_some());
         cache.verify_list_integrity();
@@ -1019,7 +1026,7 @@ mod tests {
                     let key = PageCacheKey(id_page as usize);
                     #[allow(clippy::arc_with_non_send_sync)]
                     let page = Arc::new(Page::new(id_page as usize));
-                    if cache.peek(&key, false).is_some() {
+                    if cache.peek(&key).is_some() {
                         continue; // skip duplicate page ids
                     }
                     tracing::debug!("inserting page {:?}", key);
@@ -1061,7 +1068,7 @@ mod tests {
             cache.verify_list_integrity();
             for (key, page) in &lru {
                 println!("getting page {:?}", key);
-                cache.peek(&key, false).unwrap();
+                cache.peek(&key).unwrap();
                 assert_eq!(page.get().id, key.0);
             }
         }
@@ -1125,7 +1132,7 @@ mod tests {
         let mut cache = DumbLruPageCache::default();
         for i in 0..10000 {
             let key = insert_page(&mut cache, i);
-            assert_eq!(cache.peek(&key, false).unwrap().get().id, i);
+            assert_eq!(cache.peek(&key).unwrap().get().id, i);
         }
     }
 

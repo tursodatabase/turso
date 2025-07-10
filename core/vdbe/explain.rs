@@ -1576,11 +1576,11 @@ pub fn insn_to_str(
             Insn::Int64 { dest, value } => (
                 "Int64",
                 0,
-                *dest as i64,
+                *dest as i32,
                 0,
                 Value::Integer(*value),
                 0,
-                format!("r[{}]={}", *out_reg, *value),
+                format!("r[{}]={}", *dest, *value),
             ),
             Insn::IntegrityCk {
                 max_errors,

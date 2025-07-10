@@ -855,7 +855,7 @@ impl Pager {
     // Get a page from the cache, if it exists.
     pub fn cache_get(&self, page_idx: usize) -> Option<PageRef> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
-        let mut page_cache = self.page_cache.write();
+        let page_cache = self.page_cache.read();
         let page_key = PageCacheKey(page_idx);
         page_cache.get(&page_key)
     }
@@ -891,7 +891,7 @@ impl Pager {
                     let db_size = header_accessor::get_database_size(self)?;
                     for (dirty_page_idx, page_id) in self.dirty_pages.borrow().iter().enumerate() {
                         let is_last_frame = dirty_page_idx == self.dirty_pages.borrow().len() - 1;
-                        let mut cache = self.page_cache.write();
+                        let cache = self.page_cache.read();
                         let page_key = PageCacheKey(*page_id);
                         let page = cache.get(&page_key).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
                         let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
@@ -1376,7 +1376,6 @@ impl Pager {
             }
         }
 
-        page.clear_dirty();
         Ok(())
     }
 
@@ -1626,7 +1625,7 @@ mod tests {
             })
         };
         let _ = thread.join();
-        let mut cache = cache.write();
+        let cache = cache.read();
         let page_key = PageCacheKey(1);
         let page = cache.get(&page_key);
         assert_eq!(page.unwrap().get().id, 1);
