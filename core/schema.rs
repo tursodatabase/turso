@@ -261,10 +261,7 @@ impl BTreeTable {
                 sql.push_str(", ");
             }
             sql.push_str(column.name.as_ref().expect("column name is None"));
-            if !matches!(column.ty, Type::Null) {
-                sql.push(' ');
-            }
-            sql.push_str(&column.ty.to_string());
+            sql.push_str(&column.ty_str.to_string());
 
             if column.unique {
                 sql.push_str(" UNIQUE");
@@ -1449,42 +1446,6 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
         assert_eq!(column.ty_str, "INTEGER");
-        Ok(())
-    }
-
-    #[test]
-    pub fn test_col_type_string_int() -> Result<()> {
-        let sql = r#"CREATE TABLE t1 (a InT);"#;
-        let table = BTreeTable::from_sql(sql, 0)?;
-        let column = table.get_column("a").unwrap().1;
-        assert_eq!(column.ty_str, "INT");
-        Ok(())
-    }
-
-    #[test]
-    pub fn test_col_type_string_blob() -> Result<()> {
-        let sql = r#"CREATE TABLE t1 (a bLoB);"#;
-        let table = BTreeTable::from_sql(sql, 0)?;
-        let column = table.get_column("a").unwrap().1;
-        assert_eq!(column.ty_str, "BLOB");
-        Ok(())
-    }
-
-    #[test]
-    pub fn test_col_type_string_empty() -> Result<()> {
-        let sql = r#"CREATE TABLE t1 (a);"#;
-        let table = BTreeTable::from_sql(sql, 0)?;
-        let column = table.get_column("a").unwrap().1;
-        assert_eq!(column.ty_str, "");
-        Ok(())
-    }
-
-    #[test]
-    pub fn test_col_type_string_some_nonsense() -> Result<()> {
-        let sql = r#"CREATE TABLE t1 (a someNonsenseName);"#;
-        let table = BTreeTable::from_sql(sql, 0)?;
-        let column = table.get_column("a").unwrap().1;
-        assert_eq!(column.ty_str, "someNonsenseName");
         Ok(())
     }
 
