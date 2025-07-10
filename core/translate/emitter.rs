@@ -1157,7 +1157,7 @@ fn emit_update_insns(
                         "rowid_set_clause_reg must be set because has_user_provided_rowid is true",
                     ),
                     dst_reg: rowid_reg,
-                    amount: 1,
+                    amount: 0,
                 });
                 emit_cdc_insns(
                     program,
@@ -1173,7 +1173,7 @@ fn emit_update_insns(
                 program.emit_insn(Insn::Copy {
                     src_reg: rowid_set_clause_reg.unwrap_or(beg),
                     dst_reg: rowid_reg,
-                    amount: 1,
+                    amount: 0,
                 });
                 emit_cdc_insns(
                     program,
