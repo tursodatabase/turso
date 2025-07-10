@@ -95,6 +95,11 @@ pub const DATABASE_HEADER_PAGE_ID: usize = 1;
 /// The minimum size of a cell in bytes.
 pub const MINIMUM_CELL_SIZE: usize = 4;
 
+pub const CELL_PTR_SIZE_BYTES: usize = 2;
+pub const INTERIOR_PAGE_HEADER_SIZE_BYTES: usize = 12;
+pub const LEAF_PAGE_HEADER_SIZE_BYTES: usize = 8;
+pub const LEFT_CHILD_PTR_SIZE_BYTES: usize = 4;
+
 /// The database header.
 /// The first 100 bytes of the database file comprise the database file header.
 /// The database file header is divided into fields as shown by the table below.
@@ -382,7 +387,6 @@ impl Clone for PageContent {
     }
 }
 
-const CELL_POINTER_SIZE_BYTES: usize = 2;
 impl PageContent {
     pub fn new(offset: usize, buffer: Arc<RefCell<Buffer>>) -> Self {
         Self {
@@ -475,8 +479,7 @@ impl PageContent {
     /// The size of the cell pointer array in bytes.
     /// 2 bytes per cell pointer
     pub fn cell_pointer_array_size(&self) -> usize {
-        const CELL_POINTER_SIZE_BYTES: usize = 2;
-        self.cell_count() * CELL_POINTER_SIZE_BYTES
+        self.cell_count() * CELL_PTR_SIZE_BYTES
     }
 
     /// The start of the unallocated region.
@@ -504,10 +507,8 @@ impl PageContent {
     /// 8 bytes for leaf pages, 12 bytes for interior pages (due to storing rightmost child pointer)
     pub fn header_size(&self) -> usize {
         match self.page_type() {
-            PageType::IndexInterior => 12,
-            PageType::TableInterior => 12,
-            PageType::IndexLeaf => 8,
-            PageType::TableLeaf => 8,
+            PageType::IndexInterior | PageType::TableInterior => INTERIOR_PAGE_HEADER_SIZE_BYTES,
+            PageType::IndexLeaf | PageType::TableLeaf => LEAF_PAGE_HEADER_SIZE_BYTES,
         }
     }
 
@@ -549,7 +550,7 @@ impl PageContent {
             ncells
         );
         let cell_pointer_array_start = self.header_size();
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_POINTER_SIZE_BYTES);
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
 
         // SAFETY: this buffer is valid as long as the page is alive. We could store the page in the cell and do some lifetime magic
@@ -564,7 +565,7 @@ impl PageContent {
         debug_assert!(self.page_type() == PageType::TableInterior);
         let buf = self.as_ptr();
         let cell_pointer_array_start = self.header_size();
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_POINTER_SIZE_BYTES);
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
         const LEFT_CHILD_PAGE_SIZE_BYTES: usize = 4;
         let (rowid, _) = read_varint(&buf[cell_pointer + LEFT_CHILD_PAGE_SIZE_BYTES..])?;
@@ -580,7 +581,7 @@ impl PageContent {
         );
         let buf = self.as_ptr();
         let cell_pointer_array_start = self.header_size();
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_POINTER_SIZE_BYTES);
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
         u32::from_be_bytes([
             buf[cell_pointer],
@@ -596,7 +597,7 @@ impl PageContent {
         debug_assert!(self.page_type() == PageType::TableLeaf);
         let buf = self.as_ptr();
         let cell_pointer_array_start = self.header_size();
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_POINTER_SIZE_BYTES);
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
         let mut pos = cell_pointer;
         let (_, nr) = read_varint(&buf[pos..])?;
@@ -622,7 +623,7 @@ impl PageContent {
         let ncells = self.cell_count();
         let (cell_pointer_array_start, _) = self.cell_pointer_array_offset_and_size();
         assert!(idx < ncells, "cell_get: idx out of bounds");
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_POINTER_SIZE_BYTES);
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16_no_offset(cell_pointer) as usize;
         let start = cell_pointer;
         let payload_overflow_threshold_max =
