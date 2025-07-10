@@ -2861,7 +2861,8 @@ impl BTreeCursor {
                             cell_array.cell_size_bytes(cell_right as usize) as i64;
                         // TODO: add assert nMaxCells
 
-                        let pointer_size = if i == sibling_count_new - 1 {
+                        let is_last_sibling = i == sibling_count_new - 1;
+                        let pointer_size = if is_last_sibling {
                             0
                         } else {
                             CELL_PTR_SIZE_BYTES as i64
