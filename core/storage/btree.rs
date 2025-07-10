@@ -320,7 +320,7 @@ struct BalanceInfo {
     /// Bookkeeping of the rightmost pointer so the offset::BTREE_RIGHTMOST_PTR can be updated.
     rightmost_pointer: *mut u8,
     /// Divider cells of old pages. We can have maximum 2 divider cells because of 3 pages.
-    divider_cells: [Option<Vec<u8>>; MAX_SIBLING_PAGES_TO_BALANCE - 1],
+    divider_cell_payloads: [Option<Vec<u8>>; MAX_SIBLING_PAGES_TO_BALANCE - 1],
     /// Number of siblings being used to balance
     sibling_count: usize,
     /// First divider cell to remove that marks the first sibling
@@ -2465,7 +2465,7 @@ impl BTreeCursor {
                     .replace(Some(BalanceInfo {
                         pages_to_balance,
                         rightmost_pointer: right_pointer,
-                        divider_cells: [const { None }; MAX_SIBLING_PAGES_TO_BALANCE - 1],
+                        divider_cell_payloads: [const { None }; MAX_SIBLING_PAGES_TO_BALANCE - 1],
                         sibling_count,
                         first_divider_cell: first_cell_divider,
                     }));
@@ -2533,7 +2533,7 @@ impl BTreeCursor {
                     );
 
                     // TODO(pere): make this reference and not copy
-                    balance_info.divider_cells[i].replace(cell_buf.to_vec());
+                    balance_info.divider_cell_payloads[i].replace(cell_buf.to_vec());
                     tracing::trace!(
                         "dropping divider cell from parent cell_idx={} count={}",
                         cell_idx,
@@ -2598,7 +2598,7 @@ impl BTreeCursor {
                     if i < balance_info.sibling_count - 1 && !is_table_leaf {
                         // If we are a index page or a interior table page we need to take the divider cell too.
                         // But we don't need the last divider as it will remain the same.
-                        let mut divider_cell = balance_info.divider_cells[i]
+                        let mut divider_cell = balance_info.divider_cell_payloads[i]
                             .as_mut()
                             .unwrap()
                             .as_mut_slice();
