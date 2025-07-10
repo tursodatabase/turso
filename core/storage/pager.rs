@@ -141,13 +141,16 @@ impl Page {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 /// The state of the current pager cache flush.
 enum FlushState {
     /// Idle.
     Start,
-    /// Waiting for all in-flight writes to the on-disk WAL to complete.
-    WaitAppendFrames,
+    /// Append a single frame to the WAL.
+    AppendFrame { current_page_to_append_idx: usize },
+    /// Wait for append frame to complete.
+    /// If the current page is the last page to append, sync wal and clear dirty pages and cache.
+    WaitAppendFrame { current_page_to_append_idx: usize },
     /// Fsync the on-disk WAL.
     SyncWal,
     /// Checkpoint the WAL to the database file (if needed).
@@ -181,6 +184,8 @@ struct FlushInfo {
     state: FlushState,
     /// Number of writes taking place. When in_flight gets to 0 we can schedule a fsync.
     in_flight_writes: Rc<RefCell<usize>>,
+    /// Dirty pages to be flushed.
+    dirty_pages: Vec<usize>,
 }
 
 /// Track the state of the auto-vacuum mode.
@@ -282,6 +287,7 @@ impl Pager {
             flush_info: RefCell::new(FlushInfo {
                 state: FlushState::Start,
                 in_flight_writes: Rc::new(RefCell::new(0)),
+                dirty_pages: Vec::new(),
             }),
             syncing: Rc::new(RefCell::new(false)),
             checkpoint_state: RefCell::new(CheckpointState::Checkpoint),
@@ -769,39 +775,80 @@ impl Pager {
     pub fn cacheflush(&self, wal_checkpoint_disabled: bool) -> Result<PagerCacheflushStatus> {
         let mut checkpoint_result = CheckpointResult::default();
         let res = loop {
-            let state = self.flush_info.borrow().state;
+            let state = self.flush_info.borrow().state.clone();
             trace!(?state);
             match state {
                 FlushState::Start => {
-                    let db_size = header_accessor::get_database_size(self)?;
-                    for (dirty_page_idx, page_id) in self.dirty_pages.borrow().iter().enumerate() {
-                        let is_last_frame = dirty_page_idx == self.dirty_pages.borrow().len() - 1;
+                    let dirty_pages = self
+                        .dirty_pages
+                        .borrow()
+                        .iter()
+                        .copied()
+                        .collect::<Vec<usize>>();
+                    let mut flush_info = self.flush_info.borrow_mut();
+                    if dirty_pages.is_empty() {
+                        return Ok(PagerCacheflushStatus::Done(
+                            PagerCacheflushResult::WalWritten,
+                        ));
+                    } else {
+                        flush_info.dirty_pages = dirty_pages;
+                        flush_info.state = FlushState::AppendFrame {
+                            current_page_to_append_idx: 0,
+                        };
+                    }
+                }
+                FlushState::AppendFrame {
+                    current_page_to_append_idx,
+                } => {
+                    let page_id = self.flush_info.borrow().dirty_pages[current_page_to_append_idx];
+                    let is_last_frame = current_page_to_append_idx
+                        == self.flush_info.borrow().dirty_pages.len() - 1;
+                    let page = {
                         let mut cache = self.page_cache.write();
-                        let page_key = PageCacheKey::new(*page_id);
+                        let page_key = PageCacheKey::new(page_id);
                         let page = cache.get(&page_key).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
                         let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
                         trace!("cacheflush(page={}, page_type={:?}", page_id, page_type);
-                        let db_size = if is_last_frame { db_size } else { 0 };
-                        self.wal.borrow_mut().append_frame(
-                            page.clone(),
-                            db_size,
-                            self.flush_info.borrow().in_flight_writes.clone(),
-                        )?;
-                        page.clear_dirty();
-                    }
-                    // This is okay assuming we use shared cache by default.
-                    {
-                        let mut cache = self.page_cache.write();
-                        cache.clear().unwrap();
-                    }
-                    self.dirty_pages.borrow_mut().clear();
-                    self.flush_info.borrow_mut().state = FlushState::WaitAppendFrames;
-                    return Ok(PagerCacheflushStatus::IO);
+                        page
+                    };
+
+                    let db_size = {
+                        let db_size = header_accessor::get_database_size(self)?;
+                        if is_last_frame {
+                            db_size
+                        } else {
+                            0
+                        }
+                    };
+                    self.wal.borrow_mut().append_frame(
+                        page.clone(),
+                        db_size,
+                        self.flush_info.borrow().in_flight_writes.clone(),
+                    )?;
+                    page.clear_dirty();
+                    self.flush_info.borrow_mut().state = FlushState::WaitAppendFrame {
+                        current_page_to_append_idx,
+                    };
                 }
-                FlushState::WaitAppendFrames => {
-                    let in_flight = *self.flush_info.borrow().in_flight_writes.borrow();
-                    if in_flight == 0 {
-                        self.flush_info.borrow_mut().state = FlushState::SyncWal;
+                FlushState::WaitAppendFrame {
+                    current_page_to_append_idx,
+                } => {
+                    let in_flight = self.flush_info.borrow().in_flight_writes.clone();
+                    if *in_flight.borrow() == 0 {
+                        if current_page_to_append_idx
+                            == self.flush_info.borrow().dirty_pages.len() - 1
+                        {
+                            {
+                                let mut cache = self.page_cache.write();
+                                cache.clear().unwrap();
+                            }
+                            self.dirty_pages.borrow_mut().clear();
+                            self.flush_info.borrow_mut().state = FlushState::SyncWal;
+                        } else {
+                            self.flush_info.borrow_mut().state = FlushState::AppendFrame {
+                                current_page_to_append_idx: current_page_to_append_idx + 1,
+                            }
+                        }
                     } else {
                         return Ok(PagerCacheflushStatus::IO);
                     }
