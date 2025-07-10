@@ -398,8 +398,12 @@ impl ArbitraryFrom<&mut SimulatorEnv> for InteractionPlan {
 impl Interaction {
     pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<SimValue>> {
         match self {
-            Self::Query(query) | Self::FsyncQuery(query) => query.shadow(env),
-            Self::Assumption(_) | Self::Assertion(_) | Self::Fault(_) | Self::FaultyQuery(_) => {
+            Self::Query(query) => query.shadow(env),
+            Self::Assumption(_)
+            | Self::Assertion(_)
+            | Self::Fault(_)
+            | Self::FaultyQuery(_)
+            | Self::FsyncQuery(_) => {
                 vec![]
             }
         }

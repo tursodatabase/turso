@@ -947,6 +947,7 @@ pub struct Statement {
     state: vdbe::ProgramState,
     mv_store: Option<Rc<MvStore>>,
     pager: Rc<Pager>,
+    done: Cell<bool>,
 }
 
 impl Statement {
@@ -961,6 +962,7 @@ impl Statement {
             state,
             mv_store,
             pager,
+            done: Cell::new(false),
         }
     }
 
@@ -973,8 +975,13 @@ impl Statement {
     }
 
     pub fn step(&mut self) -> Result<StepResult> {
-        self.program
-            .step(&mut self.state, self.mv_store.clone(), self.pager.clone())
+        let res = self
+            .program
+            .step(&mut self.state, self.mv_store.clone(), self.pager.clone())?;
+        if matches!(res, StepResult::Done) {
+            self.done.set(true);
+        }
+        Ok(res)
     }
 
     pub fn run_once(&self) -> Result<()> {
@@ -1015,6 +1022,7 @@ impl Statement {
 
     pub fn reset(&mut self) {
         self.state.reset();
+        self.done.set(false);
     }
 
     pub fn row(&self) -> Option<&Row> {
@@ -1023,6 +1031,23 @@ impl Statement {
 
     pub fn explain(&self) -> String {
         self.program.explain()
+    }
+}
+
+impl Drop for Statement {
+    fn drop(&mut self) {
+        if !self.done.get() {
+            let state = self.program.connection.transaction_state.get();
+            if let TransactionState::Write { schema_did_change } = state {
+                let res = self
+                    .pager
+                    .rollback(schema_did_change, &self.program.connection);
+                // Log error in Drop
+                if res.is_err() {
+                    tracing::error!(rollback_error = ?res.unwrap_err());
+                }
+            }
+        }
     }
 }
 
