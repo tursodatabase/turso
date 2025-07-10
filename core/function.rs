@@ -174,7 +174,7 @@ impl Display for VectorFunc {
             Self::VectorExtract => "vector_extract".to_string(),
             Self::VectorDistanceCos => "vector_distance_cos".to_string(),
             // We use `distance_l2` to reduce user input
-            Self::VectorDistanceEuclidean => "distance_l2".to_string(),
+            Self::VectorDistanceEuclidean => "vector_distance_l2".to_string(),
         };
         write!(f, "{str}")
     }
@@ -826,7 +826,7 @@ impl Func {
             "vector64" => Ok(Self::Vector(VectorFunc::Vector64)),
             "vector_extract" => Ok(Self::Vector(VectorFunc::VectorExtract)),
             "vector_distance_cos" => Ok(Self::Vector(VectorFunc::VectorDistanceCos)),
-            "distance_l2" => Ok(Self::Vector(VectorFunc::VectorDistanceEuclidean)),
+            "vector_distance_l2" => Ok(Self::Vector(VectorFunc::VectorDistanceEuclidean)),
             _ => crate::bail_parse_error!("no such function: {}", name),
         }
     }

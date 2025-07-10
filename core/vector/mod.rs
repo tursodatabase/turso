@@ -89,6 +89,18 @@ pub fn vector_distance_l2(args: &[Register]) -> Result<Value> {
 
     let x = parse_vector(&args[0], None)?;
     let y = parse_vector(&args[1], None)?;
-    let dist = Euclidean::calculate(&[x], &[y])?;
+    // Validate that both vectors have the same dimensions and type
+    if x.dims != y.dims {
+        return Err(LimboError::ConversionError(
+            "Vectors must have the same dimensions".to_string(),
+        ));
+    }
+    if x.vector_type != y.vector_type {
+        return Err(LimboError::ConversionError(
+            "Vectors must be of the same type".to_string(),
+        ));
+    }
+
+    let dist = Euclidean::calculate(&x, &y)?;
     Ok(Value::Float(dist))
 }

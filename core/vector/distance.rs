@@ -21,11 +21,5 @@ pub trait DistanceCalculator {
     #[allow(unused)]
     fn distance_type() -> DistanceType;
 
-    fn calculate(v1: &[Vector], v2: &[Vector]) -> Result<f64>;
-
-    #[allow(unused)]
-    fn batch_calculate<'a>(
-        v1: &'a [Vector],
-        v2: &'a [Vector],
-    ) -> Box<dyn Iterator<Item = Result<f64>> + 'a>;
+    fn calculate(v1: &Vector, v2: &Vector) -> Result<f64>;
 }

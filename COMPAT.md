@@ -633,7 +633,7 @@ The `vector` extension is compatible with libSQL native vector search.
 | vector64(x)                                    | Yes    |         |
 | vector_extract(x)                              | Yes    |         |
 | vector_distance_cos(x, y)                      | Yes    |         |
-| distance_l2(x, y)                              | Yes    |Euclidean distance|
+| vector_distance_l2(x, y)                              | Yes    |Euclidean distance|
 
 ### Time
 
