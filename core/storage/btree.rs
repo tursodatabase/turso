@@ -101,6 +101,9 @@ pub mod offset {
 /// assumed that the database is corrupt.
 pub const BTCURSOR_MAX_DEPTH: usize = 20;
 
+/// We only need maximum 5 pages to balance 3 pages, because we can guarantee that cells from 3 pages will fit in 5 pages.
+pub const MAX_NEW_PAGES_AFTER_BALANCE: usize = 5;
+
 /// Evaluate a Result<CursorResult<T>>, if IO return IO.
 macro_rules! return_if_io {
     ($expr:expr) => {
@@ -2493,8 +2496,8 @@ impl BTreeCursor {
                 // The count includes: all cells and overflow cells from the sibling pages, and divider cells from the parent page,
                 // excluding the rightmost divider, which will not be dropped from the parent; instead it will be updated at the end.
                 let mut total_cells_to_redistribute = 0;
-                // We only need maximum 5 pages to balance 3 pages, because we can guarantee that cells from 3 pages will fit in 5 pages.
-                let mut pages_to_balance_new: [Option<BTreePage>; 5] = [const { None }; 5];
+                let mut pages_to_balance_new: [Option<BTreePage>; MAX_NEW_PAGES_AFTER_BALANCE] =
+                    [const { None }; MAX_NEW_PAGES_AFTER_BALANCE];
                 for i in (0..balance_info.sibling_count).rev() {
                     let sibling_page = balance_info.pages_to_balance[i].as_ref().unwrap();
                     let sibling_page = sibling_page.get();
@@ -2537,14 +2540,15 @@ impl BTreeCursor {
                 /* 2. Initialize CellArray with all the cells used for distribution, this includes divider cells if !leaf. */
                 let mut cell_array = CellArray {
                     cell_payloads: Vec::with_capacity(total_cells_to_redistribute),
-                    cell_count_per_page_cumulative: [0; 5],
+                    cell_count_per_page_cumulative: [0; MAX_NEW_PAGES_AFTER_BALANCE],
                 };
                 let cells_capacity_start = cell_array.cell_payloads.capacity();
 
                 let mut total_cells_inserted = 0;
                 // This is otherwise identical to CellArray.cell_count_per_page_cumulative,
                 // but we exclusively track what the prefix sums were _before_ we started redistributing cells.
-                let mut old_cell_count_per_page_cumulative: [u16; 5] = [0; 5];
+                let mut old_cell_count_per_page_cumulative: [u16; MAX_NEW_PAGES_AFTER_BALANCE] =
+                    [0; MAX_NEW_PAGES_AFTER_BALANCE];
 
                 let page_type = balance_info.pages_to_balance[0]
                     .as_ref()
@@ -2637,7 +2641,8 @@ impl BTreeCursor {
                 validate_cells_after_insertion(&cell_array, is_table_leaf);
 
                 /* 3. Initiliaze current size of every page including overflow cells and divider cells that might be included. */
-                let mut new_page_sizes: [i64; 5] = [0; 5];
+                let mut new_page_sizes: [i64; MAX_NEW_PAGES_AFTER_BALANCE] =
+                    [0; MAX_NEW_PAGES_AFTER_BALANCE];
                 let header_size = if is_leaf {
                     LEAF_PAGE_HEADER_SIZE_BYTES
                 } else {
@@ -2902,7 +2907,8 @@ impl BTreeCursor {
 
                 // Reassign page numbers in increasing order
                 {
-                    let mut page_numbers: [usize; 5] = [0; 5];
+                    let mut page_numbers: [usize; MAX_NEW_PAGES_AFTER_BALANCE] =
+                        [0; MAX_NEW_PAGES_AFTER_BALANCE];
                     for (i, page) in pages_to_balance_new
                         .iter()
                         .take(sibling_count_new)
@@ -3114,7 +3120,7 @@ impl BTreeCursor {
                  ** upwards pass simply processes pages that were missed on the downward
                  ** pass.
                  */
-                let mut done = [false; 5];
+                let mut done = [false; MAX_NEW_PAGES_AFTER_BALANCE];
                 for i in (1 - sibling_count_new as i64)..sibling_count_new as i64 {
                     // As mentioned above, we do two passes over the pages:
                     // 1. Downward pass: Process pages in decreasing order
@@ -3314,7 +3320,7 @@ impl BTreeCursor {
         parent_page: &BTreePage,
         balance_info: &mut BalanceInfo,
         parent_contents: &mut PageContent,
-        pages_to_balance_new: [Option<BTreePage>; 5],
+        pages_to_balance_new: [Option<BTreePage>; MAX_NEW_PAGES_AFTER_BALANCE],
         page_type: PageType,
         leaf_data: bool,
         mut cells_debug: Vec<Vec<u8>>,
@@ -5501,7 +5507,7 @@ struct CellArray {
     /// Prefix sum of cells in each page.
     /// For example, if three pages have 1, 2, and 3 cells, respectively,
     /// then cell_count_per_page_cumulative will be [1, 3, 6].
-    cell_count_per_page_cumulative: [u16; 5],
+    cell_count_per_page_cumulative: [u16; MAX_NEW_PAGES_AFTER_BALANCE],
 }
 
 impl CellArray {
@@ -8379,7 +8385,7 @@ mod tests {
         for _ in 0..ITERATIONS {
             let mut cell_array = CellArray {
                 cell_payloads: Vec::new(),
-                cell_count_per_page_cumulative: [0; 5],
+                cell_count_per_page_cumulative: [0; MAX_NEW_PAGES_AFTER_BALANCE],
             };
             let mut cells_cloned = Vec::new();
             let (pager, _, _, _) = empty_btree();
