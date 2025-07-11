@@ -883,22 +883,14 @@ impl Pager {
 
         //  Iterate through all the children cells and update their pointer map entries
         for cell_idx in 0..contents.cell_count() {
-            use crate::storage::{
-                btree::{payload_overflow_threshold_max, payload_overflow_threshold_min},
-                sqlite3_ondisk::BTreeCell,
-            };
+            use crate::storage::sqlite3_ondisk::BTreeCell;
 
-            let cell = contents.cell_get(
-                cell_idx,
-                payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
-                payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
-                self.usable_space(),
-            )?;
+            let cell = contents.cell_get(cell_idx, self.usable_space())?;
 
             match cell {
                 BTreeCell::TableInteriorCell(table_interior_cell) => {
                     self.ptrmap_put(
-                        table_interior_cell._left_child_page,
+                        table_interior_cell.left_child_page,
                         PtrmapType::BTreeNode,
                         page.get().id as u32,
                     )?;
@@ -966,8 +958,6 @@ impl Pager {
         ptrmap_type: PtrmapType,
     ) -> Result<()> {
         use crate::storage::btree::offset;
-        use crate::storage::btree::payload_overflow_threshold_max;
-        use crate::storage::btree::payload_overflow_threshold_min;
         use crate::storage::sqlite3_ondisk::BTreeCell;
 
         let contents = parent_page.get_contents();
@@ -985,23 +975,14 @@ impl Pager {
 
         //  Iterate over all cells on this page and find the cell which points to the page number to modify
         for cell_idx in 0..contents.cell_count() {
-            let cell = contents.cell_get(
-                cell_idx,
-                payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
-                payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
-                self.usable_space(),
-            )?;
-            let (cell_start, cell_len) = contents.cell_get_raw_region(
-                cell_idx,
-                payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
-                payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
-                self.usable_space(),
-            );
+            let cell = contents.cell_get(cell_idx, self.usable_space())?;
+            let (cell_start, cell_len) =
+                contents.cell_get_raw_region(cell_idx, self.usable_space());
 
             match cell {
                 BTreeCell::TableInteriorCell(table_interior_cell) => {
                     if ptrmap_type == PtrmapType::BTreeNode
-                        && table_interior_cell._left_child_page == prev_child_page_num as u32
+                        && table_interior_cell.left_child_page == prev_child_page_num as u32
                     {
                         contents.write_u32(cell_start, new_child_page_num as u32);
                         parent_page.set_dirty();
@@ -2744,9 +2725,7 @@ mod ptrmap_tests {
         let updated_root_page = pager.read_page(3).unwrap();
         let updated_contents = updated_root_page.get_contents();
 
-        let left_child_page = updated_contents
-            .cell_table_interior_read_left_child_page(0)
-            .unwrap();
+        let left_child_page = updated_contents.cell_interior_read_left_child_page(0);
         assert_eq!(
             left_child_page, 6,
             "Interior cell should now point to relocated page 6"
@@ -2964,9 +2943,7 @@ mod ptrmap_tests {
         // Root page 3 should now point to the relocated page (formerly 4)
         let updated_root_page = pager.read_page(3).unwrap();
         let updated_contents = updated_root_page.get_contents();
-        let relocated_page_id = updated_contents
-            .cell_table_interior_read_left_child_page(0)
-            .unwrap() as usize;
+        let relocated_page_id = updated_contents.cell_interior_read_left_child_page(0) as usize;
         assert_ne!(relocated_page_id, 4, "Page 4 should have been relocated");
 
         // Pointer-map entry for relocated page should reference parent 3
