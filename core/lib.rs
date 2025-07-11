@@ -76,7 +76,8 @@ use std::{
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
 use storage::page_cache::DumbLruPageCache;
-pub use storage::pager::PagerCacheflushStatus;
+pub use storage::pager::PagerCacheCommitStatus;
+pub use storage::pager::PagerCacheFlushStatus;
 use storage::pager::{DB_STATE_INITIALIZED, DB_STATE_UNITIALIZED};
 pub use storage::{
     buffer_pool::BufferPool,
@@ -738,14 +739,12 @@ impl Connection {
     }
 
     /// Flush dirty pages to disk.
-    /// This will write the dirty pages to the WAL and then fsync the WAL.
-    /// If the WAL size is over the checkpoint threshold, it will checkpoint the WAL to
-    /// the database file and then fsync the database file.
-    pub fn cacheflush(&self) -> Result<PagerCacheflushStatus> {
+    /// This will write the dirty pages to the WAL.
+    pub fn cacheflush(&self) -> Result<PagerCacheFlushStatus> {
         if self.closed.get() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        self.pager.cacheflush(self.wal_checkpoint_disabled.get())
+        self.pager.cacheflush()
     }
 
     pub fn clear_page_cache(&self) -> Result<()> {

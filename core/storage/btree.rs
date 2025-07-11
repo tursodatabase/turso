@@ -2116,7 +2116,7 @@ impl BTreeCursor {
                                     } else {
                                         write_info.state = WriteState::BalanceStart;
                                         // If we balance, we must save the cursor position and seek to it later.
-                                        // FIXME: we shouldn't have both DeleteState::SeekAfterBalancing and 
+                                        // FIXME: we shouldn't have both DeleteState::SeekAfterBalancing and
                                         // save_context()/restore/context(), they are practically the same thing.
                                         self.save_context(CursorContext::TableRowId(bkey.to_rowid()));
                                     }
@@ -2147,7 +2147,7 @@ impl BTreeCursor {
                                     } else {
                                         write_info.state = WriteState::BalanceStart;
                                         // If we balance, we must save the cursor position and seek to it later.
-                                        // FIXME: we shouldn't have both DeleteState::SeekAfterBalancing and 
+                                        // FIXME: we shouldn't have both DeleteState::SeekAfterBalancing and
                                         // save_context()/restore/context(), they are practically the same thing.
                                         self.save_context(CursorContext::IndexKeyRowId((*record).clone()));
                                     }
@@ -6824,8 +6824,8 @@ mod tests {
                 .unwrap();
                 loop {
                     match pager.end_tx(false, false, &conn, false).unwrap() {
-                        crate::PagerCacheflushStatus::Done(_) => break,
-                        crate::PagerCacheflushStatus::IO => {
+                        crate::PagerCacheCommitStatus::Done(_) => break,
+                        crate::PagerCacheCommitStatus::IO => {
                             pager.io.run_once().unwrap();
                         }
                     }
@@ -6950,8 +6950,8 @@ mod tests {
                 cursor.move_to_root().unwrap();
                 loop {
                     match pager.end_tx(false, false, &conn, false).unwrap() {
-                        crate::PagerCacheflushStatus::Done(_) => break,
-                        crate::PagerCacheflushStatus::IO => {
+                        crate::PagerCacheCommitStatus::Done(_) => break,
+                        crate::PagerCacheCommitStatus::IO => {
                             pager.io.run_once().unwrap();
                         }
                     }
