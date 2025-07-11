@@ -1185,11 +1185,9 @@ pub unsafe extern "C" fn libsql_wal_get_frame(
     }
     let db: &mut sqlite3 = &mut *db;
     let db = db.inner.lock().unwrap();
-    match db.conn.wal_get_frame(frame_no, p_frame, frame_len) {
-        Ok(c) => match db.io.wait_for_completion(c) {
-            Ok(_) => SQLITE_OK,
-            Err(_) => SQLITE_ERROR,
-        },
+    let c = db.conn.wal_get_frame(frame_no, p_frame, frame_len);
+    match db.io.wait_for_completion(c) {
+        Ok(_) => SQLITE_OK,
         Err(_) => SQLITE_ERROR,
     }
 }
