@@ -112,7 +112,7 @@ pub struct Database {
     schema: Arc<RwLock<Schema>>,
     db_file: Arc<dyn DatabaseStorage>,
     path: String,
-    io: Arc<dyn IO<F = dyn File>>,
+    io: Arc<dyn IO>,
     // Shared structures of a Database are the parts that are common to multiple threads that might
     // create DB connections.
     _shared_page_cache: Arc<RwLock<DumbLruPageCache>>,

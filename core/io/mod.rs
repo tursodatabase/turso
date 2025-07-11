@@ -14,6 +14,11 @@ use std::{
 pub trait File: Send + Sync {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
+
+    fn pread(&self, pos: usize, c: Completion) -> Arc<Completion>;
+    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<Buffer>>, c: Completion) -> Arc<Completion>;
+    fn sync(&self, c: Completion) -> Arc<Completion>;
+    fn size(&self) -> Result<u64>;
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -34,8 +39,6 @@ impl Default for OpenFlags {
 }
 
 pub trait IO: Clock + Send + Sync {
-    type F;
-
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>>;
 
     fn run_once(&self) -> Result<()>;
@@ -45,17 +48,6 @@ pub trait IO: Clock + Send + Sync {
     fn generate_random_number(&self) -> i64;
 
     fn get_memory_io(&self) -> Arc<MemoryIO>;
-
-    fn pread(&self, file: Arc<Self::F>, pos: usize, c: Completion) -> Arc<Completion>;
-    fn pwrite(
-        &self,
-        file: Arc<Self::F>,
-        pos: usize,
-        buffer: Arc<RefCell<Buffer>>,
-        c: Completion,
-    ) -> Arc<Completion>;
-    fn sync(&self, file: Arc<Self::F>, c: Completion) -> Arc<Completion>;
-    fn size(&self, file: Arc<Self::F>) -> Result<u64>;
 }
 
 pub type Complete = dyn Fn(Arc<RefCell<Buffer>>, i32);

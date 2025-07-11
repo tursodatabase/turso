@@ -47,8 +47,6 @@ impl Clock for UnixIO {
 }
 
 impl IO for UnixIO {
-    type F = UnixFile;
-
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         trace!("open_file(path = {})", path);
         let mut file = std::fs::File::options();
@@ -62,7 +60,7 @@ impl IO for UnixIO {
         let file = file.open(path)?;
 
         #[allow(clippy::arc_with_non_send_sync)]
-        let unix_file = UnixFile::new(file);
+        let unix_file = UnixFile::new(file, self.callbacks.clone());
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err() {
             unix_file.lock_file(!flags.contains(OpenFlags::ReadOnly))?;
         }
@@ -87,7 +85,7 @@ impl IO for UnixIO {
                 } => {
                     let r = completion.as_read();
                     let mut buf = r.buf_mut();
-                    rustix::io::pread(file.file.as_fd(), buf.as_mut_slice(), pos as u64)
+                    rustix::io::pread(file.as_fd(), buf.as_mut_slice(), pos as u64)
                 }
                 CompletionCallback::Write {
                     ref file,
@@ -96,10 +94,10 @@ impl IO for UnixIO {
                     ..
                 } => {
                     let buf = buf.borrow();
-                    rustix::io::pwrite(file.file.as_fd(), buf.as_slice(), pos as u64)
+                    rustix::io::pwrite(file.as_fd(), buf.as_slice(), pos as u64)
                 }
                 CompletionCallback::Sync { ref file, .. } => {
-                    fs::fsync(file.file.as_fd())?;
+                    fs::fsync(file.as_fd())?;
                     Ok(0)
                 }
             }?;
@@ -128,81 +126,38 @@ impl IO for UnixIO {
     fn get_memory_io(&self) -> Arc<MemoryIO> {
         Arc::new(MemoryIO::new())
     }
-
-    #[instrument(skip_all, level = Level::INFO)]
-    fn pread(&self, file: Arc<Self::F>, pos: usize, c: Completion) -> Arc<Completion> {
-        tracing::trace!("");
-        let c = Arc::new(c);
-        self.callbacks.lock().push(CompletionCallback::Read {
-            file: file.clone(),
-            completion: c.clone(),
-            pos,
-        });
-        c
-    }
-
-    #[instrument(skip_all, level = Level::INFO)]
-    fn pwrite(
-        &self,
-        file: Arc<Self::F>,
-        pos: usize,
-        buffer: Arc<RefCell<super::Buffer>>,
-        c: Completion,
-    ) -> Arc<Completion> {
-        tracing::trace!("");
-        let c = Arc::new(c);
-        self.callbacks.lock().push(CompletionCallback::Write {
-            file: file.clone(),
-            completion: c.clone(),
-            buf: buffer.clone(),
-            pos,
-        });
-        c
-    }
-
-    #[instrument(skip_all, level = Level::INFO)]
-    fn sync(&self, file: Arc<Self::F>, c: Completion) -> Arc<Completion> {
-        tracing::trace!("");
-        let c = Arc::new(c);
-        self.callbacks.lock().push(CompletionCallback::Sync {
-            file: file.clone(),
-            completion: c.clone(),
-        });
-        c
-    }
-
-    #[instrument(err, skip_all, level = Level::INFO)]
-    fn size(&self, file: Arc<Self::F>) -> Result<u64> {
-        Ok(file.file.metadata()?.len())
-    }
 }
 
 enum CompletionCallback {
     Read {
-        file: Arc<UnixFile>,
+        file: Arc<std::fs::File>,
         completion: Arc<Completion>,
         pos: usize,
     },
     Write {
-        file: Arc<UnixFile>,
+        file: Arc<std::fs::File>,
         completion: Arc<Completion>,
         buf: Arc<RefCell<crate::Buffer>>,
         pos: usize,
     },
     Sync {
-        file: Arc<UnixFile>,
+        file: Arc<std::fs::File>,
         completion: Arc<Completion>,
     },
 }
 
 pub struct UnixFile {
     #[allow(clippy::arc_with_non_send_sync)]
-    file: std::fs::File,
+    file: Arc<std::fs::File>,
+    callbacks: CallbackQueue,
 }
 
 impl UnixFile {
-    fn new(file: std::fs::File) -> Self {
-        Self { file }
+    fn new(file: std::fs::File, callbacks: CallbackQueue) -> Self {
+        Self {
+            file: Arc::new(file),
+            callbacks,
+        }
     }
 }
 
@@ -245,6 +200,52 @@ impl File for UnixFile {
             ))
         })?;
         Ok(())
+    }
+
+    #[instrument(skip_all, level = Level::INFO)]
+    fn pread(&self, pos: usize, c: Completion) -> Arc<Completion> {
+        tracing::trace!("");
+        let c = Arc::new(c);
+        self.callbacks.lock().push(CompletionCallback::Read {
+            file: self.file.clone(),
+            completion: c.clone(),
+            pos,
+        });
+        c
+    }
+
+    #[instrument(skip_all, level = Level::INFO)]
+    fn pwrite(
+        &self,
+        pos: usize,
+        buffer: Arc<RefCell<super::Buffer>>,
+        c: Completion,
+    ) -> Arc<Completion> {
+        tracing::trace!("");
+        let c = Arc::new(c);
+        self.callbacks.lock().push(CompletionCallback::Write {
+            file: self.file.clone(),
+            completion: c.clone(),
+            buf: buffer.clone(),
+            pos,
+        });
+        c
+    }
+
+    #[instrument(skip_all, level = Level::INFO)]
+    fn sync(&self, c: Completion) -> Arc<Completion> {
+        tracing::trace!("");
+        let c = Arc::new(c);
+        self.callbacks.lock().push(CompletionCallback::Sync {
+            file: self.file.clone(),
+            completion: c.clone(),
+        });
+        c
+    }
+
+    #[instrument(err, skip_all, level = Level::INFO)]
+    fn size(&self) -> Result<u64> {
+        Ok(self.file.metadata()?.len())
     }
 }
 
