@@ -530,6 +530,28 @@ pub struct BTreeCursor {
     find_cell_state: FindCellState,
 }
 
+/// We store the cell index and cell count for each page in the stack.
+/// The reason we store the cell count is because we need to know when we are at the end of the page,
+/// without having to perform IO to get the ancestor pages.
+#[derive(Debug, Clone, Copy, Default)]
+struct BTreeNodeState {
+    cell_idx: i32,
+    cell_count: Option<i32>,
+}
+
+impl BTreeNodeState {
+    /// Check if the current cell index is at the end of the page.
+    /// This information is used to determine whether a child page should move up to its parent.
+    /// If the child page is the rightmost leaf page and it has reached the end, this means all of its ancestors have
+    /// already reached the end, so it should not go up because there are no more records to traverse.
+    fn is_at_end(&self) -> bool {
+        let cell_count = self.cell_count.expect("cell_count is not set");
+        // cell_idx == cell_count means: we will traverse to the rightmost pointer next.
+        // cell_idx == cell_count + 1 means: we have already gone down to the rightmost pointer.
+        self.cell_idx == cell_count + 1
+    }
+}
+
 impl BTreeCursor {
     pub fn new(
         mv_cursor: Option<Rc<RefCell<MvCursor>>>,
