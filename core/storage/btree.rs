@@ -5457,6 +5457,10 @@ impl PageStack {
             "corrupted database, stack is bigger than expected"
         );
         assert!(current >= 0);
+
+        // Pin the page to prevent it from being evicted while on the stack
+        page.get().pin();
+
         self.stack.borrow_mut()[current as usize] = Some(page);
         self.node_states.borrow_mut()[current as usize] = BTreeNodeState {
             cell_idx: starting_cell_idx,
@@ -5469,7 +5473,7 @@ impl PageStack {
     /// without having to perform IO to get the ancestor page contents.
     ///
     /// This rests on the assumption that the parent page is already in memory whenever a child is pushed onto the stack.
-    /// We currently ensure this by pinning interior pages to the page cache so that they cannot be evicted.
+    /// We currently ensure this by pinning all the pages on [PageStack] to the page cache so that they cannot be evicted.
     fn populate_parent_cell_count(&self) {
         let stack_empty = self.current_page.get() == -1;
         if stack_empty {
@@ -5479,6 +5483,16 @@ impl PageStack {
         let stack = self.stack.borrow();
         let page = stack[current].as_ref().unwrap();
         let page = page.get();
+        turso_assert!(
+            page.is_pinned(),
+            "parent page {} is not pinned",
+            page.get().id
+        );
+        turso_assert!(
+            page.is_loaded(),
+            "parent page {} is not loaded",
+            page.get().id
+        );
         let contents = page.get_contents();
         let cell_count = contents.cell_count() as i32;
         self.node_states.borrow_mut()[current].cell_count = Some(cell_count);
@@ -5499,6 +5513,12 @@ impl PageStack {
         let current = self.current_page.get();
         assert!(current >= 0);
         tracing::trace!(current);
+
+        // Unpin the page before removing it from the stack
+        if let Some(page) = &self.stack.borrow()[current as usize] {
+            page.get().unpin();
+        }
+
         self.node_states.borrow_mut()[current as usize] = BTreeNodeState::default();
         self.stack.borrow_mut()[current as usize] = None;
         self.decrement_current();
@@ -5567,7 +5587,19 @@ impl PageStack {
         self.current_page.get() > 0
     }
 
+    fn unpin_all_if_pinned(&self) {
+        self.stack
+            .borrow_mut()
+            .iter_mut()
+            .flatten()
+            .for_each(|page| {
+                let _ = page.get().try_unpin();
+            });
+    }
+
     fn clear(&self) {
+        self.unpin_all_if_pinned();
+
         self.current_page.set(-1);
     }
     pub fn parent_page(&self) -> Option<BTreePage> {
@@ -5581,6 +5613,12 @@ impl PageStack {
         } else {
             None
         }
+    }
+}
+
+impl Drop for PageStack {
+    fn drop(&mut self) {
+        self.unpin_all_if_pinned();
     }
 }
 
