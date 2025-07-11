@@ -103,22 +103,22 @@ impl File for VfsFileImpl {
             CompletionType::Read(ref r) => r,
             _ => unreachable!(),
         };
-        assert!(self.vfs.is_null(), "VFS is null");
-        let result = {
+        assert!(!self.vfs.is_null(), "VFS is null");
+        {
             let mut buf = r.buf_mut();
             let count = buf.len();
             let vfs = unsafe { &*self.vfs };
             unsafe { (vfs.read)(self.file, buf.as_mut_ptr(), count, pos as i64) }
-        };
+        }
         Arc::new(c)
     }
 
     fn pwrite(&self, pos: usize, buffer: Arc<RefCell<Buffer>>, c: Completion) -> Arc<Completion> {
         let buf = buffer.borrow();
         let count = buf.as_slice().len();
-        assert!(self.vfs.is_null(), "VFS is null");
+        assert!(!self.vfs.is_null(), "VFS is null");
         let vfs = unsafe { &*self.vfs };
-        let result = unsafe {
+        unsafe {
             (vfs.write)(
                 self.file,
                 buf.as_slice().as_ptr() as *mut u8,
@@ -132,8 +132,8 @@ impl File for VfsFileImpl {
 
     fn sync(&self, c: Completion) -> Arc<Completion> {
         let vfs = unsafe { &*self.vfs };
-        assert!(self.vfs.is_null(), "VFS is null");
-        let result = unsafe { (vfs.sync)(self.file) };
+        assert!(!self.vfs.is_null(), "VFS is null");
+        unsafe { (vfs.sync)(self.file) };
         Arc::new(c)
     }
 

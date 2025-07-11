@@ -107,10 +107,11 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
         }
 
         #[no_mangle]
-        pub unsafe extern "C" fn #read_fn_name(file_ptr: *const ::std::ffi::c_void, buf: *mut u8, count: usize, offset: i64) -> i32 {
+        pub unsafe extern "C" fn #read_fn_name(file_ptr: *const ::std::ffi::c_void, buf: *mut u8, count: usize, offset: i64) {
             if file_ptr.is_null() {
                 return -1;
             }
+            assert!(!file_ptr.is_null(), "File Ptr is NULL");
             let vfs_file: &mut ::turso_ext::VfsFileImpl = &mut *(file_ptr as *mut ::turso_ext::VfsFileImpl);
             let file: &mut <#struct_name as ::turso_ext::VfsExtension>::File =
                 &mut *(vfs_file.file as *mut <#struct_name as ::turso_ext::VfsExtension>::File);
@@ -134,9 +135,7 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
 
         #[no_mangle]
         pub unsafe extern "C" fn #write_fn_name(file_ptr: *const ::std::ffi::c_void, buf: *const u8, count: usize, offset: i64) -> i32 {
-            if file_ptr.is_null() {
-                return -1;
-            }
+            assert!(!file_ptr.is_null(), "File Ptr is NULL");
             let vfs_file: &mut ::turso_ext::VfsFileImpl = &mut *(file_ptr as *mut ::turso_ext::VfsFileImpl);
             let file: &mut <#struct_name as ::turso_ext::VfsExtension>::File =
                 &mut *(vfs_file.file as *mut <#struct_name as ::turso_ext::VfsExtension>::File);
@@ -176,9 +175,7 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
 
         #[no_mangle]
         pub unsafe extern "C" fn #sync_fn_name(file_ptr: *const ::std::ffi::c_void) -> i32 {
-            if file_ptr.is_null() {
-                return -1;
-            }
+            assert!(!file_ptr.is_null(), "File Ptr is NULL");
             let vfs_file: &mut ::turso_ext::VfsFileImpl = &mut *(file_ptr as *mut ::turso_ext::VfsFileImpl);
             let file: &mut <#struct_name as ::turso_ext::VfsExtension>::File =
                 &mut *(vfs_file.file as *mut <#struct_name as ::turso_ext::VfsExtension>::File);
