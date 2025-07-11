@@ -115,7 +115,7 @@ fn test_cdc_simple_before() {
                 Value::Integer(0),
                 Value::Text("t".to_string()),
                 Value::Integer(1),
-                Value::Blob(record([Value::Null, Value::Integer(2)])),
+                Value::Blob(record([Value::Integer(1), Value::Integer(2)])),
                 Value::Null,
             ],
             vec![
@@ -124,7 +124,7 @@ fn test_cdc_simple_before() {
                 Value::Integer(-1),
                 Value::Text("t".to_string()),
                 Value::Integer(3),
-                Value::Blob(record([Value::Null, Value::Integer(4)])),
+                Value::Blob(record([Value::Integer(3), Value::Integer(4)])),
                 Value::Null,
             ],
             vec![
@@ -133,7 +133,7 @@ fn test_cdc_simple_before() {
                 Value::Integer(-1),
                 Value::Text("t".to_string()),
                 Value::Integer(1),
-                Value::Blob(record([Value::Null, Value::Integer(3)])),
+                Value::Blob(record([Value::Integer(1), Value::Integer(3)])),
                 Value::Null,
             ]
         ]
@@ -164,7 +164,7 @@ fn test_cdc_simple_after() {
                 Value::Text("t".to_string()),
                 Value::Integer(1),
                 Value::Null,
-                Value::Blob(record([Value::Null, Value::Integer(2)])),
+                Value::Blob(record([Value::Integer(1), Value::Integer(2)])),
             ],
             vec![
                 Value::Integer(2),
@@ -173,7 +173,7 @@ fn test_cdc_simple_after() {
                 Value::Text("t".to_string()),
                 Value::Integer(3),
                 Value::Null,
-                Value::Blob(record([Value::Null, Value::Integer(4)])),
+                Value::Blob(record([Value::Integer(3), Value::Integer(4)])),
             ],
             vec![
                 Value::Integer(3),
@@ -182,7 +182,7 @@ fn test_cdc_simple_after() {
                 Value::Text("t".to_string()),
                 Value::Integer(1),
                 Value::Null,
-                Value::Blob(record([Value::Null, Value::Integer(3)])),
+                Value::Blob(record([Value::Integer(1), Value::Integer(3)])),
             ],
             vec![
                 Value::Integer(4),
@@ -230,7 +230,7 @@ fn test_cdc_simple_full() {
                 Value::Text("t".to_string()),
                 Value::Integer(1),
                 Value::Null,
-                Value::Blob(record([Value::Null, Value::Integer(2)])),
+                Value::Blob(record([Value::Integer(1), Value::Integer(2)])),
             ],
             vec![
                 Value::Integer(2),
@@ -239,7 +239,7 @@ fn test_cdc_simple_full() {
                 Value::Text("t".to_string()),
                 Value::Integer(3),
                 Value::Null,
-                Value::Blob(record([Value::Null, Value::Integer(4)])),
+                Value::Blob(record([Value::Integer(3), Value::Integer(4)])),
             ],
             vec![
                 Value::Integer(3),
@@ -247,8 +247,8 @@ fn test_cdc_simple_full() {
                 Value::Integer(0),
                 Value::Text("t".to_string()),
                 Value::Integer(1),
-                Value::Blob(record([Value::Null, Value::Integer(2)])),
-                Value::Blob(record([Value::Null, Value::Integer(3)])),
+                Value::Blob(record([Value::Integer(1), Value::Integer(2)])),
+                Value::Blob(record([Value::Integer(1), Value::Integer(3)])),
             ],
             vec![
                 Value::Integer(4),
@@ -256,7 +256,7 @@ fn test_cdc_simple_full() {
                 Value::Integer(-1),
                 Value::Text("t".to_string()),
                 Value::Integer(3),
-                Value::Blob(record([Value::Null, Value::Integer(4)])),
+                Value::Blob(record([Value::Integer(3), Value::Integer(4)])),
                 Value::Null,
             ],
             vec![
@@ -265,7 +265,7 @@ fn test_cdc_simple_full() {
                 Value::Integer(-1),
                 Value::Text("t".to_string()),
                 Value::Integer(1),
-                Value::Blob(record([Value::Null, Value::Integer(3)])),
+                Value::Blob(record([Value::Integer(1), Value::Integer(3)])),
                 Value::Null,
             ]
         ]
