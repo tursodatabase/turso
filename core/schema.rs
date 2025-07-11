@@ -1605,13 +1605,13 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a InTeGeR);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert_eq!(column.ty_str, "INTEGER");
+        assert_eq!(column.ty_str, "InTeGeR");
         Ok(())
     }
 
     #[test]
     pub fn test_sqlite_schema() {
-        let expected = r#"CREATE TABLE sqlite_schema (type TEXT, name TEXT, tbl_name TEXT, rootpage INTEGER, sql TEXT)"#;
+        let expected = r#"CREATE TABLE sqlite_schema (type TEXT, name TEXT, tbl_name TEXT, rootpage INT, sql TEXT)"#;
         let actual = sqlite_schema_table().to_sql();
         assert_eq!(expected, actual);
     }
