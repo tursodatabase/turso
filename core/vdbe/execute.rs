@@ -28,9 +28,9 @@ use crate::{
     },
 };
 use std::ops::DerefMut;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 use std::{borrow::BorrowMut, rc::Rc, sync::Arc};
-use std::{ sync::atomic::AtomicUsize};
 
 use crate::{pseudo::PseudoCursor, result::LimboResult};
 
