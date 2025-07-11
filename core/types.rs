@@ -2354,7 +2354,7 @@ pub enum SeekKey<'a> {
 
 impl RawSlice {
     pub fn create_from(value: &[u8]) -> Self {
-        if value.len() == 0 {
+        if value.is_empty() {
             RawSlice::new(std::ptr::null(), 0)
         } else {
             let ptr = &value[0] as *const u8;

@@ -107,7 +107,7 @@ pub fn convert_dbtype_to_jsonb(val: &Value, strict: Conv) -> crate::Result<Jsonb
             Value::Integer(x) => RefValue::Integer(*x),
             Value::Float(x) => RefValue::Float(*x),
             Value::Text(text) => RefValue::Text(TextRef::create_from(text.as_str().as_bytes())),
-            Value::Blob(items) => RefValue::Blob(RawSlice::create_from(&items)),
+            Value::Blob(items) => RefValue::Blob(RawSlice::create_from(items)),
         },
         strict,
     )

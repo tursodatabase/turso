@@ -4105,7 +4105,7 @@ pub fn op_function(
                     let columns_len = columns_json_array.array_len()?;
 
                     let mut record = ImmutableRecord::new(bin_record.len());
-                    read_record(&bin_record, &mut record)?;
+                    read_record(bin_record, &mut record)?;
 
                     let mut json = json::jsonb::Jsonb::make_empty_obj(record.len());
                     for i in 0..columns_len {
