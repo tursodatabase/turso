@@ -4067,7 +4067,10 @@ pub fn op_function(
                 for column in table.columns() {
                     let name = column.name.as_ref().unwrap();
                     let name_json = json::convert_ref_dbtype_to_jsonb(
-                        &RefValue::Text(TextRef::create_from(name.as_str().as_bytes())),
+                        &RefValue::Text(TextRef::create_from(
+                            name.as_str().as_bytes(),
+                            TextSubtype::Text,
+                        )),
                         json::Conv::ToString,
                     )?;
                     json.append_jsonb_to_end(name_json.data());

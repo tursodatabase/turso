@@ -48,7 +48,7 @@ impl Display for ValueType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TextSubtype {
     Text,
@@ -127,12 +127,9 @@ impl Display for TextRef {
 }
 
 impl TextRef {
-    pub fn create_from(value: &[u8]) -> Self {
+    pub fn create_from(value: &[u8], subtype: TextSubtype) -> Self {
         let value = RawSlice::create_from(value);
-        Self {
-            value,
-            subtype: TextSubtype::Text,
-        }
+        Self { value, subtype }
     }
     pub fn as_str(&self) -> &str {
         unsafe { std::str::from_utf8_unchecked(self.value.to_slice()) }

@@ -60,7 +60,9 @@ use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_thr
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::pager::Pager;
-use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef};
+use crate::types::{
+    RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype,
+};
 use crate::{File, Result, WalFileShared};
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
@@ -1162,7 +1164,10 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
             }
 
             Ok((
-                RefValue::Text(TextRef::create_from(&buf[..content_size])),
+                RefValue::Text(TextRef::create_from(
+                    &buf[..content_size],
+                    TextSubtype::Text,
+                )),
                 content_size,
             ))
         }
