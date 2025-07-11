@@ -208,10 +208,10 @@ pub trait Wal {
     fn end_write_tx(&self) -> Result<LimboResult>;
 
     /// Find the latest frame containing a page.
-    fn find_frame(&self, page_id: u64) -> Result<Option<u64>>;
+    fn find_frame(&self, page_id: u64) -> Option<u64>;
 
     /// Read a frame from the WAL.
-    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Arc<BufferPool>) -> Result<()>;
+    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Arc<BufferPool>);
 
     /// Read a frame from the WAL.
     fn read_frame_raw(
@@ -220,23 +220,18 @@ pub trait Wal {
         buffer_pool: Arc<BufferPool>,
         frame: *mut u8,
         frame_len: u32,
-    ) -> Result<Arc<Completion>>;
+    ) -> Arc<Completion>;
 
     /// Write a frame to the WAL.
     /// db_size is the database size in pages after the transaction finishes.
     /// db_size > 0    -> last frame written in transaction
     /// db_size == 0   -> non-last frame written in transaction
     /// write_counter is the counter we use to track when the I/O operation starts and completes
-    fn append_frame(
-        &mut self,
-        page: PageRef,
-        db_size: u32,
-        write_counter: Rc<RefCell<usize>>,
-    ) -> Result<()>;
+    fn append_frame(&mut self, page: PageRef, db_size: u32, write_counter: Rc<RefCell<usize>>);
 
     /// Complete append of frames by updating shared wal state. Before this
     /// all changes were stored locally.
-    fn finish_append_frames_commit(&mut self) -> Result<()>;
+    fn finish_append_frames_commit(&mut self);
 
     fn should_checkpoint(&self) -> bool;
     fn checkpoint(
@@ -245,11 +240,11 @@ pub trait Wal {
         write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<CheckpointStatus>;
-    fn sync(&mut self) -> Result<WalFsyncStatus>;
+    fn sync(&mut self) -> WalFsyncStatus;
     fn get_max_frame_in_wal(&self) -> u64;
     fn get_max_frame(&self) -> u64;
     fn get_min_frame(&self) -> u64;
-    fn rollback(&mut self) -> Result<()>;
+    fn rollback(&mut self);
 }
 
 /// A dummy WAL implementation that does nothing.
@@ -275,18 +270,11 @@ impl Wal for DummyWAL {
         Ok(LimboResult::Ok)
     }
 
-    fn find_frame(&self, _page_id: u64) -> Result<Option<u64>> {
-        Ok(None)
+    fn find_frame(&self, _page_id: u64) -> Option<u64> {
+        None
     }
 
-    fn read_frame(
-        &self,
-        _frame_id: u64,
-        _page: crate::PageRef,
-        _buffer_pool: Arc<BufferPool>,
-    ) -> Result<()> {
-        Ok(())
-    }
+    fn read_frame(&self, _frame_id: u64, _page: crate::PageRef, _buffer_pool: Arc<BufferPool>) {}
 
     fn read_frame_raw(
         &self,
@@ -294,7 +282,7 @@ impl Wal for DummyWAL {
         _buffer_pool: Arc<BufferPool>,
         _frame: *mut u8,
         _frame_len: u32,
-    ) -> Result<Arc<Completion>> {
+    ) -> Arc<Completion> {
         todo!();
     }
 
@@ -303,8 +291,7 @@ impl Wal for DummyWAL {
         _page: crate::PageRef,
         _db_size: u32,
         _write_counter: Rc<RefCell<usize>>,
-    ) -> Result<()> {
-        Ok(())
+    ) {
     }
 
     fn should_checkpoint(&self) -> bool {
@@ -322,8 +309,8 @@ impl Wal for DummyWAL {
         ))
     }
 
-    fn sync(&mut self) -> Result<crate::storage::wal::WalFsyncStatus> {
-        Ok(crate::storage::wal::WalFsyncStatus::Done)
+    fn sync(&mut self) -> crate::storage::wal::WalFsyncStatus {
+        crate::storage::wal::WalFsyncStatus::Done
     }
 
     fn get_max_frame_in_wal(&self) -> u64 {
@@ -338,14 +325,11 @@ impl Wal for DummyWAL {
         0
     }
 
-    fn finish_append_frames_commit(&mut self) -> Result<()> {
+    fn finish_append_frames_commit(&mut self) {
         tracing::trace!("finish_append_frames_commit_dumb");
-        Ok(())
     }
 
-    fn rollback(&mut self) -> Result<()> {
-        Ok(())
-    }
+    fn rollback(&mut self) {}
 }
 
 // Syncing requires a state machine because we need to schedule a sync and then wait until it is
@@ -595,25 +579,21 @@ impl Wal for WalFile {
 
     /// Find the latest frame containing a page.
     #[instrument(skip_all, level = Level::INFO)]
-    fn find_frame(&self, page_id: u64) -> Result<Option<u64>> {
+    fn find_frame(&self, page_id: u64) -> Option<u64> {
         let shared = self.get_shared();
         let frames = shared.frame_cache.lock();
-        let frames = frames.get(&page_id);
-        if frames.is_none() {
-            return Ok(None);
-        }
-        let frames = frames.unwrap();
+        let frames = frames.get(&page_id)?;
         for frame in frames.iter().rev() {
             if *frame <= self.max_frame {
-                return Ok(Some(*frame));
+                return Some(*frame);
             }
         }
-        Ok(None)
+        None
     }
 
     /// Read a frame from the WAL.
     #[instrument(skip_all, level = Level::INFO)]
-    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Arc<BufferPool>) -> Result<()> {
+    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Arc<BufferPool>) {
         tracing::debug!("read_frame({})", frame_id);
         let offset = self.frame_offset(frame_id);
         page.set_locked();
@@ -632,8 +612,7 @@ impl Wal for WalFile {
             offset + WAL_FRAME_HEADER_SIZE,
             buffer_pool,
             complete,
-        )?;
-        Ok(())
+        );
     }
 
     #[instrument(skip_all, level = Level::INFO)]
@@ -643,7 +622,7 @@ impl Wal for WalFile {
         buffer_pool: Arc<BufferPool>,
         frame: *mut u8,
         frame_len: u32,
-    ) -> Result<Arc<Completion>> {
+    ) -> Arc<Completion> {
         tracing::debug!("read_frame({})", frame_id);
         let offset = self.frame_offset(frame_id);
         let complete = Box::new(move |buf: Arc<RefCell<Buffer>>, bytes_read: i32| {
@@ -663,18 +642,13 @@ impl Wal for WalFile {
             offset + WAL_FRAME_HEADER_SIZE,
             buffer_pool,
             complete,
-        )?;
-        Ok(c)
+        );
+        c
     }
 
     /// Write a frame to the WAL.
     #[instrument(skip_all, level = Level::INFO)]
-    fn append_frame(
-        &mut self,
-        page: PageRef,
-        db_size: u32,
-        write_counter: Rc<RefCell<usize>>,
-    ) -> Result<()> {
+    fn append_frame(&mut self, page: PageRef, db_size: u32, write_counter: Rc<RefCell<usize>>) {
         let page_id = page.get().id;
         let max_frame = self.max_frame;
         let frame_id = if max_frame == 0 { 1 } else { max_frame + 1 };
@@ -694,7 +668,7 @@ impl Wal for WalFile {
                 write_counter,
                 &header,
                 checksums,
-            )?
+            )
         };
         self.last_checksum = checksums;
         self.max_frame = frame_id;
@@ -710,7 +684,6 @@ impl Wal for WalFile {
                 }
             }
         }
-        Ok(())
     }
 
     #[instrument(skip_all, level = Level::INFO)]
@@ -803,7 +776,7 @@ impl Wal for WalFile {
                                 *frame,
                                 self.ongoing_checkpoint.page.clone(),
                                 self.buffer_pool.clone(),
-                            )?;
+                            );
                             self.ongoing_checkpoint.state = CheckpointState::WaitReadFrame;
                             continue 'checkpoint_loop;
                         }
@@ -823,7 +796,7 @@ impl Wal for WalFile {
                         pager,
                         &self.ongoing_checkpoint.page,
                         write_counter.clone(),
-                    )?;
+                    );
                     self.ongoing_checkpoint.state = CheckpointState::WaitWritePage;
                 }
                 CheckpointState::WaitWritePage => {
@@ -889,8 +862,8 @@ impl Wal for WalFile {
         }
     }
 
-    #[instrument(err, skip_all, level = Level::INFO)]
-    fn sync(&mut self) -> Result<WalFsyncStatus> {
+    #[instrument(skip_all, level = Level::INFO)]
+    fn sync(&mut self) -> WalFsyncStatus {
         match self.sync_state.get() {
             SyncState::NotSyncing => {
                 tracing::debug!("wal_sync");
@@ -903,17 +876,17 @@ impl Wal for WalFile {
                     }),
                 }));
                 let shared = self.get_shared();
-                self.io.sync(shared.file.as_ref(), completion);
+                shared.file.sync(completion);
                 self.sync_state.set(SyncState::Syncing);
-                Ok(WalFsyncStatus::IO)
+                WalFsyncStatus::IO
             }
             SyncState::Syncing => {
                 if self.syncing.get() {
                     tracing::debug!("wal_sync is already syncing");
-                    Ok(WalFsyncStatus::IO)
+                    WalFsyncStatus::IO
                 } else {
                     self.sync_state.set(SyncState::NotSyncing);
-                    Ok(WalFsyncStatus::Done)
+                    WalFsyncStatus::Done
                 }
             }
         }
@@ -931,8 +904,8 @@ impl Wal for WalFile {
         self.min_frame
     }
 
-    #[instrument(err, skip_all, level = Level::INFO)]
-    fn rollback(&mut self) -> Result<()> {
+    #[instrument(skip_all, level = Level::INFO)]
+    fn rollback(&mut self) {
         // TODO(pere): have to remove things from frame_cache because they are no longer valid.
         // TODO(pere): clear page cache in pager.
         {
@@ -954,16 +927,14 @@ impl Wal for WalFile {
             let mut pages_in_frames = shared.pages_in_frames.lock();
             pages_in_frames.truncate(self.start_pages_in_frames);
         }
-        Ok(())
     }
 
     #[instrument(skip_all, level = Level::INFO)]
-    fn finish_append_frames_commit(&mut self) -> Result<()> {
+    fn finish_append_frames_commit(&mut self) {
         let shared = self.get_shared();
         shared.max_frame.store(self.max_frame, Ordering::SeqCst);
         tracing::trace!(self.max_frame, ?self.last_checksum);
         shared.last_checksum = self.last_checksum;
-        Ok(())
     }
 }
 
@@ -1059,7 +1030,7 @@ impl WalFileShared {
         page_size: u32,
         io: &Arc<dyn IO>,
         file: Arc<dyn File>,
-    ) -> Result<Arc<UnsafeCell<WalFileShared>>> {
+    ) -> Arc<UnsafeCell<WalFileShared>> {
         let magic = if cfg!(target_endian = "big") {
             WAL_MAGIC_BE
         } else {
@@ -1088,7 +1059,7 @@ impl WalFileShared {
         );
         wal_header.checksum_1 = checksums.0;
         wal_header.checksum_2 = checksums.1;
-        sqlite3_ondisk::begin_write_wal_header(&file, &wal_header)?;
+        sqlite3_ondisk::begin_write_wal_header(&file, &wal_header);
         let header = Arc::new(SpinLock::new(wal_header));
         let checksum = {
             let checksum = header.lock();
@@ -1117,7 +1088,7 @@ impl WalFileShared {
             checkpoint_lock: LimboRwLock::new(),
             loaded: AtomicBool::new(true),
         };
-        Ok(Arc::new(UnsafeCell::new(shared)))
+        Arc::new(UnsafeCell::new(shared))
     }
 
     pub fn page_size(&self) -> u32 {

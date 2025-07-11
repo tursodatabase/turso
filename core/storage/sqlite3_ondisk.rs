@@ -723,7 +723,7 @@ pub fn begin_read_page(
     buffer_pool: Arc<BufferPool>,
     page: PageRef,
     page_idx: usize,
-) -> Result<()> {
+) {
     tracing::trace!("begin_read_btree_page(page_idx = {})", page_idx);
     let buf = buffer_pool.get();
     let drop_fn = Rc::new(move |buf| {
@@ -744,8 +744,7 @@ pub fn begin_read_page(
         }
     });
     let c = Completion::new(CompletionType::Read(ReadCompletion::new(buf, complete)));
-    db_file.read_page(page_idx, c)?;
-    Ok(())
+    db_file.read_page(page_idx, c);
 }
 
 pub fn finish_read_page(
@@ -770,11 +769,7 @@ pub fn finish_read_page(
 }
 
 #[instrument(skip_all, level = Level::INFO)]
-pub fn begin_write_btree_page(
-    pager: &Pager,
-    page: &PageRef,
-    write_counter: Rc<RefCell<usize>>,
-) -> Result<()> {
+pub fn begin_write_btree_page(pager: &Pager, page: &PageRef, write_counter: Rc<RefCell<usize>>) {
     tracing::trace!("begin_write_btree_page(page={})", page.get().id);
     let page_source = &pager.db_file;
     let page_finish = page.clone();
@@ -805,16 +800,11 @@ pub fn begin_write_btree_page(
         })
     };
     let c = Completion::new(CompletionType::Write(WriteCompletion::new(write_complete)));
-    let res = page_source.write_page(page_id, buffer.clone(), c);
-    if res.is_err() {
-        // Avoid infinite loop if write page fails
-        *write_counter.borrow_mut() -= 1;
-    }
-    res
+    page_source.write_page(page_id, buffer.clone(), c)
 }
 
 #[instrument(skip_all, level = Level::INFO)]
-pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>, syncing: Rc<RefCell<bool>>) -> Result<()> {
+pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>, syncing: Rc<RefCell<bool>>) {
     assert!(!*syncing.borrow());
     *syncing.borrow_mut() = true;
     let completion = Completion::new(CompletionType::Sync(SyncCompletion {
@@ -823,8 +813,7 @@ pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>, syncing: Rc<RefCell<bool>>)
         }),
     }));
     #[allow(clippy::arc_with_non_send_sync)]
-    db_file.sync(completion)?;
-    Ok(())
+    db_file.sync(completion);
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -1304,6 +1293,7 @@ pub fn write_varint_to_vec(value: u64, payload: &mut Vec<u8>) {
 /// We need to read the WAL file on open to reconstruct the WAL frame cache.
 pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFileShared>>> {
     let drop_fn = Rc::new(|_buf| {});
+    // TODO: when we make size infallible adjust this function to remove result
     let size = file.size()?;
     #[allow(clippy::arc_with_non_send_sync)]
     let buf_for_pread = Arc::new(RefCell::new(Buffer::allocate(size as usize, drop_fn)));
@@ -1486,7 +1476,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
         buf_for_pread,
         complete,
     )));
-    file.pread(0, c)?;
+    file.pread(0, c);
 
     Ok(wal_file_shared_ret)
 }
@@ -1496,7 +1486,7 @@ pub fn begin_read_wal_frame(
     offset: usize,
     buffer_pool: Arc<BufferPool>,
     complete: Box<dyn Fn(Arc<RefCell<Buffer>>, i32)>,
-) -> Result<Arc<Completion>> {
+) -> Arc<Completion> {
     tracing::trace!("begin_read_wal_frame(offset={})", offset);
     let buf = buffer_pool.get();
     let drop_fn = Rc::new(move |buf| {
@@ -1506,11 +1496,10 @@ pub fn begin_read_wal_frame(
     let buf = Arc::new(RefCell::new(Buffer::new(buf, drop_fn)));
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new(CompletionType::Read(ReadCompletion::new(buf, complete)));
-    let c = io.pread(offset, c)?;
-    Ok(c)
+    io.pread(offset, c)
 }
 
-#[instrument(err,skip(io, page, write_counter, wal_header, checksums), level = Level::INFO)]
+#[instrument(skip(io, page, write_counter, wal_header, checksums), level = Level::INFO)]
 #[allow(clippy::too_many_arguments)]
 pub fn begin_write_wal_frame(
     io: &Arc<dyn File>,
@@ -1521,7 +1510,7 @@ pub fn begin_write_wal_frame(
     write_counter: Rc<RefCell<usize>>,
     wal_header: &WalHeader,
     checksums: (u32, u32),
-) -> Result<(u32, u32)> {
+) -> (u32, u32) {
     let page_finish = page.clone();
     let page_id = page.get().id;
     tracing::trace!(page_id);
@@ -1600,17 +1589,12 @@ pub fn begin_write_wal_frame(
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new(CompletionType::Write(WriteCompletion::new(write_complete)));
-    let res = io.pwrite(offset, buffer.clone(), c);
-    if res.is_err() {
-        // If we do not reduce the counter here on error, we incur an infinite loop when cacheflushing
-        *write_counter.borrow_mut() -= 1;
-    }
-    res?;
+    io.pwrite(offset, buffer.clone(), c);
     tracing::trace!("Frame written and synced");
-    Ok(checksums)
+    checksums
 }
 
-pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<()> {
+pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) {
     tracing::trace!("begin_write_wal_header");
     let buffer = {
         let drop_fn = Rc::new(|_buf| {});
@@ -1641,8 +1625,7 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new(CompletionType::Write(WriteCompletion::new(write_complete)));
-    io.pwrite(0, buffer.clone(), c)?;
-    Ok(())
+    io.pwrite(0, buffer.clone(), c);
 }
 
 /// Checks if payload will overflow a cell based on the maximum allowed size.

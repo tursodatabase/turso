@@ -1,4 +1,3 @@
-use crate::error::LimboError;
 use crate::io::CompletionType;
 use crate::{io::Completion, Buffer, Result};
 use std::{cell::RefCell, sync::Arc};
@@ -10,14 +9,9 @@ use tracing::{instrument, Level};
 /// the storage medium. A database can either be a file on disk, like in SQLite,
 /// or something like a remote page server service.
 pub trait DatabaseStorage: Send + Sync {
-    fn read_page(&self, page_idx: usize, c: Completion) -> Result<()>;
-    fn write_page(
-        &self,
-        page_idx: usize,
-        buffer: Arc<RefCell<Buffer>>,
-        c: Completion,
-    ) -> Result<()>;
-    fn sync(&self, c: Completion) -> Result<()>;
+    fn read_page(&self, page_idx: usize, c: Completion);
+    fn write_page(&self, page_idx: usize, buffer: Arc<RefCell<Buffer>>, c: Completion);
+    fn sync(&self, c: Completion);
     fn size(&self) -> Result<u64>;
 }
 
@@ -34,39 +28,31 @@ unsafe impl Sync for DatabaseFile {}
 #[cfg(feature = "fs")]
 impl DatabaseStorage for DatabaseFile {
     #[instrument(skip_all, level = Level::INFO)]
-    fn read_page(&self, page_idx: usize, c: Completion) -> Result<()> {
+    fn read_page(&self, page_idx: usize, c: Completion) {
         let r = c.as_read();
         let size = r.buf().len();
         assert!(page_idx > 0);
         if !(512..=65536).contains(&size) || size & (size - 1) != 0 {
-            return Err(LimboError::NotADB);
+            panic!("Not a DB");
         }
         let pos = (page_idx - 1) * size;
-        self.file.pread(pos, c)?;
-        Ok(())
+        self.file.pread(pos, c);
     }
 
     #[instrument(skip_all, level = Level::INFO)]
-    fn write_page(
-        &self,
-        page_idx: usize,
-        buffer: Arc<RefCell<Buffer>>,
-        c: Completion,
-    ) -> Result<()> {
+    fn write_page(&self, page_idx: usize, buffer: Arc<RefCell<Buffer>>, c: Completion) {
         let buffer_size = buffer.borrow().len();
         assert!(page_idx > 0);
         assert!(buffer_size >= 512);
         assert!(buffer_size <= 65536);
         assert_eq!(buffer_size & (buffer_size - 1), 0);
         let pos = (page_idx - 1) * buffer_size;
-        self.file.pwrite(pos, buffer, c)?;
-        Ok(())
+        self.file.pwrite(pos, buffer, c);
     }
 
     #[instrument(skip_all, level = Level::INFO)]
-    fn sync(&self, c: Completion) -> Result<()> {
-        let _ = self.file.sync(c)?;
-        Ok(())
+    fn sync(&self, c: Completion) {
+        self.file.sync(c);
     }
 
     #[instrument(skip_all, level = Level::INFO)]
@@ -91,7 +77,7 @@ unsafe impl Sync for FileMemoryStorage {}
 
 impl DatabaseStorage for FileMemoryStorage {
     #[instrument(skip_all, level = Level::INFO)]
-    fn read_page(&self, page_idx: usize, c: Completion) -> Result<()> {
+    fn read_page(&self, page_idx: usize, c: Completion) {
         let r = match c.completion_type {
             CompletionType::Read(ref r) => r,
             _ => unreachable!(),
@@ -99,33 +85,25 @@ impl DatabaseStorage for FileMemoryStorage {
         let size = r.buf().len();
         assert!(page_idx > 0);
         if !(512..=65536).contains(&size) || size & (size - 1) != 0 {
-            return Err(LimboError::NotADB);
+            panic!("not a DB");
         }
         let pos = (page_idx - 1) * size;
-        self.file.pread(pos, c)?;
-        Ok(())
+        self.file.pread(pos, c);
     }
 
     #[instrument(skip_all, level = Level::INFO)]
-    fn write_page(
-        &self,
-        page_idx: usize,
-        buffer: Arc<RefCell<Buffer>>,
-        c: Completion,
-    ) -> Result<()> {
+    fn write_page(&self, page_idx: usize, buffer: Arc<RefCell<Buffer>>, c: Completion) {
         let buffer_size = buffer.borrow().len();
         assert!(buffer_size >= 512);
         assert!(buffer_size <= 65536);
         assert_eq!(buffer_size & (buffer_size - 1), 0);
         let pos = (page_idx - 1) * buffer_size;
-        self.file.pwrite(pos, buffer, c)?;
-        Ok(())
+        self.file.pwrite(pos, buffer, c);
     }
 
     #[instrument(skip_all, level = Level::INFO)]
-    fn sync(&self, c: Completion) -> Result<()> {
-        let _ = self.file.sync(c)?;
-        Ok(())
+    fn sync(&self, c: Completion) {
+        self.file.sync(c);
     }
 
     #[instrument(skip_all, level = Level::INFO)]
