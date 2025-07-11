@@ -695,12 +695,11 @@ impl Pager {
         }
         let page = Arc::new(Page::new(page_idx));
         page.set_locked();
-        dbg!("here");
 
-        if let Some(frame_id) = self.wal.borrow().find_frame(page_idx as u64)? {
+        if let Some(frame_id) = self.wal.borrow().find_frame(page_idx as u64) {
             self.wal
                 .borrow()
-                .read_frame(frame_id, page.clone(), self.buffer_pool.clone())?;
+                .read_frame(frame_id, page.clone(), self.buffer_pool.clone());
             {
                 page.set_uptodate();
             }
@@ -726,7 +725,7 @@ impl Pager {
             self.buffer_pool.clone(),
             page.clone(),
             page_idx,
-        )?;
+        );
         match page_cache.insert(page_key, page.clone()) {
             Ok(_) => {}
             Err(CacheError::Full) => return Err(LimboError::CacheFull),
@@ -791,7 +790,7 @@ impl Pager {
                             page.clone(),
                             db_size,
                             self.flush_info.borrow().in_flight_writes.clone(),
-                        )?;
+                        );
                         page.clear_dirty();
                     }
                     // This is okay assuming we use shared cache by default.
@@ -812,7 +811,7 @@ impl Pager {
                     }
                 }
                 FlushState::SyncWal => {
-                    if WalFsyncStatus::IO == self.wal.borrow_mut().sync()? {
+                    if WalFsyncStatus::IO == self.wal.borrow_mut().sync() {
                         return Ok(PagerCacheflushStatus::IO);
                     }
 
@@ -832,7 +831,7 @@ impl Pager {
                     };
                 }
                 FlushState::SyncDbFile => {
-                    sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone())?;
+                    sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone());
                     self.flush_info.borrow_mut().state = FlushState::WaitSyncDbFile;
                 }
                 FlushState::WaitSyncDbFile => {
@@ -846,7 +845,7 @@ impl Pager {
             }
         };
         // We should only signal that we finished appenind frames after wal sync to avoid inconsistencies when sync fails
-        self.wal.borrow_mut().finish_append_frames_commit()?;
+        self.wal.borrow_mut().finish_append_frames_commit();
         Ok(PagerCacheflushStatus::Done(res))
     }
 
@@ -856,7 +855,7 @@ impl Pager {
         frame_no: u32,
         p_frame: *mut u8,
         frame_len: u32,
-    ) -> Result<Arc<Completion>> {
+    ) -> Arc<Completion> {
         let wal = self.wal.borrow();
         wal.read_frame_raw(
             frame_no.into(),
@@ -888,7 +887,7 @@ impl Pager {
                     };
                 }
                 CheckpointState::SyncDbFile => {
-                    sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone())?;
+                    sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone());
                     self.checkpoint_state
                         .replace(CheckpointState::WaitSyncDbFile);
                 }
@@ -929,7 +928,7 @@ impl Pager {
         {
             let mut wal = self.wal.borrow_mut();
             // fsync the wal syncronously before beginning checkpoint
-            while let Ok(WalFsyncStatus::IO) = wal.sync() {
+            while let WalFsyncStatus::IO = wal.sync() {
                 if attempts >= 10 {
                     return Err(LimboError::InternalError(
                         "Failed to fsync WAL before final checkpoint, fd likely closed".into(),
@@ -1077,7 +1076,7 @@ impl Pager {
                     (default_header.get_page_size() - default_header.reserved_space as u32) as u16,
                 );
                 let write_counter = Rc::new(RefCell::new(0));
-                begin_write_btree_page(self, &page1.get(), write_counter.clone())?;
+                begin_write_btree_page(self, &page1.get(), write_counter.clone());
 
                 self.allocate_page1_state
                     .replace(AllocatePage1State::Writing {
@@ -1207,11 +1206,7 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::INFO)]
-    pub fn rollback(
-        &self,
-        schema_did_change: bool,
-        connection: &Connection,
-    ) -> Result<(), LimboError> {
+    pub fn rollback(&self, schema_did_change: bool, connection: &Connection) {
         tracing::debug!(schema_did_change);
         self.dirty_pages.borrow_mut().clear();
         let mut cache = self.page_cache.write();
@@ -1221,9 +1216,7 @@ impl Pager {
             let prev_schema = connection._db.schema.read().clone();
             connection.schema.replace(prev_schema);
         }
-        self.wal.borrow_mut().rollback()?;
-
-        Ok(())
+        self.wal.borrow_mut().rollback();
     }
 }
 
