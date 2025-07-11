@@ -98,36 +98,25 @@ impl File for VfsFileImpl {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: Completion) -> Result<Arc<Completion>> {
+    fn pread(&self, pos: usize, c: Completion) -> Arc<Completion> {
         let r = match c.completion_type {
             CompletionType::Read(ref r) => r,
             _ => unreachable!(),
         };
+        assert!(self.vfs.is_null(), "VFS is null");
         let result = {
             let mut buf = r.buf_mut();
             let count = buf.len();
             let vfs = unsafe { &*self.vfs };
             unsafe { (vfs.read)(self.file, buf.as_mut_ptr(), count, pos as i64) }
         };
-        if result < 0 {
-            Err(LimboError::ExtensionError("pread failed".to_string()))
-        } else {
-            c.complete(result);
-            Ok(Arc::new(c))
-        }
+        Arc::new(c)
     }
 
-    fn pwrite(
-        &self,
-        pos: usize,
-        buffer: Arc<RefCell<Buffer>>,
-        c: Completion,
-    ) -> Result<Arc<Completion>> {
+    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<Buffer>>, c: Completion) -> Arc<Completion> {
         let buf = buffer.borrow();
         let count = buf.as_slice().len();
-        if self.vfs.is_null() {
-            return Err(LimboError::ExtensionError("VFS is null".to_string()));
-        }
+        assert!(self.vfs.is_null(), "VFS is null");
         let vfs = unsafe { &*self.vfs };
         let result = unsafe {
             (vfs.write)(
@@ -138,23 +127,14 @@ impl File for VfsFileImpl {
             )
         };
 
-        if result < 0 {
-            Err(LimboError::ExtensionError("pwrite failed".to_string()))
-        } else {
-            c.complete(result);
-            Ok(Arc::new(c))
-        }
+        Arc::new(c)
     }
 
-    fn sync(&self, c: Completion) -> Result<Arc<Completion>> {
+    fn sync(&self, c: Completion) -> Arc<Completion> {
         let vfs = unsafe { &*self.vfs };
+        assert!(self.vfs.is_null(), "VFS is null");
         let result = unsafe { (vfs.sync)(self.file) };
-        if result < 0 {
-            Err(LimboError::ExtensionError("sync failed".to_string()))
-        } else {
-            c.complete(0);
-            Ok(Arc::new(c))
-        }
+        Arc::new(c)
     }
 
     fn size(&self) -> Result<u64> {
