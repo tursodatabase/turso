@@ -83,6 +83,8 @@ for i in range(tbl_count):
         CREATE TABLE tbl_{i} ({cols_str})
     """)
 
+con_init.commit()
+
 con.commit()
 
 print(f"DB Schemas\n------------\n{json.dumps(schemas, indent=2)}")
