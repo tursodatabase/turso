@@ -577,28 +577,37 @@ fn create_table(
 
                 let mut typename_exactly_integer = false;
                 let ty = match col_def.col_type {
-                    Some(data_type) => {
+                    Some(data_type) => 'ty: {
                         // https://www.sqlite.org/datatype3.html
                         let mut type_name = data_type.name;
                         type_name.make_ascii_uppercase();
-                        if type_name.contains("INT") {
-                            typename_exactly_integer = type_name == "INTEGER";
-                            Type::Integer
-                        } else if type_name.contains("CHAR")
-                            || type_name.contains("CLOB")
-                            || type_name.contains("TEXT")
-                        {
-                            Type::Text
-                        } else if type_name.contains("BLOB") || type_name.is_empty() {
-                            Type::Blob
-                        } else if type_name.contains("REAL")
-                            || type_name.contains("FLOA")
-                            || type_name.contains("DOUB")
-                        {
-                            Type::Real
-                        } else {
-                            Type::Numeric
+
+                        if type_name.is_empty() {
+                            break 'ty Type::Blob;
                         }
+
+                        if type_name == "INTEGER" {
+                            typename_exactly_integer = true;
+                            break 'ty Type::Integer;
+                        }
+
+                        if let Some(ty) = type_name.as_bytes().windows(3).find_map(|s| match s {
+                            b"INT" => Some(Type::Integer),
+                            _ => None,
+                        }) {
+                            break 'ty ty;
+                        }
+
+                        if let Some(ty) = type_name.as_bytes().windows(4).find_map(|s| match s {
+                            b"CHAR" | b"CLOB" | b"TEXT" => Some(Type::Text),
+                            b"BLOB" => Some(Type::Blob),
+                            b"REAL" | b"FLOA" | b"DOUB" => Some(Type::Real),
+                            _ => None,
+                        }) {
+                            break 'ty ty;
+                        }
+
+                        Type::Numeric
                     }
                     None => Type::Null,
                 };
@@ -609,22 +618,22 @@ fn create_table(
                 let mut order = SortOrder::Asc;
                 let mut unique = false;
                 let mut collation = None;
-                for c_def in &col_def.constraints {
-                    match &c_def.constraint {
+                for c_def in col_def.constraints {
+                    match c_def.constraint {
                         turso_sqlite3_parser::ast::ColumnConstraint::PrimaryKey {
                             order: o,
                             ..
                         } => {
                             primary_key = true;
                             if let Some(o) = o {
-                                order = *o;
+                                order = o;
                             }
                         }
                         turso_sqlite3_parser::ast::ColumnConstraint::NotNull { .. } => {
                             notnull = true;
                         }
                         turso_sqlite3_parser::ast::ColumnConstraint::Default(expr) => {
-                            default = Some(expr.clone())
+                            default = Some(expr)
                         }
                         // TODO: for now we don't check Resolve type of unique
                         turso_sqlite3_parser::ast::ColumnConstraint::Unique(on_conflict) => {
@@ -636,7 +645,6 @@ fn create_table(
                         turso_sqlite3_parser::ast::ColumnConstraint::Collate { collation_name } => {
                             collation = Some(CollationSeq::new(collation_name.0.as_str())?);
                         }
-                        // Collate
                         _ => {}
                     }
                 }
