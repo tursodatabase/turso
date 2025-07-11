@@ -410,7 +410,11 @@ impl BTreeTable {
                 sql.push_str(", ");
             }
             sql.push_str(column.name.as_ref().expect("column name is None"));
-            sql.push_str(&column.ty_str.to_string());
+
+            if !column.ty_str.is_empty() {
+                sql.push(' ');
+                sql.push_str(&column.ty_str);
+            }
 
             if column.unique {
                 sql.push_str(" UNIQUE");
