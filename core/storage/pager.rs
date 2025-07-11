@@ -225,7 +225,7 @@ pub struct Pager {
     /// Cache page_size and reserved_space at Pager init and reuse for subsequent
     /// `usable_space` calls. TODO: Invalidate reserved_space when we add the functionality
     /// to change it.
-    page_size: OnceCell<u32>,
+    page_size: RefCell<Option<u32>>,
     reserved_space: OnceCell<u8>,
 }
 
@@ -291,7 +291,7 @@ impl Pager {
             db_state,
             init_lock,
             allocate_page1_state,
-            page_size: OnceCell::new(),
+            page_size: RefCell::new(None),
             reserved_space: OnceCell::new(),
         })
     }
@@ -580,13 +580,19 @@ impl Pager {
     pub fn usable_space(&self) -> usize {
         let page_size = *self
             .page_size
-            .get_or_init(|| header_accessor::get_page_size(self).unwrap_or_default());
+            .borrow_mut()
+            .get_or_insert_with(|| header_accessor::get_page_size(self).unwrap_or_default());
 
         let reserved_space = *self
             .reserved_space
             .get_or_init(|| header_accessor::get_reserved_space(self).unwrap_or_default());
 
         (page_size as usize) - (reserved_space as usize)
+    }
+
+    /// Set the initial page size for the database. Should only be called before the database is initialized
+    pub fn set_initial_page_size(&self, size: u32) {
+        self.page_size.replace(Some(size));
     }
 
     #[inline(always)]
@@ -1053,6 +1059,9 @@ impl Pager {
                 self.db_state.store(DB_STATE_INITIALIZING, Ordering::SeqCst);
                 let mut default_header = DatabaseHeader::default();
                 default_header.database_size += 1;
+                if let Some(size) = *self.page_size.borrow() {
+                    default_header.update_page_size(size);
+                }
                 let page = allocate_page(1, &self.buffer_pool, 0);
 
                 let contents = page.get_contents();

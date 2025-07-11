@@ -41,6 +41,7 @@ mod numeric;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use crate::storage::sqlite3_ondisk::is_valid_page_size;
 use crate::storage::{header_accessor, wal::DummyWAL};
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
@@ -487,6 +488,8 @@ pub struct Connection {
     syms: RefCell<SymbolTable>,
     _shared_cache: bool,
     cache_size: Cell<i32>,
+    /// page size used for an uninitialized database or the next vacuum command.
+    /// it's not always equal to the current page size of the database
     page_size: Cell<u32>,
     readonly: Cell<bool>,
     wal_checkpoint_disabled: Cell<bool>,
@@ -810,15 +813,25 @@ impl Connection {
         self.page_size.get()
     }
 
-    /// Reset the page size for the current connection. Can only be called when db is uninitialized.
+    /// Reset the page size for the current connection.
+    ///
+    /// Specifying a new page size does not change the page size immediately.
+    /// Instead, the new page size is remembered and is used to set the page size when the database
+    /// is first created, if it does not already exist when the page_size pragma is issued,
+    /// or at the next VACUUM command that is run on the same database connection while not in WAL mode.
     pub fn reset_page_size(&self, size: u32) -> Result<()> {
-        if self._db.db_state.load(Ordering::SeqCst) != DB_STATE_UNINITIALIZED {
+        if !is_valid_page_size(size) {
             return Ok(());
         }
 
         self.page_size.set(size);
+        if self._db.db_state.load(Ordering::SeqCst) != DB_STATE_UNINITIALIZED {
+            return Ok(());
+        }
+
         let pager = self._db.init_pager(Some(size as usize))?;
         self.pager.replace(Rc::new(pager));
+        self.pager.borrow().set_initial_page_size(size);
 
         Ok(())
     }
