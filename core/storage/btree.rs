@@ -3004,14 +3004,16 @@ impl BTreeCursor {
                 }
                 // TODO: pointer map update (vacuum support)
                 // Update divider cells in parent
-                for (i, page) in pages_to_balance_new
+                for (sibling_page_idx, page) in pages_to_balance_new
                     .iter()
                     .enumerate()
                     .take(sibling_count_new - 1)
                 /* do not take last page */
                 {
                     let page = page.as_ref().unwrap();
-                    let divider_cell_idx = cell_array.cell_count_up_to_page(i);
+                    // e.g. if we have 3 pages and the leftmost child page has 3 cells,
+                    // then the divider cell idx is 3 in the flat cell array.
+                    let divider_cell_idx = cell_array.cell_count_up_to_page(sibling_page_idx);
                     let mut divider_cell = &mut cell_array.cell_payloads[divider_cell_idx];
                     // FIXME: dont use auxiliary space, could be done without allocations
                     let mut new_divider_cell = Vec::new();
@@ -3063,7 +3065,7 @@ impl BTreeCursor {
                     tracing::debug!(
                         "balance_non_root(insert_divider_cell, first_divider_cell={}, divider_cell={}, left_pointer={})",
                         balance_info.first_divider_cell,
-                        i,
+                        sibling_page_idx,
                         left_pointer
                     );
                     turso_assert!(
@@ -3078,18 +3080,24 @@ impl BTreeCursor {
                     );
                     // FIXME: defragment shouldn't be needed
                     // defragment_page(parent_contents, self.usable_space() as u16);
+                    let divider_cell_insert_idx_in_parent =
+                        balance_info.first_divider_cell + sibling_page_idx;
+                    let overflow_cell_count_before = parent_contents.overflow_cells.len();
                     insert_into_cell(
                         parent_contents,
                         &new_divider_cell,
-                        balance_info.first_divider_cell + i,
+                        divider_cell_insert_idx_in_parent,
                         self.usable_space() as u16,
-                    )
-                    .unwrap();
+                    )?;
+                    let overflow_cell_count_after = parent_contents.overflow_cells.len();
+                    let divider_cell_is_overflow_cell =
+                        overflow_cell_count_after > overflow_cell_count_before;
                     #[cfg(debug_assertions)]
                     self.validate_balance_non_root_divider_cell_insertion(
                         balance_info,
                         parent_contents,
-                        i,
+                        divider_cell_insert_idx_in_parent,
+                        divider_cell_is_overflow_cell,
                         &page.get(),
                     );
                 }
@@ -3291,41 +3299,54 @@ impl BTreeCursor {
         result
     }
 
+    /// Validates that a divider cell was correctly inserted into the parent page
+    /// during B-tree balancing and that it points to the correct child page.
     #[cfg(debug_assertions)]
     fn validate_balance_non_root_divider_cell_insertion(
         &self,
         balance_info: &mut BalanceInfo,
         parent_contents: &mut PageContent,
-        i: usize,
-        page: &std::sync::Arc<crate::Page>,
+        divider_cell_insert_idx_in_parent: usize,
+        divider_cell_is_overflow_cell: bool,
+        child_page: &std::sync::Arc<crate::Page>,
     ) {
-        let left_pointer = if parent_contents.overflow_cells.is_empty() {
+        let left_pointer = if divider_cell_is_overflow_cell {
+            parent_contents.overflow_cells
+                .iter()
+                .find(|cell| cell.index == divider_cell_insert_idx_in_parent)
+                .map(|cell| read_u32(&cell.payload, 0))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "overflow cell with divider cell was not found (divider_cell_idx={}, balance_info.first_divider_cell={}, overflow_cells.len={})",
+                        divider_cell_insert_idx_in_parent,
+                        balance_info.first_divider_cell,
+                        parent_contents.overflow_cells.len(),
+                    )
+                })
+        } else if divider_cell_insert_idx_in_parent < parent_contents.cell_count() {
             let (cell_start, cell_len) = parent_contents
-                .cell_get_raw_region(balance_info.first_divider_cell + i, self.usable_space());
-            tracing::debug!(
-                "balance_non_root(cell_start={}, cell_len={})",
-                cell_start,
-                cell_len
-            );
-
-            let left_pointer = read_u32(
+                .cell_get_raw_region(divider_cell_insert_idx_in_parent, self.usable_space());
+            read_u32(
                 &parent_contents.as_ptr()[cell_start..cell_start + cell_len],
                 0,
-            );
-            left_pointer
+            )
         } else {
-            let mut left_pointer = None;
-            for cell in parent_contents.overflow_cells.iter() {
-                if cell.index == balance_info.first_divider_cell + i {
-                    left_pointer = Some(read_u32(&cell.payload, 0))
-                }
-            }
-            left_pointer.expect("overflow cell with divider cell was not found")
+            panic!(
+                "divider cell is not in the parent page (divider_cell_idx={}, balance_info.first_divider_cell={}, overflow_cells.len={})",
+                divider_cell_insert_idx_in_parent,
+                balance_info.first_divider_cell,
+                parent_contents.overflow_cells.len(),
+            )
         };
-        assert_eq!(left_pointer, page.get().id as u32, "the cell we just inserted doesn't point to the correct page. points to {}, should point to {}",
-           left_pointer,
-            page.get().id as u32
-         );
+
+        // Verify the left pointer points to the correct page
+        assert_eq!(
+            left_pointer,
+            child_page.get().id as u32,
+            "the cell we just inserted doesn't point to the correct page. points to {}, should point to {}",
+            left_pointer,
+            child_page.get().id as u32
+        );
     }
 
     #[cfg(debug_assertions)]
