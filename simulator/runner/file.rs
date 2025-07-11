@@ -71,7 +71,7 @@ impl SimulatorFile {
                 0 // No fault counter for sync
             ),
             "--------- -------- --------".to_string(),
-            format!("total     {:8} {:8}", sum_calls, sum_faults),
+            format!("total     {sum_calls:8} {sum_faults:8}"),
         ];
 
         stats_table.join("\n")

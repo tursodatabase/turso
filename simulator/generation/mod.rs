@@ -3,6 +3,8 @@ use std::{iter::Sum, ops::SubAssign};
 use anarchist_readable_name_generator_lib::readable_name_custom;
 use rand::{distributions::uniform::SampleUniform, Rng};
 
+use crate::runner::env::SimulatorTables;
+
 mod expr;
 pub mod plan;
 mod predicate;
@@ -35,6 +37,20 @@ pub trait ArbitraryFromMaybe<T> {
     fn arbitrary_from_maybe<R: Rng>(rng: &mut R, t: T) -> Option<Self>
     where
         Self: Sized;
+}
+
+/// Shadow trait for types that can be "shadowed" in the simulator environment.
+/// Shadowing is a process of applying a transformation to the simulator environment
+/// that reflects the changes made by the query or operation represented by the type.
+/// The result of the shadowing is typically a vector of rows, which can be used to
+/// update the simulator environment or to verify the correctness of the operation.
+/// The `Result` type is used to indicate the type of the result of the shadowing
+/// operation, which can vary depending on the type of the operation being shadowed.
+/// For example, a `Create` operation might return an empty vector, while an `Insert` operation
+/// might return a vector of rows that were inserted into the table.
+pub(crate) trait Shadow {
+    type Result;
+    fn shadow(&self, tables: &mut SimulatorTables) -> Self::Result;
 }
 
 /// Frequency is a helper function for composing different generators with different frequency

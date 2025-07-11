@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{model::table::SimValue, runner::env::SimulatorEnv};
+use crate::{generation::Shadow, model::table::SimValue, runner::env::SimulatorTables};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Begin {
@@ -15,24 +15,27 @@ pub(crate) struct Commit;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Rollback;
 
-impl Begin {
-    pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<SimValue>> {
-        env.tables_snapshot = Some(env.tables.clone());
+impl Shadow for Begin {
+    type Result = Vec<Vec<SimValue>>;
+    fn shadow(&self, tables: &mut SimulatorTables) -> Self::Result {
+        tables.snapshot = Some(tables.tables.clone());
         vec![]
     }
 }
 
-impl Commit {
-    pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<SimValue>> {
-        env.tables_snapshot = None;
+impl Shadow for Commit {
+    type Result = Vec<Vec<SimValue>>;
+    fn shadow(&self, tables: &mut SimulatorTables) -> Self::Result {
+        tables.snapshot = None;
         vec![]
     }
 }
 
-impl Rollback {
-    pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<SimValue>> {
-        if let Some(tables) = env.tables_snapshot.take() {
-            env.tables = tables;
+impl Shadow for Rollback {
+    type Result = Vec<Vec<SimValue>>;
+    fn shadow(&self, tables: &mut SimulatorTables) -> Self::Result {
+        if let Some(tables_) = tables.snapshot.take() {
+            tables.tables = tables_;
         }
         vec![]
     }

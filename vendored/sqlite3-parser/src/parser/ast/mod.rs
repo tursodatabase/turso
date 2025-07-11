@@ -896,7 +896,8 @@ pub struct FromClause {
     pub select: Option<Box<SelectTable>>, // FIXME mandatory
     /// `JOIN`ed tabled
     pub joins: Option<Vec<JoinedSelectTable>>,
-    op: Option<JoinOperator>, // FIXME transient
+    /// A default join operator
+    pub op: Option<JoinOperator>, // FIXME transient
 }
 impl FromClause {
     pub(crate) fn empty() -> Self {

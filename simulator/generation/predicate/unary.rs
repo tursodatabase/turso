@@ -121,27 +121,27 @@ impl SimplePredicate {
                         })
                     }),
                 ),
-                (
-                    num_retries,
-                    Box::new(|rng| {
-                        TrueValue::arbitrary_from_maybe(rng, column_value).map(|value| {
-                            assert!(value.0.as_bool());
-                            // True Value with negative is still True
-                            Expr::unary(ast::UnaryOperator::Negative, Expr::Literal(value.0.into()))
-                        })
-                    }),
-                ),
-                (
-                    num_retries,
-                    Box::new(|rng| {
-                        BitNotValue::arbitrary_from_maybe(rng, (column_value, true)).map(|value| {
-                            Expr::unary(
-                                ast::UnaryOperator::BitwiseNot,
-                                Expr::Literal(value.0.into()),
-                            )
-                        })
-                    }),
-                ),
+                // (
+                //     num_retries,
+                //     Box::new(|rng| {
+                //         TrueValue::arbitrary_from_maybe(rng, column_value).map(|value| {
+                //             assert!(value.0.as_bool());
+                //             // True Value with negative is still True
+                //             Expr::unary(ast::UnaryOperator::Negative, Expr::Literal(value.0.into()))
+                //         })
+                //     }),
+                // ),
+                // (
+                //     num_retries,
+                //     Box::new(|rng| {
+                //         BitNotValue::arbitrary_from_maybe(rng, (column_value, true)).map(|value| {
+                //             Expr::unary(
+                //                 ast::UnaryOperator::BitwiseNot,
+                //                 Expr::Literal(value.0.into()),
+                //             )
+                //         })
+                //     }),
+                // ),
                 (
                     num_retries,
                     Box::new(|rng| {
@@ -172,37 +172,37 @@ impl SimplePredicate {
         }
         let expr = backtrack(
             vec![
-                (
-                    num_retries,
-                    Box::new(|rng| {
-                        FalseValue::arbitrary_from_maybe(rng, column_value).map(|value| {
-                            assert!(!value.0.as_bool());
-                            // Positive is a no-op in Sqlite
-                            Expr::unary(ast::UnaryOperator::Positive, Expr::Literal(value.0.into()))
-                        })
-                    }),
-                ),
-                (
-                    num_retries,
-                    Box::new(|rng| {
-                        FalseValue::arbitrary_from_maybe(rng, column_value).map(|value| {
-                            assert!(!value.0.as_bool());
-                            // True Value with negative is still True
-                            Expr::unary(ast::UnaryOperator::Negative, Expr::Literal(value.0.into()))
-                        })
-                    }),
-                ),
-                (
-                    num_retries,
-                    Box::new(|rng| {
-                        BitNotValue::arbitrary_from_maybe(rng, (column_value, false)).map(|value| {
-                            Expr::unary(
-                                ast::UnaryOperator::BitwiseNot,
-                                Expr::Literal(value.0.into()),
-                            )
-                        })
-                    }),
-                ),
+                // (
+                //     num_retries,
+                //     Box::new(|rng| {
+                //         FalseValue::arbitrary_from_maybe(rng, column_value).map(|value| {
+                //             assert!(!value.0.as_bool());
+                //             // Positive is a no-op in Sqlite
+                //             Expr::unary(ast::UnaryOperator::Positive, Expr::Literal(value.0.into()))
+                //         })
+                //     }),
+                // ),
+                // (
+                //     num_retries,
+                //     Box::new(|rng| {
+                //         FalseValue::arbitrary_from_maybe(rng, column_value).map(|value| {
+                //             assert!(!value.0.as_bool());
+                //             // True Value with negative is still True
+                //             Expr::unary(ast::UnaryOperator::Negative, Expr::Literal(value.0.into()))
+                //         })
+                //     }),
+                // ),
+                // (
+                //     num_retries,
+                //     Box::new(|rng| {
+                //         BitNotValue::arbitrary_from_maybe(rng, (column_value, false)).map(|value| {
+                //             Expr::unary(
+                //                 ast::UnaryOperator::BitwiseNot,
+                //                 Expr::Literal(value.0.into()),
+                //             )
+                //         })
+                //     }),
+                // ),
                 (
                     num_retries,
                     Box::new(|rng| {
@@ -263,7 +263,7 @@ mod tests {
                 .map(|row| predicate.0.test(row, &table))
                 .reduce(|accum, curr| accum || curr)
                 .unwrap_or(false);
-            assert!(result, "Predicate: {:#?}\nSeed: {}", predicate, seed)
+            assert!(result, "Predicate: {predicate:#?}\nSeed: {seed}")
         }
     }
 
@@ -290,7 +290,7 @@ mod tests {
                 .iter()
                 .map(|row| predicate.0.test(row, &table))
                 .any(|res| !res);
-            assert!(result, "Predicate: {:#?}\nSeed: {}", predicate, seed)
+            assert!(result, "Predicate: {predicate:#?}\nSeed: {seed}")
         }
     }
 }

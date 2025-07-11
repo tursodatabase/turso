@@ -13,16 +13,71 @@ pub struct Predicate(pub ast::Expr);
 
 impl Predicate {
     pub(crate) fn true_() -> Self {
-        Self(ast::Expr::Literal(ast::Literal::Numeric("1".to_string())))
+        Self(ast::Expr::Literal(ast::Literal::Keyword(
+            "TRUE".to_string(),
+        )))
     }
 
     pub(crate) fn false_() -> Self {
-        Self(ast::Expr::Literal(ast::Literal::Numeric("0".to_string())))
+        Self(ast::Expr::Literal(ast::Literal::Keyword(
+            "FALSE".to_string(),
+        )))
+    }
+    pub(crate) fn null() -> Self {
+        Self(ast::Expr::Literal(ast::Literal::Null))
+    }
+
+    pub(crate) fn not(predicate: Predicate) -> Self {
+        let expr = ast::Expr::Parenthesized(vec![ast::Expr::Unary(
+            ast::UnaryOperator::Not,
+            Box::new(predicate.0),
+        )]);
+        Self(expr)
+    }
+
+    pub(crate) fn and(predicates: Vec<Predicate>) -> Self {
+        if predicates.is_empty() {
+            Self::true_()
+        } else if predicates.len() == 1 {
+            predicates.into_iter().next().unwrap()
+        } else {
+            let expr = ast::Expr::Parenthesized(vec![ast::Expr::Binary(
+                Box::new(predicates[0].0.clone()),
+                ast::Operator::And,
+                Box::new(Self::and(predicates[1..].to_vec()).0),
+            )]);
+            Self(expr)
+        }
+    }
+
+    pub(crate) fn or(predicates: Vec<Predicate>) -> Self {
+        if predicates.is_empty() {
+            Self::false_()
+        } else if predicates.len() == 1 {
+            predicates.into_iter().next().unwrap()
+        } else {
+            let expr = ast::Expr::Binary(
+                Box::new(predicates[0].0.clone()),
+                ast::Operator::Or,
+                Box::new(Self::or(predicates[1..].to_vec()).0),
+            );
+            Self(expr)
+        }
+    }
+
+    pub(crate) fn eq(lhs: Predicate, rhs: Predicate) -> Self {
+        let expr = ast::Expr::Binary(Box::new(lhs.0), ast::Operator::Equals, Box::new(rhs.0));
+        Self(expr)
+    }
+
+    pub(crate) fn is(lhs: Predicate, rhs: Predicate) -> Self {
+        let expr = ast::Expr::Binary(Box::new(lhs.0), ast::Operator::Is, Box::new(rhs.0));
+        Self(expr)
     }
 
     pub(crate) fn test(&self, row: &[SimValue], table: &Table) -> bool {
         let value = expr_to_value(&self.0, row, table);
-        value.map_or(false, |value| value.as_bool())
+        value.is_some_and(|value| value.as_bool())
     }
 }
 

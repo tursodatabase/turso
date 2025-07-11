@@ -44,10 +44,17 @@ pub struct SimulatorCLI {
     pub watch: bool,
     #[clap(long, help = "run differential testing between sqlite and Limbo")]
     pub differential: bool,
+    #[clap(
+        long,
+        help = "enable brute force shrink (warning: it might take a long time)"
+    )]
+    pub enable_brute_force_shrinking: bool,
     #[clap(subcommand)]
     pub subcommand: Option<SimulatorCommand>,
     #[clap(long, help = "disable BugBase", default_value_t = false)]
     pub disable_bugbase: bool,
+    #[clap(long, help = "disable heuristic shrinking", default_value_t = false)]
+    pub disable_heuristic_shrinking: bool,
     #[clap(long, help = "disable UPDATE Statement", default_value_t = false)]
     pub disable_update: bool,
     #[clap(long, help = "disable DELETE Statement", default_value_t = false)]
@@ -82,10 +89,22 @@ pub struct SimulatorCLI {
         default_value_t = false
     )]
     pub disable_select_optimizer: bool,
+    #[clap(
+        long,
+        help = "disable Where-True-False-Null Property",
+        default_value_t = false
+    )]
+    pub disable_where_true_false_null: bool,
+    #[clap(
+        long,
+        help = "disable UNION ALL preserves cardinality Property",
+        default_value_t = false
+    )]
+    pub disable_union_all_preserves_cardinality: bool,
     #[clap(long, help = "disable FsyncNoWait Property", default_value_t = true)]
     pub disable_fsync_no_wait: bool,
-    #[clap(long, help = "disable FaultyQuery Property", default_value_t = false)]
-    pub disable_faulty_query: bool,
+    #[clap(long, help = "enable FaultyQuery Property", default_value_t = false)]
+    pub enable_faulty_query: bool,
     #[clap(long, help = "disable Reopen-Database fault", default_value_t = false)]
     pub disable_reopen_database: bool,
     #[clap(
@@ -160,6 +179,10 @@ impl SimulatorCLI {
                 "latency probability must be a number between 0 and 100. Got `{}`",
                 self.latency_probability
             );
+        }
+
+        if self.doublecheck && self.differential {
+            anyhow::bail!("Cannot run doublecheck and differential testing at the same time");
         }
 
         Ok(())

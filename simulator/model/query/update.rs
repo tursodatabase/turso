@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{model::table::SimValue, SimulatorEnv};
+use crate::{generation::Shadow, model::table::SimValue, runner::env::SimulatorTables};
 
 use super::predicate::Predicate;
 
@@ -13,13 +13,21 @@ pub(crate) struct Update {
     pub(crate) predicate: Predicate,
 }
 
-impl Update {
-    pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<SimValue>> {
-        let table = env
-            .tables
-            .iter_mut()
-            .find(|t| t.name == self.table)
-            .unwrap();
+impl Shadow for Update {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+
+    fn shadow(&self, tables: &mut SimulatorTables) -> Self::Result {
+        let table = tables.tables.iter_mut().find(|t| t.name == self.table);
+
+        let table = if let Some(table) = table {
+            table
+        } else {
+            return Err(anyhow::anyhow!(
+                "Table {} does not exist. UPDATE statement ignored.",
+                self.table
+            ));
+        };
+
         let t2 = table.clone();
         for row in table
             .rows
@@ -27,17 +35,18 @@ impl Update {
             .filter(|r| self.predicate.test(r, &t2))
         {
             for (column, set_value) in &self.set_values {
-                let (idx, _) = table
+                if let Some((idx, _)) = table
                     .columns
                     .iter()
                     .enumerate()
                     .find(|(_, c)| &c.name == column)
-                    .unwrap();
-                row[idx] = set_value.clone();
+                {
+                    row[idx] = set_value.clone();
+                }
             }
         }
 
-        vec![]
+        Ok(vec![])
     }
 }
 
@@ -48,7 +57,7 @@ impl Display for Update {
             if i != 0 {
                 write!(f, ", ")?;
             }
-            write!(f, "{} = {}", name, value)?;
+            write!(f, "{name} = {value}")?;
         }
         write!(f, " WHERE {}", self.predicate)?;
         Ok(())

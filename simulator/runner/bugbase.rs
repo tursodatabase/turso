@@ -27,6 +27,8 @@ pub struct LoadedBug {
     pub seed: u64,
     /// The plan of the bug.
     pub plan: InteractionPlan,
+    /// The shrunk plan of the bug, if any.
+    pub shrunk_plan: Option<InteractionPlan>,
     /// The runs of the bug.
     pub runs: Vec<BugRun>,
 }
@@ -42,6 +44,8 @@ pub(crate) struct BugRun {
     pub(crate) error: Option<String>,
     /// Options
     pub(crate) cli_options: SimulatorCLI,
+    /// Whether the run was a shrunk run.
+    pub(crate) shrunk: bool,
 }
 
 impl Bug {
@@ -197,6 +201,7 @@ impl BugBase {
                 timestamp: SystemTime::now().into(),
                 error,
                 cli_options: cli_options.clone(),
+                shrunk: false,
             });
             self.bugs.insert(seed, Bug::Loaded(bug.clone()));
         } else {
@@ -208,7 +213,9 @@ impl BugBase {
                     timestamp: SystemTime::now().into(),
                     error,
                     cli_options: cli_options.clone(),
+                    shrunk: false,
                 }],
+                shrunk_plan: None,
             };
             self.bugs.insert(seed, Bug::Loaded(bug.clone()));
         }
@@ -246,6 +253,20 @@ impl BugBase {
                 )
                 .with_context(|| "should be able to write plan file")?;
 
+                if let Some(shrunk_plan) = &bug.shrunk_plan {
+                    let shrunk_plan_path = bug_path.join("shrunk.json");
+                    std::fs::write(
+                        &shrunk_plan_path,
+                        serde_json::to_string_pretty(shrunk_plan)
+                            .with_context(|| "should be able to serialize shrunk plan")?,
+                    )
+                    .with_context(|| "should be able to write shrunk plan file")?;
+
+                    let readable_shrunk_plan_path = bug_path.join("shrunk.sql");
+                    std::fs::write(&readable_shrunk_plan_path, shrunk_plan.to_string())
+                        .with_context(|| "should be able to write readable shrunk plan file")?;
+                }
+
                 let readable_plan_path = bug_path.join("plan.sql");
                 std::fs::write(&readable_plan_path, bug.plan.to_string())
                     .with_context(|| "should be able to write readable plan file")?;
@@ -270,15 +291,26 @@ impl BugBase {
             None => anyhow::bail!("No bugs found for seed {}", seed),
             Some(Bug::Unloaded { .. }) => {
                 let plan =
-                    std::fs::read_to_string(self.path.join(seed.to_string()).join("plan.json"))
+                    std::fs::read_to_string(self.path.join(seed.to_string()).join("test.json"))
                         .with_context(|| {
                             format!(
                                 "should be able to read plan file at {}",
-                                self.path.join(seed.to_string()).join("plan.json").display()
+                                self.path.join(seed.to_string()).join("test.json").display()
                             )
                         })?;
                 let plan: InteractionPlan = serde_json::from_str(&plan)
                     .with_context(|| "should be able to deserialize plan")?;
+
+                let shrunk_plan: Option<String> = std::fs::read_to_string(
+                    self.path.join(seed.to_string()).join("shrunk_test.json"),
+                )
+                .with_context(|| "should be able to read shrunk plan file")
+                .and_then(|shrunk| serde_json::from_str(&shrunk).map_err(|e| anyhow!("{}", e)))
+                .ok();
+
+                let shrunk_plan: Option<InteractionPlan> =
+                    shrunk_plan.and_then(|shrunk_plan| serde_json::from_str(&shrunk_plan).ok());
+
                 let runs =
                     std::fs::read_to_string(self.path.join(seed.to_string()).join("runs.json"))
                         .with_context(|| "should be able to read runs file")
@@ -289,6 +321,7 @@ impl BugBase {
                     seed,
                     plan: plan.clone(),
                     runs,
+                    shrunk_plan,
                 };
 
                 self.bugs.insert(seed, Bug::Loaded(bug.clone()));
@@ -324,6 +357,7 @@ impl BugBase {
                     timestamp: SystemTime::now().into(),
                     error: None,
                     cli_options: cli_options.clone(),
+                    shrunk: false,
                 });
                 self.bugs.insert(seed, Bug::Loaded(bug.clone()));
                 // Save the bug to the bug base.
@@ -333,6 +367,29 @@ impl BugBase {
             }
         }
 
+        Ok(())
+    }
+
+    pub(crate) fn make_shrunk(
+        &mut self,
+        seed: u64,
+        cli_options: &SimulatorCLI,
+        shrunk_plan: InteractionPlan,
+        error: Option<String>,
+    ) -> anyhow::Result<()> {
+        let mut bug = self.load_bug(seed)?;
+        bug.shrunk_plan = Some(shrunk_plan);
+        bug.runs.push(BugRun {
+            hash: Self::get_current_commit_hash()?,
+            timestamp: SystemTime::now().into(),
+            error,
+            cli_options: cli_options.clone(),
+            shrunk: true,
+        });
+        self.bugs.insert(seed, Bug::Loaded(bug.clone()));
+        // Save the bug to the bug base.
+        self.save_bug(seed)
+            .with_context(|| "should be able to save shrunk bug")?;
         Ok(())
     }
 
@@ -366,7 +423,7 @@ impl BugBase {
                     }
                 );
                 if let Some(error) = &run.error {
-                    println!("    error: {}", error);
+                    println!("    error: {error}");
                 }
             }
             println!("  ------------------");
@@ -384,12 +441,12 @@ impl BugBase {
 
     /// Get the path to the database file for a given seed.
     pub(crate) fn db_path(&self, seed: u64) -> PathBuf {
-        self.path.join(format!("{}/test.db", seed))
+        self.path.join(format!("{seed}/test.db"))
     }
 
     /// Get paths to all the files for a given seed.
     pub(crate) fn paths(&self, seed: u64) -> Paths {
-        let base = self.path.join(format!("{}/", seed));
+        let base = self.path.join(format!("{seed}/"));
         Paths::new(&base)
     }
 }

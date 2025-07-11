@@ -57,8 +57,24 @@ impl Predicate {
     pub fn true_binary<R: rand::Rng>(rng: &mut R, t: &Table, row: &[SimValue]) -> Predicate {
         // Pick a column
         let column_index = rng.gen_range(0..t.columns.len());
-        let column = &t.columns[column_index];
+        let mut column = t.columns[column_index].clone();
         let value = &row[column_index];
+
+        let mut table_name = t.name.clone();
+        if t.name.is_empty() {
+            // If the table name is empty, we cannot create a qualified expression
+            // so we use the column name directly
+            let mut splitted = column.name.split('.');
+            table_name = splitted
+                .next()
+                .expect("Column name should have a table prefix for a joined table")
+                .to_string();
+            column.name = splitted
+                .next()
+                .expect("Column name should have a column suffix for a joined table")
+                .to_string();
+        }
+
         let expr = backtrack(
             vec![
                 (
@@ -66,7 +82,7 @@ impl Predicate {
                     Box::new(|_| {
                         Some(Expr::Binary(
                             Box::new(ast::Expr::Qualified(
-                                ast::Name(t.name.clone()),
+                                ast::Name(table_name.clone()),
                                 ast::Name(column.name.clone()),
                             )),
                             ast::Operator::Equals,
@@ -83,7 +99,7 @@ impl Predicate {
                         } else {
                             Some(Expr::Binary(
                                 Box::new(ast::Expr::Qualified(
-                                    ast::Name(t.name.clone()),
+                                    ast::Name(table_name.clone()),
                                     ast::Name(column.name.clone()),
                                 )),
                                 ast::Operator::NotEquals,
@@ -98,7 +114,7 @@ impl Predicate {
                         let lt_value = LTValue::arbitrary_from(rng, value).0;
                         Some(Expr::Binary(
                             Box::new(ast::Expr::Qualified(
-                                ast::Name(t.name.clone()),
+                                ast::Name(table_name.clone()),
                                 ast::Name(column.name.clone()),
                             )),
                             ast::Operator::Greater,
@@ -112,7 +128,7 @@ impl Predicate {
                         let gt_value = GTValue::arbitrary_from(rng, value).0;
                         Some(Expr::Binary(
                             Box::new(ast::Expr::Qualified(
-                                ast::Name(t.name.clone()),
+                                ast::Name(table_name.clone()),
                                 ast::Name(column.name.clone()),
                             )),
                             ast::Operator::Less,
@@ -127,7 +143,7 @@ impl Predicate {
                         LikeValue::arbitrary_from_maybe(rng, value).map(|like| {
                             Expr::Like {
                                 lhs: Box::new(ast::Expr::Qualified(
-                                    ast::Name(t.name.clone()),
+                                    ast::Name(table_name.clone()),
                                     ast::Name(column.name.clone()),
                                 )),
                                 not: false, // TODO: also generate this value eventually
@@ -149,14 +165,30 @@ impl Predicate {
     pub fn false_binary<R: rand::Rng>(rng: &mut R, t: &Table, row: &[SimValue]) -> Predicate {
         // Pick a column
         let column_index = rng.gen_range(0..t.columns.len());
-        let column = &t.columns[column_index];
+        let mut column = t.columns[column_index].clone();
+        let mut table_name = t.name.clone();
         let value = &row[column_index];
+
+        if t.name.is_empty() {
+            // If the table name is empty, we cannot create a qualified expression
+            // so we use the column name directly
+            let mut splitted = column.name.split('.');
+            table_name = splitted
+                .next()
+                .expect("Column name should have a table prefix for a joined table")
+                .to_string();
+            column.name = splitted
+                .next()
+                .expect("Column name should have a column suffix for a joined table")
+                .to_string();
+        }
+
         let expr = one_of(
             vec![
                 Box::new(|_| {
                     Expr::Binary(
                         Box::new(ast::Expr::Qualified(
-                            ast::Name(t.name.clone()),
+                            ast::Name(table_name.clone()),
                             ast::Name(column.name.clone()),
                         )),
                         ast::Operator::NotEquals,
@@ -172,7 +204,7 @@ impl Predicate {
                     };
                     Expr::Binary(
                         Box::new(ast::Expr::Qualified(
-                            ast::Name(t.name.clone()),
+                            ast::Name(table_name.clone()),
                             ast::Name(column.name.clone()),
                         )),
                         ast::Operator::Equals,
@@ -183,7 +215,7 @@ impl Predicate {
                     let gt_value = GTValue::arbitrary_from(rng, value).0;
                     Expr::Binary(
                         Box::new(ast::Expr::Qualified(
-                            ast::Name(t.name.clone()),
+                            ast::Name(table_name.clone()),
                             ast::Name(column.name.clone()),
                         )),
                         ast::Operator::Greater,
@@ -194,7 +226,7 @@ impl Predicate {
                     let lt_value = LTValue::arbitrary_from(rng, value).0;
                     Expr::Binary(
                         Box::new(ast::Expr::Qualified(
-                            ast::Name(t.name.clone()),
+                            ast::Name(table_name.clone()),
                             ast::Name(column.name.clone()),
                         )),
                         ast::Operator::Less,
@@ -213,18 +245,34 @@ impl SimplePredicate {
     pub fn true_binary<R: rand::Rng>(rng: &mut R, table: &Table, row: &[SimValue]) -> Self {
         // Pick a random column
         let column_index = rng.gen_range(0..table.columns.len());
-        let column = &table.columns[column_index];
+        let mut column = table.columns[column_index].clone();
         let column_value = &row[column_index];
+        let mut table_name = table.name.clone();
         // Avoid creation of NULLs
         if row.is_empty() {
             return SimplePredicate(Predicate(Expr::Literal(SimValue::TRUE.into())));
         }
+
+        if table.name.is_empty() {
+            // If the table name is empty, we cannot create a qualified expression
+            // so we use the column name directly
+            let mut splitted = column.name.split('.');
+            table_name = splitted
+                .next()
+                .expect("Column name should have a table prefix for a joined table")
+                .to_string();
+            column.name = splitted
+                .next()
+                .expect("Column name should have a column suffix for a joined table")
+                .to_string();
+        }
+
         let expr = one_of(
             vec![
                 Box::new(|_rng| {
                     Expr::Binary(
                         Box::new(ast::Expr::Qualified(
-                            ast::Name(table.name.clone()),
+                            ast::Name(table_name.clone()),
                             ast::Name(column.name.clone()),
                         )),
                         ast::Operator::Equals,
@@ -235,7 +283,7 @@ impl SimplePredicate {
                     let lt_value = LTValue::arbitrary_from(rng, column_value).0;
                     Expr::Binary(
                         Box::new(Expr::Qualified(
-                            ast::Name(table.name.clone()),
+                            ast::Name(table_name.clone()),
                             ast::Name(column.name.clone()),
                         )),
                         ast::Operator::Greater,
@@ -246,7 +294,7 @@ impl SimplePredicate {
                     let gt_value = GTValue::arbitrary_from(rng, column_value).0;
                     Expr::Binary(
                         Box::new(Expr::Qualified(
-                            ast::Name(table.name.clone()),
+                            ast::Name(table_name.clone()),
                             ast::Name(column.name.clone()),
                         )),
                         ast::Operator::Less,
@@ -263,18 +311,37 @@ impl SimplePredicate {
     pub fn false_binary<R: rand::Rng>(rng: &mut R, table: &Table, row: &[SimValue]) -> Self {
         // Pick a random column
         let column_index = rng.gen_range(0..table.columns.len());
-        let column = &table.columns[column_index];
+        // println!("column_index: {}", column_index);
+        // println!("table.columns: {:?}", table.columns);
+        // println!("row: {:?}", row);
+        let mut column = table.columns[column_index].clone();
         let column_value = &row[column_index];
+        let mut table_name = table.name.clone();
         // Avoid creation of NULLs
         if row.is_empty() {
             return SimplePredicate(Predicate(Expr::Literal(SimValue::FALSE.into())));
         }
+
+        if table.name.is_empty() {
+            // If the table name is empty, we cannot create a qualified expression
+            // so we use the column name directly
+            let mut splitted = column.name.split('.');
+            table_name = splitted
+                .next()
+                .expect("Column name should have a table prefix for a joined table")
+                .to_string();
+            column.name = splitted
+                .next()
+                .expect("Column name should have a column suffix for a joined table")
+                .to_string();
+        }
+
         let expr = one_of(
             vec![
                 Box::new(|_rng| {
                     Expr::Binary(
                         Box::new(Expr::Qualified(
-                            ast::Name(table.name.clone()),
+                            ast::Name(table_name.clone()),
                             ast::Name(column.name.clone()),
                         )),
                         ast::Operator::NotEquals,
@@ -285,7 +352,7 @@ impl SimplePredicate {
                     let gt_value = GTValue::arbitrary_from(rng, column_value).0;
                     Expr::Binary(
                         Box::new(ast::Expr::Qualified(
-                            ast::Name(table.name.clone()),
+                            ast::Name(table_name.clone()),
                             ast::Name(column.name.clone()),
                         )),
                         ast::Operator::Greater,
@@ -296,7 +363,7 @@ impl SimplePredicate {
                     let lt_value = LTValue::arbitrary_from(rng, column_value).0;
                     Expr::Binary(
                         Box::new(ast::Expr::Qualified(
-                            ast::Name(table.name.clone()),
+                            ast::Name(table_name.clone()),
                             ast::Name(column.name.clone()),
                         )),
                         ast::Operator::Less,
@@ -328,11 +395,19 @@ impl CompoundPredicate {
             });
         }
         let row = pick(&table.rows, rng);
+
+        tracing::trace!(
+            "Creating a {} CompoundPredicate for table: {} and row: {:?}",
+            if predicate_value { "true" } else { "false" },
+            table.name,
+            row
+        );
+
         let predicate = if rng.gen_bool(0.7) {
             // An AND for true requires each of its children to be true
             // An AND for false requires at least one of its children to be false
             if predicate_value {
-                (0..rng.gen_range(0..=3))
+                (0..rng.gen_range(1..=3))
                     .map(|_| SimplePredicate::arbitrary_from(rng, (table, row, true)).0)
                     .reduce(|accum, curr| {
                         Predicate(Expr::Binary(
@@ -344,14 +419,14 @@ impl CompoundPredicate {
                     .unwrap_or(Predicate::true_())
             } else {
                 // Create a vector of random booleans
-                let mut booleans = (0..rng.gen_range(0..=3))
+                let mut booleans = (0..rng.gen_range(1..=3))
                     .map(|_| rng.gen_bool(0.5))
                     .collect::<Vec<_>>();
 
                 let len = booleans.len();
 
                 // Make sure at least one of them is false
-                if !booleans.is_empty() && booleans.iter().all(|b| *b) {
+                if booleans.iter().all(|b| *b) {
                     booleans[rng.gen_range(0..len)] = false;
                 }
 
@@ -372,12 +447,12 @@ impl CompoundPredicate {
             // An OR for false requires each of its children to be false
             if predicate_value {
                 // Create a vector of random booleans
-                let mut booleans = (0..rng.gen_range(0..=3))
+                let mut booleans = (0..rng.gen_range(1..=3))
                     .map(|_| rng.gen_bool(0.5))
                     .collect::<Vec<_>>();
                 let len = booleans.len();
                 // Make sure at least one of them is true
-                if !booleans.is_empty() && booleans.iter().all(|b| !*b) {
+                if booleans.iter().all(|b| !*b) {
                     booleans[rng.gen_range(0..len)] = true;
                 }
 
@@ -393,7 +468,7 @@ impl CompoundPredicate {
                     })
                     .unwrap_or(Predicate::true_())
             } else {
-                (0..rng.gen_range(0..=3))
+                (0..rng.gen_range(1..=3))
                     .map(|_| SimplePredicate::arbitrary_from(rng, (table, row, false)).0)
                     .reduce(|accum, curr| {
                         Predicate(Expr::Binary(
@@ -449,11 +524,8 @@ mod tests {
             let predicate = Predicate::true_binary(&mut rng, &table, row);
             let value = expr_to_value(&predicate.0, row, &table);
             assert!(
-                value.as_ref().map_or(false, |value| value.as_bool()),
-                "Predicate: {:#?}\nValue: {:#?}\nSeed: {}",
-                predicate,
-                value,
-                seed
+                value.as_ref().is_some_and(|value| value.as_bool()),
+                "Predicate: {predicate:#?}\nValue: {value:#?}\nSeed: {seed}"
             )
         }
     }
@@ -478,11 +550,8 @@ mod tests {
             let predicate = Predicate::false_binary(&mut rng, &table, row);
             let value = expr_to_value(&predicate.0, row, &table);
             assert!(
-                !value.as_ref().map_or(false, |value| value.as_bool()),
-                "Predicate: {:#?}\nValue: {:#?}\nSeed: {}",
-                predicate,
-                value,
-                seed
+                !value.as_ref().is_some_and(|value| value.as_bool()),
+                "Predicate: {predicate:#?}\nValue: {value:#?}\nSeed: {seed}"
             )
         }
     }
@@ -511,7 +580,7 @@ mod tests {
                 .map(|row| predicate.0.test(row, &table))
                 .reduce(|accum, curr| accum || curr)
                 .unwrap_or(false);
-            assert!(result, "Predicate: {:#?}\nSeed: {}", predicate, seed)
+            assert!(result, "Predicate: {predicate:#?}\nSeed: {seed}")
         }
     }
 
@@ -538,7 +607,7 @@ mod tests {
                 .iter()
                 .map(|row| predicate.0.test(row, &table))
                 .any(|res| !res);
-            assert!(result, "Predicate: {:#?}\nSeed: {}", predicate, seed)
+            assert!(result, "Predicate: {predicate:#?}\nSeed: {seed}")
         }
     }
 }
