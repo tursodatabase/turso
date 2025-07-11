@@ -56,7 +56,6 @@ use crate::storage::btree::offset::{
     BTREE_CELL_CONTENT_AREA, BTREE_CELL_COUNT, BTREE_FIRST_FREEBLOCK, BTREE_FRAGMENTED_BYTES_COUNT,
     BTREE_PAGE_TYPE, BTREE_RIGHTMOST_PTR,
 };
-use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::pager::Pager;
@@ -661,10 +660,12 @@ impl PageContent {
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16_no_offset(cell_pointer) as usize;
         let start = cell_pointer;
-        let payload_overflow_threshold_max =
-            payload_overflow_threshold_max(self.page_type(), usable_size as u16);
-        let payload_overflow_threshold_min =
-            payload_overflow_threshold_min(self.page_type(), usable_size as u16);
+        let payload_overflow_threshold_max = self
+            .page_type()
+            .payload_overflow_threshold_max(usable_size as u16);
+        let payload_overflow_threshold_min = self
+            .page_type()
+            .payload_overflow_threshold_min(usable_size as u16);
         let len = match self.page_type() {
             PageType::IndexInterior => {
                 let (len_payload, n_payload) = read_varint(&buf[cell_pointer + 4..]).unwrap();
@@ -917,8 +918,8 @@ pub fn read_btree_cell(
     usable_size: usize,
 ) -> Result<BTreeCell> {
     let page_type = page_content.page_type();
-    let max_local = payload_overflow_threshold_max(page_type, usable_size as u16);
-    let min_local = payload_overflow_threshold_min(page_type, usable_size as u16);
+    let max_local = page_type.payload_overflow_threshold_max(usable_size as u16);
+    let min_local = page_type.payload_overflow_threshold_min(usable_size as u16);
     match page_type {
         PageType::IndexInterior => {
             let mut pos = pos;

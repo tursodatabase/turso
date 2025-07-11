@@ -728,41 +728,33 @@ impl BTree {
         // Pin page in order to not drop it in between
         page.set_dirty();
         let contents = page.get().contents.as_ref().unwrap();
-        let page_type = contents.page_type();
         let mut previous_key = None;
         let mut valid = true;
         let mut depth = None;
         debug_validate_cells!(contents, self.pager.usable_space() as u16);
         let mut child_pages = Vec::new();
         for cell_idx in 0..contents.cell_count() {
-            let cell = contents
-                .cell_get(
-                    cell_idx,
-                    page_type.payload_overflow_threshold_max(4096),
-                    page_type.payload_overflow_threshold_min(4096),
-                    cursor.usable_space(),
-                )
-                .unwrap();
+            let cell = contents.cell_get(cell_idx, cursor.usable_space()).unwrap();
             let current_depth = match cell {
                 BTreeCell::TableLeafCell(..) => 1,
                 BTreeCell::TableInteriorCell(TableInteriorCell {
-                    _left_child_page, ..
+                    left_child_page, ..
                 }) => {
-                    let child_page = cursor.read_page(_left_child_page as usize).unwrap();
+                    let child_page = cursor.read_page(left_child_page as usize).unwrap();
                     while child_page.get().is_locked() {
                         self.io.run_once().unwrap();
                     }
                     child_pages.push(child_page);
-                    if _left_child_page == page.get().id as u32 {
+                    if left_child_page == page.get().id as u32 {
                         valid = false;
                         tracing::error!(
                             "left child page is the same as parent {}",
-                            _left_child_page
+                            left_child_page
                         );
                         continue;
                     }
                     let (child_depth, child_valid) =
-                        self.clone().validate(_left_child_page as usize);
+                        self.clone().validate(left_child_page as usize);
                     valid &= child_valid;
                     child_depth
                 }
@@ -779,17 +771,17 @@ impl BTree {
                 valid = false;
             }
             match cell {
-                BTreeCell::TableInteriorCell(TableInteriorCell { _rowid, .. })
-                | BTreeCell::TableLeafCell(TableLeafCell { _rowid, .. }) => {
-                    if previous_key.is_some() && previous_key.unwrap() >= _rowid {
+                BTreeCell::TableInteriorCell(TableInteriorCell { rowid, .. })
+                | BTreeCell::TableLeafCell(TableLeafCell { rowid, .. }) => {
+                    if previous_key.is_some() && previous_key.unwrap() >= rowid {
                         tracing::error!(
                             "keys are in bad order: prev={:?}, current={}",
                             previous_key,
-                            _rowid
+                            rowid
                         );
                         valid = false;
                     }
-                    previous_key = Some(_rowid);
+                    previous_key = Some(rowid);
                 }
                 _ => panic!("unsupported btree cell: {:?}", cell),
             }
@@ -845,34 +837,26 @@ impl BTree {
         // Pin page in order to not drop it in between loading of different pages. If not contents will be a dangling reference.
         page.set_dirty();
         let contents = page.get().contents.as_ref().unwrap();
-        let page_type = contents.page_type();
         let mut current = Vec::new();
         let mut child = Vec::new();
         for cell_idx in 0..contents.cell_count() {
-            let cell = contents
-                .cell_get(
-                    cell_idx,
-                    page_type.payload_overflow_threshold_max(4096),
-                    page_type.payload_overflow_threshold_min(4096),
-                    cursor.usable_space(),
-                )
-                .unwrap();
+            let cell = contents.cell_get(cell_idx, cursor.usable_space()).unwrap();
             match cell {
                 BTreeCell::TableInteriorCell(cell) => {
                     current.push(format!(
                         "node[rowid:{}, ptr(<=):{}]",
-                        cell._rowid, cell._left_child_page
+                        cell.rowid, cell.left_child_page
                     ));
                     let format_btree = self
                         .clone()
-                        .format(cell._left_child_page as usize, depth + 2);
+                        .format(cell.left_child_page as usize, depth + 2);
                     child.push(format_btree);
                 }
                 BTreeCell::TableLeafCell(cell) => {
                     current.push(format!(
                         "leaf[rowid:{}, len(payload):{}, overflow:{}]",
-                        cell._rowid,
-                        cell._payload.len(),
+                        cell.rowid,
+                        cell.payload.len(),
                         cell.first_overflow_page.is_some()
                     ));
                 }

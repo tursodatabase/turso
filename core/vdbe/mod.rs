@@ -390,7 +390,7 @@ impl Program {
                 // Connection is closed for whatever reason, rollback the transaction.
                 let state = self.connection.transaction_state.get();
                 if let TransactionState::Write { schema_did_change } = state {
-                    pager.rollback(schema_did_change, &self.connection)?
+                    btree.pager.rollback(schema_did_change, &self.connection)?
                 }
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
