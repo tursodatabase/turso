@@ -602,7 +602,7 @@ impl DatabaseFile {
 }
 
 impl turso_core::DatabaseStorage for DatabaseFile {
-    fn read_page(&self, page_idx: usize, c: turso_core::Completion) -> turso_core::Result<()> {
+    fn read_page(&self, page_idx: usize, c: turso_core::Completion) {
         let r = match c.completion_type {
             turso_core::CompletionType::Read(ref r) => r,
             _ => unreachable!(),
@@ -610,11 +610,10 @@ impl turso_core::DatabaseStorage for DatabaseFile {
         let size = r.buf().len();
         assert!(page_idx > 0);
         if !(512..=65536).contains(&size) || size & (size - 1) != 0 {
-            return Err(turso_core::LimboError::NotADB);
+            panic!("Not a DB");
         }
         let pos = (page_idx - 1) * size;
-        self.file.pread(pos, c)?;
-        Ok(())
+        self.file.pread(pos, c);
     }
 
     fn write_page(
@@ -622,16 +621,14 @@ impl turso_core::DatabaseStorage for DatabaseFile {
         page_idx: usize,
         buffer: Arc<std::cell::RefCell<turso_core::Buffer>>,
         c: turso_core::Completion,
-    ) -> turso_core::Result<()> {
+    ) {
         let size = buffer.borrow().len();
         let pos = (page_idx - 1) * size;
-        self.file.pwrite(pos, buffer, c)?;
-        Ok(())
+        self.file.pwrite(pos, buffer, c);
     }
 
-    fn sync(&self, c: turso_core::Completion) -> turso_core::Result<()> {
-        let _ = self.file.sync(c)?;
-        Ok(())
+    fn sync(&self, c: turso_core::Completion) {
+        self.file.sync(c);
     }
 
     fn size(&self) -> turso_core::Result<u64> {
