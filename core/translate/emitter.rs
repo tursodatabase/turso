@@ -1289,6 +1289,7 @@ pub fn emit_cdc_full_record(
     columns_reg
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn emit_cdc_insns(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
