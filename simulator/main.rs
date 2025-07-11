@@ -14,7 +14,7 @@ use runner::{differential, watch};
 use std::any::Any;
 use std::backtrace::Backtrace;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use tracing_subscriber::field::MakeExt;
@@ -697,7 +697,6 @@ fn run_simulation(
     result
 }
 
-#[allow(deprecated)]
 fn init_logger() {
     let file = OpenOptions::new()
         .create(true)
@@ -705,16 +704,20 @@ fn init_logger() {
         .truncate(true)
         .open("simulator.log")
         .unwrap();
+
+    let requires_ansi = std::io::stdout().is_terminal();
+
     let _ = tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
-                .with_ansi(true)
+                .with_ansi(requires_ansi)
                 .with_line_number(true)
                 .without_time()
                 .with_thread_ids(false),
         )
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(
+            #[allow(deprecated)]
             tracing_subscriber::fmt::layer()
                 .with_writer(file)
                 .with_ansi(false)
