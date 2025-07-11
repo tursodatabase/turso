@@ -28,10 +28,9 @@ use crate::{
     },
 };
 use std::ops::DerefMut;
-use std::str::FromStr;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 use std::{borrow::BorrowMut, rc::Rc, sync::Arc};
+use std::{ sync::atomic::AtomicUsize};
 
 use crate::{pseudo::PseudoCursor, result::LimboResult};
 
@@ -4043,48 +4042,71 @@ pub fn op_function(
             }
             ScalarFunc::TableColumnsJsonArray => {
                 assert_eq!(arg_count, 1);
-                let table = state.registers[*start_reg].get_owned_value();
-                let Value::Text(table) = table else {
+                #[cfg(not(feature = "json"))]
+                {
                     return Err(LimboError::InvalidArgument(
-                        "table_columns_json_array: function argument must be of type TEXT"
+                        "table_columns_json_array: turso must be compiled with JSON support"
                             .to_string(),
                     ));
-                };
-                let table = {
-                    let schema = program.connection.schema.borrow();
-                    match schema.get_table(table.as_str()) {
-                        Some(table) => table,
-                        None => {
-                            return Err(LimboError::InvalidArgument(format!(
-                                "table_columns_json_array: table {} doesn't exists",
-                                table
-                            )))
-                        }
-                    }
-                };
-
-                let mut json = json::jsonb::Jsonb::make_empty_array(table.columns().len() * 10);
-                for column in table.columns() {
-                    let name = column.name.as_ref().unwrap();
-                    let name_json = json::convert_ref_dbtype_to_jsonb(
-                        &RefValue::Text(TextRef::create_from(
-                            name.as_str().as_bytes(),
-                            TextSubtype::Text,
-                        )),
-                        json::Conv::ToString,
-                    )?;
-                    json.append_jsonb_to_end(name_json.data());
                 }
-                json.finalize_unsafe(json::jsonb::ElementType::ARRAY)?;
-                state.registers[*dest] = Register::Value(json::json_string_to_db_type(
-                    json,
-                    json::jsonb::ElementType::ARRAY,
-                    json::OutputVariant::String,
-                )?);
+                #[cfg(feature = "json")]
+                {
+                    use crate::types::{TextRef, TextSubtype};
+
+                    let table = state.registers[*start_reg].get_owned_value();
+                    let Value::Text(table) = table else {
+                        return Err(LimboError::InvalidArgument(
+                            "table_columns_json_array: function argument must be of type TEXT"
+                                .to_string(),
+                        ));
+                    };
+                    let table = {
+                        let schema = program.connection.schema.borrow();
+                        match schema.get_table(table.as_str()) {
+                            Some(table) => table,
+                            None => {
+                                return Err(LimboError::InvalidArgument(format!(
+                                    "table_columns_json_array: table {} doesn't exists",
+                                    table
+                                )))
+                            }
+                        }
+                    };
+
+                    let mut json = json::jsonb::Jsonb::make_empty_array(table.columns().len() * 10);
+                    for column in table.columns() {
+                        let name = column.name.as_ref().unwrap();
+                        let name_json = json::convert_ref_dbtype_to_jsonb(
+                            &RefValue::Text(TextRef::create_from(
+                                name.as_str().as_bytes(),
+                                TextSubtype::Text,
+                            )),
+                            json::Conv::ToString,
+                        )?;
+                        json.append_jsonb_to_end(name_json.data());
+                    }
+                    json.finalize_unsafe(json::jsonb::ElementType::ARRAY)?;
+                    state.registers[*dest] = Register::Value(json::json_string_to_db_type(
+                        json,
+                        json::jsonb::ElementType::ARRAY,
+                        json::OutputVariant::String,
+                    )?);
+                }
             }
             ScalarFunc::BinRecordJsonObject => {
                 assert_eq!(arg_count, 2);
+                #[cfg(not(feature = "json"))]
+                {
+                    return Err(LimboError::InvalidArgument(
+                        "bin_record_json_object: turso must be compiled with JSON support"
+                            .to_string(),
+                    ));
+                }
+                #[cfg(feature = "json")]
                 'outer: {
+                    use crate::types::RecordCursor;
+                    use std::str::FromStr;
+
                     let columns_str = state.registers[*start_reg].get_owned_value();
                     let bin_record = state.registers[*start_reg + 1].get_owned_value();
                     let Value::Text(columns_str) = columns_str else {
@@ -4108,9 +4130,10 @@ pub fn op_function(
                     let columns_len = columns_json_array.array_len()?;
 
                     let mut record = ImmutableRecord::new(bin_record.len());
-                    read_record(bin_record, &mut record)?;
+                    record.start_serialization(&bin_record);
+                    let mut record_cursor = RecordCursor::new();
 
-                    let mut json = json::jsonb::Jsonb::make_empty_obj(record.len());
+                    let mut json = json::jsonb::Jsonb::make_empty_obj(columns_len);
                     for i in 0..columns_len {
                         let mut op = json::jsonb::SearchOperation::new(0);
                         let path = json::path::JsonPath {
@@ -4124,14 +4147,14 @@ pub fn op_function(
                         let column_name = op.result();
                         json.append_jsonb_to_end(column_name.data());
 
-                        let val = record.get_value(i);
+                        let val = record_cursor.get_value(&record, i)?;
                         if let RefValue::Blob(..) = val {
                             return Err(LimboError::InvalidArgument(
                                 "bin_record_json_object: formatting of BLOB values stored in binary record is not supported".to_string()
                             ));
                         }
                         let val_json =
-                            json::convert_ref_dbtype_to_jsonb(val, json::Conv::NotStrict)?;
+                            json::convert_ref_dbtype_to_jsonb(&val, json::Conv::NotStrict)?;
                         json.append_jsonb_to_end(val_json.data());
                     }
                     json.finalize_unsafe(json::jsonb::ElementType::OBJECT)?;
