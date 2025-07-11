@@ -517,22 +517,19 @@ impl Connection {
             .unwrap()
             .trim();
         self.maybe_update_schema();
+        let pager = self.pager.borrow().clone();
         match cmd {
             Cmd::Stmt(stmt) => {
                 let program = Rc::new(translate::translate(
                     self.schema.borrow().deref(),
                     stmt,
-                    self.pager.borrow().clone(),
+                    pager.clone(),
                     self.clone(),
                     &syms,
                     QueryMode::Normal,
                     input,
                 )?);
-                Ok(Statement::new(
-                    program,
-                    self._db.mv_store.clone(),
-                    self.pager.borrow().clone(),
-                ))
+                Ok(Statement::new(program, self._db.mv_store.clone(), pager))
             }
             Cmd::Explain(_stmt) => todo!(),
             Cmd::ExplainQueryPlan(_stmt) => todo!(),
@@ -568,22 +565,19 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let syms = self.syms.borrow();
+        let pager = self.pager.borrow().clone();
         match cmd {
             Cmd::Stmt(ref stmt) | Cmd::Explain(ref stmt) => {
                 let program = translate::translate(
                     self.schema.borrow().deref(),
                     stmt.clone(),
-                    self.pager.borrow().clone(),
+                    pager.clone(),
                     self.clone(),
                     &syms,
                     cmd.into(),
                     input,
                 )?;
-                let stmt = Statement::new(
-                    program.into(),
-                    self._db.mv_store.clone(),
-                    self.pager.borrow().clone(),
-                );
+                let stmt = Statement::new(program.into(), self._db.mv_store.clone(), pager);
                 Ok(Some(stmt))
             }
             Cmd::ExplainQueryPlan(stmt) => {
@@ -623,6 +617,7 @@ impl Connection {
         let mut parser = Parser::new(sql.as_bytes());
         while let Some(cmd) = parser.next()? {
             let syms = self.syms.borrow();
+            let pager = self.pager.borrow().clone();
             let byte_offset_end = parser.offset();
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
@@ -633,7 +628,7 @@ impl Connection {
                     let program = translate::translate(
                         self.schema.borrow().deref(),
                         stmt,
-                        self.pager.borrow().clone(),
+                        pager,
                         self.clone(),
                         &syms,
                         QueryMode::Explain,
@@ -646,7 +641,7 @@ impl Connection {
                     let program = translate::translate(
                         self.schema.borrow().deref(),
                         stmt,
-                        self.pager.borrow().clone(),
+                        pager.clone(),
                         self.clone(),
                         &syms,
                         QueryMode::Normal,
@@ -656,11 +651,8 @@ impl Connection {
                     let mut state =
                         vdbe::ProgramState::new(program.max_registers, program.cursor_ref.len());
                     loop {
-                        let res = program.step(
-                            &mut state,
-                            self._db.mv_store.clone(),
-                            self.pager.borrow().clone(),
-                        )?;
+                        let res =
+                            program.step(&mut state, self._db.mv_store.clone(), pager.clone())?;
                         if matches!(res, StepResult::Done) {
                             break;
                         }

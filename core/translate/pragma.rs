@@ -30,7 +30,7 @@ fn list_pragmas(program: &mut ProgramBuilder) {
         program.emit_result_row(register, 1);
     }
     program.add_pragma_result_column("pragma_list".into());
-    program.epilogue(crate::translate::emitter::TransactionMode::None);
+    program.epilogue(TransactionMode::None);
 }
 
 #[allow(clippy::too_many_arguments)]
