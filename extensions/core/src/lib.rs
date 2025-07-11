@@ -13,7 +13,10 @@ pub use turso_macros::VfsDerive;
 pub use turso_macros::{register_extension, scalar, AggregateDerive, VTabModuleDerive};
 pub use types::{ResultCode, StepResult, Value, ValueType};
 #[cfg(feature = "vfs")]
-pub use vfs_modules::{RegisterVfsFn, VfsExtension, VfsFile, VfsFileImpl, VfsImpl, VfsInterface};
+pub use vfs_modules::{
+    CallbackFn, CompletionCallbackFn, RegisterVfsFn, VfsExtension, VfsFile, VfsFileImpl, VfsImpl,
+    VfsInterface,
+};
 use vtabs::RegisterModuleFn;
 pub use vtabs::{
     Conn, Connection, ConstraintInfo, ConstraintOp, ConstraintUsage, ExtIndexInfo, IndexInfo,

@@ -107,18 +107,14 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
         }
 
         #[no_mangle]
-        pub unsafe extern "C" fn #read_fn_name(file_ptr: *const ::std::ffi::c_void, buf: *mut u8, count: usize, offset: i64) {
-            if file_ptr.is_null() {
-                return -1;
-            }
+        pub unsafe extern "C" fn #read_fn_name(file_ptr: *const ::std::ffi::c_void, buf: *mut u8, count: usize, offset: i64, completion: *const ::std::ffi::c_void, completion_callback: *const ::std::ffi::c_void) {
             assert!(!file_ptr.is_null(), "File Ptr is NULL");
             let vfs_file: &mut ::turso_ext::VfsFileImpl = &mut *(file_ptr as *mut ::turso_ext::VfsFileImpl);
             let file: &mut <#struct_name as ::turso_ext::VfsExtension>::File =
                 &mut *(vfs_file.file as *mut <#struct_name as ::turso_ext::VfsExtension>::File);
-            match <#struct_name as ::turso_ext::VfsExtension>::File::read(file, ::std::slice::from_raw_parts_mut(buf, count), count, offset) {
-                Ok(n) => n,
-                Err(_) => -1,
-            }
+            let callback: ::turso_ext::CallbackFn = unsafe { ::std::mem::transmute(completion_callback) };
+            let callback: ::turso_ext::CompletionCallbackFn = ::std::boxed::Box::new( move |res: i32| {callback(completion, res)});
+            <#struct_name as ::turso_ext::VfsExtension>::File::read(file, buf, count, offset, callback)
         }
 
         #[no_mangle]
@@ -134,15 +130,14 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
         }
 
         #[no_mangle]
-        pub unsafe extern "C" fn #write_fn_name(file_ptr: *const ::std::ffi::c_void, buf: *const u8, count: usize, offset: i64) -> i32 {
+        pub unsafe extern "C" fn #write_fn_name(file_ptr: *const ::std::ffi::c_void, buf: *const u8, count: usize, offset: i64, completion: *const ::std::ffi::c_void, completion_callback: *const ::std::ffi::c_void) {
             assert!(!file_ptr.is_null(), "File Ptr is NULL");
             let vfs_file: &mut ::turso_ext::VfsFileImpl = &mut *(file_ptr as *mut ::turso_ext::VfsFileImpl);
             let file: &mut <#struct_name as ::turso_ext::VfsExtension>::File =
                 &mut *(vfs_file.file as *mut <#struct_name as ::turso_ext::VfsExtension>::File);
-            match <#struct_name as ::turso_ext::VfsExtension>::File::write(file, ::std::slice::from_raw_parts(buf, count), count, offset) {
-                Ok(n) => n,
-                Err(_) => -1,
-            }
+            let callback: ::turso_ext::CallbackFn = unsafe { ::std::mem::transmute(completion_callback) };
+            let callback: ::turso_ext::CompletionCallbackFn = ::std::boxed::Box::new( move |res: i32| {callback(completion, res)});
+            <#struct_name as ::turso_ext::VfsExtension>::File::write(file, buf, count, offset, callback)
         }
 
         #[no_mangle]
@@ -174,15 +169,14 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
         }
 
         #[no_mangle]
-        pub unsafe extern "C" fn #sync_fn_name(file_ptr: *const ::std::ffi::c_void) -> i32 {
+        pub unsafe extern "C" fn #sync_fn_name(file_ptr: *const ::std::ffi::c_void, completion: *const ::std::ffi::c_void, completion_callback: *const ::std::ffi::c_void) {
             assert!(!file_ptr.is_null(), "File Ptr is NULL");
             let vfs_file: &mut ::turso_ext::VfsFileImpl = &mut *(file_ptr as *mut ::turso_ext::VfsFileImpl);
             let file: &mut <#struct_name as ::turso_ext::VfsExtension>::File =
                 &mut *(vfs_file.file as *mut <#struct_name as ::turso_ext::VfsExtension>::File);
-            if <#struct_name as ::turso_ext::VfsExtension>::File::sync(file).is_err() {
-                return -1;
-            }
-            0
+            let callback: ::turso_ext::CallbackFn = unsafe { ::std::mem::transmute(completion_callback) };
+            let callback: ::turso_ext::CompletionCallbackFn = ::std::boxed::Box::new( move |res: i32| {callback(completion, res)});
+            <#struct_name as ::turso_ext::VfsExtension>::File::sync(file, callback)
         }
 
         #[no_mangle]

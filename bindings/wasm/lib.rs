@@ -221,9 +221,9 @@ impl turso_core::File for File {
         let nr = {
             let mut buf = r.buf_mut();
             let buf: &mut [u8] = buf.as_mut_slice();
-            self.vfs.pread(self.fd, buf, pos)
-        };
-        r.complete(nr);
+            self.vfs.pread(self.fd, buf, pos);
+        }
+        r.complete();
         #[allow(clippy::arc_with_non_send_sync)]
         Arc::new(c)
     }
