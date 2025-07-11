@@ -76,6 +76,12 @@ impl VfsMod {
     }
 }
 
+extern "C" fn completion_callback(completion: *const c_void, result: i32) {
+    assert!(!completion.is_null(), "Completion Is Null");
+    let completion = unsafe { Arc::from_raw(completion as *const Completion) };
+    completion.complete(result)
+}
+
 impl File for VfsFileImpl {
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         let vfs = unsafe { &*self.vfs };
@@ -99,24 +105,37 @@ impl File for VfsFileImpl {
     }
 
     fn pread(&self, pos: usize, c: Completion) -> Arc<Completion> {
+        let c = Arc::new(c);
         let r = match c.completion_type {
             CompletionType::Read(ref r) => r,
             _ => unreachable!(),
         };
         assert!(!self.vfs.is_null(), "VFS is null");
+        let clone_c = c.clone();
         {
             let mut buf = r.buf_mut();
             let count = buf.len();
             let vfs = unsafe { &*self.vfs };
-            unsafe { (vfs.read)(self.file, buf.as_mut_ptr(), count, pos as i64) }
+            unsafe {
+                (vfs.read)(
+                    self.file,
+                    buf.as_mut_ptr(),
+                    count,
+                    pos as i64,
+                    Arc::into_raw(clone_c) as *const c_void,
+                    completion_callback as *const c_void,
+                )
+            }
         }
-        Arc::new(c)
+        c
     }
 
     fn pwrite(&self, pos: usize, buffer: Arc<RefCell<Buffer>>, c: Completion) -> Arc<Completion> {
         let buf = buffer.borrow();
         let count = buf.as_slice().len();
         assert!(!self.vfs.is_null(), "VFS is null");
+        let c = Arc::new(c);
+        let clone_c = c.clone();
         let vfs = unsafe { &*self.vfs };
         unsafe {
             (vfs.write)(
@@ -124,17 +143,26 @@ impl File for VfsFileImpl {
                 buf.as_slice().as_ptr() as *mut u8,
                 count,
                 pos as i64,
+                Arc::into_raw(clone_c) as *const c_void,
+                completion_callback as *const c_void,
             )
         };
-
-        Arc::new(c)
+        c
     }
 
     fn sync(&self, c: Completion) -> Arc<Completion> {
         let vfs = unsafe { &*self.vfs };
         assert!(!self.vfs.is_null(), "VFS is null");
-        unsafe { (vfs.sync)(self.file) };
-        Arc::new(c)
+        let c = Arc::new(c);
+        let clone_c = c.clone();
+        unsafe {
+            (vfs.sync)(
+                self.file,
+                Arc::into_raw(clone_c) as *const c_void,
+                completion_callback as *const c_void,
+            )
+        };
+        c
     }
 
     fn size(&self) -> Result<u64> {

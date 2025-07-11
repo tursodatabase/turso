@@ -221,8 +221,7 @@ impl turso_core::File for File {
         {
             let mut buf = r.buf_mut();
             let buf: &mut [u8] = buf.as_mut_slice();
-            let nr = self.vfs.pread(self.fd, buf, pos);
-            assert!(nr >= 0);
+            self.vfs.pread(self.fd, buf, pos);
         }
         r.complete();
         #[allow(clippy::arc_with_non_send_sync)]

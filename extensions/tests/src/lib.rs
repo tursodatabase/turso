@@ -10,7 +10,7 @@ use turso_ext::{
     VTabModuleDerive, VTable, Value,
 };
 #[cfg(not(target_family = "wasm"))]
-use turso_ext::{VfsDerive, VfsExtension, VfsFile};
+use turso_ext::{CompletionCallbackFn, VfsDerive, VfsExtension, VfsFile};
 
 register_extension! {
     vtabs: { KVStoreVTabModule, TableStatsVtabModule },
@@ -227,16 +227,30 @@ impl VTable for KVStoreTable {
     }
 }
 
+type Callback = Box<dyn Fn() -> ExtResult<()>>;
+type CallbackQueue = Arc<Mutex<Vec<Callback>>>;
+
 pub struct TestFile {
-    file: File,
+    file: Arc<Mutex<File>>,
+    callbacks: CallbackQueue,
 }
 
 #[cfg(target_family = "wasm")]
-pub struct TestFS;
+pub struct TestFS {
+    callbacks: CallbackQueue,
+}
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(VfsDerive, Default)]
-pub struct TestFS;
+pub struct TestFS {
+    callbacks: CallbackQueue,
+}
+
+unsafe impl Send for TestFS {}
+unsafe impl Sync for TestFS {}
+
+unsafe impl Send for TestFile {}
+unsafe impl Sync for TestFile {}
 
 // Test that we can have additional extension types in the same file
 // and still register the vfs at comptime if linking staticly
@@ -258,41 +272,98 @@ impl VfsExtension for TestFS {
             .create(flags & 1 != 0)
             .open(path)
             .map_err(|_| ResultCode::Error)?;
-        Ok(TestFile { file })
+        Ok(TestFile {
+            file: Arc::new(Mutex::new(file)),
+            callbacks: self.callbacks.clone(),
+        })
+    }
+
+    fn run_once(&self) -> ExtResult<()> {
+        let mut callbacks = self.callbacks.lock().unwrap();
+        let events = callbacks.drain(0..);
+        for op in events {
+            op()?
+        }
+        Ok(())
     }
 }
 
 #[cfg(not(target_family = "wasm"))]
 impl VfsFile for TestFile {
-    fn read(&mut self, buf: &mut [u8], count: usize, offset: i64) {
-        log::debug!("reading file with testing VFS: bytes: {count} offset: {offset}");
-        if self.file.seek(SeekFrom::Start(offset as u64)).is_err() {
-            return Err(ResultCode::Error);
-        }
-        self.file
-            .read(&mut buf[..count])
-            .map_err(|_| ResultCode::Error)
-            .map(|n| n as i32)
+    unsafe fn read(
+        &mut self,
+        buf: *mut u8,
+        len: usize,
+        offset: i64,
+        callback: CompletionCallbackFn,
+    ) {
+        log::debug!("reading file with testing VFS: bytes: {len} offset: {offset}");
+        assert!(!buf.is_null(), "Buf Pointer is null");
+
+        let mut callbacks = self.callbacks.lock().unwrap();
+        let clone_file = self.file.clone();
+        callbacks.push(Box::new(move || -> ExtResult<()> {
+            let mut file = clone_file.lock().unwrap();
+            if file.seek(SeekFrom::Start(offset as u64)).is_err() {
+                return Err(ResultCode::Error);
+            }
+            let buf: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(buf, len) };
+            let res = file
+                .read(buf)
+                .map_err(|_| ResultCode::Error)
+                .map(|n| n as i32)?;
+            callback(res);
+            Ok(())
+        }));
     }
 
-    fn write(&mut self, buf: &[u8], count: usize, offset: i64) {
-        log::debug!("writing to file with testing VFS: bytes: {count} offset: {offset}");
-        if self.file.seek(SeekFrom::Start(offset as u64)).is_err() {
-            return Err(ResultCode::Error);
-        }
-        self.file
-            .write(&buf[..count])
-            .map_err(|_| ResultCode::Error)
-            .map(|n| n as i32)
+    unsafe fn write(
+        &mut self,
+        buf: *const u8,
+        len: usize,
+        offset: i64,
+        callback: CompletionCallbackFn,
+    ) {
+        log::debug!("writing to file with testing VFS: bytes: {len} offset: {offset}");
+        assert!(!buf.is_null(), "Buf Pointer is null");
+        let mut callbacks = self.callbacks.lock().unwrap();
+        let clone_file = self.file.clone();
+        callbacks.push(Box::new(move || -> ExtResult<()> {
+            let mut file = clone_file.lock().unwrap();
+            if file.seek(SeekFrom::Start(offset as u64)).is_err() {
+                return Err(ResultCode::Error);
+            }
+            let buf: &[u8] = unsafe { std::slice::from_raw_parts(buf, len) };
+
+            let res = file
+                .write(&buf[..len])
+                .map_err(|_| ResultCode::Error)
+                .map(|n| n as i32)?;
+            callback(res);
+
+            Ok(())
+        }));
     }
 
-    fn sync(&self) {
+    fn sync(&self, callback: CompletionCallbackFn) {
         log::debug!("syncing file with testing VFS");
-        self.file.sync_all().map_err(|_| ResultCode::Error)
+        let mut callbacks = self.callbacks.lock().unwrap();
+        let clone_file = self.file.clone();
+        callbacks.push(Box::new(move || -> ExtResult<()> {
+            let file = clone_file.lock().unwrap();
+            file.sync_all().map_err(|_| ResultCode::Error)?;
+            callback(0);
+            Ok(())
+        }));
     }
 
     fn size(&self) -> i64 {
-        self.file.metadata().map(|m| m.len() as i64).unwrap_or(-1)
+        self.file
+            .lock()
+            .unwrap()
+            .metadata()
+            .map(|m| m.len() as i64)
+            .unwrap_or(-1)
     }
 }
 

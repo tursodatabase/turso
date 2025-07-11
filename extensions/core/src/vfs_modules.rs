@@ -38,9 +38,23 @@ pub trait VfsFile: Send + Sync {
     fn unlock(&self) -> ExtResult<()> {
         Ok(())
     }
-    fn read(&mut self, buf: &mut [u8], count: usize, offset: i64);
-    fn write(&mut self, buf: &[u8], count: usize, offset: i64);
-    fn sync(&self);
+    /// ### Safety
+    ///
+    unsafe fn read(
+        &mut self,
+        buf: *mut u8,
+        len: usize,
+        offset: i64,
+        callback: CompletionCallbackFn,
+    );
+    unsafe fn write(
+        &mut self,
+        buf: *const u8,
+        len: usize,
+        offset: i64,
+        callback: CompletionCallbackFn,
+    );
+    fn sync(&self, callback: CompletionCallbackFn);
     fn size(&self) -> i64;
 }
 
@@ -61,6 +75,12 @@ pub struct VfsImpl {
     pub gen_random_number: VfsGenerateRandomNumber,
 }
 
+#[doc(hidden)]
+/// Not public API
+pub type CallbackFn = fn(*const ::std::ffi::c_void, i32);
+/// Function that is called after successful IO
+pub type CompletionCallbackFn = Box<dyn Fn(i32)>;
+
 pub type RegisterVfsFn =
     unsafe extern "C" fn(name: *const c_char, vfs: *const VfsImpl) -> ResultCode;
 
@@ -73,13 +93,29 @@ pub type VfsOpen = unsafe extern "C" fn(
 
 pub type VfsClose = unsafe extern "C" fn(file: *const c_void) -> ResultCode;
 
-pub type VfsRead =
-    unsafe extern "C" fn(file: *const c_void, buf: *mut u8, count: usize, offset: i64);
+pub type VfsRead = unsafe extern "C" fn(
+    file: *const c_void,
+    buf: *mut u8,
+    count: usize,
+    offset: i64,
+    completion: *const c_void,
+    completion_callback: *const c_void,
+);
 
-pub type VfsWrite =
-    unsafe extern "C" fn(file: *const c_void, buf: *const u8, count: usize, offset: i64);
+pub type VfsWrite = unsafe extern "C" fn(
+    file: *const c_void,
+    buf: *const u8,
+    count: usize,
+    offset: i64,
+    completion: *const c_void,
+    completion_callback: *const c_void,
+);
 
-pub type VfsSync = unsafe extern "C" fn(file: *const c_void);
+pub type VfsSync = unsafe extern "C" fn(
+    file: *const c_void,
+    completion: *const c_void,
+    completion_callback: *const c_void,
+);
 
 pub type VfsLock = unsafe extern "C" fn(file: *const c_void, exclusive: bool) -> ResultCode;
 
