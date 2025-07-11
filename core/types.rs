@@ -996,7 +996,7 @@ impl ImmutableRecord {
                     let ptr = unsafe { writer.buf.as_ptr().add(start_offset) };
                     let value = RefValue::Text(TextRef {
                         value: RawSlice::new(ptr, len),
-                        subtype: t.subtype.clone(),
+                        subtype: t.subtype,
                     });
                     ref_values.push(value);
                 }
@@ -1087,7 +1087,7 @@ impl Clone for ImmutableRecord {
                     let new_ptr = unsafe { new_payload.as_blob().as_ptr().add(len) };
                     RefValue::Text(TextRef {
                         value: RawSlice::new(new_ptr, text_ref.value.len),
-                        subtype: text_ref.subtype.clone(),
+                        subtype: text_ref.subtype,
                     })
                 }
                 RefValue::Blob(raw_slice) => {
@@ -1130,7 +1130,7 @@ impl RefValue {
             RefValue::Float(f) => Value::Float(*f),
             RefValue::Text(text_ref) => Value::Text(Text {
                 value: text_ref.value.to_slice().to_vec(),
-                subtype: text_ref.subtype.clone(),
+                subtype: text_ref.subtype,
             }),
             RefValue::Blob(b) => Value::Blob(b.to_slice().to_vec()),
         }
