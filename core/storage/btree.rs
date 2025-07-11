@@ -1152,6 +1152,15 @@ impl BTreeCursor {
             .copy_from_slice(&buffer[..num_bytes as usize]);
     }
 
+    /// Check if any ancestor pages still have cells to iterate.
+    /// If not, traversing back up to parent is of no use because we are at the end of the tree.
+    fn ancestor_pages_have_more_children(&self) -> bool {
+        let node_states = self.stack.node_states.borrow();
+        (0..self.stack.current())
+            .rev()
+            .any(|idx| !node_states[idx].is_at_end())
+    }
+
     /// Move the cursor to the next record and return it.
     /// Used in forwards iteration, which is the default.
     #[instrument(skip(self), level = Level::INFO, name = "next")]
@@ -1197,47 +1206,44 @@ impl BTreeCursor {
                 self.going_upwards = false;
                 return Ok(CursorResult::Ok(true));
             }
+
             // Important to advance only after loading the page in order to not advance > 1 times
             self.stack.advance();
             let cell_idx = self.stack.current_cell_index() as usize;
             tracing::debug!(id = mem_page_rc.get().get().id, cell = cell_idx, "current");
 
-            if cell_idx == cell_count {
-                // do rightmost
-                let has_parent = self.stack.has_parent();
-                match contents.rightmost_pointer() {
-                    Some(right_most_pointer) => {
+            if cell_idx >= cell_count {
+                let rightmost_already_traversed = cell_idx > cell_count;
+                match (contents.rightmost_pointer(), rightmost_already_traversed) {
+                    (Some(right_most_pointer), false) => {
+                        // do rightmost
                         self.stack.advance();
                         let mem_page = self.read_page(right_most_pointer as usize)?;
                         self.stack.push(mem_page);
                         continue;
                     }
-                    None => {
-                        if has_parent {
+                    _ => {
+                        if self.ancestor_pages_have_more_children() {
                             tracing::trace!("moving simple upwards");
                             self.going_upwards = true;
                             self.stack.pop();
                             continue;
                         } else {
+                            // If none of the ancestor pages have more children to iterate, that means we are at the end of the btree and should stop iterating.
                             return Ok(CursorResult::Ok(false));
                         }
                     }
                 }
             }
 
-            if cell_idx > contents.cell_count() {
-                // end
-                let has_parent = self.stack.current() > 0;
-                if has_parent {
-                    tracing::debug!("moving upwards");
-                    self.going_upwards = true;
-                    self.stack.pop();
-                    continue;
-                } else {
-                    return Ok(CursorResult::Ok(false));
-                }
-            }
-            turso_assert!(cell_idx < contents.cell_count(), "cell index out of bounds");
+            turso_assert!(
+                cell_idx < contents.cell_count(),
+                "cell index out of bounds: cell_idx={}, cell_count={}, page_type={:?} page_id={}",
+                cell_idx,
+                contents.cell_count(),
+                contents.page_type(),
+                mem_page_rc.get().get().id
+            );
 
             let cell = contents.cell_get(cell_idx, self.usable_space())?;
             match &cell {
