@@ -22,7 +22,7 @@ use super::select::emit_simple_count;
 use super::subquery::emit_subqueries;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::function::Func;
-use crate::schema::Schema;
+use crate::schema::{Schema, Table};
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::plan::{DeletePlan, Plan, QueryDestination, Search};
 use crate::translate::values::emit_values;
@@ -570,6 +570,7 @@ fn emit_delete_insns(
             }
         }
 
+        // Emit update in the CDC table if necessary (before DELETE updated the table)
         if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
             let rowid_reg = program.alloc_register();
             program.emit_insn(Insn::RowId {
@@ -578,18 +579,12 @@ fn emit_delete_insns(
             });
             let cdc_has_before = program.capture_data_changes_mode().has_before();
             let before_record_reg = if cdc_has_before {
-                let columns = table_reference.columns();
-                let columns_reg = program.alloc_registers(columns.len() + 1);
-                for i in 0..columns.len() {
-                    program.emit_column(main_table_cursor_id, i, columns_reg + 1 + i);
-                }
-                program.emit_insn(Insn::MakeRecord {
-                    start_reg: columns_reg + 1,
-                    count: columns.len(),
-                    dest_reg: columns_reg,
-                    index_name: None,
-                });
-                Some(columns_reg)
+                Some(emit_cdc_full_record(
+                    program,
+                    &table_reference.table,
+                    main_table_cursor_id,
+                    rowid_reg,
+                ))
             } else {
                 None
             };
@@ -1116,77 +1111,36 @@ fn emit_update_insns(
             });
         }
 
-        if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
-            let rowid_reg = program.alloc_register();
-            let has_after = program.capture_data_changes_mode().has_after();
-            let has_before = program.capture_data_changes_mode().has_before();
-            let before_record_reg = if has_before {
-                let columns = table_ref.columns();
-                let columns_reg = program.alloc_registers(columns.len() + 1);
-                for i in 0..columns.len() {
-                    program.emit_column(cursor_id, i, columns_reg + 1 + i);
-                }
-                program.emit_insn(Insn::MakeRecord {
-                    start_reg: columns_reg + 1,
-                    count: columns.len(),
-                    dest_reg: columns_reg,
-                    index_name: None,
-                });
-                Some(columns_reg)
-            } else {
-                None
-            };
-            let after_record_reg = if has_after { Some(record_reg) } else { None };
+        // create alias for CDC rowid after the change (will differ from cdc_rowid_before_reg only in case of UPDATE with change in rowid alias)
+        let cdc_rowid_after_reg = rowid_set_clause_reg.unwrap_or(beg);
+
+        // create separate register with rowid before UPDATE for CDC
+        let cdc_rowid_before_reg = if t_ctx.cdc_cursor_id.is_some() {
+            let cdc_rowid_before_reg = program.alloc_register();
             if has_user_provided_rowid {
                 program.emit_insn(Insn::RowId {
                     cursor_id,
-                    dest: rowid_reg,
+                    dest: cdc_rowid_before_reg,
                 });
-                emit_cdc_insns(
-                    program,
-                    &t_ctx.resolver,
-                    OperationMode::DELETE,
-                    cdc_cursor_id,
-                    rowid_reg,
-                    before_record_reg,
-                    None,
-                    table_ref.table.get_name(),
-                )?;
-                program.emit_insn(Insn::Copy {
-                    src_reg: rowid_set_clause_reg.expect(
-                        "rowid_set_clause_reg must be set because has_user_provided_rowid is true",
-                    ),
-                    dst_reg: rowid_reg,
-                    amount: 0,
-                });
-                emit_cdc_insns(
-                    program,
-                    &t_ctx.resolver,
-                    OperationMode::INSERT,
-                    cdc_cursor_id,
-                    rowid_reg,
-                    None,
-                    after_record_reg,
-                    table_ref.table.get_name(),
-                )?;
+                Some(cdc_rowid_before_reg)
             } else {
-                program.emit_insn(Insn::Copy {
-                    src_reg: rowid_set_clause_reg.unwrap_or(beg),
-                    dst_reg: rowid_reg,
-                    amount: 0,
-                });
-                emit_cdc_insns(
-                    program,
-                    &t_ctx.resolver,
-                    OperationMode::UPDATE,
-                    cdc_cursor_id,
-                    rowid_reg,
-                    before_record_reg,
-                    after_record_reg,
-                    table_ref.table.get_name(),
-                )?;
+                Some(cdc_rowid_after_reg)
             }
-        }
+        } else {
+            None
+        };
+
+        // create full CDC record before update if necessary
+        let cdc_before_reg = if program.capture_data_changes_mode().has_before() {
+            Some(emit_cdc_full_record(
+                program,
+                &table_ref.table,
+                cursor_id,
+                cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set"),
+            ))
+        } else {
+            None
+        };
 
         // If we are updating the rowid, we cannot rely on overwrite on the
         // Insert instruction to update the cell. We need to first delete the current cell
@@ -1202,6 +1156,58 @@ fn emit_update_insns(
             flag: InsertFlags::new().update(true),
             table_name: table_ref.identifier.clone(),
         });
+
+        // create full CDC record after update if necessary
+        let cdc_after_reg = if program.capture_data_changes_mode().has_after() {
+            Some(emit_cdc_patch_record(
+                program,
+                &table_ref.table,
+                start,
+                record_reg,
+                cdc_rowid_after_reg,
+            ))
+        } else {
+            None
+        };
+
+        // emit actual CDC instructions for write to the CDC table
+        if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
+            let cdc_rowid_before_reg =
+                cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set");
+            if has_user_provided_rowid {
+                emit_cdc_insns(
+                    program,
+                    &t_ctx.resolver,
+                    OperationMode::DELETE,
+                    cdc_cursor_id,
+                    cdc_rowid_before_reg,
+                    cdc_before_reg,
+                    None,
+                    table_ref.table.get_name(),
+                )?;
+                emit_cdc_insns(
+                    program,
+                    &t_ctx.resolver,
+                    OperationMode::INSERT,
+                    cdc_cursor_id,
+                    cdc_rowid_after_reg,
+                    cdc_after_reg,
+                    None,
+                    table_ref.table.get_name(),
+                )?;
+            } else {
+                emit_cdc_insns(
+                    program,
+                    &t_ctx.resolver,
+                    OperationMode::UPDATE,
+                    cdc_cursor_id,
+                    cdc_rowid_before_reg,
+                    cdc_before_reg,
+                    cdc_after_reg,
+                    table_ref.table.get_name(),
+                )?;
+            }
+        }
     } else if table_ref.virtual_table().is_some() {
         let arg_count = table_ref.columns().len() + 2;
         program.emit_insn(Insn::VUpdate {
@@ -1225,6 +1231,62 @@ fn emit_update_insns(
     }
 
     Ok(())
+}
+
+pub fn emit_cdc_patch_record(
+    program: &mut ProgramBuilder,
+    table: &Table,
+    columns_reg: usize,
+    record_reg: usize,
+    rowid_reg: usize,
+) -> usize {
+    let columns = table.columns();
+    let rowid_alias_position = columns.iter().position(|x| x.is_rowid_alias);
+    if let Some(rowid_alias_position) = rowid_alias_position {
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::Copy {
+            src_reg: rowid_reg,
+            dst_reg: columns_reg + rowid_alias_position,
+            amount: 0,
+        });
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: columns_reg,
+            count: table.columns().len(),
+            dest_reg: record_reg,
+            index_name: None,
+        });
+        record_reg
+    } else {
+        record_reg
+    }
+}
+
+pub fn emit_cdc_full_record(
+    program: &mut ProgramBuilder,
+    table: &Table,
+    table_cursor_id: usize,
+    rowid_reg: usize,
+) -> usize {
+    let columns = table.columns();
+    let columns_reg = program.alloc_registers(columns.len() + 1);
+    for (i, column) in columns.iter().enumerate() {
+        if column.is_rowid_alias {
+            program.emit_insn(Insn::Copy {
+                src_reg: rowid_reg,
+                dst_reg: columns_reg + 1 + i,
+                amount: 0,
+            });
+        } else {
+            program.emit_column(table_cursor_id, i, columns_reg + 1 + i);
+        }
+    }
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: columns_reg + 1,
+        count: columns.len(),
+        dest_reg: columns_reg,
+        index_name: None,
+    });
+    columns_reg
 }
 
 pub fn emit_cdc_insns(
