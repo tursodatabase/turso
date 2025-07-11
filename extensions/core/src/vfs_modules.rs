@@ -47,6 +47,8 @@ pub trait VfsFile: Send + Sync {
         offset: i64,
         callback: CompletionCallbackFn,
     );
+    /// ### Safety
+    /// 
     unsafe fn write(
         &mut self,
         buf: *const u8,
