@@ -242,9 +242,8 @@ impl Schema {
 
             drop(row);
 
-            match cursor.next()? {
-                CursorResult::IO => pager.io.run_once()?,
-                _ => {}
+            if matches!(cursor.next()?, CursorResult::IO) {
+                pager.io.run_once()?;
             };
         }
 
