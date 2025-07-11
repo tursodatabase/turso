@@ -215,7 +215,8 @@ pub fn op_drop_index(
     let Insn::DropIndex { index, db: _ } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    let mut schema = program.connection.schema.borrow_mut();
+    let mut schema_ref = program.connection.schema.borrow_mut();
+    let schema = Arc::make_mut(&mut *schema_ref);
     schema.remove_index(index);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -4924,7 +4925,8 @@ pub fn op_drop_table(
     }
     let conn = program.connection.clone();
     {
-        let mut schema = conn.schema.borrow_mut();
+        let mut schema_ref = conn.schema.borrow_mut();
+        let schema = Arc::make_mut(&mut *schema_ref);
         schema.remove_indices_for_table(table_name);
         schema.remove_table(table_name);
     }
@@ -5012,33 +5014,22 @@ pub fn op_parse_schema(
             where_clause
         ))?;
 
-        let mut new_schema = conn.schema.borrow().clone();
+        let mut schema_ref = conn.schema.borrow_mut();
+        let schema = Arc::make_mut(&mut *schema_ref);
 
         // TODO: This function below is synchronous, make it async
         {
-            parse_schema_rows(
-                Some(stmt),
-                &mut new_schema,
-                &conn.syms.borrow(),
-                state.mv_tx_id,
-            )?;
+            parse_schema_rows(Some(stmt), schema, &conn.syms.borrow(), state.mv_tx_id)?;
         }
-        conn.schema.replace(new_schema);
     } else {
         let stmt = conn.prepare("SELECT * FROM sqlite_schema")?;
-        let mut new_schema = conn.schema.borrow().clone();
+        let mut schema_ref = conn.schema.borrow_mut();
+        let schema = Arc::make_mut(&mut *schema_ref);
 
         // TODO: This function below is synchronous, make it async
         {
-            parse_schema_rows(
-                Some(stmt),
-                &mut new_schema,
-                &conn.syms.borrow(),
-                state.mv_tx_id,
-            )?;
+            parse_schema_rows(Some(stmt), schema, &conn.syms.borrow(), state.mv_tx_id)?;
         }
-
-        conn.schema.replace(new_schema);
     }
     conn.auto_commit.set(previous_auto_commit);
     state.pc += 1;
@@ -5111,7 +5102,9 @@ pub fn op_set_cookie(
                 TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
             }
 
-            program.connection.schema.borrow_mut().schema_version = *value as u32;
+            let mut schema = program.connection.schema.borrow_mut();
+            Arc::make_mut(&mut *schema).schema_version = *value as u32;
+
             header_accessor::set_schema_cookie(pager, *value as u32)?;
         }
         cookie => todo!("{cookie:?} is not yet implement for SetCookie"),

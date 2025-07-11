@@ -653,19 +653,14 @@ impl Pager {
         match cacheflush_status {
             PagerCacheflushStatus::IO => Ok(PagerCacheflushStatus::IO),
             PagerCacheflushStatus::Done(_) => {
-                let maybe_schema_pair = if schema_did_change {
-                    let schema = connection.schema.borrow().clone();
-                    // Lock first before writing to the database schema in case someone tries to read the schema before it's updated
-                    let db_schema = connection._db.schema.write();
-                    Some((schema, db_schema))
-                } else {
-                    None
-                };
                 self.wal.borrow().end_write_tx()?;
                 self.wal.borrow().end_read_tx()?;
-                if let Some((schema, mut db_schema)) = maybe_schema_pair {
-                    *db_schema = schema;
+
+                if schema_did_change {
+                    let schema = connection.schema.borrow().clone();
+                    *connection._db.schema.borrow_mut() = schema;
                 }
+
                 Ok(cacheflush_status)
             }
         }
@@ -1217,8 +1212,9 @@ impl Pager {
         cache.unset_dirty_all_pages();
         cache.clear().expect("failed to clear page cache");
         if schema_did_change {
-            let prev_schema = connection._db.schema.read().clone();
-            connection.schema.replace(prev_schema);
+            connection
+                .schema
+                .replace(connection._db.schema.borrow().clone());
         }
         self.wal.borrow_mut().rollback()?;
 
