@@ -38,9 +38,9 @@ pub trait VfsFile: Send + Sync {
     fn unlock(&self) -> ExtResult<()> {
         Ok(())
     }
-    fn read(&mut self, buf: &mut [u8], count: usize, offset: i64) -> ExtResult<i32>;
-    fn write(&mut self, buf: &[u8], count: usize, offset: i64) -> ExtResult<i32>;
-    fn sync(&self) -> ExtResult<()>;
+    fn read(&mut self, buf: &mut [u8], count: usize, offset: i64);
+    fn write(&mut self, buf: &[u8], count: usize, offset: i64);
+    fn sync(&self);
     fn size(&self) -> i64;
 }
 
@@ -74,12 +74,12 @@ pub type VfsOpen = unsafe extern "C" fn(
 pub type VfsClose = unsafe extern "C" fn(file: *const c_void) -> ResultCode;
 
 pub type VfsRead =
-    unsafe extern "C" fn(file: *const c_void, buf: *mut u8, count: usize, offset: i64) -> i32;
+    unsafe extern "C" fn(file: *const c_void, buf: *mut u8, count: usize, offset: i64);
 
 pub type VfsWrite =
-    unsafe extern "C" fn(file: *const c_void, buf: *const u8, count: usize, offset: i64) -> i32;
+    unsafe extern "C" fn(file: *const c_void, buf: *const u8, count: usize, offset: i64);
 
-pub type VfsSync = unsafe extern "C" fn(file: *const c_void) -> i32;
+pub type VfsSync = unsafe extern "C" fn(file: *const c_void);
 
 pub type VfsLock = unsafe extern "C" fn(file: *const c_void, exclusive: bool) -> ResultCode;
 

@@ -264,7 +264,7 @@ impl VfsExtension for TestFS {
 
 #[cfg(not(target_family = "wasm"))]
 impl VfsFile for TestFile {
-    fn read(&mut self, buf: &mut [u8], count: usize, offset: i64) -> ExtResult<i32> {
+    fn read(&mut self, buf: &mut [u8], count: usize, offset: i64) {
         log::debug!("reading file with testing VFS: bytes: {count} offset: {offset}");
         if self.file.seek(SeekFrom::Start(offset as u64)).is_err() {
             return Err(ResultCode::Error);
@@ -275,7 +275,7 @@ impl VfsFile for TestFile {
             .map(|n| n as i32)
     }
 
-    fn write(&mut self, buf: &[u8], count: usize, offset: i64) -> ExtResult<i32> {
+    fn write(&mut self, buf: &[u8], count: usize, offset: i64) {
         log::debug!("writing to file with testing VFS: bytes: {count} offset: {offset}");
         if self.file.seek(SeekFrom::Start(offset as u64)).is_err() {
             return Err(ResultCode::Error);
@@ -286,7 +286,7 @@ impl VfsFile for TestFile {
             .map(|n| n as i32)
     }
 
-    fn sync(&self) -> ExtResult<()> {
+    fn sync(&self) {
         log::debug!("syncing file with testing VFS");
         self.file.sync_all().map_err(|_| ResultCode::Error)
     }
