@@ -73,16 +73,6 @@ pub mod offset {
     pub const BTREE_RIGHTMOST_PTR: usize = 8;
 }
 
-/// Evaluate a Result<CursorResult<T>>, if IO return IO.
-macro_rules! return_if_io {
-    ($expr:expr) => {
-        match $expr? {
-            CursorResult::Ok(v) => v,
-            CursorResult::IO => return Ok(CursorResult::IO),
-        }
-    };
-}
-
 /// Wrapper around a page reference used in order to update the reference in case page was unloaded
 /// and we need to update the reference.
 pub struct BTreePageInner {
