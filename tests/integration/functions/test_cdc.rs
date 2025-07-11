@@ -1,4 +1,5 @@
 use rusqlite::types::Value;
+use turso_core::types::ImmutableRecord;
 
 use crate::common::{limbo_exec_rows, TempDatabase};
 
@@ -14,7 +15,7 @@ fn replace_column_with_null(rows: Vec<Vec<Value>>, column: usize) -> Vec<Vec<Val
 }
 
 #[test]
-fn test_cdc_simple() {
+fn test_cdc_simple_id() {
     let db = TempDatabase::new_empty(false);
     let conn = db.connect_limbo();
     conn.execute("PRAGMA unstable_capture_data_changes_conn('id')")
@@ -51,6 +52,220 @@ fn test_cdc_simple() {
                 Value::Text("t".to_string()),
                 Value::Integer(5),
                 Value::Null,
+                Value::Null,
+            ]
+        ]
+    );
+}
+
+fn record<const N: usize>(values: [Value; N]) -> Vec<u8> {
+    let values = values
+        .into_iter()
+        .map(|x| match x {
+            Value::Null => turso_core::Value::Null,
+            Value::Integer(x) => turso_core::Value::Integer(x),
+            Value::Real(x) => turso_core::Value::Float(x),
+            Value::Text(x) => turso_core::Value::Text(turso_core::types::Text::new(&x)),
+            Value::Blob(x) => turso_core::Value::Blob(x),
+        })
+        .collect::<Vec<_>>();
+    ImmutableRecord::from_values(&values, values.len())
+        .get_payload()
+        .to_vec()
+}
+
+#[test]
+fn test_cdc_simple_before() {
+    let db = TempDatabase::new_empty(false);
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('before')")
+        .unwrap();
+    conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 2), (3, 4)").unwrap();
+    conn.execute("UPDATE t SET y = 3 WHERE x = 1").unwrap();
+    conn.execute("DELETE FROM t WHERE x = 3").unwrap();
+    conn.execute("DELETE FROM t WHERE x = 1").unwrap();
+    let rows = replace_column_with_null(limbo_exec_rows(&db, &conn, "SELECT * FROM turso_cdc"), 1);
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(3),
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(3),
+                Value::Null,
+                Value::Integer(0),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Blob(record([Value::Null, Value::Integer(2)])),
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(4),
+                Value::Null,
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(3),
+                Value::Blob(record([Value::Null, Value::Integer(4)])),
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(5),
+                Value::Null,
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Blob(record([Value::Null, Value::Integer(3)])),
+                Value::Null,
+            ]
+        ]
+    );
+}
+
+#[test]
+fn test_cdc_simple_after() {
+    let db = TempDatabase::new_empty(false);
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('after')")
+        .unwrap();
+    conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 2), (3, 4)").unwrap();
+    conn.execute("UPDATE t SET y = 3 WHERE x = 1").unwrap();
+    conn.execute("DELETE FROM t WHERE x = 3").unwrap();
+    conn.execute("DELETE FROM t WHERE x = 1").unwrap();
+    let rows = replace_column_with_null(limbo_exec_rows(&db, &conn, "SELECT * FROM turso_cdc"), 1);
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Null,
+                Value::Blob(record([Value::Null, Value::Integer(2)])),
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(3),
+                Value::Null,
+                Value::Blob(record([Value::Null, Value::Integer(4)])),
+            ],
+            vec![
+                Value::Integer(3),
+                Value::Null,
+                Value::Integer(0),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Null,
+                Value::Blob(record([Value::Null, Value::Integer(3)])),
+            ],
+            vec![
+                Value::Integer(4),
+                Value::Null,
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(3),
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(5),
+                Value::Null,
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Null,
+                Value::Null,
+            ]
+        ]
+    );
+}
+
+#[test]
+fn test_cdc_simple_full() {
+    let db = TempDatabase::new_empty(false);
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 2), (3, 4)").unwrap();
+    conn.execute("UPDATE t SET y = 3 WHERE x = 1").unwrap();
+    conn.execute("DELETE FROM t WHERE x = 3").unwrap();
+    conn.execute("DELETE FROM t WHERE x = 1").unwrap();
+    let rows = replace_column_with_null(limbo_exec_rows(&db, &conn, "SELECT * FROM turso_cdc"), 1);
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Null,
+                Value::Blob(record([Value::Null, Value::Integer(2)])),
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(3),
+                Value::Null,
+                Value::Blob(record([Value::Null, Value::Integer(4)])),
+            ],
+            vec![
+                Value::Integer(3),
+                Value::Null,
+                Value::Integer(0),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Blob(record([Value::Null, Value::Integer(2)])),
+                Value::Blob(record([Value::Null, Value::Integer(3)])),
+            ],
+            vec![
+                Value::Integer(4),
+                Value::Null,
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(3),
+                Value::Blob(record([Value::Null, Value::Integer(4)])),
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(5),
+                Value::Null,
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Blob(record([Value::Null, Value::Integer(3)])),
                 Value::Null,
             ]
         ]
