@@ -7341,7 +7341,7 @@ mod tests {
         ));
 
         let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
-        let wal_shared = WalFileShared::new_shared(page_size, &io, wal_file).unwrap();
+        let wal_shared = WalFileShared::new_shared(page_size, &io, wal_file);
         let wal = Rc::new(RefCell::new(WalFile::new(
             io.clone(),
             wal_shared,
@@ -7400,7 +7400,7 @@ mod tests {
             #[allow(clippy::arc_with_non_send_sync)]
             pager
                 .db_file
-                .write_page(current_page as usize, buf.clone(), c)?;
+                .write_page(current_page as usize, buf.clone(), c);
             pager.io.run_once()?;
 
             let page = cursor.read_page(current_page as usize)?;

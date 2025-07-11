@@ -310,7 +310,7 @@ impl Database {
 
         let wal_path = format!("{}-wal", self.path);
         let file = self.io.open_file(&wal_path, OpenFlags::Create, false)?;
-        let real_shared_wal = WalFileShared::new_shared(page_size, &self.io, file)?;
+        let real_shared_wal = WalFileShared::new_shared(page_size, &self.io, file);
         // Modify Database::maybe_shared_wal to point to the new WAL file so that other connections
         // can open the existing WAL.
         *self.maybe_shared_wal.write() = Some(real_shared_wal.clone());
@@ -703,7 +703,7 @@ impl Connection {
         if res.is_err() {
             let state = self.transaction_state.get();
             if let TransactionState::Write { schema_did_change } = state {
-                self.pager.rollback(schema_did_change, self)?
+                self.pager.rollback(schema_did_change, self)
             }
         }
         res
@@ -758,7 +758,7 @@ impl Connection {
         frame_no: u32,
         p_frame: *mut u8,
         frame_len: u32,
-    ) -> Result<Arc<Completion>> {
+    ) -> Arc<Completion> {
         self.pager.wal_get_frame(frame_no, p_frame, frame_len)
     }
 
@@ -1008,7 +1008,7 @@ impl Statement {
             let state = self.program.connection.transaction_state.get();
             if let TransactionState::Write { schema_did_change } = state {
                 self.pager
-                    .rollback(schema_did_change, &self.program.connection)?
+                    .rollback(schema_did_change, &self.program.connection)
             }
         }
         res
