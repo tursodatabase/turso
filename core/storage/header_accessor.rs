@@ -169,6 +169,7 @@ pub fn get_page_size(pager: &Pager) -> Result<u32> {
     Ok(size as u32)
 }
 
+#[allow(dead_code)]
 pub fn set_page_size(pager: &Pager, value: u32) -> Result<()> {
     let page_size = if value == MAX_PAGE_SIZE {
         1

@@ -22,6 +22,7 @@ use strum::IntoEnumIterator;
 use super::integrity_check::translate_integrity_check;
 use crate::storage::header_accessor;
 use crate::storage::pager::Pager;
+use crate::translate::emitter::TransactionMode;
 
 fn list_pragmas(program: &mut ProgramBuilder) {
     for x in PragmaName::iter() {
@@ -47,7 +48,6 @@ pub fn translate_pragma(
         approx_num_labels: 0,
     };
     program.extend(&opts);
-    let mut write = false;
 
     if name.name.0.eq_ignore_ascii_case("pragma_list") {
         list_pragmas(&mut program);
@@ -59,22 +59,16 @@ pub fn translate_pragma(
         Err(_) => bail_parse_error!("Not a valid pragma name"),
     };
 
-    let mut program = match body {
+    let (mut program, mode) = match body {
         None => query_pragma(pragma, schema, None, pager, connection, program)?,
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
             PragmaName::TableInfo => {
                 query_pragma(pragma, schema, Some(value), pager, connection, program)?
             }
-            _ => {
-                write = true;
-                update_pragma(pragma, schema, value, pager, connection, program)?
-            }
+            _ => update_pragma(pragma, schema, value, pager, connection, program)?,
         },
     };
-    program.epilogue(match write {
-        false => super::emitter::TransactionMode::Read,
-        true => super::emitter::TransactionMode::Write,
-    });
+    program.epilogue(mode);
 
     Ok(program)
 }
@@ -86,7 +80,7 @@ fn update_pragma(
     pager: Rc<Pager>,
     connection: Arc<crate::Connection>,
     mut program: ProgramBuilder,
-) -> crate::Result<ProgramBuilder> {
+) -> crate::Result<(ProgramBuilder, TransactionMode)> {
     match pragma {
         PragmaName::CacheSize => {
             let cache_size = match parse_signed_number(&value)? {
@@ -95,7 +89,7 @@ fn update_pragma(
                 _ => bail_parse_error!("Invalid value for cache size pragma"),
             };
             update_cache_size(cache_size, pager, connection)?;
-            Ok(program)
+            Ok((program, TransactionMode::None))
         }
         PragmaName::JournalMode => query_pragma(
             PragmaName::JournalMode,
@@ -105,7 +99,7 @@ fn update_pragma(
             connection,
             program,
         ),
-        PragmaName::LegacyFileFormat => Ok(program),
+        PragmaName::LegacyFileFormat => Ok((program, TransactionMode::None)),
         PragmaName::WalCheckpoint => query_pragma(
             PragmaName::WalCheckpoint,
             schema,
@@ -136,7 +130,7 @@ fn update_pragma(
                 value: version_value,
                 p5: 1,
             });
-            Ok(program)
+            Ok((program, TransactionMode::Write))
         }
         PragmaName::SchemaVersion => {
             // TODO: Implement updating schema_version
@@ -155,7 +149,7 @@ fn update_pragma(
                 _ => bail_parse_error!("Invalid value for page size pragma"),
             };
             update_page_size(connection, page_size as u32)?;
-            Ok(program)
+            Ok((program, TransactionMode::None))
         }
         PragmaName::AutoVacuum => {
             let auto_vacuum_mode = match value {
@@ -211,7 +205,7 @@ fn update_pragma(
                 value: auto_vacuum_mode - 1,
                 p5: 0,
             });
-            Ok(program)
+            Ok((program, TransactionMode::None))
         }
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
         PragmaName::UnstableCaptureDataChangesConn => {
@@ -236,7 +230,7 @@ fn update_pragma(
                 )?;
             }
             connection.set_capture_data_changes(opts);
-            Ok(program)
+            Ok((program, TransactionMode::Write))
         }
     }
 }
@@ -248,20 +242,22 @@ fn query_pragma(
     pager: Rc<Pager>,
     connection: Arc<crate::Connection>,
     mut program: ProgramBuilder,
-) -> crate::Result<ProgramBuilder> {
+) -> crate::Result<(ProgramBuilder, TransactionMode)> {
     let register = program.alloc_register();
     match pragma {
         PragmaName::CacheSize => {
             program.emit_int(connection.get_cache_size() as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
         }
         PragmaName::JournalMode => {
             program.emit_string8("wal".into(), register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
         }
-        PragmaName::LegacyFileFormat => {}
+        PragmaName::LegacyFileFormat => Ok((program, TransactionMode::None)),
         PragmaName::WalCheckpoint => {
             // Checkpoint uses 3 registers: P1, P2, P3. Ref Insn::Checkpoint for more info.
             // Allocate two more here as one was allocated at the top.
@@ -288,6 +284,7 @@ fn query_pragma(
                 dest: register,
             });
             program.emit_result_row(register, 3);
+            Ok((program, TransactionMode::None))
         }
         PragmaName::PageCount => {
             program.emit_insn(Insn::PageCount {
@@ -296,6 +293,7 @@ fn query_pragma(
             });
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::Read))
         }
         PragmaName::TableInfo => {
             let table = match value {
@@ -341,6 +339,7 @@ fn query_pragma(
             for name in col_names {
                 program.add_pragma_result_column(name.into());
             }
+            Ok((program, TransactionMode::None))
         }
         PragmaName::UserVersion => {
             program.emit_insn(Insn::ReadCookie {
@@ -350,6 +349,7 @@ fn query_pragma(
             });
             program.add_pragma_result_column(pragma.to_string());
             program.emit_result_row(register, 1);
+            Ok((program, TransactionMode::Read))
         }
         PragmaName::SchemaVersion => {
             program.emit_insn(Insn::ReadCookie {
@@ -359,6 +359,7 @@ fn query_pragma(
             });
             program.add_pragma_result_column(pragma.to_string());
             program.emit_result_row(register, 1);
+            Ok((program, TransactionMode::Read))
         }
         PragmaName::PageSize => {
             program.emit_int(
@@ -367,6 +368,7 @@ fn query_pragma(
             );
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
         }
         PragmaName::AutoVacuum => {
             let auto_vacuum_mode = pager.get_auto_vacuum_mode();
@@ -383,9 +385,11 @@ fn query_pragma(
                 value: auto_vacuum_mode_i64,
             });
             program.emit_result_row(register, 1);
+            Ok((program, TransactionMode::None))
         }
         PragmaName::IntegrityCheck => {
             translate_integrity_check(schema, &mut program)?;
+            Ok((program, TransactionMode::Read))
         }
         PragmaName::UnstableCaptureDataChangesConn => {
             let pragma = pragma_for(pragma);
@@ -400,10 +404,9 @@ fn query_pragma(
             program.emit_result_row(register, 2);
             program.add_pragma_result_column(pragma.columns[0].to_string());
             program.add_pragma_result_column(pragma.columns[1].to_string());
+            Ok((program, TransactionMode::Read))
         }
     }
-
-    Ok(program)
 }
 
 fn update_auto_vacuum_mode(
