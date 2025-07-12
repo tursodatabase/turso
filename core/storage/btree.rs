@@ -201,7 +201,6 @@ enum DeleteState {
         post_balancing_seek_key: Option<DeleteSavepoint>,
     },
     CheckNeedsBalancing {
-        rightmost_cell_was_dropped: bool,
         post_balancing_seek_key: Option<DeleteSavepoint>,
     },
     WaitForBalancingToComplete {
@@ -303,14 +302,6 @@ impl BTreeKey<'_> {
             BTreeKey::IndexKey(_) => panic!("BTreeKey::to_rowid called on IndexKey"),
         }
     }
-
-    /// Assert that the key is an index key and return it.
-    fn to_index_key_values(&self) -> &'_ Vec<RefValue> {
-        match self {
-            BTreeKey::TableRowId(_) => panic!("BTreeKey::to_index_key called on TableRowId"),
-            BTreeKey::IndexKey(key) => key.get_values(),
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -407,6 +398,13 @@ impl Debug for CursorState {
     }
 }
 
+struct SeekResult {
+    /// Whether the cursor was left pointing to a valid record.
+    cursor_has_record: bool,
+    /// Whether the seek found a record matching the [SeekOp]
+    seek_matched: bool,
+}
+
 enum OverflowState {
     Start,
     ProcessPage { next_page: u32 },
@@ -462,27 +460,19 @@ pub enum CursorSeekState {
         /// Indicates when we have not not found a value in leaf and now will look in the next/prev record.
         /// This value is only used for indexbtree
         moving_up_to_parent: Cell<bool>,
+        /// In multiple places, we do a seek that checks for an exact match (SeekOp::EQ) in the tree.
+        /// In those cases, we need to know where to land if we don't find an exact match.
+        /// For non-eq-only conditions (GT, LT, GE, LE), this is pretty simple:
+        /// - If we are looking for GT/GE and don't find a match, we should end up beyond the end of the page (idx=cell count).
+        /// - If we are looking for LT/LE and don't find a match, we should end up before the beginning of the page (idx=-1).
+        ///
+        /// For eq-only conditions (GE { eq_only: true } or LE { eq_only: true }), we need to know where to land if we don't find an exact match.
+        /// For GE, we want to land at the first cell that is greater than the seek key.
+        /// For LE, we want to land at the last cell that is less than the seek key.
+        /// This is because e.g. when we attempt to insert rowid 666, we first check if it exists.
+        /// If it doesn't, we want to land in the place where rowid 666 WOULD be inserted.
+        target_cell_when_not_found: Cell<i32>,
     },
-}
-
-#[derive(Debug)]
-struct FindCellState(Option<(usize, usize)>); // low, high
-
-impl FindCellState {
-    #[inline]
-    fn set(&mut self, lowhigh: (usize, usize)) {
-        self.0 = Some(lowhigh);
-    }
-
-    #[inline]
-    fn get_state(&mut self) -> (usize, usize) {
-        self.0.expect("get can only be called after a set")
-    }
-
-    #[inline]
-    fn reset(&mut self) {
-        self.0 = None;
-    }
 }
 
 pub struct BTreeCursor {
@@ -526,8 +516,28 @@ pub struct BTreeCursor {
     /// Separate state to read a record with overflow pages. This separation from `state` is necessary as
     /// we can be in a function that relies on `state`, but also needs to process overflow pages
     read_overflow_state: RefCell<Option<ReadPayloadOverflow>>,
-    /// Contains the current cell_idx for `find_cell`
-    find_cell_state: FindCellState,
+}
+
+/// We store the cell index and cell count for each page in the stack.
+/// The reason we store the cell count is because we need to know when we are at the end of the page,
+/// without having to perform IO to get the ancestor pages.
+#[derive(Debug, Clone, Copy, Default)]
+struct BTreeNodeState {
+    cell_idx: i32,
+    cell_count: Option<i32>,
+}
+
+impl BTreeNodeState {
+    /// Check if the current cell index is at the end of the page.
+    /// This information is used to determine whether a child page should move up to its parent.
+    /// If the child page is the rightmost leaf page and it has reached the end, this means all of its ancestors have
+    /// already reached the end, so it should not go up because there are no more records to traverse.
+    fn is_at_end(&self) -> bool {
+        let cell_count = self.cell_count.expect("cell_count is not set");
+        // cell_idx == cell_count means: we will traverse to the rightmost pointer next.
+        // cell_idx == cell_count + 1 means: we have already gone down to the rightmost pointer.
+        self.cell_idx == cell_count + 1
+    }
 }
 
 impl BTreeCursor {
@@ -548,7 +558,7 @@ impl BTreeCursor {
             overflow_state: None,
             stack: PageStack {
                 current_page: Cell::new(-1),
-                cell_indices: RefCell::new([0; BTCURSOR_MAX_DEPTH + 1]),
+                node_states: RefCell::new([BTreeNodeState::default(); BTCURSOR_MAX_DEPTH + 1]),
                 stack: RefCell::new([const { None }; BTCURSOR_MAX_DEPTH + 1]),
             },
             reusable_immutable_record: RefCell::new(None),
@@ -559,7 +569,6 @@ impl BTreeCursor {
             collations,
             seek_state: CursorSeekState::Start,
             read_overflow_state: RefCell::new(None),
-            find_cell_state: FindCellState(None),
             parse_record_state: RefCell::new(ParseRecordState::Init),
         }
     }
@@ -1130,6 +1139,15 @@ impl BTreeCursor {
             .copy_from_slice(&buffer[..num_bytes as usize]);
     }
 
+    /// Check if any ancestor pages still have cells to iterate.
+    /// If not, traversing back up to parent is of no use because we are at the end of the tree.
+    fn ancestor_pages_have_more_children(&self) -> bool {
+        let node_states = self.stack.node_states.borrow();
+        (0..self.stack.current())
+            .rev()
+            .any(|idx| !node_states[idx].is_at_end())
+    }
+
     /// Move the cursor to the next record and return it.
     /// Used in forwards iteration, which is the default.
     #[instrument(skip(self), level = Level::INFO, name = "next")]
@@ -1175,47 +1193,44 @@ impl BTreeCursor {
                 self.going_upwards = false;
                 return Ok(CursorResult::Ok(true));
             }
+
             // Important to advance only after loading the page in order to not advance > 1 times
             self.stack.advance();
             let cell_idx = self.stack.current_cell_index() as usize;
             tracing::debug!(id = mem_page_rc.get().get().id, cell = cell_idx, "current");
 
-            if cell_idx == cell_count {
-                // do rightmost
-                let has_parent = self.stack.has_parent();
-                match contents.rightmost_pointer() {
-                    Some(right_most_pointer) => {
+            if cell_idx >= cell_count {
+                let rightmost_already_traversed = cell_idx > cell_count;
+                match (contents.rightmost_pointer(), rightmost_already_traversed) {
+                    (Some(right_most_pointer), false) => {
+                        // do rightmost
                         self.stack.advance();
                         let mem_page = self.read_page(right_most_pointer as usize)?;
                         self.stack.push(mem_page);
                         continue;
                     }
-                    None => {
-                        if has_parent {
+                    _ => {
+                        if self.ancestor_pages_have_more_children() {
                             tracing::trace!("moving simple upwards");
                             self.going_upwards = true;
                             self.stack.pop();
                             continue;
                         } else {
+                            // If none of the ancestor pages have more children to iterate, that means we are at the end of the btree and should stop iterating.
                             return Ok(CursorResult::Ok(false));
                         }
                     }
                 }
             }
 
-            if cell_idx > contents.cell_count() {
-                // end
-                let has_parent = self.stack.current() > 0;
-                if has_parent {
-                    tracing::debug!("moving upwards");
-                    self.going_upwards = true;
-                    self.stack.pop();
-                    continue;
-                } else {
-                    return Ok(CursorResult::Ok(false));
-                }
-            }
-            turso_assert!(cell_idx < contents.cell_count(), "cell index out of bounds");
+            turso_assert!(
+                cell_idx < contents.cell_count(),
+                "cell index out of bounds: cell_idx={}, cell_count={}, page_type={:?} page_id={}",
+                cell_idx,
+                contents.cell_count(),
+                contents.page_type(),
+                mem_page_rc.get().get().id
+            );
 
             let cell = contents.cell_get(cell_idx, self.usable_space())?;
             match &cell {
@@ -1252,7 +1267,7 @@ impl BTreeCursor {
     /// This may be used to seek to a specific record in a point query (e.g. SELECT * FROM table WHERE col = 10)
     /// or e.g. find the first record greater than the seek key in a range query (e.g. SELECT * FROM table WHERE col > 10).
     /// We don't include the rowid in the comparison and that's why the last value from the record is not included.
-    fn do_seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<CursorResult<bool>> {
+    fn do_seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<CursorResult<SeekResult>> {
         let ret = return_if_io!(match key {
             SeekKey::TableRowId(rowid) => {
                 self.tablebtree_seek(rowid, op)
@@ -1627,7 +1642,7 @@ impl BTreeCursor {
     /// Specialized version of do_seek() for table btrees that uses binary search instead
     /// of iterating cells in order.
     #[instrument(skip_all, level = Level::INFO)]
-    fn tablebtree_seek(&mut self, rowid: i64, seek_op: SeekOp) -> Result<CursorResult<bool>> {
+    fn tablebtree_seek(&mut self, rowid: i64, seek_op: SeekOp) -> Result<CursorResult<SeekResult>> {
         turso_assert!(
             self.mv_cursor.is_none(),
             "attempting to seek with MV cursor"
@@ -1654,7 +1669,10 @@ impl BTreeCursor {
             let cell_count = contents.cell_count();
             if cell_count == 0 {
                 self.stack.set_cell_index(0);
-                return Ok(CursorResult::Ok(false));
+                return Ok(CursorResult::Ok(SeekResult {
+                    cursor_has_record: false,
+                    seek_matched: false,
+                }));
             }
             let min_cell_idx = Cell::new(0);
             let max_cell_idx = Cell::new(cell_count as isize - 1);
@@ -1669,6 +1687,10 @@ impl BTreeCursor {
                 nearest_matching_cell,
                 moving_up_to_parent: Cell::new(false),
                 eq_seen: Cell::new(false), // not relevant for table btrees
+                target_cell_when_not_found: Cell::new(match seek_op.iteration_direction() {
+                    IterationDirection::Forwards => cell_count as i32,
+                    IterationDirection::Backwards => -1,
+                }),
             };
         }
 
@@ -1676,6 +1698,7 @@ impl BTreeCursor {
             min_cell_idx,
             max_cell_idx,
             nearest_matching_cell,
+            target_cell_when_not_found,
             ..
         } = &self.seek_state
         else {
@@ -1693,9 +1716,16 @@ impl BTreeCursor {
             if min > max {
                 if let Some(nearest_matching_cell) = nearest_matching_cell.get() {
                     self.stack.set_cell_index(nearest_matching_cell as i32);
-                    return Ok(CursorResult::Ok(true));
+                    return Ok(CursorResult::Ok(SeekResult {
+                        cursor_has_record: true,
+                        seek_matched: true,
+                    }));
                 } else {
-                    return Ok(CursorResult::Ok(false));
+                    self.stack.set_cell_index(target_cell_when_not_found.get());
+                    return Ok(CursorResult::Ok(SeekResult {
+                        cursor_has_record: false,
+                        seek_matched: false,
+                    }));
                 };
             }
 
@@ -1716,7 +1746,10 @@ impl BTreeCursor {
             // rowids are unique, so we can return the rowid immediately
             if found && seek_op.eq_only() {
                 self.stack.set_cell_index(cur_cell_idx as i32);
-                return Ok(CursorResult::Ok(true));
+                return Ok(CursorResult::Ok(SeekResult {
+                    cursor_has_record: true,
+                    seek_matched: true,
+                }));
             }
 
             if found {
@@ -1730,8 +1763,16 @@ impl BTreeCursor {
                     }
                 }
             } else if cmp.is_gt() {
+                if matches!(seek_op, SeekOp::GE { eq_only: true }) {
+                    target_cell_when_not_found
+                        .set(target_cell_when_not_found.get().min(cur_cell_idx as i32));
+                }
                 max_cell_idx.set(cur_cell_idx - 1);
             } else if cmp.is_lt() {
+                if matches!(seek_op, SeekOp::LE { eq_only: true }) {
+                    target_cell_when_not_found
+                        .set(target_cell_when_not_found.get().max(cur_cell_idx as i32));
+                }
                 min_cell_idx.set(cur_cell_idx + 1);
             } else {
                 match iter_dir {
@@ -1751,7 +1792,7 @@ impl BTreeCursor {
         &mut self,
         key: &ImmutableRecord,
         seek_op: SeekOp,
-    ) -> Result<CursorResult<bool>> {
+    ) -> Result<CursorResult<SeekResult>> {
         if matches!(
             self.seek_state,
             CursorSeekState::Start
@@ -1775,14 +1816,10 @@ impl BTreeCursor {
             let cell_count = contents.cell_count();
             if cell_count == 0 {
                 self.stack.set_cell_index(0);
-                match seek_op.iteration_direction() {
-                    IterationDirection::Forwards => {
-                        return self.next();
-                    }
-                    IterationDirection::Backwards => {
-                        return self.prev();
-                    }
-                }
+                return Ok(CursorResult::Ok(SeekResult {
+                    cursor_has_record: false,
+                    seek_matched: false,
+                }));
             }
 
             let min = Cell::new(0);
@@ -1798,6 +1835,10 @@ impl BTreeCursor {
                 nearest_matching_cell,
                 moving_up_to_parent: Cell::new(false),
                 eq_seen: Cell::new(eq_seen),
+                target_cell_when_not_found: Cell::new(match seek_op.iteration_direction() {
+                    IterationDirection::Forwards => cell_count as i32,
+                    IterationDirection::Backwards => -1,
+                }),
             };
         }
 
@@ -1807,6 +1848,7 @@ impl BTreeCursor {
             nearest_matching_cell,
             eq_seen,
             moving_up_to_parent,
+            target_cell_when_not_found,
         } = &self.seek_state
         else {
             unreachable!(
@@ -1842,14 +1884,16 @@ impl BTreeCursor {
             };
             let (_, found) = self.compare_with_current_record(key, seek_op);
             moving_up_to_parent.set(false);
-            return Ok(CursorResult::Ok(found));
+            return Ok(CursorResult::Ok(SeekResult {
+                cursor_has_record: true,
+                seek_matched: found,
+            }));
         }
 
         let page = self.stack.top();
         return_if_locked_maybe_load!(self.pager, page);
         let page = page.get();
         let contents = page.get().contents.as_ref().unwrap();
-        let cell_count = contents.cell_count();
 
         let iter_dir = seek_op.iteration_direction();
 
@@ -1859,7 +1903,10 @@ impl BTreeCursor {
             if min > max {
                 if let Some(nearest_matching_cell) = nearest_matching_cell.get() {
                     self.stack.set_cell_index(nearest_matching_cell as i32);
-                    return Ok(CursorResult::Ok(true));
+                    return Ok(CursorResult::Ok(SeekResult {
+                        cursor_has_record: true,
+                        seek_matched: true,
+                    }));
                 } else {
                     // We have now iterated over all cells in the leaf page and found no match.
                     // Unlike tables, indexes store payloads in interior cells as well. self.move_to() always moves to a leaf page, so there are cases where we need to
@@ -1881,17 +1928,27 @@ impl BTreeCursor {
                     // - We have seen an EQ match up in the tree in an interior node
                     // - Or, we are not looking for an exact match.
                     if seek_op.eq_only() && !eq_seen.get() {
-                        return Ok(CursorResult::Ok(false));
+                        let target_cell = target_cell_when_not_found.get();
+                        self.stack.set_cell_index(target_cell);
+                        let has_record =
+                            target_cell >= 0 && target_cell < contents.cell_count() as i32;
+                        return Ok(CursorResult::Ok(SeekResult {
+                            cursor_has_record: has_record,
+                            seek_matched: false,
+                        }));
                     }
                     match iter_dir {
                         IterationDirection::Forwards => {
                             if !moving_up_to_parent.get() {
                                 moving_up_to_parent.set(true);
-                                self.stack.set_cell_index(cell_count as i32);
+                                self.stack.set_cell_index(target_cell_when_not_found.get());
                             }
                             let next_res = return_if_io!(self.next());
                             if !next_res {
-                                return Ok(CursorResult::Ok(false));
+                                return Ok(CursorResult::Ok(SeekResult {
+                                    cursor_has_record: false,
+                                    seek_matched: false,
+                                }));
                             }
                             // FIXME: optimize this in case record can be read directly
                             return Ok(CursorResult::IO);
@@ -1899,11 +1956,14 @@ impl BTreeCursor {
                         IterationDirection::Backwards => {
                             if !moving_up_to_parent.get() {
                                 moving_up_to_parent.set(true);
-                                self.stack.set_cell_index(-1);
+                                self.stack.set_cell_index(target_cell_when_not_found.get());
                             }
                             let prev_res = return_if_io!(self.prev());
                             if !prev_res {
-                                return Ok(CursorResult::Ok(false));
+                                return Ok(CursorResult::Ok(SeekResult {
+                                    cursor_has_record: false,
+                                    seek_matched: false,
+                                }));
                             }
                             // FIXME: optimize this in case record can be read directly
                             return Ok(CursorResult::IO);
@@ -1945,8 +2005,16 @@ impl BTreeCursor {
                     }
                 }
             } else if cmp.is_gt() {
+                if matches!(seek_op, SeekOp::GE { eq_only: true }) {
+                    target_cell_when_not_found
+                        .set(target_cell_when_not_found.get().min(cur_cell_idx as i32));
+                }
                 max_cell_idx.set(cur_cell_idx - 1);
             } else if cmp.is_lt() {
+                if matches!(seek_op, SeekOp::LE { eq_only: true }) {
+                    target_cell_when_not_found
+                        .set(target_cell_when_not_found.get().max(cur_cell_idx as i32));
+                }
                 min_cell_idx.set(cur_cell_idx + 1);
             } else {
                 match iter_dir {
@@ -1988,23 +2056,6 @@ impl BTreeCursor {
             SeekOp::LT => cmp.is_lt(),
         };
         (cmp, found)
-    }
-
-    fn read_record_w_possible_overflow(
-        &mut self,
-        payload: &'static [u8],
-        next_page: Option<u32>,
-        payload_size: u64,
-    ) -> Result<CursorResult<()>> {
-        if let Some(next_page) = next_page {
-            self.process_overflow_read(payload, next_page, payload_size)
-        } else {
-            crate::storage::sqlite3_ondisk::read_record(
-                payload,
-                self.get_immutable_record_or_create().as_mut().unwrap(),
-            )?;
-            Ok(CursorResult::Ok(()))
-        }
     }
 
     #[instrument(skip_all, level = Level::INFO)]
@@ -2083,23 +2134,20 @@ impl BTreeCursor {
                     return_if_locked_maybe_load!(self.pager, page);
 
                     // get page and find cell
-                    let (cell_idx, page_type) = {
+                    let cell_idx = {
                         return_if_locked!(page.get());
                         let page = page.get();
 
                         page.set_dirty();
                         self.pager.add_dirty(page.get().id);
 
-                        let page = page.get().contents.as_mut().unwrap();
-                        turso_assert!(
-                            matches!(page.page_type(), PageType::TableLeaf | PageType::IndexLeaf),
-                            "expected table or index leaf page"
-                        );
-
-                        // find cell
-                        (return_if_io!(self.find_cell(page, bkey)), page.page_type())
+                        self.stack.current_cell_index()
                     };
-                    self.stack.set_cell_index(cell_idx as i32);
+                    if cell_idx == -1 {
+                        // This might be a brand new table and the cursor hasn't moved yet. Let's advance it to the first slot.
+                        self.stack.set_cell_index(0);
+                    }
+                    let cell_idx = self.stack.current_cell_index() as usize;
                     tracing::debug!(cell_idx);
 
                     // if the cell index is less than the total cells, check: if its an existing
@@ -2130,8 +2178,8 @@ impl BTreeCursor {
                                     continue;
                                 }
                             }
-                            BTreeCell::IndexLeafCell(..) => {
-                                // Not necessary to read record again here, as find_cell already does that for us
+                            BTreeCell::IndexLeafCell(..) | BTreeCell::IndexInteriorCell(..) => {
+                                return_if_io!(self.record());
                                 let cmp = compare_immutable(
                                     record.get_values(),
                                     self.get_immutable_record()
@@ -2159,17 +2207,24 @@ impl BTreeCursor {
                                         self.save_context(CursorContext::IndexKeyRowId((*record).clone()));
                                     }
                                     continue;
+                                } else {
+                                    turso_assert!(
+                                        !matches!(cell, BTreeCell::IndexInteriorCell(..)),
+                                         "we should not be inserting a new index interior cell. the only valid operation on an index interior cell is an overwrite!"
+                                    );
                                 }
                             }
                             other => panic!("unexpected cell type, expected TableLeaf or IndexLeaf, found: {other:?}"),
                         }
                     }
+
                     // insert cell
                     let mut cell_payload: Vec<u8> = Vec::with_capacity(record.len() + 4);
                     fill_cell_payload(
-                        page_type,
+                        page.get().get().contents.as_ref().unwrap(),
                         bkey.maybe_rowid(),
                         &mut cell_payload,
+                        cell_idx,
                         record,
                         self.usable_space() as u16,
                         self.pager.clone(),
@@ -3827,83 +3882,6 @@ impl BTreeCursor {
         self.pager.usable_space()
     }
 
-    /// Find the index of the cell in the page that contains the given rowid.
-    #[instrument( skip_all, level = Level::INFO)]
-    fn find_cell(&mut self, page: &PageContent, key: &BTreeKey) -> Result<CursorResult<usize>> {
-        let cell_count = page.cell_count();
-        let mut low = 0;
-        let mut high = if cell_count > 0 { cell_count - 1 } else { 0 };
-        let mut result_index = cell_count;
-        if self.find_cell_state.0.is_some() {
-            (low, high) = self.find_cell_state.get_state();
-        }
-
-        while low <= high && cell_count > 0 {
-            let mid = low + (high - low) / 2;
-            self.find_cell_state.set((low, high));
-            let cell = page.cell_get(mid, self.usable_space())?;
-
-            let comparison_result = match cell {
-                BTreeCell::TableLeafCell(cell) => key.to_rowid().cmp(&cell.rowid),
-                BTreeCell::TableInteriorCell(cell) => key.to_rowid().cmp(&cell.rowid),
-                BTreeCell::IndexInteriorCell(IndexInteriorCell {
-                    payload,
-                    first_overflow_page,
-                    payload_size,
-                    ..
-                })
-                | BTreeCell::IndexLeafCell(IndexLeafCell {
-                    payload,
-                    first_overflow_page,
-                    payload_size,
-                    ..
-                }) => {
-                    // TODO: implement efficient comparison of records
-                    // e.g. https://github.com/sqlite/sqlite/blob/master/src/vdbeaux.c#L4719
-                    return_if_io!(self.read_record_w_possible_overflow(
-                        payload,
-                        first_overflow_page,
-                        payload_size
-                    ));
-
-                    let key_values = key.to_index_key_values();
-                    let record = self.get_immutable_record();
-                    let record = record.as_ref().unwrap();
-                    let record_same_number_cols = &record.get_values()[..key_values.len()];
-                    compare_immutable(
-                        key_values,
-                        record_same_number_cols,
-                        self.key_sort_order(),
-                        &self.collations,
-                    )
-                }
-            };
-
-            match comparison_result {
-                Ordering::Equal => {
-                    result_index = mid;
-                    break;
-                }
-                Ordering::Greater => {
-                    low = mid + 1;
-                }
-                Ordering::Less => {
-                    result_index = mid;
-                    if mid == 0 {
-                        break;
-                    }
-                    high = mid - 1;
-                }
-            }
-        }
-
-        self.find_cell_state.reset();
-        assert!(result_index <= cell_count);
-
-        Ok(CursorResult::Ok(result_index))
-    }
-
-    #[instrument(skip_all, level = Level::INFO)]
     pub fn seek_end(&mut self) -> Result<CursorResult<()>> {
         assert!(self.mv_cursor.is_none()); // unsure about this -_-
         self.move_to_root()?;
@@ -4047,13 +4025,16 @@ impl BTreeCursor {
         // because it might have been set to false by an unmatched left-join row during the previous iteration
         // on the outer loop.
         self.set_null_flag(false);
-        let cursor_has_record = return_if_io!(self.do_seek(key, op));
+        let SeekResult {
+            cursor_has_record,
+            seek_matched,
+        } = return_if_io!(self.do_seek(key.clone(), op));
         self.invalidate_record();
         // Reset seek state
         self.seek_state = CursorSeekState::Start;
         self.valid_state = CursorValidState::Valid;
         self.has_record.replace(cursor_has_record);
-        Ok(CursorResult::Ok(cursor_has_record))
+        Ok(CursorResult::Ok(seek_matched))
     }
 
     /// Return a reference to the record the cursor is currently pointing to.
@@ -4145,20 +4126,15 @@ impl BTreeCursor {
                     moved_before = false;
                 }
                 if !moved_before {
-                    // Use move_to() so that we always end up on a leaf page. seek() might go back to an interior cell in index seeks,
-                    // which we never want. The reason we can use move_to() is that
-                    // find_cell() iterates the leaf page from left to right to find the insertion point anyway, so we don't care
-                    // which cell we are in as long as we are on the right page.
-                    // FIXME: find_cell() should not use linear search because it's slow.
                     match key {
                         BTreeKey::IndexKey(_) => {
-                            return_if_io!(self.move_to(
+                            return_if_io!(self.seek(
                                 SeekKey::IndexKey(key.get_record().unwrap()),
                                 SeekOp::GE { eq_only: true }
                             ))
                         }
                         BTreeKey::TableRowId(_) => {
-                            return_if_io!(self.move_to(
+                            return_if_io!(self.seek(
                                 SeekKey::TableRowId(key.to_rowid()),
                                 SeekOp::GE { eq_only: true }
                             ))
@@ -4328,12 +4304,10 @@ impl BTreeCursor {
                             post_balancing_seek_key,
                         };
                     } else {
-                        let is_last_cell = cell_idx == contents.cell_count().saturating_sub(1);
                         drop_cell(contents, cell_idx, self.usable_space() as u16)?;
 
                         let delete_info = self.state.mut_delete_info().unwrap();
                         delete_info.state = DeleteState::CheckNeedsBalancing {
-                            rightmost_cell_was_dropped: is_last_cell,
                             post_balancing_seek_key,
                         };
                     }
@@ -4423,13 +4397,11 @@ impl BTreeCursor {
 
                     let delete_info = self.state.mut_delete_info().unwrap();
                     delete_info.state = DeleteState::CheckNeedsBalancing {
-                        rightmost_cell_was_dropped: false,
                         post_balancing_seek_key,
                     };
                 }
 
                 DeleteState::CheckNeedsBalancing {
-                    rightmost_cell_was_dropped,
                     post_balancing_seek_key,
                 } => {
                     let page = self.stack.top();
@@ -4440,15 +4412,6 @@ impl BTreeCursor {
                     let free_space = compute_free_space(contents, self.usable_space() as u16);
                     let needs_balancing = self.stack.has_parent()
                         && free_space as usize * 3 > self.usable_space() * 2;
-
-                    if rightmost_cell_was_dropped {
-                        // If we drop a cell in the middle, e.g. our current index is 2 and we drop 'c' from [a,b,c,d,e], then we don't need to retreat index,
-                        // because index 2 is still going to be the right place [a,b,D,e]
-                        // but:
-                        // If we drop the rightmost cell, e.g. our current index is 4 and we drop 'e' from [a,b,c,d,e], then we need to retreat index,
-                        // because index 4 is now pointing beyond the last cell [a,b,c,d] _ <-- index 4
-                        self.stack.retreat();
-                    }
 
                     if needs_balancing {
                         let delete_info = self.state.mut_delete_info().unwrap();
@@ -4815,13 +4778,21 @@ impl BTreeCursor {
         record: &ImmutableRecord,
     ) -> Result<CursorResult<()>> {
         // build the new payload
-        let page_type = page_ref.get().get().contents.as_ref().unwrap().page_type();
+        let page = page_ref.get();
+        let page_contents = page.get().contents.as_ref().unwrap();
+        tracing::info!(
+            "Overwriting cell {} in page {}. (page_type={:?})",
+            cell_idx,
+            page.get().id,
+            page_contents.page_type()
+        );
         let mut new_payload = Vec::with_capacity(record.len());
         let rowid = return_if_io!(self.rowid());
         fill_cell_payload(
-            page_type,
+            page_contents,
             rowid,
             &mut new_payload,
+            cell_idx,
             record,
             self.usable_space() as u16,
             self.pager.clone(),
@@ -5394,15 +5365,15 @@ struct PageStack {
     /// Pointer to the current page being consumed
     current_page: Cell<i32>,
     /// List of pages in the stack. Root page will be in index 0
-    stack: RefCell<[Option<BTreePage>; BTCURSOR_MAX_DEPTH + 1]>,
+    pub stack: RefCell<[Option<BTreePage>; BTCURSOR_MAX_DEPTH + 1]>,
     /// List of cell indices in the stack.
-    /// cell_indices[current_page] is the current cell index being consumed. Similarly
-    /// cell_indices[current_page-1] is the cell index of the parent of the current page
+    /// node_states[current_page] is the current cell index being consumed. Similarly
+    /// node_states[current_page-1] is the cell index of the parent of the current page
     /// that we save in case of going back up.
     /// There are two points that need special attention:
-    ///  If cell_indices[current_page] = -1, it indicates that the current iteration has reached the start of the current_page
-    ///  If cell_indices[current_page] = `cell_count`, it means that the current iteration has reached the end of the current_page
-    cell_indices: RefCell<[i32; BTCURSOR_MAX_DEPTH + 1]>,
+    ///  If node_states[current_page] = -1, it indicates that the current iteration has reached the start of the current_page
+    ///  If node_states[current_page] = `cell_count`, it means that the current iteration has reached the end of the current_page
+    node_states: RefCell<[BTreeNodeState; BTCURSOR_MAX_DEPTH + 1]>,
 }
 
 impl PageStack {
@@ -5421,6 +5392,7 @@ impl PageStack {
             current = self.current_page.get(),
             new_page_id = page.get().get().id,
         );
+        self.populate_parent_cell_count();
         self.increment_current();
         let current = self.current_page.get();
         assert!(
@@ -5428,8 +5400,45 @@ impl PageStack {
             "corrupted database, stack is bigger than expected"
         );
         assert!(current >= 0);
+
+        // Pin the page to prevent it from being evicted while on the stack
+        page.get().pin();
+
         self.stack.borrow_mut()[current as usize] = Some(page);
-        self.cell_indices.borrow_mut()[current as usize] = starting_cell_idx;
+        self.node_states.borrow_mut()[current as usize] = BTreeNodeState {
+            cell_idx: starting_cell_idx,
+            cell_count: None, // we don't know the cell count yet, so we set it to None. any code pushing a child page onto the stack MUST set the parent page's cell_count.
+        };
+    }
+
+    /// Populate the parent page's cell count.
+    /// This is needed so that we can, from a child page, check of ancestor pages' position relative to its cell index
+    /// without having to perform IO to get the ancestor page contents.
+    ///
+    /// This rests on the assumption that the parent page is already in memory whenever a child is pushed onto the stack.
+    /// We currently ensure this by pinning all the pages on [PageStack] to the page cache so that they cannot be evicted.
+    fn populate_parent_cell_count(&self) {
+        let stack_empty = self.current_page.get() == -1;
+        if stack_empty {
+            return;
+        }
+        let current = self.current();
+        let stack = self.stack.borrow();
+        let page = stack[current].as_ref().unwrap();
+        let page = page.get();
+        turso_assert!(
+            page.is_pinned(),
+            "parent page {} is not pinned",
+            page.get().id
+        );
+        turso_assert!(
+            page.is_loaded(),
+            "parent page {} is not loaded",
+            page.get().id
+        );
+        let contents = page.get_contents();
+        let cell_count = contents.cell_count() as i32;
+        self.node_states.borrow_mut()[current].cell_count = Some(cell_count);
     }
 
     fn push(&self, page: BTreePage) {
@@ -5447,7 +5456,13 @@ impl PageStack {
         let current = self.current_page.get();
         assert!(current >= 0);
         tracing::trace!(current);
-        self.cell_indices.borrow_mut()[current as usize] = 0;
+
+        // Unpin the page before removing it from the stack
+        if let Some(page) = &self.stack.borrow()[current as usize] {
+            page.get().unpin();
+        }
+
+        self.node_states.borrow_mut()[current as usize] = BTreeNodeState::default();
         self.stack.borrow_mut()[current as usize] = None;
         self.decrement_current();
     }
@@ -5474,7 +5489,7 @@ impl PageStack {
     /// Cell index of the current page
     fn current_cell_index(&self) -> i32 {
         let current = self.current();
-        self.cell_indices.borrow()[current]
+        self.node_states.borrow()[current].cell_idx
     }
 
     /// Check if the current cell index is less than 0.
@@ -5490,32 +5505,44 @@ impl PageStack {
     fn advance(&self) {
         let current = self.current();
         tracing::trace!(
-            curr_cell_index = self.cell_indices.borrow()[current],
-            cell_indices = ?self.cell_indices,
+            curr_cell_index = self.node_states.borrow()[current].cell_idx,
+            node_states = ?self.node_states.borrow().iter().map(|state| state.cell_idx).collect::<Vec<_>>(),
         );
-        self.cell_indices.borrow_mut()[current] += 1;
+        self.node_states.borrow_mut()[current].cell_idx += 1;
     }
 
     #[instrument(skip(self), level = Level::INFO, name = "pagestack::retreat")]
     fn retreat(&self) {
         let current = self.current();
         tracing::trace!(
-            curr_cell_index = self.cell_indices.borrow()[current],
-            cell_indices = ?self.cell_indices,
+            curr_cell_index = self.node_states.borrow()[current].cell_idx,
+            node_states = ?self.node_states.borrow().iter().map(|state| state.cell_idx).collect::<Vec<_>>(),
         );
-        self.cell_indices.borrow_mut()[current] -= 1;
+        self.node_states.borrow_mut()[current].cell_idx -= 1;
     }
 
     fn set_cell_index(&self, idx: i32) {
         let current = self.current();
-        self.cell_indices.borrow_mut()[current] = idx;
+        self.node_states.borrow_mut()[current].cell_idx = idx;
     }
 
     fn has_parent(&self) -> bool {
         self.current_page.get() > 0
     }
 
+    fn unpin_all_if_pinned(&self) {
+        self.stack
+            .borrow_mut()
+            .iter_mut()
+            .flatten()
+            .for_each(|page| {
+                let _ = page.get().try_unpin();
+            });
+    }
+
     fn clear(&self) {
+        self.unpin_all_if_pinned();
+
         self.current_page.set(-1);
     }
     pub fn parent_page(&self) -> Option<BTreePage> {
@@ -5529,6 +5556,12 @@ impl PageStack {
         } else {
             None
         }
+    }
+}
+
+impl Drop for PageStack {
+    fn drop(&mut self) {
+        self.unpin_all_if_pinned();
     }
 }
 
@@ -6060,9 +6093,10 @@ fn insert_into_cell(
 ) -> Result<()> {
     assert!(
         cell_idx <= page.cell_count() + page.overflow_cells.len(),
-        "attempting to add cell to an incorrect place cell_idx={} cell_count={}",
+        "attempting to add cell to an incorrect place cell_idx={} cell_count={} page_type={:?}",
         cell_idx,
-        page.cell_count()
+        page.cell_count(),
+        page.page_type()
     );
     let free = compute_free_space(page, usable_space);
     let enough_space = payload.len() + CELL_PTR_SIZE_BYTES <= free as usize;
@@ -6212,21 +6246,25 @@ fn allocate_cell_space(page_ref: &PageContent, amount: u16, usable_space: u16) -
 /// Fill in the cell payload with the record.
 /// If the record is too large to fit in the cell, it will spill onto overflow pages.
 fn fill_cell_payload(
-    page_type: PageType,
+    page_contents: &PageContent,
     int_key: Option<i64>,
     cell_payload: &mut Vec<u8>,
+    cell_idx: usize,
     record: &ImmutableRecord,
     usable_space: u16,
     pager: Rc<Pager>,
 ) {
-    assert!(matches!(
-        page_type,
-        PageType::TableLeaf | PageType::IndexLeaf
-    ));
     // TODO: make record raw from start, having to serialize is not good
     let record_buf = record.get_payload().to_vec();
 
+    let page_type = page_contents.page_type();
     // fill in header
+    if matches!(page_type, PageType::IndexInterior) {
+        // if a write happened on an index interior page, it is always an overwrite.
+        // we must copy the left child pointer of the replaced cell to the new cell.
+        let left_child_page = page_contents.cell_interior_read_left_child_page(cell_idx);
+        cell_payload.extend_from_slice(&left_child_page.to_be_bytes());
+    }
     if matches!(page_type, PageType::TableLeaf) {
         let int_key = int_key.unwrap();
         write_varint_to_vec(record_buf.len() as u64, cell_payload);
@@ -6458,9 +6496,10 @@ mod tests {
     ) -> Vec<u8> {
         let mut payload: Vec<u8> = Vec::new();
         fill_cell_payload(
-            page.page_type(),
+            page,
             Some(id as i64),
             &mut payload,
+            pos,
             &record,
             4096,
             conn.pager.clone(),
@@ -6985,6 +7024,15 @@ mod tests {
                     .map(|col| Register::Value(Value::Integer(*col)))
                     .collect::<Vec<_>>();
                 let value = ImmutableRecord::from_registers(&regs, regs.len());
+                run_until_done(
+                    || {
+                        let record = ImmutableRecord::from_registers(&regs, regs.len());
+                        let key = SeekKey::IndexKey(&record);
+                        cursor.seek(key, SeekOp::GE { eq_only: true })
+                    },
+                    pager.deref(),
+                )
+                .unwrap();
                 run_until_done(
                     || {
                         cursor.insert(
@@ -7565,9 +7613,10 @@ mod tests {
                     let record = ImmutableRecord::from_registers(regs, regs.len());
                     let mut payload: Vec<u8> = Vec::new();
                     fill_cell_payload(
-                        page.page_type(),
+                        page,
                         Some(i as i64),
                         &mut payload,
+                        cell_idx,
                         &record,
                         4096,
                         conn.pager.clone(),
@@ -7638,9 +7687,10 @@ mod tests {
                         let record = ImmutableRecord::from_registers(regs, regs.len());
                         let mut payload: Vec<u8> = Vec::new();
                         fill_cell_payload(
-                            page.page_type(),
+                            page,
                             Some(i),
                             &mut payload,
+                            cell_idx,
                             &record,
                             4096,
                             conn.pager.clone(),
@@ -8002,9 +8052,10 @@ mod tests {
         let record = ImmutableRecord::from_registers(regs, regs.len());
         let mut payload: Vec<u8> = Vec::new();
         fill_cell_payload(
-            page.get().get_contents().page_type(),
+            page.get().get_contents(),
             Some(0),
             &mut payload,
+            0,
             &record,
             4096,
             conn.pager.clone(),
@@ -8077,9 +8128,10 @@ mod tests {
         let record = ImmutableRecord::from_registers(regs, regs.len());
         let mut payload: Vec<u8> = Vec::new();
         fill_cell_payload(
-            page.get().get_contents().page_type(),
+            page.get().get_contents(),
             Some(0),
             &mut payload,
+            0,
             &record,
             4096,
             conn.pager.clone(),
@@ -8427,7 +8479,7 @@ mod tests {
             // add a bunch of cells
             while compute_free_space(page.get_contents(), pager.usable_space() as u16) >= size + 10
             {
-                insert_cell(i, size, page.get_contents(), pager.clone(), page_type);
+                insert_cell(i, size, page.get_contents(), pager.clone());
                 i += 1;
                 size = (rng.next_u64() % 1024) as u16;
             }
@@ -8484,24 +8536,25 @@ mod tests {
         }
     }
 
-    fn insert_cell(
-        i: u64,
-        size: u16,
-        contents: &mut PageContent,
-        pager: Rc<Pager>,
-        page_type: PageType,
-    ) {
+    fn insert_cell(cell_idx: u64, size: u16, contents: &mut PageContent, pager: Rc<Pager>) {
         let mut payload = Vec::new();
         let regs = &[Register::Value(Value::Blob(vec![0; size as usize]))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
         fill_cell_payload(
-            page_type,
-            Some(i as i64),
+            contents,
+            Some(cell_idx as i64),
             &mut payload,
+            cell_idx as usize,
             &record,
             pager.usable_space() as u16,
             pager.clone(),
         );
-        insert_into_cell(contents, &payload, i as usize, pager.usable_space() as u16).unwrap();
+        insert_into_cell(
+            contents,
+            &payload,
+            cell_idx as usize,
+            pager.usable_space() as u16,
+        )
+        .unwrap();
     }
 }

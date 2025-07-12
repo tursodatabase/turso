@@ -6,7 +6,7 @@ use crate::storage::header_accessor;
 use crate::storage::sqlite3_ondisk::{self, DatabaseHeader, PageContent, PageType};
 use crate::storage::wal::{CheckpointResult, Wal, WalFsyncStatus};
 use crate::types::CursorResult;
-use crate::{Buffer, Connection, LimboError, Result};
+use crate::{turso_assert, Buffer, Connection, LimboError, Result};
 use crate::{Completion, WalFile};
 use parking_lot::RwLock;
 use std::cell::{OnceCell, RefCell, UnsafeCell};
@@ -28,6 +28,7 @@ pub struct PageInner {
     pub flags: AtomicUsize,
     pub contents: Option<PageContent>,
     pub id: usize,
+    pub pin_count: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -57,6 +58,7 @@ impl Page {
                 flags: AtomicUsize::new(0),
                 contents: None,
                 id,
+                pin_count: AtomicUsize::new(0),
             }),
         }
     }
@@ -138,6 +140,41 @@ impl Page {
             PageType::IndexLeaf | PageType::IndexInterior => true,
             PageType::TableLeaf | PageType::TableInterior => false,
         }
+    }
+
+    /// Pin the page to prevent it from being evicted from the page cache.
+    pub fn pin(&self) {
+        self.get().pin_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Unpin the page to allow it to be evicted from the page cache.
+    pub fn unpin(&self) {
+        let was_pinned = self.try_unpin();
+
+        turso_assert!(
+            was_pinned,
+            "Attempted to unpin page {} that was not pinned",
+            self.get().id
+        );
+    }
+
+    /// Try to unpin the page if it's pinned, otherwise do nothing.
+    /// Returns true if the page was originally pinned.
+    pub fn try_unpin(&self) -> bool {
+        self.get()
+            .pin_count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                if current == 0 {
+                    None
+                } else {
+                    Some(current - 1)
+                }
+            })
+            .is_ok()
+    }
+
+    pub fn is_pinned(&self) -> bool {
+        self.get().pin_count.load(Ordering::SeqCst) > 0
     }
 }
 
