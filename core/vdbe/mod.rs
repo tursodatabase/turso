@@ -390,7 +390,7 @@ impl Program {
                 // Connection is closed for whatever reason, rollback the transaction.
                 let state = self.connection.transaction_state.get();
                 if let TransactionState::Write { schema_did_change } = state {
-                    pager.rollback(schema_did_change, &self.connection)?
+                    pager.rollback(schema_did_change, &self.connection)
                 }
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
@@ -405,7 +405,7 @@ impl Program {
             if res.is_err() {
                 let state = self.connection.transaction_state.get();
                 if let TransactionState::Write { schema_did_change } = state {
-                    pager.rollback(schema_did_change, &self.connection)?
+                    pager.rollback(schema_did_change, &self.connection)
                 }
             }
             match res? {
@@ -510,7 +510,7 @@ impl Program {
                     status,
                     crate::storage::pager::PagerCacheflushResult::Rollback
                 ) {
-                    pager.rollback(schema_did_change, connection)?;
+                    pager.rollback(schema_did_change, connection);
                 }
                 connection.transaction_state.replace(TransactionState::None);
                 *commit_state = CommitState::Ready;
@@ -587,10 +587,10 @@ fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> Immu
 
 #[instrument(skip(program), level = Level::INFO)]
 fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
-    if !tracing::enabled!(tracing::Level::TRACE) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
         return;
     }
-    tracing::trace!(
+    tracing::debug!(
         "\n{}",
         explain::insn_to_str(
             program,
