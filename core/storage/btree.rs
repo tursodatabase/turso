@@ -5403,10 +5403,10 @@ impl BTreeCursor {
     /// This method is used to save a cursor when external invalidation occurs (an example being autovacuum inserts)
     /// The [BTreeCursor] will look up its own internal state, save that to a context and mark its state as requiring a seek
     /// This will also force all cursors to drop all their references to pages, making it safe to move pages around
-    pub fn save_context_external_invalidation(&mut self) -> Result<CursorResult<()>> {
+    pub fn save_context_external_invalidation(&mut self) -> Result<IOResult<()>> {
         assert!(!matches!(self.valid_state, CursorValidState::RequireSeek));
         if !self.has_record.get() {
-            return Ok(CursorResult::Ok(()));
+            return Ok(IOResult::Done(()));
         }
 
         let page = self.stack.top();
@@ -5437,7 +5437,7 @@ impl BTreeCursor {
         self.save_context(context_to_save);
         self.stack.clear_and_drop_references();
         self.has_record.set(false);
-        Ok(CursorResult::Ok(()))
+        Ok(IOResult::Done(()))
     }
 
     // Save cursor context, to be restored later

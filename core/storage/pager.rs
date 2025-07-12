@@ -26,7 +26,7 @@ use super::sqlite3_ondisk::{begin_write_btree_page, DATABASE_HEADER_SIZE};
 use super::wal::CheckpointMode;
 
 #[cfg(not(feature = "omit_autovacuum"))]
-use {crate::io::Buffer as IoBuffer, ptrmap::*};
+use {crate::io::Buffer as IoBuffer, crate::DatabaseMode, ptrmap::*};
 
 pub struct PageInner {
     pub flags: AtomicUsize,
@@ -707,11 +707,11 @@ impl Pager {
                         }
 
                         let ptrmap_entry = match self.ptrmap_get(root_page_num)? {
-                            CursorResult::Ok(result) => match result {
+                            IOResult::Done(result) => match result {
                                 Some(entry) => entry,
                                 None => panic!("something went wrong"),
                             },
-                            CursorResult::IO => return Ok(CursorResult::IO),
+                            IOResult::IO => return Ok(IOResult::IO),
                         };
 
                         //  These conditions shouldn't be possible because:
@@ -868,7 +868,7 @@ impl Pager {
     /// Update all the child pointer maps of this page to point to the new page number of this page
     /// Called after pages have been relocated
     #[cfg(not(feature = "omit_autovacuum"))]
-    fn set_child_ptrmaps(&self, page: Arc<Page>) -> Result<CursorResult<()>> {
+    fn set_child_ptrmaps(&self, page: Arc<Page>) -> Result<IOResult<()>> {
         let contents = page.get_contents();
 
         //  Iterate through all the children cells and update their pointer map entries
@@ -918,17 +918,17 @@ impl Pager {
                 self.ptrmap_put(right_child, PtrmapType::BTreeNode, page.get().id as u32)?;
             }
         }
-        Ok(CursorResult::Ok(()))
+        Ok(IOResult::Done(()))
     }
 
     #[cfg(not(feature = "omit_autovacuum"))]
     /// The page is an overflow page so check if this page has a chained overflow pointer and update
     /// the pointer map entry over that chained overflow page
-    fn update_overflow_pointer(&self, page: Arc<Page>) -> Result<CursorResult<()>> {
+    fn update_overflow_pointer(&self, page: Arc<Page>) -> Result<IOResult<()>> {
         let contents = page.get_contents();
         let overflow_ptr = contents.read_u32_no_offset(0);
         if overflow_ptr == 0 {
-            return Ok(CursorResult::Ok(()));
+            return Ok(IOResult::Done(()));
         }
         self.ptrmap_put(overflow_ptr, PtrmapType::Overflow2, page.get().id as u32)
     }
