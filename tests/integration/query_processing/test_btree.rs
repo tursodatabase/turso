@@ -76,6 +76,7 @@ pub struct BTreeTablePageData {
 #[derive(Debug)]
 pub enum BTreePageData {
     Table(BTreeTablePageData),
+    #[allow(dead_code)]
     Overflow(BTreeOverflowPageData),
 }
 
