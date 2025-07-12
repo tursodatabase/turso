@@ -37,3 +37,4 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 anyhow.workspace = true
 turso_sqlite3_parser = { workspace = true, features = ["serde"]}
 hex = "0.4.3"
+tracing-appender = "0.2.3"
