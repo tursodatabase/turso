@@ -1505,8 +1505,7 @@ mod ptrmap_tests {
                 &io,
                 io.open_file("test.db-wal", OpenFlags::Create, false)
                     .unwrap(),
-            )
-            .unwrap(),
+            ),
             buffer_pool.clone(),
         )));
 
