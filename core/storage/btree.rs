@@ -1753,15 +1753,11 @@ impl BTreeCursor {
                     self.stack.set_cell_index(nearest_matching_cell as i32);
                     return Ok(CursorResult::Ok(SeekResult::Found));
                 } else {
-                    let eq_only = match &seek_op {
-                        SeekOp::GE { eq_only } | SeekOp::LE { eq_only } => *eq_only,
-                        SeekOp::LT | SeekOp::GT => false,
-                    };
                     // if !eq_only - matching entry can exist in neighbour leaf page
                     // this can happen if key in the interiour page was deleted - but divider kept untouched
                     // in such case BTree can navigate to the leaf which no longer has matching key for seek_op
                     // in this case, caller must advance cursor if necessary
-                    return Ok(CursorResult::Ok(if eq_only {
+                    return Ok(CursorResult::Ok(if seek_op.eq_only() {
                         SeekResult::NotFound
                     } else {
                         let contents = page.get().contents.as_ref().unwrap();

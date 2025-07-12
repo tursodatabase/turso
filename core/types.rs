@@ -2293,8 +2293,18 @@ pub enum CursorResult<T> {
 
 #[derive(Debug)]
 pub enum SeekResult {
+    /// Record matching the [SeekOp] found in the B-tree and cursor was positioned to point onto that record
     Found,
+    /// Record matching the [SeekOp] doesn't exists in the B-tree
     NotFound,
+    /// This result can happen only if eq_only for [SeekOp] is false
+    /// In this case Seek can position cursor to the leaf page boundaries (before the start, after the end)
+    /// (e.g. if leaf page holds rows with keys from range [1..10], key 10 is absent and [SeekOp] is >= 10)
+    ///
+    /// turso-db has this extra [SeekResult] in order to make [BTreeCursor::seek] method to position cursor at
+    /// the leaf of potential insertion, but also communicate to caller the fact that current cursor position
+    /// doesn't hold a matching entry
+    /// (necessary for Seek{XX} VM op-codes, so these op-codes will try to advance cursor in order to move it to matching entry)
     TryAdvance,
 }
 

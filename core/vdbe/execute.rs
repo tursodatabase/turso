@@ -2393,9 +2393,14 @@ pub fn op_deferred_seek(
 }
 
 pub enum OpSeekState {
+    /// Initial state
     Start,
+    /// Position cursor with seek operation with (rowid, op) search parameters
     Seek { rowid: i64, op: SeekOp },
+    /// Advance cursor (with [BTreeCursor::next]/[BTreeCursor::prev] methods) which was
+    /// positioned after [OpSeekState::Seek] state if [BTreeCursor::seek] returned [SeekResult::TryAdvance]
     Advance { op: SeekOp },
+    /// Move cursor to the last BTree row if DB knows that comparison result will be fixed (due to type ordering, e.g. NUMBER always <= TEXT)
     MoveLast,
 }
 
@@ -2591,6 +2596,22 @@ pub fn op_seek_internal(
                 let found = {
                     let mut cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
+                    // Seek operation has anchor number which equals to the closed boundary of the range
+                    // (e.g. for >= x - anchor is x, for > x - anchor is x + 1)
+                    //
+                    // Before Advance state, cursor was positioned to the leaf page which should hold the anchor.
+                    // Sometimes this leaf page can have no matching rows, and in this case
+                    // we need to move cursor in the direction of Seek to find record which matches the seek filter
+                    //
+                    // Consider following scenario: Seek [> 666]
+                    // interior page dividers:       I1: [ .. 667 .. ]
+                    //                                       /   \
+                    //             leaf pages:    P1[661,665]   P2[anything here is GT 666]
+                    // After the initial Seek, cursor will be positioned after the end of leaf page P1 [661, 665]
+                    // because this is potential position for insertion of value 666.
+                    // But as P1 has no row matching Seek criteria - we need to move it to the right
+                    // (and as we at the page boundary, we will move cursor to the next neighbor leaf, which guaranteed to have
+                    // row keys greater than divider, which is greater or equal than anchor)
                     match op {
                         SeekOp::GT | SeekOp::GE { eq_only: false } => return_if_io!(cursor.next()),
                         SeekOp::LT | SeekOp::LE { eq_only: false } => return_if_io!(cursor.prev()),
