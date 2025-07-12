@@ -84,6 +84,13 @@ impl SimulatorFile {
         rng.gen_bool(self.latency_probability as f64 / 100.0)
             .then(|| std::time::Duration::from_millis(rng.gen_range(20..50)))
     }
+
+    pub fn is_syncing(&self) -> bool {
+        self.sync_completion
+            .borrow()
+            .as_ref()
+            .map_or(false, |c| !c.is_completed())
+    }
 }
 
 impl File for SimulatorFile {

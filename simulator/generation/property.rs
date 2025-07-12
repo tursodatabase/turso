@@ -1,8 +1,11 @@
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use turso_core::LimboError;
 use turso_sqlite3_parser::ast;
 
 use crate::{
+    generation::ArbitraryFromMaybe,
     model::{
         query::{
             predicate::Predicate,
@@ -127,25 +130,19 @@ pub(crate) enum Property {
     /// tends to optimize `where` statements while keeping the result column expressions
     /// unoptimized. This property is used to test the optimizer. The property is successful
     /// if the two queries return the same number of rows.
-    SelectSelectOptimizer {
-        table: String,
-        predicate: Predicate,
-    },
+    SelectSelectOptimizer { table: String, predicate: Predicate },
     /// FsyncNoWait is a property which tests if we do not loose any data after not waiting for fsync.
     ///
     /// # Interactions
-    /// - Executes the `query` without waiting for fsync
+    /// - Executes the `query` without waiting for fsync to complete
     /// - Drop all connections and Reopen the database
-    /// - Execute the `query` again
-    /// - Query tables to assert that the values were inserted
+    /// - Query tables to assert that we are seeing the expected table state
     ///
-    FsyncNoWait {
-        query: Query,
-        tables: Vec<String>,
-    },
+    FsyncNoWait { query: Query, tables: Vec<String> },
     FaultyQuery {
         query: Query,
         tables: Vec<String>,
+        interactive: Option<InteractiveQueryInfo>,
     },
 }
 
@@ -153,6 +150,18 @@ pub(crate) enum Property {
 pub struct InteractiveQueryInfo {
     start_with_immediate: bool,
     end_with_commit: bool,
+}
+
+impl ArbitraryFromMaybe<()> for InteractiveQueryInfo {
+    fn arbitrary_from_maybe<R: rand::Rng>(rng: &mut R, _t: ()) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        rng.gen_bool(0.5).then(|| InteractiveQueryInfo {
+            start_with_immediate: rng.gen_bool(0.5),
+            end_with_commit: rng.gen_bool(0.5),
+        })
+    }
 }
 
 impl Property {
@@ -470,13 +479,22 @@ impl Property {
                 vec![assumption, select1, select2, assertion]
             }
             Property::FsyncNoWait { query, tables } => {
-                let checks = assert_all_table_values(tables);
+                let iter = tables.iter().map(|s| s.as_str());
+                let checks = assert_all_table_values(iter);
                 Vec::from_iter(
                     std::iter::once(Interaction::FsyncQuery(query.clone())).chain(checks),
                 )
             }
-            Property::FaultyQuery { query, tables } => {
-                let checks = assert_all_table_values(tables);
+            Property::FaultyQuery {
+                query,
+                tables,
+                interactive,
+            } => {
+                let mut total_tables = HashSet::with_capacity(tables.len());
+                total_tables.extend(query.uses());
+                total_tables.extend(tables.clone());
+                let iter = total_tables.iter().map(|s| s.as_str());
+                let checks = assert_all_table_values(iter);
                 let query_clone = query.clone();
                 let assumption = Assertion {
                     // A fault may not occur as we first signal we want a fault injected,
@@ -501,21 +519,43 @@ impl Property {
                         }
                     }),
                 };
-                let first = [
-                    Interaction::FaultyQuery(query.clone()),
-                    Interaction::Assumption(assumption),
-                ]
-                .into_iter();
+
+                let first: std::vec::IntoIter<Interaction> =
+                    if let Some(ref interactive) = interactive {
+                        let begin_query = Query::Begin(Begin {
+                            immediate: interactive.start_with_immediate,
+                        });
+                        let end_interactive_query = if interactive.end_with_commit {
+                            Query::Commit(Commit)
+                        } else {
+                            Query::Rollback(Rollback)
+                        };
+                        vec![
+                            Interaction::Query(begin_query),
+                            Interaction::FaultyQuery(query.clone()),
+                            Interaction::Assumption(assumption),
+                            Interaction::Query(end_interactive_query),
+                        ]
+                        .into_iter()
+                    } else {
+                        vec![
+                            Interaction::FaultyQuery(query.clone()),
+                            Interaction::Assumption(assumption),
+                        ]
+                        .into_iter()
+                    };
                 Vec::from_iter(first.chain(checks))
             }
         }
     }
 }
 
-fn assert_all_table_values(tables: &[String]) -> impl Iterator<Item = Interaction> + use<'_> {
-    let checks = tables.iter().flat_map(|table| {
+fn assert_all_table_values<'a, T: Iterator<Item = &'a str>>(
+    tables: T,
+) -> impl Iterator<Item = Interaction> + use<'a, T> {
+    let checks = tables.flat_map(|table| {
         let select = Interaction::Query(Query::Select(Select {
-            table: table.clone(),
+            table: table.to_owned(),
             result_columns: vec![ResultColumn::Star],
             predicate: Predicate::true_(),
             limit: None,
@@ -524,7 +564,7 @@ fn assert_all_table_values(tables: &[String]) -> impl Iterator<Item = Interactio
         let assertion = Interaction::Assertion(Assertion {
             message: format!("table {} should contain all of its values", table),
             func: Box::new({
-                let table = table.clone();
+                let table = table.to_owned();
                 move |stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
                     let table = env.tables.iter().find(|t| t.name == table).ok_or_else(|| {
                         LimboError::InternalError(format!(
@@ -616,14 +656,7 @@ fn property_insert_values_select<R: rand::Rng>(
     };
 
     // Choose if we want queries to be executed in an interactive transaction
-    let interactive = if rng.gen_bool(0.5) {
-        Some(InteractiveQueryInfo {
-            start_with_immediate: rng.gen_bool(0.5),
-            end_with_commit: rng.gen_bool(0.5),
-        })
-    } else {
-        None
-    };
+    let interactive = InteractiveQueryInfo::arbitrary_from_maybe(rng, ());
     // Create random queries respecting the constraints
     let mut queries = Vec::new();
     // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
@@ -851,6 +884,7 @@ fn property_faulty_query<R: rand::Rng>(
     Property::FaultyQuery {
         query: Query::arbitrary_from(rng, (env, remaining)),
         tables: env.tables.iter().map(|t| t.name.clone()).collect(),
+        interactive: InteractiveQueryInfo::arbitrary_from_maybe(rng, ()),
     }
 }
 
