@@ -541,6 +541,10 @@ pub fn translate_insert(
         .enumerate()
         .filter(|(_, col)| col.column.notnull)
     {
+        // if this is rowid alias - turso-db will emit NULL as a column value and always use rowid for the row as a column value
+        if col.column.is_rowid_alias {
+            continue;
+        }
         let target_reg = i + column_registers_start;
         program.emit_insn(Insn::HaltIfNull {
             target_reg,
