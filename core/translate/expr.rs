@@ -1723,12 +1723,18 @@ pub fn translate_expr(
                             }
 
                             let start_reg = program.alloc_register();
+                            translate_expr(
+                                program,
+                                referenced_tables,
+                                &args[0],
+                                start_reg,
+                                resolver,
+                            )?;
                             program.emit_insn(Insn::Copy {
                                 src_reg: start_reg,
                                 dst_reg: target_register,
                                 amount: 0,
                             });
-
                             Ok(target_register)
                         }
                         ScalarFunc::TableColumnsJsonArray => {
