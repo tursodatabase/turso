@@ -1156,6 +1156,7 @@ impl Statement {
     pub fn run_once(&self) -> Result<()> {
         let res = self.pager.io.run_once();
         if res.is_err() {
+            tracing::error!(err = %res.as_ref().unwrap_err());
             let state = self.program.connection.transaction_state.get();
             if let TransactionState::Write { schema_did_change } = state {
                 self.pager
