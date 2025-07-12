@@ -8,7 +8,7 @@ use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::wal::DummyWAL;
 use crate::storage::{self, header_accessor};
 use crate::translate::collate::CollationSeq;
-use crate::types::{ImmutableRecord, Text};
+use crate::types::{ImmutableRecord, SeekResult, Text};
 use crate::util::normalize_ident;
 use crate::{
     error::{
@@ -2094,10 +2094,10 @@ pub fn op_seek_rowid(
 
         match rowid {
             Some(rowid) => {
-                let found = return_if_io!(
+                let seek_result = return_if_io!(
                     cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
                 );
-                if !found {
+                if !matches!(seek_result, SeekResult::Found) {
                     target_pc.as_offset_int()
                 } else {
                     state.pc + 1
@@ -2206,13 +2206,13 @@ pub fn op_seek_internal(
     };
     // todo (sivukhin): fix index too
     if *is_index {
-        let found = {
+        let seek_result = {
             let mut cursor = state.get_cursor(*cursor_id);
             let cursor = cursor.as_btree_mut();
             let record_from_regs = make_record(&state.registers, start_reg, num_regs);
             return_if_io!(cursor.seek(SeekKey::IndexKey(&record_from_regs), op))
         };
-        if !found {
+        if !matches!(seek_result, SeekResult::Found) {
             state.pc = target_pc.as_offset_int();
         } else {
             state.pc += 1;
@@ -2304,12 +2304,12 @@ pub fn op_seek_internal(
                 continue;
             }
             OpSeekState::Seek { rowid, op } => {
-                let found = {
+                let seek_result = {
                     let mut cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(cursor.seek(SeekKey::TableRowId(*rowid), *op))
                 };
-                if !found {
+                if !matches!(seek_result, SeekResult::Found) {
                     state.pc = target_pc.as_offset_int()
                 } else {
                     state.pc += 1
@@ -4368,12 +4368,12 @@ pub fn op_idx_delete(
                 let found = {
                     let mut cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
-                    let found = return_if_io!(
+                    let seek_result = return_if_io!(
                         cursor.seek(SeekKey::IndexKey(record), SeekOp::GE { eq_only: true })
                     );
                     tracing::debug!(
                         "op_idx_delete: found={:?}, rootpage={}, key={:?}",
-                        found,
+                        seek_result,
                         cursor.root_page(),
                         record
                     );
@@ -4677,10 +4677,10 @@ pub fn op_no_conflict(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    let conflict =
+    let seek_result =
         return_if_io!(cursor.seek(SeekKey::IndexKey(record), SeekOp::GE { eq_only: true }));
     drop(cursor_ref);
-    if !conflict {
+    if !matches!(seek_result, SeekResult::Found) {
         state.pc = target_pc.as_offset_int();
     } else {
         state.pc += 1;
@@ -5476,7 +5476,7 @@ pub fn op_found(
 
     let not = matches!(insn, Insn::NotFound { .. });
 
-    let found = {
+    let seek_result = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
 
@@ -5497,6 +5497,7 @@ pub fn op_found(
         }
     };
 
+    let found = matches!(seek_result, SeekResult::Found);
     let do_jump = (!found && not) || (found && !not);
     if do_jump {
         state.pc = target_pc.as_offset_int();
