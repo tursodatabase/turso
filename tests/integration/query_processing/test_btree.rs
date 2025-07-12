@@ -1,13 +1,17 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
-    i64,
-    os::unix::fs::FileExt,
     path::Path,
+    pin::Pin,
     rc::Rc,
+    sync::Arc,
 };
 
 use rand::{seq::SliceRandom, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use turso_core::{
+    Buffer, Completion, CompletionType, File, OpenFlags, PlatformIO, WriteCompletion, IO,
+};
 use zerocopy::big_endian::{U16, U32, U64};
 
 use crate::common::{limbo_exec_rows, sqlite_exec_rows, TempDatabase};
@@ -91,7 +95,7 @@ pub fn list_pages(root: &Rc<BTreePageData>, pages: &mut Vec<Rc<BTreePageData>>) 
                         let Some(overflow_page) = &cell.overflow_page else {
                             continue;
                         };
-                        list_pages(&overflow_page, pages);
+                        list_pages(overflow_page, pages);
                     }
                 }
             }
@@ -153,7 +157,7 @@ pub fn length_varint(value: u64) -> usize {
 
 fn write_u64_column(header: &mut Vec<u8>, data: &mut Vec<u8>, value: u64) {
     let mut buf = [0u8; 10];
-    let buf_len = write_varint(&mut buf, 6 as u64);
+    let buf_len = write_varint(&mut buf, 6u64);
     header.extend_from_slice(&buf[0..buf_len]);
     data.extend_from_slice(&U64::new(value).to_bytes());
 }
@@ -187,7 +191,7 @@ struct BTreeGenerator<'a> {
     max_payload_size: usize,
 }
 
-impl<'a> BTreeGenerator<'a> {
+impl BTreeGenerator<'_> {
     pub fn create_page(
         &self,
         page: &BTreePageData,
@@ -205,7 +209,7 @@ impl<'a> BTreeGenerator<'a> {
     ) -> Vec<u8> {
         let mut data = [255u8; 4096];
         let first_4bytes = if let Some(next) = &page.next {
-            *page_numbers.get(&Rc::as_ptr(&next)).unwrap()
+            *page_numbers.get(&Rc::as_ptr(next)).unwrap()
         } else {
             0
         };
@@ -233,7 +237,7 @@ impl<'a> BTreeGenerator<'a> {
         let mut offset = 8;
         if page.page_type == BTreePageType::Interior {
             let cell_right_pointer = page.cell_right_pointer.as_ref().unwrap();
-            let cell_right_pointer = Rc::as_ptr(&cell_right_pointer);
+            let cell_right_pointer = Rc::as_ptr(cell_right_pointer);
             let cell_right_pointer = page_numbers.get(&cell_right_pointer).unwrap();
             data[8..12].copy_from_slice(&U32::new(*cell_right_pointer).to_bytes());
             offset = 12;
@@ -246,7 +250,7 @@ impl<'a> BTreeGenerator<'a> {
 
         for i in 0..page.free_blocks.len() {
             let offset = page.free_blocks[i].offset as usize;
-            data[offset + 0..offset + 2].copy_from_slice(
+            data[offset..offset + 2].copy_from_slice(
                 &U16::new(page.free_blocks.get(i + 1).map(|x| x.offset).unwrap_or(0)).to_bytes(),
             );
             data[offset + 2..offset + 4]
@@ -265,11 +269,11 @@ impl<'a> BTreeGenerator<'a> {
                 }
                 BTreeCell::Leaf(cell) => {
                     p += write_varint(&mut data[p..], cell.size as u64);
-                    p += write_varint(&mut data[p..], cell.rowid as u64);
+                    p += write_varint(&mut data[p..], cell.rowid);
                     data[p..p + cell.on_page_data.len()].copy_from_slice(&cell.on_page_data);
                     p += cell.on_page_data.len();
                     if let Some(overflow_page) = &cell.overflow_page {
-                        let overflow_page = Rc::as_ptr(&overflow_page);
+                        let overflow_page = Rc::as_ptr(overflow_page);
                         let overflow_page = page_numbers.get(&overflow_page).unwrap();
                         data[p..p + 4].copy_from_slice(&U32::new(*overflow_page).to_bytes());
                     }
@@ -403,27 +407,38 @@ impl<'a> BTreeGenerator<'a> {
 
     fn write_btree(&mut self, path: &Path, root: &Rc<BTreePageData>, start_page: u32) {
         let mut pages = Vec::new();
-        list_pages(&root, &mut pages);
+        list_pages(root, &mut pages);
         pages[1..].shuffle(&mut self.rng);
         let mut page_numbers = HashMap::new();
         for (page, page_no) in pages.iter().zip(start_page..) {
-            page_numbers.insert(Rc::as_ptr(&page), page_no);
+            page_numbers.insert(Rc::as_ptr(page), page_no);
         }
 
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
+        let io = PlatformIO::new().unwrap();
+        let file = io
+            .open_file(path.to_str().unwrap(), OpenFlags::None, true)
             .unwrap();
 
-        assert_eq!(file.metadata().unwrap().len(), 4096 * 2);
+        assert_eq!(file.size().unwrap(), 4096 * 2);
         for (i, page) in pages.iter().enumerate() {
             let page = self.create_page(page, &page_numbers);
-            file.write_at(&page, 4096 * (i + 1) as u64).unwrap();
+            write_at(&io, file.clone(), 4096 * (i + 1), &page);
         }
         let size = 1 + pages.len();
         let size_bytes = U32::new(size as u32).to_bytes();
-        file.write_at(&size_bytes, 28).unwrap();
+        write_at(&io, file, 28, &size_bytes);
+    }
+}
+
+fn write_at(io: &impl IO, file: Arc<dyn File>, offset: usize, data: &[u8]) {
+    let completion = Completion::new(CompletionType::Write(WriteCompletion::new(Box::new(
+        |_| {},
+    ))));
+    let drop_fn = Rc::new(move |_| {});
+    let buffer = Arc::new(RefCell::new(Buffer::new(Pin::new(data.to_vec()), drop_fn)));
+    let result = file.pwrite(offset, buffer, completion).unwrap();
+    while !result.is_completed() {
+        io.run_once().unwrap();
     }
 }
 
