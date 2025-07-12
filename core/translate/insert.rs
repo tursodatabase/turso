@@ -6,7 +6,7 @@ use turso_sqlite3_parser::ast::{
 
 use crate::error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY};
 use crate::schema::{IndexColumn, Table};
-use crate::translate::emitter::{emit_cdc_insns, OperationMode};
+use crate::translate::emitter::{emit_cdc_insns, emit_cdc_patch_record, OperationMode};
 use crate::util::normalize_ident;
 use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::{IdxInsertFlags, InsertFlags, RegisterOrLiteral};
@@ -444,18 +444,6 @@ pub fn translate_insert(
         _ => (),
     }
 
-    // Write record to the turso_cdc table if necessary
-    if let Some((cdc_cursor_id, _)) = &cdc_table {
-        emit_cdc_insns(
-            &mut program,
-            &resolver,
-            OperationMode::INSERT,
-            *cdc_cursor_id,
-            rowid_reg,
-            &table_name.0,
-        )?;
-    }
-
     let index_col_mappings = resolve_indicies_for_insert(schema, table.as_ref(), &column_mappings)?;
     for index_col_mapping in index_col_mappings {
         // find which cursor we opened earlier for this index
@@ -574,7 +562,6 @@ pub fn translate_insert(
         dest_reg: record_register,
         index_name: None,
     });
-
     program.emit_insn(Insn::Insert {
         cursor: cursor_id,
         key_reg: rowid_reg,
@@ -582,6 +569,32 @@ pub fn translate_insert(
         flag: InsertFlags::new(),
         table_name: table_name.to_string(),
     });
+
+    // Emit update in the CDC table if necessary (after the INSERT updated the table)
+    if let Some((cdc_cursor_id, _)) = &cdc_table {
+        let cdc_has_after = program.capture_data_changes_mode().has_after();
+        let after_record_reg = if cdc_has_after {
+            Some(emit_cdc_patch_record(
+                &mut program,
+                &table,
+                column_registers_start,
+                record_register,
+                rowid_reg,
+            ))
+        } else {
+            None
+        };
+        emit_cdc_insns(
+            &mut program,
+            &resolver,
+            OperationMode::INSERT,
+            *cdc_cursor_id,
+            rowid_reg,
+            None,
+            after_record_reg,
+            &table_name.0,
+        )?;
+    }
 
     if inserting_multiple_rows {
         if let Some(temp_table_ctx) = temp_table_ctx {
