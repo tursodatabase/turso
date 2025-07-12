@@ -48,7 +48,7 @@ use crate::{
         builder::CursorType,
         insn::{IdxInsertFlags, Insn},
     },
-    vector::{vector32, vector64, vector_distance_cos, vector_extract},
+    vector::{vector32, vector64, vector_distance_cos, vector_distance_l2, vector_extract},
 };
 
 use crate::{
@@ -3743,6 +3743,11 @@ pub fn op_function(
             VectorFunc::VectorDistanceCos => {
                 let result =
                     vector_distance_cos(&state.registers[*start_reg..*start_reg + arg_count])?;
+                state.registers[*dest] = Register::Value(result);
+            }
+            VectorFunc::VectorDistanceEuclidean => {
+                let result =
+                    vector_distance_l2(&state.registers[*start_reg..*start_reg + arg_count])?;
                 state.registers[*dest] = Register::Value(result);
             }
         },
