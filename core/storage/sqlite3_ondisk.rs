@@ -1205,17 +1205,12 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
                     content_size
                 );
             }
-            let slice = if content_size == 0 {
-                RawSlice::new(std::ptr::null(), 0)
-            } else {
-                let ptr = &buf[0] as *const u8;
-                RawSlice::new(ptr, content_size)
-            };
+
             Ok((
-                RefValue::Text(TextRef {
-                    value: slice,
-                    subtype: TextSubtype::Text,
-                }),
+                RefValue::Text(TextRef::create_from(
+                    &buf[..content_size],
+                    TextSubtype::Text,
+                )),
                 content_size,
             ))
         }

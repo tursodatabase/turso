@@ -43,7 +43,7 @@ impl Display for ValueType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TextSubtype {
     Text,
@@ -122,6 +122,10 @@ impl Display for TextRef {
 }
 
 impl TextRef {
+    pub fn create_from(value: &[u8], subtype: TextSubtype) -> Self {
+        let value = RawSlice::create_from(value);
+        Self { value, subtype }
+    }
     pub fn as_str(&self) -> &str {
         unsafe { std::str::from_utf8_unchecked(self.value.to_slice()) }
     }
@@ -895,19 +899,29 @@ impl ImmutableRecord {
         self.values.is_empty()
     }
 
-    pub fn from_registers<'a>(
-        registers: impl IntoIterator<Item = &'a Register> + Copy,
+    pub fn from_registers<'a, I: Iterator<Item = &'a Register> + Clone>(
+        // we need to accept both &[Register] and &[&Register] values - that's why non-trivial signature
+        //
+        // std::slice::Iter under the hood just stores pointer and length of slice and also implements a Clone which just copy those meta-values
+        // (without copying the data itself)
+        registers: impl IntoIterator<Item = &'a Register, IntoIter = I>,
         len: usize,
     ) -> Self {
-        let mut values = Vec::with_capacity(len);
+        Self::from_values(registers.into_iter().map(|x| x.get_owned_value()), len)
+    }
+
+    pub fn from_values<'a>(
+        values: impl IntoIterator<Item = &'a Value> + Clone,
+        len: usize,
+    ) -> Self {
+        let mut ref_values = Vec::with_capacity(len);
         let mut serials = Vec::with_capacity(len);
         let mut size_header = 0;
         let mut size_values = 0;
 
         let mut serial_type_buf = [0; 9];
         // write serial types
-        for value in registers {
-            let value = value.get_owned_value();
+        for value in values.clone() {
             let serial_type = SerialType::from(value);
             let n = write_varint(&mut serial_type_buf[0..], serial_type.into());
             serials.push((serial_type_buf, n));
@@ -949,15 +963,14 @@ impl ImmutableRecord {
         }
 
         // write content
-        for value in registers {
-            let value = value.get_owned_value();
+        for value in values {
             let start_offset = writer.pos;
             match value {
                 Value::Null => {
-                    values.push(RefValue::Null);
+                    ref_values.push(RefValue::Null);
                 }
                 Value::Integer(i) => {
-                    values.push(RefValue::Integer(*i));
+                    ref_values.push(RefValue::Integer(*i));
                     let serial_type = SerialType::from(value);
                     match serial_type.kind() {
                         SerialTypeKind::ConstInt0 | SerialTypeKind::ConstInt1 => {}
@@ -973,7 +986,7 @@ impl ImmutableRecord {
                     }
                 }
                 Value::Float(f) => {
-                    values.push(RefValue::Float(*f));
+                    ref_values.push(RefValue::Float(*f));
                     writer.extend_from_slice(&f.to_be_bytes())
                 }
                 Value::Text(t) => {
@@ -983,16 +996,16 @@ impl ImmutableRecord {
                     let ptr = unsafe { writer.buf.as_ptr().add(start_offset) };
                     let value = RefValue::Text(TextRef {
                         value: RawSlice::new(ptr, len),
-                        subtype: t.subtype.clone(),
+                        subtype: t.subtype,
                     });
-                    values.push(value);
+                    ref_values.push(value);
                 }
                 Value::Blob(b) => {
                     writer.extend_from_slice(b);
                     let end_offset = writer.pos;
                     let len = end_offset - start_offset;
                     let ptr = unsafe { writer.buf.as_ptr().add(start_offset) };
-                    values.push(RefValue::Blob(RawSlice::new(ptr, len)));
+                    ref_values.push(RefValue::Blob(RawSlice::new(ptr, len)));
                 }
             };
         }
@@ -1000,7 +1013,7 @@ impl ImmutableRecord {
         writer.assert_finish_capacity();
         Self {
             payload: Value::Blob(buf),
-            values,
+            values: ref_values,
             recreating: false,
         }
     }
@@ -1074,7 +1087,7 @@ impl Clone for ImmutableRecord {
                     let new_ptr = unsafe { new_payload.as_blob().as_ptr().add(len) };
                     RefValue::Text(TextRef {
                         value: RawSlice::new(new_ptr, text_ref.value.len),
-                        subtype: text_ref.subtype.clone(),
+                        subtype: text_ref.subtype,
                     })
                 }
                 RefValue::Blob(raw_slice) => {
@@ -1117,7 +1130,7 @@ impl RefValue {
             RefValue::Float(f) => Value::Float(*f),
             RefValue::Text(text_ref) => Value::Text(Text {
                 value: text_ref.value.to_slice().to_vec(),
-                subtype: text_ref.subtype.clone(),
+                subtype: text_ref.subtype,
             }),
             RefValue::Blob(b) => Value::Blob(b.to_slice().to_vec()),
         }
@@ -1623,6 +1636,14 @@ pub enum SeekKey<'a> {
 }
 
 impl RawSlice {
+    pub fn create_from(value: &[u8]) -> Self {
+        if value.is_empty() {
+            RawSlice::new(std::ptr::null(), 0)
+        } else {
+            let ptr = &value[0] as *const u8;
+            RawSlice::new(ptr, value.len())
+        }
+    }
     pub fn new(data: *const u8, len: usize) -> Self {
         Self { data, len }
     }
