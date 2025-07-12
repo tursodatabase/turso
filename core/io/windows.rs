@@ -1,15 +1,26 @@
 use super::MemoryIO;
 use crate::{Clock, Completion, File, Instant, LimboError, OpenFlags, Result, IO};
+use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
 use tracing::{debug, trace};
-pub struct WindowsIO {}
+
+type CompletionCallback = Box<dyn Fn() -> Result<()>>;
+// TODO: Arc + Mutex here for Send + Sync functionality
+// can maybe see a way for only submitting IO through
+type CallbackQueue = Arc<Mutex<Vec<CompletionCallback>>>;
+
+pub struct WindowsIO {
+    callbacks: CallbackQueue,
+}
 
 impl WindowsIO {
     pub fn new() -> Result<Self> {
         debug!("Using IO backend 'syscall'");
-        Ok(Self {})
+        Ok(Self {
+            callbacks: Arc::new(Mutex::new(Vec::new())),
+        })
     }
 }
 
@@ -17,7 +28,7 @@ unsafe impl Send for WindowsIO {}
 unsafe impl Sync for WindowsIO {}
 
 impl IO for WindowsIO {
-    fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+    fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         trace!("open_file(path = {})", path);
         let mut file = std::fs::File::options();
         file.read(true);
@@ -29,7 +40,8 @@ impl IO for WindowsIO {
 
         let file = file.open(path)?;
         Ok(Arc::new(WindowsFile {
-            file: RefCell::new(file),
+            file: Arc::new(Mutex::new(file)),
+            callbacks: self.callbacks.clone(),
         }))
     }
 
@@ -41,6 +53,15 @@ impl IO for WindowsIO {
     }
 
     fn run_once(&self) -> Result<()> {
+        let mut callbacks = self.callbacks.lock();
+        if callbacks.is_empty() {
+            return Ok(());
+        }
+        trace!("run_once() waits for events");
+        let events = callbacks.drain(0..);
+        for callback in events {
+            callback()?;
+        }
         Ok(())
     }
 
@@ -66,14 +87,15 @@ impl Clock for WindowsIO {
 }
 
 pub struct WindowsFile {
-    file: RefCell<std::fs::File>,
+    file: Arc<Mutex<std::fs::File>>,
+    callbacks: CallbackQueue,
 }
 
 unsafe impl Send for WindowsFile {}
 unsafe impl Sync for WindowsFile {}
 
 impl File for WindowsFile {
-    fn lock_file(&self, exclusive: bool) -> Result<()> {
+    fn lock_file(&self, _exclusive: bool) -> Result<()> {
         unimplemented!()
     }
 
@@ -81,18 +103,25 @@ impl File for WindowsFile {
         unimplemented!()
     }
 
-    fn pread(&self, pos: usize, c: Completion) -> Result<Arc<Completion>> {
-        let mut file = self.file.borrow_mut();
-        file.seek(std::io::SeekFrom::Start(pos as u64))?;
-        let nr = {
-            let r = c.as_read();
-            let mut buf = r.buf_mut();
-            let buf = buf.as_mut_slice();
-            file.read_exact(buf)?;
-            buf.len() as i32
-        };
-        c.complete(nr);
-        Ok(Arc::new(c))
+    fn pread(&self, pos: usize, c: Completion) -> Arc<Completion> {
+        let c = Arc::new(c);
+        let file = self.file.clone();
+        let clone_c = c.clone();
+        let callback = Box::new(move || -> Result<()> {
+            let mut file = file.lock();
+            file.seek(std::io::SeekFrom::Start(pos as u64))?;
+            let nr = {
+                let r = clone_c.as_read();
+                let mut buf = r.buf_mut();
+                let buf = buf.as_mut_slice();
+                file.read_exact(buf)?;
+                buf.len() as i32
+            };
+            clone_c.complete(nr);
+            Ok(())
+        });
+        self.callbacks.lock().push(callback);
+        c
     }
 
     fn pwrite(
@@ -100,25 +129,39 @@ impl File for WindowsFile {
         pos: usize,
         buffer: Arc<RefCell<crate::Buffer>>,
         c: Completion,
-    ) -> Result<Arc<Completion>> {
-        let mut file = self.file.borrow_mut();
-        file.seek(std::io::SeekFrom::Start(pos as u64))?;
-        let buf = buffer.borrow();
-        let buf = buf.as_slice();
-        file.write_all(buf)?;
-        c.complete(buffer.borrow().len() as i32);
-        Ok(Arc::new(c))
+    ) -> Arc<Completion> {
+        let c = Arc::new(c);
+        let file = self.file.clone();
+        let clone_c = c.clone();
+        let callback = Box::new(move || -> Result<()> {
+            let mut file = file.lock();
+            file.seek(std::io::SeekFrom::Start(pos as u64))?;
+            let buf = buffer.borrow();
+            let buf = buf.as_slice();
+            file.write_all(buf)?;
+            clone_c.complete(buffer.borrow().len() as i32);
+            Ok(())
+        });
+        self.callbacks.lock().push(callback);
+        c
     }
 
-    fn sync(&self, c: Completion) -> Result<Arc<Completion>> {
-        let file = self.file.borrow_mut();
-        file.sync_all().map_err(LimboError::IOError)?;
-        c.complete(0);
-        Ok(Arc::new(c))
+    fn sync(&self, c: Completion) -> Arc<Completion> {
+        let c = Arc::new(c);
+        let file = self.file.clone();
+        let clone_c = c.clone();
+        let callback = Box::new(move || -> Result<()> {
+            let file = file.lock();
+            file.sync_all().map_err(|err| LimboError::IOError(err))?;
+            clone_c.complete(0);
+            Ok(())
+        });
+        self.callbacks.lock().push(callback);
+        c
     }
 
     fn size(&self) -> Result<u64> {
-        let file = self.file.borrow();
-        Ok(file.metadata().unwrap().len())
+        let file = self.file.lock();
+        Ok(file.metadata()?.len())
     }
 }
