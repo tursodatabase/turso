@@ -343,7 +343,7 @@ impl DumbLruPageCache {
 
     /// This method re-numbers the from_page to the to_page
     /// The from_page needs to exist. If the to_page exists, assert that no other part of the system has a reference to it and delete the entry and clear the page
-    /// Change the number of the from_page and remap it in the cache
+    /// Change the number of the from_page to to_page_num and remap it in the cache
     pub fn move_page(
         &mut self,
         from_page_num: usize,
@@ -352,18 +352,32 @@ impl DumbLruPageCache {
         let from_key = PageCacheKey::new(from_page_num);
         let to_key = PageCacheKey::new(to_page_num);
 
-        let from_page = self.get(&from_key).ok_or_else(|| {
-            CacheError::InternalError(format!("Page {:?} not found in page cache", from_key))
-        })?;
         if let Some(existing_to_page) = self.peek(&to_key, false) {
             let ref_count = Arc::strong_count(&existing_to_page);
-            assert!(ref_count <= 2);
+            assert!(
+                ref_count <= 2,
+                "Page {:?} has {} references where it should have at most 2",
+                to_key,
+                ref_count
+            );
+            if existing_to_page.is_dirty() {
+                return Err(CacheError::Dirty { pgno: to_page_num });
+            }
             self._delete(to_key.clone(), true)?;
         }
 
-        self._delete(from_key, false)?;
-        from_page.get().id = to_page_num;
-        self.insert(to_key, from_page)?;
+        let from_entry_ptr = self.get_ptr(&from_key).ok_or_else(|| {
+            CacheError::InternalError(format!("Page {:?} not found in page cache", from_key))
+        })?;
+        self.map.borrow_mut().remove(&from_key);
+        self.map.borrow_mut().insert(to_key, from_entry_ptr);
+
+        unsafe {
+            let entry = from_entry_ptr.as_ref();
+            entry.page.get().id = to_page_num;
+            let entry_mut = from_entry_ptr.as_ptr().cast::<PageCacheEntry>();
+            (*entry_mut).key = PageCacheKey::new(to_page_num);
+        }
 
         Ok(())
     }
