@@ -280,8 +280,7 @@ impl VfsExtension for TestFS {
 
     fn run_once(&self) -> ExtResult<()> {
         let mut callbacks = self.callbacks.lock().unwrap();
-        let events = callbacks.drain(0..);
-        for op in events {
+        while let Some(op) = callbacks.pop() {
             op()?
         }
         Ok(())

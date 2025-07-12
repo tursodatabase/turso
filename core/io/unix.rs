@@ -74,9 +74,8 @@ impl IO for UnixIO {
             return Ok(());
         }
         trace!("run_once() waits for events");
-        let events = callbacks.drain(0..);
 
-        for cf in events {
+        while let Some(cf) = callbacks.pop() {
             let n = match cf {
                 CompletionCallback::Read {
                     ref file,
