@@ -617,12 +617,12 @@ fn test_bind_parameters_update_rowid_alias_seek_rowid() -> anyhow::Result<()> {
                     row.get::<&Value>(2).unwrap(),
                     &Value::Integer(if i == 0 { 4 } else { 11 })
                 );
+                i += 1;
             }
             StepResult::IO => sel.run_once()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
         }
-        i += 1;
     }
     let mut ins = conn.prepare("update test set name = ? where id < ? AND age between ? and ?;")?;
     ins.bind_at(1.try_into()?, Value::build_text("updated"));
@@ -648,12 +648,12 @@ fn test_bind_parameters_update_rowid_alias_seek_rowid() -> anyhow::Result<()> {
                     row.get::<&Value>(0).unwrap(),
                     &Value::build_text(if i == 0 { "updated" } else { "test" }),
                 );
+                i += 1;
             }
             StepResult::IO => sel.run_once()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
         }
-        i += 1;
     }
 
     assert_eq!(ins.parameters().count(), 4);
@@ -692,12 +692,12 @@ fn test_bind_parameters_delete_rowid_alias_seek_out_of_order() -> anyhow::Result
             StepResult::Row => {
                 let row = sel.row().unwrap();
                 assert_eq!(row.get::<&Value>(0).unwrap(), &Value::build_text("correct"),);
+                i += 1;
             }
             StepResult::IO => sel.run_once()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
         }
-        i += 1;
     }
     assert_eq!(i, 1);
     assert_eq!(ins.parameters().count(), 4);
