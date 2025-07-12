@@ -7858,6 +7858,9 @@ mod tests {
                     StepResult::Done => {
                         break;
                     }
+                    StepResult::IO => {
+                        stmt.run_once().unwrap();
+                    }
                     _ => {
                         tracing::debug!("row {:?}", row);
                     }
@@ -7916,6 +7919,9 @@ mod tests {
                 match row {
                     StepResult::Done => {
                         break;
+                    }
+                    StepResult::IO => {
+                        stmt.run_once().unwrap();
                     }
                     _ => {
                         tracing::debug!("row {:?}", row);

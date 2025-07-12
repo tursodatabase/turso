@@ -570,6 +570,7 @@ impl ConnectionPlan {
                     let step_result = stmt.step()?;
                     match step_result {
                         StepResult::IO => {
+                            stmt.run_once()?;
                             return Ok(false);
                         }
                         StepResult::Done => {
