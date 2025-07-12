@@ -309,6 +309,10 @@ impl turso_core::IO for PlatformIO {
     fn get_memory_io(&self) -> Arc<turso_core::MemoryIO> {
         Arc::new(turso_core::MemoryIO::new())
     }
+
+    fn database_mode(&self) -> turso_core::DatabaseMode {
+        turso_core::DatabaseMode::File
+    }
 }
 
 #[wasm_bindgen]

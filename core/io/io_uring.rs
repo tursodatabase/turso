@@ -3,7 +3,7 @@
 use super::{common, Completion, File, OpenFlags, WriteCompletion, IO};
 use crate::io::clock::{Clock, Instant};
 use crate::io::CompletionType;
-use crate::{LimboError, MemoryIO, Result};
+use crate::{DatabaseMode, LimboError, MemoryIO, Result};
 use rustix::fs::{self, FlockOperation, OFlags};
 use rustix::io_uring::iovec;
 use std::cell::RefCell;
@@ -214,6 +214,10 @@ impl IO for UringIO {
 
     fn get_memory_io(&self) -> Arc<MemoryIO> {
         Arc::new(MemoryIO::new())
+    }
+
+    fn database_mode(&self) -> crate::DatabaseMode {
+        DatabaseMode::File
     }
 }
 

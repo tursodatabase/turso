@@ -2,7 +2,7 @@ use super::{Buffer, Completion, File, MemoryIO, OpenFlags, IO};
 use crate::ext::VfsMod;
 use crate::io::clock::{Clock, Instant};
 use crate::io::CompletionType;
-use crate::{LimboError, Result};
+use crate::{DatabaseMode, LimboError, Result};
 use std::cell::RefCell;
 use std::ffi::{c_void, CString};
 use std::sync::Arc;
@@ -58,6 +58,10 @@ impl IO for VfsMod {
 
     fn get_memory_io(&self) -> Arc<MemoryIO> {
         Arc::new(MemoryIO::new())
+    }
+
+    fn database_mode(&self) -> crate::DatabaseMode {
+        DatabaseMode::File
     }
 }
 

@@ -4981,6 +4981,46 @@ impl BTreeCursor {
         }
     }
 
+    /// This method is used to save a cursor when external invalidation occurs (an example being autovacuum inserts)
+    /// The [BTreeCursor] will look up its own internal state, save that to a context and mark its state as requiring a seek
+    /// This will also force all cursors to drop all their references to pages, making it safe to move pages around
+    pub fn save_context_external_invalidation(&mut self) -> Result<CursorResult<()>> {
+        assert!(!matches!(self.valid_state, CursorValidState::RequireSeek));
+        if !self.has_record.get() {
+            return Ok(CursorResult::Ok(()));
+        }
+
+        let page = self.stack.top();
+        return_if_locked_maybe_load!(self.pager, page);
+
+        let page_ref = page.get();
+        let contents = page_ref.get_contents();
+
+        let context_to_save = if self.index_key_info.is_none() {
+            //  This is a table btree page to save
+            let cell_idx = self.stack.current_cell_index() as usize;
+            let cell = contents.cell_get(cell_idx, self.usable_space())?;
+
+            match cell {
+                BTreeCell::TableLeafCell(table_leaf_cell) => CursorContext::TableRowId(table_leaf_cell.rowid),
+                BTreeCell::TableInteriorCell(table_int_cell) => CursorContext::TableRowId(table_int_cell.rowid), // TODO (Zaid): is it valid to save the state of an interior cell?
+                BTreeCell::IndexLeafCell(_) => return Err(LimboError::InternalError("save_context_external_invalidation called for an index cell without invariants set correctly".into())),
+                BTreeCell::IndexInteriorCell(_) => return Err(LimboError::InternalError("save_context_external_invalidation called for an index cell without invariants set correctly".into())),
+            }
+        } else {
+            //  This is an index btree page to save
+            let record = return_if_io!(self.record()).ok_or_else(|| {
+                LimboError::InternalError("Cannot save context for a cursor with no record".into())
+            })?;
+            CursorContext::IndexKeyRowId(record.clone())
+        };
+
+        self.save_context(context_to_save);
+        self.stack.clear_and_drop_references();
+        self.has_record.set(false);
+        Ok(CursorResult::Ok(()))
+    }
+
     // Save cursor context, to be restored later
     pub fn save_context(&mut self, cursor_context: CursorContext) {
         self.valid_state = CursorValidState::RequireSeek;
@@ -5521,6 +5561,16 @@ impl PageStack {
     fn clear(&self) {
         self.current_page.set(-1);
     }
+
+    /// Clear the stack and drop all page references
+    /// This is required for autovacuum operations where pages will be physically moved in the database file
+    fn clear_and_drop_references(&self) {
+        for slot in self.stack.borrow_mut().iter_mut() {
+            *slot = None;
+        }
+        self.current_page.set(-1);
+    }
+
     pub fn parent_page(&self) -> Option<BTreePage> {
         if self.current_page.get() > 0 {
             Some(
@@ -6058,7 +6108,7 @@ fn debug_validate_cells_core(page: &PageContent, usable_space: u16) {
 /// insert_into_cell() is called from insert_into_page(),
 /// and the overflow cell count is used to determine if the page overflows,
 /// i.e. whether we need to balance the btree after the insert.
-fn insert_into_cell(
+pub fn insert_into_cell(
     page: &mut PageContent,
     payload: &[u8],
     cell_idx: usize,
@@ -6956,8 +7006,9 @@ mod tests {
         tracing::info!("super seed: {}", seed);
         for _ in 0..attempts {
             let (pager, _, _db, conn) = empty_btree();
-            let index_root_page_result =
-                pager.btree_create(&CreateBTreeFlags::new_index()).unwrap();
+            let index_root_page_result = pager
+                .btree_create(&CreateBTreeFlags::new_index(), &mut Vec::new())
+                .unwrap();
             let index_root_page = match index_root_page_result {
                 crate::types::CursorResult::Ok(id) => id as usize,
                 crate::types::CursorResult::IO => {
