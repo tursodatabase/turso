@@ -6,7 +6,7 @@ use crate::storage::header_accessor;
 use crate::storage::sqlite3_ondisk::{self, DatabaseHeader, PageContent, PageType};
 use crate::storage::wal::{CheckpointResult, Wal, WalFsyncStatus};
 use crate::types::{Cursor, CursorResult};
-use crate::{Buffer, Completion, Connection, DatabaseMode, LimboError, Result, WalFile};
+use crate::{Buffer, Completion, Connection, LimboError, Result, WalFile};
 use parking_lot::RwLock;
 use std::cell::{OnceCell, RefCell, UnsafeCell};
 use std::collections::HashSet;
@@ -21,7 +21,7 @@ use super::sqlite3_ondisk::{begin_write_btree_page, DATABASE_HEADER_SIZE};
 use super::wal::{CheckpointMode, CheckpointStatus};
 
 #[cfg(not(feature = "omit_autovacuum"))]
-use {crate::io::Buffer as IoBuffer, ptrmap::*};
+use {crate::io::Buffer as IoBuffer, crate::DatabaseMode, ptrmap::*};
 
 pub struct PageInner {
     pub flags: AtomicUsize,
