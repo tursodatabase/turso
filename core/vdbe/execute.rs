@@ -23,6 +23,7 @@ use crate::{
         printf::exec_printf,
     },
     types::compare_immutable,
+    IO,
 };
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
@@ -51,9 +52,7 @@ use crate::{
     vector::{vector32, vector64, vector_distance_cos, vector_extract},
 };
 
-use crate::{
-    info, BufferPool, MvCursor, OpenFlags, RefValue, Row, StepResult, TransactionState, IO,
-};
+use crate::{info, BufferPool, MvCursor, OpenFlags, RefValue, Row, StepResult, TransactionState};
 
 use super::{
     insn::{Cookie, RegisterOrLiteral},
@@ -5304,7 +5303,7 @@ pub fn op_open_ephemeral(
         OpOpenEphemeralState::Start => {
             tracing::trace!("Start");
             let conn = program.connection.clone();
-            let io = conn.pager.io.get_memory_io();
+            let io = conn.pager.borrow().io.get_memory_io();
 
             let file = io.open_file("", OpenFlags::Create, true)?;
             let db_file = Arc::new(FileMemoryStorage::new(file));
