@@ -768,15 +768,6 @@ pub struct ImmutableRecord {
     payload: Value,
 }
 
-// impl Debug for ImmutableRecord {
-//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//         f.debug_struct("ImmutableRecord")
-//             .field("values", &self.values)
-//             .field("recreating", &self.recreating)
-//             .finish()
-//     }
-// }
-
 #[derive(PartialEq)]
 pub enum ParseRecordState {
     Init,
@@ -890,7 +881,6 @@ impl ImmutableRecord {
         let mut header_size = size_header;
         const MIN_HEADER_SIZE: usize = 126;
         if header_size <= MIN_HEADER_SIZE {
-            assert!(header_size <= 126);
             // common case
             // This case means the header size can be contained by a single byte, therefore
             // header_size == size of serial types + 1 byte from the header size
