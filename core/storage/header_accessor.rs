@@ -41,7 +41,7 @@ fn get_header_page(pager: &Pager) -> Result<CursorResult<PageRef>> {
         ));
     }
     let page = pager.read_page(DATABASE_HEADER_PAGE_ID)?;
-    if !page.is_loaded() || page.is_locked() {
+    if page.is_locked() {
         return Ok(CursorResult::IO);
     }
     Ok(CursorResult::Ok(page))
@@ -56,7 +56,7 @@ fn get_header_page_for_write(pager: &Pager) -> Result<CursorResult<PageRef>> {
         ));
     }
     let page = pager.read_page(DATABASE_HEADER_PAGE_ID)?;
-    if !page.is_loaded() || page.is_locked() {
+    if page.is_locked() {
         return Ok(CursorResult::IO);
     }
     page.set_dirty();
