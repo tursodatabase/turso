@@ -4755,6 +4755,7 @@ pub fn op_insert(
             Register::Aggregate(..) => unreachable!("Cannot insert an aggregate value."),
         };
 
+        // query planner must emit NewRowId/NotExists/etc op-codes which will properly reposition cursor
         return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(record.as_ref())), true));
     }
 
