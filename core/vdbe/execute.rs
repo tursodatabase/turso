@@ -1283,8 +1283,21 @@ pub fn op_last(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Fast varint reader optimized for the common cases of 1-byte and 2-byte varints.
+///
+/// This function is a performance-optimized version of `read_varint()` that handles
+/// the most common varint cases inline before falling back to the full implementation.
+/// It follows the same varint encoding as SQLite.
+///
+/// # Optimized Cases
+///
+/// - **Single-byte case**: Values 0-127 (0x00-0x7F) are returned immediately
+/// - **Two-byte case**: Values 128-16383 (0x80-0x3FFF) are handled inline
+/// - **Multi-byte case**: Larger values fall back to the full `read_varint()` implementation
+/// This is similar to `sqlite3GetVarint32`
 #[inline(always)]
 fn read_varint_fast(buf: &[u8]) -> Result<(u64, usize)> {
+    // Fast path: Single-byte varint
     if let Some(&first_byte) = buf.first() {
         if first_byte & 0x80 == 0 {
             return Ok((first_byte as u64, 1));
@@ -1293,6 +1306,7 @@ fn read_varint_fast(buf: &[u8]) -> Result<(u64, usize)> {
         crate::bail_corrupt_error!("Invalid varint");
     }
 
+    // Fast path: Two-byte varint
     if let Some(&second_byte) = buf.get(1) {
         if second_byte & 0x80 == 0 {
             let v = (((buf[0] & 0x7f) as u64) << 7) + (second_byte as u64);
@@ -1302,9 +1316,33 @@ fn read_varint_fast(buf: &[u8]) -> Result<(u64, usize)> {
         crate::bail_corrupt_error!("Invalid varint");
     }
 
+    //Fallback: Multi-byte varint
     read_varint(buf)
 }
 
+/// This function directly interprets bytes as big-endian signed integers with proper
+/// sign extension. It's used when the caller already knows the value is an integer
+/// from parsing the record header.
+///
+/// # How OP_Column Uses This
+///
+/// In `op_column()`, the record header is parsed incrementally to extract serial types.
+/// When a serial type indicates an integer (values 1-6), OP_Column can skip the generic
+/// `read_value()` path and call this function directly:
+///
+///
+/// match serial_type {
+///     1..=6 => {
+///         let expected_len = match serial_type {
+///             1 => 1, 2 => 2, 3 => 3, 4 => 4, 5 => 6, 6 => 8, _ => 0,
+///         };
+///         Value::Integer(read_integer_fast(data_slice, expected_len))
+///     }
+///     // ... other types use generic path
+/// }
+///
+///
+/// This avoids the general case path: `SerialType::try_from() → match kind() → read_integer()`.
 #[inline(always)]
 fn read_integer_fast(buf: &[u8], len: usize) -> i64 {
     debug_assert!(buf.len() >= len, "Buffer too short for requested length");
