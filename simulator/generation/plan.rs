@@ -446,7 +446,9 @@ impl Interaction {
                     StepResult::Done => {
                         break;
                     }
-                    StepResult::Busy => {}
+                    StepResult::Busy => {
+                        return Err(turso_core::LimboError::Busy);
+                    }
                 }
             }
 
@@ -579,7 +581,10 @@ impl Interaction {
                     StepResult::Done => {
                         break;
                     }
-                    StepResult::Interrupt | StepResult::Busy => {}
+                    StepResult::Busy => {
+                        return Err(turso_core::LimboError::Busy);
+                    }
+                    StepResult::Interrupt => {}
                 }
             }
 
@@ -646,7 +651,10 @@ impl Interaction {
                     StepResult::Done => {
                         break;
                     }
-                    StepResult::Interrupt | StepResult::Busy => {}
+                    StepResult::Busy => {
+                        return Err(turso_core::LimboError::Busy);
+                    }
+                    StepResult::Interrupt => {}
                 }
             }
 
