@@ -216,6 +216,17 @@ public final class TursoStatement {
       throws SQLException;
 
   /**
+   * Clears all parameters that were previously bound to this prepared statement.
+   *
+   * @throws SQLException If a database access error occurs while clearing the parameters
+   */
+  public void clearParameters() throws SQLException {
+    clearParameters(statementPointer);
+  }
+
+  private native int clearParameters(long statementPointer) throws SQLException;
+
+  /**
    * Returns total number of changes.
    *
    * @throws SQLException If a database access error occurs
