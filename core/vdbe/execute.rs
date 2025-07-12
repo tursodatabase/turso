@@ -52,8 +52,7 @@ use crate::{
 };
 
 use crate::{
-    info, BufferPool, DatabaseMode, MvCursor, OpenFlags, RefValue, Row, StepResult,
-    TransactionState, IO,
+    info, BufferPool, MvCursor, OpenFlags, RefValue, Row, StepResult, TransactionState, IO,
 };
 
 use super::{
@@ -5323,7 +5322,6 @@ pub fn op_open_ephemeral(
                 buffer_pool.clone(),
                 Arc::new(AtomicUsize::new(0)),
                 Arc::new(Mutex::new(())),
-                DatabaseMode::Memory,
             )?);
 
             let page_size = header_accessor::get_page_size(&pager)

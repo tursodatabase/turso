@@ -276,7 +276,6 @@ impl Database {
                 buffer_pool,
                 is_empty,
                 self.init_lock.clone(),
-                DatabaseMode::File,
             )?);
 
             let page_size = header_accessor::get_page_size(&pager)
@@ -321,7 +320,6 @@ impl Database {
             buffer_pool.clone(),
             is_empty,
             Arc::new(Mutex::new(())),
-            DatabaseMode::File,
         )?;
         let page_size = header_accessor::get_page_size(&pager)
             .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as u32;

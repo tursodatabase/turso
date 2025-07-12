@@ -485,14 +485,6 @@ impl FindCellState {
     }
 }
 
-/// Used to decide which cursors to save
-pub enum SaveCursorsMode {
-    /// Save all cursors in the database file
-    SaveAllCursors,
-    /// Save only cursors for a specific table identified by the root page passed in
-    SaveCursorForTable(usize),
-}
-
 pub struct BTreeCursor {
     /// The multi-version cursor that is used to read and write to the database file.
     mv_cursor: Option<Rc<RefCell<MvCursor>>>,
@@ -4992,19 +4984,10 @@ impl BTreeCursor {
     /// This method is used to save a cursor when external invalidation occurs (an example being autovacuum inserts)
     /// The [BTreeCursor] will look up its own internal state, save that to a context and mark its state as requiring a seek
     /// This will also force all cursors to drop all their references to pages, making it safe to move pages around
-    pub fn save_context_external_invalidation(
-        &mut self,
-        save_cursors_mode: SaveCursorsMode,
-    ) -> Result<CursorResult<()>> {
+    pub fn save_context_external_invalidation(&mut self) -> Result<CursorResult<()>> {
         assert!(!matches!(self.valid_state, CursorValidState::RequireSeek));
         if !self.has_record.get() {
             return Ok(CursorResult::Ok(()));
-        }
-
-        if let SaveCursorsMode::SaveCursorForTable(root_page) = save_cursors_mode {
-            if self.root_page != root_page {
-                return Ok(CursorResult::Ok(()));
-            }
         }
 
         let page = self.stack.top();
@@ -5033,7 +5016,7 @@ impl BTreeCursor {
         };
 
         self.save_context(context_to_save);
-        self.stack.clear();
+        self.stack.clear_and_drop_references();
         self.has_record.set(false);
         Ok(CursorResult::Ok(()))
     }
@@ -5576,11 +5559,18 @@ impl PageStack {
     }
 
     fn clear(&self) {
+        self.current_page.set(-1);
+    }
+
+    /// Clear the stack and drop all page references
+    /// This is required for autovacuum operations where pages will be physically moved in the database file
+    fn clear_and_drop_references(&self) {
         for slot in self.stack.borrow_mut().iter_mut() {
             *slot = None;
         }
         self.current_page.set(-1);
     }
+
     pub fn parent_page(&self) -> Option<BTreePage> {
         if self.current_page.get() > 0 {
             Some(
@@ -7286,7 +7276,6 @@ mod tests {
                 buffer_pool,
                 Arc::new(AtomicUsize::new(0)),
                 Arc::new(Mutex::new(())),
-                crate::DatabaseMode::Memory,
             )
             .unwrap(),
         );
