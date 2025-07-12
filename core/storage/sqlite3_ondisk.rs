@@ -60,9 +60,7 @@ use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_thr
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::pager::Pager;
-use crate::types::{
-    ImmutableRecord, RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype,
-};
+use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
 use crate::{File, Result, WalFileShared};
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
@@ -971,6 +969,7 @@ fn read_payload(unread: &'static [u8], payload_size: usize) -> (&'static [u8], O
 }
 
 #[inline(always)]
+#[allow(dead_code)]
 pub fn validate_serial_type(value: u64) -> Result<()> {
     if !SerialType::u64_is_valid_serial_type(value) {
         crate::bail_corrupt_error!("Invalid serial type: {}", value);
@@ -1051,50 +1050,6 @@ impl<T: Default + Copy, const N: usize> Iterator for SmallVecIter<'_, T, N> {
         self.pos += 1;
         Some(next)
     }
-}
-
-pub fn read_record(payload: &[u8], reuse_immutable: &mut ImmutableRecord) -> Result<()> {
-    // Let's clear previous use
-    reuse_immutable.invalidate();
-    // Copy payload to ImmutableRecord in order to make RefValue that point to this new buffer.
-    // By reusing this immutable record we make it less allocation expensive.
-    reuse_immutable.start_serialization(payload);
-
-    let mut pos = 0;
-    let (header_size, nr) = read_varint(payload)?;
-    assert!((header_size as usize) >= nr);
-    let mut header_size = (header_size as usize) - nr;
-    pos += nr;
-
-    let mut serial_types = SmallVec::<u64, 64>::new();
-    while header_size > 0 {
-        let (serial_type, nr) = read_varint(&reuse_immutable.get_payload()[pos..])?;
-        validate_serial_type(serial_type)?;
-        serial_types.push(serial_type);
-        pos += nr;
-        assert!(header_size >= nr);
-        header_size -= nr;
-    }
-
-    for &serial_type in &serial_types.data[..serial_types.len.min(serial_types.data.len())] {
-        let (value, n) = read_value(&reuse_immutable.get_payload()[pos..], unsafe {
-            serial_type.assume_init().try_into()?
-        })?;
-        pos += n;
-        reuse_immutable.add_value(value);
-    }
-    if let Some(extra) = serial_types.extra_data.as_ref() {
-        for serial_type in extra {
-            let (value, n) = read_value(
-                &reuse_immutable.get_payload()[pos..],
-                (*serial_type).try_into()?,
-            )?;
-            pos += n;
-            reuse_immutable.add_value(value);
-        }
-    }
-
-    Ok(())
 }
 
 /// Reads a value that might reference the buffer it is reading from. Be sure to store RefValue with the buffer
@@ -1219,6 +1174,64 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
                 content_size,
             ))
         }
+    }
+}
+
+#[inline(always)]
+pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
+    match serial_type {
+        1 => {
+            if buf.is_empty() {
+                crate::bail_corrupt_error!("Invalid 1-byte int");
+            }
+            Ok(buf[0] as i8 as i64)
+        }
+        2 => {
+            if buf.len() < 2 {
+                crate::bail_corrupt_error!("Invalid 2-byte int");
+            }
+            Ok(i16::from_be_bytes([buf[0], buf[1]]) as i64)
+        }
+        3 => {
+            if buf.len() < 3 {
+                crate::bail_corrupt_error!("Invalid 3-byte int");
+            }
+            let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
+            Ok(i32::from_be_bytes([sign_extension, buf[0], buf[1], buf[2]]) as i64)
+        }
+        4 => {
+            if buf.len() < 4 {
+                crate::bail_corrupt_error!("Invalid 4-byte int");
+            }
+            Ok(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64)
+        }
+        5 => {
+            if buf.len() < 6 {
+                crate::bail_corrupt_error!("Invalid 6-byte int");
+            }
+            let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
+            Ok(i64::from_be_bytes([
+                sign_extension,
+                sign_extension,
+                buf[0],
+                buf[1],
+                buf[2],
+                buf[3],
+                buf[4],
+                buf[5],
+            ]))
+        }
+        6 => {
+            if buf.len() < 8 {
+                crate::bail_corrupt_error!("Invalid 8-byte int");
+            }
+            Ok(i64::from_be_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]))
+        }
+        8 => Ok(0),
+        9 => Ok(1),
+        _ => crate::bail_corrupt_error!("Invalid serial type for integer"),
     }
 }
 

@@ -5,11 +5,15 @@ use crate::storage::btree::{integrity_check, IntegrityCheckError, IntegrityCheck
 use crate::storage::database::FileMemoryStorage;
 use crate::storage::page_cache::DumbLruPageCache;
 use crate::storage::pager::CreateBTreeFlags;
+use crate::storage::sqlite3_ondisk::read_varint;
 use crate::storage::wal::DummyWAL;
 use crate::storage::{self, header_accessor};
 use crate::translate::collate::CollationSeq;
-use crate::types::{ImmutableRecord, Text};
+use crate::types::{
+    compare_immutable, compare_records_generic, ImmutableRecord, Text, TextSubtype,
+};
 use crate::util::normalize_ident;
+use crate::vdbe::registers_to_ref_values;
 use crate::{
     error::{
         LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
@@ -22,8 +26,8 @@ use crate::{
         },
         printf::exec_printf,
     },
-    types::compare_immutable,
 };
+use std::ops::DerefMut;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 use std::{borrow::BorrowMut, rc::Rc, sync::Arc};
@@ -890,9 +894,15 @@ pub fn op_open_read(
         None => None,
     };
     let mut cursors = state.cursors.borrow_mut();
+    let num_columns = match cursor_type {
+        CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
+        CursorType::BTreeIndex(index_arc) => index_arc.columns.len(),
+        _ => unreachable!("This should not have happened"),
+    };
+
     match cursor_type {
         CursorType::BTreeTable(_) => {
-            let cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), *root_page);
+            let cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), *root_page, num_columns);
             cursors
                 .get_mut(*cursor_id)
                 .unwrap()
@@ -924,6 +934,7 @@ pub fn op_open_read(
                 *root_page,
                 index.as_ref(),
                 collations,
+                num_columns,
             );
             cursors
                 .get_mut(*cursor_id)
@@ -1272,6 +1283,98 @@ pub fn op_last(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Fast varint reader optimized for the common cases of 1-byte and 2-byte varints.
+///
+/// This function is a performance-optimized version of `read_varint()` that handles
+/// the most common varint cases inline before falling back to the full implementation.
+/// It follows the same varint encoding as SQLite.
+///
+/// # Optimized Cases
+///
+/// - **Single-byte case**: Values 0-127 (0x00-0x7F) are returned immediately
+/// - **Two-byte case**: Values 128-16383 (0x80-0x3FFF) are handled inline
+/// - **Multi-byte case**: Larger values fall back to the full `read_varint()` implementation
+///   
+/// This function is similar to `sqlite3GetVarint32`
+#[inline(always)]
+fn read_varint_fast(buf: &[u8]) -> Result<(u64, usize)> {
+    // Fast path: Single-byte varint
+    if let Some(&first_byte) = buf.first() {
+        if first_byte & 0x80 == 0 {
+            return Ok((first_byte as u64, 1));
+        }
+    } else {
+        crate::bail_corrupt_error!("Invalid varint");
+    }
+
+    // Fast path: Two-byte varint
+    if let Some(&second_byte) = buf.get(1) {
+        if second_byte & 0x80 == 0 {
+            let v = (((buf[0] & 0x7f) as u64) << 7) + (second_byte as u64);
+            return Ok((v, 2));
+        }
+    } else {
+        crate::bail_corrupt_error!("Invalid varint");
+    }
+
+    //Fallback: Multi-byte varint
+    read_varint(buf)
+}
+
+/// This function directly interprets bytes as big-endian signed integers with proper
+/// sign extension. It's used when the caller already knows the value is an integer
+/// from parsing the record header.
+///
+/// # How OP_Column Uses This
+///
+/// In `op_column()`, the record header is parsed incrementally to extract serial types.
+/// When a serial type indicates an integer (values 1-6), OP_Column can skip the generic
+/// `read_value()` path and call this function directly:
+///
+///
+/// match serial_type {
+///     1..=6 => {
+///         let expected_len = match serial_type {
+///             1 => 1, 2 => 2, 3 => 3, 4 => 4, 5 => 6, 6 => 8, _ => 0,
+///         };
+///         Value::Integer(read_integer_fast(data_slice, expected_len))
+///     }
+///     // ... other types use generic path
+/// }
+///
+///
+/// This avoids the general case path: `SerialType::try_from() → match kind() → read_integer()`.
+#[inline(always)]
+fn read_integer_fast(buf: &[u8], len: usize) -> i64 {
+    debug_assert!(buf.len() >= len, "Buffer too short for requested length");
+    match len {
+        1 => buf[0] as i8 as i64,
+        2 => i16::from_be_bytes([buf[0], buf[1]]) as i64,
+        3 => {
+            let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
+            i32::from_be_bytes([sign_extension, buf[0], buf[1], buf[2]]) as i64
+        }
+        4 => i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64,
+        6 => {
+            let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
+            i64::from_be_bytes([
+                sign_extension,
+                sign_extension,
+                buf[0],
+                buf[1],
+                buf[2],
+                buf[3],
+                buf[4],
+                buf[5],
+            ])
+        }
+        8 => i64::from_be_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]),
+        _ => 0,
+    }
+}
+
 pub fn op_column(
     program: &Program,
     state: &mut ProgramState,
@@ -1315,6 +1418,7 @@ pub fn op_column(
             return Ok(InsnFunctionStepResult::IO);
         }
     }
+
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
     match cursor_type {
         CursorType::BTreeTable(_) | CursorType::BTreeIndex(_) => {
@@ -1322,35 +1426,192 @@ pub fn op_column(
                 let mut cursor =
                     must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Column");
                 let cursor = cursor.as_btree_mut();
-                let record = return_if_io!(cursor.record());
-
-                let Some(record) = record.as_ref() else {
-                    break 'value Value::Null;
-                };
 
                 if cursor.get_null_flag() {
                     break 'value Value::Null;
                 }
 
-                if let Some(value) = record.get_value_opt(*column) {
-                    break 'value value.to_owned();
+                let record_result = return_if_io!(cursor.record());
+                let Some(record) = record_result.as_ref() else {
+                    break 'value default.clone().unwrap_or(Value::Null);
+                };
+
+                let payload = record.get_payload();
+
+                if payload.is_empty() {
+                    break 'value default.clone().unwrap_or(Value::Null);
                 }
 
-                default.clone().unwrap_or(Value::Null)
-            };
-            // If we are copying a text/blob, let's try to simply update size of text if we need to allocate more and reuse.
-            match (&value, &mut state.registers[*dest]) {
-                (Value::Text(text_ref), Register::Value(Value::Text(text_reg))) => {
-                    text_reg.value.clear();
-                    text_reg.value.extend_from_slice(text_ref.value.as_slice());
+                let mut record_cursor = cursor.record_cursor.borrow_mut();
+
+                if record_cursor.serial_types.is_empty() && record_cursor.offsets.is_empty() {
+                    let (header_size, header_len_bytes) = read_varint_fast(payload)?;
+                    let header_size = header_size as usize;
+
+                    if header_size > payload.len() || header_size > 98307 {
+                        return Err(LimboError::Corrupt("Header size exceeds bounds".into()));
+                    }
+
+                    record_cursor.header_size = header_size;
+                    record_cursor.header_offset = header_len_bytes;
+
+                    record_cursor.offsets.push(header_size);
                 }
-                (Value::Blob(raw_slice), Register::Value(Value::Blob(blob_reg))) => {
-                    blob_reg.clear();
-                    blob_reg.extend_from_slice(raw_slice.as_slice());
+
+                let target_column = *column;
+                let mut parse_pos = record_cursor.header_offset;
+                let mut data_offset = record_cursor
+                    .offsets
+                    .last()
+                    .copied()
+                    .unwrap_or(record_cursor.header_size);
+
+                // Adjust data_offset if we already have some columns parsed
+                if !record_cursor.serial_types.is_empty() && !record_cursor.offsets.is_empty() {
+                    data_offset = *record_cursor.offsets.last().unwrap();
+                }
+
+                // Parse the header for serial types incrementally until we have the target column
+                while record_cursor.serial_types.len() <= target_column
+                    && parse_pos < record_cursor.header_size
+                    && parse_pos < payload.len()
+                {
+                    let (serial_type, varint_len) = read_varint_fast(&payload[parse_pos..])?;
+
+                    record_cursor.serial_types.push(serial_type);
+                    parse_pos += varint_len;
+                    let data_size = match serial_type {
+                        0 => 0,
+                        1 => 1,
+                        2 => 2,
+                        3 => 3,
+                        4 => 4,
+                        5 => 6,
+                        6 => 8,
+                        7 => 8,
+                        8 => 0,
+                        9 => 0,
+                        n if n >= 12 && n % 2 == 0 => (n - 12) / 2,
+                        n if n >= 13 && n % 2 == 1 => (n - 13) / 2,
+                        10 | 11 => {
+                            return Err(LimboError::Corrupt(format!(
+                                "Reserved serial type: {}",
+                                serial_type
+                            )))
+                        }
+                        _ => {
+                            return Err(LimboError::Corrupt(format!(
+                                "Invalid serial type: {}",
+                                serial_type
+                            )))
+                        }
+                    } as usize;
+                    data_offset += data_size;
+                    record_cursor.offsets.push(data_offset);
+                }
+
+                record_cursor.header_offset = parse_pos;
+
+                if parse_pos > record_cursor.header_size || data_offset > payload.len() {
+                    record_cursor.serial_types.clear();
+                    record_cursor.offsets.clear();
+                    record_cursor.header_offset = 0;
+                    record_cursor.header_size = 0;
+                    break 'value default.clone().unwrap_or(Value::Null);
+                }
+
+                if target_column >= record_cursor.serial_types.len() {
+                    break 'value default.clone().unwrap_or(Value::Null);
+                }
+
+                let serial_type = record_cursor.serial_types[target_column];
+
+                // Fast path for common constant cases
+                match serial_type {
+                    0 => break 'value Value::Null,
+                    8 => break 'value Value::Integer(0),
+                    9 => break 'value Value::Integer(1),
+                    _ => {}
+                }
+
+                if target_column + 1 >= record_cursor.offsets.len() {
+                    break 'value default.clone().unwrap_or(Value::Null);
+                }
+
+                let start_offset = record_cursor.offsets[target_column];
+                let end_offset = record_cursor.offsets[target_column + 1];
+
+                let data_slice = &payload[start_offset..end_offset];
+                let data_len = end_offset - start_offset;
+
+                match serial_type {
+                    1..=6 => {
+                        let expected_len = match serial_type {
+                            1 => 1,
+                            2 => 2,
+                            3 => 3,
+                            4 => 4,
+                            5 => 6,
+                            6 => 8,
+                            _ => 0,
+                        };
+
+                        if data_len >= expected_len {
+                            Value::Integer(read_integer_fast(data_slice, expected_len))
+                        } else {
+                            return Err(LimboError::Corrupt(format!(
+                                "Insufficient data for integer type {}: expected {}, got {}",
+                                serial_type, expected_len, data_len
+                            )));
+                        }
+                    }
+                    7 => {
+                        if data_len >= 8 {
+                            let bytes = [
+                                data_slice[0],
+                                data_slice[1],
+                                data_slice[2],
+                                data_slice[3],
+                                data_slice[4],
+                                data_slice[5],
+                                data_slice[6],
+                                data_slice[7],
+                            ];
+                            Value::Float(f64::from_be_bytes(bytes))
+                        } else {
+                            default.clone().unwrap_or(Value::Null)
+                        }
+                    }
+                    n if n >= 12 && n % 2 == 0 => Value::Blob(data_slice.to_vec()),
+                    n if n >= 13 && n % 2 == 1 => Value::Text(Text {
+                        value: data_slice.to_vec(),
+                        subtype: TextSubtype::Text,
+                    }),
+                    _ => default.clone().unwrap_or(Value::Null),
+                }
+            };
+
+            // Try to reuse the registers when allocation is not needed.
+            match (&value, &mut state.registers[*dest]) {
+                (Value::Text(new_text), Register::Value(Value::Text(existing_text))) => {
+                    if existing_text.value.capacity() >= new_text.value.len() {
+                        existing_text.value.clear();
+                        existing_text.value.extend_from_slice(&new_text.value);
+                        existing_text.subtype = new_text.subtype.clone();
+                    } else {
+                        state.registers[*dest] = Register::Value(value);
+                    }
+                }
+                (Value::Blob(new_blob), Register::Value(Value::Blob(existing_blob))) => {
+                    if existing_blob.capacity() >= new_blob.len() {
+                        existing_blob.clear();
+                        existing_blob.extend_from_slice(new_blob);
+                    } else {
+                        state.registers[*dest] = Register::Value(value);
+                    }
                 }
                 _ => {
-                    let reg = &mut state.registers[*dest];
-                    *reg = Register::Value(value);
+                    state.registers[*dest] = Register::Value(value);
                 }
             }
         }
@@ -1374,7 +1635,7 @@ pub fn op_column(
                 let mut cursor = state.get_cursor(*cursor_id);
                 let cursor = cursor.as_pseudo_mut();
                 if let Some(record) = cursor.record() {
-                    record.get_value(*column).to_owned()
+                    record.get_value(*column)?.to_owned()
                 } else {
                     Value::Null
                 }
@@ -1991,9 +2252,11 @@ pub fn op_row_id(
                     CursorResult::Ok(record) => record,
                 };
                 let record = record.as_ref().unwrap();
-                let rowid = record.get_values().last().unwrap();
+                let mut record_cursor_ref = index_cursor.record_cursor.borrow_mut();
+                let record_cursor = record_cursor_ref.deref_mut();
+                let rowid = record.last_value(record_cursor).unwrap();
                 match rowid {
-                    RefValue::Integer(rowid) => *rowid,
+                    Ok(RefValue::Integer(rowid)) => rowid,
                     _ => unreachable!(),
                 }
             };
@@ -2300,6 +2563,16 @@ pub fn op_seek(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[inline(always)]
+fn get_tie_breaker_from_idx_comp_op(insn: &Insn) -> std::cmp::Ordering {
+    match insn {
+        Insn::IdxLE { .. } | Insn::IdxGT { .. } => std::cmp::Ordering::Less,
+        Insn::IdxGE { .. } | Insn::IdxLT { .. } => std::cmp::Ordering::Equal,
+        _ => panic!("Invalid instruction for index comparison"),
+    }
+}
+
+#[allow(clippy::let_and_return)]
 pub fn op_idx_ge(
     program: &Program,
     state: &mut ProgramState,
@@ -2317,31 +2590,37 @@ pub fn op_idx_ge(
         unreachable!("unexpected Insn {:?}", insn)
     };
     assert!(target_pc.is_offset());
+
     let pc = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
-        let record_from_regs = make_record(&state.registers, start_reg, num_regs);
+
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
-            // Compare against the same number of values
-            let idx_values = idx_record.get_values();
-            let idx_values = &idx_values[..record_from_regs.len()];
-            let record_values = record_from_regs.get_values();
-            let ord = compare_immutable(
-                idx_values,
-                record_values,
-                cursor.key_sort_order(),
-                cursor.collations(),
-            );
+            // Create the comparison record from registers
+            let values =
+                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
+            let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
+            let ord = compare_records_generic(
+                &idx_record,                     // The serialized record from the index
+                &values,                         // The record built from registers
+                &cursor.index_key_info.unwrap(), // Sort order flags
+                cursor.collations(),             // Collation sequences
+                0,
+                tie_breaker,
+            )?;
+
             if ord.is_ge() {
                 target_pc.as_offset_int()
             } else {
                 state.pc + 1
             }
         } else {
+            // No record at cursor position, jump to target
             target_pc.as_offset_int()
         };
         pc
     };
+
     state.pc = pc;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2364,6 +2643,7 @@ pub fn op_seek_end(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[allow(clippy::let_and_return)]
 pub fn op_idx_le(
     program: &Program,
     state: &mut ProgramState,
@@ -2381,35 +2661,41 @@ pub fn op_idx_le(
         unreachable!("unexpected Insn {:?}", insn)
     };
     assert!(target_pc.is_offset());
+
     let pc = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
-        let record_from_regs = make_record(&state.registers, start_reg, num_regs);
-        let pc = if let Some(ref idx_record) = return_if_io!(cursor.record()) {
-            // Compare against the same number of values
-            let idx_values = idx_record.get_values();
-            let idx_values = &idx_values[..record_from_regs.len()];
-            let record_values = record_from_regs.get_values();
-            let ord = compare_immutable(
-                idx_values,
-                record_values,
-                cursor.key_sort_order(),
+
+        let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
+            let values =
+                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
+            let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
+            let ord = compare_records_generic(
+                &idx_record,
+                &values,
+                &cursor.index_key_info.unwrap(),
                 cursor.collations(),
-            );
+                0,
+                tie_breaker,
+            )?;
+
             if ord.is_le() {
                 target_pc.as_offset_int()
             } else {
                 state.pc + 1
             }
         } else {
+            // No record at cursor position, jump to target
             target_pc.as_offset_int()
         };
         pc
     };
+
     state.pc = pc;
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[allow(clippy::let_and_return)]
 pub fn op_idx_gt(
     program: &Program,
     state: &mut ProgramState,
@@ -2427,35 +2713,41 @@ pub fn op_idx_gt(
         unreachable!("unexpected Insn {:?}", insn)
     };
     assert!(target_pc.is_offset());
+
     let pc = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
-        let record_from_regs = make_record(&state.registers, start_reg, num_regs);
-        let pc = if let Some(ref idx_record) = return_if_io!(cursor.record()) {
-            // Compare against the same number of values
-            let idx_values = idx_record.get_values();
-            let idx_values = &idx_values[..record_from_regs.len()];
-            let record_values = record_from_regs.get_values();
-            let ord = compare_immutable(
-                idx_values,
-                record_values,
-                cursor.key_sort_order(),
+
+        let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
+            let values =
+                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
+            let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
+            let ord = compare_records_generic(
+                &idx_record,
+                &values,
+                &cursor.index_key_info.unwrap(),
                 cursor.collations(),
-            );
+                0,
+                tie_breaker,
+            )?;
+
             if ord.is_gt() {
                 target_pc.as_offset_int()
             } else {
                 state.pc + 1
             }
         } else {
+            // No record at cursor position, jump to target
             target_pc.as_offset_int()
         };
         pc
     };
+
     state.pc = pc;
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[allow(clippy::let_and_return)]
 pub fn op_idx_lt(
     program: &Program,
     state: &mut ProgramState,
@@ -2473,31 +2765,37 @@ pub fn op_idx_lt(
         unreachable!("unexpected Insn {:?}", insn)
     };
     assert!(target_pc.is_offset());
+
     let pc = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
-        let record_from_regs = make_record(&state.registers, start_reg, num_regs);
-        let pc = if let Some(ref idx_record) = return_if_io!(cursor.record()) {
-            // Compare against the same number of values
-            let idx_values = idx_record.get_values();
-            let idx_values = &idx_values[..record_from_regs.len()];
-            let record_values = record_from_regs.get_values();
-            let ord = compare_immutable(
-                idx_values,
-                record_values,
-                cursor.key_sort_order(),
+
+        let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
+            let values =
+                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
+
+            let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
+            let ord = compare_records_generic(
+                &idx_record,
+                &values,
+                &cursor.index_key_info.unwrap(),
                 cursor.collations(),
-            );
+                0,
+                tie_breaker,
+            )?;
+
             if ord.is_lt() {
                 target_pc.as_offset_int()
             } else {
                 state.pc + 1
             }
         } else {
+            // No record at cursor position, jump to target
             target_pc.as_offset_int()
         };
         pc
     };
+
     state.pc = pc;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -4473,9 +4771,10 @@ pub fn op_idx_insert(
                 // Cursor is pointing at a record; if the index has a rowid, exclude it from the comparison since it's a pointer to the table row;
                 // UNIQUE indexes disallow duplicates like (a=1,b=2,rowid=1) and (a=1,b=2,rowid=2).
                 let existing_key = if cursor.has_rowid() {
-                    &record.get_values()[..record.count().saturating_sub(1)]
+                    let count = cursor.record_cursor.borrow_mut().count(record);
+                    record.get_values()[..count.saturating_sub(1)].to_vec()
                 } else {
-                    record.get_values()
+                    record.get_values().to_vec()
                 };
                 let inserted_key_vals = &record_to_insert.get_values();
                 if existing_key.len() != inserted_key_vals.len() {
@@ -4483,7 +4782,7 @@ pub fn op_idx_insert(
                 }
 
                 let conflict = compare_immutable(
-                    existing_key,
+                    existing_key.as_slice(),
                     inserted_key_vals,
                     cursor.key_sort_order(),
                     &cursor.collations,
@@ -4784,6 +5083,8 @@ pub fn op_open_write(
         let table = schema
             .get_table(&index.table_name)
             .and_then(|table| table.btree());
+
+        let num_columns = index.columns.len();
         let collations = table.map_or(Vec::new(), |table| {
             index
                 .columns
@@ -4798,19 +5099,27 @@ pub fn op_open_write(
                 })
                 .collect()
         });
+
         let cursor = BTreeCursor::new_index(
             mv_cursor,
             pager.clone(),
             root_page as usize,
             index.as_ref(),
             collations,
+            num_columns,
         );
         cursors
             .get_mut(*cursor_id)
             .unwrap()
             .replace(Cursor::new_btree(cursor));
     } else {
-        let cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), root_page as usize);
+        let num_columns = match cursor_type {
+            CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
+            _ => unreachable!("Expected BTreeTable. This should not have happened."),
+        };
+
+        let cursor =
+            BTreeCursor::new_table(mv_cursor, pager.clone(), root_page as usize, num_columns);
         cursors
             .get_mut(*cursor_id)
             .unwrap()
@@ -4885,7 +5194,7 @@ pub fn op_destroy(
         todo!("temp databases not implemented yet.");
     }
     // TODO not sure if should be BTreeCursor::new_table or BTreeCursor::new_index here or neither and just pass an emtpy vec
-    let mut cursor = BTreeCursor::new(None, pager.clone(), *root, Vec::new());
+    let mut cursor = BTreeCursor::new(None, pager.clone(), *root, Vec::new(), 0);
     let former_root_page_result = cursor.btree_destroy()?;
     if let CursorResult::Ok(former_root_page) = former_root_page_result {
         state.registers[*former_root_reg] =
@@ -5341,6 +5650,13 @@ pub fn op_open_ephemeral(
                 }
                 None => None,
             };
+
+            let num_columns = match cursor_type {
+                CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
+                CursorType::BTreeIndex(index_arc) => index_arc.columns.len(),
+                _ => unreachable!("This should not have happened"),
+            };
+
             let mut cursor = if let CursorType::BTreeIndex(index) = cursor_type {
                 BTreeCursor::new_index(
                     mv_cursor,
@@ -5352,9 +5668,10 @@ pub fn op_open_ephemeral(
                         .iter()
                         .map(|c| c.collation.unwrap_or_default())
                         .collect(),
+                    num_columns,
                 )
             } else {
-                BTreeCursor::new_table(mv_cursor, pager.clone(), root_page as usize)
+                BTreeCursor::new_table(mv_cursor, pager.clone(), root_page as usize, num_columns)
             };
             cursor.rewind()?; // Will never return io
 
