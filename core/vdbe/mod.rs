@@ -27,7 +27,7 @@ pub mod sorter;
 use crate::{
     error::LimboError,
     function::{AggFunc, FuncCtx},
-    storage::{pager::PagerCacheflushStatus, sqlite3_ondisk::SmallVec},
+    storage::{pager::PagerCacheCommitStatus, sqlite3_ondisk::SmallVec},
     translate::plan::TableReferences,
     vdbe::execute::OpIdxInsertState,
     vdbe::execute::OpInsertState,
@@ -502,20 +502,20 @@ impl Program {
             connection.wal_checkpoint_disabled.get(),
         )?;
         match cacheflush_status {
-            PagerCacheflushStatus::Done(status) => {
+            PagerCacheCommitStatus::Done(status) => {
                 if self.change_cnt_on {
                     self.connection.set_changes(self.n_change.get());
                 }
                 if matches!(
                     status,
-                    crate::storage::pager::PagerCacheflushResult::Rollback
+                    crate::storage::pager::PagerCacheCommitResult::Rollback
                 ) {
                     pager.rollback(schema_did_change, connection)?;
                 }
                 connection.transaction_state.replace(TransactionState::None);
                 *commit_state = CommitState::Ready;
             }
-            PagerCacheflushStatus::IO => {
+            PagerCacheCommitStatus::IO => {
                 tracing::trace!("Cacheflush IO");
                 *commit_state = CommitState::Committing;
                 return Ok(StepResult::IO);
