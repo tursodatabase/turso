@@ -325,9 +325,6 @@ pub struct Pager {
     pub buffer_pool: Arc<BufferPool>,
     /// I/O interface for input/output operations.
     pub io: Arc<dyn crate::io::IO>,
-    /// Indicates whether the database is running as transient or persistent
-    #[cfg_attr(feature = "omit_autovacuum", allow(dead_code))]
-    database_mode: DatabaseMode,
 
     dirty_pages: Rc<RefCell<HashSet<usize, hash::BuildHasherDefault<hash::DefaultHasher>>>>,
 
@@ -421,7 +418,6 @@ impl Pager {
         buffer_pool: Arc<BufferPool>,
         db_state: Arc<AtomicDbState>,
         init_lock: Arc<Mutex<()>>,
-        database_mode: DatabaseMode,
     ) -> Result<Self> {
         let allocate_page1_state = if !db_state.is_initialized() {
             RefCell::new(AllocatePage1State::Start)
@@ -703,14 +699,10 @@ impl Pager {
                         //  save all the btree cursors so that all page references are freed
                         for cursor in cursors {
                             if let Some(cursor) = cursor {
-                                use crate::storage::btree::SaveCursorsMode;
-
                                 let Cursor::BTree(c) = cursor else {
                                     continue;
                                 };
-                                c.save_context_external_invalidation(
-                                    SaveCursorsMode::SaveAllCursors,
-                                )?;
+                                c.save_context_external_invalidation()?;
                             }
                         }
 
@@ -808,7 +800,7 @@ impl Pager {
                         .remove(&(dest_page_num as usize));
                 }
 
-                if matches!(self.database_mode, DatabaseMode::Memory) {
+                if matches!(self.io.database_mode(), DatabaseMode::Memory) {
                     //  this is a temporary database, so do not discard the page if we need to rollback later
                     let temp_page_num = database_size + 1;
                     cache
@@ -830,7 +822,7 @@ impl Pager {
                 .map_err(|e| LimboError::InternalError(format!("{:?}", e)))?;
 
             //  For the temporary database, associate the temporary page with the original source page number in the cache
-            if matches!(self.database_mode, DatabaseMode::Memory) {
+            if matches!(self.io.database_mode(), DatabaseMode::Memory) {
                 if let Some(temp_page_num) = temp_page_opt {
                     cache
                         .move_page(temp_page_num as usize, orig_source_page_num)
@@ -2438,7 +2430,7 @@ mod ptrmap_tests {
         }
     }
     // Helper to create a Pager for testing
-    fn test_pager_setup(page_size: u32, initial_db_pages: u32, mode: DatabaseMode) -> Pager {
+    fn test_pager_setup(page_size: u32, initial_db_pages: u32) -> Pager {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(
             io.open_file("test.db", OpenFlags::Create, true).unwrap(),
@@ -2470,7 +2462,6 @@ mod ptrmap_tests {
             buffer_pool,
             Arc::new(AtomicDbState::new(DbState::Uninitialized)),
             Arc::new(Mutex::new(())),
-            mode,
         )
         .unwrap();
         run_until_done(|| pager.allocate_page1(), &pager).unwrap();
@@ -2500,7 +2491,7 @@ mod ptrmap_tests {
     fn test_ptrmap_page_allocation() {
         let page_size = 4096;
         let initial_db_pages = 10;
-        let pager = test_pager_setup(page_size, initial_db_pages, DatabaseMode::Memory);
+        let pager = test_pager_setup(page_size, initial_db_pages);
 
         // Page 5 should be mapped by ptrmap page 2.
         let db_page_to_update: u32 = 5;
@@ -2595,25 +2586,16 @@ mod ptrmap_tests {
         );
     }
 
+    /// Test the basic scenario of page relocation for autovacuum operations when a new root page is allocated
     #[test]
-    fn test_root_page_relocation_persistent() {
-        run_relocation_scenario(DatabaseMode::File);
-    }
-
-    #[test]
-    fn test_root_page_relocation_tempdb() {
-        run_relocation_scenario(DatabaseMode::Memory);
-    }
-
-    /// Common body used by both variants above.
-    fn run_relocation_scenario(db_mode: DatabaseMode) {
+    fn test_run_relocation_scenario() {
         use crate::storage::header_accessor;
         use ptrmap::PtrmapType;
 
         //  Create a single root page which will be allocated to page 3
         const PAGE_SIZE: u32 = 4096;
         const INITIAL_ROOTS: u32 = 1;
-        let pager = test_pager_setup(PAGE_SIZE, INITIAL_ROOTS, db_mode);
+        let pager = test_pager_setup(PAGE_SIZE, INITIAL_ROOTS);
 
         //  Check that the root page was mapped properly
         let root_page = pager.read_page(3).unwrap();
@@ -2742,13 +2724,14 @@ mod ptrmap_tests {
     /// node with two leaf children. Relocating this interior node forces `set_child_ptrmaps` to
     /// update the pointer-map entries of its children so that they now reference the relocated
     /// parent. The test asserts that this update took place successfully.
-    fn run_relocation_grandchild_scenario(db_mode: DatabaseMode) {
+    #[test]
+    fn test_run_relocation_grandchild_scenario() {
         use crate::storage::header_accessor;
         use ptrmap::PtrmapType;
 
         //  Create a single root page which will be allocated to page 3
         const PAGE_SIZE: u32 = 4096;
-        let pager = test_pager_setup(PAGE_SIZE, 1, db_mode);
+        let pager = test_pager_setup(PAGE_SIZE, 1);
 
         // Root page (3) should exist already and be mapped as a root page
         let root_page = pager.read_page(3).unwrap();
@@ -2759,7 +2742,7 @@ mod ptrmap_tests {
         assert_eq!(root_ptrmap_entry.entry_type, PtrmapType::RootPage);
 
         // ------------------------------------------------------------------
-        // Construct the following b-tree shape (only page numbers shown):
+        // Construct the following b-tree shape
         //            3 (root – interior)
         //           / \
         //          4   5 (leaves)
@@ -2954,15 +2937,4 @@ mod ptrmap_tests {
             );
         }
     }
-
-    #[test]
-    fn test_grandchild_page_relocation_persistent() {
-        run_relocation_grandchild_scenario(DatabaseMode::File);
-    }
-
-    #[test]
-    fn test_grandchild_page_relocation_tempdb() {
-        run_relocation_grandchild_scenario(DatabaseMode::Memory);
-    }
-    // NEW_CODE_END
 }

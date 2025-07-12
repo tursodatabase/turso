@@ -151,8 +151,6 @@ pub struct Database {
     init_lock: Arc<Mutex<()>>,
     open_flags: OpenFlags,
     builtin_syms: RefCell<SymbolTable>,
-    #[allow(dead_code)]
-    database_mode: DatabaseMode,
 }
 
 unsafe impl Send for Database {}
@@ -429,7 +427,6 @@ impl Database {
             buffer_pool.clone(),
             db_state,
             Arc::new(Mutex::new(())),
-            DatabaseMode::File,
         )?;
 
         let size = match page_size {

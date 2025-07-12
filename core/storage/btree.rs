@@ -5403,19 +5403,10 @@ impl BTreeCursor {
     /// This method is used to save a cursor when external invalidation occurs (an example being autovacuum inserts)
     /// The [BTreeCursor] will look up its own internal state, save that to a context and mark its state as requiring a seek
     /// This will also force all cursors to drop all their references to pages, making it safe to move pages around
-    pub fn save_context_external_invalidation(
-        &mut self,
-        save_cursors_mode: SaveCursorsMode,
-    ) -> Result<CursorResult<()>> {
+    pub fn save_context_external_invalidation(&mut self) -> Result<CursorResult<()>> {
         assert!(!matches!(self.valid_state, CursorValidState::RequireSeek));
         if !self.has_record.get() {
             return Ok(CursorResult::Ok(()));
-        }
-
-        if let SaveCursorsMode::SaveCursorForTable(root_page) = save_cursors_mode {
-            if self.root_page != root_page {
-                return Ok(CursorResult::Ok(()));
-            }
         }
 
         let page = self.stack.top();
@@ -5444,7 +5435,7 @@ impl BTreeCursor {
         };
 
         self.save_context(context_to_save);
-        self.stack.clear();
+        self.stack.clear_and_drop_references();
         self.has_record.set(false);
         Ok(CursorResult::Ok(()))
     }
@@ -6070,6 +6061,12 @@ impl PageStack {
     }
 
     fn unpin_all_if_pinned(&self) {
+        self.current_page.set(-1);
+    }
+
+    /// Clear the stack and drop all page references
+    /// This is required for autovacuum operations where pages will be physically moved in the database file
+    fn clear_and_drop_references(&self) {
         self.stack
             .borrow_mut()
             .iter_mut()
@@ -8344,7 +8341,6 @@ mod tests {
                 buffer_pool,
                 Arc::new(AtomicDbState::new(DbState::Uninitialized)),
                 Arc::new(Mutex::new(())),
-                crate::DatabaseMode::Memory,
             )
             .unwrap(),
         );

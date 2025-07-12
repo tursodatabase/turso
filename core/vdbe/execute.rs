@@ -61,10 +61,7 @@ use crate::{
     vector::{vector32, vector64, vector_distance_cos, vector_distance_l2, vector_extract},
 };
 
-use crate::{
-    info, BufferPool, DatabaseMode, MvCursor, OpenFlags, RefValue, Row, StepResult,
-    TransactionState,
-};
+use crate::{info, BufferPool, MvCursor, OpenFlags, RefValue, Row, StepResult, TransactionState};
 
 use super::{
     insn::{Cookie, RegisterOrLiteral},
@@ -6305,7 +6302,6 @@ pub fn op_open_ephemeral(
                 buffer_pool.clone(),
                 Arc::new(AtomicDbState::new(DbState::Uninitialized)),
                 Arc::new(Mutex::new(())),
-                DatabaseMode::Memory,
             )?);
 
             let page_size = header_accessor::get_page_size(&pager)
