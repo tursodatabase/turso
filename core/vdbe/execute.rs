@@ -9,7 +9,9 @@ use crate::storage::sqlite3_ondisk::read_varint;
 use crate::storage::wal::DummyWAL;
 use crate::storage::{self, header_accessor};
 use crate::translate::collate::CollationSeq;
-use crate::types::{compare_records_generic, ImmutableRecord, Text, TextSubtype};
+use crate::types::{
+    compare_immutable, compare_records_generic, ImmutableRecord, Text, TextSubtype,
+};
 use crate::util::normalize_ident;
 use crate::vdbe::registers_to_ref_values;
 use crate::{
@@ -4730,9 +4732,10 @@ pub fn op_idx_insert(
                 // Cursor is pointing at a record; if the index has a rowid, exclude it from the comparison since it's a pointer to the table row;
                 // UNIQUE indexes disallow duplicates like (a=1,b=2,rowid=1) and (a=1,b=2,rowid=2).
                 let existing_key = if cursor.has_rowid() {
-                    &record.get_values()[..record.count().saturating_sub(1)]
+                    let count = cursor.record_cursor.borrow_mut().count(record);
+                    record.get_values()[..count.saturating_sub(1)].to_vec()
                 } else {
-                    record.get_values()
+                    record.get_values().to_vec()
                 };
                 let inserted_key_vals = &record_to_insert.get_values();
                 if existing_key.len() != inserted_key_vals.len() {
@@ -4740,7 +4743,7 @@ pub fn op_idx_insert(
                 }
 
                 let conflict = compare_immutable(
-                    existing_key,
+                    existing_key.as_slice(),
                     inserted_key_vals,
                     cursor.key_sort_order(),
                     &cursor.collations,
