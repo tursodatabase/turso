@@ -344,7 +344,7 @@ impl Register {
                 assert!(!r.is_invalidated());
                 r.as_blob_value()
             }
-            _ => panic!("register holds unexpected value: {:?}", self),
+            _ => panic!("register holds unexpected value: {self:?}"),
         }
     }
 }

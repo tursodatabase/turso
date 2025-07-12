@@ -216,7 +216,7 @@ impl Limbo {
         }) {
             n if n < 0 => String::from(")x!...>"),
             0 => String::from("   ...> "),
-            n if n < 10 => format!("(x{}...> ", n),
+            n if n < 10 => format!("(x{n}...> "),
             _ => String::from("(.....> "),
         };
     }
@@ -230,7 +230,7 @@ impl Limbo {
     }
 
     fn dump_table(&mut self, name: &str) -> Result<(), LimboError> {
-        let query = format!("pragma table_info={}", name);
+        let query = format!("pragma table_info={name}");
         let mut cols = vec![];
         let mut value_types = vec![];
         query_internal!(
@@ -248,7 +248,7 @@ impl Limbo {
         // it, but it requires pragma index_list, and it seems to be relevant
         // only for indexes.
         let cols_str = cols.join(", ");
-        let select = format!("select {} from {}", cols_str, name);
+        let select = format!("select {cols_str} from {name}");
         query_internal!(
             self,
             select,
@@ -273,14 +273,14 @@ impl Limbo {
                                         fmt::Write::write_fmt(&mut output, format_args!("{b:02x}"));
                                     output
                                 });
-                            format!("X'{}'", hex_string)
+                            format!("X'{hex_string}'")
                         } else {
                             value.to_string()
                         }
                     })
                     .collect::<Vec<_>>()
                     .join(",");
-                self.write_fmt(format_args!("INSERT INTO {} VALUES({});", name, values))?;
+                self.write_fmt(format_args!("INSERT INTO {name} VALUES({values});"))?;
                 Ok(())
             }
         )?;
@@ -306,7 +306,7 @@ impl Limbo {
             |row: &turso_core::Row| -> Result<(), LimboError> {
                 let sql: &str = row.get::<&str>(2)?;
                 let name: &str = row.get::<&str>(0)?;
-                self.write_fmt(format_args!("{};", sql))?;
+                self.write_fmt(format_args!("{sql};"))?;
                 self.dump_table(name)
             }
         );
@@ -484,7 +484,7 @@ impl Limbo {
         };
         let sample_stats_as_str = |name: &str, samples: Vec<Duration>| {
             if samples.is_empty() {
-                return format!("{}: No samples available", name);
+                return format!("{name}: No samples available");
             }
             let avg_time_spent = samples.iter().sum::<Duration>() / samples.len() as u32;
             let total_time = samples.iter().fold(Duration::ZERO, |acc, x| acc + *x);
@@ -561,7 +561,7 @@ impl Limbo {
             let buff = self.input_buff.clone();
             self.run_query(buff.as_str());
         } else {
-            self.buffer_input(format!("{}\n", line).as_str());
+            self.buffer_input(format!("{line}\n").as_str());
             self.set_multiline_prompt();
         }
         self.reset_line(line)?;
@@ -608,12 +608,12 @@ impl Limbo {
                     if let Some(opcode) = args.opcode {
                         for op in &OPCODE_DESCRIPTIONS {
                             if op.name.eq_ignore_ascii_case(opcode.trim()) {
-                                let _ = self.write_fmt(format_args!("{}", op));
+                                let _ = self.write_fmt(format_args!("{op}"));
                             }
                         }
                     } else {
                         for op in &OPCODE_DESCRIPTIONS {
-                            let _ = self.write_fmt(format_args!("{}\n", op));
+                            let _ = self.write_fmt(format_args!("{op}\n"));
                         }
                     }
                 }
@@ -622,13 +622,13 @@ impl Limbo {
                 }
                 Command::OutputMode(args) => {
                     if let Err(e) = self.set_mode(args.mode) {
-                        let _ = self.write_fmt(format_args!("Error: {}", e));
+                        let _ = self.write_fmt(format_args!("Error: {e}"));
                     }
                 }
                 Command::SetOutput(args) => {
                     if let Some(path) = args.path {
                         if let Err(e) = self.set_output_file(&path) {
-                            let _ = self.write_fmt(format_args!("Error: {}", e));
+                            let _ = self.write_fmt(format_args!("Error: {e}"));
                         }
                     } else {
                         self.set_output_stdout();
@@ -655,7 +655,7 @@ impl Limbo {
                 }
                 Command::Dump => {
                     if let Err(e) = self.dump_database() {
-                        let _ = self.write_fmt(format_args!("/****** ERROR: {} ******/", e));
+                        let _ = self.write_fmt(format_args!("/****** ERROR: {e} ******/"));
                     }
                 }
                 Command::ListVfs => {
@@ -731,8 +731,7 @@ impl Limbo {
                                         let _ =
                                             self.writer.write(self.opts.null_value.as_bytes())?;
                                     } else {
-                                        let _ =
-                                            self.writer.write(format!("{}", value).as_bytes())?;
+                                        let _ = self.writer.write(format!("{value}").as_bytes())?;
                                     }
                                 }
                                 let _ = self.writeln("");
@@ -764,7 +763,7 @@ impl Limbo {
                                 }
                                 let report =
                                     miette::Error::from(err).with_source_code(sql.to_owned());
-                                let _ = self.write_fmt(format_args!("{:?}", report));
+                                let _ = self.write_fmt(format_args!("{report:?}"));
                                 break;
                             }
                         }
@@ -808,17 +807,13 @@ impl Limbo {
                                             (self.opts.null_value.clone(), CellAlignment::Left)
                                         }
                                         Value::Integer(_) => {
-                                            (format!("{}", value), CellAlignment::Right)
+                                            (format!("{value}"), CellAlignment::Right)
                                         }
                                         Value::Float(_) => {
-                                            (format!("{}", value), CellAlignment::Right)
+                                            (format!("{value}"), CellAlignment::Right)
                                         }
-                                        Value::Text(_) => {
-                                            (format!("{}", value), CellAlignment::Left)
-                                        }
-                                        Value::Blob(_) => {
-                                            (format!("{}", value), CellAlignment::Left)
-                                        }
+                                        Value::Text(_) => (format!("{value}"), CellAlignment::Left),
+                                        Value::Blob(_) => (format!("{value}"), CellAlignment::Left),
                                     };
                                     row.add_cell(
                                         Cell::new(content)
@@ -862,21 +857,21 @@ impl Limbo {
                                 }
                                 let report =
                                     miette::Error::from(err).with_source_code(sql.to_owned());
-                                let _ = self.write_fmt(format_args!("{:?}", report));
+                                let _ = self.write_fmt(format_args!("{report:?}"));
                                 break;
                             }
                         }
                     }
 
                     if !table.is_empty() {
-                        let _ = self.write_fmt(format_args!("{}", table));
+                        let _ = self.write_fmt(format_args!("{table}"));
                     }
                 }
             },
             Ok(None) => {}
             Err(err) => {
                 let report = miette::Error::from(err).with_source_code(sql.to_owned());
-                let _ = self.write_fmt(format_args!("{:?}", report));
+                let _ = self.write_fmt(format_args!("{report:?}"));
                 anyhow::bail!("We have to throw here, even if we printed error");
             }
         }
@@ -915,7 +910,7 @@ impl Limbo {
             )
             .try_init()
         {
-            println!("Unable to setup tracing appender: {:?}", e);
+            println!("Unable to setup tracing appender: {e:?}");
         }
         Ok(guard)
     }
@@ -923,8 +918,7 @@ impl Limbo {
     fn display_schema(&mut self, table: Option<&str>) -> anyhow::Result<()> {
         let sql = match table {
         Some(table_name) => format!(
-            "SELECT sql FROM sqlite_schema WHERE type IN ('table', 'index') AND tbl_name = '{}' AND name NOT LIKE 'sqlite_%'",
-            table_name
+            "SELECT sql FROM sqlite_schema WHERE type IN ('table', 'index') AND tbl_name = '{table_name}' AND name NOT LIKE 'sqlite_%'"
         ),
         None => String::from(
             "SELECT sql FROM sqlite_schema WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'"
@@ -957,7 +951,7 @@ impl Limbo {
                 if !found {
                     if let Some(table_name) = table {
                         let _ = self
-                            .write_fmt(format_args!("-- Error: Table '{}' not found.", table_name));
+                            .write_fmt(format_args!("-- Error: Table '{table_name}' not found."));
                     } else {
                         let _ = self.writeln("-- No tables or indexes found in the database.");
                     }
@@ -981,8 +975,7 @@ impl Limbo {
     fn display_indexes(&mut self, maybe_table: Option<String>) -> anyhow::Result<()> {
         let sql = match maybe_table {
             Some(ref tbl_name) => format!(
-                "SELECT name FROM sqlite_schema WHERE type='index' AND tbl_name = '{}' ORDER BY 1",
-                tbl_name
+                "SELECT name FROM sqlite_schema WHERE type='index' AND tbl_name = '{tbl_name}' ORDER BY 1"
             ),
             None => String::from("SELECT name FROM sqlite_schema WHERE type='index' ORDER BY 1"),
         };
@@ -1030,8 +1023,7 @@ impl Limbo {
     fn display_tables(&mut self, pattern: Option<&str>) -> anyhow::Result<()> {
         let sql = match pattern {
             Some(pattern) => format!(
-                "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name LIKE '{}' ORDER BY 1",
-                pattern
+                "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name LIKE '{pattern}' ORDER BY 1"
             ),
             None => String::from(
                 "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY 1"
@@ -1066,8 +1058,7 @@ impl Limbo {
                     let _ = self.writeln(tables.trim_end());
                 } else if let Some(pattern) = pattern {
                     let _ = self.write_fmt(format_args!(
-                        "Error: Tables with pattern '{}' not found.",
-                        pattern
+                        "Error: Tables with pattern '{pattern}' not found."
                     ));
                 } else {
                     let _ = self.writeln("No tables found in the database.");

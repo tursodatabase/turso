@@ -152,7 +152,7 @@ pub fn translate_create_table(
         p5: 0,
     });
     // TODO: remove format, it sucks for performance but is convenient
-    let parse_schema_where_clause = format!("tbl_name = '{}' AND type != 'trigger'", tbl_name);
+    let parse_schema_where_clause = format!("tbl_name = '{tbl_name}' AND type != 'trigger'");
     program.emit_insn(Insn::ParseSchema {
         db: sqlite_schema_cursor_id,
         where_clause: Some(parse_schema_where_clause),
@@ -506,7 +506,7 @@ fn create_vtable_body_to_str(vtab: &CreateVirtualTable, module: Rc<VTabImpl>) ->
         if args.is_empty() {
             String::new()
         } else {
-            format!("({})", args)
+            format!("({args})")
         },
         vtab.tbl_name.name.0,
         vtab_args
@@ -602,7 +602,7 @@ pub fn translate_create_virtual_table(
         value: schema.schema_version as i32 + 1,
         p5: 0,
     });
-    let parse_schema_where_clause = format!("tbl_name = '{}' AND type != 'trigger'", table_name);
+    let parse_schema_where_clause = format!("tbl_name = '{table_name}' AND type != 'trigger'");
     program.emit_insn(Insn::ParseSchema {
         db: sqlite_schema_cursor_id,
         where_clause: Some(parse_schema_where_clause),

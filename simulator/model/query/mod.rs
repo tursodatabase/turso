@@ -92,16 +92,16 @@ impl Query {
 impl Display for Query {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Create(create) => write!(f, "{}", create),
-            Self::Select(select) => write!(f, "{}", select),
-            Self::Insert(insert) => write!(f, "{}", insert),
-            Self::Delete(delete) => write!(f, "{}", delete),
-            Self::Update(update) => write!(f, "{}", update),
-            Self::Drop(drop) => write!(f, "{}", drop),
-            Self::CreateIndex(create_index) => write!(f, "{}", create_index),
-            Self::Begin(begin) => write!(f, "{}", begin),
-            Self::Commit(commit) => write!(f, "{}", commit),
-            Self::Rollback(rollback) => write!(f, "{}", rollback),
+            Self::Create(create) => write!(f, "{create}"),
+            Self::Select(select) => write!(f, "{select}"),
+            Self::Insert(insert) => write!(f, "{insert}"),
+            Self::Delete(delete) => write!(f, "{delete}"),
+            Self::Update(update) => write!(f, "{update}"),
+            Self::Drop(drop) => write!(f, "{drop}"),
+            Self::CreateIndex(create_index) => write!(f, "{create_index}"),
+            Self::Begin(begin) => write!(f, "{begin}"),
+            Self::Commit(commit) => write!(f, "{commit}"),
+            Self::Rollback(rollback) => write!(f, "{rollback}"),
         }
     }
 }

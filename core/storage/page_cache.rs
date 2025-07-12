@@ -1209,11 +1209,10 @@ mod tests {
         let final_memory = memory_stats::memory_stats().unwrap().physical_mem;
 
         let growth = final_memory.saturating_sub(initial_memory);
-        println!("Growth: {}", growth);
+        println!("Growth: {growth}");
         assert!(
             growth < 10_000_000,
-            "Memory grew by {} bytes over 10 cycles",
-            growth
+            "Memory grew by {growth} bytes over 10 cycles"
         );
     }
 }

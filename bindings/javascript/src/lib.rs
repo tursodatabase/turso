@@ -107,7 +107,7 @@ impl Database {
         pragma_name: String,
         options: Option<PragmaOptions>,
     ) -> napi::Result<JsUnknown> {
-        let sql = format!("PRAGMA {}", pragma_name);
+        let sql = format!("PRAGMA {pragma_name}");
         let stmt = self.prepare(sql)?;
         match options {
             Some(PragmaOptions { simple: true, .. }) => {
@@ -129,7 +129,7 @@ impl Database {
                         | step @ turso_core::StepResult::Busy => {
                             return Err(napi::Error::new(
                                 napi::Status::GenericFailure,
-                                format!("{:?}", step),
+                                format!("{step:?}"),
                             ))
                         }
                     }
@@ -194,7 +194,7 @@ impl Database {
                         Err(err) => {
                             return Err(napi::Error::new(
                                 "SQLITE_ERROR".to_owned(),
-                                format!("Error executing SQL: {}", err),
+                                format!("Error executing SQL: {err}"),
                             ));
                         }
                     }
@@ -203,7 +203,7 @@ impl Database {
                 Err(err) => {
                     return Err(napi::Error::new(
                         "SQLITE_ERROR".to_owned(),
-                        format!("Error executing SQL: {}", err),
+                        format!("Error executing SQL: {err}"),
                     ));
                 }
             }

@@ -29,7 +29,7 @@ impl From<TursoError> for JniError {
             | TursoError::InvalidDatabasePointer
             | TursoError::InvalidConnectionPointer
             | TursoError::JNIErrors(_) => {
-                eprintln!("Error occurred: {:?}", value);
+                eprintln!("Error occurred: {value:?}");
                 JniError::Other(-1)
             }
         }

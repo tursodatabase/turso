@@ -285,7 +285,7 @@ impl Property {
                 let table_name = select.table.clone();
 
                 let assumption = Interaction::Assumption(Assertion {
-                    message: format!("table {} exists", table_name),
+                    message: format!("table {table_name} exists"),
                     func: Box::new({
                         let table_name = table_name.clone();
                         move |_, env: &mut SimulatorEnv| {
@@ -321,7 +321,7 @@ impl Property {
                 queries,
             } => {
                 let assumption = Interaction::Assumption(Assertion {
-                    message: format!("table {} exists", table),
+                    message: format!("table {table} exists"),
                     func: Box::new({
                         let table = table.clone();
                         move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
@@ -344,7 +344,7 @@ impl Property {
                 }));
 
                 let assertion = Interaction::Assertion(Assertion {
-                    message: format!("`{}` should return no values for table `{}`", select, table,),
+                    message: format!("`{select}` should return no values for table `{table}`",),
                     func: Box::new(move |stack: &Vec<ResultSet>, _| {
                         let rows = stack.last().unwrap();
                         match rows {
@@ -369,7 +369,7 @@ impl Property {
                 select,
             } => {
                 let assumption = Interaction::Assumption(Assertion {
-                    message: format!("table {} exists", table),
+                    message: format!("table {table} exists"),
                     func: Box::new({
                         let table = table.clone();
                         move |_, env: &mut SimulatorEnv| {
@@ -381,10 +381,7 @@ impl Property {
                 let table_name = table.clone();
 
                 let assertion = Interaction::Assertion(Assertion {
-                    message: format!(
-                        "select query should result in an error for table '{}'",
-                        table
-                    ),
+                    message: format!("select query should result in an error for table '{table}'"),
                     func: Box::new(move |stack: &Vec<ResultSet>, _| {
                         let last = stack.last().unwrap();
                         match last {
@@ -414,7 +411,7 @@ impl Property {
             }
             Property::SelectSelectOptimizer { table, predicate } => {
                 let assumption = Interaction::Assumption(Assertion {
-                    message: format!("table {} exists", table),
+                    message: format!("table {table} exists"),
                     func: Box::new({
                         let table = table.clone();
                         move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
@@ -491,7 +488,7 @@ impl Property {
                                 Ok(true)
                             }
                             Err(err) => {
-                                let msg = format!("{}", err);
+                                let msg = format!("{err}");
                                 if msg.contains(FAULT_ERROR_MSG) {
                                     Ok(true)
                                 } else {
@@ -522,20 +519,19 @@ fn assert_all_table_values(tables: &[String]) -> impl Iterator<Item = Interactio
             distinct: Distinctness::All,
         }));
         let assertion = Interaction::Assertion(Assertion {
-            message: format!("table {} should contain all of its values", table),
+            message: format!("table {table} should contain all of its values"),
             func: Box::new({
                 let table = table.clone();
                 move |stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
                     let table = env.tables.iter().find(|t| t.name == table).ok_or_else(|| {
                         LimboError::InternalError(format!(
-                            "table {} should exist in simulator env",
-                            table
+                            "table {table} should exist in simulator env"
                         ))
                     })?;
                     let last = stack.last().unwrap();
                     match last {
                         Ok(vals) => Ok(*vals == table.rows),
-                        Err(err) => Err(LimboError::InternalError(format!("{}", err))),
+                        Err(err) => Err(LimboError::InternalError(format!("{err}"))),
                     }
                 }
             }),

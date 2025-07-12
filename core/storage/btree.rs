@@ -3071,9 +3071,12 @@ impl BTreeCursor {
                         "left pointer is not the same as page id"
                     );
                     // FIXME: remove this lock
+                    let database_size = header_accessor::get_database_size(&self.pager)?;
                     turso_assert!(
-                        left_pointer <= header_accessor::get_database_size(&self.pager)?,
-                        "invalid page number divider left pointer {left_pointer} > database number of pages",
+                        left_pointer <= database_size,
+                        "invalid page number divider left pointer {} > database number of pages {}",
+                        left_pointer,
+                        database_size
                     );
                     // FIXME: defragment shouldn't be needed
                     // defragment_page(parent_contents, self.usable_space() as u16);
@@ -3838,10 +3841,7 @@ impl BTreeCursor {
         while low <= high && cell_count > 0 {
             let mid = low + (high - low) / 2;
             self.find_cell_state.set((low, high));
-            let cell = match page.cell_get(mid, self.usable_space()) {
-                Ok(c) => c,
-                Err(e) => return Err(e),
-            };
+            let cell = page.cell_get(mid, self.usable_space())?;
 
             let comparison_result = match cell {
                 BTreeCell::TableLeafCell(cell) => key.to_rowid().cmp(&cell.rowid),

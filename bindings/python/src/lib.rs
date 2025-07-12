@@ -74,7 +74,7 @@ impl Cursor {
         let stmt_is_tx = stmt_is_tx(sql);
 
         let statement = self.conn.conn.prepare(sql).map_err(|e| {
-            PyErr::new::<ProgrammingError, _>(format!("Failed to prepare statement: {:?}", e))
+            PyErr::new::<ProgrammingError, _>(format!("Failed to prepare statement: {e:?}"))
         })?;
 
         let stmt = Rc::new(RefCell::new(statement));
@@ -96,8 +96,7 @@ impl Cursor {
         if stmt_is_dml && self.conn.conn.get_auto_commit() {
             self.conn.conn.execute("BEGIN").map_err(|e| {
                 PyErr::new::<OperationalError, _>(format!(
-                    "Failed to start transaction after DDL: {:?}",
-                    e
+                    "Failed to start transaction after DDL: {e:?}"
                 ))
             })?;
         }
@@ -108,10 +107,10 @@ impl Cursor {
             let mut stmt = stmt.borrow_mut();
             while let turso_core::StepResult::IO = stmt
                 .step()
-                .map_err(|e| PyErr::new::<OperationalError, _>(format!("Step error: {:?}", e)))?
+                .map_err(|e| PyErr::new::<OperationalError, _>(format!("Step error: {e:?}")))?
             {
                 stmt.run_once()
-                    .map_err(|e| PyErr::new::<OperationalError, _>(format!("IO error: {:?}", e)))?;
+                    .map_err(|e| PyErr::new::<OperationalError, _>(format!("IO error: {e:?}")))?;
             }
         }
 
@@ -130,9 +129,10 @@ impl Cursor {
         if let Some(smt) = &self.smt {
             loop {
                 let mut stmt = smt.borrow_mut();
-                match stmt.step().map_err(|e| {
-                    PyErr::new::<OperationalError, _>(format!("Step error: {:?}", e))
-                })? {
+                match stmt
+                    .step()
+                    .map_err(|e| PyErr::new::<OperationalError, _>(format!("Step error: {e:?}")))?
+                {
                     turso_core::StepResult::Row => {
                         let row = stmt.row().unwrap();
                         let py_row = row_to_py(py, row)?;
@@ -140,7 +140,7 @@ impl Cursor {
                     }
                     turso_core::StepResult::IO => {
                         stmt.run_once().map_err(|e| {
-                            PyErr::new::<OperationalError, _>(format!("IO error: {:?}", e))
+                            PyErr::new::<OperationalError, _>(format!("IO error: {e:?}"))
                         })?;
                     }
                     turso_core::StepResult::Interrupt => {
@@ -166,9 +166,10 @@ impl Cursor {
         if let Some(smt) = &self.smt {
             loop {
                 let mut stmt = smt.borrow_mut();
-                match stmt.step().map_err(|e| {
-                    PyErr::new::<OperationalError, _>(format!("Step error: {:?}", e))
-                })? {
+                match stmt
+                    .step()
+                    .map_err(|e| PyErr::new::<OperationalError, _>(format!("Step error: {e:?}")))?
+                {
                     turso_core::StepResult::Row => {
                         let row = stmt.row().unwrap();
                         let py_row = row_to_py(py, row)?;
@@ -176,7 +177,7 @@ impl Cursor {
                     }
                     turso_core::StepResult::IO => {
                         stmt.run_once().map_err(|e| {
-                            PyErr::new::<OperationalError, _>(format!("IO error: {:?}", e))
+                            PyErr::new::<OperationalError, _>(format!("IO error: {e:?}"))
                         })?;
                     }
                     turso_core::StepResult::Interrupt => {
@@ -257,7 +258,7 @@ impl Connection {
 
     pub fn close(&self) -> PyResult<()> {
         self.conn.close().map_err(|e| {
-            PyErr::new::<OperationalError, _>(format!("Failed to close connection: {:?}", e))
+            PyErr::new::<OperationalError, _>(format!("Failed to close connection: {e:?}"))
         })?;
 
         Ok(())
@@ -266,11 +267,11 @@ impl Connection {
     pub fn commit(&self) -> PyResult<()> {
         if !self.conn.get_auto_commit() {
             self.conn.execute("COMMIT").map_err(|e| {
-                PyErr::new::<OperationalError, _>(format!("Failed to commit: {:?}", e))
+                PyErr::new::<OperationalError, _>(format!("Failed to commit: {e:?}"))
             })?;
 
             self.conn.execute("BEGIN").map_err(|e| {
-                PyErr::new::<OperationalError, _>(format!("Failed to commit: {:?}", e))
+                PyErr::new::<OperationalError, _>(format!("Failed to commit: {e:?}"))
             })?;
         }
         Ok(())
@@ -279,11 +280,11 @@ impl Connection {
     pub fn rollback(&self) -> PyResult<()> {
         if !self.conn.get_auto_commit() {
             self.conn.execute("ROLLBACK").map_err(|e| {
-                PyErr::new::<OperationalError, _>(format!("Failed to commit: {:?}", e))
+                PyErr::new::<OperationalError, _>(format!("Failed to commit: {e:?}"))
             })?;
 
             self.conn.execute("BEGIN").map_err(|e| {
-                PyErr::new::<OperationalError, _>(format!("Failed to commit: {:?}", e))
+                PyErr::new::<OperationalError, _>(format!("Failed to commit: {e:?}"))
             })?;
         }
         Ok(())
@@ -319,8 +320,7 @@ pub fn connect(path: &str) -> Result<Connection> {
     match turso_core::Connection::from_uri(path, false, false) {
         Ok((io, conn)) => Ok(Connection { conn, _io: io }),
         Err(e) => Err(PyErr::new::<ProgrammingError, _>(format!(
-            "Failed to create connection: {:?}",
-            e
+            "Failed to create connection: {e:?}"
         ))
         .into()),
     }

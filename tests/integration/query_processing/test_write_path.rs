@@ -728,8 +728,7 @@ fn test_wal_bad_frame() -> anyhow::Result<()> {
 
                 assert!(
                     panic_msg.contains("WAL frame checksum mismatch."),
-                    "Expected panic message not found. Got: {}",
-                    panic_msg
+                    "Expected panic message not found. Got: {panic_msg}"
                 );
             }
             Ok(_) => panic!("Expected query to panic, but it succeeded"),

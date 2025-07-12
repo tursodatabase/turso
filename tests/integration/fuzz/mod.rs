@@ -1367,12 +1367,12 @@ mod tests {
 
         let datatypes = ["INTEGER", "TEXT", "REAL", "BLOB"];
         let (mut rng, seed) = rng_from_time();
-        log::info!("seed: {}", seed);
+        log::info!("seed: {seed}");
 
         for _ in 0..1000 {
             // Create table with random datatype
             let datatype = datatypes[rng.random_range(0..datatypes.len())];
-            let create_table = format!("CREATE TABLE t(x {})", datatype);
+            let create_table = format!("CREATE TABLE t(x {datatype})");
 
             let db = TempDatabase::new_empty(false);
             let limbo_conn = db.connect_limbo();
@@ -1396,7 +1396,7 @@ mod tests {
                     3 => "NULL".to_string(),                        // NULL
                     _ => unreachable!(),
                 };
-                values.push(format!("({})", value));
+                values.push(format!("({value})"));
             }
 
             let insert = format!("INSERT INTO t VALUES {}", values.join(","));
@@ -1405,14 +1405,13 @@ mod tests {
 
             // Test min and max
             for agg in ["min(x)", "max(x)"] {
-                let query = format!("SELECT {} FROM t", agg);
+                let query = format!("SELECT {agg} FROM t");
                 let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
                 let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
 
                 assert_eq!(
                     limbo, sqlite,
-                    "query: {}, limbo: {:?}, sqlite: {:?}, seed: {}, values: {:?}, schema: {}",
-                    query, limbo, sqlite, seed, values, create_table
+                    "query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?}, seed: {seed}, values: {values:?}, schema: {create_table}"
                 );
             }
         }

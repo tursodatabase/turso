@@ -977,8 +977,7 @@ impl Affinity {
             SQLITE_AFF_REAL => Ok(Affinity::Real),
             SQLITE_AFF_NUMERIC => Ok(Affinity::Numeric),
             _ => Err(LimboError::InternalError(format!(
-                "Invalid affinity character: {}",
-                char
+                "Invalid affinity character: {char}"
             ))),
         }
     }
@@ -1010,7 +1009,7 @@ impl fmt::Display for Type {
             Self::Real => "REAL",
             Self::Blob => "BLOB",
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 

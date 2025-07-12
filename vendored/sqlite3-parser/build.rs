@@ -78,7 +78,7 @@ fn build_keyword_map(
     fn write_entry(writer: &mut impl Write, entry: &PathEntry) -> Result<()> {
         if let Some(result) = entry.result {
             writeln!(writer, "if idx == buf.len() {{")?;
-            writeln!(writer, "return Some(TokenType::{});", result)?;
+            writeln!(writer, "return Some(TokenType::{result});")?;
             writeln!(writer, "}}")?;
         }
 
@@ -96,7 +96,7 @@ fn build_keyword_map(
             if b.is_ascii_alphabetic() {
                 writeln!(writer, "{} | {} => {{", b, b.to_ascii_lowercase())?;
             } else {
-                writeln!(writer, "{} => {{", b)?;
+                writeln!(writer, "{b} => {{")?;
             }
             writeln!(writer, "idx += 1;")?;
             write_entry(writer, sub_entry)?;
@@ -110,19 +110,16 @@ fn build_keyword_map(
 
     writeln!(
         writer,
-        "pub(crate) const MAX_KEYWORD_LEN: usize = {};",
-        max_len
+        "pub(crate) const MAX_KEYWORD_LEN: usize = {max_len};"
     )?;
     writeln!(
         writer,
-        "pub(crate) const MIN_KEYWORD_LEN: usize = {};",
-        min_len
+        "pub(crate) const MIN_KEYWORD_LEN: usize = {min_len};"
     )?;
     writeln!(writer, "/// Check if `word` is a keyword")?;
     writeln!(
         writer,
-        "pub fn {}(buf: &[u8]) -> Option<TokenType> {{",
-        func_name
+        "pub fn {func_name}(buf: &[u8]) -> Option<TokenType> {{"
     )?;
     writeln!(
         writer,

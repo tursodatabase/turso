@@ -377,8 +377,7 @@ impl Database {
                         "io_uring" => Arc::new(UringIO::new()?),
                         other => {
                             return Err(LimboError::InvalidArgument(format!(
-                                "no such VFS: {}",
-                                other
+                                "no such VFS: {other}"
                             )));
                         }
                     },
@@ -859,7 +858,7 @@ impl Connection {
         if self.closed.get() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        let pragma = format!("PRAGMA {}", pragma_name);
+        let pragma = format!("PRAGMA {pragma_name}");
         let mut stmt = self.prepare(pragma)?;
         let mut results = Vec::new();
         loop {
@@ -890,7 +889,7 @@ impl Connection {
         if self.closed.get() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        let pragma = format!("PRAGMA {} = {}", pragma_name, pragma_value);
+        let pragma = format!("PRAGMA {pragma_name} = {pragma_value}");
         let mut stmt = self.prepare(pragma)?;
         let mut results = Vec::new();
         loop {
@@ -923,7 +922,7 @@ impl Connection {
         if self.closed.get() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        let pragma = format!("PRAGMA {}({})", pragma_name, pragma_value);
+        let pragma = format!("PRAGMA {pragma_name}({pragma_value})");
         let mut stmt = self.prepare(pragma)?;
         let mut results = Vec::new();
         loop {
