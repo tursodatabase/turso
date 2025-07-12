@@ -58,8 +58,7 @@ impl IO for GenericIO {
             return Ok(());
         }
         trace!("run_once() waits for events");
-        let events = callbacks.drain(0..);
-        for callback in events {
+        while let Some(callback) = callbacks.pop() {
             callback()?;
         }
         Ok(())
