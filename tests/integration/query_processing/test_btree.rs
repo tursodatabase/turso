@@ -229,7 +229,7 @@ impl BTreeGenerator<'_> {
             BTreePageType::Leaf => 0x0d,
         };
         data[1..3].copy_from_slice(
-            &U16::new(page.free_blocks.get(0).map(|x| x.offset).unwrap_or(0)).to_bytes(),
+            &U16::new(page.free_blocks.first().map(|x| x.offset).unwrap_or(0)).to_bytes(),
         );
         data[3..5].copy_from_slice(&U16::new(page.cells.len() as u16).to_bytes());
         data[5..7].copy_from_slice(&U16::new(page.cell_content_area).to_bytes());
@@ -435,6 +435,7 @@ fn write_at(io: &impl IO, file: Arc<dyn File>, offset: usize, data: &[u8]) {
         |_| {},
     ))));
     let drop_fn = Rc::new(move |_| {});
+    #[allow(clippy::arc_with_non_send_sync)]
     let buffer = Arc::new(RefCell::new(Buffer::new(Pin::new(data.to_vec()), drop_fn)));
     let result = file.pwrite(offset, buffer, completion).unwrap();
     while !result.is_completed() {
