@@ -801,8 +801,6 @@ impl Pager {
                     ref_count
                 );
 
-                //  TODO(Zaid) This is a hack currently until the rollback journal and subjournal is implemented
-                //  See this function from SQLite - https://github.com/sqlite/sqlite/blob/master/src/pager.c#L7141-L7270
                 if dest_page.is_dirty() {
                     dest_page.clear_dirty();
                     self.dirty_pages
@@ -2681,16 +2679,6 @@ mod ptrmap_tests {
         pager
             .ptrmap_put(page_5.get().id as u32, PtrmapType::BTreeNode, 3)
             .unwrap();
-
-        //  TODO(Zaid) This is a hack to mark all pages as clean before relocation as part of autovacuum
-        //  In reality, dirty pages should become part of the subjournal so they can be rolled back
-        //  See - https://github.com/sqlite/sqlite/blob/master/src/pager.c#L7141-L7270
-        loop {
-            match pager.cacheflush(true).unwrap() {
-                PagerCacheflushStatus::Done(_) => break,
-                PagerCacheflushStatus::IO => pager.io.run_once().unwrap(),
-            }
-        }
 
         //  Create a new table which will be allocated root page 4 forcing a relocation from 4 to 6
         let new_root = run_until_done(
