@@ -15,7 +15,7 @@ use crate::{
     turso_assert,
     types::{
         find_compare, get_tie_breaker_from_seek_op, IndexKeyInfo, IndexKeySortOrder,
-        ParseRecordState, RecordCompare, RecordCursor,
+        ParseRecordState, RecordCompare, RecordCursor, SeekResult,
     },
     MvCursor,
 };
@@ -1285,13 +1285,21 @@ impl BTreeCursor {
     /// This may be used to seek to a specific record in a point query (e.g. SELECT * FROM table WHERE col = 10)
     /// or e.g. find the first record greater than the seek key in a range query (e.g. SELECT * FROM table WHERE col > 10).
     /// We don't include the rowid in the comparison and that's why the last value from the record is not included.
-    fn do_seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<CursorResult<bool>> {
+    fn do_seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<CursorResult<SeekResult>> {
         let ret = return_if_io!(match key {
             SeekKey::TableRowId(rowid) => {
                 self.tablebtree_seek(rowid, op)
             }
             SeekKey::IndexKey(index_key) => {
-                self.indexbtree_seek(index_key, op)
+                match self.indexbtree_seek(index_key, op) {
+                    Ok(CursorResult::Ok(found)) => Ok(CursorResult::Ok(if found {
+                        SeekResult::Found
+                    } else {
+                        SeekResult::NotFound
+                    })),
+                    Ok(CursorResult::IO) => Ok(CursorResult::IO),
+                    Err(err) => Err(err),
+                }
             }
         });
         self.valid_state = CursorValidState::Valid;
@@ -1677,7 +1685,7 @@ impl BTreeCursor {
     /// Specialized version of do_seek() for table btrees that uses binary search instead
     /// of iterating cells in order.
     #[instrument(skip_all, level = Level::INFO)]
-    fn tablebtree_seek(&mut self, rowid: i64, seek_op: SeekOp) -> Result<CursorResult<bool>> {
+    fn tablebtree_seek(&mut self, rowid: i64, seek_op: SeekOp) -> Result<CursorResult<SeekResult>> {
         turso_assert!(
             self.mv_cursor.is_none(),
             "attempting to seek with MV cursor"
@@ -1704,7 +1712,7 @@ impl BTreeCursor {
             let cell_count = contents.cell_count();
             if cell_count == 0 {
                 self.stack.set_cell_index(0);
-                return Ok(CursorResult::Ok(false));
+                return Ok(CursorResult::Ok(SeekResult::NotFound));
             }
             let min_cell_idx = Cell::new(0);
             let max_cell_idx = Cell::new(cell_count as isize - 1);
@@ -1743,9 +1751,21 @@ impl BTreeCursor {
             if min > max {
                 if let Some(nearest_matching_cell) = nearest_matching_cell.get() {
                     self.stack.set_cell_index(nearest_matching_cell as i32);
-                    return Ok(CursorResult::Ok(true));
+                    return Ok(CursorResult::Ok(SeekResult::Found));
                 } else {
-                    return Ok(CursorResult::Ok(false));
+                    let eq_only = match &seek_op {
+                        SeekOp::GE { eq_only } | SeekOp::LE { eq_only } => *eq_only,
+                        SeekOp::LT | SeekOp::GT => false,
+                    };
+                    // if !eq_only - matching entry can exist in neighbour leaf page
+                    // this can happen if key in the interiour page was deleted - but divider kept untouched
+                    // in such case BTree can navigate to the leaf which no longer has matching key for seek_op
+                    // in this case, caller must advance cursor if necessary
+                    return Ok(CursorResult::Ok(if eq_only {
+                        SeekResult::NotFound
+                    } else {
+                        SeekResult::TryAdvance
+                    }));
                 };
             }
 
@@ -1766,7 +1786,7 @@ impl BTreeCursor {
             // rowids are unique, so we can return the rowid immediately
             if found && seek_op.eq_only() {
                 self.stack.set_cell_index(cur_cell_idx as i32);
-                return Ok(CursorResult::Ok(true));
+                return Ok(CursorResult::Ok(SeekResult::Found));
             }
 
             if found {
@@ -4134,7 +4154,7 @@ impl BTreeCursor {
     }
 
     #[instrument(skip(self), level = Level::INFO)]
-    pub fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<CursorResult<bool>> {
+    pub fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<CursorResult<SeekResult>> {
         assert!(self.mv_cursor.is_none());
         // Empty trace to capture the span information
         tracing::trace!("");
@@ -4142,13 +4162,14 @@ impl BTreeCursor {
         // because it might have been set to false by an unmatched left-join row during the previous iteration
         // on the outer loop.
         self.set_null_flag(false);
-        let cursor_has_record = return_if_io!(self.do_seek(key, op));
+        let seek_result = return_if_io!(self.do_seek(key, op));
         self.invalidate_record();
         // Reset seek state
         self.seek_state = CursorSeekState::Start;
         self.valid_state = CursorValidState::Valid;
-        self.has_record.replace(cursor_has_record);
-        Ok(CursorResult::Ok(cursor_has_record))
+        self.has_record
+            .replace(matches!(seek_result, SeekResult::Found));
+        Ok(CursorResult::Ok(seek_result))
     }
 
     /// Return a reference to the record the cursor is currently pointing to.
@@ -4649,8 +4670,9 @@ impl BTreeCursor {
             Value::Integer(i) => i,
             _ => unreachable!("btree tables are indexed by integers!"),
         };
-        let has_record =
+        let seek_result =
             return_if_io!(self.seek(SeekKey::TableRowId(*int_key), SeekOp::GE { eq_only: true }));
+        let has_record = matches!(seek_result, SeekResult::Found);
         self.has_record.set(has_record);
         self.invalidate_record();
         Ok(CursorResult::Ok(has_record))
@@ -6892,7 +6914,7 @@ mod tests {
                 assert!(
                     matches!(
                         cursor.seek(seek_key, SeekOp::GE { eq_only: true }).unwrap(),
-                        CursorResult::Ok(true)
+                        CursorResult::Ok(SeekResult::Found)
                     ),
                     "key {key} is not found"
                 );
@@ -7135,7 +7157,10 @@ mod tests {
                     pager.deref(),
                 )
                 .unwrap();
-                assert!(exists, "key {key:?} is not found");
+                assert!(
+                    matches!(exists, SeekResult::Found),
+                    "key {key:?} is not found"
+                );
             }
             // Check that key count is right
             cursor.move_to_root().unwrap();
@@ -8257,13 +8282,13 @@ mod tests {
             let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
             let seek_key = SeekKey::TableRowId(i);
 
-            let found = run_until_done(
+            let seek_result = run_until_done(
                 || cursor.seek(seek_key.clone(), SeekOp::GE { eq_only: true }),
                 pager.deref(),
             )
             .unwrap();
 
-            if found {
+            if matches!(seek_result, SeekResult::Found) {
                 run_until_done(|| cursor.delete(), pager.deref()).unwrap();
             }
         }

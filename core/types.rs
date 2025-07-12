@@ -2291,6 +2291,13 @@ pub enum CursorResult<T> {
     IO,
 }
 
+#[derive(Debug)]
+pub enum SeekResult {
+    Found,
+    NotFound,
+    TryAdvance,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 /// The match condition of a table/index seek.
 pub enum SeekOp {
