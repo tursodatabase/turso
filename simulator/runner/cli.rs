@@ -89,11 +89,23 @@ pub struct SimulatorCLI {
     #[clap(long, help = "disable Reopen-Database fault", default_value_t = false)]
     pub disable_reopen_database: bool,
     #[clap(
-        long = "latency_prob",
+        long = "latency-prob",
         help = "added IO latency probability",
-        default_value_t = 0
+        default_value_t = 1
     )]
     pub latency_probability: usize,
+    #[clap(
+        long,
+        help = "Minimum tick time in microseconds for simulated time",
+        default_value_t = 1
+    )]
+    pub min_tick: u64,
+    #[clap(
+        long,
+        help = "Maximum tick time in microseconds for simulated time",
+        default_value_t = 30
+    )]
+    pub max_tick: u64,
     #[clap(long, help = "Enable experimental MVCC feature")]
     pub experimental_mvcc: bool,
     #[clap(long, help = "Enable experimental indexing feature")]

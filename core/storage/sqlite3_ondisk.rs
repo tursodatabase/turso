@@ -753,12 +753,13 @@ pub fn begin_read_page(
     Ok(())
 }
 
+#[instrument(skip_all, level = Level::INFO)]
 pub fn finish_read_page(
     page_idx: usize,
     buffer_ref: Arc<RefCell<Buffer>>,
     page: PageRef,
 ) -> Result<()> {
-    tracing::trace!("finish_read_btree_page(page_idx = {})", page_idx);
+    tracing::trace!(page_idx);
     let pos = if page_idx == DATABASE_HEADER_PAGE_ID {
         DATABASE_HEADER_SIZE
     } else {
@@ -1475,7 +1476,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
         buf_for_pread,
         complete,
     )));
-    file.pread(0, c)?;
+    file.pread(0, c.into())?;
 
     Ok(wal_file_shared_ret)
 }
@@ -1495,7 +1496,7 @@ pub fn begin_read_wal_frame(
     let buf = Arc::new(RefCell::new(Buffer::new(buf, drop_fn)));
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new(CompletionType::Read(ReadCompletion::new(buf, complete)));
-    let c = io.pread(offset, c)?;
+    let c = io.pread(offset, c.into())?;
     Ok(c)
 }
 
@@ -1588,7 +1589,7 @@ pub fn begin_write_wal_frame(
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new(CompletionType::Write(WriteCompletion::new(write_complete)));
-    let res = io.pwrite(offset, buffer.clone(), c);
+    let res = io.pwrite(offset, buffer.clone(), c.into());
     if res.is_err() {
         // If we do not reduce the counter here on error, we incur an infinite loop when cacheflushing
         *write_counter.borrow_mut() -= 1;
@@ -1630,7 +1631,7 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new(CompletionType::Write(WriteCompletion::new(write_complete)));
-    io.pwrite(0, buffer.clone(), c)?;
+    io.pwrite(0, buffer.clone(), c.into())?;
     Ok(())
 }
 
