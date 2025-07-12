@@ -1294,7 +1294,8 @@ pub fn op_last(
 /// - **Single-byte case**: Values 0-127 (0x00-0x7F) are returned immediately
 /// - **Two-byte case**: Values 128-16383 (0x80-0x3FFF) are handled inline
 /// - **Multi-byte case**: Larger values fall back to the full `read_varint()` implementation
-/// This is similar to `sqlite3GetVarint32`
+///   
+/// This function is similar to `sqlite3GetVarint32`
 #[inline(always)]
 fn read_varint_fast(buf: &[u8]) -> Result<(u64, usize)> {
     // Fast path: Single-byte varint
