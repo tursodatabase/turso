@@ -61,7 +61,7 @@ pub unsafe extern "C" fn execute(
                         return ResultCode::Error;
                     }
                     Ok(StepResult::Done) => {
-                        *last_insert_rowid = conn.last_insert_rowid();
+                        ptr::write_unaligned(last_insert_rowid, conn.last_insert_rowid());
                         return ResultCode::OK;
                     }
                     Ok(StepResult::IO) => {
@@ -224,7 +224,7 @@ pub unsafe extern "C" fn stmt_get_column_names(
     count: *mut i32,
 ) -> *mut *mut c_char {
     if !count.is_null() {
-        *count = 0;
+        ptr::write_unaligned(count, 0);
     }
     let Ok(stmt) = Stmt::from_ptr(ctx) else {
         tracing::error!("stmt_get_column_names: null Stmt pointer");
@@ -253,7 +253,7 @@ pub unsafe extern "C" fn stmt_get_column_names(
     }
 
     if !count.is_null() {
-        *count = names.len() as i32;
+        ptr::write_unaligned(count, names.len() as i32);
     }
     Box::into_raw(names.into_boxed_slice()) as *mut *mut c_char
 }
