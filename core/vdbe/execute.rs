@@ -2392,7 +2392,27 @@ pub fn op_deferred_seek(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub enum OpSeekState {
+    Start,
+    Seek { rowid: i64, op: SeekOp },
+    MoveLast,
+}
+
 pub fn op_seek(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Rc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    let result = op_seek_internal(program, state, insn, pager, mv_store);
+    if let Err(_) | Ok(InsnFunctionStepResult::Step) = &result {
+        state.op_seek_state = OpSeekState::Start;
+    }
+    result
+}
+
+pub fn op_seek_internal(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
@@ -2447,12 +2467,7 @@ pub fn op_seek(
         Insn::SeekLT { .. } => SeekOp::LT,
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
-    let op_name = match op {
-        SeekOp::GE { .. } => "SeekGE",
-        SeekOp::GT => "SeekGT",
-        SeekOp::LE { .. } => "SeekLE",
-        SeekOp::LT => "SeekLT",
-    };
+    // todo (sivukhin): fix index too
     if *is_index {
         let found = {
             let mut cursor = state.get_cursor(*cursor_id);
@@ -2465,102 +2480,116 @@ pub fn op_seek(
         } else {
             state.pc += 1;
         }
-    } else {
-        let pc = {
-            let original_value = state.registers[*start_reg].get_owned_value().clone();
-            let mut temp_value = original_value.clone();
-
-            let conversion_successful = if matches!(temp_value, Value::Text(_)) {
-                let mut temp_reg = Register::Value(temp_value);
-                let converted = apply_numeric_affinity(&mut temp_reg, false);
-                temp_value = temp_reg.get_owned_value().clone();
-                converted
-            } else {
-                true // Non-text values don't need conversion
-            };
-
-            let int_key = extract_int_value(&temp_value);
-            let lost_precision = !conversion_successful || !matches!(temp_value, Value::Integer(_));
-            let actual_op = if lost_precision {
-                match &temp_value {
-                    Value::Float(f) => {
-                        let int_key_as_float = int_key as f64;
-                        let c = if int_key_as_float > *f {
-                            1
-                        } else if int_key_as_float < *f {
-                            -1
-                        } else {
-                            0
-                        };
-
-                        match c.cmp(&0) {
-                            std::cmp::Ordering::Less => match op {
-                                SeekOp::LT => SeekOp::LE { eq_only: false }, // (x < 5.1) -> (x <= 5)
-                                SeekOp::GE { .. } => SeekOp::GT, // (x >= 5.1) -> (x > 5)
-                                other => other,
-                            },
-                            std::cmp::Ordering::Greater => match op {
-                                SeekOp::GT => SeekOp::GE { eq_only: false }, // (x > 4.9) -> (x >= 5)
-                                SeekOp::LE { .. } => SeekOp::LT, // (x <= 4.9) -> (x < 5)
-                                other => other,
-                            },
-                            std::cmp::Ordering::Equal => op,
-                        }
-                    }
-                    Value::Text(_) | Value::Blob(_) => {
-                        match op {
-                            SeekOp::GT | SeekOp::GE { .. } => {
-                                // No integers are > or >= non-numeric text, jump to target (empty result)
-                                state.pc = target_pc.as_offset_int();
-                                return Ok(InsnFunctionStepResult::Step);
-                            }
-                            SeekOp::LT | SeekOp::LE { .. } => {
-                                // All integers are < or <= non-numeric text
-                                // Move to last position and then use the normal seek logic
-                                {
-                                    let mut cursor = state.get_cursor(*cursor_id);
-                                    let cursor = cursor.as_btree_mut();
-                                    return_if_io!(cursor.last());
-                                }
-                                state.pc += 1;
-                                return Ok(InsnFunctionStepResult::Step);
-                            }
-                        }
-                    }
-                    _ => op,
-                }
-            } else {
-                op
-            };
-
-            let rowid = if matches!(original_value, Value::Null) {
-                match actual_op {
-                    SeekOp::GE { .. } | SeekOp::GT => {
-                        state.pc = target_pc.as_offset_int();
-                        return Ok(InsnFunctionStepResult::Step);
-                    }
-                    SeekOp::LE { .. } | SeekOp::LT => {
-                        // No integers are < NULL, so jump to target
-                        state.pc = target_pc.as_offset_int();
-                        return Ok(InsnFunctionStepResult::Step);
-                    }
-                }
-            } else {
-                int_key
-            };
-            let mut cursor = state.get_cursor(*cursor_id);
-            let cursor = cursor.as_btree_mut();
-            let found = return_if_io!(cursor.seek(SeekKey::TableRowId(rowid), actual_op));
-
-            if !found {
-                target_pc.as_offset_int()
-            } else {
-                state.pc + 1
-            }
-        };
-        state.pc = pc;
+        return Ok(InsnFunctionStepResult::Step);
     }
-    Ok(InsnFunctionStepResult::Step)
+    loop {
+        match &state.op_seek_state {
+            OpSeekState::Start => {
+                let original_value = state.registers[*start_reg].get_owned_value().clone();
+                let mut temp_value = original_value.clone();
+
+                let conversion_successful = if matches!(temp_value, Value::Text(_)) {
+                    let mut temp_reg = Register::Value(temp_value);
+                    let converted = apply_numeric_affinity(&mut temp_reg, false);
+                    temp_value = temp_reg.get_owned_value().clone();
+                    converted
+                } else {
+                    true // Non-text values don't need conversion
+                };
+                let int_key = extract_int_value(&temp_value);
+                let lost_precision =
+                    !conversion_successful || !matches!(temp_value, Value::Integer(_));
+                let actual_op = if lost_precision {
+                    match &temp_value {
+                        Value::Float(f) => {
+                            let int_key_as_float = int_key as f64;
+                            let c = if int_key_as_float > *f {
+                                1
+                            } else if int_key_as_float < *f {
+                                -1
+                            } else {
+                                0
+                            };
+
+                            match c.cmp(&0) {
+                                std::cmp::Ordering::Less => match op {
+                                    SeekOp::LT => SeekOp::LE { eq_only: false }, // (x < 5.1) -> (x <= 5)
+                                    SeekOp::GE { .. } => SeekOp::GT, // (x >= 5.1) -> (x > 5)
+                                    other => other,
+                                },
+                                std::cmp::Ordering::Greater => match op {
+                                    SeekOp::GT => SeekOp::GE { eq_only: false }, // (x > 4.9) -> (x >= 5)
+                                    SeekOp::LE { .. } => SeekOp::LT, // (x <= 4.9) -> (x < 5)
+                                    other => other,
+                                },
+                                std::cmp::Ordering::Equal => op,
+                            }
+                        }
+                        Value::Text(_) | Value::Blob(_) => {
+                            match op {
+                                SeekOp::GT | SeekOp::GE { .. } => {
+                                    // No integers are > or >= non-numeric text, jump to target (empty result)
+                                    state.pc = target_pc.as_offset_int();
+                                    return Ok(InsnFunctionStepResult::Step);
+                                }
+                                SeekOp::LT | SeekOp::LE { .. } => {
+                                    // All integers are < or <= non-numeric text
+                                    // Move to last position and then use the normal seek logic
+                                    state.op_seek_state = OpSeekState::MoveLast;
+                                    continue;
+                                }
+                            }
+                        }
+                        _ => op,
+                    }
+                } else {
+                    op
+                };
+                let rowid = if matches!(original_value, Value::Null) {
+                    match actual_op {
+                        SeekOp::GE { .. } | SeekOp::GT => {
+                            state.pc = target_pc.as_offset_int();
+                            return Ok(InsnFunctionStepResult::Step);
+                        }
+                        SeekOp::LE { .. } | SeekOp::LT => {
+                            // No integers are < NULL, so jump to target
+                            state.pc = target_pc.as_offset_int();
+                            return Ok(InsnFunctionStepResult::Step);
+                        }
+                    }
+                } else {
+                    int_key
+                };
+                state.op_seek_state = OpSeekState::Seek {
+                    rowid,
+                    op: actual_op,
+                };
+                continue;
+            }
+            OpSeekState::Seek { rowid, op } => {
+                let found = {
+                    let mut cursor = state.get_cursor(*cursor_id);
+                    let cursor = cursor.as_btree_mut();
+                    return_if_io!(cursor.seek(SeekKey::TableRowId(*rowid), *op))
+                };
+                if !found {
+                    state.pc = target_pc.as_offset_int()
+                } else {
+                    state.pc += 1
+                }
+                return Ok(InsnFunctionStepResult::Step);
+            }
+            OpSeekState::MoveLast => {
+                {
+                    let mut cursor = state.get_cursor(*cursor_id);
+                    let cursor = cursor.as_btree_mut();
+                    return_if_io!(cursor.last());
+                }
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
+    }
 }
 
 /// Returns the tie-breaker ordering for SQLite index comparison opcodes.
