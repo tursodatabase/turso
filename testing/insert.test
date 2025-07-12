@@ -380,3 +380,9 @@ do_execsql_test_on_specific_db {:memory:} negative-primary-integer-key {
 } {-2
 13}
 
+do_execsql_test_on_specific_db {:memory:} not-null-rowid-alias {
+    CREATE TABLE t(a INTEGER PRIMARY KEY NOT NULL, b);
+    insert into t values (1, 2);
+    select * from t;
+} {1|2}
+
