@@ -31,6 +31,7 @@ use crate::{
     translate::plan::TableReferences,
     vdbe::execute::OpIdxInsertState,
     vdbe::execute::OpInsertState,
+    vdbe::execute::OpSeekState,
 };
 
 use crate::{
@@ -254,6 +255,7 @@ pub struct ProgramState {
     op_open_ephemeral_state: OpOpenEphemeralState,
     op_idx_insert_state: OpIdxInsertState,
     op_insert_state: OpInsertState,
+    op_seek_state: OpSeekState,
 }
 
 impl ProgramState {
@@ -282,6 +284,7 @@ impl ProgramState {
             op_open_ephemeral_state: OpOpenEphemeralState::Start,
             op_idx_insert_state: OpIdxInsertState::SeekIfUnique,
             op_insert_state: OpInsertState::Insert,
+            op_seek_state: OpSeekState::Start,
         }
     }
 
