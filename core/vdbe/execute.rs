@@ -2395,6 +2395,7 @@ pub fn op_deferred_seek(
 pub enum OpSeekState {
     Start,
     Seek { rowid: i64, op: SeekOp },
+    Advance { op: SeekOp },
     MoveLast,
 }
 
@@ -2572,7 +2573,32 @@ pub fn op_seek_internal(
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(cursor.seek(SeekKey::TableRowId(*rowid), *op))
                 };
-                if !matches!(seek_result, SeekResult::Found) {
+                let found = match seek_result {
+                    SeekResult::Found => true,
+                    SeekResult::NotFound => false,
+                    SeekResult::TryAdvance => {
+                        state.op_seek_state = OpSeekState::Advance { op: *op };
+                        continue;
+                    }
+                };
+                if !found {
+                    state.pc = target_pc.as_offset_int()
+                } else {
+                    state.pc += 1
+                }
+                return Ok(InsnFunctionStepResult::Step);
+            }
+            OpSeekState::Advance { op } => {
+                let found = {
+                    let mut cursor = state.get_cursor(*cursor_id);
+                    let cursor = cursor.as_btree_mut();
+                    match op {
+                        SeekOp::GT | SeekOp::GE { eq_only: false } => return_if_io!(cursor.next()),
+                        SeekOp::LT | SeekOp::LE { eq_only: false } => return_if_io!(cursor.prev()),
+                        _ => unreachable!("eq_only: true state must be unreachable"),
+                    }
+                };
+                if !found {
                     state.pc = target_pc.as_offset_int()
                 } else {
                     state.pc += 1
@@ -4833,7 +4859,7 @@ pub fn op_idx_delete(
                         cursor.root_page(),
                         record
                     );
-                    found
+                    matches!(seek_result, SeekResult::Found)
                 };
 
                 if !found {

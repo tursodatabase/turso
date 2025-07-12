@@ -1764,6 +1764,17 @@ impl BTreeCursor {
                     return Ok(CursorResult::Ok(if eq_only {
                         SeekResult::NotFound
                     } else {
+                        let contents = page.get().contents.as_ref().unwrap();
+                        turso_assert!(
+                            contents.is_leaf(),
+                            "tablebtree_seek() called on non-leaf page"
+                        );
+                        let cell_count = contents.cell_count();
+                        // set cursor to the position where which would hold the op-boundary if it were present
+                        self.stack.set_cell_index(match &seek_op {
+                            SeekOp::GT | SeekOp::GE { .. } => cell_count as i32,
+                            SeekOp::LT | SeekOp::LE { .. } => 0,
+                        });
                         SeekResult::TryAdvance
                     }));
                 };
