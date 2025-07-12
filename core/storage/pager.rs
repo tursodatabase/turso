@@ -810,7 +810,7 @@ impl Pager {
                     // This is okay assuming we use shared cache by default.
                     {
                         let mut cache = self.page_cache.write();
-                        cache.clear().unwrap();
+                        cache.clear(false).unwrap();
                     }
                     self.dirty_pages.borrow_mut().clear();
                     self.flush_info.borrow_mut().state = FlushState::WaitAppendFrames;
@@ -930,11 +930,9 @@ impl Pager {
     /// right after new writes happened which would invalidate current page cache.
     pub fn clear_page_cache(&self) {
         self.dirty_pages.borrow_mut().clear();
-        self.page_cache.write().unset_dirty_all_pages();
-        self.page_cache
-            .write()
-            .clear()
-            .expect("Failed to clear page cache");
+        let mut cache = self.page_cache.write();
+        cache.unset_dirty_all_pages();
+        cache.clear(false).expect("Failed to clear page cache");
     }
 
     pub fn checkpoint_shutdown(&self, wal_checkpoint_disabled: bool) -> Result<()> {
@@ -987,7 +985,7 @@ impl Pager {
         // TODO: only clear cache of things that are really invalidated
         self.page_cache
             .write()
-            .clear()
+            .clear(false)
             .map_err(|e| LimboError::InternalError(format!("Failed to clear page cache: {e:?}")))?;
         Ok(checkpoint_result)
     }
@@ -1262,9 +1260,11 @@ impl Pager {
     pub fn rollback(&self, schema_did_change: bool, connection: &Connection) {
         tracing::debug!(schema_did_change);
         self.dirty_pages.borrow_mut().clear();
-        let mut cache = self.page_cache.write();
-        cache.unset_dirty_all_pages();
-        cache.clear().expect("failed to clear page cache");
+        {
+            let mut cache = self.page_cache.write();
+            cache.unset_dirty_all_pages();
+            cache.clear(true).expect("failed to clear page cache");
+        }
         if schema_did_change {
             let prev_schema = connection._db.schema.read().clone();
             connection.schema.replace(prev_schema);

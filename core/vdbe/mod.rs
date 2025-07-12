@@ -579,10 +579,10 @@ pub fn registers_to_ref_values(registers: &[Register]) -> Vec<RefValue> {
 
 #[instrument(skip(program), level = Level::INFO)]
 fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
-    if !tracing::enabled!(tracing::Level::TRACE) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
         return;
     }
-    tracing::trace!(
+    tracing::debug!(
         "\n{}",
         explain::insn_to_str(
             program,
