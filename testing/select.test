@@ -572,3 +572,48 @@ if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-s
       select * from t INTERSECT select * from u EXCEPT select * from v;
     } {}
 }
+
+do_execsql_test_on_specific_db {:memory:} select-no-match-in-leaf-page {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    insert into t values (1, randomblob(1024));
+    insert into t values (2, randomblob(1024));
+    insert into t values (3, randomblob(1024));
+    insert into t values (4, randomblob(1024));
+    insert into t values (5, randomblob(1024));
+    insert into t values (6, randomblob(1024));
+    insert into t values (7, randomblob(1024));
+    insert into t values (8, randomblob(1024));
+    insert into t values (9, randomblob(1024));
+    insert into t values (10, randomblob(1024));
+    insert into t values (11, randomblob(1024));
+    insert into t values (12, randomblob(1024));
+    insert into t values (13, randomblob(1024));
+    insert into t values (14, randomblob(1024));
+    insert into t values (15, randomblob(1024));
+    insert into t values (16, randomblob(1024));
+    delete from t where a in (3, 6, 9, 12);
+    select count(*) from t where a >= 2;
+    select count(*) from t where a >= 3;
+    select count(*) from t where a >= 4;
+    select count(*) from t where a > 1;
+    select count(*) from t where a > 2;
+    select count(*) from t where a > 3;
+    select count(*) from t where a <= 3 ORDER BY a DESC;
+    select count(*) from t where a <= 4 ORDER BY a DESC;
+    select count(*) from t where a <= 5 ORDER BY a DESC;
+    select count(*) from t where a < 2 ORDER BY a DESC;
+    select count(*) from t where a < 3 ORDER BY a DESC;
+    select count(*) from t where a < 4 ORDER BY a DESC;
+} {11
+10
+10
+11
+10
+10
+2
+3
+4
+1
+2
+2}
+
