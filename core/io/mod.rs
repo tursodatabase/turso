@@ -1,3 +1,7 @@
+//! Currently all IO implementations inside the codebase, except IO Uring, are synchronous.
+//! However, to prepare for us to transition to asynchronous IO, the interfaces are designed so that all IO
+//! should only be ran in `[IO::run_once]`. All the other methods just schedule IO to be ran when we want to run it.
+
 use crate::Result;
 use bitflags::bitflags;
 use cfg_block::cfg_block;
@@ -18,6 +22,7 @@ pub trait File: Send + Sync {
     fn pread(&self, pos: usize, c: Completion) -> Arc<Completion>;
     fn pwrite(&self, pos: usize, buffer: Arc<RefCell<Buffer>>, c: Completion) -> Arc<Completion>;
     fn sync(&self, c: Completion) -> Arc<Completion>;
+    // TODO: eventually change this interface to schedule IO as well
     fn size(&self) -> Result<u64>;
 }
 
