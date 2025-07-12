@@ -2468,7 +2468,6 @@ pub fn op_seek_internal(
         Insn::SeekLT { .. } => SeekOp::LT,
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
-    // todo (sivukhin): fix index too
     if *is_index {
         let seek_result = {
             let mut cursor = state.get_cursor(*cursor_id);
