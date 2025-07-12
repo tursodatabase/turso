@@ -858,7 +858,8 @@ fn test_cdc_bin_record() {
     let record = record([
         Value::Null,
         Value::Integer(1),
-        Value::Real(3.1415),
+        // use golden ratio instead of pi because clippy has weird rule that I can't use PI approximation written by hand
+        Value::Real(1.61803),
         Value::Text("hello".to_string()),
     ]);
     let mut record_hex = String::new();
@@ -874,7 +875,7 @@ fn test_cdc_bin_record() {
     assert_eq!(
         rows,
         vec![vec![Value::Text(
-            r#"{"a":null,"b":1,"c":3.1415,"d":"hello"}"#.to_string()
+            r#"{"a":null,"b":1,"c":1.61803,"d":"hello"}"#.to_string()
         )]]
     );
 }
