@@ -179,7 +179,6 @@ impl Database {
     ) -> Result<Arc<Database>> {
         let wal_path = format!("{}-wal", path);
         let maybe_shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path.as_str())?;
-        let db_size = db_file.size()?;
 
         let mv_store = if enable_mvcc {
             Some(Rc::new(MvStore::new(
@@ -189,12 +188,9 @@ impl Database {
         } else {
             None
         };
-        let wal_has_frames = maybe_shared_wal.as_ref().map_or(false, |wal| {
-            unsafe { &*wal.get() }.max_frame.load(Ordering::SeqCst) > 0
-        });
 
-        // No pages in DB file or WAL -> empty database
-        let db_state = if db_size == 0 && !wal_has_frames {
+        let db_size = db_file.size()?;
+        let db_state = if db_size == 0 {
             DB_STATE_UNINITIALIZED
         } else {
             DB_STATE_INITIALIZED
@@ -228,10 +224,9 @@ impl Database {
                 .expect("lock on schema should succeed first try");
 
             let syms = conn.syms.borrow();
+            let pager = conn.pager.borrow().clone();
 
-            if let Err(LimboError::ExtensionError(e)) =
-                schema.make_from_btree(None, conn.pager.clone(), &syms)
-            {
+            if let Err(LimboError::ExtensionError(e)) = schema.make_from_btree(None, pager, &syms) {
                 // this means that a vtab exists and we no longer have the module loaded. we print
                 // a warning to the user to load the module
                 eprintln!("Warning: {}", e);

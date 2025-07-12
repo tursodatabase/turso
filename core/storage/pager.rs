@@ -9,7 +9,7 @@ use crate::types::CursorResult;
 use crate::Completion;
 use crate::{Buffer, Connection, LimboError, Result};
 use parking_lot::RwLock;
-use std::cell::{OnceCell, RefCell, UnsafeCell};
+use std::cell::{Cell, OnceCell, RefCell, UnsafeCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -225,7 +225,7 @@ pub struct Pager {
     /// Cache page_size and reserved_space at Pager init and reuse for subsequent
     /// `usable_space` calls. TODO: Invalidate reserved_space when we add the functionality
     /// to change it.
-    page_size: RefCell<Option<u32>>,
+    page_size: Cell<Option<u32>>,
     reserved_space: OnceCell<u8>,
 }
 
@@ -291,7 +291,7 @@ impl Pager {
             db_state,
             init_lock,
             allocate_page1_state,
-            page_size: RefCell::new(None),
+            page_size: Cell::new(None),
             reserved_space: OnceCell::new(),
         })
     }
@@ -580,7 +580,7 @@ impl Pager {
     pub fn usable_space(&self) -> usize {
         let page_size = *self
             .page_size
-            .borrow_mut()
+            .get()
             .get_or_insert_with(|| header_accessor::get_page_size(self).unwrap_or_default());
 
         let reserved_space = *self
@@ -592,6 +592,7 @@ impl Pager {
 
     /// Set the initial page size for the database. Should only be called before the database is initialized
     pub fn set_initial_page_size(&self, size: u32) {
+        assert_eq!(self.db_state.load(Ordering::SeqCst), DB_STATE_UNINITIALIZED);
         self.page_size.replace(Some(size));
     }
 
@@ -1059,7 +1060,7 @@ impl Pager {
                 self.db_state.store(DB_STATE_INITIALIZING, Ordering::SeqCst);
                 let mut default_header = DatabaseHeader::default();
                 default_header.database_size += 1;
-                if let Some(size) = *self.page_size.borrow() {
+                if let Some(size) = self.page_size.get() {
                     default_header.update_page_size(size);
                 }
                 let page = allocate_page(1, &self.buffer_pool, 0);
