@@ -31,25 +31,25 @@ members = [
 exclude = ["perf/latency/limbo"]
 
 [workspace.package]
-version = "0.1.2-pre.2"
+version = "0.1.2-pre.3"
 authors = ["the Limbo authors"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/tursodatabase/turso"
 
 [workspace.dependencies]
-limbo_completion = { path = "extensions/completion", version = "0.1.2-pre.2" }
-turso_core = { path = "core", version = "0.1.2-pre.2" }
-limbo_crypto = { path = "extensions/crypto", version = "0.1.2-pre.2" }
-limbo_csv = { path = "extensions/csv", version = "0.1.2-pre.2" }
-turso_ext = { path = "extensions/core", version = "0.1.2-pre.2" }
-turso_ext_tests = { path = "extensions/tests", version = "0.1.2-pre.2" }
-limbo_ipaddr = { path = "extensions/ipaddr", version = "0.1.2-pre.2" }
-turso_macros = { path = "macros", version = "0.1.2-pre.2" }
-limbo_percentile = { path = "extensions/percentile", version = "0.1.2-pre.2" }
-limbo_regexp = { path = "extensions/regexp", version = "0.1.2-pre.2" }
-turso_sqlite3_parser = { path = "vendored/sqlite3-parser", version = "0.1.2-pre.2" }
-limbo_uuid = { path = "extensions/uuid", version = "0.1.2-pre.2" }
+limbo_completion = { path = "extensions/completion", version = "0.1.2-pre.3" }
+turso_core = { path = "core", version = "0.1.2-pre.3" }
+limbo_crypto = { path = "extensions/crypto", version = "0.1.2-pre.3" }
+limbo_csv = { path = "extensions/csv", version = "0.1.2-pre.3" }
+turso_ext = { path = "extensions/core", version = "0.1.2-pre.3" }
+turso_ext_tests = { path = "extensions/tests", version = "0.1.2-pre.3" }
+limbo_ipaddr = { path = "extensions/ipaddr", version = "0.1.2-pre.3" }
+turso_macros = { path = "macros", version = "0.1.2-pre.3" }
+limbo_percentile = { path = "extensions/percentile", version = "0.1.2-pre.3" }
+limbo_regexp = { path = "extensions/regexp", version = "0.1.2-pre.3" }
+turso_sqlite3_parser = { path = "vendored/sqlite3-parser", version = "0.1.2-pre.3" }
+limbo_uuid = { path = "extensions/uuid", version = "0.1.2-pre.3" }
 strum = { version = "0.26", features = ["derive"] }
 strum_macros = "0.26"
 serde = "1.0"
