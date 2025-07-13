@@ -385,7 +385,7 @@ pub struct Program {
 }
 
 impl Program {
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn step(
         &self,
         state: &mut ProgramState,
@@ -426,7 +426,7 @@ impl Program {
         }
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn commit_txn(
         &self,
         pager: Rc<Pager>,
@@ -493,7 +493,7 @@ impl Program {
         }
     }
 
-    #[instrument(skip(self, pager, connection), level = Level::INFO)]
+    #[instrument(skip(self, pager, connection), level = Level::DEBUG)]
     fn step_end_write_txn(
         &self,
         pager: &Rc<Pager>,
@@ -577,7 +577,7 @@ pub fn registers_to_ref_values(registers: &[Register]) -> Vec<RefValue> {
         .collect()
 }
 
-#[instrument(skip(program), level = Level::INFO)]
+#[instrument(skip(program), level = Level::DEBUG)]
 fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
     if !tracing::enabled!(tracing::Level::DEBUG) {
         return;

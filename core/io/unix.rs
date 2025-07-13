@@ -67,13 +67,12 @@ impl IO for UnixIO {
         Ok(Arc::new(unix_file))
     }
 
-    #[instrument(err, skip_all, level = Level::INFO)]
+    #[instrument(err, skip_all, level = Level::TRACE)]
     fn run_once(&self) -> Result<()> {
         let mut callbacks = self.callbacks.lock();
         if callbacks.is_empty() {
             return Ok(());
         }
-        trace!("run_once() waits for events");
 
         while let Some(cf) = callbacks.pop() {
             let n = match cf {
@@ -201,7 +200,7 @@ impl File for UnixFile {
         Ok(())
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::TRACE)]
     fn pread(&self, pos: usize, c: Completion) -> Arc<Completion> {
         tracing::trace!("");
         let c = Arc::new(c);
@@ -213,7 +212,7 @@ impl File for UnixFile {
         c
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::TRACE)]
     fn pwrite(
         &self,
         pos: usize,
@@ -231,7 +230,7 @@ impl File for UnixFile {
         c
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::TRACE)]
     fn sync(&self, c: Completion) -> Arc<Completion> {
         tracing::trace!("");
         let c = Arc::new(c);
@@ -242,7 +241,7 @@ impl File for UnixFile {
         c
     }
 
-    #[instrument(err, skip_all, level = Level::INFO)]
+    #[instrument(err, skip_all, level = Level::TRACE)]
     fn size(&self) -> Result<u64> {
         Ok(self.file.metadata()?.len())
     }

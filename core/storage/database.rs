@@ -27,7 +27,7 @@ unsafe impl Sync for DatabaseFile {}
 
 #[cfg(feature = "fs")]
 impl DatabaseStorage for DatabaseFile {
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn read_page(&self, page_idx: usize, c: Completion) {
         let r = c.as_read();
         let size = r.buf().len();
@@ -39,7 +39,7 @@ impl DatabaseStorage for DatabaseFile {
         self.file.pread(pos, c);
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn write_page(&self, page_idx: usize, buffer: Arc<RefCell<Buffer>>, c: Completion) {
         let buffer_size = buffer.borrow().len();
         assert!(page_idx > 0);
@@ -50,12 +50,12 @@ impl DatabaseStorage for DatabaseFile {
         self.file.pwrite(pos, buffer, c);
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn sync(&self, c: Completion) {
         self.file.sync(c);
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn size(&self) -> Result<u64> {
         self.file.size()
     }
@@ -76,7 +76,7 @@ unsafe impl Send for FileMemoryStorage {}
 unsafe impl Sync for FileMemoryStorage {}
 
 impl DatabaseStorage for FileMemoryStorage {
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn read_page(&self, page_idx: usize, c: Completion) {
         let r = match c.completion_type {
             CompletionType::Read(ref r) => r,
@@ -91,7 +91,7 @@ impl DatabaseStorage for FileMemoryStorage {
         self.file.pread(pos, c);
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn write_page(&self, page_idx: usize, buffer: Arc<RefCell<Buffer>>, c: Completion) {
         let buffer_size = buffer.borrow().len();
         assert!(buffer_size >= 512);
@@ -101,12 +101,12 @@ impl DatabaseStorage for FileMemoryStorage {
         self.file.pwrite(pos, buffer, c);
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn sync(&self, c: Completion) {
         self.file.sync(c);
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn size(&self) -> Result<u64> {
         self.file.size()
     }

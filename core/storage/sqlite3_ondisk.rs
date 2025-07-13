@@ -717,7 +717,7 @@ impl PageContent {
     }
 }
 
-#[instrument(skip_all, level = Level::INFO)]
+#[instrument(skip_all, level = Level::DEBUG)]
 pub fn begin_read_page(
     db_file: Arc<dyn DatabaseStorage>,
     buffer_pool: Arc<BufferPool>,
@@ -747,7 +747,7 @@ pub fn begin_read_page(
     db_file.read_page(page_idx, c);
 }
 
-#[instrument(skip_all, level = Level::INFO)]
+#[instrument(skip_all, level = Level::DEBUG)]
 pub fn finish_read_page(
     page_idx: usize,
     buffer_ref: Arc<RefCell<Buffer>>,
@@ -769,7 +769,7 @@ pub fn finish_read_page(
     Ok(())
 }
 
-#[instrument(skip_all, level = Level::INFO)]
+#[instrument(skip_all, level = Level::DEBUG)]
 pub fn begin_write_btree_page(pager: &Pager, page: &PageRef, write_counter: Rc<RefCell<usize>>) {
     tracing::trace!("begin_write_btree_page(page={})", page.get().id);
     let page_source = &pager.db_file;
@@ -804,7 +804,7 @@ pub fn begin_write_btree_page(pager: &Pager, page: &PageRef, write_counter: Rc<R
     page_source.write_page(page_id, buffer.clone(), c)
 }
 
-#[instrument(skip_all, level = Level::INFO)]
+#[instrument(skip_all, level = Level::DEBUG)]
 pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>, syncing: Rc<RefCell<bool>>) {
     assert!(!*syncing.borrow());
     *syncing.borrow_mut() = true;
@@ -1500,7 +1500,7 @@ pub fn begin_read_wal_frame(
     io.pread(offset, c)
 }
 
-#[instrument(skip(io, page, write_counter, wal_header, checksums), level = Level::INFO)]
+#[instrument(skip(io, page, write_counter, wal_header, checksums), level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
 pub fn begin_write_wal_frame(
     io: &Arc<dyn File>,
