@@ -2563,6 +2563,38 @@ pub fn op_seek(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Returns the tie-breaker ordering for SQLite index comparison opcodes.
+///
+/// When comparing index keys that omit the PRIMARY KEY/ROWID, SQLite uses a
+/// tie-breaker value (`default_rc` in the C code) to determine the result when
+/// the non-primary-key portions of the keys are equal.
+///
+/// This function extracts the appropriate tie-breaker based on the comparison opcode:
+///
+/// ## Tie-breaker Logic
+///
+/// - **`IdxLE` and `IdxGT`**: Return `Ordering::Less` (equivalent to `default_rc = -1`)
+///   - When keys are equal, these operations should favor the "less than" result
+///   - `IdxLE`: "less than or equal" - equality should be treated as "less"
+///   - `IdxGT`: "greater than" - equality should be treated as "less" (so condition fails)
+///
+/// - **`IdxGE` and `IdxLT`**: Return `Ordering::Equal` (equivalent to `default_rc = 0`)  
+///   - When keys are equal, these operations should treat it as true equality
+///   - `IdxGE`: "greater than or equal" - equality should be treated as "equal"
+///   - `IdxLT`: "less than" - equality should be treated as "equal" (so condition fails)
+///
+/// ## SQLite Implementation Details
+///
+/// In SQLite's C implementation, this corresponds to:
+/// ```c
+/// if( pOp->opcode<OP_IdxLT ){
+///     assert( pOp->opcode==OP_IdxLE || pOp->opcode==OP_IdxGT );
+///     r.default_rc = -1;  // Ordering::Less
+/// }else{
+///     assert( pOp->opcode==OP_IdxGE || pOp->opcode==OP_IdxLT );
+///     r.default_rc = 0;   // Ordering::Equal
+/// }
+/// ```
 #[inline(always)]
 fn get_tie_breaker_from_idx_comp_op(insn: &Insn) -> std::cmp::Ordering {
     match insn {
