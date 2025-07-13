@@ -138,7 +138,7 @@ print(res.fetchone())
 </details>
 
 <details>
-<summary>🐹 Go</summary>
+<summary>🦫 Go</summary>
 <br>
 
 1. Clone the repository
