@@ -22,39 +22,45 @@ mixin _$Params {
     required TResult Function() none,
     required TResult Function(List<Value> field0) positional,
     required TResult Function(List<(String, Value)> field0) named,
-  }) => throw _privateConstructorUsedError;
+  }) =>
+      throw _privateConstructorUsedError;
   @optionalTypeArgs
   TResult? whenOrNull<TResult extends Object?>({
     TResult? Function()? none,
     TResult? Function(List<Value> field0)? positional,
     TResult? Function(List<(String, Value)> field0)? named,
-  }) => throw _privateConstructorUsedError;
+  }) =>
+      throw _privateConstructorUsedError;
   @optionalTypeArgs
   TResult maybeWhen<TResult extends Object?>({
     TResult Function()? none,
     TResult Function(List<Value> field0)? positional,
     TResult Function(List<(String, Value)> field0)? named,
     required TResult orElse(),
-  }) => throw _privateConstructorUsedError;
+  }) =>
+      throw _privateConstructorUsedError;
   @optionalTypeArgs
   TResult map<TResult extends Object?>({
     required TResult Function(Params_None value) none,
     required TResult Function(Params_Positional value) positional,
     required TResult Function(Params_Named value) named,
-  }) => throw _privateConstructorUsedError;
+  }) =>
+      throw _privateConstructorUsedError;
   @optionalTypeArgs
   TResult? mapOrNull<TResult extends Object?>({
     TResult? Function(Params_None value)? none,
     TResult? Function(Params_Positional value)? positional,
     TResult? Function(Params_Named value)? named,
-  }) => throw _privateConstructorUsedError;
+  }) =>
+      throw _privateConstructorUsedError;
   @optionalTypeArgs
   TResult maybeMap<TResult extends Object?>({
     TResult Function(Params_None value)? none,
     TResult Function(Params_Positional value)? positional,
     TResult Function(Params_Named value)? named,
     required TResult orElse(),
-  }) => throw _privateConstructorUsedError;
+  }) =>
+      throw _privateConstructorUsedError;
 }
 
 /// @nodoc
@@ -220,7 +226,7 @@ class __$$Params_PositionalImplCopyWithImpl<$Res>
         null == field0
             ? _value._field0
             : field0 // ignore: cast_nullable_to_non_nullable
-                  as List<Value>,
+                as List<Value>,
       ),
     );
   }
@@ -230,8 +236,8 @@ class __$$Params_PositionalImplCopyWithImpl<$Res>
 
 class _$Params_PositionalImpl extends Params_Positional {
   const _$Params_PositionalImpl(final List<Value> field0)
-    : _field0 = field0,
-      super._();
+      : _field0 = field0,
+        super._();
 
   final List<Value> _field0;
   @override
@@ -381,7 +387,7 @@ class __$$Params_NamedImplCopyWithImpl<$Res>
         null == field0
             ? _value._field0
             : field0 // ignore: cast_nullable_to_non_nullable
-                  as List<(String, Value)>,
+                as List<(String, Value)>,
       ),
     );
   }
@@ -391,8 +397,8 @@ class __$$Params_NamedImplCopyWithImpl<$Res>
 
 class _$Params_NamedImpl extends Params_Named {
   const _$Params_NamedImpl(final List<(String, Value)> field0)
-    : _field0 = field0,
-      super._();
+      : _field0 = field0,
+        super._();
 
   final List<(String, Value)> _field0;
   @override

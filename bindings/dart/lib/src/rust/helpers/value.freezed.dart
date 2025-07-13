@@ -24,7 +24,8 @@ mixin _$Value {
     required TResult Function(String field0) text,
     required TResult Function(Uint8List field0) blob,
     required TResult Function() null_,
-  }) => throw _privateConstructorUsedError;
+  }) =>
+      throw _privateConstructorUsedError;
   @optionalTypeArgs
   TResult? whenOrNull<TResult extends Object?>({
     TResult? Function(int field0)? integer,
@@ -32,7 +33,8 @@ mixin _$Value {
     TResult? Function(String field0)? text,
     TResult? Function(Uint8List field0)? blob,
     TResult? Function()? null_,
-  }) => throw _privateConstructorUsedError;
+  }) =>
+      throw _privateConstructorUsedError;
   @optionalTypeArgs
   TResult maybeWhen<TResult extends Object?>({
     TResult Function(int field0)? integer,
@@ -41,7 +43,8 @@ mixin _$Value {
     TResult Function(Uint8List field0)? blob,
     TResult Function()? null_,
     required TResult orElse(),
-  }) => throw _privateConstructorUsedError;
+  }) =>
+      throw _privateConstructorUsedError;
   @optionalTypeArgs
   TResult map<TResult extends Object?>({
     required TResult Function(Value_Integer value) integer,
@@ -49,7 +52,8 @@ mixin _$Value {
     required TResult Function(Value_Text value) text,
     required TResult Function(Value_Blob value) blob,
     required TResult Function(Value_Null value) null_,
-  }) => throw _privateConstructorUsedError;
+  }) =>
+      throw _privateConstructorUsedError;
   @optionalTypeArgs
   TResult? mapOrNull<TResult extends Object?>({
     TResult? Function(Value_Integer value)? integer,
@@ -57,7 +61,8 @@ mixin _$Value {
     TResult? Function(Value_Text value)? text,
     TResult? Function(Value_Blob value)? blob,
     TResult? Function(Value_Null value)? null_,
-  }) => throw _privateConstructorUsedError;
+  }) =>
+      throw _privateConstructorUsedError;
   @optionalTypeArgs
   TResult maybeMap<TResult extends Object?>({
     TResult Function(Value_Integer value)? integer,
@@ -66,7 +71,8 @@ mixin _$Value {
     TResult Function(Value_Blob value)? blob,
     TResult Function(Value_Null value)? null_,
     required TResult orElse(),
-  }) => throw _privateConstructorUsedError;
+  }) =>
+      throw _privateConstructorUsedError;
 }
 
 /// @nodoc
@@ -118,7 +124,7 @@ class __$$Value_IntegerImplCopyWithImpl<$Res>
         null == field0
             ? _value.field0
             : field0 // ignore: cast_nullable_to_non_nullable
-                  as int,
+                as int,
       ),
     );
   }
@@ -279,7 +285,7 @@ class __$$Value_RealImplCopyWithImpl<$Res>
         null == field0
             ? _value.field0
             : field0 // ignore: cast_nullable_to_non_nullable
-                  as double,
+                as double,
       ),
     );
   }
@@ -440,7 +446,7 @@ class __$$Value_TextImplCopyWithImpl<$Res>
         null == field0
             ? _value.field0
             : field0 // ignore: cast_nullable_to_non_nullable
-                  as String,
+                as String,
       ),
     );
   }
@@ -601,7 +607,7 @@ class __$$Value_BlobImplCopyWithImpl<$Res>
         null == field0
             ? _value.field0
             : field0 // ignore: cast_nullable_to_non_nullable
-                  as Uint8List,
+                as Uint8List,
       ),
     );
   }
