@@ -29,7 +29,7 @@ use crate::{
     function::{AggFunc, FuncCtx},
     storage::{pager::PagerCacheCommitStatus, sqlite3_ondisk::SmallVec},
     translate::plan::TableReferences,
-    types::{RawSlice, SeekKey, SeekOp, TextRef},
+    types::{RawSlice, TextRef},
     vdbe::execute::OpIdxInsertState,
     vdbe::execute::OpInsertState,
     vdbe::execute::OpNewRowidState,
