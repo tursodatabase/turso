@@ -736,7 +736,7 @@ pub fn begin_read_page(
         let buf_len = buf.borrow().len();
         turso_assert!(
             bytes_read == buf_len as i32,
-            "read({bytes_read}) less than expected({buf_len})"
+            "read({bytes_read}) != expected({buf_len})"
         );
         let page = page.clone();
         if finish_read_page(page_idx, buf, page.clone()).is_err() {
@@ -800,7 +800,7 @@ pub fn begin_write_btree_page(
             page_finish.clear_dirty();
             turso_assert!(
                 bytes_written == buf_len as i32,
-                "wrote({bytes_written}) less than expected({buf_len})"
+                "wrote({bytes_written}) != expected({buf_len})"
             );
         })
     };
@@ -1336,7 +1336,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
         let buf_slice = buf.as_slice();
         turso_assert!(
             bytes_read == buf_slice.len() as i32,
-            "read({bytes_read}) less than expected({})",
+            "read({bytes_read}) != expected({})",
             buf_slice.len()
         );
         let mut header_locked = header.lock();
@@ -1594,7 +1594,7 @@ pub fn begin_write_wal_frame(
             page_finish.clear_dirty();
             turso_assert!(
                 bytes_written == buf_len as i32,
-                "wrote({bytes_written}) less than expected({buf_len})"
+                "wrote({bytes_written}) != expected({buf_len})"
             );
         })
     };
@@ -1635,7 +1635,7 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
         Box::new(move |bytes_written: i32| {
             turso_assert!(
                 bytes_written == WAL_HEADER_SIZE as i32,
-                "wal header wrote({bytes_written}) less than expected({WAL_HEADER_SIZE})"
+                "wal header wrote({bytes_written}) != expected({WAL_HEADER_SIZE})"
             );
         })
     };

@@ -651,7 +651,7 @@ impl Wal for WalFile {
             let buf_len = buf.len();
             turso_assert!(
                 bytes_read == buf_len as i32,
-                "read({bytes_read}) less than expected({buf_len})"
+                "read({bytes_read}) != expected({buf_len})"
             );
             let buf_ptr = buf.as_ptr();
             unsafe {

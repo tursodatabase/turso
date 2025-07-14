@@ -1,6 +1,6 @@
+use crate::error::LimboError;
 use crate::io::common;
 use crate::Result;
-use crate::{error::LimboError, turso_assert};
 
 use super::{Completion, File, MemoryIO, OpenFlags, IO};
 use crate::io::clock::{Clock, Instant};
@@ -345,7 +345,6 @@ impl File for UnixFile<'_> {
         let c = Arc::new(c);
         match result {
             Ok(n) => {
-                let r = c.as_read();
                 trace!("pread n: {}", n);
                 // Read succeeded immediately
                 c.complete(n as i32);
