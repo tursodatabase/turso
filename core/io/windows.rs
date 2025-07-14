@@ -84,13 +84,14 @@ impl File for WindowsFile {
     fn pread(&self, pos: usize, c: Completion) -> Result<Arc<Completion>> {
         let mut file = self.file.borrow_mut();
         file.seek(std::io::SeekFrom::Start(pos as u64))?;
-        {
+        let nr = {
             let r = c.as_read();
             let mut buf = r.buf_mut();
             let buf = buf.as_mut_slice();
             file.read_exact(buf)?;
-        }
-        c.complete(0);
+            buf.len() as i32
+        };
+        c.complete(nr);
         Ok(Arc::new(c))
     }
 
