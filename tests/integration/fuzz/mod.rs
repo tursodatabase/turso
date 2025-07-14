@@ -64,9 +64,19 @@ mod tests {
         let db = TempDatabase::new_with_rusqlite("CREATE TABLE t(x INTEGER PRIMARY KEY)", false); // INTEGER PRIMARY KEY is a rowid alias, so an index is not created
         let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
 
+        let (mut rng, _seed) = rng_from_time_or_env();
+
+        let mut values: Vec<i32> = Vec::with_capacity(3000);
+        while values.len() < 3000 {
+            let val = rng.random_range(-100000..100000);
+            if !values.contains(&val) {
+                values.push(val);
+            }
+        }
         let insert = format!(
             "INSERT INTO t VALUES {}",
-            (1..100)
+            values
+                .iter()
                 .map(|x| format!("({x})"))
                 .collect::<Vec<_>>()
                 .join(", ")
