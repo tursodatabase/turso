@@ -2302,6 +2302,15 @@ pub enum CursorResult<T> {
 }
 
 #[derive(Debug)]
+/// Result of an generic IO operation.
+// Currently we have a lot of different enums that are just Done(T)/IO, which could be abstracted into
+// a single enum. TODO: Use this enum instead of separate enums for each IO operation when applicable.
+pub enum IoResult<T> {
+    Done(T),
+    IO,
+}
+
+#[derive(Debug)]
 pub enum SeekResult {
     /// Record matching the [SeekOp] found in the B-tree and cursor was positioned to point onto that record
     Found,
