@@ -205,6 +205,17 @@ impl Connection {
         })?;
         Ok(())
     }
+
+    /// Flush dirty pages to disk.
+    /// This will write the dirty pages to the WAL.
+    pub fn cacheflush(&self) -> Result<()> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        conn.cacheflush()?;
+        Ok(())
+    }
 }
 
 impl Debug for Connection {
