@@ -2426,7 +2426,7 @@ mod tests {
             Value::Float(f) => RefValue::Float(*f),
             Value::Text(text) => RefValue::Text(TextRef {
                 value: RawSlice::from_slice(&text.value),
-                subtype: text.subtype.clone(),
+                subtype: text.subtype,
             }),
             Value::Blob(blob) => RefValue::Blob(RawSlice::from_slice(blob)),
         }
