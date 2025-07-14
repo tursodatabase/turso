@@ -218,13 +218,12 @@ impl turso_core::File for File {
             turso_core::CompletionType::Read(ref r) => r,
             _ => unreachable!(),
         };
-        {
+        let nr = {
             let mut buf = r.buf_mut();
             let buf: &mut [u8] = buf.as_mut_slice();
-            let nr = self.vfs.pread(self.fd, buf, pos);
-            assert!(nr >= 0);
-        }
-        r.complete();
+            self.vfs.pread(self.fd, buf, pos)
+        };
+        r.complete(nr);
         #[allow(clippy::arc_with_non_send_sync)]
         Ok(Arc::new(c))
     }
