@@ -34,6 +34,59 @@ impl<'a> ImportFile<'a> {
     }
 
     pub fn import_csv(&mut self, args: ImportArgs) {
+        // Check if the target table exists
+        let table_check_query = format!(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='{}';",
+            args.table
+        );
+
+        match self.conn.query(table_check_query) {
+            Ok(rows) => {
+                if let Some(mut rows) = rows {
+                    let mut table_exists = false;
+                    loop {
+                        match rows.step() {
+                            Ok(turso_core::StepResult::Row) => {
+                                table_exists = true;
+                                break;
+                            }
+                            Ok(turso_core::StepResult::Done) => break,
+                            Ok(turso_core::StepResult::IO) => {
+                                rows.run_once().unwrap();
+                            }
+                            Ok(
+                                turso_core::StepResult::Interrupt | turso_core::StepResult::Busy,
+                            ) => break,
+                            Err(e) => {
+                                let _ = self.writer.write_all(
+                                    format!("Error checking table existence: {e:?}\n").as_bytes(),
+                                );
+                                return;
+                            }
+                        }
+                    }
+
+                    if !table_exists {
+                        let _ = self.writer.write_all(
+                            format!("Error: no such table: {}\n", args.table).as_bytes(),
+                        );
+                        return;
+                    }
+                } else {
+                    let _ = self
+                        .writer
+                        .write_all(format!("Error: no such table: {}\n", args.table).as_bytes());
+                    return;
+                }
+            }
+            Err(e) => {
+                let _ = self
+                    .writer
+                    .write_all(format!("Error checking table existence: {e:?}\n").as_bytes());
+                return;
+            }
+        }
+
         let file = match File::open(args.file) {
             Ok(file) => file,
             Err(e) => {
