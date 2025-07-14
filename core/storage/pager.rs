@@ -8,6 +8,7 @@ use crate::storage::wal::{CheckpointResult, Wal, WalFsyncStatus};
 use crate::types::CursorResult;
 use crate::{Buffer, Connection, LimboError, Result};
 use crate::{Completion, WalFile};
+use bitflags::bitflags;
 use parking_lot::RwLock;
 use std::cell::{OnceCell, RefCell, UnsafeCell};
 use std::collections::HashSet;
@@ -33,6 +34,20 @@ pub struct PageInner {
 #[derive(Debug)]
 pub struct Page {
     pub inner: UnsafeCell<PageInner>,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct SpillFlag(u8);
+
+bitflags! {
+    impl SpillFlag: u8 {
+        /// Never spill cache. Set via pragma
+        const OFF = 0b01;
+        /// Current rolling back, so do not spill
+        const ROLLBACK = 0b10;
+        /// Spill is ok, but do not sync
+        const NO_SYNC = 0b11;
+    }
 }
 
 // Concurrency control of pages will be handled by the pager, we won't wrap Page with RwLock
@@ -243,6 +258,7 @@ pub struct Pager {
     /// to change it.
     page_size: OnceCell<u16>,
     reserved_space: OnceCell<u8>,
+    spill_flag: SpillFlag,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -320,6 +336,7 @@ impl Pager {
                 state: FlushState::Start,
                 in_flight_writes: Rc::new(RefCell::new(0)),
             }),
+            spill_flag: SpillFlag::empty(),
         })
     }
 
