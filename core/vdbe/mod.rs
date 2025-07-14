@@ -385,7 +385,7 @@ pub struct Program {
 }
 
 impl Program {
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn step(
         &self,
         state: &mut ProgramState,
@@ -397,7 +397,7 @@ impl Program {
                 // Connection is closed for whatever reason, rollback the transaction.
                 let state = self.connection.transaction_state.get();
                 if let TransactionState::Write { schema_did_change } = state {
-                    pager.rollback(schema_did_change, &self.connection)?
+                    pager.rollback(schema_did_change, &self.connection)
                 }
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
@@ -412,7 +412,7 @@ impl Program {
             if res.is_err() {
                 let state = self.connection.transaction_state.get();
                 if let TransactionState::Write { schema_did_change } = state {
-                    pager.rollback(schema_did_change, &self.connection)?
+                    pager.rollback(schema_did_change, &self.connection)
                 }
             }
             match res? {
@@ -426,7 +426,7 @@ impl Program {
         }
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn commit_txn(
         &self,
         pager: Rc<Pager>,
@@ -493,7 +493,7 @@ impl Program {
         }
     }
 
-    #[instrument(skip(self, pager, connection), level = Level::INFO)]
+    #[instrument(skip(self, pager, connection), level = Level::DEBUG)]
     fn step_end_write_txn(
         &self,
         pager: &Rc<Pager>,
@@ -517,7 +517,7 @@ impl Program {
                     status,
                     crate::storage::pager::PagerCacheflushResult::Rollback
                 ) {
-                    pager.rollback(schema_did_change, connection)?;
+                    pager.rollback(schema_did_change, connection);
                 }
                 connection.transaction_state.replace(TransactionState::None);
                 *commit_state = CommitState::Ready;
@@ -577,12 +577,12 @@ pub fn registers_to_ref_values(registers: &[Register]) -> Vec<RefValue> {
         .collect()
 }
 
-#[instrument(skip(program), level = Level::INFO)]
+#[instrument(skip(program), level = Level::DEBUG)]
 fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
-    if !tracing::enabled!(tracing::Level::TRACE) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
         return;
     }
-    tracing::trace!(
+    tracing::debug!(
         "\n{}",
         explain::insn_to_str(
             program,

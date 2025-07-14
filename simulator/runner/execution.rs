@@ -174,7 +174,7 @@ pub(crate) enum ExecutionContinuation {
     NextProperty,
 }
 
-#[instrument(skip(env, interaction, stack), fields(interaction = %interaction))]
+#[instrument(skip_all)]
 pub(crate) fn execute_interaction(
     env: &mut SimulatorEnv,
     connection_index: usize,
@@ -182,7 +182,7 @@ pub(crate) fn execute_interaction(
     stack: &mut Vec<ResultSet>,
 ) -> Result<ExecutionContinuation> {
     // Leave this empty info! here to print the span of the execution
-    tracing::info!("");
+    tracing::info!(connection_index, %interaction);
     match interaction {
         Interaction::Query(_) => {
             let conn = match &mut env.connections[connection_index] {

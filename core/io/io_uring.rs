@@ -272,7 +272,7 @@ impl File for UringFile {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: Completion) -> Result<Arc<Completion>> {
+    fn pread(&self, pos: usize, c: Completion) -> Arc<Completion> {
         let r = c.as_read();
         trace!("pread(pos = {}, length = {})", pos, r.buf().len());
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
@@ -289,7 +289,7 @@ impl File for UringFile {
         };
         let c = Arc::new(c);
         io.ring.submit_entry(&read_e, c.clone());
-        Ok(c)
+        c
     }
 
     fn pwrite(
@@ -297,7 +297,7 @@ impl File for UringFile {
         pos: usize,
         buffer: Arc<RefCell<crate::Buffer>>,
         c: Completion,
-    ) -> Result<Arc<Completion>> {
+    ) -> Arc<Completion> {
         let mut io = self.io.borrow_mut();
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
         let write = {
@@ -321,10 +321,10 @@ impl File for UringFile {
                 })),
             ))),
         );
-        Ok(c)
+        c
     }
 
-    fn sync(&self, c: Completion) -> Result<Arc<Completion>> {
+    fn sync(&self, c: Completion) -> Arc<Completion> {
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
         let mut io = self.io.borrow_mut();
         trace!("sync()");
@@ -333,7 +333,7 @@ impl File for UringFile {
             .user_data(io.ring.get_key());
         let c = Arc::new(c);
         io.ring.submit_entry(&sync, c.clone());
-        Ok(c)
+        c
     }
 
     fn size(&self) -> Result<u64> {

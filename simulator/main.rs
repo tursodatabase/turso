@@ -17,6 +17,7 @@ use std::fs::OpenOptions;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
+use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::field::MakeExt;
 use tracing_subscriber::fmt::format;
 use tracing_subscriber::EnvFilter;
@@ -53,7 +54,7 @@ impl Paths {
 }
 
 fn main() -> anyhow::Result<()> {
-    init_logger();
+    let _guard = init_logger();
     let mut cli_opts = SimulatorCLI::parse();
     cli_opts.validate()?;
 
@@ -697,7 +698,7 @@ fn run_simulation(
     result
 }
 
-fn init_logger() {
+fn init_logger() -> WorkerGuard {
     let file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -705,9 +706,11 @@ fn init_logger() {
         .open("simulator.log")
         .unwrap();
 
+    let (file, guard) = tracing_appender::non_blocking(file);
+
     let requires_ansi = std::io::stdout().is_terminal();
 
-    let _ = tracing_subscriber::registry()
+    tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(requires_ansi)
@@ -727,7 +730,8 @@ fn init_logger() {
                 .with_thread_ids(false)
                 .map_fmt_fields(|f| f.debug_alt()),
         )
-        .try_init();
+        .init();
+    guard
 }
 
 fn banner() {

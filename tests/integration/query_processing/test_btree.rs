@@ -437,7 +437,7 @@ fn write_at(io: &impl IO, file: Arc<dyn File>, offset: usize, data: &[u8]) {
     let drop_fn = Rc::new(move |_| {});
     #[allow(clippy::arc_with_non_send_sync)]
     let buffer = Arc::new(RefCell::new(Buffer::new(Pin::new(data.to_vec()), drop_fn)));
-    let result = file.pwrite(offset, buffer, completion).unwrap();
+    let result = file.pwrite(offset, buffer, completion);
     while !result.is_completed() {
         io.run_once().unwrap();
     }

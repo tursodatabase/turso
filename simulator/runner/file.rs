@@ -105,19 +105,8 @@ impl File for SimulatorFile {
         self.inner.unlock_file()
     }
 
-    fn pread(
-        &self,
-        pos: usize,
-        mut c: turso_core::Completion,
-    ) -> Result<Arc<turso_core::Completion>> {
+    fn pread(&self, pos: usize, mut c: turso_core::Completion) -> Arc<turso_core::Completion> {
         self.nr_pread_calls.set(self.nr_pread_calls.get() + 1);
-        if self.fault.get() {
-            tracing::debug!("pread fault");
-            self.nr_pread_faults.set(self.nr_pread_faults.get() + 1);
-            return Err(turso_core::LimboError::InternalError(
-                FAULT_ERROR_MSG.into(),
-            ));
-        }
         if let Some(latency) = self.generate_latency_duration() {
             let CompletionType::Read(read_completion) = &mut c.completion_type else {
                 unreachable!();
@@ -144,15 +133,8 @@ impl File for SimulatorFile {
         pos: usize,
         buffer: Arc<RefCell<turso_core::Buffer>>,
         mut c: turso_core::Completion,
-    ) -> Result<Arc<turso_core::Completion>> {
+    ) -> Arc<turso_core::Completion> {
         self.nr_pwrite_calls.set(self.nr_pwrite_calls.get() + 1);
-        if self.fault.get() {
-            tracing::debug!("pwrite fault");
-            self.nr_pwrite_faults.set(self.nr_pwrite_faults.get() + 1);
-            return Err(turso_core::LimboError::InternalError(
-                FAULT_ERROR_MSG.into(),
-            ));
-        }
         if let Some(latency) = self.generate_latency_duration() {
             let CompletionType::Write(write_completion) = &mut c.completion_type else {
                 unreachable!();
@@ -174,15 +156,8 @@ impl File for SimulatorFile {
         self.inner.pwrite(pos, buffer, c)
     }
 
-    fn sync(&self, mut c: turso_core::Completion) -> Result<Arc<turso_core::Completion>> {
+    fn sync(&self, mut c: turso_core::Completion) -> Arc<turso_core::Completion> {
         self.nr_sync_calls.set(self.nr_sync_calls.get() + 1);
-        if self.fault.get() {
-            tracing::debug!("sync fault");
-            self.nr_sync_faults.set(self.nr_sync_faults.get() + 1);
-            return Err(turso_core::LimboError::InternalError(
-                FAULT_ERROR_MSG.into(),
-            ));
-        }
         if let Some(latency) = self.generate_latency_duration() {
             let CompletionType::Sync(sync_completion) = &mut c.completion_type else {
                 unreachable!();
@@ -201,9 +176,9 @@ impl File for SimulatorFile {
             };
             sync_completion.complete = Box::new(new_complete);
         };
-        let c = self.inner.sync(c)?;
+        let c = self.inner.sync(c);
         *self.sync_completion.borrow_mut() = Some(c.clone());
-        Ok(c)
+        c
     }
 
     fn size(&self) -> Result<u64> {

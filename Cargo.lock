@@ -1967,6 +1967,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
  "turso_core",
  "turso_sqlite3_parser",

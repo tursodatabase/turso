@@ -201,7 +201,7 @@ pub enum TransactionMode {
 
 /// Main entry point for emitting bytecode for a SQL query
 /// Takes a query plan and generates the corresponding bytecode program
-#[instrument(skip_all, level = Level::INFO)]
+#[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program(
     program: &mut ProgramBuilder,
     plan: Plan,
@@ -219,7 +219,7 @@ pub fn emit_program(
     }
 }
 
-#[instrument(skip_all, level = Level::INFO)]
+#[instrument(skip_all, level = Level::DEBUG)]
 fn emit_program_for_select(
     program: &mut ProgramBuilder,
     mut plan: SelectPlan,
@@ -258,7 +258,7 @@ fn emit_program_for_select(
     Ok(())
 }
 
-#[instrument(skip_all, level = Level::INFO)]
+#[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_query<'a>(
     program: &mut ProgramBuilder,
     plan: &'a mut SelectPlan,
@@ -398,7 +398,7 @@ pub fn emit_query<'a>(
     Ok(t_ctx.reg_result_cols_start.unwrap())
 }
 
-#[instrument(skip_all, level = Level::INFO)]
+#[instrument(skip_all, level = Level::DEBUG)]
 fn emit_program_for_delete(
     program: &mut ProgramBuilder,
     plan: DeletePlan,
@@ -614,7 +614,7 @@ fn emit_delete_insns(
     Ok(())
 }
 
-#[instrument(skip_all, level = Level::INFO)]
+#[instrument(skip_all, level = Level::DEBUG)]
 fn emit_program_for_update(
     program: &mut ProgramBuilder,
     mut plan: UpdatePlan,
@@ -733,7 +733,7 @@ fn emit_program_for_update(
     Ok(())
 }
 
-#[instrument(skip_all, level = Level::INFO)]
+#[instrument(skip_all, level = Level::DEBUG)]
 fn emit_update_insns(
     plan: &UpdatePlan,
     t_ctx: &TranslateCtx,

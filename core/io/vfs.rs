@@ -76,6 +76,12 @@ impl VfsMod {
     }
 }
 
+extern "C" fn completion_callback(completion: *const c_void, result: i32) {
+    assert!(!completion.is_null(), "Completion Is Null");
+    let completion = unsafe { Arc::from_raw(completion as *const Completion) };
+    completion.complete(result)
+}
+
 impl File for VfsFileImpl {
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         let vfs = unsafe { &*self.vfs };
@@ -98,63 +104,65 @@ impl File for VfsFileImpl {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: Completion) -> Result<Arc<Completion>> {
+    fn pread(&self, pos: usize, c: Completion) -> Arc<Completion> {
+        let c = Arc::new(c);
         let r = match c.completion_type {
             CompletionType::Read(ref r) => r,
             _ => unreachable!(),
         };
-        let result = {
+        assert!(!self.vfs.is_null(), "VFS is null");
+        let clone_c = c.clone();
+        {
             let mut buf = r.buf_mut();
             let count = buf.len();
             let vfs = unsafe { &*self.vfs };
-            unsafe { (vfs.read)(self.file, buf.as_mut_ptr(), count, pos as i64) }
-        };
-        if result < 0 {
-            Err(LimboError::ExtensionError("pread failed".to_string()))
-        } else {
-            c.complete(result);
-            Ok(Arc::new(c))
+            unsafe {
+                (vfs.read)(
+                    self.file,
+                    buf.as_mut_ptr(),
+                    count,
+                    pos as i64,
+                    Arc::into_raw(clone_c) as *const c_void,
+                    completion_callback as *const c_void,
+                )
+            }
         }
+        c
     }
 
-    fn pwrite(
-        &self,
-        pos: usize,
-        buffer: Arc<RefCell<Buffer>>,
-        c: Completion,
-    ) -> Result<Arc<Completion>> {
+    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<Buffer>>, c: Completion) -> Arc<Completion> {
         let buf = buffer.borrow();
         let count = buf.as_slice().len();
-        if self.vfs.is_null() {
-            return Err(LimboError::ExtensionError("VFS is null".to_string()));
-        }
+        assert!(!self.vfs.is_null(), "VFS is null");
+        let c = Arc::new(c);
+        let clone_c = c.clone();
         let vfs = unsafe { &*self.vfs };
-        let result = unsafe {
+        unsafe {
             (vfs.write)(
                 self.file,
                 buf.as_slice().as_ptr() as *mut u8,
                 count,
                 pos as i64,
+                Arc::into_raw(clone_c) as *const c_void,
+                completion_callback as *const c_void,
             )
         };
-
-        if result < 0 {
-            Err(LimboError::ExtensionError("pwrite failed".to_string()))
-        } else {
-            c.complete(result);
-            Ok(Arc::new(c))
-        }
+        c
     }
 
-    fn sync(&self, c: Completion) -> Result<Arc<Completion>> {
+    fn sync(&self, c: Completion) -> Arc<Completion> {
         let vfs = unsafe { &*self.vfs };
-        let result = unsafe { (vfs.sync)(self.file) };
-        if result < 0 {
-            Err(LimboError::ExtensionError("sync failed".to_string()))
-        } else {
-            c.complete(0);
-            Ok(Arc::new(c))
-        }
+        assert!(!self.vfs.is_null(), "VFS is null");
+        let c = Arc::new(c);
+        let clone_c = c.clone();
+        unsafe {
+            (vfs.sync)(
+                self.file,
+                Arc::into_raw(clone_c) as *const c_void,
+                completion_callback as *const c_void,
+            )
+        };
+        c
     }
 
     fn size(&self) -> Result<u64> {

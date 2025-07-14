@@ -53,7 +53,7 @@ use transaction::{translate_tx_begin, translate_tx_commit};
 use turso_sqlite3_parser::ast::{self, Delete, Insert};
 use update::translate_update;
 
-#[instrument(skip_all, level = Level::INFO)]
+#[instrument(skip_all, level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
 pub fn translate(
     schema: &Schema,
