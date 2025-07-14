@@ -221,9 +221,9 @@ impl turso_core::File for File {
         let nr = {
             let mut buf = r.buf_mut();
             let buf: &mut [u8] = buf.as_mut_slice();
-            self.vfs.pread(self.fd, buf, pos);
-        }
-        r.complete();
+            self.vfs.pread(self.fd, buf, pos)
+        };
+        r.complete(nr);
         #[allow(clippy::arc_with_non_send_sync)]
         Arc::new(c)
     }
@@ -414,10 +414,10 @@ extern "C" {
     fn close(this: &VFS, fd: i32) -> bool;
 
     #[wasm_bindgen(method)]
-    fn pwrite(this: &VFS, fd: i32, buffer: &[u8], offset: usize);
+    fn pwrite(this: &VFS, fd: i32, buffer: &[u8], offset: usize) -> i32;
 
     #[wasm_bindgen(method)]
-    fn pread(this: &VFS, fd: i32, buffer: &mut [u8], offset: usize);
+    fn pread(this: &VFS, fd: i32, buffer: &mut [u8], offset: usize) -> i32;
 
     #[wasm_bindgen(method)]
     fn size(this: &VFS, fd: i32) -> u64;
