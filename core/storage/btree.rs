@@ -4147,7 +4147,7 @@ impl BTreeCursor {
         Ok(IOResult::Done(Some(record_ref)))
     }
 
-    #[instrument(skip(self), level = Level::DEBUG)]
+    #[instrument(skip(self, key), level = Level::DEBUG)]
     pub fn insert(
         &mut self,
         key: &BTreeKey,
@@ -4156,6 +4156,7 @@ impl BTreeCursor {
         // variables are very hard to reason about
         mut moved_before: bool,
     ) -> Result<IOResult<()>> {
+        tracing::trace!(?key);
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
         match &self.mv_cursor {
             Some(mv_cursor) => match key.maybe_rowid() {
