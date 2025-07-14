@@ -61,7 +61,7 @@ use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::pager::Pager;
 use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
-use crate::{File, Result, WalFileShared};
+use crate::{turso_assert, File, Result, WalFileShared};
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
@@ -732,7 +732,12 @@ pub fn begin_read_page(
     });
     #[allow(clippy::arc_with_non_send_sync)]
     let buf = Arc::new(RefCell::new(Buffer::new(buf, drop_fn)));
-    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>, bytes_read: i32| {
+        let buf_len = buf.borrow().len();
+        turso_assert!(
+            bytes_read == buf_len as i32,
+            "read({bytes_read}) less than expected({buf_len})"
+        );
         let page = page.clone();
         if finish_read_page(page_idx, buf, page.clone()).is_err() {
             page.set_error();
@@ -793,9 +798,10 @@ pub fn begin_write_btree_page(
             *clone_counter.borrow_mut() -= 1;
 
             page_finish.clear_dirty();
-            if bytes_written < buf_len as i32 {
-                tracing::error!("wrote({bytes_written}) less than expected({buf_len})");
-            }
+            turso_assert!(
+                bytes_written == buf_len as i32,
+                "wrote({bytes_written}) less than expected({buf_len})"
+            );
         })
     };
     let c = Completion::new(CompletionType::Write(WriteCompletion::new(write_complete)));
@@ -1325,9 +1331,14 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
     }));
     let wal_file_shared_for_completion = wal_file_shared_ret.clone();
 
-    let complete: Box<Complete> = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+    let complete: Box<Complete> = Box::new(move |buf: Arc<RefCell<Buffer>>, bytes_read: i32| {
         let buf = buf.borrow();
         let buf_slice = buf.as_slice();
+        turso_assert!(
+            bytes_read == buf_slice.len() as i32,
+            "read({bytes_read}) less than expected({})",
+            buf_slice.len()
+        );
         let mut header_locked = header.lock();
         // Read header
         header_locked.magic =
@@ -1484,7 +1495,7 @@ pub fn begin_read_wal_frame(
     io: &Arc<dyn File>,
     offset: usize,
     buffer_pool: Arc<BufferPool>,
-    complete: Box<dyn Fn(Arc<RefCell<Buffer>>)>,
+    complete: Box<dyn Fn(Arc<RefCell<Buffer>>, i32)>,
 ) -> Result<Arc<Completion>> {
     tracing::trace!("begin_read_wal_frame(offset={})", offset);
     let buf = buffer_pool.get();
@@ -1581,9 +1592,10 @@ pub fn begin_write_wal_frame(
             *clone_counter.borrow_mut() -= 1;
 
             page_finish.clear_dirty();
-            if bytes_written < buf_len as i32 {
-                tracing::error!("wrote({bytes_written}) less than expected({buf_len})");
-            }
+            turso_assert!(
+                bytes_written == buf_len as i32,
+                "wrote({bytes_written}) less than expected({buf_len})"
+            );
         })
     };
     #[allow(clippy::arc_with_non_send_sync)]
@@ -1603,7 +1615,7 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
     let buffer = {
         let drop_fn = Rc::new(|_buf| {});
 
-        let mut buffer = Buffer::allocate(512, drop_fn);
+        let mut buffer = Buffer::allocate(WAL_HEADER_SIZE, drop_fn);
         let buf = buffer.as_mut_slice();
 
         buf[0..4].copy_from_slice(&header.magic.to_be_bytes());
@@ -1621,11 +1633,10 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
 
     let write_complete = {
         Box::new(move |bytes_written: i32| {
-            if bytes_written < WAL_HEADER_SIZE as i32 {
-                tracing::error!(
-                    "wal header wrote({bytes_written}) less than expected({WAL_HEADER_SIZE})"
-                );
-            }
+            turso_assert!(
+                bytes_written == WAL_HEADER_SIZE as i32,
+                "wal header wrote({bytes_written}) less than expected({WAL_HEADER_SIZE})"
+            );
         })
     };
     #[allow(clippy::arc_with_non_send_sync)]

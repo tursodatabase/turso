@@ -123,13 +123,13 @@ impl File for SimulatorFile {
                 unreachable!();
             };
             let before = self.rng.borrow_mut().gen_bool(0.5);
-            let dummy_complete = Box::new(|_| {});
+            let dummy_complete = Box::new(|_, _| {});
             let prev_complete = std::mem::replace(&mut read_completion.complete, dummy_complete);
-            let new_complete = move |res| {
+            let new_complete = move |res, bytes_read| {
                 if before {
                     std::thread::sleep(latency);
                 }
-                (prev_complete)(res);
+                (prev_complete)(res, bytes_read);
                 if !before {
                     std::thread::sleep(latency);
                 }

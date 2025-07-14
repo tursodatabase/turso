@@ -23,7 +23,7 @@ use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_write_wal_frame, finish_read_page, WAL_FRAME_HEADER_SIZE,
     WAL_HEADER_SIZE,
 };
-use crate::{Buffer, LimboError, Result};
+use crate::{turso_assert, Buffer, LimboError, Result};
 use crate::{Completion, Page};
 
 use self::sqlite3_ondisk::{checksum_wal, PageContent, WAL_MAGIC_BE, WAL_MAGIC_LE};
@@ -618,7 +618,12 @@ impl Wal for WalFile {
         let offset = self.frame_offset(frame_id);
         page.set_locked();
         let frame = page.clone();
-        let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+        let complete = Box::new(move |buf: Arc<RefCell<Buffer>>, bytes_read: i32| {
+            let buf_len = buf.borrow().len();
+            turso_assert!(
+                bytes_read == buf_len as i32,
+                "read({bytes_read}) less than expected({buf_len})"
+            );
             let frame = frame.clone();
             finish_read_page(page.get().id, buf, frame).unwrap();
         });
@@ -641,8 +646,13 @@ impl Wal for WalFile {
     ) -> Result<Arc<Completion>> {
         tracing::debug!("read_frame({})", frame_id);
         let offset = self.frame_offset(frame_id);
-        let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+        let complete = Box::new(move |buf: Arc<RefCell<Buffer>>, bytes_read: i32| {
             let buf = buf.borrow();
+            let buf_len = buf.len();
+            turso_assert!(
+                bytes_read == buf_len as i32,
+                "read({bytes_read}) less than expected({buf_len})"
+            );
             let buf_ptr = buf.as_ptr();
             unsafe {
                 std::ptr::copy_nonoverlapping(buf_ptr, frame, frame_len as usize);
