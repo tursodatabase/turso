@@ -5165,10 +5165,11 @@ pub fn op_new_rowid(
                 let exists = {
                     let mut cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut();
-                    return_if_io!(cursor.seek(
+                    let seek_result = return_if_io!(cursor.seek(
                         SeekKey::TableRowId(*candidate),
                         SeekOp::GE { eq_only: true }
-                    ))
+                    ));
+                    matches!(seek_result, SeekResult::Found)
                 };
 
                 if !exists {
