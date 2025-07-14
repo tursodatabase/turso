@@ -173,7 +173,7 @@ pub(crate) enum ExecutionContinuation {
     NextProperty,
 }
 
-#[instrument(skip(env, interaction, stack), fields(seed = %env.opts.seed, interaction = %interaction))]
+#[instrument(skip(env, interaction, stack), fields(seed = %env.opts.seed,))]
 pub(crate) fn execute_interaction(
     env: &mut SimulatorEnv,
     connection_index: usize,
@@ -181,7 +181,7 @@ pub(crate) fn execute_interaction(
     stack: &mut Vec<ResultSet>,
 ) -> Result<ExecutionContinuation> {
     // Leave this empty info! here to print the span of the execution
-    tracing::info!("");
+    tracing::info!(%interaction);
     match interaction {
         Interaction::Query(_) => {
             let conn = match &mut env.connections[connection_index] {
@@ -191,7 +191,7 @@ pub(crate) fn execute_interaction(
             };
             tracing::debug!(?interaction);
             let results = interaction.execute_query(conn, &env.io);
-            tracing::debug!(?results);
+            tracing::trace!(?results);
             stack.push(results);
             limbo_integrity_check(conn)?;
         }
@@ -203,7 +203,7 @@ pub(crate) fn execute_interaction(
             };
 
             let results = interaction.execute_fsync_query(conn.clone(), env);
-            tracing::debug!(?results);
+            tracing::trace!(?results);
             stack.push(results);
 
             let query_interaction = Interaction::Query(query.clone());
@@ -234,7 +234,7 @@ pub(crate) fn execute_interaction(
             };
 
             let results = interaction.execute_faulty_query(&conn, env);
-            tracing::debug!(?results);
+            tracing::trace!(?results);
             stack.push(results);
             // Reset fault injection
             env.io.inject_fault(false);
@@ -246,6 +246,7 @@ pub(crate) fn execute_interaction(
 }
 
 fn limbo_integrity_check(conn: &Arc<Connection>) -> Result<()> {
+    tracing::debug!("starting Turso integrity check");
     let mut rows = conn.query("PRAGMA integrity_check;")?.unwrap();
     let mut result = Vec::new();
 
