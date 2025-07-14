@@ -295,13 +295,6 @@ pub struct Pager {
 }
 
 #[derive(Debug, Copy, Clone)]
-/// Status of the current cache flush.
-pub enum PagerCacheFlushStatus {
-    Done,
-    IO,
-}
-
-#[derive(Debug, Copy, Clone)]
 /// The status of the current cache commit.
 /// A Done state means that the WAL was committed to disk and fsynced,
 /// plus potentially checkpointed to the DB (and the DB then fsynced).
@@ -847,43 +840,19 @@ impl Pager {
     /// Flush all dirty pages to disk.
     /// Unlike commit_dirty_pages, this function does not commit, checkpoint now sync the WAL/Database.
     #[instrument(skip_all, level = Level::INFO)]
-    pub fn cacheflush(&self) -> Result<PagerCacheFlushStatus> {
-        let state = self.flush_info.borrow().state;
-        trace!(?state);
-        match state {
-            FlushState::Start => {
-                for page_id in self.dirty_pages.borrow().iter() {
-                    let mut cache = self.page_cache.write();
-                    let page_key = PageCacheKey(*page_id);
-                    let page = cache.get(&page_key).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
-                    let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
-                    trace!("cacheflush(page={}, page_type={:?})", page_id, page_type);
-                    self.wal.borrow_mut().append_frame(
-                        page.clone(),
-                        0,
-                        self.flush_info.borrow().in_flight_writes.clone(),
-                    )?;
-                    page.clear_dirty();
-                }
-                {
-                    let mut cache = self.page_cache.write();
-                    cache.clear().unwrap();
-                }
-                self.dirty_pages.borrow_mut().clear();
-                self.flush_info.borrow_mut().state = FlushState::WaitAppendFrames;
-                return Ok(PagerCacheFlushStatus::IO);
-            }
-            FlushState::WaitAppendFrames => {
-                let in_flight = *self.flush_info.borrow().in_flight_writes.borrow();
-                if in_flight == 0 {
-                    self.flush_info.borrow_mut().state = FlushState::Start;
-                    self.wal.borrow_mut().finish_append_frames_commit()?;
-                    return Ok(PagerCacheFlushStatus::Done);
-                } else {
-                    return Ok(PagerCacheFlushStatus::IO);
-                }
-            }
+    pub fn cacheflush(&self) -> Result<IoResult<()>> {
+        let mut cache = self.page_cache.write();
+        let dirty_pages = self.dirty_pages.borrow();
+        let dirty_pages = dirty_pages
+                    .iter()
+                    .map(|key| cache.get(&PageCacheKey(*key)).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it."));
+
+        if let IoResult::Done(_) = self.stress(dirty_pages)? {
+            self.dirty_pages.borrow_mut().clear();
+            return Ok(IoResult::Done(()));
         }
+
+        Ok(IoResult::IO)
     }
 
     /// Flush all dirty pages to disk.

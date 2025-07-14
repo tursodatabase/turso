@@ -77,7 +77,6 @@ use std::{
 use storage::database::DatabaseFile;
 use storage::page_cache::DumbLruPageCache;
 pub use storage::pager::PagerCacheCommitStatus;
-pub use storage::pager::PagerCacheFlushStatus;
 use storage::pager::{DB_STATE_INITIALIZED, DB_STATE_UNITIALIZED};
 pub use storage::{
     buffer_pool::BufferPool,
@@ -89,6 +88,7 @@ pub use storage::{
 use tracing::{instrument, Level};
 use translate::select::prepare_select_plan;
 use turso_sqlite3_parser::{ast, ast::Cmd, lexer::sql::Parser};
+use types::IoResult;
 pub use types::RefValue;
 pub use types::Value;
 use util::parse_schema_rows;
@@ -765,7 +765,7 @@ impl Connection {
 
     /// Flush dirty pages to disk.
     /// This will write the dirty pages to the WAL.
-    pub fn cacheflush(&self) -> Result<PagerCacheFlushStatus> {
+    pub fn cacheflush(&self) -> Result<IoResult<()>> {
         if self.closed.get() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
