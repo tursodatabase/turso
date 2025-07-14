@@ -5,13 +5,14 @@ use crate::storage::database::DatabaseStorage;
 use crate::storage::header_accessor;
 use crate::storage::sqlite3_ondisk::{self, DatabaseHeader, PageContent, PageType};
 use crate::storage::wal::{CheckpointResult, Wal, WalFsyncStatus};
-use crate::types::CursorResult;
+use crate::types::{CursorResult, IoResult};
 use crate::{Buffer, Connection, LimboError, Result};
 use crate::{Completion, WalFile};
 use bitflags::bitflags;
 use parking_lot::RwLock;
 use std::cell::{OnceCell, RefCell, UnsafeCell};
 use std::collections::HashSet;
+use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,12 +42,26 @@ pub struct SpillFlag(u8);
 
 bitflags! {
     impl SpillFlag: u8 {
+        /// Allow spilling cache. Default behavior.
+        const ALLOWED = 0b00;
         /// Never spill cache. Set via pragma
         const OFF = 0b01;
         /// Current rolling back, so do not spill
         const ROLLBACK = 0b10;
         /// Spill is ok, but do not sync
         const NO_SYNC = 0b11;
+    }
+}
+
+impl fmt::Display for SpillFlag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            0b00 => write!(f, "ALLOWED"),
+            0b01 => write!(f, "OFF"),
+            0b10 => write!(f, "ROLLBACK"),
+            0b11 => write!(f, "NO_SYNC"),
+            _ => write!(f, "UNKNOWN"),
+        }
     }
 }
 
@@ -1336,6 +1351,52 @@ impl Pager {
         self.wal.borrow_mut().rollback()?;
 
         Ok(())
+    }
+
+    // TODO: find better name for this, use as a callback like SQLite?
+    /// This function is called by the cache layer when it has reached some soft memory limit.
+    /// The pager must be purgeable (not in-memory)
+    #[instrument(skip_all, level = Level::INFO)]
+    pub fn stress<T>(&self, pages: T) -> Result<IoResult<()>>
+    where
+        T: Iterator<Item = PageRef>,
+    {
+        // todo: improve error handling
+        if !self.spill_flag.borrow().can_spill() {
+            return Err(LimboError::SpillNotAllowed(*self.spill_flag.borrow()));
+        }
+
+        let state = self.flush_info.borrow().state;
+        trace!(?state);
+
+        match state {
+            FlushState::Start => {
+                for page in pages {
+                    assert!(page.is_dirty());
+                    trace!("pager.stress(page={})", page.get().id);
+                    self.wal.borrow_mut().append_frame(
+                        page.clone(),
+                        0,
+                        self.flush_info.borrow().in_flight_writes.clone(),
+                    )?;
+
+                    page.clear_dirty();
+                }
+
+                self.flush_info.borrow_mut().state = FlushState::WaitAppendFrames;
+                return Ok(IoResult::IO);
+            }
+            FlushState::WaitAppendFrames => {
+                let in_flight = *self.flush_info.borrow().in_flight_writes.borrow();
+                if in_flight == 0 {
+                    self.flush_info.borrow_mut().state = FlushState::Start;
+                    self.wal.borrow_mut().finish_append_frames_commit()?;
+                    return Ok(IoResult::Done(()));
+                }
+            }
+        }
+
+        Ok(IoResult::IO)
     }
 
     pub fn disable_cache_spill(&self, toggle: bool) {
