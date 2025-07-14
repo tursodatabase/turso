@@ -50,6 +50,24 @@ bitflags! {
     }
 }
 
+impl SpillFlag {
+    pub fn can_spill(&self) -> bool {
+        self.contains(SpillFlag::NO_SYNC) || self.is_empty()
+    }
+
+    pub fn is_off(&self) -> bool {
+        self.contains(SpillFlag::OFF)
+    }
+
+    pub fn disable(&mut self, toggle: bool) {
+        if toggle {
+            self.remove(SpillFlag::OFF);
+        } else {
+            *self = SpillFlag::OFF;
+        }
+    }
+}
+
 // Concurrency control of pages will be handled by the pager, we won't wrap Page with RwLock
 // because that is bad bad.
 pub type PageRef = Arc<Page>;
@@ -233,7 +251,7 @@ pub struct Pager {
     /// The write-ahead log (WAL) for the database.
     wal: Rc<RefCell<dyn Wal>>,
     /// A page cache for the database.
-    page_cache: Arc<RwLock<DumbLruPageCache>>,
+    pub page_cache: Arc<RwLock<DumbLruPageCache>>,
     /// Buffer pool for temporary data storage.
     pub buffer_pool: Arc<BufferPool>,
     /// I/O interface for input/output operations.
@@ -258,7 +276,7 @@ pub struct Pager {
     /// to change it.
     page_size: OnceCell<u16>,
     reserved_space: OnceCell<u8>,
-    spill_flag: SpillFlag,
+    pub spill_flag: RefCell<SpillFlag>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -336,7 +354,7 @@ impl Pager {
                 state: FlushState::Start,
                 in_flight_writes: Rc::new(RefCell::new(0)),
             }),
-            spill_flag: SpillFlag::empty(),
+            spill_flag: RefCell::new(SpillFlag::empty()),
         })
     }
 
@@ -1318,6 +1336,10 @@ impl Pager {
         self.wal.borrow_mut().rollback()?;
 
         Ok(())
+    }
+
+    pub fn disable_cache_spill(&self, toggle: bool) {
+        self.spill_flag.borrow_mut().disable(toggle);
     }
 }
 

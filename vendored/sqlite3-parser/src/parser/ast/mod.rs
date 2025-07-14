@@ -1766,6 +1766,8 @@ pub enum PragmaName {
     UserVersion,
     /// trigger a checkpoint to run on database(s) if WAL is enabled
     WalCheckpoint,
+    /// Enables or disables the pager cache spilling in the middle of a transaction.
+    CacheSpill,
 }
 
 /// `CREATE TRIGGER` time

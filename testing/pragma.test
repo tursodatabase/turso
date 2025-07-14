@@ -169,3 +169,16 @@ do_execsql_test pragma-function-sql-injection {
   SELECT * FROM pragma_table_info('sqlite_schema'';CREATE TABLE foo(c0);SELECT ''bar');
   SELECT * FROM pragma_table_info('foo');
 } {}
+
+do_execsql_test_on_specific_db ":memory:" pragma-cache-spill {
+  PRAGMA cache_spill;
+} {483}
+
+do_execsql_test_on_specific_db ":memory:" pragma-cache-spill-empty-when-false {
+  PRAGMA cache_spill = false;
+} {}
+
+do_execsql_test_on_specific_db ":memory:" pragma-update-cache-spill {
+  PRAGMA cache_spill = 500;
+  PRAGMA cache_spill;
+} {500}

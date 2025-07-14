@@ -293,6 +293,16 @@ impl Value {
             Value::Blob(b) => out.extend_from_slice(b),
         };
     }
+
+    /// Converts the value to an integer.
+    /// If the value is a float, it will be rounded down to the nearest integer.
+    pub fn to_int(&self) -> Option<i64> {
+        match self {
+            Value::Integer(t) => Some(*t),
+            Value::Float(f) => Some(f.floor() as i64),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1734,7 +1744,7 @@ fn compare_records_int(
 /// This function is an optimized version of `compare_records_generic()` for the
 /// common case where:
 /// - (a) The first field of the unpacked record is a string
-/// - (b) The serialized record's first field is also a string  
+/// - (b) The serialized record's first field is also a string
 /// - (c) The header size varint fits in a single byte (most records)
 ///
 /// This optimization avoids the overhead of generic field parsing by directly
@@ -1764,7 +1774,7 @@ fn compare_records_int(
 /// The function follows SQLite's string comparison semantics:
 ///
 /// 1. **Type checking**: Ensures both sides are strings, otherwise falls back
-/// 2. **String comparison**: Uses collation if provided, binary otherwise  
+/// 2. **String comparison**: Uses collation if provided, binary otherwise
 /// 3. **Sort order**: Applies ascending/descending order to comparison result
 /// 4. **Length comparison**: If strings are equal, compares lengths
 /// 5. **Remaining fields**: If first field is equal and more fields exist,
@@ -1886,7 +1896,7 @@ fn compare_records_string(
 /// # Arguments
 ///
 /// * `serialized` - The left-hand side record in serialized format
-/// * `unpacked` - The right-hand side record as an array of parsed values  
+/// * `unpacked` - The right-hand side record as an array of parsed values
 /// * `index_info` - Contains sort order information for each field
 /// * `collations` - Array of collation sequences for string comparisons
 /// * `skip` - Number of initial fields to skip (assumes caller verified equality)

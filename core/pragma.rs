@@ -81,6 +81,7 @@ pub fn pragma_for(pragma: PragmaName) -> Pragma {
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
             &["mode", "table"],
         ),
+        CacheSpill => Pragma::new(PragmaFlags::Result0, &["cache_spill"]),
     }
 }
 
