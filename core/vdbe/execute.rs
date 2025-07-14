@@ -1597,7 +1597,7 @@ pub fn op_column(
                     if existing_text.value.capacity() >= new_text.value.len() {
                         existing_text.value.clear();
                         existing_text.value.extend_from_slice(&new_text.value);
-                        existing_text.subtype = new_text.subtype.clone();
+                        existing_text.subtype = new_text.subtype;
                     } else {
                         state.registers[*dest] = Register::Value(value);
                     }
@@ -4130,7 +4130,7 @@ pub fn op_function(
                     let columns_len = columns_json_array.array_len()?;
 
                     let mut record = ImmutableRecord::new(bin_record.len());
-                    record.start_serialization(&bin_record);
+                    record.start_serialization(bin_record);
                     let mut record_cursor = RecordCursor::new();
 
                     let mut json = json::jsonb::Jsonb::make_empty_obj(columns_len);

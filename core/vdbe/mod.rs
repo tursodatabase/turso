@@ -598,7 +598,7 @@ pub fn registers_to_ref_values(registers: &[Register]) -> Vec<RefValue> {
                 Value::Float(f) => RefValue::Float(*f),
                 Value::Text(t) => RefValue::Text(TextRef {
                     value: RawSlice::new(t.value.as_ptr(), t.value.len()),
-                    subtype: t.subtype.clone(),
+                    subtype: t.subtype,
                 }),
                 Value::Blob(b) => RefValue::Blob(RawSlice::new(b.as_ptr(), b.len())),
             }
