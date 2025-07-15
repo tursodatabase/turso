@@ -596,13 +596,7 @@ impl Interaction {
                         out.push(r);
                     }
                     StepResult::IO => {
-                        let syncing = {
-                            let files = env.io.files.borrow();
-                            // TODO: currently assuming we only have 1 file that is syncing
-                            files
-                                .iter()
-                                .any(|file| file.sync_completion.borrow().is_some())
-                        };
+                        let syncing = env.io.syncing();
                         if syncing {
                             reopen_database(env);
                         } else {
@@ -648,13 +642,7 @@ impl Interaction {
             let mut current_prob = 0.05;
             let mut incr = 0.001;
             loop {
-                let syncing = {
-                    let files = env.io.files.borrow();
-                    // TODO: currently assuming we only have 1 file that is syncing
-                    files
-                        .iter()
-                        .any(|file| file.sync_completion.borrow().is_some())
-                };
+                let syncing = env.io.syncing();
                 let inject_fault = env.rng.gen_bool(current_prob);
                 if inject_fault || syncing {
                     env.io.inject_fault(true);
@@ -704,7 +692,7 @@ fn reopen_database(env: &mut SimulatorEnv) {
 
     // Clear all open files
     // TODO: for correct reporting of faults we should get all the recorded numbers and transfer to the new file
-    env.io.files.borrow_mut().clear();
+    env.io.close_files();
 
     // 2. Re-open database
     match env.type_ {

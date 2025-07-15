@@ -8,8 +8,11 @@ use rand_chacha::ChaCha8Rng;
 use turso_core::{Clock, Instant, MemoryIO, OpenFlags, PlatformIO, Result, IO};
 
 use crate::{
+    
     model::FAULT_ERROR_MSG,
-    runner::{clock::SimulatorClock, file::SimulatorFile},
+   
+    runner::{clock::SimulatorClock, {file::SimulatorFile},
+, SimIO},
 };
 
 pub(crate) struct SimulatorIO {
@@ -54,19 +57,33 @@ impl SimulatorIO {
             clock: Arc::new(clock),
         })
     }
+}
 
-    pub(crate) fn inject_fault(&self, fault: bool) {
+impl SimIO for SimulatorIO {
+    fn inject_fault(&self, fault: bool) {
         self.fault.replace(fault);
         for file in self.files.borrow().iter() {
             file.inject_fault(fault);
         }
     }
 
-    pub(crate) fn print_stats(&self) {
+    fn print_stats(&self) {
         tracing::info!("run_once faults: {}", self.nr_run_once_faults.get());
         for file in self.files.borrow().iter() {
             tracing::info!("\n===========================\n{}", file.stats_table());
         }
+    }
+
+    fn syncing(&self) -> bool {
+        let files = self.files.borrow();
+        // TODO: currently assuming we only have 1 file that is syncing
+        files
+            .iter()
+            .any(|file| file.sync_completion.borrow().is_some())
+    }
+
+    fn close_files(&self) {
+        self.files.borrow_mut().clear()
     }
 }
 
