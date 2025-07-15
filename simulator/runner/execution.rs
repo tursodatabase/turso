@@ -1,12 +1,14 @@
 use std::sync::{Arc, Mutex};
 
 use tracing::instrument;
-use turso_core::{Connection, LimboError, Result, StepResult};
+use turso_core::{LimboError, Result, StepResult};
 
-use crate::generation::{
-    pick_index,
-    plan::{Interaction, InteractionPlan, InteractionPlanState, ResultSet},
-    Shadow as _,
+use crate::{
+    generation::{
+        plan::{Interaction, InteractionPlan, InteractionPlanState},
+        Shadow,
+    },
+    runner::future::FuturesByConnection,
 };
 
 use super::env::{SimConnection, SimulatorEnv};
@@ -58,81 +60,103 @@ impl ExecutionResult {
 
 pub(crate) fn execute_plans(
     env: Arc<Mutex<SimulatorEnv>>,
-    plans: &mut [InteractionPlan],
-    states: &mut [InteractionPlanState],
+    plans: Vec<Arc<InteractionPlan>>,
+    states: Vec<Arc<Mutex<InteractionPlanState>>>,
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
     let mut history = ExecutionHistory::new();
     let now = std::time::Instant::now();
-    env.clear_poison();
-    let mut env = env.lock().unwrap();
-
-    env.tables.clear();
-
-    for _tick in 0..env.opts.ticks {
-        tracing::trace!("Executing tick {}", _tick);
-        // Pick the connection to interact with
-        let connection_index = pick_index(env.connections.len(), &mut env.rng);
-        let state = &mut states[connection_index];
-
-        history.history.push(Execution::new(
-            connection_index,
-            state.interaction_pointer,
-            state.secondary_pointer,
-        ));
-        let mut last_execution = last_execution.lock().unwrap();
-        last_execution.connection_index = connection_index;
-        last_execution.interaction_index = state.interaction_pointer;
-        last_execution.secondary_index = state.secondary_pointer;
-        // Execute the interaction for the selected connection
-        match execute_plan(&mut env, connection_index, plans, states) {
-            Ok(_) => {}
-            Err(err) => {
-                return ExecutionResult::new(history, Some(err));
+    let mut futures_by_connection = FuturesByConnection::new(env.lock().unwrap().connections.len());
+    let ticks = env.lock().unwrap().opts.ticks;
+    let max_time_simulation = env.lock().unwrap().opts.max_time_simulation;
+    let connections_len = env.lock().unwrap().connections.len();
+    for _tick in 0..ticks {
+        // Run every connection concurrently.
+        for connection_index in 0..connections_len {
+            std::thread::sleep(std::time::Duration::from_millis(
+                std::env::var("TICK_SLEEP")
+                    .unwrap_or("0".into())
+                    .parse()
+                    .unwrap_or(0),
+            ));
+            let state = states[connection_index].clone();
+            {
+                let state = state.lock().unwrap();
+                history.history.push(Execution::new(
+                    connection_index,
+                    state.interaction_pointer,
+                    state.secondary_pointer,
+                ));
+                let mut last_execution = last_execution.lock().unwrap();
+                last_execution.connection_index = connection_index;
+                last_execution.interaction_index = state.interaction_pointer;
+                last_execution.secondary_index = state.secondary_pointer;
             }
-        }
-        // Check if the maximum time for the simulation has been reached
-        if now.elapsed().as_secs() >= env.opts.max_time_simulation as u64 {
-            return ExecutionResult::new(
-                history,
-                Some(LimboError::InternalError(
-                    "maximum time for simulation reached".into(),
-                )),
-            );
+            let connection = env.lock().unwrap().connections[connection_index].clone();
+            // Execute the interaction for the selected connection
+            if futures_by_connection.connection_without_future(connection_index) {
+                futures_by_connection.set_future(
+                    connection_index,
+                    Box::pin(execute_plan(
+                        env.clone(),
+                        connection.clone(),
+                        plans[connection_index].clone(),
+                        state.clone(),
+                    )),
+                );
+            }
+
+            match futures_by_connection.poll_at(connection_index) {
+                Ok(_) => {}
+                Err(err) => {
+                    return ExecutionResult::new(history, Some(err));
+                }
+            }
+
+            // Check if the maximum time for the simulation has been reached
+            if now.elapsed().as_secs() >= max_time_simulation as u64 {
+                return ExecutionResult::new(
+                    history,
+                    Some(LimboError::InternalError(
+                        "maximum time for simulation reached".into(),
+                    )),
+                );
+            }
         }
     }
 
     ExecutionResult::new(history, None)
 }
 
-fn execute_plan(
-    env: &mut SimulatorEnv,
-    connection_index: usize,
-    plans: &mut [InteractionPlan],
-    states: &mut [InteractionPlanState],
+async fn execute_plan(
+    env: Arc<Mutex<SimulatorEnv>>,
+    connection: Arc<Mutex<SimConnection>>,
+    plan: Arc<InteractionPlan>,
+    state: Arc<Mutex<InteractionPlanState>>,
 ) -> Result<()> {
-    let connection = &env.connections[connection_index];
-    let plan = &mut plans[connection_index];
-    let state = &mut states[connection_index];
-
-    if state.interaction_pointer >= plan.plan.len() {
+    let interaction_pointer = state.lock().unwrap().interaction_pointer;
+    let secondary_pointer = state.lock().unwrap().secondary_pointer;
+    if interaction_pointer >= plan.plan.len() {
         return Ok(());
     }
 
-    let interaction = &plan.plan[state.interaction_pointer].interactions()[state.secondary_pointer];
+    let interaction = &plan.plan[interaction_pointer].interactions()[secondary_pointer];
 
-    if let SimConnection::Disconnected = connection {
-        tracing::debug!("connecting {}", connection_index);
-        env.connections[connection_index] =
-            SimConnection::LimboConnection(env.db.connect().unwrap());
+    let is_connected = connection.lock().unwrap().is_connected();
+    if !is_connected {
+        tracing::debug!("connecting {}", 1); // todo: add index to simconnetion
+        let env = env.lock().unwrap();
+        *connection.lock().unwrap() = SimConnection::LimboConnection(env.db.connect().unwrap());
     } else {
-        tracing::debug!("connection {} already connected", connection_index);
-        match execute_interaction(env, connection_index, interaction, &mut state.stack) {
+        tracing::debug!("connection {} already connected", 1); // todo: add index to simconnetion
+        match execute_interaction(env.clone(), connection.clone(), interaction, state.clone()).await
+        {
             Ok(next_execution) => {
-                tracing::debug!("connection {} processed", connection_index);
-                // Move to the next interaction or property
+                tracing::debug!("connection {} processed", 1); // todo: add index to simconnetion
+                                                               // Move to the next interaction or property
                 match next_execution {
                     ExecutionContinuation::NextInteraction => {
+                        let mut state = state.lock().unwrap();
                         if state.secondary_pointer + 1
                             >= plan.plan[state.interaction_pointer].interactions().len()
                         {
@@ -146,6 +170,7 @@ fn execute_plan(
                     }
                     ExecutionContinuation::NextProperty => {
                         // Skip to the next property
+                        let mut state = state.lock().unwrap();
                         state.interaction_pointer += 1;
                         state.secondary_pointer = 0;
                     }
@@ -173,50 +198,49 @@ pub(crate) enum ExecutionContinuation {
     NextProperty,
 }
 
-#[instrument(skip(env, interaction, stack), fields(seed = %env.opts.seed, interaction = %interaction))]
-pub(crate) fn execute_interaction(
-    env: &mut SimulatorEnv,
-    connection_index: usize,
+#[instrument(skip(env, interaction, state, connection), fields(interaction = %interaction))]
+pub(crate) async fn execute_interaction(
+    env: Arc<Mutex<SimulatorEnv>>,
+    connection: Arc<Mutex<SimConnection>>,
     interaction: &Interaction,
-    stack: &mut Vec<ResultSet>,
+    state: Arc<Mutex<InteractionPlanState>>,
 ) -> Result<ExecutionContinuation> {
     // Leave this empty info! here to print the span of the execution
     tracing::info!("");
     match interaction {
         Interaction::Query(_) => {
-            let conn = match &mut env.connections[connection_index] {
-                SimConnection::LimboConnection(conn) => conn,
-                SimConnection::SQLiteConnection(_) => unreachable!(),
-                SimConnection::Disconnected => unreachable!(),
-            };
             tracing::debug!(?interaction);
-            let results = interaction.execute_query(conn, &env.io);
+            let results = interaction.execute_query(connection.clone()).await;
             tracing::debug!(?results);
-            stack.push(results);
-            limbo_integrity_check(conn)?;
+            state.lock().unwrap().stack.push(results);
+            limbo_integrity_check(connection.clone())?;
         }
         Interaction::FsyncQuery(query) => {
-            let conn = match &env.connections[connection_index] {
-                SimConnection::LimboConnection(conn) => conn.clone(),
-                SimConnection::SQLiteConnection(_) => unreachable!(),
-                SimConnection::Disconnected => unreachable!(),
-            };
-
-            let results = interaction.execute_fsync_query(conn.clone(), env);
+            // SAFETY: we lock connection only inside execute plan which is async
+            let results =
+                interaction.execute_fsync_query(connection.clone(), &mut env.lock().unwrap());
             tracing::debug!(?results);
-            stack.push(results);
+            state.lock().unwrap().stack.push(results);
 
             let query_interaction = Interaction::Query(query.clone());
 
-            execute_interaction(env, connection_index, &query_interaction, stack)?;
+            // Avoid recursive .await to prevent infinitely sized future.
+            // Box::pin is used to introduce indirection.
+            {
+                let fut =
+                    execute_interaction(env.clone(), connection.clone(), &query_interaction, state);
+                Box::pin(fut).await?;
+            }
         }
         Interaction::Assertion(_) => {
-            interaction.execute_assertion(stack, env)?;
-            stack.clear();
+            interaction
+                .execute_assertion(&state.lock().unwrap().stack, &mut env.lock().unwrap())?;
+            state.lock().unwrap().stack.clear();
         }
         Interaction::Assumption(_) => {
-            let assumption_result = interaction.execute_assumption(stack, env);
-            stack.clear();
+            let assumption_result = interaction
+                .execute_assumption(&state.lock().unwrap().stack, &mut env.lock().unwrap());
+            state.lock().unwrap().stack.clear();
 
             if assumption_result.is_err() {
                 tracing::warn!("assumption failed: {:?}", assumption_result);
@@ -224,28 +248,30 @@ pub(crate) fn execute_interaction(
             }
         }
         Interaction::Fault(_) => {
-            interaction.execute_fault(env, connection_index)?;
+            interaction.execute_fault(&mut env.lock().unwrap(), connection)?;
         }
         Interaction::FaultyQuery(_) => {
-            let conn = match &env.connections[connection_index] {
-                SimConnection::LimboConnection(conn) => conn.clone(),
-                SimConnection::SQLiteConnection(_) => unreachable!(),
-                SimConnection::Disconnected => unreachable!(),
-            };
-
-            let results = interaction.execute_faulty_query(&conn, env);
+            let results = interaction
+                .execute_faulty_query(connection.clone(), env.clone())
+                .await;
             tracing::debug!(?results);
-            stack.push(results);
+            state.lock().unwrap().stack.push(results);
             // Reset fault injection
-            env.io.inject_fault(false);
-            limbo_integrity_check(&conn)?;
+            env.lock().unwrap().io.inject_fault(false);
+            limbo_integrity_check(connection.clone())?;
         }
     }
-    let _ = interaction.shadow(&mut env.tables);
+    let _ = interaction.shadow(&mut env.lock().unwrap().tables);
     Ok(ExecutionContinuation::NextInteraction)
 }
 
-fn limbo_integrity_check(conn: &Arc<Connection>) -> Result<()> {
+fn limbo_integrity_check(conn: Arc<Mutex<SimConnection>>) -> Result<()> {
+    let mut conn = conn.lock().unwrap();
+    let conn = match &mut *conn {
+        SimConnection::LimboConnection(conn) => conn,
+        SimConnection::SQLiteConnection(_) => unreachable!(),
+        SimConnection::Disconnected => unreachable!(),
+    };
     let mut rows = conn.query("PRAGMA integrity_check;")?.unwrap();
     let mut result = Vec::new();
 

@@ -2,13 +2,14 @@ use std::{
     collections::HashSet,
     fmt::{Debug, Display},
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
     vec,
 };
 
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
-use turso_core::{Connection, Result, StepResult};
+use turso_core::{Result, StepResult};
 
 use crate::{
     generation::{query::SelectFree, Shadow},
@@ -18,7 +19,7 @@ use crate::{
     },
     runner::{
         env::{SimConnection, SimulationType, SimulatorTables},
-        io::SimulatorIO,
+        future::yield_once,
     },
     SimulatorEnv,
 };
@@ -439,11 +440,21 @@ impl Shadow for Interaction {
         }
     }
 }
+
 impl Interaction {
-    pub(crate) fn execute_query(&self, conn: &mut Arc<Connection>, _io: &SimulatorIO) -> ResultSet {
+    pub(crate) async fn execute_query(&self, connection: Arc<Mutex<SimConnection>>) -> ResultSet {
         if let Self::Query(query) = self {
             let query_str = query.to_string();
-            let rows = conn.query(&query_str);
+            let rows = {
+                let mut conn = connection.lock().unwrap();
+                let conn = match &mut *conn {
+                    SimConnection::LimboConnection(conn) => conn,
+                    SimConnection::SQLiteConnection(_) => unreachable!(),
+                    SimConnection::Disconnected => unreachable!(),
+                };
+                conn.query(&query_str)
+            };
+
             if rows.is_err() {
                 let err = rows.err();
                 tracing::debug!(
@@ -469,7 +480,9 @@ impl Interaction {
                         out.push(r);
                     }
                     StepResult::IO => {
+                        // TODO: we should run io in a centralized place and choose to rollback in that place. For now let's just run I/O here and yield anyways.
                         rows.run_once().unwrap();
+                        yield_once().await;
                     }
                     StepResult::Interrupt => {}
                     StepResult::Done => {
@@ -539,19 +552,24 @@ impl Interaction {
         }
     }
 
-    pub(crate) fn execute_fault(&self, env: &mut SimulatorEnv, conn_index: usize) -> Result<()> {
+    pub(crate) fn execute_fault(
+        &self,
+        env: &mut SimulatorEnv,
+        conn: Arc<Mutex<SimConnection>>,
+    ) -> Result<()> {
         match self {
             Self::Fault(fault) => {
                 match fault {
                     Fault::Disconnect => {
-                        if env.connections[conn_index].is_connected() {
-                            env.connections[conn_index].disconnect();
+                        let mut conn = conn.lock().unwrap();
+                        if conn.is_connected() {
+                            conn.disconnect();
                         } else {
                             return Err(turso_core::LimboError::InternalError(
                                 "connection already disconnected".into(),
                             ));
                         }
-                        env.connections[conn_index] = SimConnection::Disconnected;
+                        *conn = SimConnection::Disconnected;
                     }
                     Fault::ReopenDatabase => {
                         reopen_database(env);
@@ -567,12 +585,20 @@ impl Interaction {
 
     pub(crate) fn execute_fsync_query(
         &self,
-        conn: Arc<Connection>,
+        connection: Arc<Mutex<SimConnection>>,
         env: &mut SimulatorEnv,
     ) -> ResultSet {
         if let Self::FsyncQuery(query) = self {
             let query_str = query.to_string();
-            let rows = conn.query(&query_str);
+            let rows = {
+                let mut conn = connection.lock().unwrap();
+                let conn = match &mut *conn {
+                    SimConnection::LimboConnection(conn) => conn,
+                    SimConnection::SQLiteConnection(_) => unreachable!(),
+                    SimConnection::Disconnected => unreachable!(),
+                };
+                conn.query(&query_str)
+            };
             if rows.is_err() {
                 let err = rows.err();
                 tracing::debug!(
@@ -625,15 +651,22 @@ impl Interaction {
         }
     }
 
-    pub(crate) fn execute_faulty_query(
+    pub(crate) async fn execute_faulty_query(
         &self,
-        conn: &Arc<Connection>,
-        env: &mut SimulatorEnv,
+        connection: Arc<Mutex<SimConnection>>,
+        env: Arc<Mutex<SimulatorEnv>>,
     ) -> ResultSet {
-        use rand::Rng;
         if let Self::FaultyQuery(query) = self {
             let query_str = query.to_string();
-            let rows = conn.query(&query_str);
+            let rows = {
+                let mut conn = connection.lock().unwrap();
+                let conn = match &mut *conn {
+                    SimConnection::LimboConnection(conn) => conn,
+                    SimConnection::SQLiteConnection(_) => unreachable!(),
+                    SimConnection::Disconnected => unreachable!(),
+                };
+                conn.query(&query_str)
+            };
             if rows.is_err() {
                 let err = rows.err();
                 tracing::debug!(
@@ -649,15 +682,22 @@ impl Interaction {
             let mut incr = 0.001;
             loop {
                 let syncing = {
+                    let env = env.lock().unwrap();
                     let files = env.io.files.borrow();
                     // TODO: currently assuming we only have 1 file that is syncing
                     files
                         .iter()
                         .any(|file| file.sync_completion.borrow().is_some())
                 };
-                let inject_fault = env.rng.gen_bool(current_prob);
+                let inject_fault = env
+                    .lock()
+                    .unwrap()
+                    .rng
+                    .lock()
+                    .unwrap()
+                    .gen_bool(current_prob);
                 if inject_fault || syncing {
-                    env.io.inject_fault(true);
+                    env.lock().unwrap().io.inject_fault(true);
                 }
 
                 match rows.step()? {
@@ -672,6 +712,7 @@ impl Interaction {
                     }
                     StepResult::IO => {
                         rows.run_once()?;
+                        yield_once().await;
                         current_prob += incr;
                         if current_prob > 1.0 {
                             current_prob = 1.0;
@@ -710,10 +751,11 @@ fn reopen_database(env: &mut SimulatorEnv) {
     match env.type_ {
         SimulationType::Differential => {
             for _ in 0..num_conns {
-                env.connections.push(SimConnection::SQLiteConnection(
-                    rusqlite::Connection::open(env.get_db_path())
-                        .expect("Failed to open SQLite connection"),
-                ));
+                env.connections
+                    .push(Arc::new(Mutex::new(SimConnection::SQLiteConnection(
+                        rusqlite::Connection::open(env.get_db_path())
+                            .expect("Failed to open SQLite connection"),
+                    ))));
             }
         }
         SimulationType::Default | SimulationType::Doublecheck => {
@@ -738,7 +780,9 @@ fn reopen_database(env: &mut SimulatorEnv) {
 
             for _ in 0..num_conns {
                 env.connections
-                    .push(SimConnection::LimboConnection(env.db.connect().unwrap()));
+                    .push(Arc::new(Mutex::new(SimConnection::LimboConnection(
+                        env.db.connect().unwrap(),
+                    ))));
             }
         }
     };

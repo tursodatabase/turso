@@ -251,7 +251,7 @@ impl InteractionPlan {
             std::panic::catch_unwind(|| {
                 run_simulation(
                     env.clone(),
-                    &mut [test_plan.clone()],
+                    vec![Arc::new(test_plan.clone())],
                     last_execution.clone(),
                 )
             }),
