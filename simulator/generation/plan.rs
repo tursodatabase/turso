@@ -2,10 +2,11 @@ use std::{
     collections::HashSet,
     fmt::{Debug, Display},
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
     vec,
 };
 
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use turso_core::{Connection, Result, StepResult};
@@ -18,7 +19,7 @@ use crate::{
     },
     runner::{
         env::{SimConnection, SimulationType, SimulatorTables},
-        io::SimulatorIO,
+        future::yield_once,
     },
     SimulatorEnv,
 };
@@ -439,8 +440,9 @@ impl Shadow for Interaction {
         }
     }
 }
+
 impl Interaction {
-    pub(crate) fn execute_query(&self, conn: &mut Arc<Connection>, _io: &SimulatorIO) -> ResultSet {
+    pub(crate) async fn execute_query(&self, conn: &mut Arc<Connection>) -> ResultSet {
         if let Self::Query(query) = self {
             let query_str = query.to_string();
             let rows = conn.query(&query_str);
@@ -469,7 +471,9 @@ impl Interaction {
                         out.push(r);
                     }
                     StepResult::IO => {
+                        // TODO: we should run io in a centralized place and choose to rollback in that place. For now let's just run I/O here and yield anyways.
                         rows.run_once().unwrap();
+                        yield_once().await;
                     }
                     StepResult::Interrupt => {}
                     StepResult::Done => {
@@ -539,19 +543,24 @@ impl Interaction {
         }
     }
 
-    pub(crate) fn execute_fault(&self, env: &mut SimulatorEnv, conn_index: usize) -> Result<()> {
+    pub(crate) fn execute_fault(
+        &self,
+        env: &mut SimulatorEnv,
+        conn: Arc<Mutex<SimConnection>>,
+    ) -> Result<()> {
         match self {
             Self::Fault(fault) => {
                 match fault {
                     Fault::Disconnect => {
-                        if env.connections[conn_index].is_connected() {
-                            env.connections[conn_index].disconnect();
+                        let mut conn = conn.lock().unwrap();
+                        if conn.is_connected() {
+                            conn.disconnect();
                         } else {
                             return Err(turso_core::LimboError::InternalError(
                                 "connection already disconnected".into(),
                             ));
                         }
-                        env.connections[conn_index] = SimConnection::Disconnected;
+                        *conn = SimConnection::Disconnected;
                     }
                     Fault::ReopenDatabase => {
                         reopen_database(env);
@@ -625,12 +634,11 @@ impl Interaction {
         }
     }
 
-    pub(crate) fn execute_faulty_query(
+    pub(crate) async fn execute_faulty_query(
         &self,
         conn: &Arc<Connection>,
         env: &mut SimulatorEnv,
     ) -> ResultSet {
-        use rand::Rng;
         if let Self::FaultyQuery(query) = self {
             let query_str = query.to_string();
             let rows = conn.query(&query_str);
@@ -655,7 +663,7 @@ impl Interaction {
                         .iter()
                         .any(|file| file.sync_completion.borrow().is_some())
                 };
-                let inject_fault = env.rng.gen_bool(current_prob);
+                let inject_fault = env.rng.lock().unwrap().gen_bool(current_prob);
                 if inject_fault || syncing {
                     env.io.inject_fault(true);
                 }
@@ -672,6 +680,7 @@ impl Interaction {
                     }
                     StepResult::IO => {
                         rows.run_once()?;
+                        yield_once().await;
                         current_prob += incr;
                         if current_prob > 1.0 {
                             current_prob = 1.0;
