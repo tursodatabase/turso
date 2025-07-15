@@ -26,8 +26,19 @@ pub enum Operation {
         offset: usize,
     },
     Sync {
+        fd: Arc<Fd>,
         completion: Arc<Completion>,
     },
+}
+
+impl Operation {
+    fn get_fd(&self) -> &Fd {
+        match self {
+            Operation::Read { fd, .. }
+            | Operation::Write { fd, .. }
+            | Operation::Sync { fd, .. } => fd,
+        }
+    }
 }
 
 pub type CallbackQueue = Arc<Mutex<Vec<Operation>>>;
@@ -68,7 +79,9 @@ impl MemorySimIO {
 impl SimIO for MemorySimIO {
     fn inject_fault(&self, fault: bool) {
         self.fault.replace(fault);
-        tracing::debug!("fault injected");
+        if fault {
+            tracing::debug!("fault injected");
+        }
     }
 
     fn print_stats(&self) {
@@ -135,14 +148,19 @@ impl IO for MemorySimIO {
     }
 
     fn run_once(&self) -> Result<()> {
+        let mut callbacks = self.callbacks.lock();
+        tracing::trace!(callbacks.len = callbacks.len());
         if self.fault.get() {
             self.nr_run_once_faults
                 .replace(self.nr_run_once_faults.get() + 1);
+            // TODO: currently we only deal with single threaded execution in one file
+            // When we support multiple db files, we need to only remove callbacks not relevant to the current file
+            // and maybe connection
+            callbacks.clear();
             return Err(turso_core::LimboError::InternalError(
                 FAULT_ERROR_MSG.into(),
             ));
         }
-        let mut callbacks = self.callbacks.lock();
         let files = self.files.borrow_mut();
         while let Some(callback) = callbacks.pop() {
             match callback {

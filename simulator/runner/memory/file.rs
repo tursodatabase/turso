@@ -173,6 +173,7 @@ impl File for MemorySimFile {
         };
         let c = Arc::new(c);
         let op = Operation::Sync {
+            fd: self.fd.clone(),
             completion: c.clone(),
         };
         self.callbacks.lock().push(op);
