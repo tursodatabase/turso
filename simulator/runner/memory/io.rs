@@ -68,6 +68,7 @@ impl MemorySimIO {
 impl SimIO for MemorySimIO {
     fn inject_fault(&self, fault: bool) {
         self.fault.replace(fault);
+        tracing::debug!("fault injected");
     }
 
     fn print_stats(&self) {
@@ -110,6 +111,7 @@ impl IO for MemorySimIO {
         let mut files = self.files.borrow_mut();
         let fd = path.to_string();
         let file = if let Some(file) = files.get(path) {
+            file.closed.set(false);
             file.clone()
         } else {
             let file = Arc::new(MemorySimFile::new(
