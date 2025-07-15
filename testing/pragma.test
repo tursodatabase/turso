@@ -104,10 +104,14 @@ do_execsql_test pragma-vtab-table-info-invalid-table {
   SELECT * FROM pragma_table_info WHERE arg = 'pekka'
 } {}
 
-# temporarily skip this test case. The issue is detailed in #1407
-#do_execsql_test_on_specific_db ":memory:" pragma-page-count-empty {
-#  PRAGMA page_count
-#} {0}
+do_execsql_test_on_specific_db ":memory:" pragma-page-count-empty {
+  PRAGMA page_count
+} {0}
+
+do_execsql_test_on_specific_db ":memory:" pragma-page-count-empty {
+  PRAGMA user_version=1;
+  PRAGMA page_count
+} {1}
 
 do_execsql_test_on_specific_db ":memory:" pragma-page-count-table {
   CREATE TABLE foo(bar);
