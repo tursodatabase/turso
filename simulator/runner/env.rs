@@ -3,7 +3,7 @@ use std::mem;
 use std::ops::Deref;
 use std::panic::UnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -60,7 +60,7 @@ impl Deref for SimulatorTables {
 
 pub(crate) struct SimulatorEnv {
     pub(crate) opts: SimulatorOpts,
-    pub(crate) connections: Vec<SimConnection>,
+    pub(crate) connections: Vec<Arc<Mutex<SimConnection>>>,
     pub(crate) io: Arc<SimulatorIO>,
     pub(crate) db: Arc<Database>,
     pub(crate) rng: ChaCha8Rng,
@@ -78,7 +78,7 @@ impl SimulatorEnv {
             opts: self.opts.clone(),
             tables: self.tables.clone(),
             connections: (0..self.connections.len())
-                .map(|_| SimConnection::Disconnected)
+                .map(|_| Arc::new(Mutex::new(SimConnection::Disconnected)))
                 .collect(),
             io: self.io.clone(),
             db: self.db.clone(),
@@ -217,7 +217,7 @@ impl SimulatorEnv {
         let opts = SimulatorOpts {
             seed,
             ticks: rng.gen_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
-            max_connections: 1, // TODO: for now let's use one connection as we didn't implement
+            max_connections: rng.gen_range(1..=cli_opts.max_connections),
             // correct transactions processing
             max_tables: rng.gen_range(0..128),
             create_percent,
@@ -275,7 +275,7 @@ impl SimulatorEnv {
         };
 
         let connections = (0..opts.max_connections)
-            .map(|_| SimConnection::Disconnected)
+            .map(|_| Arc::new(Mutex::new(SimConnection::Disconnected)))
             .collect::<Vec<_>>();
 
         SimulatorEnv {
@@ -283,7 +283,7 @@ impl SimulatorEnv {
             tables: SimulatorTables::new(),
             connections,
             paths,
-            rng,
+            rng: Arc::new(Mutex::new(rng)),
             io,
             db,
             type_: simulation_type,
