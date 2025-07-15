@@ -8,9 +8,10 @@ use rand_chacha::ChaCha8Rng;
 use tracing::{instrument, Level};
 use turso_core::{CompletionType, File, Result};
 
-use crate::runner::memory::io::Fd;
+use crate::runner::memory::io::{CallbackQueue, Fd, Operation};
 
 pub struct MemorySimFile {
+    pub callbacks: CallbackQueue,
     pub fd: Fd,
     pub buffer: RefCell<Vec<u8>>,
     // TODO: add fault map later here
@@ -32,8 +33,9 @@ unsafe impl Send for MemorySimFile {}
 unsafe impl Sync for MemorySimFile {}
 
 impl MemorySimFile {
-    pub fn new(fd: Fd, seed: u64, latency_probability: usize) -> Self {
+    pub fn new(callbacks: CallbackQueue, fd: Fd, seed: u64, latency_probability: usize) -> Self {
         Self {
+            callbacks,
             fd,
             buffer: RefCell::new(Vec::new()),
             closed: false,
@@ -102,7 +104,14 @@ impl File for MemorySimFile {
             };
             read_completion.complete = Box::new(new_complete);
         };
-        Ok(Arc::new(c))
+        let c = Arc::new(c);
+        let op = Operation::Read {
+            fd: self.fd,
+            completion: c.clone(),
+            offset: pos,
+        };
+        self.callbacks.lock().push(op);
+        Ok(c)
     }
 
     fn pwrite(
@@ -129,7 +138,15 @@ impl File for MemorySimFile {
             };
             write_completion.complete = Box::new(new_complete);
         };
-        Ok(Arc::new(c))
+        let c = Arc::new(c);
+        let op = Operation::Write {
+            fd: self.fd,
+            buffer,
+            completion: c.clone(),
+            offset: pos,
+        };
+        self.callbacks.lock().push(op);
+        Ok(c)
     }
 
     fn sync(&self, mut c: turso_core::Completion) -> Result<Arc<turso_core::Completion>> {
@@ -152,7 +169,13 @@ impl File for MemorySimFile {
             };
             sync_completion.complete = Box::new(new_complete);
         };
-        Ok(Arc::new(c))
+        let c = Arc::new(c);
+        let op = Operation::Sync {
+            fd: self.fd,
+            completion: c.clone(),
+        };
+        self.callbacks.lock().push(op);
+        Ok(c)
     }
 
     fn size(&self) -> Result<u64> {
