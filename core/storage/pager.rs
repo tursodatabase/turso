@@ -605,11 +605,6 @@ impl Pager {
     #[inline(always)]
     #[instrument(skip_all, level = Level::INFO)]
     pub fn begin_read_tx(&self) -> Result<CursorResult<LimboResult>> {
-        // We allocate the first page lazily in the first transaction
-        match self.maybe_allocate_page1()? {
-            CursorResult::Ok(_) => {}
-            CursorResult::IO => return Ok(CursorResult::IO),
-        }
         Ok(CursorResult::Ok(self.wal.borrow_mut().begin_read_tx()?))
     }
 
