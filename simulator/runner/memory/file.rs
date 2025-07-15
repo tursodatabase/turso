@@ -12,10 +12,10 @@ use crate::runner::memory::io::{CallbackQueue, Fd, Operation};
 
 pub struct MemorySimFile {
     pub callbacks: CallbackQueue,
-    pub fd: Fd,
+    pub fd: Arc<Fd>,
     pub buffer: RefCell<Vec<u8>>,
     // TODO: add fault map later here
-    pub closed: bool,
+    pub closed: Cell<bool>,
 
     /// Number of `pread` function calls (both success and failures).
     pub nr_pread_calls: Cell<usize>,
@@ -36,9 +36,9 @@ impl MemorySimFile {
     pub fn new(callbacks: CallbackQueue, fd: Fd, seed: u64, latency_probability: usize) -> Self {
         Self {
             callbacks,
-            fd,
+            fd: Arc::new(fd),
             buffer: RefCell::new(Vec::new()),
-            closed: false,
+            closed: Cell::new(false),
             nr_pread_calls: Cell::new(0),
             nr_pwrite_calls: Cell::new(0),
             nr_sync_calls: Cell::new(0),
@@ -86,6 +86,7 @@ impl File for MemorySimFile {
         pos: usize,
         mut c: turso_core::Completion,
     ) -> Result<Arc<turso_core::Completion>> {
+        self.nr_pread_calls.set(self.nr_pread_calls.get() + 1);
         if let Some(latency) = self.generate_latency_duration() {
             let CompletionType::Read(read_completion) = &mut c.completion_type else {
                 unreachable!();
@@ -106,7 +107,7 @@ impl File for MemorySimFile {
         };
         let c = Arc::new(c);
         let op = Operation::Read {
-            fd: self.fd,
+            fd: self.fd.clone(),
             completion: c.clone(),
             offset: pos,
         };
@@ -120,6 +121,7 @@ impl File for MemorySimFile {
         buffer: Arc<RefCell<turso_core::Buffer>>,
         mut c: turso_core::Completion,
     ) -> Result<Arc<turso_core::Completion>> {
+        self.nr_pwrite_calls.set(self.nr_pwrite_calls.get() + 1);
         if let Some(latency) = self.generate_latency_duration() {
             let CompletionType::Write(write_completion) = &mut c.completion_type else {
                 unreachable!();
@@ -140,7 +142,7 @@ impl File for MemorySimFile {
         };
         let c = Arc::new(c);
         let op = Operation::Write {
-            fd: self.fd,
+            fd: self.fd.clone(),
             buffer,
             completion: c.clone(),
             offset: pos,
@@ -171,7 +173,6 @@ impl File for MemorySimFile {
         };
         let c = Arc::new(c);
         let op = Operation::Sync {
-            fd: self.fd,
             completion: c.clone(),
         };
         self.callbacks.lock().push(op);

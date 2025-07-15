@@ -1,40 +1,41 @@
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
+use indexmap::IndexMap;
 use parking_lot::Mutex;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::{Clock, Completion, Instant, OpenFlags, Result, IO};
 
+use crate::runner::SimIO;
 use crate::{model::FAULT_ERROR_MSG, runner::memory::file::MemorySimFile};
 
 /// File descriptor
-pub type Fd = usize;
+pub type Fd = String;
 
 pub enum Operation {
     Read {
-        fd: usize,
+        fd: Arc<Fd>,
         completion: Arc<Completion>,
         offset: usize,
     },
     Write {
-        fd: usize,
+        fd: Arc<Fd>,
         buffer: Arc<RefCell<turso_core::Buffer>>,
         completion: Arc<Completion>,
         offset: usize,
     },
     Sync {
-        fd: usize,
         completion: Arc<Completion>,
     },
 }
 
 pub type CallbackQueue = Arc<Mutex<Vec<Operation>>>;
 
-pub struct MemorySimIo {
+pub struct MemorySimIO {
     callbacks: CallbackQueue,
     pub fault: Cell<bool>,
-    pub files: RefCell<Vec<Arc<MemorySimFile>>>,
+    pub files: RefCell<IndexMap<Fd, Arc<MemorySimFile>>>,
     pub rng: RefCell<ChaCha8Rng>,
     pub nr_run_once_faults: Cell<usize>,
     pub page_size: usize,
@@ -42,13 +43,13 @@ pub struct MemorySimIo {
     latency_probability: usize,
 }
 
-unsafe impl Send for MemorySimIo {}
-unsafe impl Sync for MemorySimIo {}
+unsafe impl Send for MemorySimIO {}
+unsafe impl Sync for MemorySimIO {}
 
-impl MemorySimIo {
+impl MemorySimIO {
     pub fn new(seed: u64, page_size: usize, latency_probability: usize) -> Result<Self> {
         let fault = Cell::new(false);
-        let files = RefCell::new(Vec::new());
+        let files = RefCell::new(IndexMap::new());
         let rng = RefCell::new(ChaCha8Rng::seed_from_u64(seed));
         let nr_run_once_faults = Cell::new(0);
         Ok(Self {
@@ -62,20 +63,35 @@ impl MemorySimIo {
             latency_probability,
         })
     }
+}
 
-    pub fn inject_fault(&self, fault: bool) {
+impl SimIO for MemorySimIO {
+    fn inject_fault(&self, fault: bool) {
         self.fault.replace(fault);
     }
 
-    pub fn print_stats(&self) {
+    fn print_stats(&self) {
         tracing::info!("run_once faults: {}", self.nr_run_once_faults.get());
-        for file in self.files.borrow().iter() {
+        for file in self.files.borrow().values() {
             tracing::info!("\n===========================\n{}", file.stats_table());
+        }
+    }
+
+    fn syncing(&self) -> bool {
+        let callbacks = self.callbacks.try_lock().unwrap();
+        callbacks
+            .iter()
+            .any(|operation| matches!(operation, Operation::Sync { .. }))
+    }
+
+    fn close_files(&self) {
+        for file in self.files.borrow().values() {
+            file.closed.set(true);
         }
     }
 }
 
-impl Clock for MemorySimIo {
+impl Clock for MemorySimIO {
     fn now(&self) -> Instant {
         Instant {
             secs: 1704067200, // 2024-01-01 00:00:00 UTC
@@ -84,22 +100,28 @@ impl Clock for MemorySimIo {
     }
 }
 
-impl IO for MemorySimIo {
+impl IO for MemorySimIO {
     fn open_file(
         &self,
-        _path: &str,
+        path: &str,
         _flags: OpenFlags, // TODO: ignoring open flags for now as we don't test read only mode in the simulator yet
         _direct: bool,
     ) -> Result<Arc<dyn turso_core::File>> {
-        let files = self.files.borrow_mut();
-        let fd = files.len();
-        let file = Arc::new(MemorySimFile::new(
-            self.callbacks.clone(),
-            fd,
-            self.seed,
-            self.latency_probability,
-        ));
-        self.files.borrow_mut().push(file.clone());
+        let mut files = self.files.borrow_mut();
+        let fd = path.to_string();
+        let file = if let Some(file) = files.get(path) {
+            file.clone()
+        } else {
+            let file = Arc::new(MemorySimFile::new(
+                self.callbacks.clone(),
+                fd.clone(),
+                self.seed,
+                self.latency_probability,
+            ));
+            files.insert(fd, file.clone());
+            file
+        };
+
         Ok(file)
     }
 
@@ -127,15 +149,18 @@ impl IO for MemorySimIo {
                     completion,
                     offset,
                 } => {
-                    let file = &files[fd];
+                    let file = files.get(fd.as_str()).unwrap();
                     let file_buf = file.buffer.borrow_mut();
                     let buffer = completion.as_read().buf.clone();
-                    let mut buf = buffer.borrow_mut();
-                    let buf = buf.as_mut_slice();
-                    // TODO: check for sector faults here
+                    let buf_size = {
+                        let mut buf = buffer.borrow_mut();
+                        let buf = buf.as_mut_slice();
+                        // TODO: check for sector faults here
 
-                    buf.copy_from_slice(&file_buf[offset..][0..buf.len()]);
-                    completion.complete(buf.len() as i32);
+                        buf.copy_from_slice(&file_buf[offset..][0..buf.len()]);
+                        buf.len() as i32
+                    };
+                    completion.complete(buf_size);
                 }
                 Operation::Write {
                     fd,
@@ -143,16 +168,27 @@ impl IO for MemorySimIo {
                     completion,
                     offset,
                 } => {
-                    let file = &files[fd];
-                    let mut file_buf = file.buffer.borrow_mut();
-                    let buf = buffer.borrow_mut();
-                    let buf = buf.as_slice();
-                    let write_size = file_buf.len() - offset;
-                    if write_size < buf.len() {
-                        file_buf.reserve(write_size);
-                    }
-                    file_buf[offset..][0..buf.len()].copy_from_slice(buf);
-                    completion.complete(buf.len() as i32);
+                    let file = files.get(fd.as_str()).unwrap();
+                    let buf_size = {
+                        let mut file_buf = file.buffer.borrow_mut();
+                        let buf = buffer.borrow_mut();
+                        let buf = buf.as_slice();
+                        let more_space = if file_buf.len() < offset {
+                            (offset + buf.len()) - file_buf.len()
+                        } else {
+                            buf.len().saturating_sub(file_buf.len() - offset)
+                        };
+                        if more_space > 0 {
+                            file_buf.reserve(more_space);
+                            for _ in 0..more_space {
+                                file_buf.push(0);
+                            }
+                        }
+
+                        file_buf[offset..][0..buf.len()].copy_from_slice(buf);
+                        buf.len() as i32
+                    };
+                    completion.complete(buf_size);
                 }
                 Operation::Sync { completion, .. } => {
                     // There is no Sync for in memory

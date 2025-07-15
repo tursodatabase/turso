@@ -39,3 +39,4 @@ turso_sqlite3_parser = { workspace = true, features = ["serde"]}
 hex = "0.4.3"
 itertools = "0.14.0"
 parking_lot = "0.12.4"
+indexmap = "2.10.0"
