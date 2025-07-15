@@ -11,7 +11,7 @@ const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES_MAKE_ME_SMALLER_ONCE_WAL_SPILL_IS_IMPLEME
 
 #[derive(Debug, Eq, Hash, PartialEq, Clone)]
 pub struct PageCacheKey {
-    pub pgno: usize,
+    pgno: usize,
 }
 
 #[allow(dead_code)]
@@ -131,7 +131,7 @@ impl DumbLruPageCache {
     }
 
     // Returns Ok if key is not found
-    fn _delete(&mut self, key: PageCacheKey, clean_page: bool) -> Result<(), CacheError> {
+    pub fn _delete(&mut self, key: PageCacheKey, clean_page: bool) -> Result<(), CacheError> {
         if !self.contains_key(&key) {
             return Ok(());
         }
