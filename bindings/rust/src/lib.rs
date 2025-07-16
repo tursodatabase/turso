@@ -35,12 +35,17 @@
 pub mod params;
 pub mod value;
 
+use turso_core::types::{DatabaseChange, DatabaseChangeType, ImmutableRecord, RecordCursor};
+use turso_core::{DatabaseStorage, LimboError};
 pub use value::Value;
 
 pub use params::params_from_iter;
 
 use crate::params::*;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
+use std::hash::Hash;
+use std::i64;
 use std::num::NonZero;
 use std::sync::{Arc, Mutex};
 
@@ -52,6 +57,8 @@ pub enum Error {
     MutexError(String),
     #[error("SQL execution failure: `{0}`")]
     SqlExecutionFailure(String),
+    #[error("SQL internal failure: `{0}`")]
+    InternalError(String),
 }
 
 impl From<turso_core::LimboError> for Error {
@@ -152,6 +159,94 @@ impl Clone for Connection {
 unsafe impl Send for Connection {}
 unsafe impl Sync for Connection {}
 
+pub struct DatabaseReplayContext {
+    cached_delete_stmt: HashMap<String, Statement>,
+    cached_insert_stmt: HashMap<(String, usize), Statement>,
+}
+
+impl DatabaseReplayContext {
+    pub fn new() -> Self {
+        DatabaseReplayContext {
+            cached_delete_stmt: HashMap::new(),
+            cached_insert_stmt: HashMap::new(),
+        }
+    }
+}
+
+pub struct DatabaseChangesIterator {
+    query_stmt: Statement,
+    previous_change_id: Option<i64>,
+    batch: VecDeque<DatabaseChange>,
+}
+
+impl DatabaseChangesIterator {
+    pub async fn next(&mut self) -> Result<Option<DatabaseChange>> {
+        if self.batch.is_empty() {
+            let change_id_filter = self.previous_change_id.unwrap_or(-1);
+            self.query_stmt.reset();
+            let mut rows = self.query_stmt.query((change_id_filter,)).await?;
+            while let Some(row) = rows.next().await? {
+                let change_id = match row.get_value(0)? {
+                    Value::Integer(i) => Ok(i as i64),
+                    v => Err(Error::InternalError(format!(
+                        "change_id column type mismatch: expected integer, got '{v:?}'"
+                    ))),
+                }?;
+                let change_time = match row.get_value(1)? {
+                    Value::Integer(i) => Ok(i as u64),
+                    v => Err(Error::InternalError(format!(
+                        "change_time column type mismatch: expected integer, got '{v:?}'"
+                    ))),
+                }?;
+                let table_name = match row.get_value(3)? {
+                    Value::Text(t) => Ok(t),
+                    v => Err(Error::InternalError(format!(
+                        "table_name column type mismatch: expected string, got '{v:?}'"
+                    ))),
+                }?;
+                let id = match row.get_value(4)? {
+                    Value::Integer(i) => Ok(i),
+                    v => Err(Error::InternalError(format!(
+                        "id column type mismatch: expected integer, got '{v:?}'"
+                    ))),
+                }?;
+                let change = {
+                    let after = || match row.get_value(6) {
+                        Ok(Value::Blob(b)) => Ok(b),
+                        v => Err(Error::InternalError(format!(
+                            "after column type mismatch: expected blob, got '{v:?}'"
+                        ))),
+                    };
+                    match row.get_value(2)? {
+                        Value::Integer(-1) => Ok(DatabaseChangeType::Delete),
+                        Value::Integer(0) => Ok(DatabaseChangeType::Update {
+                            bin_record: after()?,
+                        }),
+                        Value::Integer(1) => Ok(DatabaseChangeType::Insert {
+                            bin_record: after()?,
+                        }),
+                        v => Err(Error::InternalError(format!(
+                            "change_type column type mismatch: expected -1|0|1, got '{v:?}'"
+                        ))),
+                    }?
+                };
+                self.batch.push_back(DatabaseChange {
+                    change_id,
+                    change_time,
+                    change,
+                    table_name,
+                    id,
+                });
+            }
+            let batch_len = self.batch.len();
+            if batch_len > 0 {
+                self.previous_change_id = Some(self.batch[batch_len - 1].change_id);
+            }
+        }
+        Ok(self.batch.pop_front())
+    }
+}
+
 impl Connection {
     /// Query the database with SQL.
     pub async fn query(&self, sql: &str, params: impl IntoParams) -> Result<Rows> {
@@ -179,6 +274,69 @@ impl Connection {
             inner: Arc::new(Mutex::new(stmt)),
         };
         Ok(statement)
+    }
+
+    pub async fn changes_iterator(
+        &self,
+        cdc_table_name: &str,
+        previous_change_id: Option<i64>,
+        batch_size: usize,
+    ) -> Result<DatabaseChangesIterator> {
+        let query_stmt = self
+            .prepare(&format!(
+                "SELECT * FROM {} WHERE operation_id > ? LIMIT {}",
+                cdc_table_name, batch_size
+            ))
+            .await?;
+        Ok(DatabaseChangesIterator {
+            previous_change_id,
+            batch: VecDeque::with_capacity(batch_size),
+            query_stmt,
+        })
+    }
+
+    pub async fn replay_change(
+        &self,
+        ctx: &mut DatabaseReplayContext,
+        change: DatabaseChange,
+    ) -> Result<()> {
+        let table_name = &change.table_name;
+        if let DatabaseChangeType::Delete | DatabaseChangeType::Update { .. } = &change.change {
+            if !ctx.cached_delete_stmt.contains_key(table_name) {
+                let query = format!("DELETE FROM {} WHERE rowid = ?", table_name);
+                let stmt = self.prepare(&query).await?;
+                ctx.cached_delete_stmt.insert(table_name.clone(), stmt);
+            }
+            let stmt = ctx.cached_delete_stmt.get_mut(table_name).unwrap();
+            stmt.execute((change.id,)).await?;
+        }
+        if let DatabaseChangeType::Update { bin_record }
+        | DatabaseChangeType::Insert { bin_record } = change.change
+        {
+            let record = ImmutableRecord::from_bin_record(bin_record);
+            let mut cursor = RecordCursor::new();
+            let columns = cursor.count(&record);
+            let key = (table_name.to_string(), columns);
+            if !ctx.cached_insert_stmt.contains_key(&key) {
+                let placeholders = ["?"].repeat(columns).join(",");
+                let query = format!("INSERT INTO {} VALUES ({})", table_name, placeholders);
+                let stmt = self.prepare(&query).await?;
+                ctx.cached_insert_stmt.insert(key.clone(), stmt);
+            }
+            let mut values = Vec::with_capacity(columns);
+            for i in 0..columns {
+                values.push(match cursor.get_value(&record, i)?.to_owned() {
+                    turso_core::Value::Null => Value::Null,
+                    turso_core::Value::Integer(x) => Value::Integer(x),
+                    turso_core::Value::Float(x) => Value::Real(x),
+                    turso_core::Value::Text(x) => Value::Text(x.as_str().to_string()),
+                    turso_core::Value::Blob(x) => Value::Blob(x),
+                });
+            }
+            let stmt = ctx.cached_insert_stmt.get_mut(&key).unwrap();
+            stmt.execute(params::Params::Positional(values)).await?;
+        }
+        Ok(())
     }
 
     /// Query a pragma.
@@ -323,6 +481,12 @@ impl Statement {
         }
 
         cols
+    }
+
+    /// Reset internal statement state after previous execution so it can be reused again
+    pub fn reset(&self) {
+        let mut stmt = self.inner.lock().unwrap();
+        stmt.reset();
     }
 }
 
@@ -608,5 +772,140 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    async fn setup_schema(conn: &Connection) {
+        conn.execute("CREATE TABLE a(x INTEGER PRIMARY KEY, y);", ())
+            .await
+            .unwrap();
+        conn.execute("CREATE TABLE b(x INTEGER PRIMARY KEY, y, z);", ())
+            .await
+            .unwrap();
+    }
+
+    fn convert_value(value: turso_core::Value) -> Value {
+        match value {
+            turso_core::Value::Null => Value::Null,
+            turso_core::Value::Integer(x) => Value::Integer(x),
+            turso_core::Value::Float(x) => Value::Real(x),
+            turso_core::Value::Text(x) => Value::Text(x.as_str().to_string()),
+            turso_core::Value::Blob(x) => Value::Blob(x),
+        }
+    }
+
+    async fn fetch_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let mut rows = vec![];
+        let mut iterator_a = conn.query("SELECT * FROM a", ()).await.unwrap();
+        while let Some(row) = iterator_a.next().await.unwrap() {
+            rows.push(row.values.into_iter().map(convert_value).collect());
+        }
+        let mut iterator_b = conn.query("SELECT * FROM b", ()).await.unwrap();
+        while let Some(row) = iterator_b.next().await.unwrap() {
+            rows.push(row.values.into_iter().map(convert_value).collect());
+        }
+        rows
+    }
+
+    #[tokio::test]
+    async fn test_database_cdc() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let db_path2 = temp_file2.path().to_str().unwrap();
+
+        let db1 = Builder::new_local(db_path1).build().await.unwrap();
+        let conn1 = db1.connect().unwrap();
+
+        let db2 = Builder::new_local(db_path2).build().await.unwrap();
+        let conn2 = db2.connect().unwrap();
+
+        setup_schema(&conn1).await;
+        setup_schema(&conn2).await;
+
+        conn1
+            .execute("PRAGMA unstable_capture_data_changes_conn('full')", ())
+            .await
+            .unwrap();
+        conn1
+            .execute("INSERT INTO a VALUES (1, 'hello'), (2, 'turso')", ())
+            .await
+            .unwrap();
+
+        conn1
+            .execute(
+                "INSERT INTO b VALUES (3, 'bye', 0.1), (4, 'limbo', 0.2)",
+                (),
+            )
+            .await
+            .unwrap();
+
+        let mut ctx = DatabaseReplayContext::new();
+        let mut changes = conn1.changes_iterator("turso_cdc", None, 10).await.unwrap();
+        while let Some(change) = changes.next().await.unwrap() {
+            conn2.replay_change(&mut ctx, change).await.unwrap();
+        }
+
+        assert_eq!(
+            fetch_rows(&conn2).await,
+            vec![
+                vec![Value::Integer(1), Value::Text("hello".to_string())],
+                vec![Value::Integer(2), Value::Text("turso".to_string())],
+                vec![
+                    Value::Integer(3),
+                    Value::Text("bye".to_string()),
+                    Value::Real(0.1)
+                ],
+                vec![
+                    Value::Integer(4),
+                    Value::Text("limbo".to_string()),
+                    Value::Real(0.2)
+                ],
+            ]
+        );
+
+        conn1
+            .execute("DELETE FROM b WHERE y = 'limbo'", ())
+            .await
+            .unwrap();
+
+        while let Some(change) = changes.next().await.unwrap() {
+            conn2.replay_change(&mut ctx, change).await.unwrap();
+        }
+
+        assert_eq!(
+            fetch_rows(&conn2).await,
+            vec![
+                vec![Value::Integer(1), Value::Text("hello".to_string())],
+                vec![Value::Integer(2), Value::Text("turso".to_string())],
+                vec![
+                    Value::Integer(3),
+                    Value::Text("bye".to_string()),
+                    Value::Real(0.1)
+                ],
+            ]
+        );
+
+        conn1
+            .execute("UPDATE b SET y = x'deadbeef' WHERE x = 3", ())
+            .await
+            .unwrap();
+
+        while let Some(change) = changes.next().await.unwrap() {
+            conn2.replay_change(&mut ctx, change).await.unwrap();
+        }
+
+        assert_eq!(
+            fetch_rows(&conn2).await,
+            vec![
+                vec![Value::Integer(1), Value::Text("hello".to_string())],
+                vec![Value::Integer(2), Value::Text("turso".to_string())],
+                vec![
+                    Value::Integer(3),
+                    Value::Blob(vec![0xde, 0xad, 0xbe, 0xef]),
+                    Value::Real(0.1)
+                ],
+            ]
+        );
     }
 }
