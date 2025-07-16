@@ -1518,7 +1518,7 @@ pub fn begin_read_wal_frame(
     Ok(c)
 }
 
-#[instrument(err,skip(io, page, write_counter, wal_header, checksums), level = Level::DEBUG)]
+#[instrument(err,skip(io, page, wal_header, checksums), level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
 pub fn begin_write_wal_frame(
     io: &Arc<dyn File>,
@@ -1526,10 +1526,9 @@ pub fn begin_write_wal_frame(
     page: &PageRef,
     page_size: u16,
     db_size: u32,
-    write_counter: Rc<RefCell<usize>>,
     wal_header: &WalHeader,
     checksums: (u32, u32),
-) -> Result<(u32, u32)> {
+) -> Result<(Arc<Completion>, (u32, u32))> {
     let page_finish = page.clone();
     let page_id = page.get().id;
     tracing::trace!(page_id);
@@ -1590,14 +1589,11 @@ pub fn begin_write_wal_frame(
         (Arc::new(RefCell::new(buffer)), final_checksum)
     };
 
-    let clone_counter = write_counter.clone();
-    *write_counter.borrow_mut() += 1;
     let write_complete = {
         let buf_copy = buffer.clone();
         Box::new(move |bytes_written: i32| {
             let buf_copy = buf_copy.clone();
             let buf_len = buf_copy.borrow().len();
-            *clone_counter.borrow_mut() -= 1;
 
             page_finish.clear_dirty();
             turso_assert!(
@@ -1608,14 +1604,9 @@ pub fn begin_write_wal_frame(
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new_write(write_complete);
-    let res = io.pwrite(offset, buffer.clone(), c.into());
-    if res.is_err() {
-        // If we do not reduce the counter here on error, we incur an infinite loop when cacheflushing
-        *write_counter.borrow_mut() -= 1;
-    }
-    res?;
+    let c = io.pwrite(offset, buffer.clone(), c.into())?;
     tracing::trace!("Frame written and synced");
-    Ok(checksums)
+    Ok((c, checksums))
 }
 
 pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<()> {

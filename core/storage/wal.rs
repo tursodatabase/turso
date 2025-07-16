@@ -223,12 +223,7 @@ pub trait Wal {
     /// db_size > 0    -> last frame written in transaction
     /// db_size == 0   -> non-last frame written in transaction
     /// write_counter is the counter we use to track when the I/O operation starts and completes
-    fn append_frame(
-        &mut self,
-        page: PageRef,
-        db_size: u32,
-        write_counter: Rc<RefCell<usize>>,
-    ) -> Result<()>;
+    fn append_frame(&mut self, page: PageRef, db_size: u32) -> Result<Arc<Completion>>;
 
     /// Complete append of frames by updating shared wal state. Before this
     /// all changes were stored locally.
@@ -293,13 +288,12 @@ impl Wal for DummyWAL {
         todo!();
     }
 
-    fn append_frame(
-        &mut self,
-        _page: crate::PageRef,
-        _db_size: u32,
-        _write_counter: Rc<RefCell<usize>>,
-    ) -> Result<()> {
-        Ok(())
+    fn append_frame(&mut self, _page: crate::PageRef, _db_size: u32) -> Result<Arc<Completion>> {
+        Ok(Arc::new(Completion::new(CompletionType::Write(
+            crate::WriteCompletion {
+                complete: Box::new(|_| {}),
+            },
+        ))))
     }
 
     fn should_checkpoint(&self) -> bool {
@@ -647,18 +641,13 @@ impl Wal for WalFile {
 
     /// Write a frame to the WAL.
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn append_frame(
-        &mut self,
-        page: PageRef,
-        db_size: u32,
-        write_counter: Rc<RefCell<usize>>,
-    ) -> Result<()> {
+    fn append_frame(&mut self, page: PageRef, db_size: u32) -> Result<Arc<Completion>> {
         let page_id = page.get().id;
         let max_frame = self.max_frame;
         let frame_id = if max_frame == 0 { 1 } else { max_frame + 1 };
         let offset = self.frame_offset(frame_id);
         tracing::debug!(frame_id, offset, page_id);
-        let checksums = {
+        let (completion, checksums) = {
             let shared = self.get_shared();
             let header = shared.wal_header.clone();
             let header = header.lock();
@@ -669,7 +658,6 @@ impl Wal for WalFile {
                 &page,
                 header.page_size as u16,
                 db_size,
-                write_counter,
                 &header,
                 checksums,
             )?
@@ -688,7 +676,7 @@ impl Wal for WalFile {
                 }
             }
         }
-        Ok(())
+        Ok(completion)
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
