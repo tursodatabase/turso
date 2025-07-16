@@ -237,6 +237,8 @@ enum WriteState {
     /// 1. If the leftmost page triggered balancing, up to 3 leftmost pages will be balanced.
     /// 2. If the rightmost page triggered balancing, up to 3 rightmost pages will be balanced.
     BalanceNonRootPickSiblings,
+    /// Waits for the Sibling pages to be loaded
+    BalanceNonRootWaitSiblings,
     /// Perform the actual balancing. This will result in 1-5 pages depending on the number of total cells to be distributed
     /// from the source pages.
     BalanceNonRootDoBalancing,
@@ -2254,6 +2256,7 @@ impl BTreeCursor {
                 }
                 WriteState::BalanceStart
                 | WriteState::BalanceNonRootPickSiblings
+                | WriteState::BalanceNonRootWaitSiblings
                 | WriteState::BalanceNonRootDoBalancing => {
                     return_if_io!(self.balance(None));
                 }
@@ -2346,7 +2349,10 @@ impl BTreeCursor {
                     self.stack.pop();
                     return_if_io!(self.balance_non_root());
                 }
-                WriteState::BalanceNonRootPickSiblings | WriteState::BalanceNonRootDoBalancing => {
+                WriteState::BalanceNonRootPickSiblings
+                | WriteState::BalanceNonRootWaitSiblings
+                | WriteState::BalanceNonRootDoBalancing
+                | WriteState::BalanceFreePages { .. } => {
                     return_if_io!(self.balance_non_root());
                 }
                 WriteState::Finish => return Ok(IOResult::Done(())),
@@ -2457,6 +2463,7 @@ impl BTreeCursor {
                 // start loading right page first
                 let mut pgno: u32 = unsafe { right_pointer.cast::<u32>().read().swap_bytes() };
                 let current_sibling = sibling_pointer;
+
                 for i in (0..=current_sibling).rev() {
                     let page = self.read_page(pgno as usize)?;
                     {
@@ -2464,14 +2471,6 @@ impl BTreeCursor {
                         let sibling_page = page.get();
                         sibling_page.set_dirty();
                         self.pager.add_dirty(sibling_page.get().id);
-                    }
-                    #[cfg(debug_assertions)]
-                    {
-                        return_if_locked!(page.get());
-                        debug_validate_cells!(
-                            &page.get().get_contents(),
-                            self.usable_space() as u16
-                        );
                     }
                     pages_to_balance[i].replace(page);
                     turso_assert!(
@@ -2495,22 +2494,6 @@ impl BTreeCursor {
                     };
                 }
 
-                #[cfg(debug_assertions)]
-                {
-                    let page_type_of_siblings = pages_to_balance[0]
-                        .as_ref()
-                        .unwrap()
-                        .get()
-                        .get_contents()
-                        .page_type();
-                    for page in pages_to_balance.iter().take(sibling_count) {
-                        return_if_locked_maybe_load!(self.pager, page.as_ref().unwrap());
-                        let page = page.as_ref().unwrap().get();
-                        let contents = page.get_contents();
-                        debug_validate_cells!(&contents, self.usable_space() as u16);
-                        assert_eq!(contents.page_type(), page_type_of_siblings);
-                    }
-                }
                 self.state
                     .write_info()
                     .unwrap()
@@ -2522,7 +2505,42 @@ impl BTreeCursor {
                         sibling_count,
                         first_divider_cell: first_cell_divider,
                     }));
-                (WriteState::BalanceNonRootDoBalancing, Ok(IOResult::IO))
+                (WriteState::BalanceNonRootWaitSiblings, Ok(IOResult::IO))
+            }
+            WriteState::BalanceNonRootWaitSiblings => {
+                let balance_info = self.state.write_info().unwrap().balance_info.borrow_mut();
+                let balance_info = balance_info.as_ref().unwrap();
+                let current_sibling = balance_info.sibling_count - 1;
+                let locked = (0..=current_sibling).rev().any(|i| {
+                    balance_info.pages_to_balance[i]
+                        .as_ref()
+                        .map_or(false, |page| page.get().is_locked())
+                });
+                if locked {
+                    (WriteState::BalanceNonRootWaitSiblings, Ok(IOResult::IO))
+                } else {
+                    #[cfg(debug_assertions)]
+                    {
+                        let page_type_of_siblings = balance_info.pages_to_balance[0]
+                            .as_ref()
+                            .unwrap()
+                            .get()
+                            .get_contents()
+                            .page_type();
+                        for page in balance_info
+                            .pages_to_balance
+                            .iter()
+                            .take(balance_info.sibling_count)
+                        {
+                            let page = page.as_ref().unwrap().get();
+                            let contents = page.get_contents();
+                            debug_validate_cells!(&contents, self.usable_space() as u16);
+                            assert_eq!(contents.page_type(), page_type_of_siblings);
+                        }
+                    }
+
+                    (WriteState::BalanceNonRootDoBalancing, Ok(IOResult::IO))
+                }
             }
             WriteState::BalanceNonRootDoBalancing => {
                 // Ensure all involved pages are in memory.
@@ -3368,7 +3386,7 @@ impl BTreeCursor {
                             curr_page: curr_page + 1,
                             sibling_count_new,
                         },
-                        Ok(IOResult::Done(())),
+                        Ok(IOResult::IO),
                     )
                 }
                 (WriteState::BalanceStart, Ok(IOResult::Done(())))

@@ -62,6 +62,7 @@ use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, Text
 use crate::{turso_assert, File, Result, WalFileShared};
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -826,7 +827,7 @@ pub struct TableInteriorCell {
     pub rowid: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TableLeafCell {
     pub rowid: i64,
     /// Payload of cell, if it overflows it won't include overflowed payload.
@@ -834,6 +835,16 @@ pub struct TableLeafCell {
     /// This is the complete payload size including overflow pages.
     pub payload_size: u64,
     pub first_overflow_page: Option<u32>,
+}
+
+impl Debug for TableLeafCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TableLeafCell")
+            .field("rowid", &self.rowid)
+            .field("payload_size", &self.payload_size)
+            .field("first_overflow_page", &self.first_overflow_page)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]

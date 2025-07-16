@@ -1118,8 +1118,8 @@ impl Pager {
         const TRUNK_PAGE_LEAF_COUNT_OFFSET: usize = 4; // Offset to leaf count
 
         let mut state = self.free_page_state.borrow_mut();
-        tracing::debug!(?state);
         loop {
+            tracing::debug!(?state);
             match &mut *state {
                 FreePageState::Start => {
                     if page_id < 2 || page_id > header_accessor::get_database_size(self)? as usize {
@@ -1145,10 +1145,8 @@ impl Pager {
                         }
                         None => self.read_page(page_id)?,
                     };
-                    header_accessor::set_freelist_pages(
-                        self,
-                        header_accessor::get_freelist_pages(self)? + 1,
-                    )?;
+                    let new_num_freelist_pages = header_accessor::get_freelist_pages(self)? + 1;
+                    header_accessor::set_freelist_pages(self, new_num_freelist_pages)?;
 
                     let trunk_page_id = header_accessor::get_freelist_trunk_page(self)?;
 
