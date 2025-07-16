@@ -11,6 +11,7 @@ use turso_core::Database;
 
 use crate::model::table::Table;
 
+use crate::runner::io::SimulatorIO;
 use crate::runner::memory::io::MemorySimIO;
 use crate::runner::SimIO;
 
@@ -252,11 +253,10 @@ impl SimulatorEnv {
             max_tick: cli_opts.max_tick,
         };
 
-        // let io =
-        //     Arc::new(SimulatorIO::new(seed, opts.page_size, cli_opts.latency_probability).unwrap());
-
-        let io = Arc::new(
-            MemorySimIO::new(
+        let io: Arc<dyn SimIO> = if cli_opts.memory_io {
+            Arc::new(MemorySimIO::new(seed, opts.page_size, cli_opts.latency_probability).unwrap())
+        } else { Arc::new(
+            SimulatorIO::new(
                 seed,
                 opts.page_size,
                 cli_opts.latency_probability,
@@ -264,7 +264,8 @@ impl SimulatorEnv {
                 cli_opts.max_tick,
             )
             .unwrap(),
-        );
+        )
+        };
 
         // Remove existing database file if it exists
         let db_path = paths.db(&simulation_type, &SimulationPhase::Test);
