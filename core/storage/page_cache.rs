@@ -216,16 +216,18 @@ impl DumbLruPageCache {
         &mut self,
         entry: NonNull<PageCacheEntry>,
         clean_page: bool,
+        rollback: bool,
     ) -> Result<(), CacheError> {
-        self._detach(entry, clean_page, false)
+        self._detach(entry, clean_page, false, rollback)
     }
 
     fn detach_even_if_pinned(
         &mut self,
         entry: NonNull<PageCacheEntry>,
         clean_page: bool,
+        rollback: bool,
     ) -> Result<(), CacheError> {
-        self._detach(entry, clean_page, true)
+        self._detach(entry, clean_page, true, rollback)
     }
 
     fn unlink(&mut self, mut entry: NonNull<PageCacheEntry>) {

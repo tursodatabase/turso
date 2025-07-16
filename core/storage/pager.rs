@@ -183,10 +183,10 @@ enum CacheFlushState {
     /// Idle.
     Start,
     /// Waiting for all in-flight writes to the on-disk WAL to complete.
-    WaitAppendFrames,
+    WaitAppendFrames { completions: Vec<Arc<Completion>> },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 /// The state of the current pager cache commit.
 enum CommitState {
     /// Idle.
@@ -224,15 +224,11 @@ pub enum BtreePageAllocMode {
 /// This will keep track of the state of current cache commit in order to not repeat work
 struct CommitInfo {
     state: CommitState,
-    /// Number of writes taking place. When in_flight gets to 0 we can schedule a fsync.
-    in_flight_writes: Rc<RefCell<usize>>,
 }
 
 /// This will keep track of the state of current cache flush in order to not repeat work
 struct FlushInfo {
     state: CacheFlushState,
-    /// Number of writes taking place. When in_flight gets to 0 we can schedule a fsync.
-    in_flight_writes: Rc<RefCell<usize>>,
 }
 
 /// Track the state of the auto-vacuum mode.
@@ -348,7 +344,6 @@ impl Pager {
             reserved_space: OnceCell::new(),
             flush_info: RefCell::new(FlushInfo {
                 state: CacheFlushState::Start,
-                in_flight_writes: Rc::new(RefCell::new(0)),
             }),
             free_page_state: RefCell::new(FreePageState::Start),
         })
@@ -832,31 +827,32 @@ impl Pager {
     /// Unlike commit_dirty_pages, this function does not commit, checkpoint now sync the WAL/Database.
     #[instrument(skip_all, level = Level::INFO)]
     pub fn cacheflush(&self) -> Result<IOResult<()>> {
-        let state = self.flush_info.borrow().state;
+        let mut flush_info = self.flush_info.borrow_mut();
+        let state = &mut flush_info.state;
         trace!(?state);
         match state {
             CacheFlushState::Start => {
+                let mut completions = Vec::with_capacity(self.dirty_pages.borrow().len());
                 for page_id in self.dirty_pages.borrow().iter() {
                     let mut cache = self.page_cache.write();
                     let page_key = PageCacheKey::new(*page_id);
                     let page = cache.get(&page_key).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
                     let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
                     trace!("cacheflush(page={}, page_type={:?})", page_id, page_type);
-                    self.wal.borrow_mut().append_frame(
-                        page.clone(),
-                        0,
-                        self.flush_info.borrow().in_flight_writes.clone(),
-                    )?;
+                    let completion = self.wal.borrow_mut().append_frame(page.clone(), 0)?;
+                    completions.push(completion);
                     page.clear_dirty();
                 }
                 self.dirty_pages.borrow_mut().clear();
-                self.flush_info.borrow_mut().state = CacheFlushState::WaitAppendFrames;
+                *state = CacheFlushState::WaitAppendFrames { completions };
                 return Ok(IOResult::IO);
             }
-            CacheFlushState::WaitAppendFrames => {
-                let in_flight = *self.flush_info.borrow().in_flight_writes.borrow();
-                if in_flight == 0 {
-                    self.flush_info.borrow_mut().state = CacheFlushState::Start;
+            CacheFlushState::WaitAppendFrames { completions } => {
+                if completions
+                    .iter()
+                    .all(|completion| completion.is_completed())
+                {
+                    *state = CacheFlushState::Start;
                     self.wal.borrow_mut().finish_append_frames_commit()?;
                     return Ok(IOResult::Done(()));
                 } else {
@@ -877,8 +873,8 @@ impl Pager {
     ) -> Result<IOResult<PagerCommitResult>> {
         let mut checkpoint_result = CheckpointResult::default();
         let res = loop {
-            let mut flush_info = self.commit_info.borrow_mut();
-            let state = &flush_info.state;
+            let mut commit_info = self.commit_info.borrow_mut();
+            let state = &commit_info.state;
             trace!(?state);
             match state {
                 CommitState::Start => {
@@ -910,12 +906,12 @@ impl Pager {
                     commit_info.state = CommitState::WaitAppendFrames { completions };
                     return Ok(IOResult::IO);
                 }
-                FlushState::WaitAppendFrames { completions } => {
+                CommitState::WaitAppendFrames { completions } => {
                     if completions
                         .iter()
                         .all(|completion| completion.is_completed())
                     {
-                        flush_info.state = FlushState::SyncWal;
+                        commit_info.state = CommitState::SyncWal;
                     } else {
                         return Ok(IOResult::IO);
                     }
@@ -972,7 +968,7 @@ impl Pager {
     pub fn checkpoint(&self) -> Result<IOResult<CheckpointResult>> {
         let mut checkpoint_result = CheckpointResult::default();
         loop {
-            let state = self.checkpoint_state.borrow();
+            let mut state = self.checkpoint_state.borrow_mut();
             trace!(?state);
             match &*state {
                 CheckpointState::Checkpoint => {
@@ -984,25 +980,23 @@ impl Pager {
                         IOResult::IO => return Ok(IOResult::IO),
                         IOResult::Done(res) => {
                             checkpoint_result = res;
-                            self.checkpoint_state.replace(CheckpointState::SyncDbFile);
+                            *state = CheckpointState::SyncDbFile;
                         }
                     };
                 }
                 CheckpointState::SyncDbFile => {
                     let completion = sqlite3_ondisk::begin_sync(self.db_file.clone())?;
-                    self.checkpoint_state
-                        .replace(CheckpointState::WaitSyncDbFile { completion });
+                    *state = CheckpointState::WaitSyncDbFile { completion };
                 }
                 CheckpointState::WaitSyncDbFile { completion } => {
                     if !completion.is_completed() {
                         return Ok(IOResult::IO);
                     } else {
-                        self.checkpoint_state
-                            .replace(CheckpointState::CheckpointDone);
+                        *state = CheckpointState::CheckpointDone;
                     }
                 }
                 CheckpointState::CheckpointDone => {
-                    self.checkpoint_state.replace(CheckpointState::Checkpoint);
+                    *state = CheckpointState::Checkpoint;
                     return Ok(IOResult::Done(checkpoint_result));
                 }
             }
@@ -1371,9 +1365,12 @@ impl Pager {
     /// Reset state machines
     fn reset(&self) {
         self.flush_info.replace(FlushInfo {
-            state: FlushState::Start,
+            state: CacheFlushState::Start,
         });
         self.checkpoint_state.replace(CheckpointState::Checkpoint);
+        self.commit_info.replace(CommitInfo {
+            state: CommitState::Start,
+        });
     }
 }
 
