@@ -806,9 +806,7 @@ pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Arc<Compl
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-pub fn begin_sync(
-    db_file: Arc<dyn DatabaseStorage>,
-) -> Result<Arc<Completion>> {
+pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>) -> Result<Arc<Completion>> {
     let completion = Completion::new_sync(move |_| {});
     #[allow(clippy::arc_with_non_send_sync)]
     db_file.sync(completion)

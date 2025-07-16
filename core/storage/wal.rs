@@ -2,7 +2,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::array;
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
 use strum::EnumString;
 use tracing::{instrument, Level};
@@ -19,7 +19,7 @@ use crate::storage::sqlite3_ondisk::{
     prepare_wal_frame, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
 };
 use crate::types::IOResult;
-use crate::{turso_assert, Buffer, LimboError, Result};
+use crate::{turso_assert, Buffer, CompletionType, LimboError, Result};
 use crate::{Completion, Page};
 
 use self::sqlite3_ondisk::{checksum_wal, PageContent, WAL_MAGIC_BE, WAL_MAGIC_LE};
@@ -226,12 +226,7 @@ pub trait Wal {
     /// db_size > 0    -> last frame written in transaction
     /// db_size == 0   -> non-last frame written in transaction
     /// write_counter is the counter we use to track when the I/O operation starts and completes
-    fn append_frame(
-        &mut self,
-        page: PageRef,
-        db_size: u32,
-        write_counter: Rc<RefCell<usize>>,
-    ) -> Result<()>;
+    fn append_frame(&mut self, page: PageRef, db_size: u32) -> Result<Arc<Completion>>;
 
     /// Complete append of frames by updating shared wal state. Before this
     /// all changes were stored locally.
@@ -295,13 +290,12 @@ impl Wal for DummyWAL {
         todo!();
     }
 
-    fn append_frame(
-        &mut self,
-        _page: crate::PageRef,
-        _db_size: u32,
-        _write_counter: Rc<RefCell<usize>>,
-    ) -> Result<()> {
-        Ok(())
+    fn append_frame(&mut self, _page: crate::PageRef, _db_size: u32) -> Result<Arc<Completion>> {
+        Ok(Arc::new(Completion::new(CompletionType::Write(
+            crate::WriteCompletion {
+                complete: Box::new(|_| {}),
+            },
+        ))))
     }
 
     fn should_checkpoint(&self) -> bool {
@@ -731,17 +725,12 @@ impl Wal for WalFile {
 
     /// Write a frame to the WAL.
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn append_frame(
-        &mut self,
-        page: PageRef,
-        db_size: u32,
-        write_counter: Rc<RefCell<usize>>,
-    ) -> Result<()> {
+    fn append_frame(&mut self, page: PageRef, db_size: u32) -> Result<Arc<Completion>> {
         let page_id = page.get().id;
         let frame_id = self.max_frame + 1;
         let offset = self.frame_offset(frame_id);
         tracing::debug!(frame_id, offset, page_id);
-        let checksums = {
+        let (completion, checksums) = {
             let shared = self.get_shared();
             let header = shared.wal_header.clone();
             let header = header.lock();
@@ -757,10 +746,8 @@ impl Wal for WalFile {
                 page_buf,
             );
 
-            *write_counter.borrow_mut() += 1;
             let c = Completion::new_write({
                 let frame_bytes = frame_bytes.clone();
-                let write_counter = write_counter.clone();
                 move |bytes_written| {
                     let frame_len = frame_bytes.borrow().len();
                     turso_assert!(
@@ -769,18 +756,13 @@ impl Wal for WalFile {
                     );
 
                     page.clear_dirty();
-                    *write_counter.borrow_mut() -= 1;
                 }
             });
-            let result = shared.file.pwrite(offset, frame_bytes.clone(), c.into());
-            if let Err(err) = result {
-                *write_counter.borrow_mut() -= 1;
-                return Err(err);
-            }
-            frame_checksums
+            let completion = shared.file.pwrite(offset, frame_bytes.clone(), c.into())?;
+            (completion, frame_checksums)
         };
         self.complete_append_frame(page_id as u64, frame_id, checksums);
-        Ok(())
+        Ok(completion)
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
