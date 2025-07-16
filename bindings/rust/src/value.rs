@@ -110,6 +110,18 @@ impl Value {
     }
 }
 
+impl From<turso_core::Value> for Value {
+    fn from(val: turso_core::Value) -> Self {
+        match val {
+            turso_core::Value::Null => Value::Null,
+            turso_core::Value::Integer(n) => Value::Integer(n),
+            turso_core::Value::Float(n) => Value::Real(n),
+            turso_core::Value::Text(t) => Value::Text(t.into()),
+            turso_core::Value::Blob(items) => Value::Blob(items),
+        }
+    }
+}
+
 impl From<Value> for turso_core::Value {
     fn from(val: Value) -> Self {
         match val {

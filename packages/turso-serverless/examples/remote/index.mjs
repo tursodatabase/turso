@@ -8,15 +8,13 @@ const client = connect({
 await client.batch(
     [
         "CREATE TABLE IF NOT EXISTS users (email TEXT)",
-        "INSERT INTO users VALUES ('first@example.com')",
-        "INSERT INTO users VALUES ('second@example.com')",
-        "INSERT INTO users VALUES ('third@example.com')",
+        "INSERT INTO users VALUES (x'deadbeef')",
     ],
     "write",
 );
 
 // Using execute method
-const result = await client.execute("SELECT * FROM users");
+const result = await client.execute("SELECT email as [e mail] FROM users");
 console.log("Users (execute):", result.rows);
 
 // Using prepare and get method

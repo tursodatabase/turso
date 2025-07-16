@@ -1,0 +1,28 @@
+[package]
+name = "turso-sync"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+turso_core = { workspace = true }
+turso = { workspace = true }
+http = "1.3.1"
+http-body-util = "0.1.3"
+hyper = { version = "1.6.0", features = ["client", "http1"] }
+hyper-rustls = "0.27.7"
+hyper-util = { version = "0.1.16", features = ["http1", "client"] }
+rustls = "0.23.29"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror = "2.0.12"
+tokio = { version = "1.46.1", features = ["fs", "io-util"] }
+tracing = "0.1.41"
+
+[dev-dependencies]
+ctor = "0.4.2"
+tempfile = "3.20.0"
+tokio = { version = "1.46.1", features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
