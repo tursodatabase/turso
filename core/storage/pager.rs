@@ -1014,7 +1014,7 @@ impl Pager {
     pub fn checkpoint(&self) -> Result<IOResult<CheckpointResult>> {
         let mut checkpoint_result = CheckpointResult::default();
         loop {
-            let state = self.checkpoint_state.borrow();
+            let mut state = self.checkpoint_state.borrow_mut();
             trace!(?state);
             match &*state {
                 CheckpointState::Checkpoint => {
@@ -1026,25 +1026,23 @@ impl Pager {
                         IOResult::IO => return Ok(IOResult::IO),
                         IOResult::Done(res) => {
                             checkpoint_result = res;
-                            self.checkpoint_state.replace(CheckpointState::SyncDbFile);
+                            *state = CheckpointState::SyncDbFile;
                         }
                     };
                 }
                 CheckpointState::SyncDbFile => {
                     let completion = sqlite3_ondisk::begin_sync(self.db_file.clone())?;
-                    self.checkpoint_state
-                        .replace(CheckpointState::WaitSyncDbFile { completion });
+                    *state = CheckpointState::WaitSyncDbFile { completion };
                 }
                 CheckpointState::WaitSyncDbFile { completion } => {
                     if !completion.is_completed() {
                         return Ok(IOResult::IO);
                     } else {
-                        self.checkpoint_state
-                            .replace(CheckpointState::CheckpointDone);
+                        *state = CheckpointState::CheckpointDone;
                     }
                 }
                 CheckpointState::CheckpointDone => {
-                    self.checkpoint_state.replace(CheckpointState::Checkpoint);
+                    *state = CheckpointState::Checkpoint;
                     return Ok(IOResult::Done(checkpoint_result));
                 }
             }
@@ -1417,6 +1415,9 @@ impl Pager {
             state: CacheFlushState::Start,
         });
         self.checkpoint_state.replace(CheckpointState::Checkpoint);
+        self.commit_info.replace(CommitInfo {
+            state: CommitState::Start,
+        });
     }
 }
 

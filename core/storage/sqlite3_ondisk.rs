@@ -801,8 +801,7 @@ pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Arc<Compl
         })
     };
     let c = Completion::new_write(write_complete);
-    let res = page_source.write_page(page_id, buffer.clone(), c);
-    res
+    page_source.write_page(page_id, buffer.clone(), c)
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]

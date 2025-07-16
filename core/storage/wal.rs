@@ -225,7 +225,6 @@ pub trait Wal {
     /// db_size is the database size in pages after the transaction finishes.
     /// db_size > 0    -> last frame written in transaction
     /// db_size == 0   -> non-last frame written in transaction
-    /// write_counter is the counter we use to track when the I/O operation starts and completes
     fn append_frame(&mut self, page: PageRef, db_size: u32) -> Result<Arc<Completion>>;
 
     /// Complete append of frames by updating shared wal state. Before this

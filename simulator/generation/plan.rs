@@ -16,10 +16,7 @@ use crate::{
         query::{update::Update, Create, CreateIndex, Delete, Drop, Insert, Query, Select},
         table::SimValue,
     },
-    runner::{
-        env::{SimConnection, SimulationType, SimulatorTables},
-        io::SimulatorIO,
-    },
+    runner::env::{SimConnection, SimulationType, SimulatorTables},
     SimulatorEnv,
 };
 
@@ -440,7 +437,7 @@ impl Shadow for Interaction {
     }
 }
 impl Interaction {
-    pub(crate) fn execute_query(&self, conn: &mut Arc<Connection>, _io: &SimulatorIO) -> ResultSet {
+    pub(crate) fn execute_query(&self, conn: &mut Arc<Connection>) -> ResultSet {
         if let Self::Query(query) = self {
             let query_str = query.to_string();
             let rows = conn.query(&query_str);
