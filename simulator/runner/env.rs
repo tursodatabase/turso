@@ -70,6 +70,7 @@ pub(crate) struct SimulatorEnv {
     pub(crate) type_: SimulationType,
     pub(crate) phase: SimulationPhase,
     pub(crate) tables: SimulatorTables,
+    pub memory_io: bool,
 }
 
 impl UnwindSafe for SimulatorEnv {}
@@ -88,6 +89,7 @@ impl SimulatorEnv {
             paths: self.paths.clone(),
             type_: self.type_,
             phase: self.phase,
+            memory_io: self.memory_io,
         }
     }
 
@@ -96,16 +98,27 @@ impl SimulatorEnv {
         self.connections.iter_mut().for_each(|c| c.disconnect());
         self.rng = ChaCha8Rng::seed_from_u64(self.opts.seed);
 
-        let io = Arc::new(
-            SimulatorIO::new(
-                self.opts.seed,
-                self.opts.page_size,
-                self.opts.latency_probability,
-                self.opts.min_tick,
+        let io: Arc<dyn SimIO> = if self.memory_io {
+            Arc::new(
+                MemorySimIO::new(
+                    self.opts.seed,
+                    self.opts.page_size,
+                    self.opts.latency_probability,
+                )
+                .unwrap(),
+            )
+        } else {
+            Arc::new(
+                SimulatorIO::new(
+                    self.opts.seed,
+                    self.opts.page_size,
+                    self.opts.latency_probability,
+                    self.opts.min_tick,
                 self.opts.max_tick,
             )
-            .unwrap(),
-        );
+                .unwrap(),
+            )
+        };
 
         // Remove existing database file
         let db_path = self.get_db_path();
@@ -305,6 +318,7 @@ impl SimulatorEnv {
             db,
             type_: simulation_type,
             phase: SimulationPhase::Test,
+            memory_io: cli_opts.memory_io,
         }
     }
 

@@ -129,7 +129,11 @@ pub struct SimulatorCLI {
     pub experimental_mvcc: bool,
     #[clap(long, help = "Enable experimental indexing feature")]
     pub experimental_indexes: bool,
-    #[clap(long, help = "Use memory IO for complex simulations")]
+    #[clap(
+        long,
+        help = "Use memory IO for complex simulations",
+        default_value_t = false
+    )]
     pub memory_io: bool,
 }
 
