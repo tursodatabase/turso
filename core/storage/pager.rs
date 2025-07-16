@@ -177,7 +177,7 @@ impl Page {
         self.get().pin_count.load(Ordering::SeqCst) > 0
     }
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 /// The state of the current pager cache flush.
 enum CacheFlushState {
     /// Idle.
@@ -200,14 +200,14 @@ enum CommitState {
     /// Fsync the database file.
     SyncDbFile,
     /// Waiting for the database file to be fsynced.
-    WaitSyncDbFile,
+    WaitSyncDbFile { completion: Arc<Completion> },
 }
 
-#[derive(Clone, Debug, Copy)]
+#[derive(Clone, Debug)]
 enum CheckpointState {
     Checkpoint,
     SyncDbFile,
-    WaitSyncDbFile,
+    WaitSyncDbFile { completion: Arc<Completion> },
     CheckpointDone,
 }
 
@@ -265,8 +265,6 @@ pub struct Pager {
     commit_info: RefCell<CommitInfo>,
     flush_info: RefCell<FlushInfo>,
     checkpoint_state: RefCell<CheckpointState>,
-    checkpoint_inflight: Rc<RefCell<usize>>,
-    syncing: Rc<RefCell<bool>>,
     auto_vacuum_mode: RefCell<AutoVacuumMode>,
     /// 0 -> Database is empty,
     /// 1 -> Database is being initialized,
@@ -298,7 +296,7 @@ pub enum PagerCommitResult {
 enum AllocatePage1State {
     Start,
     Writing {
-        write_counter: Rc<RefCell<usize>>,
+        completion: Arc<Completion>,
         page: BTreePage,
     },
     Done,
@@ -341,9 +339,7 @@ impl Pager {
                 state: CommitState::Start,
                 in_flight_writes: Rc::new(RefCell::new(0)),
             }),
-            syncing: Rc::new(RefCell::new(false)),
             checkpoint_state: RefCell::new(CheckpointState::Checkpoint),
-            checkpoint_inflight: Rc::new(RefCell::new(0)),
             buffer_pool,
             auto_vacuum_mode: RefCell::new(AutoVacuumMode::None),
             db_state,
@@ -882,7 +878,8 @@ impl Pager {
     ) -> Result<IOResult<PagerCommitResult>> {
         let mut checkpoint_result = CheckpointResult::default();
         let res = loop {
-            let state = self.commit_info.borrow().state;
+            let mut flush_info = self.commit_info.borrow_mut();
+            let state = &flush_info.state;
             trace!(?state);
             match state {
                 CommitState::Start => {
@@ -902,7 +899,7 @@ impl Pager {
                         self.wal.borrow_mut().append_frame(
                             page.clone(),
                             db_size,
-                            self.commit_info.borrow().in_flight_writes.clone(),
+                            commit_info.in_flight_writes.clone(),
                         )?;
                         page.clear_dirty();
                     }
@@ -912,13 +909,13 @@ impl Pager {
                         cache.clear(false).unwrap();
                     }
                     self.dirty_pages.borrow_mut().clear();
-                    self.commit_info.borrow_mut().state = CommitState::WaitAppendFrames;
+                    commit_info.state = CommitState::WaitAppendFrames;
                     return Ok(IOResult::IO);
                 }
                 CommitState::WaitAppendFrames => {
-                    let in_flight = *self.commit_info.borrow().in_flight_writes.borrow();
+                    let in_flight = *commit_info.in_flight_writes.borrow();
                     if in_flight == 0 {
-                        self.commit_info.borrow_mut().state = CommitState::SyncWal;
+                        commit_info.state = CommitState::SyncWal;
                     } else {
                         return Ok(IOResult::IO);
                     }
@@ -927,24 +924,24 @@ impl Pager {
                     return_if_io!(self.wal.borrow_mut().sync());
 
                     if wal_checkpoint_disabled || !self.wal.borrow().should_checkpoint() {
-                        self.commit_info.borrow_mut().state = CommitState::Start;
+                        commit_info.state = CommitState::Start;
                         break PagerCommitResult::WalWritten;
                     }
-                    self.commit_info.borrow_mut().state = CommitState::Checkpoint;
+                    commit_info.state = CommitState::Checkpoint;
                 }
                 CommitState::Checkpoint => {
                     checkpoint_result = return_if_io!(self.checkpoint());
-                    self.commit_info.borrow_mut().state = CommitState::SyncDbFile;
+                    commit_info.state = CommitState::SyncDbFile;
                 }
                 CommitState::SyncDbFile => {
-                    sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone())?;
-                    self.commit_info.borrow_mut().state = CommitState::WaitSyncDbFile;
+                    let completion = sqlite3_ondisk::begin_sync(self.db_file.clone())?;
+                    commit_info.state = CommitState::WaitSyncDbFile { completion };
                 }
-                CommitState::WaitSyncDbFile => {
-                    if *self.syncing.borrow() {
+                CommitState::WaitSyncDbFile { completion } => {
+                    if !completion.is_completed() {
                         return Ok(IOResult::IO);
                     } else {
-                        self.commit_info.borrow_mut().state = CommitState::Start;
+                        commit_info.state = CommitState::Start;
                         break PagerCommitResult::Checkpointed(checkpoint_result);
                     }
                 }
@@ -975,16 +972,15 @@ impl Pager {
     pub fn checkpoint(&self) -> Result<IOResult<CheckpointResult>> {
         let mut checkpoint_result = CheckpointResult::default();
         loop {
-            let state = *self.checkpoint_state.borrow();
+            let state = self.checkpoint_state.borrow();
             trace!(?state);
-            match state {
+            match &*state {
                 CheckpointState::Checkpoint => {
-                    let in_flight = self.checkpoint_inflight.clone();
-                    match self.wal.borrow_mut().checkpoint(
-                        self,
-                        in_flight,
-                        CheckpointMode::Passive,
-                    )? {
+                    match self
+                        .wal
+                        .borrow_mut()
+                        .checkpoint(self, CheckpointMode::Passive)?
+                    {
                         IOResult::IO => return Ok(IOResult::IO),
                         IOResult::Done(res) => {
                             checkpoint_result = res;
@@ -993,12 +989,12 @@ impl Pager {
                     };
                 }
                 CheckpointState::SyncDbFile => {
-                    sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone())?;
+                    let completion = sqlite3_ondisk::begin_sync(self.db_file.clone())?;
                     self.checkpoint_state
-                        .replace(CheckpointState::WaitSyncDbFile);
+                        .replace(CheckpointState::WaitSyncDbFile { completion });
                 }
-                CheckpointState::WaitSyncDbFile => {
-                    if *self.syncing.borrow() {
+                CheckpointState::WaitSyncDbFile { completion } => {
+                    if !completion.is_completed() {
                         return Ok(IOResult::IO);
                     } else {
                         self.checkpoint_state
@@ -1006,12 +1002,8 @@ impl Pager {
                     }
                 }
                 CheckpointState::CheckpointDone => {
-                    return if *self.checkpoint_inflight.borrow() > 0 {
-                        Ok(IOResult::IO)
-                    } else {
-                        self.checkpoint_state.replace(CheckpointState::Checkpoint);
-                        Ok(IOResult::Done(checkpoint_result))
-                    };
+                    self.checkpoint_state.replace(CheckpointState::Checkpoint);
+                    return Ok(IOResult::Done(checkpoint_result));
                 }
             }
         }
@@ -1059,11 +1051,11 @@ impl Pager {
         }
         let checkpoint_result: CheckpointResult;
         loop {
-            match self.wal.borrow_mut().checkpoint(
-                self,
-                Rc::new(RefCell::new(0)),
-                CheckpointMode::Passive,
-            ) {
+            match self
+                .wal
+                .borrow_mut()
+                .checkpoint(self, CheckpointMode::Passive)
+            {
                 Ok(IOResult::IO) => {
                     self.io.run_once()?;
                 }
@@ -1221,22 +1213,18 @@ impl Pager {
                     DATABASE_HEADER_SIZE,
                     (default_header.get_page_size() - default_header.reserved_space as u32) as u16,
                 );
-                let write_counter = Rc::new(RefCell::new(0));
-                begin_write_btree_page(self, &page1.get(), write_counter.clone())?;
+                let completion = begin_write_btree_page(self, &page1.get())?;
 
                 self.allocate_page1_state
                     .replace(AllocatePage1State::Writing {
-                        write_counter,
+                        completion,
                         page: page1,
                     });
                 Ok(IOResult::IO)
             }
-            AllocatePage1State::Writing {
-                write_counter,
-                page,
-            } => {
+            AllocatePage1State::Writing { completion, page } => {
                 tracing::trace!("allocate_page1(Writing)");
-                if *write_counter.borrow() > 0 {
+                if !completion.is_completed() {
                     return Ok(IOResult::IO);
                 }
                 tracing::trace!("allocate_page1(Writing done)");
@@ -1375,8 +1363,18 @@ impl Pager {
             );
         }
         self.wal.borrow_mut().rollback()?;
+        self.reset();
 
         Ok(())
+    }
+
+    /// Reset state machines
+    fn reset(&self) {
+        self.flush_info.replace(FlushInfo {
+            state: FlushState::Start,
+            in_flight_writes: Rc::new(RefCell::new(0)),
+        });
+        self.checkpoint_state.replace(CheckpointState::Checkpoint);
     }
 }
 

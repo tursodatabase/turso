@@ -16,8 +16,8 @@ pub trait DatabaseStorage: Send + Sync {
         page_idx: usize,
         buffer: Arc<RefCell<Buffer>>,
         c: Completion,
-    ) -> Result<()>;
-    fn sync(&self, c: Completion) -> Result<()>;
+    ) -> Result<Arc<Completion>>;
+    fn sync(&self, c: Completion) -> Result<Arc<Completion>>;
     fn size(&self) -> Result<u64>;
 }
 
@@ -52,21 +52,19 @@ impl DatabaseStorage for DatabaseFile {
         page_idx: usize,
         buffer: Arc<RefCell<Buffer>>,
         c: Completion,
-    ) -> Result<()> {
+    ) -> Result<Arc<Completion>> {
         let buffer_size = buffer.borrow().len();
         assert!(page_idx > 0);
         assert!(buffer_size >= 512);
         assert!(buffer_size <= 65536);
         assert_eq!(buffer_size & (buffer_size - 1), 0);
         let pos = (page_idx - 1) * buffer_size;
-        self.file.pwrite(pos, buffer, c.into())?;
-        Ok(())
+        self.file.pwrite(pos, buffer, c.into())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn sync(&self, c: Completion) -> Result<()> {
-        let _ = self.file.sync(c.into())?;
-        Ok(())
+    fn sync(&self, c: Completion) -> Result<Arc<Completion>> {
+        self.file.sync(c.into())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -112,20 +110,18 @@ impl DatabaseStorage for FileMemoryStorage {
         page_idx: usize,
         buffer: Arc<RefCell<Buffer>>,
         c: Completion,
-    ) -> Result<()> {
+    ) -> Result<Arc<Completion>> {
         let buffer_size = buffer.borrow().len();
         assert!(buffer_size >= 512);
         assert!(buffer_size <= 65536);
         assert_eq!(buffer_size & (buffer_size - 1), 0);
         let pos = (page_idx - 1) * buffer_size;
-        self.file.pwrite(pos, buffer, c.into())?;
-        Ok(())
+        self.file.pwrite(pos, buffer, c.into())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn sync(&self, c: Completion) -> Result<()> {
-        let _ = self.file.sync(c.into())?;
-        Ok(())
+    fn sync(&self, c: Completion) -> Result<Arc<Completion>> {
+        self.file.sync(c.into())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
