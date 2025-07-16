@@ -36,15 +36,14 @@ pub mod params;
 pub mod value;
 
 use turso_core::types::{DatabaseChange, DatabaseChangeType, ImmutableRecord, RecordCursor};
-use turso_core::{DatabaseStorage, LimboError};
 pub use value::Value;
 
 pub use params::params_from_iter;
 
 use crate::params::*;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{VecDeque};
+use std::collections::HashMap;
 use std::fmt::Debug;
-use std::hash::Hash;
 use std::i64;
 use std::num::NonZero;
 use std::sync::{Arc, Mutex};
