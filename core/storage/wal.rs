@@ -9,12 +9,7 @@ use tracing::{instrument, Level};
 
 use std::fmt::Formatter;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::{
-    cell::{Cell, RefCell},
-    fmt,
-    rc::Rc,
-    sync::Arc,
-};
+use std::{cell::RefCell, fmt, rc::Rc, sync::Arc};
 
 use crate::fast_lock::SpinLock;
 use crate::io::{File, IO};
@@ -246,7 +241,6 @@ pub trait Wal {
     fn checkpoint(
         &mut self,
         pager: &Pager,
-        write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>>;
     fn sync(&mut self) -> Result<IOResult<()>>;
@@ -317,7 +311,6 @@ impl Wal for DummyWAL {
     fn checkpoint(
         &mut self,
         _pager: &Pager,
-        _write_counter: Rc<RefCell<usize>>,
         _mode: crate::CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
         Ok(IOResult::Done(CheckpointResult::default()))
@@ -351,19 +344,19 @@ impl Wal for DummyWAL {
 
 // Syncing requires a state machine because we need to schedule a sync and then wait until it is
 // finished. If we don't wait there will be undefined behaviour that no one wants to debug.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 enum SyncState {
     NotSyncing,
-    Syncing,
+    Syncing { completion: Arc<Completion> },
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub enum CheckpointState {
     Start,
     ReadFrame,
     WaitReadFrame,
     WritePage,
-    WaitWritePage,
+    WaitWritePage { completion: Arc<Completion> },
     Done,
 }
 
@@ -399,8 +392,7 @@ pub struct WalFile {
     io: Arc<dyn IO>,
     buffer_pool: Arc<BufferPool>,
 
-    syncing: Rc<Cell<bool>>,
-    sync_state: Cell<SyncState>,
+    sync_state: RefCell<SyncState>,
 
     shared: Arc<UnsafeCell<WalFileShared>>,
     ongoing_checkpoint: OngoingCheckpoint,
@@ -426,7 +418,6 @@ pub struct WalFile {
 impl fmt::Debug for WalFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WalFile")
-            .field("syncing", &self.syncing.get())
             .field("sync_state", &self.sync_state)
             .field("page_size", &self.page_size())
             .field("shared", &self.shared)
@@ -803,7 +794,6 @@ impl Wal for WalFile {
     fn checkpoint(
         &mut self,
         pager: &Pager,
-        write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
         assert!(
@@ -811,7 +801,7 @@ impl Wal for WalFile {
             "only passive mode supported for now"
         );
         'checkpoint_loop: loop {
-            let state = self.ongoing_checkpoint.state;
+            let state = &self.ongoing_checkpoint.state;
             tracing::debug!(?state);
             match state {
                 CheckpointState::Start => {
@@ -898,15 +888,11 @@ impl Wal for WalFile {
                 }
                 CheckpointState::WritePage => {
                     self.ongoing_checkpoint.page.set_dirty();
-                    begin_write_btree_page(
-                        pager,
-                        &self.ongoing_checkpoint.page,
-                        write_counter.clone(),
-                    )?;
-                    self.ongoing_checkpoint.state = CheckpointState::WaitWritePage;
+                    let completion = begin_write_btree_page(pager, &self.ongoing_checkpoint.page)?;
+                    self.ongoing_checkpoint.state = CheckpointState::WaitWritePage { completion };
                 }
-                CheckpointState::WaitWritePage => {
-                    if *write_counter.borrow() > 0 {
+                CheckpointState::WaitWritePage { completion } => {
+                    if !completion.is_completed() {
                         return Ok(IOResult::IO);
                     }
                     // If page was in cache clear it.
@@ -925,9 +911,6 @@ impl Wal for WalFile {
                     }
                 }
                 CheckpointState::Done => {
-                    if *write_counter.borrow() > 0 {
-                        return Ok(IOResult::IO);
-                    }
                     let shared = self.get_shared();
                     shared.checkpoint_lock.unlock();
 
@@ -970,26 +953,24 @@ impl Wal for WalFile {
 
     #[instrument(err, skip_all, level = Level::DEBUG)]
     fn sync(&mut self) -> Result<IOResult<()>> {
-        match self.sync_state.get() {
+        let mut state = self.sync_state.borrow_mut();
+        match &mut *state {
             SyncState::NotSyncing => {
                 tracing::debug!("wal_sync");
-                let syncing = self.syncing.clone();
-                self.syncing.set(true);
                 let completion = Completion::new_sync(move |_| {
                     tracing::debug!("wal_sync finish");
-                    syncing.set(false);
                 });
                 let shared = self.get_shared();
-                shared.file.sync(completion.into())?;
-                self.sync_state.set(SyncState::Syncing);
+                let completion = shared.file.sync(completion.into())?;
+                *state = SyncState::Syncing { completion };
                 Ok(IOResult::IO)
             }
-            SyncState::Syncing => {
-                if self.syncing.get() {
+            SyncState::Syncing { completion } => {
+                if !completion.is_completed() {
                     tracing::debug!("wal_sync is already syncing");
                     Ok(IOResult::IO)
                 } else {
-                    self.sync_state.set(SyncState::NotSyncing);
+                    *state = SyncState::NotSyncing;
                     Ok(IOResult::Done(()))
                 }
             }
@@ -1034,6 +1015,7 @@ impl Wal for WalFile {
             }
             self.last_checksum = shared.last_checksum;
         }
+        self.reset();
         Ok(())
     }
 
@@ -1082,8 +1064,7 @@ impl WalFile {
             },
             checkpoint_threshold: 1000,
             buffer_pool,
-            syncing: Rc::new(Cell::new(false)),
-            sync_state: Cell::new(SyncState::NotSyncing),
+            sync_state: RefCell::new(SyncState::NotSyncing),
             min_frame: 0,
             max_frame_read_lock_index: 0,
             last_checksum,
@@ -1123,6 +1104,31 @@ impl WalFile {
                 }
             }
         }
+    }
+
+    /// Reset in memory state machines
+    fn reset(&mut self) {
+        let checkpoint_page = Arc::new(Page::new(0));
+        let buffer = self.buffer_pool.get();
+        {
+            let buffer_pool = self.buffer_pool.clone();
+            let drop_fn = Rc::new(move |buf| {
+                buffer_pool.put(buf);
+            });
+            checkpoint_page.get().contents = Some(PageContent::new(
+                0,
+                Arc::new(RefCell::new(Buffer::new(buffer, drop_fn))),
+            ));
+        }
+        let ongoing_checkpoint = OngoingCheckpoint {
+            page: checkpoint_page,
+            state: CheckpointState::Start,
+            min_frame: 0,
+            max_frame: 0,
+            current_page: 0,
+        };
+        self.ongoing_checkpoint = ongoing_checkpoint;
+        self.sync_state.replace(SyncState::NotSyncing);
     }
 }
 

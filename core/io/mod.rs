@@ -58,6 +58,7 @@ pub type Complete = dyn Fn(Arc<RefCell<Buffer>>, i32);
 pub type WriteComplete = dyn Fn(i32);
 pub type SyncComplete = dyn Fn(i32);
 
+#[derive(Debug)]
 pub struct Completion {
     pub completion_type: CompletionType,
     is_completed: Cell<bool>,
@@ -67,6 +68,16 @@ pub enum CompletionType {
     Read(ReadCompletion),
     Write(WriteCompletion),
     Sync(SyncCompletion),
+}
+
+impl Debug for CompletionType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(..) => f.debug_tuple("Read").finish(),
+            Self::Write(..) => f.debug_tuple("Write").finish(),
+            Self::Sync(..) => f.debug_tuple("Sync").finish(),
+        }
+    }
 }
 
 pub struct ReadCompletion {
