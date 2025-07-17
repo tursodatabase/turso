@@ -24,7 +24,7 @@ use crate::storage::sqlite3_ondisk::{
     WAL_HEADER_SIZE,
 };
 use crate::types::IOResult;
-use crate::{turso_assert, Buffer, LimboError, Result};
+use crate::{turso_assert, Buffer, LimboError, OpenFlags, Result};
 use crate::{Completion, Page};
 
 use self::sqlite3_ondisk::{checksum_wal, PageContent, WAL_MAGIC_BE, WAL_MAGIC_LE};
@@ -1020,8 +1020,9 @@ impl WalFileShared {
     pub fn open_shared_if_exists(
         io: &Arc<dyn IO>,
         path: &str,
+        flags: OpenFlags,
     ) -> Result<Option<Arc<UnsafeCell<WalFileShared>>>> {
-        let file = io.open_file(path, crate::io::OpenFlags::Create, false)?;
+        let file = io.open_file(path, flags, false)?;
         if file.size()? > 0 {
             let wal_file_shared = sqlite3_ondisk::read_entire_wal_dumb(&file)?;
             // TODO: Return a completion instead.

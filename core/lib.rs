@@ -177,13 +177,9 @@ impl Database {
         enable_mvcc: bool,
         enable_indexes: bool,
     ) -> Result<Arc<Database>> {
-        let maybe_shared_wal = if !flags.contains(OpenFlags::ReadOnly) {
-            let wal_path = format!("{path}-wal");
-            WalFileShared::open_shared_if_exists(&io, wal_path.as_str())?
-        } else {
-            None
-        };
-
+        let wal_path = format!("{path}-wal");
+        let maybe_shared_wal =
+            WalFileShared::open_shared_if_exists(&io, wal_path.as_str(), flags).unwrap_or(None);
         let mv_store = if enable_mvcc {
             Some(Rc::new(MvStore::new(
                 mvcc::LocalClock::new(),
@@ -288,16 +284,11 @@ impl Database {
             let buffer_pool = Arc::new(BufferPool::new(Some(size)));
 
             let db_state = self.db_state.clone();
-            // if we open in read-only mode, we don't need a real WAL
-            let wal: Rc<RefCell<dyn Wal>> = if self.open_flags.contains(OpenFlags::ReadOnly) {
-                Rc::new(RefCell::new(DummyWAL {}))
-            } else {
-                Rc::new(RefCell::new(WalFile::new(
-                    self.io.clone(),
-                    shared_wal,
-                    buffer_pool.clone(),
-                )))
-            };
+            let wal = Rc::new(RefCell::new(WalFile::new(
+                self.io.clone(),
+                shared_wal,
+                buffer_pool.clone(),
+            )));
             let pager = Pager::new(
                 self.db_file.clone(),
                 wal,
@@ -325,11 +316,6 @@ impl Database {
             Arc::new(Mutex::new(())),
         )?;
 
-        // for a readonly connection we can keep the dummy WAL we initialized the pager with
-        if self.open_flags.contains(OpenFlags::ReadOnly) {
-            return Ok(pager);
-        }
-
         let size = match page_size {
             Some(size) => size as u32,
             None => {
@@ -341,7 +327,7 @@ impl Database {
         };
 
         let wal_path = format!("{}-wal", self.path);
-        let file = self.io.open_file(&wal_path, OpenFlags::Create, false)?;
+        let file = self.io.open_file(&wal_path, self.open_flags, false)?;
         let real_shared_wal = WalFileShared::new_shared(size, &self.io, file)?;
         // Modify Database::maybe_shared_wal to point to the new WAL file so that other connections
         // can open the existing WAL.
