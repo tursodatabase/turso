@@ -12,7 +12,7 @@ use super::{
 
 pub(crate) fn run_simulation(
     env: Arc<Mutex<SimulatorEnv>>,
-    plans: Arc<Vec<Arc<Vec<Vec<Interaction>>>>>,
+    plans: Vec<Arc<Vec<Vec<Interaction>>>>,
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
     let states = plans
@@ -25,7 +25,6 @@ pub(crate) fn run_simulation(
             }))
         })
         .collect::<Vec<_>>();
-    let states = Arc::new(Mutex::new(states));
     let result = execute_plans(env.clone(), plans, states, last_execution);
 
     let env = env.lock().unwrap();
@@ -38,8 +37,8 @@ pub(crate) fn run_simulation(
 
 pub(crate) fn execute_plans(
     env: Arc<Mutex<SimulatorEnv>>,
-    plans: Arc<Vec<Arc<Vec<Vec<Interaction>>>>>,
-    states: Arc<Mutex<Vec<Arc<Mutex<InteractionPlanState>>>>>,
+    plans: Vec<Arc<Vec<Vec<Interaction>>>>,
+    states: Vec<Arc<Mutex<InteractionPlanState>>>,
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
     let mut history = ExecutionHistory::new();
@@ -56,7 +55,7 @@ pub(crate) fn execute_plans(
     for _tick in 0..ticks {
         // Run every connection concurrently.
         for connection_index in 0..connections_len {
-            let state = states.lock().unwrap()[connection_index].clone();
+            let state = states[connection_index].clone();
             let plan = plans[connection_index].clone();
             let connection = env.lock().unwrap().connections[connection_index].clone();
             {
@@ -122,9 +121,9 @@ async fn execute_plan(
 
     let is_connected = connection.lock().unwrap().is_connected();
     if !is_connected {
-        tracing::debug!("connecting {}", 1); // todo: add index to simconnetion
         let env = env.lock().unwrap();
         let mut conn = connection.lock().unwrap();
+        tracing::debug!("connecting {}", conn);
         *conn = SimConnection::LimboConnection(env.db.connect().unwrap());
     } else {
         match execute_interaction(env.clone(), connection.clone(), interaction, state.clone()).await
