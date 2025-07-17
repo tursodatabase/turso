@@ -222,6 +222,10 @@ struct DeleteInfo {
 enum WriteState {
     Start,
     BalanceStart,
+     BalanceFreePages {
+        curr_page: usize,
+        sibling_count_new: usize,
+    },
     /// Choose which sibling pages to balance (max 3).
     /// Generally, the siblings involved will be the page that triggered the balancing and its left and right siblings.
     /// The exceptions are:
@@ -2246,6 +2250,7 @@ impl BTreeCursor {
                     }
                 }
                 WriteState::BalanceStart
+                | WriteState::BalanceFreePages { .. }
                 | WriteState::BalanceNonRootPickSiblings
                 | WriteState::BalanceNonRootWaitSiblings
                 | WriteState::BalanceNonRootDoBalancing => {
@@ -3365,7 +3370,6 @@ impl BTreeCursor {
                         Ok(IOResult::IO),
                     )
                 }
-                (WriteState::BalanceStart, Ok(IOResult::Done(())))
             }
             WriteState::Finish => todo!(),
         };
