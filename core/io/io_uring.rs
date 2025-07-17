@@ -364,6 +364,18 @@ impl File for UringFile {
     fn size(&self) -> Result<u64> {
         Ok(self.file.metadata()?.len())
     }
+
+    fn truncate(&self, len: u64, c: Completion) -> Result<Arc<Completion>> {
+        let mut io = self.io.borrow_mut();
+        let truncate = with_fd!(self, |fd| {
+            io_uring::opcode::Ftruncate::new(fd, len)
+                .build()
+                .user_data(io.ring.get_key())
+        });
+        let c = Arc::new(c);
+        io.ring.submit_entry(&truncate, c.clone());
+        Ok(c)
+    }
 }
 
 impl Drop for UringFile {
