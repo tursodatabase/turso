@@ -719,10 +719,11 @@ fn reopen_database(env: &mut SimulatorEnv) {
     match env.type_ {
         SimulationType::Differential => {
             for _ in 0..num_conns {
-                env.connections.push(SimConnection::SQLiteConnection(
-                    rusqlite::Connection::open(env.get_db_path())
-                        .expect("Failed to open SQLite connection"),
-                ));
+                env.connections
+                    .push(Arc::new(Mutex::new(SimConnection::SQLiteConnection(
+                        rusqlite::Connection::open(env.get_db_path())
+                            .expect("Failed to open SQLite connection"),
+                    ))));
             }
         }
         SimulationType::Default | SimulationType::Doublecheck => {
@@ -747,7 +748,9 @@ fn reopen_database(env: &mut SimulatorEnv) {
 
             for _ in 0..num_conns {
                 env.connections
-                    .push(SimConnection::LimboConnection(env.db.connect().unwrap()));
+                    .push(Arc::new(Mutex::new(SimConnection::LimboConnection(
+                        env.db.connect().unwrap(),
+                    ))));
             }
         }
     };

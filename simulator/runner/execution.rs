@@ -238,7 +238,8 @@ pub(crate) async fn execute_interaction(
             // Avoid recursive .await to prevent infinitely sized future.
             // Box::pin is used to introduce indirection.
             {
-                let fut = execute_interaction(env, connection.clone(), &query_interaction, state);
+                let fut =
+                    execute_interaction(env.clone(), connection.clone(), &query_interaction, state);
                 Box::pin(fut).await?;
             }
         }
@@ -278,7 +279,7 @@ pub(crate) async fn execute_interaction(
             limbo_integrity_check(conn)?;
         }
     }
-    let _ = interaction.shadow(&mut env.tables);
+    let _ = interaction.shadow(&mut env.lock().unwrap().tables);
     Ok(ExecutionContinuation::NextInteraction)
 }
 
