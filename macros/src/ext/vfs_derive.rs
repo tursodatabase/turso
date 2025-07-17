@@ -11,6 +11,7 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
     let close_fn_name = format_ident!("{}_close", struct_name);
     let read_fn_name = format_ident!("{}_read", struct_name);
     let write_fn_name = format_ident!("{}_write", struct_name);
+    let trunc_fn_name = format_ident!("{}_truncate", struct_name);
     let lock_fn_name = format_ident!("{}_lock", struct_name);
     let unlock_fn_name = format_ident!("{}_unlock", struct_name);
     let sync_fn_name = format_ident!("{}_sync", struct_name);
@@ -36,6 +37,7 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
                 unlock: #unlock_fn_name,
                 sync: #sync_fn_name,
                 size: #size_fn_name,
+                truncate: #trunc_fn_name,
                 run_once: #run_once_fn_name,
                 gen_random_number: #generate_random_number_fn_name,
                 current_time: #get_current_time_fn_name,
@@ -59,6 +61,7 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
                 unlock: #unlock_fn_name,
                 sync: #sync_fn_name,
                 size: #size_fn_name,
+                truncate: #trunc_fn_name,
                 run_once: #run_once_fn_name,
                 gen_random_number: #generate_random_number_fn_name,
                 current_time: #get_current_time_fn_name,
@@ -183,6 +186,20 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
             let file: &mut <#struct_name as ::turso_ext::VfsExtension>::File =
                 &mut *(vfs_file.file as *mut <#struct_name as ::turso_ext::VfsExtension>::File);
             if <#struct_name as ::turso_ext::VfsExtension>::File::sync(file).is_err() {
+                return -1;
+            }
+            0
+        }
+
+        #[no_mangle]
+        pub unsafe extern "C" fn #trunc_fn_name(file_ptr: *const ::std::ffi::c_void, len: i64) -> i32 {
+            if file_ptr.is_null() {
+                return -1;
+            }
+            let vfs_file: &mut ::turso_ext::VfsFileImpl = &mut *(file_ptr as *mut ::turso_ext::VfsFileImpl);
+            let file: &mut <#struct_name as ::turso_ext::VfsExtension>::File =
+                &mut *(vfs_file.file as *mut <#struct_name as ::turso_ext::VfsExtension>::File);
+            if <#struct_name as ::turso_ext::VfsExtension>::File::truncate(file, len).is_err() {
                 return -1;
             }
             0

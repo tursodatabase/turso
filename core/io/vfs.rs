@@ -166,6 +166,20 @@ impl File for VfsFileImpl {
             Ok(result as u64)
         }
     }
+
+    fn truncate(&self, len: u64, c: Completion) -> Result<Arc<Completion>> {
+        if self.vfs.is_null() {
+            return Err(LimboError::ExtensionError("VFS is null".to_string()));
+        }
+        let vfs = unsafe { &*self.vfs };
+        let result = unsafe { (vfs.truncate)(self.file, len as i64) };
+        if result.is_error() {
+            Err(LimboError::ExtensionError("truncate failed".to_string()))
+        } else {
+            c.complete(0);
+            Ok(Arc::new(c))
+        }
+    }
 }
 
 impl Drop for VfsMod {

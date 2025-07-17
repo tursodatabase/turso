@@ -314,6 +314,11 @@ impl VfsFile for TestFile {
         self.file.sync_all().map_err(|_| ResultCode::Error)
     }
 
+    fn truncate(&self, len: i64) -> ExtResult<()> {
+        log::debug!("truncating file with testing VFS to length: {len}");
+        self.file.set_len(len as u64).map_err(|_| ResultCode::Error)
+    }
+
     fn size(&self) -> i64 {
         self.file.metadata().map(|m| m.len() as i64).unwrap_or(-1)
     }
