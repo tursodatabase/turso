@@ -30,9 +30,9 @@ mod runner;
 mod shrink;
 
 fn main() -> anyhow::Result<()> {
-    init_logger();
     let mut cli_opts = SimulatorCLI::parse();
     cli_opts.validate()?;
+    init_logger(cli_opts.disable_log_file);
 
     match cli_opts.subcommand {
         Some(SimulatorCommand::List) => {
@@ -604,17 +604,10 @@ fn run_simulation_default(
     result
 }
 
-fn init_logger() {
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open("simulator.log")
-        .unwrap();
-
+fn init_logger(disable_log_file: bool) {
     let requires_ansi = std::io::stdout().is_terminal();
 
-    let _ = tracing_subscriber::registry()
+    let registry = tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(requires_ansi)
@@ -622,8 +615,17 @@ fn init_logger() {
                 .without_time()
                 .with_thread_ids(false),
         )
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")));
+
+    if !disable_log_file {
+        let file_layer = {
+            let file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open("simulator.log")
+                .unwrap();
+
             #[allow(deprecated)]
             tracing_subscriber::fmt::layer()
                 .with_writer(file)
@@ -632,9 +634,13 @@ fn init_logger() {
                 .with_line_number(true)
                 .without_time()
                 .with_thread_ids(false)
-                .map_fmt_fields(|f| f.debug_alt()),
-        )
-        .try_init();
+                .map_fmt_fields(|f| f.debug_alt())
+        };
+
+        registry.with(file_layer).init();
+    } else {
+        registry.init();
+    };
 }
 
 fn banner() {
