@@ -961,7 +961,10 @@ impl Pager {
                     let page = {
                         let mut cache = self.page_cache.write();
                         let page_key = PageCacheKey::new(page_id);
-                        let page = cache.get(&page_key).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
+                        let page = cache.get(&page_key).expect(&format!(
+                            "we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it. page={}",
+                            page_id
+                        ));
                         let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
                         trace!(
                             "commit_dirty_pages(page={}, page_type={:?}",
@@ -1451,6 +1454,9 @@ impl Pager {
         tracing::debug!(schema_did_change);
         self.dirty_pages.borrow_mut().clear();
         let mut cache = self.page_cache.write();
+
+        self.reset_internal_states();
+
         cache.unset_dirty_all_pages();
         cache.clear().expect("failed to clear page cache");
         if schema_did_change {
@@ -1466,6 +1472,17 @@ impl Pager {
         self.wal.borrow_mut().rollback()?;
 
         Ok(())
+    }
+
+    fn reset_internal_states(&self) {
+        self.checkpoint_state.replace(CheckpointState::Checkpoint);
+        self.checkpoint_inflight.replace(0);
+        self.syncing.replace(false);
+        self.flush_info.replace(FlushInfo {
+            state: FlushState::Start,
+            in_flight_writes: Rc::new(RefCell::new(0)),
+            dirty_pages: Vec::new(),
+        });
     }
 }
 
