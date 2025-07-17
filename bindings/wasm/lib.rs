@@ -260,6 +260,13 @@ impl turso_core::File for File {
     fn size(&self) -> Result<u64> {
         Ok(self.vfs.size(self.fd))
     }
+
+    fn truncate(&self, len: u64, c: turso_core::Completion) -> Result<Arc<turso_core::Completion>> {
+        self.vfs.truncate(self.fd, len as usize);
+        c.complete(0);
+        #[allow(clippy::arc_with_non_send_sync)]
+        Ok(Arc::new(c))
+    }
 }
 
 pub struct PlatformIO {
@@ -379,6 +386,11 @@ impl turso_core::DatabaseStorage for DatabaseFile {
     fn size(&self) -> Result<u64> {
         self.file.size()
     }
+
+    fn truncate(&self, len: u64, c: turso_core::Completion) -> Result<()> {
+        self.file.truncate(len, c);
+        Ok(())
+    }
 }
 
 #[cfg(all(feature = "web", not(feature = "nodejs")))]
@@ -402,6 +414,9 @@ extern "C" {
 
     #[wasm_bindgen(method)]
     fn size(this: &VFS, fd: i32) -> u64;
+
+    #[wasm_bindgen(method)]
+    fn truncate(this: &VFS, fd: i32, len: usize);
 
     #[wasm_bindgen(method)]
     fn sync(this: &VFS, fd: i32);
@@ -428,6 +443,9 @@ extern "C" {
 
     #[wasm_bindgen(method)]
     fn size(this: &VFS, fd: i32) -> u64;
+
+    #[wasm_bindgen(method)]
+    fn truncate(this: &VFS, fd: i32, len: usize);
 
     #[wasm_bindgen(method)]
     fn sync(this: &VFS, fd: i32);
