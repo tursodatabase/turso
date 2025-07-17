@@ -177,8 +177,12 @@ impl Database {
         enable_mvcc: bool,
         enable_indexes: bool,
     ) -> Result<Arc<Database>> {
-        let wal_path = format!("{path}-wal");
-        let maybe_shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path.as_str())?;
+        let maybe_shared_wal = if !flags.contains(OpenFlags::ReadOnly) {
+            let wal_path = format!("{path}-wal");
+            WalFileShared::open_shared_if_exists(&io, wal_path.as_str())?
+        } else {
+            None
+        };
 
         let mv_store = if enable_mvcc {
             Some(Rc::new(MvStore::new(
@@ -262,7 +266,7 @@ impl Database {
             _shared_cache: false,
             cache_size: Cell::new(default_cache_size),
             page_size: Cell::new(page_size),
-            readonly: Cell::new(false),
+            readonly: Cell::new(self.open_flags.contains(OpenFlags::ReadOnly)),
             wal_checkpoint_disabled: Cell::new(false),
             capture_data_changes: RefCell::new(CaptureDataChangesMode::Off),
             closed: Cell::new(false),
@@ -284,11 +288,16 @@ impl Database {
             let buffer_pool = Arc::new(BufferPool::new(Some(size)));
 
             let db_state = self.db_state.clone();
-            let wal = Rc::new(RefCell::new(WalFile::new(
-                self.io.clone(),
-                shared_wal,
-                buffer_pool.clone(),
-            )));
+            // if we open in read-only mode, we don't need a real WAL
+            let wal: Rc<RefCell<dyn Wal>> = if self.open_flags.contains(OpenFlags::ReadOnly) {
+                Rc::new(RefCell::new(DummyWAL {}))
+            } else {
+                Rc::new(RefCell::new(WalFile::new(
+                    self.io.clone(),
+                    shared_wal,
+                    buffer_pool.clone(),
+                )))
+            };
             let pager = Pager::new(
                 self.db_file.clone(),
                 wal,
@@ -315,6 +324,11 @@ impl Database {
             db_state,
             Arc::new(Mutex::new(())),
         )?;
+
+        // for a readonly connection we can keep the dummy WAL we initialized the pager with
+        if self.open_flags.contains(OpenFlags::ReadOnly) {
+            return Ok(pager);
+        }
 
         let size = match page_size {
             Some(size) => size as u32,
