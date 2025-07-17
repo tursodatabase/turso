@@ -230,7 +230,7 @@ fn run_simulator(
         std::panic::catch_unwind(|| {
             run_simulation(
                 env.clone(),
-                Arc::new(plans.iter().map(|p| Arc::new(p.clone())).collect()),
+                plans.iter().map(|p| Arc::new(p.clone())).collect(),
                 last_execution.clone(),
             )
         }),
@@ -313,7 +313,7 @@ fn run_simulator(
                     std::panic::catch_unwind(|| {
                         run_simulation(
                             env.clone(),
-                            Arc::new(shrunk_plans.iter().map(|p| Arc::new(p.clone())).collect()),
+                            shrunk_plans.iter().map(|p| Arc::new(p.clone())).collect(),
                             last_execution.clone(),
                         )
                     }),
@@ -556,7 +556,7 @@ fn setup_simulation(
 
 fn run_simulation(
     env: Arc<Mutex<SimulatorEnv>>,
-    plans: Arc<Vec<Arc<InteractionPlan>>>,
+    plans: Vec<Arc<InteractionPlan>>,
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
     let simulation_type = {
@@ -589,7 +589,7 @@ fn run_simulation(
 
 fn run_simulation_default(
     env: Arc<Mutex<SimulatorEnv>>,
-    plans: Arc<Vec<Arc<InteractionPlan>>>,
+    plans: Vec<Arc<InteractionPlan>>,
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
     tracing::info!("Executing database interaction plan...");
