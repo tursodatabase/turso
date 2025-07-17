@@ -135,6 +135,8 @@ pub struct SimulatorCLI {
         default_value_t = false
     )]
     pub memory_io: bool,
+    #[clap(long, help = "Disable log file output", default_value_t = false)]
+    pub disable_log_file: bool,
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
