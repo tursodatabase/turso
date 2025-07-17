@@ -5060,7 +5060,7 @@ impl BTreeCursor {
         let page_ref = page.get();
         let contents = page_ref.get_contents();
 
-        let context_to_save = if self.index_key_info.is_none() {
+        let context_to_save = if self.index_info.is_none() {
             //  This is a table btree page to save
             let cell_idx = self.stack.current_cell_index() as usize;
             let cell = contents.cell_get(cell_idx, self.usable_space())?;
