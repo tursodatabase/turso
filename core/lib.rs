@@ -327,6 +327,9 @@ impl Database {
         };
 
         let wal_path = format!("{}-wal", self.path);
+        if !std::fs::exists(&wal_path)? && self.open_flags.contains(OpenFlags::ReadOnly) {
+            return Ok(pager);
+        };
         let file = self.io.open_file(&wal_path, self.open_flags, false)?;
         let real_shared_wal = WalFileShared::new_shared(size, &self.io, file)?;
         // Modify Database::maybe_shared_wal to point to the new WAL file so that other connections
