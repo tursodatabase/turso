@@ -20,7 +20,7 @@ use super::{
 pub(crate) fn run_simulation(
     env: Arc<Mutex<SimulatorEnv>>,
     rusqlite_env: Arc<Mutex<SimulatorEnv>>,
-    plans: Arc<Vec<Arc<InteractionPlan>>>,
+    plans: Vec<Arc<InteractionPlan>>,
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
     tracing::info!("Executing database interaction plan...");
@@ -50,7 +50,7 @@ pub(crate) fn run_simulation(
     let result = execute_plans(
         env,
         rusqlite_env,
-        plans.clone(),
+        plans,
         states,
         rusqlite_states,
         last_execution,
@@ -132,7 +132,7 @@ fn execute_query_rusqlite(
 pub(crate) fn execute_plans(
     env: Arc<Mutex<SimulatorEnv>>,
     rusqlite_env: Arc<Mutex<SimulatorEnv>>,
-    plans: Arc<Vec<Arc<InteractionPlan>>>,
+    plans: Vec<Arc<InteractionPlan>>,
     states: Vec<Arc<Mutex<InteractionPlanState>>>,
     rusqlite_states: Vec<Arc<Mutex<InteractionPlanState>>>,
     last_execution: Arc<Mutex<Execution>>,

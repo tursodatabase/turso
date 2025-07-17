@@ -60,7 +60,7 @@ impl ExecutionResult {
 
 pub(crate) fn execute_plans(
     env: Arc<Mutex<SimulatorEnv>>,
-    plans: Arc<Vec<Arc<InteractionPlan>>>,
+    plans: Vec<Arc<InteractionPlan>>,
     states: Vec<Arc<Mutex<InteractionPlanState>>>,
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
