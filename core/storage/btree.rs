@@ -222,7 +222,7 @@ struct DeleteInfo {
 enum WriteState {
     Start,
     BalanceStart,
-     BalanceFreePages {
+    BalanceFreePages {
         curr_page: usize,
         sibling_count_new: usize,
     },

@@ -6,9 +6,12 @@ use std::{
 use rand::{Rng as _, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use tracing::{instrument, Level};
-use turso_core::{CompletionType, File, Result};
+use turso_core::{File, Result};
 
-use crate::runner::memory::io::{CallbackQueue, Fd, Operation};
+use crate::runner::{
+    clock::SimulatorClock,
+    memory::io::{CallbackQueue, Fd, Operation, OperationType},
+};
 
 pub struct MemorySimFile {
     pub callbacks: CallbackQueue,
@@ -27,13 +30,27 @@ pub struct MemorySimFile {
     pub rng: RefCell<ChaCha8Rng>,
 
     pub latency_probability: usize,
+    clock: Arc<SimulatorClock>,
+}
+
+type IoOperation = Box<dyn FnOnce(OperationType) -> Result<Arc<turso_core::Completion>>>;
+
+pub struct DelayedIo {
+    pub time: turso_core::Instant,
+    pub op: IoOperation,
 }
 
 unsafe impl Send for MemorySimFile {}
 unsafe impl Sync for MemorySimFile {}
 
 impl MemorySimFile {
-    pub fn new(callbacks: CallbackQueue, fd: Fd, seed: u64, latency_probability: usize) -> Self {
+    pub fn new(
+        callbacks: CallbackQueue,
+        fd: Fd,
+        seed: u64,
+        latency_probability: usize,
+        clock: Arc<SimulatorClock>,
+    ) -> Self {
         Self {
             callbacks,
             fd: Arc::new(fd),
@@ -44,6 +61,7 @@ impl MemorySimFile {
             nr_sync_calls: Cell::new(0),
             rng: RefCell::new(ChaCha8Rng::seed_from_u64(seed)),
             latency_probability,
+            clock,
         }
     }
 
@@ -64,11 +82,15 @@ impl MemorySimFile {
     }
 
     #[instrument(skip_all, level = Level::TRACE)]
-    fn generate_latency_duration(&self) -> Option<std::time::Duration> {
+    fn generate_latency(&self) -> Option<turso_core::Instant> {
         let mut rng = self.rng.borrow_mut();
         // Chance to introduce some latency
         rng.gen_bool(self.latency_probability as f64 / 100.0)
-            .then(|| std::time::Duration::from_millis(rng.gen_range(20..50)))
+            .then(|| {
+                let now = self.clock.now();
+                let sum = now + std::time::Duration::from_millis(rng.gen_range(5..20));
+                sum.into()
+            })
     }
 }
 
@@ -84,34 +106,19 @@ impl File for MemorySimFile {
     fn pread(
         &self,
         pos: usize,
-        mut c: turso_core::Completion,
+        c: Arc<turso_core::Completion>,
     ) -> Result<Arc<turso_core::Completion>> {
         self.nr_pread_calls.set(self.nr_pread_calls.get() + 1);
-        if let Some(latency) = self.generate_latency_duration() {
-            let CompletionType::Read(read_completion) = &mut c.completion_type else {
-                unreachable!();
-            };
-            let before = self.rng.borrow_mut().gen_bool(0.5);
-            let dummy_complete = Box::new(|_, _| {});
-            let prev_complete = std::mem::replace(&mut read_completion.complete, dummy_complete);
-            let new_complete = move |res, bytes_read| {
-                if before {
-                    std::thread::sleep(latency);
-                }
-                (prev_complete)(res, bytes_read);
-                if !before {
-                    std::thread::sleep(latency);
-                }
-            };
-            read_completion.complete = Box::new(new_complete);
-        };
-        let c = Arc::new(c);
-        let op = Operation::Read {
+
+        let op = OperationType::Read {
             fd: self.fd.clone(),
             completion: c.clone(),
             offset: pos,
         };
-        self.callbacks.lock().push(op);
+        self.callbacks.lock().push(Operation {
+            time: self.generate_latency(),
+            op,
+        });
         Ok(c)
     }
 
@@ -119,64 +126,32 @@ impl File for MemorySimFile {
         &self,
         pos: usize,
         buffer: Arc<RefCell<turso_core::Buffer>>,
-        mut c: turso_core::Completion,
+        c: Arc<turso_core::Completion>,
     ) -> Result<Arc<turso_core::Completion>> {
         self.nr_pwrite_calls.set(self.nr_pwrite_calls.get() + 1);
-        if let Some(latency) = self.generate_latency_duration() {
-            let CompletionType::Write(write_completion) = &mut c.completion_type else {
-                unreachable!();
-            };
-            let before = self.rng.borrow_mut().gen_bool(0.5);
-            let dummy_complete = Box::new(|_| {});
-            let prev_complete = std::mem::replace(&mut write_completion.complete, dummy_complete);
-            let new_complete = move |res| {
-                if before {
-                    std::thread::sleep(latency);
-                }
-                (prev_complete)(res);
-                if !before {
-                    std::thread::sleep(latency);
-                }
-            };
-            write_completion.complete = Box::new(new_complete);
-        };
-        let c = Arc::new(c);
-        let op = Operation::Write {
+        let op = OperationType::Write {
             fd: self.fd.clone(),
             buffer,
             completion: c.clone(),
             offset: pos,
         };
-        self.callbacks.lock().push(op);
+        self.callbacks.lock().push(Operation {
+            time: self.generate_latency(),
+            op,
+        });
         Ok(c)
     }
 
-    fn sync(&self, mut c: turso_core::Completion) -> Result<Arc<turso_core::Completion>> {
+    fn sync(&self, c: Arc<turso_core::Completion>) -> Result<Arc<turso_core::Completion>> {
         self.nr_sync_calls.set(self.nr_sync_calls.get() + 1);
-        if let Some(latency) = self.generate_latency_duration() {
-            let CompletionType::Sync(sync_completion) = &mut c.completion_type else {
-                unreachable!();
-            };
-            let before = self.rng.borrow_mut().gen_bool(0.5);
-            let dummy_complete = Box::new(|_| {});
-            let prev_complete = std::mem::replace(&mut sync_completion.complete, dummy_complete);
-            let new_complete = move |res| {
-                if before {
-                    std::thread::sleep(latency);
-                }
-                (prev_complete)(res);
-                if !before {
-                    std::thread::sleep(latency);
-                }
-            };
-            sync_completion.complete = Box::new(new_complete);
-        };
-        let c = Arc::new(c);
-        let op = Operation::Sync {
+        let op = OperationType::Sync {
             fd: self.fd.clone(),
             completion: c.clone(),
         };
-        self.callbacks.lock().push(op);
+        self.callbacks.lock().push(Operation {
+            time: self.generate_latency(),
+            op,
+        });
         Ok(c)
     }
 

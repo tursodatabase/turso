@@ -104,6 +104,8 @@ impl SimulatorEnv {
                     self.opts.seed,
                     self.opts.page_size,
                     self.opts.latency_probability,
+                    self.opts.min_tick,
+                    self.opts.max_tick,
                 )
                 .unwrap(),
             )
@@ -114,8 +116,8 @@ impl SimulatorEnv {
                     self.opts.page_size,
                     self.opts.latency_probability,
                     self.opts.min_tick,
-                self.opts.max_tick,
-            )
+                    self.opts.max_tick,
+                )
                 .unwrap(),
             )
         };
@@ -267,17 +269,27 @@ impl SimulatorEnv {
         };
 
         let io: Arc<dyn SimIO> = if cli_opts.memory_io {
-            Arc::new(MemorySimIO::new(seed, opts.page_size, cli_opts.latency_probability).unwrap())
-        } else { Arc::new(
-            SimulatorIO::new(
-                seed,
-                opts.page_size,
-                cli_opts.latency_probability,
-                cli_opts.min_tick,
-                cli_opts.max_tick,
+            Arc::new(
+                MemorySimIO::new(
+                    seed,
+                    opts.page_size,
+                    cli_opts.latency_probability,
+                    cli_opts.min_tick,
+                    cli_opts.max_tick,
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        )
+        } else {
+            Arc::new(
+                SimulatorIO::new(
+                    seed,
+                    opts.page_size,
+                    cli_opts.latency_probability,
+                    cli_opts.min_tick,
+                    cli_opts.max_tick,
+                )
+                .unwrap(),
+            )
         };
 
         // Remove existing database file if it exists

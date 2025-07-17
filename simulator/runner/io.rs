@@ -8,11 +8,8 @@ use rand_chacha::ChaCha8Rng;
 use turso_core::{Clock, Instant, MemoryIO, OpenFlags, PlatformIO, Result, IO};
 
 use crate::{
-    
     model::FAULT_ERROR_MSG,
-   
-    runner::{clock::SimulatorClock, {file::SimulatorFile},
-, SimIO},
+    runner::{clock::SimulatorClock, file::SimulatorFile, SimIO},
 };
 
 pub(crate) struct SimulatorIO {
