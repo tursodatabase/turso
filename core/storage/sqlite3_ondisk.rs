@@ -622,9 +622,9 @@ impl PageContent {
         let cell_pointer = self.read_u16_no_offset(cell_pointer) as usize;
         let start = cell_pointer;
         let payload_overflow_threshold_max =
-            payload_overflow_threshold_max(self.page_type(), usable_size as u16);
+            payload_overflow_threshold_max(self.page_type(), usable_size);
         let payload_overflow_threshold_min =
-            payload_overflow_threshold_min(self.page_type(), usable_size as u16);
+            payload_overflow_threshold_min(self.page_type(), usable_size);
         let len = match self.page_type() {
             PageType::IndexInterior => {
                 let (len_payload, n_payload) = read_varint(&buf[cell_pointer + 4..]).unwrap();
@@ -879,8 +879,8 @@ pub fn read_btree_cell(
     usable_size: usize,
 ) -> Result<BTreeCell> {
     let page_type = page_content.page_type();
-    let max_local = payload_overflow_threshold_max(page_type, usable_size as u16);
-    let min_local = payload_overflow_threshold_min(page_type, usable_size as u16);
+    let max_local = payload_overflow_threshold_max(page_type, usable_size);
+    let min_local = payload_overflow_threshold_min(page_type, usable_size);
     match page_type {
         PageType::IndexInterior => {
             let mut pos = pos;
