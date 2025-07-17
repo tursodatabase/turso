@@ -175,11 +175,7 @@ fn watch_mode(env: SimulatorEnv) -> notify::Result<()> {
                             // });
 
                             let env = Arc::new(Mutex::new(env.clone_without_connections()));
-                            watch::run_simulation(
-                                env,
-                                Arc::new(vec![Arc::new(plan)]),
-                                last_execution_.clone(),
-                            )
+                            watch::run_simulation(env, vec![Arc::new(plan)], last_execution_)
                         }),
                         last_execution.clone(),
                     );

@@ -637,7 +637,7 @@ impl Interaction {
     pub(crate) async fn execute_faulty_query(
         &self,
         conn: &Arc<Connection>,
-        env: &mut SimulatorEnv,
+        env: Arc<Mutex<SimulatorEnv>>,
     ) -> ResultSet {
         if let Self::FaultyQuery(query) = self {
             let query_str = query.to_string();
@@ -657,15 +657,22 @@ impl Interaction {
             let mut incr = 0.001;
             loop {
                 let syncing = {
+                    let env = env.lock().unwrap();
                     let files = env.io.files.borrow();
                     // TODO: currently assuming we only have 1 file that is syncing
                     files
                         .iter()
                         .any(|file| file.sync_completion.borrow().is_some())
                 };
-                let inject_fault = env.rng.lock().unwrap().gen_bool(current_prob);
+                let inject_fault = env
+                    .lock()
+                    .unwrap()
+                    .rng
+                    .lock()
+                    .unwrap()
+                    .gen_bool(current_prob);
                 if inject_fault || syncing {
-                    env.io.inject_fault(true);
+                    env.lock().unwrap().io.inject_fault(true);
                 }
 
                 match rows.step()? {

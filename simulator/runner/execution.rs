@@ -269,9 +269,7 @@ pub(crate) async fn execute_interaction(
                 SimConnection::Disconnected => unreachable!(),
             };
 
-            let results = interaction
-                .execute_faulty_query(conn, &mut env.lock().unwrap())
-                .await;
+            let results = interaction.execute_faulty_query(conn, env.clone()).await;
             tracing::debug!(?results);
             state.lock().unwrap().stack.push(results);
             // Reset fault injection
