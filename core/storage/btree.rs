@@ -2514,7 +2514,7 @@ impl BTreeCursor {
                 let locked = (0..=current_sibling).rev().any(|i| {
                     balance_info.pages_to_balance[i]
                         .as_ref()
-                        .map_or(false, |page| page.get().is_locked())
+                        .is_some_and(|page| page.get().is_locked())
                 });
                 if locked {
                     (WriteState::BalanceNonRootWaitSiblings, Ok(IOResult::IO))

@@ -38,3 +38,5 @@ testing/*.log
 limbostress.log
 simulator.log
 **/*.txt
+# Ignore simulator output when bugbase is disabled
+simulator-output/
