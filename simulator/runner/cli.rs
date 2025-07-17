@@ -61,8 +61,8 @@ pub struct SimulatorCLI {
     pub disable_delete: bool,
     #[clap(long, help = "disable CREATE Statement", default_value_t = false)]
     pub disable_create: bool,
-    #[clap(long, help = "disable CREATE INDEX Statement", default_value_t = true)]
-    pub disable_create_index: bool,
+    #[clap(long, help = "enable CREATE INDEX Statement", default_value_t = false)]
+    pub enable_create_index: bool,
     #[clap(long, help = "disable DROP Statement", default_value_t = false)]
     pub disable_drop: bool,
     #[clap(

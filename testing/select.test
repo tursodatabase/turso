@@ -617,3 +617,20 @@ do_execsql_test_on_specific_db {:memory:} select-no-match-in-leaf-page {
 2
 2}
 
+# Regression tests for double-quoted strings in SELECT statements
+do_execsql_test_skip_lines_on_specific_db 1 {:memory:} select-double-quotes-values {
+    .dbconfig dqs_dml on
+    SELECT * FROM (VALUES ("select", "test"), ("double", "quotes"));
+} {select|test
+double|quotes}
+
+do_execsql_test_skip_lines_on_specific_db 1 {:memory:} select-double-quotes-no-column {
+    .dbconfig dqs_dml on
+    SELECT "first"
+} {first}
+
+do_execsql_test_skip_lines_on_specific_db 1 {:memory:} select-double-quotes-literal {
+    .dbconfig dqs_dml on
+    SELECT "literal_string" AS col;
+} {literal_string}
+

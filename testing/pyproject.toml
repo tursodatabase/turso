@@ -18,6 +18,7 @@ test-memory = "cli_tests.memory:main"
 bench-vfs = "cli_tests.vfs_bench:main"
 test-constraint = "cli_tests.constraint:main"
 test-collate = "cli_tests.collate:main"
+test-mvcc = "cli_tests.mvcc:main"
 
 [tool.uv]
 package = true

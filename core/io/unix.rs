@@ -14,10 +14,8 @@ use std::{
     cell::{RefCell, UnsafeCell},
     mem::MaybeUninit,
 };
-use std::{
-    io::{ErrorKind, Read, Seek, Write},
-    sync::Arc,
-};
+
+use std::{io::ErrorKind, sync::Arc};
 use tracing::{debug, instrument, trace, Level};
 
 struct OwnedCallbacks(UnsafeCell<Callbacks>);
@@ -36,6 +34,11 @@ impl OwnedCallbacks {
 
     fn is_empty(&self) -> bool {
         self.as_mut().inline_count == 0
+    }
+
+    fn get(&self, fd: usize) -> Option<&CompletionCallback> {
+        let callbacks = unsafe { &mut *self.0.get() };
+        callbacks.get(fd)
     }
 
     fn remove(&self, fd: usize) -> Option<CompletionCallback> {
@@ -124,6 +127,16 @@ impl Callbacks {
         } else {
             self.heap_entries.push((fd, callback));
         }
+    }
+
+    fn get(&self, fd: usize) -> Option<&CompletionCallback> {
+        if let Some(pos) = self.find_inline(fd) {
+            let (_, callback) = unsafe { self.inline_entries[pos].assume_init_ref() };
+            return Some(callback);
+        } else if let Some(pos) = self.heap_entries.iter().position(|&(k, _)| k == fd) {
+            return Some(&self.heap_entries[pos].1);
+        }
+        None
     }
 
     fn remove(&mut self, fd: usize) -> Option<CompletionCallback> {
@@ -229,28 +242,38 @@ impl IO for UnixIO {
         self.poller.wait(self.events.as_mut(), None)?;
 
         for event in self.events.iter() {
-            if let Some(cf) = self.callbacks.remove(event.key) {
+            if let Some(cf) = self.callbacks.get(event.key) {
                 let result = match cf {
                     CompletionCallback::Read(ref file, ref c, pos) => {
-                        let mut file = file.borrow_mut();
+                        let file = file.borrow_mut();
                         let r = c.as_read();
                         let mut buf = r.buf_mut();
-                        file.seek(std::io::SeekFrom::Start(pos as u64))?;
-                        file.read(buf.as_mut_slice())
+                        rustix::io::pread(file.as_fd(), buf.as_mut_slice(), *pos as u64)
                     }
                     CompletionCallback::Write(ref file, _, ref buf, pos) => {
-                        let mut file = file.borrow_mut();
+                        let file = file.borrow_mut();
                         let buf = buf.borrow();
-                        file.seek(std::io::SeekFrom::Start(pos as u64))?;
-                        file.write(buf.as_slice())
+                        rustix::io::pwrite(file.as_fd(), buf.as_slice(), *pos as u64)
                     }
                 };
                 match result {
-                    Ok(n) => match &cf {
-                        CompletionCallback::Read(_, ref c, _) => c.complete(0),
-                        CompletionCallback::Write(_, ref c, _, _) => c.complete(n as i32),
-                    },
-                    Err(e) => return Err(e.into()),
+                    Ok(n) => {
+                        let cf = self
+                            .callbacks
+                            .remove(event.key)
+                            .expect("callback should exist");
+                        match cf {
+                            CompletionCallback::Read(_, c, _) => c.complete(0),
+                            CompletionCallback::Write(_, c, _, _) => c.complete(n as i32),
+                        }
+                    }
+                    Err(Errno::AGAIN) => (),
+                    Err(e) => {
+                        self.callbacks.remove(event.key);
+
+                        trace!("run_once() error: {}", e);
+                        return Err(e.into());
+                    }
                 }
             }
         }
@@ -391,7 +414,7 @@ impl File for UnixFile<'_> {
                 // Would block, set up polling
                 let fd = file.as_raw_fd();
                 self.poller
-                    .add(&file.as_fd(), Event::readable(fd as usize))?;
+                    .add(&file.as_fd(), Event::writable(fd as usize))?;
                 self.callbacks.insert(
                     fd as usize,
                     CompletionCallback::Write(self.file.clone(), c.clone(), buffer.clone(), pos),

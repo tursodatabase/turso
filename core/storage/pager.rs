@@ -650,11 +650,11 @@ impl Pager {
         let page_size = *self
             .page_size
             .get()
-            .get_or_insert_with(|| header_accessor::get_page_size(self).unwrap_or_default());
+            .get_or_insert_with(|| header_accessor::get_page_size(self).unwrap());
 
         let reserved_space = *self
             .reserved_space
-            .get_or_init(|| header_accessor::get_reserved_space(self).unwrap_or_default());
+            .get_or_init(|| header_accessor::get_reserved_space(self).unwrap());
 
         (page_size as usize) - (reserved_space as usize)
     }
@@ -677,7 +677,7 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn maybe_allocate_page1(&self) -> Result<IOResult<()>> {
+    pub fn maybe_allocate_page1(&self) -> Result<IOResult<()>> {
         if self.db_state.load(Ordering::SeqCst) < DB_STATE_INITIALIZED {
             if let Ok(_lock) = self.init_lock.try_lock() {
                 match (
@@ -1164,6 +1164,7 @@ impl Pager {
 
                         break;
                     }
+                    *state = FreePageState::NewTrunk { page: page.clone() };
                 }
                 FreePageState::NewTrunk { page } => {
                     if page.is_locked() || !page.is_loaded() {

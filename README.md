@@ -77,6 +77,52 @@ You can also build and run the latest development version with:
 ```shell
 cargo run
 ```
+
+### MCP Server Mode
+
+The Turso CLI includes a built-in [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that allows AI assistants to interact with your databases. Start the MCP server with:
+
+```shell
+tursodb your_database.db --mcp
+```
+
+The MCP server provides seven tools for database interaction:
+
+#### Available Tools
+
+1. **`list_tables`** - List all tables in the database
+2. **`describe_table`** - Describe the structure of a specific table
+3. **`execute_query`** - Execute read-only SELECT queries
+4. **`insert_data`** - Insert new data into tables
+5. **`update_data`** - Update existing data in tables
+6. **`delete_data`** - Delete data from tables
+7. **`schema_change`** - Execute schema modification statements (CREATE TABLE, ALTER TABLE, DROP TABLE)
+
+#### Example Usage
+
+The MCP server runs as a single process that handles multiple JSON-RPC requests over stdin/stdout. Here's how to interact with it:
+
+#### Example with In-Memory Database
+
+```bash
+cat << 'EOF' | tursodb --mcp
+{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "client", "version": "1.0"}}}
+{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "schema_change", "arguments": {"query": "CREATE TABLE users (id INTEGER, name TEXT, email TEXT)"}}}
+{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "list_tables", "arguments": {}}}
+{"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "insert_data", "arguments": {"query": "INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')"}}}
+{"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "execute_query", "arguments": {"query": "SELECT * FROM users"}}}
+EOF
+```
+
+#### Example with Existing Database
+
+```bash
+# Working with an existing database file
+cat << 'EOF' | tursodb mydb.db --mcp
+{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "client", "version": "1.0"}}}
+{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_tables", "arguments": {}}}
+EOF
+```
 </details>
 
 <details>

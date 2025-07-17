@@ -505,10 +505,21 @@ impl Statement {
                 return Err(napi::Error::from_status(napi::Status::PendingException));
             }
 
-            if args.len() == 1 && matches!(args[0].get_type()?, napi::ValueType::Object) {
-                bind_named_parameters(&mut stmt, args)?;
+            if args.len() == 1 {
+                if matches!(args[0].get_type()?, napi::ValueType::Object) {
+                    let obj: napi::JsObject =
+                        args.into_iter().next().unwrap().coerce_to_object()?;
+
+                    if obj.is_array()? {
+                        bind_positional_param_array(&mut stmt, &obj)?;
+                    } else {
+                        bind_host_params(&mut stmt, &obj)?;
+                    }
+                } else {
+                    bind_single_param(&mut stmt, args.into_iter().next().unwrap())?;
+                }
             } else {
-                bind_parameters(&mut stmt, args)?;
+                bind_positional_params(&mut stmt, args)?;
             }
         }
 
@@ -516,7 +527,7 @@ impl Statement {
     }
 }
 
-fn bind_parameters(
+fn bind_positional_params(
     stmt: &mut RefMut<'_, turso_core::Statement>,
     args: Vec<JsUnknown>,
 ) -> Result<(), napi::Error> {
@@ -527,22 +538,93 @@ fn bind_parameters(
     Ok(())
 }
 
-fn bind_named_parameters(
+fn bind_host_params(
     stmt: &mut RefMut<'_, turso_core::Statement>,
-    args: Vec<JsUnknown>,
+    obj: &napi::JsObject,
 ) -> Result<(), napi::Error> {
-    let obj: napi::JsObject = args.into_iter().next().unwrap().coerce_to_object()?;
-    for idx in 1..stmt.parameters_count() {
+    if first_key_is_number(obj) {
+        bind_numbered_params(stmt, obj)?;
+    } else {
+        bind_named_params(stmt, obj)?;
+    }
+
+    Ok(())
+}
+
+fn first_key_is_number(obj: &napi::JsObject) -> bool {
+    napi::JsObject::keys(obj)
+        .iter()
+        .flatten()
+        .filter(|key| matches!(obj.has_own_property(key), Ok(result) if result))
+        .take(1)
+        .any(|key| str::parse::<u32>(key).is_ok())
+}
+
+fn bind_numbered_params(
+    stmt: &mut RefMut<'_, turso_core::Statement>,
+    obj: &napi::JsObject,
+) -> Result<(), napi::Error> {
+    for key in napi::JsObject::keys(obj)?.iter() {
+        let Ok(param_idx) = str::parse::<u32>(key) else {
+            return Err(napi::Error::new(
+                napi::Status::GenericFailure,
+                "cannot mix numbers and strings",
+            ));
+        };
+        let Some(non_zero) = NonZero::new(param_idx as usize) else {
+            return Err(napi::Error::new(
+                napi::Status::GenericFailure,
+                "numbered parameters cannot be lower than 1",
+            ));
+        };
+
+        stmt.bind_at(non_zero, from_js_value(obj.get_named_property(key)?)?);
+    }
+    Ok(())
+}
+
+fn bind_named_params(
+    stmt: &mut RefMut<'_, turso_core::Statement>,
+    obj: &napi::JsObject,
+) -> Result<(), napi::Error> {
+    for idx in 1..stmt.parameters_count() + 1 {
         let non_zero_idx = NonZero::new(idx).unwrap();
 
         let param = stmt.parameters().name(non_zero_idx);
         let Some(name) = param else {
-            return Err(napi::Error::from_status(napi::Status::GenericFailure));
+            return Err(napi::Error::from_reason(format!(
+                "could not find named parameter with index {idx}"
+            )));
         };
 
-        let value = obj.get_named_property::<napi::JsUnknown>(&name)?;
+        let value = obj.get_named_property::<napi::JsUnknown>(&name[1..])?;
         stmt.bind_at(non_zero_idx, from_js_value(value)?);
     }
+
+    Ok(())
+}
+
+fn bind_positional_param_array(
+    stmt: &mut RefMut<'_, turso_core::Statement>,
+    obj: &napi::JsObject,
+) -> Result<(), napi::Error> {
+    assert!(obj.is_array()?, "bind_array can only be called with arrays");
+
+    for idx in 1..obj.get_array_length()? {
+        stmt.bind_at(
+            NonZero::new(idx as usize).unwrap(),
+            from_js_value(obj.get_element(idx)?)?,
+        );
+    }
+
+    Ok(())
+}
+
+fn bind_single_param(
+    stmt: &mut RefMut<'_, turso_core::Statement>,
+    obj: napi::JsUnknown,
+) -> Result<(), napi::Error> {
+    stmt.bind_at(NonZero::new(1).unwrap(), from_js_value(obj)?);
     Ok(())
 }
 
@@ -554,6 +636,7 @@ pub struct IteratorStatement {
     presentation_mode: PresentationMode,
 }
 
+#[napi]
 impl Generator for IteratorStatement {
     type Yield = JsUnknown;
 

@@ -117,7 +117,7 @@ pub fn translate_create_index(
         cursor_id: sorter_cursor_id,
         columns: columns.len(),
         order,
-        collations: tbl.column_collations(),
+        collations: idx.columns.iter().map(|c| c.collation).collect(),
     });
     let content_reg = program.alloc_register();
     program.emit_insn(Insn::OpenPseudo {

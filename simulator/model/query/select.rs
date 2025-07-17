@@ -4,7 +4,7 @@ use anyhow::Context;
 pub use ast::Distinctness;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use turso_sqlite3_parser::ast::{self, fmt::ToTokens};
+use turso_sqlite3_parser::ast::{self, fmt::ToTokens, SortOrder};
 
 use crate::{
     generation::Shadow,
@@ -63,6 +63,7 @@ impl Select {
                     columns: vec![ResultColumn::Expr(expr)],
                     from: None,
                     where_clause: Predicate::true_(),
+                    order_by: None,
                 }),
                 compounds: Vec::new(),
             },
@@ -87,6 +88,7 @@ impl Select {
                         joins: Vec::new(),
                     }),
                     where_clause,
+                    order_by: None,
                 }),
                 compounds: Vec::new(),
             },
@@ -141,6 +143,11 @@ pub struct SelectBody {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OrderBy {
+    pub columns: Vec<(String, SortOrder)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SelectInner {
     /// `DISTINCT`
     pub distinctness: Distinctness,
@@ -150,6 +157,8 @@ pub struct SelectInner {
     pub from: Option<FromClause>,
     /// `WHERE` clause
     pub where_clause: Predicate,
+    /// `ORDER BY` clause
+    pub order_by: Option<OrderBy>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -496,7 +505,19 @@ impl Select {
                         .collect(),
                 ),
             },
-            order_by: None,
+            order_by: self.body.select.order_by.as_ref().map(|o| {
+                o.columns
+                    .iter()
+                    .map(|(name, order)| ast::SortedColumn {
+                        expr: ast::Expr::Id(ast::Id(name.clone())),
+                        order: match order {
+                            SortOrder::Asc => Some(ast::SortOrder::Asc),
+                            SortOrder::Desc => Some(ast::SortOrder::Desc),
+                        },
+                        nulls: None,
+                    })
+                    .collect()
+            }),
             limit: self.limit.map(|l| {
                 Box::new(ast::Limit {
                     expr: ast::Expr::Literal(ast::Literal::Numeric(l.to_string())),

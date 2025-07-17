@@ -82,6 +82,33 @@ impl Completion {
         }
     }
 
+    pub fn new_write<F>(complete: F) -> Self
+    where
+        F: Fn(i32) + 'static,
+    {
+        Self::new(CompletionType::Write(WriteCompletion::new(Box::new(
+            complete,
+        ))))
+    }
+
+    pub fn new_read<F>(buf: Arc<RefCell<Buffer>>, complete: F) -> Self
+    where
+        F: Fn(Arc<RefCell<Buffer>>, i32) + 'static,
+    {
+        Self::new(CompletionType::Read(ReadCompletion::new(
+            buf,
+            Box::new(complete),
+        )))
+    }
+    pub fn new_sync<F>(complete: F) -> Self
+    where
+        F: Fn(i32) + 'static,
+    {
+        Self::new(CompletionType::Sync(SyncCompletion::new(Box::new(
+            complete,
+        ))))
+    }
+
     pub fn is_completed(&self) -> bool {
         self.is_completed.get()
     }

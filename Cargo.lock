@@ -3806,6 +3806,7 @@ dependencies = [
  "rustyline",
  "schemars",
  "serde",
+ "serde_json",
  "shlex",
  "syntect",
  "toml",

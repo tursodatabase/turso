@@ -69,6 +69,7 @@ bitflags = "2.9.0"
 serde = { workspace = true , optional = true, features = ["derive"] }
 paste = "1.0.15"
 uuid = { version = "1.11.0", features = ["v4", "v7"], optional = true }
+tempfile = "3.8.0"
 
 [build-dependencies]
 chrono = { version = "0.4.38", default-features = false }
@@ -86,7 +87,6 @@ criterion = { version = "0.5", features = [
 ] }
 rstest = "0.18.2"
 rusqlite = "0.34.0"
-tempfile = "3.8.0"
 quickcheck = { version = "1.0", default-features = false }
 quickcheck_macros = { version = "1.0", default-features = false }
 rand = "0.8.5" # Required for quickcheck

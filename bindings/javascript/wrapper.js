@@ -264,8 +264,11 @@ class Statement {
    *
    * @param bindParameters - The bind parameters for executing the statement.
    */
-  iterate(...bindParameters) {
-    return this.stmt.iterate(bindParameters.flat());
+  *iterate(...bindParameters) {
+    // revisit this solution when https://github.com/napi-rs/napi-rs/issues/2574 is fixed
+    for (const row of this.stmt.iterate(bindParameters.flat())) {
+      yield row;
+    }
   }
 
   /**

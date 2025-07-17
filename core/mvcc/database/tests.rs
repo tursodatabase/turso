@@ -823,6 +823,8 @@ fn test_scan_cursor_basic() {
 
     let mut cursor = ScanCursor::new(db.clone(), tx_id, table_id).unwrap();
 
+    cursor.forward();
+
     // Check first row
     assert!(!cursor.is_empty());
     let row = cursor.current_row().unwrap().unwrap();
@@ -863,7 +865,8 @@ fn test_cursor_with_empty_table() {
     assert!(cursor.current_row_id().is_none());
 
     // Test ScanCursor with empty table
-    let cursor = ScanCursor::new(db.clone(), tx_id, table_id).unwrap();
+    let mut cursor = ScanCursor::new(db.clone(), tx_id, table_id).unwrap();
+    cursor.forward();
     assert!(cursor.is_empty());
     assert!(cursor.current_row_id().is_none());
 }

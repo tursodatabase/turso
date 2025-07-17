@@ -109,6 +109,7 @@ pub struct InsertFlags(pub u8);
 
 impl InsertFlags {
     pub const UPDATE: u8 = 0x01; // Flag indicating this is part of an UPDATE statement
+    pub const REQUIRE_SEEK: u8 = 0x02; // Flag indicating that a seek is required to insert the row
 
     pub fn new() -> Self {
         InsertFlags(0)
@@ -118,12 +119,8 @@ impl InsertFlags {
         (self.0 & flag) != 0
     }
 
-    pub fn update(mut self, is_update: bool) -> Self {
-        if is_update {
-            self.0 |= InsertFlags::UPDATE;
-        } else {
-            self.0 &= !InsertFlags::UPDATE;
-        }
+    pub fn require_seek(mut self) -> Self {
+        self.0 |= InsertFlags::REQUIRE_SEEK;
         self
     }
 }

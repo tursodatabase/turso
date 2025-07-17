@@ -285,8 +285,7 @@ fn execute_plan(
                                             "differences: {}",
                                             diff.iter()
                                                 .map(|((i, j), (l, r))| format!(
-                                                    "\t({}, {}): ({}) != ({})",
-                                                    i, j, l, r
+                                                    "\t({i}, {j}): ({l}) != ({r})"
                                                 ))
                                                 .collect::<Vec<_>>()
                                                 .join("\n")

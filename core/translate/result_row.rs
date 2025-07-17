@@ -128,7 +128,8 @@ pub fn emit_result_row_and_limit(
                 cursor: *table_cursor_id,
                 key_reg: result_columns_start_reg + (plan.result_columns.len() - 1), // Rowid reg is the last register
                 record_reg,
-                flag: InsertFlags(0),
+                // since we are not doing an Insn::NewRowid or an Insn::NotExists here, we need to seek to ensure the insertion happens in the correct place.
+                flag: InsertFlags::new().require_seek(),
                 table_name: table.name.clone(),
             });
         }

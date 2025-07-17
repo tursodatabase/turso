@@ -1,8 +1,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
-use super::{common, Completion, File, OpenFlags, WriteCompletion, IO};
+use super::{common, Completion, File, OpenFlags, IO};
 use crate::io::clock::{Clock, Instant};
-use crate::io::CompletionType;
 use crate::{LimboError, MemoryIO, Result};
 use rustix::fs::{self, FlockOperation, OFlags};
 use std::cell::RefCell;
@@ -341,13 +340,11 @@ impl File for UringFile {
         let c_uring = c.clone();
         io.ring.submit_entry(
             &write,
-            Arc::new(Completion::new(CompletionType::Write(
-                WriteCompletion::new(Box::new(move |result| {
-                    c_uring.complete(result);
-                    // NOTE: Explicitly reference buffer to ensure it lives until here
-                    let _ = buffer.borrow();
-                })),
-            ))),
+            Arc::new(Completion::new_write(move |result| {
+                c_uring.complete(result);
+                // NOTE: Explicitly reference buffer to ensure it lives until here
+                let _ = buffer.borrow();
+            })),
         );
         Ok(c)
     }

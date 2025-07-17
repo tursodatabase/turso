@@ -26,3 +26,25 @@ do_execsql_test values-in-join {
   select * from (values(1, 2)) join (values(3, 4), (5, 6));
 } {1|2|3|4
   1|2|5|6};
+
+do_execsql_test_skip_lines_on_specific_db 1 {:memory:} values-double-quotes-simple {
+    .dbconfig dqs_dml on
+    VALUES ("double_quoted_string");
+} {double_quoted_string}
+
+do_execsql_test_skip_lines_on_specific_db 1 {:memory:} values-double-quotes-multiple {
+    .dbconfig dqs_dml on
+    VALUES ("first", "second"), ("third", "fourth");
+} {first|second
+third|fourth}
+
+do_execsql_test_skip_lines_on_specific_db 1 {:memory:} values-mixed-quotes {
+    .dbconfig dqs_dml on
+    VALUES ("double", 'single'), ('single', "double");
+} {double|single
+single|double}
+
+do_execsql_test_skip_lines_on_specific_db 1 {:memory:} values-double-quotes-subquery {
+    .dbconfig dqs_dml on
+    SELECT * FROM (VALUES ("subquery_string"));
+} {subquery_string}

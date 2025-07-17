@@ -17,7 +17,7 @@ use std::{
 };
 
 use crate::fast_lock::SpinLock;
-use crate::io::{CompletionType, File, SyncCompletion, IO};
+use crate::io::{File, IO};
 use crate::result::LimboResult;
 use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_write_wal_frame, finish_read_page, WAL_FRAME_HEADER_SIZE,
@@ -883,12 +883,10 @@ impl Wal for WalFile {
                 tracing::debug!("wal_sync");
                 let syncing = self.syncing.clone();
                 self.syncing.set(true);
-                let completion = Completion::new(CompletionType::Sync(SyncCompletion {
-                    complete: Box::new(move |_| {
-                        tracing::debug!("wal_sync finish");
-                        syncing.set(false);
-                    }),
-                }));
+                let completion = Completion::new_sync(move |_| {
+                    tracing::debug!("wal_sync finish");
+                    syncing.set(false);
+                });
                 let shared = self.get_shared();
                 shared.file.sync(completion.into())?;
                 self.sync_state.set(SyncState::Syncing);

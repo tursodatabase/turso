@@ -864,7 +864,7 @@ fn test_cdc_bin_record() {
     ]);
     let mut record_hex = String::new();
     for byte in record {
-        record_hex.push_str(&format!("{:02X}", byte));
+        record_hex.push_str(&format!("{byte:02X}"));
     }
 
     let rows = limbo_exec_rows(

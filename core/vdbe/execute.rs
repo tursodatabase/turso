@@ -13,6 +13,7 @@ use crate::types::{
     compare_immutable, compare_records_generic, ImmutableRecord, SeekResult, Text, TextSubtype,
 };
 use crate::util::normalize_ident;
+use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::registers_to_ref_values;
 use crate::{
     error::{
@@ -1473,14 +1474,12 @@ pub fn op_column(
                         n if n >= 13 && n % 2 == 1 => (n - 13) / 2,
                         10 | 11 => {
                             return Err(LimboError::Corrupt(format!(
-                                "Reserved serial type: {}",
-                                serial_type
+                                "Reserved serial type: {serial_type}"
                             )))
                         }
                         _ => {
                             return Err(LimboError::Corrupt(format!(
-                                "Invalid serial type: {}",
-                                serial_type
+                                "Invalid serial type: {serial_type}"
                             )))
                         }
                     } as usize;
@@ -1538,8 +1537,7 @@ pub fn op_column(
                             Value::Integer(read_integer_fast(data_slice, expected_len))
                         } else {
                             return Err(LimboError::Corrupt(format!(
-                                "Insufficient data for integer type {}: expected {}, got {}",
-                                serial_type, expected_len, data_len
+                                "Insufficient data for integer type {serial_type}: expected {expected_len}, got {data_len}"
                             )));
                         }
                     }
@@ -1924,6 +1922,8 @@ pub fn op_transaction(
 
     if let Some(mv_store) = &mv_store {
         if state.mv_tx_id.is_none() {
+            // We allocate the first page lazily in the first transaction.
+            return_if_io!(pager.maybe_allocate_page1());
             let tx_id = mv_store.begin_tx();
             conn.mv_transactions.borrow_mut().push(tx_id);
             state.mv_tx_id = Some(tx_id);
@@ -2689,8 +2689,8 @@ pub fn seek_internal(
                         // this same logic applies for indexes, but the next/prev record is expected to be found in the parent page's
                         // divider cell.
                         let result = match op {
-                            SeekOp::GT { .. } | SeekOp::GE { .. } => cursor.next()?,
-                            SeekOp::LT { .. } | SeekOp::LE { .. } => cursor.prev()?,
+                            SeekOp::GT | SeekOp::GE { .. } => cursor.next()?,
+                            SeekOp::LT | SeekOp::LE { .. } => cursor.prev()?,
                         };
                         match result {
                             IOResult::Done(found) => found,
@@ -3416,12 +3416,24 @@ pub fn op_sorter_open(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
+    let cache_size = program.connection.get_cache_size();
+    // Set the buffer size threshold to be roughly the same as the limit configured for the page-cache.
+    let page_size = header_accessor::get_page_size(pager)
+        .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as usize;
+    let max_buffer_size_bytes = if cache_size < 0 {
+        (cache_size.abs() * 1024) as usize
+    } else {
+        (cache_size as usize) * page_size
+    };
     let cursor = Sorter::new(
         order,
         collations
             .iter()
             .map(|collation| collation.unwrap_or_default())
             .collect(),
+        max_buffer_size_bytes,
+        page_size,
+        pager.io.clone(),
     );
     let mut cursors = state.cursors.borrow_mut();
     cursors
@@ -3489,7 +3501,7 @@ pub fn op_sorter_insert(
             Register::Record(record) => record,
             _ => unreachable!("SorterInsert on non-record register"),
         };
-        cursor.insert(record);
+        cursor.insert(record)?;
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -3514,7 +3526,9 @@ pub fn op_sorter_sort(
         let cursor = cursor.as_sorter_mut();
         let is_empty = cursor.is_empty();
         if !is_empty {
-            cursor.sort();
+            if let IOResult::IO = cursor.sort()? {
+                return Ok(InsnFunctionStepResult::IO);
+            }
         }
         is_empty
     };
@@ -3544,7 +3558,9 @@ pub fn op_sorter_next(
     let has_more = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_sorter_mut();
-        cursor.next();
+        if let IOResult::IO = cursor.next()? {
+            return Ok(InsnFunctionStepResult::IO);
+        }
         cursor.has_more()
     };
     if has_more {
@@ -4231,8 +4247,7 @@ pub fn op_function(
                             Some(table) => table,
                             None => {
                                 return Err(LimboError::InvalidArgument(format!(
-                                    "table_columns_json_array: table {} doesn't exists",
-                                    table
+                                    "table_columns_json_array: table {table} doesn't exists"
                                 )))
                             }
                         }
@@ -4870,8 +4885,15 @@ pub fn op_insert(
             Register::Aggregate(..) => unreachable!("Cannot insert an aggregate value."),
         };
 
-        // query planner must emit NewRowId/NotExists/etc op-codes which will properly reposition cursor
-        return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(record.as_ref())), true));
+        // In a table insert, if the caller does not pass InsertFlags::REQUIRE_SEEK, they must ensure that a seek has already happened to the correct location.
+        // This typically happens by invoking either Insn::NewRowid or Insn::NotExists, because:
+        // 1. op_new_rowid() seeks to the end of the table, which is the correct insertion position.
+        // 2. op_not_exists() seeks to the position in the table where the target rowid would be inserted.
+        let moved_before = !flag.has(InsertFlags::REQUIRE_SEEK);
+        return_if_io!(cursor.insert(
+            &BTreeKey::new_table_rowid(key, Some(record.as_ref())),
+            moved_before
+        ));
     }
 
     // Only update last_insert_rowid for regular table inserts, not schema modifications
@@ -5178,8 +5200,17 @@ pub enum OpNewRowidState {
     Start,
     SeekingToLast,
     ReadingMaxRowid,
-    GeneratingRandom { attempts: u32 },
-    VerifyingCandidate { attempts: u32, candidate: i64 },
+    GeneratingRandom {
+        attempts: u32,
+    },
+    VerifyingCandidate {
+        attempts: u32,
+        candidate: i64,
+    },
+    /// In case a rowid was generated and not provided by the user, we need to call next() on the cursor
+    /// after generating the rowid. This is because the rowid was generated by seeking to the last row in the
+    /// table, and we need to insert _after_ that row.
+    GoNext,
 }
 
 pub fn op_new_rowid(
@@ -5195,6 +5226,13 @@ pub fn op_new_rowid(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
+
+    if let Some(mv_store) = mv_store {
+        let rowid = mv_store.get_next_rowid();
+        state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid));
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
 
     const MAX_ROWID: i64 = i64::MAX;
     const MAX_ATTEMPTS: u32 = 100;
@@ -5229,9 +5267,8 @@ pub fn op_new_rowid(
                     Some(rowid) if rowid < MAX_ROWID => {
                         // Can use sequential
                         state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid + 1));
-                        state.op_new_rowid_state = OpNewRowidState::Start;
-                        state.pc += 1;
-                        return Ok(InsnFunctionStepResult::Step);
+                        state.op_new_rowid_state = OpNewRowidState::GoNext;
+                        continue;
                     }
                     Some(_) => {
                         // Must use random (rowid == MAX_ROWID)
@@ -5241,9 +5278,8 @@ pub fn op_new_rowid(
                     None => {
                         // Empty table
                         state.registers[*rowid_reg] = Register::Value(Value::Integer(1));
-                        state.op_new_rowid_state = OpNewRowidState::Start;
-                        state.pc += 1;
-                        return Ok(InsnFunctionStepResult::Step);
+                        state.op_new_rowid_state = OpNewRowidState::GoNext;
+                        continue;
                     }
                 }
             }
@@ -5293,6 +5329,16 @@ pub fn op_new_rowid(
                         attempts: attempts + 1,
                     };
                 }
+            }
+            OpNewRowidState::GoNext => {
+                {
+                    let mut cursor = state.get_cursor(*cursor);
+                    let cursor = cursor.as_btree_mut();
+                    return_if_io!(cursor.next());
+                }
+                state.op_new_rowid_state = OpNewRowidState::Start;
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
             }
         }
     }
@@ -5839,15 +5885,16 @@ pub fn op_set_cookie(
             header_accessor::set_incremental_vacuum_enabled(pager, *value as u32)?;
         }
         Cookie::SchemaVersion => {
-            // we update transaction state to indicate that the schema has changed
-            match program.connection.transaction_state.get() {
-                TransactionState::Write { schema_did_change } => {
-                    program.connection.transaction_state.set(TransactionState::Write { schema_did_change: true });
-                },
-                TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
-                TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
+            if mv_store.is_none() {
+                // we update transaction state to indicate that the schema has changed
+                match program.connection.transaction_state.get() {
+                    TransactionState::Write { schema_did_change } => {
+                        program.connection.transaction_state.set(TransactionState::Write { schema_did_change: true });
+                    },
+                    TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
+                    TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
+                }
             }
-
             program
                 .connection
                 .with_schema_mut(|schema| schema.schema_version = *value as u32);

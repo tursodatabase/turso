@@ -1,5 +1,6 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{MvStore, Result, Row, RowID};
+use crate::turso_assert;
 use std::fmt::Debug;
 use std::rc::Rc;
 
@@ -22,22 +23,30 @@ impl<Clock: LogicalClock> ScanCursor<Clock> {
         })
     }
 
+    pub fn rewind(&mut self) {
+        self.index = 0;
+    }
+
     pub fn insert(&self, row: Row) -> Result<()> {
         self.db.insert(self.tx_id, row)
     }
 
     pub fn current_row_id(&self) -> Option<RowID> {
-        if self.index >= self.row_ids.len() {
+        turso_assert!(self.index > 0, "index must be greater than zero");
+        let idx = self.index - 1;
+        if idx >= self.row_ids.len() {
             return None;
         }
-        Some(self.row_ids[self.index])
+        Some(self.row_ids[idx])
     }
 
     pub fn current_row(&self) -> Result<Option<Row>> {
-        if self.index >= self.row_ids.len() {
+        turso_assert!(self.index > 0, "index must be greater than zero");
+        let idx = self.index - 1;
+        if idx >= self.row_ids.len() {
             return Ok(None);
         }
-        let id = self.row_ids[self.index];
+        let id = self.row_ids[idx];
         self.db.read(self.tx_id, id)
     }
 
@@ -47,7 +56,8 @@ impl<Clock: LogicalClock> ScanCursor<Clock> {
 
     pub fn forward(&mut self) -> bool {
         self.index += 1;
-        self.index < self.row_ids.len()
+        let idx = self.index - 1;
+        idx < self.row_ids.len()
     }
 
     pub fn is_empty(&self) -> bool {

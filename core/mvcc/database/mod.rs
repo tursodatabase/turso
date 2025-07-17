@@ -227,6 +227,7 @@ pub struct MvStore<Clock: LogicalClock> {
     rows: SkipMap<RowID, RwLock<Vec<RowVersion>>>,
     txs: SkipMap<TxID, RwLock<Transaction>>,
     tx_ids: AtomicU64,
+    next_rowid: AtomicU64,
     clock: Clock,
     storage: Storage,
 }
@@ -238,9 +239,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             rows: SkipMap::new(),
             txs: SkipMap::new(),
             tx_ids: AtomicU64::new(1), // let's reserve transaction 0 for special purposes
+            next_rowid: AtomicU64::new(0), // TODO: determine this from B-Tree
             clock,
             storage,
         }
+    }
+
+    pub fn get_next_rowid(&self) -> i64 {
+        self.next_rowid.fetch_add(1, Ordering::SeqCst) as i64
     }
 
     /// Inserts a new row into the database.

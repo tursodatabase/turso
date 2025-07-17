@@ -33,8 +33,10 @@
 //! ```
 
 pub mod params;
+pub mod transaction;
 pub mod value;
 
+use transaction::TransactionBehavior;
 pub use value::Value;
 
 pub use params::params_from_iter;
@@ -131,6 +133,7 @@ impl Database {
         #[allow(clippy::arc_with_non_send_sync)]
         let connection = Connection {
             inner: Arc::new(Mutex::new(conn)),
+            transaction_behavior: TransactionBehavior::Deferred,
         };
         Ok(connection)
     }
@@ -139,12 +142,14 @@ impl Database {
 /// A database connection.
 pub struct Connection {
     inner: Arc<Mutex<Arc<turso_core::Connection>>>,
+    transaction_behavior: TransactionBehavior,
 }
 
 impl Clone for Connection {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            transaction_behavior: self.transaction_behavior,
         }
     }
 }
@@ -215,6 +220,15 @@ impl Connection {
             .map_err(|e| Error::MutexError(e.to_string()))?;
         conn.cacheflush()?;
         Ok(())
+    }
+
+    pub fn is_autocommit(&self) -> Result<bool> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+
+        Ok(conn.get_auto_commit())
     }
 }
 

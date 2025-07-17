@@ -230,7 +230,7 @@ impl Property {
                             if env.tables.iter().any(|t| t.name == table_name) {
                                 Ok(Ok(()))
                             } else {
-                                Ok(Err(format!("table {} does not exist", table_name)))
+                                Ok(Err(format!("table {table_name} does not exist")))
                             }
                         }
                     }),
@@ -286,7 +286,7 @@ impl Property {
                         if !env.tables.iter().any(|t| t.name == table_name) {
                             Ok(Ok(()))
                         } else {
-                            Ok(Err(format!("table {} already exists", table_name)))
+                            Ok(Err(format!("table {table_name} already exists")))
                         }
                     }),
                 });
@@ -303,12 +303,12 @@ impl Property {
                             func: Box::new(move |stack: &Vec<ResultSet>, _| {
                                 let last = stack.last().unwrap();
                                 match last {
-                                    Ok(success) => Ok(Err(format!("expected table creation to fail but it succeeded: {:?}", success))),
+                                    Ok(success) => Ok(Err(format!("expected table creation to fail but it succeeded: {success:?}"))),
                                     Err(e) => {
                                         if e.to_string().to_lowercase().contains(&format!("table {table_name} already exists")) {
                                             Ok(Ok(()))
                                         } else {
-                                            Ok(Err(format!("expected table already exists error, got: {}", e)))
+                                            Ok(Err(format!("expected table already exists error, got: {e}")))
                                         }
                                     }
                                 }
@@ -347,7 +347,7 @@ impl Property {
                                     .iter()
                                     .filter(|t| !env.tables.iter().any(|t2| t2.name == **t))
                                     .collect::<Vec<&String>>();
-                                Ok(Err(format!("missing tables: {:?}", missing_tables)))
+                                Ok(Err(format!("missing tables: {missing_tables:?}")))
                             }
                         }
                     }),
@@ -401,8 +401,7 @@ impl Property {
                                     let available_tables: Vec<String> =
                                         env.tables.iter().map(|t| t.name.clone()).collect();
                                     Ok(Err(format!(
-                                        "table \'{}\' not found. Available tables: {:?}",
-                                        table, available_tables
+                                        "table \'{table}\' not found. Available tables: {available_tables:?}"
                                     )))
                                 }
                             }
@@ -470,8 +469,7 @@ impl Property {
                                     let available_tables: Vec<String> =
                                         env.tables.iter().map(|t| t.name.clone()).collect();
                                     Ok(Err(format!(
-                                        "table \'{}\' not found. Available tables: {:?}",
-                                        table, available_tables
+                                        "table \'{table}\' not found. Available tables: {available_tables:?}"
                                     )))
                                 }
                             }
@@ -487,8 +485,7 @@ impl Property {
                         let last = stack.last().unwrap();
                         match last {
                             Ok(success) => Ok(Err(format!(
-                                "expected table creation to fail but it succeeded: {:?}",
-                                success
+                                "expected table creation to fail but it succeeded: {success:?}"
                             ))),
                             Err(e) => {
                                 if e.to_string()
@@ -497,8 +494,7 @@ impl Property {
                                     Ok(Ok(()))
                                 } else {
                                     Ok(Err(format!(
-                                        "expected table does not exist error, got: {}",
-                                        e
+                                        "expected table does not exist error, got: {e}"
                                     )))
                                 }
                             }
@@ -535,8 +531,7 @@ impl Property {
                                     let available_tables: Vec<String> =
                                         env.tables.iter().map(|t| t.name.clone()).collect();
                                     Ok(Err(format!(
-                                        "table \'{}\' not found. Available tables: {:?}",
-                                        table, available_tables
+                                        "table \'{table}\' not found. Available tables: {available_tables:?}"
                                     )))
                                 }
                             }
@@ -615,7 +610,7 @@ impl Property {
             Property::FaultyQuery { query, tables } => {
                 let checks = assert_all_table_values(tables);
                 let query_clone = query.clone();
-                let assumption = Assertion {
+                let assert = Assertion {
                     // A fault may not occur as we first signal we want a fault injected,
                     // then when IO is called the fault triggers. It may happen that a fault is injected
                     // but no IO happens right after it
@@ -640,7 +635,7 @@ impl Property {
                 };
                 let first = [
                     Interaction::FaultyQuery(query.clone()),
-                    Interaction::Assumption(assumption),
+                    Interaction::Assertion(assert),
                 ]
                 .into_iter();
                 Vec::from_iter(first.chain(checks))
@@ -668,7 +663,7 @@ impl Property {
                                     .iter()
                                     .filter(|t| !env.tables.iter().any(|t2| t2.name == **t))
                                     .collect::<Vec<&String>>();
-                                Ok(Err(format!("missing tables: {:?}", missing_tables)))
+                                Ok(Err(format!("missing tables: {missing_tables:?}")))
                             }
                         }
                     }),
@@ -693,6 +688,7 @@ impl Property {
                             columns: select.body.select.columns.clone(),
                             from: select.body.select.from.clone(),
                             where_clause: p_true,
+                            order_by: None,
                         }),
                         compounds: vec![
                             CompoundSelect {
@@ -702,6 +698,7 @@ impl Property {
                                     columns: select.body.select.columns.clone(),
                                     from: select.body.select.from.clone(),
                                     where_clause: p_false,
+                                    order_by: None,
                                 }),
                             },
                             CompoundSelect {
@@ -711,6 +708,7 @@ impl Property {
                                     columns: select.body.select.columns.clone(),
                                     from: select.body.select.from.clone(),
                                     where_clause: p_null,
+                                    order_by: None,
                                 }),
                             },
                         ],
@@ -818,7 +816,7 @@ impl Property {
                                     if union_count == count1 + count2 {
                                         Ok(Ok(()))
                                     } else {
-                                        Ok(Err(format!("UNION ALL should preserve cardinality but it didn't: {} + {} != {}", count1, count2, union_count)))
+                                        Ok(Err(format!("UNION ALL should preserve cardinality but it didn't: {count1} + {count2} != {union_count}")))
                                     }
                                 }
                                 (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {

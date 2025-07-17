@@ -49,9 +49,7 @@ use super::pager::PageRef;
 use super::wal::LimboRwLock;
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
-use crate::io::{
-    Buffer, Complete, Completion, CompletionType, ReadCompletion, SyncCompletion, WriteCompletion,
-};
+use crate::io::{Buffer, Complete, Completion};
 use crate::storage::btree::offset::{
     BTREE_CELL_CONTENT_AREA, BTREE_CELL_COUNT, BTREE_FIRST_FREEBLOCK, BTREE_FRAGMENTED_BYTES_COUNT,
     BTREE_PAGE_TYPE, BTREE_RIGHTMOST_PTR,
@@ -624,9 +622,9 @@ impl PageContent {
         let cell_pointer = self.read_u16_no_offset(cell_pointer) as usize;
         let start = cell_pointer;
         let payload_overflow_threshold_max =
-            payload_overflow_threshold_max(self.page_type(), usable_size as u16);
+            payload_overflow_threshold_max(self.page_type(), usable_size);
         let payload_overflow_threshold_min =
-            payload_overflow_threshold_min(self.page_type(), usable_size as u16);
+            payload_overflow_threshold_min(self.page_type(), usable_size);
         let len = match self.page_type() {
             PageType::IndexInterior => {
                 let (len_payload, n_payload) = read_varint(&buf[cell_pointer + 4..]).unwrap();
@@ -747,7 +745,7 @@ pub fn begin_read_page(
             page.set_error();
         }
     });
-    let c = Completion::new(CompletionType::Read(ReadCompletion::new(buf, complete)));
+    let c = Completion::new_read(buf, complete);
     db_file.read_page(page_idx, c)?;
     Ok(())
 }
@@ -809,7 +807,7 @@ pub fn begin_write_btree_page(
             );
         })
     };
-    let c = Completion::new(CompletionType::Write(WriteCompletion::new(write_complete)));
+    let c = Completion::new_write(write_complete);
     let res = page_source.write_page(page_id, buffer.clone(), c);
     if res.is_err() {
         // Avoid infinite loop if write page fails
@@ -822,11 +820,9 @@ pub fn begin_write_btree_page(
 pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>, syncing: Rc<RefCell<bool>>) -> Result<()> {
     assert!(!*syncing.borrow());
     *syncing.borrow_mut() = true;
-    let completion = Completion::new(CompletionType::Sync(SyncCompletion {
-        complete: Box::new(move |_| {
-            *syncing.borrow_mut() = false;
-        }),
-    }));
+    let completion = Completion::new_sync(move |_| {
+        *syncing.borrow_mut() = false;
+    });
     #[allow(clippy::arc_with_non_send_sync)]
     db_file.sync(completion)?;
     Ok(())
@@ -883,8 +879,8 @@ pub fn read_btree_cell(
     usable_size: usize,
 ) -> Result<BTreeCell> {
     let page_type = page_content.page_type();
-    let max_local = payload_overflow_threshold_max(page_type, usable_size as u16);
-    let min_local = payload_overflow_threshold_min(page_type, usable_size as u16);
+    let max_local = payload_overflow_threshold_max(page_type, usable_size);
+    let min_local = payload_overflow_threshold_min(page_type, usable_size);
     match page_type {
         PageType::IndexInterior => {
             let mut pos = pos;
@@ -1061,6 +1057,30 @@ impl<T: Default + Copy, const N: usize> Iterator for SmallVecIter<'_, T, N> {
         self.pos += 1;
         Some(next)
     }
+}
+
+pub fn read_record_size(payload: &[u8]) -> Result<usize> {
+    let mut offset = 0;
+    let mut record_size = 0;
+
+    let (header_size, bytes_read) = read_varint(payload)?;
+    let header_size = header_size as usize;
+    if header_size > payload.len() {
+        crate::bail_corrupt_error!("Incomplete record header");
+    }
+
+    offset += bytes_read;
+    record_size += header_size;
+
+    while offset < header_size {
+        let (serial_type, bytes_read) = read_varint(&payload[offset..])?;
+        offset += bytes_read;
+
+        let serial_type_obj = SerialType::try_from(serial_type)?;
+        record_size += serial_type_obj.size();
+    }
+
+    Ok(record_size)
 }
 
 /// Reads a value that might reference the buffer it is reading from. Be sure to store RefValue with the buffer
@@ -1487,10 +1507,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
         wfs_data.last_checksum = cumulative_checksum;
         wfs_data.loaded.store(true, Ordering::SeqCst);
     });
-    let c = Completion::new(CompletionType::Read(ReadCompletion::new(
-        buf_for_pread,
-        complete,
-    )));
+    let c = Completion::new_read(buf_for_pread, complete);
     file.pread(0, c.into())?;
 
     Ok(wal_file_shared_ret)
@@ -1510,7 +1527,7 @@ pub fn begin_read_wal_frame(
     });
     let buf = Arc::new(RefCell::new(Buffer::new(buf, drop_fn)));
     #[allow(clippy::arc_with_non_send_sync)]
-    let c = Completion::new(CompletionType::Read(ReadCompletion::new(buf, complete)));
+    let c = Completion::new_read(buf, complete);
     let c = io.pread(offset, c.into())?;
     Ok(c)
 }
@@ -1604,7 +1621,7 @@ pub fn begin_write_wal_frame(
         })
     };
     #[allow(clippy::arc_with_non_send_sync)]
-    let c = Completion::new(CompletionType::Write(WriteCompletion::new(write_complete)));
+    let c = Completion::new_write(write_complete);
     let res = io.pwrite(offset, buffer.clone(), c.into());
     if res.is_err() {
         // If we do not reduce the counter here on error, we incur an infinite loop when cacheflushing
@@ -1636,16 +1653,14 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
         Arc::new(RefCell::new(buffer))
     };
 
-    let write_complete = {
-        Box::new(move |bytes_written: i32| {
-            turso_assert!(
-                bytes_written == WAL_HEADER_SIZE as i32,
-                "wal header wrote({bytes_written}) != expected({WAL_HEADER_SIZE})"
-            );
-        })
+    let write_complete = move |bytes_written: i32| {
+        turso_assert!(
+            bytes_written == WAL_HEADER_SIZE as i32,
+            "wal header wrote({bytes_written}) != expected({WAL_HEADER_SIZE})"
+        );
     };
     #[allow(clippy::arc_with_non_send_sync)]
-    let c = Completion::new(CompletionType::Write(WriteCompletion::new(write_complete)));
+    let c = Completion::new_write(write_complete);
     io.pwrite(0, buffer.clone(), c.into())?;
     Ok(())
 }

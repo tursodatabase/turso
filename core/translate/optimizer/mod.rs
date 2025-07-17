@@ -12,7 +12,7 @@ use turso_sqlite3_parser::ast::{self, fmt::ToTokens as _, Expr, SortOrder};
 use crate::{
     parameters::PARAM_PREFIX,
     schema::{Index, IndexColumn, Schema, Table},
-    translate::{expr::walk_expr_mut, plan::TerminationKey},
+    translate::{expr::is_double_quoted_identifier, expr::walk_expr_mut, plan::TerminationKey},
     types::SeekOp,
     Result,
 };
@@ -604,7 +604,11 @@ impl Optimizable for ast::Expr {
                         .is_none_or(|args| args.iter().all(|arg| arg.is_constant(resolver)))
             }
             Expr::FunctionCallStar { .. } => false,
-            Expr::Id(_) => panic!("Id should have been rewritten as Column"),
+            Expr::Id(id) => {
+                // If we got here with an id, this has to be double-quotes identifier
+                assert!(is_double_quoted_identifier(&id.0));
+                true
+            }
             Expr::Column { .. } => false,
             Expr::RowId { .. } => false,
             Expr::InList { lhs, rhs, .. } => {

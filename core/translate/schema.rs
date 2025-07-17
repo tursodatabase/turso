@@ -155,7 +155,7 @@ pub fn translate_create_table(
     });
     // TODO: remove format, it sucks for performance but is convenient
     let parse_schema_where_clause =
-        format!("tbl_name = '{}' AND type != 'trigger'", normalized_tbl_name);
+        format!("tbl_name = '{normalized_tbl_name}' AND type != 'trigger'");
     program.emit_insn(Insn::ParseSchema {
         db: sqlite_schema_cursor_id,
         where_clause: Some(parse_schema_where_clause),

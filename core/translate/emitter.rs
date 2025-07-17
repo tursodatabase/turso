@@ -1153,7 +1153,13 @@ fn emit_update_insns(
             cursor: cursor_id,
             key_reg: rowid_set_clause_reg.unwrap_or(beg),
             record_reg,
-            flag: InsertFlags::new().update(true),
+            flag: if has_user_provided_rowid {
+                // The previous Insn::NotExists and Insn::Delete seek to the old rowid,
+                // so to insert a new user-provided rowid, we need to seek to the correct place.
+                InsertFlags::new().require_seek()
+            } else {
+                InsertFlags::new()
+            },
             table_name: table_ref.identifier.clone(),
         });
 

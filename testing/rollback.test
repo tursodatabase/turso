@@ -55,7 +55,7 @@ do_execsql_test_on_specific_db {:memory:} rollback-mixed-operations {
     select * from t order by x;
 } {1 2}
 
-# The point of this test was to test we drop dirty pages after rollback by inserting into another table so that 
+# The point of this test was to test we drop dirty pages after rollback by inserting into another table so that
 # pages used are different.
 do_execsql_test_on_specific_db {:memory:} insert-after-rollback {
     create table t (x);
@@ -137,17 +137,15 @@ if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-s
     } {"CREATE TABLE t (x)"}
 }
 
-
 do_execsql_test_on_specific_db {:memory:} schema-drop-table-rollback {
     create table t (x);
     begin;
-    drop table t; 
+    drop table t;
     rollback;
     select sql from sqlite_schema;
 } {"CREATE TABLE t (x)"}
 
-
 # TODO: add tests for:
-# * create virtual table 
+# * create virtual table
 # * drop index
 # * views...

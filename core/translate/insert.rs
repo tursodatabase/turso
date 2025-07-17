@@ -231,7 +231,8 @@ pub fn translate_insert(
                         cursor: temp_cursor_id,
                         key_reg: rowid_reg,
                         record_reg,
-                        flag: InsertFlags::new(),
+                        // since we are not doing an Insn::NewRowid or an Insn::NotExists here, we need to seek to ensure the insertion happens in the correct place.
+                        flag: InsertFlags::new().require_seek(),
                         table_name: "".to_string(),
                     });
 

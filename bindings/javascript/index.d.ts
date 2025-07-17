@@ -44,4 +44,6 @@ export declare class Statement {
   static columns(): void
   bind(args?: Array<unknown> | undefined | null): Statement
 }
-export declare class IteratorStatement { }
+export declare class IteratorStatement {
+  [Symbol.iterator](): Iterator<unknown, void, void>
+}

@@ -178,7 +178,7 @@ impl SimulatorEnv {
             // Create percent should be 5-15% of the write percent
             create_percent = rng.gen_range(0.05..=0.15) * write_percent;
         }
-        if !cli_opts.disable_create_index {
+        if cli_opts.enable_create_index {
             // Create indexpercent should be 2-5% of the write percent
             create_index_percent = rng.gen_range(0.02..=0.05) * write_percent;
         }

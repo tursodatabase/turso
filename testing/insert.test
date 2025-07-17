@@ -410,3 +410,51 @@ if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-s
         SELECT COUNT(*) FROM t WHERE x >= replace(hex(zeroblob(100)), '00', 'a');
     } {8}
 }
+
+do_execsql_test_skip_lines_on_specific_db 1 {:memory:} double-quote-string-literals {
+    .dbconfig dqs_dml on
+    CREATE TABLE test (id INTEGER, name TEXT);
+    INSERT INTO test (id, name) VALUES (1, "Dave");
+    INSERT INTO test (id,name) VALUES (2, 'Alice');
+    SELECT * FROM test ORDER BY id;
+} {1|Dave
+2|Alice}
+
+do_execsql_test_skip_lines_on_specific_db 1 {:memory:} mixed-quote-types {
+    .dbconfig dqs_dml on
+    CREATE TABLE mixed (a TEXT, b TEXT, c TEXT);
+    INSERT INTO mixed (a,b,c) VALUES ("double", 'single', "another");
+    SELECT * FROM mixed;
+} {double|single|another}
+
+do_execsql_test_skip_lines_on_specific_db 1 {:memory:} double-quote-regression-original-case {
+    .dbconfig dqs_dml on
+    CREATE TABLE users (
+        id INTEGER,
+        name TEXT,
+        email TEXT
+    );
+    INSERT INTO users (name) values ("Dave");
+    SELECT name FROM users;
+} {Dave}
+
+do_execsql_test_skip_lines_on_specific_db 1 {:memory:} double-quote-multiple-rows {
+    .dbconfig dqs_dml on
+    CREATE TABLE items (id INTEGER, description TEXT, category TEXT);
+    INSERT INTO items (id, description, category) VALUES
+        (1, "First_item", "category_a"),
+        (2, 'Second_item', "category_b"),
+        (3, "Third_item", 'category_c');
+    SELECT id, description, category FROM items ORDER BY id;
+} {1|First_item|category_a
+2|Second_item|category_b
+3|Third_item|category_c}
+
+do_execsql_test_skip_lines_on_specific_db 1 {:memory:} double-quote-inner-quotes-preservation {
+    .dbconfig dqs_dml on
+    CREATE TABLE inner_quotes_test (id INTEGER, content TEXT);
+    INSERT INTO inner_quotes_test VALUES (1, '"foo"');
+    INSERT INTO inner_quotes_test VALUES (2, "'bar'");
+    SELECT id, content FROM inner_quotes_test ORDER BY id;
+} {1|"foo"
+2|'bar'}

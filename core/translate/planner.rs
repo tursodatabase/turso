@@ -21,8 +21,8 @@ use crate::{
 };
 use turso_sqlite3_parser::ast::Literal::Null;
 use turso_sqlite3_parser::ast::{
-    self, As, Expr, FromClause, JoinType, Limit, Materialized, QualifiedName, TableInternalId,
-    UnaryOperator, With,
+    self, As, Expr, FromClause, JoinType, Limit, Literal, Materialized, QualifiedName,
+    TableInternalId, UnaryOperator, With,
 };
 
 pub const ROWID: &str = "rowid";
@@ -200,7 +200,16 @@ pub fn bind_column_references(
                         }
                     }
                 }
-                crate::bail_parse_error!("Column {} not found", id.0);
+                // SQLite behavior: Only double-quoted identifiers get fallback to string literals
+                // Single quotes are handled as literals earlier, unquoted identifiers must resolve to columns
+                if crate::translate::expr::is_double_quoted_identifier(&id.0) {
+                    // Convert failed double-quoted identifier to string literal
+                    *expr = Expr::Literal(Literal::String(id.0.clone()));
+                    Ok(())
+                } else {
+                    // Unquoted identifiers must resolve to columns - no fallback
+                    crate::bail_parse_error!("Column {} not found", id.0)
+                }
             }
             Expr::Qualified(tbl, id) => {
                 let normalized_table_name = normalize_ident(tbl.0.as_str());

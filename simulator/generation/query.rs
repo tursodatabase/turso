@@ -2,7 +2,7 @@ use crate::generation::{Arbitrary, ArbitraryFrom, ArbitrarySizedFrom, Shadow};
 use crate::model::query::predicate::Predicate;
 use crate::model::query::select::{
     CompoundOperator, CompoundSelect, Distinctness, FromClause, JoinTable, JoinType, JoinedTable,
-    ResultColumn, SelectBody, SelectInner,
+    OrderBy, ResultColumn, SelectBody, SelectInner,
 };
 use crate::model::query::update::Update;
 use crate::model::query::{Create, Delete, Drop, Insert, Query, Select};
@@ -10,7 +10,7 @@ use crate::model::table::{SimValue, Table};
 use crate::SimulatorEnv;
 use itertools::Itertools;
 use rand::Rng;
-use turso_sqlite3_parser::ast::Expr;
+use turso_sqlite3_parser::ast::{Expr, SortOrder};
 
 use super::property::Remaining;
 use super::{backtrack, frequency, pick};
@@ -85,6 +85,46 @@ impl ArbitraryFrom<&SimulatorEnv> for SelectInner {
             .expect("Failed to shadow FromClause")
             .into_table();
 
+        let order_by = 'order_by: {
+            if rng.gen_bool(0.3) {
+                let order_by_table_candidates = from
+                    .joins
+                    .iter()
+                    .map(|j| j.table.clone())
+                    .chain(std::iter::once(from.table.clone()))
+                    .collect::<Vec<_>>();
+                let cuml_col_count = join_table.columns.len();
+                let order_by_col_count =
+                    (rng.gen::<f64>() * rng.gen::<f64>() * (cuml_col_count as f64)) as usize; // skew towards 0
+                if order_by_col_count == 0 {
+                    break 'order_by None;
+                }
+                let mut col_names = std::collections::HashSet::new();
+                let mut order_by_cols = Vec::new();
+                while order_by_cols.len() < order_by_col_count {
+                    let table = pick(&order_by_table_candidates, rng);
+                    let table = tables.iter().find(|t| t.name == *table).unwrap();
+                    let col = pick(&table.columns, rng);
+                    let col_name = format!("{}.{}", table.name, col.name);
+                    if col_names.insert(col_name.clone()) {
+                        order_by_cols.push((
+                            col_name,
+                            if rng.gen_bool(0.5) {
+                                SortOrder::Asc
+                            } else {
+                                SortOrder::Desc
+                            },
+                        ));
+                    }
+                }
+                Some(OrderBy {
+                    columns: order_by_cols,
+                })
+            } else {
+                None
+            }
+        };
+
         SelectInner {
             distinctness: if env.opts.experimental_indexes {
                 Distinctness::arbitrary(rng)
@@ -94,6 +134,7 @@ impl ArbitraryFrom<&SimulatorEnv> for SelectInner {
             columns: vec![ResultColumn::Star],
             from: Some(from),
             where_clause: Predicate::arbitrary_from(rng, &join_table),
+            order_by,
         }
     }
 }

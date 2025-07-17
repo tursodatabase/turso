@@ -1885,10 +1885,14 @@ pub fn translate_expr(
             }
         }
         ast::Expr::FunctionCallStar { .. } => todo!(),
-        ast::Expr::Id(id) => crate::bail_parse_error!(
-            "no such column: {} - should this be a string literal in single-quotes?",
-            id.0
-        ),
+        ast::Expr::Id(id) => {
+            // Treat double-quoted identifiers as string literals (SQLite compatibility)
+            program.emit_insn(Insn::String8 {
+                value: sanitize_double_quoted_string(&id.0),
+                dest: target_register,
+            });
+            Ok(target_register)
+        }
         ast::Expr::Column {
             database: _,
             table: table_ref_id,
@@ -2684,10 +2688,21 @@ pub fn maybe_apply_affinity(col_type: Type, target_register: usize, program: &mu
     }
 }
 
-/// Sanitaizes a string literal by removing single quote at front and back
+/// Sanitizes a string literal by removing single quote at front and back
 /// and escaping double single quotes
 pub fn sanitize_string(input: &str) -> String {
     input[1..input.len() - 1].replace("''", "'").to_string()
+}
+
+/// Sanitizes a double-quoted string literal by removing double quotes at front and back
+/// and unescaping double quotes
+pub fn sanitize_double_quoted_string(input: &str) -> String {
+    input[1..input.len() - 1].replace("\"\"", "\"").to_string()
+}
+
+/// Checks if an identifier represents a double-quoted string that should get fallback behavior
+pub fn is_double_quoted_identifier(id_str: &str) -> bool {
+    id_str.len() >= 2 && id_str.starts_with('"') && id_str.ends_with('"')
 }
 
 /// Returns the components of a binary expression

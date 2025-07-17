@@ -405,20 +405,26 @@ impl Program {
             let _ = state.result_row.take();
             let (insn, insn_function) = &self.insns[state.pc as usize];
             trace_insn(self, state.pc as InsnReference, insn);
-            let res = insn_function(self, state, insn, &pager, mv_store.as_ref());
-            if res.is_err() {
-                let state = self.connection.transaction_state.get();
-                if let TransactionState::Write { schema_did_change } = state {
-                    pager.rollback(schema_did_change, &self.connection)?
+            match insn_function(self, state, insn, &pager, mv_store.as_ref()) {
+                Ok(InsnFunctionStepResult::Step) => {}
+                Ok(InsnFunctionStepResult::Done) => return Ok(StepResult::Done),
+                Ok(InsnFunctionStepResult::IO) => return Ok(StepResult::IO),
+                Ok(InsnFunctionStepResult::Row) => return Ok(StepResult::Row),
+                Ok(InsnFunctionStepResult::Interrupt) => return Ok(StepResult::Interrupt),
+                Ok(InsnFunctionStepResult::Busy) => return Ok(StepResult::Busy),
+                Err(err) => {
+                    match err {
+                        LimboError::TxError(_) => {}
+                        _ => {
+                            let state = self.connection.transaction_state.get();
+                            if let TransactionState::Write { schema_did_change } = state {
+                                pager.rollback(schema_did_change, &self.connection)?
+                            }
+                        }
+                    }
+                    let err = Err(err);
+                    return err;
                 }
-            }
-            match res? {
-                InsnFunctionStepResult::Step => {}
-                InsnFunctionStepResult::Done => return Ok(StepResult::Done),
-                InsnFunctionStepResult::IO => return Ok(StepResult::IO),
-                InsnFunctionStepResult::Row => return Ok(StepResult::Row),
-                InsnFunctionStepResult::Interrupt => return Ok(StepResult::Interrupt),
-                InsnFunctionStepResult::Busy => return Ok(StepResult::Busy),
             }
         }
     }

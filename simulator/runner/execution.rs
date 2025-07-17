@@ -173,7 +173,7 @@ pub(crate) enum ExecutionContinuation {
     NextProperty,
 }
 
-#[instrument(skip(env, interaction, stack), fields(interaction = %interaction))]
+#[instrument(skip(env, interaction, stack), fields(seed = %env.opts.seed, interaction = %interaction))]
 pub(crate) fn execute_interaction(
     env: &mut SimulatorEnv,
     connection_index: usize,

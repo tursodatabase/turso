@@ -157,19 +157,21 @@ impl Schema {
         let mut automatic_indices: HashMap<String, Vec<(String, usize)>> =
             HashMap::with_capacity(10);
 
-        match pager.begin_read_tx()? {
-            IOResult::Done(v) => {
-                if matches!(v, LimboResult::Busy) {
-                    return Err(LimboError::Busy);
+        loop {
+            match pager.begin_read_tx()? {
+                IOResult::Done(v) => {
+                    if matches!(v, LimboResult::Busy) {
+                        return Err(LimboError::Busy);
+                    }
+                    break;
                 }
+                IOResult::IO => pager.io.run_once()?,
             }
-            IOResult::IO => pager.io.run_once()?,
         }
 
-        match cursor.rewind()? {
-            IOResult::Done(v) => v,
-            IOResult::IO => pager.io.run_once()?,
-        };
+        while let IOResult::IO = cursor.rewind()? {
+            pager.io.run_once()?
+        }
 
         loop {
             let Some(row) = (loop {
@@ -285,9 +287,9 @@ impl Schema {
             drop(record_cursor);
             drop(row);
 
-            if matches!(cursor.next()?, IOResult::IO) {
+            while let IOResult::IO = cursor.next()? {
                 pager.io.run_once()?;
-            };
+            }
         }
 
         pager.end_read_tx()?;

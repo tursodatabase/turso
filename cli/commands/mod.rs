@@ -2,8 +2,9 @@ pub mod args;
 pub mod import;
 
 use args::{
-    CwdArgs, EchoArgs, ExitArgs, HeadersArgs, IndexesArgs, LoadExtensionArgs, NullValueArgs,
-    OpcodesArgs, OpenArgs, OutputModeArgs, SchemaArgs, SetOutputArgs, TablesArgs, TimerArgs,
+    CwdArgs, DbConfigArgs, EchoArgs, ExitArgs, HeadersArgs, IndexesArgs, LoadExtensionArgs,
+    NullValueArgs, OpcodesArgs, OpenArgs, OutputModeArgs, SchemaArgs, SetOutputArgs, TablesArgs,
+    TimerArgs,
 };
 use clap::Parser;
 use import::ImportArgs;
@@ -69,6 +70,9 @@ pub enum Command {
     LoadExtension(LoadExtensionArgs),
     /// Dump the current database as a list of SQL statements
     Dump,
+    /// Print or set the current configuration for the database. Currently ignored.
+    #[command(name = "dbconfig", display_name = ".dbconfig")]
+    DbConfig(DbConfigArgs),
     /// List vfs modules available
     #[command(name = "vfslist", display_name = ".vfslist")]
     ListVfs,

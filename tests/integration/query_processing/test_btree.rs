@@ -9,9 +9,7 @@ use std::{
 
 use rand::{seq::SliceRandom, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use turso_core::{
-    Buffer, Completion, CompletionType, File, OpenFlags, PlatformIO, WriteCompletion, IO,
-};
+use turso_core::{Buffer, Completion, File, OpenFlags, PlatformIO, IO};
 use zerocopy::big_endian::{U16, U32, U64};
 
 use crate::common::{limbo_exec_rows, sqlite_exec_rows, TempDatabase};
@@ -431,9 +429,7 @@ impl BTreeGenerator<'_> {
 }
 
 fn write_at(io: &impl IO, file: Arc<dyn File>, offset: usize, data: &[u8]) {
-    let completion = Completion::new(CompletionType::Write(WriteCompletion::new(Box::new(
-        |_| {},
-    ))));
+    let completion = Completion::new_write(|_| {});
     let drop_fn = Rc::new(move |_| {});
     #[allow(clippy::arc_with_non_send_sync)]
     let buffer = Arc::new(RefCell::new(Buffer::new(Pin::new(data.to_vec()), drop_fn)));
@@ -487,8 +483,7 @@ fn test_btree() {
                 };
                 assert_eq!(
                     limbo_sum, sqlite_sum,
-                    "query={}, limbo={:?}, sqlite={:?}",
-                    query, limbo_sum, sqlite_sum
+                    "query={query}, limbo={limbo_sum:?}, sqlite={sqlite_sum:?}"
                 );
             }
         }

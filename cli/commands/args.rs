@@ -125,6 +125,19 @@ pub struct TimerArgs {
     pub mode: TimerMode,
 }
 
+#[derive(Debug, ValueEnum, Clone)]
+pub enum DbConfigMode {
+    On,
+    Off,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DbConfigArgs {
+    pub config: Option<String>,
+    #[arg(value_enum)]
+    pub mode: Option<DbConfigMode>,
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct HeadersArgs {
     pub mode: HeadersMode,

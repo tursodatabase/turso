@@ -11,8 +11,8 @@ proc test_put {msg db test_name} {
 }
 
 proc evaluate_sql {sqlite_exec db_name sql} {
-    set command [list $sqlite_exec $db_name $sql]
-    set output [exec {*}$command]
+    set command [list $sqlite_exec $db_name]
+    set output [exec echo $sql | {*}$command]
     return $output
 }
 
@@ -68,6 +68,26 @@ proc do_execsql_test_on_specific_db {db_name test_name sql_statements expected_o
     set combined_expected_output [join $expected_outputs "\n"]
     run_test $::sqlite_exec $db_name $combined_sql $combined_expected_output
 }
+
+proc run_test_skip_lines {sqlite_exec skip_lines db_name sql expected_output} {
+    set actual_output [evaluate_sql $sqlite_exec $db_name $sql]
+    set lines [split $actual_output "\n"]
+    set actual_without_skipped [join [lrange $lines $skip_lines end] "\n"]
+    if {$actual_without_skipped ne $expected_output} {
+        error_put $sql
+        puts "returned '$actual_without_skipped'"
+        puts "expected '$expected_output'"
+        exit 1
+    }
+}
+
+proc do_execsql_test_skip_lines_on_specific_db {skip_lines db_name test_name sql_statements expected_outputs} {
+    test_put "Running test" $db_name $test_name
+    set combined_sql [string trim $sql_statements]
+    set combined_expected_output [join $expected_outputs "\n"]
+    run_test_skip_lines $::sqlite_exec $skip_lines $db_name $combined_sql $combined_expected_output
+}
+
 
 proc within_tolerance {actual expected tolerance} {
     expr {abs($actual - $expected) <= $tolerance}

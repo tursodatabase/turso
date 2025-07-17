@@ -64,6 +64,8 @@ pub struct Opts {
     pub experimental_indexes: bool,
     #[clap(short = 't', long, help = "specify output file for log traces")]
     pub tracing_output: Option<String>,
+    #[clap(long, help = "Start MCP server instead of interactive shell")]
+    pub mcp: bool,
 }
 
 const PROMPT: &str = "turso> ";
@@ -185,6 +187,11 @@ impl Limbo {
     }
 
     fn first_run(&mut self, sql: Option<String>, quiet: bool) -> Result<(), LimboError> {
+        // Skip startup messages and SQL execution in MCP mode
+        if self.is_mcp_mode() {
+            return Ok(());
+        }
+
         if let Some(sql) = sql {
             self.handle_first_input(&sql)?;
         }
@@ -348,6 +355,18 @@ impl Limbo {
 
     pub fn close_conn(&mut self) -> Result<(), LimboError> {
         self.conn.close()
+    }
+
+    pub fn get_connection(&self) -> Arc<turso_core::Connection> {
+        self.conn.clone()
+    }
+
+    pub fn is_mcp_mode(&self) -> bool {
+        self.opts.mcp
+    }
+
+    pub fn get_interrupt_count(&self) -> Arc<AtomicUsize> {
+        self.interrupt_count.clone()
     }
 
     fn toggle_echo(&mut self, arg: EchoMode) {
@@ -658,6 +677,9 @@ impl Limbo {
                     if let Err(e) = self.dump_database() {
                         let _ = self.write_fmt(format_args!("/****** ERROR: {e} ******/"));
                     }
+                }
+                Command::DbConfig(_args) => {
+                    let _ = self.writeln("dbconfig currently ignored");
                 }
                 Command::ListVfs => {
                     let _ = self.writeln("Available VFS modules:");

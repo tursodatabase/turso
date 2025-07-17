@@ -4,9 +4,11 @@ mod commands;
 mod config;
 mod helper;
 mod input;
+mod mcp_server;
 mod opcodes_dictionary;
 
 use config::CONFIG_DIR;
+use mcp_server::TursoMcpServer;
 use rustyline::{error::ReadlineError, Config, Editor};
 use std::{
     path::PathBuf,
@@ -25,8 +27,20 @@ pub static HOME_DIR: LazyLock<PathBuf> =
 
 pub static HISTORY_FILE: LazyLock<PathBuf> = LazyLock::new(|| HOME_DIR.join(".limbo_history"));
 
+fn run_mcp_server(app: app::Limbo) -> anyhow::Result<()> {
+    let conn = app.get_connection();
+    let interrupt_count = app.get_interrupt_count();
+    let mcp_server = TursoMcpServer::new(conn, interrupt_count);
+
+    mcp_server.run()
+}
+
 fn main() -> anyhow::Result<()> {
     let (mut app, _guard) = app::Limbo::new()?;
+
+    if app.is_mcp_mode() {
+        return run_mcp_server(app);
+    }
 
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         let mut rl = Editor::with_config(rustyline_config())?;

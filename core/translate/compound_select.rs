@@ -333,7 +333,7 @@ fn create_dedupe_index(
         root_page: 0,
         ephemeral: true,
         table_name: String::new(),
-        unique: true,
+        unique: false,
         has_rowid: false,
     });
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(dedupe_index.clone()));

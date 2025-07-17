@@ -84,7 +84,7 @@ dualTest.both("Statement.get() [no parameters]", async (t) => {
   t.deepEqual(stmt.raw().get(), [1, 'Alice', 'alice@example.org']);
 });
 
-dualTest.onlySqlitePasses("Statement.get() [positional]", async (t) => {
+dualTest.both("Statement.get() [positional]", async (t) => {
   const db = t.context.db;
 
   var stmt = 0;
@@ -101,7 +101,7 @@ dualTest.onlySqlitePasses("Statement.get() [positional]", async (t) => {
   t.is(stmt.get({ 1: 2 }).name, "Bob");
 });
 
-dualTest.onlySqlitePasses("Statement.get() [named]", async (t) => {
+dualTest.both("Statement.get() [named]", async (t) => {
   const db = t.context.db;
 
   var stmt = undefined;
@@ -132,7 +132,7 @@ dualTest.both("Statement.get() [raw]", async (t) => {
   t.deepEqual(stmt.raw().get(1), [1, "Alice", "alice@example.org"]);
 });
 
-dualTest.onlySqlitePasses("Statement.iterate() [empty]", async (t) => {
+dualTest.both("Statement.iterate() [empty]", async (t) => {
   const db = t.context.db;
 
   const stmt = db.prepare("SELECT * FROM users WHERE id = 0");

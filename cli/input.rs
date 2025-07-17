@@ -84,6 +84,7 @@ pub struct Settings {
     pub tracing_output: Option<String>,
     pub timer: bool,
     pub headers: bool,
+    pub mcp: bool,
 }
 
 impl From<Opts> for Settings {
@@ -109,6 +110,7 @@ impl From<Opts> for Settings {
             tracing_output: opts.tracing_output,
             timer: false,
             headers: false,
+            mcp: opts.mcp,
         }
     }
 }

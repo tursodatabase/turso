@@ -68,7 +68,7 @@ uv-sync-test:
 	uv sync --all-extras --dev --package turso_test
 .PHONE: uv-sync
 
-test: limbo uv-sync-test test-compat test-vector test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions
+test: limbo uv-sync-test test-compat test-vector test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-mvcc
 .PHONY: test
 
 test-extensions: limbo uv-sync-test
@@ -140,6 +140,10 @@ test-constraint: limbo uv-sync-test
 		echo "Skipping test-constraint: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
 	fi
 .PHONY: test-constraint
+
+test-mvcc: limbo uv-sync-test
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-mvcc;
+.PHONY: test-mvcc
 
 bench-vfs: uv-sync-test
 	cargo build --release
