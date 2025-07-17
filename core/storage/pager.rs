@@ -706,7 +706,9 @@ impl Pager {
         // we should have a unique API to begin transactions, something like sqlite3BtreeBeginTrans
         match self.maybe_allocate_page1()? {
             IOResult::Done(_) => {}
-            IOResult::IO => return Ok(IOResult::IO),
+            IOResult::IO => {
+                return Ok(IOResult::IO)
+            },
         }
         Ok(IOResult::Done(self.wal.borrow_mut().begin_write_tx()?))
     }
@@ -731,7 +733,6 @@ impl Pager {
             IOResult::Done(_) => {
                 self.wal.borrow().end_write_tx()?;
                 self.wal.borrow().end_read_tx()?;
-
                 if schema_did_change {
                     let schema = connection.schema.borrow().clone();
                     *connection

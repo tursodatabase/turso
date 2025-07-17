@@ -6,8 +6,7 @@ use turso_core::mvcc::database::{MvStore, Row, RowID};
 
 fn bench_db() -> MvStore<LocalClock> {
     let clock = LocalClock::default();
-    let storage = turso_core::mvcc::persistent_storage::Storage::new_noop();
-    MvStore::new(clock, storage)
+    MvStore::new(clock)
 }
 
 fn bench(c: &mut Criterion) {
