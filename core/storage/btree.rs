@@ -6440,7 +6440,7 @@ fn fill_cell_payload(
     let payload_overflow_threshold_min = payload_overflow_threshold_min(page_type, usable_space);
     // see e.g. https://github.com/sqlite/sqlite/blob/9591d3fe93936533c8c3b0dc4d025ac999539e11/src/dbstat.c#L371
     let mut space_left = payload_overflow_threshold_min
-        + (record_buf.len() - payload_overflow_threshold_min) % (usable_space as usize - 4);
+        + (record_buf.len() - payload_overflow_threshold_min) % (usable_space - 4);
 
     if space_left > payload_overflow_threshold_max {
         space_left = payload_overflow_threshold_min;
@@ -6479,7 +6479,7 @@ fn fill_cell_payload(
 
             pointer = unsafe { buf.as_mut_ptr().add(4) };
             pointer_to_next = buf.as_mut_ptr();
-            space_left = usable_space as usize - 4;
+            space_left = usable_space - 4;
         }
 
         to_copy_buffer = &to_copy_buffer[to_copy..];

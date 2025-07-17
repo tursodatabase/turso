@@ -650,11 +650,11 @@ impl Pager {
         let page_size = *self
             .page_size
             .get()
-            .get_or_insert_with(|| header_accessor::get_page_size(self).unwrap_or_default());
+            .get_or_insert_with(|| header_accessor::get_page_size(self).unwrap());
 
         let reserved_space = *self
             .reserved_space
-            .get_or_init(|| header_accessor::get_reserved_space(self).unwrap_or_default());
+            .get_or_init(|| header_accessor::get_reserved_space(self).unwrap());
 
         (page_size as usize) - (reserved_space as usize)
     }
