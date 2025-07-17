@@ -932,7 +932,7 @@ impl Pager {
     ) -> Result<IOResult<PagerCommitResult>> {
         let mut checkpoint_result = CheckpointResult::default();
         let res = loop {
-            let state = self.commit_info.borrow().state.clone();
+            let state = self.commit_info.borrow().state;
             trace!(?state);
             match state {
                 CommitState::Start => {
@@ -961,10 +961,12 @@ impl Pager {
                     let page = {
                         let mut cache = self.page_cache.write();
                         let page_key = PageCacheKey::new(page_id);
-                        let page = cache.get(&page_key).expect(&format!(
-                            "we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it. page={}",
-                            page_id
-                        ));
+                        let page = cache.get(&page_key).unwrap_or_else(|| {
+                            panic!(
+                                "we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it. page={}",
+                                page_id
+                            )
+                        });
                         let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
                         trace!(
                             "commit_dirty_pages(page={}, page_type={:?}",
