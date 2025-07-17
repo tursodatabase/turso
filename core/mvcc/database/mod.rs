@@ -1,8 +1,11 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::errors::DatabaseError;
-use crate::mvcc::persistent_storage::Storage;
+use crate::storage::btree::BTreeKey;
+use crate::storage::pager::Pager;
+use crate::types::ImmutableRecord;
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use std::fmt::Debug;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
@@ -28,11 +31,12 @@ impl RowID {
 pub struct Row {
     pub id: RowID,
     pub data: Vec<u8>,
+    pub column_count: usize,
 }
 
 impl Row {
-    pub fn new(id: RowID, data: Vec<u8>) -> Self {
-        Self { id, data }
+    pub fn new(id: RowID, data: Vec<u8>, column_count: usize) -> Self {
+        Self { id, data, column_count }
     }
 }
 
@@ -45,22 +49,6 @@ pub struct RowVersion {
 }
 
 pub type TxID = u64;
-
-/// A log record contains all the versions inserted and deleted by a transaction.
-#[derive(Clone, Debug)]
-pub struct LogRecord {
-    pub(crate) tx_timestamp: TxID,
-    row_versions: Vec<RowVersion>,
-}
-
-impl LogRecord {
-    fn new(tx_timestamp: TxID) -> Self {
-        Self {
-            tx_timestamp,
-            row_versions: Vec::new(),
-        }
-    }
-}
 
 /// A transaction timestamp or ID.
 ///
@@ -222,26 +210,35 @@ impl AtomicTransactionState {
 }
 
 /// A multi-version concurrency control database.
-#[derive(Debug)]
 pub struct MvStore<Clock: LogicalClock> {
     rows: SkipMap<RowID, RwLock<Vec<RowVersion>>>,
     txs: SkipMap<TxID, RwLock<Transaction>>,
     tx_ids: AtomicU64,
     next_rowid: AtomicU64,
     clock: Clock,
-    storage: Storage,
+}
+
+impl<Clock: LogicalClock> std::fmt::Debug for MvStore<Clock> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MvStore")
+            .field("rows", &self.rows)
+            .field("txs", &self.txs)
+            .field("tx_ids", &self.tx_ids)
+            .field("next_rowid", &self.next_rowid)
+            .field("clock", &"<Clock>")
+            .finish()
+    }
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
     /// Creates a new database.
-    pub fn new(clock: Clock, storage: Storage) -> Self {
+    pub fn new(clock: Clock) -> Self {
         Self {
             rows: SkipMap::new(),
             txs: SkipMap::new(),
             tx_ids: AtomicU64::new(1), // let's reserve transaction 0 for special purposes
             next_rowid: AtomicU64::new(0), // TODO: determine this from B-Tree
             clock,
-            storage,
         }
     }
 
@@ -502,7 +499,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// # Arguments
     ///
     /// * `tx_id` - The ID of the transaction to commit.
-    pub fn commit_tx(&self, tx_id: TxID) -> Result<()> {
+    /// * `pager` - The pager to use for persisting the changes.
+    /// * `connection` - The connection to use for persisting the changes.
+    pub fn commit_tx(
+        &self,
+        tx_id: TxID,
+        pager: Rc<Pager>,
+        connection: &crate::Connection,
+    ) -> Result<()> {
         let end_ts = self.get_timestamp();
         // NOTICE: the first shadowed tx keeps the entry alive in the map
         // for the duration of this whole function, which is important for correctness!
@@ -594,10 +598,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         tracing::trace!("commit_tx(tx_id={})", tx_id);
         let write_set: Vec<RowID> = tx.write_set.iter().map(|v| *v.value()).collect();
         drop(tx);
-        // Postprocessing: inserting row versions and logging the transaction to persistent storage.
-        // TODO: we should probably save to persistent storage first, and only then update the in-memory structures.
-        let mut log_record = LogRecord::new(end_ts);
-        for ref id in write_set {
+        // Postprocessing: inserting row versions and updating timestamps
+        for ref id in &write_set {
             if let Some(row_versions) = self.rows.get(id) {
                 let mut row_versions = row_versions.value().write().unwrap();
                 for row_version in row_versions.iter_mut() {
@@ -606,10 +608,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             // New version is valid STARTING FROM committing transaction's end timestamp
                             // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
                             row_version.begin = TxTimestampOrID::Timestamp(end_ts);
-                            self.insert_version_raw(
-                                &mut log_record.row_versions,
-                                row_version.clone(),
-                            ); // FIXME: optimize cloning out
                         }
                     }
                     if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
@@ -617,10 +615,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             // Old version is valid UNTIL committing transaction's end timestamp
                             // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
                             row_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
-                            self.insert_version_raw(
-                                &mut log_record.row_versions,
-                                row_version.clone(),
-                            ); // FIXME: optimize cloning out
                         }
                     }
                 }
@@ -636,10 +630,49 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // FIXME: it actually just become a problem for today!!!
         // TODO: test that reproduces this failure, and then a fix
         self.txs.remove(&tx_id);
-        if !log_record.row_versions.is_empty() {
-            self.storage.log_tx(log_record)?;
+
+        // Start write transaction before writing data to pager
+        if let crate::types::IOResult::Done(result) = pager.begin_write_tx().map_err(|e| DatabaseError::Io(e.to_string())).unwrap() {
+            if let crate::result::LimboResult::Busy = result {
+                return Err(DatabaseError::Io("Pager write transaction busy".to_string()));
+            }
         }
+
+        // Write committed data to pager for persistence
+        for ref id in &write_set {
+            if let Some(row_versions) = self.rows.get(id) {
+                let row_versions = row_versions.value().read().unwrap();
+                // Find the version that was just committed
+                for (i, row_version) in row_versions.iter().enumerate() {
+                    if let TxTimestampOrID::Timestamp(ts) = row_version.begin {
+                        if ts == end_ts {
+                            // This is the version we just committed
+                            self.write_row_to_pager(pager.clone(), &row_version.row).unwrap();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         tracing::trace!("logged(tx_id={})", tx_id);
+
+        // Flush dirty pages to WAL - this is critical for data persistence
+        // Similar to what step_end_write_txn does for legacy transactions
+        loop {
+            let result = pager
+            .end_tx(
+                false, // rollback = false since we're committing
+                false, // schema_did_change = false for now (could be improved)
+                connection,
+                connection.wal_checkpoint_disabled.get(),
+            )
+            .map_err(|e| DatabaseError::Io(e.to_string())).unwrap();
+            if let crate::types::IOResult::Done(result) = result {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
         Ok(())
     }
 
@@ -660,7 +693,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let write_set: Vec<RowID> = tx.write_set.iter().map(|v| *v.value()).collect();
         drop(tx);
 
-        for ref id in write_set {
+        for ref id in &write_set {
             if let Some(row_versions) = self.rows.get(id) {
                 let mut row_versions = row_versions.value().write().unwrap();
                 row_versions.retain(|rv| rv.begin != TxTimestampOrID::TxID(tx_id));
@@ -676,6 +709,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // FIXME: verify that we can already remove the transaction here!
         // Maybe it's fine for snapshot isolation, but too early for serializable?
         self.txs.remove(&tx_id);
+
+        // TODO: rollback the transaction in the pager
     }
 
     /// Generates next unique transaction id
@@ -746,15 +781,63 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         dropped
     }
 
-    pub fn recover(&self) -> Result<()> {
-        let tx_log = self.storage.read_tx_log()?;
-        for record in tx_log {
-            tracing::debug!("recover() -> tx_timestamp={}", record.tx_timestamp);
-            for version in record.row_versions {
-                self.insert_version(version.row.id, version);
+    /// Writes a row to the pager for persistence.
+    fn write_row_to_pager(
+        &self,
+        pager: Rc<Pager>,
+        row: &Row,
+    ) -> Result<()> {
+        use crate::storage::btree::BTreeCursor;
+        use crate::types::{IOResult, SeekKey, SeekOp};
+
+        // The row.data is already a properly serialized SQLite record payload
+        // Create an ImmutableRecord and copy the data
+        let mut record = ImmutableRecord::new(row.data.len());
+        record.start_serialization(&row.data);
+
+        // Create a BTreeKey for the row
+        let key = BTreeKey::new_table_rowid(row.id.row_id, Some(&record));
+
+        // Get the column count from the row
+        let root_page = row.id.table_id as usize;
+        let num_columns = row.column_count;
+
+        let mut cursor = BTreeCursor::new_table(
+            None, // Write directly to B-tree
+            pager,
+            root_page,
+            num_columns,
+        );
+
+        // Position the cursor first by seeking to the row position
+        let seek_key = SeekKey::TableRowId(row.id.row_id);
+        match cursor
+            .seek(seek_key, SeekOp::GE { eq_only: true })
+            .map_err(|e| DatabaseError::Io(e.to_string()))?
+        {
+            IOResult::Done(_) => {}
+            IOResult::IO => {
+                panic!("IOResult::IO not supported in write_row_to_pager seek");
             }
-            self.clock.reset(record.tx_timestamp);
         }
+
+        // Insert the record into the B-tree
+        match cursor
+            .insert(&key, true)
+            .map_err(|e| DatabaseError::Io(e.to_string()))?
+        {
+            IOResult::Done(()) => {
+            }
+            IOResult::IO => {
+                panic!("IOResult::IO not supported in write_row_to_pager insert");
+            }
+        }
+        
+        tracing::trace!(
+            "write_row_to_pager(table_id={}, row_id={})",
+            row.id.table_id,
+            row.id.row_id
+        );
         Ok(())
     }
 

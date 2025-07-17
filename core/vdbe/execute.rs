@@ -28,6 +28,7 @@ use crate::{
         printf::exec_printf,
     },
     IO,
+    turso_assert,
 };
 use std::ops::DerefMut;
 use std::{
@@ -1966,12 +1967,14 @@ pub fn op_transaction(
         };
 
         if updated && matches!(current_state, TransactionState::None) {
+            turso_assert!(mv_store.is_none(), "VDBE should not start pager transactions with MVCC");
             if let LimboResult::Busy = pager.begin_read_tx()? {
                 return Ok(InsnFunctionStepResult::Busy);
             }
         }
 
         if updated && matches!(new_transaction_state, TransactionState::Write { .. }) {
+            turso_assert!(mv_store.is_none(), "VDBE should not start pager transactions with MVCC");
             match pager.begin_write_tx()? {
                 IOResult::Done(r) => {
                     if let LimboResult::Busy = r {
@@ -6240,6 +6243,7 @@ pub fn op_open_ephemeral(
         }
         OpOpenEphemeralState::StartingTxn { pager } => {
             tracing::trace!("StartingTxn");
+            turso_assert!(mv_store.is_none(), "Ephemeral tables don't support MVCC");
             return_if_io!(pager.begin_write_tx());
             state.op_open_ephemeral_state = OpOpenEphemeralState::CreateBtree {
                 pager: pager.clone(),
@@ -6247,6 +6251,7 @@ pub fn op_open_ephemeral(
         }
         OpOpenEphemeralState::CreateBtree { pager } => {
             tracing::trace!("CreateBtree");
+            turso_assert!(mv_store.is_none(), "Ephemeral tables don't support MVCC");
             // FIXME: handle page cache is full
             let flag = if is_table {
                 &CreateBTreeFlags::new_table()
