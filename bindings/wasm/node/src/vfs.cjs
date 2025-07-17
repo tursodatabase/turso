@@ -28,6 +28,10 @@ class VFS {
   sync(fd) {
     fs.fsyncSync(fd);
   }
+
+  truncate(fd, size) {
+    fs.ftruncateSync(fs, size)
+  }
 }
 
 module.exports = { VFS };
