@@ -418,7 +418,10 @@ impl Program {
                         _ => {
                             let state = self.connection.transaction_state.get();
                             if let TransactionState::Write { schema_did_change } = state {
-                                pager.rollback(schema_did_change, &self.connection)?
+                                pager.rollback(schema_did_change, &self.connection)?;
+                                self.connection
+                                    .transaction_state
+                                    .replace(TransactionState::None);
                             }
                         }
                     }

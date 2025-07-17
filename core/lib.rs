@@ -1049,8 +1049,13 @@ impl Statement {
         if res.is_err() {
             let state = self.program.connection.transaction_state.get();
             if let TransactionState::Write { schema_did_change } = state {
-                self.pager
-                    .rollback(schema_did_change, &self.program.connection)?;
+                if let Err(e) = self
+                    .pager
+                    .rollback(schema_did_change, &self.program.connection)
+                {
+                    // Let's panic for now as we don't want to leave state in a bad state.
+                    panic!("rollback failed: {:?}", e);
+                }
                 let end_tx_res =
                     self.pager
                         .end_tx(true, schema_did_change, &self.program.connection, true)?;
@@ -1059,7 +1064,7 @@ impl Statement {
                     .transaction_state
                     .set(TransactionState::None);
                 assert!(
-                    matches!(end_tx_res, PagerCacheflushStatus::Done(_)),
+                    matches!(end_tx_res, IOResult::Done(_)),
                     "end_tx should not return IO as it should just end txn without flushing anything. Got {:?}",
                     end_tx_res
                 );

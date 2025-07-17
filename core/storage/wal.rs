@@ -1014,10 +1014,13 @@ impl WalFile {
         unsafe { self.shared.get().as_mut().unwrap() }
     }
 
-    fn reset_internal_states(&self) {
+    fn reset_internal_states(&mut self) {
+        self.ongoing_checkpoint.state = CheckpointState::Start;
+        self.ongoing_checkpoint.min_frame = 0;
+        self.ongoing_checkpoint.max_frame = 0;
+        self.ongoing_checkpoint.current_page = 0;
         self.sync_state.set(SyncState::NotSyncing);
         self.syncing.set(false);
-        self.ongoing_checkpoint.state = CheckpointState::Start;
     }
 }
 

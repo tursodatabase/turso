@@ -893,8 +893,8 @@ impl Pager {
                     self.flush_info.borrow().in_flight_writes.clone(),
                 )?;
                 page.clear_dirty();
-                self.flush_info.borrow_mut().state = CacheFlushState::AppendFrame {
-                    current_page_to_append_idx: current_page_to_append_idx + 1,
+                self.flush_info.borrow_mut().state = CacheFlushState::WaitAppendFrame {
+                    current_page_to_append_idx,
                 };
                 return Ok(IOResult::IO);
             }
@@ -1479,7 +1479,12 @@ impl Pager {
         self.checkpoint_inflight.replace(0);
         self.syncing.replace(false);
         self.flush_info.replace(FlushInfo {
-            state: FlushState::Start,
+            state: CacheFlushState::Start,
+            in_flight_writes: Rc::new(RefCell::new(0)),
+            dirty_pages: Vec::new(),
+        });
+        self.commit_info.replace(CommitInfo {
+            state: CommitState::Start,
             in_flight_writes: Rc::new(RefCell::new(0)),
             dirty_pages: Vec::new(),
         });
