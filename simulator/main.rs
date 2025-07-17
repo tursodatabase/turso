@@ -589,7 +589,7 @@ fn run_simulation(
 
 fn run_simulation_default(
     env: Arc<Mutex<SimulatorEnv>>,
-    plans: &mut [InteractionPlan],
+    plans: Arc<Vec<Arc<InteractionPlan>>>,
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
     tracing::info!("Executing database interaction plan...");

@@ -2,8 +2,10 @@ use std::fmt::Display;
 use std::mem;
 use std::ops::Deref;
 use std::panic::UnwindSafe;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -63,7 +65,7 @@ pub(crate) struct SimulatorEnv {
     pub(crate) connections: Vec<Arc<Mutex<SimConnection>>>,
     pub(crate) io: Arc<SimulatorIO>,
     pub(crate) db: Arc<Database>,
-    pub(crate) rng: ChaCha8Rng,
+    pub(crate) rng: Arc<Mutex<ChaCha8Rng>>,
     pub(crate) paths: Paths,
     pub(crate) type_: SimulationType,
     pub(crate) phase: SimulationPhase,
@@ -91,8 +93,10 @@ impl SimulatorEnv {
 
     pub(crate) fn clear(&mut self) {
         self.tables.clear();
-        self.connections.iter_mut().for_each(|c| c.disconnect());
-        self.rng = ChaCha8Rng::seed_from_u64(self.opts.seed);
+        self.connections
+            .iter_mut()
+            .for_each(|c| c.lock().unwrap().disconnect());
+        self.rng = Arc::new(Mutex::new(ChaCha8Rng::seed_from_u64(self.opts.seed)));
 
         let io = Arc::new(
             SimulatorIO::new(
@@ -296,7 +300,11 @@ impl SimulatorEnv {
             panic!("connection index out of bounds");
         }
 
-        if self.connections[connection_index].is_connected() {
+        if self.connections[connection_index]
+            .lock()
+            .unwrap()
+            .is_connected()
+        {
             log::trace!(
                 "Connection {connection_index} is already connected, skipping reconnection"
             );
@@ -305,17 +313,19 @@ impl SimulatorEnv {
 
         match self.type_ {
             SimulationType::Default | SimulationType::Doublecheck => {
-                self.connections[connection_index] = SimConnection::LimboConnection(
-                    self.db
-                        .connect()
-                        .expect("Failed to connect to Limbo database"),
-                );
+                self.connections[connection_index] =
+                    Arc::new(Mutex::new(SimConnection::LimboConnection(
+                        self.db
+                            .connect()
+                            .expect("Failed to connect to Limbo database"),
+                    )));
             }
             SimulationType::Differential => {
-                self.connections[connection_index] = SimConnection::SQLiteConnection(
-                    rusqlite::Connection::open(self.get_db_path())
-                        .expect("Failed to open SQLite connection"),
-                );
+                self.connections[connection_index] =
+                    Arc::new(Mutex::new(SimConnection::SQLiteConnection(
+                        rusqlite::Connection::open(self.get_db_path())
+                            .expect("Failed to open SQLite connection"),
+                    )));
             }
         };
     }
