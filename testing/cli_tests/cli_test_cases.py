@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -312,6 +313,19 @@ def test_uri_readonly():
     turso.quit()
 
 
+def test_readonly_doesnt_create_wal():
+    test_file = tempfile.NamedTemporaryFile(prefix="readonly_test", suffix=".db", delete_on_close=False, delete=False)
+    # open the file in readonly mode
+    turso = TestTursoShell(flags=f"--readonly {test_file.name}", init_commands="")
+    # ensure we did not create a new WAL file
+    if os.path.exists(f"{test_file.name}-wal"):
+        assert False, "WAL file should not be created in readonly mode"
+    turso.run_test_fn(
+        "create table t(a,b,c);", lambda res: "Database Connection is read-only" in res, "readonly-wal-select-works"
+    )
+    os.remove(test_file.name)
+
+
 def main():
     console.info("Running all turso CLI tests...")
     test_basic_queries()
@@ -333,6 +347,7 @@ def main():
     test_update_with_limit()
     test_update_with_limit_and_offset()
     test_uri_readonly()
+    test_readonly_doesnt_create_wal()
     console.info("All tests have passed")
 
 
