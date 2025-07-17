@@ -1050,7 +1050,19 @@ impl Statement {
             let state = self.program.connection.transaction_state.get();
             if let TransactionState::Write { schema_did_change } = state {
                 self.pager
-                    .rollback(schema_did_change, &self.program.connection)?
+                    .rollback(schema_did_change, &self.program.connection)?;
+                let end_tx_res =
+                    self.pager
+                        .end_tx(true, schema_did_change, &self.program.connection, true)?;
+                self.program
+                    .connection
+                    .transaction_state
+                    .set(TransactionState::None);
+                assert!(
+                    matches!(end_tx_res, PagerCacheflushStatus::Done(_)),
+                    "end_tx should not return IO as it should just end txn without flushing anything. Got {:?}",
+                    end_tx_res
+                );
             }
         }
         res
