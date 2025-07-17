@@ -171,6 +171,20 @@ impl File for MemoryFile {
         Ok(c)
     }
 
+    fn truncate(&self, len: u64, c: Completion) -> Result<Arc<Completion>> {
+        let new_size = len as usize;
+        if new_size < self.size.get() {
+            // Truncate pages
+            unsafe {
+                let pages = &mut *self.pages.get();
+                pages.retain(|&k, _| k * PAGE_SIZE < new_size);
+            }
+        }
+        self.size.set(new_size);
+        c.complete(0);
+        Ok(Arc::new(c))
+    }
+
     fn size(&self) -> Result<u64> {
         Ok(self.size.get() as u64)
     }

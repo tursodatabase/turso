@@ -117,6 +117,13 @@ impl File for WindowsFile {
         Ok(c)
     }
 
+    fn truncate(&self, len: u64, c: Completion) -> Result<()> {
+        let mut file = self.file.borrow_mut();
+        file.set_len(len).map_err(LimboError::IOError)?;
+        c.complete(0);
+        Ok(())
+    }
+
     fn size(&self) -> Result<u64> {
         let file = self.file.borrow();
         Ok(file.metadata().unwrap().len())
