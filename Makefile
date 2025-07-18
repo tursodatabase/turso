@@ -14,7 +14,7 @@ all: check-rust-version check-wasm-target limbo limbo-wasm
 
 check-rust-version:
 	@echo "Checking Rust version..."
-	@if [ "$(shell printf '%s\n' "$(MINIMUM_RUST_VERSION)" "$(CURRENT_RUST_VERSION)" | sort -V | head -n1)" = "$(CURRENT_RUST_VERSION)" ]; then \
+	@if [ "$(shell printf '%s\n' "$(MINIMUM_RUST_VERSION)" "$(CURRENT_RUST_VERSION)" | sort -V | head -n1)" != "$(MINIMUM_RUST_VERSION)" ]; then \
 		echo "Rust version greater than $(MINIMUM_RUST_VERSION) is required. Current version is $(CURRENT_RUST_VERSION)."; \
 		if [ -n "$(RUSTUP)" ]; then \
 			echo "Updating Rust..."; \
