@@ -124,9 +124,10 @@ impl File for GenericFile {
         Ok(c)
     }
 
-    fn truncate(&self, len: u64, c: Completion) -> Result<Arc<Completion>> {
+    fn truncate(&self, len: usize, c: Completion) -> Result<Arc<Completion>> {
         let mut file = self.file.borrow_mut();
-        file.set_len(len).map_err(|err| LimboError::IOError(err))?;
+        file.set_len(len as u64)
+            .map_err(|err| LimboError::IOError(err))?;
         c.complete(0);
         Ok(Arc::new(c))
     }
