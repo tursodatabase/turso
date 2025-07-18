@@ -333,11 +333,7 @@ impl Database {
             let buffer_pool = Arc::new(BufferPool::new(Some(size)));
 
             let db_state = self.db_state.clone();
-            let wal = Rc::new(RefCell::new(WalFile::new(
-                self.io.clone(),
-                shared_wal,
-                buffer_pool.clone(),
-            )));
+            let wal = self.io.open_wal(shared_wal, buffer_pool.clone());
             let pager = Pager::new(
                 self.db_file.clone(),
                 wal,
@@ -381,11 +377,7 @@ impl Database {
         // Modify Database::maybe_shared_wal to point to the new WAL file so that other connections
         // can open the existing WAL.
         *maybe_shared_wal = Some(real_shared_wal.clone());
-        let wal = Rc::new(RefCell::new(WalFile::new(
-            self.io.clone(),
-            real_shared_wal,
-            buffer_pool,
-        )));
+        let wal = self.io.open_wal(real_shared_wal, buffer_pool.clone());
         pager.set_wal(wal);
 
         Ok(pager)

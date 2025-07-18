@@ -6652,7 +6652,7 @@ mod tests {
         types::Text,
         util::IOExt as _,
         vdbe::Register,
-        BufferPool, Completion, Connection, StepResult, WalFile, WalFileShared,
+        BufferPool, Completion, Connection, StepResult, WalFileShared,
     };
     use std::{
         cell::RefCell,
@@ -7518,11 +7518,7 @@ mod tests {
 
         let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
         let wal_shared = WalFileShared::new_shared(page_size, &io, wal_file).unwrap();
-        let wal = Rc::new(RefCell::new(WalFile::new(
-            io.clone(),
-            wal_shared,
-            buffer_pool.clone(),
-        )));
+        let wal = io.open_wal(wal_shared, buffer_pool.clone());
 
         let pager = Rc::new(
             Pager::new(
