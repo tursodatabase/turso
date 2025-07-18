@@ -779,6 +779,10 @@ impl turso_core::DatabaseStorage for DatabaseFile {
     fn size(&self) -> turso_core::Result<u64> {
         self.file.size()
     }
+    fn truncate(&self, len: usize, c: turso_core::Completion) -> turso_core::Result<()> {
+        let _ = self.file.truncate(len, c)?;
+        Ok(())
+    }
 }
 
 #[inline]
