@@ -243,9 +243,10 @@ impl Database {
         let default_cache_size = header_accessor::get_default_page_cache_size(&pager)
             .unwrap_or(storage::sqlite3_ondisk::DEFAULT_CACHE_SIZE);
 
+        let pager = Rc::new(pager);
         let conn = Arc::new(Connection {
             _db: self.clone(),
-            pager: RefCell::new(Rc::new(pager)),
+            pager: RefCell::new(pager.clone()),
             schema: RefCell::new(
                 self.schema
                     .lock()
@@ -267,6 +268,7 @@ impl Database {
             capture_data_changes: RefCell::new(CaptureDataChangesMode::Off),
             closed: Cell::new(false),
         });
+        pager.set_connection(Arc::downgrade(&conn));
 
         if let Err(e) = conn.register_builtins() {
             return Err(LimboError::ExtensionError(e));

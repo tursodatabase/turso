@@ -4,9 +4,10 @@ use std::cell::{Cell, RefCell};
 use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
 use std::collections::BinaryHeap;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tempfile;
 
+use crate::Connection;
 use crate::{
     error::LimboError,
     io::{
@@ -47,6 +48,8 @@ pub struct Sorter {
     wait_for_read_complete: Vec<usize>,
     /// The temporary directory for chunk files.
     temp_dir: Option<tempfile::TempDir>,
+    /// The connection.
+    connection: Option<Weak<Connection>>,
 }
 
 impl Sorter {
@@ -56,6 +59,7 @@ impl Sorter {
         max_buffer_size_bytes: usize,
         min_chunk_read_buffer_size_bytes: usize,
         io: Arc<dyn IO>,
+        connection: Option<Weak<Connection>>,
     ) -> Self {
         assert_eq!(order.len(), collations.len());
         Self {
@@ -81,6 +85,7 @@ impl Sorter {
             io,
             wait_for_read_complete: Vec::new(),
             temp_dir: None,
+            connection,
         }
     }
 
@@ -147,7 +152,7 @@ impl Sorter {
                 SortedChunkIOState::WriteComplete => {
                     all_read_complete = false;
                     // Write complete, we can now read from the chunk.
-                    chunk.read()?;
+                    chunk.read(self.connection.clone())?;
                 }
                 SortedChunkIOState::WaitingForWrite => {
                     all_read_complete = false;
@@ -199,7 +204,7 @@ impl Sorter {
         let chunk = &mut self.chunks[chunk_idx];
 
         if chunk.has_more() {
-            let record = chunk.next()?.unwrap();
+            let record = chunk.next(self.connection.clone())?.unwrap();
             self.chunk_heap.push((
                 Reverse(SortableImmutableRecord::new(
                     record,
@@ -245,7 +250,7 @@ impl Sorter {
             self.current_buffer_size,
             chunk_buffer_size,
         );
-        chunk.write(&mut self.records)?;
+        chunk.write(&mut self.records, self.connection.clone())?;
         self.chunks.push(chunk);
 
         self.current_buffer_size = 0;
@@ -289,7 +294,7 @@ impl SortedChunk {
         !self.records.is_empty() || self.io_state.get() != SortedChunkIOState::ReadEOF
     }
 
-    fn next(&mut self) -> Result<Option<ImmutableRecord>> {
+    fn next(&mut self, connection: Option<Weak<Connection>>) -> Result<Option<ImmutableRecord>> {
         let mut buffer_len = self.buffer_len.get();
         if self.records.is_empty() && buffer_len == 0 {
             return Ok(None);
@@ -341,12 +346,12 @@ impl SortedChunk {
         let record = self.records.pop();
         if self.records.is_empty() && self.io_state.get() != SortedChunkIOState::ReadEOF {
             // We've consumed the last record. Read more payload into the buffer.
-            self.read()?;
+            self.read(connection)?;
         }
         Ok(record)
     }
 
-    fn read(&mut self) -> Result<()> {
+    fn read(&mut self, connection: Option<Weak<Connection>>) -> Result<()> {
         if self.io_state.get() == SortedChunkIOState::ReadEOF {
             return Ok(());
         }
@@ -386,15 +391,19 @@ impl SortedChunk {
             total_bytes_read_copy.set(total_bytes_read_copy.get() + bytes_read);
         });
 
-        let c = Completion::new(CompletionType::Read(ReadCompletion::new(
-            read_buffer_ref,
-            read_complete,
-        )));
+        let c = Completion::new(
+            CompletionType::Read(ReadCompletion::new(read_buffer_ref, read_complete)),
+            connection,
+        );
         self.file.pread(self.total_bytes_read.get(), Arc::new(c))?;
         Ok(())
     }
 
-    fn write(&mut self, records: &mut Vec<SortableImmutableRecord>) -> Result<()> {
+    fn write(
+        &mut self,
+        records: &mut Vec<SortableImmutableRecord>,
+        connection: Option<Weak<Connection>>,
+    ) -> Result<()> {
         assert!(self.io_state.get() == SortedChunkIOState::None);
         self.io_state.set(SortedChunkIOState::WaitingForWrite);
 
@@ -421,7 +430,10 @@ impl SortedChunk {
             }
         });
 
-        let c = Completion::new(CompletionType::Write(WriteCompletion::new(write_complete)));
+        let c = Completion::new(
+            CompletionType::Write(WriteCompletion::new(write_complete)),
+            connection,
+        );
         self.file.pwrite(0, buffer_ref, Arc::new(c))?;
         Ok(())
     }
@@ -493,7 +505,7 @@ mod tests {
     use super::*;
     use crate::translate::collate::CollationSeq;
     use crate::types::{ImmutableRecord, RefValue, Value, ValueType};
-    use crate::PlatformIO;
+    use crate::{Connection, PlatformIO};
     use rand_chacha::{
         rand_core::{RngCore, SeedableRng},
         ChaCha8Rng,
@@ -524,6 +536,7 @@ mod tests {
             256,
             64,
             io.clone(),
+            None,
         );
 
         let attempts = 8;

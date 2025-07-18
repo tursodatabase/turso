@@ -3434,6 +3434,7 @@ pub fn op_sorter_open(
         max_buffer_size_bytes,
         page_size,
         pager.io.clone(),
+        pager.get_connection(),
     );
     let mut cursors = state.cursors.borrow_mut();
     cursors

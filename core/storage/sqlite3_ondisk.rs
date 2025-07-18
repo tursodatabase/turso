@@ -59,14 +59,14 @@ use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::pager::Pager;
 use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
-use crate::{turso_assert, File, Result, WalFileShared};
+use crate::{turso_assert, Connection, File, Result, WalFileShared};
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 /// The size of the database header in bytes.
 pub const DATABASE_HEADER_SIZE: usize = 100;
@@ -725,6 +725,7 @@ pub fn begin_read_page(
     buffer_pool: Arc<BufferPool>,
     page: PageRef,
     page_idx: usize,
+    connection: Weak<Connection>,
 ) -> Result<()> {
     tracing::trace!("begin_read_btree_page(page_idx = {})", page_idx);
     let buf = buffer_pool.get();
@@ -745,7 +746,7 @@ pub fn begin_read_page(
             page.set_error();
         }
     });
-    let c = Completion::new_read(buf, complete);
+    let c = Completion::new_read(buf, complete, Some(connection));
     db_file.read_page(page_idx, c)?;
     Ok(())
 }
@@ -777,6 +778,7 @@ pub fn begin_write_btree_page(
     pager: &Pager,
     page: &PageRef,
     write_counter: Rc<RefCell<usize>>,
+    connection: Weak<Connection>,
 ) -> Result<()> {
     tracing::trace!("begin_write_btree_page(page={})", page.get().id);
     let page_source = &pager.db_file;
@@ -807,7 +809,7 @@ pub fn begin_write_btree_page(
             );
         })
     };
-    let c = Completion::new_write(write_complete);
+    let c = Completion::new_write(write_complete, Some(connection));
     let res = page_source.write_page(page_id, buffer.clone(), c);
     if res.is_err() {
         // Avoid infinite loop if write page fails
@@ -817,12 +819,19 @@ pub fn begin_write_btree_page(
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>, syncing: Rc<RefCell<bool>>) -> Result<()> {
+pub fn begin_sync(
+    db_file: Arc<dyn DatabaseStorage>,
+    syncing: Rc<RefCell<bool>>,
+    connection: Weak<Connection>,
+) -> Result<()> {
     assert!(!*syncing.borrow());
     *syncing.borrow_mut() = true;
-    let completion = Completion::new_sync(move |_| {
-        *syncing.borrow_mut() = false;
-    });
+    let completion = Completion::new_sync(
+        move |_| {
+            *syncing.borrow_mut() = false;
+        },
+        Some(connection),
+    );
     #[allow(clippy::arc_with_non_send_sync)]
     db_file.sync(completion)?;
     Ok(())
@@ -1513,7 +1522,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
             wfs_data.loaded.store(true, Ordering::SeqCst);
         },
     );
-    let c = Completion::new_read(buf_for_pread, complete);
+    let c = Completion::new_read(buf_for_pread, complete, None);
     file.pread(0, c.into())?;
 
     Ok(wal_file_shared_ret)
@@ -1524,6 +1533,7 @@ pub fn begin_read_wal_frame(
     offset: usize,
     buffer_pool: Arc<BufferPool>,
     complete: Box<dyn Fn(Arc<RefCell<Buffer>>, i32)>,
+    connection: Option<Weak<Connection>>,
 ) -> Result<Arc<Completion>> {
     tracing::trace!("begin_read_wal_frame(offset={})", offset);
     let buf = buffer_pool.get();
@@ -1533,7 +1543,7 @@ pub fn begin_read_wal_frame(
     });
     let buf = Arc::new(RefCell::new(Buffer::new(buf, drop_fn)));
     #[allow(clippy::arc_with_non_send_sync)]
-    let c = Completion::new_read(buf, complete);
+    let c = Completion::new_read(buf, complete, connection);
     let c = io.pread(offset, c.into())?;
     Ok(c)
 }
@@ -1549,6 +1559,7 @@ pub fn begin_write_wal_frame(
     write_counter: Rc<RefCell<usize>>,
     wal_header: &WalHeader,
     checksums: (u32, u32),
+    connection: Option<Weak<Connection>>,
 ) -> Result<(u32, u32)> {
     let page_finish = page.clone();
     let page_id = page.get().id;
@@ -1627,7 +1638,7 @@ pub fn begin_write_wal_frame(
         })
     };
     #[allow(clippy::arc_with_non_send_sync)]
-    let c = Completion::new_write(write_complete);
+    let c = Completion::new_write(write_complete, connection);
     let res = io.pwrite(offset, buffer.clone(), c.into());
     if res.is_err() {
         // If we do not reduce the counter here on error, we incur an infinite loop when cacheflushing
@@ -1638,7 +1649,11 @@ pub fn begin_write_wal_frame(
     Ok(checksums)
 }
 
-pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<()> {
+pub fn begin_write_wal_header(
+    io: &Arc<dyn File>,
+    header: &WalHeader,
+    connection: Option<Weak<Connection>>,
+) -> Result<()> {
     tracing::trace!("begin_write_wal_header");
     let buffer = {
         let drop_fn = Rc::new(|_buf| {});
@@ -1666,7 +1681,7 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
         );
     };
     #[allow(clippy::arc_with_non_send_sync)]
-    let c = Completion::new_write(write_complete);
+    let c = Completion::new_write(write_complete, connection);
     io.pwrite(0, buffer.clone(), c.into())?;
     Ok(())
 }

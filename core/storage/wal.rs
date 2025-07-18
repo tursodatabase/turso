@@ -4,6 +4,7 @@
 use std::array;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
+use std::sync::Weak;
 use strum::EnumString;
 use tracing::{instrument, Level};
 
@@ -24,7 +25,7 @@ use crate::storage::sqlite3_ondisk::{
     WAL_HEADER_SIZE,
 };
 use crate::types::IOResult;
-use crate::{turso_assert, Buffer, LimboError, Result};
+use crate::{turso_assert, Buffer, Connection, LimboError, Result};
 use crate::{Completion, Page};
 
 use self::sqlite3_ondisk::{checksum_wal, PageContent, WAL_MAGIC_BE, WAL_MAGIC_LE};
@@ -212,7 +213,13 @@ pub trait Wal {
     fn find_frame(&self, page_id: u64) -> Result<Option<u64>>;
 
     /// Read a frame from the WAL.
-    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Arc<BufferPool>) -> Result<()>;
+    fn read_frame(
+        &self,
+        frame_id: u64,
+        page: PageRef,
+        buffer_pool: Arc<BufferPool>,
+        connection: Option<Weak<Connection>>,
+    ) -> Result<()>;
 
     /// Read a frame from the WAL.
     fn read_frame_raw(
@@ -221,6 +228,7 @@ pub trait Wal {
         buffer_pool: Arc<BufferPool>,
         frame: *mut u8,
         frame_len: u32,
+        connection: Option<Weak<Connection>>,
     ) -> Result<Arc<Completion>>;
 
     /// Write a frame to the WAL.
@@ -233,6 +241,7 @@ pub trait Wal {
         page: PageRef,
         db_size: u32,
         write_counter: Rc<RefCell<usize>>,
+        connection: Option<Weak<Connection>>,
     ) -> Result<()>;
 
     /// Complete append of frames by updating shared wal state. Before this
@@ -245,8 +254,9 @@ pub trait Wal {
         pager: &Pager,
         write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
+        connection: Option<Weak<Connection>>,
     ) -> Result<IOResult<CheckpointResult>>;
-    fn sync(&mut self) -> Result<IOResult<()>>;
+    fn sync(&mut self, connection: Option<Weak<Connection>>) -> Result<IOResult<()>>;
     fn get_max_frame_in_wal(&self) -> u64;
     fn get_max_frame(&self) -> u64;
     fn get_min_frame(&self) -> u64;
@@ -285,6 +295,7 @@ impl Wal for DummyWAL {
         _frame_id: u64,
         _page: crate::PageRef,
         _buffer_pool: Arc<BufferPool>,
+        _connection: Option<Weak<Connection>>,
     ) -> Result<()> {
         Ok(())
     }
@@ -295,6 +306,7 @@ impl Wal for DummyWAL {
         _buffer_pool: Arc<BufferPool>,
         _frame: *mut u8,
         _frame_len: u32,
+        _connection: Option<Weak<Connection>>,
     ) -> Result<Arc<Completion>> {
         todo!();
     }
@@ -304,6 +316,7 @@ impl Wal for DummyWAL {
         _page: crate::PageRef,
         _db_size: u32,
         _write_counter: Rc<RefCell<usize>>,
+        _connection: Option<Weak<Connection>>,
     ) -> Result<()> {
         Ok(())
     }
@@ -317,11 +330,12 @@ impl Wal for DummyWAL {
         _pager: &Pager,
         _write_counter: Rc<RefCell<usize>>,
         _mode: crate::CheckpointMode,
+        _connection: Option<Weak<Connection>>,
     ) -> Result<IOResult<CheckpointResult>> {
         Ok(IOResult::Done(CheckpointResult::default()))
     }
 
-    fn sync(&mut self) -> Result<IOResult<()>> {
+    fn sync(&mut self, _connection: Option<Weak<Connection>>) -> Result<IOResult<()>> {
         Ok(IOResult::Done(()))
     }
 
@@ -600,7 +614,13 @@ impl Wal for WalFile {
 
     /// Read a frame from the WAL.
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Arc<BufferPool>) -> Result<()> {
+    fn read_frame(
+        &self,
+        frame_id: u64,
+        page: PageRef,
+        buffer_pool: Arc<BufferPool>,
+        connection: Option<Weak<Connection>>,
+    ) -> Result<()> {
         tracing::debug!("read_frame({})", frame_id);
         let offset = self.frame_offset(frame_id);
         page.set_locked();
@@ -619,6 +639,7 @@ impl Wal for WalFile {
             offset + WAL_FRAME_HEADER_SIZE,
             buffer_pool,
             complete,
+            connection,
         )?;
         Ok(())
     }
@@ -630,6 +651,7 @@ impl Wal for WalFile {
         buffer_pool: Arc<BufferPool>,
         frame: *mut u8,
         frame_len: u32,
+        connection: Option<Weak<Connection>>,
     ) -> Result<Arc<Completion>> {
         tracing::debug!("read_frame({})", frame_id);
         let offset = self.frame_offset(frame_id);
@@ -650,6 +672,7 @@ impl Wal for WalFile {
             offset + WAL_FRAME_HEADER_SIZE,
             buffer_pool,
             complete,
+            connection,
         )?;
         Ok(c)
     }
@@ -661,6 +684,7 @@ impl Wal for WalFile {
         page: PageRef,
         db_size: u32,
         write_counter: Rc<RefCell<usize>>,
+        connection: Option<Weak<Connection>>,
     ) -> Result<()> {
         let page_id = page.get().id;
         let max_frame = self.max_frame;
@@ -681,6 +705,7 @@ impl Wal for WalFile {
                 write_counter,
                 &header,
                 checksums,
+                connection,
             )?
         };
         self.last_checksum = checksums;
@@ -713,6 +738,7 @@ impl Wal for WalFile {
         pager: &Pager,
         write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
+        connection: Option<Weak<Connection>>,
     ) -> Result<IOResult<CheckpointResult>> {
         assert!(
             matches!(mode, CheckpointMode::Passive),
@@ -790,6 +816,7 @@ impl Wal for WalFile {
                                 *frame,
                                 self.ongoing_checkpoint.page.clone(),
                                 self.buffer_pool.clone(),
+                                connection.clone(),
                             )?;
                             self.ongoing_checkpoint.state = CheckpointState::WaitReadFrame;
                             continue 'checkpoint_loop;
@@ -810,6 +837,7 @@ impl Wal for WalFile {
                         pager,
                         &self.ongoing_checkpoint.page,
                         write_counter.clone(),
+                        connection.as_ref().unwrap().clone(),
                     )?;
                     self.ongoing_checkpoint.state = CheckpointState::WaitWritePage;
                 }
@@ -877,16 +905,19 @@ impl Wal for WalFile {
     }
 
     #[instrument(err, skip_all, level = Level::DEBUG)]
-    fn sync(&mut self) -> Result<IOResult<()>> {
+    fn sync(&mut self, connection: Option<Weak<Connection>>) -> Result<IOResult<()>> {
         match self.sync_state.get() {
             SyncState::NotSyncing => {
                 tracing::debug!("wal_sync");
                 let syncing = self.syncing.clone();
                 self.syncing.set(true);
-                let completion = Completion::new_sync(move |_| {
-                    tracing::debug!("wal_sync finish");
-                    syncing.set(false);
-                });
+                let completion = Completion::new_sync(
+                    move |_| {
+                        tracing::debug!("wal_sync finish");
+                        syncing.set(false);
+                    },
+                    connection.clone(),
+                );
                 let shared = self.get_shared();
                 shared.file.sync(completion.into())?;
                 self.sync_state.set(SyncState::Syncing);
@@ -1073,7 +1104,7 @@ impl WalFileShared {
         );
         wal_header.checksum_1 = checksums.0;
         wal_header.checksum_2 = checksums.1;
-        sqlite3_ondisk::begin_write_wal_header(&file, &wal_header)?;
+        sqlite3_ondisk::begin_write_wal_header(&file, &wal_header, None)?;
         let header = Arc::new(SpinLock::new(wal_header));
         let checksum = {
             let checksum = header.lock();
