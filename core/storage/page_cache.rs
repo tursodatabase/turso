@@ -10,9 +10,7 @@ const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES_MAKE_ME_SMALLER_ONCE_WAL_SPILL_IS_IMPLEME
     100000;
 
 #[derive(Debug, Eq, Hash, PartialEq, Clone)]
-pub struct PageCacheKey {
-    pgno: usize,
-}
+pub struct PageCacheKey(pub usize);
 
 #[allow(dead_code)]
 struct PageCacheEntry {
@@ -61,11 +59,6 @@ pub enum CacheResizeResult {
     PendingEvictions,
 }
 
-impl PageCacheKey {
-    pub fn new(pgno: usize) -> Self {
-        Self { pgno }
-    }
-}
 impl DumbLruPageCache {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "capacity of cache should be at least 1");
@@ -603,9 +596,9 @@ impl PageHashMap {
 
     fn hash(&self, key: &PageCacheKey) -> usize {
         if self.capacity.is_power_of_two() {
-            key.pgno & (self.capacity - 1)
+            key.0 & (self.capacity - 1)
         } else {
-            key.pgno % self.capacity
+            key.0 % self.capacity
         }
     }
 
@@ -635,7 +628,7 @@ mod tests {
     };
 
     fn create_key(id: usize) -> PageCacheKey {
-        PageCacheKey::new(id)
+        PageCacheKey(id)
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -1035,7 +1028,7 @@ mod tests {
                 0 => {
                     // add
                     let id_page = rng.next_u64() % max_pages;
-                    let key = PageCacheKey::new(id_page as usize);
+                    let key = PageCacheKey(id_page as usize);
                     #[allow(clippy::arc_with_non_send_sync)]
                     let page = Arc::new(Page::new(id_page as usize));
                     if cache.peek(&key, false).is_some() {
@@ -1060,7 +1053,7 @@ mod tests {
                     let key = if random || lru.is_empty() {
                         let id_page: u64 = rng.next_u64() % max_pages;
 
-                        PageCacheKey::new(id_page as usize)
+                        PageCacheKey(id_page as usize)
                     } else {
                         let i = rng.next_u64() as usize % lru.len();
                         let key: PageCacheKey = lru.iter().nth(i).unwrap().0.clone();
@@ -1081,7 +1074,7 @@ mod tests {
             for (key, page) in &lru {
                 println!("getting page {key:?}");
                 cache.peek(key, false).unwrap();
-                assert_eq!(page.get().id, key.pgno);
+                assert_eq!(page.get().id, key.0);
             }
         }
     }
