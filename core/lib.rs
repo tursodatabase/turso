@@ -1054,7 +1054,7 @@ impl Statement {
                     .rollback(schema_did_change, &self.program.connection)
                 {
                     // Let's panic for now as we don't want to leave state in a bad state.
-                    panic!("rollback failed: {:?}", e);
+                    panic!("rollback failed: {e:?}");
                 }
                 let end_tx_res =
                     self.pager
@@ -1065,8 +1065,7 @@ impl Statement {
                     .set(TransactionState::None);
                 assert!(
                     matches!(end_tx_res, IOResult::Done(_)),
-                    "end_tx should not return IO as it should just end txn without flushing anything. Got {:?}",
-                    end_tx_res
+                    "end_tx should not return IO as it should just end txn without flushing anything. Got {end_tx_res:?}"
                 );
             }
         }

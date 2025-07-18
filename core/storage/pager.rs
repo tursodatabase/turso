@@ -963,8 +963,7 @@ impl Pager {
                         let page_key = PageCacheKey::new(page_id);
                         let page = cache.get(&page_key).unwrap_or_else(|| {
                             panic!(
-                                "we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it. page={}",
-                                page_id
+                                "we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it. page={page_id}"
                             )
                         });
                         let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
