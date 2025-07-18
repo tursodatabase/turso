@@ -970,20 +970,14 @@ impl Wal for WalFile {
         }
         let shared = self.shared.clone();
         let io = self.io.clone();
-        let done = Rc::new(AtomicBool::new(false));
-        let cloned = done.clone();
         let c = Completion::new_trunc(move |_| {
             let shared = shared.clone();
             let shared = unsafe { shared.get().as_mut().unwrap() };
             let io = io.clone();
-            shared.restart_wal_header(&io, cloned.clone()).unwrap();
+            shared.restart_wal_header(&io).unwrap();
         });
         let shared = self.get_shared();
         shared.file.truncate(WAL_HEADER_SIZE, c.into())?;
-        // ensure that the header is written and not just this completion fires
-        while !done.load(Ordering::Relaxed) {
-            self.io.run_once()?;
-        }
         Ok(())
     }
 }
@@ -1109,23 +1103,13 @@ impl WalFileShared {
         );
         wal_header.checksum_1 = checksums.0;
         wal_header.checksum_2 = checksums.1;
-        let done = Rc::new(AtomicBool::new(false));
-        sqlite3_ondisk::begin_write_wal_header(&file, &wal_header, done.clone())?;
+        let c = sqlite3_ondisk::begin_write_wal_header(&file, &wal_header)?;
         let header = Arc::new(SpinLock::new(wal_header));
         let checksum = {
             let checksum = header.lock();
             (checksum.checksum_1, checksum.checksum_2)
         };
-        let mut max_iterations = 1000;
-        while !done.load(Ordering::Relaxed) && max_iterations > 0 {
-            io.run_once()?;
-            max_iterations -= 1;
-        }
-        if !done.load(Ordering::Relaxed) {
-            return Err(LimboError::InternalError(
-                "unable to write WAL header in 1000 IO cycles".to_string(),
-            ));
-        }
+        io.wait_for_completion(c)?;
         tracing::debug!("new_shared(header={:?})", header);
         let shared = WalFileShared {
             wal_header: header,
@@ -1171,7 +1155,7 @@ impl WalFileShared {
     /// This function updates the shared-memory structures so that the next
     /// client to write to the database (which may be this one) does so by
     /// writing frames into the start of the log file.
-    fn restart_wal_header(&mut self, io: &Arc<dyn IO>, done: Rc<AtomicBool>) -> Result<()> {
+    fn restart_wal_header(&mut self, io: &Arc<dyn IO>) -> Result<()> {
         // bump checkpoint sequence
         let mut hdr = self.wal_header.lock();
         hdr.checkpoint_seq = hdr.checkpoint_seq.wrapping_add(1);
@@ -1187,7 +1171,8 @@ impl WalFileShared {
         hdr.salt_2 = io.generate_random_number() as u32;
 
         // rewrite header on disk
-        sqlite3_ondisk::begin_write_wal_header(&self.file, &hdr, done)?;
+        let c = sqlite3_ondisk::begin_write_wal_header(&self.file, &hdr)?;
+        io.wait_for_completion(c)?;
 
         self.frame_cache.lock().clear();
         self.pages_in_frames.lock().clear();

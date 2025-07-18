@@ -54,7 +54,7 @@ impl IO for MemoryIO {
     }
 
     fn wait_for_completion(&self, _c: Arc<Completion>) -> Result<()> {
-        todo!();
+        Ok(())
     }
 
     fn generate_random_number(&self) -> i64 {
