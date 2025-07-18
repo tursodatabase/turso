@@ -13,6 +13,7 @@ use bitflags::bitflags;
 use parking_lot::RwLock;
 use std::cell::{Cell, OnceCell, RefCell, UnsafeCell};
 use std::collections::HashSet;
+use std::fmt;
 use std::hash;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32,6 +33,8 @@ pub struct SpillFlag(u8);
 
 bitflags! {
     impl SpillFlag: u8 {
+        /// Allow spilling cache. Default behavior.
+        const ALLOWED = 0b00;
         /// Never spill cache. Set via pragma
         const OFF = 0b01;
         /// Current rolling back, so do not spill
@@ -55,6 +58,18 @@ impl SpillFlag {
             self.remove(SpillFlag::OFF);
         } else {
             *self = SpillFlag::OFF;
+        }
+    }
+}
+
+impl fmt::Display for SpillFlag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            0b00 => write!(f, "ALLOWED"),
+            0b01 => write!(f, "OFF"),
+            0b10 => write!(f, "ROLLBACK"),
+            0b11 => write!(f, "NO_SYNC"),
+            _ => write!(f, "UNKNOWN"),
         }
     }
 }
@@ -1398,6 +1413,63 @@ impl Pager {
         Ok(())
     }
 
+    // TODO: find better name for this, use as a callback like SQLite?
+    /// This function is called by the cache layer when it has reached some soft memory limit.
+    /// The pager must be purgeable (not in-memory)
+    #[instrument(skip_all, level = Level::INFO)]
+    pub fn stress(&self, full: bool) -> Result<IOResult<()>> {
+        // todo: improve error handling
+        if !self.spill_flag.borrow().can_spill() {
+            return Err(LimboError::SpillNotAllowed(*self.spill_flag.borrow()));
+        }
+        let state = self.flush_info.borrow().state;
+        trace!(?state);
+        match state {
+            CacheFlushState::Start => {
+                let mut page_cache = self.page_cache.write();
+                let page_ids: Vec<_> = self.dirty_pages.borrow().iter().copied().collect();
+                let mut dirty_pages = self.dirty_pages.borrow_mut();
+
+                for page_id in page_ids {
+                    let page = page_cache.get(&PageCacheKey(page_id)).expect(
+                        format!(
+                            "We somehow have a dirty page that isn't in the cache: page_id({})",
+                            page_id
+                        )
+                        .as_str(),
+                    );
+                    assert!(page.is_dirty());
+                    trace!("pager.stress(page={})", page.get().id);
+                    self.wal.borrow_mut().append_frame(
+                        page.clone(),
+                        0,
+                        self.flush_info.borrow().in_flight_writes.clone(),
+                    )?;
+
+                    page.clear_dirty();
+                    page_cache.delete(PageCacheKey(page_id)).unwrap();
+                    dirty_pages.remove(&page_id);
+                    if !full {
+                        break;
+                    }
+                }
+
+                self.flush_info.borrow_mut().state = CacheFlushState::WaitAppendFrames;
+                return Ok(IOResult::IO);
+            }
+
+            CacheFlushState::WaitAppendFrames => {
+                let in_flight = *self.flush_info.borrow().in_flight_writes.borrow();
+                if in_flight == 0 {
+                    self.flush_info.borrow_mut().state = CacheFlushState::Start;
+                    self.wal.borrow_mut().finish_append_frames_commit()?;
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
+
+        Ok(IOResult::IO)
+    }
     pub fn disable_cache_spill(&self, toggle: bool) {
         self.spill_flag.borrow_mut().disable(toggle);
     }
