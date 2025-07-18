@@ -264,12 +264,12 @@ impl turso_core::File for File {
     fn truncate(
         &self,
         len: usize,
-        c: turso_core::Completion,
+        c: Arc<turso_core::Completion>,
     ) -> Result<Arc<turso_core::Completion>> {
-        self.vfs.truncate(self.fd, len as usize);
+        self.vfs.truncate(self.fd, len);
         c.complete(0);
         #[allow(clippy::arc_with_non_send_sync)]
-        Ok(Arc::new(c))
+        Ok(c)
     }
 }
 
@@ -391,7 +391,7 @@ impl turso_core::DatabaseStorage for DatabaseFile {
         self.file.size()
     }
 
-    fn truncate(&self, len: usize, c: turso_core::Completion) -> Result<()> {
+    fn truncate(&self, len: usize, c: Arc<turso_core::Completion>) -> Result<()> {
         self.file.truncate(len, c)?;
         Ok(())
     }

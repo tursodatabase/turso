@@ -233,33 +233,24 @@ impl File for SimulatorFile {
     fn truncate(
         &self,
         len: usize,
-        mut c: turso_core::Completion,
+        c: Arc<turso_core::Completion>,
     ) -> Result<Arc<turso_core::Completion>> {
         if self.fault.get() {
             return Err(turso_core::LimboError::InternalError(
                 FAULT_ERROR_MSG.into(),
             ));
         }
-        if let Some(latency) = self.generate_latency_duration() {
-            let CompletionType::Truncate(truncate_completion) = &mut c.completion_type else {
-                unreachable!();
-            };
-            let before = self.rng.borrow_mut().gen_bool(0.5);
-            let dummy_complete = Box::new(|_| {});
-            let prev_complete =
-                std::mem::replace(&mut truncate_completion.complete, dummy_complete);
-            let new_complete = move |res| {
-                if before {
-                    std::thread::sleep(latency);
-                }
-                (prev_complete)(res);
-                if !before {
-                    std::thread::sleep(latency);
-                }
-            };
-            truncate_completion.complete = Box::new(new_complete);
+        let c = if let Some(latency) = self.generate_latency_duration() {
+            let cloned_c = c.clone();
+            let op = Box::new(move |file: &SimulatorFile| file.inner.truncate(len, cloned_c));
+            self.queued_io
+                .borrow_mut()
+                .push(DelayedIo { time: latency, op });
+            c
+        } else {
+            self.inner.truncate(len, c)?
         };
-        self.inner.truncate(len, c)
+        Ok(c)
     }
 }
 

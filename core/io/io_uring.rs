@@ -365,14 +365,13 @@ impl File for UringFile {
         Ok(self.file.metadata()?.len())
     }
 
-    fn truncate(&self, len: usize, c: Completion) -> Result<Arc<Completion>> {
+    fn truncate(&self, len: usize, c: Arc<Completion>) -> Result<Arc<Completion>> {
         let mut io = self.io.borrow_mut();
         let truncate = with_fd!(self, |fd| {
             io_uring::opcode::Ftruncate::new(fd, len as u64)
                 .build()
                 .user_data(io.ring.get_key())
         });
-        let c = Arc::new(c);
         io.ring.submit_entry(&truncate, c.clone());
         Ok(c)
     }
