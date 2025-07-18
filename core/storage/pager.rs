@@ -555,7 +555,8 @@ impl Pager {
             let auto_vacuum_mode = self.auto_vacuum_mode.borrow();
             match *auto_vacuum_mode {
                 AutoVacuumMode::None => {
-                    let page = self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any)?;
+                    let page =
+                        return_if_io!(self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any));
                     let page_id = page.get().get().id;
                     Ok(IOResult::Done(page_id as u32))
                 }
@@ -580,11 +581,11 @@ impl Pager {
                     assert!(root_page_num >= 3); //  the very first root page is page 3
 
                     //  root_page_num here is the desired root page
-                    let page = self.do_allocate_page(
+                    let page = return_if_io!(self.do_allocate_page(
                         page_type,
                         0,
                         BtreePageAllocMode::Exact(root_page_num),
-                    )?;
+                    ));
                     let allocated_page_id = page.get().get().id as u32;
                     if allocated_page_id != root_page_num {
                         //  TODO(Zaid): Handle swapping the allocated page with the desired root page
@@ -628,35 +629,48 @@ impl Pager {
         page_type: PageType,
         offset: usize,
         _alloc_mode: BtreePageAllocMode,
-    ) -> Result<BTreePage> {
+    ) -> Result<IOResult<BTreePage>> {
         let page = self.allocate_page()?;
         let page = Arc::new(BTreePageInner {
             page: RefCell::new(page),
         });
-        btree_init_page(&page, page_type, offset, self.usable_space() as u16);
+        let usable_space = return_if_io!(self.usable_space());
+        btree_init_page(&page, page_type, offset, usable_space as u16);
         tracing::debug!(
             "do_allocate_page(id={}, page_type={:?})",
             page.get().get().id,
             page.get().get_contents().page_type()
         );
-        Ok(page)
+        Ok(IOResult::Done(page))
     }
 
     /// The "usable size" of a database page is the page size specified by the 2-byte integer at offset 16
     /// in the header, minus the "reserved" space size recorded in the 1-byte integer at offset 20 in the header.
     /// The usable size of a page might be an odd number. However, the usable size is not allowed to be less than 480.
     /// In other words, if the page size is 512, then the reserved space size cannot exceed 32.
-    pub fn usable_space(&self) -> usize {
-        let page_size = *self
-            .page_size
-            .get()
-            .get_or_insert_with(|| header_accessor::get_page_size(self).unwrap_or_default());
+    pub fn usable_space(&self) -> Result<IOResult<usize>> {
+        let page_size = if let Some(page_size) = self.page_size.get() {
+            page_size
+        } else {
+            let size = return_if_io!(header_accessor::get_page_size_async(self));
+            self.page_size.set(Some(size));
+            size
+        };
 
-        let reserved_space = *self
-            .reserved_space
-            .get_or_init(|| header_accessor::get_reserved_space(self).unwrap_or_default());
+        let reserved_space = if let Some(reserved_space) = self.reserved_space.get() {
+            *reserved_space
+        } else {
+            let space = match header_accessor::get_reserved_space_async(self)? {
+                IOResult::Done(s) => s,
+                IOResult::IO => return Ok(IOResult::IO),
+            };
+            self.reserved_space.set(space).unwrap();
+            space
+        };
 
-        (page_size as usize) - (reserved_space as usize)
+        Ok(IOResult::Done(
+            (page_size as usize) - (reserved_space as usize),
+        ))
     }
 
     /// Set the initial page size for the database. Should only be called before the database is initialized
@@ -1146,8 +1160,8 @@ impl Pager {
                         trunk_page_contents.read_u32(TRUNK_PAGE_LEAF_COUNT_OFFSET);
 
                     // Reserve 2 slots for the trunk page header which is 8 bytes or 2*LEAF_ENTRY_SIZE
-                    let max_free_list_entries =
-                        (self.usable_space() / LEAF_ENTRY_SIZE) - RESERVED_SLOTS;
+                    let usable_space = return_if_io!(self.usable_space());
+                    let max_free_list_entries = (usable_space / LEAF_ENTRY_SIZE) - RESERVED_SLOTS;
 
                     if number_of_leaf_pages < max_free_list_entries as u32 {
                         trunk_page.set_dirty();
