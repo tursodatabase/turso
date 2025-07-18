@@ -52,7 +52,9 @@ pub trait IO: Clock + Send + Sync {
 
     fn generate_random_number(&self) -> i64;
 
-    fn get_memory_io(&self) -> Arc<MemoryIO>;
+    fn get_memory_io(&self) -> Arc<MemoryIO> {
+        Arc::new(MemoryIO::new())
+    }
 
     #[doc(hidden)]
     fn open_wal(

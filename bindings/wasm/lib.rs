@@ -310,10 +310,6 @@ impl turso_core::IO for PlatformIO {
         getrandom::getrandom(&mut buf).unwrap();
         i64::from_ne_bytes(buf)
     }
-
-    fn get_memory_io(&self) -> Arc<turso_core::MemoryIO> {
-        Arc::new(turso_core::MemoryIO::new())
-    }
 }
 
 #[wasm_bindgen]
