@@ -4,7 +4,7 @@ use crate::numeric::{NullableInteger, Numeric};
 use crate::storage::btree::{integrity_check, IntegrityCheckError, IntegrityCheckState};
 use crate::storage::database::FileMemoryStorage;
 use crate::storage::page_cache::DumbLruPageCache;
-use crate::storage::pager::CreateBTreeFlags;
+use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
 use crate::storage::sqlite3_ondisk::read_varint;
 use crate::storage::wal::DummyWAL;
 use crate::storage::{self, header_accessor};
@@ -30,7 +30,6 @@ use crate::{
     IO,
 };
 use std::ops::DerefMut;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 use std::{borrow::BorrowMut, rc::Rc, sync::Arc};
 
@@ -6104,7 +6103,7 @@ pub fn op_open_ephemeral(
                 io,
                 page_cache,
                 buffer_pool.clone(),
-                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicDbState::new(DbState::Uninitialized)),
                 Arc::new(Mutex::new(())),
             )?);
 
