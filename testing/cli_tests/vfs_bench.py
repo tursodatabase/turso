@@ -32,7 +32,7 @@ def bench_one(vfs: str, sql: str, iterations: int) -> list[float]:
     """
     shell = TestTursoShell(
         exec_name=str(LIMBO_BIN),
-        flags=f"-q -m list --vfs {vfs} {DB_FILE}",
+        flags=f"-m list --vfs {vfs} {DB_FILE}",
         init_commands="",
     )
 

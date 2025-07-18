@@ -44,5 +44,8 @@ for i in range(insertions):
             # Ignore UNIQUE constraint violations
             pass
         else:
+            con.rollback()
             # Re-raise other operational errors
             raise
+
+con.commit()

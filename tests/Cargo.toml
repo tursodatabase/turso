@@ -24,6 +24,7 @@ log = "0.4.22"
 assert_cmd = "^2"
 rand_chacha = "0.9.0"
 rand = "0.9.0"
+zerocopy = "0.8.26"
 
 [dev-dependencies]
 test-log = { version = "0.2.17", features = ["trace"] }

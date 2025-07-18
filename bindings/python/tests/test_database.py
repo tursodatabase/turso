@@ -158,6 +158,25 @@ def test_commit(provider):
     assert record
 
 
+# Test case for: https://github.com/tursodatabase/turso/issues/2002
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_first_rollback(provider, tmp_path):
+    db_file = tmp_path / "test_first_rollback.db"
+
+    conn = connect(provider, str(db_file))
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT)")
+    cur.execute("INSERT INTO users VALUES (1, 'alice')")
+    cur.execute("INSERT INTO users VALUES (2, 'bob')")
+
+    conn.rollback()
+
+    cur.execute("SELECT * FROM users")
+    users = cur.fetchall()
+
+    assert users == []
+    conn.close()
+
 @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_with_statement(provider):
     with connect(provider, "tests/database.db") as conn:

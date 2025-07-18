@@ -293,7 +293,7 @@ pub fn constraints_from_where_clause(
 
         // For each constraint we found, add a reference to it for each index that may be able to use it.
         for (i, constraint) in cs.constraints.iter().enumerate() {
-            if rowid_alias_column.map_or(false, |idx| constraint.table_col_pos == idx) {
+            if rowid_alias_column == Some(constraint.table_col_pos) {
                 let rowid_candidate = cs
                     .candidates
                     .iter_mut()
@@ -325,7 +325,7 @@ pub fn constraints_from_where_clause(
                             if candidate
                                 .index
                                 .as_ref()
-                                .map_or(false, |i| Arc::ptr_eq(index, i))
+                                .is_some_and(|i| Arc::ptr_eq(index, i))
                             {
                                 Some(candidate)
                             } else {
@@ -409,6 +409,6 @@ fn opposite_cmp_op(op: ast::Operator) -> ast::Operator {
         ast::Operator::GreaterEquals => ast::Operator::LessEquals,
         ast::Operator::Less => ast::Operator::Greater,
         ast::Operator::LessEquals => ast::Operator::GreaterEquals,
-        _ => panic!("unexpected operator: {:?}", op),
+        _ => panic!("unexpected operator: {op:?}"),
     }
 }

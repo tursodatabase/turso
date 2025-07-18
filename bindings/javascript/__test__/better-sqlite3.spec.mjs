@@ -32,7 +32,7 @@ const genDatabaseFilename = () => {
   return `test-${crypto.randomBytes(8).toString('hex')}.db`;
 };
 
-new DualTest().onlySqlitePasses("opening a read-only database fails if the file doesn't exist", async (t) => {
+new DualTest().both("opening a read-only database fails if the file doesn't exist", async (t) => {
   t.throws(() => t.context.connect(genDatabaseFilename(), { readonly: true }),
     {
       any: true,
@@ -45,7 +45,7 @@ foobarTest.both("Property .readonly of database if not set", async (t) => {
   t.is(db.readonly, false);
 });
 
-foobarTest.onlySqlitePasses("Property .open of database", async (t) => {
+foobarTest.both("Property .open of database", async (t) => {
   const db = t.context.db;
   t.is(db.open, true);
 });
@@ -66,9 +66,7 @@ inMemoryTest.both("Statement.get() returns undefined when no data", async (t) =>
   t.is(result, undefined);
 });
 
-inMemoryTest.onlySqlitePasses("Statement.run() returns correct result object", async (t) => {
-  // run() isn't 100% compatible with better-sqlite3
-  // it should return a result object, not a row object
+inMemoryTest.both("Statement.run() returns correct result object", async (t) => {
   const db = t.context.db;
   db.prepare("CREATE TABLE users (name TEXT)").run();
   const rows = db.prepare("INSERT INTO users (name) VALUES (?)").run("Alice");
@@ -98,13 +96,16 @@ inMemoryTest.both("Statment.iterate() should correctly return an iterable object
   }
 });
 
-inMemoryTest.both("Empty prepared statement should throw", async (t) => {
+inMemoryTest.both("Empty prepared statement should throw the correct error", async (t) => {
   const db = t.context.db;
   t.throws(
     () => {
       db.prepare("");
     },
-    { instanceOf: Error },
+    {
+      instanceOf: RangeError,
+      message: "The supplied SQL string contains no statements",
+    },
   );
 });
 
@@ -156,9 +157,12 @@ inMemoryTest.both("Statement shouldn't bind twice with bind()", async (t) => {
 
   t.throws(
     () => {
-      db.bind("Bob");
+      stmt.bind("Bob");
     },
-    { instanceOf: Error },
+    {
+      instanceOf: TypeError,
+      message: 'The bind() method can only be invoked once per statement object',
+    },
   );
 });
 
@@ -371,4 +375,5 @@ inMemoryTest.both("Test Statement.source", async t => {
   let stmt = db.prepare(sql);
   t.is(stmt.source, sql);
 });
+
 

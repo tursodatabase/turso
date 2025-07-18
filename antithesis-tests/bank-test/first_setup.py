@@ -50,3 +50,5 @@ cur.execute(f"""
     INSERT INTO initial_state (num_accts, total)
     VALUES ({num_accts}, {total})
 """)
+
+con.commit()

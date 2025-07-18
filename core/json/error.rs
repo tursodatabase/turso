@@ -38,7 +38,7 @@ impl From<std::str::Utf8Error> for Error {
 impl Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Message { ref msg, .. } => write!(formatter, "{}", msg),
+            Self::Message { ref msg, .. } => write!(formatter, "{msg}"),
         }
     }
 }

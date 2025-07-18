@@ -4519,7 +4519,8 @@ void ReportTable(
   if( lemp->stacksize ){
     fprintf(out,"const YYSTACKDEPTH: usize = %s;\n",lemp->stacksize);  lineno++;
   } else {
-    fprintf(out, "const YYSTACKDEPTH: usize = 128;\n"); lineno++;
+    // from sqlite: The default value is 100. A typical application will use less than about 20 levels of the stack. Developers whose applications contain SQL statements that need more than 100 LALR(1) stack entries should seriously consider refactoring their SQL as it is likely to be well beyond the ability of any human to comprehend.
+    fprintf(out, "const YYSTACKDEPTH: usize = 100;\n"); lineno++;
   }
   if( lemp->errsym && lemp->errsym->useCnt ){
     fprintf(out,"const YYERRORSYMBOL: YYCODETYPE = %d;\n",lemp->errsym->index); lineno++;

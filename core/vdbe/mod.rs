@@ -27,14 +27,17 @@ pub mod sorter;
 use crate::{
     error::LimboError,
     function::{AggFunc, FuncCtx},
-    storage::{pager::PagerCacheflushStatus, sqlite3_ondisk::SmallVec},
+    storage::{pager, sqlite3_ondisk::SmallVec},
     translate::plan::TableReferences,
+    types::{IOResult, RawSlice, TextRef},
+    vdbe::execute::{OpIdxInsertState, OpInsertState, OpNewRowidState, OpSeekState},
+    RefValue,
 };
 
 use crate::{
-    storage::{btree::BTreeCursor, pager::Pager},
+    storage::pager::Pager,
     translate::plan::ResultSetColumn,
-    types::{AggContext, Cursor, CursorResult, ImmutableRecord, Value},
+    types::{AggContext, Cursor, ImmutableRecord, Value},
     vdbe::{builder::CursorType, insn::Insn},
 };
 
@@ -47,7 +50,6 @@ use execute::{
     OpOpenEphemeralState,
 };
 
-use rand::Rng;
 use regex::Regex;
 use std::{
     cell::{Cell, RefCell},
@@ -154,13 +156,13 @@ pub enum StepResult {
 }
 
 /// If there is I/O, the instruction is restarted.
-/// Evaluate a Result<CursorResult<T>>, if IO return Ok(StepResult::IO).
+/// Evaluate a Result<IOResult<T>>, if IO return Ok(StepResult::IO).
 #[macro_export]
-macro_rules! return_if_io {
+macro_rules! return_step_if_io {
     ($expr:expr) => {
         match $expr? {
-            CursorResult::Ok(v) => v,
-            CursorResult::IO => return Ok(StepResult::IO),
+            IOResult::Ok(v) => v,
+            IOResult::IO => return Ok(StepResult::IO),
         }
     };
 }
@@ -250,6 +252,10 @@ pub struct ProgramState {
     op_idx_delete_state: Option<OpIdxDeleteState>,
     op_integrity_check_state: OpIntegrityCheckState,
     op_open_ephemeral_state: OpOpenEphemeralState,
+    op_new_rowid_state: OpNewRowidState,
+    op_idx_insert_state: OpIdxInsertState,
+    op_insert_state: OpInsertState,
+    seek_state: OpSeekState,
 }
 
 impl ProgramState {
@@ -276,6 +282,10 @@ impl ProgramState {
             op_idx_delete_state: None,
             op_integrity_check_state: OpIntegrityCheckState::Start,
             op_open_ephemeral_state: OpOpenEphemeralState::Start,
+            op_new_rowid_state: OpNewRowidState::Start,
+            op_idx_insert_state: OpIdxInsertState::SeekIfUnique,
+            op_insert_state: OpInsertState::Insert,
+            seek_state: OpSeekState::Start,
         }
     }
 
@@ -323,9 +333,9 @@ impl ProgramState {
         let cursors = self.cursors.borrow_mut();
         std::cell::RefMut::map(cursors, |c| {
             c.get_mut(cursor_id)
-                .unwrap_or_else(|| panic!("cursor id {} out of bounds", cursor_id))
+                .unwrap_or_else(|| panic!("cursor id {cursor_id} out of bounds"))
                 .as_mut()
-                .unwrap_or_else(|| panic!("cursor id {} is None", cursor_id))
+                .unwrap_or_else(|| panic!("cursor id {cursor_id} is None"))
         })
     }
 }
@@ -334,7 +344,11 @@ impl Register {
     pub fn get_owned_value(&self) -> &Value {
         match self {
             Register::Value(v) => v,
-            _ => unreachable!(),
+            Register::Record(r) => {
+                assert!(!r.is_invalidated());
+                r.as_blob_value()
+            }
+            _ => panic!("register holds unexpected value: {self:?}"),
         }
     }
 }
@@ -368,6 +382,7 @@ pub struct Program {
 }
 
 impl Program {
+    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn step(
         &self,
         state: &mut ProgramState,
@@ -375,6 +390,14 @@ impl Program {
         pager: Rc<Pager>,
     ) -> Result<StepResult> {
         loop {
+            if self.connection.closed.get() {
+                // Connection is closed for whatever reason, rollback the transaction.
+                let state = self.connection.transaction_state.get();
+                if let TransactionState::Write { schema_did_change } = state {
+                    pager.rollback(schema_did_change, &self.connection)?
+                }
+                return Err(LimboError::InternalError("Connection closed".to_string()));
+            }
             if state.is_interrupted() {
                 return Ok(StepResult::Interrupt);
             }
@@ -382,8 +405,14 @@ impl Program {
             let _ = state.result_row.take();
             let (insn, insn_function) = &self.insns[state.pc as usize];
             trace_insn(self, state.pc as InsnReference, insn);
-            let res = insn_function(self, state, insn, &pager, mv_store.as_ref())?;
-            match res {
+            let res = insn_function(self, state, insn, &pager, mv_store.as_ref());
+            if res.is_err() {
+                let state = self.connection.transaction_state.get();
+                if let TransactionState::Write { schema_did_change } = state {
+                    pager.rollback(schema_did_change, &self.connection)?
+                }
+            }
+            match res? {
                 InsnFunctionStepResult::Step => {}
                 InsnFunctionStepResult::Done => return Ok(StepResult::Done),
                 InsnFunctionStepResult::IO => return Ok(StepResult::IO),
@@ -394,7 +423,7 @@ impl Program {
         }
     }
 
-    #[instrument(skip_all, level = Level::TRACE)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn commit_txn(
         &self,
         pager: Rc<Pager>,
@@ -422,7 +451,8 @@ impl Program {
                 program_state.commit_state
             );
             if program_state.commit_state == CommitState::Committing {
-                let TransactionState::Write { change_schema } = connection.transaction_state.get()
+                let TransactionState::Write { schema_did_change } =
+                    connection.transaction_state.get()
                 else {
                     unreachable!("invalid state for write commit step")
                 };
@@ -431,18 +461,18 @@ impl Program {
                     &mut program_state.commit_state,
                     &connection,
                     rollback,
-                    change_schema,
+                    schema_did_change,
                 )
             } else if auto_commit {
                 let current_state = connection.transaction_state.get();
                 tracing::trace!("Auto-commit state: {:?}", current_state);
                 match current_state {
-                    TransactionState::Write { change_schema } => self.step_end_write_txn(
+                    TransactionState::Write { schema_did_change } => self.step_end_write_txn(
                         &pager,
                         &mut program_state.commit_state,
                         &connection,
                         rollback,
-                        change_schema,
+                        schema_did_change,
                     ),
                     TransactionState::Read => {
                         connection.transaction_state.replace(TransactionState::None);
@@ -460,30 +490,33 @@ impl Program {
         }
     }
 
-    #[instrument(skip(self, pager, connection), level = Level::TRACE)]
+    #[instrument(skip(self, pager, connection), level = Level::DEBUG)]
     fn step_end_write_txn(
         &self,
         pager: &Rc<Pager>,
         commit_state: &mut CommitState,
         connection: &Connection,
         rollback: bool,
-        change_schema: bool,
+        schema_did_change: bool,
     ) -> Result<StepResult> {
         let cacheflush_status = pager.end_tx(
             rollback,
-            change_schema,
+            schema_did_change,
             connection,
             connection.wal_checkpoint_disabled.get(),
         )?;
         match cacheflush_status {
-            PagerCacheflushStatus::Done(_) => {
+            IOResult::Done(status) => {
                 if self.change_cnt_on {
                     self.connection.set_changes(self.n_change.get());
+                }
+                if matches!(status, pager::PagerCommitResult::Rollback) {
+                    pager.rollback(schema_did_change, connection)?;
                 }
                 connection.transaction_state.replace(TransactionState::None);
                 *commit_state = CommitState::Ready;
             }
-            PagerCacheflushStatus::IO => {
+            IOResult::IO => {
                 tracing::trace!("Cacheflush IO");
                 *commit_state = CommitState::Committing;
                 return Ok(StepResult::IO);
@@ -514,46 +547,31 @@ impl Program {
     }
 }
 
-fn get_new_rowid<R: Rng>(cursor: &mut BTreeCursor, mut _rng: R) -> Result<CursorResult<i64>> {
-    match cursor.seek_to_last()? {
-        CursorResult::Ok(()) => {}
-        CursorResult::IO => return Ok(CursorResult::IO),
-    }
-    let rowid = match cursor.rowid()? {
-        CursorResult::Ok(Some(rowid)) => rowid.checked_add(1).unwrap_or(i64::MAX), // add 1 but be careful with overflows, in case of overflow - use i64::MAX
-        CursorResult::Ok(None) => 1,
-        CursorResult::IO => return Ok(CursorResult::IO),
-    };
-    // NOTE(nilskch): I commented this part out because this condition will never be true.
-    // if rowid > i64::MAX {
-    //     let distribution = Uniform::from(1..=i64::MAX);
-    //     let max_attempts = 100;
-    //     for count in 0..max_attempts {
-    //         rowid = distribution.sample(&mut rng);
-    //         match cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })? {
-    //             CursorResult::Ok(false) => break, // Found a non-existing rowid
-    //             CursorResult::Ok(true) => {
-    //                 if count == max_attempts - 1 {
-    //                     return Err(LimboError::InternalError(
-    //                         "Failed to generate a new rowid".to_string(),
-    //                     ));
-    //                 } else {
-    //                     continue; // Try next random rowid
-    //                 }
-    //             }
-    //             CursorResult::IO => return Ok(CursorResult::IO),
-    //         }
-    //     }
-    // }
-    Ok(CursorResult::Ok(rowid))
-}
-
 fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> ImmutableRecord {
     let regs = &registers[*start_reg..*start_reg + *count];
     ImmutableRecord::from_registers(regs, regs.len())
 }
 
-#[instrument(skip(program), level = Level::TRACE)]
+pub fn registers_to_ref_values(registers: &[Register]) -> Vec<RefValue> {
+    registers
+        .iter()
+        .map(|reg| {
+            let value = reg.get_owned_value();
+            match value {
+                Value::Null => RefValue::Null,
+                Value::Integer(i) => RefValue::Integer(*i),
+                Value::Float(f) => RefValue::Float(*f),
+                Value::Text(t) => RefValue::Text(TextRef {
+                    value: RawSlice::new(t.value.as_ptr(), t.value.len()),
+                    subtype: t.subtype,
+                }),
+                Value::Blob(b) => RefValue::Blob(RawSlice::new(b.as_ptr(), b.len())),
+            }
+        })
+        .collect()
+}
+
+#[instrument(skip(program), level = Level::DEBUG)]
 fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
     if !tracing::enabled!(tracing::Level::TRACE) {
         return;

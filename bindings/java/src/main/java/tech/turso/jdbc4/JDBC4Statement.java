@@ -18,6 +18,7 @@ public class JDBC4Statement implements Statement {
   private final JDBC4Connection connection;
 
   @Nullable protected TursoStatement statement = null;
+  protected long updateCount;
 
   // Because JDBC4Statement has different life cycle in compared to tursoStatement, let's use this
   // field to manage JDBC4Statement lifecycle
@@ -173,8 +174,10 @@ public class JDBC4Statement implements Statement {
             // TODO: if sql is a readOnly query, do we still need the locks?
             connectionLock.lock();
             statement = connection.prepare(sql);
+            final long previousChanges = statement.totalChanges();
             final boolean result = statement.execute();
             updateGeneratedKeys();
+            updateCount = statement.totalChanges() - previousChanges;
 
             return result;
           } finally {
@@ -186,19 +189,13 @@ public class JDBC4Statement implements Statement {
   @Override
   public ResultSet getResultSet() throws SQLException {
     requireNonNull(statement, "statement is null");
+    ensureOpen();
     return new JDBC4ResultSet(statement.getResultSet());
   }
 
   @Override
   public int getUpdateCount() throws SQLException {
-    // TODO
-    return 0;
-  }
-
-  @Override
-  public boolean getMoreResults() throws SQLException {
-    // TODO
-    return false;
+    return (int) updateCount;
   }
 
   @Override
@@ -255,8 +252,21 @@ public class JDBC4Statement implements Statement {
   }
 
   @Override
+  public boolean getMoreResults() throws SQLException {
+    return getMoreResults(Statement.CLOSE_CURRENT_RESULT);
+  }
+
+  @Override
   public boolean getMoreResults(int current) throws SQLException {
-    // TODO
+    requireNonNull(statement, "statement should not be null");
+
+    if (current != Statement.CLOSE_CURRENT_RESULT) {
+      throw new SQLException("Invalid argument");
+    }
+
+    statement.getResultSet().close();
+    updateCount = -1;
+
     return false;
   }
 

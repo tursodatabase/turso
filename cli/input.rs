@@ -29,7 +29,7 @@ impl Display for Io {
             Io::Syscall => write!(f, "syscall"),
             #[cfg(all(target_os = "linux", feature = "io_uring"))]
             Io::IoUring => write!(f, "io_uring"),
-            Io::External(str) => write!(f, "{}", str),
+            Io::External(str) => write!(f, "{str}"),
         }
     }
 }
@@ -83,6 +83,7 @@ pub struct Settings {
     pub io: Io,
     pub tracing_output: Option<String>,
     pub timer: bool,
+    pub headers: bool,
 }
 
 impl From<Opts> for Settings {
@@ -107,6 +108,7 @@ impl From<Opts> for Settings {
             },
             tracing_output: opts.tracing_output,
             timer: false,
+            headers: false,
         }
     }
 }
@@ -115,7 +117,7 @@ impl std::fmt::Display for Settings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Settings:\nOutput mode: {}\nDB: {}\nOutput: {}\nNull value: {}\nCWD: {}\nEcho: {}",
+            "Settings:\nOutput mode: {}\nDB: {}\nOutput: {}\nNull value: {}\nCWD: {}\nEcho: {}\nHeaders: {}",
             self.output_mode,
             self.db_file,
             match self.is_stdout {
@@ -125,6 +127,10 @@ impl std::fmt::Display for Settings {
             self.null_value,
             std::env::current_dir().unwrap().display(),
             match self.echo {
+                true => "on",
+                false => "off",
+            },
+            match self.headers {
                 true => "on",
                 false => "off",
             }
@@ -138,7 +144,7 @@ pub fn get_writer(output: &str) -> Box<dyn Write> {
         _ => match std::fs::File::create(output) {
             Ok(file) => Box::new(file),
             Err(e) => {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e}");
                 Box::new(io::stdout())
             }
         },
@@ -220,6 +226,12 @@ pub const AFTER_HELP_MSG: &str = r#"Usage Examples:
    .listvfs
 14. To show names of indexes:
    .indexes ?TABLE?
+
+15. To turn on column headers in list mode:
+   .headers on
+
+16. To turn off column headers in list mode:
+   .headers off
 
 Note:
 - All SQL commands must end with a semicolon (;).

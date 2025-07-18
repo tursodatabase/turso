@@ -13,12 +13,12 @@ use turso_core::Connection;
 #[derive(Clone)]
 pub struct TursoConnection {
     pub(crate) conn: Arc<Connection>,
-    pub(crate) io: Arc<dyn turso_core::IO>,
+    pub(crate) _io: Arc<dyn turso_core::IO>,
 }
 
 impl TursoConnection {
     pub fn new(conn: Arc<Connection>, io: Arc<dyn turso_core::IO>) -> Self {
-        TursoConnection { conn, io }
+        TursoConnection { conn, _io: io }
     }
 
     #[allow(clippy::wrong_self_convention)]

@@ -686,7 +686,7 @@ fn setup_sequential_db() -> (Rc<MvStore<TestClock>>, u64) {
     let table_id = 1;
     for i in 1..6 {
         let id = RowID::new(table_id, i);
-        let data = format!("row{}", i).into_bytes();
+        let data = format!("row{i}").into_bytes();
         let row = Row::new(id, data);
         db.insert(tx_id, row).unwrap();
     }

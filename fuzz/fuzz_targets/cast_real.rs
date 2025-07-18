@@ -1,7 +1,7 @@
 #![no_main]
 use libfuzzer_sys::{fuzz_target, Corpus};
-use turso_core::numeric::StrToF64;
 use std::error::Error;
+use turso_core::numeric::StrToF64;
 
 fn do_fuzz(text: String) -> Result<Corpus, Box<dyn Error>> {
     let expected = {
@@ -13,7 +13,7 @@ fn do_fuzz(text: String) -> Result<Corpus, Box<dyn Error>> {
 
     let actual = turso_core::numeric::str_to_f64(&text)
         .map(|v| {
-            let (StrToF64::Fractional(non_nan) | StrToF64::Decimal(non_nan)) =  v;
+            let (StrToF64::Fractional(non_nan) | StrToF64::Decimal(non_nan)) = v;
             f64::from(non_nan)
         })
         .unwrap_or(0.0);

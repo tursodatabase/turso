@@ -34,7 +34,6 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
     super(connection);
     this.sql = sql;
     this.statement = connection.prepare(sql);
-    this.statement.initializeColumnMetadata();
     this.resultSet = new JDBC4ResultSet(this.statement.getResultSet());
   }
 

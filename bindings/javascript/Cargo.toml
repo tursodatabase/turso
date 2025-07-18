@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 [dependencies]
 turso_core = { workspace = true }
 napi = { version = "2.16.17", default-features = false, features = ["napi4"] }
-napi-derive = { version = "2.16.13", default-features = false }
+napi-derive = { version = "2.16.13", default-features = true }
 
 [build-dependencies]
 napi-build = "2.2.0"

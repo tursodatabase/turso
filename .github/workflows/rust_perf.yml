@@ -88,7 +88,7 @@ jobs:
           nyrkio-public: true
 
       - name: Analyze SQLITE3 result with Nyrkiö
-        uses: nyrkio/github-action-benchmark@HEAD
+        uses: nyrkio/change-detection@HEAD
         with:
           name: clickbench/sqlite3
           tool: time

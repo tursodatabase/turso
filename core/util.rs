@@ -3,9 +3,10 @@ use crate::{
     schema::{self, Column, Schema, Type},
     translate::{collate::CollationSeq, expr::walk_expr, plan::JoinOrderMember},
     types::{Value, ValueType},
-    LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable, IO,
+    LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable,
 };
 use std::{rc::Rc, sync::Arc};
+use tracing::{instrument, Level};
 use turso_sqlite3_parser::ast::{
     self, CreateTableBody, Expr, FunctionTail, Literal, UnaryOperator,
 };
@@ -42,16 +43,16 @@ pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 /// Unparsed index that comes from a sql query, i.e not an automatic index
 ///
 /// CREATE INDEX idx ON table_name(sql)
-struct UnparsedFromSqlIndex {
-    table_name: String,
-    root_page: usize,
-    sql: String,
+pub struct UnparsedFromSqlIndex {
+    pub table_name: String,
+    pub root_page: usize,
+    pub sql: String,
 }
 
+#[instrument(skip_all, level = Level::INFO)]
 pub fn parse_schema_rows(
     rows: Option<Statement>,
     schema: &mut Schema,
-    io: Arc<dyn IO>,
     syms: &SymbolTable,
     mv_tx_id: Option<u64>,
 ) -> Result<()> {
@@ -130,7 +131,7 @@ pub fn parse_schema_rows(
                 StepResult::IO => {
                     // TODO: How do we ensure that the I/O we submitted to
                     // read the schema is actually complete?
-                    io.run_once()?;
+                    rows.run_once()?;
                 }
                 StepResult::Interrupt => break,
                 StepResult::Done => break,
@@ -189,7 +190,7 @@ pub fn check_ident_equivalency(ident1: &str, ident2: &str) -> bool {
     strip_quotes(ident1).eq_ignore_ascii_case(strip_quotes(ident2))
 }
 
-fn module_name_from_sql(sql: &str) -> Result<&str> {
+pub fn module_name_from_sql(sql: &str) -> Result<&str> {
     if let Some(start) = sql.find("USING") {
         let start = start + 6;
         // stop at the first space, semicolon, or parenthesis
@@ -207,7 +208,7 @@ fn module_name_from_sql(sql: &str) -> Result<&str> {
 
 // CREATE VIRTUAL TABLE table_name USING module_name(arg1, arg2, ...);
 // CREATE VIRTUAL TABLE table_name USING module_name;
-fn module_args_from_sql(sql: &str) -> Result<Vec<turso_ext::Value>> {
+pub fn module_args_from_sql(sql: &str) -> Result<Vec<turso_ext::Value>> {
     if !sql.contains('(') {
         return Ok(vec![]);
     }
@@ -491,91 +492,90 @@ pub fn columns_from_create_table_body(body: &ast::CreateTableBody) -> crate::Res
 
     Ok(columns
         .into_iter()
-        .filter_map(|(name, column_def)| {
-            // if column_def.col_type includes HIDDEN, omit it for now
-            if let Some(data_type) = column_def.col_type.as_ref() {
-                if data_type.name.as_str().contains("HIDDEN") {
-                    return None;
-                }
-            }
-            let column =
-                Column {
-                    name: Some(normalize_ident(&name.0)),
-                    ty: match column_def.col_type {
-                        Some(ref data_type) => {
-                            // https://www.sqlite.org/datatype3.html
-                            let type_name = data_type.name.as_str().to_uppercase();
-                            if type_name.contains("INT") {
-                                Type::Integer
-                            } else if type_name.contains("CHAR")
-                                || type_name.contains("CLOB")
-                                || type_name.contains("TEXT")
-                            {
-                                Type::Text
-                            } else if type_name.contains("BLOB") || type_name.is_empty() {
-                                Type::Blob
-                            } else if type_name.contains("REAL")
-                                || type_name.contains("FLOA")
-                                || type_name.contains("DOUB")
-                            {
-                                Type::Real
-                            } else {
-                                Type::Numeric
-                            }
+        .map(|(name, column_def)| {
+            Column {
+                name: Some(normalize_ident(&name.0)),
+                ty: match column_def.col_type {
+                    Some(ref data_type) => {
+                        // https://www.sqlite.org/datatype3.html
+                        let type_name = data_type.name.as_str().to_uppercase();
+                        if type_name.contains("INT") {
+                            Type::Integer
+                        } else if type_name.contains("CHAR")
+                            || type_name.contains("CLOB")
+                            || type_name.contains("TEXT")
+                        {
+                            Type::Text
+                        } else if type_name.contains("BLOB") || type_name.is_empty() {
+                            Type::Blob
+                        } else if type_name.contains("REAL")
+                            || type_name.contains("FLOA")
+                            || type_name.contains("DOUB")
+                        {
+                            Type::Real
+                        } else {
+                            Type::Numeric
                         }
-                        None => Type::Null,
-                    },
-                    default: column_def
-                        .constraints
-                        .iter()
-                        .find_map(|c| match &c.constraint {
-                            turso_sqlite3_parser::ast::ColumnConstraint::Default(val) => {
-                                Some(val.clone())
-                            }
-                            _ => None,
-                        }),
-                    notnull: column_def.constraints.iter().any(|c| {
-                        matches!(
-                            c.constraint,
-                            turso_sqlite3_parser::ast::ColumnConstraint::NotNull { .. }
-                        )
+                    }
+                    None => Type::Null,
+                },
+                default: column_def
+                    .constraints
+                    .iter()
+                    .find_map(|c| match &c.constraint {
+                        turso_sqlite3_parser::ast::ColumnConstraint::Default(val) => {
+                            Some(val.clone())
+                        }
+                        _ => None,
                     }),
-                    ty_str: column_def
-                        .col_type
-                        .clone()
-                        .map(|t| t.name.to_string())
-                        .unwrap_or_default(),
-                    primary_key: column_def.constraints.iter().any(|c| {
-                        matches!(
-                            c.constraint,
-                            turso_sqlite3_parser::ast::ColumnConstraint::PrimaryKey { .. }
-                        )
+                notnull: column_def.constraints.iter().any(|c| {
+                    matches!(
+                        c.constraint,
+                        turso_sqlite3_parser::ast::ColumnConstraint::NotNull { .. }
+                    )
+                }),
+                ty_str: column_def
+                    .col_type
+                    .clone()
+                    .map(|t| t.name.to_string())
+                    .unwrap_or_default(),
+                primary_key: column_def.constraints.iter().any(|c| {
+                    matches!(
+                        c.constraint,
+                        turso_sqlite3_parser::ast::ColumnConstraint::PrimaryKey { .. }
+                    )
+                }),
+                is_rowid_alias: false,
+                unique: column_def.constraints.iter().any(|c| {
+                    matches!(
+                        c.constraint,
+                        turso_sqlite3_parser::ast::ColumnConstraint::Unique(..)
+                    )
+                }),
+                collation: column_def
+                    .constraints
+                    .iter()
+                    .find_map(|c| match &c.constraint {
+                        // TODO: see if this should be the correct behavior
+                        // currently there cannot be any user defined collation sequences.
+                        // But in the future, when a user defines a collation sequence, creates a table with it,
+                        // then closes the db and opens it again. This may panic here if the collation seq is not registered
+                        // before reading the columns
+                        turso_sqlite3_parser::ast::ColumnConstraint::Collate { collation_name } => {
+                            Some(
+                                CollationSeq::new(collation_name.0.as_str()).expect(
+                                    "collation should have been set correctly in create table",
+                                ),
+                            )
+                        }
+                        _ => None,
                     }),
-                    is_rowid_alias: false,
-                    unique: column_def.constraints.iter().any(|c| {
-                        matches!(
-                            c.constraint,
-                            turso_sqlite3_parser::ast::ColumnConstraint::Unique(..)
-                        )
-                    }),
-                    collation: column_def
-                        .constraints
-                        .iter()
-                        .find_map(|c| match &c.constraint {
-                            // TODO: see if this should be the correct behavior
-                            // currently there cannot be any user defined collation sequences.
-                            // But in the future, when a user defines a collation sequence, creates a table with it,
-                            // then closes the db and opens it again. This may panic here if the collation seq is not registered
-                            // before reading the columns
-                            turso_sqlite3_parser::ast::ColumnConstraint::Collate {
-                                collation_name,
-                            } => Some(CollationSeq::new(collation_name.0.as_str()).expect(
-                                "collation should have been set correctly in create table",
-                            )),
-                            _ => None,
-                        }),
-                };
-            Some(column)
+                hidden: column_def
+                    .col_type
+                    .as_ref()
+                    .map(|data_type| data_type.name.as_str().contains("HIDDEN"))
+                    .unwrap_or(false),
+            }
         })
         .collect::<Vec<_>>())
 }
@@ -667,8 +667,7 @@ impl OpenMode {
             "memory" => Ok(OpenMode::Memory),
             "rwc" => Ok(OpenMode::ReadWriteCreate),
             _ => Err(LimboError::InvalidArgument(format!(
-                "Invalid mode: '{}'. Expected one of 'ro', 'rw', 'memory', 'rwc'",
-                s
+                "Invalid mode: '{s}'. Expected one of 'ro', 'rw', 'memory', 'rwc'"
             ))),
         }
     }
@@ -729,8 +728,7 @@ impl<'a> OpenOptions<'a> {
             // sqlite allows only `localhost` or empty authority.
             if !(authority.is_empty() || authority == "localhost") {
                 return Err(LimboError::InvalidArgument(format!(
-                    "Invalid authority '{}'. Only '' or 'localhost' allowed.",
-                    authority
+                    "Invalid authority '{authority}'. Only '' or 'localhost' allowed."
                 )));
             }
             opts.authority = if authority.is_empty() {
@@ -1044,39 +1042,44 @@ pub fn parse_signed_number(expr: &Expr) -> Result<Value> {
     }
 }
 
-// for TVF's we need these at planning time so we cannot emit translate_expr
-pub fn vtable_args(args: &[ast::Expr]) -> Vec<turso_ext::Value> {
-    let mut vtable_args = Vec::new();
-    for arg in args {
-        match arg {
-            Expr::Literal(lit) => match lit {
-                Literal::Numeric(i) => {
-                    if i.contains('.') {
-                        vtable_args.push(turso_ext::Value::from_float(i.parse().unwrap()));
-                    } else {
-                        vtable_args.push(turso_ext::Value::from_integer(i.parse().unwrap()));
-                    }
-                }
-                Literal::String(s) => {
-                    vtable_args.push(turso_ext::Value::from_text(s.clone()));
-                }
-                Literal::Blob(b) => {
-                    vtable_args.push(turso_ext::Value::from_blob(b.as_bytes().into()));
-                }
-                _ => {
-                    vtable_args.push(turso_ext::Value::null());
-                }
-            },
-            _ => vtable_args.push(turso_ext::Value::null()),
+pub fn parse_string(expr: &Expr) -> Result<String> {
+    match expr {
+        Expr::Name(ast::Name(s)) if s.len() >= 2 && s.starts_with("'") && s.ends_with("'") => {
+            Ok(s[1..s.len() - 1].to_string())
+        }
+        _ => Err(LimboError::InvalidArgument(format!(
+            "string parameter expected, got {expr:?} instead"
+        ))),
+    }
+}
+
+#[allow(unused)]
+pub fn parse_pragma_bool(expr: &Expr) -> Result<bool> {
+    const TRUE_VALUES: &[&str] = &["yes", "true", "on"];
+    const FALSE_VALUES: &[&str] = &["no", "false", "off"];
+    if let Ok(number) = parse_signed_number(expr) {
+        if let Value::Integer(x @ (0 | 1)) = number {
+            return Ok(x != 0);
+        }
+    } else if let Expr::Name(name) = expr {
+        let ident = normalize_ident(&name.0);
+        if TRUE_VALUES.contains(&ident.as_str()) {
+            return Ok(true);
+        }
+        if FALSE_VALUES.contains(&ident.as_str()) {
+            return Ok(false);
         }
     }
-    vtable_args
+    Err(LimboError::InvalidArgument(
+        "boolean pragma value must be either 0|1 integer or yes|true|on|no|false|off token"
+            .to_string(),
+    ))
 }
 
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use turso_sqlite3_parser::ast::{self, Expr, Id, Literal, Operator::*, Type};
+    use turso_sqlite3_parser::ast::{self, Expr, Id, Literal, Name, Operator::*, Type};
 
     #[test]
     fn test_normalize_ident() {
@@ -2030,5 +2033,22 @@ pub mod tests {
             parse_numeric_literal("-9223372036854775809").unwrap(),
             Value::Float(-9.223_372_036_854_776e18)
         );
+    }
+
+    #[test]
+    fn test_parse_pragma_bool() {
+        assert!(parse_pragma_bool(&Expr::Literal(Literal::Numeric("1".into()))).unwrap(),);
+        assert!(parse_pragma_bool(&Expr::Name(Name("true".into()))).unwrap(),);
+        assert!(parse_pragma_bool(&Expr::Name(Name("on".into()))).unwrap(),);
+        assert!(parse_pragma_bool(&Expr::Name(Name("yes".into()))).unwrap(),);
+
+        assert!(!parse_pragma_bool(&Expr::Literal(Literal::Numeric("0".into()))).unwrap(),);
+        assert!(!parse_pragma_bool(&Expr::Name(Name("false".into()))).unwrap(),);
+        assert!(!parse_pragma_bool(&Expr::Name(Name("off".into()))).unwrap(),);
+        assert!(!parse_pragma_bool(&Expr::Name(Name("no".into()))).unwrap(),);
+
+        assert!(parse_pragma_bool(&Expr::Name(Name("nono".into()))).is_err());
+        assert!(parse_pragma_bool(&Expr::Name(Name("10".into()))).is_err());
+        assert!(parse_pragma_bool(&Expr::Name(Name("-1".into()))).is_err());
     }
 }

@@ -3,10 +3,8 @@ use rusqlite::params;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
-use turso_core::{Connection, Database, PagerCacheflushStatus, IO};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use turso_core::{types::IOResult, Connection, Database, IO};
 
 #[allow(dead_code)]
 pub struct TempDatabase {
@@ -115,10 +113,10 @@ impl TempDatabase {
 pub(crate) fn do_flush(conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
     loop {
         match conn.cacheflush()? {
-            PagerCacheflushStatus::Done(_) => {
+            IOResult::Done(_) => {
                 break;
             }
-            PagerCacheflushStatus::IO => {
+            IOResult::IO => {
                 tmp_db.io.run_once()?;
             }
         }
@@ -172,7 +170,7 @@ pub(crate) fn sqlite_exec_rows(
             let column: rusqlite::types::Value = match row.get(i) {
                 Ok(column) => column,
                 Err(rusqlite::Error::InvalidColumnIndex(_)) => break,
-                Err(err) => panic!("unexpected rusqlite error: {}", err),
+                Err(err) => panic!("unexpected rusqlite error: {err}"),
             };
             result.push(column);
         }
@@ -183,7 +181,7 @@ pub(crate) fn sqlite_exec_rows(
 }
 
 pub(crate) fn limbo_exec_rows(
-    db: &TempDatabase,
+    _db: &TempDatabase,
     conn: &Arc<turso_core::Connection>,
     query: &str,
 ) -> Vec<Vec<rusqlite::types::Value>> {
@@ -198,11 +196,12 @@ pub(crate) fn limbo_exec_rows(
                     break row;
                 }
                 turso_core::StepResult::IO => {
-                    db.io.run_once().unwrap();
+                    stmt.run_once().unwrap();
                     continue;
                 }
+
                 turso_core::StepResult::Done => break 'outer,
-                r => panic!("unexpected result {:?}: expecting single row", r),
+                r => panic!("unexpected result {r:?}: expecting single row"),
             }
         };
         let row = row
@@ -221,7 +220,7 @@ pub(crate) fn limbo_exec_rows(
 }
 
 pub(crate) fn limbo_exec_rows_error(
-    db: &TempDatabase,
+    _db: &TempDatabase,
     conn: &Arc<turso_core::Connection>,
     query: &str,
 ) -> turso_core::Result<()> {
@@ -230,11 +229,11 @@ pub(crate) fn limbo_exec_rows_error(
         let result = stmt.step()?;
         match result {
             turso_core::StepResult::IO => {
-                db.io.run_once()?;
+                stmt.run_once()?;
                 continue;
             }
             turso_core::StepResult::Done => return Ok(()),
-            r => panic!("unexpected result {:?}: expecting single row", r),
+            r => panic!("unexpected result {r:?}: expecting single row"),
         }
     }
 }
@@ -297,7 +296,7 @@ mod tests {
             );
             let conn = db.connect_limbo();
             let ret = limbo_exec_rows(&db, &conn, "CREATE table t(a)");
-            assert!(ret.is_empty(), "{:?}", ret);
+            assert!(ret.is_empty(), "{ret:?}");
             limbo_exec_rows(&db, &conn, "INSERT INTO t values (1)");
             conn.close().unwrap()
         }
@@ -313,7 +312,7 @@ mod tests {
             assert_eq!(ret, vec![vec![Value::Integer(1)]]);
 
             let err = limbo_exec_rows_error(&db, &conn, "INSERT INTO t values (1)").unwrap_err();
-            assert!(matches!(err, turso_core::LimboError::ReadOnly), "{:?}", err);
+            assert!(matches!(err, turso_core::LimboError::ReadOnly), "{err:?}");
         }
         Ok(())
     }
@@ -338,8 +337,8 @@ mod tests {
             }
             i += 1;
             expected.push(val);
-            let ret = limbo_exec_rows(&db, &conn, &format!("INSERT INTO t VALUES ({})", val));
-            assert!(ret.is_empty(), "Insert failed for value {}: {:?}", val, ret);
+            let ret = limbo_exec_rows(&db, &conn, &format!("INSERT INTO t VALUES ({val})"));
+            assert!(ret.is_empty(), "Insert failed for value {val}: {ret:?}");
         }
 
         // Sort expected values to match index order
@@ -370,9 +369,9 @@ mod tests {
 
         // Insert 11 unique 1MB blobs
         for i in 0..11 {
-            println!("Inserting blob #{}", i);
+            println!("Inserting blob #{i}");
             let ret = limbo_exec_rows(&db, &conn, "INSERT INTO t VALUES (randomblob(1024*1024))");
-            assert!(ret.is_empty(), "Insert #{} failed: {:?}", i, ret);
+            assert!(ret.is_empty(), "Insert #{i} failed: {ret:?}");
         }
 
         // Verify we have 11 rows
@@ -380,8 +379,7 @@ mod tests {
         assert_eq!(
             ret,
             vec![vec![Value::Integer(11)]],
-            "Expected 11 rows but got {:?}",
-            ret
+            "Expected 11 rows but got {ret:?}",
         );
 
         Ok(())

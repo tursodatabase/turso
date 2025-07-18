@@ -412,14 +412,14 @@ impl Conn {
         };
         let arg_count = args.len() as i32;
         let args = args.as_ptr();
-        let last_insert_rowid = 0;
+        let mut last_insert_rowid: i64 = 0;
         if let ResultCode::OK = unsafe {
             (self._execute)(
                 self as *const _ as *mut Conn,
                 sql.as_ptr(),
                 args as *mut Value,
                 arg_count,
-                &last_insert_rowid as *const _ as *mut i64,
+                &mut last_insert_rowid as *mut i64,
             )
         } {
             return Ok(Some(last_insert_rowid as usize));

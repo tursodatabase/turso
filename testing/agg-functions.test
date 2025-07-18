@@ -55,6 +55,19 @@ do_execsql_test select-min {
   SELECT min(age) FROM users;
 } {1}
 
+do_execsql_test_on_specific_db {:memory:} min-null-regression-test {
+  CREATE TABLE t(a);
+  INSERT INTO t VALUES ('abc'), (NULL);
+  SELECT min(a) FROM t;
+} {abc}
+
+do_execsql_test_on_specific_db {:memory:} max-null-regression-test {
+  CREATE TABLE t(a);
+  INSERT INTO t VALUES ('abc'), (NULL);
+  SELECT max(a) FROM t;
+} {abc}
+
+
 do_execsql_test select-max-text {
   SELECT max(first_name) FROM users;
 } {Zoe}

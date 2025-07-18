@@ -22,7 +22,7 @@ use super::select::emit_simple_count;
 use super::subquery::emit_subqueries;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::function::Func;
-use crate::schema::Schema;
+use crate::schema::{Schema, Table};
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::plan::{DeletePlan, Plan, QueryDestination, Search};
 use crate::translate::values::emit_values;
@@ -31,7 +31,7 @@ use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
 use crate::vdbe::CursorID;
 use crate::vdbe::{insn::Insn, BranchOffset};
-use crate::{Result, SymbolTable};
+use crate::{bail_parse_error, Result, SymbolTable};
 
 pub struct Resolver<'a> {
     pub schema: &'a Schema,
@@ -149,6 +149,8 @@ pub struct TranslateCtx<'a> {
     /// - First: all `GROUP BY` expressions, in the order they appear in the `GROUP BY` clause.
     /// - Then: remaining non-aggregate expressions that are not part of `GROUP BY`.
     pub non_aggregate_expressions: Vec<(&'a Expr, bool)>,
+    /// Cursor id for cdc table (if capture_data_changes PRAGMA is set and query can modify the data)
+    pub cdc_cursor_id: Option<usize>,
 }
 
 impl<'a> TranslateCtx<'a> {
@@ -175,6 +177,7 @@ impl<'a> TranslateCtx<'a> {
             result_columns_to_skip_in_orderby_sorter: None,
             resolver: Resolver::new(schema, syms),
             non_aggregate_expressions: Vec::new(),
+            cdc_cursor_id: None,
         }
     }
 }
@@ -198,7 +201,7 @@ pub enum TransactionMode {
 
 /// Main entry point for emitting bytecode for a SQL query
 /// Takes a query plan and generates the corresponding bytecode program
-#[instrument(skip_all, level = Level::TRACE)]
+#[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program(
     program: &mut ProgramBuilder,
     plan: Plan,
@@ -216,7 +219,7 @@ pub fn emit_program(
     }
 }
 
-#[instrument(skip_all, level = Level::TRACE)]
+#[instrument(skip_all, level = Level::DEBUG)]
 fn emit_program_for_select(
     program: &mut ProgramBuilder,
     mut plan: SelectPlan,
@@ -255,7 +258,7 @@ fn emit_program_for_select(
     Ok(())
 }
 
-#[instrument(skip_all, level = Level::TRACE)]
+#[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_query<'a>(
     program: &mut ProgramBuilder,
     plan: &'a mut SelectPlan,
@@ -395,7 +398,7 @@ pub fn emit_query<'a>(
     Ok(t_ctx.reg_result_cols_start.unwrap())
 }
 
-#[instrument(skip_all, level = Level::TRACE)]
+#[instrument(skip_all, level = Level::DEBUG)]
 fn emit_program_for_delete(
     program: &mut ProgramBuilder,
     plan: DeletePlan,
@@ -562,8 +565,39 @@ fn emit_delete_insns(
                     start_reg,
                     num_regs,
                     cursor_id: index_cursor_id,
+                    raise_error_if_no_matching_entry: true,
                 });
             }
+        }
+
+        // Emit update in the CDC table if necessary (before DELETE updated the table)
+        if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
+            let rowid_reg = program.alloc_register();
+            program.emit_insn(Insn::RowId {
+                cursor_id: main_table_cursor_id,
+                dest: rowid_reg,
+            });
+            let cdc_has_before = program.capture_data_changes_mode().has_before();
+            let before_record_reg = if cdc_has_before {
+                Some(emit_cdc_full_record(
+                    program,
+                    &table_reference.table,
+                    main_table_cursor_id,
+                    rowid_reg,
+                ))
+            } else {
+                None
+            };
+            emit_cdc_insns(
+                program,
+                &t_ctx.resolver,
+                OperationMode::DELETE,
+                cdc_cursor_id,
+                rowid_reg,
+                before_record_reg,
+                None,
+                table_reference.table.get_name(),
+            )?;
         }
 
         program.emit_insn(Insn::Delete {
@@ -580,7 +614,7 @@ fn emit_delete_insns(
     Ok(())
 }
 
-#[instrument(skip_all, level = Level::TRACE)]
+#[instrument(skip_all, level = Level::DEBUG)]
 fn emit_program_for_update(
     program: &mut ProgramBuilder,
     mut plan: UpdatePlan,
@@ -699,7 +733,7 @@ fn emit_program_for_update(
     Ok(())
 }
 
-#[instrument(skip_all, level = Level::TRACE)]
+#[instrument(skip_all, level = Level::DEBUG)]
 fn emit_update_insns(
     plan: &UpdatePlan,
     t_ctx: &TranslateCtx,
@@ -790,7 +824,7 @@ fn emit_update_insns(
         program.emit_insn(Insn::Copy {
             src_reg: beg,
             dst_reg: beg + 1,
-            amount: 0,
+            extra_amount: 0,
         })
     }
 
@@ -907,14 +941,14 @@ fn emit_update_insns(
             program.emit_insn(Insn::Copy {
                 src_reg: idx_cols_start_reg + col.pos_in_table,
                 dst_reg: idx_start_reg + i,
-                amount: 0,
+                extra_amount: 0,
             });
         }
         // last register is the rowid
         program.emit_insn(Insn::Copy {
             src_reg: rowid_reg,
             dst_reg: idx_start_reg + num_cols,
-            amount: 0,
+            extra_amount: 0,
         });
 
         // this record will be inserted into the index later
@@ -1064,6 +1098,7 @@ fn emit_update_insns(
                 start_reg,
                 num_regs,
                 cursor_id: idx_cursor_id,
+                raise_error_if_no_matching_entry: true,
             });
 
             // Insert new index key (filled further above with values from set_clauses)
@@ -1075,6 +1110,37 @@ fn emit_update_insns(
                 flags: IdxInsertFlags::new(),
             });
         }
+
+        // create alias for CDC rowid after the change (will differ from cdc_rowid_before_reg only in case of UPDATE with change in rowid alias)
+        let cdc_rowid_after_reg = rowid_set_clause_reg.unwrap_or(beg);
+
+        // create separate register with rowid before UPDATE for CDC
+        let cdc_rowid_before_reg = if t_ctx.cdc_cursor_id.is_some() {
+            let cdc_rowid_before_reg = program.alloc_register();
+            if has_user_provided_rowid {
+                program.emit_insn(Insn::RowId {
+                    cursor_id,
+                    dest: cdc_rowid_before_reg,
+                });
+                Some(cdc_rowid_before_reg)
+            } else {
+                Some(cdc_rowid_after_reg)
+            }
+        } else {
+            None
+        };
+
+        // create full CDC record before update if necessary
+        let cdc_before_reg = if program.capture_data_changes_mode().has_before() {
+            Some(emit_cdc_full_record(
+                program,
+                &table_ref.table,
+                cursor_id,
+                cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set"),
+            ))
+        } else {
+            None
+        };
 
         // If we are updating the rowid, we cannot rely on overwrite on the
         // Insert instruction to update the cell. We need to first delete the current cell
@@ -1090,6 +1156,58 @@ fn emit_update_insns(
             flag: InsertFlags::new().update(true),
             table_name: table_ref.identifier.clone(),
         });
+
+        // create full CDC record after update if necessary
+        let cdc_after_reg = if program.capture_data_changes_mode().has_after() {
+            Some(emit_cdc_patch_record(
+                program,
+                &table_ref.table,
+                start,
+                record_reg,
+                cdc_rowid_after_reg,
+            ))
+        } else {
+            None
+        };
+
+        // emit actual CDC instructions for write to the CDC table
+        if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
+            let cdc_rowid_before_reg =
+                cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set");
+            if has_user_provided_rowid {
+                emit_cdc_insns(
+                    program,
+                    &t_ctx.resolver,
+                    OperationMode::DELETE,
+                    cdc_cursor_id,
+                    cdc_rowid_before_reg,
+                    cdc_before_reg,
+                    None,
+                    table_ref.table.get_name(),
+                )?;
+                emit_cdc_insns(
+                    program,
+                    &t_ctx.resolver,
+                    OperationMode::INSERT,
+                    cdc_cursor_id,
+                    cdc_rowid_after_reg,
+                    cdc_after_reg,
+                    None,
+                    table_ref.table.get_name(),
+                )?;
+            } else {
+                emit_cdc_insns(
+                    program,
+                    &t_ctx.resolver,
+                    OperationMode::UPDATE,
+                    cdc_cursor_id,
+                    cdc_rowid_before_reg,
+                    cdc_before_reg,
+                    cdc_after_reg,
+                    table_ref.table.get_name(),
+                )?;
+            }
+        }
     } else if table_ref.virtual_table().is_some() {
         let arg_count = table_ref.columns().len() + 2;
         program.emit_insn(Insn::VUpdate {
@@ -1112,6 +1230,160 @@ fn emit_update_insns(
         program.preassign_label_to_next_insn(label);
     }
 
+    Ok(())
+}
+
+pub fn emit_cdc_patch_record(
+    program: &mut ProgramBuilder,
+    table: &Table,
+    columns_reg: usize,
+    record_reg: usize,
+    rowid_reg: usize,
+) -> usize {
+    let columns = table.columns();
+    let rowid_alias_position = columns.iter().position(|x| x.is_rowid_alias);
+    if let Some(rowid_alias_position) = rowid_alias_position {
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::Copy {
+            src_reg: rowid_reg,
+            dst_reg: columns_reg + rowid_alias_position,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: columns_reg,
+            count: table.columns().len(),
+            dest_reg: record_reg,
+            index_name: None,
+        });
+        record_reg
+    } else {
+        record_reg
+    }
+}
+
+pub fn emit_cdc_full_record(
+    program: &mut ProgramBuilder,
+    table: &Table,
+    table_cursor_id: usize,
+    rowid_reg: usize,
+) -> usize {
+    let columns = table.columns();
+    let columns_reg = program.alloc_registers(columns.len() + 1);
+    for (i, column) in columns.iter().enumerate() {
+        if column.is_rowid_alias {
+            program.emit_insn(Insn::Copy {
+                src_reg: rowid_reg,
+                dst_reg: columns_reg + 1 + i,
+                extra_amount: 0,
+            });
+        } else {
+            program.emit_column(table_cursor_id, i, columns_reg + 1 + i);
+        }
+    }
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: columns_reg + 1,
+        count: columns.len(),
+        dest_reg: columns_reg,
+        index_name: None,
+    });
+    columns_reg
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn emit_cdc_insns(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    operation_mode: OperationMode,
+    cdc_cursor_id: usize,
+    rowid_reg: usize,
+    before_record_reg: Option<usize>,
+    after_record_reg: Option<usize>,
+    table_name: &str,
+) -> Result<()> {
+    // (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB)
+    let turso_cdc_registers = program.alloc_registers(7);
+    program.emit_insn(Insn::Null {
+        dest: turso_cdc_registers,
+        dest_end: None,
+    });
+    program.mark_last_insn_constant();
+
+    let Some(unixepoch_fn) = resolver.resolve_function("unixepoch", 0) else {
+        bail_parse_error!("no function {}", "unixepoch");
+    };
+    let unixepoch_fn_ctx = crate::function::FuncCtx {
+        func: unixepoch_fn,
+        arg_count: 0,
+    };
+
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: 0,
+        dest: turso_cdc_registers + 1,
+        func: unixepoch_fn_ctx,
+    });
+
+    let change_type = match operation_mode {
+        OperationMode::INSERT => 1,
+        OperationMode::UPDATE | OperationMode::SELECT => 0,
+        OperationMode::DELETE => -1,
+    };
+    program.emit_int(change_type, turso_cdc_registers + 2);
+    program.mark_last_insn_constant();
+
+    program.emit_string8(table_name.to_string(), turso_cdc_registers + 3);
+    program.mark_last_insn_constant();
+
+    program.emit_insn(Insn::Copy {
+        src_reg: rowid_reg,
+        dst_reg: turso_cdc_registers + 4,
+        extra_amount: 0,
+    });
+
+    if let Some(before_record_reg) = before_record_reg {
+        program.emit_insn(Insn::Copy {
+            src_reg: before_record_reg,
+            dst_reg: turso_cdc_registers + 5,
+            extra_amount: 0,
+        });
+    } else {
+        program.emit_null(turso_cdc_registers + 5, None);
+        program.mark_last_insn_constant();
+    }
+
+    if let Some(after_record_reg) = after_record_reg {
+        program.emit_insn(Insn::Copy {
+            src_reg: after_record_reg,
+            dst_reg: turso_cdc_registers + 6,
+            extra_amount: 0,
+        });
+    } else {
+        program.emit_null(turso_cdc_registers + 6, None);
+        program.mark_last_insn_constant();
+    }
+
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: cdc_cursor_id,
+        rowid_reg,
+        prev_largest_reg: 0, // todo(sivukhin): properly set value here from sqlite_sequence table when AUTOINCREMENT will be properly implemented in Turso
+    });
+
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: turso_cdc_registers,
+        count: 7,
+        dest_reg: record_reg,
+        index_name: None,
+    });
+
+    program.emit_insn(Insn::Insert {
+        cursor: cdc_cursor_id,
+        key_reg: rowid_reg,
+        record_reg,
+        flag: InsertFlags::new(),
+        table_name: "".to_string(),
+    });
     Ok(())
 }
 

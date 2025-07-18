@@ -117,7 +117,7 @@ pub fn translate_create_index(
         cursor_id: sorter_cursor_id,
         columns: columns.len(),
         order,
-        collations: tbl.column_collations(),
+        collations: idx.columns.iter().map(|c| c.collation).collect(),
     });
     let content_reg = program.alloc_register();
     program.emit_insn(Insn::OpenPseudo {
@@ -226,7 +226,7 @@ pub fn translate_create_index(
         p5: 0,
     });
     // Parse the schema table to get the index root page and add new index to Schema
-    let parse_schema_where_clause = format!("name = '{}' AND type = 'index'", idx_name);
+    let parse_schema_where_clause = format!("name = '{idx_name}' AND type = 'index'");
     program.emit_insn(Insn::ParseSchema {
         db: sqlite_schema_cursor_id,
         where_clause: Some(parse_schema_where_clause),

@@ -228,6 +228,30 @@ def test_import_csv_skip():
     shell.quit()
 
 
+def test_import_csv_create_table_from_header():
+    shell = TestTursoShell()
+    shell.run_test("open-memory", ".open :memory:", "")
+    # Import CSV with header - should create table automatically
+    shell.run_test(
+        "import-csv-create-table",
+        ".import --csv ./testing/test_files/test_w_header.csv auto_table",
+        "",
+    )
+    # Verify table was created with correct column names
+    shell.run_test(
+        "verify-auto-table-schema",
+        ".schema auto_table",
+        "CREATE TABLE auto_table (id, interesting_number, interesting_string);",
+    )
+    # Verify data was imported correctly (header row excluded)
+    shell.run_test(
+        "verify-auto-table-data",
+        "select * from auto_table;",
+        "1|2.0|String'1\n3|4.0|String2",
+    )
+    shell.quit()
+
+
 def test_table_patterns():
     shell = TestTursoShell()
     shell.run_test("tables-pattern", ".tables us%", "users")
@@ -275,7 +299,7 @@ def test_insert_default_values():
 
 
 def test_uri_readonly():
-    turso = TestTursoShell(flags="-q file:testing/testing_small.db?mode=ro", init_commands="")
+    turso = TestTursoShell(flags="file:testing/testing_small.db?mode=ro", init_commands="")
     turso.run_test("read-only-uri-reads-work", "SELECT COUNT(*) FROM demo;", "5")
     turso.run_test_fn(
         "INSERT INTO demo (id, value) values (6, 'demo');",
@@ -304,6 +328,7 @@ def main():
     test_import_csv()
     test_import_csv_verbose()
     test_import_csv_skip()
+    test_import_csv_create_table_from_header()
     test_table_patterns()
     test_update_with_limit()
     test_update_with_limit_and_offset()

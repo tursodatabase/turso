@@ -44,17 +44,24 @@ pub struct SimulatorCLI {
     pub watch: bool,
     #[clap(long, help = "run differential testing between sqlite and Limbo")]
     pub differential: bool,
+    #[clap(
+        long,
+        help = "enable brute force shrink (warning: it might take a long time)"
+    )]
+    pub enable_brute_force_shrinking: bool,
     #[clap(subcommand)]
     pub subcommand: Option<SimulatorCommand>,
     #[clap(long, help = "disable BugBase", default_value_t = false)]
     pub disable_bugbase: bool,
+    #[clap(long, help = "disable heuristic shrinking", default_value_t = false)]
+    pub disable_heuristic_shrinking: bool,
     #[clap(long, help = "disable UPDATE Statement", default_value_t = false)]
     pub disable_update: bool,
     #[clap(long, help = "disable DELETE Statement", default_value_t = false)]
     pub disable_delete: bool,
     #[clap(long, help = "disable CREATE Statement", default_value_t = false)]
     pub disable_create: bool,
-    #[clap(long, help = "disable CREATE INDEX Statement", default_value_t = false)]
+    #[clap(long, help = "disable CREATE INDEX Statement", default_value_t = true)]
     pub disable_create_index: bool,
     #[clap(long, help = "disable DROP Statement", default_value_t = false)]
     pub disable_drop: bool,
@@ -82,18 +89,42 @@ pub struct SimulatorCLI {
         default_value_t = false
     )]
     pub disable_select_optimizer: bool,
+    #[clap(
+        long,
+        help = "disable Where-True-False-Null Property",
+        default_value_t = false
+    )]
+    pub disable_where_true_false_null: bool,
+    #[clap(
+        long,
+        help = "disable UNION ALL preserves cardinality Property",
+        default_value_t = false
+    )]
+    pub disable_union_all_preserves_cardinality: bool,
     #[clap(long, help = "disable FsyncNoWait Property", default_value_t = true)]
     pub disable_fsync_no_wait: bool,
-    #[clap(long, help = "disable FaultyQuery Property", default_value_t = true)]
-    pub disable_faulty_query: bool,
+    #[clap(long, help = "enable FaultyQuery Property", default_value_t = false)]
+    pub enable_faulty_query: bool,
     #[clap(long, help = "disable Reopen-Database fault", default_value_t = false)]
     pub disable_reopen_database: bool,
     #[clap(
-        long = "latency_prob",
+        long = "latency-prob",
         help = "added IO latency probability",
-        default_value_t = 0
+        default_value_t = 1
     )]
     pub latency_probability: usize,
+    #[clap(
+        long,
+        help = "Minimum tick time in microseconds for simulated time",
+        default_value_t = 1
+    )]
+    pub min_tick: u64,
+    #[clap(
+        long,
+        help = "Maximum tick time in microseconds for simulated time",
+        default_value_t = 30
+    )]
+    pub max_tick: u64,
     #[clap(long, help = "Enable experimental MVCC feature")]
     pub experimental_mvcc: bool,
     #[clap(long, help = "Enable experimental indexing feature")]
@@ -160,6 +191,10 @@ impl SimulatorCLI {
                 "latency probability must be a number between 0 and 100. Got `{}`",
                 self.latency_probability
             );
+        }
+
+        if self.doublecheck && self.differential {
+            anyhow::bail!("Cannot run doublecheck and differential testing at the same time");
         }
 
         Ok(())

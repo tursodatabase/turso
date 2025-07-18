@@ -370,7 +370,7 @@ mod tests {
                     let mut stmt = ptr::null_mut();
                     for i in 1..2000 {
                         let sql =
-                            std::ffi::CString::new(format!("INSERT INTO test (id) VALUES ({})", i))
+                            std::ffi::CString::new(format!("INSERT INTO test (id) VALUES ({i})"))
                                 .unwrap();
                         assert_eq!(
                             sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
@@ -473,7 +473,7 @@ mod tests {
                     let mut stmt = ptr::null_mut();
                     for i in 1..=2000 {
                         let sql =
-                            std::ffi::CString::new(format!("INSERT INTO test (id) VALUES ({})", i))
+                            std::ffi::CString::new(format!("INSERT INTO test (id) VALUES ({i})"))
                                 .unwrap();
                         assert_eq!(
                             sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),

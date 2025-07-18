@@ -124,3 +124,14 @@ pub struct TimerArgs {
     #[arg(value_enum)]
     pub mode: TimerMode,
 }
+
+#[derive(Debug, Clone, Args)]
+pub struct HeadersArgs {
+    pub mode: HeadersMode,
+}
+
+#[derive(ValueEnum, Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HeadersMode {
+    On,
+    Off,
+}

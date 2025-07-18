@@ -319,10 +319,8 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   }
 
   @Override
-  @SkipNullableCheck
   public Object getObject(int columnIndex) throws SQLException {
-    // TODO
-    return null;
+    return resultSet.get(columnIndex);
   }
 
   @Override
@@ -1226,20 +1224,22 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
 
   @Override
   public int getColumnDisplaySize(int column) throws SQLException {
-    // TODO
-    return 0;
+    return Integer.MAX_VALUE;
   }
 
   @Override
   public String getColumnLabel(int column) throws SQLException {
-    // TODO
-    return "";
+    // TODO: should consider "AS" keyword
+    return getColumnName(column);
   }
 
   @Override
   public String getColumnName(int column) throws SQLException {
-    // TODO
-    return "";
+    if (column > 0 && column <= resultSet.getColumnNames().length) {
+      return resultSet.getColumnNames()[column - 1];
+    }
+
+    throw new SQLException("Index out of bound: " + column);
   }
 
   @Override

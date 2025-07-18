@@ -102,7 +102,7 @@ fn emit_toplevel_values(
         program.emit_insn(Insn::Copy {
             src_reg: start_reg + i,
             dst_reg: copy_start_reg + i,
-            amount: 0,
+            extra_amount: 0,
         });
     }
 

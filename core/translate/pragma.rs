@@ -3,23 +3,26 @@
 
 use std::rc::Rc;
 use std::sync::Arc;
-use turso_sqlite3_parser::ast::PragmaName;
-use turso_sqlite3_parser::ast::{self, Expr};
+use turso_sqlite3_parser::ast::{self, ColumnDefinition, Expr};
+use turso_sqlite3_parser::ast::{PragmaName, QualifiedName};
 
+use crate::pragma::pragma_for;
 use crate::schema::Schema;
 use crate::storage::pager::AutoVacuumMode;
 use crate::storage::sqlite3_ondisk::MIN_PAGE_CACHE_SIZE;
 use crate::storage::wal::CheckpointMode;
-use crate::util::{normalize_ident, parse_signed_number};
+use crate::translate::schema::translate_create_table;
+use crate::util::{normalize_ident, parse_signed_number, parse_string};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, storage, LimboError, Value};
+use crate::{bail_parse_error, storage, CaptureDataChangesMode, LimboError, Value};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
 use super::integrity_check::translate_integrity_check;
 use crate::storage::header_accessor;
 use crate::storage::pager::Pager;
+use crate::translate::emitter::TransactionMode;
 
 fn list_pragmas(program: &mut ProgramBuilder) {
     for x in PragmaName::iter() {
@@ -27,7 +30,7 @@ fn list_pragmas(program: &mut ProgramBuilder) {
         program.emit_result_row(register, 1);
     }
     program.add_pragma_result_column("pragma_list".into());
-    program.epilogue(crate::translate::emitter::TransactionMode::None);
+    program.epilogue(TransactionMode::None);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -45,7 +48,6 @@ pub fn translate_pragma(
         approx_num_labels: 0,
     };
     program.extend(&opts);
-    let mut write = false;
 
     if name.name.0.eq_ignore_ascii_case("pragma_list") {
         list_pragmas(&mut program);
@@ -57,24 +59,16 @@ pub fn translate_pragma(
         Err(_) => bail_parse_error!("Not a valid pragma name"),
     };
 
-    match body {
-        None => {
-            query_pragma(pragma, schema, None, pager, connection, &mut program)?;
-        }
+    let (mut program, mode) = match body {
+        None => query_pragma(pragma, schema, None, pager, connection, program)?,
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
             PragmaName::TableInfo => {
-                query_pragma(pragma, schema, Some(value), pager, connection, &mut program)?;
+                query_pragma(pragma, schema, Some(value), pager, connection, program)?
             }
-            _ => {
-                write = true;
-                update_pragma(pragma, schema, value, pager, connection, &mut program)?;
-            }
+            _ => update_pragma(pragma, schema, value, pager, connection, program)?,
         },
     };
-    program.epilogue(match write {
-        false => super::emitter::TransactionMode::Read,
-        true => super::emitter::TransactionMode::Write,
-    });
+    program.epilogue(mode);
 
     Ok(program)
 }
@@ -85,8 +79,8 @@ fn update_pragma(
     value: ast::Expr,
     pager: Rc<Pager>,
     connection: Arc<crate::Connection>,
-    program: &mut ProgramBuilder,
-) -> crate::Result<()> {
+    mut program: ProgramBuilder,
+) -> crate::Result<(ProgramBuilder, TransactionMode)> {
     match pragma {
         PragmaName::CacheSize => {
             let cache_size = match parse_signed_number(&value)? {
@@ -95,42 +89,33 @@ fn update_pragma(
                 _ => bail_parse_error!("Invalid value for cache size pragma"),
             };
             update_cache_size(cache_size, pager, connection)?;
-            Ok(())
+            Ok((program, TransactionMode::None))
         }
-        PragmaName::JournalMode => {
-            query_pragma(
-                PragmaName::JournalMode,
-                schema,
-                None,
-                pager,
-                connection,
-                program,
-            )?;
-            Ok(())
-        }
-        PragmaName::LegacyFileFormat => Ok(()),
-        PragmaName::WalCheckpoint => {
-            query_pragma(
-                PragmaName::WalCheckpoint,
-                schema,
-                Some(value),
-                pager,
-                connection,
-                program,
-            )?;
-            Ok(())
-        }
-        PragmaName::PageCount => {
-            query_pragma(
-                PragmaName::PageCount,
-                schema,
-                None,
-                pager,
-                connection,
-                program,
-            )?;
-            Ok(())
-        }
+        PragmaName::JournalMode => query_pragma(
+            PragmaName::JournalMode,
+            schema,
+            None,
+            pager,
+            connection,
+            program,
+        ),
+        PragmaName::LegacyFileFormat => Ok((program, TransactionMode::None)),
+        PragmaName::WalCheckpoint => query_pragma(
+            PragmaName::WalCheckpoint,
+            schema,
+            Some(value),
+            pager,
+            connection,
+            program,
+        ),
+        PragmaName::PageCount => query_pragma(
+            PragmaName::PageCount,
+            schema,
+            None,
+            pager,
+            connection,
+            program,
+        ),
         PragmaName::UserVersion => {
             let data = parse_signed_number(&value)?;
             let version_value = match data {
@@ -145,7 +130,7 @@ fn update_pragma(
                 value: version_value,
                 p5: 1,
             });
-            Ok(())
+            Ok((program, TransactionMode::Write))
         }
         PragmaName::SchemaVersion => {
             // TODO: Implement updating schema_version
@@ -158,7 +143,13 @@ fn update_pragma(
             unreachable!();
         }
         PragmaName::PageSize => {
-            bail_parse_error!("Updating database page size is not supported.");
+            let page_size = match parse_signed_number(&value)? {
+                Value::Integer(size) => size,
+                Value::Float(size) => size as i64,
+                _ => bail_parse_error!("Invalid value for page size pragma"),
+            };
+            update_page_size(connection, page_size as u32)?;
+            Ok((program, TransactionMode::None))
         }
         PragmaName::AutoVacuum => {
             let auto_vacuum_mode = match value {
@@ -214,9 +205,33 @@ fn update_pragma(
                 value: auto_vacuum_mode - 1,
                 p5: 0,
             });
-            Ok(())
+            Ok((program, TransactionMode::None))
         }
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
+        PragmaName::UnstableCaptureDataChangesConn => {
+            let value = parse_string(&value)?;
+            // todo(sivukhin): ideally, we should consistently update capture_data_changes connection flag only after successfull execution of schema change statement
+            // but for now, let's keep it as is...
+            let opts = CaptureDataChangesMode::parse(&value)?;
+            if let Some(table) = &opts.table() {
+                // make sure that we have table created
+                program = translate_create_table(
+                    QualifiedName::single(ast::Name(table.to_string())),
+                    false,
+                    ast::CreateTableBody::columns_and_constraints_from_definition(
+                        turso_cdc_table_columns(),
+                        None,
+                        ast::TableOptions::NONE,
+                    )
+                    .unwrap(),
+                    true,
+                    schema,
+                    program,
+                )?;
+            }
+            connection.set_capture_data_changes(opts);
+            Ok((program, TransactionMode::Write))
+        }
     }
 }
 
@@ -226,21 +241,23 @@ fn query_pragma(
     value: Option<ast::Expr>,
     pager: Rc<Pager>,
     connection: Arc<crate::Connection>,
-    program: &mut ProgramBuilder,
-) -> crate::Result<()> {
+    mut program: ProgramBuilder,
+) -> crate::Result<(ProgramBuilder, TransactionMode)> {
     let register = program.alloc_register();
     match pragma {
         PragmaName::CacheSize => {
             program.emit_int(connection.get_cache_size() as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
         }
         PragmaName::JournalMode => {
             program.emit_string8("wal".into(), register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
         }
-        PragmaName::LegacyFileFormat => {}
+        PragmaName::LegacyFileFormat => Ok((program, TransactionMode::None)),
         PragmaName::WalCheckpoint => {
             // Checkpoint uses 3 registers: P1, P2, P3. Ref Insn::Checkpoint for more info.
             // Allocate two more here as one was allocated at the top.
@@ -248,7 +265,7 @@ fn query_pragma(
                 Some(ast::Expr::Name(name)) => {
                     let mode_name = normalize_ident(&name.0);
                     CheckpointMode::from_str(&mode_name).map_err(|e| {
-                        LimboError::ParseError(format!("Unknown Checkpoint Mode: {}", e))
+                        LimboError::ParseError(format!("Unknown Checkpoint Mode: {e}"))
                     })?
                 }
                 _ => CheckpointMode::Passive,
@@ -267,6 +284,7 @@ fn query_pragma(
                 dest: register,
             });
             program.emit_result_row(register, 3);
+            Ok((program, TransactionMode::None))
         }
         PragmaName::PageCount => {
             program.emit_insn(Insn::PageCount {
@@ -275,6 +293,7 @@ fn query_pragma(
             });
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::Read))
         }
         PragmaName::TableInfo => {
             let table = match value {
@@ -288,7 +307,10 @@ fn query_pragma(
             let base_reg = register;
             program.alloc_registers(5);
             if let Some(table) = table {
-                for (i, column) in table.columns().iter().enumerate() {
+                // According to the SQLite documentation: "The 'cid' column should not be taken to
+                // mean more than 'rank within the current result set'."
+                // Therefore, we enumerate only after filtering out hidden columns.
+                for (i, column) in table.columns().iter().filter(|col| !col.hidden).enumerate() {
                     // cid
                     program.emit_int(i as i64, base_reg);
                     // name
@@ -320,6 +342,7 @@ fn query_pragma(
             for name in col_names {
                 program.add_pragma_result_column(name.into());
             }
+            Ok((program, TransactionMode::None))
         }
         PragmaName::UserVersion => {
             program.emit_insn(Insn::ReadCookie {
@@ -329,6 +352,7 @@ fn query_pragma(
             });
             program.add_pragma_result_column(pragma.to_string());
             program.emit_result_row(register, 1);
+            Ok((program, TransactionMode::Read))
         }
         PragmaName::SchemaVersion => {
             program.emit_insn(Insn::ReadCookie {
@@ -338,15 +362,16 @@ fn query_pragma(
             });
             program.add_pragma_result_column(pragma.to_string());
             program.emit_result_row(register, 1);
+            Ok((program, TransactionMode::Read))
         }
         PragmaName::PageSize => {
             program.emit_int(
-                header_accessor::get_page_size(&pager)
-                    .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as i64,
+                header_accessor::get_page_size(&pager).unwrap_or(connection.get_page_size()) as i64,
                 register,
             );
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
         }
         PragmaName::AutoVacuum => {
             let auto_vacuum_mode = pager.get_auto_vacuum_mode();
@@ -363,13 +388,28 @@ fn query_pragma(
                 value: auto_vacuum_mode_i64,
             });
             program.emit_result_row(register, 1);
+            Ok((program, TransactionMode::None))
         }
         PragmaName::IntegrityCheck => {
-            translate_integrity_check(schema, program)?;
+            translate_integrity_check(schema, &mut program)?;
+            Ok((program, TransactionMode::Read))
+        }
+        PragmaName::UnstableCaptureDataChangesConn => {
+            let pragma = pragma_for(&pragma);
+            let second_column = program.alloc_register();
+            let opts = connection.get_capture_data_changes();
+            program.emit_string8(opts.mode_name().to_string(), register);
+            if let Some(table) = &opts.table() {
+                program.emit_string8(table.to_string(), second_column);
+            } else {
+                program.emit_null(second_column, None);
+            }
+            program.emit_result_row(register, 2);
+            program.add_pragma_result_column(pragma.columns[0].to_string());
+            program.add_pragma_result_column(pragma.columns[1].to_string());
+            Ok((program, TransactionMode::Read))
         }
     }
-
-    Ok(())
 }
 
 fn update_auto_vacuum_mode(
@@ -429,9 +469,78 @@ fn update_cache_size(
 
     pager
         .change_page_cache_size(final_cache_size)
-        .map_err(|e| {
-            LimboError::InternalError(format!("Failed to update page cache size: {}", e))
-        })?;
+        .map_err(|e| LimboError::InternalError(format!("Failed to update page cache size: {e}")))?;
 
+    Ok(())
+}
+
+pub const TURSO_CDC_DEFAULT_TABLE_NAME: &str = "turso_cdc";
+fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
+    vec![
+        ast::ColumnDefinition {
+            col_name: ast::Name("change_id".to_string()),
+            col_type: Some(ast::Type {
+                name: "INTEGER".to_string(),
+                size: None,
+            }),
+            constraints: vec![ast::NamedColumnConstraint {
+                name: None,
+                constraint: ast::ColumnConstraint::PrimaryKey {
+                    order: None,
+                    conflict_clause: None,
+                    auto_increment: true,
+                },
+            }],
+        },
+        ast::ColumnDefinition {
+            col_name: ast::Name("change_time".to_string()),
+            col_type: Some(ast::Type {
+                name: "INTEGER".to_string(),
+                size: None,
+            }),
+            constraints: vec![],
+        },
+        ast::ColumnDefinition {
+            col_name: ast::Name("change_type".to_string()),
+            col_type: Some(ast::Type {
+                name: "INTEGER".to_string(),
+                size: None,
+            }),
+            constraints: vec![],
+        },
+        ast::ColumnDefinition {
+            col_name: ast::Name("table_name".to_string()),
+            col_type: Some(ast::Type {
+                name: "TEXT".to_string(),
+                size: None,
+            }),
+            constraints: vec![],
+        },
+        ast::ColumnDefinition {
+            col_name: ast::Name("id".to_string()),
+            col_type: None,
+            constraints: vec![],
+        },
+        ast::ColumnDefinition {
+            col_name: ast::Name("before".to_string()),
+            col_type: Some(ast::Type {
+                name: "BLOB".to_string(),
+                size: None,
+            }),
+            constraints: vec![],
+        },
+        ast::ColumnDefinition {
+            col_name: ast::Name("after".to_string()),
+            col_type: Some(ast::Type {
+                name: "BLOB".to_string(),
+                size: None,
+            }),
+            constraints: vec![],
+        },
+    ]
+}
+
+fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate::Result<()> {
+    connection.reset_page_size(page_size)?;
     Ok(())
 }

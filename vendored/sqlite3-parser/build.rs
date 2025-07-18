@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::io::{BufWriter, Result, Write};
@@ -5,7 +6,132 @@ use std::path::Path;
 use std::process::Command;
 
 use cc::Build;
-use uncased::UncasedStr;
+
+/// generates a trie-like function with nested match expressions for parsing SQL keywords
+/// example: input: [["ABORT", "TK_ABORT"], ["ACTION", "TK_ACTION"], ["ADD", "TK_ADD"],]
+/// A
+/// ├─ B
+/// │  ├─ O
+/// │  │  ├─ R
+/// │  │  │  ├─ T -> TK_ABORT
+/// ├─ C
+/// │  ├─ T
+/// │  │  ├─ I
+/// │  │  │  ├─ O
+/// │  │  │  │  ├─ N -> TK_ACTION
+/// ├─ D
+/// │  ├─ D -> TK_ADD
+fn build_keyword_map(
+    writer: &mut impl Write,
+    func_name: &str,
+    keywords: &[[&'static str; 2]],
+) -> Result<()> {
+    assert!(!keywords.is_empty());
+    let mut min_len = keywords[0][0].len();
+    let mut max_len = keywords[0][0].len();
+
+    struct PathEntry {
+        result: Option<&'static str>,
+        sub_entries: HashMap<u8, Box<PathEntry>>,
+    }
+
+    let mut paths = Box::new(PathEntry {
+        result: None,
+        sub_entries: HashMap::new(),
+    });
+
+    for keyword in keywords {
+        let keyword_b = keyword[0].as_bytes();
+
+        if keyword_b.len() < min_len {
+            min_len = keyword_b.len();
+        }
+
+        if keyword_b.len() > max_len {
+            max_len = keyword_b.len();
+        }
+
+        let mut current = &mut paths;
+
+        for &b in keyword_b {
+            let upper_b = b.to_ascii_uppercase();
+
+            match current.sub_entries.get(&upper_b) {
+                Some(_) => {
+                    current = current.sub_entries.get_mut(&upper_b).unwrap();
+                }
+                None => {
+                    let new_entry = Box::new(PathEntry {
+                        result: None,
+                        sub_entries: HashMap::new(),
+                    });
+                    current.sub_entries.insert(upper_b, new_entry);
+                    current = current.sub_entries.get_mut(&upper_b).unwrap();
+                }
+            }
+        }
+
+        assert!(current.result.is_none());
+        current.result = Some(keyword[1]);
+    }
+
+    fn write_entry(writer: &mut impl Write, entry: &PathEntry) -> Result<()> {
+        if let Some(result) = entry.result {
+            writeln!(writer, "if idx == buf.len() {{")?;
+            writeln!(writer, "return Some(TokenType::{result});")?;
+            writeln!(writer, "}}")?;
+        }
+
+        if entry.sub_entries.is_empty() {
+            writeln!(writer, "None")?;
+            return Ok(());
+        }
+
+        writeln!(writer, "if idx >= buf.len() {{")?;
+        writeln!(writer, "return None;")?;
+        writeln!(writer, "}}")?;
+
+        writeln!(writer, "match buf[idx] {{")?;
+        for (&b, sub_entry) in &entry.sub_entries {
+            if b.is_ascii_alphabetic() {
+                writeln!(writer, "{} | {} => {{", b, b.to_ascii_lowercase())?;
+            } else {
+                writeln!(writer, "{b} => {{")?;
+            }
+            writeln!(writer, "idx += 1;")?;
+            write_entry(writer, sub_entry)?;
+            writeln!(writer, "}}")?;
+        }
+
+        writeln!(writer, "_ => None")?;
+        writeln!(writer, "}}")?;
+        Ok(())
+    }
+
+    writeln!(
+        writer,
+        "pub(crate) const MAX_KEYWORD_LEN: usize = {max_len};"
+    )?;
+    writeln!(
+        writer,
+        "pub(crate) const MIN_KEYWORD_LEN: usize = {min_len};"
+    )?;
+    writeln!(writer, "/// Check if `word` is a keyword")?;
+    writeln!(
+        writer,
+        "pub fn {func_name}(buf: &[u8]) -> Option<TokenType> {{"
+    )?;
+    writeln!(
+        writer,
+        "if buf.len() < MIN_KEYWORD_LEN || buf.len() > MAX_KEYWORD_LEN {{"
+    )?;
+    writeln!(writer, "return None;")?;
+    writeln!(writer, "}}")?;
+    writeln!(writer, "let mut idx = 0;")?;
+    write_entry(writer, &paths)?;
+    writeln!(writer, "}}")?;
+    Ok(())
+}
 
 fn main() -> Result<()> {
     let out_dir = env::var("OUT_DIR").unwrap();
@@ -43,164 +169,158 @@ fn main() -> Result<()> {
 
     let keywords = out_path.join("keywords.rs");
     let mut keywords = BufWriter::new(File::create(keywords)?);
-    write!(
+    build_keyword_map(
         &mut keywords,
-        "static KEYWORDS: ::phf::Map<&'static UncasedStr, TokenType> = \n{};",
-        phf_codegen::Map::new()
-            .entry(UncasedStr::new("ABORT"), "TokenType::TK_ABORT")
-            .entry(UncasedStr::new("ACTION"), "TokenType::TK_ACTION")
-            .entry(UncasedStr::new("ADD"), "TokenType::TK_ADD")
-            .entry(UncasedStr::new("AFTER"), "TokenType::TK_AFTER")
-            .entry(UncasedStr::new("ALL"), "TokenType::TK_ALL")
-            .entry(UncasedStr::new("ALTER"), "TokenType::TK_ALTER")
-            .entry(UncasedStr::new("ALWAYS"), "TokenType::TK_ALWAYS")
-            .entry(UncasedStr::new("ANALYZE"), "TokenType::TK_ANALYZE")
-            .entry(UncasedStr::new("AND"), "TokenType::TK_AND")
-            .entry(UncasedStr::new("AS"), "TokenType::TK_AS")
-            .entry(UncasedStr::new("ASC"), "TokenType::TK_ASC")
-            .entry(UncasedStr::new("ATTACH"), "TokenType::TK_ATTACH")
-            .entry(UncasedStr::new("AUTOINCREMENT"), "TokenType::TK_AUTOINCR")
-            .entry(UncasedStr::new("BEFORE"), "TokenType::TK_BEFORE")
-            .entry(UncasedStr::new("BEGIN"), "TokenType::TK_BEGIN")
-            .entry(UncasedStr::new("BETWEEN"), "TokenType::TK_BETWEEN")
-            .entry(UncasedStr::new("BY"), "TokenType::TK_BY")
-            .entry(UncasedStr::new("CASCADE"), "TokenType::TK_CASCADE")
-            .entry(UncasedStr::new("CASE"), "TokenType::TK_CASE")
-            .entry(UncasedStr::new("CAST"), "TokenType::TK_CAST")
-            .entry(UncasedStr::new("CHECK"), "TokenType::TK_CHECK")
-            .entry(UncasedStr::new("COLLATE"), "TokenType::TK_COLLATE")
-            .entry(UncasedStr::new("COLUMN"), "TokenType::TK_COLUMNKW")
-            .entry(UncasedStr::new("COMMIT"), "TokenType::TK_COMMIT")
-            .entry(UncasedStr::new("CONFLICT"), "TokenType::TK_CONFLICT")
-            .entry(UncasedStr::new("CONSTRAINT"), "TokenType::TK_CONSTRAINT")
-            .entry(UncasedStr::new("CREATE"), "TokenType::TK_CREATE")
-            .entry(UncasedStr::new("CROSS"), "TokenType::TK_JOIN_KW")
-            .entry(UncasedStr::new("CURRENT"), "TokenType::TK_CURRENT")
-            .entry(UncasedStr::new("CURRENT_DATE"), "TokenType::TK_CTIME_KW")
-            .entry(UncasedStr::new("CURRENT_TIME"), "TokenType::TK_CTIME_KW")
-            .entry(
-                UncasedStr::new("CURRENT_TIMESTAMP"),
-                "TokenType::TK_CTIME_KW"
-            )
-            .entry(UncasedStr::new("DATABASE"), "TokenType::TK_DATABASE")
-            .entry(UncasedStr::new("DEFAULT"), "TokenType::TK_DEFAULT")
-            .entry(UncasedStr::new("DEFERRABLE"), "TokenType::TK_DEFERRABLE")
-            .entry(UncasedStr::new("DEFERRED"), "TokenType::TK_DEFERRED")
-            .entry(UncasedStr::new("DELETE"), "TokenType::TK_DELETE")
-            .entry(UncasedStr::new("DESC"), "TokenType::TK_DESC")
-            .entry(UncasedStr::new("DETACH"), "TokenType::TK_DETACH")
-            .entry(UncasedStr::new("DISTINCT"), "TokenType::TK_DISTINCT")
-            .entry(UncasedStr::new("DO"), "TokenType::TK_DO")
-            .entry(UncasedStr::new("DROP"), "TokenType::TK_DROP")
-            .entry(UncasedStr::new("EACH"), "TokenType::TK_EACH")
-            .entry(UncasedStr::new("ELSE"), "TokenType::TK_ELSE")
-            .entry(UncasedStr::new("END"), "TokenType::TK_END")
-            .entry(UncasedStr::new("ESCAPE"), "TokenType::TK_ESCAPE")
-            .entry(UncasedStr::new("EXCEPT"), "TokenType::TK_EXCEPT")
-            .entry(UncasedStr::new("EXCLUDE"), "TokenType::TK_EXCLUDE")
-            .entry(UncasedStr::new("EXCLUSIVE"), "TokenType::TK_EXCLUSIVE")
-            .entry(UncasedStr::new("EXISTS"), "TokenType::TK_EXISTS")
-            .entry(UncasedStr::new("EXPLAIN"), "TokenType::TK_EXPLAIN")
-            .entry(UncasedStr::new("FAIL"), "TokenType::TK_FAIL")
-            .entry(UncasedStr::new("FILTER"), "TokenType::TK_FILTER")
-            .entry(UncasedStr::new("FIRST"), "TokenType::TK_FIRST")
-            .entry(UncasedStr::new("FOLLOWING"), "TokenType::TK_FOLLOWING")
-            .entry(UncasedStr::new("FOR"), "TokenType::TK_FOR")
-            .entry(UncasedStr::new("FOREIGN"), "TokenType::TK_FOREIGN")
-            .entry(UncasedStr::new("FROM"), "TokenType::TK_FROM")
-            .entry(UncasedStr::new("FULL"), "TokenType::TK_JOIN_KW")
-            .entry(UncasedStr::new("GENERATED"), "TokenType::TK_GENERATED")
-            .entry(UncasedStr::new("GLOB"), "TokenType::TK_LIKE_KW")
-            .entry(UncasedStr::new("GROUP"), "TokenType::TK_GROUP")
-            .entry(UncasedStr::new("GROUPS"), "TokenType::TK_GROUPS")
-            .entry(UncasedStr::new("HAVING"), "TokenType::TK_HAVING")
-            .entry(UncasedStr::new("IF"), "TokenType::TK_IF")
-            .entry(UncasedStr::new("IGNORE"), "TokenType::TK_IGNORE")
-            .entry(UncasedStr::new("IMMEDIATE"), "TokenType::TK_IMMEDIATE")
-            .entry(UncasedStr::new("IN"), "TokenType::TK_IN")
-            .entry(UncasedStr::new("INDEX"), "TokenType::TK_INDEX")
-            .entry(UncasedStr::new("INDEXED"), "TokenType::TK_INDEXED")
-            .entry(UncasedStr::new("INITIALLY"), "TokenType::TK_INITIALLY")
-            .entry(UncasedStr::new("INNER"), "TokenType::TK_JOIN_KW")
-            .entry(UncasedStr::new("INSERT"), "TokenType::TK_INSERT")
-            .entry(UncasedStr::new("INSTEAD"), "TokenType::TK_INSTEAD")
-            .entry(UncasedStr::new("INTERSECT"), "TokenType::TK_INTERSECT")
-            .entry(UncasedStr::new("INTO"), "TokenType::TK_INTO")
-            .entry(UncasedStr::new("IS"), "TokenType::TK_IS")
-            .entry(UncasedStr::new("ISNULL"), "TokenType::TK_ISNULL")
-            .entry(UncasedStr::new("JOIN"), "TokenType::TK_JOIN")
-            .entry(UncasedStr::new("KEY"), "TokenType::TK_KEY")
-            .entry(UncasedStr::new("LAST"), "TokenType::TK_LAST")
-            .entry(UncasedStr::new("LEFT"), "TokenType::TK_JOIN_KW")
-            .entry(UncasedStr::new("LIKE"), "TokenType::TK_LIKE_KW")
-            .entry(UncasedStr::new("LIMIT"), "TokenType::TK_LIMIT")
-            .entry(UncasedStr::new("MATCH"), "TokenType::TK_MATCH")
-            .entry(
-                UncasedStr::new("MATERIALIZED"),
-                "TokenType::TK_MATERIALIZED"
-            )
-            .entry(UncasedStr::new("NATURAL"), "TokenType::TK_JOIN_KW")
-            .entry(UncasedStr::new("NO"), "TokenType::TK_NO")
-            .entry(UncasedStr::new("NOT"), "TokenType::TK_NOT")
-            .entry(UncasedStr::new("NOTHING"), "TokenType::TK_NOTHING")
-            .entry(UncasedStr::new("NOTNULL"), "TokenType::TK_NOTNULL")
-            .entry(UncasedStr::new("NULL"), "TokenType::TK_NULL")
-            .entry(UncasedStr::new("NULLS"), "TokenType::TK_NULLS")
-            .entry(UncasedStr::new("OF"), "TokenType::TK_OF")
-            .entry(UncasedStr::new("OFFSET"), "TokenType::TK_OFFSET")
-            .entry(UncasedStr::new("ON"), "TokenType::TK_ON")
-            .entry(UncasedStr::new("OR"), "TokenType::TK_OR")
-            .entry(UncasedStr::new("ORDER"), "TokenType::TK_ORDER")
-            .entry(UncasedStr::new("OTHERS"), "TokenType::TK_OTHERS")
-            .entry(UncasedStr::new("OUTER"), "TokenType::TK_JOIN_KW")
-            .entry(UncasedStr::new("OVER"), "TokenType::TK_OVER")
-            .entry(UncasedStr::new("PARTITION"), "TokenType::TK_PARTITION")
-            .entry(UncasedStr::new("PLAN"), "TokenType::TK_PLAN")
-            .entry(UncasedStr::new("PRAGMA"), "TokenType::TK_PRAGMA")
-            .entry(UncasedStr::new("PRECEDING"), "TokenType::TK_PRECEDING")
-            .entry(UncasedStr::new("PRIMARY"), "TokenType::TK_PRIMARY")
-            .entry(UncasedStr::new("QUERY"), "TokenType::TK_QUERY")
-            .entry(UncasedStr::new("RAISE"), "TokenType::TK_RAISE")
-            .entry(UncasedStr::new("RANGE"), "TokenType::TK_RANGE")
-            .entry(UncasedStr::new("RECURSIVE"), "TokenType::TK_RECURSIVE")
-            .entry(UncasedStr::new("REFERENCES"), "TokenType::TK_REFERENCES")
-            .entry(UncasedStr::new("REGEXP"), "TokenType::TK_LIKE_KW")
-            .entry(UncasedStr::new("REINDEX"), "TokenType::TK_REINDEX")
-            .entry(UncasedStr::new("RELEASE"), "TokenType::TK_RELEASE")
-            .entry(UncasedStr::new("RENAME"), "TokenType::TK_RENAME")
-            .entry(UncasedStr::new("REPLACE"), "TokenType::TK_REPLACE")
-            .entry(UncasedStr::new("RETURNING"), "TokenType::TK_RETURNING")
-            .entry(UncasedStr::new("RESTRICT"), "TokenType::TK_RESTRICT")
-            .entry(UncasedStr::new("RIGHT"), "TokenType::TK_JOIN_KW")
-            .entry(UncasedStr::new("ROLLBACK"), "TokenType::TK_ROLLBACK")
-            .entry(UncasedStr::new("ROW"), "TokenType::TK_ROW")
-            .entry(UncasedStr::new("ROWS"), "TokenType::TK_ROWS")
-            .entry(UncasedStr::new("SAVEPOINT"), "TokenType::TK_SAVEPOINT")
-            .entry(UncasedStr::new("SELECT"), "TokenType::TK_SELECT")
-            .entry(UncasedStr::new("SET"), "TokenType::TK_SET")
-            .entry(UncasedStr::new("TABLE"), "TokenType::TK_TABLE")
-            .entry(UncasedStr::new("TEMP"), "TokenType::TK_TEMP")
-            .entry(UncasedStr::new("TEMPORARY"), "TokenType::TK_TEMP")
-            .entry(UncasedStr::new("THEN"), "TokenType::TK_THEN")
-            .entry(UncasedStr::new("TIES"), "TokenType::TK_TIES")
-            .entry(UncasedStr::new("TO"), "TokenType::TK_TO")
-            .entry(UncasedStr::new("TRANSACTION"), "TokenType::TK_TRANSACTION")
-            .entry(UncasedStr::new("TRIGGER"), "TokenType::TK_TRIGGER")
-            .entry(UncasedStr::new("UNBOUNDED"), "TokenType::TK_UNBOUNDED")
-            .entry(UncasedStr::new("UNION"), "TokenType::TK_UNION")
-            .entry(UncasedStr::new("UNIQUE"), "TokenType::TK_UNIQUE")
-            .entry(UncasedStr::new("UPDATE"), "TokenType::TK_UPDATE")
-            .entry(UncasedStr::new("USING"), "TokenType::TK_USING")
-            .entry(UncasedStr::new("VACUUM"), "TokenType::TK_VACUUM")
-            .entry(UncasedStr::new("VALUES"), "TokenType::TK_VALUES")
-            .entry(UncasedStr::new("VIEW"), "TokenType::TK_VIEW")
-            .entry(UncasedStr::new("VIRTUAL"), "TokenType::TK_VIRTUAL")
-            .entry(UncasedStr::new("WHEN"), "TokenType::TK_WHEN")
-            .entry(UncasedStr::new("WHERE"), "TokenType::TK_WHERE")
-            .entry(UncasedStr::new("WINDOW"), "TokenType::TK_WINDOW")
-            .entry(UncasedStr::new("WITH"), "TokenType::TK_WITH")
-            .entry(UncasedStr::new("WITHOUT"), "TokenType::TK_WITHOUT")
-            .build()
+        "keyword_token",
+        &[
+            ["ABORT", "TK_ABORT"],
+            ["ACTION", "TK_ACTION"],
+            ["ADD", "TK_ADD"],
+            ["AFTER", "TK_AFTER"],
+            ["ALL", "TK_ALL"],
+            ["ALTER", "TK_ALTER"],
+            ["ALWAYS", "TK_ALWAYS"],
+            ["ANALYZE", "TK_ANALYZE"],
+            ["AND", "TK_AND"],
+            ["AS", "TK_AS"],
+            ["ASC", "TK_ASC"],
+            ["ATTACH", "TK_ATTACH"],
+            ["AUTOINCREMENT", "TK_AUTOINCR"],
+            ["BEFORE", "TK_BEFORE"],
+            ["BEGIN", "TK_BEGIN"],
+            ["BETWEEN", "TK_BETWEEN"],
+            ["BY", "TK_BY"],
+            ["CASCADE", "TK_CASCADE"],
+            ["CASE", "TK_CASE"],
+            ["CAST", "TK_CAST"],
+            ["CHECK", "TK_CHECK"],
+            ["COLLATE", "TK_COLLATE"],
+            ["COLUMN", "TK_COLUMNKW"],
+            ["COMMIT", "TK_COMMIT"],
+            ["CONFLICT", "TK_CONFLICT"],
+            ["CONSTRAINT", "TK_CONSTRAINT"],
+            ["CREATE", "TK_CREATE"],
+            ["CROSS", "TK_JOIN_KW"],
+            ["CURRENT", "TK_CURRENT"],
+            ["CURRENT_DATE", "TK_CTIME_KW"],
+            ["CURRENT_TIME", "TK_CTIME_KW"],
+            ["CURRENT_TIMESTAMP", "TK_CTIME_KW"],
+            ["DATABASE", "TK_DATABASE"],
+            ["DEFAULT", "TK_DEFAULT"],
+            ["DEFERRABLE", "TK_DEFERRABLE"],
+            ["DEFERRED", "TK_DEFERRED"],
+            ["DELETE", "TK_DELETE"],
+            ["DESC", "TK_DESC"],
+            ["DETACH", "TK_DETACH"],
+            ["DISTINCT", "TK_DISTINCT"],
+            ["DO", "TK_DO"],
+            ["DROP", "TK_DROP"],
+            ["EACH", "TK_EACH"],
+            ["ELSE", "TK_ELSE"],
+            ["END", "TK_END"],
+            ["ESCAPE", "TK_ESCAPE"],
+            ["EXCEPT", "TK_EXCEPT"],
+            ["EXCLUDE", "TK_EXCLUDE"],
+            ["EXCLUSIVE", "TK_EXCLUSIVE"],
+            ["EXISTS", "TK_EXISTS"],
+            ["EXPLAIN", "TK_EXPLAIN"],
+            ["FAIL", "TK_FAIL"],
+            ["FILTER", "TK_FILTER"],
+            ["FIRST", "TK_FIRST"],
+            ["FOLLOWING", "TK_FOLLOWING"],
+            ["FOR", "TK_FOR"],
+            ["FOREIGN", "TK_FOREIGN"],
+            ["FROM", "TK_FROM"],
+            ["FULL", "TK_JOIN_KW"],
+            ["GENERATED", "TK_GENERATED"],
+            ["GLOB", "TK_LIKE_KW"],
+            ["GROUP", "TK_GROUP"],
+            ["GROUPS", "TK_GROUPS"],
+            ["HAVING", "TK_HAVING"],
+            ["IF", "TK_IF"],
+            ["IGNORE", "TK_IGNORE"],
+            ["IMMEDIATE", "TK_IMMEDIATE"],
+            ["IN", "TK_IN"],
+            ["INDEX", "TK_INDEX"],
+            ["INDEXED", "TK_INDEXED"],
+            ["INITIALLY", "TK_INITIALLY"],
+            ["INNER", "TK_JOIN_KW"],
+            ["INSERT", "TK_INSERT"],
+            ["INSTEAD", "TK_INSTEAD"],
+            ["INTERSECT", "TK_INTERSECT"],
+            ["INTO", "TK_INTO"],
+            ["IS", "TK_IS"],
+            ["ISNULL", "TK_ISNULL"],
+            ["JOIN", "TK_JOIN"],
+            ["KEY", "TK_KEY"],
+            ["LAST", "TK_LAST"],
+            ["LEFT", "TK_JOIN_KW"],
+            ["LIKE", "TK_LIKE_KW"],
+            ["LIMIT", "TK_LIMIT"],
+            ["MATCH", "TK_MATCH"],
+            ["MATERIALIZED", "TK_MATERIALIZED"],
+            ["NATURAL", "TK_JOIN_KW"],
+            ["NO", "TK_NO"],
+            ["NOT", "TK_NOT"],
+            ["NOTHING", "TK_NOTHING"],
+            ["NOTNULL", "TK_NOTNULL"],
+            ["NULL", "TK_NULL"],
+            ["NULLS", "TK_NULLS"],
+            ["OF", "TK_OF"],
+            ["OFFSET", "TK_OFFSET"],
+            ["ON", "TK_ON"],
+            ["OR", "TK_OR"],
+            ["ORDER", "TK_ORDER"],
+            ["OTHERS", "TK_OTHERS"],
+            ["OUTER", "TK_JOIN_KW"],
+            ["OVER", "TK_OVER"],
+            ["PARTITION", "TK_PARTITION"],
+            ["PLAN", "TK_PLAN"],
+            ["PRAGMA", "TK_PRAGMA"],
+            ["PRECEDING", "TK_PRECEDING"],
+            ["PRIMARY", "TK_PRIMARY"],
+            ["QUERY", "TK_QUERY"],
+            ["RAISE", "TK_RAISE"],
+            ["RANGE", "TK_RANGE"],
+            ["RECURSIVE", "TK_RECURSIVE"],
+            ["REFERENCES", "TK_REFERENCES"],
+            ["REGEXP", "TK_LIKE_KW"],
+            ["REINDEX", "TK_REINDEX"],
+            ["RELEASE", "TK_RELEASE"],
+            ["RENAME", "TK_RENAME"],
+            ["REPLACE", "TK_REPLACE"],
+            ["RETURNING", "TK_RETURNING"],
+            ["RESTRICT", "TK_RESTRICT"],
+            ["RIGHT", "TK_JOIN_KW"],
+            ["ROLLBACK", "TK_ROLLBACK"],
+            ["ROW", "TK_ROW"],
+            ["ROWS", "TK_ROWS"],
+            ["SAVEPOINT", "TK_SAVEPOINT"],
+            ["SELECT", "TK_SELECT"],
+            ["SET", "TK_SET"],
+            ["TABLE", "TK_TABLE"],
+            ["TEMP", "TK_TEMP"],
+            ["TEMPORARY", "TK_TEMP"],
+            ["THEN", "TK_THEN"],
+            ["TIES", "TK_TIES"],
+            ["TO", "TK_TO"],
+            ["TRANSACTION", "TK_TRANSACTION"],
+            ["TRIGGER", "TK_TRIGGER"],
+            ["UNBOUNDED", "TK_UNBOUNDED"],
+            ["UNION", "TK_UNION"],
+            ["UNIQUE", "TK_UNIQUE"],
+            ["UPDATE", "TK_UPDATE"],
+            ["USING", "TK_USING"],
+            ["VACUUM", "TK_VACUUM"],
+            ["VALUES", "TK_VALUES"],
+            ["VIEW", "TK_VIEW"],
+            ["VIRTUAL", "TK_VIRTUAL"],
+            ["WHEN", "TK_WHEN"],
+            ["WHERE", "TK_WHERE"],
+            ["WINDOW", "TK_WINDOW"],
+            ["WITH", "TK_WITH"],
+            ["WITHOUT", "TK_WITHOUT"],
+        ],
     )?;
 
     println!("cargo:rerun-if-changed=third_party/lemon/lemon.c");

@@ -1,9 +1,15 @@
+use crate::result::LimboResult;
+use crate::storage::btree::BTreeCursor;
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::SelectPlan;
+use crate::types::IOResult;
+use crate::util::{module_args_from_sql, module_name_from_sql, UnparsedFromSqlIndex};
 use crate::{util::normalize_ident, Result};
-use crate::{LimboError, VirtualTable};
+use crate::{LimboError, MvCursor, Pager, RefValue, SymbolTable, VirtualTable};
 use core::fmt;
 use fallible_iterator::FallibleIterator;
+use std::cell::RefCell;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -37,6 +43,9 @@ impl Schema {
             SCHEMA_TABLE_NAME.to_string(),
             Arc::new(Table::BTree(sqlite_schema_table().into())),
         );
+        for function in VirtualTable::builtin_functions() {
+            tables.insert(function.name.to_owned(), Arc::new(Table::Virtual(function)));
+        }
         Self {
             tables,
             indexes,
@@ -133,6 +142,190 @@ impl Schema {
 
     pub fn indexes_enabled(&self) -> bool {
         self.indexes_enabled
+    }
+
+    /// Update [Schema] by scanning the first root page (sqlite_schema)
+    pub fn make_from_btree(
+        &mut self,
+        mv_cursor: Option<Rc<RefCell<MvCursor>>>,
+        pager: Rc<Pager>,
+        syms: &SymbolTable,
+    ) -> Result<()> {
+        let mut cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), 1, 10);
+
+        let mut from_sql_indexes = Vec::with_capacity(10);
+        let mut automatic_indices: HashMap<String, Vec<(String, usize)>> =
+            HashMap::with_capacity(10);
+
+        loop {
+            match pager.begin_read_tx()? {
+                IOResult::Done(v) => {
+                    if matches!(v, LimboResult::Busy) {
+                        return Err(LimboError::Busy);
+                    }
+                    break;
+                }
+                IOResult::IO => pager.io.run_once()?,
+            }
+        }
+
+        while let IOResult::IO = cursor.rewind()? {
+            pager.io.run_once()?
+        }
+
+        loop {
+            let Some(row) = (loop {
+                match cursor.record()? {
+                    IOResult::Done(v) => break v,
+                    IOResult::IO => pager.io.run_once()?,
+                }
+            }) else {
+                break;
+            };
+
+            let mut record_cursor = cursor.record_cursor.borrow_mut();
+            let ty_value = record_cursor.get_value(&row, 0)?;
+            let RefValue::Text(ty) = ty_value else {
+                return Err(LimboError::ConversionError("Expected text value".into()));
+            };
+            match ty.as_str() {
+                "table" => {
+                    let root_page_value = record_cursor.get_value(&row, 3)?;
+                    let RefValue::Integer(root_page) = root_page_value else {
+                        return Err(LimboError::ConversionError("Expected integer value".into()));
+                    };
+                    let sql_value = record_cursor.get_value(&row, 4)?;
+                    let RefValue::Text(sql_text) = sql_value else {
+                        return Err(LimboError::ConversionError("Expected text value".into()));
+                    };
+                    let sql = sql_text.as_str();
+                    let create_virtual = "create virtual";
+                    if root_page == 0
+                        && sql[0..create_virtual.len()].eq_ignore_ascii_case(create_virtual)
+                    {
+                        let name_value = record_cursor.get_value(&row, 1)?;
+                        let RefValue::Text(name_text) = name_value else {
+                            return Err(LimboError::ConversionError("Expected text value".into()));
+                        };
+                        let name = name_text.as_str();
+
+                        // a virtual table is found in the sqlite_schema, but it's no
+                        // longer in the in-memory schema. We need to recreate it if
+                        // the module is loaded in the symbol table.
+                        let vtab = if let Some(vtab) = syms.vtabs.get(name) {
+                            vtab.clone()
+                        } else {
+                            let mod_name = module_name_from_sql(sql)?;
+                            crate::VirtualTable::table(
+                                Some(name),
+                                mod_name,
+                                module_args_from_sql(sql)?,
+                                syms,
+                            )?
+                        };
+                        self.add_virtual_table(vtab);
+                        continue;
+                    }
+
+                    let table = BTreeTable::from_sql(sql, root_page as usize)?;
+                    self.add_btree_table(Rc::new(table));
+                }
+                "index" => {
+                    let root_page_value = record_cursor.get_value(&row, 3)?;
+                    let RefValue::Integer(root_page) = root_page_value else {
+                        return Err(LimboError::ConversionError("Expected integer value".into()));
+                    };
+                    match record_cursor.get_value(&row, 4) {
+                        Ok(RefValue::Text(sql_text)) => {
+                            let table_name_value = record_cursor.get_value(&row, 2)?;
+                            let RefValue::Text(table_name_text) = table_name_value else {
+                                return Err(LimboError::ConversionError(
+                                    "Expected text value".into(),
+                                ));
+                            };
+
+                            from_sql_indexes.push(UnparsedFromSqlIndex {
+                                table_name: table_name_text.as_str().to_string(),
+                                root_page: root_page as usize,
+                                sql: sql_text.as_str().to_string(),
+                            });
+                        }
+                        _ => {
+                            let index_name_value = record_cursor.get_value(&row, 1)?;
+                            let RefValue::Text(index_name_text) = index_name_value else {
+                                return Err(LimboError::ConversionError(
+                                    "Expected text value".into(),
+                                ));
+                            };
+
+                            let table_name_value = record_cursor.get_value(&row, 2)?;
+                            let RefValue::Text(table_name_text) = table_name_value else {
+                                return Err(LimboError::ConversionError(
+                                    "Expected text value".into(),
+                                ));
+                            };
+
+                            match automatic_indices.entry(table_name_text.as_str().to_string()) {
+                                Entry::Vacant(e) => {
+                                    e.insert(vec![(
+                                        index_name_text.as_str().to_string(),
+                                        root_page as usize,
+                                    )]);
+                                }
+                                Entry::Occupied(mut e) => {
+                                    e.get_mut().push((
+                                        index_name_text.as_str().to_string(),
+                                        root_page as usize,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            };
+            drop(record_cursor);
+            drop(row);
+
+            while let IOResult::IO = cursor.next()? {
+                pager.io.run_once()?;
+            }
+        }
+
+        pager.end_read_tx()?;
+
+        for unparsed_sql_from_index in from_sql_indexes {
+            if !self.indexes_enabled() {
+                self.table_set_has_index(&unparsed_sql_from_index.table_name);
+            } else {
+                let table = self
+                    .get_btree_table(&unparsed_sql_from_index.table_name)
+                    .unwrap();
+                let index = Index::from_sql(
+                    &unparsed_sql_from_index.sql,
+                    unparsed_sql_from_index.root_page,
+                    table.as_ref(),
+                )?;
+                self.add_index(Arc::new(index));
+            }
+        }
+
+        for automatic_index in automatic_indices {
+            if !self.indexes_enabled() {
+                self.table_set_has_index(&automatic_index.0);
+            } else {
+                let table = self.get_btree_table(&automatic_index.0).unwrap();
+                let ret_index = Index::automatic_from_primary_key_and_unique(
+                    table.as_ref(),
+                    automatic_index.1,
+                )?;
+                for index in ret_index {
+                    self.add_index(Arc::new(index));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -261,10 +454,11 @@ impl BTreeTable {
                 sql.push_str(", ");
             }
             sql.push_str(column.name.as_ref().expect("column name is None"));
-            if !matches!(column.ty, Type::Null) {
+
+            if !column.ty_str.is_empty() {
                 sql.push(' ');
+                sql.push_str(&column.ty_str);
             }
-            sql.push_str(&column.ty.to_string());
 
             if column.unique {
                 sql.push_str(" UNIQUE");
@@ -419,43 +613,47 @@ fn create_table(
                 // A column defined as exactly INTEGER PRIMARY KEY is a rowid alias, meaning that the rowid
                 // and the value of this column are the same.
                 // https://www.sqlite.org/lang_createtable.html#rowids_and_the_integer_primary_key
-                let mut typename_exactly_integer = false;
-                let (ty, ty_str) = match col_def.col_type {
-                    Some(data_type) => {
-                        let s = data_type.name.as_str();
-                        let ty_str = if matches!(
-                            s.to_uppercase().as_str(),
-                            "TEXT" | "INT" | "INTEGER" | "BLOB" | "REAL"
-                        ) {
-                            s.to_uppercase().to_string()
-                        } else {
-                            s.to_string()
-                        };
+                let ty_str = col_def
+                    .col_type
+                    .as_ref()
+                    .map(|ast::Type { name, .. }| name.clone())
+                    .unwrap_or_default();
 
+                let mut typename_exactly_integer = false;
+                let ty = match col_def.col_type {
+                    Some(data_type) => 'ty: {
                         // https://www.sqlite.org/datatype3.html
-                        let type_name = ty_str.to_uppercase();
-                        if type_name.contains("INT") {
-                            typename_exactly_integer = type_name == "INTEGER";
-                            (Type::Integer, ty_str)
-                        } else if type_name.contains("CHAR")
-                            || type_name.contains("CLOB")
-                            || type_name.contains("TEXT")
-                        {
-                            (Type::Text, ty_str)
-                        } else if type_name.contains("BLOB") {
-                            (Type::Blob, ty_str)
-                        } else if type_name.is_empty() {
-                            (Type::Blob, "".to_string())
-                        } else if type_name.contains("REAL")
-                            || type_name.contains("FLOA")
-                            || type_name.contains("DOUB")
-                        {
-                            (Type::Real, ty_str)
-                        } else {
-                            (Type::Numeric, ty_str)
+                        let mut type_name = data_type.name;
+                        type_name.make_ascii_uppercase();
+
+                        if type_name.is_empty() {
+                            break 'ty Type::Blob;
                         }
+
+                        if type_name == "INTEGER" {
+                            typename_exactly_integer = true;
+                            break 'ty Type::Integer;
+                        }
+
+                        if let Some(ty) = type_name.as_bytes().windows(3).find_map(|s| match s {
+                            b"INT" => Some(Type::Integer),
+                            _ => None,
+                        }) {
+                            break 'ty ty;
+                        }
+
+                        if let Some(ty) = type_name.as_bytes().windows(4).find_map(|s| match s {
+                            b"CHAR" | b"CLOB" | b"TEXT" => Some(Type::Text),
+                            b"BLOB" => Some(Type::Blob),
+                            b"REAL" | b"FLOA" | b"DOUB" => Some(Type::Real),
+                            _ => None,
+                        }) {
+                            break 'ty ty;
+                        }
+
+                        Type::Numeric
                     }
-                    None => (Type::Null, "".to_string()),
+                    None => Type::Null,
                 };
 
                 let mut default = None;
@@ -464,22 +662,22 @@ fn create_table(
                 let mut order = SortOrder::Asc;
                 let mut unique = false;
                 let mut collation = None;
-                for c_def in &col_def.constraints {
-                    match &c_def.constraint {
+                for c_def in col_def.constraints {
+                    match c_def.constraint {
                         turso_sqlite3_parser::ast::ColumnConstraint::PrimaryKey {
                             order: o,
                             ..
                         } => {
                             primary_key = true;
                             if let Some(o) = o {
-                                order = *o;
+                                order = o;
                             }
                         }
                         turso_sqlite3_parser::ast::ColumnConstraint::NotNull { .. } => {
                             notnull = true;
                         }
                         turso_sqlite3_parser::ast::ColumnConstraint::Default(expr) => {
-                            default = Some(expr.clone())
+                            default = Some(expr)
                         }
                         // TODO: for now we don't check Resolve type of unique
                         turso_sqlite3_parser::ast::ColumnConstraint::Unique(on_conflict) => {
@@ -491,7 +689,6 @@ fn create_table(
                         turso_sqlite3_parser::ast::ColumnConstraint::Collate { collation_name } => {
                             collation = Some(CollationSeq::new(collation_name.0.as_str())?);
                         }
-                        // Collate
                         _ => {}
                     }
                 }
@@ -515,6 +712,7 @@ fn create_table(
                     default,
                     unique,
                     collation,
+                    hidden: false,
                 });
             }
             if options.contains(TableOptions::WITHOUT_ROWID) {
@@ -586,6 +784,7 @@ pub struct Column {
     pub default: Option<Expr>,
     pub unique: bool,
     pub collation: Option<CollationSeq>,
+    pub hidden: bool,
 }
 
 impl Column {
@@ -664,6 +863,7 @@ impl From<ColumnDefinition> for Column {
             is_rowid_alias: primary_key && matches!(ty, Type::Integer),
             unique,
             collation,
+            hidden: false,
         }
     }
 }
@@ -825,8 +1025,7 @@ impl Affinity {
             SQLITE_AFF_REAL => Ok(Affinity::Real),
             SQLITE_AFF_NUMERIC => Ok(Affinity::Numeric),
             _ => Err(LimboError::InternalError(format!(
-                "Invalid affinity character: {}",
-                char
+                "Invalid affinity character: {char}"
             ))),
         }
     }
@@ -858,7 +1057,7 @@ impl fmt::Display for Type {
             Self::Real => "REAL",
             Self::Blob => "BLOB",
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
@@ -880,6 +1079,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 default: None,
                 unique: false,
                 collation: None,
+                hidden: false,
             },
             Column {
                 name: Some("name".to_string()),
@@ -891,6 +1091,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 default: None,
                 unique: false,
                 collation: None,
+                hidden: false,
             },
             Column {
                 name: Some("tbl_name".to_string()),
@@ -902,6 +1103,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 default: None,
                 unique: false,
                 collation: None,
+                hidden: false,
             },
             Column {
                 name: Some("rootpage".to_string()),
@@ -913,6 +1115,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 default: None,
                 unique: false,
                 collation: None,
+                hidden: false,
             },
             Column {
                 name: Some("sql".to_string()),
@@ -924,6 +1127,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 default: None,
                 unique: false,
                 collation: None,
+                hidden: false,
             },
         ],
         unique_sets: None,
@@ -1453,49 +1657,13 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a InTeGeR);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert_eq!(column.ty_str, "INTEGER");
-        Ok(())
-    }
-
-    #[test]
-    pub fn test_col_type_string_int() -> Result<()> {
-        let sql = r#"CREATE TABLE t1 (a InT);"#;
-        let table = BTreeTable::from_sql(sql, 0)?;
-        let column = table.get_column("a").unwrap().1;
-        assert_eq!(column.ty_str, "INT");
-        Ok(())
-    }
-
-    #[test]
-    pub fn test_col_type_string_blob() -> Result<()> {
-        let sql = r#"CREATE TABLE t1 (a bLoB);"#;
-        let table = BTreeTable::from_sql(sql, 0)?;
-        let column = table.get_column("a").unwrap().1;
-        assert_eq!(column.ty_str, "BLOB");
-        Ok(())
-    }
-
-    #[test]
-    pub fn test_col_type_string_empty() -> Result<()> {
-        let sql = r#"CREATE TABLE t1 (a);"#;
-        let table = BTreeTable::from_sql(sql, 0)?;
-        let column = table.get_column("a").unwrap().1;
-        assert_eq!(column.ty_str, "");
-        Ok(())
-    }
-
-    #[test]
-    pub fn test_col_type_string_some_nonsense() -> Result<()> {
-        let sql = r#"CREATE TABLE t1 (a someNonsenseName);"#;
-        let table = BTreeTable::from_sql(sql, 0)?;
-        let column = table.get_column("a").unwrap().1;
-        assert_eq!(column.ty_str, "someNonsenseName");
+        assert_eq!(column.ty_str, "InTeGeR");
         Ok(())
     }
 
     #[test]
     pub fn test_sqlite_schema() {
-        let expected = r#"CREATE TABLE sqlite_schema (type TEXT, name TEXT, tbl_name TEXT, rootpage INTEGER, sql TEXT)"#;
+        let expected = r#"CREATE TABLE sqlite_schema (type TEXT, name TEXT, tbl_name TEXT, rootpage INT, sql TEXT)"#;
         let actual = sqlite_schema_table().to_sql();
         assert_eq!(expected, actual);
     }
@@ -1573,6 +1741,7 @@ mod tests {
                 default: None,
                 unique: false,
                 collation: None,
+                hidden: false,
             }],
             unique_sets: None,
         };

@@ -11,7 +11,7 @@ use turso_sqlite3_parser::ast::{CompoundOperator, SortOrder};
 
 use tracing::Level;
 
-#[instrument(skip_all, level = Level::TRACE)]
+#[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_compound_select(
     program: &mut ProgramBuilder,
     plan: Plan,
@@ -150,9 +150,9 @@ fn emit_compound_select(
             CompoundOperator::Union => {
                 let mut new_dedupe_index = false;
                 let dedupe_index = match right_most.query_destination {
-                    QueryDestination::EphemeralIndex { cursor_id, index } => {
-                        (cursor_id, index.clone())
-                    }
+                    QueryDestination::EphemeralIndex {
+                        cursor_id, index, ..
+                    } => (cursor_id, index.clone()),
                     _ => {
                         new_dedupe_index = true;
                         create_dedupe_index(program, &right_most, schema)?
@@ -161,6 +161,7 @@ fn emit_compound_select(
                 plan.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: dedupe_index.0,
                     index: dedupe_index.1.clone(),
+                    is_delete: false,
                 };
                 let compound_select = Plan::CompoundSelect {
                     left,
@@ -182,20 +183,18 @@ fn emit_compound_select(
                 right_most.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: dedupe_index.0,
                     index: dedupe_index.1.clone(),
+                    is_delete: false,
                 };
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
 
                 if new_dedupe_index {
-                    let label_jump_over_dedupe = program.allocate_label();
-                    read_deduplicated_union_rows(
+                    read_deduplicated_union_or_except_rows(
                         program,
                         dedupe_index.0,
                         dedupe_index.1.as_ref(),
                         limit_ctx,
-                        label_jump_over_dedupe,
                         yield_reg,
                     );
-                    program.preassign_label_to_next_insn(label_jump_over_dedupe);
                 }
             }
             CompoundOperator::Intersect => {
@@ -211,6 +210,7 @@ fn emit_compound_select(
                 plan.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: left_cursor_id,
                     index: left_index.clone(),
+                    is_delete: false,
                 };
                 let compound_select = Plan::CompoundSelect {
                     left,
@@ -234,6 +234,7 @@ fn emit_compound_select(
                 right_most.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: right_cursor_id,
                     index: right_index,
+                    is_delete: false,
                 };
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
                 read_intersect_rows(
@@ -246,8 +247,49 @@ fn emit_compound_select(
                     yield_reg,
                 );
             }
-            _ => {
-                crate::bail_parse_error!("unimplemented compound select operator: {:?}", operator);
+            CompoundOperator::Except => {
+                let mut new_index = false;
+                let (cursor_id, index) = match right_most.query_destination {
+                    QueryDestination::EphemeralIndex {
+                        cursor_id, index, ..
+                    } => (cursor_id, index),
+                    _ => {
+                        new_index = true;
+                        create_dedupe_index(program, &right_most, schema)?
+                    }
+                };
+                plan.query_destination = QueryDestination::EphemeralIndex {
+                    cursor_id,
+                    index: index.clone(),
+                    is_delete: false,
+                };
+                let compound_select = Plan::CompoundSelect {
+                    left,
+                    right_most: plan,
+                    limit,
+                    offset,
+                    order_by,
+                };
+                emit_compound_select(
+                    program,
+                    compound_select,
+                    schema,
+                    syms,
+                    None,
+                    yield_reg,
+                    reg_result_cols_start,
+                )?;
+                right_most.query_destination = QueryDestination::EphemeralIndex {
+                    cursor_id,
+                    index: index.clone(),
+                    is_delete: true,
+                };
+                emit_query(program, &mut right_most, &mut right_most_ctx)?;
+                if new_index {
+                    read_deduplicated_union_or_except_rows(
+                        program, cursor_id, &index, limit_ctx, yield_reg,
+                    );
+                }
             }
         },
         None => {
@@ -302,15 +344,16 @@ fn create_dedupe_index(
     Ok((cursor_id, dedupe_index.clone()))
 }
 
-/// Emits the bytecode for reading deduplicated rows from the ephemeral index created for UNION operators.
-fn read_deduplicated_union_rows(
+/// Emits the bytecode for reading deduplicated rows from the ephemeral index created for
+/// UNION or EXCEPT operators.
+fn read_deduplicated_union_or_except_rows(
     program: &mut ProgramBuilder,
     dedupe_cursor_id: usize,
     dedupe_index: &Index,
     limit_ctx: Option<LimitCtx>,
-    label_limit_reached: BranchOffset,
     yield_reg: Option<usize>,
 ) {
+    let label_close = program.allocate_label();
     let label_dedupe_next = program.allocate_label();
     let label_dedupe_loop_start = program.allocate_label();
     let dedupe_cols_start_reg = program.alloc_registers(dedupe_index.columns.len());
@@ -348,7 +391,7 @@ fn read_deduplicated_union_rows(
     if let Some(limit_ctx) = limit_ctx {
         program.emit_insn(Insn::DecrJumpZero {
             reg: limit_ctx.reg_limit,
-            target_pc: label_limit_reached,
+            target_pc: label_close,
         })
     }
     program.preassign_label_to_next_insn(label_dedupe_next);
@@ -356,6 +399,7 @@ fn read_deduplicated_union_rows(
         cursor_id: dedupe_cursor_id,
         pc_if_next: label_dedupe_loop_start,
     });
+    program.preassign_label_to_next_insn(label_close);
     program.emit_insn(Insn::Close {
         cursor_id: dedupe_cursor_id,
     });

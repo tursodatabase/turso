@@ -87,7 +87,7 @@ fn process_payload(payload_group: Group) -> String {
         match token {
             TokenTree::Ident(ident) => {
                 if is_variable_name {
-                    variable_name_list.push_str(&format!("{},", ident));
+                    variable_name_list.push_str(&format!("{ident},"));
                 }
                 is_variable_name = false;
             }
@@ -99,7 +99,7 @@ fn process_payload(payload_group: Group) -> String {
             _ => {}
         }
     }
-    format!("{{ {} }}", variable_name_list).to_string()
+    format!("{{ {variable_name_list} }}").to_string()
 }
 /// Generates the `get_description` implementation for the processed enum.
 fn generate_get_description(
@@ -112,25 +112,21 @@ fn generate_get_description(
         let payload = payload.unwrap_or("".to_string());
         let desc;
         if let Some(description) = variant_description_map.get(&variant) {
-            desc = format!("Some({})", description);
+            desc = format!("Some({description})");
         } else {
             desc = "None".to_string();
         }
-        all_enum_arms.push_str(&format!(
-            "{}::{} {} => {},\n",
-            enum_name, variant, payload, desc
-        ));
+        all_enum_arms.push_str(&format!("{enum_name}::{variant} {payload} => {desc},\n"));
     }
 
     let enum_impl = format!(
-        "impl {}  {{ 
+        "impl {enum_name}  {{ 
      pub fn get_description(&self) -> Option<&str> {{
      match self {{
-     {}
+     {all_enum_arms}
      }}
      }}
-     }}",
-        enum_name, all_enum_arms
+     }}"
     );
     enum_impl.parse().unwrap()
 }

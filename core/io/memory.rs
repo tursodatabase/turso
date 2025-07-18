@@ -83,8 +83,7 @@ impl File for MemoryFile {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: Completion) -> Result<Arc<Completion>> {
-        let c = Arc::new(c);
+    fn pread(&self, pos: usize, c: Arc<Completion>) -> Result<Arc<Completion>> {
         let r = c.as_read();
         let buf_len = r.buf().len();
         if buf_len == 0 {
@@ -129,9 +128,8 @@ impl File for MemoryFile {
         &self,
         pos: usize,
         buffer: Arc<RefCell<Buffer>>,
-        c: Completion,
+        c: Arc<Completion>,
     ) -> Result<Arc<Completion>> {
-        let c = Arc::new(c);
         let buf = buffer.borrow();
         let buf_len = buf.len();
         if buf_len == 0 {
@@ -167,10 +165,10 @@ impl File for MemoryFile {
         Ok(c)
     }
 
-    fn sync(&self, c: Completion) -> Result<Arc<Completion>> {
+    fn sync(&self, c: Arc<Completion>) -> Result<Arc<Completion>> {
         // no-op
         c.complete(0);
-        Ok(Arc::new(c))
+        Ok(c)
     }
 
     fn size(&self) -> Result<u64> {

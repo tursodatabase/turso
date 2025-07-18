@@ -6,6 +6,7 @@ use turso_core::{Connection, LimboError, Result, StepResult};
 use crate::generation::{
     pick_index,
     plan::{Interaction, InteractionPlan, InteractionPlanState, ResultSet},
+    Shadow as _,
 };
 
 use super::env::{SimConnection, SimulatorEnv};
@@ -31,7 +32,7 @@ impl Execution {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ExecutionHistory {
     pub(crate) history: Vec<Execution>,
 }
@@ -65,16 +66,15 @@ pub(crate) fn execute_plans(
     let now = std::time::Instant::now();
     env.clear_poison();
     let mut env = env.lock().unwrap();
+
+    env.tables.clear();
+
     for _tick in 0..env.opts.ticks {
+        tracing::trace!("Executing tick {}", _tick);
         // Pick the connection to interact with
         let connection_index = pick_index(env.connections.len(), &mut env.rng);
         let state = &mut states[connection_index];
-        std::thread::sleep(std::time::Duration::from_millis(
-            std::env::var("TICK_SLEEP")
-                .unwrap_or("0".into())
-                .parse()
-                .unwrap_or(0),
-        ));
+
         history.history.push(Execution::new(
             connection_index,
             state.interaction_pointer,
@@ -129,7 +129,6 @@ fn execute_plan(
         tracing::debug!("connection {} already connected", connection_index);
         match execute_interaction(env, connection_index, interaction, &mut state.stack) {
             Ok(next_execution) => {
-                interaction.shadow(env);
                 tracing::debug!("connection {} processed", connection_index);
                 // Move to the next interaction or property
                 match next_execution {
@@ -190,7 +189,7 @@ pub(crate) fn execute_interaction(
                 SimConnection::SQLiteConnection(_) => unreachable!(),
                 SimConnection::Disconnected => unreachable!(),
             };
-
+            tracing::debug!(?interaction);
             let results = interaction.execute_query(conn, &env.io);
             tracing::debug!(?results);
             stack.push(results);
@@ -242,7 +241,7 @@ pub(crate) fn execute_interaction(
             limbo_integrity_check(&conn)?;
         }
     }
-
+    let _ = interaction.shadow(&mut env.tables);
     Ok(ExecutionContinuation::NextInteraction)
 }
 
@@ -268,7 +267,9 @@ fn limbo_integrity_check(conn: &Arc<Connection>) -> Result<()> {
             StepResult::Done => {
                 break;
             }
-            StepResult::Busy => {}
+            StepResult::Busy => {
+                return Err(LimboError::Busy);
+            }
         }
     }
 
@@ -280,8 +281,7 @@ fn limbo_integrity_check(conn: &Arc<Connection>) -> Result<()> {
     let message = result.join("\n");
     if message != "ok" {
         return Err(LimboError::InternalError(format!(
-            "Integrity Check Failed: {}",
-            message
+            "Integrity Check Failed: {message}"
         )));
     }
     Ok(())

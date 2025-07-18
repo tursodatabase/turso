@@ -14,7 +14,7 @@ use indexmap::{IndexMap, IndexSet};
 
 use crate::custom_err;
 use crate::dialect::TokenType::{self, *};
-use crate::dialect::{from_token, is_identifier, Token};
+use crate::dialect::{from_token, Token};
 use crate::parser::{parse::YYCODETYPE, ParserError};
 
 /// `?` or `$` Prepared statement arg placeholder(s)
@@ -896,7 +896,8 @@ pub struct FromClause {
     pub select: Option<Box<SelectTable>>, // FIXME mandatory
     /// `JOIN`ed tabled
     pub joins: Option<Vec<JoinedSelectTable>>,
-    op: Option<JoinOperator>, // FIXME transient
+    /// A default join operator
+    pub op: Option<JoinOperator>, // FIXME transient
 }
 impl FromClause {
     pub(crate) fn empty() -> Self {
@@ -1099,7 +1100,6 @@ impl TryFrom<&[u8]> for JoinType {
 /// `JOIN` constraint
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-
 pub enum JoinConstraint {
     /// `ON`
     On(Expr),
@@ -1356,6 +1356,23 @@ impl CreateTableBody {
         constraints: Option<Vec<NamedTableConstraint>>,
         options: TableOptions,
     ) -> Result<Self, ParserError> {
+        Ok(Self::ColumnsAndConstraints {
+            columns,
+            constraints,
+            options,
+        })
+    }
+
+    /// Constructor from Vec of column definition
+    pub fn columns_and_constraints_from_definition(
+        columns_vec: Vec<ColumnDefinition>,
+        constraints: Option<Vec<NamedTableConstraint>>,
+        options: TableOptions,
+    ) -> Result<Self, ParserError> {
+        let mut columns = IndexMap::new();
+        for def in columns_vec {
+            columns.insert(def.col_name.clone(), def);
+        }
         Ok(Self::ColumnsAndConstraints {
             columns,
             constraints,
@@ -1744,6 +1761,8 @@ pub enum PragmaName {
     SchemaVersion,
     /// returns information about the columns of a table
     TableInfo,
+    /// enable capture-changes logic for the connection
+    UnstableCaptureDataChangesConn,
     /// Returns the user version of the database file.
     UserVersion,
     /// trigger a checkpoint to run on database(s) if WAL is enabled

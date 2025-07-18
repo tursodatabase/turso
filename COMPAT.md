@@ -137,11 +137,11 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | PRAGMA index_info                | No         |                                              |
 | PRAGMA index_list                | No         |                                              |
 | PRAGMA index_xinfo               | No         |                                              |
-| PRAGMA integrity_check           | No         |                                              |
+| PRAGMA integrity_check           | Yes        |                                              |
 | PRAGMA journal_mode              | Yes        |                                              |
 | PRAGMA journal_size_limit        | No         |                                              |
 | PRAGMA legacy_alter_table        | No         |                                              |
-| PRAGMA legacy_file_format        | Yes        |                                              |
+| PRAGMA legacy_file_format         | Yes        |                                              |
 | PRAGMA locking_mode              | No         |                                              |
 | PRAGMA max_page_count            | No         |                                              |
 | PRAGMA mmap_size                 | No         |                                              |
@@ -633,6 +633,7 @@ The `vector` extension is compatible with libSQL native vector search.
 | vector64(x)                                    | Yes    |         |
 | vector_extract(x)                              | Yes    |         |
 | vector_distance_cos(x, y)                      | Yes    |         |
+| vector_distance_l2(x, y)                              | Yes    |Euclidean distance|
 
 ### Time
 

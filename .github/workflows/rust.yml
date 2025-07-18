@@ -17,6 +17,8 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
     - name: Check formatting
       run: cargo fmt --check
+    - name: Check formatting (fuzz)
+      run: cd fuzz && cargo fmt --check
 
   build-native:
     strategy:
@@ -73,19 +75,12 @@ jobs:
         with:
           prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
       - name: Install the project
-        run: ./scripts/run-sim --iterations 50
+        run: ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 loop -n 10 -s
 
   test-limbo:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
-      - name: Install cargo-c
-        env:
-          LINK: https://github.com/lu-zero/cargo-c/releases/download/v0.10.7
-          CARGO_C_FILE: cargo-c-x86_64-unknown-linux-musl.tar.gz
-        run: |
-          curl -L $LINK/$CARGO_C_FILE | tar xz -C ~/.cargo/bin
-
       - uses: actions/checkout@v3
 
       - name: Install uv
@@ -95,9 +90,6 @@ jobs:
 
       - name: Set up Python
         run: uv python install
-
-      - name: Install the project
-        run: uv sync --all-extras --dev --all-packages
 
       - uses: "./.github/shared/install_sqlite"
       - name: Test

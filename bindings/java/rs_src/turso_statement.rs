@@ -76,7 +76,7 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_step<'local>(
                 };
             }
             StepResult::IO => {
-                if let Err(e) = stmt.connection.io.run_once() {
+                if let Err(e) = stmt.stmt.run_once() {
                     set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
                     return to_turso_step_result(&mut env, STEP_RESULT_ID_ERROR, None);
                 }
@@ -118,7 +118,7 @@ fn row_to_obj_array<'local>(
             turso_core::Value::Blob(b) => env.byte_array_from_slice(b.as_slice())?.into(),
         };
         if let Err(e) = env.set_object_array_element(&obj_array, i as i32, obj) {
-            eprintln!("Error on parsing row: {:?}", e);
+            eprintln!("Error on parsing row: {e:?}");
         }
     }
 

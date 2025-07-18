@@ -7,10 +7,7 @@ use cost::Cost;
 use join::{compute_best_join_order, BestJoinOrderResult};
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy};
-use turso_sqlite3_parser::{
-    ast::{self, Expr, SortOrder},
-    to_sql_string::ToSqlString as _,
-};
+use turso_sqlite3_parser::ast::{self, fmt::ToTokens as _, Expr, SortOrder};
 
 use crate::{
     parameters::PARAM_PREFIX,
@@ -51,7 +48,11 @@ pub fn optimize_plan(plan: &mut Plan, schema: &Schema) -> Result<()> {
         }
     }
     // When debug tracing is enabled, print the optimized plan as a SQL string for debugging
-    tracing::debug!(plan_sql = plan.to_sql_string(&crate::translate::display::PlanContext(&[])));
+    tracing::debug!(
+        plan_sql = plan
+            .format_with_context(&crate::translate::display::PlanContext(&[]))
+            .unwrap()
+    );
     Ok(())
 }
 
@@ -231,7 +232,7 @@ fn optimize_table_access(
             is_outer: joined_tables[table_number]
                 .join_info
                 .as_ref()
-                .map_or(false, |join_info| join_info.outer),
+                .is_some_and(|join_info| join_info.outer),
         })
         .collect();
 
@@ -243,11 +244,11 @@ fn optimize_table_access(
             let try_to_build_ephemeral_index = if schema.indexes_enabled() {
                 let is_leftmost_table = i == 0;
                 let uses_index = access_method.index.is_some();
-                let source_table_is_from_clause_subquery = matches!(
+                let source_table_does_not_support_search = matches!(
                     &joined_tables[table_idx].table,
-                    Table::FromClauseSubquery(_)
+                    Table::FromClauseSubquery(_) | Table::Virtual(_)
                 );
-                !is_leftmost_table && !uses_index && !source_table_is_from_clause_subquery
+                !is_leftmost_table && !uses_index && !source_table_does_not_support_search
             } else {
                 false
             };
@@ -334,8 +335,7 @@ fn optimize_table_access(
             }
             assert!(
                 constraint_refs.len() == 1,
-                "expected exactly one constraint for rowid seek, got {:?}",
-                constraint_refs
+                "expected exactly one constraint for rowid seek, got {constraint_refs:?}"
             );
             let constraint = &constraints_per_table[table_idx].constraints
                 [constraint_refs[0].constraint_vec_pos];
@@ -467,14 +467,10 @@ pub trait Optimizable {
     // return a [ConstantPredicate].
     fn check_always_true_or_false(&self) -> Result<Option<AlwaysTrueOrFalse>>;
     fn is_always_true(&self) -> Result<bool> {
-        Ok(self
-            .check_always_true_or_false()?
-            .map_or(false, |c| c == AlwaysTrueOrFalse::AlwaysTrue))
+        Ok(self.check_always_true_or_false()? == Some(AlwaysTrueOrFalse::AlwaysTrue))
     }
     fn is_always_false(&self) -> Result<bool> {
-        Ok(self
-            .check_always_true_or_false()?
-            .map_or(false, |c| c == AlwaysTrueOrFalse::AlwaysFalse))
+        Ok(self.check_always_true_or_false()? == Some(AlwaysTrueOrFalse::AlwaysFalse))
     }
     fn is_constant(&self, resolver: &Resolver<'_>) -> bool;
     fn is_nonnull(&self, tables: &TableReferences) -> bool;
@@ -499,13 +495,13 @@ impl Optimizable for ast::Expr {
                 else_expr,
                 ..
             } => {
-                base.as_ref().map_or(true, |base| base.is_nonnull(tables))
+                base.as_ref().is_none_or(|base| base.is_nonnull(tables))
                     && when_then_pairs
                         .iter()
                         .all(|(_, then)| then.is_nonnull(tables))
                     && else_expr
                         .as_ref()
-                        .map_or(true, |else_expr| else_expr.is_nonnull(tables))
+                        .is_none_or(|else_expr| else_expr.is_nonnull(tables))
             }
             Expr::Cast { expr, .. } => expr.is_nonnull(tables),
             Expr::Collate(expr, _) => expr.is_nonnull(tables),
@@ -536,7 +532,7 @@ impl Optimizable for ast::Expr {
                 lhs.is_nonnull(tables)
                     && rhs
                         .as_ref()
-                        .map_or(true, |rhs| rhs.iter().all(|rhs| rhs.is_nonnull(tables)))
+                        .is_none_or(|rhs| rhs.iter().all(|rhs| rhs.is_nonnull(tables)))
             }
             Expr::InSelect { .. } => false,
             Expr::InTable { .. } => false,
@@ -582,14 +578,13 @@ impl Optimizable for ast::Expr {
                 when_then_pairs,
                 else_expr,
             } => {
-                base.as_ref()
-                    .map_or(true, |base| base.is_constant(resolver))
+                base.as_ref().is_none_or(|base| base.is_constant(resolver))
                     && when_then_pairs.iter().all(|(when, then)| {
                         when.is_constant(resolver) && then.is_constant(resolver)
                     })
                     && else_expr
                         .as_ref()
-                        .map_or(true, |else_expr| else_expr.is_constant(resolver))
+                        .is_none_or(|else_expr| else_expr.is_constant(resolver))
             }
             Expr::Cast { expr, .. } => expr.is_constant(resolver),
             Expr::Collate(expr, _) => expr.is_constant(resolver),
@@ -604,9 +599,9 @@ impl Optimizable for ast::Expr {
                     return false;
                 };
                 func.is_deterministic()
-                    && args.as_ref().map_or(true, |args| {
-                        args.iter().all(|arg| arg.is_constant(resolver))
-                    })
+                    && args
+                        .as_ref()
+                        .is_none_or(|args| args.iter().all(|arg| arg.is_constant(resolver)))
             }
             Expr::FunctionCallStar { .. } => false,
             Expr::Id(_) => panic!("Id should have been rewritten as Column"),
@@ -616,7 +611,7 @@ impl Optimizable for ast::Expr {
                 lhs.is_constant(resolver)
                     && rhs
                         .as_ref()
-                        .map_or(true, |rhs| rhs.iter().all(|rhs| rhs.is_constant(resolver)))
+                        .is_none_or(|rhs| rhs.iter().all(|rhs| rhs.is_constant(resolver)))
             }
             Expr::InSelect { .. } => {
                 false // might be constant, too annoying to check subqueries etc. implement later
@@ -630,7 +625,7 @@ impl Optimizable for ast::Expr {
                     && rhs.is_constant(resolver)
                     && escape
                         .as_ref()
-                        .map_or(true, |escape| escape.is_constant(resolver))
+                        .is_none_or(|escape| escape.is_constant(resolver))
             }
             Expr::Literal(_) => true,
             Expr::Name(_) => false,
@@ -639,9 +634,7 @@ impl Optimizable for ast::Expr {
             Expr::Qualified(_, _) => {
                 panic!("Qualified should have been rewritten as Column")
             }
-            Expr::Raise(_, expr) => expr
-                .as_ref()
-                .map_or(true, |expr| expr.is_constant(resolver)),
+            Expr::Raise(_, expr) => expr.as_ref().is_none_or(|expr| expr.is_constant(resolver)),
             Expr::Subquery(_) => false,
             Expr::Unary(_, expr) => expr.is_constant(resolver),
             Expr::Variable(_) => false,
@@ -816,7 +809,7 @@ fn ephemeral_index_build(
         has_rowid: table_reference
             .table
             .btree()
-            .map_or(false, |btree| btree.has_rowid),
+            .is_some_and(|btree| btree.has_rowid),
     };
 
     ephemeral_index
@@ -1322,7 +1315,7 @@ pub fn rewrite_expr(top_level_expr: &mut ast::Expr, param_idx: &mut usize) -> Re
                 if var.is_empty() {
                     // rewrite anonymous variables only, ensure that the `param_idx` starts at 1 and
                     // all the expressions are rewritten in the order they come in the statement
-                    *expr = ast::Expr::Variable(format!("{}{param_idx}", PARAM_PREFIX));
+                    *expr = ast::Expr::Variable(format!("{PARAM_PREFIX}{param_idx}"));
                     *param_idx += 1;
                 }
             }

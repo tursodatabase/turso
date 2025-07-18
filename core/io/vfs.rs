@@ -98,7 +98,7 @@ impl File for VfsFileImpl {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: Completion) -> Result<Arc<Completion>> {
+    fn pread(&self, pos: usize, c: Arc<Completion>) -> Result<Arc<Completion>> {
         let r = match c.completion_type {
             CompletionType::Read(ref r) => r,
             _ => unreachable!(),
@@ -113,7 +113,7 @@ impl File for VfsFileImpl {
             Err(LimboError::ExtensionError("pread failed".to_string()))
         } else {
             c.complete(result);
-            Ok(Arc::new(c))
+            Ok(c)
         }
     }
 
@@ -121,7 +121,7 @@ impl File for VfsFileImpl {
         &self,
         pos: usize,
         buffer: Arc<RefCell<Buffer>>,
-        c: Completion,
+        c: Arc<Completion>,
     ) -> Result<Arc<Completion>> {
         let buf = buffer.borrow();
         let count = buf.as_slice().len();
@@ -142,18 +142,18 @@ impl File for VfsFileImpl {
             Err(LimboError::ExtensionError("pwrite failed".to_string()))
         } else {
             c.complete(result);
-            Ok(Arc::new(c))
+            Ok(c)
         }
     }
 
-    fn sync(&self, c: Completion) -> Result<Arc<Completion>> {
+    fn sync(&self, c: Arc<Completion>) -> Result<Arc<Completion>> {
         let vfs = unsafe { &*self.vfs };
         let result = unsafe { (vfs.sync)(self.file) };
         if result < 0 {
             Err(LimboError::ExtensionError("sync failed".to_string()))
         } else {
             c.complete(0);
-            Ok(Arc::new(c))
+            Ok(c)
         }
     }
 

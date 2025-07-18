@@ -4,7 +4,7 @@ use pprof::{
     flamegraph::Options,
 };
 use std::sync::Arc;
-use turso_core::{Database, PlatformIO, IO};
+use turso_core::{Database, PlatformIO};
 
 // Title: JSONB Function Benchmarking
 
@@ -443,17 +443,16 @@ fn bench(criterion: &mut Criterion) {
     for (size_name, json_payload) in json_sizes.iter() {
         let query = format!("SELECT jsonb('{}')", json_payload.replace("'", "\\'"));
 
-        let mut group = criterion.benchmark_group(format!("JSONB Size - {}", size_name));
+        let mut group = criterion.benchmark_group(format!("JSONB Size - {size_name}"));
 
         group.bench_function("Limbo", |b| {
             let mut stmt = limbo_conn.prepare(&query).unwrap();
-            let io = io.clone();
             b.iter(|| {
                 loop {
                     match stmt.step().unwrap() {
                         turso_core::StepResult::Row => {}
                         turso_core::StepResult::IO => {
-                            let _ = io.run_once();
+                            stmt.run_once().unwrap();
                         }
                         turso_core::StepResult::Done => {
                             break;
@@ -606,13 +605,12 @@ fn bench_sequential_jsonb(criterion: &mut Criterion) {
 
     group.bench_function("Limbo - Sequential", |b| {
         let mut stmt = limbo_conn.prepare(&query).unwrap();
-        let io = io.clone();
         b.iter(|| {
             loop {
                 match stmt.step().unwrap() {
                     turso_core::StepResult::Row => {}
                     turso_core::StepResult::IO => {
-                        let _ = io.run_once();
+                        stmt.run_once().unwrap();
                     }
                     turso_core::StepResult::Done => {
                         break;
@@ -895,17 +893,16 @@ fn bench_json_patch(criterion: &mut Criterion) {
             patch_json.replace("'", "''")
         );
 
-        let mut group = criterion.benchmark_group(format!("JSON Patch - {}", case_name));
+        let mut group = criterion.benchmark_group(format!("JSON Patch - {case_name}"));
 
         group.bench_function("Limbo", |b| {
             let mut stmt = limbo_conn.prepare(&query).unwrap();
-            let io = io.clone();
             b.iter(|| {
                 loop {
                     match stmt.step().unwrap() {
                         turso_core::StepResult::Row => {}
                         turso_core::StepResult::IO => {
-                            let _ = io.run_once();
+                            stmt.run_once().unwrap();
                         }
                         turso_core::StepResult::Done => {
                             break;

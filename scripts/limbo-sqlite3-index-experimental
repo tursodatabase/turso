@@ -1,8 +1,17 @@
 #!/bin/bash
 
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Go to the project root (one level up from scripts/)
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+TURSODB="$PROJECT_ROOT/target/debug/tursodb"
+
+# Add experimental features for testing
+EXPERIMENTAL_FLAGS="--experimental-indexes"
+
 # if RUST_LOG is non-empty, enable tracing output
 if [ -n "$RUST_LOG" ]; then
-   target/debug/tursodb --experimental-indexes -m list -t testing/test.log "$@"
+   "$TURSODB" -m list -q $EXPERIMENTAL_FLAGS -t testing/test.log "$@"
 else
-   target/debug/tursodb --experimental-indexes -m list "$@"
+   "$TURSODB" -m list -q $EXPERIMENTAL_FLAGS "$@"
 fi

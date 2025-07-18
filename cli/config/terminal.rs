@@ -25,8 +25,8 @@ impl TerminalDetector {
 impl TerminalDetector {
     /// Detects terminal background using ANSI escape sequences on Unix systems
     pub fn detect_theme() -> TerminalTheme {
-        // Only works on interactive terminals
-        if !io::stdin().is_terminal() {
+        // Only works on interactive terminals where both stdin and stdout are terminals
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return TerminalTheme::Unknown; // No colors for non-interactive
         }
 

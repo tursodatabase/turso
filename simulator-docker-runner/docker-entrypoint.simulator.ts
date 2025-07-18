@@ -2,6 +2,7 @@
 
 import { spawn } from "bun";
 import { GithubClient } from "./github";
+import { SlackClient } from "./slack";
 import { extractFailureInfo } from "./logParse";
 import { randomSeed } from "./random";
 
@@ -12,12 +13,14 @@ const PER_RUN_TIMEOUT_SECONDS = Number.isInteger(Number(process.env.PER_RUN_TIME
 const LOG_TO_STDOUT = process.env.LOG_TO_STDOUT === "true";
 
 const github = new GithubClient();
+const slack = new SlackClient();
 
 process.env.RUST_BACKTRACE = "1";
 
 console.log("Starting limbo_sim in a loop...");
 console.log(`Git hash: ${github.GIT_HASH}`);
 console.log(`GitHub issues enabled: ${github.mode === 'real'}`);
+console.log(`Slack notifications enabled: ${slack.mode === 'real'}`);
 console.log(`Time limit: ${TIME_LIMIT_MINUTES} minutes`);
 console.log(`Log simulator output to stdout: ${LOG_TO_STDOUT}`);
 console.log(`Sleep between runs: ${SLEEP_BETWEEN_RUNS_SECONDS} seconds`);
@@ -69,7 +72,7 @@ const timeouter = (seconds: number, runNumber: number) => {
   return timeouterPromise;
 }
 
-const run = async (seed: string, bin: string, args: string[]) => {
+const run = async (seed: string, bin: string, args: string[]): Promise<boolean> => {
   const proc = spawn([`/app/${bin}`, ...args], {
     stdout: LOG_TO_STDOUT ? "inherit" : "pipe",
     stderr: LOG_TO_STDOUT ? "inherit" : "pipe",
@@ -77,6 +80,7 @@ const run = async (seed: string, bin: string, args: string[]) => {
   });
 
   const timeout = timeouter(PER_RUN_TIMEOUT_SECONDS, runNumber);
+  let issuePosted = false;
 
   try {
     const exitCode = await Promise.race([proc.exited, timeout]);
@@ -102,6 +106,7 @@ const run = async (seed: string, bin: string, args: string[]) => {
             command: args.join(" "),
             stackTrace: failureInfo,
           });
+          issuePosted = true;
         } else {
           await github.postGitHubIssue({
             type: "assertion",
@@ -109,6 +114,7 @@ const run = async (seed: string, bin: string, args: string[]) => {
             command: args.join(" "),
             failureInfo,
           });
+          issuePosted = true;
         }
       } catch (err2) {
         console.error(`Error extracting simulator seed and stack trace: ${err2}`);
@@ -134,6 +140,7 @@ const run = async (seed: string, bin: string, args: string[]) => {
         command: args.join(" "),
         output: lastLines,
       });
+      issuePosted = true;
     } else {
       throw err;
     }
@@ -141,12 +148,16 @@ const run = async (seed: string, bin: string, args: string[]) => {
     // @ts-ignore
     timeout.clear();
   }
+  
+  return issuePosted;
 }
 
 // Main execution loop
 const startTime = new Date();
 const limboSimArgs = process.argv.slice(2);
 let runNumber = 0;
+let totalIssuesPosted = 0;
+
 while (new Date().getTime() - startTime.getTime() < TIME_LIMIT_MINUTES * 60 * 1000) {
   const timestamp = new Date().toISOString();
   const args = [...limboSimArgs];
@@ -160,12 +171,28 @@ while (new Date().getTime() - startTime.getTime() < TIME_LIMIT_MINUTES * 60 * 10
   args.push(...loop);
 
   console.log(`[${timestamp}]: Running "limbo_sim ${args.join(" ")}" - (seed ${seed}, run number ${runNumber})`);
-  await run(seed, "limbo_sim", args);
+  const issuePosted = await run(seed, "limbo_sim", args);
+  
+  if (issuePosted) {
+    totalIssuesPosted++;
+  }
 
   runNumber++;
 
   SLEEP_BETWEEN_RUNS_SECONDS > 0 && (await sleep(SLEEP_BETWEEN_RUNS_SECONDS));
 }
+
+// Post summary to Slack after the run completes
+const endTime = new Date();
+const timeElapsed = Math.floor((endTime.getTime() - startTime.getTime()) / 1000);
+console.log(`\nRun completed! Total runs: ${runNumber}, Issues posted: ${totalIssuesPosted}, Time elapsed: ${timeElapsed}s`);
+
+await slack.postRunSummary({
+  totalRuns: runNumber,
+  issuesPosted: totalIssuesPosted,
+  timeElapsed,
+  gitHash: github.GIT_HASH,
+});
 
 async function sleep(sec: number) {
   return new Promise(resolve => setTimeout(resolve, sec * 1000));

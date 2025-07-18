@@ -25,26 +25,22 @@ default = ["YYNOERRORRECOVERY", "NDEBUG"]
 serde = ["dep:serde", "indexmap/serde", "bitflags/serde"]
 
 [dependencies]
-phf = { version = "0.11", features = ["uncased"] }
 log = "0.4.22"
 memchr = "2.0"
 fallible-iterator = "0.3"
 bitflags = "2.0"
-uncased = "0.9.10"
 indexmap = "2.0"
 miette = "7.4.0"
 strum = { workspace = true }
 strum_macros = {workspace = true }
 serde = { workspace = true , optional = true, features = ["derive"] }
+smallvec = { version = "1.15.1", features = ["const_generics"] }
 
 [dev-dependencies]
 env_logger = { version = "0.11", default-features = false }
 
 [build-dependencies]
 cc = "1.0"
-phf_shared = { version = "0.11", features = ["uncased"] }
-phf_codegen = "0.11"
-uncased = "0.9.10"
 
 [lints.rust]
 dead_code = "allow"

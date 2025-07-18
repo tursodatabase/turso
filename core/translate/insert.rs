@@ -6,6 +6,7 @@ use turso_sqlite3_parser::ast::{
 
 use crate::error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY};
 use crate::schema::{IndexColumn, Table};
+use crate::translate::emitter::{emit_cdc_insns, emit_cdc_patch_record, OperationMode};
 use crate::util::normalize_ident;
 use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::{IdxInsertFlags, InsertFlags, RegisterOrLiteral};
@@ -115,6 +116,26 @@ pub fn translate_insert(
 
     let halt_label = program.allocate_label();
     let loop_start_label = program.allocate_label();
+
+    let cdc_table = program.capture_data_changes_mode().table();
+    let cdc_table = if let Some(cdc_table) = cdc_table {
+        if table.get_name() != cdc_table {
+            let Some(turso_cdc_table) = schema.get_table(cdc_table) else {
+                crate::bail_parse_error!("no such table: {}", cdc_table);
+            };
+            let Some(cdc_btree) = turso_cdc_table.btree().clone() else {
+                crate::bail_parse_error!("no such table: {}", cdc_table);
+            };
+            Some((
+                program.alloc_cursor_id(CursorType::BTreeTable(cdc_btree.clone())),
+                cdc_btree,
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let mut yield_reg_opt = None;
     let mut temp_table_ctx = None;
@@ -328,6 +349,15 @@ pub fn translate_insert(
             &resolver,
         )?;
     }
+    // Open turso_cdc table btree for writing if necessary
+    if let Some((cdc_cursor_id, cdc_btree)) = &cdc_table {
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: *cdc_cursor_id,
+            root_page: cdc_btree.root_page.into(),
+            name: cdc_btree.name.clone(),
+        });
+    }
+
     // Open all the index btrees for writing
     for idx_cursor in idx_cursors.iter() {
         program.emit_insn(Insn::OpenWrite {
@@ -349,7 +379,7 @@ pub fn translate_insert(
             program.emit_insn(Insn::Copy {
                 src_reg: reg,
                 dst_reg: rowid_reg,
-                amount: 0, // TODO: rename 'amount' to something else; amount==0 means 1
+                extra_amount: 0, // TODO: rename 'amount' to something else; amount==0 means 1
             });
             // for the row record, the rowid alias column is always set to NULL
             program.emit_insn(Insn::SoftNull { reg });
@@ -434,14 +464,14 @@ pub fn translate_insert(
             program.emit_insn(Insn::Copy {
                 src_reg: column_registers_start + col.0,
                 dst_reg: idx_start_reg + i,
-                amount: 0,
+                extra_amount: 0,
             });
         }
         // last register is the rowid
         program.emit_insn(Insn::Copy {
             src_reg: rowid_reg,
             dst_reg: idx_start_reg + num_cols,
-            amount: 0,
+            extra_amount: 0,
         });
 
         let index = schema
@@ -511,6 +541,10 @@ pub fn translate_insert(
         .enumerate()
         .filter(|(_, col)| col.column.notnull)
     {
+        // if this is rowid alias - turso-db will emit NULL as a column value and always use rowid for the row as a column value
+        if col.column.is_rowid_alias {
+            continue;
+        }
         let target_reg = i + column_registers_start;
         program.emit_insn(Insn::HaltIfNull {
             target_reg,
@@ -532,7 +566,6 @@ pub fn translate_insert(
         dest_reg: record_register,
         index_name: None,
     });
-
     program.emit_insn(Insn::Insert {
         cursor: cursor_id,
         key_reg: rowid_reg,
@@ -540,6 +573,32 @@ pub fn translate_insert(
         flag: InsertFlags::new(),
         table_name: table_name.to_string(),
     });
+
+    // Emit update in the CDC table if necessary (after the INSERT updated the table)
+    if let Some((cdc_cursor_id, _)) = &cdc_table {
+        let cdc_has_after = program.capture_data_changes_mode().has_after();
+        let after_record_reg = if cdc_has_after {
+            Some(emit_cdc_patch_record(
+                &mut program,
+                &table,
+                column_registers_start,
+                record_register,
+                rowid_reg,
+            ))
+        } else {
+            None
+        };
+        emit_cdc_insns(
+            &mut program,
+            &resolver,
+            OperationMode::INSERT,
+            *cdc_cursor_id,
+            rowid_reg,
+            None,
+            after_record_reg,
+            &table_name.0,
+        )?;
+    }
 
     if inserting_multiple_rows {
         if let Some(temp_table_ctx) = temp_table_ctx {
@@ -603,25 +662,30 @@ fn resolve_columns_for_insert<'a>(
     let table_columns = table.columns();
     // Case 1: No columns specified - map values to columns in order
     if columns.is_none() {
-        if num_values != table_columns.len() {
+        let mut value_idx = 0;
+        let mut column_mappings = Vec::with_capacity(table_columns.len());
+        for col in table_columns {
+            let mapping = ColumnMapping {
+                column: col,
+                value_index: if col.hidden { None } else { Some(value_idx) },
+                default_value: col.default.as_ref(),
+            };
+            if !col.hidden {
+                value_idx += 1;
+            }
+            column_mappings.push(mapping);
+        }
+
+        if num_values != value_idx {
             crate::bail_parse_error!(
                 "table {} has {} columns but {} values were supplied",
                 &table.get_name(),
-                table_columns.len(),
+                value_idx,
                 num_values
             );
         }
 
-        // Map each column to either its corresponding value index or None
-        return Ok(table_columns
-            .iter()
-            .enumerate()
-            .map(|(i, col)| ColumnMapping {
-                column: col,
-                value_index: if i < num_values { Some(i) } else { None },
-                default_value: col.default.as_ref(),
-            })
-            .collect());
+        return Ok(column_mappings);
     }
 
     // Case 2: Columns specified - map named columns to their values
@@ -640,7 +704,7 @@ fn resolve_columns_for_insert<'a>(
         let table_index = table_columns.iter().position(|c| {
             c.name
                 .as_ref()
-                .map_or(false, |name| name.eq_ignore_ascii_case(&column_name))
+                .is_some_and(|name| name.eq_ignore_ascii_case(&column_name))
         });
 
         let Some(table_index) = table_index else {
@@ -701,7 +765,7 @@ fn resolve_indicies_for_insert(
                     .column
                     .name
                     .as_ref()
-                    .map_or(false, |name| name.eq_ignore_ascii_case(&target_name))
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&target_name))
             }) {
                 idx_map.columns.push((i, idx_col.clone()));
                 idx_map.value_indicies.push(col_mapping.value_index);
@@ -747,7 +811,7 @@ fn populate_columns_multiple_rows(
                 program.emit_insn(Insn::Copy {
                     src_reg: yield_reg + value_index_seen,
                     dst_reg: column_registers_start + value_index + other_values_seen,
-                    amount: 0,
+                    extra_amount: 0,
                 });
             }
 
@@ -810,6 +874,12 @@ fn populate_column_registers(
             if write_directly_to_rowid_reg {
                 program.emit_insn(Insn::SoftNull { reg: target_reg });
             }
+        } else if mapping.column.hidden {
+            program.emit_insn(Insn::Null {
+                dest: target_reg,
+                dest_end: None,
+            });
+            program.mark_last_insn_constant();
         } else if let Some(default_expr) = mapping.default_value {
             translate_expr_no_constant_opt(
                 program,

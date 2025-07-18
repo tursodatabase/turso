@@ -10,6 +10,7 @@ SQLITE_EXTENSION_INIT1
 #include <string.h>
 
 typedef struct {
+    char *comment;
     char *key;
     char *value;
     sqlite3_int64 rowid;
@@ -38,7 +39,12 @@ static int kvstoreConnect(
     kv_table *pNew;
     int rc;
 
-    rc = sqlite3_declare_vtab(db, "CREATE TABLE x (key TEXT PRIMARY KEY, value TEXT)");
+    rc = sqlite3_declare_vtab(db,
+        "CREATE TABLE x("
+        "  comment TEXT HIDDEN NOT NULL DEFAULT 'default comment',"
+        "  key TEXT PRIMARY KEY,"
+        "  value TEXT"
+        ")");
 
     if (rc == SQLITE_OK) {
         pNew = sqlite3_malloc(sizeof(*pNew));
@@ -54,6 +60,7 @@ static int kvstoreConnect(
 static int kvstoreDisconnect(sqlite3_vtab *pVtab) {
     kv_table *table = (kv_table *)pVtab;
     for (int i = 0; i < table->row_count; i++) {
+        sqlite3_free(table->rows[i].comment);
         sqlite3_free(table->rows[i].key);
         sqlite3_free(table->rows[i].value);
     }
@@ -101,9 +108,12 @@ static int kvstoreColumn(sqlite3_vtab_cursor *cur, sqlite3_context *ctx, int col
     kv_row *row = &cursor->table->rows[cursor->current];
     switch (col) {
         case 0:
-            sqlite3_result_text(ctx, row->key, -1, SQLITE_TRANSIENT);
+            sqlite3_result_text(ctx, row->comment, -1, SQLITE_TRANSIENT);
             break;
         case 1:
+            sqlite3_result_text(ctx, row->key, -1, SQLITE_TRANSIENT);
+            break;
+        case 2:
             sqlite3_result_text(ctx, row->value, -1, SQLITE_TRANSIENT);
             break;
     }
@@ -140,13 +150,21 @@ static int kvUpsert(
 ) {
     kv_table *table = (kv_table *)pVTab;
 
-    const char *key = (const char *)sqlite3_value_text(argv[2]);
-    const char *value = (const char *)sqlite3_value_text(argv[3]);
+    const char *comment;
+    if (sqlite3_value_type(argv[2]) == SQLITE_NULL) {
+        comment = "auto-generated";
+    } else {
+        comment = (const char *)sqlite3_value_text(argv[2]);
+    }
+    const char *key = (const char *)sqlite3_value_text(argv[3]);
+    const char *value = (const char *)sqlite3_value_text(argv[4]);
 
     // Check if key exists; if so, replace
     for (int i = 0; i < table->row_count; i++) {
         if (strcmp(table->rows[i].key, key) == 0) {
+            sqlite3_free(table->rows[i].comment);
             sqlite3_free(table->rows[i].value);
+            table->rows[i].comment = sqlite3_mprintf("%s", comment);
             table->rows[i].value = sqlite3_mprintf("%s", value);
             return SQLITE_OK;
         }
@@ -155,6 +173,7 @@ static int kvUpsert(
     // Otherwise, insert new
     table->rows = sqlite3_realloc(table->rows, sizeof(kv_row) * (table->row_count + 1));
     kv_row *row = &table->rows[table->row_count++];
+    row->comment = sqlite3_mprintf("%s", comment);
     row->key = sqlite3_mprintf("%s", key);
     row->value = sqlite3_mprintf("%s", value);
     row->rowid = table->next_rowid;
@@ -175,6 +194,7 @@ static int kvDelete(sqlite3_vtab *pVTab, sqlite3_int64 rowid) {
     }
 
     if (idx > -1) {
+        sqlite3_free(table->rows[idx].comment);
         sqlite3_free(table->rows[idx].key);
         sqlite3_free(table->rows[idx].value);
 
@@ -196,7 +216,7 @@ static int kvstoreUpdate(
     if (argc == 1) {
         return kvDelete(pVTab, sqlite3_value_int64(argv[0]));
     } else {
-        assert(argc == 4);
+        assert(argc == 5);
         return kvUpsert(pVTab, argv, pRowid);
     }
 }

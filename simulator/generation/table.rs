@@ -19,7 +19,13 @@ impl Arbitrary for Table {
     fn arbitrary<R: Rng>(rng: &mut R) -> Self {
         let name = Name::arbitrary(rng).0;
         let columns = loop {
-            let columns = (1..=rng.gen_range(1..10))
+            let large_table = rng.gen_bool(0.1);
+            let column_size = if large_table {
+                rng.gen_range(64..125) // todo: make this higher (128+)
+            } else {
+                rng.gen_range(1..=10)
+            };
+            let columns = (1..=column_size)
                 .map(|_| Column::arbitrary(rng))
                 .collect::<Vec<_>>();
             // TODO: see if there is a better way to detect duplicates here

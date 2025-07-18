@@ -1,6 +1,7 @@
 #[cfg(feature = "fs")]
 mod dynamic;
 mod vtab_xconnect;
+use crate::vtab::VirtualTable;
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
 use crate::UringIO;
 use crate::{function::ExternalFunc, Connection, Database, LimboError, IO};
@@ -102,10 +103,7 @@ impl Database {
             other => match get_vfs_modules().iter().find(|v| v.0 == vfs) {
                 Some((_, vfs)) => vfs.clone(),
                 None => {
-                    return Err(LimboError::InvalidArgument(format!(
-                        "no such VFS: {}",
-                        other
-                    )));
+                    return Err(LimboError::InvalidArgument(format!("no such VFS: {other}")));
                 }
             },
         };
@@ -151,6 +149,13 @@ impl Connection {
             .borrow_mut()
             .vtab_modules
             .insert(name.to_string(), vmodule.into());
+        if kind == VTabKind::TableValuedFunction {
+            if let Ok(vtab) = VirtualTable::function(name, &self.syms.borrow()) {
+                self.with_schema_mut(|schema| schema.add_virtual_table(vtab));
+            } else {
+                return ResultCode::Error;
+            }
+        }
         ResultCode::OK
     }
 

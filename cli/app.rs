@@ -1,6 +1,6 @@
 use crate::{
     commands::{
-        args::{EchoMode, TimerMode},
+        args::{EchoMode, HeadersMode, TimerMode},
         import::ImportFile,
         Command, CommandParser,
     },
@@ -16,7 +16,7 @@ use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Row, Table
 use rustyline::{error::ReadlineError, history::DefaultHistory, Editor};
 use std::{
     fmt,
-    io::{self, BufRead as _, Write},
+    io::{self, BufRead as _, IsTerminal, Write},
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -24,6 +24,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{Connection, Database, LimboError, OpenFlags, Statement, StepResult, Value};
@@ -95,7 +96,7 @@ macro_rules! query_internal {
                         $body(row)?;
                     }
                     StepResult::IO => {
-                        $self.io.run_once()?;
+                        rows.run_once()?;
                     }
                     StepResult::Interrupt => break,
                     StepResult::Done => break,
@@ -110,7 +111,7 @@ macro_rules! query_internal {
 }
 
 impl Limbo {
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new() -> anyhow::Result<(Self, WorkerGuard)> {
         let opts = Opts::parse();
         let db_file = opts
             .database
@@ -163,8 +164,9 @@ impl Limbo {
             rl: None,
             config: Some(config),
         };
+        let guard = app.init_tracing()?;
         app.first_run(sql, quiet)?;
-        Ok(app)
+        Ok((app, guard))
     }
 
     pub fn with_config(mut self, config: Config) -> Self {
@@ -175,7 +177,6 @@ impl Limbo {
     pub fn with_readline(mut self, mut rl: Editor<LimboHelper, DefaultHistory>) -> Self {
         let h = LimboHelper::new(
             self.conn.clone(),
-            self.io.clone(),
             self.config.as_ref().map(|c| c.highlight.clone()),
         );
         rl.set_helper(Some(h));
@@ -216,7 +217,7 @@ impl Limbo {
         }) {
             n if n < 0 => String::from(")x!...>"),
             0 => String::from("   ...> "),
-            n if n < 10 => format!("(x{}...> ", n),
+            n if n < 10 => format!("(x{n}...> "),
             _ => String::from("(.....> "),
         };
     }
@@ -230,7 +231,7 @@ impl Limbo {
     }
 
     fn dump_table(&mut self, name: &str) -> Result<(), LimboError> {
-        let query = format!("pragma table_info={}", name);
+        let query = format!("pragma table_info={name}");
         let mut cols = vec![];
         let mut value_types = vec![];
         query_internal!(
@@ -248,7 +249,7 @@ impl Limbo {
         // it, but it requires pragma index_list, and it seems to be relevant
         // only for indexes.
         let cols_str = cols.join(", ");
-        let select = format!("select {} from {}", cols_str, name);
+        let select = format!("select {cols_str} from {name}");
         query_internal!(
             self,
             select,
@@ -273,14 +274,14 @@ impl Limbo {
                                         fmt::Write::write_fmt(&mut output, format_args!("{b:02x}"));
                                     output
                                 });
-                            format!("X'{}'", hex_string)
+                            format!("X'{hex_string}'")
                         } else {
                             value.to_string()
                         }
                     })
                     .collect::<Vec<_>>()
                     .join(",");
-                self.write_fmt(format_args!("INSERT INTO {} VALUES({});", name, values))?;
+                self.write_fmt(format_args!("INSERT INTO {name} VALUES({values});"))?;
                 Ok(())
             }
         )?;
@@ -306,7 +307,7 @@ impl Limbo {
             |row: &turso_core::Row| -> Result<(), LimboError> {
                 let sql: &str = row.get::<&str>(2)?;
                 let name: &str = row.get::<&str>(0)?;
-                self.write_fmt(format_args!("{};", sql))?;
+                self.write_fmt(format_args!("{sql};"))?;
                 self.dump_table(name)
             }
         );
@@ -484,7 +485,7 @@ impl Limbo {
         };
         let sample_stats_as_str = |name: &str, samples: Vec<Duration>| {
             if samples.is_empty() {
-                return format!("{}: No samples available", name);
+                return format!("{name}: No samples available");
             }
             let avg_time_spent = samples.iter().sum::<Duration>() / samples.len() as u32;
             let total_time = samples.iter().fold(Duration::ZERO, |acc, x| acc + *x);
@@ -561,7 +562,7 @@ impl Limbo {
             let buff = self.input_buff.clone();
             self.run_query(buff.as_str());
         } else {
-            self.buffer_input(format!("{}\n", line).as_str());
+            self.buffer_input(format!("{line}\n").as_str());
             self.set_multiline_prompt();
         }
         self.reset_line(line)?;
@@ -608,12 +609,12 @@ impl Limbo {
                     if let Some(opcode) = args.opcode {
                         for op in &OPCODE_DESCRIPTIONS {
                             if op.name.eq_ignore_ascii_case(opcode.trim()) {
-                                let _ = self.write_fmt(format_args!("{}", op));
+                                let _ = self.write_fmt(format_args!("{op}"));
                             }
                         }
                     } else {
                         for op in &OPCODE_DESCRIPTIONS {
-                            let _ = self.write_fmt(format_args!("{}\n", op));
+                            let _ = self.write_fmt(format_args!("{op}\n"));
                         }
                     }
                 }
@@ -622,13 +623,13 @@ impl Limbo {
                 }
                 Command::OutputMode(args) => {
                     if let Err(e) = self.set_mode(args.mode) {
-                        let _ = self.write_fmt(format_args!("Error: {}", e));
+                        let _ = self.write_fmt(format_args!("Error: {e}"));
                     }
                 }
                 Command::SetOutput(args) => {
                     if let Some(path) = args.path {
                         if let Err(e) = self.set_output_file(&path) {
-                            let _ = self.write_fmt(format_args!("Error: {}", e));
+                            let _ = self.write_fmt(format_args!("Error: {e}"));
                         }
                     } else {
                         self.set_output_stdout();
@@ -644,8 +645,7 @@ impl Limbo {
                     let _ = self.show_info();
                 }
                 Command::Import(args) => {
-                    let mut import_file =
-                        ImportFile::new(self.conn.clone(), self.io.clone(), &mut self.writer);
+                    let mut import_file = ImportFile::new(self.conn.clone(), &mut self.writer);
                     import_file.import(args)
                 }
                 Command::LoadExtension(args) => {
@@ -656,7 +656,7 @@ impl Limbo {
                 }
                 Command::Dump => {
                     if let Err(e) = self.dump_database() {
-                        let _ = self.write_fmt(format_args!("/****** ERROR: {} ******/", e));
+                        let _ = self.write_fmt(format_args!("/****** ERROR: {e} ******/"));
                     }
                 }
                 Command::ListVfs => {
@@ -676,6 +676,12 @@ impl Limbo {
                         TimerMode::Off => false,
                     };
                 }
+                Command::Headers(headers_mode) => {
+                    self.opts.headers = match headers_mode.mode {
+                        HeadersMode::On => true,
+                        HeadersMode::Off => false,
+                    };
+                }
             },
         }
     }
@@ -688,62 +694,82 @@ impl Limbo {
     ) -> anyhow::Result<()> {
         match output {
             Ok(Some(ref mut rows)) => match self.opts.output_mode {
-                OutputMode::List => loop {
-                    if self.interrupt_count.load(Ordering::SeqCst) > 0 {
-                        println!("Query interrupted.");
-                        return Ok(());
-                    }
+                OutputMode::List => {
+                    let mut headers_printed = false;
+                    loop {
+                        if self.interrupt_count.load(Ordering::SeqCst) > 0 {
+                            println!("Query interrupted.");
+                            return Ok(());
+                        }
 
-                    let start = Instant::now();
+                        let start = Instant::now();
 
-                    match rows.step() {
-                        Ok(StepResult::Row) => {
-                            if let Some(ref mut stats) = statistics {
-                                stats.execute_time_elapsed_samples.push(start.elapsed());
-                            }
-                            let row = rows.row().unwrap();
-                            for (i, value) in row.get_values().enumerate() {
-                                if i > 0 {
-                                    let _ = self.writer.write(b"|");
+                        match rows.step() {
+                            Ok(StepResult::Row) => {
+                                if let Some(ref mut stats) = statistics {
+                                    stats.execute_time_elapsed_samples.push(start.elapsed());
                                 }
-                                if matches!(value, Value::Null) {
-                                    let _ = self.writer.write(self.opts.null_value.as_bytes())?;
-                                } else {
-                                    let _ = self.writer.write(format!("{}", value).as_bytes())?;
+
+                                // Print headers if enabled and not already printed
+                                if self.opts.headers && !headers_printed {
+                                    for i in 0..rows.num_columns() {
+                                        if i > 0 {
+                                            let _ = self.writer.write(b"|");
+                                        }
+                                        let _ =
+                                            self.writer.write(rows.get_column_name(i).as_bytes());
+                                    }
+                                    let _ = self.writeln("");
+                                    headers_printed = true;
+                                }
+
+                                let row = rows.row().unwrap();
+                                for (i, value) in row.get_values().enumerate() {
+                                    if i > 0 {
+                                        let _ = self.writer.write(b"|");
+                                    }
+                                    if matches!(value, Value::Null) {
+                                        let _ =
+                                            self.writer.write(self.opts.null_value.as_bytes())?;
+                                    } else {
+                                        let _ = self.writer.write(format!("{value}").as_bytes())?;
+                                    }
+                                }
+                                let _ = self.writeln("");
+                            }
+                            Ok(StepResult::IO) => {
+                                let start = Instant::now();
+                                rows.run_once()?;
+                                if let Some(ref mut stats) = statistics {
+                                    stats.io_time_elapsed_samples.push(start.elapsed());
                                 }
                             }
-                            let _ = self.writeln("");
-                        }
-                        Ok(StepResult::IO) => {
-                            let start = Instant::now();
-                            self.io.run_once()?;
-                            if let Some(ref mut stats) = statistics {
-                                stats.io_time_elapsed_samples.push(start.elapsed());
+                            Ok(StepResult::Interrupt) => break,
+                            Ok(StepResult::Done) => {
+                                if let Some(ref mut stats) = statistics {
+                                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                                }
+                                break;
                             }
-                        }
-                        Ok(StepResult::Interrupt) => break,
-                        Ok(StepResult::Done) => {
-                            if let Some(ref mut stats) = statistics {
-                                stats.execute_time_elapsed_samples.push(start.elapsed());
+                            Ok(StepResult::Busy) => {
+                                if let Some(ref mut stats) = statistics {
+                                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                                }
+                                let _ = self.writeln("database is busy");
+                                break;
                             }
-                            break;
-                        }
-                        Ok(StepResult::Busy) => {
-                            if let Some(ref mut stats) = statistics {
-                                stats.execute_time_elapsed_samples.push(start.elapsed());
+                            Err(err) => {
+                                if let Some(ref mut stats) = statistics {
+                                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                                }
+                                let report =
+                                    miette::Error::from(err).with_source_code(sql.to_owned());
+                                let _ = self.write_fmt(format_args!("{report:?}"));
+                                break;
                             }
-                            let _ = self.writeln("database is busy");
-                            break;
-                        }
-                        Err(err) => {
-                            if let Some(ref mut stats) = statistics {
-                                stats.execute_time_elapsed_samples.push(start.elapsed());
-                            }
-                            let _ = self.writeln(err.to_string());
-                            break;
                         }
                     }
-                },
+                }
                 OutputMode::Pretty => {
                     if self.interrupt_count.load(Ordering::SeqCst) > 0 {
                         println!("Query interrupted.");
@@ -782,17 +808,13 @@ impl Limbo {
                                             (self.opts.null_value.clone(), CellAlignment::Left)
                                         }
                                         Value::Integer(_) => {
-                                            (format!("{}", value), CellAlignment::Right)
+                                            (format!("{value}"), CellAlignment::Right)
                                         }
                                         Value::Float(_) => {
-                                            (format!("{}", value), CellAlignment::Right)
+                                            (format!("{value}"), CellAlignment::Right)
                                         }
-                                        Value::Text(_) => {
-                                            (format!("{}", value), CellAlignment::Left)
-                                        }
-                                        Value::Blob(_) => {
-                                            (format!("{}", value), CellAlignment::Left)
-                                        }
+                                        Value::Text(_) => (format!("{value}"), CellAlignment::Left),
+                                        Value::Blob(_) => (format!("{value}"), CellAlignment::Left),
                                     };
                                     row.add_cell(
                                         Cell::new(content)
@@ -806,7 +828,7 @@ impl Limbo {
                             }
                             Ok(StepResult::IO) => {
                                 let start = Instant::now();
-                                self.io.run_once()?;
+                                rows.run_once()?;
                                 if let Some(ref mut stats) = statistics {
                                     stats.io_time_elapsed_samples.push(start.elapsed());
                                 }
@@ -836,21 +858,21 @@ impl Limbo {
                                 }
                                 let report =
                                     miette::Error::from(err).with_source_code(sql.to_owned());
-                                let _ = self.write_fmt(format_args!("{:?}", report));
+                                let _ = self.write_fmt(format_args!("{report:?}"));
                                 break;
                             }
                         }
                     }
 
                     if !table.is_empty() {
-                        let _ = self.write_fmt(format_args!("{}", table));
+                        let _ = self.write_fmt(format_args!("{table}"));
                     }
                 }
             },
             Ok(None) => {}
             Err(err) => {
                 let report = miette::Error::from(err).with_source_code(sql.to_owned());
-                let _ = self.write_fmt(format_args!("{:?}", report));
+                let _ = self.write_fmt(format_args!("{report:?}"));
                 anyhow::bail!("We have to throw here, even if we printed error");
             }
         }
@@ -870,7 +892,10 @@ impl Limbo {
                     false,
                 )
             } else {
-                (tracing_appender::non_blocking(std::io::stderr()), true)
+                (
+                    tracing_appender::non_blocking(std::io::stderr()),
+                    IsTerminal::is_terminal(&std::io::stderr()),
+                )
             };
         // Disable rustyline traces
         if let Err(e) = tracing_subscriber::registry()
@@ -884,7 +909,7 @@ impl Limbo {
             .with(EnvFilter::from_default_env().add_directive("rustyline=off".parse().unwrap()))
             .try_init()
         {
-            println!("Unable to setup tracing appender: {:?}", e);
+            println!("Unable to setup tracing appender: {e:?}");
         }
         Ok(guard)
     }
@@ -892,8 +917,7 @@ impl Limbo {
     fn display_schema(&mut self, table: Option<&str>) -> anyhow::Result<()> {
         let sql = match table {
         Some(table_name) => format!(
-            "SELECT sql FROM sqlite_schema WHERE type IN ('table', 'index') AND tbl_name = '{}' AND name NOT LIKE 'sqlite_%'",
-            table_name
+            "SELECT sql FROM sqlite_schema WHERE type IN ('table', 'index') AND tbl_name = '{table_name}' AND name NOT LIKE 'sqlite_%'"
         ),
         None => String::from(
             "SELECT sql FROM sqlite_schema WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'"
@@ -913,7 +937,7 @@ impl Limbo {
                             }
                         }
                         StepResult::IO => {
-                            self.io.run_once()?;
+                            rows.run_once()?;
                         }
                         StepResult::Interrupt => break,
                         StepResult::Done => break,
@@ -926,7 +950,7 @@ impl Limbo {
                 if !found {
                     if let Some(table_name) = table {
                         let _ = self
-                            .write_fmt(format_args!("-- Error: Table '{}' not found.", table_name));
+                            .write_fmt(format_args!("-- Error: Table '{table_name}' not found."));
                     } else {
                         let _ = self.writeln("-- No tables or indexes found in the database.");
                     }
@@ -950,8 +974,7 @@ impl Limbo {
     fn display_indexes(&mut self, maybe_table: Option<String>) -> anyhow::Result<()> {
         let sql = match maybe_table {
             Some(ref tbl_name) => format!(
-                "SELECT name FROM sqlite_schema WHERE type='index' AND tbl_name = '{}' ORDER BY 1",
-                tbl_name
+                "SELECT name FROM sqlite_schema WHERE type='index' AND tbl_name = '{tbl_name}' ORDER BY 1"
             ),
             None => String::from("SELECT name FROM sqlite_schema WHERE type='index' ORDER BY 1"),
         };
@@ -969,7 +992,7 @@ impl Limbo {
                             }
                         }
                         StepResult::IO => {
-                            self.io.run_once()?;
+                            rows.run_once()?;
                         }
                         StepResult::Interrupt => break,
                         StepResult::Done => break,
@@ -999,8 +1022,7 @@ impl Limbo {
     fn display_tables(&mut self, pattern: Option<&str>) -> anyhow::Result<()> {
         let sql = match pattern {
             Some(pattern) => format!(
-                "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name LIKE '{}' ORDER BY 1",
-                pattern
+                "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name LIKE '{pattern}' ORDER BY 1"
             ),
             None => String::from(
                 "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY 1"
@@ -1020,7 +1042,7 @@ impl Limbo {
                             }
                         }
                         StepResult::IO => {
-                            self.io.run_once()?;
+                            rows.run_once()?;
                         }
                         StepResult::Interrupt => break,
                         StepResult::Done => break,
@@ -1035,8 +1057,7 @@ impl Limbo {
                     let _ = self.writeln(tables.trim_end());
                 } else if let Some(pattern) = pattern {
                     let _ = self.write_fmt(format_args!(
-                        "Error: Tables with pattern '{}' not found.",
-                        pattern
+                        "Error: Tables with pattern '{pattern}' not found."
                     ));
                 } else {
                     let _ = self.writeln("No tables found in the database.");

@@ -285,6 +285,18 @@ do_execsql_test_on_specific_db {:memory:} select-union-all-with-filters {
 6
 10}
 
+do_execsql_test_error select-star-no-from {
+  SELECT *;
+} {no tables specified}
+
+do_execsql_test_error select-star-and-constant-no-from {
+  SELECT *, 1;
+} {no tables specified}
+
+do_execsql_test_error select-star-subquery {
+  SELECT 1 FROM (SELECT *);
+} {no tables specified}
+
 if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
     do_execsql_test_on_specific_db {:memory:} select-union-1 {
     CREATE TABLE t(x TEXT, y TEXT);
@@ -449,4 +461,159 @@ if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-s
     } {a|a
     b|b
     z|z}
+
+    do_execsql_test_on_specific_db {:memory:} select-except-1 {
+      CREATE TABLE t(x TEXT, y TEXT);
+      CREATE TABLE u(x TEXT, y TEXT);
+      INSERT INTO t VALUES('x','x'),('y','y');
+      INSERT INTO u VALUES('x','x'),('z','y');
+
+      select * from t EXCEPT select * from u;
+    } {y|y}
+
+    do_execsql_test_on_specific_db {:memory:} select-except-2 {
+      CREATE TABLE t(x TEXT, y TEXT);
+      CREATE TABLE u(x TEXT, y TEXT);
+      INSERT INTO t VALUES('x','x'),('y','y');
+      INSERT INTO u VALUES('x','x'),('y','y');
+
+      select * from t EXCEPT select * from u;
+    } {}
+
+    do_execsql_test_on_specific_db {:memory:} select-except-3 {
+      CREATE TABLE t(x TEXT, y TEXT);
+      CREATE TABLE u(x TEXT, y TEXT);
+      CREATE TABLE v(x TEXT, y TEXT);
+      INSERT INTO t VALUES('x','x'),('y','y');
+      INSERT INTO u VALUES('x','x'),('a','y');
+      INSERT INTO v VALUES('a','x'),('b','y');
+
+      select * from t EXCEPT select * from u EXCEPT select * from v;
+    } {y|y}
+
+    do_execsql_test_on_specific_db {:memory:} select-except-limit {
+      CREATE TABLE t(x TEXT, y TEXT);
+      CREATE TABLE u(x TEXT, y TEXT);
+      INSERT INTO t VALUES('a', 'a'),('x','x'),('y','y'),('z','z');
+      INSERT INTO u VALUES('x','x'),('z','y');
+
+      select * from t EXCEPT select * from u limit 2;
+    } {a|a
+    y|y}
+
+    do_execsql_test_on_specific_db {:memory:} select-except-union-all {
+      CREATE TABLE t(x TEXT, y TEXT);
+      CREATE TABLE u(x TEXT, y TEXT);
+      CREATE TABLE v(x TEXT, y TEXT);
+      INSERT INTO t VALUES('x','x'),('y','y');
+      INSERT INTO u VALUES('x','x'),('z','y');
+      INSERT INTO v VALUES('x','x'),('y','y');
+
+      select * from t EXCEPT select * from u UNION ALL select * from v;
+    } {y|y
+    x|x
+    y|y}
+
+    do_execsql_test_on_specific_db {:memory:} select-union-all-except {
+      CREATE TABLE t(x TEXT, y TEXT);
+      CREATE TABLE u(x TEXT, y TEXT);
+      CREATE TABLE v(x TEXT, y TEXT);
+      INSERT INTO t VALUES('x','x'),('y','y');
+      INSERT INTO u VALUES('x','x'),('z','y');
+      INSERT INTO v VALUES('x','x'),('y','y');
+
+      select * from t UNION ALL select * from u EXCEPT select * from v;
+    } {z|y}
+
+    do_execsql_test_on_specific_db {:memory:} select-except-union {
+      CREATE TABLE t(x TEXT, y TEXT);
+      CREATE TABLE u(x TEXT, y TEXT);
+      CREATE TABLE v(x TEXT, y TEXT);
+      INSERT INTO t VALUES('x','x'),('y','y');
+      INSERT INTO u VALUES('x','x'),('z','y');
+      INSERT INTO v VALUES('x','x'),('z','z');
+
+      select * from t EXCEPT select * from u UNION select * from v;
+    } {x|x
+    y|y
+    z|z}
+
+    do_execsql_test_on_specific_db {:memory:} select-union-except {
+      CREATE TABLE t(x TEXT, y TEXT);
+      CREATE TABLE u(x TEXT, y TEXT);
+      CREATE TABLE v(x TEXT, y TEXT);
+      INSERT INTO t VALUES('x','x'),('y','y');
+      INSERT INTO u VALUES('x','x'),('z','y');
+      INSERT INTO v VALUES('x','x'),('z','z');
+
+      select * from t UNION select * from u EXCEPT select * from v;
+    } {y|y
+    z|y}
+
+    do_execsql_test_on_specific_db {:memory:} select-except-intersect {
+      CREATE TABLE t(x TEXT, y TEXT);
+      CREATE TABLE u(x TEXT, y TEXT);
+      CREATE TABLE v(x TEXT, y TEXT);
+      INSERT INTO t VALUES('x','x'),('y','y');
+      INSERT INTO u VALUES('x','x'),('z','y');
+      INSERT INTO v VALUES('y','y'),('z','z');
+
+      select * from t EXCEPT select * from u INTERSECT select * from v;
+    } {y|y}
+
+    do_execsql_test_on_specific_db {:memory:} select-intersect-except {
+      CREATE TABLE t(x TEXT, y TEXT);
+      CREATE TABLE u(x TEXT, y TEXT);
+      CREATE TABLE v(x TEXT, y TEXT);
+      INSERT INTO t VALUES('x','x'),('y','y');
+      INSERT INTO u VALUES('x','x'),('z','y');
+      INSERT INTO v VALUES('x','x'),('z','z');
+
+      select * from t INTERSECT select * from u EXCEPT select * from v;
+    } {}
 }
+
+do_execsql_test_on_specific_db {:memory:} select-no-match-in-leaf-page {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    insert into t values (1, randomblob(1024));
+    insert into t values (2, randomblob(1024));
+    insert into t values (3, randomblob(1024));
+    insert into t values (4, randomblob(1024));
+    insert into t values (5, randomblob(1024));
+    insert into t values (6, randomblob(1024));
+    insert into t values (7, randomblob(1024));
+    insert into t values (8, randomblob(1024));
+    insert into t values (9, randomblob(1024));
+    insert into t values (10, randomblob(1024));
+    insert into t values (11, randomblob(1024));
+    insert into t values (12, randomblob(1024));
+    insert into t values (13, randomblob(1024));
+    insert into t values (14, randomblob(1024));
+    insert into t values (15, randomblob(1024));
+    insert into t values (16, randomblob(1024));
+    delete from t where a in (3, 6, 9, 12);
+    select count(*) from t where a >= 2;
+    select count(*) from t where a >= 3;
+    select count(*) from t where a >= 4;
+    select count(*) from t where a > 1;
+    select count(*) from t where a > 2;
+    select count(*) from t where a > 3;
+    select count(*) from t where a <= 3 ORDER BY a DESC;
+    select count(*) from t where a <= 4 ORDER BY a DESC;
+    select count(*) from t where a <= 5 ORDER BY a DESC;
+    select count(*) from t where a < 2 ORDER BY a DESC;
+    select count(*) from t where a < 3 ORDER BY a DESC;
+    select count(*) from t where a < 4 ORDER BY a DESC;
+} {11
+10
+10
+11
+10
+10
+2
+3
+4
+1
+2
+2}
+

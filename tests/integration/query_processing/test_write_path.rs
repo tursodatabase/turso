@@ -42,7 +42,7 @@ fn test_simple_overflow_page() -> anyhow::Result<()> {
         Ok(Some(ref mut rows)) => loop {
             match rows.step()? {
                 StepResult::IO => {
-                    tmp_db.io.run_once()?;
+                    rows.run_once()?;
                 }
                 StepResult::Done => break,
                 _ => unreachable!(),
@@ -50,7 +50,7 @@ fn test_simple_overflow_page() -> anyhow::Result<()> {
         },
         Ok(None) => {}
         Err(err) => {
-            eprintln!("{}", err);
+            eprintln!("{err}");
         }
     };
 
@@ -68,7 +68,7 @@ fn test_simple_overflow_page() -> anyhow::Result<()> {
                     compare_string(&huge_text, text);
                 }
                 StepResult::IO => {
-                    tmp_db.io.run_once()?;
+                    rows.run_once()?;
                 }
                 StepResult::Interrupt => break,
                 StepResult::Done => break,
@@ -77,7 +77,7 @@ fn test_simple_overflow_page() -> anyhow::Result<()> {
         },
         Ok(None) => {}
         Err(err) => {
-            eprintln!("{}", err);
+            eprintln!("{err}");
         }
     }
     do_flush(&conn, &tmp_db)?;
@@ -110,7 +110,7 @@ fn test_sequential_overflow_page() -> anyhow::Result<()> {
             Ok(Some(ref mut rows)) => loop {
                 match rows.step()? {
                     StepResult::IO => {
-                        tmp_db.io.run_once()?;
+                        rows.run_once()?;
                     }
                     StepResult::Done => break,
                     _ => unreachable!(),
@@ -118,7 +118,7 @@ fn test_sequential_overflow_page() -> anyhow::Result<()> {
             },
             Ok(None) => {}
             Err(err) => {
-                eprintln!("{}", err);
+                eprintln!("{err}");
             }
         };
     }
@@ -138,7 +138,7 @@ fn test_sequential_overflow_page() -> anyhow::Result<()> {
                     current_index += 1;
                 }
                 StepResult::IO => {
-                    tmp_db.io.run_once()?;
+                    rows.run_once()?;
                 }
                 StepResult::Interrupt => break,
                 StepResult::Done => break,
@@ -147,7 +147,7 @@ fn test_sequential_overflow_page() -> anyhow::Result<()> {
         },
         Ok(None) => {}
         Err(err) => {
-            eprintln!("{}", err);
+            eprintln!("{err}");
         }
     }
     do_flush(&conn, &tmp_db)?;
@@ -167,12 +167,12 @@ fn test_sequential_write() -> anyhow::Result<()> {
     let list_query = "SELECT * FROM test";
     let max_iterations = 10000;
     for i in 0..max_iterations {
-        println!("inserting {} ", i);
+        println!("inserting {i} ");
         if (i % 100) == 0 {
             let progress = (i as f64 / max_iterations as f64) * 100.0;
-            println!("progress {:.1}%", progress);
+            println!("progress {progress:.1}%");
         }
-        let insert_query = format!("INSERT INTO test VALUES ({})", i);
+        let insert_query = format!("INSERT INTO test VALUES ({i})");
         run_query(&tmp_db, &conn, &insert_query)?;
 
         let mut current_read_index = 0;
@@ -247,7 +247,7 @@ fn test_statement_reset() -> anyhow::Result<()> {
                 );
                 break;
             }
-            StepResult::IO => tmp_db.io.run_once()?,
+            StepResult::IO => stmt.run_once()?,
             _ => break,
         }
     }
@@ -264,7 +264,7 @@ fn test_statement_reset() -> anyhow::Result<()> {
                 );
                 break;
             }
-            StepResult::IO => tmp_db.io.run_once()?,
+            StepResult::IO => stmt.run_once()?,
             _ => break,
         }
     }
@@ -283,7 +283,7 @@ fn test_wal_checkpoint() -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
     for i in 0..iterations {
-        let insert_query = format!("INSERT INTO test VALUES ({})", i);
+        let insert_query = format!("INSERT INTO test VALUES ({i})");
         do_flush(&conn, &tmp_db)?;
         conn.checkpoint()?;
         run_query(&tmp_db, &conn, &insert_query)?;
@@ -309,10 +309,10 @@ fn test_wal_restart() -> anyhow::Result<()> {
     // threshold is 1000 by default
 
     fn insert(i: usize, conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
-        debug!("inserting {}", i);
-        let insert_query = format!("INSERT INTO test VALUES ({})", i);
+        debug!("inserting {i}");
+        let insert_query = format!("INSERT INTO test VALUES ({i})");
         run_query(tmp_db, conn, &insert_query)?;
-        debug!("inserted {}", i);
+        debug!("inserted {i}");
         tmp_db.io.run_once()?;
         Ok(())
     }
@@ -324,7 +324,7 @@ fn test_wal_restart() -> anyhow::Result<()> {
         run_query_on_row(tmp_db, conn, list_query, |row: &Row| {
             assert!(count.is_none());
             count = Some(row.get::<i64>(0).unwrap() as usize);
-            debug!("counted {:?}", count);
+            debug!("counted {count:?}");
         })?;
         Ok(count.unwrap())
     }
@@ -372,15 +372,15 @@ fn test_write_delete_with_index() -> anyhow::Result<()> {
     let list_query = "SELECT * FROM test";
     let max_iterations = 1000;
     for i in 0..max_iterations {
-        println!("inserting {} ", i);
-        let insert_query = format!("INSERT INTO test VALUES ({})", i);
+        println!("inserting {i} ");
+        let insert_query = format!("INSERT INTO test VALUES ({i})");
         run_query(&tmp_db, &conn, &insert_query)?;
     }
     for i in 0..max_iterations {
-        println!("deleting {} ", i);
-        let delete_query = format!("delete from test where x={}", i);
+        println!("deleting {i} ");
+        let delete_query = format!("delete from test where x={i}");
         run_query(&tmp_db, &conn, &delete_query)?;
-        println!("listing after deleting {} ", i);
+        println!("listing after deleting {i} ");
         let mut current_read_index = i + 1;
         run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
             let first_value = row.get::<&Value>(0).expect("missing id");
@@ -397,7 +397,7 @@ fn test_write_delete_with_index() -> anyhow::Result<()> {
             run_query_on_row(
                 &tmp_db,
                 &conn,
-                &format!("select * from test where x = {}", i),
+                &format!("select * from test where x = {i}"),
                 |row| {
                     let first_value = row.get::<&Value>(0).expect("missing id");
                     let id = match first_value {
@@ -530,8 +530,13 @@ fn check_integrity_is_ok(tmp_db: TempDatabase, conn: Arc<Connection>) -> Result<
 }
 
 enum ConnectionState {
-    PrepareQuery { query_idx: usize },
-    ExecuteQuery { query_idx: usize, stmt: Statement },
+    PrepareQuery {
+        query_idx: usize,
+    },
+    ExecuteQuery {
+        query_idx: usize,
+        stmt: Box<Statement>,
+    },
     Done,
 }
 
@@ -552,7 +557,7 @@ impl ConnectionPlan {
                     }
                     let query = &self.queries[*query_idx];
                     tracing::info!("preparing {}", query);
-                    let stmt = self.conn.query(query)?.unwrap();
+                    let stmt = Box::new(self.conn.query(query)?.unwrap());
                     self.state = ConnectionState::ExecuteQuery {
                         query_idx: *query_idx,
                         stmt,
@@ -723,12 +728,38 @@ fn test_wal_bad_frame() -> anyhow::Result<()> {
 
                 assert!(
                     panic_msg.contains("WAL frame checksum mismatch."),
-                    "Expected panic message not found. Got: {}",
-                    panic_msg
+                    "Expected panic message not found. Got: {panic_msg}"
                 );
             }
             Ok(_) => panic!("Expected query to panic, but it succeeded"),
         }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_read_wal_dumb_no_frames() -> anyhow::Result<()> {
+    maybe_setup_tracing();
+    let _ = env_logger::try_init();
+    let db_path = {
+        let tmp_db = TempDatabase::new_empty(false);
+        let conn = tmp_db.connect_limbo();
+        conn.close()?;
+        tmp_db.path.clone()
+    };
+    // Second connection must recover from the WAL file. Last checksum should be filled correctly.
+    {
+        let tmp_db = TempDatabase::new_with_existent(&db_path, false);
+        let conn = tmp_db.connect_limbo();
+        conn.execute("CREATE TABLE t0(x)")?;
+        conn.close()?;
+    }
+    {
+        let tmp_db = TempDatabase::new_with_existent(&db_path, false);
+        let conn = tmp_db.connect_limbo();
+        conn.execute("INSERT INTO t0(x) VALUES (1)")?;
+        conn.close()?;
     }
 
     Ok(())
@@ -748,7 +779,7 @@ fn run_query_on_row(
 }
 
 fn run_query_core(
-    tmp_db: &TempDatabase,
+    _tmp_db: &TempDatabase,
     conn: &Arc<Connection>,
     query: &str,
     mut on_row: Option<impl FnMut(&Row)>,
@@ -757,7 +788,7 @@ fn run_query_core(
         Ok(Some(ref mut rows)) => loop {
             match rows.step()? {
                 StepResult::IO => {
-                    tmp_db.io.run_once()?;
+                    rows.run_once()?;
                 }
                 StepResult::Done => break,
                 StepResult::Row => {
@@ -771,7 +802,7 @@ fn run_query_core(
         },
         Ok(None) => {}
         Err(err) => {
-            eprintln!("{}", err);
+            eprintln!("{err}");
         }
     };
     Ok(())

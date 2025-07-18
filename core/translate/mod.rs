@@ -53,7 +53,7 @@ use transaction::{translate_tx_begin, translate_tx_commit};
 use turso_sqlite3_parser::ast::{self, Delete, Insert};
 use update::translate_update;
 
-#[instrument(skip_all, level = Level::TRACE)]
+#[instrument(skip_all, level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
 pub fn translate(
     schema: &Schema,
@@ -75,6 +75,7 @@ pub fn translate(
 
     let mut program = ProgramBuilder::new(
         query_mode,
+        connection.get_capture_data_changes().clone(),
         // These options will be extended whithin each translate program
         ProgramBuilderOpts {
             num_cursors: 1,

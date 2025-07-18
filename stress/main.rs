@@ -33,7 +33,7 @@ pub struct Column {
 }
 
 /// Represents SQLite data types
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DataType {
     Integer,
     Real,
@@ -47,6 +47,7 @@ pub enum DataType {
 pub enum Constraint {
     PrimaryKey,
     NotNull,
+    #[cfg(feature = "experimental_indexes")]
     Unique,
 }
 
@@ -79,17 +80,20 @@ fn generate_random_data_type() -> DataType {
 }
 
 fn generate_random_constraint() -> Constraint {
+    #[cfg(feature = "experimental_indexes")]
     match get_random() % 2 {
         0 => Constraint::NotNull,
         _ => Constraint::Unique,
     }
+    #[cfg(not(feature = "experimental_indexes"))]
+    Constraint::NotNull
 }
 
 fn generate_random_column() -> Column {
     let name = generate_random_identifier();
     let data_type = generate_random_data_type();
 
-    let constraint_count = (get_random() % 3) as usize;
+    let constraint_count = (get_random() % 2) as usize;
     let mut constraints = Vec::with_capacity(constraint_count);
 
     for _ in 0..constraint_count {
@@ -122,11 +126,37 @@ fn generate_random_table() -> Table {
         columns.push(column);
     }
 
-    // Then, randomly select one column to be the primary key
-    let pk_index = (get_random() % column_count as u64) as usize;
-    columns[pk_index].constraints.push(Constraint::PrimaryKey);
+    #[cfg(feature = "experimental_indexes")]
+    {
+        // Then, randomly select one column to be the primary key
+        let pk_index = (get_random() % column_count as u64) as usize;
+        columns[pk_index].constraints.push(Constraint::PrimaryKey);
+        Table { name, columns }
+    }
+    #[cfg(not(feature = "experimental_indexes"))]
+    {
+        // Pick a random column that is exactly INTEGER type to be the primary key (INTEGER PRIMARY KEY does not require indexes,
+        // as it becomes an alias for the ROWID).
+        let pk_candidates = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, col)| col.data_type == DataType::Integer)
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        if pk_candidates.is_empty() {
+            // if there are no INTEGER columns, make a random column INTEGER and set it as PRIMARY KEY
+            let col_id = (get_random() % column_count as u64) as usize;
+            columns[col_id].data_type = DataType::Integer;
+            columns[col_id].constraints.push(Constraint::PrimaryKey);
+            return Table { name, columns };
+        }
+        let pk_index = pk_candidates
+            .get((get_random() % pk_candidates.len() as u64) as usize)
+            .unwrap();
+        columns[*pk_index].constraints.push(Constraint::PrimaryKey);
 
-    Table { name, columns }
+        Table { name, columns }
+    }
 }
 
 pub fn gen_bool(probability_true: f64) -> bool {
@@ -165,12 +195,9 @@ impl ArbitrarySchema {
                     .map(|col| {
                         let mut col_def =
                             format!("  {} {}", col.name, data_type_to_sql(&col.data_type));
-                        if false {
-                            /* FIXME */
-                            for constraint in &col.constraints {
-                                col_def.push(' ');
-                                col_def.push_str(&constraint_to_sql(constraint));
-                            }
+                        for constraint in &col.constraints {
+                            col_def.push(' ');
+                            col_def.push_str(&constraint_to_sql(constraint));
                         }
                         col_def
                     })
@@ -197,6 +224,7 @@ fn constraint_to_sql(constraint: &Constraint) -> String {
     match constraint {
         Constraint::PrimaryKey => "PRIMARY KEY".to_string(),
         Constraint::NotNull => "NOT NULL".to_string(),
+        #[cfg(feature = "experimental_indexes")]
         Constraint::Unique => "UNIQUE".to_string(),
     }
 }
@@ -321,7 +349,7 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
         writeln!(log_file, "{}", opts.nr_iterations)?;
         writeln!(log_file, "{}", ddl_statements.len())?;
         for stmt in &ddl_statements {
-            writeln!(log_file, "{}", stmt)?;
+            writeln!(log_file, "{stmt}")?;
         }
     }
     plan.ddl_statements = ddl_statements;
@@ -345,7 +373,7 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
             }
             let sql = generate_random_statement(&schema);
             if !opts.skip_log {
-                writeln!(log_file, "{}", sql)?;
+                writeln!(log_file, "{sql}")?;
             }
             queries.push(sql);
             if tx.is_some() {
@@ -415,7 +443,7 @@ pub fn init_tracing() -> Result<WorkerGuard, std::io::Error> {
         .with(EnvFilter::from_default_env())
         .try_init()
     {
-        println!("Unable to setup tracing appender: {:?}", e);
+        println!("Unable to setup tracing appender: {e:?}");
     }
     Ok(guard)
 }
@@ -458,7 +486,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Apply each DDL statement individually
         for stmt in &plan.ddl_statements {
             if opts.verbose {
-                println!("executing ddl {}", stmt);
+                println!("executing ddl {stmt}");
             }
             if let Err(e) = conn.execute(stmt, ()).await {
                 match e {
@@ -466,7 +494,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         if e.contains("Corrupt database") {
                             panic!("Error creating table: {}", e);
                         } else {
-                            println!("Error creating table: {}", e);
+                            println!("Error creating table: {e}");
                         }
                     }
                     _ => panic!("Error creating table: {}", e),
@@ -500,7 +528,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let sql = &plan.queries_per_thread[thread][query_index];
                 if !opts.silent {
                     if opts.verbose {
-                        println!("executing query {}", sql);
+                        println!("executing query {sql}");
                     } else if query_index % 100 == 0 {
                         print!(
                             "\r{:.2} %",
@@ -515,9 +543,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             if e.contains("Corrupt database") {
                                 panic!("Error executing query: {}", e);
                             } else if e.contains("UNIQUE constraint failed") {
-                                println!("Skipping UNIQUE constraint violation: {}", e);
-                            } else {
-                                println!("Error executing query: {}", e);
+                                if opts.verbose {
+                                    println!("Skipping UNIQUE constraint violation: {e}");
+                                }
+                            } else if opts.verbose {
+                                println!("Error executing query: {e}");
                             }
                         }
                         _ => panic!("Error executing query: {}", e),
@@ -545,6 +575,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         handle.await??;
     }
     println!("Done. SQL statements written to {}", opts.log_file);
-    println!("Database file: {}", db_file);
+    println!("Database file: {db_file}");
     Ok(())
 }

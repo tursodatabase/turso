@@ -1136,7 +1136,7 @@ impl Jsonb {
                                 b'\r' => string.push_str("\\r"),
                                 _ => {
                                     // Format as \u00XX
-                                    let hex = format!("\\u{:04x}", ch);
+                                    let hex = format!("\\u{ch:04x}");
                                     string.push_str(&hex);
                                 }
                             }
@@ -1304,7 +1304,7 @@ impl Jsonb {
 
                 value = value * 16 + ch.to_digit(16).unwrap_or(0) as u64;
             }
-            write!(string, "{}", value)
+            write!(string, "{value}")
                 .map_err(|_| LimboError::ParseError("Error writing string to json!".to_string()))?;
         } else {
             string.push_str(hex_str);
@@ -1336,7 +1336,7 @@ impl Jsonb {
             val if val
                 .chars()
                 .next()
-                .map_or(false, |c| c.is_ascii_alphanumeric() || c == '+' || c == '-') =>
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-') =>
             {
                 string.push_str(val);
                 string.push('0');
@@ -1403,7 +1403,7 @@ impl Jsonb {
                 || c == b'-'
                 || c == b'+'
                 || c == b'.'
-                || c.to_ascii_lowercase() == b'i' =>
+                || c.eq_ignore_ascii_case(&b'i') =>
             {
                 pos = self.deserialize_number(input, pos)?;
             }
@@ -2113,7 +2113,7 @@ impl Jsonb {
             std::cmp::Ordering::Greater => {
                 self.data.splice(
                     cursor + old_len..cursor + old_len,
-                    std::iter::repeat(0).take(new_len - old_len),
+                    std::iter::repeat_n(0, new_len - old_len),
                 );
             }
             std::cmp::Ordering::Less => {
@@ -3562,7 +3562,7 @@ world""#,
         // Generate a large JSON with many elements
         let mut large_array = String::from("[");
         for i in 0..1000 {
-            large_array.push_str(&format!("{}", i));
+            large_array.push_str(&format!("{i}"));
             if i < 999 {
                 large_array.push(',');
             }

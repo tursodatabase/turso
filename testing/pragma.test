@@ -83,12 +83,25 @@ do_execsql_test pragma-function-table-info {
 4|sql|TEXT|0||0
 }
 
+do_execsql_test pragma-vtab-table-info {
+  SELECT * FROM pragma_table_info WHERE arg = 'sqlite_schema'
+} {0|type|TEXT|0||0
+1|name|TEXT|0||0
+2|tbl_name|TEXT|0||0
+3|rootpage|INT|0||0
+4|sql|TEXT|0||0
+}
+
 do_execsql_test pragma-table-info-invalid-table {
   PRAGMA table_info=pekka
 } {}
 
 do_execsql_test pragma-function-table-info-invalid-table {
   SELECT * FROM pragma_table_info('pekka')
+} {}
+
+do_execsql_test pragma-vtab-table-info-invalid-table {
+  SELECT * FROM pragma_table_info WHERE arg = 'pekka'
 } {}
 
 # temporarily skip this test case. The issue is detailed in #1407
@@ -128,17 +141,17 @@ do_execsql_test pragma-legacy-file-format {
   PRAGMA legacy_file_format
 } {}
 
-do_execsql_test_error_content pragma-function-legacy-file-format {
+do_execsql_test_error pragma-function-legacy-file-format {
   SELECT * FROM pragma_legacy_file_format()
-} {"No such table"}
+} {(no such table|Table.*not found)}
 
 do_execsql_test_error_content pragma-function-too-many-arguments {
   SELECT * FROM pragma_table_info('sqlite_schema', 'main', 'arg3')
 } {"Too many arguments"}
 
-do_execsql_test_error_content pragma-function-update {
+do_execsql_test_error pragma-function-update {
   SELECT * FROM pragma_wal_checkpoint()
-} {"No such table"}
+} {(no such table|Table.*not found)}
 
 do_execsql_test pragma-function-nontext-argument {
   SELECT * FROM pragma_table_info('sqlite_schema', NULL);
@@ -149,8 +162,21 @@ do_execsql_test pragma-function-nontext-argument {
 4|sql|TEXT|0||0
 }
 
+do_execsql_test pragma-vtab-nontext-argument {
+  SELECT * FROM pragma_table_info WHERE arg ='sqlite_schema' AND schema IS NULL;
+} {0|type|TEXT|0||0
+1|name|TEXT|0||0
+2|tbl_name|TEXT|0||0
+3|rootpage|INT|0||0
+4|sql|TEXT|0||0
+}
+
 do_execsql_test pragma-function-no-arguments {
   SELECT * FROM pragma_table_info();
+} {}
+
+do_execsql_test pragma-vtab-no-arguments {
+  SELECT * FROM pragma_table_info;
 } {}
 
 do_execsql_test_on_specific_db ":memory:" pragma-function-argument-with-space {
@@ -169,3 +195,37 @@ do_execsql_test pragma-function-sql-injection {
   SELECT * FROM pragma_table_info('sqlite_schema'';CREATE TABLE foo(c0);SELECT ''bar');
   SELECT * FROM pragma_table_info('foo');
 } {}
+
+do_execsql_test_on_specific_db ":memory:" pragma-page-size-default {
+  PRAGMA page_size
+} {4096}
+
+do_execsql_test_on_specific_db ":memory:" pragma-page-size-set {
+  PRAGMA page_size=1024;
+  PRAGMA page_size
+} {1024}
+
+# pragma page_size=xxx doesn't change the page size of an initialized database.
+do_execsql_test_on_specific_db ":memory:" pragma-page-size-set-initialized-db {
+  CREATE TABLE "foo bar"(c0);
+
+  PRAGMA page_size=1024;
+  PRAGMA page_size
+} {4096}
+
+# pragma page_size=xxx changes the page size of an uninitialized database and persists the change.
+set test_pragma_page_size_db "testing/testing_pragma_page_size.db"
+catch {file delete -force $test_pragma_page_size_db}
+catch {file delete -force "${test_pragma_page_size_db}-wal"}
+# set user_version to trigger database initialization.
+do_execsql_test_on_specific_db $test_pragma_page_size_db pragma-page-size-set-uninitialized-db-1 {
+  PRAGMA page_size=1024;
+  PRAGMA user_version=1;
+  PRAGMA page_size
+} {1024}
+
+do_execsql_test_on_specific_db $test_pragma_page_size_db pragma-page-size-set-uninitialized-db-2 {
+  PRAGMA page_size
+} {1024}
+catch {file delete -force $test_pragma_page_size_db}
+catch {file delete -force "${test_pragma_page_size_db}-wal"}

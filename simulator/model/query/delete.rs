@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{model::table::SimValue, SimulatorEnv};
+use crate::{generation::Shadow, model::table::SimValue, runner::env::SimulatorTables};
 
 use super::predicate::Predicate;
 
@@ -12,19 +12,25 @@ pub(crate) struct Delete {
     pub(crate) predicate: Predicate,
 }
 
-impl Delete {
-    pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<SimValue>> {
-        let table = env
-            .tables
-            .iter_mut()
-            .find(|t| t.name == self.table)
-            .unwrap();
+impl Shadow for Delete {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
-        let t2 = table.clone();
+    fn shadow(&self, tables: &mut SimulatorTables) -> Self::Result {
+        let table = tables.tables.iter_mut().find(|t| t.name == self.table);
 
-        table.rows.retain_mut(|r| !self.predicate.test(r, &t2));
+        if let Some(table) = table {
+            // If the table exists, we can delete from it
+            let t2 = table.clone();
+            table.rows.retain_mut(|r| !self.predicate.test(r, &t2));
+        } else {
+            // If the table does not exist, we return an error
+            return Err(anyhow::anyhow!(
+                "Table {} does not exist. DELETE statement ignored.",
+                self.table
+            ));
+        }
 
-        vec![]
+        Ok(vec![])
     }
 }
 

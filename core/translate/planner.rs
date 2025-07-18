@@ -19,8 +19,10 @@ use crate::{
     vdbe::{builder::TableRefIdCounter, BranchOffset},
     Result,
 };
+use turso_sqlite3_parser::ast::Literal::Null;
 use turso_sqlite3_parser::ast::{
-    self, Expr, FromClause, JoinType, Limit, Materialized, TableInternalId, UnaryOperator, With,
+    self, As, Expr, FromClause, JoinType, Limit, Materialized, QualifiedName, TableInternalId,
+    UnaryOperator, With,
 };
 
 pub const ROWID: &str = "rowid";
@@ -51,8 +53,7 @@ pub fn resolve_aggregates(
                 } else {
                     0
                 };
-                match Func::resolve_function(normalize_ident(name.0.as_str()).as_str(), args_count)
-                {
+                match Func::resolve_function(&name.0, args_count) {
                     Ok(Func::Agg(f)) => {
                         let distinctness = Distinctness::from_ast(distinctness.as_ref());
                         if !schema.indexes_enabled() && distinctness.is_distinct() {
@@ -84,9 +85,7 @@ pub fn resolve_aggregates(
                 }
             }
             Expr::FunctionCallStar { name, .. } => {
-                if let Ok(Func::Agg(f)) =
-                    Func::resolve_function(normalize_ident(name.0.as_str()).as_str(), 0)
-                {
+                if let Ok(Func::Agg(f)) = Func::resolve_function(&name.0, 0) {
                     aggs.push(Aggregate {
                         func: f,
                         args: vec![],
@@ -138,7 +137,7 @@ pub fn bind_column_references(
                     let col_idx = joined_table.table.columns().iter().position(|c| {
                         c.name
                             .as_ref()
-                            .map_or(false, |name| name.eq_ignore_ascii_case(&normalized_id))
+                            .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
                     });
                     if col_idx.is_some() {
                         if match_result.is_some() {
@@ -166,7 +165,7 @@ pub fn bind_column_references(
                         let col_idx = outer_ref.table.columns().iter().position(|c| {
                             c.name
                                 .as_ref()
-                                .map_or(false, |name| name.eq_ignore_ascii_case(&normalized_id))
+                                .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
                         });
                         if col_idx.is_some() {
                             if match_result.is_some() {
@@ -194,7 +193,7 @@ pub fn bind_column_references(
                     for result_column in result_columns.iter() {
                         if result_column
                             .name(referenced_tables)
-                            .map_or(false, |name| name.eq_ignore_ascii_case(&normalized_id))
+                            .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
                         {
                             *expr = result_column.expr.clone();
                             return Ok(());
@@ -208,7 +207,7 @@ pub fn bind_column_references(
                 let matching_tbl = referenced_tables
                     .find_table_and_internal_id_by_identifier(&normalized_table_name);
                 if matching_tbl.is_none() {
-                    crate::bail_parse_error!("Table {} not found", normalized_table_name);
+                    crate::bail_parse_error!("no such table: {}", normalized_table_name);
                 }
                 let (tbl_id, tbl) = matching_tbl.unwrap();
                 let normalized_id = normalize_ident(id.0.as_str());
@@ -221,7 +220,7 @@ pub fn bind_column_references(
                 let col_idx = tbl.columns().iter().position(|c| {
                     c.name
                         .as_ref()
-                        .map_or(false, |name| name.eq_ignore_ascii_case(&normalized_id))
+                        .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
                 });
                 let Some(col_idx) = col_idx else {
                     crate::bail_parse_error!("Column {} not found", normalized_id);
@@ -245,83 +244,22 @@ fn parse_from_clause_table(
     schema: &Schema,
     table: ast::SelectTable,
     table_references: &mut TableReferences,
+    out_where_clause: &mut Vec<WhereTerm>,
     ctes: &mut Vec<JoinedTable>,
     syms: &SymbolTable,
     table_ref_counter: &mut TableRefIdCounter,
 ) -> Result<()> {
     match table {
-        ast::SelectTable::Table(qualified_name, maybe_alias, _) => {
-            let normalized_qualified_name = normalize_ident(qualified_name.name.0.as_str());
-            // Check if the FROM clause table is referring to a CTE in the current scope.
-            if let Some(cte_idx) = ctes
-                .iter()
-                .position(|cte| cte.identifier == normalized_qualified_name)
-            {
-                // TODO: what if the CTE is referenced multiple times?
-                let cte_table = ctes.remove(cte_idx);
-                table_references.add_joined_table(cte_table);
-                return Ok(());
-            };
-
-            // Check if our top level schema has this table.
-            if let Some(table) = schema.get_table(&normalized_qualified_name) {
-                let alias = maybe_alias
-                    .map(|a| match a {
-                        ast::As::As(id) => id,
-                        ast::As::Elided(id) => id,
-                    })
-                    .map(|a| a.0);
-                let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
-                    Table::Virtual(tbl.clone())
-                } else if let Table::BTree(table) = table.as_ref() {
-                    Table::BTree(table.clone())
-                } else {
-                    return Err(crate::LimboError::InvalidArgument(
-                        "Table type not supported".to_string(),
-                    ));
-                };
-                table_references.add_joined_table(JoinedTable {
-                    op: Operation::Scan {
-                        iter_dir: IterationDirection::Forwards,
-                        index: None,
-                    },
-                    table: tbl_ref,
-                    identifier: alias.unwrap_or(normalized_qualified_name),
-                    internal_id: table_ref_counter.next(),
-                    join_info: None,
-                    col_used_mask: ColumnUsedMask::default(),
-                });
-                return Ok(());
-            };
-
-            // CTEs are transformed into FROM clause subqueries.
-            // If we find a CTE with this name in our outer query references,
-            // we can use it as a joined table, but we must clone it since it's not MATERIALIZED.
-            //
-            // For other types of tables in the outer query references, we do not add them as joined tables,
-            // because the query can simply _reference_ them in e.g. the SELECT columns or the WHERE clause,
-            // but it's not part of the join order.
-            if let Some(outer_ref) =
-                table_references.find_outer_query_ref_by_identifier(&normalized_qualified_name)
-            {
-                if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
-                    table_references.add_joined_table(JoinedTable {
-                        op: Operation::Scan {
-                            iter_dir: IterationDirection::Forwards,
-                            index: None,
-                        },
-                        table: outer_ref.table.clone(),
-                        identifier: outer_ref.identifier.clone(),
-                        internal_id: table_ref_counter.next(),
-                        join_info: None,
-                        col_used_mask: ColumnUsedMask::default(),
-                    });
-                    return Ok(());
-                }
-            }
-
-            crate::bail_parse_error!("Table {} not found", normalized_qualified_name);
-        }
+        ast::SelectTable::Table(qualified_name, maybe_alias, _) => parse_table(
+            schema,
+            table_references,
+            ctes,
+            table_ref_counter,
+            out_where_clause,
+            qualified_name,
+            maybe_alias,
+            None,
+        ),
         ast::SelectTable::Select(subselect, maybe_alias) => {
             let Plan::Select(subplan) = prepare_select_plan(
                 schema,
@@ -343,7 +281,7 @@ fn parse_from_clause_table(
                     ast::As::As(id) => id.0.clone(),
                     ast::As::Elided(id) => id.0.clone(),
                 })
-                .unwrap_or(format!("subquery_{}", cur_table_index));
+                .unwrap_or(format!("subquery_{cur_table_index}"));
             table_references.add_joined_table(JoinedTable::new_subquery(
                 identifier,
                 subplan,
@@ -352,33 +290,176 @@ fn parse_from_clause_table(
             ));
             Ok(())
         }
-        ast::SelectTable::TableCall(qualified_name, maybe_args, maybe_alias) => {
-            let normalized_name = &normalize_ident(qualified_name.name.0.as_str());
-            let vtab = crate::VirtualTable::function(normalized_name, maybe_args, syms)?;
-            let alias = maybe_alias
-                .as_ref()
-                .map(|a| match a {
-                    ast::As::As(id) => id.0.clone(),
-                    ast::As::Elided(id) => id.0.clone(),
-                })
-                .unwrap_or(normalized_name.to_string());
+        ast::SelectTable::TableCall(qualified_name, maybe_args, maybe_alias) => parse_table(
+            schema,
+            table_references,
+            ctes,
+            table_ref_counter,
+            out_where_clause,
+            qualified_name,
+            maybe_alias,
+            maybe_args,
+        ),
+        _ => todo!(),
+    }
+}
 
+#[allow(clippy::too_many_arguments)]
+fn parse_table(
+    schema: &Schema,
+    table_references: &mut TableReferences,
+    ctes: &mut Vec<JoinedTable>,
+    table_ref_counter: &mut TableRefIdCounter,
+    out_where_clause: &mut Vec<WhereTerm>,
+    qualified_name: QualifiedName,
+    maybe_alias: Option<As>,
+    maybe_args: Option<Vec<Expr>>,
+) -> Result<()> {
+    let normalized_qualified_name = normalize_ident(qualified_name.name.0.as_str());
+    // Check if the FROM clause table is referring to a CTE in the current scope.
+    if let Some(cte_idx) = ctes
+        .iter()
+        .position(|cte| cte.identifier == normalized_qualified_name)
+    {
+        // TODO: what if the CTE is referenced multiple times?
+        let cte_table = ctes.remove(cte_idx);
+        table_references.add_joined_table(cte_table);
+        return Ok(());
+    };
+
+    // Check if our top level schema has this table.
+    if let Some(table) = schema.get_table(&normalized_qualified_name) {
+        let alias = maybe_alias
+            .map(|a| match a {
+                ast::As::As(id) => id,
+                ast::As::Elided(id) => id,
+            })
+            .map(|a| a.0);
+        let internal_id = table_ref_counter.next();
+        let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
+            if let Some(args) = maybe_args {
+                transform_args_into_where_terms(
+                    args,
+                    internal_id,
+                    out_where_clause,
+                    table.as_ref(),
+                )?;
+            }
+            Table::Virtual(tbl.clone())
+        } else if let Table::BTree(table) = table.as_ref() {
+            Table::BTree(table.clone())
+        } else {
+            return Err(crate::LimboError::InvalidArgument(
+                "Table type not supported".to_string(),
+            ));
+        };
+        table_references.add_joined_table(JoinedTable {
+            op: Operation::Scan {
+                iter_dir: IterationDirection::Forwards,
+                index: None,
+            },
+            table: tbl_ref,
+            identifier: alias.unwrap_or(normalized_qualified_name),
+            internal_id,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+        });
+        return Ok(());
+    };
+
+    // CTEs are transformed into FROM clause subqueries.
+    // If we find a CTE with this name in our outer query references,
+    // we can use it as a joined table, but we must clone it since it's not MATERIALIZED.
+    //
+    // For other types of tables in the outer query references, we do not add them as joined tables,
+    // because the query can simply _reference_ them in e.g. the SELECT columns or the WHERE clause,
+    // but it's not part of the join order.
+    if let Some(outer_ref) =
+        table_references.find_outer_query_ref_by_identifier(&normalized_qualified_name)
+    {
+        if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
             table_references.add_joined_table(JoinedTable {
                 op: Operation::Scan {
                     iter_dir: IterationDirection::Forwards,
                     index: None,
                 },
-                join_info: None,
-                table: Table::Virtual(vtab),
-                identifier: alias,
+                table: outer_ref.table.clone(),
+                identifier: outer_ref.identifier.clone(),
                 internal_id: table_ref_counter.next(),
+                join_info: None,
                 col_used_mask: ColumnUsedMask::default(),
             });
-
-            Ok(())
+            return Ok(());
         }
-        _ => todo!(),
     }
+
+    crate::bail_parse_error!("no such table: {}", normalized_qualified_name);
+}
+
+fn transform_args_into_where_terms(
+    args: Vec<Expr>,
+    internal_id: TableInternalId,
+    out_where_clause: &mut Vec<WhereTerm>,
+    table: &Table,
+) -> Result<()> {
+    let mut args_iter = args.into_iter();
+    let mut hidden_count = 0;
+    for (i, col) in table.columns().iter().enumerate() {
+        if !col.hidden {
+            continue;
+        }
+        hidden_count += 1;
+
+        if let Some(arg_expr) = args_iter.next() {
+            if contains_column_reference(&arg_expr)? {
+                crate::bail_parse_error!(
+                    "Column references are not supported as table-valued function arguments yet"
+                );
+            }
+            let column_expr = Expr::Column {
+                database: None,
+                table: internal_id,
+                column: i,
+                is_rowid_alias: col.is_rowid_alias,
+            };
+            let expr = match arg_expr {
+                Expr::Literal(Null) => Expr::IsNull(Box::new(column_expr)),
+                other => Expr::Binary(
+                    Box::new(column_expr),
+                    ast::Operator::Equals,
+                    Box::new(other),
+                ),
+            };
+            out_where_clause.push(WhereTerm {
+                expr,
+                from_outer_join: None,
+                consumed: Cell::new(false),
+            });
+        }
+    }
+
+    if args_iter.next().is_some() {
+        return Err(crate::LimboError::ParseError(format!(
+            "Too many arguments for {}: expected at most {}, got {}",
+            table.get_name(),
+            hidden_count,
+            hidden_count + 1 + args_iter.count()
+        )));
+    }
+
+    Ok(())
+}
+
+fn contains_column_reference(top_level_expr: &Expr) -> Result<bool> {
+    let mut contains = false;
+    walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
+        match expr {
+            Expr::Id(_) | Expr::Qualified(_, _) | Expr::Column { .. } => contains = true,
+            _ => {}
+        };
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(contains)
 }
 
 pub fn parse_from(
@@ -471,6 +552,7 @@ pub fn parse_from(
         schema,
         select_owned,
         table_references,
+        out_where_clause,
         &mut ctes_as_subqueries,
         syms,
         table_ref_counter,
@@ -709,6 +791,7 @@ fn parse_join(
         schema,
         table,
         table_references,
+        out_where_clause,
         ctes,
         syms,
         table_ref_counter,
@@ -733,17 +816,17 @@ fn parse_join(
         assert!(table_references.joined_tables().len() >= 2);
         let rightmost_table = table_references.joined_tables().last().unwrap();
         // NATURAL JOIN is first transformed into a USING join with the common columns
-        let right_cols = rightmost_table.columns();
         let mut distinct_names: Option<ast::DistinctNames> = None;
         // TODO: O(n^2) maybe not great for large tables or big multiway joins
-        for right_col in right_cols.iter() {
+        // SQLite doesn't use HIDDEN columns for NATURAL joins: https://www3.sqlite.org/src/info/ab09ef427181130b
+        for right_col in rightmost_table.columns().iter().filter(|col| !col.hidden) {
             let mut found_match = false;
             for left_table in table_references
                 .joined_tables()
                 .iter()
                 .take(table_references.joined_tables().len() - 1)
             {
-                for left_col in left_table.columns().iter() {
+                for left_col in left_table.columns().iter().filter(|col| !col.hidden) {
                     if left_col.name == right_col.name {
                         if let Some(distinct_names) = distinct_names.as_mut() {
                             distinct_names
@@ -808,10 +891,11 @@ fn parse_join(
                             .columns()
                             .iter()
                             .enumerate()
+                            .filter(|(_, col)| !natural || !col.hidden)
                             .find(|(_, col)| {
                                 col.name
                                     .as_ref()
-                                    .map_or(false, |name| *name == name_normalized)
+                                    .is_some_and(|name| *name == name_normalized)
                             })
                             .map(|(idx, col)| (left_table_idx, left_table.internal_id, idx, col));
                         if left_col.is_some() {
@@ -827,7 +911,7 @@ fn parse_join(
                     let right_col = right_table.columns().iter().enumerate().find(|(_, col)| {
                         col.name
                             .as_ref()
-                            .map_or(false, |name| *name == name_normalized)
+                            .is_some_and(|name| *name == name_normalized)
                     });
                     if right_col.is_none() {
                         crate::bail_parse_error!(

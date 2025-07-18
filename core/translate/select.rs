@@ -74,7 +74,7 @@ pub fn translate_select(
                         .sum::<usize>(),
             }
         }
-        other => panic!("plan is not a SelectPlan: {:?}", other),
+        other => panic!("plan is not a SelectPlan: {other:?}"),
     };
 
     program.extend(&opts);
@@ -124,15 +124,6 @@ pub fn prepare_select_plan(
 
             let mut left = Vec::with_capacity(compounds.len());
             for CompoundSelect { select, operator } in compounds {
-                // TODO: add support for EXCEPT
-                if operator != ast::CompoundOperator::UnionAll
-                    && operator != ast::CompoundOperator::Union
-                    && operator != ast::CompoundOperator::Intersect
-                {
-                    crate::bail_parse_error!(
-                        "only UNION ALL, UNION and INTERSECT are supported for compound SELECTs"
-                    );
-                }
                 left.push((last, operator));
                 last = prepare_one_select_plan(
                     schema,
@@ -157,7 +148,7 @@ pub fn prepare_select_plan(
             let (limit, offset) = select.limit.map_or(Ok((None, None)), |l| parse_limit(&l))?;
 
             // FIXME: handle OFFSET for compound selects
-            if offset.map_or(false, |o| o > 0) {
+            if offset.is_some_and(|o| o > 0) {
                 crate::bail_parse_error!("OFFSET is not supported for compound SELECTs yet");
             }
             // FIXME: handle ORDER BY for compound selects
@@ -215,6 +206,14 @@ fn prepare_one_select_plan(
 
             let mut table_references = TableReferences::new(vec![], outer_query_refs.to_vec());
 
+            if from.is_none() {
+                for column in &columns {
+                    if matches!(column, ResultColumn::Star) {
+                        crate::bail_parse_error!("no tables specified");
+                    }
+                }
+            }
+
             // Parse the FROM clause into a vec of TableReferences. Fold all the join conditions expressions into the WHERE clause.
             parse_from(
                 schema,
@@ -235,14 +234,14 @@ fn prepare_one_select_plan(
                         ResultColumn::Star => table_references
                             .joined_tables()
                             .iter()
-                            .map(|t| t.columns().len())
+                            .map(|t| t.columns().iter().filter(|col| !col.hidden).count())
                             .sum(),
                         // Guess 5 columns if we can't find the table using the identifier (maybe it's in [brackets] or `tick_quotes`, or miXeDcAse)
                         ResultColumn::TableStar(n) => table_references
                             .joined_tables()
                             .iter()
                             .find(|t| t.identifier == n.0)
-                            .map(|t| t.columns().len())
+                            .map(|t| t.columns().iter().filter(|col| !col.hidden).count())
                             .unwrap_or(5),
                         // Otherwise allocate space for 1 column
                         ResultColumn::Expr(_, _) => 1,
@@ -258,7 +257,7 @@ fn prepare_one_select_plan(
                     .map(|(i, t)| JoinOrderMember {
                         table_id: t.internal_id,
                         original_idx: i,
-                        is_outer: t.join_info.as_ref().map_or(false, |j| j.outer),
+                        is_outer: t.join_info.as_ref().is_some_and(|j| j.outer),
                     })
                     .collect(),
                 table_references,
@@ -285,6 +284,10 @@ fn prepare_one_select_plan(
                         );
                         for table in plan.table_references.joined_tables_mut() {
                             for idx in 0..table.columns().len() {
+                                let column = &table.columns()[idx];
+                                if column.hidden {
+                                    continue;
+                                }
                                 table.mark_column_used(idx);
                             }
                         }
@@ -298,21 +301,21 @@ fn prepare_one_select_plan(
                             .find(|t| t.identifier == name_normalized);
 
                         if referenced_table.is_none() {
-                            crate::bail_parse_error!("Table {} not found", name.0);
+                            crate::bail_parse_error!("no such table: {}", name.0);
                         }
                         let table = referenced_table.unwrap();
                         let num_columns = table.columns().len();
                         for idx in 0..num_columns {
-                            let is_rowid_alias = {
-                                let columns = table.columns();
-                                columns[idx].is_rowid_alias
-                            };
+                            let column = &table.columns()[idx];
+                            if column.hidden {
+                                continue;
+                            }
                             plan.result_columns.push(ResultSetColumn {
                                 expr: ast::Expr::Column {
                                     database: None, // TODO: support different databases
                                     table: table.internal_id,
                                     column: idx,
-                                    is_rowid_alias,
+                                    is_rowid_alias: column.is_rowid_alias,
                                 },
                                 alias: None,
                                 contains_aggregates: false,
@@ -349,10 +352,7 @@ fn prepare_one_select_plan(
                                 if distinctness.is_distinct() && args_count != 1 {
                                     crate::bail_parse_error!("DISTINCT aggregate functions must have exactly one argument");
                                 }
-                                match Func::resolve_function(
-                                    normalize_ident(name.0.as_str()).as_str(),
-                                    args_count,
-                                ) {
+                                match Func::resolve_function(&name.0, args_count) {
                                     Ok(Func::Agg(f)) => {
                                         let agg_args = match (args, &f) {
                                             (None, crate::function::AggFunc::Count0) => {
@@ -451,11 +451,8 @@ fn prepare_one_select_plan(
                             ast::Expr::FunctionCallStar {
                                 name,
                                 filter_over: _,
-                            } => {
-                                if let Ok(Func::Agg(f)) = Func::resolve_function(
-                                    normalize_ident(name.0.as_str()).as_str(),
-                                    0,
-                                ) {
+                            } => match Func::resolve_function(&name.0, 0) {
+                                Ok(Func::Agg(f)) => {
                                     let agg = Aggregate {
                                         func: f,
                                         args: vec![ast::Expr::Literal(ast::Literal::Numeric(
@@ -473,13 +470,25 @@ fn prepare_one_select_plan(
                                         expr: expr.clone(),
                                         contains_aggregates: true,
                                     });
-                                } else {
+                                }
+                                Ok(_) => {
                                     crate::bail_parse_error!(
                                         "Invalid aggregate function: {}",
                                         name.0
                                     );
                                 }
-                            }
+                                Err(e) => match e {
+                                    crate::LimboError::ParseError(e) => {
+                                        crate::bail_parse_error!("{}", e);
+                                    }
+                                    _ => {
+                                        crate::bail_parse_error!(
+                                            "Invalid aggregate function: {}",
+                                            name.0
+                                        );
+                                    }
+                                },
+                            },
                             expr => {
                                 let contains_aggregates =
                                     resolve_aggregates(schema, expr, &mut aggregate_expressions)?;
@@ -732,7 +741,7 @@ pub fn emit_simple_count(
     program.emit_insn(Insn::Copy {
         src_reg: target_reg,
         dst_reg: output_reg,
-        amount: 0,
+        extra_amount: 0,
     });
     program.emit_result_row(output_reg, 1);
     Ok(())

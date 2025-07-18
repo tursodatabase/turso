@@ -3,6 +3,8 @@ use std::{iter::Sum, ops::SubAssign};
 use anarchist_readable_name_generator_lib::readable_name_custom;
 use rand::{distributions::uniform::SampleUniform, Rng};
 
+use crate::runner::env::SimulatorTables;
+
 mod expr;
 pub mod plan;
 mod predicate;
@@ -21,6 +23,16 @@ pub trait Arbitrary {
     fn arbitrary<R: Rng>(rng: &mut R) -> Self;
 }
 
+/// ArbitrarySized trait for generating random values of a specific size
+/// An implementation of arbitrary_sized is assumed to be a uniform sampling of
+/// the possible values of the type, with a bias towards smaller values for
+/// practicality, but with the additional constraint that the generated value
+/// must fit in the given size. This is useful for generating values that are
+/// constrained by a specific size, such as integers or strings.
+pub trait ArbitrarySized {
+    fn arbitrary_sized<R: Rng>(rng: &mut R, size: usize) -> Self;
+}
+
 /// ArbitraryFrom trait for generating random values from a given value
 /// ArbitraryFrom allows for constructing relations, where the generated
 /// value is dependent on the given value. These relations could be constraints
@@ -30,11 +42,37 @@ pub trait ArbitraryFrom<T> {
     fn arbitrary_from<R: Rng>(rng: &mut R, t: T) -> Self;
 }
 
+/// ArbitrarySizedFrom trait for generating random values from a given value
+/// ArbitrarySizedFrom allows for constructing relations, where the generated
+/// value is dependent on the given value and a size constraint. These relations
+/// could be constraints such as generating an integer within an interval,
+/// or a value that fits in a table, or a predicate satisfying a given table row,
+/// but with the additional constraint that the generated value must fit in the given size.
+/// This is useful for generating values that are constrained by a specific size,
+/// such as integers or strings, while still being dependent on the given value.
+pub trait ArbitrarySizedFrom<T> {
+    fn arbitrary_sized_from<R: Rng>(rng: &mut R, t: T, size: usize) -> Self;
+}
+
 /// ArbitraryFromMaybe trait for fallibally generating random values from a given value
 pub trait ArbitraryFromMaybe<T> {
     fn arbitrary_from_maybe<R: Rng>(rng: &mut R, t: T) -> Option<Self>
     where
         Self: Sized;
+}
+
+/// Shadow trait for types that can be "shadowed" in the simulator environment.
+/// Shadowing is a process of applying a transformation to the simulator environment
+/// that reflects the changes made by the query or operation represented by the type.
+/// The result of the shadowing is typically a vector of rows, which can be used to
+/// update the simulator environment or to verify the correctness of the operation.
+/// The `Result` type is used to indicate the type of the result of the shadowing
+/// operation, which can vary depending on the type of the operation being shadowed.
+/// For example, a `Create` operation might return an empty vector, while an `Insert` operation
+/// might return a vector of rows that were inserted into the table.
+pub(crate) trait Shadow {
+    type Result;
+    fn shadow(&self, tables: &mut SimulatorTables) -> Self::Result;
 }
 
 /// Frequency is a helper function for composing different generators with different frequency
@@ -130,9 +168,9 @@ pub(crate) fn gen_random_text<T: Rng>(rng: &mut T) -> String {
     let big_text = rng.gen_ratio(1, 1000);
     if big_text {
         // let max_size: u64 = 2 * 1024 * 1024 * 1024;
-        let max_size: u64 = 2 * 1024; // todo: change this back to 2 * 1024 * 1024 * 1024
+        let max_size: u64 = 2 * 1024;
         let size = rng.gen_range(1024..max_size);
-        let mut name = String::new();
+        let mut name = String::with_capacity(size as usize);
         for i in 0..size {
             name.push(((i % 26) as u8 + b'A') as char);
         }

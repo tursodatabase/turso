@@ -200,9 +200,20 @@ impl Connection {
 
         rows.iter().try_for_each(|row| {
             f(row).map_err(|e| {
-                Error::SqlExecutionFailure(format!("Error executing user defined function: {}", e))
+                Error::SqlExecutionFailure(format!("Error executing user defined function: {e}"))
             })
         })?;
+        Ok(())
+    }
+
+    /// Flush dirty pages to disk.
+    /// This will write the dirty pages to the WAL.
+    pub fn cacheflush(&self) -> Result<()> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        conn.cacheflush()?;
         Ok(())
     }
 }
@@ -502,10 +513,10 @@ mod tests {
 
         let mut original_data = Vec::with_capacity(NUM_INSERTS);
         for i in 0..NUM_INSERTS {
-            let prefix = format!("test_string_{:04}_", i);
+            let prefix = format!("test_string_{i:04}_");
             let padding_len = TARGET_STRING_LEN.saturating_sub(prefix.len());
             let padding: String = "A".repeat(padding_len);
-            original_data.push(format!("{}{}", prefix, padding));
+            original_data.push(format!("{prefix}{padding}"));
         }
 
         // First, create the database, a table, and insert many large strings
@@ -539,12 +550,11 @@ mod tests {
             let row = rows
                 .next()
                 .await?
-                .unwrap_or_else(|| panic!("Expected row {} but found None", i));
+                .unwrap_or_else(|| panic!("Expected row {i} but found None"));
             assert_eq!(
                 row.get_value(0)?,
                 Value::Text(value.clone()),
-                "Mismatch in retrieved data for row {}",
-                i
+                "Mismatch in retrieved data for row {i}"
             );
         }
 
@@ -554,9 +564,9 @@ mod tests {
         );
 
         // Delete the WAL file only and try to re-open and query
-        let wal_path = format!("{}-wal", db_path);
+        let wal_path = format!("{db_path}-wal");
         std::fs::remove_file(&wal_path)
-            .map_err(|e| eprintln!("Warning: Failed to delete WAL file for test: {}", e))
+            .map_err(|e| eprintln!("Warning: Failed to delete WAL file for test: {e}"))
             .unwrap();
 
         // Attempt to re-open the database after deleting WAL and assert that table is missing.
@@ -571,14 +581,12 @@ mod tests {
             Ok(_) => panic!("Query succeeded after WAL deletion and DB reopen, but was expected to fail because the table definition should have been in the WAL."),
             Err(Error::SqlExecutionFailure(msg)) => {
                 assert!(
-                    msg.contains("test_large_persistence not found"),
-                    "Expected 'test_large_persistence not found' error, but got: {}",
-                    msg
+                    msg.contains("no such table: test_large_persistence"),
+                    "Expected 'test_large_persistence not found' error, but got: {msg}"
                 );
             }
             Err(e) => panic!(
-                "Expected SqlExecutionFailure for 'no such table', but got a different error: {:?}",
-                e
+                "Expected SqlExecutionFailure for 'no such table', but got a different error: {e:?}"
             ),
         }
 

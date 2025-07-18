@@ -63,6 +63,7 @@ impl IdxInsertFlags {
     pub const APPEND: u8 = 0x01; // Hint: insert likely at the end
     pub const NCHANGE: u8 = 0x02; // Increment the change counter
     pub const USE_SEEK: u8 = 0x04; // Skip seek if last one was same key
+    pub const NO_OP_DUPLICATE: u8 = 0x08; // Do not error on duplicate key
     pub fn new() -> Self {
         IdxInsertFlags(0)
     }
@@ -91,6 +92,14 @@ impl IdxInsertFlags {
         } else {
             self.0 &= !IdxInsertFlags::NCHANGE;
         }
+        self
+    }
+    /// If this is set, we will not error on duplicate key.
+    /// This is a bit of a hack we use to make ephemeral indexes for UNION work --
+    /// instead we should allow overwriting index interior cells, which we currently don't;
+    /// this should (and will) be fixed in a future PR.
+    pub fn no_op_duplicate(mut self) -> Self {
+        self.0 |= IdxInsertFlags::NO_OP_DUPLICATE;
         self
     }
 }
@@ -733,10 +742,15 @@ pub enum Insn {
         cursor_id: CursorID,
     },
 
+    /// If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error if no matching index entry
+    /// is found. This happens when running an UPDATE or DELETE statement and the index entry to
+    /// be updated or deleted is not found. For some uses of IdxDelete (example: the EXCEPT operator)
+    /// it does not matter that no matching entry is found. For those cases, P5 is zero.
     IdxDelete {
         start_reg: usize,
         num_regs: usize,
         cursor_id: CursorID,
+        raise_error_if_no_matching_entry: bool, // P5
     },
 
     NewRowid {
@@ -786,7 +800,7 @@ pub enum Insn {
     Copy {
         src_reg: usize,
         dst_reg: usize,
-        amount: usize, // 0 amount means we include src_reg, dst_reg..=dst_reg+amount = src_reg..=src_reg+amount
+        extra_amount: usize, // 0 extra_amount means we include src_reg, dst_reg..=dst_reg+amount = src_reg..=src_reg+amount
     },
 
     /// Allocate a new b-tree.

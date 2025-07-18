@@ -41,7 +41,7 @@
     trace!(target: TARGET, "incomplete input");
     self.ctx.error = Some(ParserError::UnexpectedEof);
   } else {
-    trace!(target: TARGET, "near \"{:?}\": syntax error", yyminor);
+    trace!(target: TARGET, "near \"{yyminor:?}\": syntax error");
     self.ctx.error = Some(ParserError::SyntaxError(from_bytes(yyminor.1)));
   }
 }

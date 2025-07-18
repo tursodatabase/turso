@@ -38,7 +38,7 @@ linux_x86:
 	@echo "Building release version for linux x86_64..."
 	@mkdir -p $(TEMP_DIR) $(LINUX_X86_DIR)
 	@CARGO_TARGET_DIR=$(TEMP_DIR) $(CARGO_BUILD) --target x86_64-unknown-linux-gnu
-	@cp $(TEMP_DIR)/x86_64-unknown-linux-gnu/release/lib_turso_java.d $(LINUX_X86_DIR)
+	@cp $(TEMP_DIR)/x86_64-unknown-linux-gnu/release/lib_turso_java.so $(LINUX_X86_DIR)
 	@rm -rf $(TEMP_DIR)
 
 lint:

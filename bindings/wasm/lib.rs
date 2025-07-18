@@ -68,8 +68,9 @@ impl RowIterator {
             Ok(turso_core::StepResult::Done) | Ok(turso_core::StepResult::Interrupt) => {
                 JsValue::UNDEFINED
             }
+
             Ok(turso_core::StepResult::Busy) => JsValue::UNDEFINED,
-            Err(e) => panic!("Error: {:?}", e),
+            Err(e) => panic!("Error: {e:?}"),
         }
     }
 }
@@ -104,11 +105,12 @@ impl Statement {
                 }
                 JsValue::from(row_array)
             }
+
             Ok(turso_core::StepResult::IO)
             | Ok(turso_core::StepResult::Done)
             | Ok(turso_core::StepResult::Interrupt)
             | Ok(turso_core::StepResult::Busy) => JsValue::UNDEFINED,
-            Err(e) => panic!("Error: {:?}", e),
+            Err(e) => panic!("Error: {e:?}"),
         }
     }
 
@@ -130,7 +132,7 @@ impl Statement {
                 Ok(turso_core::StepResult::Interrupt) => break,
                 Ok(turso_core::StepResult::Done) => break,
                 Ok(turso_core::StepResult::Busy) => break,
-                Err(e) => panic!("Error: {:?}", e),
+                Err(e) => panic!("Error: {e:?}"),
             }
         }
         array
@@ -211,27 +213,30 @@ impl turso_core::File for File {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: turso_core::Completion) -> Result<Arc<turso_core::Completion>> {
+    fn pread(
+        &self,
+        pos: usize,
+        c: Arc<turso_core::Completion>,
+    ) -> Result<Arc<turso_core::Completion>> {
         let r = match c.completion_type {
             turso_core::CompletionType::Read(ref r) => r,
             _ => unreachable!(),
         };
-        {
+        let nr = {
             let mut buf = r.buf_mut();
             let buf: &mut [u8] = buf.as_mut_slice();
-            let nr = self.vfs.pread(self.fd, buf, pos);
-            assert!(nr >= 0);
-        }
-        r.complete();
+            self.vfs.pread(self.fd, buf, pos)
+        };
+        r.complete(nr);
         #[allow(clippy::arc_with_non_send_sync)]
-        Ok(Arc::new(c))
+        Ok(c)
     }
 
     fn pwrite(
         &self,
         pos: usize,
         buffer: Arc<std::cell::RefCell<turso_core::Buffer>>,
-        c: turso_core::Completion,
+        c: Arc<turso_core::Completion>,
     ) -> Result<Arc<turso_core::Completion>> {
         let w = match c.completion_type {
             turso_core::CompletionType::Write(ref w) => w,
@@ -242,14 +247,14 @@ impl turso_core::File for File {
         self.vfs.pwrite(self.fd, buf, pos);
         w.complete(buf.len() as i32);
         #[allow(clippy::arc_with_non_send_sync)]
-        Ok(Arc::new(c))
+        Ok(c)
     }
 
-    fn sync(&self, c: turso_core::Completion) -> Result<Arc<turso_core::Completion>> {
+    fn sync(&self, c: Arc<turso_core::Completion>) -> Result<Arc<turso_core::Completion>> {
         self.vfs.sync(self.fd);
         c.complete(0);
         #[allow(clippy::arc_with_non_send_sync)]
-        Ok(Arc::new(c))
+        Ok(c)
     }
 
     fn size(&self) -> Result<u64> {
@@ -350,7 +355,7 @@ impl turso_core::DatabaseStorage for DatabaseFile {
             return Err(turso_core::LimboError::NotADB);
         }
         let pos = (page_idx - 1) * size;
-        self.file.pread(pos, c)?;
+        self.file.pread(pos, c.into())?;
         Ok(())
     }
 
@@ -362,12 +367,12 @@ impl turso_core::DatabaseStorage for DatabaseFile {
     ) -> Result<()> {
         let size = buffer.borrow().len();
         let pos = (page_idx - 1) * size;
-        self.file.pwrite(pos, buffer, c)?;
+        self.file.pwrite(pos, buffer, c.into())?;
         Ok(())
     }
 
     fn sync(&self, c: turso_core::Completion) -> Result<()> {
-        let _ = self.file.sync(c)?;
+        let _ = self.file.sync(c.into())?;
         Ok(())
     }
 

@@ -2,6 +2,28 @@
 
 const { Database: NativeDB } = require("./index.js");
 
+const SqliteError = require("./sqlite-error.js");
+
+const convertibleErrorTypes = { TypeError };
+const CONVERTIBLE_ERROR_PREFIX = '[TURSO_CONVERT_TYPE]';
+
+function convertError(err) {
+  if ((err.code ?? '').startsWith(CONVERTIBLE_ERROR_PREFIX)) {
+    return createErrorByName(err.code.substring(CONVERTIBLE_ERROR_PREFIX.length), err.message);
+  }
+
+  return new SqliteError(err.message, err.code, err.rawCode);
+}
+
+function createErrorByName(name, message) {
+  const ErrorConstructor = convertibleErrorTypes[name];
+  if (!ErrorConstructor) {
+    throw new Error(`unknown error type ${name} from Turso`);
+  }
+
+  return new ErrorConstructor(message);
+}
+
 /**
  * Database represents a connection that can prepare and execute SQL statements.
  */
@@ -41,6 +63,11 @@ class Database {
           return opts.readonly;
         },
       },
+      open: {
+        get() {
+          return this.db.open;
+        }
+      }
     });
   }
 
@@ -50,6 +77,10 @@ class Database {
    * @param {string} sql - The SQL statement string to prepare.
    */
   prepare(sql) {
+    if (!sql) {
+      throw new RangeError('The supplied SQL string contains no statements');
+    }
+
     try {
       return new Statement(this.db.prepare(sql), this);
     } catch (err) {
@@ -145,7 +176,11 @@ class Database {
    * @param {string} sql - The SQL statement string to execute.
    */
   exec(sql) {
-    this.db.exec(sql);
+    try {
+      this.db.exec(sql);
+    } catch (err) {
+      throw convertError(err);
+    }
   }
 
   /**
@@ -264,8 +299,13 @@ class Statement {
    * @returns this - Statement with binded parameters
    */
   bind(...bindParameters) {
-    return this.stmt.bind(bindParameters.flat());
+    try {
+      return new Statement(this.stmt.bind(bindParameters.flat()), this.db);
+    } catch (err) {
+      throw convertError(err);
+    }
   }
 }
 
 module.exports = Database;
+module.exports.SqliteError = SqliteError;

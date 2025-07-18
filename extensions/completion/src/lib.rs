@@ -7,20 +7,21 @@ use std::sync::Arc;
 
 use keywords::KEYWORDS;
 use turso_ext::{
-    register_extension, Connection, ResultCode, VTabCursor, VTabModule, VTabModuleDerive, VTable,
-    Value,
+    register_extension, Connection, ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo,
+    OrderByInfo, ResultCode, VTabCursor, VTabModule, VTabModuleDerive, VTable, Value,
 };
 
 register_extension! {
     vtabs: { CompletionVTabModule }
 }
 
-macro_rules! try_option {
-    ($expr:expr, $err:expr) => {
-        match $expr {
-            Some(val) => val,
-            None => return $err,
-        }
+macro_rules! extract_arg_text {
+    ($args:expr, $idx:expr) => {
+        $args
+            .get($idx)
+            .map(|v| v.to_text().unwrap_or(""))
+            .unwrap_or("")
+            .to_string()
     };
 }
 
@@ -90,6 +91,60 @@ impl VTable for CompletionTable {
     fn open(&self, _conn: Option<Arc<Connection>>) -> Result<Self::Cursor, Self::Error> {
         Ok(CompletionCursor::default())
     }
+
+    fn best_index(constraints: &[ConstraintInfo], _order_by: &[OrderByInfo]) -> IndexInfo {
+        // The bits of `idx_num` are used to indicate which arguments are available to the filter method:
+        // - Bit 0 set -> 'prefix' is available
+        // - Bit 1 set -> 'wholeline' is available
+        let mut idx_num = 0;
+        let mut prefix_idx = None;
+        let mut wholeline_idx = None;
+
+        for (i, c) in constraints.iter().enumerate() {
+            if !c.usable || c.op != ConstraintOp::Eq {
+                continue;
+            }
+            match c.column_index {
+                1 => {
+                    prefix_idx = Some(i);
+                    idx_num |= 1;
+                }
+                2 => {
+                    wholeline_idx = Some(i);
+                    idx_num |= 2;
+                }
+                _ => {}
+            }
+        }
+
+        let mut argv_idx = 1;
+        let constraint_usages = constraints
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                if Some(i) == prefix_idx || Some(i) == wholeline_idx {
+                    let usage = ConstraintUsage {
+                        argv_index: Some(argv_idx),
+                        omit: true,
+                    };
+                    argv_idx += 1;
+                    usage
+                } else {
+                    ConstraintUsage {
+                        argv_index: Some(0),
+                        omit: false,
+                    }
+                }
+            })
+            .collect();
+
+        IndexInfo {
+            idx_num,
+            idx_str: Some(idx_num.to_string()),
+            constraint_usages,
+            ..Default::default()
+        }
+    }
 }
 
 /// The cursor for iterating over the completions
@@ -116,19 +171,21 @@ impl CompletionCursor {
 impl VTabCursor for CompletionCursor {
     type Error = ResultCode;
 
-    fn filter(&mut self, args: &[Value], _: Option<(&str, i32)>) -> ResultCode {
-        if args.is_empty() || args.len() > 2 {
-            return ResultCode::InvalidArgs;
-        }
+    fn filter(&mut self, args: &[Value], idx_info: Option<(&str, i32)>) -> ResultCode {
         self.reset();
-        let prefix = try_option!(args[0].to_text(), ResultCode::InvalidArgs);
 
-        let wholeline = args.get(1).map(|v| v.to_text().unwrap_or("")).unwrap_or("");
+        if let Some((_, idx_num)) = idx_info {
+            let mut arg_idx = 0;
+            // For the semantics of `idx_num`, see the comment in the `best_index` method.
+            if idx_num & 1 != 0 {
+                self.prefix = extract_arg_text!(args, arg_idx);
+                arg_idx += 1;
+            }
+            if idx_num & 2 != 0 {
+                self.line = extract_arg_text!(args, arg_idx);
+            }
+        }
 
-        self.line = wholeline.to_string();
-        self.prefix = prefix.to_string();
-
-        // Currently best index is not implemented so the correct arg parsing is not done here
         if !self.line.is_empty() && self.prefix.is_empty() {
             let mut i = self.line.len();
             while let Some(ch) = self.line.chars().next() {

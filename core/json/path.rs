@@ -395,7 +395,7 @@ mod tests {
                 Err(crate::error::LimboError::ParseError(_)) => {
                     // happy path
                 }
-                _ => panic!("Expected error for: {:?}, got: {:?}", value, path),
+                _ => panic!("Expected error for: {value:?}, got: {path:?}"),
             }
         }
     }

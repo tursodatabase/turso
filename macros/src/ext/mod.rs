@@ -23,8 +23,7 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
     } = input_ast;
 
     let scalar_calls = scalars.iter().map(|scalar_ident| {
-        let register_fn =
-            syn::Ident::new(&format!("register_{}", scalar_ident), scalar_ident.span());
+        let register_fn = syn::Ident::new(&format!("register_{scalar_ident}"), scalar_ident.span());
         quote! {
             {
                 let result = unsafe { #register_fn(api)};
@@ -36,7 +35,7 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
     });
 
     let aggregate_calls = aggregates.iter().map(|agg_ident| {
-        let register_fn = syn::Ident::new(&format!("register_{}", agg_ident), agg_ident.span());
+        let register_fn = syn::Ident::new(&format!("register_{agg_ident}"), agg_ident.span());
         quote! {
             {
                 let result = unsafe{ #agg_ident::#register_fn(api)};
@@ -47,7 +46,7 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
         }
     });
     let vtab_calls = vtabs.iter().map(|vtab_ident| {
-        let register_fn = syn::Ident::new(&format!("register_{}", vtab_ident), vtab_ident.span());
+        let register_fn = syn::Ident::new(&format!("register_{vtab_ident}"), vtab_ident.span());
         quote! {
             {
                 let result = unsafe{ #vtab_ident::#register_fn(api)};
@@ -58,7 +57,7 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
         }
     });
     let vfs_calls = vfs.iter().map(|vfs_ident| {
-        let register_fn = syn::Ident::new(&format!("register_{}", vfs_ident), vfs_ident.span());
+        let register_fn = syn::Ident::new(&format!("register_{vfs_ident}"), vfs_ident.span());
         quote! {
             {
                 let result = unsafe { #register_fn(api) };
@@ -70,7 +69,7 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
     });
     let static_vfs = vfs.iter().map(|vfs_ident| {
         let static_register =
-            syn::Ident::new(&format!("register_static_{}", vfs_ident), vfs_ident.span());
+            syn::Ident::new(&format!("register_static_{vfs_ident}"), vfs_ident.span());
         quote! {
             {
                     let result = api.add_builtin_vfs(unsafe { #static_register()});

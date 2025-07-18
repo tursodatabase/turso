@@ -35,6 +35,10 @@ do_execsql_test concat_ws-multiple {
   select concat_ws(',', 1, 2), concat_ws(',', 3, 4)
 } {1,2|3,4}
 
+do_execsql_test concat_ws-complex-args {
+  select concat_ws(',', 'a' || 'b', 'b' || 'c', 'c' || 'd');
+} {ab,bc,cd}
+
 do_execsql_test char {
   select char(108, 105)
 } {li}

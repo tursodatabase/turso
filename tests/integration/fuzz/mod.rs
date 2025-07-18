@@ -36,8 +36,7 @@ mod tests {
         let sqlite_result = sqlite_exec_rows(&sqlite_conn, offending_query);
         assert_eq!(
             limbo_result, sqlite_result,
-            "query: {}, limbo: {:?}, sqlite: {:?}",
-            offending_query, limbo_result, sqlite_result
+            "query: {offending_query}, limbo: {limbo_result:?}, sqlite: {sqlite_result:?}"
         );
     }
 
@@ -55,8 +54,7 @@ mod tests {
             let sqlite = sqlite_exec_rows(&sqlite_conn, query);
             assert_eq!(
                 limbo, sqlite,
-                "query: {}, limbo: {:?}, sqlite: {:?}",
-                query, limbo, sqlite
+                "query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?}"
             );
         }
     }
@@ -66,10 +64,20 @@ mod tests {
         let db = TempDatabase::new_with_rusqlite("CREATE TABLE t(x INTEGER PRIMARY KEY)", false); // INTEGER PRIMARY KEY is a rowid alias, so an index is not created
         let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
 
+        let (mut rng, _seed) = rng_from_time_or_env();
+
+        let mut values: Vec<i32> = Vec::with_capacity(3000);
+        while values.len() < 3000 {
+            let val = rng.random_range(-100000..100000);
+            if !values.contains(&val) {
+                values.push(val);
+            }
+        }
         let insert = format!(
             "INSERT INTO t VALUES {}",
-            (1..100)
-                .map(|x| format!("({})", x))
+            values
+                .iter()
+                .map(|x| format!("({x})"))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -104,13 +112,12 @@ mod tests {
                             order_by.unwrap_or("")
                         );
 
-                        log::trace!("query: {}", query);
+                        log::trace!("query: {query}");
                         let limbo_result = limbo_exec_rows(&db, &limbo_conn, &query);
                         let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
                         assert_eq!(
                             limbo_result, sqlite_result,
-                            "query: {}, limbo: {:?}, sqlite: {:?}, seed: {}",
-                            query, limbo_result, sqlite_result, seed
+                            "query: {query}, limbo: {limbo_result:?}, sqlite: {sqlite_result:?}, seed: {seed}"
                         );
                     }
                 }
@@ -189,7 +196,7 @@ mod tests {
         let insert = format!(
             "INSERT INTO t VALUES {}",
             (0..10000)
-                .map(|x| format!("({})", x))
+                .map(|x| format!("({x})"))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -220,8 +227,7 @@ mod tests {
                     let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
                     assert_eq!(
                         limbo, sqlite,
-                        "query: {}, limbo: {:?}, sqlite: {:?}",
-                        query, limbo, sqlite
+                        "query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?}",
                     );
                 }
             }
@@ -409,9 +415,9 @@ mod tests {
 
             // Generate ORDER BY string
             let order_by_components = vec![
-                order_by1.map(|x| format!("x {}", x)),
-                order_by2.map(|x| format!("y {}", x)),
-                order_by3.map(|x| format!("z {}", x)),
+                order_by1.map(|x| format!("x {x}")),
+                order_by2.map(|x| format!("y {x}")),
+                order_by3.map(|x| format!("z {x}")),
             ]
             .into_iter()
             .flatten()
@@ -430,7 +436,7 @@ mod tests {
                 order_by,
                 limit
             );
-            log::debug!("query: {}", query);
+            log::debug!("query: {query}");
 
             // Execute the query on all databases and compare the results
             for (i, sqlite_conn) in sqlite_conns.iter().enumerate() {
@@ -445,11 +451,11 @@ mod tests {
                     let order_by_only_equalities = !order_by_components.is_empty()
                         && order_by_components.iter().all(|o: &String| {
                             if o.starts_with("x ") {
-                                comp1.map_or(false, |c| c == "=")
+                                comp1 == Some("=")
                             } else if o.starts_with("y ") {
-                                comp2.map_or(false, |c| c == "=")
+                                comp2 == Some("=")
                             } else {
-                                comp3.map_or(false, |c| c == "=")
+                                comp3 == Some("=")
                             }
                         });
 
@@ -511,7 +517,7 @@ mod tests {
     pub fn compound_select_fuzz() {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time();
-        log::info!("compound_select_fuzz seed: {}", seed);
+        log::info!("compound_select_fuzz seed: {seed}");
 
         // Constants for fuzzing parameters
         const MAX_TABLES: usize = 7;
@@ -532,12 +538,12 @@ mod tests {
 
         const COLS: [&str; 3] = ["c1", "c2", "c3"];
         for i in 0..num_tables {
-            let table_name = format!("t{}", i);
+            let table_name = format!("t{i}");
             let create_table_sql = format!(
                 "CREATE TABLE {} ({})",
                 table_name,
                 COLS.iter()
-                    .map(|c| format!("{} INTEGER", c))
+                    .map(|c| format!("{c} INTEGER"))
                     .collect::<Vec<_>>()
                     .join(", ")
             );
@@ -551,10 +557,8 @@ mod tests {
                 let c2_val: i64 = rng.random_range(-3..3);
                 let c3_val: i64 = rng.random_range(-3..3);
 
-                let insert_sql = format!(
-                    "INSERT INTO {} VALUES ({}, {}, {})",
-                    table_name, c1_val, c2_val, c3_val
-                );
+                let insert_sql =
+                    format!("INSERT INTO {table_name} VALUES ({c1_val}, {c2_val}, {c3_val})",);
                 limbo_exec_rows(&db, &limbo_conn, &insert_sql);
                 sqlite_exec_rows(&sqlite_conn, &insert_sql);
             }
@@ -584,7 +588,8 @@ mod tests {
                 ));
             }
 
-            const COMPOUND_OPERATORS: [&str; 3] = [" UNION ALL ", " UNION ", " INTERSECT "];
+            const COMPOUND_OPERATORS: [&str; 4] =
+                [" UNION ALL ", " UNION ", " INTERSECT ", " EXCEPT "];
 
             let mut query = String::new();
             for (i, select_statement) in select_statements.iter().enumerate() {
@@ -596,7 +601,7 @@ mod tests {
 
             if rng.random_bool(0.8) {
                 let limit_val = rng.random_range(0..=MAX_LIMIT_VALUE); // LIMIT 0 is valid
-                query = format!("{} LIMIT {}", query, limit_val);
+                query = format!("{query} LIMIT {limit_val}");
             }
 
             log::debug!(
@@ -672,15 +677,14 @@ mod tests {
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
         let (mut rng, seed) = rng_from_time();
-        log::info!("seed: {}", seed);
+        log::info!("seed: {seed}");
         for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
             let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
             assert_eq!(
                 limbo, sqlite,
-                "query: {}, limbo: {:?}, sqlite: {:?} seed: {}",
-                query, limbo, sqlite, seed
+                "query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?} seed: {seed}"
             );
         }
     }
@@ -707,8 +711,7 @@ mod tests {
             let sqlite = sqlite_exec_rows(&sqlite_conn, query);
             assert_eq!(
                 limbo, sqlite,
-                "query: {}, limbo: {:?}, sqlite: {:?}",
-                query, limbo, sqlite
+                "query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?}"
             );
         }
     }
@@ -793,10 +796,10 @@ mod tests {
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
         let (mut rng, seed) = rng_from_time();
-        log::info!("seed: {}", seed);
+        log::info!("seed: {seed}");
         for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
-            log::info!("query: {}", query);
+            log::info!("query: {query}");
             let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
             match (&limbo[0][0], &sqlite[0][0]) {
@@ -807,11 +810,7 @@ mod tests {
                     assert!(
                         (limbo - sqlite).abs() < 1e-9
                             || (limbo - sqlite) / (limbo.abs().max(sqlite.abs())) < 1e-9,
-                        "query: {}, limbo: {:?}, sqlite: {:?} seed: {}",
-                        query,
-                        limbo,
-                        sqlite,
-                        seed
+                        "query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?} seed: {seed}"
                     )
                 }
                 _ => {}
@@ -957,16 +956,15 @@ mod tests {
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
         let (mut rng, seed) = rng_from_time();
-        log::info!("seed: {}", seed);
+        log::info!("seed: {seed}");
         for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
-            log::info!("query: {}", query);
+            log::info!("query: {query}");
             let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
             assert_eq!(
                 limbo, sqlite,
-                "query: {}, limbo: {:?}, sqlite: {:?} seed: {}",
-                query, limbo, sqlite, seed
+                "query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?} seed: {seed}"
             );
         }
     }
@@ -1327,16 +1325,15 @@ mod tests {
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
         let (mut rng, seed) = rng_from_time();
-        log::info!("seed: {}", seed);
+        log::info!("seed: {seed}");
         for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
-            log::info!("query: {}", query);
+            log::info!("query: {query}");
             let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
             assert_eq!(
                 limbo, sqlite,
-                "query: {}, limbo: {:?}, sqlite: {:?} seed: {}",
-                query, limbo, sqlite, seed
+                "query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?} seed: {seed}"
             );
         }
     }
@@ -1365,8 +1362,66 @@ mod tests {
                 let sqlite = sqlite_exec_rows(&sqlite_conn, query);
                 assert_eq!(
                     limbo, sqlite,
-                    "queries: {:?}, query: {}, limbo: {:?}, sqlite: {:?}",
-                    queries, query, limbo, sqlite
+                    "queries: {queries:?}, query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    /// Ignored because of https://github.com/tursodatabase/turso/issues/2040, https://github.com/tursodatabase/turso/issues/2041
+    /// TODO: add fuzzing for other aggregate functions
+    pub fn min_max_agg_fuzz() {
+        let _ = env_logger::try_init();
+
+        let datatypes = ["INTEGER", "TEXT", "REAL", "BLOB"];
+        let (mut rng, seed) = rng_from_time();
+        log::info!("seed: {seed}");
+
+        for _ in 0..1000 {
+            // Create table with random datatype
+            let datatype = datatypes[rng.random_range(0..datatypes.len())];
+            let create_table = format!("CREATE TABLE t(x {datatype})");
+
+            let db = TempDatabase::new_empty(false);
+            let limbo_conn = db.connect_limbo();
+            let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+            limbo_exec_rows(&db, &limbo_conn, &create_table);
+            sqlite_exec_rows(&sqlite_conn, &create_table);
+
+            // Insert 5 random values of random types
+            let mut values = Vec::new();
+            for _ in 0..5 {
+                let value = match rng.random_range(0..4) {
+                    0 => rng.random_range(-1000..1000).to_string(), // Integer
+                    1 => format!(
+                        "'{}'",
+                        (0..10)
+                            .map(|_| rng.random_range(b'a'..=b'z') as char)
+                            .collect::<String>()
+                    ), // Text
+                    2 => format!("{:.2}", rng.random_range(-100..100) as f64 / 10.0), // Real
+                    3 => "NULL".to_string(),                        // NULL
+                    _ => unreachable!(),
+                };
+                values.push(format!("({value})"));
+            }
+
+            let insert = format!("INSERT INTO t VALUES {}", values.join(","));
+            limbo_exec_rows(&db, &limbo_conn, &insert);
+            sqlite_exec_rows(&sqlite_conn, &insert);
+
+            // Test min and max
+            for agg in ["min(x)", "max(x)"] {
+                let query = format!("SELECT {agg} FROM t");
+                let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
+                let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
+
+                assert_eq!(
+                    limbo, sqlite,
+                    "query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?}, seed: {seed}, values: {values:?}, schema: {create_table}"
                 );
             }
         }
@@ -1404,13 +1459,12 @@ mod tests {
 
             assert_eq!(
                 limbo, sqlite,
-                "query: {}, limbo: {:?}, sqlite: {:?}",
-                query, limbo, sqlite
+                "query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?}",
             );
         }
 
         let (mut rng, seed) = rng_from_time();
-        log::info!("seed: {}", seed);
+        log::info!("seed: {seed}");
 
         let mut i = 0;
         let mut primary_key_set = HashSet::with_capacity(100);
@@ -1424,14 +1478,13 @@ mod tests {
                 g.generate(&mut rng, builders.number, 1),
                 g.generate(&mut rng, builders.number, 1),
             );
-            let query = format!("INSERT INTO t VALUES ({}, {}, {})", x, y, z);
-            log::info!("insert: {}", query);
+            let query = format!("INSERT INTO t VALUES ({x}, {y}, {z})");
+            log::info!("insert: {query}");
             dbg!(&query);
             assert_eq!(
                 limbo_exec_rows(&db, &limbo_conn, &query),
                 sqlite_exec_rows(&sqlite_conn, &query),
-                "seed: {}",
-                seed,
+                "seed: {seed}",
             );
             i += 1;
         }
@@ -1439,7 +1492,7 @@ mod tests {
         let query = "SELECT COUNT(*) FROM t".to_string();
         let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
         let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
-        assert_eq!(limbo, sqlite, "seed: {}", seed);
+        assert_eq!(limbo, sqlite, "seed: {seed}");
 
         let sql = g
             .create()
@@ -1450,7 +1503,7 @@ mod tests {
 
         for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
-            log::info!("query: {}", query);
+            log::info!("query: {query}");
             let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
 

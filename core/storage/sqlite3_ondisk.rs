@@ -45,18 +45,23 @@
 
 use tracing::{instrument, Level};
 
+use super::pager::PageRef;
+use super::wal::LimboRwLock;
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
 use crate::io::{
     Buffer, Complete, Completion, CompletionType, ReadCompletion, SyncCompletion, WriteCompletion,
 };
+use crate::storage::btree::offset::{
+    BTREE_CELL_CONTENT_AREA, BTREE_CELL_COUNT, BTREE_FIRST_FREEBLOCK, BTREE_FRAGMENTED_BYTES_COUNT,
+    BTREE_PAGE_TYPE, BTREE_RIGHTMOST_PTR,
+};
+use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::pager::Pager;
-use crate::types::{
-    ImmutableRecord, RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype,
-};
-use crate::{File, Result, WalFileShared};
+use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
+use crate::{turso_assert, File, Result, WalFileShared};
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
@@ -64,9 +69,6 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-
-use super::pager::PageRef;
-use super::wal::LimboRwLock;
 
 /// The size of the database header in bytes.
 pub const DATABASE_HEADER_SIZE: usize = 100;
@@ -81,12 +83,20 @@ pub const MIN_PAGE_CACHE_SIZE: usize = 10;
 pub const MIN_PAGE_SIZE: u32 = 512;
 
 /// The maximum page size in bytes.
-const MAX_PAGE_SIZE: u32 = 65536;
+pub const MAX_PAGE_SIZE: u32 = 65536;
 
 /// The default page size in bytes.
-pub const DEFAULT_PAGE_SIZE: u16 = 4096;
+pub const DEFAULT_PAGE_SIZE: u32 = 4096;
 
 pub const DATABASE_HEADER_PAGE_ID: usize = 1;
+
+/// The minimum size of a cell in bytes.
+pub const MINIMUM_CELL_SIZE: usize = 4;
+
+pub const CELL_PTR_SIZE_BYTES: usize = 2;
+pub const INTERIOR_PAGE_HEADER_SIZE_BYTES: usize = 12;
+pub const LEAF_PAGE_HEADER_SIZE_BYTES: usize = 8;
+pub const LEFT_CHILD_PTR_SIZE_BYTES: usize = 4;
 
 /// The database header.
 /// The first 100 bytes of the database file comprise the database file header.
@@ -241,7 +251,7 @@ impl Default for DatabaseHeader {
     fn default() -> Self {
         Self {
             magic: *b"SQLite format 3\0",
-            page_size: DEFAULT_PAGE_SIZE,
+            page_size: DEFAULT_PAGE_SIZE as u16,
             write_version: 2,
             read_version: 2,
             reserved_space: 0,
@@ -269,7 +279,7 @@ impl Default for DatabaseHeader {
 
 impl DatabaseHeader {
     pub fn update_page_size(&mut self, size: u32) {
-        if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&size) || (size & (size - 1) != 0) {
+        if !is_valid_page_size(size) {
             return;
         }
 
@@ -287,6 +297,10 @@ impl DatabaseHeader {
             self.page_size as u32
         }
     }
+}
+
+pub fn is_valid_page_size(size: u32) -> bool {
+    (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&size) && (size & (size - 1)) == 0
 }
 
 pub fn write_header_to_buf(buf: &mut [u8], header: &DatabaseHeader) {
@@ -344,7 +358,7 @@ impl TryFrom<u8> for PageType {
             5 => Ok(Self::TableInterior),
             10 => Ok(Self::IndexLeaf),
             13 => Ok(Self::TableLeaf),
-            _ => Err(LimboError::Corrupt(format!("Invalid page type: {}", value))),
+            _ => Err(LimboError::Corrupt(format!("Invalid page type: {value}"))),
         }
     }
 }
@@ -357,6 +371,8 @@ pub struct OverflowCell {
 
 #[derive(Debug)]
 pub struct PageContent {
+    /// the position where page content starts. it's 100 for page 1(database file header is 100 bytes),
+    /// 0 for all other pages.
     pub offset: usize,
     pub buffer: Arc<RefCell<Buffer>>,
     pub overflow_cells: Vec<OverflowCell>,
@@ -383,14 +399,11 @@ impl PageContent {
     }
 
     pub fn page_type(&self) -> PageType {
-        self.read_u8(0).try_into().unwrap()
+        self.read_u8(BTREE_PAGE_TYPE).try_into().unwrap()
     }
 
     pub fn maybe_page_type(&self) -> Option<PageType> {
-        match self.read_u8(0).try_into() {
-            Ok(v) => Some(v),
-            Err(_) => None, // this could be an overflow page
-        }
+        self.read_u8(0).try_into().ok() // this could be an overflow page
     }
 
     #[allow(clippy::mut_from_ref)]
@@ -452,26 +465,20 @@ impl PageContent {
         buf[self.offset + pos..self.offset + pos + 4].copy_from_slice(&value.to_be_bytes());
     }
 
-    /// The second field of the b-tree page header is the offset of the first freeblock, or zero if there are no freeblocks on the page.
-    /// A freeblock is a structure used to identify unallocated space within a b-tree page.
-    /// Freeblocks are organized as a chain.
-    ///
-    /// To be clear, freeblocks do not mean the regular unallocated free space to the left of the cell content area pointer, but instead
-    /// blocks of at least 4 bytes WITHIN the cell content area that are not in use due to e.g. deletions.
+    /// The offset of the first freeblock, or zero if there are no freeblocks on the page.
     pub fn first_freeblock(&self) -> u16 {
-        self.read_u16(1)
+        self.read_u16(BTREE_FIRST_FREEBLOCK)
     }
 
     /// The number of cells on the page.
     pub fn cell_count(&self) -> usize {
-        self.read_u16(3) as usize
+        self.read_u16(BTREE_CELL_COUNT) as usize
     }
 
     /// The size of the cell pointer array in bytes.
     /// 2 bytes per cell pointer
     pub fn cell_pointer_array_size(&self) -> usize {
-        const CELL_POINTER_SIZE_BYTES: usize = 2;
-        self.cell_count() * CELL_POINTER_SIZE_BYTES
+        self.cell_count() * CELL_PTR_SIZE_BYTES
     }
 
     /// The start of the unallocated region.
@@ -486,34 +493,33 @@ impl PageContent {
     }
 
     /// The start of the cell content area.
-    /// SQLite strives to place cells as far toward the end of the b-tree page as it can,
-    /// in order to leave space for future growth of the cell pointer array.
-    /// = the cell content area pointer moves leftward as cells are added to the page
-    pub fn cell_content_area(&self) -> u16 {
-        self.read_u16(5)
+    pub fn cell_content_area(&self) -> u32 {
+        let offset = self.read_u16(BTREE_CELL_CONTENT_AREA);
+        if offset == 0 {
+            MAX_PAGE_SIZE
+        } else {
+            offset as u32
+        }
     }
 
     /// The size of the page header in bytes.
     /// 8 bytes for leaf pages, 12 bytes for interior pages (due to storing rightmost child pointer)
     pub fn header_size(&self) -> usize {
         match self.page_type() {
-            PageType::IndexInterior => 12,
-            PageType::TableInterior => 12,
-            PageType::IndexLeaf => 8,
-            PageType::TableLeaf => 8,
+            PageType::IndexInterior | PageType::TableInterior => INTERIOR_PAGE_HEADER_SIZE_BYTES,
+            PageType::IndexLeaf | PageType::TableLeaf => LEAF_PAGE_HEADER_SIZE_BYTES,
         }
     }
 
-    /// The total number of bytes in all fragments is stored in the fifth field of the b-tree page header.
-    /// Fragments are isolated groups of 1, 2, or 3 unused bytes within the cell content area.
+    /// The total number of bytes in all fragments
     pub fn num_frag_free_bytes(&self) -> u8 {
-        self.read_u8(7)
+        self.read_u8(BTREE_FRAGMENTED_BYTES_COUNT)
     }
 
     pub fn rightmost_pointer(&self) -> Option<u32> {
         match self.page_type() {
-            PageType::IndexInterior => Some(self.read_u32(8)),
-            PageType::TableInterior => Some(self.read_u32(8)),
+            PageType::IndexInterior => Some(self.read_u32(BTREE_RIGHTMOST_PTR)),
+            PageType::TableInterior => Some(self.read_u32(BTREE_RIGHTMOST_PTR)),
             PageType::IndexLeaf => None,
             PageType::TableLeaf => None,
         }
@@ -521,48 +527,33 @@ impl PageContent {
 
     pub fn rightmost_pointer_raw(&self) -> Option<*mut u8> {
         match self.page_type() {
-            PageType::IndexInterior | PageType::TableInterior => {
-                Some(unsafe { self.as_ptr().as_mut_ptr().add(self.offset + 8) })
-            }
+            PageType::IndexInterior | PageType::TableInterior => Some(unsafe {
+                self.as_ptr()
+                    .as_mut_ptr()
+                    .add(self.offset + BTREE_RIGHTMOST_PTR)
+            }),
             PageType::IndexLeaf => None,
             PageType::TableLeaf => None,
         }
     }
 
-    pub fn cell_get(
-        &self,
-        idx: usize,
-        payload_overflow_threshold_max: usize,
-        payload_overflow_threshold_min: usize,
-        usable_size: usize,
-    ) -> Result<BTreeCell> {
+    pub fn cell_get(&self, idx: usize, usable_size: usize) -> Result<BTreeCell> {
         tracing::trace!("cell_get(idx={})", idx);
         let buf = self.as_ptr();
 
         let ncells = self.cell_count();
-        // the page header is 12 bytes for interior pages, 8 bytes for leaf pages
-        // this is because the 4 last bytes in the interior page's header are used for the rightmost pointer.
-        let cell_pointer_array_start = self.header_size();
         assert!(
             idx < ncells,
-            "cell_get: idx out of bounds: idx={}, ncells={}",
-            idx,
-            ncells
+            "cell_get: idx out of bounds: idx={idx}, ncells={ncells}"
         );
-        let cell_pointer = cell_pointer_array_start + (idx * 2);
+        let cell_pointer_array_start = self.header_size();
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
 
         // SAFETY: this buffer is valid as long as the page is alive. We could store the page in the cell and do some lifetime magic
         // but that is extra memory for no reason at all. Just be careful like in the old times :).
         let static_buf: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(buf) };
-        read_btree_cell(
-            static_buf,
-            &self.page_type(),
-            cell_pointer,
-            payload_overflow_threshold_max,
-            payload_overflow_threshold_min,
-            usable_size,
-        )
+        read_btree_cell(static_buf, self, cell_pointer, usable_size)
     }
 
     /// Read the rowid of a table interior cell.
@@ -570,30 +561,31 @@ impl PageContent {
     pub fn cell_table_interior_read_rowid(&self, idx: usize) -> Result<i64> {
         debug_assert!(self.page_type() == PageType::TableInterior);
         let buf = self.as_ptr();
-        const INTERIOR_PAGE_HEADER_SIZE_BYTES: usize = 12;
-        let cell_pointer_array_start = INTERIOR_PAGE_HEADER_SIZE_BYTES;
-        let cell_pointer = cell_pointer_array_start + (idx * 2);
+        let cell_pointer_array_start = self.header_size();
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
         const LEFT_CHILD_PAGE_SIZE_BYTES: usize = 4;
         let (rowid, _) = read_varint(&buf[cell_pointer + LEFT_CHILD_PAGE_SIZE_BYTES..])?;
         Ok(rowid as i64)
     }
 
-    /// Read the left child page of a table interior cell.
+    /// Read the left child page of a table interior cell or an index interior cell.
     #[inline(always)]
-    pub fn cell_table_interior_read_left_child_page(&self, idx: usize) -> Result<u32> {
-        debug_assert!(self.page_type() == PageType::TableInterior);
+    pub fn cell_interior_read_left_child_page(&self, idx: usize) -> u32 {
+        debug_assert!(
+            self.page_type() == PageType::TableInterior
+                || self.page_type() == PageType::IndexInterior
+        );
         let buf = self.as_ptr();
-        const INTERIOR_PAGE_HEADER_SIZE_BYTES: usize = 12;
-        let cell_pointer_array_start = INTERIOR_PAGE_HEADER_SIZE_BYTES;
-        let cell_pointer = cell_pointer_array_start + (idx * 2);
+        let cell_pointer_array_start = self.header_size();
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
-        Ok(u32::from_be_bytes([
+        u32::from_be_bytes([
             buf[cell_pointer],
             buf[cell_pointer + 1],
             buf[cell_pointer + 2],
             buf[cell_pointer + 3],
-        ]))
+        ])
     }
 
     /// Read the rowid of a table leaf cell.
@@ -601,9 +593,8 @@ impl PageContent {
     pub fn cell_table_leaf_read_rowid(&self, idx: usize) -> Result<i64> {
         debug_assert!(self.page_type() == PageType::TableLeaf);
         let buf = self.as_ptr();
-        const LEAF_PAGE_HEADER_SIZE_BYTES: usize = 8;
-        let cell_pointer_array_start = LEAF_PAGE_HEADER_SIZE_BYTES;
-        let cell_pointer = cell_pointer_array_start + (idx * 2);
+        let cell_pointer_array_start = self.header_size();
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
         let mut pos = cell_pointer;
         let (_, nr) = read_varint(&buf[pos..])?;
@@ -623,21 +614,19 @@ impl PageContent {
         (self.offset + header_size, self.cell_pointer_array_size())
     }
 
-    /// Get region of a cell's payload
-    pub fn cell_get_raw_region(
-        &self,
-        idx: usize,
-        payload_overflow_threshold_max: usize,
-        payload_overflow_threshold_min: usize,
-        usable_size: usize,
-    ) -> (usize, usize) {
+    /// Get region(start end length) of a cell's payload
+    pub fn cell_get_raw_region(&self, idx: usize, usable_size: usize) -> (usize, usize) {
         let buf = self.as_ptr();
         let ncells = self.cell_count();
         let (cell_pointer_array_start, _) = self.cell_pointer_array_offset_and_size();
         assert!(idx < ncells, "cell_get: idx out of bounds");
-        let cell_pointer = cell_pointer_array_start + (idx * 2); // pointers are 2 bytes each
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16_no_offset(cell_pointer) as usize;
         let start = cell_pointer;
+        let payload_overflow_threshold_max =
+            payload_overflow_threshold_max(self.page_type(), usable_size as u16);
+        let payload_overflow_threshold_min =
+            payload_overflow_threshold_min(self.page_type(), usable_size as u16);
         let len = match self.page_type() {
             PageType::IndexInterior => {
                 let (len_payload, n_payload) = read_varint(&buf[cell_pointer + 4..]).unwrap();
@@ -668,7 +657,11 @@ impl PageContent {
                 if overflows {
                     to_read + n_payload
                 } else {
-                    len_payload as usize + n_payload
+                    let mut size = len_payload as usize + n_payload;
+                    if size < MINIMUM_CELL_SIZE {
+                        size = MINIMUM_CELL_SIZE;
+                    }
+                    size
                 }
             }
             PageType::TableLeaf => {
@@ -683,7 +676,11 @@ impl PageContent {
                 if overflows {
                     to_read + n_payload + n_rowid
                 } else {
-                    len_payload as usize + n_payload + n_rowid
+                    let mut size = len_payload as usize + n_payload + n_rowid;
+                    if size < MINIMUM_CELL_SIZE {
+                        size = MINIMUM_CELL_SIZE;
+                    }
+                    size
                 }
             }
         };
@@ -708,7 +705,7 @@ impl PageContent {
         let mut pc = self.first_freeblock() as usize;
         let mut block_num = 0;
         println!("---- Free List Blocks ----");
-        println!("first freeblock pointer: {}", pc);
+        println!("first freeblock pointer: {pc}");
         println!("cell content area: {}", self.cell_content_area());
         println!("fragmented bytes: {}", self.num_frag_free_bytes());
 
@@ -716,10 +713,7 @@ impl PageContent {
             let next = self.read_u16_no_offset(pc);
             let size = self.read_u16_no_offset(pc + 2);
 
-            println!(
-                "block {}: position={}, size={}, next={}",
-                block_num, pc, size, next
-            );
+            println!("block {block_num}: position={pc}, size={size}, next={next}");
             pc = next as usize;
             block_num += 1;
         }
@@ -727,6 +721,7 @@ impl PageContent {
     }
 }
 
+#[instrument(skip_all, level = Level::DEBUG)]
 pub fn begin_read_page(
     db_file: Arc<dyn DatabaseStorage>,
     buffer_pool: Arc<BufferPool>,
@@ -741,7 +736,12 @@ pub fn begin_read_page(
     });
     #[allow(clippy::arc_with_non_send_sync)]
     let buf = Arc::new(RefCell::new(Buffer::new(buf, drop_fn)));
-    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>, bytes_read: i32| {
+        let buf_len = buf.borrow().len();
+        turso_assert!(
+            bytes_read == buf_len as i32,
+            "read({bytes_read}) != expected({buf_len})"
+        );
         let page = page.clone();
         if finish_read_page(page_idx, buf, page.clone()).is_err() {
             page.set_error();
@@ -752,12 +752,13 @@ pub fn begin_read_page(
     Ok(())
 }
 
+#[instrument(skip_all, level = Level::INFO)]
 pub fn finish_read_page(
     page_idx: usize,
     buffer_ref: Arc<RefCell<Buffer>>,
     page: PageRef,
 ) -> Result<()> {
-    tracing::trace!("finish_read_btree_page(page_idx = {})", page_idx);
+    tracing::trace!(page_idx);
     let pos = if page_idx == DATABASE_HEADER_PAGE_ID {
         DATABASE_HEADER_SIZE
     } else {
@@ -773,6 +774,7 @@ pub fn finish_read_page(
     Ok(())
 }
 
+#[instrument(skip_all, level = Level::DEBUG)]
 pub fn begin_write_btree_page(
     pager: &Pager,
     page: &PageRef,
@@ -791,25 +793,32 @@ pub fn begin_write_btree_page(
     };
 
     *write_counter.borrow_mut() += 1;
+    let clone_counter = write_counter.clone();
     let write_complete = {
         let buf_copy = buffer.clone();
         Box::new(move |bytes_written: i32| {
             tracing::trace!("finish_write_btree_page");
             let buf_copy = buf_copy.clone();
             let buf_len = buf_copy.borrow().len();
-            *write_counter.borrow_mut() -= 1;
+            *clone_counter.borrow_mut() -= 1;
 
             page_finish.clear_dirty();
-            if bytes_written < buf_len as i32 {
-                tracing::error!("wrote({bytes_written}) less than expected({buf_len})");
-            }
+            turso_assert!(
+                bytes_written == buf_len as i32,
+                "wrote({bytes_written}) != expected({buf_len})"
+            );
         })
     };
     let c = Completion::new(CompletionType::Write(WriteCompletion::new(write_complete)));
-    page_source.write_page(page_id, buffer.clone(), c)?;
-    Ok(())
+    let res = page_source.write_page(page_id, buffer.clone(), c);
+    if res.is_err() {
+        // Avoid infinite loop if write page fails
+        *write_counter.borrow_mut() -= 1;
+    }
+    res
 }
 
+#[instrument(skip_all, level = Level::DEBUG)]
 pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>, syncing: Rc<RefCell<bool>>) -> Result<()> {
     assert!(!*syncing.borrow());
     *syncing.borrow_mut() = true;
@@ -834,15 +843,15 @@ pub enum BTreeCell {
 
 #[derive(Debug, Clone)]
 pub struct TableInteriorCell {
-    pub _left_child_page: u32,
-    pub _rowid: i64,
+    pub left_child_page: u32,
+    pub rowid: i64,
 }
 
 #[derive(Debug, Clone)]
 pub struct TableLeafCell {
-    pub _rowid: i64,
+    pub rowid: i64,
     /// Payload of cell, if it overflows it won't include overflowed payload.
-    pub _payload: &'static [u8],
+    pub payload: &'static [u8],
     /// This is the complete payload size including overflow pages.
     pub payload_size: u64,
     pub first_overflow_page: Option<u32>,
@@ -860,21 +869,22 @@ pub struct IndexInteriorCell {
 #[derive(Debug, Clone)]
 pub struct IndexLeafCell {
     pub payload: &'static [u8],
-    pub first_overflow_page: Option<u32>,
     /// This is the complete payload size including overflow pages.
     pub payload_size: u64,
+    pub first_overflow_page: Option<u32>,
 }
 
 /// read_btree_cell contructs a BTreeCell which is basically a wrapper around pointer to the payload of a cell.
 /// buffer input "page" is static because we want the cell to point to the data in the page in case it has any payload.
 pub fn read_btree_cell(
     page: &'static [u8],
-    page_type: &PageType,
+    page_content: &PageContent,
     pos: usize,
-    max_local: usize,
-    min_local: usize,
     usable_size: usize,
 ) -> Result<BTreeCell> {
+    let page_type = page_content.page_type();
+    let max_local = payload_overflow_threshold_max(page_type, usable_size as u16);
+    let min_local = payload_overflow_threshold_min(page_type, usable_size as u16);
     match page_type {
         PageType::IndexInterior => {
             let mut pos = pos;
@@ -904,8 +914,8 @@ pub fn read_btree_cell(
             pos += 4;
             let (rowid, _) = read_varint(&page[pos..])?;
             Ok(BTreeCell::TableInteriorCell(TableInteriorCell {
-                _left_child_page: left_child_page,
-                _rowid: rowid as i64,
+                left_child_page,
+                rowid: rowid as i64,
             }))
         }
         PageType::IndexLeaf => {
@@ -939,8 +949,8 @@ pub fn read_btree_cell(
             let (payload, first_overflow_page) =
                 read_payload(&page[pos..pos + to_read], payload_size as usize);
             Ok(BTreeCell::TableLeafCell(TableLeafCell {
-                _rowid: rowid as i64,
-                _payload: payload,
+                rowid: rowid as i64,
+                payload,
                 first_overflow_page,
                 payload_size,
             }))
@@ -970,6 +980,7 @@ fn read_payload(unread: &'static [u8], payload_size: usize) -> (&'static [u8], O
 }
 
 #[inline(always)]
+#[allow(dead_code)]
 pub fn validate_serial_type(value: u64) -> Result<()> {
     if !SerialType::u64_is_valid_serial_type(value) {
         crate::bail_corrupt_error!("Invalid serial type: {}", value);
@@ -1050,50 +1061,6 @@ impl<T: Default + Copy, const N: usize> Iterator for SmallVecIter<'_, T, N> {
         self.pos += 1;
         Some(next)
     }
-}
-
-pub fn read_record(payload: &[u8], reuse_immutable: &mut ImmutableRecord) -> Result<()> {
-    // Let's clear previous use
-    reuse_immutable.invalidate();
-    // Copy payload to ImmutableRecord in order to make RefValue that point to this new buffer.
-    // By reusing this immutable record we make it less allocation expensive.
-    reuse_immutable.start_serialization(payload);
-
-    let mut pos = 0;
-    let (header_size, nr) = read_varint(payload)?;
-    assert!((header_size as usize) >= nr);
-    let mut header_size = (header_size as usize) - nr;
-    pos += nr;
-
-    let mut serial_types = SmallVec::<u64, 64>::new();
-    while header_size > 0 {
-        let (serial_type, nr) = read_varint(&reuse_immutable.get_payload()[pos..])?;
-        validate_serial_type(serial_type)?;
-        serial_types.push(serial_type);
-        pos += nr;
-        assert!(header_size >= nr);
-        header_size -= nr;
-    }
-
-    for &serial_type in &serial_types.data[..serial_types.len.min(serial_types.data.len())] {
-        let (value, n) = read_value(&reuse_immutable.get_payload()[pos..], unsafe {
-            serial_type.assume_init().try_into()?
-        })?;
-        pos += n;
-        reuse_immutable.add_value(value);
-    }
-    if let Some(extra) = serial_types.extra_data.as_ref() {
-        for serial_type in extra {
-            let (value, n) = read_value(
-                &reuse_immutable.get_payload()[pos..],
-                (*serial_type).try_into()?,
-            )?;
-            pos += n;
-            reuse_immutable.add_value(value);
-        }
-    }
-
-    Ok(())
 }
 
 /// Reads a value that might reference the buffer it is reading from. Be sure to store RefValue with the buffer
@@ -1204,20 +1171,73 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
                     content_size
                 );
             }
-            let slice = if content_size == 0 {
-                RawSlice::new(std::ptr::null(), 0)
-            } else {
-                let ptr = &buf[0] as *const u8;
-                RawSlice::new(ptr, content_size)
-            };
+
             Ok((
-                RefValue::Text(TextRef {
-                    value: slice,
-                    subtype: TextSubtype::Text,
-                }),
+                RefValue::Text(TextRef::create_from(
+                    &buf[..content_size],
+                    TextSubtype::Text,
+                )),
                 content_size,
             ))
         }
+    }
+}
+
+#[inline(always)]
+pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
+    match serial_type {
+        1 => {
+            if buf.is_empty() {
+                crate::bail_corrupt_error!("Invalid 1-byte int");
+            }
+            Ok(buf[0] as i8 as i64)
+        }
+        2 => {
+            if buf.len() < 2 {
+                crate::bail_corrupt_error!("Invalid 2-byte int");
+            }
+            Ok(i16::from_be_bytes([buf[0], buf[1]]) as i64)
+        }
+        3 => {
+            if buf.len() < 3 {
+                crate::bail_corrupt_error!("Invalid 3-byte int");
+            }
+            let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
+            Ok(i32::from_be_bytes([sign_extension, buf[0], buf[1], buf[2]]) as i64)
+        }
+        4 => {
+            if buf.len() < 4 {
+                crate::bail_corrupt_error!("Invalid 4-byte int");
+            }
+            Ok(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64)
+        }
+        5 => {
+            if buf.len() < 6 {
+                crate::bail_corrupt_error!("Invalid 6-byte int");
+            }
+            let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
+            Ok(i64::from_be_bytes([
+                sign_extension,
+                sign_extension,
+                buf[0],
+                buf[1],
+                buf[2],
+                buf[3],
+                buf[4],
+                buf[5],
+            ]))
+        }
+        6 => {
+            if buf.len() < 8 {
+                crate::bail_corrupt_error!("Invalid 8-byte int");
+            }
+            Ok(i64::from_be_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]))
+        }
+        8 => Ok(0),
+        9 => Ok(1),
+        _ => crate::bail_corrupt_error!("Invalid serial type for integer"),
     }
 }
 
@@ -1312,12 +1332,18 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
         ],
         write_lock: LimboRwLock::new(),
         loaded: AtomicBool::new(false),
+        checkpoint_lock: LimboRwLock::new(),
     }));
     let wal_file_shared_for_completion = wal_file_shared_ret.clone();
 
-    let complete: Box<Complete> = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+    let complete: Box<Complete> = Box::new(move |buf: Arc<RefCell<Buffer>>, bytes_read: i32| {
         let buf = buf.borrow();
         let buf_slice = buf.as_slice();
+        turso_assert!(
+            bytes_read == buf_slice.len() as i32,
+            "read({bytes_read}) != expected({})",
+            buf_slice.len()
+        );
         let mut header_locked = header.lock();
         // Read header
         header_locked.magic =
@@ -1336,6 +1362,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
             u32::from_be_bytes([buf_slice[24], buf_slice[25], buf_slice[26], buf_slice[27]]);
         header_locked.checksum_2 =
             u32::from_be_bytes([buf_slice[28], buf_slice[29], buf_slice[30], buf_slice[31]]);
+        tracing::debug!("read_entire_wal_dumb(header={:?})", *header_locked);
 
         // Read frames into frame_cache and pages_in_frames
         if buf_slice.len() < WAL_HEADER_SIZE {
@@ -1368,7 +1395,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
         if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&page_size_u32)
             || page_size_u32.count_ones() != 1
         {
-            panic!("Invalid page size in WAL header: {}", page_size_u32);
+            panic!("Invalid page size in WAL header: {page_size_u32}");
         }
         let page_size = page_size_u32 as usize;
 
@@ -1418,6 +1445,13 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
                 use_native_endian_checksum,
             );
 
+            tracing::debug!(
+                "read_entire_wal_dumb(frame_h_checksum=({}, {}), calculated_frame_checksum=({}, {}))",
+                frame_h_checksum_1,
+                frame_h_checksum_2,
+                calculated_frame_checksum.0,
+                calculated_frame_checksum.1
+            );
             if calculated_frame_checksum != (frame_h_checksum_1, frame_h_checksum_2) {
                 panic!(
                     "WAL frame checksum mismatch. Expected ({}, {}), Got ({}, {})",
@@ -1444,20 +1478,20 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
             let is_commit_record = frame_h_db_size > 0;
             if is_commit_record {
                 wfs_data.max_frame.store(frame_idx, Ordering::SeqCst);
-                wfs_data.last_checksum = cumulative_checksum;
             }
 
             frame_idx += 1;
             current_offset += WAL_FRAME_HEADER_SIZE + page_size;
         }
 
+        wfs_data.last_checksum = cumulative_checksum;
         wfs_data.loaded.store(true, Ordering::SeqCst);
     });
     let c = Completion::new(CompletionType::Read(ReadCompletion::new(
         buf_for_pread,
         complete,
     )));
-    file.pread(0, c)?;
+    file.pread(0, c.into())?;
 
     Ok(wal_file_shared_ret)
 }
@@ -1466,7 +1500,7 @@ pub fn begin_read_wal_frame(
     io: &Arc<dyn File>,
     offset: usize,
     buffer_pool: Arc<BufferPool>,
-    complete: Box<dyn Fn(Arc<RefCell<Buffer>>)>,
+    complete: Box<dyn Fn(Arc<RefCell<Buffer>>, i32)>,
 ) -> Result<Arc<Completion>> {
     tracing::trace!("begin_read_wal_frame(offset={})", offset);
     let buf = buffer_pool.get();
@@ -1477,11 +1511,11 @@ pub fn begin_read_wal_frame(
     let buf = Arc::new(RefCell::new(Buffer::new(buf, drop_fn)));
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new(CompletionType::Read(ReadCompletion::new(buf, complete)));
-    let c = io.pread(offset, c)?;
+    let c = io.pread(offset, c.into())?;
     Ok(c)
 }
 
-#[instrument(skip(io, page, write_counter, wal_header, checksums), level = Level::TRACE)]
+#[instrument(err,skip(io, page, write_counter, wal_header, checksums), level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
 pub fn begin_write_wal_frame(
     io: &Arc<dyn File>,
@@ -1540,6 +1574,11 @@ pub fn begin_write_wal_frame(
         );
         header.checksum_1 = final_checksum.0;
         header.checksum_2 = final_checksum.1;
+        tracing::trace!(
+            "begin_write_wal_frame(checksum=({}, {}))",
+            header.checksum_1,
+            header.checksum_2
+        );
 
         buf[16..20].copy_from_slice(&header.checksum_1.to_be_bytes());
         buf[20..24].copy_from_slice(&header.checksum_2.to_be_bytes());
@@ -1548,32 +1587,40 @@ pub fn begin_write_wal_frame(
         (Arc::new(RefCell::new(buffer)), final_checksum)
     };
 
+    let clone_counter = write_counter.clone();
     *write_counter.borrow_mut() += 1;
     let write_complete = {
         let buf_copy = buffer.clone();
         Box::new(move |bytes_written: i32| {
             let buf_copy = buf_copy.clone();
             let buf_len = buf_copy.borrow().len();
-            *write_counter.borrow_mut() -= 1;
+            *clone_counter.borrow_mut() -= 1;
 
             page_finish.clear_dirty();
-            if bytes_written < buf_len as i32 {
-                tracing::error!("wrote({bytes_written}) less than expected({buf_len})");
-            }
+            turso_assert!(
+                bytes_written == buf_len as i32,
+                "wrote({bytes_written}) != expected({buf_len})"
+            );
         })
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new(CompletionType::Write(WriteCompletion::new(write_complete)));
-    io.pwrite(offset, buffer.clone(), c)?;
+    let res = io.pwrite(offset, buffer.clone(), c.into());
+    if res.is_err() {
+        // If we do not reduce the counter here on error, we incur an infinite loop when cacheflushing
+        *write_counter.borrow_mut() -= 1;
+    }
+    res?;
     tracing::trace!("Frame written and synced");
     Ok(checksums)
 }
 
 pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<()> {
+    tracing::trace!("begin_write_wal_header");
     let buffer = {
         let drop_fn = Rc::new(|_buf| {});
 
-        let mut buffer = Buffer::allocate(512, drop_fn);
+        let mut buffer = Buffer::allocate(WAL_HEADER_SIZE, drop_fn);
         let buf = buffer.as_mut_slice();
 
         buf[0..4].copy_from_slice(&header.magic.to_be_bytes());
@@ -1591,16 +1638,15 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
 
     let write_complete = {
         Box::new(move |bytes_written: i32| {
-            if bytes_written < WAL_HEADER_SIZE as i32 {
-                tracing::error!(
-                    "wal header wrote({bytes_written}) less than expected({WAL_HEADER_SIZE})"
-                );
-            }
+            turso_assert!(
+                bytes_written == WAL_HEADER_SIZE as i32,
+                "wal header wrote({bytes_written}) != expected({WAL_HEADER_SIZE})"
+            );
         })
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new(CompletionType::Write(WriteCompletion::new(write_complete)));
-    io.pwrite(0, buffer.clone(), c)?;
+    io.pwrite(0, buffer.clone(), c.into())?;
     Ok(())
 }
 

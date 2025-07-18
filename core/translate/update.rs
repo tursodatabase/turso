@@ -250,6 +250,7 @@ pub fn prepare_update_plan(
                 default: None,
                 unique: false,
                 collation: None,
+                hidden: false,
             }],
             is_strict: false,
             unique_sets: None,

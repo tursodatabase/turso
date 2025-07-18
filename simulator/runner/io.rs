@@ -5,9 +5,12 @@ use std::{
 
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use turso_core::{Clock, Instant, OpenFlags, PlatformIO, Result, IO};
+use turso_core::{Clock, Instant, MemoryIO, OpenFlags, PlatformIO, Result, IO};
 
-use crate::runner::file::SimulatorFile;
+use crate::{
+    model::FAULT_ERROR_MSG,
+    runner::{clock::SimulatorClock, file::SimulatorFile},
+};
 
 pub(crate) struct SimulatorIO {
     pub(crate) inner: Box<dyn IO>,
@@ -18,18 +21,27 @@ pub(crate) struct SimulatorIO {
     pub(crate) page_size: usize,
     seed: u64,
     latency_probability: usize,
+    clock: Arc<SimulatorClock>,
 }
 
 unsafe impl Send for SimulatorIO {}
 unsafe impl Sync for SimulatorIO {}
 
 impl SimulatorIO {
-    pub(crate) fn new(seed: u64, page_size: usize, latency_probability: usize) -> Result<Self> {
+    pub(crate) fn new(
+        seed: u64,
+        page_size: usize,
+        latency_probability: usize,
+        min_tick: u64,
+        max_tick: u64,
+    ) -> Result<Self> {
         let inner = Box::new(PlatformIO::new()?);
         let fault = Cell::new(false);
         let files = RefCell::new(Vec::new());
         let rng = RefCell::new(ChaCha8Rng::seed_from_u64(seed));
         let nr_run_once_faults = Cell::new(0);
+        let clock = SimulatorClock::new(ChaCha8Rng::seed_from_u64(seed), min_tick, max_tick);
+
         Ok(Self {
             inner,
             fault,
@@ -39,6 +51,7 @@ impl SimulatorIO {
             page_size,
             seed,
             latency_probability,
+            clock: Arc::new(clock),
         })
     }
 
@@ -59,10 +72,7 @@ impl SimulatorIO {
 
 impl Clock for SimulatorIO {
     fn now(&self) -> Instant {
-        Instant {
-            secs: 1704067200, // 2024-01-01 00:00:00 UTC
-            micros: 0,
-        }
+        self.clock.now().into()
     }
 }
 
@@ -87,6 +97,8 @@ impl IO for SimulatorIO {
             rng: RefCell::new(ChaCha8Rng::seed_from_u64(self.seed)),
             latency_probability: self.latency_probability,
             sync_completion: RefCell::new(None),
+            queued_io: RefCell::new(Vec::new()),
+            clock: self.clock.clone(),
         });
         self.files.borrow_mut().push(file.clone());
         Ok(file)
@@ -104,8 +116,12 @@ impl IO for SimulatorIO {
             self.nr_run_once_faults
                 .replace(self.nr_run_once_faults.get() + 1);
             return Err(turso_core::LimboError::InternalError(
-                "Injected fault".into(),
+                FAULT_ERROR_MSG.into(),
             ));
+        }
+        let now = self.now();
+        for file in self.files.borrow().iter() {
+            file.run_queued_io(now)?;
         }
         self.inner.run_once()?;
         Ok(())
@@ -116,6 +132,6 @@ impl IO for SimulatorIO {
     }
 
     fn get_memory_io(&self) -> Arc<turso_core::MemoryIO> {
-        todo!()
+        Arc::new(MemoryIO::new())
     }
 }

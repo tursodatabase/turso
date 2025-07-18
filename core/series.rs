@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use turso_ext::{
-    Connection, ExtensionApi, ResultCode, VTabCursor, VTabKind, VTabModule, VTabModuleDerive,
-    VTable, Value,
+    Connection, ConstraintInfo, ConstraintOp, ConstraintUsage, ExtensionApi, IndexInfo,
+    OrderByInfo, ResultCode, VTabCursor, VTabKind, VTabModule, VTabModuleDerive, VTable, Value,
 };
 
 pub fn register_extension(ext_api: &mut ExtensionApi) {
@@ -12,12 +12,12 @@ pub fn register_extension(ext_api: &mut ExtensionApi) {
     }
 }
 
-macro_rules! try_option {
-    ($expr:expr, $err:expr) => {
-        match $expr {
-            Some(val) => val,
-            None => return $err,
-        }
+macro_rules! extract_arg_integer {
+    ($args:expr, $idx:expr, $unknown_type_default:expr) => {
+        $args
+            .get($idx)
+            .map(|v| v.to_integer().unwrap_or($unknown_type_default))
+            .unwrap_or(-1)
     };
 }
 
@@ -56,6 +56,66 @@ impl VTable for GenerateSeriesTable {
             current: 0,
         })
     }
+
+    fn best_index(constraints: &[ConstraintInfo], _order_by: &[OrderByInfo]) -> IndexInfo {
+        // The bits of `idx_num` are used to indicate which arguments are available to the filter method:
+        // - Bit 0 set -> 'start' is available
+        // - Bit 1 set -> 'stop' is available
+        // - Bit 2 set -> 'step' is available
+        let mut idx_num = 0;
+        let mut start_idx = None;
+        let mut stop_idx = None;
+        let mut step_idx = None;
+
+        for (i, c) in constraints.iter().enumerate() {
+            if !c.usable || c.op != ConstraintOp::Eq {
+                continue;
+            }
+            match c.column_index {
+                1 => {
+                    start_idx = Some(i);
+                    idx_num |= 1;
+                }
+                2 => {
+                    stop_idx = Some(i);
+                    idx_num |= 2;
+                }
+                3 => {
+                    step_idx = Some(i);
+                    idx_num |= 4;
+                }
+                _ => {}
+            }
+        }
+
+        let mut argv_idx = 1;
+        let constraint_usages = constraints
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                if Some(i) == start_idx || Some(i) == stop_idx || Some(i) == step_idx {
+                    let usage = ConstraintUsage {
+                        argv_index: Some(argv_idx),
+                        omit: true,
+                    };
+                    argv_idx += 1;
+                    usage
+                } else {
+                    ConstraintUsage {
+                        argv_index: Some(0),
+                        omit: false,
+                    }
+                }
+            })
+            .collect();
+
+        IndexInfo {
+            idx_num,
+            idx_str: Some(idx_num.to_string()),
+            constraint_usages,
+            ..Default::default()
+        }
+    }
 }
 
 /// The cursor for iterating over the generated sequence
@@ -93,20 +153,36 @@ impl GenerateSeriesCursor {
 impl VTabCursor for GenerateSeriesCursor {
     type Error = ResultCode;
 
-    fn filter(&mut self, args: &[Value], _: Option<(&str, i32)>) -> ResultCode {
-        // args are the start, stop, and step
-        if args.is_empty() || args.len() > 3 {
+    fn filter(&mut self, args: &[Value], idx_info: Option<(&str, i32)>) -> ResultCode {
+        let mut start = -1;
+        let mut stop = -1;
+        let mut step = 1;
+
+        if let Some((_, idx_num)) = idx_info {
+            let mut arg_idx = 0;
+            // For the semantics of `idx_num`, see the comment in the `best_index` method.
+            if idx_num & 1 != 0 {
+                start = extract_arg_integer!(args, arg_idx, -1);
+                arg_idx += 1;
+            }
+            if idx_num & 2 != 0 {
+                stop = extract_arg_integer!(args, arg_idx, i64::MAX);
+                arg_idx += 1;
+            }
+            if idx_num & 4 != 0 {
+                step = args
+                    .get(arg_idx)
+                    .map(|v| v.to_integer().unwrap_or(1))
+                    .unwrap_or(1);
+            }
+        }
+
+        if start == -1 {
             return ResultCode::InvalidArgs;
         }
-        let start = try_option!(args[0].to_integer(), ResultCode::InvalidArgs);
-        let stop = try_option!(
-            args.get(1).map(|v| v.to_integer().unwrap_or(i64::MAX)),
-            ResultCode::EOF // Sqlite returns an empty series for wacky args
-        );
-        let mut step = args
-            .get(2)
-            .map(|v| v.to_integer().unwrap_or(1))
-            .unwrap_or(1);
+        if stop == -1 {
+            return ResultCode::EOF; // Sqlite returns an empty series for wacky args
+        }
 
         // Convert zero step to 1, matching SQLite behavior
         if step == 0 {
@@ -240,7 +316,7 @@ mod tests {
         ];
 
         // Initialize cursor through filter
-        match cursor.filter(&args, None) {
+        match cursor.filter(&args, Some(("idx", 1 | 2 | 4))) {
             ResultCode::OK => (),
             ResultCode::EOF => return Ok(vec![]),
             err => return Err(err),
@@ -274,20 +350,13 @@ mod tests {
         let stop = series.stop;
         let step = series.step;
         let values = collect_series(series.clone()).unwrap_or_else(|e| {
-            panic!(
-                "Failed to generate series for start={}, stop={}, step={}: {:?}",
-                start, stop, step, e
-            )
+            panic!("Failed to generate series for start={start}, stop={stop}, step={step}: {e:?}")
         });
 
         if series_is_invalid_or_empty(&series) {
             assert!(
                 values.is_empty(),
-                "Series should be empty for invalid range: start={}, stop={}, step={}, got {:?}",
-                start,
-                stop,
-                step,
-                values
+                "Series should be empty for invalid range: start={start}, stop={stop}, step={step}, got {values:?}"
             );
         } else {
             let expected_len = series_expected_length(&series);
@@ -316,19 +385,13 @@ mod tests {
         let step = series.step;
 
         let values = collect_series(series.clone()).unwrap_or_else(|e| {
-            panic!(
-                "Failed to generate series for start={}, stop={}, step={}: {:?}",
-                start, stop, step, e
-            )
+            panic!("Failed to generate series for start={start}, stop={stop}, step={step}: {e:?}")
         });
 
         if series_is_invalid_or_empty(&series) {
             assert!(
                 values.is_empty(),
-                "Series should be empty for invalid range: start={}, stop={}, step={}",
-                start,
-                stop,
-                step
+                "Series should be empty for invalid range: start={start}, stop={stop}, step={step}"
             );
         } else {
             assert!(
@@ -356,19 +419,13 @@ mod tests {
         let step = series.step;
 
         let values = collect_series(series.clone()).unwrap_or_else(|e| {
-            panic!(
-                "Failed to generate series for start={}, stop={}, step={}: {:?}",
-                start, stop, step, e
-            )
+            panic!("Failed to generate series for start={start}, stop={stop}, step={step}: {e:?}")
         });
 
         if series_is_invalid_or_empty(&series) {
             assert!(
                 values.is_empty(),
-                "Series should be empty for invalid range: start={}, stop={}, step={}",
-                start,
-                stop,
-                step
+                "Series should be empty for invalid range: start={start}, stop={stop}, step={step}"
             );
         } else if !values.is_empty() {
             assert!(
@@ -396,37 +453,27 @@ mod tests {
         let step = series.step;
 
         let values = collect_series(series.clone()).unwrap_or_else(|e| {
-            panic!(
-                "Failed to generate series for start={}, stop={}, step={}: {:?}",
-                start, stop, step, e
-            )
+            panic!("Failed to generate series for start={start}, stop={stop}, step={step}: {e:?}")
         });
 
         if series_is_invalid_or_empty(&series) {
             assert!(
                 values.is_empty(),
-                "Series should be empty for invalid range: start={}, stop={}, step={}",
-                start,
-                stop,
-                step
+                "Series should be empty for invalid range: start={start}, stop={stop}, step={step}"
             );
         } else if !values.is_empty() {
             assert_eq!(
                 values.first(),
                 Some(&start),
-                "Series doesn't start with start value: {:?} (expected start: {})",
-                values,
-                start
+                "Series doesn't start with start value: {values:?} (expected start: {start})"
             );
             assert!(
-                values.last().map_or(true, |&last| if step > 0 {
+                values.last().is_none_or(|&last| if step > 0 {
                     last <= stop
                 } else {
                     last >= stop
                 }),
-                "Series exceeds stop value: {:?} (stop: {})",
-                values,
-                stop
+                "Series exceeds stop value: {values:?} (stop: {stop})"
             );
         }
     }
@@ -501,8 +548,7 @@ mod tests {
         .expect("Failed to generate series");
         assert!(
             values.is_empty(),
-            "Invalid positive range should return empty series, got {:?}",
-            values
+            "Invalid positive range should return empty series, got {values:?}"
         );
 
         let values = collect_series(Series {
@@ -556,7 +602,7 @@ mod tests {
         ];
 
         // Initialize cursor through filter
-        cursor.filter(&args, None);
+        cursor.filter(&args, Some(("idx", 1 | 2 | 4)));
 
         let mut rowids = vec![];
         while !cursor.eof() {
@@ -564,20 +610,15 @@ mod tests {
             match cursor.next() {
                 ResultCode::OK => rowids.push(cur_rowid),
                 ResultCode::EOF => break,
-                err => panic!(
-                    "Unexpected error {:?} for start={}, stop={}, step={}",
-                    err, start, stop, step
-                ),
+                err => {
+                    panic!("Unexpected error {err:?} for start={start}, stop={stop}, step={step}")
+                }
             }
         }
 
         assert!(
             rowids.windows(2).all(|w| w[1] == w[0] + 1),
-            "Rowids not monotonically increasing: {:?} (start={}, stop={}, step={})",
-            rowids,
-            start,
-            stop,
-            step
+            "Rowids not monotonically increasing: {rowids:?} (start={start}, stop={stop}, step={step})"
         );
     }
 
@@ -589,19 +630,13 @@ mod tests {
         let step = series.step;
 
         let values = collect_series(series.clone()).unwrap_or_else(|e| {
-            panic!(
-                "Failed to generate series for start={}, stop={}, step={}: {:?}",
-                start, stop, step, e
-            )
+            panic!("Failed to generate series for start={start}, stop={stop}, step={step}: {e:?}")
         });
 
         if series_is_invalid_or_empty(&series) {
             assert!(
                 values.is_empty(),
-                "Series should be empty for invalid range: start={}, stop={}, step={}",
-                start,
-                stop,
-                step
+                "Series should be empty for invalid range: start={start}, stop={stop}, step={step}"
             );
         } else if start == stop {
             assert_eq!(

@@ -16,7 +16,7 @@ fn test_last_insert_rowid_basic() -> anyhow::Result<()> {
         loop {
             match rows.step()? {
                 StepResult::IO => {
-                    tmp_db.io.run_once()?;
+                    rows.run_once()?;
                 }
                 StepResult::Done => break,
                 _ => unreachable!(),
@@ -36,7 +36,7 @@ fn test_last_insert_rowid_basic() -> anyhow::Result<()> {
                     }
                 }
                 StepResult::IO => {
-                    tmp_db.io.run_once()?;
+                    rows.run_once()?;
                 }
                 StepResult::Interrupt => break,
                 StepResult::Done => break,
@@ -50,14 +50,14 @@ fn test_last_insert_rowid_basic() -> anyhow::Result<()> {
         Ok(Some(ref mut rows)) => loop {
             match rows.step()? {
                 StepResult::IO => {
-                    tmp_db.io.run_once()?;
+                    rows.run_once()?;
                 }
                 StepResult::Done => break,
                 _ => unreachable!(),
             }
         },
         Ok(None) => {}
-        Err(err) => eprintln!("{}", err),
+        Err(err) => eprintln!("{err}"),
     };
 
     // Check last_insert_rowid after explicit id
@@ -72,7 +72,7 @@ fn test_last_insert_rowid_basic() -> anyhow::Result<()> {
                     }
                 }
                 StepResult::IO => {
-                    tmp_db.io.run_once()?;
+                    rows.run_once()?;
                 }
                 StepResult::Interrupt => break,
                 StepResult::Done => break,
@@ -80,7 +80,7 @@ fn test_last_insert_rowid_basic() -> anyhow::Result<()> {
             }
         },
         Ok(None) => {}
-        Err(err) => eprintln!("{}", err),
+        Err(err) => eprintln!("{err}"),
     };
     assert_eq!(last_id, 5, "Explicit insert should have rowid 5");
     do_flush(&conn, &tmp_db)?;
@@ -101,7 +101,7 @@ fn test_integer_primary_key() -> anyhow::Result<()> {
         let mut insert_query = conn.query(query)?.unwrap();
         loop {
             match insert_query.step()? {
-                StepResult::IO => tmp_db.io.run_once()?,
+                StepResult::IO => insert_query.run_once()?,
                 StepResult::Done => break,
                 _ => unreachable!(),
             }
@@ -117,7 +117,7 @@ fn test_integer_primary_key() -> anyhow::Result<()> {
                     rowids.push(*id);
                 }
             }
-            StepResult::IO => tmp_db.io.run_once()?,
+            StepResult::IO => select_query.run_once()?,
             StepResult::Interrupt | StepResult::Done => break,
             StepResult::Busy => panic!("Database is busy"),
         }

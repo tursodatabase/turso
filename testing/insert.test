@@ -360,6 +360,17 @@ if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-s
         INSERT INTO t SELECT * FROM t1 INTERSECT SELECT * FROM t2 INTERSECT SELECT * FROM t3;
         SELECT * FROM t;
     } {2|200}
+
+    do_execsql_test_on_specific_db {:memory:} insert_from_select_except {
+        CREATE TABLE t(a, b);
+        CREATE TABLE t1(a, b);
+        CREATE TABLE t2(a, b);
+
+        INSERT INTO t1 VALUES (1, 100), (2, 200);
+        INSERT INTO t2 VALUES (2, 200), (3, 300);
+        INSERT INTO t SELECT * FROM t1 EXCEPT SELECT * FROM t2;
+        SELECT * FROM t;
+    } {1|100}
 }
 
 do_execsql_test_on_specific_db {:memory:} negative-primary-integer-key {
@@ -369,3 +380,33 @@ do_execsql_test_on_specific_db {:memory:} negative-primary-integer-key {
 } {-2
 13}
 
+do_execsql_test_on_specific_db {:memory:} not-null-rowid-alias {
+    CREATE TABLE t(a INTEGER PRIMARY KEY NOT NULL, b);
+    insert into t values (1, 2);
+    select * from t;
+} {1|2}
+
+do_execsql_test_on_specific_db {:memory:} rowid-overflow-random-generation {
+    CREATE TABLE q(x INTEGER PRIMARY KEY, y);
+    INSERT INTO q VALUES (9223372036854775807, 1);
+    INSERT INTO q(y) VALUES (2);
+    INSERT INTO q(y) VALUES (3);
+    SELECT COUNT(*) FROM q;
+} {3}
+
+# regression test for incorrect processing of record header in the case of large text columns
+if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
+    do_execsql_test_on_specific_db {:memory:} large-text-index-seek {
+        CREATE TABLE t(x TEXT, y);
+        CREATE INDEX t_idx ON t(x);
+        INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'a', 1);
+        INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'b', 2);
+        INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'c', 3);
+        INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'd', 4);
+        INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'e', 5);
+        INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'f', 6);
+        INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'g', 7);
+        INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'h', 8);
+        SELECT COUNT(*) FROM t WHERE x >= replace(hex(zeroblob(100)), '00', 'a');
+    } {8}
+}

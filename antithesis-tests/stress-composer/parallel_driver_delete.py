@@ -37,6 +37,13 @@ print(f"Attempt to delete {deletions} rows in tbl_{selected_tbl}...")
 for i in range(deletions):
     where_clause = f"col_{pk} = {generate_random_value(tbl_schema[f'col_{pk}']['data_type'])}"
 
-    cur.execute(f"""
-        DELETE FROM tbl_{selected_tbl} WHERE {where_clause}
-    """)
+    try:
+        cur.execute(f"""
+            DELETE FROM tbl_{selected_tbl} WHERE {where_clause}
+        """)
+    except turso.OperationalError:
+        con.rollback()
+        # Re-raise other operational errors
+        raise
+
+con.commit()

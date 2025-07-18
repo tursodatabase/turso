@@ -9,7 +9,7 @@ use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
 use crate::schema::{Affinity, Table, Type};
-use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
+use crate::util::{exprs_are_equivalent, parse_numeric_literal};
 use crate::vdbe::builder::CursorKey;
 use crate::vdbe::{
     builder::ProgramBuilder,
@@ -27,7 +27,7 @@ pub struct ConditionMetadata {
     pub jump_target_when_false: BranchOffset,
 }
 
-#[instrument(skip_all, level = Level::TRACE)]
+#[instrument(skip_all, level = Level::DEBUG)]
 fn emit_cond_jump(program: &mut ProgramBuilder, cond_meta: ConditionMetadata, reg: usize) {
     if cond_meta.jump_if_condition_is_true {
         program.emit_insn(Insn::If {
@@ -131,7 +131,7 @@ macro_rules! expect_arguments_even {
     }};
 }
 
-#[instrument(skip(program, referenced_tables, expr, resolver), level = Level::TRACE)]
+#[instrument(skip(program, referenced_tables, expr, resolver), level = Level::DEBUG)]
 pub fn translate_condition_expr(
     program: &mut ProgramBuilder,
     referenced_tables: &TableReferences,
@@ -458,7 +458,7 @@ pub fn translate_expr(
         program.emit_insn(Insn::Copy {
             src_reg: reg,
             dst_reg: target_register,
-            amount: 0,
+            extra_amount: 0,
         });
         if let Some(span) = constant_span {
             program.constant_span_end(span);
@@ -680,8 +680,7 @@ pub fn translate_expr(
             order_by: _,
         } => {
             let args_count = if let Some(args) = args { args.len() } else { 0 };
-            let func_name = normalize_ident(name.0.as_str());
-            let func_type = resolver.resolve_function(&func_name, args_count);
+            let func_type = resolver.resolve_function(&name.0, args_count);
 
             if func_type.is_none() {
                 crate::bail_parse_error!("unknown function {}", name.0);
@@ -694,7 +693,7 @@ pub fn translate_expr(
 
             match &func_ctx.func {
                 Func::Agg(_) => {
-                    crate::bail_parse_error!("aggregation function in non-aggregation context")
+                    crate::bail_parse_error!("misuse of aggregate function {}()", name.0)
                 }
                 Func::External(_) => {
                     let regs = program.alloc_registers(args_count);
@@ -920,6 +919,19 @@ pub fn translate_expr(
                         });
                         Ok(target_register)
                     }
+                    VectorFunc::VectorDistanceEuclidean => {
+                        let args = expect_arguments_exact!(args, 2, vector_func);
+                        let regs = program.alloc_registers(2);
+                        translate_expr(program, referenced_tables, &args[0], regs, resolver)?;
+                        translate_expr(program, referenced_tables, &args[1], regs + 1, resolver)?;
+                        program.emit_insn(Insn::Function {
+                            constant_mask: 0,
+                            start_reg: regs,
+                            dest: target_register,
+                            func: func_ctx,
+                        });
+                        Ok(target_register)
+                    }
                 },
                 Func::Scalar(srf) => {
                     match srf {
@@ -1012,10 +1024,15 @@ pub fn translate_expr(
                         ScalarFunc::ConcatWs => {
                             let args = expect_arguments_min!(args, 2, srf);
 
-                            let temp_register = program.alloc_register();
-                            for arg in args.iter() {
-                                let reg = program.alloc_register();
-                                translate_expr(program, referenced_tables, arg, reg, resolver)?;
+                            let temp_register = program.alloc_registers(args.len() + 1);
+                            for (i, arg) in args.iter().enumerate() {
+                                translate_expr(
+                                    program,
+                                    referenced_tables,
+                                    arg,
+                                    temp_register + i + 1,
+                                    resolver,
+                                )?;
                             }
                             program.emit_insn(Insn::Function {
                                 constant_mask: 0,
@@ -1027,7 +1044,7 @@ pub fn translate_expr(
                             program.emit_insn(Insn::Copy {
                                 src_reg: temp_register,
                                 dst_reg: target_register,
-                                amount: 1,
+                                extra_amount: 0,
                             });
                             Ok(target_register)
                         }
@@ -1071,7 +1088,7 @@ pub fn translate_expr(
                             program.emit_insn(Insn::Copy {
                                 src_reg: temp_reg,
                                 dst_reg: target_register,
-                                amount: 0,
+                                extra_amount: 0,
                             });
 
                             Ok(target_register)
@@ -1557,7 +1574,7 @@ pub fn translate_expr(
                             program.emit_insn(Insn::Copy {
                                 src_reg: output_register,
                                 dst_reg: target_register,
-                                amount: 0,
+                                extra_amount: 0,
                             });
                             Ok(target_register)
                         }
@@ -1579,7 +1596,7 @@ pub fn translate_expr(
                             program.emit_insn(Insn::Copy {
                                 src_reg: output_register,
                                 dst_reg: target_register,
-                                amount: 0,
+                                extra_amount: 0,
                             });
                             Ok(target_register)
                         }
@@ -1731,13 +1748,64 @@ pub fn translate_expr(
                                 start_reg,
                                 resolver,
                             )?;
-
                             program.emit_insn(Insn::Copy {
                                 src_reg: start_reg,
                                 dst_reg: target_register,
-                                amount: 0,
+                                extra_amount: 0,
                             });
-
+                            Ok(target_register)
+                        }
+                        ScalarFunc::TableColumnsJsonArray => {
+                            if args.is_none() || args.as_ref().unwrap().len() != 1 {
+                                crate::bail_parse_error!(
+                                    "table_columns_json_array() function must have exactly 1 argument",
+                                );
+                            }
+                            let args = args.as_ref().unwrap();
+                            let start_reg = program.alloc_register();
+                            translate_expr(
+                                program,
+                                referenced_tables,
+                                &args[0],
+                                start_reg,
+                                resolver,
+                            )?;
+                            program.emit_insn(Insn::Function {
+                                constant_mask: 0,
+                                start_reg,
+                                dest: target_register,
+                                func: func_ctx,
+                            });
+                            Ok(target_register)
+                        }
+                        ScalarFunc::BinRecordJsonObject => {
+                            if args.is_none() || args.as_ref().unwrap().len() != 2 {
+                                crate::bail_parse_error!(
+                                    "bin_record_json_object() function must have exactly 2 arguments",
+                                );
+                            }
+                            let args = args.as_ref().unwrap();
+                            let start_reg = program.alloc_registers(2);
+                            translate_expr(
+                                program,
+                                referenced_tables,
+                                &args[0],
+                                start_reg,
+                                resolver,
+                            )?;
+                            translate_expr(
+                                program,
+                                referenced_tables,
+                                &args[1],
+                                start_reg + 1,
+                                resolver,
+                            )?;
+                            program.emit_insn(Insn::Function {
+                                constant_mask: 0,
+                                start_reg,
+                                dest: target_register,
+                                func: func_ctx,
+                            });
                             Ok(target_register)
                         }
                     }
@@ -1917,7 +1985,7 @@ pub fn translate_expr(
                             .expect("Subquery result_columns_start_reg must be set")
                             + *column,
                         dst_reg: target_register,
-                        amount: 0,
+                        extra_amount: 0,
                     });
                     Ok(target_register)
                 }

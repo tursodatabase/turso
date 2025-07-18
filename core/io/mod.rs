@@ -14,14 +14,14 @@ use std::{
 pub trait File: Send + Sync {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
-    fn pread(&self, pos: usize, c: Completion) -> Result<Arc<Completion>>;
+    fn pread(&self, pos: usize, c: Arc<Completion>) -> Result<Arc<Completion>>;
     fn pwrite(
         &self,
         pos: usize,
         buffer: Arc<RefCell<Buffer>>,
-        c: Completion,
+        c: Arc<Completion>,
     ) -> Result<Arc<Completion>>;
-    fn sync(&self, c: Completion) -> Result<Arc<Completion>>;
+    fn sync(&self, c: Arc<Completion>) -> Result<Arc<Completion>>;
     fn size(&self) -> Result<u64>;
 }
 
@@ -54,7 +54,7 @@ pub trait IO: Clock + Send + Sync {
     fn get_memory_io(&self) -> Arc<MemoryIO>;
 }
 
-pub type Complete = dyn Fn(Arc<RefCell<Buffer>>);
+pub type Complete = dyn Fn(Arc<RefCell<Buffer>>, i32);
 pub type WriteComplete = dyn Fn(i32);
 pub type SyncComplete = dyn Fn(i32);
 
@@ -88,7 +88,7 @@ impl Completion {
 
     pub fn complete(&self, result: i32) {
         match &self.completion_type {
-            CompletionType::Read(r) => r.complete(),
+            CompletionType::Read(r) => r.complete(result),
             CompletionType::Write(w) => w.complete(result),
             CompletionType::Sync(s) => s.complete(result), // fix
         };
@@ -126,8 +126,8 @@ impl ReadCompletion {
         self.buf.borrow_mut()
     }
 
-    pub fn complete(&self) {
-        (self.complete)(self.buf.clone());
+    pub fn complete(&self, bytes_read: i32) {
+        (self.complete)(self.buf.clone(), bytes_read);
     }
 }
 

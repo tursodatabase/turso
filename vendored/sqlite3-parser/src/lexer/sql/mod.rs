@@ -4,9 +4,7 @@ use memchr::memchr;
 
 pub use crate::dialect::TokenType;
 use crate::dialect::TokenType::*;
-use crate::dialect::{
-    is_identifier_continue, is_identifier_start, keyword_token, sentinel, MAX_KEYWORD_LEN,
-};
+use crate::dialect::{is_identifier_continue, is_identifier_start, keyword_token, sentinel};
 use crate::parser::ast::Cmd;
 use crate::parser::parse::{yyParser, YYCODETYPE};
 use crate::parser::Context;
@@ -692,8 +690,7 @@ fn find_end_of_number(
         if test(&b) {
             continue;
         } else if b == b'_' {
-            if j >= 1 && data.get(j - 1).map_or(false, test) && data.get(j + 1).map_or(false, test)
-            {
+            if j >= 1 && data.get(j - 1).is_some_and(test) && data.get(j + 1).is_some_and(test) {
                 continue;
             }
             return Err(Error::BadNumber(None, None, Some(j), unsafe {
@@ -719,12 +716,7 @@ impl Tokenizer {
             _ => data.len(),
         };
         let word = &data[..i];
-        let tt = if word.len() >= 2 && word.len() <= MAX_KEYWORD_LEN && word.is_ascii() {
-            keyword_token(word).unwrap_or(TK_ID)
-        } else {
-            TK_ID
-        };
-        (Some((word, tt)), i)
+        (Some((word, keyword_token(word).unwrap_or(TK_ID))), i)
     }
 }
 

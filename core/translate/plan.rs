@@ -324,6 +324,8 @@ pub enum QueryDestination {
         cursor_id: CursorID,
         /// The index that will be used to store the results.
         index: Arc<Index>,
+        /// Whether this is a delete operation that will remove the index entries
+        is_delete: bool,
     },
     /// The results of the query are stored in an ephemeral table,
     /// later used by the parent query.
@@ -553,6 +555,7 @@ pub fn select_star(tables: &[JoinedTable], out_columns: &mut Vec<ResultSetColumn
                 .columns()
                 .iter()
                 .enumerate()
+                .filter(|(_, col)| !col.hidden)
                 .filter(|(_, col)| {
                     // If we are joining with USING, we need to deduplicate the columns from the right table
                     // that are also present in the USING clause.
@@ -560,7 +563,7 @@ pub fn select_star(tables: &[JoinedTable], out_columns: &mut Vec<ResultSetColumn
                         !using_cols.iter().any(|using_col| {
                             col.name
                                 .as_ref()
-                                .map_or(false, |name| name.eq_ignore_ascii_case(&using_col.0))
+                                .is_some_and(|name| name.eq_ignore_ascii_case(&using_col.0))
                         })
                     } else {
                         true
@@ -809,10 +812,7 @@ impl TableReferences {
         {
             outer_query_ref.mark_column_used(column_index);
         } else {
-            panic!(
-                "table with internal id {} not found in table references",
-                internal_id
-            );
+            panic!("table with internal id {internal_id} not found in table references");
         }
     }
 
@@ -918,6 +918,7 @@ impl JoinedTable {
                 default: None,
                 unique: false,
                 collation: None, // FIXME: infer collation from subquery
+                hidden: false,
             })
             .collect();
 
@@ -962,7 +963,7 @@ impl JoinedTable {
         match &self.table {
             Table::BTree(btree) => {
                 let use_covering_index = self.utilizes_covering_index();
-                let index_is_ephemeral = index.map_or(false, |index| index.ephemeral);
+                let index_is_ephemeral = index.is_some_and(|index| index.ephemeral);
                 let table_not_required =
                     OperationMode::SELECT == mode && use_covering_index && !index_is_ephemeral;
                 let table_cursor_id = if table_not_required {

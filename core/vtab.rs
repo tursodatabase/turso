@@ -1,6 +1,6 @@
 use crate::pragma::{PragmaVirtualTable, PragmaVirtualTableCursor};
 use crate::schema::Column;
-use crate::util::{columns_from_create_table_body, vtable_args};
+use crate::util::columns_from_create_table_body;
 use crate::{Connection, LimboError, SymbolTable, Value};
 use fallible_iterator::FallibleIterator;
 use std::cell::RefCell;
@@ -19,39 +19,41 @@ enum VirtualTableType {
 #[derive(Clone, Debug)]
 pub struct VirtualTable {
     pub(crate) name: String,
-    pub(crate) args: Option<Vec<ast::Expr>>,
     pub(crate) columns: Vec<Column>,
     pub(crate) kind: VTabKind,
     vtab_type: VirtualTableType,
 }
 
 impl VirtualTable {
-    pub(crate) fn function(
-        name: &str,
-        args: Option<Vec<ast::Expr>>,
-        syms: &SymbolTable,
-    ) -> crate::Result<Rc<VirtualTable>> {
+    pub(crate) fn builtin_functions() -> Vec<Rc<VirtualTable>> {
+        PragmaVirtualTable::functions()
+            .into_iter()
+            .map(|(tab, schema)| {
+                let vtab = VirtualTable {
+                    name: format!("pragma_{}", tab.pragma_name),
+                    columns: Self::resolve_columns(schema)
+                        .expect("built-in function schema resolution should not fail"),
+                    kind: VTabKind::TableValuedFunction,
+                    vtab_type: VirtualTableType::Pragma(tab),
+                };
+                Rc::new(vtab)
+            })
+            .collect()
+    }
+
+    pub(crate) fn function(name: &str, syms: &SymbolTable) -> crate::Result<Rc<VirtualTable>> {
         let module = syms.vtab_modules.get(name);
         let (vtab_type, schema) = if module.is_some() {
-            let ext_args = match args {
-                Some(ref args) => vtable_args(args),
-                None => vec![],
-            };
-            ExtVirtualTable::create(name, module, ext_args, VTabKind::TableValuedFunction)
+            ExtVirtualTable::create(name, module, Vec::new(), VTabKind::TableValuedFunction)
                 .map(|(vtab, columns)| (VirtualTableType::External(vtab), columns))?
-        } else if let Some(pragma_name) = name.strip_prefix("pragma_") {
-            PragmaVirtualTable::create(pragma_name)
-                .map(|(vtab, columns)| (VirtualTableType::Pragma(vtab), columns))?
         } else {
             return Err(LimboError::ParseError(format!(
-                "No such table-valued function: {}",
-                name
+                "No such table-valued function: {name}"
             )));
         };
 
         let vtab = VirtualTable {
             name: name.to_owned(),
-            args,
             columns: Self::resolve_columns(schema)?,
             kind: VTabKind::TableValuedFunction,
             vtab_type,
@@ -70,7 +72,6 @@ impl VirtualTable {
             ExtVirtualTable::create(module_name, module, args, VTabKind::VirtualTable)?;
         let vtab = VirtualTable {
             name: tbl_name.unwrap_or(module_name).to_owned(),
-            args: None,
             columns: Self::resolve_columns(schema)?,
             kind: VTabKind::VirtualTable,
             vtab_type: VirtualTableType::External(table),
@@ -93,7 +94,9 @@ impl VirtualTable {
 
     pub(crate) fn open(&self, conn: Arc<Connection>) -> crate::Result<VirtualTableCursor> {
         match &self.vtab_type {
-            VirtualTableType::Pragma(table) => Ok(VirtualTableCursor::Pragma(table.open(conn)?)),
+            VirtualTableType::Pragma(table) => {
+                Ok(VirtualTableCursor::Pragma(Box::new(table.open(conn)?)))
+            }
             VirtualTableType::External(table) => {
                 Ok(VirtualTableCursor::External(table.open(conn)?))
             }
@@ -120,19 +123,14 @@ impl VirtualTable {
         order_by: &[OrderByInfo],
     ) -> IndexInfo {
         match &self.vtab_type {
-            VirtualTableType::Pragma(_) => {
-                // SQLite tries to estimate cost and row count for pragma_ TVFs,
-                // but since Limbo doesn't have cost-based planning yet, this
-                // estimation is not currently implemented.
-                Default::default()
-            }
+            VirtualTableType::Pragma(table) => table.best_index(constraints),
             VirtualTableType::External(table) => table.best_index(constraints, order_by),
         }
     }
 }
 
 pub enum VirtualTableCursor {
-    Pragma(PragmaVirtualTableCursor),
+    Pragma(Box<PragmaVirtualTableCursor>),
     External(ExtVirtualTableCursor),
 }
 
@@ -216,8 +214,7 @@ impl ExtVirtualTable {
         kind: VTabKind,
     ) -> crate::Result<(Self, String)> {
         let module = module.ok_or(LimboError::ExtensionError(format!(
-            "Virtual table module not found: {}",
-            module_name
+            "Virtual table module not found: {module_name}"
         )))?;
         if kind != module.module_kind {
             let expected = match kind {
@@ -225,8 +222,7 @@ impl ExtVirtualTable {
                 VTabKind::TableValuedFunction => "table-valued function",
             };
             return Err(LimboError::ExtensionError(format!(
-                "{} is not a {} module",
-                module_name, expected
+                "{module_name} is not a {expected} module"
             )));
         }
         let (schema, table_ptr) = module.implementation.create(args)?;

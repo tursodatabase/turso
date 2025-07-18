@@ -98,7 +98,7 @@ pub fn find_best_access_method_for_join_order<'a>(
                     match &candidate.index {
                         Some(index) => index.columns[i].pos_in_table == order_target.0[i].column_no,
                         None => {
-                            rowid_column_idx.map_or(false, |idx| idx == order_target.0[i].column_no)
+                            rowid_column_idx.is_some_and(|idx| idx == order_target.0[i].column_no)
                         }
                     }
                 };

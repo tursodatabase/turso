@@ -12,6 +12,7 @@ use crate::schema::Type;
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::ProgramBuilder;
 use crate::translate::ProgramBuilderOpts;
+use crate::util::normalize_ident;
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::Cookie;
@@ -40,13 +41,14 @@ pub fn translate_create_table(
         approx_num_labels: 1,
     };
     program.extend(&opts);
-    if schema.get_table(tbl_name.name.0.as_str()).is_some() {
+    let normalized_tbl_name = normalize_ident(&tbl_name.name.0);
+    if schema.get_table(&normalized_tbl_name).is_some() {
         if if_not_exists {
             program.epilogue(crate::translate::emitter::TransactionMode::Write);
 
             return Ok(program);
         }
-        bail_parse_error!("Table {} already exists", tbl_name);
+        bail_parse_error!("Table {} already exists", normalized_tbl_name);
     }
 
     let sql = create_table_body_to_str(&tbl_name, &body);
@@ -116,8 +118,8 @@ pub fn translate_create_table(
         &mut program,
         sqlite_schema_cursor_id,
         SchemaEntryType::Table,
-        &tbl_name.name.0,
-        &tbl_name.name.0,
+        &normalized_tbl_name,
+        &normalized_tbl_name,
         table_root_reg,
         Some(sql),
     );
@@ -136,7 +138,7 @@ pub fn translate_create_table(
                 sqlite_schema_cursor_id,
                 SchemaEntryType::Index,
                 &index_name,
-                &tbl_name.name.0,
+                &normalized_tbl_name,
                 index_reg,
                 None,
             );
@@ -152,7 +154,8 @@ pub fn translate_create_table(
         p5: 0,
     });
     // TODO: remove format, it sucks for performance but is convenient
-    let parse_schema_where_clause = format!("tbl_name = '{}' AND type != 'trigger'", tbl_name);
+    let parse_schema_where_clause =
+        format!("tbl_name = '{normalized_tbl_name}' AND type != 'trigger'");
     program.emit_insn(Insn::ParseSchema {
         db: sqlite_schema_cursor_id,
         where_clause: Some(parse_schema_where_clause),
@@ -210,7 +213,7 @@ pub fn emit_schema_entry(
         program.emit_insn(Insn::Copy {
             src_reg: root_page_reg,
             dst_reg: rootpage_reg,
-            amount: 1,
+            extra_amount: 0,
         });
     }
 
@@ -506,7 +509,7 @@ fn create_vtable_body_to_str(vtab: &CreateVirtualTable, module: Rc<VTabImpl>) ->
         if args.is_empty() {
             String::new()
         } else {
-            format!("({})", args)
+            format!("({args})")
         },
         vtab.tbl_name.name.0,
         vtab_args
@@ -602,7 +605,7 @@ pub fn translate_create_virtual_table(
         value: schema.schema_version as i32 + 1,
         p5: 0,
     });
-    let parse_schema_where_clause = format!("tbl_name = '{}' AND type != 'trigger'", table_name);
+    let parse_schema_where_clause = format!("tbl_name = '{table_name}' AND type != 'trigger'");
     program.emit_insn(Insn::ParseSchema {
         db: sqlite_schema_cursor_id,
         where_clause: Some(parse_schema_where_clause),
@@ -783,6 +786,7 @@ pub fn translate_drop_table(
                 default: None,
                 unique: false,
                 collation: None,
+                hidden: false,
             }],
             is_strict: false,
             unique_sets: None,

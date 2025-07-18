@@ -184,12 +184,13 @@ pub struct yyParser<'input> {
     //#[cfg(not(feature = "YYNOERRORRECOVERY"))]
     yyerrcnt: i32, /* Shifts left before out of the error */
 %%                               /* A place to hold %extra_context */
-    yystack: Vec<yyStackEntry<'input>>, /* The parser's stack */
+    yystack: smallvec::SmallVec<[yyStackEntry<'input>; YYSTACKDEPTH]>, /* The parser's stack */
 }
 
 use std::cmp::Ordering;
 use std::ops::Neg;
 impl<'input> yyParser<'input> {
+    #[inline]
     fn shift(&self, shift: i8) -> usize {
         assert!(shift <= 1);
         match shift.cmp(&0) {
@@ -199,6 +200,7 @@ impl<'input> yyParser<'input> {
         }
     }
 
+    #[inline]
     fn yyidx_shift(&mut self, shift: i8) {
         match shift.cmp(&0) {
             Ordering::Greater => self.yyidx += shift as usize,
@@ -207,12 +209,17 @@ impl<'input> yyParser<'input> {
         }
     }
 
+    #[inline]
     fn yy_move(&mut self, shift: i8) -> yyStackEntry<'input> {
-        use std::mem::take;
         let idx = self.shift(shift);
-        take(&mut self.yystack[idx])
+
+        // TODO: The compiler optimizes `std::mem::take` to two `memcpy` 
+        // but `yyStackEntry` requires 168 bytes, so it is not worth it (maybe).
+        assert_eq!(std::mem::size_of::<yyStackEntry>(), 168);
+        std::mem::take(&mut self.yystack[idx])
     }
 
+    #[inline]
     fn push(&mut self, entry: yyStackEntry<'input>) {
         if self.yyidx == self.yystack.len() {
             self.yystack.push(entry);
@@ -226,12 +233,14 @@ use std::ops::{Index, IndexMut};
 impl<'input> Index<i8> for yyParser<'input> {
     type Output = yyStackEntry<'input>;
 
+    #[inline]
     fn index(&self, shift: i8) -> &yyStackEntry<'input> {
         let idx = self.shift(shift);
         &self.yystack[idx]
     }
 }
 impl<'input> IndexMut<i8> for yyParser<'input> {
+    #[inline]
     fn index_mut(&mut self, shift: i8) -> &mut yyStackEntry<'input> {
         let idx = self.shift(shift);
         &mut self.yystack[idx]
@@ -261,9 +270,11 @@ static yyRuleName: [&str; YYNRULE] = [
 ** of errors.  Return 0 on success.
 */
 impl yyParser<'_> {
+    #[inline]
     fn yy_grow_stack_if_needed(&mut self) -> bool {
         false
     }
+    #[inline]
     fn yy_grow_stack_for_push(&mut self) -> bool {
         // yystack is not prefilled with zero value like in C.
         if self.yyidx == self.yystack.len() {
@@ -281,17 +292,15 @@ impl yyParser<'_> {
     pub fn new(
 %%               /* Optional %extra_context parameter */
     ) -> yyParser {
-        let mut p = yyParser {
+        yyParser {
             yyidx: 0,
             #[cfg(feature = "YYTRACKMAXSTACKDEPTH")]
             yyhwm: 0,
-            yystack: Vec::with_capacity(YYSTACKDEPTH),
+            yystack: smallvec::smallvec![yyStackEntry::default()],
             //#[cfg(not(feature = "YYNOERRORRECOVERY"))]
             yyerrcnt: -1,
 %%               /* Optional %extra_context store */
-        };
-        p.push(yyStackEntry::default());
-        p
+        }
     }
 }
 
@@ -299,6 +308,7 @@ impl yyParser<'_> {
 ** Pop the parser's stack once.
 */
 impl yyParser<'_> {
+    #[inline]
     fn yy_pop_parser_stack(&mut self) {
         use std::mem::take;
         let _yytos = take(&mut self.yystack[self.yyidx]);
@@ -319,6 +329,7 @@ impl yyParser<'_> {
 */
 impl yyParser<'_> {
     #[expect(non_snake_case)]
+    #[inline]
     pub fn ParseFinalize(&mut self) {
         while self.yyidx > 0 {
             self.yy_pop_parser_stack();
@@ -333,9 +344,11 @@ impl yyParser<'_> {
 #[cfg(feature = "YYTRACKMAXSTACKDEPTH")]
 impl yyParser<'_> {
     #[expect(non_snake_case)]
+    #[inline]
     pub fn ParseStackPeak(&self) -> usize {
         self.yyhwm
     }
+    #[inline]
     fn yyhwm_incr(&mut self) {
         if self.yyidx > self.yyhwm {
             self.yyhwm += 1;
@@ -488,6 +501,7 @@ fn yy_find_reduce_action(
 impl yyParser<'_> {
     #[expect(non_snake_case)]
     #[cfg(feature = "NDEBUG")]
+    #[inline]
     fn yyTraceShift(&self, _: YYACTIONTYPE, _: &str) {
     }
     #[expect(non_snake_case)]
@@ -893,6 +907,7 @@ impl<'input> yyParser<'input> {
      ** Return the fallback token corresponding to canonical token iToken, or
      ** 0 if iToken has no fallback.
      */
+    #[inline]
     pub fn parse_fallback(i_token: YYCODETYPE) -> YYCODETYPE {
         if YYFALLBACK {
             return yyFallback[i_token as usize];
