@@ -290,11 +290,7 @@ impl Wal for DummyWAL {
     }
 
     fn append_frame(&mut self, _page: crate::PageRef, _db_size: u32) -> Result<Arc<Completion>> {
-        Ok(Arc::new(Completion::new(CompletionType::Write(
-            crate::WriteCompletion {
-                complete: Box::new(|_| {}),
-            },
-        ))))
+        Ok(Arc::new(Completion::new_write(|_| {})))
     }
 
     fn should_checkpoint(&self) -> bool {
