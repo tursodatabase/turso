@@ -24,13 +24,13 @@ import java.util.Calendar;
 import java.util.Map;
 import tech.turso.annotations.Nullable;
 import tech.turso.annotations.SkipNullableCheck;
-import tech.turso.core.LimboResultSet;
+import tech.turso.core.TursoResultSet;
 
 public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
 
-  private final LimboResultSet resultSet;
+  private final TursoResultSet resultSet;
 
-  public JDBC4ResultSet(LimboResultSet resultSet) {
+  public JDBC4ResultSet(TursoResultSet resultSet) {
     this.resultSet = resultSet;
   }
 

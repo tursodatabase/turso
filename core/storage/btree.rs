@@ -7057,7 +7057,7 @@ mod tests {
                 )
                 .unwrap();
                 loop {
-                    match pager.end_tx(false, false, &conn).unwrap() {
+                    match pager.end_tx(false, false, &conn, false).unwrap() {
                         crate::PagerCacheflushStatus::Done(_) => break,
                         crate::PagerCacheflushStatus::IO => {
                             pager.io.run_once().unwrap();
@@ -7183,7 +7183,7 @@ mod tests {
                 .unwrap();
                 cursor.move_to_root();
                 loop {
-                    match pager.end_tx(false, false, &conn).unwrap() {
+                    match pager.end_tx(false, false, &conn, false).unwrap() {
                         crate::PagerCacheflushStatus::Done(_) => break,
                         crate::PagerCacheflushStatus::IO => {
                             pager.io.run_once().unwrap();

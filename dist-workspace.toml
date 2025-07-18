@@ -19,7 +19,7 @@ targets = [
 # Which actions to run on pull requests
 pr-run-mode = "plan"
 # Path that installers should place binaries in
-install-path = "~/.limbo"
+install-path = "~/.turso"
 # Whether to install an updater program
 install-updater = true
 # Whether to consider the binaries in a package for distribution (defaults true)

@@ -1,7 +1,7 @@
 use clap::{command, Parser};
 
 #[derive(Parser)]
-#[command(name = "limbo_stress")]
+#[command(name = "turso_stress")]
 #[command(author, version, about, long_about = None)]
 pub struct Opts {
     /// Verbose mode

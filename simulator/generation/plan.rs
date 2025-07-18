@@ -650,7 +650,12 @@ fn reopen_database(env: &mut SimulatorEnv) {
 
     // 2. Re-open database
     let db_path = env.db_path.clone();
-    let db = match turso_core::Database::open_file(env.io.clone(), &db_path, false, false) {
+    let db = match turso_core::Database::open_file(
+        env.io.clone(),
+        &db_path,
+        env.opts.experimental_mvcc,
+        env.opts.experimental_indexes,
+    ) {
         Ok(db) => db,
         Err(e) => {
             panic!("error opening simulator test file {:?}: {:?}", db_path, e);

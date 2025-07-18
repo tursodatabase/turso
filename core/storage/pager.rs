@@ -636,6 +636,7 @@ impl Pager {
         rollback: bool,
         change_schema: bool,
         connection: &Connection,
+        wal_checkpoint_disabled: bool,
     ) -> Result<PagerCacheflushStatus> {
         tracing::trace!("end_tx(rollback={})", rollback);
         if rollback {
@@ -643,7 +644,7 @@ impl Pager {
             self.wal.borrow().end_read_tx()?;
             return Ok(PagerCacheflushStatus::Done(PagerCacheflushResult::Rollback));
         }
-        let cacheflush_status = self.cacheflush()?;
+        let cacheflush_status = self.cacheflush(wal_checkpoint_disabled)?;
         match cacheflush_status {
             PagerCacheflushStatus::IO => Ok(PagerCacheflushStatus::IO),
             PagerCacheflushStatus::Done(_) => {
@@ -758,7 +759,7 @@ impl Pager {
     /// In the base case, it will write the dirty pages to the WAL and then fsync the WAL.
     /// If the WAL size is over the checkpoint threshold, it will checkpoint the WAL to
     /// the database file and then fsync the database file.
-    pub fn cacheflush(&self) -> Result<PagerCacheflushStatus> {
+    pub fn cacheflush(&self, wal_checkpoint_disabled: bool) -> Result<PagerCacheflushStatus> {
         let mut checkpoint_result = CheckpointResult::default();
         loop {
             let state = self.flush_info.borrow().state;
@@ -804,7 +805,7 @@ impl Pager {
                         return Ok(PagerCacheflushStatus::IO);
                     }
 
-                    if !self.wal.borrow().should_checkpoint() {
+                    if wal_checkpoint_disabled || !self.wal.borrow().should_checkpoint() {
                         self.flush_info.borrow_mut().state = FlushState::Start;
                         return Ok(PagerCacheflushStatus::Done(
                             PagerCacheflushResult::WalWritten,
@@ -912,7 +913,7 @@ impl Pager {
             .expect("Failed to clear page cache");
     }
 
-    pub fn checkpoint_shutdown(&self) -> Result<()> {
+    pub fn checkpoint_shutdown(&self, wal_checkpoint_disabled: bool) -> Result<()> {
         let mut attempts = 0;
         {
             let mut wal = self.wal.borrow_mut();
@@ -927,11 +928,17 @@ impl Pager {
                 attempts += 1;
             }
         }
-        self.wal_checkpoint()?;
+        self.wal_checkpoint(wal_checkpoint_disabled)?;
         Ok(())
     }
 
-    pub fn wal_checkpoint(&self) -> Result<CheckpointResult> {
+    pub fn wal_checkpoint(&self, wal_checkpoint_disabled: bool) -> Result<CheckpointResult> {
+        if wal_checkpoint_disabled {
+            return Ok(CheckpointResult {
+                num_wal_frames: 0,
+                num_checkpointed_frames: 0,
+            });
+        }
         let checkpoint_result: CheckpointResult;
         loop {
             match self.wal.borrow_mut().checkpoint(

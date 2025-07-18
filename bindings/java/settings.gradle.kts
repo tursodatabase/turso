@@ -1,1 +1,1 @@
-rootProject.name = "limbo"
+rootProject.name = "turso"

@@ -561,8 +561,15 @@ pub unsafe extern "C" fn sqlite3_column_name(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_column_int64(_stmt: *mut sqlite3_stmt, _idx: ffi::c_int) -> i64 {
-    stub!();
+pub unsafe extern "C" fn sqlite3_column_int64(stmt: *mut sqlite3_stmt, idx: ffi::c_int) -> i64 {
+    // Attempt to convert idx to usize
+    let idx = idx.try_into().unwrap();
+    let stmt = &mut *stmt;
+    let row = stmt
+        .stmt
+        .row()
+        .expect("Function should only be called after `SQLITE_ROW`");
+    row.get(idx).unwrap()
 }
 
 #[no_mangle]
@@ -1186,6 +1193,23 @@ pub unsafe extern "C" fn libsql_wal_get_frame(
         },
         Err(_) => SQLITE_ERROR,
     }
+}
+
+/// Disable WAL checkpointing.
+///
+/// Note: This function disables WAL checkpointing entirely for the connection. This is different from
+/// sqlite3_wal_autocheckpoint() which only disables automatic checkpoints
+/// for the current connection, but still allows checkpointing when the
+/// connection is closed.
+#[no_mangle]
+pub unsafe extern "C" fn libsql_wal_disable_checkpoint(db: *mut sqlite3) -> ffi::c_int {
+    if db.is_null() {
+        return SQLITE_MISUSE;
+    }
+    let db: &mut sqlite3 = &mut *db;
+    let db = db.inner.lock().unwrap();
+    db.conn.wal_disable_checkpoint();
+    SQLITE_OK
 }
 
 fn sqlite3_safety_check_sick_or_ok(db: &sqlite3Inner) -> bool {

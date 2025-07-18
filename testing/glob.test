@@ -69,6 +69,19 @@ do_execsql_test where-glob-impossible {
     select * from products where 'foobar' glob 'fooba';
 } {}
 
+do_execsql_test_on_specific_db {:memory:} glob-null-other-types {
+    DROP TABLE IF EXISTS t0;
+    CREATE TABLE IF NOT EXISTS t0 (c0 REAL);
+    UPDATE t0 SET c0='C2IS*24', c0=0Xffffffffbfc4330f, c0=0.6463854797956918 WHERE ((((((((t0.c0)AND(t0.c0)))AND(0.23913649834358142)))OR(CASE t0.c0  WHEN t0.c0 THEN 'j2' WHEN t0.c0 THEN t0.c0 WHEN t0.c0 THEN t0.c0 END)))OR(((((((((t0.c0)AND(t0.c0)))AND(t0.c0)))OR(t0.c0)))AND(t0.c0)))); 
+    INSERT INTO t0 VALUES (NULL);
+    INSERT INTO t0 VALUES ('0&');
+    UPDATE t0 SET c0=2352448 WHERE ((((t0.c0)GLOB(t0.c0))) NOT NULL);
+    SELECT * from t0;
+} {
+    {}
+    2352448.0
+}
+
 foreach {testnum pattern text ans} {
    1  abcdefg   abcdefg   1
    2  abcdefG   abcdefg   0

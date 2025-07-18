@@ -118,7 +118,6 @@ pub struct Database {
     maybe_shared_wal: RwLock<Option<Arc<UnsafeCell<WalFileShared>>>>,
     is_empty: Arc<AtomicUsize>,
     init_lock: Arc<Mutex<()>>,
-
     open_flags: OpenFlags,
 }
 
@@ -278,6 +277,7 @@ impl Database {
                 _shared_cache: false,
                 cache_size: Cell::new(default_cache_size),
                 readonly: Cell::new(false),
+                wal_checkpoint_disabled: Cell::new(false),
             });
             if let Err(e) = conn.register_builtins() {
                 return Err(LimboError::ExtensionError(e));
@@ -329,6 +329,7 @@ impl Database {
             _shared_cache: false,
             cache_size: Cell::new(default_cache_size),
             readonly: Cell::new(false),
+            wal_checkpoint_disabled: Cell::new(false),
         });
 
         if let Err(e) = conn.register_builtins() {
@@ -448,6 +449,7 @@ pub struct Connection {
     _shared_cache: bool,
     cache_size: Cell<i32>,
     readonly: Cell<bool>,
+    wal_checkpoint_disabled: Cell<bool>,
 }
 
 impl Connection {
@@ -674,7 +676,7 @@ impl Connection {
     /// If the WAL size is over the checkpoint threshold, it will checkpoint the WAL to
     /// the database file and then fsync the database file.
     pub fn cacheflush(&self) -> Result<PagerCacheflushStatus> {
-        self.pager.cacheflush()
+        self.pager.cacheflush(self.wal_checkpoint_disabled.get())
     }
 
     pub fn clear_page_cache(&self) -> Result<()> {
@@ -683,12 +685,18 @@ impl Connection {
     }
 
     pub fn checkpoint(&self) -> Result<CheckpointResult> {
-        self.pager.wal_checkpoint()
+        self.pager
+            .wal_checkpoint(self.wal_checkpoint_disabled.get())
     }
 
     /// Close a connection and checkpoint.
     pub fn close(&self) -> Result<()> {
-        self.pager.checkpoint_shutdown()
+        self.pager
+            .checkpoint_shutdown(self.wal_checkpoint_disabled.get())
+    }
+
+    pub fn wal_disable_checkpoint(&self) {
+        self.wal_checkpoint_disabled.set(true);
     }
 
     pub fn last_insert_rowid(&self) -> i64 {

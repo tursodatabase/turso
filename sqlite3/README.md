@@ -1,14 +1,14 @@
-# SQLite3 Implementation for Limbo
+# SQLite3 Implementation for Turso
 
-This directory contains a Rust implementation of the SQLite3 C API. The implementation serves as a compatibility layer between SQLite's C API and Limbo's native Rust database implementation.
+This directory contains a Rust implementation of the SQLite3 C API. The implementation serves as a compatibility layer between SQLite's C API and Turso's native Rust database implementation.
 
 ## Purpose
 
-This implementation provides SQLite3 API compatibility for Limbo, allowing existing applications that use SQLite to work with Limbo without modification. The code:
+This implementation provides SQLite3 API compatibility for Turso, allowing existing applications that use SQLite to work with Turso without modification. The code:
 
 1. Implements the SQLite3 C API functions in Rust
 2. Translates between C and Rust data structures
-3. Maps SQLite operations to equivalent Limbo operations
+3. Maps SQLite operations to equivalent Turso operations
 4. Maintains API compatibility with SQLite version 3.42.0
 
 ## Testing Strategy

@@ -388,25 +388,50 @@ fn update_cache_size(
     connection: Arc<crate::Connection>,
 ) -> crate::Result<()> {
     let mut cache_size_unformatted: i64 = value;
+
     let mut cache_size = if cache_size_unformatted < 0 {
-        let kb = cache_size_unformatted.abs() * 1024;
+        let kb = cache_size_unformatted.abs().saturating_mul(1024);
         let page_size = header_accessor::get_page_size(&pager)
             .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as i64;
-        kb / page_size as i64
+        if page_size == 0 {
+            return Err(LimboError::InternalError(
+                "Page size cannot be zero".to_string(),
+            ));
+        }
+        kb / page_size
     } else {
         value
-    } as usize;
+    };
 
-    if cache_size < MIN_PAGE_CACHE_SIZE {
-        cache_size = MIN_PAGE_CACHE_SIZE;
-        cache_size_unformatted = MIN_PAGE_CACHE_SIZE as i64;
+    // SQLite uses this value as threshold for maximum cache size
+    const MAX_SAFE_CACHE_SIZE: i64 = 2147450880;
+
+    if cache_size > MAX_SAFE_CACHE_SIZE {
+        cache_size = 0;
+        cache_size_unformatted = 0;
     }
+
+    if cache_size < 0 {
+        cache_size = 0;
+        cache_size_unformatted = 0;
+    }
+
+    let cache_size_usize = cache_size as usize;
+
+    let final_cache_size = if cache_size_usize < MIN_PAGE_CACHE_SIZE {
+        cache_size_unformatted = MIN_PAGE_CACHE_SIZE as i64;
+        MIN_PAGE_CACHE_SIZE
+    } else {
+        cache_size_usize
+    };
+
     connection.set_cache_size(cache_size_unformatted as i32);
 
-    // update cache size
     pager
-        .change_page_cache_size(cache_size)
-        .expect("couldn't update page cache size");
+        .change_page_cache_size(final_cache_size)
+        .map_err(|e| {
+            LimboError::InternalError(format!("Failed to update page cache size: {}", e))
+        })?;
 
     Ok(())
 }

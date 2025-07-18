@@ -23,7 +23,7 @@ import java.sql.Time;
 import java.sql.Timestamp;
 import java.util.Calendar;
 import tech.turso.annotations.SkipNullableCheck;
-import tech.turso.core.LimboResultSet;
+import tech.turso.core.TursoResultSet;
 
 public final class JDBC4PreparedStatement extends JDBC4Statement implements PreparedStatement {
 
@@ -32,7 +32,6 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
 
   public JDBC4PreparedStatement(JDBC4Connection connection, String sql) throws SQLException {
     super(connection);
-
     this.sql = sql;
     this.statement = connection.prepare(sql);
     this.statement.initializeColumnMetadata();
@@ -48,7 +47,7 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
   @Override
   public int executeUpdate() throws SQLException {
     requireNonNull(this.statement);
-    final LimboResultSet resultSet = statement.getResultSet();
+    final TursoResultSet resultSet = statement.getResultSet();
     resultSet.consumeAll();
 
     // TODO: return updated count

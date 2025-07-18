@@ -2,6 +2,7 @@ package tech.turso.jdbc4;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -21,7 +22,7 @@ class JDBC4StatementTest {
   @BeforeEach
   void setUp() throws Exception {
     String filePath = TestUtils.createTempFile();
-    String url = "jdbc:sqlite:" + filePath;
+    String url = "jdbc:turso:" + filePath;
     final JDBC4Connection connection = new JDBC4Connection(url, filePath, new Properties());
     stmt =
         connection.createStatement(
@@ -38,21 +39,45 @@ class JDBC4StatementTest {
   @Test
   void execute_insert_should_return_false() throws Exception {
     stmt.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT);");
-    assertFalse(stmt.execute("INSERT INTO users VALUES (1, 'limbo');"));
+    assertFalse(stmt.execute("INSERT INTO users VALUES (1, 'turso');"));
   }
 
   @Test
   void execute_update_should_return_false() throws Exception {
     stmt.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT);");
-    stmt.execute("INSERT INTO users VALUES (1, 'limbo');");
+    stmt.execute("INSERT INTO users VALUES (1, 'turso');");
     assertFalse(stmt.execute("UPDATE users SET username = 'seonwoo' WHERE id = 1;"));
   }
 
   @Test
   void execute_select_should_return_true() throws Exception {
     stmt.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT);");
-    stmt.execute("INSERT INTO users VALUES (1, 'limbo');");
+    stmt.execute("INSERT INTO users VALUES (1, 'turso');");
     assertTrue(stmt.execute("SELECT * FROM users;"));
+  }
+
+  @Test
+  void execute_select() throws Exception {
+    stmt.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT);");
+    stmt.execute("INSERT INTO users VALUES (1, 'turso 1')");
+    stmt.execute("INSERT INTO users VALUES (2, 'turso 2')");
+    stmt.execute("INSERT INTO users VALUES (3, 'turso 3')");
+
+    ResultSet rs = stmt.executeQuery("SELECT * FROM users;");
+    rs.next();
+    int rowCount = 0;
+
+    do {
+      rowCount++;
+      int id = rs.getInt(1);
+      String username = rs.getString(2);
+
+      assertEquals(id, rowCount);
+      assertEquals(username, "turso " + rowCount);
+    } while (rs.next());
+
+    assertEquals(rowCount, 3);
+    assertFalse(rs.next());
   }
 
   @Test

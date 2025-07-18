@@ -1,3 +1,3 @@
 #!/usr/bin/env bash
 
-/bin/limbo_stress --silent --nr-iterations 10000
+/bin/turso_stress --silent --nr-iterations 10000

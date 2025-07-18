@@ -123,6 +123,8 @@ impl SimulatorEnv {
             max_interactions: rng.gen_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
             max_time_simulation: cli_opts.maximum_time,
             disable_reopen_database: cli_opts.disable_reopen_database,
+            experimental_mvcc: cli_opts.experimental_mvcc,
+            experimental_indexes: cli_opts.experimental_indexes,
         };
 
         let io =
@@ -138,7 +140,12 @@ impl SimulatorEnv {
             std::fs::remove_file(wal_path).unwrap();
         }
 
-        let db = match Database::open_file(io.clone(), db_path.to_str().unwrap(), false, false) {
+        let db = match Database::open_file(
+            io.clone(),
+            db_path.to_str().unwrap(),
+            opts.experimental_mvcc,
+            opts.experimental_indexes,
+        ) {
             Ok(db) => db,
             Err(e) => {
                 panic!("error opening simulator test file {:?}: {:?}", db_path, e);
@@ -241,4 +248,7 @@ pub(crate) struct SimulatorOpts {
     pub(crate) max_interactions: usize,
     pub(crate) page_size: usize,
     pub(crate) max_time_simulation: usize,
+
+    pub(crate) experimental_mvcc: bool,
+    pub(crate) experimental_indexes: bool,
 }

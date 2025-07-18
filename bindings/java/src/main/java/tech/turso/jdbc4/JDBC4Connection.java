@@ -6,24 +6,24 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.Executor;
 import tech.turso.annotations.SkipNullableCheck;
-import tech.turso.core.LimboConnection;
-import tech.turso.core.LimboStatement;
+import tech.turso.core.TursoConnection;
+import tech.turso.core.TursoStatement;
 
 public final class JDBC4Connection implements Connection {
 
-  private final LimboConnection connection;
+  private final TursoConnection connection;
 
   private Map<String, Class<?>> typeMap = new HashMap<>();
 
   public JDBC4Connection(String url, String filePath) throws SQLException {
-    this.connection = new LimboConnection(url, filePath);
+    this.connection = new TursoConnection(url, filePath);
   }
 
   public JDBC4Connection(String url, String filePath, Properties properties) throws SQLException {
-    this.connection = new LimboConnection(url, filePath, properties);
+    this.connection = new TursoConnection(url, filePath, properties);
   }
 
-  public LimboStatement prepare(String sql) throws SQLException {
+  public TursoStatement prepare(String sql) throws SQLException {
     return connection.prepare(sql);
   }
 
@@ -154,7 +154,7 @@ public final class JDBC4Connection implements Connection {
   public void setHoldability(int holdability) throws SQLException {
     connection.checkOpen();
     if (holdability != ResultSet.CLOSE_CURSORS_AT_COMMIT) {
-      throw new SQLException("Limbo only supports CLOSE_CURSORS_AT_COMMIT");
+      throw new SQLException("turso only supports CLOSE_CURSORS_AT_COMMIT");
     }
   }
 
@@ -201,7 +201,7 @@ public final class JDBC4Connection implements Connection {
   public CallableStatement prepareCall(
       String sql, int resultSetType, int resultSetConcurrency, int resultSetHoldability)
       throws SQLException {
-    throw new SQLException("Limbo does not support stored procedures");
+    throw new SQLException("turso does not support stored procedures");
   }
 
   @Override

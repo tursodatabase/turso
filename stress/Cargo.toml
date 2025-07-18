@@ -1,7 +1,7 @@
 # Copyright 2025 the Limbo authors. All rights reserved. MIT license.
 
 [package]
-name = "limbo_stress"
+name = "turso_stress"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -11,7 +11,7 @@ description = "The Limbo stress tester"
 publish = false
 
 [[bin]]
-name = "limbo_stress"
+name = "turso_stress"
 path = "main.rs"
 
 [features]

@@ -1,4 +1,4 @@
-use crate::errors::LimboError;
+use crate::errors::TursoError;
 use jni::objects::{JByteArray, JObject};
 use jni::JNIEnv;
 
@@ -8,9 +8,9 @@ pub(crate) fn utf8_byte_arr_to_str(
 ) -> crate::errors::Result<String> {
     let bytes = env
         .convert_byte_array(bytes)
-        .map_err(|_| LimboError::CustomError("Failed to retrieve bytes".to_string()))?;
+        .map_err(|_| TursoError::CustomError("Failed to retrieve bytes".to_string()))?;
     let str = String::from_utf8(bytes).map_err(|_| {
-        LimboError::CustomError("Failed to convert utf8 byte array into string".to_string())
+        TursoError::CustomError("Failed to convert utf8 byte array into string".to_string())
     })?;
     Ok(str)
 }
@@ -18,7 +18,7 @@ pub(crate) fn utf8_byte_arr_to_str(
 /// Sets the error message and throws a Java exception.
 ///
 /// This function converts the provided error message to a byte array and calls the
-/// `throwLimboException` method on the provided Java object to throw an exception.
+/// `throwTursoException` method on the provided Java object to throw an exception.
 ///
 /// # Parameters
 /// - `env`: The JNI environment.
@@ -41,7 +41,7 @@ pub fn set_err_msg_and_throw_exception<'local>(
         .expect("Failed to convert to byte array");
     match env.call_method(
         obj,
-        "throwLimboException",
+        "throwTursoException",
         "(I[B)V",
         &[err_code.into(), (&error_message_bytes).into()],
     ) {

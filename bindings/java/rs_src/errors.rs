@@ -2,7 +2,7 @@ use jni::errors::{Error, JniError};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum LimboError {
+pub enum TursoError {
     #[error("Custom error: `{0}`")]
     CustomError(String),
 
@@ -16,19 +16,19 @@ pub enum LimboError {
     JNIErrors(Error),
 }
 
-impl From<turso_core::LimboError> for LimboError {
+impl From<turso_core::LimboError> for TursoError {
     fn from(_value: turso_core::LimboError) -> Self {
         todo!()
     }
 }
 
-impl From<LimboError> for JniError {
-    fn from(value: LimboError) -> Self {
+impl From<TursoError> for JniError {
+    fn from(value: TursoError) -> Self {
         match value {
-            LimboError::CustomError(_)
-            | LimboError::InvalidDatabasePointer
-            | LimboError::InvalidConnectionPointer
-            | LimboError::JNIErrors(_) => {
+            TursoError::CustomError(_)
+            | TursoError::InvalidDatabasePointer
+            | TursoError::InvalidConnectionPointer
+            | TursoError::JNIErrors(_) => {
                 eprintln!("Error occurred: {:?}", value);
                 JniError::Other(-1)
             }
@@ -36,13 +36,13 @@ impl From<LimboError> for JniError {
     }
 }
 
-impl From<jni::errors::Error> for LimboError {
+impl From<jni::errors::Error> for TursoError {
     fn from(value: jni::errors::Error) -> Self {
-        LimboError::JNIErrors(value)
+        TursoError::JNIErrors(value)
     }
 }
 
-pub type Result<T> = std::result::Result<T, LimboError>;
+pub type Result<T> = std::result::Result<T, TursoError>;
 
 pub const SQLITE_OK: i32 = 0; // Successful result
 pub const SQLITE_ERROR: i32 = 1; // Generic error
@@ -106,6 +106,6 @@ pub const SQLITE_BLOB: i32 = 4;
 #[allow(dead_code)]
 pub const SQLITE_NULL: i32 = 5;
 
-pub const LIMBO_FAILED_TO_PARSE_BYTE_ARRAY: i32 = 1100;
-pub const LIMBO_FAILED_TO_PREPARE_STATEMENT: i32 = 1200;
-pub const LIMBO_ETC: i32 = 9999;
+pub const TURSO_FAILED_TO_PARSE_BYTE_ARRAY: i32 = 1100;
+pub const TURSO_FAILED_TO_PREPARE_STATEMENT: i32 = 1200;
+pub const TURSO_ETC: i32 = 9999;

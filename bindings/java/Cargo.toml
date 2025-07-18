@@ -1,5 +1,5 @@
 [package]
-name = "limbo-java"
+name = "turso-java"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -8,7 +8,7 @@ repository.workspace = true
 publish = false
 
 [lib]
-name = "_limbo_java"
+name = "_turso_java"
 crate-type = ["cdylib"]
 path = "rs_src/lib.rs"
 

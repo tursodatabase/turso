@@ -268,4 +268,4 @@ class Statement {
   }
 }
 
-module.exports.Database = Database;
+module.exports = Database;

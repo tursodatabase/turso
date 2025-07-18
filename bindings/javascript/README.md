@@ -23,7 +23,7 @@ npm install @tursodatabase/turso
 ### In-Memory Database
 
 ```javascript
-import { Database } from '@tursodatabase/turso';
+import Database from '@tursodatabase/turso';
 
 // Create an in-memory database
 const db = new Database(':memory:');
@@ -48,7 +48,7 @@ console.log(users);
 ### File-Based Database
 
 ```javascript
-import { Database } from '@tursodatabase/turso';
+import Database from '@tursodatabase/turso';
 
 // Create or open a database file
 const db = new Database('my-database.db');

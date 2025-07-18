@@ -37,6 +37,7 @@ extern "C" {
         log_size: *mut i32,
         checkpoint_count: *mut i32,
     ) -> i32;
+    fn sqlite3_column_int64(stmt: *mut sqlite3_stmt, idx: i32) -> i64;
     fn libsql_wal_frame_count(db: *mut sqlite3, p_frame_count: *mut u32) -> i32;
     fn libsql_wal_get_frame(
         db: *mut sqlite3,
@@ -44,10 +45,12 @@ extern "C" {
         p_frame: *mut u8,
         frame_len: u32,
     ) -> i32;
+    fn libsql_wal_disable_checkpoint(db: *mut sqlite3) -> i32;
 }
 
 const SQLITE_OK: i32 = 0;
 const SQLITE_CANTOPEN: i32 = 14;
+const SQLITE_ROW: i32 = 100;
 const SQLITE_DONE: i32 = 101;
 
 const SQLITE_CHECKPOINT_PASSIVE: i32 = 0;
@@ -299,6 +302,213 @@ mod tests {
                     );
                 }
                 assert_eq!(sqlite3_close(db), SQLITE_OK);
+            }
+        }
+
+        #[test]
+        fn test_disable_wal_checkpoint() {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            unsafe {
+                let mut db = ptr::null_mut();
+                let path = temp_file.path();
+                let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+                assert_eq!(sqlite3_open(c_path.as_ptr(), &mut db), SQLITE_OK);
+                // Create a table and insert a row.
+                let mut stmt = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_prepare_v2(
+                        db,
+                        c"CREATE TABLE test (id INTEGER PRIMARY KEY)".as_ptr(),
+                        -1,
+                        &mut stmt,
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+                assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+                let mut stmt = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_prepare_v2(
+                        db,
+                        c"INSERT INTO test (id) VALUES (0)".as_ptr(),
+                        -1,
+                        &mut stmt,
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+                assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+                let mut log_size = 0;
+                let mut checkpoint_count = 0;
+
+                assert_eq!(
+                    sqlite3_wal_checkpoint_v2(
+                        db,
+                        ptr::null(),
+                        SQLITE_CHECKPOINT_PASSIVE,
+                        &mut log_size,
+                        &mut checkpoint_count
+                    ),
+                    SQLITE_OK
+                );
+            }
+            let mut wal_path = temp_file.path().to_path_buf();
+            assert!(wal_path.set_extension("db-wal"));
+            std::fs::remove_file(wal_path.clone()).unwrap();
+
+            {
+                let mut db = ptr::null_mut();
+                unsafe {
+                    let path = temp_file.path();
+                    let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+                    assert_eq!(sqlite3_open(c_path.as_ptr(), &mut db), SQLITE_OK);
+                    assert_eq!(libsql_wal_disable_checkpoint(db), SQLITE_OK);
+                    // Insert at least 1000 rows to go over checkpoint threshold.
+                    let mut stmt = ptr::null_mut();
+                    for i in 1..2000 {
+                        let sql =
+                            std::ffi::CString::new(format!("INSERT INTO test (id) VALUES ({})", i))
+                                .unwrap();
+                        assert_eq!(
+                            sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                            SQLITE_OK
+                        );
+                        assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+                        assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+                    }
+                }
+            }
+
+            // Delete WAL to ensure that we don't load anything from it
+            std::fs::remove_file(wal_path).unwrap();
+            let mut db = ptr::null_mut();
+            unsafe {
+                let path = temp_file.path();
+                let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+                assert_eq!(sqlite3_open(c_path.as_ptr(), &mut db), SQLITE_OK);
+                // Insert at least 1000 rows to go over checkpoint threshold.
+                let mut stmt = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_prepare_v2(
+                        db,
+                        c"SELECT count() FROM test".as_ptr(),
+                        -1,
+                        &mut stmt,
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+                let count = sqlite3_column_int64(stmt, 0);
+                assert_eq!(count, 1);
+                assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+                assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            }
+        }
+
+        #[test]
+        fn test_wal_checkpoint() {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            unsafe {
+                let mut db = ptr::null_mut();
+                let path = temp_file.path();
+                let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+                assert_eq!(sqlite3_open(c_path.as_ptr(), &mut db), SQLITE_OK);
+                // Create a table and insert a row.
+                let mut stmt = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_prepare_v2(
+                        db,
+                        c"CREATE TABLE test (id INTEGER PRIMARY KEY)".as_ptr(),
+                        -1,
+                        &mut stmt,
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+                assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+                let mut stmt = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_prepare_v2(
+                        db,
+                        c"INSERT INTO test (id) VALUES (0)".as_ptr(),
+                        -1,
+                        &mut stmt,
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+                assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+                let mut log_size = 0;
+                let mut checkpoint_count = 0;
+
+                assert_eq!(
+                    sqlite3_wal_checkpoint_v2(
+                        db,
+                        ptr::null(),
+                        SQLITE_CHECKPOINT_PASSIVE,
+                        &mut log_size,
+                        &mut checkpoint_count
+                    ),
+                    SQLITE_OK
+                );
+            }
+            let mut wal_path = temp_file.path().to_path_buf();
+            assert!(wal_path.set_extension("db-wal"));
+            std::fs::remove_file(wal_path.clone()).unwrap();
+
+            {
+                let mut db = ptr::null_mut();
+                unsafe {
+                    let path = temp_file.path();
+                    let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+                    assert_eq!(sqlite3_open(c_path.as_ptr(), &mut db), SQLITE_OK);
+                    // Insert at least 1000 rows to go over checkpoint threshold.
+                    let mut stmt = ptr::null_mut();
+                    for i in 1..=2000 {
+                        let sql =
+                            std::ffi::CString::new(format!("INSERT INTO test (id) VALUES ({})", i))
+                                .unwrap();
+                        assert_eq!(
+                            sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                            SQLITE_OK
+                        );
+                        assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+                        assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+                    }
+                }
+            }
+
+            // Delete WAL to ensure that we don't load anything from it
+            std::fs::remove_file(wal_path).unwrap();
+            let mut db = ptr::null_mut();
+            unsafe {
+                let path = temp_file.path();
+                let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+                assert_eq!(sqlite3_open(c_path.as_ptr(), &mut db), SQLITE_OK);
+                // Insert at least 1000 rows to go over checkpoint threshold.
+                let mut stmt = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_prepare_v2(
+                        db,
+                        c"SELECT count() FROM test".as_ptr(),
+                        -1,
+                        &mut stmt,
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+                let count = sqlite3_column_int64(stmt, 0);
+                assert_eq!(count, 2000);
+                assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+                assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
             }
         }
     }

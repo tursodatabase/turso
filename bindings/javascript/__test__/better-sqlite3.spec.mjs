@@ -1,39 +1,57 @@
-import test from "ava";
+import crypto from 'crypto';
 import fs from "node:fs";
 import { fileURLToPath } from "url";
 import path from "node:path"
+import DualTest from "./dual-test.mjs";
 
-import Database from "better-sqlite3";
+const inMemoryTest = new DualTest(":memory:");
+const foobarTest = new DualTest("foobar.db");
 
-test("Open in-memory database", async (t) => {
-  const [db] = await connect(":memory:");
+inMemoryTest.both("Open in-memory database", async (t) => {
+  const db = t.context.db;
   t.is(db.memory, true);
 });
 
-test("Property .name of in-memory database", async (t) => {
-  let name = ":memory:";
-  const db = new Database(name);
-  t.is(db.name, name);
+inMemoryTest.both("Property .name of in-memory database", async (t) => {
+  const db = t.context.db;
+  t.is(db.name, t.context.path);
 });
 
-test("Property .name of database", async (t) => {
-  let name = "foobar.db";
-  const db = new Database(name);
-  t.is(db.name, name);
+foobarTest.both("Property .name of database", async (t) => {
+  const db = t.context.db;
+  t.is(db.name, t.context.path);
 });
 
-test("Property .readonly of database if set", async (t) => {
-  const db = new Database("foobar.db", { readonly: true });
-  t.is(db.readonly, true);
-});
+new DualTest("foobar.db", { readonly: true })
+  .both("Property .readonly of database if set", async (t) => {
+    const db = t.context.db;
+    t.is(db.readonly, true);
+  });
 
-test("Property .readonly of database if not set", async (t) => {
-  const db = new Database("foobar.db");
+const genDatabaseFilename = () => {
+  return `test-${crypto.randomBytes(8).toString('hex')}.db`;
+};
+
+new DualTest().onlySqlitePasses("opening a read-only database fails if the file doesn't exist", async (t) => {
+  t.throws(() => t.context.connect(genDatabaseFilename(), { readonly: true }),
+    {
+      any: true,
+      code: 'SQLITE_CANTOPEN',
+    });
+})
+
+foobarTest.both("Property .readonly of database if not set", async (t) => {
+  const db = t.context.db;
   t.is(db.readonly, false);
 });
 
-test("Statement.get() returns data", async (t) => {
-  const [db] = await connect(":memory:");
+foobarTest.onlySqlitePasses("Property .open of database", async (t) => {
+  const db = t.context.db;
+  t.is(db.open, true);
+});
+
+inMemoryTest.both("Statement.get() returns data", async (t) => {
+  const db = t.context.db;
   const stmt = db.prepare("SELECT 1");
   const result = stmt.get();
   t.is(result["1"], 1);
@@ -41,22 +59,24 @@ test("Statement.get() returns data", async (t) => {
   t.is(result2["1"], 1);
 });
 
-test("Statement.get() returns undefined when no data", async (t) => {
-  const [db] = await connect(":memory:");
+inMemoryTest.both("Statement.get() returns undefined when no data", async (t) => {
+  const db = t.context.db;
   const stmt = db.prepare("SELECT 1 WHERE 1 = 2");
   const result = stmt.get();
   t.is(result, undefined);
 });
 
-test("Statement.run() returns correct result object", async (t) => {
-  const [db] = await connect(":memory:");
+inMemoryTest.onlySqlitePasses("Statement.run() returns correct result object", async (t) => {
+  // run() isn't 100% compatible with better-sqlite3
+  // it should return a result object, not a row object
+  const db = t.context.db;
   db.prepare("CREATE TABLE users (name TEXT)").run();
   const rows = db.prepare("INSERT INTO users (name) VALUES (?)").run("Alice");
   t.deepEqual(rows, { changes: 1, lastInsertRowid: 1 });
 });
 
-test("Statment.iterate() should correctly return an iterable object", async (t) => {
-  const [db] = await connect(":memory:");
+inMemoryTest.both("Statment.iterate() should correctly return an iterable object", async (t) => {
+  const db = t.context.db;
   db.prepare(
     "CREATE TABLE users (name TEXT, age INTEGER, nationality TEXT)",
   ).run();
@@ -78,8 +98,8 @@ test("Statment.iterate() should correctly return an iterable object", async (t) 
   }
 });
 
-test("Empty prepared statement should throw", async (t) => {
-  const [db] = await connect(":memory:");
+inMemoryTest.both("Empty prepared statement should throw", async (t) => {
+  const db = t.context.db;
   t.throws(
     () => {
       db.prepare("");
@@ -88,21 +108,21 @@ test("Empty prepared statement should throw", async (t) => {
   );
 });
 
-test("Test pragma()", async (t) => {
-  const [db] = await connect(":memory:");
+inMemoryTest.both("Test pragma()", async (t) => {
+  const db = t.context.db;
   t.deepEqual(typeof db.pragma("cache_size")[0].cache_size, "number");
   t.deepEqual(typeof db.pragma("cache_size", { simple: true }), "number");
 });
 
-test("pragma query", async (t) => {
-  const [db] = await connect(":memory:");
+inMemoryTest.both("pragma query", async (t) => {
+  const db = t.context.db;
   let page_size = db.pragma("page_size");
   let expectedValue = [{ page_size: 4096 }];
   t.deepEqual(page_size, expectedValue);
 });
 
-test("pragma table_list", async (t) => {
-  const [db] = await connect(":memory:");
+inMemoryTest.both("pragma table_list", async (t) => {
+  const db = t.context.db;
   let param = "sqlite_schema";
   let actual = db.pragma(`table_info(${param})`);
   let expectedValue = [
@@ -115,16 +135,16 @@ test("pragma table_list", async (t) => {
   t.deepEqual(actual, expectedValue);
 });
 
-test("simple pragma table_list", async (t) => {
-  const [db] = await connect(":memory:");
+inMemoryTest.both("simple pragma table_list", async (t) => {
+  const db = t.context.db;
   let param = "sqlite_schema";
   let actual = db.pragma(`table_info(${param})`, { simple: true });
   let expectedValue = 0;
   t.deepEqual(actual, expectedValue);
 });
 
-test("Statement shouldn't bind twice with bind()", async (t) => {
-  const [db] = await connect(":memory:");
+inMemoryTest.both("Statement shouldn't bind twice with bind()", async (t) => {
+  const db = t.context.db;
   db.prepare("CREATE TABLE users (name TEXT, age INTEGER)").run();
   db.prepare("INSERT INTO users (name, age) VALUES (?, ?)").run("Alice", 42);
   let stmt = db.prepare("SELECT * FROM users WHERE name = ?").bind("Alice");
@@ -142,8 +162,8 @@ test("Statement shouldn't bind twice with bind()", async (t) => {
   );
 });
 
-test("Test pluck(): Rows should only have the values of the first column", async (t) => {
-  const [db] = await connect(":memory:");
+inMemoryTest.both("Test pluck(): Rows should only have the values of the first column", async (t) => {
+  const db = t.context.db;
   db.prepare("CREATE TABLE users (name TEXT, age INTEGER)").run();
   db.prepare("INSERT INTO users (name, age) VALUES (?, ?)").run("Alice", 42);
   db.prepare("INSERT INTO users (name, age) VALUES (?, ?)").run("Bob", 24);
@@ -156,8 +176,8 @@ test("Test pluck(): Rows should only have the values of the first column", async
   }
 });
 
-test("Test raw(): Rows should be returned as arrays", async (t) => {
-  const [db] = await connect(":memory:");
+inMemoryTest.both("Test raw(): Rows should be returned as arrays", async (t) => {
+  const db = t.context.db;
   db.prepare("CREATE TABLE users (name TEXT, age INTEGER)").run();
   db.prepare("INSERT INTO users (name, age) VALUES (?, ?)").run("Alice", 42);
   db.prepare("INSERT INTO users (name, age) VALUES (?, ?)").run("Bob", 24);
@@ -189,7 +209,7 @@ test("Test raw(): Rows should be returned as arrays", async (t) => {
   t.deepEqual(rows[1], ["Bob", 24]);
 });
 
-test("Test expand(): Columns should be namespaced", async (t) => {
+inMemoryTest.onlySqlitePasses("Test expand(): Columns should be namespaced", async (t) => {
   const expandedResults = [
     {
       users: {
@@ -230,7 +250,7 @@ test("Test expand(): Columns should be namespaced", async (t) => {
     },
   ];
 
-  const [db] = await connect(":memory:");
+  const db = t.context.db;
   db.prepare("CREATE TABLE users (name TEXT, type TEXT)").run();
   db.prepare("CREATE TABLE addresses (userName TEXT, street TEXT, type TEXT)")
     .run();
@@ -265,8 +285,8 @@ test("Test expand(): Columns should be namespaced", async (t) => {
   t.deepEqual(allRows, regularResults);
 });
 
-test("Presentation modes should be mutually exclusive", async (t) => {
-  const [db] = await connect(":memory:");
+inMemoryTest.both("Presentation modes should be mutually exclusive", async (t) => {
+  const db = t.context.db;
   db.prepare("CREATE TABLE users (name TEXT, age INTEGER)").run();
   db.prepare("INSERT INTO users (name, age) VALUES (?, ?)").run("Alice", 42);
   db.prepare("INSERT INTO users (name, age) VALUES (?, ?)").run("Bob", 24);
@@ -305,22 +325,31 @@ test("Presentation modes should be mutually exclusive", async (t) => {
     t.truthy(name);
     t.assert(typeof name === "string");
   }
+});
+
+inMemoryTest.onlySqlitePasses("Presentation mode 'expand' should be mutually exclusive", async (t) => {
+  // this test can be appended to the previous one when 'expand' is implemented in Turso
+  const db = t.context.db;
+  db.prepare("CREATE TABLE users (name TEXT, age INTEGER)").run();
+  db.prepare("INSERT INTO users (name, age) VALUES (?, ?)").run("Alice", 42);
+  db.prepare("INSERT INTO users (name, age) VALUES (?, ?)").run("Bob", 24);
+
+  let stmt = db.prepare("SELECT * FROM users").pluck().raw();
 
   // test expand()
   stmt = db.prepare("SELECT * FROM users").raw().pluck().expand();
-  rows = stmt.all();
+  const rows = stmt.all();
   t.true(Array.isArray(rows));
   t.is(rows.length, 2);
   t.deepEqual(rows[0], { users: { name: "Alice", age: 42 } });
   t.deepEqual(rows[1], { users: { name: "Bob", age: 24 } });
-});
+})
 
-
-test("Test exec(): Should correctly load multiple statements from file", async (t) => {
+inMemoryTest.both("Test exec(): Should correctly load multiple statements from file", async (t) => {
   const __filename = fileURLToPath(import.meta.url);
   const __dirname = path.dirname(__filename);
 
-  const [db] = await connect(":memory:");
+  const db = t.context.db;
   const file = fs.readFileSync(path.resolve(__dirname, "./artifacts/basic-test.sql"), "utf8");
   db.exec(file);
   let rows = db.prepare("SELECT * FROM users").iterate();
@@ -330,20 +359,16 @@ test("Test exec(): Should correctly load multiple statements from file", async (
   }
 });
 
-test("Test Statement.database gets the database object", async t => {
-  const [db] = await connect(":memory:");
+inMemoryTest.both("Test Statement.database gets the database object", async t => {
+  const db = t.context.db;
   let stmt = db.prepare("SELECT 1");
   t.is(stmt.database, db);
 });
 
-test("Test Statement.source", async t => {
-  const [db] = await connect(":memory:");
+inMemoryTest.both("Test Statement.source", async t => {
+  const db = t.context.db;
   let sql = "CREATE TABLE t (id int)";
   let stmt = db.prepare(sql);
   t.is(stmt.source, sql);
 });
 
-const connect = async (path) => {
-  const db = new Database(path);
-  return [db];
-};

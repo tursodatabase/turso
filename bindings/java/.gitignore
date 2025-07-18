@@ -24,6 +24,7 @@ out/
 bin/
 !**/src/main/**/bin/
 !**/src/test/**/bin/
+**/debug/**
 
 ### NetBeans ###
 /nbproject/private/
@@ -38,5 +39,5 @@ bin/
 ### Mac OS ###
 .DS_Store
 
-### limbo builds ###
+### turso builds ###
 libs

@@ -22,26 +22,26 @@ class JDBCTest {
   @Test
   void non_null_connection_is_returned_when_valid_url_is_passed() throws Exception {
     String fileUrl = TestUtils.createTempFile();
-    JDBC4Connection connection = JDBC.createConnection("jdbc:sqlite:" + fileUrl, new Properties());
+    JDBC4Connection connection = JDBC.createConnection("jdbc:turso:" + fileUrl, new Properties());
     assertThat(connection).isNotNull();
   }
 
   @Test
   void connection_can_be_retrieved_from_DriverManager() throws SQLException {
-    try (Connection connection = DriverManager.getConnection("jdbc:sqlite:sample.db")) {
+    try (Connection connection = DriverManager.getConnection("jdbc:turso:sample.db")) {
       assertThat(connection).isNotNull();
     }
   }
 
   @Test
   void retrieve_version() {
-    assertDoesNotThrow(() -> DriverManager.getDriver("jdbc:sqlite:").getMajorVersion());
-    assertDoesNotThrow(() -> DriverManager.getDriver("jdbc:sqlite:").getMinorVersion());
+    assertDoesNotThrow(() -> DriverManager.getDriver("jdbc:turso:").getMajorVersion());
+    assertDoesNotThrow(() -> DriverManager.getDriver("jdbc:turso:").getMinorVersion());
   }
 
   @Test
   void all_driver_property_info_should_have_a_description() throws Exception {
-    Driver driver = DriverManager.getDriver("jdbc:sqlite:");
+    Driver driver = DriverManager.getDriver("jdbc:turso:");
     assertThat(driver.getPropertyInfo(null, null))
         .allSatisfy((info) -> assertThat(info.description).isNotNull());
   }

@@ -64,7 +64,7 @@ Turso
 Enter ".help" for usage hints.
 Connected to a transient in-memory database.
 Use ".open FILENAME" to reopen on a persistent database
-turso> CREATE TABLE users (id INT PRIMARY KEY, username TEXT);
+turso> CREATE TABLE users (id INT, username TEXT);
 turso> INSERT INTO users VALUES (1, 'alice');
 turso> INSERT INTO users VALUES (2, 'bob');
 turso> SELECT * FROM users;

@@ -48,6 +48,6 @@ jobs:
     - name: Build
       run: cargo build --verbose
     - name: Run ignored long tests
-      run: cargo run -p limbo_stress -- -t 1 -i 10000 -s
+      run: cargo run -p turso_stress -- -t 1 -i 10000 -s
       env:
         RUST_BACKTRACE: 1

@@ -9,7 +9,7 @@ import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
 import tech.turso.annotations.Nullable;
 import tech.turso.annotations.SkipNullableCheck;
-import tech.turso.core.LimboPropertiesHolder;
+import tech.turso.core.TursoPropertiesHolder;
 import tech.turso.utils.Logger;
 import tech.turso.utils.LoggerFactory;
 
@@ -18,22 +18,37 @@ public final class JDBC4DatabaseMetaData implements DatabaseMetaData {
   private static final Logger logger = LoggerFactory.getLogger(JDBC4DatabaseMetaData.class);
 
   private final JDBC4Connection connection;
+
   @Nullable private PreparedStatement getTables = null;
+
   @Nullable private PreparedStatement getTableTypes = null;
+
   @Nullable private PreparedStatement getTypeInfo = null;
+
   @Nullable private PreparedStatement getCatalogs = null;
+
   @Nullable private PreparedStatement getSchemas = null;
+
   @Nullable private PreparedStatement getUDTs = null;
+
   @Nullable private PreparedStatement getColumnsTblName = null;
+
   @Nullable private PreparedStatement getSuperTypes = null;
+
   @Nullable private PreparedStatement getSuperTables = null;
+
   @Nullable private PreparedStatement getTablePrivileges = null;
+
   @Nullable private PreparedStatement getIndexInfo = null;
+
   @Nullable private PreparedStatement getProcedures = null;
-  @Nullable private PreparedStatement getProcedureColumns = null;
+
   @Nullable private PreparedStatement getAttributes = null;
+
   @Nullable private PreparedStatement getBestRowIdentifier = null;
+
   @Nullable private PreparedStatement getVersionColumns = null;
+
   @Nullable private PreparedStatement getColumnPrivileges = null;
 
   public JDBC4DatabaseMetaData(JDBC4Connection connection) {
@@ -88,7 +103,7 @@ public final class JDBC4DatabaseMetaData implements DatabaseMetaData {
 
   @Override
   public String getDatabaseProductName() {
-    return "Limbo";
+    return "turso";
   }
 
   @Override
@@ -99,12 +114,12 @@ public final class JDBC4DatabaseMetaData implements DatabaseMetaData {
 
   @Override
   public String getDriverName() {
-    return LimboPropertiesHolder.getDriverName();
+    return TursoPropertiesHolder.getDriverName();
   }
 
   @Override
   public String getDriverVersion() {
-    return LimboPropertiesHolder.getDriverVersion();
+    return TursoPropertiesHolder.getDriverVersion();
   }
 
   @Override
@@ -174,13 +189,13 @@ public final class JDBC4DatabaseMetaData implements DatabaseMetaData {
 
   @Override
   public String getSQLKeywords() {
-    // TODO: add more limbo supported keywords
-    return "ABORT,ACTION,AFTER,ANALYZE,ATTACH,AUTOINCREMENT,BEFORE,"
+    // TODO: add more turso supported keywords
+    return ("ABORT,ACTION,AFTER,ANALYZE,ATTACH,AUTOINCREMENT,BEFORE,"
         + "CASCADE,CONFLICT,DATABASE,DEFERRABLE,DEFERRED,DESC,DETACH,"
         + "EXCLUSIVE,EXPLAIN,FAIL,GLOB,IGNORE,INDEX,INDEXED,INITIALLY,INSTEAD,ISNULL,"
         + "KEY,LIMIT,NOTNULL,OFFSET,PLAN,PRAGMA,QUERY,"
         + "RAISE,REGEXP,REINDEX,RENAME,REPLACE,RESTRICT,"
-        + "TEMP,TEMPORARY,TRANSACTION,VACUUM,VIEW,VIRTUAL";
+        + "TEMP,TEMPORARY,TRANSACTION,VACUUM,VIEW,VIRTUAL");
   }
 
   @Override
@@ -318,7 +333,7 @@ public final class JDBC4DatabaseMetaData implements DatabaseMetaData {
     //   DECLARE CURSOR
     //   FETCH
     //   CLOSE CURSOR
-    // TODO: Let's return true when limbo supports them all
+    // TODO: Let's return true when turso supports them all
     return false;
   }
 
@@ -331,7 +346,7 @@ public final class JDBC4DatabaseMetaData implements DatabaseMetaData {
     //   Table expressions (SELECT column FROM (SELECT * FROM table) AS subquery)
     //   Data type support (includes more SQL data types like FLOAT, NUMERIC, DECIMAL)
     //   Basic string functions (e.g., LENGTH(), SUBSTRING(), CONCAT())
-    // TODO: Let's return true when limbo supports them all
+    // TODO: Let's return true when turso supports them all
     return false;
   }
 
@@ -392,7 +407,7 @@ public final class JDBC4DatabaseMetaData implements DatabaseMetaData {
 
   @Override
   public boolean isCatalogAtStart() {
-    // sqlite and limbo doesn't use catalog
+    // sqlite and turso doesn't use catalog
     return false;
   }
 
@@ -498,13 +513,13 @@ public final class JDBC4DatabaseMetaData implements DatabaseMetaData {
 
   @Override
   public boolean supportsUnion() {
-    // TODO: return true when limbo supports
+    // TODO: return true when turso supports
     return false;
   }
 
   @Override
   public boolean supportsUnionAll() {
-    // TODO: return true when limbo supports
+    // TODO: return true when turso supports
     return false;
   }
 
@@ -635,13 +650,13 @@ public final class JDBC4DatabaseMetaData implements DatabaseMetaData {
 
   @Override
   public int getDefaultTransactionIsolation() {
-    // TODO: after limbo introduces Hekaton MVCC, what should we return?
+    // TODO: after turso introduces Hekaton MVCC, what should we return?
     return Connection.TRANSACTION_SERIALIZABLE;
   }
 
   @Override
   public boolean supportsTransactions() {
-    // TODO: limbo doesn't support transactions fully, let's return true when supported
+    // TODO: turso doesn't support transactions fully, let's return true when supported
     return false;
   }
 
@@ -922,7 +937,7 @@ public final class JDBC4DatabaseMetaData implements DatabaseMetaData {
 
   @Override
   public boolean supportsResultSetConcurrency(int type, int concurrency) {
-    return type == ResultSet.TYPE_FORWARD_ONLY && concurrency == ResultSet.CONCUR_READ_ONLY;
+    return (type == ResultSet.TYPE_FORWARD_ONLY && concurrency == ResultSet.CONCUR_READ_ONLY);
   }
 
   @Override
@@ -1001,13 +1016,13 @@ public final class JDBC4DatabaseMetaData implements DatabaseMetaData {
 
   @Override
   public boolean supportsSavepoints() {
-    // TODO: return true when limbo supports save points
+    // TODO: return true when turso supports save points
     return false;
   }
 
   @Override
   public boolean supportsNamedParameters() {
-    // TODO: return true when both limbo and jdbc supports named parameters
+    // TODO: return true when both turso and jdbc supports named parameters
     return false;
   }
 

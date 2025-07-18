@@ -27,7 +27,7 @@ publishing {
         create<MavenPublication>("mavenJava") {
             from(components["java"])
             groupId = "tech.turso"
-            artifactId = "limbo"
+            artifactId = "turso"
             version = "0.0.1-SNAPSHOT"
         }
     }
@@ -49,10 +49,10 @@ dependencies {
 }
 
 application {
-    val limboSystemLibraryPath = System.getenv("LIMBO_LIBRARY_PATH")
-    if (limboSystemLibraryPath != null) {
+    val tursoSystemLibraryPath = System.getenv("TURSO_LIBRARY_PATH")
+    if (tursoSystemLibraryPath != null) {
         applicationDefaultJvmArgs = listOf(
-            "-Djava.library.path=${System.getProperty("java.library.path")}:$limboSystemLibraryPath"
+            "-Djava.library.path=${System.getProperty("java.library.path")}:$tursoSystemLibraryPath"
         )
     }
 }
@@ -66,7 +66,7 @@ tasks.jar {
 sourceSets {
     test {
         resources {
-            file("src/main/resource/limbo-jdbc.properties")
+            file("src/main/resource/turso-jdbc.properties")
         }
     }
 }
@@ -76,7 +76,7 @@ tasks.test {
     // In order to find rust built file under resources, we need to set it as system path
     systemProperty(
         "java.library.path",
-        "${System.getProperty("java.library.path")}:$projectDir/src/test/resources/limbo/debug"
+        "${System.getProperty("java.library.path")}:$projectDir/src/test/resources/turso/debug"
     )
 
     // For our fancy test logging
@@ -143,6 +143,7 @@ spotless {
     java {
         target("**/*.java")
         targetExclude(layout.buildDirectory.dir("**/*.java").get().asFile)
+        targetExclude("example/**/*.java")
         removeUnusedImports()
         googleJavaFormat("1.7") // or use eclipse().configFile("path/to/eclipse-format.xml")
     }

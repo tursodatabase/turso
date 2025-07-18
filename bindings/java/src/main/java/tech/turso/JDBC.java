@@ -5,15 +5,16 @@ import java.util.Locale;
 import java.util.Properties;
 import tech.turso.annotations.Nullable;
 import tech.turso.annotations.SkipNullableCheck;
-import tech.turso.core.LimboPropertiesHolder;
+import tech.turso.core.TursoPropertiesHolder;
 import tech.turso.jdbc4.JDBC4Connection;
 import tech.turso.utils.Logger;
 import tech.turso.utils.LoggerFactory;
 
 public final class JDBC implements Driver {
+
   private static final Logger logger = LoggerFactory.getLogger(JDBC.class);
 
-  private static final String VALID_URL_PREFIX = "jdbc:sqlite:";
+  private static final String VALID_URL_PREFIX = "jdbc:turso:";
 
   static {
     try {
@@ -33,7 +34,7 @@ public final class JDBC implements Driver {
   }
 
   private static boolean isValidURL(String url) {
-    return url != null && url.toLowerCase(Locale.ROOT).startsWith(VALID_URL_PREFIX);
+    return (url != null && url.toLowerCase(Locale.ROOT).startsWith(VALID_URL_PREFIX));
   }
 
   private static String extractAddress(String url) {
@@ -53,17 +54,17 @@ public final class JDBC implements Driver {
 
   @Override
   public DriverPropertyInfo[] getPropertyInfo(String url, Properties info) throws SQLException {
-    return LimboConfig.getDriverPropertyInfo();
+    return TursoConfig.getDriverPropertyInfo();
   }
 
   @Override
   public int getMajorVersion() {
-    return Integer.parseInt(LimboPropertiesHolder.getDriverVersion().split("\\.")[0]);
+    return Integer.parseInt(TursoPropertiesHolder.getDriverVersion().split("\\.")[0]);
   }
 
   @Override
   public int getMinorVersion() {
-    return Integer.parseInt(LimboPropertiesHolder.getDriverVersion().split("\\.")[1]);
+    return Integer.parseInt(TursoPropertiesHolder.getDriverVersion().split("\\.")[1]);
   }
 
   @Override

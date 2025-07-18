@@ -3454,6 +3454,7 @@ pub fn op_function(
                 let pattern = &state.registers[*start_reg];
                 let text = &state.registers[*start_reg + 1];
                 let result = match (pattern.get_owned_value(), text.get_owned_value()) {
+                    (Value::Null, _) | (_, Value::Null) => Value::Null,
                     (Value::Text(pattern), Value::Text(text)) => {
                         let cache = if *constant_mask > 0 {
                             Some(&mut state.regex_cache.glob)
@@ -3462,8 +3463,16 @@ pub fn op_function(
                         };
                         Value::Integer(exec_glob(cache, pattern.as_str(), text.as_str()) as i64)
                     }
-                    _ => {
-                        unreachable!("Like on non-text registers");
+                    // Convert any other value types to text for GLOB comparison
+                    (pattern_val, text_val) => {
+                        let pattern_str = pattern_val.to_string();
+                        let text_str = text_val.to_string();
+                        let cache = if *constant_mask > 0 {
+                            Some(&mut state.regex_cache.glob)
+                        } else {
+                            None
+                        };
+                        Value::Integer(exec_glob(cache, &pattern_str, &text_str) as i64)
                     }
                 };
                 state.registers[*dest] = Register::Value(result);

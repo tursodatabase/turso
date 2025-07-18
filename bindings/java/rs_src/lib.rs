@@ -1,5 +1,5 @@
 mod errors;
-mod limbo_connection;
-mod limbo_db;
-mod limbo_statement;
+mod turso_connection;
+mod turso_db;
+mod turso_statement;
 mod utils;

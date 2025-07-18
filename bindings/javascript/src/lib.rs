@@ -35,8 +35,8 @@ pub struct Database {
     pub readonly: bool,
     // #[napi(writable = false)]
     // pub in_transaction: bool,
-    // #[napi(writable = false)]
-    // pub open: bool,
+    #[napi(writable = false)]
+    pub open: bool,
     #[napi(writable = false)]
     pub name: String,
     _db: Arc<turso_core::Database>,
@@ -80,6 +80,7 @@ impl Database {
             memory,
             _db: db,
             conn,
+            open: true,
             name: path,
             io,
         })
@@ -133,6 +134,11 @@ impl Database {
     #[napi]
     pub fn readonly(&self) -> bool {
         self.readonly
+    }
+
+    #[napi]
+    pub fn open(&self) -> bool {
+        self.open
     }
 
     #[napi]
@@ -208,8 +214,11 @@ impl Database {
     }
 
     #[napi]
-    pub fn close(&self) -> napi::Result<()> {
-        self.conn.close().map_err(into_napi_error)?;
+    pub fn close(&mut self) -> napi::Result<()> {
+        if self.open {
+            self.conn.close().map_err(into_napi_error)?;
+            self.open = false;
+        }
         Ok(())
     }
 }

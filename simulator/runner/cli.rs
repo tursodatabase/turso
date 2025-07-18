@@ -94,6 +94,10 @@ pub struct SimulatorCLI {
         default_value_t = 0
     )]
     pub latency_probability: usize,
+    #[clap(long, help = "Enable experimental MVCC feature")]
+    pub experimental_mvcc: bool,
+    #[clap(long, help = "Enable experimental indexing feature")]
+    pub experimental_indexes: bool,
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]

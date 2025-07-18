@@ -10,15 +10,16 @@ import java.sql.Statement;
 import java.util.concurrent.locks.ReentrantLock;
 import tech.turso.annotations.Nullable;
 import tech.turso.annotations.SkipNullableCheck;
-import tech.turso.core.LimboResultSet;
-import tech.turso.core.LimboStatement;
+import tech.turso.core.TursoResultSet;
+import tech.turso.core.TursoStatement;
 
 public class JDBC4Statement implements Statement {
 
   private final JDBC4Connection connection;
-  @Nullable protected LimboStatement statement = null;
 
-  // Because JDBC4Statement has different life cycle in compared to LimboStatement, let's use this
+  @Nullable protected TursoStatement statement = null;
+
+  // Because JDBC4Statement has different life cycle in compared to tursoStatement, let's use this
   // field to manage JDBC4Statement lifecycle
   private boolean closed;
   private boolean closeOnCompletion;
@@ -76,7 +77,7 @@ public class JDBC4Statement implements Statement {
 
     execute(sql);
     requireNonNull(statement, "statement should not be null after running execute method");
-    final LimboResultSet resultSet = statement.getResultSet();
+    final TursoResultSet resultSet = statement.getResultSet();
     resultSet.consumeAll();
 
     return (int) (statement.totalChanges() - previousTotalChanges);

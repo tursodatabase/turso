@@ -27,7 +27,7 @@ class JDBC4ResultSetTest {
   @BeforeEach
   void setUp() throws Exception {
     String filePath = TestUtils.createTempFile();
-    String url = "jdbc:sqlite:" + filePath;
+    String url = "jdbc:turso:" + filePath;
     final JDBC4Connection connection = new JDBC4Connection(url, filePath, new Properties());
     stmt =
         connection.createStatement(
