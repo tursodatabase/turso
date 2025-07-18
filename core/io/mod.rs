@@ -23,7 +23,7 @@ pub trait File: Send + Sync {
     ) -> Result<Arc<Completion>>;
     fn sync(&self, c: Arc<Completion>) -> Result<Arc<Completion>>;
     fn size(&self) -> Result<u64>;
-    fn truncate(&self, len: usize, c: Completion) -> Result<Arc<Completion>>;
+    fn truncate(&self, len: usize, c: Arc<Completion>) -> Result<Arc<Completion>>;
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -112,6 +112,14 @@ impl Completion {
         ))))
     }
 
+    pub fn new_trunc<F>(complete: F) -> Self
+    where
+        F: Fn(i32) + 'static,
+    {
+        Self::new(CompletionType::Truncate(TruncateCompletion::new(Box::new(
+            complete,
+        ))))
+    }
     pub fn is_completed(&self) -> bool {
         self.is_completed.get()
     }
