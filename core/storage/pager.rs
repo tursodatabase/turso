@@ -660,10 +660,7 @@ impl Pager {
         let reserved_space = if let Some(reserved_space) = self.reserved_space.get() {
             *reserved_space
         } else {
-            let space = match header_accessor::get_reserved_space_async(self)? {
-                IOResult::Done(s) => s,
-                IOResult::IO => return Ok(IOResult::IO),
-            };
+            let space = return_if_io!(header_accessor::get_reserved_space_async(self));
             self.reserved_space.set(space).unwrap();
             space
         };
