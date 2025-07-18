@@ -48,7 +48,12 @@ pub trait IO: Clock + Send + Sync {
 
     fn run_once(&self) -> Result<()>;
 
-    fn wait_for_completion(&self, c: Arc<Completion>) -> Result<()>;
+    fn wait_for_completion(&self, c: Arc<Completion>) -> Result<()> {
+        while !c.is_completed() {
+            self.run_once()?;
+        }
+        Ok(())
+    }
 
     fn generate_random_number(&self) -> i64 {
         let mut buf = [0u8; 8];

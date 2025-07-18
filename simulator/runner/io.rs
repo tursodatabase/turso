@@ -104,13 +104,6 @@ impl IO for SimulatorIO {
         Ok(file)
     }
 
-    fn wait_for_completion(&self, c: Arc<turso_core::Completion>) -> Result<()> {
-        while !c.is_completed() {
-            self.run_once()?;
-        }
-        Ok(())
-    }
-
     fn run_once(&self) -> Result<()> {
         if self.fault.get() {
             self.nr_run_once_faults

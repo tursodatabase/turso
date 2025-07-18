@@ -279,13 +279,6 @@ impl IO for UnixIO {
         }
         Ok(())
     }
-
-    fn wait_for_completion(&self, c: Arc<Completion>) -> Result<()> {
-        while !c.is_completed() {
-            self.run_once()?;
-        }
-        Ok(())
-    }
 }
 
 enum CompletionCallback {

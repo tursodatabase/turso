@@ -44,10 +44,6 @@ impl IO for VfsMod {
         Ok(())
     }
 
-    fn wait_for_completion(&self, _c: Arc<Completion>) -> Result<()> {
-        todo!();
-    }
-
     fn generate_random_number(&self) -> i64 {
         if self.ctx.is_null() {
             return -1;
