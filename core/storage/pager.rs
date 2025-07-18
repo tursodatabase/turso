@@ -9,6 +9,7 @@ use crate::types::IOResult;
 use crate::util::IOExt as _;
 use crate::{return_if_io, Completion};
 use crate::{turso_assert, Buffer, Connection, LimboError, Result};
+use bitflags::bitflags;
 use parking_lot::RwLock;
 use std::cell::{Cell, OnceCell, RefCell, UnsafeCell};
 use std::collections::HashSet;
@@ -25,6 +26,38 @@ use super::wal::CheckpointMode;
 
 #[cfg(not(feature = "omit_autovacuum"))]
 use {crate::io::Buffer as IoBuffer, ptrmap::*};
+
+#[derive(Debug, Copy, Clone)]
+pub struct SpillFlag(u8);
+
+bitflags! {
+    impl SpillFlag: u8 {
+        /// Never spill cache. Set via pragma
+        const OFF = 0b01;
+        /// Current rolling back, so do not spill
+        const ROLLBACK = 0b10;
+        /// Spill is ok, but do not sync
+        const NO_SYNC = 0b11;
+    }
+}
+
+impl SpillFlag {
+    pub fn can_spill(&self) -> bool {
+        self.contains(SpillFlag::NO_SYNC) || self.is_empty()
+    }
+
+    pub fn is_off(&self) -> bool {
+        self.contains(SpillFlag::OFF)
+    }
+
+    pub fn disable(&mut self, toggle: bool) {
+        if toggle {
+            self.remove(SpillFlag::OFF);
+        } else {
+            *self = SpillFlag::OFF;
+        }
+    }
+}
 
 pub struct PageInner {
     pub flags: AtomicUsize,
@@ -257,7 +290,7 @@ pub struct Pager {
     /// The write-ahead log (WAL) for the database.
     wal: Rc<RefCell<dyn Wal>>,
     /// A page cache for the database.
-    page_cache: Arc<RwLock<DumbLruPageCache>>,
+    pub page_cache: Arc<RwLock<DumbLruPageCache>>,
     /// Buffer pool for temporary data storage.
     pub buffer_pool: Arc<BufferPool>,
     /// I/O interface for input/output operations.
@@ -283,6 +316,7 @@ pub struct Pager {
     page_size: Cell<Option<u32>>,
     reserved_space: OnceCell<u8>,
     free_page_state: RefCell<FreePageState>,
+    pub spill_flag: RefCell<SpillFlag>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -360,6 +394,7 @@ impl Pager {
                 in_flight_writes: Rc::new(RefCell::new(0)),
             }),
             free_page_state: RefCell::new(FreePageState::Start),
+            spill_flag: RefCell::new(SpillFlag::empty()),
         })
     }
 
@@ -1361,6 +1396,10 @@ impl Pager {
         self.wal.borrow_mut().rollback()?;
 
         Ok(())
+    }
+
+    pub fn disable_cache_spill(&self, toggle: bool) {
+        self.spill_flag.borrow_mut().disable(toggle);
     }
 }
 

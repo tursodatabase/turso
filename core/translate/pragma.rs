@@ -12,7 +12,7 @@ use crate::storage::pager::AutoVacuumMode;
 use crate::storage::sqlite3_ondisk::MIN_PAGE_CACHE_SIZE;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::schema::translate_create_table;
-use crate::util::{normalize_ident, parse_signed_number, parse_string};
+use crate::util::{normalize_ident, parse_pragma_bool, parse_signed_number, parse_string};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::{bail_parse_error, storage, CaptureDataChangesMode, LimboError, Value};
@@ -251,6 +251,18 @@ fn update_pragma(
             Ok((program, TransactionMode::Write))
         }
         PragmaName::DatabaseList => unreachable!("database_list cannot be set"),
+        PragmaName::CacheSpill => {
+            if let Ok(toggle) = parse_pragma_bool(&value) {
+                pager.disable_cache_spill(toggle);
+            } else if let Ok(v) = parse_signed_number(&value) {
+                let usable_space = pager.usable_space();
+                let mut page_cache = pager.page_cache.write();
+                let threshold = v.to_int().unwrap();
+                page_cache.set_spill_threshold(threshold, usable_space);
+            }
+
+            Ok((program, TransactionMode::None))
+        }
     }
 }
 
@@ -458,6 +470,18 @@ fn query_pragma(
             program.add_pragma_result_column(pragma.columns[0].to_string());
             program.add_pragma_result_column(pragma.columns[1].to_string());
             Ok((program, TransactionMode::Read))
+        }
+        PragmaName::CacheSpill => {
+            let register = program.alloc_register();
+            if pager.spill_flag.borrow().is_off() {
+                program.emit_int(0, register);
+                program.emit_result_row(register, 1);
+            } else {
+                program.emit_int(pager.page_cache.read().spill_threshold as i64, register);
+                program.emit_result_row(register, 1);
+            }
+
+            Ok((program, TransactionMode::None))
         }
     }
 }

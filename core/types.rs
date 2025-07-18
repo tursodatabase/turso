@@ -293,6 +293,16 @@ impl Value {
             Value::Blob(b) => out.extend_from_slice(b),
         };
     }
+
+    /// Converts the value to an integer.
+    /// If the value is a float, it will be rounded down to the nearest integer.
+    pub fn to_int(&self) -> Option<i64> {
+        match self {
+            Value::Integer(t) => Some(*t),
+            Value::Float(f) => Some(f.floor() as i64),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
