@@ -192,17 +192,17 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
         }
 
         #[no_mangle]
-        pub unsafe extern "C" fn #trunc_fn_name(file_ptr: *const ::std::ffi::c_void, len: i64) -> i32 {
+        pub unsafe extern "C" fn #trunc_fn_name(file_ptr: *const ::std::ffi::c_void, len: i64) -> ::turso_ext::ResultCode {
             if file_ptr.is_null() {
-                return -1;
+                return ::turso_ext::ResultCode::Error;
             }
             let vfs_file: &mut ::turso_ext::VfsFileImpl = &mut *(file_ptr as *mut ::turso_ext::VfsFileImpl);
             let file: &mut <#struct_name as ::turso_ext::VfsExtension>::File =
                 &mut *(vfs_file.file as *mut <#struct_name as ::turso_ext::VfsExtension>::File);
             if <#struct_name as ::turso_ext::VfsExtension>::File::truncate(file, len).is_err() {
-                return -1;
+                return ::turso_ext::ResultCode::Error;
             }
-            0
+            ::turso_ext::ResultCode::OK
         }
 
         #[no_mangle]
