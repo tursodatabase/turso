@@ -2207,7 +2207,7 @@ impl BTreeCursor {
                     // insert cell
 
                     let mut cell_payload: Vec<u8> = Vec::with_capacity(record_values.len() + 4);
-                    fill_cell_payload(
+                    return_if_io!(fill_cell_payload(
                         page.get().get().contents.as_ref().unwrap(),
                         bkey.maybe_rowid(),
                         &mut cell_payload,
@@ -2215,7 +2215,7 @@ impl BTreeCursor {
                         record,
                         return_if_io!(self.usable_space()) as u16,
                         self.pager.clone(),
-                    );
+                    ));
 
                     // insert
                     let overflow = {
@@ -4932,7 +4932,7 @@ impl BTreeCursor {
         let serial_types_len = self.record_cursor.borrow_mut().len(record);
         let mut new_payload = Vec::with_capacity(serial_types_len);
         let rowid = return_if_io!(self.rowid());
-        fill_cell_payload(
+        return_if_io!(fill_cell_payload(
             page_contents,
             rowid,
             &mut new_payload,
@@ -4940,7 +4940,7 @@ impl BTreeCursor {
             record,
             return_if_io!(self.usable_space()) as u16,
             self.pager.clone(),
-        );
+        ));
 
         // figure out old cell offset & size
         let (old_offset, old_local_size) = {
@@ -6453,7 +6453,7 @@ fn fill_cell_payload(
     record: &ImmutableRecord,
     usable_space: u16,
     pager: Rc<Pager>,
-) {
+) -> Result<IOResult<()>> {
     // TODO: make record raw from start, having to serialize is not good
     let record_buf = record.get_payload().to_vec();
 
@@ -6482,7 +6482,7 @@ fn fill_cell_payload(
     if record_buf.len() <= payload_overflow_threshold_max {
         // enough allowed space to fit inside a btree page
         cell_payload.extend_from_slice(record_buf.as_slice());
-        return;
+        return Ok(IOResult::Done(()));
     }
 
     let payload_overflow_threshold_min = payload_overflow_threshold_min(page_type, usable_space);
@@ -6514,7 +6514,7 @@ fn fill_cell_payload(
 
         // we still have bytes to add, we will need to allocate new overflow page
         // FIXME: handle page cache is full
-        let overflow_page = pager.allocate_overflow_page();
+        let overflow_page = return_if_io!(pager.allocate_overflow_page());
         {
             let id = overflow_page.get().id as u32;
             let contents = overflow_page.get().contents.as_mut().unwrap();
@@ -6534,6 +6534,7 @@ fn fill_cell_payload(
     }
 
     assert_eq!(cell_size, cell_payload.len());
+    Ok(IOResult::Done(()))
 }
 
 /// Returns the maximum payload size (X) that can be stored directly on a b-tree page without spilling to overflow pages.
@@ -6695,9 +6696,9 @@ mod tests {
         page: &mut PageContent,
         record: ImmutableRecord,
         conn: &Arc<Connection>,
-    ) -> Vec<u8> {
+    ) -> Result<IOResult<Vec<u8>>> {
         let mut payload: Vec<u8> = Vec::new();
-        fill_cell_payload(
+        return_if_io!(fill_cell_payload(
             page,
             Some(id as i64),
             &mut payload,
@@ -6705,9 +6706,9 @@ mod tests {
             &record,
             4096,
             conn.pager.borrow().clone(),
-        );
+        ));
         insert_into_cell(page, &payload, pos, 4096).unwrap();
-        payload
+        Ok(IOResult::Done(payload))
     }
 
     #[test]
@@ -6720,7 +6721,11 @@ mod tests {
         let header_size = 8;
         let regs = &[Register::Value(Value::Integer(1))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
-        let payload = add_record(1, 0, page, record, &conn);
+        let payload = run_until_done(
+            || add_record(1, 0, page, record.clone(), &conn),
+            &conn.pager.borrow(),
+        )
+        .unwrap();
         assert_eq!(page.cell_count(), 1);
         let free = compute_free_space(page, 4096);
         assert_eq!(free, 4096 - payload.len() as u16 - 2 - header_size);
@@ -6750,7 +6755,11 @@ mod tests {
         for i in 0..3 {
             let regs = &[Register::Value(Value::Integer(i as i64))];
             let record = ImmutableRecord::from_registers(regs, regs.len());
-            let payload = add_record(i, i, page, record, &conn);
+            let payload = run_until_done(
+                || add_record(i, i, page, record.clone(), &conn),
+                &conn.pager.borrow(),
+            )
+            .unwrap();
             assert_eq!(page.cell_count(), i + 1);
             let free = compute_free_space(page, usable_space);
             total_size += payload.len() as u16 + 2;
@@ -6950,7 +6959,7 @@ mod tests {
 
         // FIXME: handle page cache is full
         let _ = run_until_done(|| pager.allocate_page1(), &pager);
-        let page2 = pager.allocate_page().unwrap();
+        let page2 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
         let page2 = Arc::new(BTreePageInner {
             page: RefCell::new(page2),
         });
@@ -7373,7 +7382,11 @@ mod tests {
         for i in 0..total_cells {
             let regs = &[Register::Value(Value::Integer(i as i64))];
             let record = ImmutableRecord::from_registers(regs, regs.len());
-            let payload = add_record(i, i, page, record, &conn);
+            let payload = run_until_done(
+                || add_record(i, i, page, record.clone(), &conn),
+                &conn.pager.borrow(),
+            )
+            .unwrap();
             assert_eq!(page.cell_count(), i + 1);
             let free = compute_free_space(page, usable_space);
             total_size += payload.len() as u16 + 2;
@@ -7763,7 +7776,11 @@ mod tests {
         for i in 0..3 {
             let regs = &[Register::Value(Value::Integer(i as i64))];
             let record = ImmutableRecord::from_registers(regs, regs.len());
-            let payload = add_record(i, i, page, record, &conn);
+            let payload = run_until_done(
+                || add_record(i, i, page, record.clone(), &conn),
+                &conn.pager.borrow(),
+            )
+            .unwrap();
             assert_eq!(page.cell_count(), i + 1);
             let free = compute_free_space(page, usable_space);
             total_size += payload.len() as u16 + 2;
@@ -7805,7 +7822,11 @@ mod tests {
         for i in 0..total_cells {
             let regs = &[Register::Value(Value::Integer(i as i64))];
             let record = ImmutableRecord::from_registers(regs, regs.len());
-            let payload = add_record(i, i, page, record, &conn);
+            let payload = run_until_done(
+                || add_record(i, i, page, record.clone(), &conn),
+                &conn.pager.borrow(),
+            )
+            .unwrap();
             assert_eq!(page.cell_count(), i + 1);
             let free = compute_free_space(page, usable_space);
             total_size += payload.len() as u16 + 2;
@@ -7862,15 +7883,21 @@ mod tests {
                     let regs = &[Register::Value(Value::Integer(i as i64))];
                     let record = ImmutableRecord::from_registers(regs, regs.len());
                     let mut payload: Vec<u8> = Vec::new();
-                    fill_cell_payload(
-                        page,
-                        Some(i as i64),
-                        &mut payload,
-                        cell_idx,
-                        &record,
-                        4096,
-                        conn.pager.borrow().clone(),
-                    );
+                    run_until_done(
+                        || {
+                            fill_cell_payload(
+                                page,
+                                Some(i as i64),
+                                &mut payload,
+                                cell_idx,
+                                &record,
+                                4096,
+                                conn.pager.borrow().clone(),
+                            )
+                        },
+                        &conn.pager.borrow(),
+                    )
+                    .unwrap();
                     if (free as usize) < payload.len() + 2 {
                         // do not try to insert overflow pages because they require balancing
                         continue;
@@ -7936,15 +7963,21 @@ mod tests {
                         let regs = &[Register::Value(Value::Integer(i))];
                         let record = ImmutableRecord::from_registers(regs, regs.len());
                         let mut payload: Vec<u8> = Vec::new();
-                        fill_cell_payload(
-                            page,
-                            Some(i),
-                            &mut payload,
-                            cell_idx,
-                            &record,
-                            4096,
-                            conn.pager.borrow().clone(),
-                        );
+                        run_until_done(
+                            || {
+                                fill_cell_payload(
+                                    page,
+                                    Some(i),
+                                    &mut payload,
+                                    cell_idx,
+                                    &record,
+                                    4096,
+                                    conn.pager.borrow().clone(),
+                                )
+                            },
+                            &conn.pager.borrow(),
+                        )
+                        .unwrap();
                         if (free as usize) < payload.len() - 2 {
                             // do not try to insert overflow pages because they require balancing
                             continue;
@@ -8090,7 +8123,11 @@ mod tests {
 
         let regs = &[Register::Value(Value::Integer(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
-        let payload = add_record(0, 0, page, record, &conn);
+        let payload = run_until_done(
+            || add_record(0, 0, page, record.clone(), &conn),
+            &conn.pager.borrow(),
+        )
+        .unwrap();
         let free = compute_free_space(page, usable_space);
         assert_eq!(free, 4096 - payload.len() as u16 - 2 - header_size);
     }
@@ -8107,7 +8144,11 @@ mod tests {
 
         let regs = &[Register::Value(Value::Integer(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
-        let payload = add_record(0, 0, page, record, &conn);
+        let payload = run_until_done(
+            || add_record(0, 0, page, record.clone(), &conn),
+            &conn.pager.borrow(),
+        )
+        .unwrap();
 
         assert_eq!(page.cell_count(), 1);
         defragment_page(page, usable_space);
@@ -8140,7 +8181,11 @@ mod tests {
 
         let regs = &[Register::Value(Value::Integer(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
-        let payload = add_record(0, 0, page, record, &conn);
+        let payload = run_until_done(
+            || add_record(0, 0, page, record.clone(), &conn),
+            &conn.pager.borrow(),
+        )
+        .unwrap();
         assert_eq!(page.cell_count(), 1);
 
         let (start, len) = page.cell_get_raw_region(0, usable_space as usize);
@@ -8172,7 +8217,11 @@ mod tests {
 
             let regs = &[Register::Value(Value::Integer(0))];
             let record = ImmutableRecord::from_registers(regs, regs.len());
-            let payload = add_record(0, 0, page, record, &conn);
+            let payload = run_until_done(
+                || add_record(0, 0, page, record.clone(), &conn),
+                &conn.pager.borrow(),
+            )
+            .unwrap();
             assert_eq!(page.cell_count(), 1);
 
             let (start, len) = page.cell_get_raw_region(0, usable_space as usize);
@@ -8193,7 +8242,11 @@ mod tests {
 
         let regs = &[Register::Value(Value::Integer(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
-        let payload = add_record(0, 0, page, record, &conn);
+        let payload = run_until_done(
+            || add_record(0, 0, page, record.clone(), &conn),
+            &conn.pager.borrow(),
+        )
+        .unwrap();
         let regs = &[Register::Value(Value::Integer(1))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
         let _ = add_record(1, 1, page, record, &conn);
@@ -8301,15 +8354,21 @@ mod tests {
         let regs = &[Register::Value(Value::Integer(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
         let mut payload: Vec<u8> = Vec::new();
-        fill_cell_payload(
-            page.get().get_contents(),
-            Some(0),
-            &mut payload,
-            0,
-            &record,
-            4096,
-            conn.pager.borrow().clone(),
-        );
+        run_until_done(
+            || {
+                fill_cell_payload(
+                    page.get().get_contents(),
+                    Some(0),
+                    &mut payload,
+                    0,
+                    &record,
+                    4096,
+                    conn.pager.borrow().clone(),
+                )
+            },
+            &conn.pager.borrow(),
+        )
+        .unwrap();
         let page = page.get();
         insert(0, page.get_contents());
         defragment(page.get_contents());
@@ -8381,15 +8440,21 @@ mod tests {
         let regs = &[Register::Value(Value::Blob(vec![0; 3600]))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
         let mut payload: Vec<u8> = Vec::new();
-        fill_cell_payload(
-            page.get().get_contents(),
-            Some(0),
-            &mut payload,
-            0,
-            &record,
-            4096,
-            conn.pager.borrow().clone(),
-        );
+        run_until_done(
+            || {
+                fill_cell_payload(
+                    page.get().get_contents(),
+                    Some(0),
+                    &mut payload,
+                    0,
+                    &record,
+                    4096,
+                    conn.pager.borrow().clone(),
+                )
+            },
+            &conn.pager.borrow(),
+        )
+        .unwrap();
         insert_into_cell(page.get().get_contents(), &payload, 0, 4096).unwrap();
         let free = compute_free_space(page.get().get_contents(), usable_space);
         let total_size = payload.len() + 2;
@@ -8729,7 +8794,7 @@ mod tests {
             let mut cells_cloned = Vec::new();
             let (pager, _, _, _) = empty_btree();
             let page_type = PageType::TableLeaf;
-            let page = pager.allocate_page().unwrap();
+            let page = run_until_done(|| pager.allocate_page(), &pager).unwrap();
             let page = Arc::new(BTreePageInner {
                 page: RefCell::new(page),
             });
@@ -8796,15 +8861,21 @@ mod tests {
         let regs = &[Register::Value(Value::Blob(vec![0; size as usize]))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
         let usable_space = run_until_done(|| pager.usable_space(), &pager).unwrap();
-        fill_cell_payload(
-            contents,
-            Some(cell_idx as i64),
-            &mut payload,
-            cell_idx as usize,
-            &record,
-            usable_space as u16,
-            pager.clone(),
-        );
+        run_until_done(
+            || {
+                fill_cell_payload(
+                    contents,
+                    Some(cell_idx as i64),
+                    &mut payload,
+                    cell_idx as usize,
+                    &record,
+                    usable_space as u16,
+                    pager.clone(),
+                )
+            },
+            &pager,
+        )
+        .unwrap();
         insert_into_cell(contents, &payload, cell_idx as usize, usable_space as u16).unwrap();
     }
 }

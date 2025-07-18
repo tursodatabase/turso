@@ -609,8 +609,8 @@ impl Pager {
     /// Allocate a new overflow page.
     /// This is done when a cell overflows and new space is needed.
     // FIXME: handle no room in page cache
-    pub fn allocate_overflow_page(&self) -> PageRef {
-        let page = self.allocate_page().unwrap();
+    pub fn allocate_overflow_page(&self) -> Result<IOResult<PageRef>> {
+        let page = return_if_io!(self.allocate_page());
         tracing::debug!("Pager::allocate_overflow_page(id={})", page.get().id);
 
         // setup overflow page
@@ -618,7 +618,7 @@ impl Pager {
         let buf = contents.as_ptr();
         buf.fill(0);
 
-        page
+        Ok(IOResult::Done(page))
     }
 
     /// Allocate a new page to the btree via the pager.
@@ -630,7 +630,7 @@ impl Pager {
         offset: usize,
         _alloc_mode: BtreePageAllocMode,
     ) -> Result<IOResult<BTreePage>> {
-        let page = self.allocate_page()?;
+        let page = return_if_io!(self.allocate_page());
         let page = Arc::new(BTreePageInner {
             page: RefCell::new(page),
         });
@@ -897,7 +897,7 @@ impl Pager {
             trace!(?state);
             match state {
                 CommitState::Start => {
-                    let db_size = header_accessor::get_database_size(self)?;
+                    let db_size = return_if_io!(header_accessor::get_database_size_async(self));
                     for (dirty_page_idx, page_id) in self.dirty_pages.borrow().iter().enumerate() {
                         let is_last_frame = dirty_page_idx == self.dirty_pages.borrow().len() - 1;
                         let mut cache = self.page_cache.write();
@@ -1112,7 +1112,9 @@ impl Pager {
         loop {
             match &mut *state {
                 FreePageState::Start => {
-                    if page_id < 2 || page_id > header_accessor::get_database_size(self)? as usize {
+                    let database_size =
+                        return_if_io!(header_accessor::get_database_size_async(self));
+                    if page_id < 2 || page_id > database_size as usize {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid page number {page_id} for free operation"
                         )));
@@ -1125,12 +1127,14 @@ impl Pager {
                         }
                         None => self.read_page(page_id)?,
                     };
-                    header_accessor::set_freelist_pages(
-                        self,
-                        header_accessor::get_freelist_pages(self)? + 1,
-                    )?;
 
-                    let trunk_page_id = header_accessor::get_freelist_trunk_page(self)?;
+                    return_if_io!(header_accessor::set_freelist_pages_async(
+                        self,
+                        return_if_io!(header_accessor::get_freelist_pages_async(self)) + 1
+                    ));
+
+                    let trunk_page_id =
+                        return_if_io!(header_accessor::get_freelist_trunk_page_async(self));
 
                     if trunk_page_id != 0 {
                         *state = FreePageState::AddToTrunk {
@@ -1142,7 +1146,8 @@ impl Pager {
                     }
                 }
                 FreePageState::AddToTrunk { page, trunk_page } => {
-                    let trunk_page_id = header_accessor::get_freelist_trunk_page(self)?;
+                    let trunk_page_id =
+                        return_if_io!(header_accessor::get_freelist_trunk_page_async(self));
                     if trunk_page.is_none() {
                         // Add as leaf to current trunk
                         trunk_page.replace(self.read_page(trunk_page_id as usize)?);
@@ -1185,7 +1190,8 @@ impl Pager {
                     page.set_dirty();
                     self.add_dirty(page_id);
 
-                    let trunk_page_id = header_accessor::get_freelist_trunk_page(self)?;
+                    let trunk_page_id =
+                        return_if_io!(header_accessor::get_freelist_trunk_page_async(self));
 
                     let contents = page.get().contents.as_mut().unwrap();
                     // Point to previous trunk
@@ -1193,7 +1199,10 @@ impl Pager {
                     // Zero leaf count
                     contents.write_u32(TRUNK_PAGE_LEAF_COUNT_OFFSET, 0);
                     // Update page 1 to point to new trunk
-                    header_accessor::set_freelist_trunk_page(self, page_id as u32)?;
+                    return_if_io!(header_accessor::set_freelist_trunk_page_async(
+                        self,
+                        page_id as u32
+                    ));
                     // Clear flags
                     page.clear_uptodate();
                     break;
@@ -1281,8 +1290,8 @@ impl Pager {
     // FIXME: handle no room in page cache
     #[allow(clippy::readonly_write_lock)]
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn allocate_page(&self) -> Result<PageRef> {
-        let old_db_size = header_accessor::get_database_size(self)?;
+    pub fn allocate_page(&self) -> Result<IOResult<PageRef>> {
+        let old_db_size = return_if_io!(header_accessor::get_database_size_async(self));
         #[allow(unused_mut)]
         let mut new_db_size = old_db_size + 1;
 
@@ -1294,7 +1303,10 @@ impl Pager {
             //  - autovacuum is enabled
             //  - the last page is a pointer map page
             if matches!(*self.auto_vacuum_mode.borrow(), AutoVacuumMode::Full)
-                && is_ptrmap_page(new_db_size, header_accessor::get_page_size(self)? as usize)
+                && is_ptrmap_page(
+                    new_db_size,
+                    return_if_io!(header_accessor::get_page_size_async(self)) as usize,
+                )
             {
                 let page = allocate_page(new_db_size as usize, &self.buffer_pool, 0);
                 page.set_dirty();
@@ -1316,7 +1328,7 @@ impl Pager {
             }
         }
 
-        header_accessor::set_database_size(self, new_db_size)?;
+        return_if_io!(header_accessor::set_database_size_async(self, new_db_size));
 
         // FIXME: should reserve page cache entry before modifying the database
         let page = allocate_page(new_db_size as usize, &self.buffer_pool, 0);
@@ -1328,11 +1340,13 @@ impl Pager {
             let page_key = PageCacheKey::new(page.get().id);
             let mut cache = self.page_cache.write();
             match cache.insert(page_key, page.clone()) {
-                Err(CacheError::Full) => Err(LimboError::CacheFull),
-                Err(_) => Err(LimboError::InternalError(
-                    "Unknown error inserting page to cache".into(),
-                )),
-                Ok(_) => Ok(page),
+                Err(CacheError::Full) => return Err(LimboError::CacheFull),
+                Err(_) => {
+                    return Err(LimboError::InternalError(
+                        "Unknown error inserting page to cache".into(),
+                    ))
+                }
+                Ok(_) => return Ok(IOResult::Done(page)),
             }
         }
     }
@@ -1358,10 +1372,10 @@ impl Pager {
         Ok(())
     }
 
-    pub fn usable_size(&self) -> usize {
-        let page_size = header_accessor::get_page_size(self).unwrap_or_default() as u32;
-        let reserved_space = header_accessor::get_reserved_space(self).unwrap_or_default() as u32;
-        (page_size - reserved_space) as usize
+    pub fn usable_size(&self) -> Result<IOResult<usize>> {
+        let page_size = return_if_io!(header_accessor::get_page_size_async(self));
+        let reserved_space = return_if_io!(header_accessor::get_reserved_space_async(self)) as u32;
+        Ok(IOResult::Done((page_size - reserved_space) as usize))
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
