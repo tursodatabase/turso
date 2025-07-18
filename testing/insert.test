@@ -410,3 +410,26 @@ if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-s
         SELECT COUNT(*) FROM t WHERE x >= replace(hex(zeroblob(100)), '00', 'a');
     } {8}
 }
+
+# regression test for incorrect order of column in insert
+do_execsql_test_on_specific_db {:memory:} insert-tricky-column-order-values {
+    create table t(x, y, z);
+    insert into t(z, x) values (1, 2), (3, 4);
+    insert into t(y, z) values (5, 6), (7, 8);
+    select * from t;
+} {2||1
+4||3
+|5|6
+|7|8}
+
+do_execsql_test_on_specific_db {:memory:} insert-tricky-column-order-table {
+    create table t(x, y, z);
+    create table q(x, y, z);
+    insert into q values (1, 2, 3), (4, 5, 6);
+    insert into t(z, x) select y, x from q;
+    insert into t(y, z) select z, y from q;
+    select * from t;
+} {1||2
+4||5
+|3|2
+|6|5}

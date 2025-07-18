@@ -787,36 +787,29 @@ fn resolve_indicies_for_insert(
 
 fn populate_columns_multiple_rows(
     program: &mut ProgramBuilder,
-    column_mappings: &[ColumnMapping],
+    column_mappings: &[ColumnMapping], // columns in order of table definition
     column_registers_start: usize,
     yield_reg: usize,
     resolver: &Resolver,
     temp_table_ctx: &Option<TempTableCtx>,
 ) -> Result<()> {
-    let mut value_index_seen = 0;
-    let mut other_values_seen = 0;
     for (i, mapping) in column_mappings.iter().enumerate() {
         let target_reg = column_registers_start + i;
 
-        other_values_seen += 1;
         if let Some(value_index) = mapping.value_index {
-            // Decrement as we have now seen a value index instead
-            other_values_seen -= 1;
             if let Some(temp_table_ctx) = temp_table_ctx {
                 program.emit_column(
                     temp_table_ctx.cursor_id,
-                    value_index_seen,
+                    value_index,
                     column_registers_start + i,
                 );
             } else {
                 program.emit_insn(Insn::Copy {
-                    src_reg: yield_reg + value_index_seen,
-                    dst_reg: column_registers_start + value_index + other_values_seen,
+                    src_reg: yield_reg + value_index,
+                    dst_reg: column_registers_start + i,
                     extra_amount: 0,
                 });
             }
-
-            value_index_seen += 1;
         } else if mapping.column.is_rowid_alias {
             program.emit_insn(Insn::SoftNull { reg: target_reg });
         } else if let Some(default_expr) = mapping.default_value {
