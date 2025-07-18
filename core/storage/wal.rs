@@ -17,7 +17,7 @@ use std::{
 };
 
 use crate::fast_lock::SpinLock;
-use crate::io::{CompletionType, File, IO};
+use crate::io::{File, IO};
 use crate::result::LimboResult;
 use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_write_wal_frame, finish_read_page, WAL_FRAME_HEADER_SIZE,
@@ -1189,10 +1189,7 @@ impl WalFileShared {
 
 #[cfg(test)]
 pub mod test {
-    use crate::{
-        storage::sqlite3_ondisk::WAL_HEADER_SIZE, Completion, CompletionType, Database, MemoryIO,
-        IO,
-    };
+    use crate::{storage::sqlite3_ondisk::WAL_HEADER_SIZE, Completion, Database, MemoryIO, IO};
     use std::{cell::Cell, rc::Rc, sync::Arc};
     use tempfile::TempDir;
 
@@ -1224,12 +1221,10 @@ pub mod test {
         let _done = done.clone();
         let _ = file.file.truncate(
             WAL_HEADER_SIZE,
-            Completion::new(CompletionType::Truncate(
-                crate::io::TruncateCompletion::new(Box::new(move |_| {
-                    let done = _done.clone();
-                    done.set(true);
-                })),
-            )),
+            Arc::new(Completion::new_trunc(move |_| {
+                let done = _done.clone();
+                done.set(true);
+            })),
         );
         assert!(file.file.size().unwrap() == WAL_HEADER_SIZE as u64);
         assert!(done.get());

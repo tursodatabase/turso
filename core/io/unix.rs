@@ -446,10 +446,9 @@ impl File for UnixFile<'_> {
     }
 
     #[instrument(err, skip_all, level = Level::INFO)]
-    fn truncate(&self, len: usize, c: Completion) -> Result<Arc<Completion>> {
+    fn truncate(&self, len: usize, c: Arc<Completion>) -> Result<Arc<Completion>> {
         let file = self.file.borrow();
         let result = file.set_len(len as u64);
-        let c = Arc::new(c);
         match result {
             Ok(()) => {
                 trace!("file truncated to len=({})", len);

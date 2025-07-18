@@ -117,11 +117,11 @@ impl File for WindowsFile {
         Ok(c)
     }
 
-    fn truncate(&self, len: usize, c: Completion) -> Result<()> {
+    fn truncate(&self, len: usize, c: Arc<Completion>) -> Result<Arc<Completion>> {
         let mut file = self.file.borrow_mut();
         file.set_len(len as u64).map_err(LimboError::IOError)?;
         c.complete(0);
-        Ok(())
+        Ok(c)
     }
 
     fn size(&self) -> Result<u64> {
