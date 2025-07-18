@@ -45,7 +45,8 @@ impl IO for VfsMod {
     }
 
     fn wait_for_completion(&self, _c: Arc<Completion>) -> Result<()> {
-        todo!();
+        // for the moment anyway, this is currently a sync api
+        Ok(())
     }
 
     fn generate_random_number(&self) -> i64 {
