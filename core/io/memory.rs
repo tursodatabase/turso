@@ -171,7 +171,7 @@ impl File for MemoryFile {
         Ok(c)
     }
 
-    fn truncate(&self, len: u64, c: Completion) -> Result<Arc<Completion>> {
+    fn truncate(&self, len: usize, c: Completion) -> Result<Arc<Completion>> {
         let new_size = len as usize;
         if new_size < self.size.get() {
             // Truncate pages
