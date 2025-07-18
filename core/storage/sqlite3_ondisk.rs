@@ -1632,7 +1632,11 @@ pub fn begin_write_wal_frame(
     Ok(checksums)
 }
 
-pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<()> {
+pub fn begin_write_wal_header(
+    io: &Arc<dyn File>,
+    header: &WalHeader,
+    done: Rc<AtomicBool>,
+) -> Result<()> {
     tracing::trace!("begin_write_wal_header");
     let buffer = {
         let drop_fn = Rc::new(|_buf| {});
@@ -1658,6 +1662,8 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
             bytes_written == WAL_HEADER_SIZE as i32,
             "wal header wrote({bytes_written}) != expected({WAL_HEADER_SIZE})"
         );
+        let done = done.clone();
+        done.store(true, Ordering::Relaxed);
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new_write(write_complete);
