@@ -107,14 +107,14 @@ impl TursoMcpServer {
                     let request: JsonRpcRequest = match serde_json::from_str(&line) {
                         Ok(req) => req,
                         Err(e) => {
-                            eprintln!("Failed to parse JSON-RPC request: {}", e);
+                            eprintln!("Failed to parse JSON-RPC request: {e}");
                             continue;
                         }
                     };
 
                     let response = self.handle_request(request);
                     let response_json = serde_json::to_string(&response)?;
-                    writeln!(stdout_lock, "{}", response_json)?;
+                    writeln!(stdout_lock, "{response_json}")?;
                     stdout_lock.flush()?;
                 }
                 Ok(Err(_)) => {
@@ -287,7 +287,7 @@ impl TursoMcpServer {
                         result: None,
                         error: Some(JsonRpcError {
                             code: -32602,
-                            message: format!("Invalid params: {}", e),
+                            message: format!("Invalid params: {e}"),
                             data: None,
                         }),
                     };
@@ -368,7 +368,7 @@ impl TursoMcpServer {
                             return "Database is busy".to_string();
                         }
                         Err(e) => {
-                            return format!("Error listing tables: {}", e);
+                            return format!("Error listing tables: {e}");
                         }
                     }
                 }
@@ -380,7 +380,7 @@ impl TursoMcpServer {
                 }
             }
             Ok(None) => "No results returned from the query".to_string(),
-            Err(e) => format!("Error querying database: {}", e),
+            Err(e) => format!("Error querying database: {e}"),
         }
     }
 
@@ -393,7 +393,7 @@ impl TursoMcpServer {
             None => return "Missing table_name parameter".to_string(),
         };
 
-        let query = format!("PRAGMA table_info({})", table_name);
+        let query = format!("PRAGMA table_info({table_name})");
 
         match self.conn.query(&query) {
             Ok(Some(mut rows)) => {
@@ -419,7 +419,7 @@ impl TursoMcpServer {
                                 let default_str = if matches!(default_value, DbValue::Null) {
                                     "".to_string()
                                 } else {
-                                    format!("DEFAULT {}", default_value)
+                                    format!("DEFAULT {default_value}")
                                 };
 
                                 columns.push(
@@ -455,19 +455,19 @@ impl TursoMcpServer {
                             return "Database is busy".to_string();
                         }
                         Err(e) => {
-                            return format!("Error describing table: {}", e);
+                            return format!("Error describing table: {e}");
                         }
                     }
                 }
 
                 if columns.is_empty() {
-                    format!("Table '{}' not found", table_name)
+                    format!("Table '{table_name}' not found")
                 } else {
                     format!("Table '{}' columns:\n{}", table_name, columns.join("\n"))
                 }
             }
-            Ok(None) => format!("Table '{}' not found", table_name),
-            Err(e) => format!("Error querying database: {}", e),
+            Ok(None) => format!("Table '{table_name}' not found"),
+            Err(e) => format!("Error querying database: {e}"),
         }
     }
 
@@ -519,7 +519,7 @@ impl TursoMcpServer {
                             return "Database is busy".to_string();
                         }
                         Err(e) => {
-                            return format!("Error executing query: {}", e);
+                            return format!("Error executing query: {e}");
                         }
                     }
                 }
@@ -545,7 +545,7 @@ impl TursoMcpServer {
                 }
             }
             Ok(None) => "No results returned from the query".to_string(),
-            Err(e) => format!("Error executing query: {}", e),
+            Err(e) => format!("Error executing query: {e}"),
         }
     }
 
@@ -566,7 +566,7 @@ impl TursoMcpServer {
 
         match self.conn.execute(query) {
             Ok(()) => "INSERT successful.".to_string(),
-            Err(e) => format!("Error executing INSERT: {}", e),
+            Err(e) => format!("Error executing INSERT: {e}"),
         }
     }
 
@@ -587,7 +587,7 @@ impl TursoMcpServer {
 
         match self.conn.execute(query) {
             Ok(()) => "UPDATE successful.".to_string(),
-            Err(e) => format!("Error executing UPDATE: {}", e),
+            Err(e) => format!("Error executing UPDATE: {e}"),
         }
     }
 
@@ -608,7 +608,7 @@ impl TursoMcpServer {
 
         match self.conn.execute(query) {
             Ok(()) => "DELETE successful.".to_string(),
-            Err(e) => format!("Error executing DELETE: {}", e),
+            Err(e) => format!("Error executing DELETE: {e}"),
         }
     }
 
@@ -632,7 +632,7 @@ impl TursoMcpServer {
 
         match self.conn.execute(query) {
             Ok(()) => "Schema change successful.".to_string(),
-            Err(e) => format!("Error executing schema change: {}", e),
+            Err(e) => format!("Error executing schema change: {e}"),
         }
     }
 }

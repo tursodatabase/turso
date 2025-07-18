@@ -593,8 +593,7 @@ fn bind_named_params(
         let param = stmt.parameters().name(non_zero_idx);
         let Some(name) = param else {
             return Err(napi::Error::from_reason(format!(
-                "could not find named parameter with index {}",
-                idx
+                "could not find named parameter with index {idx}"
             )));
         };
 
