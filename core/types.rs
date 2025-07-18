@@ -852,6 +852,12 @@ impl ImmutableRecord {
         }
     }
 
+    pub fn from_bin_record(payload: Vec<u8>) -> Self {
+        Self {
+            payload: Value::Blob(payload),
+        }
+    }
+
     // TODO: inline the complete record parsing code here.
     // Its probably more efficient.
     pub fn get_values(&self) -> Vec<RefValue> {
@@ -2329,6 +2335,22 @@ impl RawSlice {
             unsafe { std::slice::from_raw_parts(self.data, self.len) }
         }
     }
+}
+
+#[derive(Debug)]
+pub enum DatabaseChangeType {
+    Delete,
+    Update { bin_record: Vec<u8> },
+    Insert { bin_record: Vec<u8> },
+}
+
+#[derive(Debug)]
+pub struct DatabaseChange {
+    pub change_id: i64,
+    pub change_time: u64,
+    pub change: DatabaseChangeType,
+    pub table_name: String,
+    pub id: i64,
 }
 
 #[cfg(test)]
