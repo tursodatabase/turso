@@ -50,7 +50,11 @@ pub trait IO: Clock + Send + Sync {
 
     fn wait_for_completion(&self, c: Arc<Completion>) -> Result<()>;
 
-    fn generate_random_number(&self) -> i64;
+    fn generate_random_number(&self) -> i64 {
+        let mut buf = [0u8; 8];
+        getrandom::getrandom(&mut buf).unwrap();
+        i64::from_ne_bytes(buf)
+    }
 
     fn get_memory_io(&self) -> Arc<MemoryIO> {
         Arc::new(MemoryIO::new())
