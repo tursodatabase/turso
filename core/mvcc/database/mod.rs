@@ -781,11 +781,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         dropped
     }
 
-    // TODO: Implement recovery with pager
-    // pub fn recover(&self) -> Result<()> {
-    //     Ok(())
-    // }
-
     /// Writes a row to the pager for persistence.
     fn write_row_to_pager(
         &self,
