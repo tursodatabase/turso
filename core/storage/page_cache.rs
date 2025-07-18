@@ -356,9 +356,7 @@ impl DumbLruPageCache {
             let ref_count = Arc::strong_count(&existing_to_page);
             assert!(
                 ref_count <= 2,
-                "Page {:?} has {} references where it should have at most 2",
-                to_key,
-                ref_count
+                "Page {to_key:?} has {ref_count} references where it should have at most 2",
             );
             if existing_to_page.is_dirty() {
                 return Err(CacheError::Dirty { pgno: to_page_num });
@@ -367,7 +365,7 @@ impl DumbLruPageCache {
         }
 
         let from_entry_ptr = self.get_ptr(&from_key).ok_or_else(|| {
-            CacheError::InternalError(format!("Page {:?} not found in page cache", from_key))
+            CacheError::InternalError(format!("Page {from_key:?} not found in page cache"))
         })?;
         self.map.borrow_mut().remove(&from_key);
         self.map.borrow_mut().insert(to_key, from_entry_ptr);
