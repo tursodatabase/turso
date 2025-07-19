@@ -62,6 +62,7 @@ use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, Text
 use crate::{turso_assert, File, Result, WalFileShared};
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -622,9 +623,9 @@ impl PageContent {
         let cell_pointer = self.read_u16_no_offset(cell_pointer) as usize;
         let start = cell_pointer;
         let payload_overflow_threshold_max =
-            payload_overflow_threshold_max(self.page_type(), usable_size as u16);
+            payload_overflow_threshold_max(self.page_type(), usable_size);
         let payload_overflow_threshold_min =
-            payload_overflow_threshold_min(self.page_type(), usable_size as u16);
+            payload_overflow_threshold_min(self.page_type(), usable_size);
         let len = match self.page_type() {
             PageType::IndexInterior => {
                 let (len_payload, n_payload) = read_varint(&buf[cell_pointer + 4..]).unwrap();
@@ -750,7 +751,7 @@ pub fn begin_read_page(
     Ok(())
 }
 
-#[instrument(skip_all, level = Level::INFO)]
+#[instrument(skip_all, level = Level::DEBUG)]
 pub fn finish_read_page(
     page_idx: usize,
     buffer_ref: Arc<RefCell<Buffer>>,
@@ -773,11 +774,7 @@ pub fn finish_read_page(
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-pub fn begin_write_btree_page(
-    pager: &Pager,
-    page: &PageRef,
-    write_counter: Rc<RefCell<usize>>,
-) -> Result<()> {
+pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Arc<Completion>> {
     tracing::trace!("begin_write_btree_page(page={})", page.get().id);
     let page_source = &pager.db_file;
     let page_finish = page.clone();
@@ -790,15 +787,12 @@ pub fn begin_write_btree_page(
         contents.buffer.clone()
     };
 
-    *write_counter.borrow_mut() += 1;
-    let clone_counter = write_counter.clone();
     let write_complete = {
         let buf_copy = buffer.clone();
         Box::new(move |bytes_written: i32| {
             tracing::trace!("finish_write_btree_page");
             let buf_copy = buf_copy.clone();
             let buf_len = buf_copy.borrow().len();
-            *clone_counter.borrow_mut() -= 1;
 
             page_finish.clear_dirty();
             turso_assert!(
@@ -808,24 +802,14 @@ pub fn begin_write_btree_page(
         })
     };
     let c = Completion::new_write(write_complete);
-    let res = page_source.write_page(page_id, buffer.clone(), c);
-    if res.is_err() {
-        // Avoid infinite loop if write page fails
-        *write_counter.borrow_mut() -= 1;
-    }
-    res
+    page_source.write_page(page_id, buffer.clone(), c)
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>, syncing: Rc<RefCell<bool>>) -> Result<()> {
-    assert!(!*syncing.borrow());
-    *syncing.borrow_mut() = true;
-    let completion = Completion::new_sync(move |_| {
-        *syncing.borrow_mut() = false;
-    });
+pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>) -> Result<Arc<Completion>> {
+    let completion = Completion::new_sync(move |_| {});
     #[allow(clippy::arc_with_non_send_sync)]
-    db_file.sync(completion)?;
-    Ok(())
+    db_file.sync(completion)
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -843,7 +827,7 @@ pub struct TableInteriorCell {
     pub rowid: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TableLeafCell {
     pub rowid: i64,
     /// Payload of cell, if it overflows it won't include overflowed payload.
@@ -851,6 +835,16 @@ pub struct TableLeafCell {
     /// This is the complete payload size including overflow pages.
     pub payload_size: u64,
     pub first_overflow_page: Option<u32>,
+}
+
+impl Debug for TableLeafCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TableLeafCell")
+            .field("rowid", &self.rowid)
+            .field("payload_size", &self.payload_size)
+            .field("first_overflow_page", &self.first_overflow_page)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -879,8 +873,8 @@ pub fn read_btree_cell(
     usable_size: usize,
 ) -> Result<BTreeCell> {
     let page_type = page_content.page_type();
-    let max_local = payload_overflow_threshold_max(page_type, usable_size as u16);
-    let min_local = payload_overflow_threshold_min(page_type, usable_size as u16);
+    let max_local = payload_overflow_threshold_max(page_type, usable_size);
+    let min_local = payload_overflow_threshold_min(page_type, usable_size);
     match page_type {
         PageType::IndexInterior => {
             let mut pos = pos;
@@ -1532,7 +1526,7 @@ pub fn begin_read_wal_frame(
     Ok(c)
 }
 
-#[instrument(err,skip(io, page, write_counter, wal_header, checksums), level = Level::DEBUG)]
+#[instrument(err,skip(io, page, wal_header, checksums), level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
 pub fn begin_write_wal_frame(
     io: &Arc<dyn File>,
@@ -1540,10 +1534,9 @@ pub fn begin_write_wal_frame(
     page: &PageRef,
     page_size: u16,
     db_size: u32,
-    write_counter: Rc<RefCell<usize>>,
     wal_header: &WalHeader,
     checksums: (u32, u32),
-) -> Result<(u32, u32)> {
+) -> Result<(Arc<Completion>, (u32, u32))> {
     let page_finish = page.clone();
     let page_id = page.get().id;
     tracing::trace!(page_id);
@@ -1604,14 +1597,11 @@ pub fn begin_write_wal_frame(
         (Arc::new(RefCell::new(buffer)), final_checksum)
     };
 
-    let clone_counter = write_counter.clone();
-    *write_counter.borrow_mut() += 1;
     let write_complete = {
         let buf_copy = buffer.clone();
         Box::new(move |bytes_written: i32| {
             let buf_copy = buf_copy.clone();
             let buf_len = buf_copy.borrow().len();
-            *clone_counter.borrow_mut() -= 1;
 
             page_finish.clear_dirty();
             turso_assert!(
@@ -1622,14 +1612,9 @@ pub fn begin_write_wal_frame(
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new_write(write_complete);
-    let res = io.pwrite(offset, buffer.clone(), c.into());
-    if res.is_err() {
-        // If we do not reduce the counter here on error, we incur an infinite loop when cacheflushing
-        *write_counter.borrow_mut() -= 1;
-    }
-    res?;
+    let c = io.pwrite(offset, buffer.clone(), c.into())?;
     tracing::trace!("Frame written and synced");
-    Ok(checksums)
+    Ok((c, checksums))
 }
 
 pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<()> {

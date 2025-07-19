@@ -232,6 +232,8 @@ enum WriteState {
     /// 1. If the leftmost page triggered balancing, up to 3 leftmost pages will be balanced.
     /// 2. If the rightmost page triggered balancing, up to 3 rightmost pages will be balanced.
     BalanceNonRootPickSiblings,
+    /// Waits for the Sibling pages to be loaded
+    BalanceNonRootWaitSiblings,
     /// Perform the actual balancing. This will result in 1-5 pages depending on the number of total cells to be distributed
     /// from the source pages.
     BalanceNonRootDoBalancing,
@@ -837,8 +839,8 @@ impl BTreeCursor {
         page_type: PageType,
         usable_size: usize,
     ) -> Result<(usize, usize)> {
-        let max_local = payload_overflow_threshold_max(page_type, usable_size as u16);
-        let min_local = payload_overflow_threshold_min(page_type, usable_size as u16);
+        let max_local = payload_overflow_threshold_max(page_type, usable_size);
+        let min_local = payload_overflow_threshold_min(page_type, usable_size);
 
         // This matches btreeParseCellAdjustSizeForOverflow logic
         let n_local = if payload_len <= max_local {
@@ -2206,7 +2208,7 @@ impl BTreeCursor {
                         &mut cell_payload,
                         cell_idx,
                         record,
-                        self.usable_space() as u16,
+                        self.usable_space(),
                         self.pager.clone(),
                     );
 
@@ -2250,6 +2252,7 @@ impl BTreeCursor {
                 WriteState::BalanceStart
                 | WriteState::BalanceFreePages { .. }
                 | WriteState::BalanceNonRootPickSiblings
+                | WriteState::BalanceNonRootWaitSiblings
                 | WriteState::BalanceNonRootDoBalancing => {
                     return_if_io!(self.balance());
                 }
@@ -2328,6 +2331,7 @@ impl BTreeCursor {
                     return_if_io!(self.balance_non_root());
                 }
                 WriteState::BalanceNonRootPickSiblings
+                | WriteState::BalanceNonRootWaitSiblings
                 | WriteState::BalanceNonRootDoBalancing
                 | WriteState::BalanceFreePages { .. } => {
                     return_if_io!(self.balance_non_root());
@@ -2346,7 +2350,7 @@ impl BTreeCursor {
             "Cursor must be in balancing state"
         );
         let state = self.state.write_info().expect("must be balancing").state;
-        tracing::debug!(?state);
+        tracing::debug!("balance_non_root(state={:?})", state);
         let (next_write_state, result) = match state {
             WriteState::Start => todo!(),
             WriteState::BalanceStart => todo!(),
@@ -2440,6 +2444,7 @@ impl BTreeCursor {
                 // start loading right page first
                 let mut pgno: u32 = unsafe { right_pointer.cast::<u32>().read().swap_bytes() };
                 let current_sibling = sibling_pointer;
+
                 for i in (0..=current_sibling).rev() {
                     let page = self.read_page(pgno as usize)?;
                     {
@@ -2447,14 +2452,6 @@ impl BTreeCursor {
                         let sibling_page = page.get();
                         sibling_page.set_dirty();
                         self.pager.add_dirty(sibling_page.get().id);
-                    }
-                    #[cfg(debug_assertions)]
-                    {
-                        return_if_locked!(page.get());
-                        debug_validate_cells!(
-                            &page.get().get_contents(),
-                            self.usable_space() as u16
-                        );
                     }
                     pages_to_balance[i].replace(page);
                     turso_assert!(
@@ -2478,22 +2475,6 @@ impl BTreeCursor {
                     };
                 }
 
-                #[cfg(debug_assertions)]
-                {
-                    let page_type_of_siblings = pages_to_balance[0]
-                        .as_ref()
-                        .unwrap()
-                        .get()
-                        .get_contents()
-                        .page_type();
-                    for page in pages_to_balance.iter().take(sibling_count) {
-                        return_if_locked_maybe_load!(self.pager, page.as_ref().unwrap());
-                        let page = page.as_ref().unwrap().get();
-                        let contents = page.get_contents();
-                        debug_validate_cells!(&contents, self.usable_space() as u16);
-                        assert_eq!(contents.page_type(), page_type_of_siblings);
-                    }
-                }
                 self.state
                     .write_info()
                     .unwrap()
@@ -2505,7 +2486,42 @@ impl BTreeCursor {
                         sibling_count,
                         first_divider_cell: first_cell_divider,
                     }));
-                (WriteState::BalanceNonRootDoBalancing, Ok(IOResult::IO))
+                (WriteState::BalanceNonRootWaitSiblings, Ok(IOResult::IO))
+            }
+            WriteState::BalanceNonRootWaitSiblings => {
+                let balance_info = self.state.write_info().unwrap().balance_info.borrow_mut();
+                let balance_info = balance_info.as_ref().unwrap();
+                let current_sibling = balance_info.sibling_count - 1;
+                let locked = (0..=current_sibling).rev().any(|i| {
+                    balance_info.pages_to_balance[i]
+                        .as_ref()
+                        .is_some_and(|page| page.get().is_locked())
+                });
+                if locked {
+                    (WriteState::BalanceNonRootWaitSiblings, Ok(IOResult::IO))
+                } else {
+                    #[cfg(debug_assertions)]
+                    {
+                        let page_type_of_siblings = balance_info.pages_to_balance[0]
+                            .as_ref()
+                            .unwrap()
+                            .get()
+                            .get_contents()
+                            .page_type();
+                        for page in balance_info
+                            .pages_to_balance
+                            .iter()
+                            .take(balance_info.sibling_count)
+                        {
+                            let page = page.as_ref().unwrap().get();
+                            let contents = page.get_contents();
+                            debug_validate_cells!(&contents, self.usable_space() as u16);
+                            assert_eq!(contents.page_type(), page_type_of_siblings);
+                        }
+                    }
+
+                    (WriteState::BalanceNonRootDoBalancing, Ok(IOResult::IO))
+                }
             }
             WriteState::BalanceNonRootDoBalancing => {
                 // Ensure all involved pages are in memory.
@@ -3351,7 +3367,7 @@ impl BTreeCursor {
                             curr_page: curr_page + 1,
                             sibling_count_new,
                         },
-                        Ok(IOResult::Done(())),
+                        Ok(IOResult::IO),
                     )
                 }
             }
@@ -4147,7 +4163,7 @@ impl BTreeCursor {
         Ok(IOResult::Done(Some(record_ref)))
     }
 
-    #[instrument(skip(self), level = Level::DEBUG)]
+    #[instrument(skip(self, key), level = Level::DEBUG)]
     pub fn insert(
         &mut self,
         key: &BTreeKey,
@@ -4156,6 +4172,7 @@ impl BTreeCursor {
         // variables are very hard to reason about
         mut moved_before: bool,
     ) -> Result<IOResult<()>> {
+        tracing::trace!(?key);
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
         match &self.mv_cursor {
             Some(mv_cursor) => match key.maybe_rowid() {
@@ -4661,7 +4678,7 @@ impl BTreeCursor {
                     let contents = page.get().contents.as_ref().unwrap();
                     let next = contents.read_u32(0);
 
-                    return_if_io!(self.pager.free_page(Some(page), next_page as usize));
+                    self.pager.free_page(Some(page), next_page as usize)?;
 
                     if next != 0 {
                         self.overflow_state = Some(OverflowState::ProcessPage { next_page: next });
@@ -4848,7 +4865,7 @@ impl BTreeCursor {
                     let page = self.stack.top();
                     let page_id = page.get().get().id;
 
-                    return_if_io!(self.pager.free_page(Some(page.get()), page_id));
+                    self.pager.free_page(Some(page.get()), page_id)?;
 
                     if self.stack.has_parent() {
                         self.stack.pop();
@@ -4890,7 +4907,7 @@ impl BTreeCursor {
             &mut new_payload,
             cell_idx,
             record,
-            self.usable_space() as u16,
+            self.usable_space(),
             self.pager.clone(),
         );
 
@@ -6403,7 +6420,7 @@ fn fill_cell_payload(
     cell_payload: &mut Vec<u8>,
     cell_idx: usize,
     record: &ImmutableRecord,
-    usable_space: u16,
+    usable_space: usize,
     pager: Rc<Pager>,
 ) {
     // TODO: make record raw from start, having to serialize is not good
@@ -6440,7 +6457,7 @@ fn fill_cell_payload(
     let payload_overflow_threshold_min = payload_overflow_threshold_min(page_type, usable_space);
     // see e.g. https://github.com/sqlite/sqlite/blob/9591d3fe93936533c8c3b0dc4d025ac999539e11/src/dbstat.c#L371
     let mut space_left = payload_overflow_threshold_min
-        + (record_buf.len() - payload_overflow_threshold_min) % (usable_space as usize - 4);
+        + (record_buf.len() - payload_overflow_threshold_min) % (usable_space - 4);
 
     if space_left > payload_overflow_threshold_max {
         space_left = payload_overflow_threshold_min;
@@ -6479,7 +6496,7 @@ fn fill_cell_payload(
 
             pointer = unsafe { buf.as_mut_ptr().add(4) };
             pointer_to_next = buf.as_mut_ptr();
-            space_left = usable_space as usize - 4;
+            space_left = usable_space - 4;
         }
 
         to_copy_buffer = &to_copy_buffer[to_copy..];
@@ -6498,13 +6515,13 @@ fn fill_cell_payload(
 /// - Give a minimum fanout of 4 for index b-trees
 /// - Ensure enough payload is on the b-tree page that the record header can usually be accessed
 ///   without consulting an overflow page
-pub fn payload_overflow_threshold_max(page_type: PageType, usable_space: u16) -> usize {
+pub fn payload_overflow_threshold_max(page_type: PageType, usable_space: usize) -> usize {
     match page_type {
         PageType::IndexInterior | PageType::IndexLeaf => {
-            ((usable_space as usize - 12) * 64 / 255) - 23 // Index page formula
+            ((usable_space - 12) * 64 / 255) - 23 // Index page formula
         }
         PageType::TableInterior | PageType::TableLeaf => {
-            usable_space as usize - 35 // Table leaf page formula
+            usable_space - 35 // Table leaf page formula
         }
     }
 }
@@ -6518,9 +6535,9 @@ pub fn payload_overflow_threshold_max(page_type: PageType, usable_space: u16) ->
 /// - Otherwise: store M bytes on page
 ///
 /// The remaining bytes are stored on overflow pages in both cases.
-pub fn payload_overflow_threshold_min(_page_type: PageType, usable_space: u16) -> usize {
+pub fn payload_overflow_threshold_min(_page_type: PageType, usable_space: usize) -> usize {
     // Same formula for all page types
-    ((usable_space as usize - 12) * 32 / 255) - 23
+    ((usable_space - 12) * 32 / 255) - 23
 }
 
 /// Drop a cell from a page.
@@ -8746,7 +8763,7 @@ mod tests {
             &mut payload,
             cell_idx as usize,
             &record,
-            pager.usable_space() as u16,
+            pager.usable_space(),
             pager.clone(),
         );
         insert_into_cell(
