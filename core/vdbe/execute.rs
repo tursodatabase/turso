@@ -5675,7 +5675,9 @@ pub fn op_create_btree(
         todo!("temp databases not implemented yet");
     }
     // FIXME: handle page cache is full
-    let root_page = return_if_io!(pager.btree_create(flags));
+    let mut cursors = state.cursors.borrow_mut();
+    let root_page = return_if_io!(pager.btree_create(flags, &mut cursors));
+    drop(cursors);
     state.registers[*root] = Register::Value(Value::Integer(root_page as i64));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -6130,7 +6132,9 @@ pub fn op_open_ephemeral(
             } else {
                 &CreateBTreeFlags::new_index()
             };
-            let root_page = return_if_io!(pager.btree_create(flag));
+            let mut cursors = state.cursors.borrow_mut();
+            let root_page = return_if_io!(pager.btree_create(flag, &mut cursors));
+            drop(cursors);
 
             let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
             let mv_cursor = match state.mv_tx_id {

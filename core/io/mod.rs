@@ -52,6 +52,8 @@ pub trait IO: Clock + Send + Sync {
     fn generate_random_number(&self) -> i64;
 
     fn get_memory_io(&self) -> Arc<MemoryIO>;
+
+    fn database_mode(&self) -> crate::DatabaseMode;
 }
 
 pub type Complete = dyn Fn(Arc<RefCell<Buffer>>, i32);

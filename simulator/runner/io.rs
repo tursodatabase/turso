@@ -5,7 +5,7 @@ use std::{
 
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use turso_core::{Clock, Instant, MemoryIO, OpenFlags, PlatformIO, Result, IO};
+use turso_core::{Clock, DatabaseMode, Instant, MemoryIO, OpenFlags, PlatformIO, Result, IO};
 
 use crate::{
     model::FAULT_ERROR_MSG,
@@ -133,5 +133,9 @@ impl IO for SimulatorIO {
 
     fn get_memory_io(&self) -> Arc<turso_core::MemoryIO> {
         Arc::new(MemoryIO::new())
+    }
+
+    fn database_mode(&self) -> turso_core::DatabaseMode {
+        DatabaseMode::File
     }
 }

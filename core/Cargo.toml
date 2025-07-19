@@ -15,7 +15,7 @@ path = "lib.rs"
 
 [features]
 antithesis = ["dep:antithesis_sdk"]
-default = ["fs", "uuid", "time", "json", "series"]
+default = ["fs", "uuid", "time", "json", "series", "omit_autovacuum"]
 fs = ["turso_ext/vfs"]
 json = []
 uuid = ["dep:uuid"]
@@ -66,7 +66,7 @@ ryu = "1.0.19"
 uncased = "0.9.10"
 strum_macros = { workspace = true }
 bitflags = "2.9.0"
-serde = { workspace = true , optional = true, features = ["derive"] }
+serde = { workspace = true, optional = true, features = ["derive"] }
 paste = "1.0.15"
 uuid = { version = "1.11.0", features = ["v4", "v7"], optional = true }
 tempfile = "3.8.0"
