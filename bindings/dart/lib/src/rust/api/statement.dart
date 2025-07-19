@@ -18,13 +18,11 @@ abstract class RustStatement implements RustOpaqueInterface {
   Future<ExecuteResult> execute({required Params params});
 
   // HINT: Make it `#[frb(sync)]` to let it become the default constructor of Dart class.
-  static Future<RustStatement> newInstance({
-    required WrapperStatement statement,
-    required WrapperArcConnection connection,
-  }) => RustLib.instance.api.crateApiStatementRustStatementNew(
-    statement: statement,
-    connection: connection,
-  );
+  static Future<RustStatement> newInstance(
+          {required WrapperStatement statement,
+          required WrapperArcConnection connection}) =>
+      RustLib.instance.api.crateApiStatementRustStatementNew(
+          statement: statement, connection: connection);
 
   Future<QueryResult> query({required Params params});
 

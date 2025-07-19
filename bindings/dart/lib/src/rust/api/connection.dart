@@ -17,11 +17,10 @@ abstract class RustConnection implements RustOpaqueInterface {
   Future<ExecuteResult> execute({required String sql, required Params params});
 
   // HINT: Make it `#[frb(sync)]` to let it become the default constructor of Dart class.
-  static Future<RustConnection> newInstance({
-    required WrapperArcConnection connection,
-  }) => RustLib.instance.api.crateApiConnectionRustConnectionNew(
-    connection: connection,
-  );
+  static Future<RustConnection> newInstance(
+          {required WrapperArcConnection connection}) =>
+      RustLib.instance.api
+          .crateApiConnectionRustConnectionNew(connection: connection);
 
   Future<RustStatement> prepare({required String sql});
 

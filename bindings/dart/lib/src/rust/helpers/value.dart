@@ -12,9 +12,17 @@ part 'value.freezed.dart';
 sealed class Value with _$Value {
   const Value._();
 
-  const factory Value.integer(PlatformInt64 field0) = Value_Integer;
-  const factory Value.real(double field0) = Value_Real;
-  const factory Value.text(String field0) = Value_Text;
-  const factory Value.blob(Uint8List field0) = Value_Blob;
+  const factory Value.integer(
+    PlatformInt64 field0,
+  ) = Value_Integer;
+  const factory Value.real(
+    double field0,
+  ) = Value_Real;
+  const factory Value.text(
+    String field0,
+  ) = Value_Text;
+  const factory Value.blob(
+    Uint8List field0,
+  ) = Value_Blob;
   const factory Value.null_() = Value_Null;
 }

@@ -12,9 +12,17 @@ part 'return_value.freezed.dart';
 sealed class ReturnValue with _$ReturnValue {
   const ReturnValue._();
 
-  const factory ReturnValue.integer(PlatformInt64 field0) = ReturnValue_Integer;
-  const factory ReturnValue.real(double field0) = ReturnValue_Real;
-  const factory ReturnValue.text(String field0) = ReturnValue_Text;
-  const factory ReturnValue.blob(Uint8List field0) = ReturnValue_Blob;
+  const factory ReturnValue.integer(
+    PlatformInt64 field0,
+  ) = ReturnValue_Integer;
+  const factory ReturnValue.real(
+    double field0,
+  ) = ReturnValue_Real;
+  const factory ReturnValue.text(
+    String field0,
+  ) = ReturnValue_Text;
+  const factory ReturnValue.blob(
+    Uint8List field0,
+  ) = ReturnValue_Blob;
   const factory ReturnValue.null_() = ReturnValue_Null;
 }

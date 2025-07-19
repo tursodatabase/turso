@@ -57,4 +57,9 @@ class ConnectArgs {
           offline == other.offline;
 }
 
-enum OpenFlags { readOnly, readWrite, create }
+enum OpenFlags {
+  readOnly,
+  readWrite,
+  create,
+  ;
+}

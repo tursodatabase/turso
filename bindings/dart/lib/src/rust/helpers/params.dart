@@ -14,6 +14,10 @@ sealed class Params with _$Params {
   const Params._();
 
   const factory Params.none() = Params_None;
-  const factory Params.positional(List<Value> field0) = Params_Positional;
-  const factory Params.named(List<(String, Value)> field0) = Params_Named;
+  const factory Params.positional(
+    List<Value> field0,
+  ) = Params_Positional;
+  const factory Params.named(
+    List<(String, Value)> field0,
+  ) = Params_Named;
 }

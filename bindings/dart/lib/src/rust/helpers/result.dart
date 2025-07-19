@@ -10,7 +10,9 @@ import 'return_value.dart';
 class ExecuteResult {
   final BigInt rowsAffected;
 
-  const ExecuteResult({required this.rowsAffected});
+  const ExecuteResult({
+    required this.rowsAffected,
+  });
 
   @override
   int get hashCode => rowsAffected.hashCode;

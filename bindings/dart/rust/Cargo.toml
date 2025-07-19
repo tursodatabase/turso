@@ -11,7 +11,15 @@ publish = false
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-flutter_rust_bridge = "=2.10.0"
+flutter_rust_bridge = { version = "=2.10.0", default-features = false, features = [
+	"anyhow",
+	"dart-opaque",
+	"log",
+	"portable-atomic",
+	"thread-pool",
+	"user-utils",
+	"wasm-start"
+]}
 turso_core = { workspace = true, features = ["fs"] }
 
 [lints.rust]

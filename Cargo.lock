@@ -1106,16 +1106,13 @@ dependencies = [
  "dart-sys",
  "delegate-attr",
  "flutter_rust_bridge_macros",
- "futures",
  "js-sys",
  "lazy_static",
  "log",
  "oslog",
  "portable-atomic",
  "threadpool",
- "tokio",
  "wasm-bindgen",
- "wasm-bindgen-futures",
  "web-sys",
 ]
 
