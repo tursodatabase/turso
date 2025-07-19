@@ -178,8 +178,8 @@ impl Database {
         enable_indexes: bool,
     ) -> Result<Arc<Database>> {
         let wal_path = format!("{path}-wal");
-        let maybe_shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path.as_str())?;
-
+        let maybe_shared_wal =
+            WalFileShared::open_shared_if_exists(&io, wal_path.as_str(), flags).unwrap_or(None);
         let mv_store = if enable_mvcc {
             Some(Rc::new(MvStore::new(
                 mvcc::LocalClock::new(),
@@ -262,7 +262,7 @@ impl Database {
             _shared_cache: false,
             cache_size: Cell::new(default_cache_size),
             page_size: Cell::new(page_size),
-            readonly: Cell::new(false),
+            readonly: Cell::new(self.open_flags.contains(OpenFlags::ReadOnly)),
             wal_checkpoint_disabled: Cell::new(false),
             capture_data_changes: RefCell::new(CaptureDataChangesMode::Off),
             closed: Cell::new(false),
@@ -327,7 +327,10 @@ impl Database {
         };
 
         let wal_path = format!("{}-wal", self.path);
-        let file = self.io.open_file(&wal_path, OpenFlags::Create, false)?;
+        if !std::fs::exists(&wal_path)? && self.open_flags.contains(OpenFlags::ReadOnly) {
+            return Ok(pager);
+        };
+        let file = self.io.open_file(&wal_path, self.open_flags, false)?;
         let real_shared_wal = WalFileShared::new_shared(size, &self.io, file)?;
         // Modify Database::maybe_shared_wal to point to the new WAL file so that other connections
         // can open the existing WAL.
