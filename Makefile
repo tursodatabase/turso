@@ -40,10 +40,10 @@ check-tcl-version:
 .PHONY: check-tcl-version
 
 check-wasm-target:
-	@echo "Checking wasm32-wasi target..."
-	@if ! rustup target list | grep -q "wasm32-wasi (installed)"; then \
-		echo "Installing wasm32-wasi target..."; \
-		rustup target add wasm32-wasi; \
+	@echo "Checking wasm32-wasip1 target..."
+	@if ! rustup target list | grep -q "wasm32-wasip1 (installed)"; then \
+		echo "Installing wasm32-wasip1 target..."; \
+		rustup target add wasm32-wasip1; \
 	fi
 .PHONY: check-wasm-target
 
@@ -56,8 +56,8 @@ limbo-c:
 .PHONY: limbo-c
 
 limbo-wasm:
-	rustup target add wasm32-wasi
-	cargo build --package limbo-wasm --target wasm32-wasi
+	rustup target add wasm32-wasip1
+	cargo build --package limbo-wasm --target wasm32-wasip1
 .PHONY: limbo-wasm
 
 uv-sync:
