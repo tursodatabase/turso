@@ -837,8 +837,8 @@ impl BTreeCursor {
         page_type: PageType,
         usable_size: usize,
     ) -> Result<(usize, usize)> {
-        let max_local = payload_overflow_threshold_max(page_type, usable_size as u16);
-        let min_local = payload_overflow_threshold_min(page_type, usable_size as u16);
+        let max_local = payload_overflow_threshold_max(page_type, usable_size);
+        let min_local = payload_overflow_threshold_min(page_type, usable_size);
 
         // This matches btreeParseCellAdjustSizeForOverflow logic
         let n_local = if payload_len <= max_local {
@@ -2206,7 +2206,7 @@ impl BTreeCursor {
                         &mut cell_payload,
                         cell_idx,
                         record,
-                        self.usable_space() as u16,
+                        self.usable_space(),
                         self.pager.clone(),
                     );
 
@@ -4890,7 +4890,7 @@ impl BTreeCursor {
             &mut new_payload,
             cell_idx,
             record,
-            self.usable_space() as u16,
+            self.usable_space(),
             self.pager.clone(),
         );
 
@@ -6403,7 +6403,7 @@ fn fill_cell_payload(
     cell_payload: &mut Vec<u8>,
     cell_idx: usize,
     record: &ImmutableRecord,
-    usable_space: u16,
+    usable_space: usize,
     pager: Rc<Pager>,
 ) {
     // TODO: make record raw from start, having to serialize is not good
@@ -6440,7 +6440,7 @@ fn fill_cell_payload(
     let payload_overflow_threshold_min = payload_overflow_threshold_min(page_type, usable_space);
     // see e.g. https://github.com/sqlite/sqlite/blob/9591d3fe93936533c8c3b0dc4d025ac999539e11/src/dbstat.c#L371
     let mut space_left = payload_overflow_threshold_min
-        + (record_buf.len() - payload_overflow_threshold_min) % (usable_space as usize - 4);
+        + (record_buf.len() - payload_overflow_threshold_min) % (usable_space - 4);
 
     if space_left > payload_overflow_threshold_max {
         space_left = payload_overflow_threshold_min;
@@ -6479,7 +6479,7 @@ fn fill_cell_payload(
 
             pointer = unsafe { buf.as_mut_ptr().add(4) };
             pointer_to_next = buf.as_mut_ptr();
-            space_left = usable_space as usize - 4;
+            space_left = usable_space - 4;
         }
 
         to_copy_buffer = &to_copy_buffer[to_copy..];
@@ -6498,13 +6498,13 @@ fn fill_cell_payload(
 /// - Give a minimum fanout of 4 for index b-trees
 /// - Ensure enough payload is on the b-tree page that the record header can usually be accessed
 ///   without consulting an overflow page
-pub fn payload_overflow_threshold_max(page_type: PageType, usable_space: u16) -> usize {
+pub fn payload_overflow_threshold_max(page_type: PageType, usable_space: usize) -> usize {
     match page_type {
         PageType::IndexInterior | PageType::IndexLeaf => {
-            ((usable_space as usize - 12) * 64 / 255) - 23 // Index page formula
+            ((usable_space - 12) * 64 / 255) - 23 // Index page formula
         }
         PageType::TableInterior | PageType::TableLeaf => {
-            usable_space as usize - 35 // Table leaf page formula
+            usable_space - 35 // Table leaf page formula
         }
     }
 }
@@ -6518,9 +6518,9 @@ pub fn payload_overflow_threshold_max(page_type: PageType, usable_space: u16) ->
 /// - Otherwise: store M bytes on page
 ///
 /// The remaining bytes are stored on overflow pages in both cases.
-pub fn payload_overflow_threshold_min(_page_type: PageType, usable_space: u16) -> usize {
+pub fn payload_overflow_threshold_min(_page_type: PageType, usable_space: usize) -> usize {
     // Same formula for all page types
-    ((usable_space as usize - 12) * 32 / 255) - 23
+    ((usable_space - 12) * 32 / 255) - 23
 }
 
 /// Drop a cell from a page.
@@ -8737,7 +8737,7 @@ mod tests {
             &mut payload,
             cell_idx as usize,
             &record,
-            pager.usable_space() as u16,
+            pager.usable_space(),
             pager.clone(),
         );
         insert_into_cell(
