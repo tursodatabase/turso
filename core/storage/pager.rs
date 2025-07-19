@@ -4,7 +4,7 @@ use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::header_accessor;
 use crate::storage::sqlite3_ondisk::{
-    self, parse_wal_frame_header, DatabaseHeader, PageContent, PageType,
+    self, parse_wal_frame_header, DatabaseHeader, PageContent, PageType, DEFAULT_PAGE_SIZE,
 };
 use crate::storage::wal::{CheckpointResult, Wal};
 use crate::types::IOResult;
@@ -1267,9 +1267,30 @@ impl Pager {
         let checkpoint_result = self.io.block(|| {
             self.wal
                 .borrow_mut()
-                .checkpoint(self, Rc::new(RefCell::new(0)), CheckpointMode::Passive)
+                .checkpoint(self, Rc::new(RefCell::new(0)), mode)
                 .map_err(|err| panic!("error while clearing cache {err}"))
         })?;
+
+        if checkpoint_result.everything_backfilled() {
+            let db_size = header_accessor::get_database_size(self)?;
+            let page_size = self.page_size.get().unwrap_or(DEFAULT_PAGE_SIZE);
+            let expected = (db_size * page_size) as u64;
+            if expected < self.db_file.size()? {
+                self.db_file.truncate(
+                    expected as usize,
+                    Completion::new_trunc(move |_| {
+                        tracing::trace!(
+                            "Database file truncated to expected size: {} bytes",
+                            expected
+                        );
+                    })
+                    .into(),
+                )?;
+                self.db_file.sync(Completion::new_sync(move |_| {
+                    tracing::trace!("Database file syncd after truncation");
+                }))?;
+            }
+        }
 
         // TODO: only clear cache of things that are really invalidated
         self.page_cache
