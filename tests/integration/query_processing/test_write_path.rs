@@ -2,8 +2,10 @@ use crate::common::{self, maybe_setup_tracing};
 use crate::common::{compare_string, do_flush, TempDatabase};
 use log::debug;
 use std::io::{Read, Seek, Write};
+use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
 use std::sync::Arc;
-use turso_core::{Connection, Database, LimboError, Row, Statement, StepResult, Value};
+use turso_core::{CheckpointMode, Connection, Database, Row, Statement, StepResult, Value};
 
 const WAL_HEADER_SIZE: usize = 32;
 const WAL_FRAME_HEADER_SIZE: usize = 24;
@@ -285,7 +287,7 @@ fn test_wal_checkpoint() -> anyhow::Result<()> {
     for i in 0..iterations {
         let insert_query = format!("INSERT INTO test VALUES ({i})");
         do_flush(&conn, &tmp_db)?;
-        conn.checkpoint()?;
+        conn.checkpoint(CheckpointMode::Passive)?;
         run_query(&tmp_db, &conn, &insert_query)?;
     }
 
@@ -297,6 +299,40 @@ fn test_wal_checkpoint() -> anyhow::Result<()> {
         assert_eq!(current_index, id as usize);
         current_index += 1;
     })?;
+    do_flush(&conn, &tmp_db)?;
+    Ok(())
+}
+
+#[test]
+#[ignore]
+fn test_wal_checkpoint_truncate() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let tmp_db =
+        TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY);", false);
+    let iterations = 100_usize;
+    let conn = tmp_db.connect_limbo();
+
+    for i in 0..iterations {
+        let insert_query = format!("INSERT INTO test VALUES ({i})");
+        do_flush(&conn, &tmp_db)?;
+        run_query(&tmp_db, &conn, &insert_query)?;
+    }
+    conn.checkpoint(CheckpointMode::Truncate)?;
+    let file = PathBuf::from(format!("{}-wal", tmp_db.path.to_string_lossy()));
+    assert!(file.exists(), "WAL file should exist after checkpoint");
+    let size = file.metadata()?.blocks();
+    assert_eq!(
+        size, 0,
+        "WAL file should be truncated to a small size, found: {size}",
+    );
+    // assert data is all in table
+    for i in 0..iterations {
+        let select_query = format!("SELECT * FROM test WHERE x = {i}");
+        run_query_on_row(&tmp_db, &conn, &select_query, |row: &Row| {
+            let id = row.get::<i64>(0).unwrap();
+            assert_eq!(i as i64, id);
+        })?;
+    }
     do_flush(&conn, &tmp_db)?;
     Ok(())
 }
