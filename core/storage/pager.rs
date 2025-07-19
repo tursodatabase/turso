@@ -1250,17 +1250,18 @@ impl Pager {
                 _attempts += 1;
             }
         }
-        self.wal_checkpoint(wal_checkpoint_disabled)?;
+        self.wal_checkpoint(wal_checkpoint_disabled, CheckpointMode::Passive)?;
         Ok(())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn wal_checkpoint(&self, wal_checkpoint_disabled: bool) -> Result<CheckpointResult> {
+    pub fn wal_checkpoint(
+        &self,
+        wal_checkpoint_disabled: bool,
+        mode: CheckpointMode,
+    ) -> Result<CheckpointResult> {
         if wal_checkpoint_disabled {
-            return Ok(CheckpointResult {
-                num_wal_frames: 0,
-                num_checkpointed_frames: 0,
-            });
+            return Ok(CheckpointResult::default());
         }
 
         let checkpoint_result = self.io.block(|| {
