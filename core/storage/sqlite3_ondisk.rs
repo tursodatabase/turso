@@ -1440,10 +1440,10 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
             let frame_h_checksum_2 =
                 u32::from_be_bytes(frame_header_slice[20..24].try_into().unwrap());
 
-            // It contains more frames with mismatched SALT values, which means they're leftovers from previous checkpoints
+            // Check if this frame belongs to the current WAL generation
             if frame_h_salt_1 != header_locked.salt_1 || frame_h_salt_2 != header_locked.salt_2 {
                 tracing::trace!(
-                    "WAL frame salt mismatch: expected ({}, {}), got ({}, {}), ignoring frame",
+                    "WAL frame salt mismatch: expected ({}, {}), got ({}, {}), stopping",
                     header_locked.salt_1,
                     header_locked.salt_2,
                     frame_h_salt_1,
@@ -1452,6 +1452,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
                 break;
             }
 
+            // Now verify the checksum using the header's salts (since we know they match)
             let checksum_after_fh_meta = checksum_wal(
                 &frame_header_slice[0..8],
                 &header_locked,
@@ -1472,6 +1473,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
                 calculated_frame_checksum.0,
                 calculated_frame_checksum.1
             );
+
             if calculated_frame_checksum != (frame_h_checksum_1, frame_h_checksum_2) {
                 panic!(
                     "WAL frame checksum mismatch. Expected ({}, {}), Got ({}, {})",
