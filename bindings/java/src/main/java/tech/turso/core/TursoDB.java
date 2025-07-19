@@ -24,14 +24,12 @@ public final class TursoDB implements AutoCloseable {
 
   private final String url;
   private final String filePath;
-  private static boolean isLoaded;
 
   static {
     if ("The Android Project".equals(System.getProperty("java.vm.vendor"))) {
       // TODO
     } else {
       // continue with non Android execution path
-      isLoaded = false;
     }
   }
 
@@ -39,7 +37,7 @@ public final class TursoDB implements AutoCloseable {
    * Enum representing different architectures and their corresponding library paths and file
    * extensions.
    */
-  enum Architecture {
+  private enum Architecture {
     MACOS_ARM64("libs/macos_arm64/lib_turso_java.dylib", ".dylib"),
     MACOS_X86("libs/macos_x86/lib_turso_java.dylib", ".dylib"),
     LINUX_X86("libs/linux_x86/lib_turso_java.so", ".so"),
@@ -100,17 +98,17 @@ public final class TursoDB implements AutoCloseable {
    * @throws InternalError if the native library cannot be loaded from either the system path or the
    *     JAR file.
    */
-  public static void load() {
-    if (isLoaded) {
-      return;
-    }
+  private static void load() {
+    new SingletonHolder();
+  }
 
-    if (loadFromSystemPath() || loadFromJar()) {
-      isLoaded = true;
-      return;
+  // "lazy initialization holder class idiom" (Effective Java #83)
+  private static class SingletonHolder {
+    static {
+      if (!loadFromSystemPath() && !loadFromJar()) {
+        throw new InternalError("Unable to load necessary native library");
+      }
     }
-
-    throw new InternalError("Unable to load necessary native library");
   }
 
   /**
@@ -187,9 +185,11 @@ public final class TursoDB implements AutoCloseable {
   }
 
   // TODO: receive config as argument
-  private TursoDB(String url, String filePath) {
+  private TursoDB(String url, String filePath) throws SQLException {
     this.url = url;
     this.filePath = filePath;
+    load();
+    open(0);
   }
 
   // TODO: add support for JNI
@@ -203,16 +203,11 @@ public final class TursoDB implements AutoCloseable {
     return this.isOpen;
   }
 
-  public void open(int openFlags) throws SQLException {
+  private void open(int openFlags) throws SQLException {
     open0(filePath, openFlags);
   }
 
   private void open0(String filePath, int openFlags) throws SQLException {
-    if (isOpen) {
-      throw TursoExceptionUtils.buildTursoException(
-          TursoErrorCode.TURSO_ETC.code, "Already opened");
-    }
-
     byte[] filePathBytes = stringToUtf8ByteArray(filePath);
     if (filePathBytes == null) {
       throw TursoExceptionUtils.buildTursoException(

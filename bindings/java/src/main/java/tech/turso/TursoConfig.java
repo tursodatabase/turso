@@ -7,23 +7,16 @@ import java.util.Properties;
 /** Turso Configuration. */
 public final class TursoConfig {
 
-  private Properties pragma;
+  private static final DriverPropertyInfo[] driverPropertyInfo = driverPropertyInfo();
+
+  private final Properties pragma;
 
   public TursoConfig(Properties properties) {
     this.pragma = properties;
   }
 
   public static DriverPropertyInfo[] getDriverPropertyInfo() {
-    return Arrays.stream(Pragma.values())
-        .map(
-            p -> {
-              DriverPropertyInfo info = new DriverPropertyInfo(p.pragmaName, null);
-              info.description = p.description;
-              info.choices = p.choices;
-              info.required = false;
-              return info;
-            })
-        .toArray(DriverPropertyInfo[]::new);
+    return driverPropertyInfo;
   }
 
   public Properties toProperties() {
@@ -48,5 +41,18 @@ public final class TursoConfig {
     public String getPragmaName() {
       return pragmaName;
     }
+  }
+
+  private static DriverPropertyInfo[] driverPropertyInfo() {
+    return Arrays.stream(Pragma.values())
+        .map(
+            p -> {
+              DriverPropertyInfo info = new DriverPropertyInfo(p.pragmaName, null);
+              info.description = p.description;
+              info.choices = p.choices;
+              info.required = false;
+              return info;
+            })
+        .toArray(DriverPropertyInfo[]::new);
   }
 }

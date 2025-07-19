@@ -8,7 +8,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import tech.turso.jdbc4.JDBC4Connection;
 
-public class IntegrationTest {
+class IntegrationTest {
 
   private JDBC4Connection connection;
 
@@ -21,12 +21,13 @@ public class IntegrationTest {
 
   @Test
   void create_table_multi_inserts_select() throws Exception {
-    Statement stmt = createDefaultStatement();
-    stmt.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT);");
-    stmt.execute("INSERT INTO users VALUES (1, 'seonwoo');");
-    stmt.execute("INSERT INTO users VALUES (2, 'seonwoo');");
-    stmt.execute("INSERT INTO users VALUES (3, 'seonwoo');");
-    stmt.execute("SELECT * FROM users");
+    try (Statement stmt = createDefaultStatement()) {
+      stmt.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT);");
+      stmt.execute("INSERT INTO users VALUES (1, 'seonwoo');");
+      stmt.execute("INSERT INTO users VALUES (2, 'seonwoo');");
+      stmt.execute("INSERT INTO users VALUES (3, 'seonwoo');");
+      stmt.execute("SELECT * FROM users");
+    }
   }
 
   private Statement createDefaultStatement() throws SQLException {

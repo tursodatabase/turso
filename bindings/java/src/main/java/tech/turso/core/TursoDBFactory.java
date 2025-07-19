@@ -3,6 +3,7 @@ package tech.turso.core;
 import java.sql.SQLException;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 
 /**
  * Factory class for managing and creating instances of {@link TursoDB}. This class ensures that
@@ -12,6 +13,8 @@ public final class TursoDBFactory {
 
   private static final ConcurrentHashMap<String, TursoDB> databaseHolder =
       new ConcurrentHashMap<>();
+
+  private TursoDBFactory() {}
 
   /**
    * If a database with the same URL already exists, it returns the existing instance. Otherwise, it
@@ -26,24 +29,34 @@ public final class TursoDBFactory {
    */
   public static TursoDB open(String url, String filePath, Properties properties)
       throws SQLException {
-    if (databaseHolder.containsKey(url)) {
-      return databaseHolder.get(url);
-    }
-
     if (filePath.isEmpty()) {
       throw new IllegalArgumentException("filePath should not be empty");
     }
 
-    final TursoDB database;
     try {
-      TursoDB.load();
-      database = TursoDB.create(url, filePath);
+      return databaseHolder.computeIfAbsent(
+          url, (Sneaky<String, TursoDB, SQLException>) u -> TursoDB.create(u, filePath));
     } catch (Exception e) {
       throw new SQLException("Error opening connection", e);
     }
+  }
 
-    database.open(0);
-    databaseHolder.put(url, database);
-    return database;
+  private interface Sneaky<S, T, E extends Exception> extends Function<S, T> {
+
+    T applySneakily(S s) throws E;
+
+    @Override
+    default T apply(S s) {
+      try {
+        return applySneakily(s);
+      } catch (Exception e) {
+        throw sneakyThrow(e);
+      }
+    }
+
+    @SuppressWarnings("unchecked")
+    static <T extends Exception> T sneakyThrow(Exception e) throws T {
+      throw (T) e;
+    }
   }
 }

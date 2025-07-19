@@ -1,10 +1,8 @@
 package tech.turso.core;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 
-import java.sql.SQLException;
 import org.junit.jupiter.api.Test;
 import tech.turso.TestUtils;
 import tech.turso.TursoErrorCode;
@@ -13,37 +11,17 @@ import tech.turso.exceptions.TursoException;
 public class TursoDBTest {
 
   @Test
-  void db_should_open_normally() throws Exception {
-    TursoDB.load();
+  void db_should_open_and_close_normally() throws Exception {
     String dbPath = TestUtils.createTempFile();
     TursoDB db = TursoDB.create("jdbc:turso" + dbPath, dbPath);
-    db.open(0);
-  }
 
-  @Test
-  void db_should_close_normally() throws Exception {
-    TursoDB.load();
-    String dbPath = TestUtils.createTempFile();
-    TursoDB db = TursoDB.create("jdbc:turso" + dbPath, dbPath);
-    db.open(0);
     db.close();
 
     assertFalse(db.isOpen());
   }
 
   @Test
-  void should_throw_exception_when_opened_twice() throws Exception {
-    TursoDB.load();
-    String dbPath = TestUtils.createTempFile();
-    TursoDB db = TursoDB.create("jdbc:turso:" + dbPath, dbPath);
-    db.open(0);
-
-    assertThatThrownBy(() -> db.open(0)).isInstanceOf(SQLException.class);
-  }
-
-  @Test
   void throwJavaException_should_throw_appropriate_java_exception() throws Exception {
-    TursoDB.load();
     String dbPath = TestUtils.createTempFile();
     TursoDB db = TursoDB.create("jdbc:turso:" + dbPath, dbPath);
 
