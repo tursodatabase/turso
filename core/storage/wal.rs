@@ -251,6 +251,7 @@ pub trait Wal {
     fn get_max_frame(&self) -> u64;
     fn get_min_frame(&self) -> u64;
     fn rollback(&mut self) -> Result<()>;
+    fn truncate(&mut self) -> Result<()>;
 }
 
 /// A dummy WAL implementation that does nothing.
@@ -343,6 +344,9 @@ impl Wal for DummyWAL {
     }
 
     fn rollback(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn truncate(&mut self) -> Result<()> {
         Ok(())
     }
 }
@@ -950,6 +954,32 @@ impl Wal for WalFile {
         shared.last_checksum = self.last_checksum;
         Ok(())
     }
+
+    #[instrument(skip_all, level = Level::INFO)]
+    fn truncate(&mut self) -> Result<()> {
+        tracing::debug!("truncate_wal_file");
+        let shared = self.get_shared();
+        let busy = !shared.write_lock.write();
+        if busy {
+            return Err(LimboError::Busy);
+        }
+        let busy = !shared.checkpoint_lock.write();
+        if busy {
+            shared.write_lock.unlock();
+            return Err(LimboError::Busy);
+        }
+        let shared = self.shared.clone();
+        let io = self.io.clone();
+        let c = Completion::new_trunc(move |_| {
+            let shared = shared.clone();
+            let shared = unsafe { shared.get().as_mut().unwrap() };
+            let io = io.clone();
+            shared.restart_wal_header(&io).unwrap();
+        });
+        let shared = self.get_shared();
+        shared.file.truncate(WAL_HEADER_SIZE, c.into())?;
+        Ok(())
+    }
 }
 
 impl WalFile {
@@ -1073,12 +1103,13 @@ impl WalFileShared {
         );
         wal_header.checksum_1 = checksums.0;
         wal_header.checksum_2 = checksums.1;
-        sqlite3_ondisk::begin_write_wal_header(&file, &wal_header)?;
+        let c = sqlite3_ondisk::begin_write_wal_header(&file, &wal_header)?;
         let header = Arc::new(SpinLock::new(wal_header));
         let checksum = {
             let checksum = header.lock();
             (checksum.checksum_1, checksum.checksum_2)
         };
+        io.wait_for_completion(c)?;
         tracing::debug!("new_shared(header={:?})", header);
         let shared = WalFileShared {
             wal_header: header,
@@ -1107,5 +1138,113 @@ impl WalFileShared {
 
     pub fn page_size(&self) -> u32 {
         self.wal_header.lock().page_size
+    }
+
+    /// Called after a successful RESTART/TRUNCATE checkpoint when
+    /// all frames are back‑filled.
+    ///
+    /// sqlite3/src/wal.c
+    /// The following is guaranteed when this function is called:
+    ///
+    ///   a) the WRITER lock is held,
+    ///   b) the entire log file has been checkpointed, and
+    ///   c) any existing readers are reading exclusively from the database
+    ///      file - there are no readers that may attempt to read a frame from
+    ///      the log file.
+    ///
+    /// This function updates the shared-memory structures so that the next
+    /// client to write to the database (which may be this one) does so by
+    /// writing frames into the start of the log file.
+    fn restart_wal_header(&mut self, io: &Arc<dyn IO>) -> Result<()> {
+        // bump checkpoint sequence
+        let mut hdr = self.wal_header.lock();
+        hdr.checkpoint_seq = hdr.checkpoint_seq.wrapping_add(1);
+
+        // reset frame counters
+        hdr.checksum_1 = 0;
+        hdr.checksum_2 = 0;
+        self.max_frame.store(0, Ordering::SeqCst);
+        self.nbackfills.store(0, Ordering::SeqCst);
+
+        // update salts. increment the first and generate a new random one for the second
+        hdr.salt_1 = hdr.salt_1.wrapping_add(1); // aSalt[0]++
+        hdr.salt_2 = io.generate_random_number() as u32;
+
+        // rewrite header on disk
+        let c = sqlite3_ondisk::begin_write_wal_header(&self.file, &hdr)?;
+        io.wait_for_completion(c)?;
+
+        self.frame_cache.lock().clear();
+        self.pages_in_frames.lock().clear();
+        self.last_checksum = (hdr.checksum_1, hdr.checksum_2);
+
+        // reset read‑marks
+        self.read_locks[0].value.store(0, Ordering::SeqCst);
+        self.read_locks[1].value.store(0, Ordering::SeqCst);
+        for lock in &self.read_locks[2..] {
+            lock.value.store(READMARK_NOT_USED, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub mod test {
+    use crate::{storage::sqlite3_ondisk::WAL_HEADER_SIZE, Completion, Database, MemoryIO, IO};
+    use std::{cell::Cell, rc::Rc, sync::Arc};
+    use tempfile::TempDir;
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn get_database() -> Arc<Database> {
+        let mut path = TempDir::new().unwrap().keep();
+        path.push("test.db");
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .pragma_update(None, "journal_mode", "wal")
+                .unwrap();
+        }
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io.clone(), path.to_str().unwrap(), false, false).unwrap();
+        db
+    }
+    #[test]
+    fn test_truncate_file() {
+        let db = get_database();
+        let conn = db.connect().unwrap();
+        conn.execute("create table test (id integer primary key, value text)")
+            .unwrap();
+        let _ = conn.execute("insert into test (value) values ('test1'), ('test2'), ('test3')");
+        let wal = db.maybe_shared_wal.write();
+        let wal_file = wal.as_ref().unwrap();
+        let file = unsafe { &mut *wal_file.get() };
+        let done = Rc::new(Cell::new(false));
+        let _done = done.clone();
+        let _ = file.file.truncate(
+            WAL_HEADER_SIZE,
+            Arc::new(Completion::new_trunc(move |_| {
+                let done = _done.clone();
+                done.set(true);
+            })),
+        );
+        assert!(file.file.size().unwrap() == WAL_HEADER_SIZE as u64);
+        assert!(done.get());
+    }
+
+    #[test]
+    fn test_truncate_wal() {
+        let db = get_database();
+        let conn = db.connect().unwrap();
+        conn.execute("create table test (id integer primary key, value text)")
+            .unwrap();
+        for _i in 0..100 {
+            let _ = conn.execute("insert into test (value) values ('test1'), ('test2'), ('test3')");
+        }
+        let file = conn.pager.borrow_mut();
+        let _ = file.cacheflush();
+        let mut wal = file.wal.borrow_mut();
+        wal.truncate().unwrap();
+        drop(wal);
+        assert_eq!(file.wal_frame_count().unwrap(), 0);
     }
 }

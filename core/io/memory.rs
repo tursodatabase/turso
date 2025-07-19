@@ -54,7 +54,7 @@ impl IO for MemoryIO {
     }
 
     fn wait_for_completion(&self, _c: Arc<Completion>) -> Result<()> {
-        todo!();
+        Ok(())
     }
 
     fn generate_random_number(&self) -> i64 {
@@ -167,6 +167,19 @@ impl File for MemoryFile {
 
     fn sync(&self, c: Arc<Completion>) -> Result<Arc<Completion>> {
         // no-op
+        c.complete(0);
+        Ok(c)
+    }
+
+    fn truncate(&self, len: usize, c: Arc<Completion>) -> Result<Arc<Completion>> {
+        if len < self.size.get() {
+            // Truncate pages
+            unsafe {
+                let pages = &mut *self.pages.get();
+                pages.retain(|&k, _| k * PAGE_SIZE < len);
+            }
+        }
+        self.size.set(len);
         c.complete(0);
         Ok(c)
     }
