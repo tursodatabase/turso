@@ -244,9 +244,49 @@ pub enum AutoVacuumMode {
     Incremental,
 }
 
-pub const DB_STATE_UNINITIALIZED: usize = 0;
-pub const DB_STATE_INITIALIZING: usize = 1;
-pub const DB_STATE_INITIALIZED: usize = 2;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct DbState(usize);
+
+impl DbState {
+    #![allow(non_upper_case_globals)]
+    pub const Uninitialized: Self = Self(0);
+    pub const Initializing: Self = Self(1);
+    pub const Initialized: Self = Self(2);
+
+    #[inline]
+    pub fn is_initialized(&self) -> bool {
+        matches!(*self, DbState::Initialized)
+    }
+}
+
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct AtomicDbState(AtomicUsize);
+
+impl AtomicDbState {
+    #[inline]
+    pub const fn new(state: DbState) -> Self {
+        Self(AtomicUsize::new(state.0))
+    }
+
+    #[inline]
+    pub fn set(&self, state: DbState) {
+        self.0.store(state.0, Ordering::SeqCst);
+    }
+
+    #[inline]
+    pub fn get(&self) -> DbState {
+        let v = self.0.load(Ordering::SeqCst);
+        DbState(v)
+    }
+
+    #[inline]
+    pub fn is_initialized(&self) -> bool {
+        self.get().is_initialized()
+    }
+}
+
 /// The pager interface implements the persistence layer by providing access
 /// to pages of the database file, including caching, concurrency control, and
 /// transaction management.
@@ -272,7 +312,7 @@ pub struct Pager {
     /// 0 -> Database is empty,
     /// 1 -> Database is being initialized,
     /// 2 -> Database is initialized and ready for use.
-    pub db_state: Arc<AtomicUsize>,
+    pub db_state: Arc<AtomicDbState>,
     /// Mutex for synchronizing database initialization to prevent race conditions
     init_lock: Arc<Mutex<()>>,
     allocate_page1_state: RefCell<AllocatePage1State>,
@@ -324,10 +364,10 @@ impl Pager {
         io: Arc<dyn crate::io::IO>,
         page_cache: Arc<RwLock<DumbLruPageCache>>,
         buffer_pool: Arc<BufferPool>,
-        db_state: Arc<AtomicUsize>,
+        db_state: Arc<AtomicDbState>,
         init_lock: Arc<Mutex<()>>,
     ) -> Result<Self> {
-        let allocate_page1_state = if db_state.load(Ordering::SeqCst) < DB_STATE_INITIALIZED {
+        let allocate_page1_state = if !db_state.is_initialized() {
             RefCell::new(AllocatePage1State::Start)
         } else {
             RefCell::new(AllocatePage1State::Done)
@@ -662,7 +702,7 @@ impl Pager {
 
     /// Set the initial page size for the database. Should only be called before the database is initialized
     pub fn set_initial_page_size(&self, size: u32) {
-        assert_eq!(self.db_state.load(Ordering::SeqCst), DB_STATE_UNINITIALIZED);
+        assert_eq!(self.db_state.get(), DbState::Uninitialized);
         self.page_size.replace(Some(size));
     }
 
@@ -679,17 +719,16 @@ impl Pager {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn maybe_allocate_page1(&self) -> Result<IOResult<()>> {
-        if self.db_state.load(Ordering::SeqCst) < DB_STATE_INITIALIZED {
+        if !self.db_state.is_initialized() {
             if let Ok(_lock) = self.init_lock.try_lock() {
-                match (
-                    self.db_state.load(Ordering::SeqCst),
-                    self.allocating_page1(),
-                ) {
+                match (self.db_state.get(), self.allocating_page1()) {
                     // In case of being empty or (allocating and this connection is performing allocation) then allocate the first page
-                    (0, false) | (1, true) => match self.allocate_page1()? {
-                        IOResult::Done(_) => Ok(IOResult::Done(())),
-                        IOResult::IO => Ok(IOResult::IO),
-                    },
+                    (DbState::Uninitialized, false) | (DbState::Initializing, true) => {
+                        match self.allocate_page1()? {
+                            IOResult::Done(_) => Ok(IOResult::Done(())),
+                            IOResult::IO => Ok(IOResult::IO),
+                        }
+                    }
                     _ => Ok(IOResult::IO),
                 }
             } else {
@@ -1191,7 +1230,7 @@ impl Pager {
         match state {
             AllocatePage1State::Start => {
                 tracing::trace!("allocate_page1(Start)");
-                self.db_state.store(DB_STATE_INITIALIZING, Ordering::SeqCst);
+                self.db_state.set(DbState::Initializing);
                 let mut default_header = DatabaseHeader::default();
                 default_header.database_size += 1;
                 if let Some(size) = self.page_size.get() {
@@ -1240,7 +1279,7 @@ impl Pager {
                 cache.insert(page_key, page1_ref.clone()).map_err(|e| {
                     LimboError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
                 })?;
-                self.db_state.store(DB_STATE_INITIALIZED, Ordering::SeqCst);
+                self.db_state.set(DbState::Initialized);
                 self.allocate_page1_state.replace(AllocatePage1State::Done);
                 Ok(IOResult::Done(page1_ref.clone()))
             }
@@ -1679,7 +1718,7 @@ mod ptrmap_tests {
             io,
             page_cache,
             buffer_pool,
-            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicDbState::new(DbState::Uninitialized)),
             Arc::new(Mutex::new(())),
         )
         .unwrap();
