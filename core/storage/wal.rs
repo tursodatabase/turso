@@ -1333,7 +1333,12 @@ impl WalFile {
             shared.file.truncate(0, c.clone()).inspect_err(|e| {
                 handle_err(e);
             })?;
-
+            let hdr = shared.wal_header.lock();
+            // sqlite just lets the next writer create it when the first frame is written.
+            // we can write the new header here for simplicity.
+            sqlite3_ondisk::begin_write_wal_header(&shared.file, &hdr).inspect_err(|e| {
+                handle_err(e);
+            })?;
             let c = Completion::new_sync(|_| {
                 tracing::trace!("WAL file synced after truncation");
             });
