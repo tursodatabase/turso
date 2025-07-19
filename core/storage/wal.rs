@@ -39,12 +39,14 @@ pub const NO_LOCK: u32 = 0;
 pub const SHARED_LOCK: u32 = 1;
 pub const WRITE_LOCK: u32 = 2;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub struct CheckpointResult {
     /// number of frames in WAL
     pub num_wal_frames: u64,
     /// number of frames moved successfully from WAL to db file after checkpoint
     pub num_checkpointed_frames: u64,
+    /// will drop automatically and free any remaining locks we need to hold
+    maybe_guard: Option<CheckpointGuard>,
 }
 
 impl Default for CheckpointResult {
@@ -58,10 +60,15 @@ impl CheckpointResult {
         Self {
             num_wal_frames: 0,
             num_checkpointed_frames: 0,
+            maybe_guard: None,
         }
     }
+
     pub const fn everything_backfilled(&self) -> bool {
         self.num_wal_frames > 0 && self.num_wal_frames == self.num_checkpointed_frames
+    }
+    pub fn release_guard(&mut self) {
+        let _ = self.maybe_guard.take();
     }
 }
 
@@ -499,6 +506,7 @@ impl fmt::Debug for WalFileShared {
     }
 }
 
+#[derive(Clone, Debug)]
 enum CheckpointGuard {
     Writer { ptr: Arc<UnsafeCell<WalFileShared>> },
     Read0 { ptr: Arc<UnsafeCell<WalFileShared>> },
@@ -1012,7 +1020,7 @@ impl Wal for WalFile {
                     if *write_counter.borrow() > 0 {
                         return Ok(IOResult::IO);
                     }
-                    let (checkpoint_result, everything_backfilled) = {
+                    let (mut checkpoint_result, everything_backfilled) = {
                         let shared = self.get_shared();
                         let current_mx = shared.max_frame.load(Ordering::SeqCst);
                         // Record two num pages fields to return as checkpoint result to caller.
@@ -1021,6 +1029,7 @@ impl Wal for WalFile {
                             CheckpointResult {
                                 num_wal_frames: current_mx,
                                 num_checkpointed_frames: self.ongoing_checkpoint.max_frame,
+                                maybe_guard: None,
                             },
                             // if the current max frame that we read while holding checkpoint_lock is equal to the max frame of the
                             // ongoing checkpoint, it means that we have backfilled everything
@@ -1036,14 +1045,20 @@ impl Wal for WalFile {
                     {
                         ensure_unlock!(self, self.restart_log(mode));
                     }
-                    // we cannot truncate the db file here, because we are currently inside a
-                    // mut borrow of pager.wal, and accessing the header will attempt a borrow,
-                    // so the caller will determine if:
-                    // a. the max frame == num wal frames
-                    // b. the db file size != num of db pages * page_size
-                    // and truncate the db file if necessary.
+                    // we cannot truncate the db file here because we are currently inside a
+                    // mut borrow of pager.wal, and accessing the header will attempt a borrow
+                    // during 'read_page', so the caller will use the result to determine if:
+                    // a. the max frame == num wal frames (everything backfilled)
+                    // b. the physical db file size differs from the expected pages * page_size
+                    // and truncate + sync the db file if necessary.
+                    if checkpoint_result.everything_backfilled() {
+                        // temporarily hold the locks in the case that the db file must be truncated
+                        checkpoint_result.maybe_guard = self.checkpoint_guard.take();
+                    } else {
+                        // we can drop them now
+                        let _ = self.checkpoint_guard.take();
+                    }
                     self.ongoing_checkpoint.state = CheckpointState::Start;
-                    let _ = self.checkpoint_guard.take();
                     return Ok(IOResult::Done(checkpoint_result));
                 }
             }
@@ -1218,8 +1233,7 @@ impl WalFile {
         self.syncing.set(false);
     }
 
-    // coordinate among many readers what the maximum safe frame is for us
-    // to backfill when checkpointing.
+    // Coordinate what the maximum safe frame is for us to backfill when checkpointing.
     fn determine_max_safe_checkpoint_frame(&self) -> u64 {
         let shared = self.get_shared();
         let mut max_safe_frame = shared.max_frame.load(Ordering::SeqCst);
@@ -1292,7 +1306,8 @@ impl WalFile {
             .inspect_err(|e| {
                 handle_err(e);
             })?;
-        // For TRUNCATE: physically shrink the WAL to 0 B
+
+        // For TRUNCATE mode: shrink the WAL file to 0 B
         if matches!(mode, CheckpointMode::Truncate) {
             let c = Arc::new(Completion::new_trunc(|_| {
                 tracing::trace!("WAL file truncated to 0 B");
