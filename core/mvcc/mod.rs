@@ -35,7 +35,6 @@ pub mod clock;
 pub mod cursor;
 pub mod database;
 pub mod errors;
-pub mod persistent_storage;
 
 pub use clock::LocalClock;
 pub use database::MvStore;
@@ -47,6 +46,31 @@ mod tests {
     use std::sync::atomic::AtomicI64;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
+    use std::rc::Rc;
+    use crate::storage::sqlite3_ondisk::DatabaseHeader;
+    use crate::storage::pager::Pager;
+    use crate::storage::wal::DummyWAL;
+    use crate::storage::page_cache::DumbLruPageCache;
+    use crate::storage::database::FileMemoryStorage;
+    use crate::OpenFlags;
+
+    fn dummy_pager() -> Rc<Pager> {
+        let storage = FileMemoryStorage::new();
+        let cache = DumbLruPageCache::new(1024);
+        let wal = DummyWAL::new();
+        let header = DatabaseHeader::new(1024, 1, 1);
+        let pager = Pager::new(header, storage, cache, wal, OpenFlags::ReadWrite).unwrap();
+        Rc::new(pager)
+    }
+
+    fn dummy_connection() -> crate::Connection {
+        let storage = FileMemoryStorage::new();
+        let cache = DumbLruPageCache::new(1024);
+        let wal = DummyWAL::new();
+        let header = DatabaseHeader::new(1024, 1, 1);
+        let pager = Pager::new(header, storage, cache, wal, OpenFlags::ReadWrite).unwrap();
+        crate::Connection::new(pager).unwrap()
+    }
 
     static IDS: AtomicI64 = AtomicI64::new(1);
 
@@ -55,8 +79,7 @@ mod tests {
         // Two threads insert to the database concurrently using non-overlapping
         // row IDs.
         let clock = LocalClock::default();
-        let storage = crate::mvcc::persistent_storage::Storage::new_noop();
-        let db = Arc::new(MvStore::new(clock, storage));
+        let db = Arc::new(MvStore::new(clock));
         let iterations = 100000;
 
         let th1 = {
@@ -72,12 +95,13 @@ mod tests {
                     let row = Row {
                         id,
                         data: "Hello".to_string().into_bytes(),
+                        column_count: 1,
                     };
                     db.insert(tx, row.clone()).unwrap();
-                    db.commit_tx(tx).unwrap();
+                    db.commit_tx(tx, dummy_pager(), &dummy_connection()).unwrap();
                     let tx = db.begin_tx();
                     let committed_row = db.read(tx, id).unwrap();
-                    db.commit_tx(tx).unwrap();
+                    db.commit_tx(tx, dummy_pager(), &dummy_connection()).unwrap();
                     assert_eq!(committed_row, Some(row));
                 }
             })
@@ -94,12 +118,13 @@ mod tests {
                     let row = Row {
                         id,
                         data: "World".to_string().into_bytes(),
+                        column_count: 1,
                     };
                     db.insert(tx, row.clone()).unwrap();
-                    db.commit_tx(tx).unwrap();
+                    db.commit_tx(tx, dummy_pager(), &dummy_connection()).unwrap();
                     let tx = db.begin_tx();
                     let committed_row = db.read(tx, id).unwrap();
-                    db.commit_tx(tx).unwrap();
+                    db.commit_tx(tx, dummy_pager(), &dummy_connection()).unwrap();
                     assert_eq!(committed_row, Some(row));
                 }
             })
@@ -113,8 +138,7 @@ mod tests {
     #[ignore]
     fn test_overlapping_concurrent_inserts_read_your_writes() {
         let clock = LocalClock::default();
-        let storage = crate::mvcc::persistent_storage::Storage::new_noop();
-        let db = Arc::new(MvStore::new(clock, storage));
+        let db = Arc::new(MvStore::new(clock));
         let iterations = 100000;
 
         let work = |prefix: &'static str| {
@@ -145,7 +169,7 @@ mod tests {
                         continue;
                     }
                     let committed_row = db.read(tx, id).unwrap();
-                    db.commit_tx(tx).unwrap();
+                    db.commit_tx(tx, dummy_pager(), &dummy_connection()).unwrap();
                     assert_eq!(committed_row, Some(row));
                 }
                 tracing::info!(
