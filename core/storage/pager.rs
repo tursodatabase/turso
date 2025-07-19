@@ -545,7 +545,7 @@ impl Pager {
         };
         #[cfg(feature = "omit_autovacuum")]
         {
-            let page = self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any)?;
+            let page = return_if_io!(self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any));
             let page_id = page.get().get().id;
             Ok(IOResult::Done(page_id as u32))
         }
@@ -556,7 +556,8 @@ impl Pager {
             let auto_vacuum_mode = self.auto_vacuum_mode.borrow();
             match *auto_vacuum_mode {
                 AutoVacuumMode::None => {
-                    let page = self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any)?;
+                    let page =
+                        return_if_io!(self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any));
                     let page_id = page.get().get().id;
                     Ok(IOResult::Done(page_id as u32))
                 }
@@ -581,11 +582,11 @@ impl Pager {
                     assert!(root_page_num >= 3); //  the very first root page is page 3
 
                     //  root_page_num here is the desired root page
-                    let page = self.do_allocate_page(
+                    let page = return_if_io!(self.do_allocate_page(
                         page_type,
                         0,
                         BtreePageAllocMode::Exact(root_page_num),
-                    )?;
+                    ));
                     let allocated_page_id = page.get().get().id as u32;
                     if allocated_page_id != root_page_num {
                         //  TODO(Zaid): Handle swapping the allocated page with the desired root page
@@ -609,8 +610,8 @@ impl Pager {
     /// Allocate a new overflow page.
     /// This is done when a cell overflows and new space is needed.
     // FIXME: handle no room in page cache
-    pub fn allocate_overflow_page(&self) -> PageRef {
-        let page = self.allocate_page().unwrap();
+    pub fn allocate_overflow_page(&self) -> Result<IOResult<PageRef>> {
+        let page = return_if_io!(self.allocate_page());
         tracing::debug!("Pager::allocate_overflow_page(id={})", page.get().id);
 
         // setup overflow page
@@ -618,7 +619,7 @@ impl Pager {
         let buf = contents.as_ptr();
         buf.fill(0);
 
-        page
+        Ok(IOResult::Done(page))
     }
 
     /// Allocate a new page to the btree via the pager.
@@ -629,35 +630,45 @@ impl Pager {
         page_type: PageType,
         offset: usize,
         _alloc_mode: BtreePageAllocMode,
-    ) -> Result<BTreePage> {
-        let page = self.allocate_page()?;
+    ) -> Result<IOResult<BTreePage>> {
+        let page = return_if_io!(self.allocate_page());
         let page = Arc::new(BTreePageInner {
             page: RefCell::new(page),
         });
-        btree_init_page(&page, page_type, offset, self.usable_space() as u16);
+        let usable_space = return_if_io!(self.usable_space());
+        btree_init_page(&page, page_type, offset, usable_space as u16);
         tracing::debug!(
             "do_allocate_page(id={}, page_type={:?})",
             page.get().get().id,
             page.get().get_contents().page_type()
         );
-        Ok(page)
+        Ok(IOResult::Done(page))
     }
 
     /// The "usable size" of a database page is the page size specified by the 2-byte integer at offset 16
     /// in the header, minus the "reserved" space size recorded in the 1-byte integer at offset 20 in the header.
     /// The usable size of a page might be an odd number. However, the usable size is not allowed to be less than 480.
     /// In other words, if the page size is 512, then the reserved space size cannot exceed 32.
-    pub fn usable_space(&self) -> usize {
-        let page_size = *self
-            .page_size
-            .get()
-            .get_or_insert_with(|| header_accessor::get_page_size(self).unwrap_or_default());
+    pub fn usable_space(&self) -> Result<IOResult<usize>> {
+        let page_size = if let Some(page_size) = self.page_size.get() {
+            page_size
+        } else {
+            let size = return_if_io!(header_accessor::get_page_size_async(self));
+            self.page_size.set(Some(size));
+            size
+        };
 
-        let reserved_space = *self
-            .reserved_space
-            .get_or_init(|| header_accessor::get_reserved_space(self).unwrap_or_default());
+        let reserved_space = if let Some(reserved_space) = self.reserved_space.get() {
+            *reserved_space
+        } else {
+            let space = return_if_io!(header_accessor::get_reserved_space_async(self));
+            self.reserved_space.set(space).unwrap();
+            space
+        };
 
-        (page_size as usize) - (reserved_space as usize)
+        Ok(IOResult::Done(
+            (page_size as usize) - (reserved_space as usize),
+        ))
     }
 
     /// Set the initial page size for the database. Should only be called before the database is initialized
@@ -887,7 +898,7 @@ impl Pager {
             trace!(?state);
             match state {
                 CommitState::Start => {
-                    let db_size = header_accessor::get_database_size(self)?;
+                    let db_size = return_if_io!(header_accessor::get_database_size_async(self));
                     for (dirty_page_idx, page_id) in self.dirty_pages.borrow().iter().enumerate() {
                         let is_last_frame = dirty_page_idx == self.dirty_pages.borrow().len() - 1;
                         let mut cache = self.page_cache.write();
@@ -1093,7 +1104,9 @@ impl Pager {
         loop {
             match &mut *state {
                 FreePageState::Start => {
-                    if page_id < 2 || page_id > header_accessor::get_database_size(self)? as usize {
+                    let database_size =
+                        return_if_io!(header_accessor::get_database_size_async(self));
+                    if page_id < 2 || page_id > database_size as usize {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid page number {page_id} for free operation"
                         )));
@@ -1106,12 +1119,14 @@ impl Pager {
                         }
                         None => self.read_page(page_id)?,
                     };
-                    header_accessor::set_freelist_pages(
-                        self,
-                        header_accessor::get_freelist_pages(self)? + 1,
-                    )?;
 
-                    let trunk_page_id = header_accessor::get_freelist_trunk_page(self)?;
+                    return_if_io!(header_accessor::set_freelist_pages_async(
+                        self,
+                        return_if_io!(header_accessor::get_freelist_pages_async(self)) + 1
+                    ));
+
+                    let trunk_page_id =
+                        return_if_io!(header_accessor::get_freelist_trunk_page_async(self));
 
                     if trunk_page_id != 0 {
                         *state = FreePageState::AddToTrunk {
@@ -1123,7 +1138,8 @@ impl Pager {
                     }
                 }
                 FreePageState::AddToTrunk { page, trunk_page } => {
-                    let trunk_page_id = header_accessor::get_freelist_trunk_page(self)?;
+                    let trunk_page_id =
+                        return_if_io!(header_accessor::get_freelist_trunk_page_async(self));
                     if trunk_page.is_none() {
                         // Add as leaf to current trunk
                         trunk_page.replace(self.read_page(trunk_page_id as usize)?);
@@ -1138,8 +1154,8 @@ impl Pager {
                         trunk_page_contents.read_u32(TRUNK_PAGE_LEAF_COUNT_OFFSET);
 
                     // Reserve 2 slots for the trunk page header which is 8 bytes or 2*LEAF_ENTRY_SIZE
-                    let max_free_list_entries =
-                        (self.usable_space() / LEAF_ENTRY_SIZE) - RESERVED_SLOTS;
+                    let usable_space = return_if_io!(self.usable_space());
+                    let max_free_list_entries = (usable_space / LEAF_ENTRY_SIZE) - RESERVED_SLOTS;
 
                     if number_of_leaf_pages < max_free_list_entries as u32 {
                         trunk_page.set_dirty();
@@ -1166,7 +1182,8 @@ impl Pager {
                     page.set_dirty();
                     self.add_dirty(page_id);
 
-                    let trunk_page_id = header_accessor::get_freelist_trunk_page(self)?;
+                    let trunk_page_id =
+                        return_if_io!(header_accessor::get_freelist_trunk_page_async(self));
 
                     let contents = page.get().contents.as_mut().unwrap();
                     // Point to previous trunk
@@ -1174,7 +1191,10 @@ impl Pager {
                     // Zero leaf count
                     contents.write_u32(TRUNK_PAGE_LEAF_COUNT_OFFSET, 0);
                     // Update page 1 to point to new trunk
-                    header_accessor::set_freelist_trunk_page(self, page_id as u32)?;
+                    return_if_io!(header_accessor::set_freelist_trunk_page_async(
+                        self,
+                        page_id as u32
+                    ));
                     // Clear flags
                     page.clear_uptodate();
                     break;
@@ -1262,8 +1282,8 @@ impl Pager {
     // FIXME: handle no room in page cache
     #[allow(clippy::readonly_write_lock)]
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn allocate_page(&self) -> Result<PageRef> {
-        let old_db_size = header_accessor::get_database_size(self)?;
+    pub fn allocate_page(&self) -> Result<IOResult<PageRef>> {
+        let old_db_size = return_if_io!(header_accessor::get_database_size_async(self));
         #[allow(unused_mut)]
         let mut new_db_size = old_db_size + 1;
 
@@ -1275,7 +1295,10 @@ impl Pager {
             //  - autovacuum is enabled
             //  - the last page is a pointer map page
             if matches!(*self.auto_vacuum_mode.borrow(), AutoVacuumMode::Full)
-                && is_ptrmap_page(new_db_size, header_accessor::get_page_size(self)? as usize)
+                && is_ptrmap_page(
+                    new_db_size,
+                    return_if_io!(header_accessor::get_page_size_async(self)) as usize,
+                )
             {
                 let page = allocate_page(new_db_size as usize, &self.buffer_pool, 0);
                 page.set_dirty();
@@ -1297,7 +1320,7 @@ impl Pager {
             }
         }
 
-        header_accessor::set_database_size(self, new_db_size)?;
+        return_if_io!(header_accessor::set_database_size_async(self, new_db_size));
 
         // FIXME: should reserve page cache entry before modifying the database
         let page = allocate_page(new_db_size as usize, &self.buffer_pool, 0);
@@ -1309,11 +1332,13 @@ impl Pager {
             let page_key = PageCacheKey::new(page.get().id);
             let mut cache = self.page_cache.write();
             match cache.insert(page_key, page.clone()) {
-                Err(CacheError::Full) => Err(LimboError::CacheFull),
-                Err(_) => Err(LimboError::InternalError(
-                    "Unknown error inserting page to cache".into(),
-                )),
-                Ok(_) => Ok(page),
+                Err(CacheError::Full) => return Err(LimboError::CacheFull),
+                Err(_) => {
+                    return Err(LimboError::InternalError(
+                        "Unknown error inserting page to cache".into(),
+                    ))
+                }
+                Ok(_) => return Ok(IOResult::Done(page)),
             }
         }
     }
@@ -1339,10 +1364,10 @@ impl Pager {
         Ok(())
     }
 
-    pub fn usable_size(&self) -> usize {
-        let page_size = header_accessor::get_page_size(self).unwrap_or_default() as u32;
-        let reserved_space = header_accessor::get_reserved_space(self).unwrap_or_default() as u32;
-        (page_size - reserved_space) as usize
+    pub fn usable_size(&self) -> Result<IOResult<usize>> {
+        let page_size = return_if_io!(header_accessor::get_page_size_async(self));
+        let reserved_space = return_if_io!(header_accessor::get_reserved_space_async(self)) as u32;
+        Ok(IOResult::Done((page_size - reserved_space) as usize))
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
