@@ -312,7 +312,9 @@ impl Statement {
                     return Ok(2);
                 }
                 Ok(turso_core::StepResult::Done) => {
-                    return Ok(0);
+                    let changes = stmt.n_change();
+                    assert!(changes >= 0);
+                    return Ok(changes as u64);
                 }
                 Ok(turso_core::StepResult::IO) => {
                     let _ = stmt.run_once();
