@@ -67,7 +67,7 @@ use std::{
     borrow::Cow,
     cell::{Cell, RefCell, UnsafeCell},
     collections::HashMap,
-    fmt::Display,
+    fmt::{self, Display},
     io::Write,
     num::NonZero,
     ops::Deref,
@@ -77,7 +77,7 @@ use std::{
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
 use storage::page_cache::DumbLruPageCache;
-use storage::pager::{DB_STATE_INITIALIZED, DB_STATE_UNINITIALIZED};
+use storage::pager::{DB_STATE_INITIALIZED, DB_STATE_INITIALIZING, DB_STATE_UNINITIALIZED};
 pub use storage::{
     buffer_pool::BufferPool,
     database::DatabaseStorage,
@@ -125,6 +125,54 @@ pub struct Database {
 
 unsafe impl Send for Database {}
 unsafe impl Sync for Database {}
+
+impl fmt::Debug for Database {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug_struct = f.debug_struct("Database");
+        debug_struct
+            .field("path", &self.path)
+            .field("open_flags", &self.open_flags);
+
+        // Database state information
+        let db_state_value = match self.db_state.load(std::sync::atomic::Ordering::Relaxed) {
+            DB_STATE_UNINITIALIZED => "uninitialized".to_string(),
+            DB_STATE_INITIALIZING => "initializing".to_string(),
+            DB_STATE_INITIALIZED => "initialized".to_string(),
+            x => format!("invalid ({x})"),
+        };
+        debug_struct.field("db_state", &db_state_value);
+
+        let mv_store_status = if self.mv_store.is_some() {
+            "present"
+        } else {
+            "none"
+        };
+        debug_struct.field("mv_store", &mv_store_status);
+
+        let init_lock_status = if self.init_lock.try_lock().is_ok() {
+            "unlocked"
+        } else {
+            "locked"
+        };
+        debug_struct.field("init_lock", &init_lock_status);
+
+        let wal_status = match self.maybe_shared_wal.try_read().as_deref() {
+            Some(Some(_)) => "present",
+            Some(None) => "none",
+            None => "locked_for_write",
+        };
+        debug_struct.field("wal_state", &wal_status);
+
+        // Page cache info (just basic stats, not full contents)
+        let cache_info = match self._shared_page_cache.try_read() {
+            Some(cache) => format!("( capacity {}, used: {} )", cache.capacity(), cache.len()),
+            None => "locked".to_string(),
+        };
+        debug_struct.field("page_cache", &cache_info);
+
+        debug_struct.finish()
+    }
+}
 
 impl Database {
     #[cfg(feature = "fs")]

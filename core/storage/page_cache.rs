@@ -373,6 +373,10 @@ impl DumbLruPageCache {
         self.map.borrow().len()
     }
 
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     #[cfg(test)]
     fn get_entry_ptr(&self, key: &PageCacheKey) -> Option<NonNull<PageCacheEntry>> {
         self.map.borrow().get(key).copied()
