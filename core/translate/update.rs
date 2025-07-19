@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::schema::{BTreeTable, Column, Type};
@@ -141,32 +142,29 @@ pub fn prepare_update_plan(
         col_used_mask: ColumnUsedMask::default(),
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
-    let set_clauses = body
-        .sets
-        .iter_mut()
-        .map(|set| {
-            let ident = normalize_ident(set.col_names[0].0.as_str());
-            let col_index = table
-                .columns()
-                .iter()
-                .enumerate()
-                .find_map(|(i, col)| {
-                    col.name
-                        .as_ref()
-                        .filter(|name| name.eq_ignore_ascii_case(&ident))
-                        .map(|_| i)
-                })
-                .ok_or_else(|| {
-                    crate::LimboError::ParseError(format!(
-                        "column '{}' not found in table '{}'",
-                        ident, table_name.0
-                    ))
-                })?;
 
-            let _ = bind_column_references(&mut set.expr, &mut table_references, None);
-            Ok((col_index, set.expr.clone()))
-        })
-        .collect::<Result<Vec<(usize, Expr)>, crate::LimboError>>()?;
+    let column_lookup: HashMap<String, usize> = table
+        .columns()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
+        .collect();
+
+    let mut set_clauses = Vec::with_capacity(body.sets.len());
+    for set in &mut body.sets {
+        let ident = normalize_ident(set.col_names[0].0.as_str());
+        let Some(col_index) = column_lookup.get(&ident) else {
+            bail_parse_error!("Parse error: no such column: {}", ident);
+        };
+
+        let _ = bind_column_references(&mut set.expr, &mut table_references, None);
+
+        if let Some(idx) = set_clauses.iter().position(|(idx, _)| *idx == *col_index) {
+            set_clauses[idx].1 = set.expr.clone();
+        } else {
+            set_clauses.push((*col_index, set.expr.clone()));
+        }
+    }
 
     let mut result_columns = vec![];
     if let Some(returning) = &mut body.returning {
