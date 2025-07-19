@@ -1100,13 +1100,13 @@ impl Connection {
         Ok(())
     }
 
-    pub fn checkpoint(&self) -> Result<CheckpointResult> {
+    pub fn checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
         if self.closed.get() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         self.pager
             .borrow()
-            .wal_checkpoint(self.wal_checkpoint_disabled.get())
+            .wal_checkpoint(self.wal_checkpoint_disabled.get(), mode)
     }
 
     /// Close a connection and checkpoint.
