@@ -435,7 +435,16 @@ impl BTreeTable {
             if i > 0 {
                 sql.push_str(", ");
             }
-            sql.push_str(column.name.as_ref().expect("column name is None"));
+
+            // we need to wrap the column name in square brackets if it contains special characters
+            let column_name = column.name.as_ref().expect("column name is None");
+            if identifier_contains_special_chars(column_name) {
+                sql.push('[');
+                sql.push_str(column_name);
+                sql.push(']');
+            } else {
+                sql.push_str(column_name);
+            }
 
             if !column.ty_str.is_empty() {
                 sql.push(' ');
@@ -462,6 +471,10 @@ impl BTreeTable {
     pub fn column_collations(&self) -> Vec<Option<CollationSeq>> {
         self.columns.iter().map(|column| column.collation).collect()
     }
+}
+
+fn identifier_contains_special_chars(name: &str) -> bool {
+    name.chars().any(|c| !c.is_ascii_alphanumeric() && c != '_')
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1648,6 +1661,25 @@ mod tests {
         let expected = r#"CREATE TABLE sqlite_schema (type TEXT, name TEXT, tbl_name TEXT, rootpage INT, sql TEXT)"#;
         let actual = sqlite_schema_table().to_sql();
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    pub fn test_special_column_names() -> Result<()> {
+        let tests = [
+            ("foobar", "CREATE TABLE t (foobar TEXT)"),
+            ("_table_name3", "CREATE TABLE t (_table_name3 TEXT)"),
+            ("special name", "CREATE TABLE t ([special name] TEXT)"),
+            ("foo&bar", "CREATE TABLE t ([foo&bar] TEXT)"),
+            (" name", "CREATE TABLE t ([ name] TEXT)"),
+        ];
+
+        for (input_column_name, expected_sql) in tests {
+            let sql = format!("CREATE TABLE t ([{input_column_name}] TEXT)");
+            let actual = BTreeTable::from_sql(&sql, 0)?.to_sql();
+            assert_eq!(expected_sql, actual);
+        }
+
+        Ok(())
     }
 
     #[test]
