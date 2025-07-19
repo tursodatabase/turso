@@ -325,12 +325,6 @@ fn query_pragma(
                 _ => CheckpointMode::Passive,
             };
 
-            if !matches!(mode, CheckpointMode::Passive) {
-                return Err(LimboError::ParseError(
-                    "only Passive mode supported".to_string(),
-                ));
-            }
-
             program.alloc_registers(2);
             program.emit_insn(Insn::Checkpoint {
                 database: 0,
