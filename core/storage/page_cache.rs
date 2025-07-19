@@ -204,7 +204,7 @@ impl DumbLruPageCache {
 
         if clean_page {
             entry_mut.page.clear_loaded();
-            debug!("cleaning up page {}", entry_mut.page.get().id);
+            debug!("clean(page={})", entry_mut.page.get().id);
             let _ = entry_mut.page.get().contents.take();
         }
         self.unlink(entry);

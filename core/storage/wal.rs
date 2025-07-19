@@ -939,6 +939,7 @@ impl Wal for WalFile {
             let mut pages_in_frames = shared.pages_in_frames.lock();
             pages_in_frames.truncate(self.start_pages_in_frames);
         }
+        self.reset_internal_states();
         Ok(())
     }
 
@@ -1011,6 +1012,15 @@ impl WalFile {
     #[allow(clippy::mut_from_ref)]
     fn get_shared(&self) -> &mut WalFileShared {
         unsafe { self.shared.get().as_mut().unwrap() }
+    }
+
+    fn reset_internal_states(&mut self) {
+        self.ongoing_checkpoint.state = CheckpointState::Start;
+        self.ongoing_checkpoint.min_frame = 0;
+        self.ongoing_checkpoint.max_frame = 0;
+        self.ongoing_checkpoint.current_page = 0;
+        self.sync_state.set(SyncState::NotSyncing);
+        self.syncing.set(false);
     }
 }
 
