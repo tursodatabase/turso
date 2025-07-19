@@ -3,7 +3,7 @@
 
 use std::ffi::{self, CStr, CString};
 use tracing::trace;
-use turso_core::{LimboError, Value};
+use turso_core::{CheckpointMode, LimboError, Value};
 
 use std::sync::{Arc, Mutex};
 
@@ -1108,7 +1108,7 @@ pub unsafe extern "C" fn sqlite3_wal_checkpoint(
 pub unsafe extern "C" fn sqlite3_wal_checkpoint_v2(
     db: *mut sqlite3,
     _db_name: *const ffi::c_char,
-    _mode: ffi::c_int,
+    mode: ffi::c_int,
     _log_size: *mut ffi::c_int,
     _checkpoint_count: *mut ffi::c_int,
 ) -> ffi::c_int {
@@ -1118,7 +1118,14 @@ pub unsafe extern "C" fn sqlite3_wal_checkpoint_v2(
     let db: &mut sqlite3 = &mut *db;
     let db = db.inner.lock().unwrap();
     // TODO: Checkpointing modes and reporting back log size and checkpoint count to caller.
-    if db.conn.checkpoint().is_err() {
+    let chkptmode = match mode {
+        SQLITE_CHECKPOINT_PASSIVE => CheckpointMode::Passive,
+        SQLITE_CHECKPOINT_RESTART => CheckpointMode::Restart,
+        SQLITE_CHECKPOINT_TRUNCATE => CheckpointMode::Truncate,
+        SQLITE_CHECKPOINT_FULL => CheckpointMode::Full,
+        _ => return SQLITE_MISUSE, // Unsupported mode
+    };
+    if db.conn.checkpoint(chkptmode).is_err() {
         return SQLITE_ERROR;
     }
     SQLITE_OK
