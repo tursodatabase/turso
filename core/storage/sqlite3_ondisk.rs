@@ -1059,30 +1059,6 @@ impl<T: Default + Copy, const N: usize> Iterator for SmallVecIter<'_, T, N> {
     }
 }
 
-pub fn read_record_size(payload: &[u8]) -> Result<usize> {
-    let mut offset = 0;
-    let mut record_size = 0;
-
-    let (header_size, bytes_read) = read_varint(payload)?;
-    let header_size = header_size as usize;
-    if header_size > payload.len() {
-        crate::bail_corrupt_error!("Incomplete record header");
-    }
-
-    offset += bytes_read;
-    record_size += header_size;
-
-    while offset < header_size {
-        let (serial_type, bytes_read) = read_varint(&payload[offset..])?;
-        offset += bytes_read;
-
-        let serial_type_obj = SerialType::try_from(serial_type)?;
-        record_size += serial_type_obj.size();
-    }
-
-    Ok(record_size)
-}
-
 /// Reads a value that might reference the buffer it is reading from. Be sure to store RefValue with the buffer
 /// always.
 #[inline(always)]
@@ -1279,6 +1255,26 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
     }
     v = (v << 8) + buf[8] as u64;
     Ok((v, 9))
+}
+
+pub fn varint_len(value: u64) -> usize {
+    if value <= 0x7f {
+        return 1;
+    }
+    if value <= 0x3fff {
+        return 2;
+    }
+    if (value & ((0xff000000_u64) << 32)) > 0 {
+        return 9;
+    }
+
+    let mut bytes = value;
+    let mut n = 0;
+    while bytes != 0 {
+        bytes >>= 7;
+        n += 1;
+    }
+    n
 }
 
 pub fn write_varint(buf: &mut [u8], value: u64) -> usize {

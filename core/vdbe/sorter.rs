@@ -13,7 +13,7 @@ use crate::{
         Buffer, BufferData, Completion, CompletionType, File, OpenFlags, ReadCompletion,
         WriteCompletion, IO,
     },
-    storage::sqlite3_ondisk::read_record_size,
+    storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
     translate::collate::CollationSeq,
     types::{compare_immutable, IOResult, ImmutableRecord, KeyInfo},
     Result,
@@ -236,15 +236,11 @@ impl Sorter {
             self.io
                 .open_file(chunk_file_path.to_str().unwrap(), OpenFlags::Create, false)?;
 
-        // Make sure the chunk buffer size can fit the largest record.
+        // Make sure the chunk buffer size can fit the largest record and its size varint.
         let chunk_buffer_size = self
             .min_chunk_read_buffer_size
-            .max(self.max_payload_size_in_buffer);
-        let mut chunk = SortedChunk::new(
-            chunk_file.clone(),
-            self.current_buffer_size,
-            chunk_buffer_size,
-        );
+            .max(self.max_payload_size_in_buffer + 9);
+        let mut chunk = SortedChunk::new(chunk_file.clone(), chunk_buffer_size);
         chunk.write(&mut self.records)?;
         self.chunks.push(chunk);
 
@@ -258,7 +254,7 @@ impl Sorter {
 struct SortedChunk {
     /// The chunk file.
     file: Arc<dyn File>,
-    /// The chunk size.
+    /// The size of this chunk file in bytes.
     chunk_size: usize,
     /// The read buffer.
     buffer: Rc<RefCell<Vec<u8>>>,
@@ -273,10 +269,10 @@ struct SortedChunk {
 }
 
 impl SortedChunk {
-    fn new(file: Arc<dyn File>, chunk_size: usize, buffer_size: usize) -> Self {
+    fn new(file: Arc<dyn File>, buffer_size: usize) -> Self {
         Self {
             file,
-            chunk_size,
+            chunk_size: 0,
             buffer: Rc::new(RefCell::new(vec![0; buffer_size])),
             buffer_len: Rc::new(Cell::new(0)),
             records: Vec::new(),
@@ -300,26 +296,27 @@ impl SortedChunk {
             let buffer = buffer_ref.as_mut_slice();
             let mut buffer_offset = 0;
             while buffer_offset < buffer_len {
-                // Decode records from the buffer until we run out of the buffer or we hit an incomplete record.
-                let record_size = match read_record_size(&buffer[buffer_offset..buffer_len]) {
-                    Ok(record_size) => record_size,
-                    Err(LimboError::Corrupt(_))
-                        if self.io_state.get() != SortedChunkIOState::ReadEOF =>
-                    {
-                        // Failed to decode a partial record.
-                        break;
-                    }
-                    Err(e) => {
-                        return Err(e);
-                    }
-                };
-
-                if record_size > buffer_len - buffer_offset {
+                // Extract records from the buffer until we run out of the buffer or we hit an incomplete record.
+                let (record_size, bytes_read) =
+                    match read_varint(&buffer[buffer_offset..buffer_len]) {
+                        Ok((record_size, bytes_read)) => (record_size as usize, bytes_read),
+                        Err(LimboError::Corrupt(_))
+                            if self.io_state.get() != SortedChunkIOState::ReadEOF =>
+                        {
+                            // Failed to decode a partial varint.
+                            break;
+                        }
+                        Err(e) => {
+                            return Err(e);
+                        }
+                    };
+                if record_size > buffer_len - (buffer_offset + bytes_read) {
                     if self.io_state.get() == SortedChunkIOState::ReadEOF {
                         crate::bail_corrupt_error!("Incomplete record");
                     }
                     break;
                 }
+                buffer_offset += bytes_read;
 
                 let mut record = ImmutableRecord::new(record_size);
                 record.start_serialization(&buffer[buffer_offset..buffer_offset + record_size]);
@@ -348,6 +345,10 @@ impl SortedChunk {
 
     fn read(&mut self) -> Result<()> {
         if self.io_state.get() == SortedChunkIOState::ReadEOF {
+            return Ok(());
+        }
+        if self.chunk_size - self.total_bytes_read.get() == 0 {
+            self.io_state.set(SortedChunkIOState::ReadEOF);
             return Ok(());
         }
         self.io_state.set(SortedChunkIOState::WaitingForRead);
@@ -397,14 +398,28 @@ impl SortedChunk {
     fn write(&mut self, records: &mut Vec<SortableImmutableRecord>) -> Result<()> {
         assert!(self.io_state.get() == SortedChunkIOState::None);
         self.io_state.set(SortedChunkIOState::WaitingForWrite);
+        self.chunk_size = 0;
+
+        // Pre-compute varint lengths for record sizes to determine the total buffer size.
+        let mut record_size_lengths = Vec::with_capacity(records.len());
+        for record in records.iter() {
+            let record_size = record.record.get_payload().len();
+            let size_len = varint_len(record_size as u64);
+            record_size_lengths.push(size_len);
+            self.chunk_size += size_len + record_size;
+        }
 
         let drop_fn = Rc::new(|_buffer: BufferData| {});
         let mut buffer = Buffer::allocate(self.chunk_size, drop_fn);
 
         let mut buf_pos = 0;
         let buf = buffer.as_mut_slice();
-        for record in records.drain(..) {
+        for (record, size_len) in records.drain(..).zip(record_size_lengths) {
             let payload = record.record.get_payload();
+            // Write the record size varint.
+            write_varint(&mut buf[buf_pos..buf_pos + size_len], payload.len() as u64);
+            buf_pos += size_len;
+            // Write the record payload.
             buf[buf_pos..buf_pos + payload.len()].copy_from_slice(payload);
             buf_pos += payload.len();
         }
