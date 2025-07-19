@@ -13,7 +13,7 @@ use std::cell::{Cell, OnceCell, RefCell, UnsafeCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use tracing::{instrument, trace, Level};
 
 use super::btree::{btree_init_page, BTreePage};
@@ -281,6 +281,7 @@ pub struct Pager {
     page_size: Cell<Option<u32>>,
     reserved_space: OnceCell<u8>,
     free_page_state: RefCell<FreePageState>,
+    connection: RefCell<Option<Weak<Connection>>>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -356,6 +357,7 @@ impl Pager {
                 in_flight_writes: Rc::new(RefCell::new(0)),
             }),
             free_page_state: RefCell::new(FreePageState::Start),
+            connection: RefCell::new(None),
         })
     }
 
@@ -765,9 +767,12 @@ impl Pager {
         page.set_locked();
 
         if let Some(frame_id) = self.wal.borrow().find_frame(page_idx as u64)? {
-            self.wal
-                .borrow()
-                .read_frame(frame_id, page.clone(), self.buffer_pool.clone())?;
+            self.wal.borrow().read_frame(
+                frame_id,
+                page.clone(),
+                self.buffer_pool.clone(),
+                self.connection.borrow().clone(),
+            )?;
             {
                 page.set_uptodate();
             }
@@ -793,6 +798,11 @@ impl Pager {
             self.buffer_pool.clone(),
             page.clone(),
             page_idx,
+            self.connection
+                .borrow()
+                .as_ref()
+                .expect("connection not set")
+                .clone(),
         )?;
         match page_cache.insert(page_key, page.clone()) {
             Ok(_) => {}
@@ -851,6 +861,7 @@ impl Pager {
                         page.clone(),
                         0,
                         self.flush_info.borrow().in_flight_writes.clone(),
+                        self.connection.borrow().clone(),
                     )?;
                     page.clear_dirty();
                 }
@@ -903,6 +914,7 @@ impl Pager {
                             page.clone(),
                             db_size,
                             self.commit_info.borrow().in_flight_writes.clone(),
+                            self.connection.borrow().clone(),
                         )?;
                         page.clear_dirty();
                     }
@@ -924,7 +936,7 @@ impl Pager {
                     }
                 }
                 CommitState::SyncWal => {
-                    return_if_io!(self.wal.borrow_mut().sync());
+                    return_if_io!(self.wal.borrow_mut().sync(self.connection.borrow().clone()));
 
                     if wal_checkpoint_disabled || !self.wal.borrow().should_checkpoint() {
                         self.commit_info.borrow_mut().state = CommitState::Start;
@@ -937,7 +949,15 @@ impl Pager {
                     self.commit_info.borrow_mut().state = CommitState::SyncDbFile;
                 }
                 CommitState::SyncDbFile => {
-                    sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone())?;
+                    sqlite3_ondisk::begin_sync(
+                        self.db_file.clone(),
+                        self.syncing.clone(),
+                        self.connection
+                            .borrow()
+                            .as_ref()
+                            .expect("connection not set")
+                            .clone(),
+                    )?;
                     self.commit_info.borrow_mut().state = CommitState::WaitSyncDbFile;
                 }
                 CommitState::WaitSyncDbFile => {
@@ -968,6 +988,7 @@ impl Pager {
             self.buffer_pool.clone(),
             p_frame,
             frame_len,
+            self.connection.borrow().clone(),
         )
     }
 
@@ -984,6 +1005,7 @@ impl Pager {
                         self,
                         in_flight,
                         CheckpointMode::Passive,
+                        self.connection.borrow().clone(),
                     )? {
                         IOResult::IO => return Ok(IOResult::IO),
                         IOResult::Done(res) => {
@@ -993,7 +1015,15 @@ impl Pager {
                     };
                 }
                 CheckpointState::SyncDbFile => {
-                    sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone())?;
+                    sqlite3_ondisk::begin_sync(
+                        self.db_file.clone(),
+                        self.syncing.clone(),
+                        self.connection
+                            .borrow()
+                            .as_ref()
+                            .expect("connection not set")
+                            .clone(),
+                    )?;
                     self.checkpoint_state
                         .replace(CheckpointState::WaitSyncDbFile);
                 }
@@ -1034,7 +1064,7 @@ impl Pager {
         {
             let mut wal = self.wal.borrow_mut();
             // fsync the wal syncronously before beginning checkpoint
-            while let Ok(IOResult::IO) = wal.sync() {
+            while let Ok(IOResult::IO) = wal.sync(self.connection.borrow().clone()) {
                 // TODO: for now forget about timeouts as they fail regularly in SIM
                 // need to think of a better way to do this
 
@@ -1065,6 +1095,7 @@ impl Pager {
                 self,
                 Rc::new(RefCell::new(0)),
                 CheckpointMode::Passive,
+                self.connection.borrow().clone(),
             ) {
                 Ok(IOResult::IO) => {
                     self.io.run_once()?;
@@ -1224,7 +1255,16 @@ impl Pager {
                     (default_header.get_page_size() - default_header.reserved_space as u32) as u16,
                 );
                 let write_counter = Rc::new(RefCell::new(0));
-                begin_write_btree_page(self, &page1.get(), write_counter.clone())?;
+                begin_write_btree_page(
+                    self,
+                    &page1.get(),
+                    write_counter.clone(),
+                    self.connection
+                        .borrow()
+                        .as_ref()
+                        .expect("connection not set")
+                        .clone(),
+                )?;
 
                 self.allocate_page1_state
                     .replace(AllocatePage1State::Writing {
@@ -1377,6 +1417,14 @@ impl Pager {
         self.wal.borrow_mut().rollback()?;
 
         Ok(())
+    }
+
+    pub fn set_connection(&self, connection: Weak<Connection>) {
+        self.connection.replace(Some(connection));
+    }
+
+    pub fn get_connection(&self) -> Option<Weak<Connection>> {
+        self.connection.borrow().clone()
     }
 }
 

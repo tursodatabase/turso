@@ -1,8 +1,8 @@
-use crate::Result;
+use crate::{Connection, Result};
 use bitflags::bitflags;
 use cfg_block::cfg_block;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::{
     cell::{Cell, Ref, RefCell, RefMut},
     fmt::Debug,
@@ -54,13 +54,14 @@ pub trait IO: Clock + Send + Sync {
     fn get_memory_io(&self) -> Arc<MemoryIO>;
 }
 
-pub type Complete = dyn Fn(Arc<RefCell<Buffer>>, i32);
+pub type ReadComplete = dyn Fn(Arc<RefCell<Buffer>>, i32);
 pub type WriteComplete = dyn Fn(i32);
 pub type SyncComplete = dyn Fn(i32);
 
 pub struct Completion {
     pub completion_type: CompletionType,
     is_completed: Cell<bool>,
+    pub connection: Option<Weak<Connection>>,
 }
 
 pub enum CompletionType {
@@ -71,42 +72,49 @@ pub enum CompletionType {
 
 pub struct ReadCompletion {
     pub buf: Arc<RefCell<Buffer>>,
-    pub complete: Box<Complete>,
+    pub complete: Box<ReadComplete>,
 }
 
 impl Completion {
-    pub fn new(completion_type: CompletionType) -> Self {
+    pub fn new(completion_type: CompletionType, connection: Option<Weak<Connection>>) -> Self {
         Self {
             completion_type,
             is_completed: Cell::new(false),
+            connection,
         }
     }
 
-    pub fn new_write<F>(complete: F) -> Self
+    pub fn new_write<F>(complete: F, connection: Option<Weak<Connection>>) -> Self
     where
         F: Fn(i32) + 'static,
     {
-        Self::new(CompletionType::Write(WriteCompletion::new(Box::new(
-            complete,
-        ))))
+        Self::new(
+            CompletionType::Write(WriteCompletion::new(Box::new(complete))),
+            connection,
+        )
     }
 
-    pub fn new_read<F>(buf: Arc<RefCell<Buffer>>, complete: F) -> Self
+    pub fn new_read<F>(
+        buf: Arc<RefCell<Buffer>>,
+        complete: F,
+        connection: Option<Weak<Connection>>,
+    ) -> Self
     where
         F: Fn(Arc<RefCell<Buffer>>, i32) + 'static,
     {
-        Self::new(CompletionType::Read(ReadCompletion::new(
-            buf,
-            Box::new(complete),
-        )))
+        Self::new(
+            CompletionType::Read(ReadCompletion::new(buf, Box::new(complete))),
+            connection,
+        )
     }
-    pub fn new_sync<F>(complete: F) -> Self
+    pub fn new_sync<F>(complete: F, connection: Option<Weak<Connection>>) -> Self
     where
         F: Fn(i32) + 'static,
     {
-        Self::new(CompletionType::Sync(SyncCompletion::new(Box::new(
-            complete,
-        ))))
+        Self::new(
+            CompletionType::Sync(SyncCompletion::new(Box::new(complete))),
+            connection,
+        )
     }
 
     pub fn is_completed(&self) -> bool {
@@ -141,7 +149,7 @@ pub struct SyncCompletion {
 }
 
 impl ReadCompletion {
-    pub fn new(buf: Arc<RefCell<Buffer>>, complete: Box<Complete>) -> Self {
+    pub fn new(buf: Arc<RefCell<Buffer>>, complete: Box<ReadComplete>) -> Self {
         Self { buf, complete }
     }
 
