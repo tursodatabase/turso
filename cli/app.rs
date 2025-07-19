@@ -613,8 +613,8 @@ impl Limbo {
                     std::process::exit(0)
                 }
                 Command::Open(args) => {
-                    if self.open_db(&args.path, args.vfs_name.as_deref()).is_err() {
-                        let _ = self.writeln("Error: Unable to open database file.");
+                    if let Err(e) = self.open_db(&args.path, args.vfs_name.as_deref()) {
+                        let _ = self.writeln(e.to_string());
                     }
                 }
                 Command::Schema(args) => {
