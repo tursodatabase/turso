@@ -6061,12 +6061,6 @@ impl PageStack {
     }
 
     fn unpin_all_if_pinned(&self) {
-        self.current_page.set(-1);
-    }
-
-    /// Clear the stack and drop all page references
-    /// This is required for autovacuum operations where pages will be physically moved in the database file
-    fn clear_and_drop_references(&self) {
         self.stack
             .borrow_mut()
             .iter_mut()
@@ -6074,6 +6068,17 @@ impl PageStack {
             .for_each(|page| {
                 let _ = page.get().try_unpin();
             });
+    }
+
+    /// Clear the stack and drop all page references
+    /// This is required for autovacuum operations where pages will be physically moved in the database file
+    fn clear_and_drop_references(&self) {
+        self.unpin_all_if_pinned();
+        let mut stack = self.stack.borrow_mut();
+        for page_slot in stack.iter_mut() {
+            *page_slot = None;
+        }
+        self.current_page.set(-1);
     }
 
     fn clear(&self) {
