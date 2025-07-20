@@ -304,40 +304,6 @@ fn test_wal_checkpoint() -> anyhow::Result<()> {
 }
 
 #[test]
-#[ignore]
-fn test_wal_checkpoint_truncate() -> anyhow::Result<()> {
-    let _ = env_logger::try_init();
-    let tmp_db =
-        TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY);", false);
-    let iterations = 100_usize;
-    let conn = tmp_db.connect_limbo();
-
-    for i in 0..iterations {
-        let insert_query = format!("INSERT INTO test VALUES ({i})");
-        do_flush(&conn, &tmp_db)?;
-        run_query(&tmp_db, &conn, &insert_query)?;
-    }
-    conn.checkpoint(CheckpointMode::Truncate)?;
-    let file = PathBuf::from(format!("{}-wal", tmp_db.path.to_string_lossy()));
-    assert!(file.exists(), "WAL file should exist after checkpoint");
-    let size = file.metadata()?.blocks();
-    assert_eq!(
-        size, 0,
-        "WAL file should be truncated to a small size, found: {size}",
-    );
-    // assert data is all in table
-    for i in 0..iterations {
-        let select_query = format!("SELECT * FROM test WHERE x = {i}");
-        run_query_on_row(&tmp_db, &conn, &select_query, |row: &Row| {
-            let id = row.get::<i64>(0).unwrap();
-            assert_eq!(i as i64, id);
-        })?;
-    }
-    do_flush(&conn, &tmp_db)?;
-    Ok(())
-}
-
-#[test]
 fn test_wal_restart() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let tmp_db =
