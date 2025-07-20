@@ -2,8 +2,6 @@ use crate::common::{self, maybe_setup_tracing};
 use crate::common::{compare_string, do_flush, TempDatabase};
 use log::debug;
 use std::io::{Read, Seek, Write};
-use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
 use std::sync::Arc;
 use turso_core::{CheckpointMode, Connection, Database, Row, Statement, StepResult, Value};
 
