@@ -62,9 +62,9 @@ pub fn translate(
     connection: Arc<Connection>,
     syms: &SymbolTable,
     query_mode: QueryMode,
-    _input: &str, // TODO: going to be used for CREATE VIEW
+    input: &str,
 ) -> Result<Program> {
-    tracing::trace!("querying {}", _input);
+    tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
         stmt,
         ast::Stmt::CreateIndex { .. }
@@ -101,7 +101,7 @@ pub fn translate(
 
     // TODO: bring epilogue here when I can sort out what instructions correspond to a Write or a Read transaction
 
-    Ok(program.build(connection, change_cnt_on))
+    Ok(program.build(connection, change_cnt_on, input))
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty

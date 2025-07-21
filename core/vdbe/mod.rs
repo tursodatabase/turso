@@ -379,6 +379,7 @@ pub struct Program {
     pub change_cnt_on: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
+    pub sql: String
 }
 
 impl Program {

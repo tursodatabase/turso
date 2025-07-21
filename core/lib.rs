@@ -608,7 +608,11 @@ impl Connection {
                     QueryMode::Normal,
                     input,
                 )?);
-                Ok(Statement::new(program, self._db.mv_store.clone(), pager))
+                Ok(Statement::new(
+                    program,
+                    self._db.mv_store.clone(),
+                    pager,
+                ))
             }
             Cmd::Explain(_stmt) => todo!(),
             Cmd::ExplainQueryPlan(_stmt) => todo!(),
