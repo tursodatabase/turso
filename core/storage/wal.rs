@@ -19,7 +19,7 @@ use crate::storage::sqlite3_ondisk::{
     prepare_wal_frame, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
 };
 use crate::types::IOResult;
-use crate::{turso_assert, Buffer, CompletionType, LimboError, Result};
+use crate::{turso_assert, Buffer, LimboError, Result};
 use crate::{Completion, Page};
 
 use self::sqlite3_ondisk::{checksum_wal, PageContent, WAL_MAGIC_BE, WAL_MAGIC_LE};

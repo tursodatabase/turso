@@ -186,10 +186,10 @@ impl DumbLruPageCache {
         mut entry: NonNull<PageCacheEntry>,
         clean_page: bool,
         allow_detach_pinned: bool,
-        rollback: bool,
+        allow_detach_locked: bool,
     ) -> Result<(), CacheError> {
         let entry_mut = unsafe { entry.as_mut() };
-        if !rollback && entry_mut.page.is_locked() {
+        if !allow_detach_locked && entry_mut.page.is_locked() {
             return Err(CacheError::Locked);
         }
         if entry_mut.page.is_dirty() {
@@ -216,18 +216,18 @@ impl DumbLruPageCache {
         &mut self,
         entry: NonNull<PageCacheEntry>,
         clean_page: bool,
-        rollback: bool,
+        allow_detach_locked: bool,
     ) -> Result<(), CacheError> {
-        self._detach(entry, clean_page, false, rollback)
+        self._detach(entry, clean_page, false, allow_detach_locked)
     }
 
     fn detach_even_if_pinned(
         &mut self,
         entry: NonNull<PageCacheEntry>,
         clean_page: bool,
-        rollback: bool,
+        allow_detach_locked: bool,
     ) -> Result<(), CacheError> {
-        self._detach(entry, clean_page, true, rollback)
+        self._detach(entry, clean_page, true, allow_detach_locked)
     }
 
     fn unlink(&mut self, mut entry: NonNull<PageCacheEntry>) {
@@ -319,14 +319,14 @@ impl DumbLruPageCache {
         }
     }
 
-    pub fn clear(&mut self, rollback: bool) -> Result<(), CacheError> {
+    pub fn clear(&mut self, allow_detach_locked: bool) -> Result<(), CacheError> {
         let mut current = *self.head.borrow();
         while let Some(current_entry) = current {
             unsafe {
                 self.map.borrow_mut().remove(&current_entry.as_ref().key);
             }
             let next = unsafe { current_entry.as_ref().next };
-            self.detach_even_if_pinned(current_entry, true, rollback)?;
+            self.detach_even_if_pinned(current_entry, true, allow_detach_locked)?;
             unsafe {
                 assert!(!current_entry.as_ref().page.is_dirty());
             }

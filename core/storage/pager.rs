@@ -950,7 +950,7 @@ impl Pager {
                     // This is okay assuming we use shared cache by default.
                     {
                         let mut cache = self.page_cache.write();
-                        cache.clear(false).unwrap();
+                        cache.clear(true).unwrap();
                     }
                     self.dirty_pages.borrow_mut().clear();
                     commit_info.state = CommitState::WaitAppendFrames { completions };
