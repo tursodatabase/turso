@@ -43,7 +43,7 @@ pub fn derive_opcode(input: TokenStream) -> TokenStream {
 
         // Use the variant name as the opcode name (e.g., "Add", "Subtract")
         let opcode_name = variant_name.to_string();
-        let description = format!("Description for {}", variant_name);
+        let description = format!("Description for {variant_name}");
 
         // Start with default values for SQLite parameters
         let mut field_patterns = Vec::new();
@@ -80,7 +80,7 @@ pub fn derive_opcode(input: TokenStream) -> TokenStream {
                     #p3,
                     String::new(),  // P4 - we'll add this later if needed
                     0,              // P5 - same here
-                    format!("Generated comment for {}", #opcode_name),
+                    format!("Generated comment for {opcode_name}"),
                 )
             },
         };
