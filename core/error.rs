@@ -63,6 +63,8 @@ pub enum LimboError {
     Busy,
     #[error("Conflict: {0}")]
     Conflict(String),
+    #[error("Database schema changed")]
+    SchemaUpdated,
     #[error("Transaction terminated")]
     TxTerminated,
     #[error("Write-write conflict")]
