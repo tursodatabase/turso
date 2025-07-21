@@ -1106,8 +1106,53 @@ impl Statement {
     }
 
     pub fn step(&mut self) -> Result<StepResult> {
-        self.program
-            .step(&mut self.state, self.mv_store.clone(), self.pager.clone())
+        const MAX_SCHEMA_RETRY: usize = 50;
+        let mut res = self
+            .program
+            .step(&mut self.state, self.mv_store.clone(), self.pager.clone());
+        for _ in 0..MAX_SCHEMA_RETRY {
+            // Only reprepare if we still need to update schema
+            if !matches!(res, Err(LimboError::SchemaUpdated)) {
+                break;
+            }
+            self.reprepare()?;
+            res = self
+                .program
+                .step(&mut self.state, self.mv_store.clone(), self.pager.clone());
+        }
+
+        res
+    }
+
+    fn reprepare(&mut self) -> Result<()> {
+        self.program = {
+            let mut parser = Parser::new(self.program.sql.as_bytes());
+            let cmd = parser.next()?;
+            let cmd = cmd.expect("Same SQL string should be able to be parsed");
+
+            let conn = self.program.connection.clone();
+            let syms = conn.syms.borrow();
+
+            match cmd {
+                Cmd::Stmt(stmt) => translate::translate(
+                    conn.schema.borrow().deref(),
+                    stmt,
+                    self.pager.clone(),
+                    conn.clone(),
+                    &syms,
+                    QueryMode::Normal,
+                    &self.program.sql,
+                )?,
+                Cmd::Explain(_stmt) => todo!(),
+                Cmd::ExplainQueryPlan(_stmt) => todo!(),
+            }
+        };
+        // Save parameters before they are reset
+        let parameters = std::mem::take(&mut self.state.parameters);
+        self.reset();
+        // Load the parameters back into the state
+        self.state.parameters = parameters;
+        Ok(())
     }
 
     pub fn run_once(&self) -> Result<()> {
