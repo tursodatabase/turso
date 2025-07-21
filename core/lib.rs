@@ -796,7 +796,7 @@ impl Connection {
         let pager = self.pager.borrow().clone();
         match cmd {
             Cmd::Stmt(stmt) => {
-                let program = Rc::new(translate::translate(
+                let program = translate::translate(
                     self.schema.borrow().deref(),
                     stmt,
                     pager.clone(),
@@ -804,12 +804,8 @@ impl Connection {
                     &syms,
                     QueryMode::Normal,
                     input,
-                )?);
-                Ok(Statement::new(
-                    program,
-                    self._db.mv_store.clone(),
-                    pager,
-                ))
+                )?;
+                Ok(Statement::new(program, self._db.mv_store.clone(), pager))
             }
             _ => unreachable!(),
         }
@@ -989,7 +985,7 @@ impl Connection {
                     cmd.into(),
                     input,
                 )?;
-                let stmt = Statement::new(program.into(), self._db.mv_store.clone(), pager);
+                let stmt = Statement::new(program, self._db.mv_store.clone(), pager);
                 Ok(Some(stmt))
             }
             Cmd::ExplainQueryPlan(stmt) => {
@@ -1716,18 +1712,14 @@ impl Connection {
 }
 
 pub struct Statement {
-    program: Rc<vdbe::Program>,
+    program: vdbe::Program,
     state: vdbe::ProgramState,
     mv_store: Option<Arc<MvStore>>,
     pager: Rc<Pager>,
 }
 
 impl Statement {
-    pub fn new(
-        program: Rc<vdbe::Program>,
-        mv_store: Option<Arc<MvStore>>,
-        pager: Rc<Pager>,
-    ) -> Self {
+    pub fn new(program: vdbe::Program, mv_store: Option<Arc<MvStore>>, pager: Rc<Pager>) -> Self {
         let state = vdbe::ProgramState::new(program.max_registers, program.cursor_ref.len());
         Self {
             program,
