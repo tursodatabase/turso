@@ -868,7 +868,7 @@ impl ProgramBuilder {
         });
     }
 
-    pub fn build(mut self, connection: Arc<Connection>, change_cnt_on: bool) -> Program {
+    pub fn build(mut self, connection: Arc<Connection>, change_cnt_on: bool, sql: &str) -> Program {
         self.resolve_labels();
 
         self.parameters.list.dedup();
@@ -887,6 +887,7 @@ impl ProgramBuilder {
             change_cnt_on,
             result_columns: self.result_columns,
             table_references: self.table_references,
+            sql: sql.to_string(),
         }
     }
 }
