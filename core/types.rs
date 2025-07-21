@@ -2249,6 +2249,16 @@ pub enum IOResult<T> {
     IO,
 }
 
+impl<T, E> IOResult<Result<T, E>> {
+    pub fn transpose(self) -> Result<IOResult<T>, E> {
+        match self {
+            IOResult::Done(Err(e)) => Err(e),
+            IOResult::Done(Ok(x)) => Ok(IOResult::Done(x)),
+            IOResult::IO => Ok(IOResult::IO),
+        }
+    }
+}
+
 /// Evaluate a Result<IOResult<T>>, if IO return IO.
 #[macro_export]
 macro_rules! return_if_io {

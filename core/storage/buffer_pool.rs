@@ -3,18 +3,18 @@ use parking_lot::Mutex;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use super::sqlite3_ondisk::PageSize;
+
 pub struct BufferPool {
     pub free_buffers: Mutex<Vec<BufferData>>,
     page_size: AtomicUsize,
 }
 
-const DEFAULT_PAGE_SIZE: usize = 4096;
-
 impl BufferPool {
     pub fn new(page_size: Option<usize>) -> Self {
         Self {
             free_buffers: Mutex::new(Vec::new()),
-            page_size: AtomicUsize::new(page_size.unwrap_or(DEFAULT_PAGE_SIZE)),
+            page_size: AtomicUsize::new(page_size.unwrap_or(PageSize::DEFAULT as usize)),
         }
     }
 

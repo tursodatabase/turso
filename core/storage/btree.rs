@@ -3,11 +3,10 @@ use tracing::{instrument, Level};
 use crate::{
     schema::Index,
     storage::{
-        header_accessor,
         pager::{BtreePageAllocMode, Pager},
         sqlite3_ondisk::{
-            read_u32, read_varint, BTreeCell, PageContent, PageType, TableInteriorCell,
-            TableLeafCell, CELL_PTR_SIZE_BYTES, INTERIOR_PAGE_HEADER_SIZE_BYTES,
+            read_u32, read_varint, BTreeCell, DatabaseHeader, PageContent, PageType,
+            TableInteriorCell, TableLeafCell, CELL_PTR_SIZE_BYTES, INTERIOR_PAGE_HEADER_SIZE_BYTES,
             LEAF_PAGE_HEADER_SIZE_BYTES, LEFT_CHILD_PTR_SIZE_BYTES,
         },
     },
@@ -17,6 +16,7 @@ use crate::{
         find_compare, get_tie_breaker_from_seek_op, IndexInfo, ParseRecordState, RecordCompare,
         RecordCursor, SeekResult,
     },
+    util::IOExt,
     MvCursor,
 };
 
@@ -29,8 +29,7 @@ use crate::{
 use super::{
     pager::PageRef,
     sqlite3_ondisk::{
-        write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell, DATABASE_HEADER_SIZE,
-        MINIMUM_CELL_SIZE,
+        write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell, MINIMUM_CELL_SIZE,
     },
 };
 #[cfg(debug_assertions)]
@@ -3136,7 +3135,11 @@ impl BTreeCursor {
                         "left pointer is not the same as page id"
                     );
                     // FIXME: remove this lock
-                    let database_size = header_accessor::get_database_size(&self.pager)?;
+                    let database_size = self
+                        .pager
+                        .io
+                        .block(|| self.pager.with_header(|header| header.database_size))?
+                        .get();
                     turso_assert!(
                         left_pointer <= database_size,
                         "invalid page number divider left pointer {} > database number of pages {}",
@@ -3295,7 +3298,7 @@ impl BTreeCursor {
                     // sub-algorithm in some documentation.
                     assert!(sibling_count_new == 1);
                     let parent_offset = if parent_page.get().id == 1 {
-                        DATABASE_HEADER_SIZE
+                        DatabaseHeader::SIZE
                     } else {
                         0
                     };
@@ -3847,7 +3850,7 @@ impl BTreeCursor {
             current_root.get().get().id == 1
         };
 
-        let offset = if is_page_1 { DATABASE_HEADER_SIZE } else { 0 };
+        let offset = if is_page_1 { DatabaseHeader::SIZE } else { 0 };
 
         let root_btree = self.stack.top();
         let root = root_btree.get();
@@ -4718,7 +4721,11 @@ impl BTreeCursor {
                 OverflowState::ProcessPage { next_page } => {
                     if next_page < 2
                         || next_page as usize
-                            > header_accessor::get_database_size(&self.pager)? as usize
+                            > self
+                                .pager
+                                .io
+                                .block(|| self.pager.with_header(|header| header.database_size))?
+                                .get() as usize
                     {
                         self.overflow_state = None;
                         return Err(LimboError::Corrupt("Invalid overflow page number".into()));
@@ -6651,9 +6658,9 @@ mod tests {
             database::DatabaseFile,
             page_cache::DumbLruPageCache,
             pager::{AtomicDbState, DbState},
+            sqlite3_ondisk::PageSize,
         },
         types::Text,
-        util::IOExt as _,
         vdbe::Register,
         BufferPool, Completion, Connection, StepResult, WalFile, WalFileShared,
     };
@@ -7547,7 +7554,12 @@ mod tests {
             pager.allocate_page().unwrap();
         }
 
-        header_accessor::set_page_size(&pager, page_size).unwrap();
+        pager
+            .io
+            .block(|| {
+                pager.with_header_mut(|header| header.page_size = PageSize::new(page_size).unwrap())
+            })
+            .unwrap();
 
         pager
     }
@@ -7571,7 +7583,10 @@ mod tests {
             let drop_fn = Rc::new(|_buf| {});
             #[allow(clippy::arc_with_non_send_sync)]
             let buf = Arc::new(RefCell::new(Buffer::allocate(
-                header_accessor::get_page_size(&pager)? as usize,
+                pager
+                    .io
+                    .block(|| pager.with_header(|header| header.page_size))?
+                    .get() as usize,
                 drop_fn,
             )));
             let c = Completion::new_write(|_| {});
@@ -7613,20 +7628,35 @@ mod tests {
             payload_size: large_payload.len() as u64,
         });
 
-        let initial_freelist_pages = header_accessor::get_freelist_pages(&pager)?;
+        let initial_freelist_pages = pager
+            .io
+            .block(|| pager.with_header(|header| header.freelist_pages))?
+            .get();
         // Clear overflow pages
         let clear_result = cursor.clear_overflow_pages(&leaf_cell)?;
         match clear_result {
             IOResult::Done(_) => {
+                let (freelist_pages, freelist_trunk_page) = pager
+                    .io
+                    .block(|| {
+                        pager.with_header(|header| {
+                            (
+                                header.freelist_pages.get(),
+                                header.freelist_trunk_page.get(),
+                            )
+                        })
+                    })
+                    .unwrap();
+
                 // Verify proper number of pages were added to freelist
                 assert_eq!(
-                    header_accessor::get_freelist_pages(&pager)?,
+                    freelist_pages,
                     initial_freelist_pages + 3,
                     "Expected 3 pages to be added to freelist"
                 );
 
                 // If this is first trunk page
-                let trunk_page_id = header_accessor::get_freelist_trunk_page(&pager)?;
+                let trunk_page_id = freelist_trunk_page;
                 if trunk_page_id > 0 {
                     // Verify trunk page structure
                     let trunk_page = cursor.read_page(trunk_page_id as usize)?;
@@ -7670,23 +7700,33 @@ mod tests {
             payload_size: small_payload.len() as u64,
         });
 
-        let initial_freelist_pages = header_accessor::get_freelist_pages(&pager)?;
+        let initial_freelist_pages = pager
+            .io
+            .block(|| pager.with_header(|header| header.freelist_pages))?
+            .get() as usize;
 
         // Try to clear non-existent overflow pages
         let clear_result = cursor.clear_overflow_pages(&leaf_cell)?;
         match clear_result {
             IOResult::Done(_) => {
+                let (freelist_pages, freelist_trunk_page) = pager.io.block(|| {
+                    pager.with_header(|header| {
+                        (
+                            header.freelist_pages.get(),
+                            header.freelist_trunk_page.get(),
+                        )
+                    })
+                })?;
+
                 // Verify freelist was not modified
                 assert_eq!(
-                    header_accessor::get_freelist_pages(&pager)?,
-                    initial_freelist_pages,
+                    freelist_pages as usize, initial_freelist_pages,
                     "Freelist should not change when no overflow pages exist"
                 );
 
                 // Verify trunk page wasn't created
                 assert_eq!(
-                    header_accessor::get_freelist_trunk_page(&pager)?,
-                    0,
+                    freelist_trunk_page, 0,
                     "No trunk page should be created when no overflow pages exist"
                 );
             }
@@ -7757,18 +7797,28 @@ mod tests {
 
         // Verify structure before destruction
         assert_eq!(
-            header_accessor::get_database_size(&pager)?,
+            pager
+                .io
+                .block(|| pager.with_header(|header| header.database_size))?
+                .get(),
             4, // We should have pages 1-4
             "Database should have 4 pages total"
         );
 
         // Track freelist state before destruction
-        let initial_free_pages = header_accessor::get_freelist_pages(&pager)?;
+        let initial_free_pages = pager
+            .io
+            .block(|| pager.with_header(|header| header.freelist_pages))?
+            .get();
         assert_eq!(initial_free_pages, 0, "should start with no free pages");
 
         run_until_done(|| cursor.btree_destroy(), pager.deref())?;
 
-        let pages_freed = header_accessor::get_freelist_pages(&pager)? - initial_free_pages;
+        let pages_freed = pager
+            .io
+            .block(|| pager.with_header(|header| header.freelist_pages))?
+            .get()
+            - initial_free_pages;
         assert_eq!(pages_freed, 3, "should free 3 pages (root + 2 leaves)");
 
         Ok(())
