@@ -554,7 +554,7 @@ impl CaptureDataChangesMode {
 
 pub struct Connection {
     _db: Arc<Database>,
-    pager: RefCell<Rc<Pager>>,
+    pub pager: RefCell<Rc<Pager>>,
     schema: RefCell<Arc<Schema>>,
     /// Whether to automatically commit transaction
     auto_commit: Cell<bool>,

@@ -255,13 +255,13 @@ fn update_pragma(
             if let Ok(toggle) = parse_pragma_bool(&value) {
                 pager.disable_cache_spill(toggle);
             } else if let Ok(v) = parse_signed_number(&value) {
-                let usable_space = pager.usable_space();
+                let usable_size = pager.usable_size();
                 let mut page_cache = pager.page_cache.write();
                 let threshold = v.to_int().unwrap();
-                page_cache.set_spill_threshold(threshold, usable_space);
+                page_cache.set_spill_threshold(threshold, usable_size);
             }
 
-            Ok((program, TransactionMode::None))
+            Ok((program, TransactionMode::Read))
         }
     }
 }

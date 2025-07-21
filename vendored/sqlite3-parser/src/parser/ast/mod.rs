@@ -1749,6 +1749,8 @@ pub enum PragmaName {
     AutoVacuum,
     /// `cache_size` pragma
     CacheSize,
+    /// Enables or disables the pager cache spilling in the middle of a transaction.
+    CacheSpill,
     /// List databases
     DatabaseList,
     /// Run integrity check on the database file
@@ -1771,8 +1773,6 @@ pub enum PragmaName {
     UserVersion,
     /// trigger a checkpoint to run on database(s) if WAL is enabled
     WalCheckpoint,
-    /// Enables or disables the pager cache spilling in the middle of a transaction.
-    CacheSpill,
 }
 
 /// `CREATE TRIGGER` time

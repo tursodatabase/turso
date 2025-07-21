@@ -1,3 +1,4 @@
+use crate::return_if_io;
 use crate::storage::sqlite3_ondisk::MAX_PAGE_SIZE;
 use crate::{
     storage::{
@@ -41,7 +42,7 @@ fn get_header_page(pager: &Pager) -> Result<IOResult<PageRef>> {
             "Database is empty, header does not exist - page 1 should've been allocated before this".to_string(),
         ));
     }
-    let page = pager.read_page(DATABASE_HEADER_PAGE_ID)?;
+    let page = return_if_io!(pager.read_page(DATABASE_HEADER_PAGE_ID));
     if page.is_locked() {
         return Ok(IOResult::IO);
     }
@@ -56,7 +57,7 @@ fn get_header_page_for_write(pager: &Pager) -> Result<IOResult<PageRef>> {
             "Cannot write to header of an empty database - page 1 should've been allocated before this".to_string(),
         ));
     }
-    let page = pager.read_page(DATABASE_HEADER_PAGE_ID)?;
+    let page = return_if_io!(pager.read_page(DATABASE_HEADER_PAGE_ID));
     if page.is_locked() {
         return Ok(IOResult::IO);
     }

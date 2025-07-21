@@ -136,7 +136,7 @@ macro_rules! return_if_locked_maybe_load {
             return Ok(IOResult::IO);
         }
         if !$btree_page.get().is_loaded() {
-            let page = $pager.read_page($btree_page.get().get().id)?;
+            let page = return_if_io!($pager.read_page($btree_page.get().get().id));
             $btree_page.page.replace(page);
             return Ok(IOResult::IO);
         }
@@ -645,7 +645,7 @@ impl BTreeCursor {
             let mv_cursor = mv_cursor.borrow();
             return Ok(IOResult::Done(mv_cursor.is_empty()));
         }
-        let page = self.pager.read_page(self.root_page)?;
+        let page = return_if_io!(self.pager.read_page(self.root_page));
         return_if_locked!(page);
 
         let cell_count = page.get().contents.as_ref().unwrap().cell_count();
@@ -674,7 +674,7 @@ impl BTreeCursor {
                     let past_rightmost_pointer = cell_count as i32 + 1;
                     self.stack.set_cell_index(past_rightmost_pointer);
                     self.stack
-                        .push_backwards(self.read_page(rightmost_pointer as usize)?);
+                        .push_backwards(return_if_io!(self.read_page(rightmost_pointer as usize)));
                     continue;
                 }
             }
@@ -722,7 +722,7 @@ impl BTreeCursor {
                 BTreeCell::TableInteriorCell(TableInteriorCell {
                     left_child_page, ..
                 }) => {
-                    let mem_page = self.read_page(left_child_page as usize)?;
+                    let mem_page = return_if_io!(self.read_page(left_child_page as usize));
                     self.stack.push_backwards(mem_page);
                     continue;
                 }
@@ -740,7 +740,7 @@ impl BTreeCursor {
                         // this parent: key 666
                         // left child has: key 663, key 664, key 665
                         // we need to move to the previous parent (with e.g. key 662) when iterating backwards.
-                        let mem_page = self.read_page(left_child_page as usize)?;
+                        let mem_page = return_if_io!(self.read_page(left_child_page as usize));
                         self.stack.retreat();
                         self.stack.push_backwards(mem_page);
                         continue;
@@ -769,7 +769,7 @@ impl BTreeCursor {
         payload_size: u64,
     ) -> Result<IOResult<()>> {
         if self.read_overflow_state.borrow().is_none() {
-            let page = self.read_page(start_next_page as usize)?;
+            let page = return_if_io!(self.read_page(start_next_page as usize));
             *self.read_overflow_state.borrow_mut() = Some(ReadPayloadOverflow {
                 payload: payload.to_vec(),
                 next_page: start_next_page,
@@ -801,11 +801,10 @@ impl BTreeCursor {
         *remaining_to_read -= to_read;
 
         if *remaining_to_read != 0 && next != 0 {
-            let new_page = self.pager.read_page(next as usize).map(|page| {
-                Arc::new(BTreePageInner {
-                    page: RefCell::new(page),
-                })
-            })?;
+            let page = return_if_io!(self.pager.read_page(next as usize));
+            let new_page = Arc::new(BTreePageInner {
+                page: RefCell::new(page),
+            });
             *page_btree = new_page;
             *next_page = next;
             return Ok(IOResult::IO);
@@ -1005,7 +1004,7 @@ impl BTreeCursor {
                     is_write,
                 }) => {
                     if *pages_left_to_skip == 0 {
-                        let page = self.read_page(*next_page as usize)?;
+                        let page = return_if_io!(self.read_page(*next_page as usize));
                         return_if_locked_maybe_load!(self.pager, page);
                         self.state =
                             CursorState::ReadWritePayload(PayloadOverflowWithOffset::ProcessPage {
@@ -1020,7 +1019,7 @@ impl BTreeCursor {
                         continue;
                     }
 
-                    let page = self.read_page(*next_page as usize)?;
+                    let page = return_if_io!(self.read_page(*next_page as usize));
                     return_if_locked_maybe_load!(self.pager, page);
                     let page = page.get();
                     let contents = page.get_contents();
@@ -1115,7 +1114,7 @@ impl BTreeCursor {
                     // Load next page
                     *next_page = next;
                     *current_offset = 0; // Reset offset for new page
-                    *page_btree = self.read_page(next as usize)?;
+                    *page_btree = return_if_io!(self.read_page(next as usize));
 
                     // Return IO to allow other operations
                     return Ok(IOResult::IO);
@@ -1227,7 +1226,7 @@ impl BTreeCursor {
                     (Some(right_most_pointer), false) => {
                         // do rightmost
                         self.stack.advance();
-                        let mem_page = self.read_page(right_most_pointer as usize)?;
+                        let mem_page = return_if_io!(self.read_page(right_most_pointer as usize));
                         self.stack.push(mem_page);
                         continue;
                     }
@@ -1259,7 +1258,7 @@ impl BTreeCursor {
                 BTreeCell::TableInteriorCell(TableInteriorCell {
                     left_child_page, ..
                 }) => {
-                    let mem_page = self.read_page(*left_child_page as usize)?;
+                    let mem_page = return_if_io!(self.read_page(*left_child_page as usize));
                     self.stack.push(mem_page);
                     continue;
                 }
@@ -1273,7 +1272,7 @@ impl BTreeCursor {
                         self.going_upwards = false;
                         return Ok(IOResult::Done(true));
                     } else {
-                        let mem_page = self.read_page(*left_child_page as usize)?;
+                        let mem_page = return_if_io!(self.read_page(*left_child_page as usize));
                         self.stack.push(mem_page);
                         continue;
                     }
@@ -1304,14 +1303,14 @@ impl BTreeCursor {
 
     /// Move the cursor to the root page of the btree.
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn move_to_root(&mut self) -> Result<()> {
+    fn move_to_root(&mut self) -> Result<IOResult<()>> {
         self.seek_state = CursorSeekState::Start;
         self.going_upwards = false;
         tracing::trace!(root_page = self.root_page);
-        let mem_page = self.read_page(self.root_page)?;
+        let mem_page = return_if_io!(self.read_page(self.root_page));
         self.stack.clear();
         self.stack.push(mem_page);
-        Ok(())
+        Ok(IOResult::Done(()))
     }
 
     /// Move the cursor to the rightmost record in the btree.
@@ -1322,7 +1321,7 @@ impl BTreeCursor {
         loop {
             let mem_page = self.stack.top();
             let page_idx = mem_page.get().get().id;
-            let page = self.read_page(page_idx)?;
+            let page = return_if_io!(self.read_page(page_idx));
             return_if_locked_maybe_load!(self.pager, page);
             let page = page.get();
             let contents = page.get().contents.as_ref().unwrap();
@@ -1337,7 +1336,7 @@ impl BTreeCursor {
             match contents.rightmost_pointer() {
                 Some(right_most_pointer) => {
                     self.stack.set_cell_index(contents.cell_count() as i32 + 1);
-                    let mem_page = self.read_page(right_most_pointer as usize)?;
+                    let mem_page = return_if_io!(self.read_page(right_most_pointer as usize));
                     self.stack.push(mem_page);
                     continue;
                 }
@@ -1404,7 +1403,7 @@ impl BTreeCursor {
                         let left_child_page =
                             contents.cell_interior_read_left_child_page(nearest_matching_cell);
                         self.stack.set_cell_index(nearest_matching_cell as i32);
-                        let mem_page = self.read_page(left_child_page as usize)?;
+                        let mem_page = return_if_io!(self.read_page(left_child_page as usize));
                         self.stack.push(mem_page);
                         self.seek_state = CursorSeekState::MovingBetweenPages {
                             eq_seen: Cell::new(eq_seen.get()),
@@ -1414,7 +1413,8 @@ impl BTreeCursor {
                     self.stack.set_cell_index(cell_count as i32 + 1);
                     match contents.rightmost_pointer() {
                         Some(right_most_pointer) => {
-                            let mem_page = self.read_page(right_most_pointer as usize)?;
+                            let mem_page =
+                                return_if_io!(self.read_page(right_most_pointer as usize));
                             self.stack.push(mem_page);
                             self.seek_state = CursorSeekState::MovingBetweenPages {
                                 eq_seen: Cell::new(eq_seen.get()),
@@ -1545,7 +1545,8 @@ impl BTreeCursor {
                         self.stack.set_cell_index(contents.cell_count() as i32 + 1);
                         match contents.rightmost_pointer() {
                             Some(right_most_pointer) => {
-                                let mem_page = self.read_page(right_most_pointer as usize)?;
+                                let mem_page =
+                                    return_if_io!(self.read_page(right_most_pointer as usize));
                                 self.stack.push(mem_page);
                                 self.seek_state = CursorSeekState::MovingBetweenPages {
                                     eq_seen: Cell::new(eq_seen.get()),
@@ -1585,7 +1586,7 @@ impl BTreeCursor {
                         page.get().id
                     );
 
-                    let mem_page = self.read_page(*left_child_page as usize)?;
+                    let mem_page = return_if_io!(self.read_page(*left_child_page as usize));
                     self.stack.push(mem_page);
                     self.seek_state = CursorSeekState::MovingBetweenPages {
                         eq_seen: Cell::new(eq_seen.get()),
@@ -2209,7 +2210,7 @@ impl BTreeCursor {
                     // insert cell
 
                     let mut cell_payload: Vec<u8> = Vec::with_capacity(record_values.len() + 4);
-                    fill_cell_payload(
+                    return_if_io!(fill_cell_payload(
                         page.get().get().contents.as_ref().unwrap(),
                         bkey.maybe_rowid(),
                         &mut cell_payload,
@@ -2217,7 +2218,7 @@ impl BTreeCursor {
                         record,
                         self.usable_space(),
                         self.pager.clone(),
-                    );
+                    ));
 
                     // insert
                     let overflow = {
@@ -2465,7 +2466,7 @@ impl BTreeCursor {
                 let mut pgno: u32 = unsafe { right_pointer.cast::<u32>().read().swap_bytes() };
                 let current_sibling = sibling_pointer;
                 for i in (0..=current_sibling).rev() {
-                    let page = self.read_page(pgno as usize)?;
+                    let page = return_if_io!(self.read_page(pgno as usize));
                     {
                         // mark as dirty
                         let sibling_page = page.get();
@@ -2968,7 +2969,7 @@ impl BTreeCursor {
                         pages_to_balance_new[i].replace(page.clone());
                     } else {
                         // FIXME: handle page cache is full
-                        let page = self.allocate_page(page_type, 0)?;
+                        let page = return_if_io!(self.allocate_page(page_type, 0));
                         pages_to_balance_new[i].replace(page);
                         // Since this page didn't exist before, we can set it to cells length as it
                         // marks them as empty since it is a prefix sum of cells.
@@ -3839,7 +3840,7 @@ impl BTreeCursor {
     /// Balance the root page.
     /// This is done when the root page overflows, and we need to create a new root page.
     /// See e.g. https://en.wikipedia.org/wiki/B-tree
-    fn balance_root(&mut self) -> Result<()> {
+    fn balance_root(&mut self) -> Result<IOResult<()>> {
         /* todo: balance deeper, create child and copy contents of root there. Then split root */
         /* if we are in root page then we just need to create a new root and push key there */
 
@@ -3854,9 +3855,11 @@ impl BTreeCursor {
         let root = root_btree.get();
         let root_contents = root.get_contents();
         // FIXME: handle page cache is full
-        let child_btree =
-            self.pager
-                .do_allocate_page(root_contents.page_type(), 0, BtreePageAllocMode::Any)?;
+        let child_btree = return_if_io!(self.pager.do_allocate_page(
+            root_contents.page_type(),
+            0,
+            BtreePageAllocMode::Any
+        ));
 
         tracing::debug!(
             "balance_root(root={}, rightmost={}, page_type={:?})",
@@ -3914,7 +3917,7 @@ impl BTreeCursor {
         self.stack.push(root_btree.clone());
         self.stack.set_cell_index(0); // leave parent pointing at the rightmost pointer (in this case 0, as there are no cells), since we will be balancing the rightmost child page.
         self.stack.push(child_btree.clone());
-        Ok(())
+        Ok(IOResult::Done(()))
     }
 
     fn usable_space(&self) -> usize {
@@ -3927,7 +3930,7 @@ impl BTreeCursor {
         loop {
             let mem_page = self.stack.top();
             let page_id = mem_page.get().get().id;
-            let page = self.read_page(page_id)?;
+            let page = return_if_io!(self.read_page(page_id));
             return_if_locked_maybe_load!(self.pager, page);
 
             let page = page.get();
@@ -3941,7 +3944,7 @@ impl BTreeCursor {
             match contents.rightmost_pointer() {
                 Some(right_most_pointer) => {
                     self.stack.set_cell_index(contents.cell_count() as i32 + 1); // invalid on interior
-                    let child = self.read_page(right_most_pointer as usize)?;
+                    let child = return_if_io!(self.read_page(right_most_pointer as usize));
                     self.stack.push(child);
                 }
                 None => unreachable!("interior page must have rightmost pointer"),
@@ -4724,7 +4727,7 @@ impl BTreeCursor {
                         self.overflow_state = None;
                         return Err(LimboError::Corrupt("Invalid overflow page number".into()));
                     }
-                    let page = self.read_page(next_page as usize)?;
+                    let page = return_if_io!(self.read_page(next_page as usize));
                     return_if_locked_maybe_load!(self.pager, page);
 
                     let page = page.get();
@@ -4820,7 +4823,8 @@ impl BTreeCursor {
                             //  Non-leaf page which has processed all children but not it's potential right child
                             (false, n) if n == contents.cell_count() as i32 => {
                                 if let Some(rightmost) = contents.rightmost_pointer() {
-                                    let rightmost_page = self.read_page(rightmost as usize)?;
+                                    let rightmost_page =
+                                        return_if_io!(self.read_page(rightmost as usize));
                                     self.stack.push(rightmost_page);
                                     let destroy_info = self.state.mut_destroy_info().expect(
                                         "unable to get a mut reference to destroy state in cursor",
@@ -4877,7 +4881,8 @@ impl BTreeCursor {
                                     BTreeCell::IndexInteriorCell(cell) => cell.left_child_page,
                                     _ => panic!("expected interior cell"),
                                 };
-                                let child_page = self.read_page(child_page_id as usize)?;
+                                let child_page =
+                                    return_if_io!(self.read_page(child_page_id as usize));
                                 self.stack.push(child_page);
                                 let destroy_info = self.state.mut_destroy_info().expect(
                                     "unable to get a mut reference to destroy state in cursor",
@@ -4893,8 +4898,9 @@ impl BTreeCursor {
                         IOResult::Done(_) => match cell {
                             //  For an index interior cell, clear the left child page now that overflow pages have been cleared
                             BTreeCell::IndexInteriorCell(index_int_cell) => {
-                                let child_page =
-                                    self.read_page(index_int_cell.left_child_page as usize)?;
+                                let child_page = return_if_io!(
+                                    self.read_page(index_int_cell.left_child_page as usize)
+                                );
                                 self.stack.push(child_page);
                                 let destroy_info = self.state.mut_destroy_info().expect(
                                     "unable to get a mut reference to destroy state in cursor",
@@ -4954,7 +4960,7 @@ impl BTreeCursor {
         let serial_types_len = self.record_cursor.borrow_mut().len(record);
         let mut new_payload = Vec::with_capacity(serial_types_len);
         let rowid = return_if_io!(self.rowid());
-        fill_cell_payload(
+        return_if_io!(fill_cell_payload(
             page_contents,
             rowid,
             &mut new_payload,
@@ -4962,7 +4968,7 @@ impl BTreeCursor {
             record,
             self.usable_space(),
             self.pager.clone(),
-        );
+        ));
 
         // figure out old cell offset & size
         let (old_offset, old_local_size) = {
@@ -5092,7 +5098,7 @@ impl BTreeCursor {
                 // should be safe as contents is not a leaf page
                 let right_most_pointer = contents.rightmost_pointer().unwrap();
                 self.stack.advance();
-                let mem_page = self.read_page(right_most_pointer as usize)?;
+                let mem_page = return_if_io!(self.read_page(right_most_pointer as usize));
                 self.stack.push(mem_page);
             } else {
                 // Move to child left page
@@ -5106,7 +5112,7 @@ impl BTreeCursor {
                         left_child_page, ..
                     }) => {
                         self.stack.advance();
-                        let mem_page = self.read_page(left_child_page as usize)?;
+                        let mem_page = return_if_io!(self.read_page(left_child_page as usize));
                         self.stack.push(mem_page);
                     }
                     _ => unreachable!(),
@@ -5163,11 +5169,11 @@ impl BTreeCursor {
         }
     }
 
-    pub fn read_page(&self, page_idx: usize) -> Result<BTreePage> {
+    pub fn read_page(&self, page_idx: usize) -> Result<IOResult<BTreePage>> {
         btree_read_page(&self.pager, page_idx)
     }
 
-    pub fn allocate_page(&self, page_type: PageType, offset: usize) -> Result<BTreePage> {
+    pub fn allocate_page(&self, page_type: PageType, offset: usize) -> Result<IOResult<BTreePage>> {
         self.pager
             .do_allocate_page(page_type, offset, BtreePageAllocMode::Any)
     }
@@ -5286,7 +5292,7 @@ pub fn integrity_check(
     else {
         return Ok(IOResult::Done(()));
     };
-    let page = btree_read_page(pager, page_idx)?;
+    let page = return_if_io!(btree_read_page(pager, page_idx));
     return_if_locked_maybe_load!(pager, page);
     state.page_stack.pop();
 
@@ -5433,12 +5439,11 @@ pub fn integrity_check(
     Ok(IOResult::Done(()))
 }
 
-pub fn btree_read_page(pager: &Rc<Pager>, page_idx: usize) -> Result<BTreePage> {
-    pager.read_page(page_idx).map(|page| {
-        Arc::new(BTreePageInner {
-            page: RefCell::new(page),
-        })
-    })
+pub fn btree_read_page(pager: &Rc<Pager>, page_idx: usize) -> Result<IOResult<BTreePage>> {
+    let page = return_if_io!(pager.read_page(page_idx));
+    Ok(IOResult::Done(Arc::new(BTreePageInner {
+        page: RefCell::new(page),
+    })))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6485,7 +6490,7 @@ fn fill_cell_payload(
     record: &ImmutableRecord,
     usable_space: usize,
     pager: Rc<Pager>,
-) {
+) -> Result<IOResult<()>> {
     // TODO: make record raw from start, having to serialize is not good
     let record_buf = record.get_payload().to_vec();
 
@@ -6514,7 +6519,7 @@ fn fill_cell_payload(
     if record_buf.len() <= payload_overflow_threshold_max {
         // enough allowed space to fit inside a btree page
         cell_payload.extend_from_slice(record_buf.as_slice());
-        return;
+        return Ok(IOResult::Done(()));
     }
 
     let payload_overflow_threshold_min = payload_overflow_threshold_min(page_type, usable_space);
@@ -6546,7 +6551,7 @@ fn fill_cell_payload(
 
         // we still have bytes to add, we will need to allocate new overflow page
         // FIXME: handle page cache is full
-        let overflow_page = pager.allocate_overflow_page();
+        let overflow_page = return_if_io!(pager.allocate_overflow_page());
         {
             let id = overflow_page.get().id as u32;
             let contents = overflow_page.get().contents.as_mut().unwrap();
@@ -6566,6 +6571,7 @@ fn fill_cell_payload(
     }
 
     assert_eq!(cell_size, cell_payload.len());
+    Ok(IOResult::Done(()))
 }
 
 /// Returns the maximum payload size (X) that can be stored directly on a b-tree page without spilling to overflow pages.
@@ -6650,7 +6656,7 @@ mod tests {
         schema::IndexColumn,
         storage::{database::DatabaseFile, page_cache::DumbLruPageCache},
         types::Text,
-        util::IOExt as _,
+        util::run_until_done,
         vdbe::Register,
         BufferPool, Completion, Connection, StepResult, WalFile, WalFileShared,
     };
@@ -6728,9 +6734,9 @@ mod tests {
         page: &mut PageContent,
         record: ImmutableRecord,
         conn: &Arc<Connection>,
-    ) -> Vec<u8> {
+    ) -> Result<IOResult<Vec<u8>>> {
         let mut payload: Vec<u8> = Vec::new();
-        fill_cell_payload(
+        return_if_io!(fill_cell_payload(
             page,
             Some(id as i64),
             &mut payload,
@@ -6738,9 +6744,9 @@ mod tests {
             &record,
             4096,
             conn.pager.borrow().clone(),
-        );
+        ));
         insert_into_cell(page, &payload, pos, 4096).unwrap();
-        payload
+        Ok(IOResult::Done(payload))
     }
 
     #[test]
@@ -6753,7 +6759,11 @@ mod tests {
         let header_size = 8;
         let regs = &[Register::Value(Value::Integer(1))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
-        let payload = add_record(1, 0, page, record, &conn);
+        let payload = run_until_done(
+            || add_record(1, 0, page, record.clone(), &conn),
+            &conn.pager.borrow(),
+        )
+        .unwrap();
         assert_eq!(page.cell_count(), 1);
         let free = compute_free_space(page, 4096);
         assert_eq!(free, 4096 - payload.len() as u16 - 2 - header_size);
@@ -6783,7 +6793,11 @@ mod tests {
         for i in 0..3 {
             let regs = &[Register::Value(Value::Integer(i as i64))];
             let record = ImmutableRecord::from_registers(regs, regs.len());
-            let payload = add_record(i, i, page, record, &conn);
+            let payload = run_until_done(
+                || add_record(i, i, page, record.clone(), &conn),
+                &conn.pager.borrow(),
+            )
+            .unwrap();
             assert_eq!(page.cell_count(), i + 1);
             let free = compute_free_space(page, usable_space);
             total_size += payload.len() as u16 + 2;
@@ -6805,7 +6819,8 @@ mod tests {
     fn validate_btree(pager: Rc<Pager>, page_idx: usize) -> (usize, bool) {
         let num_columns = 5;
         let cursor = BTreeCursor::new_table(None, pager.clone(), page_idx, num_columns);
-        let page = cursor.read_page(page_idx).unwrap();
+        let page = run_until_done(|| cursor.read_page(page_idx), pager.as_ref()).unwrap();
+
         while page.get().is_locked() {
             pager.io.run_once().unwrap();
         }
@@ -6825,7 +6840,9 @@ mod tests {
                 BTreeCell::TableInteriorCell(TableInteriorCell {
                     left_child_page, ..
                 }) => {
-                    let child_page = cursor.read_page(left_child_page as usize).unwrap();
+                    let child_page =
+                        run_until_done(|| cursor.read_page(left_child_page as usize), &pager)
+                            .unwrap();
                     while child_page.get().is_locked() {
                         pager.io.run_once().unwrap();
                     }
@@ -6882,7 +6899,8 @@ mod tests {
         }
         let first_page_type = child_pages.first().map(|p| {
             if !p.get().is_loaded() {
-                let new_page = pager.read_page(p.get().get().id).unwrap();
+                let new_page =
+                    run_until_done(|| pager.read_page(p.get().get().id), &pager).unwrap();
                 p.page.replace(new_page);
             }
             while p.get().is_locked() {
@@ -6893,7 +6911,8 @@ mod tests {
         if let Some(child_type) = first_page_type {
             for page in child_pages.iter().skip(1) {
                 if !page.get().is_loaded() {
-                    let new_page = pager.read_page(page.get().get().id).unwrap();
+                    let new_page =
+                        run_until_done(|| pager.read_page(page.get().get().id), &pager).unwrap();
                     page.page.replace(new_page);
                 }
                 while page.get().is_locked() {
@@ -6916,7 +6935,7 @@ mod tests {
         let num_columns = 5;
 
         let cursor = BTreeCursor::new_table(None, pager.clone(), page_idx, num_columns);
-        let page = cursor.read_page(page_idx).unwrap();
+        let page = run_until_done(|| cursor.read_page(page_idx), &pager).unwrap();
         while page.get().is_locked() {
             pager.io.run_once().unwrap();
         }
@@ -6979,7 +6998,7 @@ mod tests {
 
         // FIXME: handle page cache is full
         let _ = run_until_done(|| pager.allocate_page1(), &pager);
-        let page2 = pager.allocate_page().unwrap();
+        let page2 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
         let page2 = Arc::new(BTreePageInner {
             page: RefCell::new(page2),
         });
@@ -7399,7 +7418,11 @@ mod tests {
         for i in 0..total_cells {
             let regs = &[Register::Value(Value::Integer(i as i64))];
             let record = ImmutableRecord::from_registers(regs, regs.len());
-            let payload = add_record(i, i, page, record, &conn);
+            let payload = run_until_done(
+                || add_record(i, i, page, record.clone(), &conn),
+                &conn.pager.borrow(),
+            )
+            .unwrap();
             assert_eq!(page.cell_count(), i + 1);
             let free = compute_free_space(page, usable_space);
             total_size += payload.len() as u16 + 2;
@@ -7578,7 +7601,7 @@ mod tests {
                 .write_page(current_page as usize, buf.clone(), c)?;
             pager.io.run_once()?;
 
-            let page = cursor.read_page(current_page as usize)?;
+            let page = run_until_done(|| cursor.read_page(current_page as usize), &pager).unwrap();
             while page.get().is_locked() {
                 cursor.pager.io.run_once()?;
             }
@@ -7626,7 +7649,9 @@ mod tests {
                 let trunk_page_id = header_accessor::get_freelist_trunk_page(&pager)?;
                 if trunk_page_id > 0 {
                     // Verify trunk page structure
-                    let trunk_page = cursor.read_page(trunk_page_id as usize)?;
+                    let trunk_page =
+                        run_until_done(|| cursor.read_page(trunk_page_id as usize), &pager)
+                            .unwrap();
                     if let Some(contents) = trunk_page.get().get().contents.as_ref() {
                         // Read number of leaf pages in trunk
                         let n_leaf = contents.read_u32(4);
@@ -7704,11 +7729,14 @@ mod tests {
         let mut cursor = BTreeCursor::new_table(None, pager.clone(), 2, num_columns);
 
         // Initialize page 2 as a root page (interior)
-        let root_page = cursor.allocate_page(PageType::TableInterior, 0)?;
+        let root_page =
+            run_until_done(|| cursor.allocate_page(PageType::TableInterior, 0), &pager).unwrap();
 
         // Allocate two leaf pages
-        let page3 = cursor.allocate_page(PageType::TableLeaf, 0)?;
-        let page4 = cursor.allocate_page(PageType::TableLeaf, 0)?;
+        let page3 =
+            run_until_done(|| cursor.allocate_page(PageType::TableLeaf, 0), &pager).unwrap();
+        let page4 =
+            run_until_done(|| cursor.allocate_page(PageType::TableLeaf, 0), &pager).unwrap();
 
         // Configure the root page to point to the two leaf pages
         {
@@ -7787,7 +7815,11 @@ mod tests {
         for i in 0..3 {
             let regs = &[Register::Value(Value::Integer(i as i64))];
             let record = ImmutableRecord::from_registers(regs, regs.len());
-            let payload = add_record(i, i, page, record, &conn);
+            let payload = run_until_done(
+                || add_record(i, i, page, record.clone(), &conn),
+                &conn.pager.borrow(),
+            )
+            .unwrap();
             assert_eq!(page.cell_count(), i + 1);
             let free = compute_free_space(page, usable_space);
             total_size += payload.len() as u16 + 2;
@@ -7829,7 +7861,11 @@ mod tests {
         for i in 0..total_cells {
             let regs = &[Register::Value(Value::Integer(i as i64))];
             let record = ImmutableRecord::from_registers(regs, regs.len());
-            let payload = add_record(i, i, page, record, &conn);
+            let payload = run_until_done(
+                || add_record(i, i, page, record.clone(), &conn),
+                &conn.pager.borrow(),
+            )
+            .unwrap();
             assert_eq!(page.cell_count(), i + 1);
             let free = compute_free_space(page, usable_space);
             total_size += payload.len() as u16 + 2;
@@ -7886,15 +7922,21 @@ mod tests {
                     let regs = &[Register::Value(Value::Integer(i as i64))];
                     let record = ImmutableRecord::from_registers(regs, regs.len());
                     let mut payload: Vec<u8> = Vec::new();
-                    fill_cell_payload(
-                        page,
-                        Some(i as i64),
-                        &mut payload,
-                        cell_idx,
-                        &record,
-                        4096,
-                        conn.pager.borrow().clone(),
-                    );
+                    run_until_done(
+                        || {
+                            fill_cell_payload(
+                                page,
+                                Some(i as i64),
+                                &mut payload,
+                                cell_idx,
+                                &record,
+                                4096,
+                                conn.pager.borrow().clone(),
+                            )
+                        },
+                        &conn.pager.borrow(),
+                    )
+                    .unwrap();
                     if (free as usize) < payload.len() + 2 {
                         // do not try to insert overflow pages because they require balancing
                         continue;
@@ -7960,15 +8002,21 @@ mod tests {
                         let regs = &[Register::Value(Value::Integer(i))];
                         let record = ImmutableRecord::from_registers(regs, regs.len());
                         let mut payload: Vec<u8> = Vec::new();
-                        fill_cell_payload(
-                            page,
-                            Some(i),
-                            &mut payload,
-                            cell_idx,
-                            &record,
-                            4096,
-                            conn.pager.borrow().clone(),
-                        );
+                        run_until_done(
+                            || {
+                                fill_cell_payload(
+                                    page,
+                                    Some(i),
+                                    &mut payload,
+                                    cell_idx,
+                                    &record,
+                                    4096,
+                                    conn.pager.borrow().clone(),
+                                )
+                            },
+                            &conn.pager.borrow(),
+                        )
+                        .unwrap();
                         if (free as usize) < payload.len() - 2 {
                             // do not try to insert overflow pages because they require balancing
                             continue;
@@ -8114,7 +8162,11 @@ mod tests {
 
         let regs = &[Register::Value(Value::Integer(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
-        let payload = add_record(0, 0, page, record, &conn);
+        let payload = run_until_done(
+            || add_record(0, 0, page, record.clone(), &conn),
+            &conn.pager.borrow(),
+        )
+        .unwrap();
         let free = compute_free_space(page, usable_space);
         assert_eq!(free, 4096 - payload.len() as u16 - 2 - header_size);
     }
@@ -8131,7 +8183,11 @@ mod tests {
 
         let regs = &[Register::Value(Value::Integer(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
-        let payload = add_record(0, 0, page, record, &conn);
+        let payload = run_until_done(
+            || add_record(0, 0, page, record.clone(), &conn),
+            &conn.pager.borrow(),
+        )
+        .unwrap();
 
         assert_eq!(page.cell_count(), 1);
         defragment_page(page, usable_space);
@@ -8156,7 +8212,11 @@ mod tests {
             Register::Value(Value::Text(Text::new("aaaaaaaa"))),
         ];
         let record = ImmutableRecord::from_registers(regs, regs.len());
-        let _ = add_record(0, 0, page, record, &conn);
+        let _ = run_until_done(
+            || add_record(0, 0, page, record.clone(), &conn),
+            &conn.pager.borrow(),
+        )
+        .unwrap();
 
         assert_eq!(page.cell_count(), 1);
         drop_cell(page, 0, usable_space).unwrap();
@@ -8164,7 +8224,11 @@ mod tests {
 
         let regs = &[Register::Value(Value::Integer(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
-        let payload = add_record(0, 0, page, record, &conn);
+        let payload = run_until_done(
+            || add_record(0, 0, page, record.clone(), &conn),
+            &conn.pager.borrow(),
+        )
+        .unwrap();
         assert_eq!(page.cell_count(), 1);
 
         let (start, len) = page.cell_get_raw_region(0, usable_space as usize);
@@ -8187,7 +8251,11 @@ mod tests {
             Register::Value(Value::Text(Text::new("aaaaaaaa"))),
         ];
         let record = ImmutableRecord::from_registers(regs, regs.len());
-        let _ = add_record(0, 0, page, record, &conn);
+        let _ = run_until_done(
+            || add_record(0, 0, page, record.clone(), &conn),
+            &conn.pager.borrow(),
+        )
+        .unwrap();
 
         for _ in 0..100 {
             assert_eq!(page.cell_count(), 1);
@@ -8196,7 +8264,11 @@ mod tests {
 
             let regs = &[Register::Value(Value::Integer(0))];
             let record = ImmutableRecord::from_registers(regs, regs.len());
-            let payload = add_record(0, 0, page, record, &conn);
+            let payload = run_until_done(
+                || add_record(0, 0, page, record.clone(), &conn),
+                &conn.pager.borrow(),
+            )
+            .unwrap();
             assert_eq!(page.cell_count(), 1);
 
             let (start, len) = page.cell_get_raw_region(0, usable_space as usize);
@@ -8217,13 +8289,25 @@ mod tests {
 
         let regs = &[Register::Value(Value::Integer(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
-        let payload = add_record(0, 0, page, record, &conn);
+        let payload = run_until_done(
+            || add_record(0, 0, page, record.clone(), &conn),
+            &conn.pager.borrow(),
+        )
+        .unwrap();
         let regs = &[Register::Value(Value::Integer(1))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
-        let _ = add_record(1, 1, page, record, &conn);
+        let _ = run_until_done(
+            || add_record(1, 1, page, record.clone(), &conn),
+            &conn.pager.borrow(),
+        )
+        .unwrap();
         let regs = &[Register::Value(Value::Integer(2))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
-        let _ = add_record(2, 2, page, record, &conn);
+        let _ = run_until_done(
+            || add_record(2, 2, page, record.clone(), &conn),
+            &conn.pager.borrow(),
+        )
+        .unwrap();
 
         drop_cell(page, 1, usable_space).unwrap();
         drop_cell(page, 1, usable_space).unwrap();
@@ -8243,24 +8327,40 @@ mod tests {
 
         let regs = &[Register::Value(Value::Integer(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
-        let _ = add_record(0, 0, page, record, &conn);
+        let _ = run_until_done(
+            || add_record(0, 0, page, record.clone(), &conn),
+            &conn.pager.borrow(),
+        )
+        .unwrap();
 
         let regs = &[Register::Value(Value::Integer(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
-        let _ = add_record(0, 0, page, record, &conn);
+        let _ = run_until_done(
+            || add_record(0, 0, page, record.clone(), &conn),
+            &conn.pager.borrow(),
+        )
+        .unwrap();
         drop_cell(page, 0, usable_space).unwrap();
 
         defragment_page(page, usable_space);
 
         let regs = &[Register::Value(Value::Integer(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
-        let _ = add_record(0, 1, page, record, &conn);
+        let _ = run_until_done(
+            || add_record(0, 1, page, record.clone(), &conn),
+            &conn.pager.borrow(),
+        )
+        .unwrap();
 
         drop_cell(page, 0, usable_space).unwrap();
 
         let regs = &[Register::Value(Value::Integer(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
-        let _ = add_record(0, 1, page, record, &conn);
+        let _ = run_until_done(
+            || add_record(0, 1, page, record.clone(), &conn),
+            &conn.pager.borrow(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -8270,10 +8370,14 @@ mod tests {
 
         let page = get_page(2);
         let usable_space = 4096;
-        let insert = |pos, page| {
+        let insert = |pos, page: &mut PageContent| {
             let regs = &[Register::Value(Value::Integer(0))];
             let record = ImmutableRecord::from_registers(regs, regs.len());
-            let _ = add_record(0, pos, page, record, &conn);
+            let _ = run_until_done(
+                || add_record(0, pos, page, record.clone(), &conn),
+                &conn.pager.borrow(),
+            )
+            .unwrap();
         };
         let drop = |pos, page| {
             drop_cell(page, pos, usable_space).unwrap();
@@ -8311,10 +8415,14 @@ mod tests {
 
         let page = get_page(2);
         let usable_space = 4096;
-        let insert = |pos, page| {
+        let insert = |pos, page: &mut PageContent| {
             let regs = &[Register::Value(Value::Integer(0))];
             let record = ImmutableRecord::from_registers(regs, regs.len());
-            let _ = add_record(0, pos, page, record, &conn);
+            let _ = run_until_done(
+                || add_record(0, pos, page, record.clone(), &conn),
+                &conn.pager.borrow(),
+            )
+            .unwrap();
         };
         let drop = |pos, page| {
             drop_cell(page, pos, usable_space).unwrap();
@@ -8325,15 +8433,21 @@ mod tests {
         let regs = &[Register::Value(Value::Integer(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
         let mut payload: Vec<u8> = Vec::new();
-        fill_cell_payload(
-            page.get().get_contents(),
-            Some(0),
-            &mut payload,
-            0,
-            &record,
-            4096,
-            conn.pager.borrow().clone(),
-        );
+        run_until_done(
+            || {
+                fill_cell_payload(
+                    page.get().get_contents(),
+                    Some(0),
+                    &mut payload,
+                    0,
+                    &record,
+                    4096,
+                    conn.pager.borrow().clone(),
+                )
+            },
+            &conn.pager.borrow(),
+        )
+        .unwrap();
         let page = page.get();
         insert(0, page.get_contents());
         defragment(page.get_contents());
@@ -8403,15 +8517,21 @@ mod tests {
         let regs = &[Register::Value(Value::Blob(vec![0; 3600]))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
         let mut payload: Vec<u8> = Vec::new();
-        fill_cell_payload(
-            page.get().get_contents(),
-            Some(0),
-            &mut payload,
-            0,
-            &record,
-            4096,
-            conn.pager.borrow().clone(),
-        );
+        run_until_done(
+            || {
+                fill_cell_payload(
+                    page.get().get_contents(),
+                    Some(0),
+                    &mut payload,
+                    0,
+                    &record,
+                    4096,
+                    conn.pager.borrow().clone(),
+                )
+            },
+            &conn.pager.borrow(),
+        )
+        .unwrap();
         insert_into_cell(page.get().get_contents(), &payload, 0, 4096).unwrap();
         let free = compute_free_space(page.get().get_contents(), usable_space);
         let total_size = payload.len() + 2;
@@ -8721,10 +8841,6 @@ mod tests {
         );
     }
 
-    fn run_until_done<T>(action: impl FnMut() -> Result<IOResult<T>>, pager: &Pager) -> Result<T> {
-        pager.io.block(action)
-    }
-
     #[test]
     fn test_free_array() {
         let (mut rng, seed) = rng_from_time_or_env();
@@ -8739,7 +8855,7 @@ mod tests {
             let mut cells_cloned = Vec::new();
             let (pager, _, _, _) = empty_btree();
             let page_type = PageType::TableLeaf;
-            let page = pager.allocate_page().unwrap();
+            let page = run_until_done(|| pager.allocate_page(), &pager).unwrap();
             let page = Arc::new(BTreePageInner {
                 page: RefCell::new(page),
             });
@@ -8750,7 +8866,11 @@ mod tests {
             // add a bunch of cells
             while compute_free_space(page.get_contents(), pager.usable_space() as u16) >= size + 10
             {
-                insert_cell(i, size, page.get_contents(), pager.clone());
+                run_until_done(
+                    || insert_cell(i, size, page.get_contents(), pager.clone()),
+                    &pager,
+                )
+                .unwrap();
                 i += 1;
                 size = (rng.next_u64() % 1024) as u16;
             }
@@ -8807,11 +8927,16 @@ mod tests {
         }
     }
 
-    fn insert_cell(cell_idx: u64, size: u16, contents: &mut PageContent, pager: Rc<Pager>) {
+    fn insert_cell(
+        cell_idx: u64,
+        size: u16,
+        contents: &mut PageContent,
+        pager: Rc<Pager>,
+    ) -> Result<IOResult<()>> {
         let mut payload = Vec::new();
         let regs = &[Register::Value(Value::Blob(vec![0; size as usize]))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
-        fill_cell_payload(
+        return_if_io!(fill_cell_payload(
             contents,
             Some(cell_idx as i64),
             &mut payload,
@@ -8819,7 +8944,7 @@ mod tests {
             &record,
             pager.usable_space(),
             pager.clone(),
-        );
+        ));
         insert_into_cell(
             contents,
             &payload,
@@ -8827,5 +8952,6 @@ mod tests {
             pager.usable_space() as u16,
         )
         .unwrap();
+        Ok(IOResult::Done(()))
     }
 }
