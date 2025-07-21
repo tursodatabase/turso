@@ -10,7 +10,8 @@ use crate::storage::wal::DummyWAL;
 use crate::storage::{self, header_accessor};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
-    compare_immutable, compare_records_generic, ImmutableRecord, SeekResult, Text, TextSubtype,
+    compare_immutable, compare_records_generic, ImmutableRecord, RawSlice, SeekResult, Text,
+    TextRef, TextSubtype,
 };
 use crate::util::normalize_ident;
 use crate::vdbe::insn::InsertFlags;
@@ -1414,18 +1415,18 @@ pub fn op_column(
                 let cursor = cursor.as_btree_mut();
 
                 if cursor.get_null_flag() {
-                    break 'value Value::Null;
+                    break 'value Some(RefValue::Null);
                 }
 
                 let record_result = return_if_io!(cursor.record());
                 let Some(record) = record_result.as_ref() else {
-                    break 'value default.clone().unwrap_or(Value::Null);
+                    break 'value None;
                 };
 
                 let payload = record.get_payload();
 
                 if payload.is_empty() {
-                    break 'value default.clone().unwrap_or(Value::Null);
+                    break 'value None;
                 }
 
                 let mut record_cursor = cursor.record_cursor.borrow_mut();
@@ -1501,25 +1502,25 @@ pub fn op_column(
                     record_cursor.offsets.clear();
                     record_cursor.header_offset = 0;
                     record_cursor.header_size = 0;
-                    break 'value default.clone().unwrap_or(Value::Null);
+                    break 'value None;
                 }
 
                 if target_column >= record_cursor.serial_types.len() {
-                    break 'value default.clone().unwrap_or(Value::Null);
+                    break 'value None;
                 }
 
                 let serial_type = record_cursor.serial_types[target_column];
 
                 // Fast path for common constant cases
                 match serial_type {
-                    0 => break 'value Value::Null,
-                    8 => break 'value Value::Integer(0),
-                    9 => break 'value Value::Integer(1),
+                    0 => break 'value Some(RefValue::Null),
+                    8 => break 'value Some(RefValue::Integer(0)),
+                    9 => break 'value Some(RefValue::Integer(1)),
                     _ => {}
                 }
 
                 if target_column + 1 >= record_cursor.offsets.len() {
-                    break 'value default.clone().unwrap_or(Value::Null);
+                    break 'value None;
                 }
 
                 let start_offset = record_cursor.offsets[target_column];
@@ -1541,7 +1542,10 @@ pub fn op_column(
                         };
 
                         if data_len >= expected_len {
-                            Value::Integer(read_integer_fast(data_slice, expected_len))
+                            Some(RefValue::Integer(read_integer_fast(
+                                data_slice,
+                                expected_len,
+                            )))
                         } else {
                             return Err(LimboError::Corrupt(format!(
                                 "Insufficient data for integer type {serial_type}: expected {expected_len}, got {data_len}"
@@ -1560,41 +1564,92 @@ pub fn op_column(
                                 data_slice[6],
                                 data_slice[7],
                             ];
-                            Value::Float(f64::from_be_bytes(bytes))
+                            Some(RefValue::Float(f64::from_be_bytes(bytes)))
                         } else {
-                            default.clone().unwrap_or(Value::Null)
+                            None
                         }
                     }
-                    n if n >= 12 && n % 2 == 0 => Value::Blob(data_slice.to_vec()),
-                    n if n >= 13 && n % 2 == 1 => Value::Text(Text {
-                        value: data_slice.to_vec(),
-                        subtype: TextSubtype::Text,
-                    }),
-                    _ => default.clone().unwrap_or(Value::Null),
+                    n if n >= 12 && n % 2 == 0 => {
+                        Some(RefValue::Blob(RawSlice::create_from(data_slice)))
+                    }
+                    n if n >= 13 && n % 2 == 1 => Some(RefValue::Text(TextRef::create_from(
+                        data_slice,
+                        TextSubtype::Text,
+                    ))),
+                    _ => None,
                 }
+            };
+
+            let Some(value) = value else {
+                // DEFAULT handling. Try to reuse the registers when allocation is not needed.
+                let Some(ref default) = default else {
+                    state.registers[*dest] = Register::Value(Value::Null);
+                    state.pc += 1;
+                    return Ok(InsnFunctionStepResult::Step);
+                };
+                match (default, &mut state.registers[*dest]) {
+                    (Value::Text(new_text), Register::Value(Value::Text(existing_text))) => {
+                        let new_text_str = new_text.as_str();
+                        if existing_text.value.capacity() >= new_text_str.len() {
+                            existing_text.value.clear();
+                            existing_text
+                                .value
+                                .extend_from_slice(new_text_str.as_bytes());
+                            existing_text.subtype = new_text.subtype;
+                        } else {
+                            state.registers[*dest] =
+                                Register::Value(Value::Text(Text::new(new_text_str)));
+                        }
+                    }
+                    (Value::Blob(new_blob), Register::Value(Value::Blob(existing_blob))) => {
+                        if existing_blob.capacity() >= new_blob.len() {
+                            existing_blob.clear();
+                            existing_blob.extend_from_slice(new_blob);
+                        } else {
+                            state.registers[*dest] =
+                                Register::Value(Value::Blob(new_blob.to_vec()));
+                        }
+                    }
+                    _ => {
+                        state.registers[*dest] = Register::Value(default.clone());
+                    }
+                }
+                return Ok(InsnFunctionStepResult::Step);
             };
 
             // Try to reuse the registers when allocation is not needed.
             match (&value, &mut state.registers[*dest]) {
-                (Value::Text(new_text), Register::Value(Value::Text(existing_text))) => {
-                    if existing_text.value.capacity() >= new_text.value.len() {
+                (RefValue::Text(new_text), Register::Value(Value::Text(existing_text))) => {
+                    let new_text_str = new_text.as_str();
+                    if existing_text.value.capacity() >= new_text_str.len() {
                         existing_text.value.clear();
-                        existing_text.value.extend_from_slice(&new_text.value);
+                        existing_text
+                            .value
+                            .extend_from_slice(new_text_str.as_bytes());
                         existing_text.subtype = new_text.subtype;
                     } else {
-                        state.registers[*dest] = Register::Value(value);
+                        state.registers[*dest] =
+                            Register::Value(Value::Text(Text::new(new_text_str)));
                     }
                 }
-                (Value::Blob(new_blob), Register::Value(Value::Blob(existing_blob))) => {
-                    if existing_blob.capacity() >= new_blob.len() {
+                (RefValue::Blob(new_blob), Register::Value(Value::Blob(existing_blob))) => {
+                    let new_blob_slice = new_blob.to_slice();
+                    if existing_blob.capacity() >= new_blob_slice.len() {
                         existing_blob.clear();
-                        existing_blob.extend_from_slice(new_blob);
+                        existing_blob.extend_from_slice(new_blob_slice);
                     } else {
-                        state.registers[*dest] = Register::Value(value);
+                        state.registers[*dest] =
+                            Register::Value(Value::Blob(new_blob_slice.to_vec()));
                     }
                 }
                 _ => {
-                    state.registers[*dest] = Register::Value(value);
+                    state.registers[*dest] = Register::Value(match value {
+                        RefValue::Integer(i) => Value::Integer(i),
+                        RefValue::Float(f) => Value::Float(f),
+                        RefValue::Text(t) => Value::Text(Text::new(t.as_str())),
+                        RefValue::Blob(b) => Value::Blob(b.to_slice().to_vec()),
+                        RefValue::Null => Value::Null,
+                    });
                 }
             }
         }
