@@ -207,7 +207,7 @@ pub fn translate_create_index(
         record_reg: sorted_record_reg,
         unpacked_start: None, // TODO: optimize with these to avoid decoding record twice
         unpacked_count: None,
-        flags: IdxInsertFlags::new().use_seek(false),
+        flags: IdxInsertFlags::new(), // data is already sorted, so we don't need to seek.
     });
     program.emit_insn(Insn::SorterNext {
         cursor_id: sorter_cursor_id,

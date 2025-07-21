@@ -168,26 +168,15 @@ struct DestroyInfo {
 }
 
 #[derive(Debug, Clone)]
-enum DeleteSavepoint {
-    Rowid(i64),
-    Payload(ImmutableRecord),
-}
-
-#[derive(Debug, Clone)]
 enum DeleteState {
     Start,
     DeterminePostBalancingSeekKey,
-    LoadPage {
-        post_balancing_seek_key: Option<DeleteSavepoint>,
-    },
-    FindCell {
-        post_balancing_seek_key: Option<DeleteSavepoint>,
-    },
+    LoadPage,
+    FindCell,
     ClearOverflowPages {
         cell_idx: usize,
         cell: BTreeCell,
         original_child_pointer: Option<u32>,
-        post_balancing_seek_key: Option<DeleteSavepoint>,
     },
     InteriorNodeReplacement {
         page: PageRef,
@@ -197,31 +186,22 @@ enum DeleteState {
         btree_depth: usize,
         cell_idx: usize,
         original_child_pointer: Option<u32>,
-        post_balancing_seek_key: Option<DeleteSavepoint>,
     },
     CheckNeedsBalancing {
         /// same as `InteriorNodeReplacement::btree_depth`
         btree_depth: usize,
-        post_balancing_seek_key: Option<DeleteSavepoint>,
     },
     WaitForBalancingToComplete {
         /// If provided, will also balance an ancestor page at depth `balance_ancestor_at_depth`.
         /// If not provided, balancing will stop as soon as a level is encountered where no balancing is required.
         balance_ancestor_at_depth: Option<usize>,
-        target_key: DeleteSavepoint,
     },
-    SeekAfterBalancing {
-        target_key: DeleteSavepoint,
-    },
-    /// If the seek performed in [DeleteState::SeekAfterBalancing] returned a [SeekResult::TryAdvance] we need to call next()/prev() to get to the right location.
-    /// We need to have this separate state for re-entrancy as calling next()/prev() might yield on IO.
-    /// FIXME: refactor DeleteState not to have SeekAfterBalancing and instead use save_context() and restore_context()
-    TryAdvance,
 }
 
 #[derive(Clone)]
 struct DeleteInfo {
     state: DeleteState,
+    post_balancing_seek_key: Option<CursorContext>,
     balance_write_info: Option<WriteInfo>,
 }
 
@@ -418,23 +398,16 @@ enum OverflowState {
 
 /// Holds a Record or RowId, so that these can be transformed into a SeekKey to restore
 /// cursor position to its previous location.
+/// Restoring cursor context needs to be done after a btree rebalancing operation, because a
+/// logical key K might be on a different page or even a different btree level after balancing.
+#[derive(Debug, Clone)]
 pub enum CursorContext {
-    TableRowId(i64),
-
-    /// If we are in an index tree we can then reuse this field to save
-    /// our cursor information
-    IndexKeyRowId(ImmutableRecord),
-}
-
-/// In the future, we may expand these general validity states
-#[derive(Debug, PartialEq, Eq)]
-pub enum CursorValidState {
-    /// Cursor is pointing a to an existing location/cell in the Btree
-    Valid,
-    /// Cursor may be pointing to a non-existent location/cell. This can happen after balancing operations
-    RequireSeek,
-    /// Cursor requires an advance after a seek
-    RequireAdvance(IterationDirection),
+    /// Restoring context will seek to this rowid.
+    TableRowId(i64, SeekOp),
+    /// Restoring context will seek to this index key.
+    IndexKey(ImmutableRecord, SeekOp),
+    /// Restoring context will advance the cursor in the given direction.
+    Advance(IterationDirection),
 }
 
 #[derive(Debug)]
@@ -511,8 +484,6 @@ pub struct BTreeCursor {
     count: usize,
     /// Stores the cursor context before rebalancing so that a seek can be done later
     context: Option<CursorContext>,
-    /// Store whether the Cursor is in a valid state. Meaning if it is pointing to a valid cell index or not
-    pub valid_state: CursorValidState,
     seek_state: CursorSeekState,
     /// Separate state to read a record with overflow pages. This separation from `state` is necessary as
     /// we can be in a function that relies on `state`, but also needs to process overflow pages
@@ -581,7 +552,6 @@ impl BTreeCursor {
             index_info: None,
             count: 0,
             context: None,
-            valid_state: CursorValidState::Valid,
             seek_state: CursorSeekState::Start,
             read_overflow_state: RefCell::new(None),
             parse_record_state: RefCell::new(ParseRecordState::Init),
@@ -1298,7 +1268,6 @@ impl BTreeCursor {
                 self.indexbtree_seek(index_key, op)
             }
         });
-        self.valid_state = CursorValidState::Valid;
         Ok(IOResult::Done(ret))
     }
 
@@ -2160,9 +2129,10 @@ impl BTreeCursor {
                                     } else {
                                         write_info.state = WriteState::BalanceStart;
                                         // If we balance, we must save the cursor position and seek to it later.
-                                        // FIXME: we shouldn't have both DeleteState::SeekAfterBalancing and
-                                        // save_context()/restore/context(), they are practically the same thing.
-                                        self.save_context(CursorContext::TableRowId(bkey.to_rowid()));
+                                        self.save_context(CursorContext::TableRowId(
+                                            bkey.to_rowid(),
+                                            SeekOp::GE { eq_only: true },
+                                        ));
                                     }
                                     continue;
                                 }
@@ -2190,9 +2160,10 @@ impl BTreeCursor {
                                     } else {
                                         write_info.state = WriteState::BalanceStart;
                                         // If we balance, we must save the cursor position and seek to it later.
-                                        // FIXME: we shouldn't have both DeleteState::SeekAfterBalancing and
-                                        // save_context()/restore/context(), they are practically the same thing.
-                                        self.save_context(CursorContext::IndexKeyRowId((*record).clone()));
+                                        self.save_context(CursorContext::IndexKey(
+                                            (*record).clone(),
+                                            SeekOp::GE { eq_only: true },
+                                        ));
                                     }
                                     continue;
                                 } else {
@@ -2238,10 +2209,13 @@ impl BTreeCursor {
                         // A balance will happen so save the key we were inserting
                         tracing::debug!(page = page.get().get().id, cell_idx, "balance triggered:");
                         self.save_context(match bkey {
-                            BTreeKey::TableRowId(rowid) => CursorContext::TableRowId(rowid.0),
-                            BTreeKey::IndexKey(record) => {
-                                CursorContext::IndexKeyRowId((*record).clone())
+                            BTreeKey::TableRowId(rowid) => {
+                                CursorContext::TableRowId(rowid.0, SeekOp::GE { eq_only: true })
                             }
+                            BTreeKey::IndexKey(record) => CursorContext::IndexKey(
+                                (*record).clone(),
+                                SeekOp::GE { eq_only: true },
+                            ),
                         });
                         let write_info = self
                             .state
@@ -2267,12 +2241,6 @@ impl BTreeCursor {
                 }
             };
         };
-        if matches!(self.state.write_info().unwrap().state, WriteState::Finish) {
-            // if there was a balance triggered, the cursor position is invalid.
-            // it's probably not the greatest idea in the world to do this eagerly here,
-            // but at least it works.
-            return_if_io!(self.restore_context());
-        }
         self.state = CursorState::None;
         ret
     }
@@ -4078,7 +4046,6 @@ impl BTreeCursor {
         self.invalidate_record();
         // Reset seek state
         self.seek_state = CursorSeekState::Start;
-        self.valid_state = CursorValidState::Valid;
         Ok(IOResult::Done(seek_result))
     }
 
@@ -4172,84 +4139,22 @@ impl BTreeCursor {
     }
 
     #[instrument(skip(self), level = Level::DEBUG)]
-    pub fn insert(
-        &mut self,
-        key: &BTreeKey,
-        // Indicate whether it's necessary to traverse to find the leaf page
-        // FIXME: refactor this out into a state machine, these ad-hoc state
-        // variables are very hard to reason about
-        mut moved_before: bool,
-    ) -> Result<IOResult<()>> {
-        tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
-        match &self.mv_cursor {
-            Some(mv_cursor) => match key.maybe_rowid() {
-                Some(rowid) => {
-                    let row_id = crate::mvcc::database::RowID::new(self.table_id() as u64, rowid);
-                    let record_buf = key.get_record().unwrap().get_payload().to_vec();
-                    let row = crate::mvcc::database::Row::new(row_id, record_buf);
-                    mv_cursor.borrow_mut().insert(row).unwrap();
-                }
-                None => todo!("Support mvcc inserts with index btrees"),
-            },
-            None => {
-                match (&self.valid_state, self.is_write_in_progress()) {
-                    (CursorValidState::Valid, _) => {
-                        // consider the current position valid unless the caller explicitly asks us to seek.
-                    }
-                    (CursorValidState::RequireSeek, false) => {
-                        // we must seek.
-                        moved_before = false;
-                    }
-                    (CursorValidState::RequireSeek, true) => {
-                        // illegal to seek during a write no matter what CursorValidState or caller says -- we might e.g. move to the wrong page during balancing
-                        moved_before = true;
-                    }
-                    (CursorValidState::RequireAdvance(direction), _) => {
-                        // FIXME: this is a hack to support the case where we need to advance the cursor after a seek.
-                        // We should have a proper state machine for this.
-                        return_if_io!(match direction {
-                            IterationDirection::Forwards => self.next(),
-                            IterationDirection::Backwards => self.prev(),
-                        });
-                        self.valid_state = CursorValidState::Valid;
-                        self.seek_state = CursorSeekState::Start;
-                        moved_before = true;
-                    }
-                };
-                if !moved_before {
-                    let seek_result = match key {
-                        BTreeKey::IndexKey(_) => {
-                            return_if_io!(self.seek(
-                                SeekKey::IndexKey(key.get_record().unwrap()),
-                                SeekOp::GE { eq_only: true }
-                            ))
-                        }
-                        BTreeKey::TableRowId(_) => {
-                            return_if_io!(self.seek(
-                                SeekKey::TableRowId(key.to_rowid()),
-                                SeekOp::GE { eq_only: true }
-                            ))
-                        }
-                    };
-                    if SeekResult::TryAdvance == seek_result {
-                        self.valid_state =
-                            CursorValidState::RequireAdvance(IterationDirection::Forwards);
-                        return_if_io!(self.next());
-                    }
-                    self.context.take(); // we know where we wanted to move so if there was any saved context, discard it.
-                    self.valid_state = CursorValidState::Valid;
-                    self.seek_state = CursorSeekState::Start;
-                    tracing::debug!(
-                        "seeked to the right place, page is now {:?}",
-                        self.stack.top().get().get().id
-                    );
-                }
-                return_if_io!(self.insert_into_page(key));
-                if key.maybe_rowid().is_some() {
-                    self.has_record.replace(true);
-                }
-            }
-        };
+    pub fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>> {
+        tracing::debug!(cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
+        if let Some(mv_cursor) = &self.mv_cursor {
+            let Some(rowid) = key.maybe_rowid() else {
+                todo!("Support mvcc inserts with index btrees");
+            };
+            let row_id = crate::mvcc::database::RowID::new(self.table_id() as u64, rowid);
+            let record_buf = key.get_record().unwrap().get_payload().to_vec();
+            let row = crate::mvcc::database::Row::new(row_id, record_buf);
+            mv_cursor.borrow_mut().insert(row).unwrap();
+            return Ok(IOResult::Done(()));
+        }
+        return_if_io!(self.insert_into_page(key));
+        if key.maybe_rowid().is_some() {
+            self.has_record.replace(true);
+        }
         Ok(IOResult::Done(()))
     }
 
@@ -4262,7 +4167,6 @@ impl BTreeCursor {
     /// if we are in interior page, we need to rotate keys in order to replace current cell (InteriorNodeReplacement).
     /// 6. InteriorNodeReplacement -> we copy the left subtree leaf node into the deleted interior node's place.
     /// 7. WaitForBalancingToComplete -> perform balancing
-    /// 8. SeekAfterBalancing -> adjust the cursor to a node that is closer to the deleted value. go to Finish
     /// 9. Finish -> Delete operation is done. Return CursorResult(Ok())
     #[instrument(skip(self), level = Level::DEBUG)]
     pub fn delete(&mut self) -> Result<IOResult<()>> {
@@ -4271,6 +4175,7 @@ impl BTreeCursor {
         if let CursorState::None = &self.state {
             self.state = CursorState::Delete(DeleteInfo {
                 state: DeleteState::Start,
+                post_balancing_seek_key: None,
                 balance_write_info: None,
             })
         }
@@ -4315,35 +4220,34 @@ impl BTreeCursor {
                             Some(record) => record.clone(),
                             None => unreachable!("there should've been a record"),
                         };
-                        DeleteSavepoint::Payload(record)
+                        // We want to end up pointing at the row to the left of the position of the row we deleted, so
+                        // that after we call next() in the loop,the next row we delete will again be the same position as this one.
+                        CursorContext::IndexKey(record, SeekOp::LT)
                     } else {
                         let Some(rowid) = return_if_io!(self.rowid()) else {
                             panic!("cursor should be pointing to a record with a rowid");
                         };
-                        DeleteSavepoint::Rowid(rowid)
+                        CursorContext::TableRowId(rowid, SeekOp::LT)
                     };
 
                     let delete_info = self.state.mut_delete_info().unwrap();
-                    delete_info.state = DeleteState::LoadPage {
-                        post_balancing_seek_key: Some(target_key),
-                    };
+                    turso_assert!(
+                        delete_info.post_balancing_seek_key.is_none(),
+                        "post_balancing_seek_key should be None"
+                    );
+                    delete_info.post_balancing_seek_key = Some(target_key);
+                    delete_info.state = DeleteState::LoadPage;
                 }
 
-                DeleteState::LoadPage {
-                    post_balancing_seek_key,
-                } => {
+                DeleteState::LoadPage => {
                     let page = self.stack.top();
                     return_if_locked_maybe_load!(self.pager, page);
 
                     let delete_info = self.state.mut_delete_info().unwrap();
-                    delete_info.state = DeleteState::FindCell {
-                        post_balancing_seek_key,
-                    };
+                    delete_info.state = DeleteState::FindCell;
                 }
 
-                DeleteState::FindCell {
-                    post_balancing_seek_key,
-                } => {
+                DeleteState::FindCell => {
                     let page = self.stack.top();
                     let cell_idx = self.stack.current_cell_index() as usize;
 
@@ -4376,7 +4280,6 @@ impl BTreeCursor {
                         cell_idx,
                         cell,
                         original_child_pointer,
-                        post_balancing_seek_key,
                     };
                 }
 
@@ -4384,7 +4287,6 @@ impl BTreeCursor {
                     cell_idx,
                     cell,
                     original_child_pointer,
-                    post_balancing_seek_key,
                 } => {
                     return_if_io!(self.clear_overflow_pages(&cell));
 
@@ -4399,7 +4301,6 @@ impl BTreeCursor {
                             btree_depth: self.stack.current(),
                             cell_idx,
                             original_child_pointer,
-                            post_balancing_seek_key,
                         };
                     } else {
                         drop_cell(contents, cell_idx, self.usable_space() as u16)?;
@@ -4407,7 +4308,6 @@ impl BTreeCursor {
                         let delete_info = self.state.mut_delete_info().unwrap();
                         delete_info.state = DeleteState::CheckNeedsBalancing {
                             btree_depth: self.stack.current(),
-                            post_balancing_seek_key,
                         };
                     }
                 }
@@ -4417,7 +4317,6 @@ impl BTreeCursor {
                     btree_depth,
                     cell_idx,
                     original_child_pointer,
-                    post_balancing_seek_key,
                 } => {
                     // This is an interior node, we need to handle deletion differently.
                     // 1. Move cursor to the largest key in the left subtree.
@@ -4507,16 +4406,10 @@ impl BTreeCursor {
                     }
 
                     let delete_info = self.state.mut_delete_info().unwrap();
-                    delete_info.state = DeleteState::CheckNeedsBalancing {
-                        btree_depth,
-                        post_balancing_seek_key,
-                    };
+                    delete_info.state = DeleteState::CheckNeedsBalancing { btree_depth };
                 }
 
-                DeleteState::CheckNeedsBalancing {
-                    btree_depth,
-                    post_balancing_seek_key,
-                } => {
+                DeleteState::CheckNeedsBalancing { btree_depth } => {
                     let page = self.stack.top();
                     return_if_locked_maybe_load!(self.pager, page);
                     // Check if either the leaf page we took the replacement cell from underflows, or if the interior page we inserted it into overflows OR underflows.
@@ -4554,6 +4447,10 @@ impl BTreeCursor {
 
                     if needs_balancing {
                         let delete_info = self.state.mut_delete_info().unwrap();
+                        let post_balancing_seek_key = delete_info
+                            .post_balancing_seek_key
+                            .take()
+                            .expect("post_balancing_seek_key should have been set");
                         if delete_info.balance_write_info.is_none() {
                             let mut write_info = WriteInfo::new();
                             write_info.state = WriteState::BalanceStart;
@@ -4574,8 +4471,8 @@ impl BTreeCursor {
                             } else {
                                 None
                             },
-                            target_key: post_balancing_seek_key.unwrap(),
-                        }
+                        };
+                        self.save_context(post_balancing_seek_key);
                     } else {
                         // No balancing needed, we're done
                         self.stack.retreat();
@@ -4585,7 +4482,6 @@ impl BTreeCursor {
                 }
 
                 DeleteState::WaitForBalancingToComplete {
-                    target_key,
                     balance_ancestor_at_depth,
                 } => {
                     let delete_info = self.state.mut_delete_info().unwrap();
@@ -4596,21 +4492,13 @@ impl BTreeCursor {
 
                     match self.balance(balance_ancestor_at_depth)? {
                         IOResult::Done(()) => {
-                            let write_info = match &self.state {
-                                CursorState::Write(wi) => wi.clone(),
-                                _ => unreachable!("Balance operation changed cursor state"),
-                            };
-
-                            // Move to seek state
-                            self.state = CursorState::Delete(DeleteInfo {
-                                state: DeleteState::SeekAfterBalancing { target_key },
-                                balance_write_info: Some(write_info),
-                            });
+                            self.state = CursorState::None;
+                            return Ok(IOResult::Done(()));
                         }
 
                         IOResult::IO => {
-                            // Move to seek state
-                            // Save balance progress and return IO
+                            // Need to set state back to CursorState::Delete here because the beginning of the delete() routine
+                            // expects it, and we need to save the balance progress too.
                             let write_info = match &self.state {
                                 CursorState::Write(wi) => wi.clone(),
                                 _ => unreachable!("Balance operation changed cursor state"),
@@ -4618,46 +4506,14 @@ impl BTreeCursor {
 
                             self.state = CursorState::Delete(DeleteInfo {
                                 state: DeleteState::WaitForBalancingToComplete {
-                                    target_key,
                                     balance_ancestor_at_depth,
                                 },
+                                post_balancing_seek_key: None,
                                 balance_write_info: Some(write_info),
                             });
                             return Ok(IOResult::IO);
                         }
                     }
-                }
-
-                DeleteState::SeekAfterBalancing { target_key } => {
-                    let key = match &target_key {
-                        DeleteSavepoint::Rowid(rowid) => SeekKey::TableRowId(*rowid),
-                        DeleteSavepoint::Payload(immutable_record) => {
-                            SeekKey::IndexKey(immutable_record)
-                        }
-                    };
-                    // We want to end up pointing at the row to the left of the position of the row we deleted, so
-                    // that after we call next() in the loop,the next row we delete will again be the same position as this one.
-                    let seek_result = return_if_io!(self.seek(key, SeekOp::LT));
-
-                    if let SeekResult::TryAdvance = seek_result {
-                        let CursorState::Delete(delete_info) = &self.state else {
-                            unreachable!("expected delete state");
-                        };
-                        self.state = CursorState::Delete(DeleteInfo {
-                            state: DeleteState::TryAdvance,
-                            balance_write_info: delete_info.balance_write_info.clone(),
-                        });
-                        continue;
-                    }
-
-                    self.state = CursorState::None;
-                    return Ok(IOResult::Done(()));
-                }
-                DeleteState::TryAdvance => {
-                    // we use LT always for post-delete seeks, which uses backwards iteration, so we always call prev() here.
-                    return_if_io!(self.prev());
-                    self.state = CursorState::None;
-                    return Ok(IOResult::Done(()));
                 }
             }
         }
@@ -5117,48 +4973,45 @@ impl BTreeCursor {
 
     // Save cursor context, to be restored later
     pub fn save_context(&mut self, cursor_context: CursorContext) {
-        self.valid_state = CursorValidState::RequireSeek;
         self.context = Some(cursor_context);
     }
 
-    /// If context is defined, restore it and set it None on success
+    /// If context is defined, restore it and set it None on success.
+    /// Context is generally saved during a btree rebalancing operation,
+    /// and restored after it.
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn restore_context(&mut self) -> Result<IOResult<()>> {
-        if self.context.is_none() || matches!(self.valid_state, CursorValidState::Valid) {
-            return Ok(IOResult::Done(()));
-        }
-        if let CursorValidState::RequireAdvance(direction) = self.valid_state {
-            let has_record = return_if_io!(match direction {
-                // Avoid calling next()/prev() directly because they immediately call restore_context()
-                IterationDirection::Forwards => self.get_next_record(),
-                IterationDirection::Backwards => self.get_prev_record(),
-            });
-            self.has_record.set(has_record);
-            self.invalidate_record();
-            self.context = None;
-            self.valid_state = CursorValidState::Valid;
-            return Ok(IOResult::Done(()));
-        }
-        let ctx = self.context.take().unwrap();
-        let seek_key = match ctx {
-            CursorContext::TableRowId(rowid) => SeekKey::TableRowId(rowid),
-            CursorContext::IndexKeyRowId(ref record) => SeekKey::IndexKey(record),
-        };
-        let res = self.seek(seek_key, SeekOp::GE { eq_only: true })?;
-        match res {
-            IOResult::Done(res) => {
-                if let SeekResult::TryAdvance = res {
-                    self.valid_state =
-                        CursorValidState::RequireAdvance(IterationDirection::Forwards);
+    pub fn restore_context(&mut self) -> Result<IOResult<()>> {
+        loop {
+            let Some(ctx) = self.context.take() else {
+                return Ok(IOResult::Done(()));
+            };
+            let (seek_key, seek_op) = match ctx {
+                CursorContext::TableRowId(rowid, op) => (SeekKey::TableRowId(rowid), op),
+                CursorContext::IndexKey(ref record, op) => (SeekKey::IndexKey(record), op),
+                CursorContext::Advance(direction) => {
+                    let has_record = return_if_io!(match direction {
+                        // Avoid calling next()/prev() directly because they immediately call restore_context()
+                        IterationDirection::Forwards => self.get_next_record(),
+                        IterationDirection::Backwards => self.get_prev_record(),
+                    });
+                    self.has_record.set(has_record);
+                    self.invalidate_record();
+                    return Ok(IOResult::Done(()));
+                }
+            };
+            let res = self.seek(seek_key, seek_op)?;
+            match res {
+                IOResult::Done(res) => {
+                    if let SeekResult::TryAdvance = res {
+                        self.context = Some(CursorContext::Advance(seek_op.iteration_direction()));
+                        continue;
+                    }
+                    return Ok(IOResult::Done(()));
+                }
+                IOResult::IO => {
                     self.context = Some(ctx);
                     return Ok(IOResult::IO);
                 }
-                self.valid_state = CursorValidState::Valid;
-                Ok(IOResult::Done(()))
-            }
-            IOResult::IO => {
-                self.context = Some(ctx);
-                Ok(IOResult::IO)
             }
         }
     }
@@ -7051,7 +6904,7 @@ mod tests {
                 let value = ImmutableRecord::from_registers(regs, regs.len());
                 tracing::info!("insert key:{}", key);
                 run_until_done(
-                    || cursor.insert(&BTreeKey::new_table_rowid(*key, Some(&value)), true),
+                    || cursor.insert(&BTreeKey::new_table_rowid(*key, Some(&value))),
                     pager.deref(),
                 )
                 .unwrap();
@@ -7148,10 +7001,11 @@ mod tests {
                     "".to_string()
                 };
                 run_until_done(
-                    || cursor.insert(&BTreeKey::new_table_rowid(key, Some(&value)), true),
+                    || cursor.insert(&BTreeKey::new_table_rowid(key, Some(&value))),
                     pager.deref(),
                 )
                 .unwrap();
+                run_until_done(|| cursor.restore_context(), pager.deref()).unwrap();
                 loop {
                     match pager.end_tx(false, false, &conn, false).unwrap() {
                         IOResult::Done(_) => break,
@@ -7300,15 +7154,11 @@ mod tests {
                 )
                 .unwrap();
                 run_until_done(
-                    || {
-                        cursor.insert(
-                            &BTreeKey::new_index_key(&value),
-                            cursor.is_write_in_progress(),
-                        )
-                    },
+                    || cursor.insert(&BTreeKey::new_index_key(&value)),
                     pager.deref(),
                 )
                 .unwrap();
+                run_until_done(|| cursor.restore_context(), pager.deref()).unwrap();
                 cursor.move_to_root().unwrap();
                 loop {
                     match pager.end_tx(false, false, &conn, false).unwrap() {
@@ -8372,7 +8222,7 @@ mod tests {
             )
             .unwrap();
             run_until_done(
-                || cursor.insert(&BTreeKey::new_table_rowid(i, Some(&value)), true),
+                || cursor.insert(&BTreeKey::new_table_rowid(i, Some(&value))),
                 pager.deref(),
             )
             .unwrap();
@@ -8451,7 +8301,7 @@ mod tests {
             .unwrap();
 
             run_until_done(
-                || cursor.insert(&BTreeKey::new_table_rowid(i, Some(&value)), true),
+                || cursor.insert(&BTreeKey::new_table_rowid(i, Some(&value))),
                 pager.deref(),
             )
             .unwrap();
@@ -8536,7 +8386,7 @@ mod tests {
             )
             .unwrap();
             run_until_done(
-                || cursor.insert(&BTreeKey::new_table_rowid(i as i64, Some(&value)), true),
+                || cursor.insert(&BTreeKey::new_table_rowid(i as i64, Some(&value))),
                 pager.deref(),
             )
             .unwrap();
@@ -8580,7 +8430,7 @@ mod tests {
         .unwrap();
 
         run_until_done(
-            || cursor.insert(&BTreeKey::new_table_rowid(1, Some(&value)), true),
+            || cursor.insert(&BTreeKey::new_table_rowid(1, Some(&value))),
             pager.deref(),
         )
         .unwrap();
@@ -8657,7 +8507,7 @@ mod tests {
         .unwrap();
 
         run_until_done(
-            || cursor.insert(&BTreeKey::new_table_rowid(1, Some(&value)), true),
+            || cursor.insert(&BTreeKey::new_table_rowid(1, Some(&value))),
             pager.deref(),
         )
         .unwrap();

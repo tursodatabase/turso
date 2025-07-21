@@ -30,7 +30,7 @@ use crate::{
     storage::{pager, sqlite3_ondisk::SmallVec},
     translate::plan::TableReferences,
     types::{IOResult, RawSlice, TextRef},
-    vdbe::execute::{OpIdxInsertState, OpInsertState, OpNewRowidState, OpSeekState},
+    vdbe::execute::{OpDeleteState, OpIdxInsertState, OpInsertState, OpNewRowidState, OpSeekState},
     RefValue,
 };
 
@@ -249,7 +249,8 @@ pub struct ProgramState {
     commit_state: CommitState,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
-    op_idx_delete_state: Option<OpIdxDeleteState>,
+    op_delete_state: OpDeleteState,
+    op_idx_delete_state: OpIdxDeleteState,
     op_integrity_check_state: OpIntegrityCheckState,
     op_open_ephemeral_state: OpOpenEphemeralState,
     op_new_rowid_state: OpNewRowidState,
@@ -279,11 +280,12 @@ impl ProgramState {
             commit_state: CommitState::Ready,
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
-            op_idx_delete_state: None,
+            op_delete_state: OpDeleteState::Delete,
+            op_idx_delete_state: OpIdxDeleteState::Seeking,
             op_integrity_check_state: OpIntegrityCheckState::Start,
             op_open_ephemeral_state: OpOpenEphemeralState::Start,
             op_new_rowid_state: OpNewRowidState::Start,
-            op_idx_insert_state: OpIdxInsertState::SeekIfUnique,
+            op_idx_insert_state: OpIdxInsertState::MaybeSeek,
             op_insert_state: OpInsertState::Insert,
             seek_state: OpSeekState::Start,
         }

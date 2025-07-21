@@ -1107,7 +1107,7 @@ fn emit_update_insns(
                 record_reg,
                 unpacked_start: Some(start),
                 unpacked_count: Some((index.columns.len() + 1) as u16),
-                flags: IdxInsertFlags::new(),
+                flags: IdxInsertFlags::new().require_seek(),
             });
         }
 

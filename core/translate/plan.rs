@@ -409,7 +409,7 @@ impl DistinctCtx {
             record_reg,
             unpacked_start: None,
             unpacked_count: None,
-            flags: IdxInsertFlags::new(),
+            flags: IdxInsertFlags::new().require_seek(),
         });
     }
 }

@@ -1454,7 +1454,7 @@ fn emit_autoindex(
         record_reg,
         unpacked_start: Some(ephemeral_cols_start_reg),
         unpacked_count: Some(num_regs_to_reserve as u16),
-        flags: IdxInsertFlags::new().use_seek(false),
+        flags: IdxInsertFlags::new().require_seek(),
     });
     program.emit_insn(Insn::Next {
         cursor_id: table_cursor_id,

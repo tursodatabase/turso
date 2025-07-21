@@ -533,7 +533,7 @@ pub fn translate_insert(
             unpacked_start: Some(idx_start_reg), // TODO: enable optimization
             unpacked_count: Some((num_cols + 1) as u16),
             // TODO: figure out how to determine whether or not we need to seek prior to insert.
-            flags: IdxInsertFlags::new(),
+            flags: IdxInsertFlags::new().require_seek(),
         });
     }
 

@@ -4824,9 +4824,13 @@ pub fn op_yield(
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub enum OpInsertState {
+    /// Seek if indicated by [InsertFlags::REQUIRE_SEEK]
+    MaybeSeek,
+    /// Insert the row.
     Insert,
-    /// Updating last_insert_rowid may return IO, so we need a separate state for it so that we don't
-    /// start inserting the same row multiple times.
+    /// Restore context if needed (insert caused a balancing operation).
+    MaybeRestoreContext,
+    /// Updating last_insert_rowid.
     UpdateLastRowid,
 }
 
@@ -4848,67 +4852,97 @@ pub fn op_insert(
         unreachable!("unexpected Insn {:?}", insn)
     };
 
-    if state.op_insert_state == OpInsertState::UpdateLastRowid {
-        let maybe_rowid = {
-            let mut cursor = state.get_cursor(*cursor_id);
-            let cursor = cursor.as_btree_mut();
-            return_if_io!(cursor.rowid())
-        };
-        if let Some(rowid) = maybe_rowid {
-            program.connection.update_last_rowid(rowid);
-
-            let prev_changes = program.n_change.get();
-            program.n_change.set(prev_changes + 1);
-        }
-        state.op_insert_state = OpInsertState::Insert;
-        state.pc += 1;
-        return Ok(InsnFunctionStepResult::Step);
-    }
-
-    {
-        let mut cursor_ref = state.get_cursor(*cursor_id);
-        let cursor = cursor_ref.as_btree_mut();
-
-        let key = match &state.registers[*key_reg].get_owned_value() {
-            Value::Integer(i) => *i,
-            _ => unreachable!("expected integer key"),
-        };
-
-        let record = match &state.registers[*record_reg] {
-            Register::Record(r) => std::borrow::Cow::Borrowed(r),
-            Register::Value(value) => {
-                let x = 1;
-                let regs = &state.registers[*record_reg..*record_reg + 1];
-                let new_regs = [&state.registers[*record_reg]];
-                let record = ImmutableRecord::from_registers(new_regs, new_regs.len());
-                std::borrow::Cow::Owned(record)
+    loop {
+        match state.op_insert_state {
+            OpInsertState::MaybeSeek => {
+                if !flag.has(InsertFlags::REQUIRE_SEEK) {
+                    state.op_insert_state = OpInsertState::Insert;
+                    continue;
+                }
+                let seek_result = seek_internal(
+                    program,
+                    state,
+                    pager,
+                    mv_store,
+                    RecordSource::Unpacked {
+                        start_reg: *key_reg,
+                        num_regs: 1,
+                    },
+                    *cursor_id,
+                    false,
+                    SeekOp::GE { eq_only: true },
+                )?;
+                if let SeekInternalResult::IO = seek_result {
+                    return Ok(InsnFunctionStepResult::IO);
+                }
+                state.op_insert_state = OpInsertState::Insert;
+                continue;
             }
-            Register::Aggregate(..) => unreachable!("Cannot insert an aggregate value."),
-        };
+            OpInsertState::Insert => {
+                {
+                    let mut cursor = state.get_cursor(*cursor_id);
+                    let cursor = cursor.as_btree_mut();
+                    let key = match &state.registers[*key_reg].get_owned_value() {
+                        Value::Integer(i) => *i,
+                        _ => unreachable!("expected integer key"),
+                    };
+                    let record = match &state.registers[*record_reg] {
+                        Register::Record(r) => std::borrow::Cow::Borrowed(r),
+                        Register::Value(value) => {
+                            let x = 1;
+                            let regs = &state.registers[*record_reg..*record_reg + 1];
+                            let new_regs = [&state.registers[*record_reg]];
+                            let record = ImmutableRecord::from_registers(new_regs, new_regs.len());
+                            std::borrow::Cow::Owned(record)
+                        }
+                        Register::Aggregate(_) => {
+                            todo!("unexpected Register::Aggregate in op_insert")
+                        }
+                    };
+                    return_if_io!(
+                        cursor.insert(&BTreeKey::new_table_rowid(key, Some(record.as_ref())))
+                    );
+                    cursor.root_page()
+                };
 
-        // In a table insert, if the caller does not pass InsertFlags::REQUIRE_SEEK, they must ensure that a seek has already happened to the correct location.
-        // This typically happens by invoking either Insn::NewRowid or Insn::NotExists, because:
-        // 1. op_new_rowid() seeks to the end of the table, which is the correct insertion position.
-        // 2. op_not_exists() seeks to the position in the table where the target rowid would be inserted.
-        let moved_before = !flag.has(InsertFlags::REQUIRE_SEEK);
-        return_if_io!(cursor.insert(
-            &BTreeKey::new_table_rowid(key, Some(record.as_ref())),
-            moved_before
-        ));
-    }
+                state.op_insert_state = OpInsertState::MaybeRestoreContext;
+                continue;
+            }
+            OpInsertState::MaybeRestoreContext => {
+                let root_page = {
+                    let mut cursor = state.get_cursor(*cursor_id);
+                    let cursor = cursor.as_btree_mut();
+                    return_if_io!(cursor.restore_context());
+                    cursor.root_page()
+                };
 
-    // Only update last_insert_rowid for regular table inserts, not schema modifications
-    let root_page = {
-        let mut cursor = state.get_cursor(*cursor_id);
-        let cursor = cursor.as_btree_mut();
-        cursor.root_page()
-    };
-    if root_page != 1 {
-        state.op_insert_state = OpInsertState::UpdateLastRowid;
-    } else {
-        state.pc += 1;
+                if root_page != 1 {
+                    state.op_insert_state = OpInsertState::UpdateLastRowid;
+                    continue;
+                } else {
+                    state.pc += 1;
+                    state.op_insert_state = OpInsertState::MaybeSeek;
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+            }
+            OpInsertState::UpdateLastRowid => {
+                let maybe_rowid = {
+                    let mut cursor = state.get_cursor(*cursor_id);
+                    let cursor = cursor.as_btree_mut();
+                    return_if_io!(cursor.rowid())
+                };
+                if let Some(rowid) = maybe_rowid {
+                    program.connection.update_last_rowid(rowid);
+
+                    let prev_changes = program.n_change.get();
+                    program.n_change.set(prev_changes + 1);
+                }
+                state.op_insert_state = OpInsertState::MaybeSeek;
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
     }
-    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_int_64(
@@ -4932,6 +4966,13 @@ pub fn op_int_64(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub enum OpDeleteState {
+    /// Delete the row.
+    Delete,
+    /// Restore context if needed (delete caused a balancing operation).
+    MaybeRestoreContext,
+}
+
 pub fn op_delete(
     program: &Program,
     state: &mut ProgramState,
@@ -4942,15 +4983,31 @@ pub fn op_delete(
     let Insn::Delete { cursor_id } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    {
-        let mut cursor = state.get_cursor(*cursor_id);
-        let cursor = cursor.as_btree_mut();
-        return_if_io!(cursor.delete());
+    loop {
+        match &mut state.op_delete_state {
+            OpDeleteState::Delete => {
+                {
+                    let mut cursor = state.get_cursor(*cursor_id);
+                    let cursor = cursor.as_btree_mut();
+                    return_if_io!(cursor.delete());
+                    let prev_changes = program.n_change.get();
+                    program.n_change.set(prev_changes + 1);
+                }
+                state.op_delete_state = OpDeleteState::MaybeRestoreContext;
+                continue;
+            }
+            OpDeleteState::MaybeRestoreContext => {
+                {
+                    let mut cursor = state.get_cursor(*cursor_id);
+                    let cursor = cursor.as_btree_mut();
+                    return_if_io!(cursor.restore_context());
+                }
+                state.op_delete_state = OpDeleteState::Delete;
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
     }
-    let prev_changes = program.n_change.get();
-    program.n_change.set(prev_changes + 1);
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
 }
 
 #[derive(Debug)]
@@ -4958,6 +5015,7 @@ pub enum OpIdxDeleteState {
     Seeking,
     Verifying,
     Deleting,
+    MaybeRestoreContext,
 }
 pub fn op_idx_delete(
     program: &Program,
@@ -4986,7 +5044,7 @@ pub fn op_idx_delete(
             state.op_idx_delete_state
         );
         match &state.op_idx_delete_state {
-            Some(OpIdxDeleteState::Seeking) => {
+            OpIdxDeleteState::Seeking => {
                 let found = match seek_internal(
                     program,
                     state,
@@ -5016,12 +5074,12 @@ pub fn op_idx_delete(
                         )));
                     }
                     state.pc += 1;
-                    state.op_idx_delete_state = None;
+                    state.op_idx_delete_state = OpIdxDeleteState::Seeking;
                     return Ok(InsnFunctionStepResult::Step);
                 }
-                state.op_idx_delete_state = Some(OpIdxDeleteState::Verifying);
+                state.op_idx_delete_state = OpIdxDeleteState::Verifying;
             }
-            Some(OpIdxDeleteState::Verifying) => {
+            OpIdxDeleteState::Verifying => {
                 let rowid = {
                     let mut cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
@@ -5034,9 +5092,9 @@ pub fn op_idx_delete(
                         make_record(&state.registers, start_reg, num_regs)
                     )));
                 }
-                state.op_idx_delete_state = Some(OpIdxDeleteState::Deleting);
+                state.op_idx_delete_state = OpIdxDeleteState::Deleting;
             }
-            Some(OpIdxDeleteState::Deleting) => {
+            OpIdxDeleteState::Deleting => {
                 {
                     let mut cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
@@ -5044,12 +5102,17 @@ pub fn op_idx_delete(
                 }
                 let n_change = program.n_change.get();
                 program.n_change.set(n_change + 1);
-                state.pc += 1;
-                state.op_idx_delete_state = None;
-                return Ok(InsnFunctionStepResult::Step);
+                state.op_idx_delete_state = OpIdxDeleteState::MaybeRestoreContext;
             }
-            None => {
-                state.op_idx_delete_state = Some(OpIdxDeleteState::Seeking);
+            OpIdxDeleteState::MaybeRestoreContext => {
+                {
+                    let mut cursor = state.get_cursor(*cursor_id);
+                    let cursor = cursor.as_btree_mut();
+                    return_if_io!(cursor.restore_context());
+                }
+                state.op_idx_delete_state = OpIdxDeleteState::Seeking;
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
             }
         }
     }
@@ -5057,13 +5120,14 @@ pub fn op_idx_delete(
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub enum OpIdxInsertState {
-    /// Optional seek step done before an unique constraint check.
-    SeekIfUnique,
+    /// Seek if a) indicated by [IdxInsertFlags::REQUIRE_SEEK] or b) the index is UNIQUE.
+    MaybeSeek,
     /// Optional unique constraint check done before an insert.
     UniqueConstraintCheck,
-    /// Main insert step. This is always performed. Usually the state machine just
-    /// skips to this step unless the insertion is made into a unique index.
-    Insert { moved_before: bool },
+    /// Main insert step. This is always performed.
+    Insert,
+    /// Restore context if needed (insert caused a balancing operation).
+    MaybeRestoreContext,
 }
 
 pub fn op_idx_insert(
@@ -5093,15 +5157,13 @@ pub fn op_idx_insert(
     };
 
     match state.op_idx_insert_state {
-        OpIdxInsertState::SeekIfUnique => {
+        OpIdxInsertState::MaybeSeek => {
             let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
             let CursorType::BTreeIndex(index_meta) = cursor_type else {
                 panic!("IdxInsert: not a BTreeIndex cursor");
             };
-            if !index_meta.unique {
-                state.op_idx_insert_state = OpIdxInsertState::Insert {
-                    moved_before: false,
-                };
+            if !index_meta.unique && !flags.has(IdxInsertFlags::REQUIRE_SEEK) {
+                state.op_idx_insert_state = OpIdxInsertState::Insert;
                 return Ok(InsnFunctionStepResult::Step);
             }
 
@@ -5116,11 +5178,15 @@ pub fn op_idx_insert(
                 SeekOp::GE { eq_only: true },
             )? {
                 SeekInternalResult::Found => {
-                    state.op_idx_insert_state = OpIdxInsertState::UniqueConstraintCheck;
+                    state.op_idx_insert_state = if index_meta.unique {
+                        OpIdxInsertState::UniqueConstraintCheck
+                    } else {
+                        OpIdxInsertState::Insert
+                    };
                     Ok(InsnFunctionStepResult::Step)
                 }
                 SeekInternalResult::NotFound => {
-                    state.op_idx_insert_state = OpIdxInsertState::Insert { moved_before: true };
+                    state.op_idx_insert_state = OpIdxInsertState::Insert;
                     Ok(InsnFunctionStepResult::Step)
                 }
                 SeekInternalResult::IO => Ok(InsnFunctionStepResult::IO),
@@ -5166,31 +5232,30 @@ pub fn op_idx_insert(
             };
             state.op_idx_insert_state = if ignore_conflict {
                 state.pc += 1;
-                OpIdxInsertState::SeekIfUnique
+                OpIdxInsertState::MaybeSeek
             } else {
-                OpIdxInsertState::Insert { moved_before: true }
+                OpIdxInsertState::Insert
             };
             Ok(InsnFunctionStepResult::Step)
         }
-        OpIdxInsertState::Insert { moved_before } => {
+        OpIdxInsertState::Insert => {
             {
                 let mut cursor = state.get_cursor(cursor_id);
                 let cursor = cursor.as_btree_mut();
-                // To make this reentrant in case of `moved_before` = false, we need to check if the previous cursor.insert started
-                // a write/balancing operation. If it did, it means we already moved to the place we wanted.
-                let moved_before = moved_before
-                    || cursor.is_write_in_progress()
-                    || flags.has(IdxInsertFlags::USE_SEEK);
-                // Start insertion of row. This might trigger a balance procedure which will take care of moving to different pages,
-                // therefore, we don't want to seek again if that happens, meaning we don't want to return on io without moving to the following opcode
-                // because it could trigger a movement to child page after a balance root which will leave the current page as the root page.
-                return_if_io!(
-                    cursor.insert(&BTreeKey::new_index_key(record_to_insert), moved_before)
-                );
+                return_if_io!(cursor.insert(&BTreeKey::new_index_key(record_to_insert)));
             }
-            state.op_idx_insert_state = OpIdxInsertState::SeekIfUnique;
-            state.pc += 1;
+            state.op_idx_insert_state = OpIdxInsertState::MaybeRestoreContext;
             // TODO: flag optimizations, update n_change if OPFLAG_NCHANGE
+            Ok(InsnFunctionStepResult::Step)
+        }
+        OpIdxInsertState::MaybeRestoreContext => {
+            {
+                let mut cursor = state.get_cursor(cursor_id);
+                let cursor = cursor.as_btree_mut();
+                return_if_io!(cursor.restore_context());
+            }
+            state.pc += 1;
+            state.op_idx_insert_state = OpIdxInsertState::MaybeSeek;
             Ok(InsnFunctionStepResult::Step)
         }
     }

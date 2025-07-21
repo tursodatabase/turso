@@ -89,7 +89,7 @@ pub fn handle_distinct(program: &mut ProgramBuilder, agg: &Aggregate, agg_arg_re
         record_reg,
         unpacked_start: None,
         unpacked_count: None,
-        flags: IdxInsertFlags::new(),
+        flags: IdxInsertFlags::new().require_seek(),
     });
 }
 
