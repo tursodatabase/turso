@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use tracing::instrument;
-use turso_core::{Connection, LimboError, Result, StepResult};
+use turso_core::{LimboError, Result, StepResult};
 
 use crate::{
     generation::{
@@ -209,27 +209,15 @@ pub(crate) async fn execute_interaction(
     tracing::info!("");
     match interaction {
         Interaction::Query(_) => {
-            let mut conn = connection.lock().unwrap();
-            let conn = match &mut *conn {
-                SimConnection::LimboConnection(conn) => conn,
-                SimConnection::SQLiteConnection(_) => unreachable!(),
-                SimConnection::Disconnected => unreachable!(),
-            };
             tracing::debug!(?interaction);
-            let results = interaction.execute_query(conn).await;
+            let results = interaction.execute_query(connection.clone()).await;
             tracing::debug!(?results);
             state.lock().unwrap().stack.push(results);
-            limbo_integrity_check(conn)?;
+            limbo_integrity_check(connection.clone())?;
         }
         Interaction::FsyncQuery(query) => {
             // SAFETY: we lock connection only inside execute plan which is async
-            let mut conn = connection.lock().unwrap();
-            let conn = match &mut *conn {
-                SimConnection::LimboConnection(conn) => conn,
-                SimConnection::SQLiteConnection(_) => unreachable!(),
-                SimConnection::Disconnected => unreachable!(),
-            };
-            let results = interaction.execute_fsync_query(conn.clone(), &mut env.lock().unwrap());
+            let results = interaction.execute_fsync_query(connection.clone(), &mut env.lock().unwrap());
             tracing::debug!(?results);
             state.lock().unwrap().stack.push(results);
 
@@ -262,26 +250,27 @@ pub(crate) async fn execute_interaction(
             interaction.execute_fault(&mut env.lock().unwrap(), connection)?;
         }
         Interaction::FaultyQuery(_) => {
-            let mut conn = connection.lock().unwrap();
-            let conn = match &mut *conn {
-                SimConnection::LimboConnection(conn) => conn,
-                SimConnection::SQLiteConnection(_) => unreachable!(),
-                SimConnection::Disconnected => unreachable!(),
-            };
-
-            let results = interaction.execute_faulty_query(conn, env.clone()).await;
+            let results = interaction
+                .execute_faulty_query(connection.clone(), env.clone())
+                .await;
             tracing::debug!(?results);
             state.lock().unwrap().stack.push(results);
             // Reset fault injection
             env.lock().unwrap().io.inject_fault(false);
-            limbo_integrity_check(conn)?;
+            limbo_integrity_check(connection.clone())?;
         }
     }
     let _ = interaction.shadow(&mut env.lock().unwrap().tables);
     Ok(ExecutionContinuation::NextInteraction)
 }
 
-fn limbo_integrity_check(conn: &Arc<Connection>) -> Result<()> {
+fn limbo_integrity_check(conn: Arc<Mutex<SimConnection>>) -> Result<()> {
+    let mut conn = conn.lock().unwrap();
+    let conn = match &mut *conn {
+        SimConnection::LimboConnection(conn) => conn,
+        SimConnection::SQLiteConnection(_) => unreachable!(),
+        SimConnection::Disconnected => unreachable!(),
+    };
     let mut rows = conn.query("PRAGMA integrity_check;")?.unwrap();
     let mut result = Vec::new();
 

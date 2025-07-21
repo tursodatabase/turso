@@ -9,7 +9,7 @@ use std::{
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
-use turso_core::{Connection, Result, StepResult};
+use turso_core::{Result, StepResult};
 
 use crate::{
     generation::{query::SelectFree, Shadow},
@@ -442,8 +442,14 @@ impl Shadow for Interaction {
 }
 
 impl Interaction {
-    pub(crate) async fn execute_query(&self, conn: &mut Arc<Connection>) -> ResultSet {
+    pub(crate) async fn execute_query(&self, connection: Arc<Mutex<SimConnection>>) -> ResultSet {
         if let Self::Query(query) = self {
+            let mut conn = connection.lock().unwrap();
+            let conn = match &mut *conn {
+                SimConnection::LimboConnection(conn) => conn,
+                SimConnection::SQLiteConnection(_) => unreachable!(),
+                SimConnection::Disconnected => unreachable!(),
+            };
             let query_str = query.to_string();
             let rows = conn.query(&query_str);
             if rows.is_err() {
@@ -576,9 +582,15 @@ impl Interaction {
 
     pub(crate) fn execute_fsync_query(
         &self,
-        conn: Arc<Connection>,
+        connection: Arc<Mutex<SimConnection>>,
         env: &mut SimulatorEnv,
     ) -> ResultSet {
+        let mut conn = connection.lock().unwrap();
+        let conn = match &mut *conn {
+            SimConnection::LimboConnection(conn) => conn,
+            SimConnection::SQLiteConnection(_) => unreachable!(),
+            SimConnection::Disconnected => unreachable!(),
+        };
         if let Self::FsyncQuery(query) = self {
             let query_str = query.to_string();
             let rows = conn.query(&query_str);
@@ -636,9 +648,15 @@ impl Interaction {
 
     pub(crate) async fn execute_faulty_query(
         &self,
-        conn: &Arc<Connection>,
+        connection: Arc<Mutex<SimConnection>>,
         env: Arc<Mutex<SimulatorEnv>>,
     ) -> ResultSet {
+        let mut conn = connection.lock().unwrap();
+        let conn = match &mut *conn {
+            SimConnection::LimboConnection(conn) => conn,
+            SimConnection::SQLiteConnection(_) => unreachable!(),
+            SimConnection::Disconnected => unreachable!(),
+        };
         if let Self::FaultyQuery(query) = self {
             let query_str = query.to_string();
             let rows = conn.query(&query_str);
