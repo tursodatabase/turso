@@ -59,6 +59,8 @@ pub enum LimboError {
     ReadOnly,
     #[error("Database is busy")]
     Busy,
+    #[error("Database schema changed")]
+    SchemaUpdated,
 }
 
 #[macro_export]
