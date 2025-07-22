@@ -7,13 +7,19 @@ mod input;
 mod mcp_server;
 mod opcodes_dictionary;
 
+use clap::Parser;
 use config::CONFIG_DIR;
 use mcp_server::TursoMcpServer;
 use rustyline::{error::ReadlineError, Config, Editor};
 use std::{
+    io::IsTerminal,
     path::PathBuf,
     sync::{atomic::Ordering, LazyLock},
 };
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+use crate::app::Opts;
 
 fn rustyline_config() -> Config {
     Config::builder()
@@ -36,7 +42,9 @@ fn run_mcp_server(app: app::Limbo) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
-    let (mut app, _guard) = app::Limbo::new()?;
+    let opts = Opts::parse();
+    let _guard = init_tracing(&opts.tracing_output);
+    let mut app = app::Limbo::new(opts)?;
 
     if app.is_mcp_mode() {
         return run_mcp_server(app);
@@ -90,4 +98,38 @@ fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+pub fn init_tracing(tracing_output: &Option<String>) -> Result<WorkerGuard, std::io::Error> {
+    let ((non_blocking, guard), should_emit_ansi) = if let Some(file) = tracing_output {
+        (
+            tracing_appender::non_blocking(
+                std::fs::File::options()
+                    .append(true)
+                    .create(true)
+                    .open(file)?,
+            ),
+            false,
+        )
+    } else {
+        (
+            tracing_appender::non_blocking(std::io::stderr()),
+            IsTerminal::is_terminal(&std::io::stderr()),
+        )
+    };
+    // Disable rustyline traces
+    if let Err(e) = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(non_blocking)
+                .with_line_number(true)
+                .with_thread_ids(true)
+                .with_ansi(should_emit_ansi),
+        )
+        .with(EnvFilter::from_default_env().add_directive("rustyline=off".parse().unwrap()))
+        .try_init()
+    {
+        println!("Unable to setup tracing appender: {e:?}");
+    }
+    Ok(guard)
 }

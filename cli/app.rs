@@ -16,7 +16,7 @@ use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Row, Table
 use rustyline::{error::ReadlineError, history::DefaultHistory, Editor};
 use std::{
     fmt,
-    io::{self, BufRead as _, IsTerminal, Write},
+    io::{self, BufRead as _, Write},
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -25,8 +25,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{Connection, Database, LimboError, OpenFlags, Statement, StepResult, Value};
 
 #[derive(Parser, Debug)]
@@ -113,8 +111,7 @@ macro_rules! query_internal {
 }
 
 impl Limbo {
-    pub fn new() -> anyhow::Result<(Self, WorkerGuard)> {
-        let opts = Opts::parse();
+    pub fn new(opts: Opts) -> anyhow::Result<Self> {
         let db_file = opts
             .database
             .as_ref()
@@ -166,9 +163,8 @@ impl Limbo {
             rl: None,
             config: Some(config),
         };
-        let guard = app.init_tracing()?;
         app.first_run(sql, quiet)?;
-        Ok((app, guard))
+        Ok(app)
     }
 
     pub fn with_config(mut self, config: Config) -> Self {
@@ -904,41 +900,6 @@ impl Limbo {
             }
         }
         Ok(())
-    }
-
-    pub fn init_tracing(&mut self) -> Result<WorkerGuard, std::io::Error> {
-        let ((non_blocking, guard), should_emit_ansi) =
-            if let Some(file) = &self.opts.tracing_output {
-                (
-                    tracing_appender::non_blocking(
-                        std::fs::File::options()
-                            .append(true)
-                            .create(true)
-                            .open(file)?,
-                    ),
-                    false,
-                )
-            } else {
-                (
-                    tracing_appender::non_blocking(std::io::stderr()),
-                    IsTerminal::is_terminal(&std::io::stderr()),
-                )
-            };
-        // Disable rustyline traces
-        if let Err(e) = tracing_subscriber::registry()
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_writer(non_blocking)
-                    .with_line_number(true)
-                    .with_thread_ids(true)
-                    .with_ansi(should_emit_ansi),
-            )
-            .with(EnvFilter::from_default_env().add_directive("rustyline=off".parse().unwrap()))
-            .try_init()
-        {
-            println!("Unable to setup tracing appender: {e:?}");
-        }
-        Ok(guard)
     }
 
     fn display_schema(&mut self, table: Option<&str>) -> anyhow::Result<()> {
