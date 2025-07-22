@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -312,6 +313,27 @@ def test_uri_readonly():
     turso.quit()
 
 
+def test_readonly_doesnt_create_wal():
+    tmpfile = tempfile.NamedTemporaryFile(delete=False, delete_on_close=False, suffix=".db")
+    sqlite = TestTursoShell(exec_name="sqlite3", flags=f"{tmpfile.name}", init_commands="create table t(a,b,c);")
+    sqlite.run_test("create-table", "insert into t (a,b,c) values (1,2,3);", "")
+    sqlite.run_test_fn("select * from t;", lambda res: "1|2|3" in res, "validating table")
+    sqlite.quit()
+    # open the file in readonly mode
+    turso = TestTursoShell(flags=f"--readonly {tmpfile.name}", init_commands="")
+    # ensure we did not create a new WAL file
+    if os.path.exists(f"{tmpfile.name}-wal"):
+        assert False, "WAL file should not be created in readonly mode"
+    turso.run_test_fn(
+        "insert into t(a,b,c) values (4,5,6);",
+        lambda res: "Database Connection is read-only" in res,
+        "db-is-readonly",
+    )
+    turso.run_test_fn("select * from t;", lambda x: "1|2|3" in x, "readonly-wal-select-works")
+    turso.quit()
+    os.remove(tmpfile.name)
+
+
 def main():
     console.info("Running all turso CLI tests...")
     test_basic_queries()
@@ -333,6 +355,7 @@ def main():
     test_update_with_limit()
     test_update_with_limit_and_offset()
     test_uri_readonly()
+    test_readonly_doesnt_create_wal()
     console.info("All tests have passed")
 
 
