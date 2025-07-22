@@ -1416,6 +1416,9 @@ impl Pager {
         connection: &Connection,
     ) -> Result<(), LimboError> {
         tracing::debug!(schema_did_change);
+        {
+            *self.spill_flag.borrow_mut() = SpillFlag::ROLLBACK;
+        }
         self.dirty_pages.borrow_mut().clear();
         let mut cache = self.page_cache.write();
         cache.unset_dirty_all_pages();
@@ -1431,7 +1434,7 @@ impl Pager {
             );
         }
         self.wal.borrow_mut().rollback()?;
-
+        *self.spill_flag.borrow_mut() = SpillFlag::ALLOWED;
         Ok(())
     }
 
