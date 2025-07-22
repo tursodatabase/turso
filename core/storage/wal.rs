@@ -39,19 +39,20 @@ pub const NO_LOCK: u32 = 0;
 pub const SHARED_LOCK: u32 = 1;
 pub const WRITE_LOCK: u32 = 2;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CheckpointResult {
     /// number of frames in WAL
     pub num_wal_frames: u64,
     /// number of frames moved successfully from WAL to db file after checkpoint
     pub num_checkpointed_frames: u64,
-    /// will drop automatically and free any remaining locks we need to hold
-    maybe_guard: Option<CheckpointGuard>,
+    /// In the case of everything backfilled, we need to hold the locks until the db
+    /// file is truncated.
+    maybe_guard: Option<CheckpointLocks>,
 }
 
-impl Default for CheckpointResult {
-    fn default() -> Self {
-        Self::new()
+impl Drop for CheckpointResult {
+    fn drop(&mut self) {
+        let _ = self.maybe_guard.take();
     }
 }
 
@@ -437,7 +438,8 @@ pub struct WalFile {
     /// Private copy of WalHeader
     pub header: WalHeader,
 
-    checkpoint_guard: Option<CheckpointGuard>,
+    /// Manages locks needed for checkpointing
+    checkpoint_guard: Option<CheckpointLocks>,
 }
 
 impl fmt::Debug for WalFile {
@@ -565,9 +567,10 @@ impl fmt::Debug for WalFileShared {
 }
 
 #[derive(Clone, Debug)]
-/// An RAII guard to ensure that no locks are leaked during checkpointing in
-/// the case of errors.
-enum CheckpointGuard {
+/// To manage and ensure that no locks are leaked during checkpointing in
+/// the case of errors. It is held by the WalFile while checkpoint is ongoing
+/// then transferred to the CheckpointResult if necessary.
+enum CheckpointLocks {
     Writer { ptr: Arc<UnsafeCell<WalFileShared>> },
     Read0 { ptr: Arc<UnsafeCell<WalFileShared>> },
 }
@@ -579,7 +582,7 @@ enum CheckpointGuard {
 /// Exclusive lock on read-mark 0.
 /// Exclusive lock on read-mark slots 1-N again. These are immediately released after being taken (RESTART and TRUNCATE only).
 /// All of the above use blocking locks.
-impl CheckpointGuard {
+impl CheckpointLocks {
     fn new(ptr: Arc<UnsafeCell<WalFileShared>>, mode: CheckpointMode) -> Result<Self> {
         let shared = &mut unsafe { &mut *ptr.get() };
         if !shared.checkpoint_lock.write() {
@@ -628,15 +631,15 @@ impl CheckpointGuard {
     }
 }
 
-impl Drop for CheckpointGuard {
+impl Drop for CheckpointLocks {
     fn drop(&mut self) {
         match self {
-            CheckpointGuard::Writer { ptr: shared } => unsafe {
+            CheckpointLocks::Writer { ptr: shared } => unsafe {
                 (*shared.get()).write_lock.unlock();
                 (*shared.get()).read_locks[0].unlock();
                 (*shared.get()).checkpoint_lock.unlock();
             },
-            CheckpointGuard::Read0 { ptr: shared } => unsafe {
+            CheckpointLocks::Read0 { ptr: shared } => unsafe {
                 (*shared.get()).read_locks[0].unlock();
                 (*shared.get()).checkpoint_lock.unlock();
             },
@@ -738,9 +741,7 @@ impl Wal for WalFile {
     /// Begin a write transaction
     #[instrument(skip_all, level = Level::DEBUG)]
     fn begin_write_tx(&mut self) -> Result<LimboResult> {
-        let busy = !self.get_shared().write_lock.write();
-        tracing::debug!("begin_write_transaction(busy={busy})");
-        if busy {
+        if !self.get_shared().write_lock.write() {
             return Ok(LimboResult::Busy);
         }
         // If the max frame is not the same as the one in the shared state, it means another
@@ -1185,16 +1186,8 @@ impl WalFile {
                         // return early success.
                         return Ok(IOResult::Done(CheckpointResult::default()));
                     }
-                    // acquire either the read0 or write lock depending on the checkpoint mode
+                    // acquire the appropriate exclusive locks depending on the checkpoint mode
                     self.acquire_proper_checkpoint_guard(mode)?;
-                    // If there is anything to copy (mxFrame > nBackfills) we must fsync the WAL file first.
-                    // For durability, we cannot rely on fsync being called in higher layers.
-                    if needs_backfill {
-                        self.sync()?;
-                        if let SyncState::Syncing = self.sync_state.get() {
-                            return Ok(IOResult::IO);
-                        }
-                    }
                     self.ongoing_checkpoint.max_frame = self.determine_max_safe_checkpoint_frame();
                     self.ongoing_checkpoint.min_frame = self.min_frame;
                     self.ongoing_checkpoint.current_page = 0;
@@ -1372,7 +1365,7 @@ impl WalFile {
             "CheckpointMode must be Restart or Truncate"
         );
         turso_assert!(
-            matches!(self.checkpoint_guard, Some(CheckpointGuard::Writer { .. })),
+            matches!(self.checkpoint_guard, Some(CheckpointLocks::Writer { .. })),
             "We must hold writer and checkpoint locks to restart the log, found: {:?}",
             self.checkpoint_guard
         );
@@ -1465,9 +1458,9 @@ impl WalFile {
     fn acquire_proper_checkpoint_guard(&mut self, mode: CheckpointMode) -> Result<()> {
         let needs_new_guard = !matches!(
             (&self.checkpoint_guard, mode),
-            (Some(CheckpointGuard::Read0 { .. }), CheckpointMode::Passive,)
+            (Some(CheckpointLocks::Read0 { .. }), CheckpointMode::Passive,)
                 | (
-                    Some(CheckpointGuard::Writer { .. }),
+                    Some(CheckpointLocks::Writer { .. }),
                     CheckpointMode::Restart | CheckpointMode::Truncate,
                 ),
         );
@@ -1476,7 +1469,7 @@ impl WalFile {
             if self.checkpoint_guard.is_some() {
                 let _ = self.checkpoint_guard.take();
             }
-            let guard = CheckpointGuard::new(self.shared.clone(), mode)?;
+            let guard = CheckpointLocks::new(self.shared.clone(), mode)?;
             self.checkpoint_guard = Some(guard);
         }
         Ok(())
