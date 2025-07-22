@@ -1264,11 +1264,11 @@ impl Pager {
             return Ok(CheckpointResult::default());
         }
 
+        let counter = Rc::new(RefCell::new(0));
         let mut checkpoint_result = self.io.block(|| {
             self.wal
                 .borrow_mut()
-                .checkpoint(self, Rc::new(RefCell::new(0)), mode)
-                .map_err(|err| panic!("error while clearing cache {err}"))
+                .checkpoint(self, counter.clone(), mode)
         })?;
 
         if checkpoint_result.everything_backfilled() {
