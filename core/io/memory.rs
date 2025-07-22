@@ -1,5 +1,5 @@
 use super::{Buffer, Clock, Completion, File, OpenFlags, IO};
-use crate::Result;
+use crate::{DatabaseMode, Result};
 
 use crate::io::clock::Instant;
 use std::{
@@ -65,6 +65,10 @@ impl IO for MemoryIO {
 
     fn get_memory_io(&self) -> Arc<MemoryIO> {
         Arc::new(MemoryIO::new())
+    }
+
+    fn database_mode(&self) -> crate::DatabaseMode {
+        DatabaseMode::Memory
     }
 }
 
