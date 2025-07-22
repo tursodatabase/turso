@@ -237,9 +237,6 @@ pub fn translate_create_index(
         cursor_id: sqlite_schema_cursor_id,
     });
 
-    // Epilogue:
-    program.epilogue(super::emitter::TransactionMode::Write);
-
     Ok(program)
 }
 
@@ -335,7 +332,6 @@ pub fn translate_drop_index(
     // then return normaly, otherwise show an error.
     if maybe_index.is_none() {
         if if_exists {
-            program.epilogue(super::emitter::TransactionMode::Write);
             return Ok(program);
         } else {
             return Err(crate::error::LimboError::InvalidArgument(format!(
@@ -449,9 +445,6 @@ pub fn translate_drop_index(
             db: 0,
         });
     }
-
-    // Epilogue:
-    program.epilogue(super::emitter::TransactionMode::Write);
 
     Ok(program)
 }

@@ -99,7 +99,7 @@ pub fn translate(
         stmt => translate_inner(schema, stmt, syms, program)?,
     };
 
-    // TODO: bring epilogue here when I can sort out what instructions correspond to a Write or a Read transaction
+    program.epilogue();
 
     Ok(program.build(connection, change_cnt_on, input))
 }
@@ -111,14 +111,37 @@ pub fn translate_inner(
     schema: &Schema,
     stmt: ast::Stmt,
     syms: &SymbolTable,
-    program: ProgramBuilder,
+    mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
+    // Indicate write operations so that in the epilogue we can emit the correct type of transaction
+    if matches!(
+        stmt,
+        ast::Stmt::AlterTable(..)
+            | ast::Stmt::CreateIndex { .. }
+            | ast::Stmt::CreateTable { .. }
+            | ast::Stmt::CreateTrigger { .. }
+            | ast::Stmt::CreateView { .. }
+            | ast::Stmt::CreateVirtualTable(..)
+            | ast::Stmt::Delete(..)
+            | ast::Stmt::DropIndex { .. }
+            | ast::Stmt::DropTable { .. }
+            | ast::Stmt::Reindex { .. }
+            | ast::Stmt::Update(..)
+            | ast::Stmt::Insert(..)
+    ) {
+        program.begin_write_operation();
+    }
+    // Indicate read operations so that in the epilogue we can emit the correct type of transaction
+    if matches!(stmt, ast::Stmt::Select { .. }) {
+        program.begin_read_operation();
+    }
+
     let program = match stmt {
         ast::Stmt::AlterTable(alter) => translate_alter_table(*alter, syms, schema, program)?,
         ast::Stmt::Analyze(_) => bail_parse_error!("ANALYZE not supported yet"),
         ast::Stmt::Attach { .. } => bail_parse_error!("ATTACH not supported yet"),
         ast::Stmt::Begin(tx_type, tx_name) => {
-            translate_tx_begin(tx_type, tx_name, &schema, program)?
+            translate_tx_begin(tx_type, tx_name, schema, program)?
         }
         ast::Stmt::Commit(tx_name) => translate_tx_commit(tx_name, program)?,
         ast::Stmt::CreateIndex {
