@@ -1356,7 +1356,7 @@ impl Pager {
 
                     // Reserve 2 slots for the trunk page header which is 8 bytes or 2*LEAF_ENTRY_SIZE
                     let max_free_list_entries =
-                        (self.usable_space() / LEAF_ENTRY_SIZE) - RESERVED_SLOTS;
+                        (header.usable_space() / LEAF_ENTRY_SIZE) - RESERVED_SLOTS;
 
                     if number_of_leaf_pages < max_free_list_entries as u32 {
                         turso_assert!(

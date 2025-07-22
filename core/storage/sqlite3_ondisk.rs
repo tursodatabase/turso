@@ -259,6 +259,10 @@ impl DatabaseHeader {
     const _CHECK: () = {
         assert!(Self::SIZE == 100);
     };
+
+    pub fn usable_space(self) -> usize {
+        (self.page_size.get() as usize) - (self.reserved_space as usize)
+    }
 }
 
 impl Default for DatabaseHeader {
