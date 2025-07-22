@@ -50,7 +50,7 @@ pub enum CacheError {
     Dirty { pgno: usize },
     Pinned { pgno: usize },
     ActiveRefs,
-    Full,
+    Full { should_spill: bool },
     KeyExists,
 }
 
@@ -280,7 +280,9 @@ impl DumbLruPageCache {
 
     pub fn make_room_for(&mut self, n: usize) -> Result<(), CacheError> {
         if n > self.capacity {
-            return Err(CacheError::Full);
+            return Err(CacheError::Full {
+                should_spill: self.map.borrow().size > self.spill_threshold,
+            });
         }
 
         let len = self.len();
@@ -314,7 +316,9 @@ impl DumbLruPageCache {
         }
 
         match need_to_evict > 0 {
-            true => Err(CacheError::Full),
+            true => Err(CacheError::Full {
+                should_spill: self.map.borrow().size > self.spill_threshold,
+            }),
             false => Ok(()),
         }
     }
@@ -1046,7 +1050,7 @@ mod tests {
                     }
                     tracing::debug!("inserting page {:?}", key);
                     match cache.insert(key.clone(), page.clone()) {
-                        Err(CacheError::Full | CacheError::ActiveRefs) => {} // Ignore
+                        Err(CacheError::Full { .. } | CacheError::ActiveRefs) => {} // Ignore
                         Err(err) => {
                             // Any other error should fail the test
                             panic!("Cache insertion failed: {err:?}");
