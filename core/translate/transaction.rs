@@ -36,7 +36,6 @@ pub fn translate_tx_begin(
             });
         }
     }
-    program.epilogue(super::emitter::TransactionMode::None);
     Ok(program)
 }
 
@@ -53,6 +52,5 @@ pub fn translate_tx_commit(
         auto_commit: true,
         rollback: false,
     });
-    program.epilogue(super::emitter::TransactionMode::None);
     Ok(program)
 }

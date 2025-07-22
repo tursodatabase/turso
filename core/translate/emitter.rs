@@ -194,6 +194,7 @@ pub enum OperationMode {
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Sqlite always considers Read transactions implicit
 pub enum TransactionMode {
     None,
     Read,
@@ -238,7 +239,6 @@ fn emit_program_for_select(
     // Trivial exit on LIMIT 0
     if let Some(limit) = plan.limit {
         if limit == 0 {
-            program.epilogue(TransactionMode::Read);
             program.result_columns = plan.result_columns;
             program.table_references.extend(plan.table_references);
             return Ok(());
@@ -246,13 +246,6 @@ fn emit_program_for_select(
     }
     // Emit main parts of query
     emit_query(program, &mut plan, &mut t_ctx)?;
-
-    // Finalize program
-    if plan.table_references.joined_tables().is_empty() {
-        program.epilogue(TransactionMode::None);
-    } else {
-        program.epilogue(TransactionMode::Read);
-    }
 
     program.result_columns = plan.result_columns;
     program.table_references.extend(plan.table_references);
@@ -416,7 +409,6 @@ fn emit_program_for_delete(
 
     // exit early if LIMIT 0
     if let Some(0) = plan.limit {
-        program.epilogue(TransactionMode::Write);
         program.result_columns = plan.result_columns;
         program.table_references.extend(plan.table_references);
         return Ok(());
@@ -472,7 +464,6 @@ fn emit_program_for_delete(
     program.preassign_label_to_next_insn(after_main_loop_label);
 
     // Finalize program
-    program.epilogue(TransactionMode::Write);
     program.result_columns = plan.result_columns;
     program.table_references.extend(plan.table_references);
     Ok(())
@@ -673,7 +664,6 @@ fn emit_program_for_update(
 
     // Exit on LIMIT 0
     if let Some(0) = plan.limit {
-        program.epilogue(TransactionMode::None);
         program.result_columns = plan.returning.unwrap_or_default();
         program.table_references.extend(plan.table_references);
         return Ok(());
@@ -767,8 +757,6 @@ fn emit_program_for_update(
 
     after(program);
 
-    // Finalize program
-    program.epilogue(TransactionMode::Write);
     program.result_columns = plan.returning.unwrap_or_default();
     program.table_references.extend(plan.table_references);
     Ok(())

@@ -1,5 +1,5 @@
 use crate::schema::{Index, IndexColumn, Schema};
-use crate::translate::emitter::{emit_query, LimitCtx, TransactionMode, TranslateCtx};
+use crate::translate::emitter::{emit_query, LimitCtx, TranslateCtx};
 use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::Insn;
@@ -33,7 +33,6 @@ pub fn emit_program_for_compound_select(
     // Trivial exit on LIMIT 0
     if let Some(limit) = limit {
         if *limit == 0 {
-            program.epilogue(TransactionMode::Read);
             program.result_columns = right_plan.result_columns;
             program.table_references.extend(right_plan.table_references);
             return Ok(());
@@ -89,7 +88,6 @@ pub fn emit_program_for_compound_select(
         reg_result_cols_start,
     )?;
 
-    program.epilogue(TransactionMode::Read);
     program.result_columns = right_plan.result_columns;
     program.table_references.extend(right_plan.table_references);
 

@@ -87,7 +87,6 @@ pub fn translate_insert(
             on_conflict,
             &resolver,
         )?;
-        program.epilogue(super::emitter::TransactionMode::Write);
         return Ok(program);
     }
 
@@ -631,7 +630,6 @@ pub fn translate_insert(
     }
 
     program.resolve_label(halt_label, program.offset());
-    program.epilogue(super::emitter::TransactionMode::Write);
 
     Ok(program)
 }
