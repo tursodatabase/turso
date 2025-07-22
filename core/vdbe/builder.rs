@@ -6,7 +6,7 @@ use turso_sqlite3_parser::ast::{self, TableInternalId};
 use crate::{
     numeric::Numeric,
     parameters::Parameters,
-    schema::{BTreeTable, Index, PseudoCursorType, Table},
+    schema::{BTreeTable, Index, PseudoCursorType, Schema, Table},
     translate::{
         collate::CollationSeq,
         emitter::TransactionMode,
@@ -778,7 +778,7 @@ impl ProgramBuilder {
     /// Clean up and finalize the program, resolving any remaining labels
     /// Note that although these are the final instructions, typically an SQLite
     /// query will jump to the Transaction instruction via init_label.
-    pub fn epilogue(&mut self) {
+    pub fn epilogue(&mut self, schema: &Schema) {
         if self.nested_level == 0 {
             // "rollback" flag is used to determine if halt should rollback the transaction.
             self.emit_halt(self.rollback);
@@ -788,7 +788,7 @@ impl ProgramBuilder {
                 self.emit_insn(Insn::Transaction {
                     db: 0,
                     write: matches!(self.txn_mode, TransactionMode::Write),
-                    schema_cookie: 0, // TODO: placeholder until we have epilogue being called only in one place
+                    schema_cookie: schema.schema_version,
                 });
             }
 
