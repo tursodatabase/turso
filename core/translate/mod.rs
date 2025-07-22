@@ -117,7 +117,9 @@ pub fn translate_inner(
         ast::Stmt::AlterTable(alter) => translate_alter_table(*alter, syms, schema, program)?,
         ast::Stmt::Analyze(_) => bail_parse_error!("ANALYZE not supported yet"),
         ast::Stmt::Attach { .. } => bail_parse_error!("ATTACH not supported yet"),
-        ast::Stmt::Begin(tx_type, tx_name) => translate_tx_begin(tx_type, tx_name, program)?,
+        ast::Stmt::Begin(tx_type, tx_name) => {
+            translate_tx_begin(tx_type, tx_name, &schema, program)?
+        }
         ast::Stmt::Commit(tx_name) => translate_tx_commit(tx_name, program)?,
         ast::Stmt::CreateIndex {
             unique,
