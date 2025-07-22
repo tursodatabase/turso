@@ -89,7 +89,7 @@ impl PageSize {
     pub const DEFAULT: u16 = 4096;
 
     pub const fn new(size: u32) -> Option<Self> {
-        if !(PageSize::MIN < size && size <= PageSize::MAX) {
+        if size < PageSize::MIN || size > PageSize::MAX {
             return None;
         }
 
