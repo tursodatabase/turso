@@ -1921,10 +1921,6 @@ pub fn op_transaction(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    let header_schema_cookie = header_accessor::get_schema_cookie(pager)?;
-    if header_schema_cookie != *schema_cookie {
-        return Err(LimboError::SchemaUpdated);
-    }
     let conn = program.connection.clone();
     if *write && conn._db.open_flags.contains(OpenFlags::ReadOnly) {
         return Err(LimboError::ReadOnly);
@@ -1934,6 +1930,10 @@ pub fn op_transaction(
         if state.mv_tx_id.is_none() {
             // We allocate the first page lazily in the first transaction.
             return_if_io!(pager.maybe_allocate_page1());
+            let header_schema_cookie = header_accessor::get_schema_cookie(pager)?;
+            if header_schema_cookie != *schema_cookie {
+                return Err(LimboError::SchemaUpdated);
+            }
             let tx_id = mv_store.begin_tx();
             conn.mv_transactions.borrow_mut().push(tx_id);
             state.mv_tx_id = Some(tx_id);
@@ -1976,6 +1976,15 @@ pub fn op_transaction(
                 return Ok(InsnFunctionStepResult::Busy);
             }
         }
+
+        // Can only read header if page 1 has been allocated already
+        // begin_write_tx and begin_read_tx guarantee that happens
+        let header_schema_cookie = header_accessor::get_schema_cookie(pager)?;
+        tracing::info!(header_schema_cookie, schema_cookie);
+        if header_schema_cookie != *schema_cookie {
+            return Err(LimboError::SchemaUpdated);
+        }
+
         if updated {
             conn.transaction_state.replace(new_transaction_state);
         }

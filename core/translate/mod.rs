@@ -99,7 +99,7 @@ pub fn translate(
         stmt => translate_inner(schema, stmt, syms, program)?,
     };
 
-    program.epilogue();
+    program.epilogue(schema);
 
     Ok(program.build(connection, change_cnt_on, input))
 }

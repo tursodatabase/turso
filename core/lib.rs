@@ -268,7 +268,7 @@ impl Database {
             let pager = conn.pager.borrow().clone();
 
             db.with_schema_mut(|schema| {
-                schema.schema_version = get_schema_version(&conn)?;
+                schema.schema_version = header_accessor::get_schema_cookie(&conn.pager.borrow())?;
                 if let Err(LimboError::ExtensionError(e)) =
                     schema.make_from_btree(None, pager, &syms)
                 {
@@ -446,50 +446,6 @@ impl Database {
         let mut schema_ref = self.schema.lock().map_err(|_| LimboError::SchemaLocked)?;
         let schema = Arc::make_mut(&mut *schema_ref);
         f(schema)
-    }
-}
-
-fn get_schema_version(conn: &Arc<Connection>) -> Result<u32> {
-    let mut rows = conn
-        .query("PRAGMA schema_version")?
-        .ok_or(LimboError::InternalError(
-            "failed to parse pragma schema_version on initialization".to_string(),
-        ))?;
-    let mut schema_version = None;
-    loop {
-        match rows.step()? {
-            StepResult::Row => {
-                let row = rows.row().unwrap();
-                if schema_version.is_some() {
-                    return Err(LimboError::InternalError(
-                        "PRAGMA schema_version; returned more that one row".to_string(),
-                    ));
-                }
-                schema_version = Some(row.get::<i64>(0)? as u32);
-            }
-            StepResult::IO => {
-                rows.run_once()?;
-            }
-            StepResult::Interrupt => {
-                return Err(LimboError::InternalError(
-                    "PRAGMA schema_version; returned more that one row".to_string(),
-                ));
-            }
-            StepResult::Done => {
-                if let Some(version) = schema_version {
-                    return Ok(version);
-                } else {
-                    return Err(LimboError::InternalError(
-                        "failed to get schema_version".to_string(),
-                    ));
-                }
-            }
-            StepResult::Busy => {
-                return Err(LimboError::InternalError(
-                    "PRAGMA schema_version; returned more that one row".to_string(),
-                ));
-            }
-        }
     }
 }
 
