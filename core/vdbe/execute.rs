@@ -1970,9 +1970,18 @@ pub fn op_transaction(
     _pager: &Rc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    let Insn::Transaction { db, write } = insn else {
+    let Insn::Transaction {
+        db,
+        write,
+        schema_cookie,
+    } = insn
+    else {
         unreachable!("unexpected Insn {:?}", insn)
     };
+    let header_schema_cookie = header_accessor::get_schema_cookie(pager)?;
+    if header_schema_cookie != *schema_cookie {
+        return Err(LimboError::SchemaUpdated);
+    }
     let conn = program.connection.clone();
     if *write && conn._db.open_flags.contains(OpenFlags::ReadOnly) {
         return Err(LimboError::ReadOnly);

@@ -123,7 +123,9 @@ pub fn translate_inner(
         ast::Stmt::Attach { expr, db_name, key } => {
             attach::translate_attach(&expr, &db_name, &key, schema, syms, program)?
         }
-        ast::Stmt::Begin(tx_type, tx_name) => translate_tx_begin(tx_type, tx_name, program)?,
+        ast::Stmt::Begin(tx_type, tx_name) => {
+            translate_tx_begin(tx_type, tx_name, &schema, program)?
+        }
         ast::Stmt::Commit(tx_name) => translate_tx_commit(tx_name, program)?,
         ast::Stmt::CreateIndex {
             unique,

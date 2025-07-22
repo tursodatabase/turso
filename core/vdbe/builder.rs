@@ -771,8 +771,13 @@ impl ProgramBuilder {
                 TransactionMode::Read => self.emit_insn(Insn::Transaction {
                     db: 0,
                     write: false,
+                    schema_cookie: 0, // TODO: placeholder until we have epilogue being called only in one place
                 }),
-                TransactionMode::Write => self.emit_insn(Insn::Transaction { db: 0, write: true }),
+                TransactionMode::Write => self.emit_insn(Insn::Transaction {
+                    db: 0,
+                    write: true,
+                    schema_cookie: 0, // TODO: placeholder until we have epilogue being called only in one place
+                }),
                 TransactionMode::None => {}
             }
 
