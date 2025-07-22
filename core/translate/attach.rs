@@ -113,7 +113,6 @@ pub fn translate_attach(
         },
     });
 
-    program.epilogue(super::emitter::TransactionMode::None);
     Ok(program)
 }
 
@@ -178,6 +177,5 @@ pub fn translate_detach(
         },
     });
 
-    program.epilogue(super::emitter::TransactionMode::None);
     Ok(program)
 }

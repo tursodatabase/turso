@@ -42,6 +42,7 @@ mod numeric;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use crate::storage::header_accessor::HeaderRef;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(feature = "fs")]
@@ -310,7 +311,10 @@ impl Database {
             let pager = conn.pager.borrow().clone();
 
             db.with_schema_mut(|schema| {
-                schema.schema_version = header_accessor::get_schema_cookie(&conn.pager.borrow())?;
+                let header_ref = pager.io.block(|| HeaderRef::from_pager(&pager))?;
+                let header = header_ref.borrow();
+                let header_schema_cookie = header.schema_cookie.get();
+                schema.schema_version = header_schema_cookie;
                 let result = schema
                     .make_from_btree(None, pager.clone(), &syms)
                     .or_else(|e| {
@@ -1701,8 +1705,9 @@ impl Statement {
         let mut res = self
             .program
             .step(&mut self.state, self.mv_store.clone(), self.pager.clone());
-        for _ in 0..MAX_SCHEMA_RETRY {
+        for i in 0..MAX_SCHEMA_RETRY {
             // Only reprepare if we still need to update schema
+            dbg!(i);
             if !matches!(res, Err(LimboError::SchemaUpdated)) {
                 break;
             }
@@ -1716,12 +1721,13 @@ impl Statement {
     }
 
     fn reprepare(&mut self) -> Result<()> {
+        let conn = self.program.connection.clone();
+        *conn.schema.borrow_mut() = conn._db.clone_schema()?;
         self.program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next()?;
             let cmd = cmd.expect("Same SQL string should be able to be parsed");
 
-            let conn = self.program.connection.clone();
             let syms = conn.syms.borrow();
 
             match cmd {
