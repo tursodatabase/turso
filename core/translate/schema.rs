@@ -44,8 +44,6 @@ pub fn translate_create_table(
     let normalized_tbl_name = normalize_ident(&tbl_name.name.0);
     if schema.get_table(&normalized_tbl_name).is_some() {
         if if_not_exists {
-            program.epilogue(crate::translate::emitter::TransactionMode::Write);
-
             return Ok(program);
         }
         bail_parse_error!("Table {} already exists", normalized_tbl_name);
@@ -162,7 +160,6 @@ pub fn translate_create_table(
     });
 
     // TODO: SqlExec
-    program.epilogue(super::emitter::TransactionMode::Write);
 
     Ok(program)
 }
@@ -540,7 +537,6 @@ pub fn translate_create_virtual_table(
     };
     if schema.get_table(&table_name).is_some() {
         if *if_not_exists {
-            program.epilogue(crate::translate::emitter::TransactionMode::Write);
             return Ok(program);
         }
         bail_parse_error!("Table {} already exists", tbl_name);
@@ -611,8 +607,6 @@ pub fn translate_create_virtual_table(
         where_clause: Some(parse_schema_where_clause),
     });
 
-    program.epilogue(super::emitter::TransactionMode::Write);
-
     Ok(program)
 }
 
@@ -636,8 +630,6 @@ pub fn translate_drop_table(
     let table = schema.get_table(tbl_name.name.0.as_str());
     if table.is_none() {
         if if_exists {
-            program.epilogue(crate::translate::emitter::TransactionMode::Write);
-
             return Ok(program);
         }
         bail_parse_error!("No such table: {}", tbl_name.name.0.as_str());
@@ -931,9 +923,6 @@ pub fn translate_drop_table(
         _p3: 0,
         table_name: tbl_name.name.0,
     });
-
-    //  end of the program
-    program.epilogue(super::emitter::TransactionMode::Write);
 
     Ok(program)
 }

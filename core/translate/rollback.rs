@@ -2,7 +2,6 @@ use turso_sqlite3_parser::ast::Name;
 
 use crate::{
     schema::Schema,
-    translate::emitter::TransactionMode,
     vdbe::{builder::ProgramBuilder, insn::Insn},
     Result, SymbolTable,
 };
@@ -22,6 +21,6 @@ pub fn translate_rollback(
         auto_commit: true,
         rollback: true,
     });
-    program.epilogue_maybe_rollback(TransactionMode::None, true);
+    program.rollback();
     Ok(program)
 }

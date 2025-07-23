@@ -6,7 +6,7 @@ use turso_sqlite3_parser::ast::{self, TableInternalId};
 use crate::{
     numeric::Numeric,
     parameters::Parameters,
-    schema::{BTreeTable, Index, PseudoCursorType, Table},
+    schema::{BTreeTable, Index, PseudoCursorType, Schema, Table},
     translate::{
         collate::CollationSeq,
         emitter::TransactionMode,
@@ -111,6 +111,9 @@ pub struct ProgramBuilder {
     init_label: BranchOffset,
     start_offset: BranchOffset,
     capture_data_changes_mode: CaptureDataChangesMode,
+    // TODO: when we support multiple dbs, this should be a write mask to track which DBs need to be written
+    txn_mode: TransactionMode,
+    rollback: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +181,8 @@ impl ProgramBuilder {
             init_label: BranchOffset::Placeholder,
             start_offset: BranchOffset::Placeholder,
             capture_data_changes_mode,
+            txn_mode: TransactionMode::None,
+            rollback: false,
         }
     }
 
@@ -751,29 +756,40 @@ impl ProgramBuilder {
         }
     }
 
-    /// Clean up and finalize the program, resolving any remaining labels
-    /// Note that although these are the final instructions, typically an SQLite
-    /// query will jump to the Transaction instruction via init_label.
-    pub fn epilogue(&mut self, txn_mode: TransactionMode) {
-        self.epilogue_maybe_rollback(txn_mode, false);
+    /// Tries to mirror: https://github.com/sqlite/sqlite/blob/e77e589a35862f6ac9c4141cfd1beb2844b84c61/src/build.c#L5379
+    /// TODO: as we currently do not support multiple dbs
+    /// this function just sets a write operation/transaction for the current db
+    pub fn begin_write_operation(&mut self) {
+        self.txn_mode = TransactionMode::Write;
+    }
+
+    pub fn begin_read_operation(&mut self) {
+        // Just override the transaction mode when it is None
+        if matches!(self.txn_mode, TransactionMode::None) {
+            self.txn_mode = TransactionMode::Read;
+        }
+    }
+
+    /// Indicates the rollback behvaiour for the halt instruction in epilogue
+    pub fn rollback(&mut self) {
+        self.rollback = true;
     }
 
     /// Clean up and finalize the program, resolving any remaining labels
     /// Note that although these are the final instructions, typically an SQLite
     /// query will jump to the Transaction instruction via init_label.
-    /// "rollback" flag is used to determine if halt should rollback the transaction.
-    pub fn epilogue_maybe_rollback(&mut self, txn_mode: TransactionMode, rollback: bool) {
+    pub fn epilogue(&mut self, schema: &Schema) {
         if self.nested_level == 0 {
-            self.emit_halt(rollback);
+            // "rollback" flag is used to determine if halt should rollback the transaction.
+            self.emit_halt(self.rollback);
             self.preassign_label_to_next_insn(self.init_label);
 
-            match txn_mode {
-                TransactionMode::Read => self.emit_insn(Insn::Transaction {
+            if !matches!(self.txn_mode, TransactionMode::None) {
+                self.emit_insn(Insn::Transaction {
                     db: 0,
-                    write: false,
-                }),
-                TransactionMode::Write => self.emit_insn(Insn::Transaction { db: 0, write: true }),
-                TransactionMode::None => {}
+                    write: matches!(self.txn_mode, TransactionMode::Write),
+                    schema_cookie: schema.schema_version,
+                });
             }
 
             self.emit_constant_insns();
@@ -868,7 +884,7 @@ impl ProgramBuilder {
         });
     }
 
-    pub fn build(mut self, connection: Arc<Connection>, change_cnt_on: bool) -> Program {
+    pub fn build(mut self, connection: Arc<Connection>, change_cnt_on: bool, sql: &str) -> Program {
         self.resolve_labels();
 
         self.parameters.list.dedup();
@@ -887,6 +903,7 @@ impl ProgramBuilder {
             change_cnt_on,
             result_columns: self.result_columns,
             table_references: self.table_references,
+            sql: sql.to_string(),
         }
     }
 }

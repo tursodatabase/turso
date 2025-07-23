@@ -270,7 +270,7 @@ impl Database {
             let pager = conn.pager.borrow().clone();
 
             db.with_schema_mut(|schema| {
-                schema.schema_version = get_schema_version(&conn)?;
+                schema.schema_version = header_accessor::get_schema_cookie(&conn.pager.borrow())?;
                 if let Err(LimboError::ExtensionError(e)) =
                     schema.make_from_btree(None, pager, &syms)
                 {
@@ -453,50 +453,6 @@ impl Database {
     }
 }
 
-fn get_schema_version(conn: &Arc<Connection>) -> Result<u32> {
-    let mut rows = conn
-        .query("PRAGMA schema_version")?
-        .ok_or(LimboError::InternalError(
-            "failed to parse pragma schema_version on initialization".to_string(),
-        ))?;
-    let mut schema_version = None;
-    loop {
-        match rows.step()? {
-            StepResult::Row => {
-                let row = rows.row().unwrap();
-                if schema_version.is_some() {
-                    return Err(LimboError::InternalError(
-                        "PRAGMA schema_version; returned more that one row".to_string(),
-                    ));
-                }
-                schema_version = Some(row.get::<i64>(0)? as u32);
-            }
-            StepResult::IO => {
-                rows.run_once()?;
-            }
-            StepResult::Interrupt => {
-                return Err(LimboError::InternalError(
-                    "PRAGMA schema_version; returned more that one row".to_string(),
-                ));
-            }
-            StepResult::Done => {
-                if let Some(version) = schema_version {
-                    return Ok(version);
-                } else {
-                    return Err(LimboError::InternalError(
-                        "failed to get schema_version".to_string(),
-                    ));
-                }
-            }
-            StepResult::Busy => {
-                return Err(LimboError::InternalError(
-                    "PRAGMA schema_version; returned more that one row".to_string(),
-                ));
-            }
-        }
-    }
-}
-
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum CaptureDataChangesMode {
     Off,
@@ -602,7 +558,7 @@ impl Connection {
         let pager = self.pager.borrow().clone();
         match cmd {
             Cmd::Stmt(stmt) => {
-                let program = Rc::new(translate::translate(
+                let program = translate::translate(
                     self.schema.borrow().deref(),
                     stmt,
                     pager.clone(),
@@ -610,7 +566,7 @@ impl Connection {
                     &syms,
                     QueryMode::Normal,
                     input,
-                )?);
+                )?;
                 Ok(Statement::new(program, self._db.mv_store.clone(), pager))
             }
             Cmd::Explain(_stmt) => todo!(),
@@ -659,7 +615,7 @@ impl Connection {
                     cmd.into(),
                     input,
                 )?;
-                let stmt = Statement::new(program.into(), self._db.mv_store.clone(), pager);
+                let stmt = Statement::new(program, self._db.mv_store.clone(), pager);
                 Ok(Some(stmt))
             }
             Cmd::ExplainQueryPlan(stmt) => {
@@ -1072,18 +1028,14 @@ impl Connection {
 }
 
 pub struct Statement {
-    program: Rc<vdbe::Program>,
+    program: vdbe::Program,
     state: vdbe::ProgramState,
     mv_store: Option<Rc<MvStore>>,
     pager: Rc<Pager>,
 }
 
 impl Statement {
-    pub fn new(
-        program: Rc<vdbe::Program>,
-        mv_store: Option<Rc<MvStore>>,
-        pager: Rc<Pager>,
-    ) -> Self {
+    pub fn new(program: vdbe::Program, mv_store: Option<Rc<MvStore>>, pager: Rc<Pager>) -> Self {
         let state = vdbe::ProgramState::new(program.max_registers, program.cursor_ref.len());
         Self {
             program,
@@ -1106,8 +1058,53 @@ impl Statement {
     }
 
     pub fn step(&mut self) -> Result<StepResult> {
-        self.program
-            .step(&mut self.state, self.mv_store.clone(), self.pager.clone())
+        const MAX_SCHEMA_RETRY: usize = 50;
+        let mut res = self
+            .program
+            .step(&mut self.state, self.mv_store.clone(), self.pager.clone());
+        for _ in 0..MAX_SCHEMA_RETRY {
+            // Only reprepare if we still need to update schema
+            if !matches!(res, Err(LimboError::SchemaUpdated)) {
+                break;
+            }
+            self.reprepare()?;
+            res = self
+                .program
+                .step(&mut self.state, self.mv_store.clone(), self.pager.clone());
+        }
+
+        res
+    }
+
+    fn reprepare(&mut self) -> Result<()> {
+        self.program = {
+            let mut parser = Parser::new(self.program.sql.as_bytes());
+            let cmd = parser.next()?;
+            let cmd = cmd.expect("Same SQL string should be able to be parsed");
+
+            let conn = self.program.connection.clone();
+            let syms = conn.syms.borrow();
+
+            match cmd {
+                Cmd::Stmt(stmt) => translate::translate(
+                    conn.schema.borrow().deref(),
+                    stmt,
+                    self.pager.clone(),
+                    conn.clone(),
+                    &syms,
+                    QueryMode::Normal,
+                    &self.program.sql,
+                )?,
+                Cmd::Explain(_stmt) => todo!(),
+                Cmd::ExplainQueryPlan(_stmt) => todo!(),
+            }
+        };
+        // Save parameters before they are reset
+        let parameters = std::mem::take(&mut self.state.parameters);
+        self.reset();
+        // Load the parameters back into the state
+        self.state.parameters = parameters;
+        Ok(())
     }
 
     pub fn run_once(&self) -> Result<()> {

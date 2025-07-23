@@ -30,7 +30,6 @@ fn list_pragmas(program: &mut ProgramBuilder) {
         program.emit_result_row(register, 1);
     }
     program.add_pragma_result_column("pragma_list".into());
-    program.epilogue(TransactionMode::None);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -68,7 +67,15 @@ pub fn translate_pragma(
             _ => update_pragma(pragma, schema, value, pager, connection, program)?,
         },
     };
-    program.epilogue(mode);
+    match mode {
+        TransactionMode::None => {}
+        TransactionMode::Read => {
+            program.begin_read_operation();
+        }
+        TransactionMode::Write => {
+            program.begin_write_operation();
+        }
+    }
 
     Ok(program)
 }
