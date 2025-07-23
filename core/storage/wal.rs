@@ -23,7 +23,7 @@ use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_read_wal_frame_raw, finish_read_page, prepare_wal_frame,
     WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
 };
-use crate::types::IOResult;
+use crate::types::{IOCompletions, IOResult};
 use crate::{turso_assert, Buffer, LimboError, Result};
 use crate::{Completion, Page};
 
@@ -212,7 +212,12 @@ pub trait Wal {
     fn find_frame(&self, page_id: u64) -> Result<Option<u64>>;
 
     /// Read a frame from the WAL.
-    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Arc<BufferPool>) -> Result<()>;
+    fn read_frame(
+        &self,
+        frame_id: u64,
+        page: PageRef,
+        buffer_pool: Arc<BufferPool>,
+    ) -> Result<Arc<Completion>>;
 
     /// Read a raw frame (header included) from the WAL.
     fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<Arc<Completion>>;
@@ -233,12 +238,7 @@ pub trait Wal {
     /// db_size > 0    -> last frame written in transaction
     /// db_size == 0   -> non-last frame written in transaction
     /// write_counter is the counter we use to track when the I/O operation starts and completes
-    fn append_frame(
-        &mut self,
-        page: PageRef,
-        db_size: u32,
-        write_counter: Rc<RefCell<usize>>,
-    ) -> Result<()>;
+    fn append_frame(&mut self, page: PageRef, db_size: u32) -> Result<Arc<Completion>>;
 
     /// Complete append of frames by updating shared wal state. Before this
     /// all changes were stored locally.
@@ -248,10 +248,9 @@ pub trait Wal {
     fn checkpoint(
         &mut self,
         pager: &Pager,
-        write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>>;
-    fn sync(&mut self) -> Result<IOResult<()>>;
+    fn sync(&mut self) -> Result<Arc<Completion>>;
     fn get_max_frame_in_wal(&self) -> u64;
     fn get_max_frame(&self) -> u64;
     fn get_min_frame(&self) -> u64;
@@ -285,9 +284,15 @@ impl Wal for DummyWAL {
         &self,
         _frame_id: u64,
         _page: crate::PageRef,
-        _buffer_pool: Arc<BufferPool>,
-    ) -> Result<()> {
-        Ok(())
+        buffer_pool: Arc<BufferPool>,
+    ) -> Result<Arc<Completion>> {
+        let buf = buffer_pool.get();
+        let drop_fn = Rc::new(move |buf| {
+            let buffer_pool = buffer_pool.clone();
+            buffer_pool.put(buf);
+        });
+        let buf = Arc::new(RefCell::new(Buffer::new(buf, drop_fn)));
+        Ok(Arc::new(Completion::new_read(buf, |_, _| {})))
     }
 
     fn read_frame_raw(&self, _frame_id: u64, _frame: &mut [u8]) -> Result<Arc<Completion>> {
@@ -302,16 +307,11 @@ impl Wal for DummyWAL {
         _db_size: u64,
         _page: &[u8],
     ) -> Result<()> {
-        todo!();
+        Ok(())
     }
 
-    fn append_frame(
-        &mut self,
-        _page: crate::PageRef,
-        _db_size: u32,
-        _write_counter: Rc<RefCell<usize>>,
-    ) -> Result<()> {
-        Ok(())
+    fn append_frame(&mut self, _page: crate::PageRef, _db_size: u32) -> Result<Arc<Completion>> {
+        Ok(Arc::new(Completion::new_write(|_| {})))
     }
 
     fn should_checkpoint(&self) -> bool {
@@ -321,14 +321,13 @@ impl Wal for DummyWAL {
     fn checkpoint(
         &mut self,
         _pager: &Pager,
-        _write_counter: Rc<RefCell<usize>>,
         _mode: crate::CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
         Ok(IOResult::Done(CheckpointResult::default()))
     }
 
-    fn sync(&mut self) -> Result<IOResult<()>> {
-        Ok(IOResult::Done(()))
+    fn sync(&mut self) -> Result<Arc<Completion>> {
+        Ok(Arc::new(Completion::new_sync(|_| {})))
     }
 
     fn get_max_frame_in_wal(&self) -> u64 {
@@ -365,9 +364,8 @@ enum SyncState {
 pub enum CheckpointState {
     Start,
     ReadFrame,
-    WaitReadFrame,
     WritePage,
-    WaitWritePage,
+    AfterWritePage,
     Done,
 }
 
@@ -615,7 +613,12 @@ impl Wal for WalFile {
 
     /// Read a frame from the WAL.
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Arc<BufferPool>) -> Result<()> {
+    fn read_frame(
+        &self,
+        frame_id: u64,
+        page: PageRef,
+        buffer_pool: Arc<BufferPool>,
+    ) -> Result<Arc<Completion>> {
         tracing::debug!("read_frame({})", frame_id);
         let offset = self.frame_offset(frame_id);
         page.set_locked();
@@ -634,8 +637,7 @@ impl Wal for WalFile {
             offset + WAL_FRAME_HEADER_SIZE,
             buffer_pool,
             complete,
-        )?;
-        Ok(())
+        )
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -746,17 +748,12 @@ impl Wal for WalFile {
 
     /// Write a frame to the WAL.
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn append_frame(
-        &mut self,
-        page: PageRef,
-        db_size: u32,
-        write_counter: Rc<RefCell<usize>>,
-    ) -> Result<()> {
+    fn append_frame(&mut self, page: PageRef, db_size: u32) -> Result<Arc<Completion>> {
         let page_id = page.get().id;
         let frame_id = self.max_frame + 1;
         let offset = self.frame_offset(frame_id);
         tracing::debug!(frame_id, offset, page_id);
-        let checksums = {
+        let (completion, checksums) = {
             let shared = self.get_shared();
             let header = shared.wal_header.clone();
             let header = header.lock();
@@ -772,10 +769,8 @@ impl Wal for WalFile {
                 page_buf,
             );
 
-            *write_counter.borrow_mut() += 1;
             let c = Completion::new_write({
                 let frame_bytes = frame_bytes.clone();
-                let write_counter = write_counter.clone();
                 move |bytes_written| {
                     let frame_len = frame_bytes.borrow().len();
                     turso_assert!(
@@ -784,18 +779,14 @@ impl Wal for WalFile {
                     );
 
                     page.clear_dirty();
-                    *write_counter.borrow_mut() -= 1;
                 }
             });
-            let result = shared.file.pwrite(offset, frame_bytes.clone(), c.into());
-            if let Err(err) = result {
-                *write_counter.borrow_mut() -= 1;
-                return Err(err);
-            }
-            frame_checksums
+            let completion = shared.file.pwrite(offset, frame_bytes.clone(), c.into())?;
+
+            (completion, frame_checksums)
         };
         self.complete_append_frame(page_id as u64, frame_id, checksums);
-        Ok(())
+        Ok(completion)
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -809,7 +800,6 @@ impl Wal for WalFile {
     fn checkpoint(
         &mut self,
         pager: &Pager,
-        write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
         assert!(
@@ -884,37 +874,32 @@ impl Wal for WalFile {
                             );
                             self.ongoing_checkpoint.page.get().id = page as usize;
 
-                            self.read_frame(
+                            let completion = self.read_frame(
                                 *frame,
                                 self.ongoing_checkpoint.page.clone(),
                                 self.buffer_pool.clone(),
                             )?;
-                            self.ongoing_checkpoint.state = CheckpointState::WaitReadFrame;
-                            continue 'checkpoint_loop;
+
+                            self.ongoing_checkpoint.state = CheckpointState::WritePage;
+                            return Ok(IOResult::IO(IOCompletions::Single(completion)));
                         }
                     }
                     self.ongoing_checkpoint.current_page += 1;
                 }
-                CheckpointState::WaitReadFrame => {
-                    if self.ongoing_checkpoint.page.is_locked() {
-                        return Ok(IOResult::IO);
-                    } else {
-                        self.ongoing_checkpoint.state = CheckpointState::WritePage;
-                    }
-                }
                 CheckpointState::WritePage => {
+                    turso_assert!(
+                        self.ongoing_checkpoint.page.is_loaded(),
+                        "page should be loaded"
+                    );
                     self.ongoing_checkpoint.page.set_dirty();
-                    begin_write_btree_page(
-                        pager,
-                        &self.ongoing_checkpoint.page,
-                        write_counter.clone(),
-                    )?;
-                    self.ongoing_checkpoint.state = CheckpointState::WaitWritePage;
+                    let completion = begin_write_btree_page(pager, &self.ongoing_checkpoint.page)?;
+                    self.ongoing_checkpoint.state = CheckpointState::AfterWritePage;
+                    return Ok(IOResult::IO(IOCompletions::Single(completion)));
                 }
-                CheckpointState::WaitWritePage => {
-                    if *write_counter.borrow() > 0 {
-                        return Ok(IOResult::IO);
-                    }
+                CheckpointState::AfterWritePage => {
+                    // TODO: need some way to assert here that we wrote the page to disk
+                    // More as a canary to alert we did something wrong than anything else
+
                     // If page was in cache clear it.
                     if let Some(page) = pager.cache_get(self.ongoing_checkpoint.page.get().id) {
                         page.clear_dirty();
@@ -931,9 +916,6 @@ impl Wal for WalFile {
                     }
                 }
                 CheckpointState::Done => {
-                    if *write_counter.borrow() > 0 {
-                        return Ok(IOResult::IO);
-                    }
                     let shared = self.get_shared();
                     shared.checkpoint_lock.unlock();
 
@@ -975,31 +957,15 @@ impl Wal for WalFile {
     }
 
     #[instrument(err, skip_all, level = Level::DEBUG)]
-    fn sync(&mut self) -> Result<IOResult<()>> {
-        match self.sync_state.get() {
-            SyncState::NotSyncing => {
-                tracing::debug!("wal_sync");
-                let syncing = self.syncing.clone();
-                self.syncing.set(true);
-                let completion = Completion::new_sync(move |_| {
-                    tracing::debug!("wal_sync finish");
-                    syncing.set(false);
-                });
-                let shared = self.get_shared();
-                shared.file.sync(completion.into())?;
-                self.sync_state.set(SyncState::Syncing);
-                Ok(IOResult::IO)
-            }
-            SyncState::Syncing => {
-                if self.syncing.get() {
-                    tracing::debug!("wal_sync is already syncing");
-                    Ok(IOResult::IO)
-                } else {
-                    self.sync_state.set(SyncState::NotSyncing);
-                    Ok(IOResult::Done(()))
-                }
-            }
-        }
+    fn sync(&mut self) -> Result<Arc<Completion>> {
+        let syncing = self.syncing.clone();
+        turso_assert!(!syncing.get(), "already syncing");
+        let completion = Completion::new_sync(move |_| {
+            tracing::debug!("wal_sync finish");
+            syncing.set(false);
+        });
+        let shared = self.get_shared();
+        shared.file.sync(completion.into())
     }
 
     fn get_max_frame_in_wal(&self) -> u64 {

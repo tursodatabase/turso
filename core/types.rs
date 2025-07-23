@@ -14,8 +14,9 @@ use crate::translate::plan::IterationDirection;
 use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
-use crate::{turso_assert, Result};
+use crate::{turso_assert, Completion, Result};
 use std::fmt::{Debug, Display};
+use std::sync::Arc;
 
 const MAX_REAL_SIZE: u8 = 15;
 
@@ -2243,10 +2244,14 @@ impl Cursor {
     }
 }
 
-#[derive(Debug)]
+pub enum IOCompletions {
+    Single(Arc<Completion>),
+    Many(Vec<Arc<Completion>>),
+}
+
 pub enum IOResult<T> {
     Done(T),
-    IO,
+    IO(IOCompletions),
 }
 
 /// Evaluate a Result<IOResult<T>>, if IO return IO.

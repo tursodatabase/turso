@@ -1,4 +1,4 @@
-use crate::Result;
+use crate::{LimboError, Result};
 use bitflags::bitflags;
 use cfg_block::cfg_block;
 use std::fmt;
@@ -61,6 +61,7 @@ pub type SyncComplete = dyn Fn(i32);
 pub struct Completion {
     pub completion_type: CompletionType,
     is_completed: Cell<bool>,
+    error: RefCell<Option<LimboError>>,
 }
 
 pub enum CompletionType {
@@ -69,16 +70,12 @@ pub enum CompletionType {
     Sync(SyncCompletion),
 }
 
-pub struct ReadCompletion {
-    pub buf: Arc<RefCell<Buffer>>,
-    pub complete: Box<ReadComplete>,
-}
-
 impl Completion {
     pub fn new(completion_type: CompletionType) -> Self {
         Self {
             completion_type,
             is_completed: Cell::new(false),
+            error: RefCell::new(None),
         }
     }
 
@@ -130,6 +127,15 @@ impl Completion {
             _ => unreachable!(),
         }
     }
+
+    pub fn has_error(&self) -> bool {
+        self.error.borrow().is_some()
+    }
+}
+
+pub struct ReadCompletion {
+    pub buf: Arc<RefCell<Buffer>>,
+    pub complete: Box<ReadComplete>,
 }
 
 pub struct WriteCompletion {
