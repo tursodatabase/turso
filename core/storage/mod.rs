@@ -18,6 +18,7 @@ pub(crate) mod page_cache;
 #[allow(clippy::arc_with_non_send_sync)]
 pub(crate) mod pager;
 pub(crate) mod sqlite3_ondisk;
+mod state_machines;
 #[allow(clippy::arc_with_non_send_sync)]
 pub(crate) mod wal;
 

@@ -10,12 +10,16 @@ use crate::{
             TableLeafCell, CELL_PTR_SIZE_BYTES, INTERIOR_PAGE_HEADER_SIZE_BYTES,
             LEAF_PAGE_HEADER_SIZE_BYTES, LEFT_CHILD_PTR_SIZE_BYTES,
         },
+        state_machines::btree::{
+            DeleteState, DestroyState, EmptyTableState, OverflowState, PayloadOverflowWithOffset,
+            WriteState,
+        },
     },
     translate::plan::IterationDirection,
     turso_assert,
     types::{
-        find_compare, get_tie_breaker_from_seek_op, IndexInfo, ParseRecordState, RecordCompare,
-        RecordCursor, SeekResult,
+        find_compare, get_tie_breaker_from_seek_op, IOCompletions, IndexInfo, ParseRecordState,
+        RecordCompare, RecordCursor, SeekResult,
     },
     MvCursor,
 };
@@ -153,71 +157,15 @@ pub struct BTreePageInner {
 pub type BTreePage = Arc<BTreePageInner>;
 unsafe impl Send for BTreePageInner {}
 unsafe impl Sync for BTreePageInner {}
-/// State machine of destroy operations
-/// Keep track of traversal so that it can be resumed when IO is encountered
-#[derive(Debug, Clone)]
-enum DestroyState {
-    Start,
-    LoadPage,
-    ProcessPage,
-    ClearOverflowPages { cell: BTreeCell },
-    FreePage,
-}
 
 struct DestroyInfo {
     state: DestroyState,
 }
 
 #[derive(Debug, Clone)]
-enum DeleteSavepoint {
+pub enum DeleteSavepoint {
     Rowid(i64),
     Payload(ImmutableRecord),
-}
-
-#[derive(Debug, Clone)]
-enum DeleteState {
-    Start,
-    DeterminePostBalancingSeekKey,
-    LoadPage {
-        post_balancing_seek_key: Option<DeleteSavepoint>,
-    },
-    FindCell {
-        post_balancing_seek_key: Option<DeleteSavepoint>,
-    },
-    ClearOverflowPages {
-        cell_idx: usize,
-        cell: BTreeCell,
-        original_child_pointer: Option<u32>,
-        post_balancing_seek_key: Option<DeleteSavepoint>,
-    },
-    InteriorNodeReplacement {
-        page: PageRef,
-        /// the btree level of the page where the cell replacement happened.
-        /// if the replacement causes the page to overflow/underflow, we need to remember it and balance it
-        /// after the deletion process is otherwise complete.
-        btree_depth: usize,
-        cell_idx: usize,
-        original_child_pointer: Option<u32>,
-        post_balancing_seek_key: Option<DeleteSavepoint>,
-    },
-    CheckNeedsBalancing {
-        /// same as `InteriorNodeReplacement::btree_depth`
-        btree_depth: usize,
-        post_balancing_seek_key: Option<DeleteSavepoint>,
-    },
-    WaitForBalancingToComplete {
-        /// If provided, will also balance an ancestor page at depth `balance_ancestor_at_depth`.
-        /// If not provided, balancing will stop as soon as a level is encountered where no balancing is required.
-        balance_ancestor_at_depth: Option<usize>,
-        target_key: DeleteSavepoint,
-    },
-    SeekAfterBalancing {
-        target_key: DeleteSavepoint,
-    },
-    /// If the seek performed in [DeleteState::SeekAfterBalancing] returned a [SeekResult::TryAdvance] we need to call next()/prev() to get to the right location.
-    /// We need to have this separate state for re-entrancy as calling next()/prev() might yield on IO.
-    /// FIXME: refactor DeleteState not to have SeekAfterBalancing and instead use save_context() and restore_context()
-    TryAdvance,
 }
 
 #[derive(Clone)]
@@ -226,78 +174,11 @@ struct DeleteInfo {
     balance_write_info: Option<WriteInfo>,
 }
 
-#[derive(Debug, Clone)]
-pub enum OverwriteCellState {
-    /// Fill the cell payload with the new value.
-    FillPayload,
-    /// Clear the overflow pages of the old celland overwrite the cell.
-    ClearOverflowPagesAndOverwrite {
-        new_payload: Vec<u8>,
-        old_offset: usize,
-        old_local_size: usize,
-    },
-}
-
-/// State machine of a write operation.
-/// May involve balancing due to overflow.
-#[derive(Debug, Clone)]
-enum WriteState {
-    Start,
-    /// Overwrite an existing cell.
-    /// In addition to deleting the old cell and writing a new one,
-    /// we may also need to clear the old cell's overflow pages
-    /// and add them to the freelist.
-    Overwrite {
-        page: Arc<BTreePageInner>,
-        cell_idx: usize,
-        state: OverwriteCellState,
-    },
-    /// Insert a new cell. This path is taken when inserting a new row.
-    Insert {
-        page: Arc<BTreePageInner>,
-        cell_idx: usize,
-    },
-    BalanceStart,
-    BalanceFreePages {
-        curr_page: usize,
-        sibling_count_new: usize,
-    },
-    /// Choose which sibling pages to balance (max 3).
-    /// Generally, the siblings involved will be the page that triggered the balancing and its left and right siblings.
-    /// The exceptions are:
-    /// 1. If the leftmost page triggered balancing, up to 3 leftmost pages will be balanced.
-    /// 2. If the rightmost page triggered balancing, up to 3 rightmost pages will be balanced.
-    BalanceNonRootPickSiblings,
-    /// Perform the actual balancing. This will result in 1-5 pages depending on the number of total cells to be distributed
-    /// from the source pages.
-    BalanceNonRootDoBalancing,
-    Finish,
-}
-
 struct ReadPayloadOverflow {
     payload: Vec<u8>,
     next_page: u32,
     remaining_to_read: usize,
     page: BTreePage,
-}
-
-enum PayloadOverflowWithOffset {
-    SkipOverflowPages {
-        next_page: u32,
-        pages_left_to_skip: u32,
-        page_offset: u32,
-        amount: u32,
-        buffer_offset: usize,
-        is_write: bool,
-    },
-    ProcessPage {
-        next_page: u32,
-        remaining_to_read: u32,
-        page: BTreePage,
-        current_offset: usize,
-        buffer_offset: usize,
-        is_write: bool,
-    },
 }
 
 #[derive(Clone, Debug)]
@@ -437,12 +318,6 @@ impl Debug for CursorState {
     }
 }
 
-enum OverflowState {
-    Start,
-    ProcessPage { next_page: u32 },
-    Done,
-}
-
 /// Holds a Record or RowId, so that these can be transformed into a SeekKey to restore
 /// cursor position to its previous location.
 pub enum CursorContext {
@@ -559,6 +434,8 @@ pub struct BTreeCursor {
     /// - Moving to a different record/row
     /// - The underlying `ImmutableRecord` is modified
     pub record_cursor: RefCell<RecordCursor>,
+
+    empty_table_state: RefCell<EmptyTableState>,
 }
 
 /// We store the cell index and cell count for each page in the stack.
@@ -613,6 +490,7 @@ impl BTreeCursor {
             read_overflow_state: RefCell::new(None),
             parse_record_state: RefCell::new(ParseRecordState::Init),
             record_cursor: RefCell::new(RecordCursor::with_capacity(num_columns)),
+            empty_table_state: RefCell::new(EmptyTableState::Start),
         }
     }
 
@@ -672,11 +550,18 @@ impl BTreeCursor {
             let mv_cursor = mv_cursor.borrow();
             return Ok(IOResult::Done(mv_cursor.is_empty()));
         }
-        let page = self.pager.read_page(self.root_page)?;
-        return_if_locked!(page);
-
-        let cell_count = page.get().contents.as_ref().unwrap().cell_count();
-        Ok(IOResult::Done(cell_count == 0))
+        let mut state = self.empty_table_state.borrow_mut();
+        match &mut *state {
+            EmptyTableState::Start => {
+                let (page, c) = self.pager.read_page(self.root_page)?;
+                *state = EmptyTableState::ReadPage { page };
+                Ok(IOResult::IO(IOCompletions::Single(c)))
+            }
+            EmptyTableState::ReadPage { page } => {
+                let cell_count = page.get().contents.as_ref().expect("page should have been loaded").cell_count();
+                Ok(IOResult::Done(cell_count == 0))
+            }
+        }
     }
 
     /// Move the cursor to the previous record and return it.
