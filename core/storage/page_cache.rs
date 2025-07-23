@@ -307,17 +307,18 @@ impl DumbLruPageCache {
             let entry = unsafe { current.as_ref() };
             // Pick prev before modifying entry
             current_opt = entry.prev;
-            match self.delete(entry.key.clone()) {
-                Err(_) => {}
-                Ok(_) => need_to_evict -= 1,
+
+            if self.delete(entry.key.clone()).is_ok() {
+                need_to_evict -= 1;
             }
         }
 
-        match need_to_evict > 0 {
-            true => Err(CacheError::Full {
+        if need_to_evict > 0 {
+            Err(CacheError::Full {
                 should_spill: self.map.borrow().size > self.spill_threshold,
-            }),
-            false => Ok(()),
+            })
+        } else {
+            Ok(())
         }
     }
 
