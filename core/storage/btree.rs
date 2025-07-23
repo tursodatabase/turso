@@ -1,3 +1,4 @@
+use parking_lot::Mutex;
 use tracing::{instrument, Level};
 
 use crate::{
@@ -232,14 +233,16 @@ pub enum OverwriteCellState {
     AllocatePayload,
     /// Fill the cell payload with the new payload.
     FillPayload {
-        new_payload: Option<Vec<u8>>, // option so it can be .take()'d out of the state
+        /// Dumb double-indirection via Arc because we clone [WriteState] for some reason and we use unsafe in [FillCellPayloadState::AllocateOverflowPages]
+        /// so the underlying Vec must not be cloned in upper layers.
+        new_payload: Arc<Mutex<Vec<u8>>>,
         rowid: Option<i64>,
         fill_cell_payload_state: FillCellPayloadState,
     },
     /// Clear the old cell's overflow pages and add them to the freelist.
     /// Overwrite the cell with the new payload.
     ClearOverflowPagesAndOverwrite {
-        new_payload: Vec<u8>,
+        new_payload: Arc<Mutex<Vec<u8>>>,
         old_offset: usize,
         old_local_size: usize,
     },
@@ -5198,7 +5201,7 @@ impl BTreeCursor {
                     let new_payload = Vec::with_capacity(serial_types_len);
                     let rowid = return_if_io!(self.rowid());
                     *state = OverwriteCellState::FillPayload {
-                        new_payload: Some(new_payload),
+                        new_payload: Arc::new(Mutex::new(new_payload)),
                         rowid,
                         fill_cell_payload_state: FillCellPayloadState::Start,
                     };
@@ -5211,16 +5214,20 @@ impl BTreeCursor {
                 } => {
                     let page = page_ref.get();
                     let page_contents = page.get().contents.as_ref().unwrap();
-                    return_if_io!(fill_cell_payload(
-                        page_contents,
-                        *rowid,
-                        new_payload.as_mut().expect("new_payload should be Some"),
-                        cell_idx,
-                        record,
-                        self.usable_space(),
-                        self.pager.clone(),
-                        fill_cell_payload_state,
-                    ));
+                    {
+                        let mut new_payload_mut = new_payload.lock();
+                        let new_payload_mut = &mut *new_payload_mut;
+                        return_if_io!(fill_cell_payload(
+                            page_contents,
+                            *rowid,
+                            new_payload_mut,
+                            cell_idx,
+                            record,
+                            self.usable_space(),
+                            self.pager.clone(),
+                            fill_cell_payload_state,
+                        ));
+                    }
                     // figure out old cell offset & size
                     let (old_offset, old_local_size) = {
                         let page_ref = page_ref.get();
@@ -5229,7 +5236,7 @@ impl BTreeCursor {
                     };
 
                     *state = OverwriteCellState::ClearOverflowPagesAndOverwrite {
-                        new_payload: new_payload.take().expect("new_payload should be Some"),
+                        new_payload: new_payload.clone(),
                         old_offset,
                         old_local_size,
                     };
@@ -5244,6 +5251,9 @@ impl BTreeCursor {
                     let page_contents = page.get().contents.as_ref().unwrap();
                     let cell = page_contents.cell_get(cell_idx, self.usable_space())?;
                     return_if_io!(self.clear_overflow_pages(&cell));
+
+                    let mut new_payload = new_payload.lock();
+                    let new_payload = &mut *new_payload;
                     // if it all fits in local space and old_local_size is enough, do an in-place overwrite
                     if new_payload.len() == *old_local_size {
                         self.overwrite_content(page_ref.clone(), *old_offset, new_payload)?;
@@ -6754,7 +6764,9 @@ fn allocate_cell_space(page_ref: &PageContent, amount: u16, usable_space: u16) -
 pub enum FillCellPayloadState {
     Start,
     AllocateOverflowPages {
-        record_buf: Vec<u8>,
+        /// Dumb double-indirection via Arc because we clone [WriteState] for some reason and we use unsafe pointer dereferences in [FillCellPayloadState::AllocateOverflowPages]
+        /// so the underlying Vec must not be cloned in upper layers.
+        record_buf: Arc<Mutex<Vec<u8>>>,
         space_left: usize,
         to_copy_buffer_ptr: *const u8,
         to_copy_buffer_len: usize,
@@ -6846,7 +6858,7 @@ fn fill_cell_payload(
                 let to_copy_buffer_len = to_copy_buffer.len();
 
                 *state = FillCellPayloadState::AllocateOverflowPages {
-                    record_buf,
+                    record_buf: Arc::new(Mutex::new(record_buf)),
                     space_left,
                     to_copy_buffer_ptr,
                     to_copy_buffer_len,
