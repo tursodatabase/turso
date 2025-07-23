@@ -12,7 +12,7 @@ use crate::{
         },
         state_machines::btree::{
             DeleteState, DestroyState, EmptyTableState, OverflowState, PayloadOverflowWithOffset,
-            WriteState,
+            SkipOverflowState, WriteState,
         },
     },
     translate::plan::IterationDirection,
@@ -812,9 +812,9 @@ impl BTreeCursor {
         }
 
         let page_btree = self.stack.top();
-        return_if_locked_maybe_load!(self.pager, page_btree);
 
         let page = page_btree.get();
+        turso_assert!(page.is_loaded(), "page should be loaded");
         let contents = page.get().contents.as_ref().unwrap();
         let cell_idx = self.stack.current_cell_index() as usize - 1;
 
@@ -882,10 +882,11 @@ impl BTreeCursor {
             let overflow_size = usable_size - 4;
             let pages_to_skip = offset / overflow_size as u32;
             let page_offset = offset % overflow_size as u32;
+            let (next_page, c) = self.read_page(first_overflow_page.unwrap() as usize)?;
 
             self.state =
                 CursorState::ReadWritePayload(PayloadOverflowWithOffset::SkipOverflowPages {
-                    next_page: first_overflow_page.unwrap(),
+                    next_page,
                     pages_left_to_skip: pages_to_skip,
                     page_offset,
                     amount,
@@ -893,7 +894,7 @@ impl BTreeCursor {
                     is_write,
                 });
 
-            return Ok(IOResult::IO);
+            return Ok(IOResult::IO(IOCompletions::Single(c)));
         }
         Ok(IOResult::Done(()))
     }
@@ -906,35 +907,39 @@ impl BTreeCursor {
     ) -> Result<IOResult<()>> {
         loop {
             let mut state = std::mem::replace(&mut self.state, CursorState::None);
+            let CursorState::ReadWritePayload(mut state) = state else {
+                return Err(LimboError::InternalError(
+                    "Invalid state for continue_payload_overflow_with_offset".into(),
+                ));
+            };
 
             match &mut state {
-                CursorState::ReadWritePayload(PayloadOverflowWithOffset::SkipOverflowPages {
+                PayloadOverflowWithOffset::SkipOverflowPages {
                     next_page,
                     pages_left_to_skip,
                     page_offset,
                     amount,
                     buffer_offset,
                     is_write,
-                }) => {
+                } => {
+                    let next_page_id = next_page.get().get().id;
+
                     if *pages_left_to_skip == 0 {
-                        let page = self.read_page(*next_page as usize)?;
-                        return_if_locked_maybe_load!(self.pager, page);
+                        let (page, c) = self.read_page(next_page_id)?;
                         self.state =
                             CursorState::ReadWritePayload(PayloadOverflowWithOffset::ProcessPage {
-                                next_page: *next_page,
+                                next_page: next_page_id as u32,
                                 remaining_to_read: *amount,
                                 page,
                                 current_offset: *page_offset as usize,
                                 buffer_offset: *buffer_offset,
                                 is_write: *is_write,
                             });
-
-                        continue;
+                        return Ok(IOResult::IO(IOCompletions::Single(c)));
                     }
 
-                    let page = self.read_page(*next_page as usize)?;
-                    return_if_locked_maybe_load!(self.pager, page);
-                    let page = page.get();
+                    let page = next_page.get();
+                    turso_assert!(page.is_loaded(), "page should have been loaded");
                     let contents = page.get_contents();
                     let next = contents.read_u32_no_offset(0);
 
@@ -943,7 +948,8 @@ impl BTreeCursor {
                             "Overflow chain ends prematurely".into(),
                         ));
                     }
-                    *next_page = next;
+                    let (next, c) = self.read_page(next as usize)?;
+
                     *pages_left_to_skip -= 1;
 
                     self.state = CursorState::ReadWritePayload(
@@ -957,30 +963,18 @@ impl BTreeCursor {
                         },
                     );
 
-                    return Ok(IOResult::IO);
+                    return Ok(IOResult::IO(IOCompletions::Single(c)));
                 }
 
-                CursorState::ReadWritePayload(PayloadOverflowWithOffset::ProcessPage {
+                PayloadOverflowWithOffset::ProcessPage {
                     next_page,
                     remaining_to_read,
                     page: page_btree,
                     current_offset,
                     buffer_offset,
                     is_write,
-                }) => {
-                    if page_btree.get().is_locked() {
-                        self.state =
-                            CursorState::ReadWritePayload(PayloadOverflowWithOffset::ProcessPage {
-                                next_page: *next_page,
-                                remaining_to_read: *remaining_to_read,
-                                page: page_btree.clone(),
-                                current_offset: *current_offset,
-                                buffer_offset: *buffer_offset,
-                                is_write: *is_write,
-                            });
-
-                        return Ok(IOResult::IO);
-                    }
+                } => {
+                    turso_assert!(!page_btree.get().is_locked(), "page should have loaded");
 
                     let page = page_btree.get();
                     let contents = page.get_contents();
@@ -1024,18 +1018,15 @@ impl BTreeCursor {
                         ));
                     }
 
+                    let (page, c) = self.read_page(next as usize)?;
+
                     // Load next page
                     *next_page = next;
                     *current_offset = 0; // Reset offset for new page
-                    *page_btree = self.read_page(next as usize)?;
+                    *page_btree = page;
 
                     // Return IO to allow other operations
-                    return Ok(IOResult::IO);
-                }
-                _ => {
-                    return Err(LimboError::InternalError(
-                        "Invalid state for continue_payload_overflow_with_offset".into(),
-                    ))
+                    return Ok(IOResult::IO(IOCompletions::Single(c)));
                 }
             }
         }

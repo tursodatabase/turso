@@ -87,7 +87,7 @@ pub enum WriteState {
 
 pub enum PayloadOverflowWithOffset {
     SkipOverflowPages {
-        next_page: u32,
+        next_page: BTreePage,
         pages_left_to_skip: u32,
         page_offset: u32,
         amount: u32,
@@ -102,6 +102,15 @@ pub enum PayloadOverflowWithOffset {
         buffer_offset: usize,
         is_write: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SkipOverflowState {
+    pub pages_left_to_skip: u32,
+    pub page_offset: u32,
+    pub amount: u32,
+    pub buffer_offset: usize,
+    pub is_write: bool,
 }
 
 pub enum OverflowState {
