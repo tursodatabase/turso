@@ -669,8 +669,8 @@ impl Wal for WalFile {
                 return Ok((LimboResult::Ok, db_has_changed));
             }
         }
-        let mut max_read_mark = 0;
         let mut max_read_mark_index = -1;
+        let mut max_read_mark = 0;
         // Find the largest mark we can find, ignore frames that are impossible to be in range and
         // that are not set
         for (index, lock) in self.get_shared().read_locks.iter().enumerate().skip(1) {
@@ -1180,7 +1180,6 @@ impl WalFile {
                         (max_frame, n_backfills)
                     };
                     let needs_backfill = max_frame > nbackfills;
-
                     if !needs_backfill && matches!(mode, CheckpointMode::Passive) {
                         // there are no frames to copy and we don't need to reset the log so we can
                         // return early success.
