@@ -21,7 +21,7 @@ use crate::{
         find_compare, get_tie_breaker_from_seek_op, IOCompletions, IndexInfo, ParseRecordState,
         RecordCompare, RecordCursor, SeekResult,
     },
-    MvCursor,
+    Completion, MvCursor,
 };
 
 use crate::{
@@ -558,7 +558,12 @@ impl BTreeCursor {
                 Ok(IOResult::IO(IOCompletions::Single(c)))
             }
             EmptyTableState::ReadPage { page } => {
-                let cell_count = page.get().contents.as_ref().expect("page should have been loaded").cell_count();
+                let cell_count = page
+                    .get()
+                    .contents
+                    .as_ref()
+                    .expect("page should have been loaded")
+                    .cell_count();
                 Ok(IOResult::Done(cell_count == 0))
             }
         }
@@ -681,14 +686,14 @@ impl BTreeCursor {
         payload_size: u64,
     ) -> Result<IOResult<()>> {
         if self.read_overflow_state.borrow().is_none() {
-            let page = self.read_page(start_next_page as usize)?;
+            let (page, c) = self.read_page(start_next_page as usize)?;
             *self.read_overflow_state.borrow_mut() = Some(ReadPayloadOverflow {
                 payload: payload.to_vec(),
                 next_page: start_next_page,
                 remaining_to_read: payload_size as usize - payload.len(),
                 page,
             });
-            return Ok(IOResult::IO);
+            return Ok(IOResult::IO(IOCompletions::Single(c)));
         }
         let mut read_overflow_state = self.read_overflow_state.borrow_mut();
         let ReadPayloadOverflow {
@@ -698,9 +703,8 @@ impl BTreeCursor {
             page: page_btree,
         } = read_overflow_state.as_mut().unwrap();
 
-        if page_btree.get().is_locked() {
-            return Ok(IOResult::IO);
-        }
+        turso_assert!(!page_btree.get().is_locked(), "btree page should be loaded");
+
         tracing::debug!(next_page, remaining_to_read, "reading overflow page");
         let page = page_btree.get();
         let contents = page.get_contents();
@@ -713,14 +717,10 @@ impl BTreeCursor {
         *remaining_to_read -= to_read;
 
         if *remaining_to_read != 0 && next != 0 {
-            let new_page = self.pager.read_page(next as usize).map(|page| {
-                Arc::new(BTreePageInner {
-                    page: RefCell::new(page),
-                })
-            })?;
+            let (new_page, c) = self.read_page(next as usize)?;
             *page_btree = new_page;
             *next_page = next;
-            return Ok(IOResult::IO);
+            return Ok(IOResult::IO(IOCompletions::Single(c)));
         }
         turso_assert!(
             *remaining_to_read == 0 && next == 0,
@@ -5274,7 +5274,7 @@ impl BTreeCursor {
         }
     }
 
-    pub fn read_page(&self, page_idx: usize) -> Result<BTreePage> {
+    pub fn read_page(&self, page_idx: usize) -> Result<(BTreePage, Arc<Completion>)> {
         btree_read_page(&self.pager, page_idx)
     }
 
@@ -5544,11 +5544,14 @@ pub fn integrity_check(
     Ok(IOResult::Done(()))
 }
 
-pub fn btree_read_page(pager: &Rc<Pager>, page_idx: usize) -> Result<BTreePage> {
-    pager.read_page(page_idx).map(|page| {
-        Arc::new(BTreePageInner {
-            page: RefCell::new(page),
-        })
+pub fn btree_read_page(pager: &Rc<Pager>, page_idx: usize) -> Result<(BTreePage, Arc<Completion>)> {
+    pager.read_page(page_idx).map(|(page, c)| {
+        (
+            Arc::new(BTreePageInner {
+                page: RefCell::new(page),
+            }),
+            c,
+        )
     })
 }
 
