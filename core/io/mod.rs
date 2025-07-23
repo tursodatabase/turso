@@ -54,7 +54,7 @@ pub trait IO: Clock + Send + Sync {
     fn get_memory_io(&self) -> Arc<MemoryIO>;
 }
 
-pub type Complete = dyn Fn(Arc<RefCell<Buffer>>, i32);
+pub type ReadComplete = dyn Fn(Arc<RefCell<Buffer>>, i32);
 pub type WriteComplete = dyn Fn(i32);
 pub type SyncComplete = dyn Fn(i32);
 
@@ -71,7 +71,7 @@ pub enum CompletionType {
 
 pub struct ReadCompletion {
     pub buf: Arc<RefCell<Buffer>>,
-    pub complete: Box<Complete>,
+    pub complete: Box<ReadComplete>,
 }
 
 impl Completion {
@@ -141,7 +141,7 @@ pub struct SyncCompletion {
 }
 
 impl ReadCompletion {
-    pub fn new(buf: Arc<RefCell<Buffer>>, complete: Box<Complete>) -> Self {
+    pub fn new(buf: Arc<RefCell<Buffer>>, complete: Box<ReadComplete>) -> Self {
         Self { buf, complete }
     }
 

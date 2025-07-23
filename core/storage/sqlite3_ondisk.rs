@@ -49,7 +49,7 @@ use super::pager::PageRef;
 use super::wal::LimboRwLock;
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
-use crate::io::{Buffer, Complete, Completion};
+use crate::io::{Buffer, Completion, ReadComplete};
 use crate::storage::btree::offset::{
     BTREE_CELL_CONTENT_AREA, BTREE_CELL_COUNT, BTREE_FIRST_FREEBLOCK, BTREE_FRAGMENTED_BYTES_COUNT,
     BTREE_PAGE_TYPE, BTREE_RIGHTMOST_PTR,
@@ -1358,135 +1358,136 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
     }));
     let wal_file_shared_for_completion = wal_file_shared_ret.clone();
 
-    let complete: Box<Complete> = Box::new(move |buf: Arc<RefCell<Buffer>>, bytes_read: i32| {
-        let buf = buf.borrow();
-        let buf_slice = buf.as_slice();
-        turso_assert!(
-            bytes_read == buf_slice.len() as i32,
-            "read({bytes_read}) != expected({})",
-            buf_slice.len()
-        );
-        let mut header_locked = header.lock();
-        // Read header
-        header_locked.magic =
-            u32::from_be_bytes([buf_slice[0], buf_slice[1], buf_slice[2], buf_slice[3]]);
-        header_locked.file_format =
-            u32::from_be_bytes([buf_slice[4], buf_slice[5], buf_slice[6], buf_slice[7]]);
-        header_locked.page_size =
-            u32::from_be_bytes([buf_slice[8], buf_slice[9], buf_slice[10], buf_slice[11]]);
-        header_locked.checkpoint_seq =
-            u32::from_be_bytes([buf_slice[12], buf_slice[13], buf_slice[14], buf_slice[15]]);
-        header_locked.salt_1 =
-            u32::from_be_bytes([buf_slice[16], buf_slice[17], buf_slice[18], buf_slice[19]]);
-        header_locked.salt_2 =
-            u32::from_be_bytes([buf_slice[20], buf_slice[21], buf_slice[22], buf_slice[23]]);
-        header_locked.checksum_1 =
-            u32::from_be_bytes([buf_slice[24], buf_slice[25], buf_slice[26], buf_slice[27]]);
-        header_locked.checksum_2 =
-            u32::from_be_bytes([buf_slice[28], buf_slice[29], buf_slice[30], buf_slice[31]]);
-        tracing::debug!("read_entire_wal_dumb(header={:?})", *header_locked);
-
-        // Read frames into frame_cache and pages_in_frames
-        if buf_slice.len() < WAL_HEADER_SIZE {
-            panic!("WAL file too small for header");
-        }
-
-        let use_native_endian_checksum =
-            cfg!(target_endian = "big") == ((header_locked.magic & 1) != 0);
-
-        let calculated_header_checksum = checksum_wal(
-            &buf_slice[0..24],
-            &header_locked,
-            (0, 0),
-            use_native_endian_checksum,
-        );
-
-        let checksum_header_failed = if calculated_header_checksum
-            != (header_locked.checksum_1, header_locked.checksum_2)
-        {
-            tracing::error!(
-                "WAL header checksum mismatch. Expected ({}, {}), Got ({}, {}). Ignoring frames starting from frame {}",
-                header_locked.checksum_1,
-                header_locked.checksum_2,
-                calculated_header_checksum.0,
-                calculated_header_checksum.1,
-                0
-
+    let complete: Box<ReadComplete> = Box::new(
+        move |buf: Arc<RefCell<Buffer>>, bytes_read: i32| {
+            let buf = buf.borrow();
+            let buf_slice = buf.as_slice();
+            turso_assert!(
+                bytes_read == buf_slice.len() as i32,
+                "read({bytes_read}) != expected({})",
+                buf_slice.len()
             );
-            true
-        } else {
-            false
-        };
+            let mut header_locked = header.lock();
+            // Read header
+            header_locked.magic =
+                u32::from_be_bytes([buf_slice[0], buf_slice[1], buf_slice[2], buf_slice[3]]);
+            header_locked.file_format =
+                u32::from_be_bytes([buf_slice[4], buf_slice[5], buf_slice[6], buf_slice[7]]);
+            header_locked.page_size =
+                u32::from_be_bytes([buf_slice[8], buf_slice[9], buf_slice[10], buf_slice[11]]);
+            header_locked.checkpoint_seq =
+                u32::from_be_bytes([buf_slice[12], buf_slice[13], buf_slice[14], buf_slice[15]]);
+            header_locked.salt_1 =
+                u32::from_be_bytes([buf_slice[16], buf_slice[17], buf_slice[18], buf_slice[19]]);
+            header_locked.salt_2 =
+                u32::from_be_bytes([buf_slice[20], buf_slice[21], buf_slice[22], buf_slice[23]]);
+            header_locked.checksum_1 =
+                u32::from_be_bytes([buf_slice[24], buf_slice[25], buf_slice[26], buf_slice[27]]);
+            header_locked.checksum_2 =
+                u32::from_be_bytes([buf_slice[28], buf_slice[29], buf_slice[30], buf_slice[31]]);
+            tracing::debug!("read_entire_wal_dumb(header={:?})", *header_locked);
 
-        let mut cumulative_checksum = (header_locked.checksum_1, header_locked.checksum_2);
-        let page_size_u32 = header_locked.page_size;
+            // Read frames into frame_cache and pages_in_frames
+            if buf_slice.len() < WAL_HEADER_SIZE {
+                panic!("WAL file too small for header");
+            }
 
-        if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&page_size_u32)
-            || page_size_u32.count_ones() != 1
-        {
-            panic!("Invalid page size in WAL header: {page_size_u32}");
-        }
-        let page_size = page_size_u32 as usize;
+            let use_native_endian_checksum =
+                cfg!(target_endian = "big") == ((header_locked.magic & 1) != 0);
 
-        let mut current_offset = WAL_HEADER_SIZE;
-        let mut frame_idx = 1_u64;
+            let calculated_header_checksum = checksum_wal(
+                &buf_slice[0..24],
+                &header_locked,
+                (0, 0),
+                use_native_endian_checksum,
+            );
 
-        let wfs_data = unsafe { &mut *wal_file_shared_for_completion.get() };
-
-        if !checksum_header_failed {
-            while current_offset + WAL_FRAME_HEADER_SIZE + page_size <= buf_slice.len() {
-                let frame_header_slice =
-                    &buf_slice[current_offset..current_offset + WAL_FRAME_HEADER_SIZE];
-                let page_data_slice = &buf_slice[current_offset + WAL_FRAME_HEADER_SIZE
-                    ..current_offset + WAL_FRAME_HEADER_SIZE + page_size];
-
-                let frame_h_page_number =
-                    u32::from_be_bytes(frame_header_slice[0..4].try_into().unwrap());
-                let frame_h_db_size =
-                    u32::from_be_bytes(frame_header_slice[4..8].try_into().unwrap());
-                let frame_h_salt_1 =
-                    u32::from_be_bytes(frame_header_slice[8..12].try_into().unwrap());
-                let frame_h_salt_2 =
-                    u32::from_be_bytes(frame_header_slice[12..16].try_into().unwrap());
-                let frame_h_checksum_1 =
-                    u32::from_be_bytes(frame_header_slice[16..20].try_into().unwrap());
-                let frame_h_checksum_2 =
-                    u32::from_be_bytes(frame_header_slice[20..24].try_into().unwrap());
-
-                if frame_h_page_number == 0 {
-                    tracing::trace!(
-                        "WAL frame with page number 0. Ignoring frames starting from frame {}",
-                        frame_idx
-                    );
-                    break;
-                }
-                // It contains more frames with mismatched SALT values, which means they're leftovers from previous checkpoints
-                if frame_h_salt_1 != header_locked.salt_1 || frame_h_salt_2 != header_locked.salt_2
-                {
-                    tracing::trace!(
-                        "WAL frame salt mismatch: expected ({}, {}), got ({}, {}). Ignoring frames starting from frame {}",
-                        header_locked.salt_1,
-                        header_locked.salt_2,
-                        frame_h_salt_1,
-                        frame_h_salt_2,
-                        frame_idx
-                    );
-                    break;
-                }
-
-                let checksum_after_fh_meta = checksum_wal(
-                    &frame_header_slice[0..8],
-                    &header_locked,
-                    cumulative_checksum,
-                    use_native_endian_checksum,
+            let checksum_header_failed = if calculated_header_checksum
+                != (header_locked.checksum_1, header_locked.checksum_2)
+            {
+                tracing::error!(
+                    "WAL header checksum mismatch. Expected ({}, {}), Got ({}, {}). Ignoring frames starting from frame {}",
+                    header_locked.checksum_1,
+                    header_locked.checksum_2,
+                    calculated_header_checksum.0,
+                    calculated_header_checksum.1,
+                    0
                 );
-                let calculated_frame_checksum = checksum_wal(
-                    page_data_slice,
-                    &header_locked,
-                    checksum_after_fh_meta,
-                    use_native_endian_checksum,
-                );
-                tracing::debug!(
+                true
+            } else {
+                false
+            };
+
+            let mut cumulative_checksum = (header_locked.checksum_1, header_locked.checksum_2);
+            let page_size_u32 = header_locked.page_size;
+
+            if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&page_size_u32)
+                || page_size_u32.count_ones() != 1
+            {
+                panic!("Invalid page size in WAL header: {page_size_u32}");
+            }
+            let page_size = page_size_u32 as usize;
+
+            let mut current_offset = WAL_HEADER_SIZE;
+            let mut frame_idx = 1_u64;
+
+            let wfs_data = unsafe { &mut *wal_file_shared_for_completion.get() };
+
+            if !checksum_header_failed {
+                while current_offset + WAL_FRAME_HEADER_SIZE + page_size <= buf_slice.len() {
+                    let frame_header_slice =
+                        &buf_slice[current_offset..current_offset + WAL_FRAME_HEADER_SIZE];
+                    let page_data_slice = &buf_slice[current_offset + WAL_FRAME_HEADER_SIZE
+                        ..current_offset + WAL_FRAME_HEADER_SIZE + page_size];
+
+                    let frame_h_page_number =
+                        u32::from_be_bytes(frame_header_slice[0..4].try_into().unwrap());
+                    let frame_h_db_size =
+                        u32::from_be_bytes(frame_header_slice[4..8].try_into().unwrap());
+                    let frame_h_salt_1 =
+                        u32::from_be_bytes(frame_header_slice[8..12].try_into().unwrap());
+                    let frame_h_salt_2 =
+                        u32::from_be_bytes(frame_header_slice[12..16].try_into().unwrap());
+                    let frame_h_checksum_1 =
+                        u32::from_be_bytes(frame_header_slice[16..20].try_into().unwrap());
+                    let frame_h_checksum_2 =
+                        u32::from_be_bytes(frame_header_slice[20..24].try_into().unwrap());
+
+                    if frame_h_page_number == 0 {
+                        tracing::trace!(
+                            "WAL frame with page number 0. Ignoring frames starting from frame {}",
+                            frame_idx
+                        );
+                        break;
+                    }
+                    // It contains more frames with mismatched SALT values, which means they're leftovers from previous checkpoints
+                    if frame_h_salt_1 != header_locked.salt_1
+                        || frame_h_salt_2 != header_locked.salt_2
+                    {
+                        tracing::trace!(
+                            "WAL frame salt mismatch: expected ({}, {}), got ({}, {}). Ignoring frames starting from frame {}",
+                            header_locked.salt_1,
+                            header_locked.salt_2,
+                            frame_h_salt_1,
+                            frame_h_salt_2,
+                        frame_idx
+                        );
+                        break;
+                    }
+
+                    let checksum_after_fh_meta = checksum_wal(
+                        &frame_header_slice[0..8],
+                        &header_locked,
+                        cumulative_checksum,
+                        use_native_endian_checksum,
+                    );
+                    let calculated_frame_checksum = checksum_wal(
+                        page_data_slice,
+                        &header_locked,
+                        checksum_after_fh_meta,
+                        use_native_endian_checksum,
+                    );
+                    tracing::debug!(
                     "read_entire_wal_dumb(frame_h_checksum=({}, {}), calculated_frame_checksum=({}, {}))",
                     frame_h_checksum_1,
                     frame_h_checksum_2,
@@ -1494,8 +1495,8 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
                     calculated_frame_checksum.1
                 );
 
-                if calculated_frame_checksum != (frame_h_checksum_1, frame_h_checksum_2) {
-                    tracing::error!(
+                    if calculated_frame_checksum != (frame_h_checksum_1, frame_h_checksum_2) {
+                        tracing::error!(
                         "WAL frame checksum mismatch. Expected ({}, {}), Got ({}, {}). Ignoring frames starting from frame {}",
                         frame_h_checksum_1,
                         frame_h_checksum_2,
@@ -1503,37 +1504,38 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
                         calculated_frame_checksum.1,
                         frame_idx
                     );
-                    break;
+                        break;
+                    }
+
+                    cumulative_checksum = calculated_frame_checksum;
+
+                    wfs_data
+                        .frame_cache
+                        .lock()
+                        .entry(frame_h_page_number as u64)
+                        .or_default()
+                        .push(frame_idx);
+                    wfs_data
+                        .pages_in_frames
+                        .lock()
+                        .push(frame_h_page_number as u64);
+
+                    let is_commit_record = frame_h_db_size > 0;
+                    if is_commit_record {
+                        wfs_data.max_frame.store(frame_idx, Ordering::SeqCst);
+                        wfs_data.last_checksum = cumulative_checksum;
+                    }
+
+                    frame_idx += 1;
+                    current_offset += WAL_FRAME_HEADER_SIZE + page_size;
                 }
-
-                cumulative_checksum = calculated_frame_checksum;
-
-                wfs_data
-                    .frame_cache
-                    .lock()
-                    .entry(frame_h_page_number as u64)
-                    .or_default()
-                    .push(frame_idx);
-                wfs_data
-                    .pages_in_frames
-                    .lock()
-                    .push(frame_h_page_number as u64);
-
-                let is_commit_record = frame_h_db_size > 0;
-                if is_commit_record {
-                    wfs_data.max_frame.store(frame_idx, Ordering::SeqCst);
-                    wfs_data.last_checksum = cumulative_checksum;
-                }
-
-                frame_idx += 1;
-                current_offset += WAL_FRAME_HEADER_SIZE + page_size;
             }
-        }
 
-        wfs_data.last_checksum = cumulative_checksum;
-        wfs_data.nbackfills.store(0, Ordering::SeqCst);
-        wfs_data.loaded.store(true, Ordering::SeqCst);
-    });
+            wfs_data.last_checksum = cumulative_checksum;
+            wfs_data.nbackfills.store(0, Ordering::SeqCst);
+            wfs_data.loaded.store(true, Ordering::SeqCst);
+        },
+    );
     let c = Completion::new_read(buf_for_pread, complete);
     file.pread(0, c.into())?;
 
