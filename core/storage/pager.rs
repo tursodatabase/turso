@@ -3,7 +3,10 @@ use crate::storage::btree::BTreePageInner;
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::header_accessor;
-use crate::storage::sqlite3_ondisk::{self, DatabaseHeader, PageContent, PageType};
+use crate::storage::sqlite3_ondisk::{
+    self, begin_write_btree_page, DatabaseHeader, PageContent, PageType, DATABASE_HEADER_PAGE_ID,
+    DATABASE_HEADER_SIZE,
+};
 use crate::storage::wal::{CheckpointResult, Wal};
 use crate::types::IOResult;
 use crate::util::IOExt as _;
@@ -22,7 +25,6 @@ use tracing::{instrument, trace, Level};
 
 use super::btree::{btree_init_page, BTreePage};
 use super::page_cache::{CacheError, CacheResizeResult, DumbLruPageCache, PageCacheKey};
-use super::sqlite3_ondisk::{begin_write_btree_page, DATABASE_HEADER_SIZE};
 use super::wal::CheckpointMode;
 
 #[cfg(not(feature = "omit_autovacuum"))]
@@ -828,7 +830,12 @@ impl Pager {
                 Ok(_) => {}
                 Err(CacheError::Full { should_spill }) => {
                     if should_spill {
-                        return_if_io!(self.stress(false))
+                        self.stress(&mut page_cache)?;
+                        page_cache.insert(page_key, page.clone()).map_err(|e| {
+                            LimboError::InternalError(format!(
+                                "Failed to insert loaded page {page_key:?} into cache: {e:?}"
+                            ))
+                        })?;
                     } else {
                         return Err(LimboError::CacheFull);
                     }
@@ -855,7 +862,12 @@ impl Pager {
             Ok(_) => {}
             Err(CacheError::Full { should_spill }) => {
                 if should_spill {
-                    return_if_io!(self.stress(false))
+                    self.stress(&mut page_cache)?;
+                    page_cache.insert(page_key, page.clone()).map_err(|e| {
+                        LimboError::InternalError(format!(
+                            "Failed to insert loaded page {page_key:?} into cache: {e:?}"
+                        ))
+                    })?;
                 } else {
                     return Err(LimboError::CacheFull);
                 }
@@ -1310,7 +1322,6 @@ impl Pager {
         Gets a new page that increasing the size of the page or uses a free page.
         Currently free list pages are not yet supported.
     */
-    // FIXME: handle no room in page cache
     #[allow(clippy::readonly_write_lock)]
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn allocate_page(&self) -> Result<IOResult<PageRef>> {
@@ -1338,7 +1349,12 @@ impl Pager {
                     Ok(_) => (),
                     Err(CacheError::Full { should_spill }) => {
                         if should_spill {
-                            return_if_io!(self.stress(false))
+                            self.stress(&mut cache)?;
+                            cache.insert(page_key, page.clone()).map_err(|e| {
+                                LimboError::InternalError(format!(
+                                    "Failed to insert loaded page {page_key:?} into cache: {e:?}"
+                                ))
+                            })?;
                         } else {
                             return Err(LimboError::CacheFull);
                         }
@@ -1368,8 +1384,14 @@ impl Pager {
             match cache.insert(page_key, page.clone()) {
                 Err(CacheError::Full { should_spill }) => {
                     if should_spill {
-                        return_if_io!(self.stress(false));
-                        Ok(IOResult::IO)
+                        self.stress(&mut cache)?;
+                        cache.insert(page_key, page.clone()).map_err(|e| {
+                            LimboError::InternalError(format!(
+                                "Failed to insert loaded page {page_key:?} into cache: {e:?}"
+                            ))
+                        })?;
+                        println!("Done! Current db_size: {new_db_size}");
+                        Ok(IOResult::Done(page))
                     } else {
                         Err(LimboError::CacheFull)
                     }
@@ -1382,23 +1404,32 @@ impl Pager {
         }
     }
 
-    pub fn update_dirty_loaded_page_in_cache(
-        &self,
-        id: usize,
-        page: PageRef,
-    ) -> Result<(), LimboError> {
+    pub fn update_dirty_loaded_page_in_cache(&self, id: usize, page: PageRef) -> Result<()> {
         let mut cache = self.page_cache.write();
         let page_key = PageCacheKey(id);
 
         // FIXME: use specific page key for writer instead of max frame, this will make readers not conflict
         assert!(page.is_dirty());
-        cache
-            .insert_ignore_existing(page_key, page.clone())
-            .map_err(|e| {
-                LimboError::InternalError(format!(
-                    "Failed to insert loaded page {id} into cache: {e:?}"
-                ))
-            })?;
+        match cache.insert_ignore_existing(page_key, page.clone()) {
+            Err(CacheError::Full { should_spill }) => {
+                if should_spill {
+                    self.stress(&mut cache)?;
+                    cache.insert(page_key, page.clone()).map_err(|e| {
+                        LimboError::InternalError(format!(
+                            "Failed to insert loaded page {page_key:?} into cache: {e:?}"
+                        ))
+                    })?;
+                } else {
+                    return Err(LimboError::CacheFull);
+                }
+            }
+            Ok(_) => {}
+            err => {
+                return Err(LimboError::InternalError(format!(
+                    "Failed to insert loaded page {id} into cache: {err:?}"
+                )))
+            }
+        }
         page.set_loaded();
         Ok(())
     }
@@ -1410,11 +1441,7 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn rollback(
-        &self,
-        schema_did_change: bool,
-        connection: &Connection,
-    ) -> Result<(), LimboError> {
+    pub fn rollback(&self, schema_did_change: bool, connection: &Connection) -> Result<()> {
         tracing::debug!(schema_did_change);
         {
             *self.spill_flag.borrow_mut() = SpillFlag::ROLLBACK;
@@ -1442,57 +1469,44 @@ impl Pager {
     /// This function is called by the cache layer when it has reached some soft memory limit.
     /// The pager must be purgeable (not in-memory)
     #[instrument(skip_all, level = Level::INFO)]
-    pub fn stress(&self, full: bool) -> Result<IOResult<()>> {
-        // todo: improve error handling
+    pub fn stress(&self, page_cache: &mut DumbLruPageCache) -> Result<()> {
         if !self.spill_flag.borrow().can_spill() {
             return Err(LimboError::SpillNotAllowed(*self.spill_flag.borrow()));
         }
-        let state = self.flush_info.borrow().state;
-        trace!(?state);
-        match state {
-            CacheFlushState::Start => {
-                let mut page_cache = self.page_cache.write();
-                let page_ids: Vec<_> = self.dirty_pages.borrow().iter().copied().collect();
-                let mut dirty_pages = self.dirty_pages.borrow_mut();
+        let page_ids: Vec<_> = self
+            .dirty_pages
+            .borrow()
+            .iter()
+            .filter(|&page_id| *page_id != DATABASE_HEADER_PAGE_ID)
+            .copied()
+            .collect();
+        let mut dirty_pages = self.dirty_pages.borrow_mut();
 
-                for page_id in page_ids {
-                    let page = page_cache.get(&PageCacheKey(page_id)).unwrap_or_else(|| {
-                        panic!(
-                            "We somehow have a dirty page that isn't in the cache: page_id({page_id})",
-                        )
-                    });
-                    assert!(page.is_dirty());
-                    trace!("pager.stress(page={})", page.get().id);
-                    self.wal.borrow_mut().append_frame(
-                        page.clone(),
-                        0,
-                        self.flush_info.borrow().in_flight_writes.clone(),
-                    )?;
-
-                    page.clear_dirty();
-                    page_cache.delete(PageCacheKey(page_id)).unwrap();
-                    dirty_pages.remove(&page_id);
-                    if !full {
-                        break;
-                    }
+        for page_id in page_ids {
+            if let Some(page) = page_cache.get(&PageCacheKey(page_id)) {
+                if page.is_pinned() {
+                    continue;
                 }
+                assert!(page.is_dirty());
+                self.wal.borrow_mut().append_frame(
+                    page.clone(),
+                    0,
+                    self.flush_info.borrow().in_flight_writes.clone(),
+                )?;
 
-                self.flush_info.borrow_mut().state = CacheFlushState::WaitAppendFrames;
-                return Ok(IOResult::IO);
-            }
-
-            CacheFlushState::WaitAppendFrames => {
-                let in_flight = *self.flush_info.borrow().in_flight_writes.borrow();
-                if in_flight == 0 {
-                    self.flush_info.borrow_mut().state = CacheFlushState::Start;
-                    self.wal.borrow_mut().finish_append_frames_commit()?;
-                    return Ok(IOResult::Done(()));
-                }
+                page.clear_dirty();
+                page_cache.delete(PageCacheKey(page_id)).unwrap();
+                dirty_pages.remove(&page_id);
             }
         }
 
-        Ok(IOResult::IO)
+        while *self.flush_info.borrow().in_flight_writes.borrow() != 0 {
+            self.io.run_once()?;
+        }
+
+        Ok(())
     }
+
     pub fn disable_cache_spill(&self, toggle: bool) {
         self.spill_flag.borrow_mut().disable(toggle);
     }
