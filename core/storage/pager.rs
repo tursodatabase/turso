@@ -1544,10 +1544,12 @@ impl Pager {
                         //  - the last page is a pointer map page
                         if matches!(*self.auto_vacuum_mode.borrow(), AutoVacuumMode::Full)
                             && is_ptrmap_page(
-                                new_db_size,
+                                new_db_size + 1,
                                 header_accessor::get_page_size(self)? as usize,
                             )
                         {
+                            // we will allocate a ptrmap page, so increment size
+                            new_db_size += 1;
                             let page =
                                 allocate_new_page(new_db_size as usize, &self.buffer_pool, 0);
                             self.add_dirty(&page);
@@ -1562,8 +1564,6 @@ impl Pager {
                                     ))
                                 }
                             }
-                            // we allocated a ptrmap page, so the next data page will be at new_db_size + 1
-                            new_db_size += 1;
                         }
                     }
 
@@ -2139,11 +2139,14 @@ mod ptrmap_tests {
         pager.set_auto_vacuum_mode(AutoVacuumMode::Full);
 
         //  Allocate all the pages as btree root pages
-        for _ in 0..initial_db_pages {
-            match pager.btree_create(&CreateBTreeFlags::new_table()) {
-                Ok(IOResult::Done(_root_page_id)) => (),
-                Ok(IOResult::IO) => {
-                    panic!("test_pager_setup: btree_create returned IOResult::IO unexpectedly");
+        const EXPECTED_FIRST_ROOT_PAGE_ID: u32 = 3; // page1 = 1,  first ptrmap page = 2, root page = 3
+        for i in 0..initial_db_pages {
+            match run_until_done(
+                || pager.btree_create(&CreateBTreeFlags::new_table()),
+                &pager,
+            ) {
+                Ok(root_page_id) => {
+                    assert_eq!(root_page_id, EXPECTED_FIRST_ROOT_PAGE_ID + i);
                 }
                 Err(e) => {
                     panic!("test_pager_setup: btree_create failed: {e:?}");
