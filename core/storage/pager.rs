@@ -221,6 +221,10 @@ enum CheckpointState {
 }
 
 /// The mode of allocating a btree page.
+/// SQLite defines the following:
+/// #define BTALLOC_ANY   0           /* Allocate any page */
+/// #define BTALLOC_EXACT 1           /* Allocate exact page if possible */
+/// #define BTALLOC_LE    2           /* Allocate any page <= the parameter */
 pub enum BtreePageAllocMode {
     /// Allocate any btree page
     Any,
