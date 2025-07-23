@@ -307,7 +307,9 @@ impl DumbLruPageCache {
             let entry = unsafe { current.as_ref() };
             // Pick prev before modifying entry
             current_opt = entry.prev;
-
+            if entry.page.is_dirty() {
+                continue;
+            }
             if self.delete(entry.key.clone()).is_ok() {
                 need_to_evict -= 1;
             }
