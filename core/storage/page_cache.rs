@@ -5,14 +5,10 @@ use tracing::{debug, trace};
 
 use super::pager::PageRef;
 
-/// FIXME: https://github.com/tursodatabase/turso/issues/1661
-const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES_MAKE_ME_SMALLER_ONCE_WAL_SPILL_IS_IMPLEMENTED: usize =
-    100000;
+const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES: usize = 2_000;
 
-#[derive(Debug, Eq, Hash, PartialEq, Clone)]
-pub struct PageCacheKey {
-    pgno: usize,
-}
+#[derive(Debug, Eq, Hash, PartialEq, Clone, Copy)]
+pub struct PageCacheKey(pub usize);
 
 #[allow(dead_code)]
 struct PageCacheEntry {
@@ -27,6 +23,7 @@ pub struct DumbLruPageCache {
     map: RefCell<PageHashMap>,
     head: RefCell<Option<NonNull<PageCacheEntry>>>,
     tail: RefCell<Option<NonNull<PageCacheEntry>>>,
+    pub spill_threshold: usize,
 }
 unsafe impl Send for DumbLruPageCache {}
 unsafe impl Sync for DumbLruPageCache {}
@@ -51,7 +48,7 @@ pub enum CacheError {
     Dirty { pgno: usize },
     Pinned { pgno: usize },
     ActiveRefs,
-    Full,
+    Full { should_spill: bool },
     KeyExists,
 }
 
@@ -61,11 +58,6 @@ pub enum CacheResizeResult {
     PendingEvictions,
 }
 
-impl PageCacheKey {
-    pub fn new(pgno: usize) -> Self {
-        Self { pgno }
-    }
-}
 impl DumbLruPageCache {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "capacity of cache should be at least 1");
@@ -74,6 +66,15 @@ impl DumbLruPageCache {
             map: RefCell::new(PageHashMap::new(capacity)),
             head: RefCell::new(None),
             tail: RefCell::new(None),
+            spill_threshold: 483, // Same as SQLite, TODO: see if it's calculated
+        }
+    }
+
+    pub fn set_spill_threshold(&mut self, threshold: i64, usable_space: usize) {
+        self.spill_threshold = if threshold < 0 {
+            ((-1024 * threshold) / usable_space as i64) as usize
+        } else {
+            threshold as usize
         }
     }
 
@@ -112,7 +113,7 @@ impl DumbLruPageCache {
         }
         self.make_room_for(1)?;
         let entry = Box::new(PageCacheEntry {
-            key: key.clone(),
+            key,
             next: None,
             prev: None,
             page: value,
@@ -277,7 +278,9 @@ impl DumbLruPageCache {
 
     pub fn make_room_for(&mut self, n: usize) -> Result<(), CacheError> {
         if n > self.capacity {
-            return Err(CacheError::Full);
+            return Err(CacheError::Full {
+                should_spill: self.map.borrow().size > self.spill_threshold,
+            });
         }
 
         let len = self.len();
@@ -304,15 +307,20 @@ impl DumbLruPageCache {
             let entry = unsafe { current.as_ref() };
             // Pick prev before modifying entry
             current_opt = entry.prev;
-            match self.delete(entry.key.clone()) {
-                Err(_) => {}
-                Ok(_) => need_to_evict -= 1,
+            if entry.page.is_dirty() {
+                continue;
+            }
+            if self.delete(entry.key).is_ok() {
+                need_to_evict -= 1;
             }
         }
 
-        match need_to_evict > 0 {
-            true => Err(CacheError::Full),
-            false => Ok(()),
+        if need_to_evict > 0 {
+            Err(CacheError::Full {
+                should_spill: self.map.borrow().size > self.spill_threshold,
+            })
+        } else {
+            Ok(())
         }
     }
 
@@ -361,7 +369,7 @@ impl DumbLruPageCache {
         let mut current = head_ptr;
         while let Some(node) = current {
             unsafe {
-                this_keys.push(node.as_ref().key.clone());
+                this_keys.push(node.as_ref().key);
                 let node_ref = node.as_ref();
                 current = node_ref.next;
             }
@@ -511,9 +519,7 @@ impl DumbLruPageCache {
 
 impl Default for DumbLruPageCache {
     fn default() -> Self {
-        DumbLruPageCache::new(
-            DEFAULT_PAGE_CACHE_SIZE_IN_PAGES_MAKE_ME_SMALLER_ONCE_WAL_SPILL_IS_IMPLEMENTED,
-        )
+        DumbLruPageCache::new(DEFAULT_PAGE_CACHE_SIZE_IN_PAGES)
     }
 }
 
@@ -603,16 +609,16 @@ impl PageHashMap {
 
     fn hash(&self, key: &PageCacheKey) -> usize {
         if self.capacity.is_power_of_two() {
-            key.pgno & (self.capacity - 1)
+            key.0 & (self.capacity - 1)
         } else {
-            key.pgno % self.capacity
+            key.0 % self.capacity
         }
     }
 
     pub fn rehash(&self, new_capacity: usize) -> PageHashMap {
         let mut new_hash_map = PageHashMap::new(new_capacity);
         for node in self.iter() {
-            new_hash_map.insert(node.key.clone(), node.value);
+            new_hash_map.insert(node.key, node.value);
         }
         new_hash_map
     }
@@ -635,7 +641,7 @@ mod tests {
     };
 
     fn create_key(id: usize) -> PageCacheKey {
-        PageCacheKey::new(id)
+        PageCacheKey(id)
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -658,7 +664,7 @@ mod tests {
     fn insert_page(cache: &mut DumbLruPageCache, id: usize) -> PageCacheKey {
         let key = create_key(id);
         let page = page_with_content(id);
-        assert!(cache.insert(key.clone(), page).is_ok());
+        assert!(cache.insert(key, page).is_ok());
         key
     }
 
@@ -672,7 +678,7 @@ mod tests {
     ) -> (PageCacheKey, NonNull<PageCacheEntry>) {
         let key = create_key(id);
         let page = page_with_content(id);
-        assert!(cache.insert(key.clone(), page).is_ok());
+        assert!(cache.insert(key, page).is_ok());
         let entry = cache.get_ptr(&key).expect("Entry should exist");
         (key, entry)
     }
@@ -687,7 +693,7 @@ mod tests {
         assert!(cache.tail.borrow().is_some());
         assert_eq!(*cache.head.borrow(), *cache.tail.borrow());
 
-        assert!(cache.delete(key1.clone()).is_ok());
+        assert!(cache.delete(key1).is_ok());
 
         assert_eq!(
             cache.len(),
@@ -719,7 +725,7 @@ mod tests {
             "Initial head check"
         );
 
-        assert!(cache.delete(key3.clone()).is_ok());
+        assert!(cache.delete(key3).is_ok());
 
         assert_eq!(cache.len(), 2, "Length should be 2 after deleting head");
         assert!(
@@ -763,7 +769,7 @@ mod tests {
             "Initial tail check"
         );
 
-        assert!(cache.delete(key1.clone()).is_ok()); // Delete tail
+        assert!(cache.delete(key1).is_ok()); // Delete tail
 
         assert_eq!(cache.len(), 2, "Length should be 2 after deleting tail");
         assert!(
@@ -814,7 +820,7 @@ mod tests {
         let head_ptr_before = cache.head.borrow().unwrap();
         let tail_ptr_before = cache.tail.borrow().unwrap();
 
-        assert!(cache.delete(key2.clone()).is_ok()); // Detach a middle element (key2)
+        assert!(cache.delete(key2).is_ok()); // Detach a middle element (key2)
 
         assert_eq!(cache.len(), 3, "Length should be 3 after deleting middle");
         assert!(
@@ -855,11 +861,11 @@ mod tests {
         let mut cache = DumbLruPageCache::default();
         let key1 = create_key(1);
         let page1 = page_with_content(1);
-        assert!(cache.insert(key1.clone(), page1.clone()).is_ok());
+        assert!(cache.insert(key1, page1.clone()).is_ok());
         assert!(page_has_content(&page1));
         cache.verify_list_integrity();
 
-        let result = cache.delete(key1.clone());
+        let result = cache.delete(key1);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), CacheError::ActiveRefs);
         assert_eq!(cache.len(), 1);
@@ -878,10 +884,10 @@ mod tests {
         let key1 = create_key(1);
         let page1_v1 = page_with_content(1);
         let page1_v2 = page_with_content(1);
-        assert!(cache.insert(key1.clone(), page1_v1.clone()).is_ok());
+        assert!(cache.insert(key1, page1_v1.clone()).is_ok());
         assert_eq!(cache.len(), 1);
         cache.verify_list_integrity();
-        let _ = cache.insert(key1.clone(), page1_v2.clone()); // Panic
+        let _ = cache.insert(key1, page1_v2.clone()); // Panic
     }
 
     #[test]
@@ -889,7 +895,7 @@ mod tests {
         let mut cache = DumbLruPageCache::default();
         let key_nonexist = create_key(99);
 
-        assert!(cache.delete(key_nonexist.clone()).is_ok()); // no-op
+        assert!(cache.delete(key_nonexist).is_ok()); // no-op
     }
 
     #[test]
@@ -991,8 +997,8 @@ mod tests {
         let (key1, _) = insert_and_get_entry(&mut cache, 1);
         let (key2, entry2) = insert_and_get_entry(&mut cache, 2);
         let (key3, _) = insert_and_get_entry(&mut cache, 3);
-        let head_key = unsafe { cache.head.borrow().unwrap().as_ref().key.clone() };
-        let tail_key = unsafe { cache.tail.borrow().unwrap().as_ref().key.clone() };
+        let head_key = unsafe { cache.head.borrow().unwrap().as_ref().key };
+        let tail_key = unsafe { cache.tail.borrow().unwrap().as_ref().key };
         assert_eq!(head_key, key3, "Head should be key3");
         assert_eq!(tail_key, key1, "Tail should be key1");
         assert!(cache.detach(entry2, false).is_ok());
@@ -1001,12 +1007,12 @@ mod tests {
         assert_eq!(head_entry.key, key3, "Head should still be key3");
         assert_eq!(tail_entry.key, key1, "Tail should still be key1");
         assert_eq!(
-            unsafe { head_entry.next.unwrap().as_ref().key.clone() },
+            unsafe { head_entry.next.unwrap().as_ref().key },
             key1,
             "Head's next should point to tail after middle element detached"
         );
         assert_eq!(
-            unsafe { tail_entry.prev.unwrap().as_ref().key.clone() },
+            unsafe { tail_entry.prev.unwrap().as_ref().key },
             key3,
             "Tail's prev should point to head after middle element detached"
         );
@@ -1035,15 +1041,15 @@ mod tests {
                 0 => {
                     // add
                     let id_page = rng.next_u64() % max_pages;
-                    let key = PageCacheKey::new(id_page as usize);
+                    let key = PageCacheKey(id_page as usize);
                     #[allow(clippy::arc_with_non_send_sync)]
                     let page = Arc::new(Page::new(id_page as usize));
                     if cache.peek(&key, false).is_some() {
                         continue; // skip duplicate page ids
                     }
                     tracing::debug!("inserting page {:?}", key);
-                    match cache.insert(key.clone(), page.clone()) {
-                        Err(CacheError::Full | CacheError::ActiveRefs) => {} // Ignore
+                    match cache.insert(key, page.clone()) {
+                        Err(CacheError::Full { .. } | CacheError::ActiveRefs) => {} // Ignore
                         Err(err) => {
                             // Any other error should fail the test
                             panic!("Cache insertion failed: {err:?}");
@@ -1060,10 +1066,10 @@ mod tests {
                     let key = if random || lru.is_empty() {
                         let id_page: u64 = rng.next_u64() % max_pages;
 
-                        PageCacheKey::new(id_page as usize)
+                        PageCacheKey(id_page as usize)
                     } else {
                         let i = rng.next_u64() as usize % lru.len();
-                        let key: PageCacheKey = lru.iter().nth(i).unwrap().0.clone();
+                        let key: PageCacheKey = *lru.iter().nth(i).unwrap().0;
                         key
                     };
                     tracing::debug!("removing page {:?}", key);
@@ -1081,7 +1087,7 @@ mod tests {
             for (key, page) in &lru {
                 println!("getting page {key:?}");
                 cache.peek(key, false).unwrap();
-                assert_eq!(page.get().id, key.pgno);
+                assert_eq!(page.get().id, key.0);
             }
         }
     }
@@ -1090,7 +1096,7 @@ mod tests {
         let this_keys = cache.keys();
         let mut lru_keys = Vec::new();
         for (lru_key, _) in lru {
-            lru_keys.push(lru_key.clone());
+            lru_keys.push(*lru_key);
         }
         if this_keys != lru_keys {
             cache.print();
@@ -1125,7 +1131,7 @@ mod tests {
     fn test_page_cache_delete() {
         let mut cache = DumbLruPageCache::default();
         let key1 = insert_page(&mut cache, 1);
-        assert!(cache.delete(key1.clone()).is_ok());
+        assert!(cache.delete(key1).is_ok());
         assert!(cache.get(&key1).is_none());
     }
 

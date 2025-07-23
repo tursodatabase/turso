@@ -1,3 +1,4 @@
+use crate::storage::pager::SpillFlag;
 use thiserror::Error;
 
 #[derive(Debug, Error, miette::Diagnostic)]
@@ -59,6 +60,8 @@ pub enum LimboError {
     ReadOnly,
     #[error("Database is busy")]
     Busy,
+    #[error("Spill not allowed for flag: {0}")]
+    SpillNotAllowed(SpillFlag),
 }
 
 #[macro_export]

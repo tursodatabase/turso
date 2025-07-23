@@ -3,15 +3,20 @@ use crate::storage::btree::BTreePageInner;
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::header_accessor;
-use crate::storage::sqlite3_ondisk::{self, DatabaseHeader, PageContent, PageType};
+use crate::storage::sqlite3_ondisk::{
+    self, begin_write_btree_page, DatabaseHeader, PageContent, PageType, DATABASE_HEADER_PAGE_ID,
+    DATABASE_HEADER_SIZE,
+};
 use crate::storage::wal::{CheckpointResult, Wal};
 use crate::types::IOResult;
 use crate::util::IOExt as _;
 use crate::{return_if_io, Completion};
 use crate::{turso_assert, Buffer, Connection, LimboError, Result};
+use bitflags::bitflags;
 use parking_lot::RwLock;
 use std::cell::{Cell, OnceCell, RefCell, UnsafeCell};
 use std::collections::HashSet;
+use std::fmt;
 use std::hash;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,11 +25,56 @@ use tracing::{instrument, trace, Level};
 
 use super::btree::{btree_init_page, BTreePage};
 use super::page_cache::{CacheError, CacheResizeResult, DumbLruPageCache, PageCacheKey};
-use super::sqlite3_ondisk::{begin_write_btree_page, DATABASE_HEADER_SIZE};
 use super::wal::CheckpointMode;
 
 #[cfg(not(feature = "omit_autovacuum"))]
 use {crate::io::Buffer as IoBuffer, ptrmap::*};
+
+#[derive(Debug, Copy, Clone)]
+pub struct SpillFlag(u8);
+
+bitflags! {
+    impl SpillFlag: u8 {
+        /// Allow spilling cache. Default behavior.
+        const ALLOWED = 0b00;
+        /// Never spill cache. Set via pragma
+        const OFF = 0b01;
+        /// Current rolling back, so do not spill
+        const ROLLBACK = 0b10;
+        /// Spill is ok, but do not sync
+        const NO_SYNC = 0b11;
+    }
+}
+
+impl SpillFlag {
+    pub fn can_spill(&self) -> bool {
+        self.contains(SpillFlag::NO_SYNC) || self.is_empty()
+    }
+
+    pub fn is_off(&self) -> bool {
+        self.contains(SpillFlag::OFF)
+    }
+
+    pub fn disable(&mut self, toggle: bool) {
+        if toggle {
+            self.remove(SpillFlag::OFF);
+        } else {
+            *self = SpillFlag::OFF;
+        }
+    }
+}
+
+impl fmt::Display for SpillFlag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            0b00 => write!(f, "ALLOWED"),
+            0b01 => write!(f, "OFF"),
+            0b10 => write!(f, "ROLLBACK"),
+            0b11 => write!(f, "NO_SYNC"),
+            _ => write!(f, "UNKNOWN"),
+        }
+    }
+}
 
 pub struct PageInner {
     pub flags: AtomicUsize,
@@ -305,7 +355,7 @@ pub struct Pager {
     /// The write-ahead log (WAL) for the database.
     wal: Rc<RefCell<dyn Wal>>,
     /// A page cache for the database.
-    page_cache: Arc<RwLock<DumbLruPageCache>>,
+    pub page_cache: Arc<RwLock<DumbLruPageCache>>,
     /// Buffer pool for temporary data storage.
     pub buffer_pool: Arc<BufferPool>,
     /// I/O interface for input/output operations.
@@ -331,6 +381,7 @@ pub struct Pager {
     page_size: Cell<Option<u32>>,
     reserved_space: OnceCell<u8>,
     free_page_state: RefCell<FreePageState>,
+    pub spill_flag: RefCell<SpillFlag>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -408,6 +459,7 @@ impl Pager {
                 in_flight_writes: Rc::new(RefCell::new(0)),
             }),
             free_page_state: RefCell::new(FreePageState::Start),
+            spill_flag: RefCell::new(SpillFlag::empty()),
         })
     }
 
@@ -449,13 +501,11 @@ impl Pager {
             ptrmap_pg_no
         );
 
-        let ptrmap_page = self.read_page(ptrmap_pg_no as usize)?;
-        if ptrmap_page.is_locked() {
+        let ptrmap_page = return_if_io!(self.read_page(ptrmap_pg_no as usize));
+        if ptrmap_page.is_locked() || !ptrmap_page.is_loaded() {
             return Ok(IOResult::IO);
         }
-        if !ptrmap_page.is_loaded() {
-            return Ok(IOResult::IO);
-        }
+
         let ptrmap_page_inner = ptrmap_page.get();
 
         let page_content: &PageContent = match ptrmap_page_inner.contents.as_ref() {
@@ -540,13 +590,11 @@ impl Pager {
             offset_in_ptrmap_page
         );
 
-        let ptrmap_page = self.read_page(ptrmap_pg_no as usize)?;
-        if ptrmap_page.is_locked() {
+        let ptrmap_page = return_if_io!(self.read_page(ptrmap_pg_no as usize));
+        if ptrmap_page.is_locked() || !ptrmap_page.is_loaded() {
             return Ok(IOResult::IO);
         }
-        if !ptrmap_page.is_loaded() {
-            return Ok(IOResult::IO);
-        }
+
         let ptrmap_page_inner = ptrmap_page.get();
 
         let page_content = match ptrmap_page_inner.contents.as_ref() {
@@ -596,7 +644,7 @@ impl Pager {
         };
         #[cfg(feature = "omit_autovacuum")]
         {
-            let page = self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any)?;
+            let page = return_if_io!(self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any));
             let page_id = page.get().get().id;
             Ok(IOResult::Done(page_id as u32))
         }
@@ -607,7 +655,8 @@ impl Pager {
             let auto_vacuum_mode = self.auto_vacuum_mode.borrow();
             match *auto_vacuum_mode {
                 AutoVacuumMode::None => {
-                    let page = self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any)?;
+                    let page =
+                        return_if_io!(self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any));
                     let page_id = page.get().get().id;
                     Ok(IOResult::Done(page_id as u32))
                 }
@@ -632,11 +681,11 @@ impl Pager {
                     assert!(root_page_num >= 3); //  the very first root page is page 3
 
                     //  root_page_num here is the desired root page
-                    let page = self.do_allocate_page(
+                    let page = return_if_io!(self.do_allocate_page(
                         page_type,
                         0,
                         BtreePageAllocMode::Exact(root_page_num),
-                    )?;
+                    ));
                     let allocated_page_id = page.get().get().id as u32;
                     if allocated_page_id != root_page_num {
                         //  TODO(Zaid): Handle swapping the allocated page with the desired root page
@@ -660,8 +709,8 @@ impl Pager {
     /// Allocate a new overflow page.
     /// This is done when a cell overflows and new space is needed.
     // FIXME: handle no room in page cache
-    pub fn allocate_overflow_page(&self) -> PageRef {
-        let page = self.allocate_page().unwrap();
+    pub fn allocate_overflow_page(&self) -> Result<IOResult<PageRef>> {
+        let page = return_if_io!(self.allocate_page());
         tracing::debug!("Pager::allocate_overflow_page(id={})", page.get().id);
 
         // setup overflow page
@@ -669,7 +718,7 @@ impl Pager {
         let buf = contents.as_ptr();
         buf.fill(0);
 
-        page
+        Ok(IOResult::Done(page))
     }
 
     /// Allocate a new page to the btree via the pager.
@@ -680,8 +729,8 @@ impl Pager {
         page_type: PageType,
         offset: usize,
         _alloc_mode: BtreePageAllocMode,
-    ) -> Result<BTreePage> {
-        let page = self.allocate_page()?;
+    ) -> Result<IOResult<BTreePage>> {
+        let page = return_if_io!(self.allocate_page());
         let page = Arc::new(BTreePageInner {
             page: RefCell::new(page),
         });
@@ -691,7 +740,7 @@ impl Pager {
             page.get().get().id,
             page.get().get_contents().page_type()
         );
-        Ok(page)
+        Ok(IOResult::Done(page))
     }
 
     /// The "usable size" of a database page is the page size specified by the 2-byte integer at offset 16
@@ -804,13 +853,13 @@ impl Pager {
 
     /// Reads a page from the database.
     #[tracing::instrument(skip_all, level = Level::DEBUG)]
-    pub fn read_page(&self, page_idx: usize) -> Result<PageRef, LimboError> {
+    pub fn read_page(&self, page_idx: usize) -> Result<IOResult<PageRef>> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
-        let page_key = PageCacheKey::new(page_idx);
+        let page_key = PageCacheKey(page_idx);
         if let Some(page) = page_cache.get(&page_key) {
             tracing::trace!("read_page(page_idx = {}) = cached", page_idx);
-            return Ok(page.clone());
+            return Ok(IOResult::Done(page.clone()));
         }
         let page = Arc::new(Page::new(page_idx));
         page.set_locked();
@@ -826,7 +875,18 @@ impl Pager {
             // read frame or page
             match page_cache.insert(page_key, page.clone()) {
                 Ok(_) => {}
-                Err(CacheError::Full) => return Err(LimboError::CacheFull),
+                Err(CacheError::Full { should_spill }) => {
+                    if should_spill {
+                        self.stress(&mut page_cache)?;
+                        page_cache.insert(page_key, page.clone()).map_err(|e| {
+                            LimboError::InternalError(format!(
+                                "Failed to insert loaded page {page_key:?} into cache: {e:?}"
+                            ))
+                        })?;
+                    } else {
+                        return Err(LimboError::CacheFull);
+                    }
+                }
                 Err(CacheError::KeyExists) => {
                     unreachable!("Page should not exist in cache after get() miss")
                 }
@@ -836,7 +896,7 @@ impl Pager {
                     )))
                 }
             }
-            return Ok(page);
+            return Ok(IOResult::Done(page));
         }
 
         sqlite3_ondisk::begin_read_page(
@@ -847,7 +907,18 @@ impl Pager {
         )?;
         match page_cache.insert(page_key, page.clone()) {
             Ok(_) => {}
-            Err(CacheError::Full) => return Err(LimboError::CacheFull),
+            Err(CacheError::Full { should_spill }) => {
+                if should_spill {
+                    self.stress(&mut page_cache)?;
+                    page_cache.insert(page_key, page.clone()).map_err(|e| {
+                        LimboError::InternalError(format!(
+                            "Failed to insert loaded page {page_key:?} into cache: {e:?}"
+                        ))
+                    })?;
+                } else {
+                    return Err(LimboError::CacheFull);
+                }
+            }
             Err(CacheError::KeyExists) => {
                 unreachable!("Page should not exist in cache after get() miss")
             }
@@ -857,14 +928,14 @@ impl Pager {
                 )))
             }
         }
-        Ok(page)
+        Ok(IOResult::Done(page))
     }
 
     // Get a page from the cache, if it exists.
     pub fn cache_get(&self, page_idx: usize) -> Option<PageRef> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
-        let page_key = PageCacheKey::new(page_idx);
+        let page_key = PageCacheKey(page_idx);
         page_cache.get(&page_key)
     }
 
@@ -894,7 +965,7 @@ impl Pager {
             CacheFlushState::Start => {
                 for page_id in self.dirty_pages.borrow().iter() {
                     let mut cache = self.page_cache.write();
-                    let page_key = PageCacheKey::new(*page_id);
+                    let page_key = PageCacheKey(*page_id);
                     let page = cache.get(&page_key).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
                     let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
                     trace!("cacheflush(page={}, page_type={:?})", page_id, page_type);
@@ -940,7 +1011,7 @@ impl Pager {
                     for (dirty_page_idx, page_id) in self.dirty_pages.borrow().iter().enumerate() {
                         let is_last_frame = dirty_page_idx == self.dirty_pages.borrow().len() - 1;
                         let mut cache = self.page_cache.write();
-                        let page_key = PageCacheKey::new(*page_id);
+                        let page_key = PageCacheKey(*page_id);
                         let page = cache.get(&page_key).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
                         let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
                         trace!(
@@ -1143,7 +1214,7 @@ impl Pager {
                             assert_eq!(page.get().id, page_id, "Page id mismatch");
                             page
                         }
-                        None => self.read_page(page_id)?,
+                        None => return_if_io!(self.read_page(page_id)),
                     };
                     header_accessor::set_freelist_pages(
                         self,
@@ -1165,7 +1236,7 @@ impl Pager {
                     let trunk_page_id = header_accessor::get_freelist_trunk_page(self)?;
                     if trunk_page.is_none() {
                         // Add as leaf to current trunk
-                        trunk_page.replace(self.read_page(trunk_page_id as usize)?);
+                        trunk_page.replace(return_if_io!(self.read_page(trunk_page_id as usize)));
                     }
                     let trunk_page = trunk_page.as_ref().unwrap();
                     if trunk_page.is_locked() || !trunk_page.is_loaded() {
@@ -1274,7 +1345,7 @@ impl Pager {
                 }
                 tracing::trace!("allocate_page1(Writing done)");
                 let page1_ref = page.get();
-                let page_key = PageCacheKey::new(page1_ref.get().id);
+                let page_key = PageCacheKey(page1_ref.get().id);
                 let mut cache = self.page_cache.write();
                 cache.insert(page_key, page1_ref.clone()).map_err(|e| {
                     LimboError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
@@ -1298,10 +1369,9 @@ impl Pager {
         Gets a new page that increasing the size of the page or uses a free page.
         Currently free list pages are not yet supported.
     */
-    // FIXME: handle no room in page cache
     #[allow(clippy::readonly_write_lock)]
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn allocate_page(&self) -> Result<PageRef> {
+    pub fn allocate_page(&self) -> Result<IOResult<PageRef>> {
         let old_db_size = header_accessor::get_database_size(self)?;
         #[allow(unused_mut)]
         let mut new_db_size = old_db_size + 1;
@@ -1320,11 +1390,22 @@ impl Pager {
                 page.set_dirty();
                 self.add_dirty(page.get().id);
 
-                let page_key = PageCacheKey::new(page.get().id);
+                let page_key = PageCacheKey(page.get().id);
                 let mut cache = self.page_cache.write();
                 match cache.insert(page_key, page.clone()) {
                     Ok(_) => (),
-                    Err(CacheError::Full) => return Err(LimboError::CacheFull),
+                    Err(CacheError::Full { should_spill }) => {
+                        if should_spill {
+                            self.stress(&mut cache)?;
+                            cache.insert(page_key, page.clone()).map_err(|e| {
+                                LimboError::InternalError(format!(
+                                    "Failed to insert loaded page {page_key:?} into cache: {e:?}"
+                                ))
+                            })?;
+                        } else {
+                            return Err(LimboError::CacheFull);
+                        }
+                    }
                     Err(_) => {
                         return Err(LimboError::InternalError(
                             "Unknown error inserting page to cache".into(),
@@ -1345,35 +1426,57 @@ impl Pager {
             page.set_dirty();
             self.add_dirty(page.get().id);
 
-            let page_key = PageCacheKey::new(page.get().id);
+            let page_key = PageCacheKey(page.get().id);
             let mut cache = self.page_cache.write();
             match cache.insert(page_key, page.clone()) {
-                Err(CacheError::Full) => Err(LimboError::CacheFull),
+                Err(CacheError::Full { should_spill }) => {
+                    if should_spill {
+                        self.stress(&mut cache)?;
+                        cache.insert(page_key, page.clone()).map_err(|e| {
+                            LimboError::InternalError(format!(
+                                "Failed to insert loaded page {page_key:?} into cache: {e:?}"
+                            ))
+                        })?;
+                        println!("Done! Current db_size: {new_db_size}");
+                        Ok(IOResult::Done(page))
+                    } else {
+                        Err(LimboError::CacheFull)
+                    }
+                }
                 Err(_) => Err(LimboError::InternalError(
                     "Unknown error inserting page to cache".into(),
                 )),
-                Ok(_) => Ok(page),
+                Ok(_) => Ok(IOResult::Done(page)),
             }
         }
     }
 
-    pub fn update_dirty_loaded_page_in_cache(
-        &self,
-        id: usize,
-        page: PageRef,
-    ) -> Result<(), LimboError> {
+    pub fn update_dirty_loaded_page_in_cache(&self, id: usize, page: PageRef) -> Result<()> {
         let mut cache = self.page_cache.write();
-        let page_key = PageCacheKey::new(id);
+        let page_key = PageCacheKey(id);
 
         // FIXME: use specific page key for writer instead of max frame, this will make readers not conflict
         assert!(page.is_dirty());
-        cache
-            .insert_ignore_existing(page_key, page.clone())
-            .map_err(|e| {
-                LimboError::InternalError(format!(
-                    "Failed to insert loaded page {id} into cache: {e:?}"
-                ))
-            })?;
+        match cache.insert_ignore_existing(page_key, page.clone()) {
+            Err(CacheError::Full { should_spill }) => {
+                if should_spill {
+                    self.stress(&mut cache)?;
+                    cache.insert(page_key, page.clone()).map_err(|e| {
+                        LimboError::InternalError(format!(
+                            "Failed to insert loaded page {page_key:?} into cache: {e:?}"
+                        ))
+                    })?;
+                } else {
+                    return Err(LimboError::CacheFull);
+                }
+            }
+            Ok(_) => {}
+            err => {
+                return Err(LimboError::InternalError(format!(
+                    "Failed to insert loaded page {id} into cache: {err:?}"
+                )))
+            }
+        }
         page.set_loaded();
         Ok(())
     }
@@ -1385,12 +1488,11 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn rollback(
-        &self,
-        schema_did_change: bool,
-        connection: &Connection,
-    ) -> Result<(), LimboError> {
+    pub fn rollback(&self, schema_did_change: bool, connection: &Connection) -> Result<()> {
         tracing::debug!(schema_did_change);
+        {
+            *self.spill_flag.borrow_mut() = SpillFlag::ROLLBACK;
+        }
         self.dirty_pages.borrow_mut().clear();
         let mut cache = self.page_cache.write();
         cache.unset_dirty_all_pages();
@@ -1406,8 +1508,54 @@ impl Pager {
             );
         }
         self.wal.borrow_mut().rollback()?;
+        *self.spill_flag.borrow_mut() = SpillFlag::ALLOWED;
+        Ok(())
+    }
+
+    // TODO: find better name for this, use as a callback like SQLite?
+    /// This function is called by the cache layer when it has reached some soft memory limit.
+    /// The pager must be purgeable (not in-memory)
+    #[instrument(skip_all, level = Level::INFO)]
+    pub fn stress(&self, page_cache: &mut DumbLruPageCache) -> Result<()> {
+        if !self.spill_flag.borrow().can_spill() {
+            return Err(LimboError::SpillNotAllowed(*self.spill_flag.borrow()));
+        }
+        let page_ids: Vec<_> = self
+            .dirty_pages
+            .borrow()
+            .iter()
+            .filter(|&page_id| *page_id != DATABASE_HEADER_PAGE_ID)
+            .copied()
+            .collect();
+        let mut dirty_pages = self.dirty_pages.borrow_mut();
+
+        for page_id in page_ids {
+            if let Some(page) = page_cache.get(&PageCacheKey(page_id)) {
+                if page.is_pinned() {
+                    continue;
+                }
+                assert!(page.is_dirty());
+                self.wal.borrow_mut().append_frame(
+                    page.clone(),
+                    0,
+                    self.flush_info.borrow().in_flight_writes.clone(),
+                )?;
+
+                page.clear_dirty();
+                page_cache.delete(PageCacheKey(page_id)).unwrap();
+                dirty_pages.remove(&page_id);
+            }
+        }
+
+        while *self.flush_info.borrow().in_flight_writes.borrow() != 0 {
+            self.io.run_once()?;
+        }
 
         Ok(())
+    }
+
+    pub fn disable_cache_spill(&self, toggle: bool) {
+        self.spill_flag.borrow_mut().disable(toggle);
     }
 }
 
@@ -1645,13 +1793,13 @@ mod tests {
             let cache = cache.clone();
             std::thread::spawn(move || {
                 let mut cache = cache.write();
-                let page_key = PageCacheKey::new(1);
+                let page_key = PageCacheKey(1);
                 cache.insert(page_key, Arc::new(Page::new(1))).unwrap();
             })
         };
         let _ = thread.join();
         let mut cache = cache.write();
-        let page_key = PageCacheKey::new(1);
+        let page_key = PageCacheKey(1);
         let page = cache.get(&page_key);
         assert_eq!(page.unwrap().get().id, 1);
     }

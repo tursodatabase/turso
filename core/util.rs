@@ -1,6 +1,6 @@
 #![allow(unused)]
 use crate::translate::expr::WalkControl;
-use crate::types::IOResult;
+
 use crate::IO;
 use crate::{
     schema::{self, Column, Schema, Type},
@@ -8,6 +8,7 @@ use crate::{
     types::{Value, ValueType},
     LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable,
 };
+use crate::{types::IOResult, Pager};
 use std::{rc::Rc, sync::Arc};
 use tracing::{instrument, Level};
 use turso_sqlite3_parser::ast::{
@@ -1092,6 +1093,14 @@ pub fn parse_pragma_bool(expr: &Expr) -> Result<bool> {
         "boolean pragma value must be either 0|1 integer or yes|true|on|no|false|off token"
             .to_string(),
     ))
+}
+
+/// Evaluate a Result<IOResult<T>> into T.
+/// This macro forcibly calls `io.run_once()` on each iteraction.
+/// Use this only in test contexts, for runtime purposes prefer `return_if_io`.
+#[allow(dead_code)]
+pub fn run_until_done<T>(action: impl FnMut() -> Result<IOResult<T>>, pager: &Pager) -> Result<T> {
+    pager.io.block(action)
 }
 
 #[cfg(test)]
