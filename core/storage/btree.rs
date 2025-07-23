@@ -576,7 +576,7 @@ impl BTreeCursor {
         loop {
             let page = self.stack.top();
 
-            return_if_locked_maybe_load!(self.pager, page);
+            turso_assert!(page.get().is_loaded(), "page should be loaded");
             let page = page.get();
             let contents = page.get().contents.as_ref().unwrap();
 
@@ -590,9 +590,9 @@ impl BTreeCursor {
                 if let Some(rightmost_pointer) = rightmost_pointer {
                     let past_rightmost_pointer = cell_count as i32 + 1;
                     self.stack.set_cell_index(past_rightmost_pointer);
-                    self.stack
-                        .push_backwards(self.read_page(rightmost_pointer as usize)?);
-                    continue;
+                    let (page, c) = self.read_page(rightmost_pointer as usize)?;
+                    self.stack.push_backwards(page);
+                    return Ok(IOResult::IO(IOCompletions::Single(c)));
                 }
             }
             if cell_idx >= cell_count as i32 {
@@ -639,9 +639,9 @@ impl BTreeCursor {
                 BTreeCell::TableInteriorCell(TableInteriorCell {
                     left_child_page, ..
                 }) => {
-                    let mem_page = self.read_page(left_child_page as usize)?;
+                    let (mem_page, c) = self.read_page(left_child_page as usize)?;
                     self.stack.push_backwards(mem_page);
-                    continue;
+                    return Ok(IOResult::IO(IOCompletions::Single(c)));
                 }
                 BTreeCell::TableLeafCell(TableLeafCell { .. }) => {
                     return Ok(IOResult::Done(true));
@@ -657,10 +657,10 @@ impl BTreeCursor {
                         // this parent: key 666
                         // left child has: key 663, key 664, key 665
                         // we need to move to the previous parent (with e.g. key 662) when iterating backwards.
-                        let mem_page = self.read_page(left_child_page as usize)?;
+                        let (mem_page, c) = self.read_page(left_child_page as usize)?;
                         self.stack.retreat();
                         self.stack.push_backwards(mem_page);
-                        continue;
+                        return Ok(IOResult::IO(IOCompletions::Single(c)));
                     }
 
                     // Going upwards = we just moved to an interior cell from the right child.
