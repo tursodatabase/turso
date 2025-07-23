@@ -131,6 +131,13 @@ impl Completion {
     pub fn has_error(&self) -> bool {
         self.error.borrow().is_some()
     }
+
+    /// Creates dummy write completion that does nothing is already complete
+    pub fn dummy_complete() -> Self {
+        let write = Self::new_write(|_| {});
+        write.complete(0);
+        write
+    }
 }
 
 pub struct ReadCompletion {

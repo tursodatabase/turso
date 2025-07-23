@@ -731,7 +731,7 @@ pub fn begin_read_page(
     buffer_pool: Arc<BufferPool>,
     page: PageRef,
     page_idx: usize,
-) -> Result<()> {
+) -> Result<Arc<Completion>> {
     tracing::trace!("begin_read_btree_page(page_idx = {})", page_idx);
     let buf = buffer_pool.get();
     let drop_fn = Rc::new(move |buf| {
@@ -752,8 +752,7 @@ pub fn begin_read_page(
         }
     });
     let c = Completion::new_read(buf, complete);
-    db_file.read_page(page_idx, c)?;
-    Ok(())
+    db_file.read_page(page_idx, c)
 }
 
 #[instrument(skip_all, level = Level::INFO)]
