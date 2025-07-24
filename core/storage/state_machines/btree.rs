@@ -139,3 +139,11 @@ pub enum RewindState {
     Start,
     NextRecord,
 }
+
+#[derive(Debug, Clone, Copy)]
+pub enum InsertState {
+    Start,
+    Seek,
+    Advance,
+    InsertIntoPage,
+}
