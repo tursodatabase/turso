@@ -378,7 +378,7 @@ pub struct BTreeCursor {
     state: CursorState,
     /// Information maintained while freeing overflow pages. Maintained separately from cursor state since
     /// any method could require freeing overflow pages
-    overflow_state: Option<OverflowState>,
+    overflow_state: OverflowState,
     /// Page stack used to traverse the btree.
     /// Each cursor has a stack because each cursor traverses the btree independently.
     stack: PageStack,
@@ -465,7 +465,7 @@ impl BTreeCursor {
             null_flag: false,
             going_upwards: false,
             state: CursorState::None,
-            overflow_state: None,
+            overflow_state: OverflowState::Start,
             stack: PageStack {
                 current_page: Cell::new(-1),
                 node_states: RefCell::new([BTreeNodeState::default(); BTCURSOR_MAX_DEPTH + 1]),
@@ -4828,7 +4828,7 @@ impl BTreeCursor {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn clear_overflow_pages(&mut self, cell: &BTreeCell) -> Result<IOResult<()>> {
         loop {
-            let state = self.overflow_state.take().unwrap_or(OverflowState::Start);
+            let state = self.overflow_state.clone();
 
             match state {
                 OverflowState::Start => {
@@ -4840,39 +4840,48 @@ impl BTreeCursor {
                         }
                         BTreeCell::TableInteriorCell(_) => return Ok(IOResult::Done(())), // No overflow pages
                     };
-
-                    if let Some(page) = first_overflow_page {
-                        self.overflow_state = Some(OverflowState::ProcessPage { next_page: page });
-                        continue;
+                    if let Some(next_page) = first_overflow_page {
+                        if next_page < 2
+                            || next_page > header_accessor::get_database_size(&self.pager)?
+                        {
+                            self.overflow_state = OverflowState::Start;
+                            return Err(LimboError::Corrupt("Invalid overflow page number".into()));
+                        }
+                        let (page, c) = self.read_page(next_page as usize)?;
+                        self.overflow_state = OverflowState::ProcessPage {
+                            next_page: page.get(),
+                        };
+                        return Ok(IOResult::IO(IOCompletions::Single(c)));
                     } else {
-                        self.overflow_state = Some(OverflowState::Done);
+                        self.overflow_state = OverflowState::Done;
                     }
                 }
                 OverflowState::ProcessPage { next_page } => {
-                    if next_page < 2
-                        || next_page as usize
-                            > header_accessor::get_database_size(&self.pager)? as usize
-                    {
-                        self.overflow_state = None;
-                        return Err(LimboError::Corrupt("Invalid overflow page number".into()));
-                    }
-                    let page = self.read_page(next_page as usize)?;
-                    return_if_locked_maybe_load!(self.pager, page);
-
-                    let page = page.get();
+                    let page = next_page;
+                    turso_assert!(page.is_loaded(), "page should be loaded");
                     let contents = page.get().contents.as_ref().unwrap();
                     let next = contents.read_u32(0);
+                    let page_id = page.get().id;
 
-                    return_if_io!(self.pager.free_page(Some(page), next_page as usize));
+                    if let IOResult::IO(io) = self.pager.free_page(Some(page), page_id)? {
+                        return Ok(IOResult::IO(io));
+                    }
 
                     if next != 0 {
-                        self.overflow_state = Some(OverflowState::ProcessPage { next_page: next });
+                        if next < 2 || next > header_accessor::get_database_size(&self.pager)? {
+                            self.overflow_state = OverflowState::Start;
+                            return Err(LimboError::Corrupt("Invalid overflow page number".into()));
+                        }
+                        let (page, c) = self.read_page(next as usize)?;
+                        self.overflow_state = OverflowState::ProcessPage {
+                            next_page: page.get(),
+                        };
                     } else {
-                        self.overflow_state = Some(OverflowState::Done);
+                        self.overflow_state = OverflowState::Done;
                     }
                 }
                 OverflowState::Done => {
-                    self.overflow_state = None;
+                    self.overflow_state = OverflowState::Start;
                     return Ok(IOResult::Done(()));
                 }
             };
@@ -5140,7 +5149,7 @@ impl BTreeCursor {
         let buf = page_ref.get().contents.as_mut().unwrap().as_ptr();
         buf[dest_offset..dest_offset + new_payload.len()].copy_from_slice(new_payload);
 
-        Ok()
+        Ok(())
     }
 
     fn get_immutable_record_or_create(&self) -> std::cell::RefMut<'_, Option<ImmutableRecord>> {

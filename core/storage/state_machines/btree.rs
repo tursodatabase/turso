@@ -82,9 +82,10 @@ pub enum PayloadOverflowWithOffset {
     },
 }
 
+#[derive(Debug, Clone)]
 pub enum OverflowState {
     Start,
-    ProcessPage { next_page: u32 },
+    ProcessPage { next_page: PageRef },
     Done,
 }
 
