@@ -5410,6 +5410,7 @@ pub struct IntegrityCheckState {
     pub current_page: usize,
     page_stack: Vec<IntegrityCheckPageEntry>,
     first_leaf_level: Option<usize>,
+    page: Option<PageRef>,
 }
 
 impl IntegrityCheckState {
@@ -5422,6 +5423,7 @@ impl IntegrityCheckState {
                 max_intkey: i64::MAX,
             }],
             first_leaf_level: None,
+            page: None,
         }
     }
 }
@@ -5457,11 +5459,20 @@ pub fn integrity_check(
     else {
         return Ok(IOResult::Done(()));
     };
-    let page = btree_read_page(pager, page_idx)?;
-    return_if_locked_maybe_load!(pager, page);
+    let page = match state.page.take() {
+        Some(page) => {
+            turso_assert!(page.is_loaded(), "page should be loaded");
+            page
+        }
+        None => {
+            let (page, c) = btree_read_page(pager, page_idx)?;
+            state.page = Some(page.get());
+            return Ok(IOResult::IO(IOCompletions::Single(c)));
+        }
+    };
+
     state.page_stack.pop();
 
-    let page = page.get();
     let contents = page.get_contents();
     let usable_space = pager.usable_space() as u16;
     let mut coverage_checker = CoverageChecker::new(page.get().id);
