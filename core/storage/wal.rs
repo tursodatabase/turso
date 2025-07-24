@@ -799,17 +799,24 @@ impl Wal for WalFile {
     fn find_frame(&self, page_id: u64) -> Result<Option<u64>> {
         let shared = self.get_shared();
         let frames = shared.frame_cache.lock();
+        // if we have read_lock 0, we are reading straight from the db file
+        if self.max_frame_read_lock_index.get() == 0 {
+            return Ok(None);
+        }
         let frames = frames.get(&page_id);
         if frames.is_none() {
             return Ok(None);
         }
         let frames = frames.unwrap();
-        for frame in frames.iter().rev() {
-            if *frame <= self.max_frame {
-                return Ok(Some(*frame));
-            }
+        if let Some(&f) = frames
+            .iter()
+            .rev()
+            .find(|&&f| f <= self.max_frame && f >= self.min_frame)
+        {
+            Ok(Some(f))
+        } else {
+            Ok(None)
         }
-        Ok(None)
     }
 
     /// Read a frame from the WAL.
@@ -1897,7 +1904,7 @@ pub mod test {
         let readmark = {
             let pager = conn2.pager.borrow_mut();
             let mut wal2 = pager.wal.borrow_mut();
-            assert!(matches!(wal2.begin_read_tx().unwrap(), LimboResult::Ok));
+            assert!(matches!(wal2.begin_read_tx().unwrap().0, LimboResult::Ok));
             wal2.get_max_frame()
         };
 
@@ -1932,7 +1939,7 @@ pub mod test {
         {
             let pager = conn2.pager.borrow_mut();
             let wal2 = pager.wal.borrow_mut();
-            wal2.end_read_tx().unwrap();
+            wal2.end_read_tx();
         }
 
         // Second passive checkpoint should finish
@@ -2068,7 +2075,7 @@ pub mod test {
         let r1_max_frame = {
             let pager = conn_r1.pager.borrow_mut();
             let mut wal = pager.wal.borrow_mut();
-            assert!(matches!(wal.begin_read_tx().unwrap(), LimboResult::Ok));
+            assert!(matches!(wal.begin_read_tx().unwrap().0, LimboResult::Ok));
             wal.get_max_frame()
         };
         bulk_inserts(&conn_writer, 5, 10);
@@ -2077,7 +2084,7 @@ pub mod test {
         let r2_max_frame = {
             let pager = conn_r2.pager.borrow_mut();
             let mut wal = pager.wal.borrow_mut();
-            assert!(matches!(wal.begin_read_tx().unwrap(), LimboResult::Ok));
+            assert!(matches!(wal.begin_read_tx().unwrap().0, LimboResult::Ok));
             wal.get_max_frame()
         };
 
@@ -2169,7 +2176,7 @@ pub mod test {
         );
 
         // release write lock
-        conn2.pager.borrow().wal.borrow().end_write_tx().unwrap();
+        conn2.pager.borrow().wal.borrow().end_write_tx();
 
         // now restart should succeed
         let result = {
