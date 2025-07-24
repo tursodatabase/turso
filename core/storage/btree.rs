@@ -13,7 +13,7 @@ use crate::{
         state_machines::btree::{
             BalanceState, DeleteState, DestroyState, EmptyTableState, InsertIntoPageState,
             InsertState, MoveToState, NextPrevState, OverflowState, PayloadOverflowWithOffset,
-            RewindState, SeekToState, WriteState,
+            RewindState, SeekToState,
         },
     },
     translate::plan::IterationDirection,
@@ -26,7 +26,7 @@ use crate::{
 };
 
 use crate::{
-    return_corrupt, return_if_io,
+    return_corrupt,
     types::{compare_immutable, IOResult, ImmutableRecord, RefValue, SeekKey, SeekOp, Value},
     LimboError, Result,
 };
@@ -4445,7 +4445,7 @@ impl BTreeCursor {
                 } => {
                     // TODO: Seems to be a redundant operation as if the page is on the stack it should have been loaded already
                     let page = self.stack.top();
-                    let (page, c) = self.read_page(page.get().get().id)?;
+                    let (_page, c) = self.read_page(page.get().get().id)?;
 
                     let delete_info = self.state.mut_delete_info().unwrap();
                     delete_info.state = DeleteState::FindCell {
@@ -4681,7 +4681,7 @@ impl BTreeCursor {
                         let delete_info = self.state.mut_delete_info().unwrap();
                         if delete_info.balance_write_info.is_none() {
                             let mut write_info = WriteInfo::new();
-                            write_info.state = WriteState::BalanceStart;
+                            write_info.state = BalanceState::Start;
                             delete_info.balance_write_info = Some(write_info);
                         }
                         let balance_only_ancestor =
@@ -4876,6 +4876,7 @@ impl BTreeCursor {
                         self.overflow_state = OverflowState::ProcessPage {
                             next_page: page.get(),
                         };
+                        return Ok(IOResult::IO(IOCompletions::Single(c)));
                     } else {
                         self.overflow_state = OverflowState::Done;
                     }
@@ -4906,7 +4907,6 @@ impl BTreeCursor {
     #[instrument(skip(self), level = Level::DEBUG)]
     pub fn btree_destroy(&mut self) -> Result<IOResult<Option<usize>>> {
         if let CursorState::None = &self.state {
-            self.move_to_root()?;
             self.state = CursorState::Destroy(DestroyInfo {
                 state: DestroyState::Start,
             });
@@ -4923,26 +4923,18 @@ impl BTreeCursor {
 
             match destroy_state {
                 DestroyState::Start => {
-                    let destroy_info = self
-                        .state
-                        .mut_destroy_info()
-                        .expect("unable to get a mut reference to destroy state in cursor");
-                    destroy_info.state = DestroyState::LoadPage;
-                }
-                DestroyState::LoadPage => {
-                    let page = self.stack.top();
-                    return_if_locked_maybe_load!(self.pager, page);
-
+                    let c = self.move_to_root()?;
                     let destroy_info = self
                         .state
                         .mut_destroy_info()
                         .expect("unable to get a mut reference to destroy state in cursor");
                     destroy_info.state = DestroyState::ProcessPage;
+                    return Ok(IOResult::IO(IOCompletions::Single(c)));
                 }
                 DestroyState::ProcessPage => {
                     let page = self.stack.top();
-                    self.stack.advance();
                     assert!(page.get().is_loaded()); //  page should be loaded at this time
+                    self.stack.advance();
                     let page = page.get();
                     let contents = page.get().contents.as_ref().unwrap();
                     let cell_idx = self.stack.current_cell_index();
@@ -4961,12 +4953,13 @@ impl BTreeCursor {
                             //  Non-leaf page which has processed all children but not it's potential right child
                             (false, n) if n == contents.cell_count() as i32 => {
                                 if let Some(rightmost) = contents.rightmost_pointer() {
-                                    let rightmost_page = self.read_page(rightmost as usize)?;
+                                    let (rightmost_page, c) = self.read_page(rightmost as usize)?;
                                     self.stack.push(rightmost_page);
                                     let destroy_info = self.state.mut_destroy_info().expect(
                                         "unable to get a mut reference to destroy state in cursor",
                                     );
-                                    destroy_info.state = DestroyState::LoadPage;
+                                    destroy_info.state = DestroyState::ProcessPage;
+                                    return Ok(IOResult::IO(IOCompletions::Single(c)));
                                 } else {
                                     let destroy_info = self.state.mut_destroy_info().expect(
                                         "unable to get a mut reference to destroy state in cursor",
@@ -5018,13 +5011,13 @@ impl BTreeCursor {
                                     BTreeCell::IndexInteriorCell(cell) => cell.left_child_page,
                                     _ => panic!("expected interior cell"),
                                 };
-                                let child_page = self.read_page(child_page_id as usize)?;
+                                let (child_page, c) = self.read_page(child_page_id as usize)?;
                                 self.stack.push(child_page);
                                 let destroy_info = self.state.mut_destroy_info().expect(
                                     "unable to get a mut reference to destroy state in cursor",
                                 );
-                                destroy_info.state = DestroyState::LoadPage;
-                                continue;
+                                destroy_info.state = DestroyState::ProcessPage;
+                                return Ok(IOResult::IO(IOCompletions::Single(c)));
                             }
                         },
                     }
@@ -5034,32 +5027,36 @@ impl BTreeCursor {
                         IOResult::Done(_) => match cell {
                             //  For an index interior cell, clear the left child page now that overflow pages have been cleared
                             BTreeCell::IndexInteriorCell(index_int_cell) => {
-                                let child_page =
+                                let (child_page, c) =
                                     self.read_page(index_int_cell.left_child_page as usize)?;
                                 self.stack.push(child_page);
                                 let destroy_info = self.state.mut_destroy_info().expect(
                                     "unable to get a mut reference to destroy state in cursor",
                                 );
-                                destroy_info.state = DestroyState::LoadPage;
-                                continue;
+                                destroy_info.state = DestroyState::ProcessPage;
+                                return Ok(IOResult::IO(IOCompletions::Single(c)));
                             }
                             //  For any leaf cell, advance the index now that overflow pages have been cleared
                             BTreeCell::TableLeafCell(_) | BTreeCell::IndexLeafCell(_) => {
                                 let destroy_info = self.state.mut_destroy_info().expect(
                                     "unable to get a mut reference to destroy state in cursor",
                                 );
-                                destroy_info.state = DestroyState::LoadPage;
+                                destroy_info.state = DestroyState::ProcessPage;
                             }
                             _ => panic!("unexpected cell type"),
                         },
-                        IOResult::IO => return Ok(IOResult::IO),
+                        IOResult::IO(io) => return Ok(IOResult::IO(io)),
                     }
                 }
                 DestroyState::FreePage => {
                     let page = self.stack.top();
-                    let page_id = page.get().get().id;
+                    let page = page.get();
+                    let page_id = page.get().id;
+                    turso_assert!(page.is_loaded(), "page should be loaded");
 
-                    return_if_io!(self.pager.free_page(Some(page.get()), page_id));
+                    if let IOResult::IO(io) = self.pager.free_page(Some(page), page_id)? {
+                        return Ok(IOResult::IO(io));
+                    }
 
                     if self.stack.has_parent() {
                         self.stack.pop();

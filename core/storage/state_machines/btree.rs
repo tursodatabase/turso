@@ -11,7 +11,6 @@ use crate::{
 #[derive(Debug, Clone)]
 pub enum DestroyState {
     Start,
-    LoadPage,
     ProcessPage,
     ClearOverflowPages { cell: BTreeCell },
     FreePage,
