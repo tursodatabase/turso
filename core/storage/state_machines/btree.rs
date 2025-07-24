@@ -127,3 +127,9 @@ pub enum NextPrevState {
     Start,
     GetRecord,
 }
+
+#[derive(Debug, Clone, Copy)]
+pub enum SeekToState {
+    Start,
+    ProcessPage,
+}

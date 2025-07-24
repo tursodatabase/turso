@@ -12,7 +12,7 @@ use crate::{
         },
         state_machines::btree::{
             DeleteState, DestroyState, EmptyTableState, MoveToState, NextPrevState, OverflowState,
-            PayloadOverflowWithOffset, WriteState,
+            PayloadOverflowWithOffset, SeekToState, WriteState,
         },
     },
     translate::plan::IterationDirection,
@@ -435,11 +435,13 @@ pub struct BTreeCursor {
     /// - The underlying `ImmutableRecord` is modified
     pub record_cursor: RefCell<RecordCursor>,
     /// State machine for `is_empty_table`
-    empty_table_state: EmptyTableState,
+    empty_table_state: RefCell<EmptyTableState>,
     /// State machine for move_to related functions
     move_to_state: MoveToState,
     /// State machine for `next` and `prev`
     next_prev_state: NextPrevState,
+    /// State machine for move_to related functions
+    seek_to_state: SeekToState,
 }
 
 /// We store the cell index and cell count for each page in the stack.
@@ -494,8 +496,10 @@ impl BTreeCursor {
             read_overflow_state: RefCell::new(None),
             parse_record_state: RefCell::new(ParseRecordState::Init),
             record_cursor: RefCell::new(RecordCursor::with_capacity(num_columns)),
-            empty_table_state: EmptyTableState::Start,
+            empty_table_state: RefCell::new(EmptyTableState::Start),
             move_to_state: MoveToState::Start,
+            next_prev_state: NextPrevState::Start,
+            seek_to_state: SeekToState::Start,
         }
     }
 
@@ -569,6 +573,7 @@ impl BTreeCursor {
                     .as_ref()
                     .expect("page should have been loaded")
                     .cell_count();
+                *state = EmptyTableState::Start;
                 Ok(IOResult::Done(cell_count == 0))
             }
         }
@@ -4031,15 +4036,15 @@ impl BTreeCursor {
         assert!(self.mv_cursor.is_none()); // unsure about this -_-
 
         // Reusing this state machine for convenience
-        let state = self.move_to_state;
+        let state = self.seek_to_state;
         match state {
-            MoveToState::Start => {
+            SeekToState::Start => {
                 // move_to_root add the page to the stack and asks to load it
                 let c = self.move_to_root()?;
-                self.move_to_state = MoveToState::ProcessPage;
+                self.move_to_state = SeekToState::ProcessPage;
                 return Ok(IOResult::IO(IOCompletions::Single(c)));
             }
-            MoveToState::ProcessPage => {
+            SeekToState::ProcessPage => {
                 let mem_page = self.stack.top();
 
                 let page = mem_page.get();
@@ -4048,7 +4053,7 @@ impl BTreeCursor {
                 if contents.is_leaf() {
                     // set cursor just past the last cell to append
                     self.stack.set_cell_index(contents.cell_count() as i32);
-                    self.move_to_state = MoveToState::Start;
+                    self.move_to_state = SeekToState::Start;
                     return Ok(IOResult::Done(()));
                 }
 
@@ -4068,15 +4073,37 @@ impl BTreeCursor {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn seek_to_last(&mut self) -> Result<IOResult<()>> {
         assert!(self.mv_cursor.is_none());
-        let has_record = return_if_io!(self.move_to_rightmost());
-        self.invalidate_record();
-        self.has_record.replace(has_record);
-        if !has_record {
-            let is_empty = return_if_io!(self.is_empty_table());
-            assert!(is_empty);
-            return Ok(IOResult::Done(()));
+        let state = self.seek_to_state;
+        loop {
+            match state {
+                SeekToState::Start => {
+                    let result = self.move_to_rightmost()?;
+                    match result {
+                        IOResult::Done(has_record) => {
+                            self.invalidate_record();
+                            self.has_record.replace(has_record);
+                            if has_record {
+                                return Ok(IOResult::Done(()));
+                            } else {
+                                self.seek_to_state = SeekToState::ProcessPage;
+                            }
+                        }
+                        IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                    }
+                }
+                SeekToState::ProcessPage => {
+                    let result = self.is_empty_table()?;
+                    match result {
+                        IOResult::Done(is_empty) => {
+                            assert!(is_empty);
+                            self.seek_to_state = SeekToState::Start;
+                            return Ok(IOResult::Done(()));
+                        }
+                        IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                    }
+                }
+            }
         }
-        Ok(IOResult::Done(()))
     }
 
     pub fn is_empty(&self) -> bool {
