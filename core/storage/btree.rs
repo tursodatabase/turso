@@ -906,7 +906,7 @@ impl BTreeCursor {
         usable_space: usize,
     ) -> Result<IOResult<()>> {
         loop {
-            let mut state = std::mem::replace(&mut self.state, CursorState::None);
+            let state = std::mem::replace(&mut self.state, CursorState::None);
             let CursorState::ReadWritePayload(mut state) = state else {
                 return Err(LimboError::InternalError(
                     "Invalid state for continue_payload_overflow_with_offset".into(),
@@ -1089,8 +1089,8 @@ impl BTreeCursor {
         }
         loop {
             let mem_page_rc = self.stack.top();
-            return_if_locked_maybe_load!(self.pager, mem_page_rc);
             let mem_page = mem_page_rc.get();
+            turso_assert!(mem_page.is_loaded(), "mem page should be loaded");
 
             let contents = mem_page.get().contents.as_ref().unwrap();
             let cell_count = contents.cell_count();
@@ -1129,9 +1129,9 @@ impl BTreeCursor {
                     (Some(right_most_pointer), false) => {
                         // do rightmost
                         self.stack.advance();
-                        let mem_page = self.read_page(right_most_pointer as usize)?;
+                        let (mem_page, c) = self.read_page(right_most_pointer as usize)?;
                         self.stack.push(mem_page);
-                        continue;
+                        return Ok(IOResult::IO(IOCompletions::Single(c)));
                     }
                     _ => {
                         if self.ancestor_pages_have_more_children() {
@@ -1161,9 +1161,9 @@ impl BTreeCursor {
                 BTreeCell::TableInteriorCell(TableInteriorCell {
                     left_child_page, ..
                 }) => {
-                    let mem_page = self.read_page(*left_child_page as usize)?;
+                    let (mem_page, c) = self.read_page(*left_child_page as usize)?;
                     self.stack.push(mem_page);
-                    continue;
+                    return Ok(IOResult::IO(IOCompletions::Single(c)));
                 }
                 BTreeCell::TableLeafCell(TableLeafCell { .. }) => {
                     return Ok(IOResult::Done(true));
@@ -1175,9 +1175,9 @@ impl BTreeCursor {
                         self.going_upwards = false;
                         return Ok(IOResult::Done(true));
                     } else {
-                        let mem_page = self.read_page(*left_child_page as usize)?;
+                        let (mem_page, c) = self.read_page(*left_child_page as usize)?;
                         self.stack.push(mem_page);
-                        continue;
+                        return Ok(IOResult::IO(IOCompletions::Single(c)));
                     }
                 }
                 BTreeCell::IndexLeafCell(IndexLeafCell { .. }) => {
