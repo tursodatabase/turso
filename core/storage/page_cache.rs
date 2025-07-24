@@ -139,7 +139,7 @@ impl DumbLruPageCache {
         let ptr = *self.map.borrow().get(&key).unwrap();
 
         // Try to detach from LRU list first, can fail
-        self.detach(ptr, clean_page)?;
+        self.detach(ptr, clean_page, false)?;
         let ptr = self.map.borrow_mut().remove(&key).unwrap();
         unsafe {
             let _ = Box::from_raw(ptr.as_ptr());
@@ -186,9 +186,10 @@ impl DumbLruPageCache {
         mut entry: NonNull<PageCacheEntry>,
         clean_page: bool,
         allow_detach_pinned: bool,
+        allow_detach_locked: bool,
     ) -> Result<(), CacheError> {
         let entry_mut = unsafe { entry.as_mut() };
-        if entry_mut.page.is_locked() {
+        if !allow_detach_locked && entry_mut.page.is_locked() {
             return Err(CacheError::Locked);
         }
         if entry_mut.page.is_dirty() {
@@ -215,16 +216,18 @@ impl DumbLruPageCache {
         &mut self,
         entry: NonNull<PageCacheEntry>,
         clean_page: bool,
+        allow_detach_locked: bool,
     ) -> Result<(), CacheError> {
-        self._detach(entry, clean_page, false)
+        self._detach(entry, clean_page, false, allow_detach_locked)
     }
 
     fn detach_even_if_pinned(
         &mut self,
         entry: NonNull<PageCacheEntry>,
         clean_page: bool,
+        allow_detach_locked: bool,
     ) -> Result<(), CacheError> {
-        self._detach(entry, clean_page, true)
+        self._detach(entry, clean_page, true, allow_detach_locked)
     }
 
     fn unlink(&mut self, mut entry: NonNull<PageCacheEntry>) {
@@ -316,14 +319,14 @@ impl DumbLruPageCache {
         }
     }
 
-    pub fn clear(&mut self) -> Result<(), CacheError> {
+    pub fn clear(&mut self, allow_detach_locked: bool) -> Result<(), CacheError> {
         let mut current = *self.head.borrow();
         while let Some(current_entry) = current {
             unsafe {
                 self.map.borrow_mut().remove(&current_entry.as_ref().key);
             }
             let next = unsafe { current_entry.as_ref().next };
-            self.detach_even_if_pinned(current_entry, true)?;
+            self.detach_even_if_pinned(current_entry, true, allow_detach_locked)?;
             unsafe {
                 assert!(!current_entry.as_ref().page.is_dirty());
             }
@@ -906,7 +909,7 @@ mod tests {
         let mut cache = DumbLruPageCache::default();
         let (_, mut entry) = insert_and_get_entry(&mut cache, 1);
         unsafe { entry.as_mut().page.set_locked() };
-        assert_eq!(cache.detach(entry, false), Err(CacheError::Locked));
+        assert_eq!(cache.detach(entry, false, false), Err(CacheError::Locked));
         cache.verify_list_integrity();
     }
 
@@ -917,7 +920,7 @@ mod tests {
         cache.get(&key).expect("Page should exist");
         unsafe { entry.as_mut().page.set_dirty() };
         assert_eq!(
-            cache.detach(entry, false),
+            cache.detach(entry, false, false),
             Err(CacheError::Dirty { pgno: 1 })
         );
         cache.verify_list_integrity();
@@ -929,7 +932,10 @@ mod tests {
         let mut cache = DumbLruPageCache::default();
         let (key, entry) = insert_and_get_entry(&mut cache, 1);
         let page_ref = cache.get(&key);
-        assert_eq!(cache.detach(entry, true), Err(CacheError::ActiveRefs));
+        assert_eq!(
+            cache.detach(entry, true, false),
+            Err(CacheError::ActiveRefs)
+        );
         drop(page_ref);
         cache.verify_list_integrity();
     }
@@ -940,7 +946,7 @@ mod tests {
         let mut cache = DumbLruPageCache::default();
         let (key, entry) = insert_and_get_entry(&mut cache, 1);
         cache.get(&key).expect("Page should exist");
-        assert!(cache.detach(entry, false).is_ok());
+        assert!(cache.detach(entry, false, false).is_ok());
         assert!(cache.map.borrow_mut().remove(&key).is_some());
         cache.verify_list_integrity();
     }
@@ -949,7 +955,7 @@ mod tests {
     fn test_detach_without_cleaning() {
         let mut cache = DumbLruPageCache::default();
         let (key, entry) = insert_and_get_entry(&mut cache, 1);
-        assert!(cache.detach(entry, false).is_ok());
+        assert!(cache.detach(entry, false, false).is_ok());
         assert!(cache.map.borrow_mut().remove(&key).is_some());
         cache.verify_list_integrity();
         assert_eq!(cache.len(), 0);
@@ -962,7 +968,7 @@ mod tests {
         let page = cache.get(&key).expect("Page should exist");
         assert!(page_has_content(&page));
         drop(page);
-        assert!(cache.detach(entry, true).is_ok());
+        assert!(cache.detach(entry, true, false).is_ok());
         // Internal testing: the page is still in map, so we use it to check content
         let page = cache.peek(&key, false).expect("Page should exist in map");
         assert!(!page_has_content(&page));
@@ -974,7 +980,7 @@ mod tests {
     fn test_detach_only_element_preserves_integrity() {
         let mut cache = DumbLruPageCache::default();
         let (_, entry) = insert_and_get_entry(&mut cache, 1);
-        assert!(cache.detach(entry, false).is_ok());
+        assert!(cache.detach(entry, false, false).is_ok());
         assert!(
             cache.head.borrow().is_none(),
             "Head should be None after detaching only element"
@@ -995,7 +1001,7 @@ mod tests {
         let tail_key = unsafe { cache.tail.borrow().unwrap().as_ref().key.clone() };
         assert_eq!(head_key, key3, "Head should be key3");
         assert_eq!(tail_key, key1, "Tail should be key1");
-        assert!(cache.detach(entry2, false).is_ok());
+        assert!(cache.detach(entry2, false, false).is_ok());
         let head_entry = unsafe { cache.head.borrow().unwrap().as_ref() };
         let tail_entry = unsafe { cache.tail.borrow().unwrap().as_ref() };
         assert_eq!(head_entry.key, key3, "Head should still be key3");
@@ -1134,7 +1140,7 @@ mod tests {
         let mut cache = DumbLruPageCache::default();
         let key1 = insert_page(&mut cache, 1);
         let key2 = insert_page(&mut cache, 2);
-        assert!(cache.clear().is_ok());
+        assert!(cache.clear(false).is_ok());
         assert!(cache.get(&key1).is_none());
         assert!(cache.get(&key2).is_none());
     }
@@ -1235,7 +1241,7 @@ mod tests {
                 cache.insert(key, page).unwrap();
             }
 
-            cache.clear().unwrap();
+            cache.clear(false).unwrap();
             drop(cache);
         }
 

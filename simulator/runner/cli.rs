@@ -129,6 +129,14 @@ pub struct SimulatorCLI {
     pub experimental_mvcc: bool,
     #[clap(long, help = "Disable experimental indexing feature")]
     pub disable_experimental_indexes: bool,
+    #[clap(
+        long,
+        help = "Use memory IO for complex simulations",
+        default_value_t = false
+    )]
+    pub memory_io: bool,
+    #[clap(long, help = "Disable log file output", default_value_t = false)]
+    pub disable_log_file: bool,
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]

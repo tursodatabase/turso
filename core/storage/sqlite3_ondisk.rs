@@ -62,6 +62,7 @@ use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, Text
 use crate::{turso_assert, File, Result, WalFileShared};
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -756,7 +757,7 @@ pub fn begin_read_page(
     Ok(())
 }
 
-#[instrument(skip_all, level = Level::INFO)]
+#[instrument(skip_all, level = Level::DEBUG)]
 pub fn finish_read_page(
     page_idx: usize,
     buffer_ref: Arc<RefCell<Buffer>>,
@@ -779,11 +780,7 @@ pub fn finish_read_page(
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-pub fn begin_write_btree_page(
-    pager: &Pager,
-    page: &PageRef,
-    write_counter: Rc<RefCell<usize>>,
-) -> Result<()> {
+pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Arc<Completion>> {
     tracing::trace!("begin_write_btree_page(page={})", page.get().id);
     let page_source = &pager.db_file;
     let page_finish = page.clone();
@@ -796,15 +793,12 @@ pub fn begin_write_btree_page(
         contents.buffer.clone()
     };
 
-    *write_counter.borrow_mut() += 1;
-    let clone_counter = write_counter.clone();
     let write_complete = {
         let buf_copy = buffer.clone();
         Box::new(move |bytes_written: i32| {
             tracing::trace!("finish_write_btree_page");
             let buf_copy = buf_copy.clone();
             let buf_len = buf_copy.borrow().len();
-            *clone_counter.borrow_mut() -= 1;
 
             page_finish.clear_dirty();
             turso_assert!(
@@ -814,24 +808,14 @@ pub fn begin_write_btree_page(
         })
     };
     let c = Completion::new_write(write_complete);
-    let res = page_source.write_page(page_id, buffer.clone(), c);
-    if res.is_err() {
-        // Avoid infinite loop if write page fails
-        *write_counter.borrow_mut() -= 1;
-    }
-    res
+    page_source.write_page(page_id, buffer.clone(), c)
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>, syncing: Rc<RefCell<bool>>) -> Result<()> {
-    assert!(!*syncing.borrow());
-    *syncing.borrow_mut() = true;
-    let completion = Completion::new_sync(move |_| {
-        *syncing.borrow_mut() = false;
-    });
+pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>) -> Result<Arc<Completion>> {
+    let completion = Completion::new_sync(move |_| {});
     #[allow(clippy::arc_with_non_send_sync)]
-    db_file.sync(completion)?;
-    Ok(())
+    db_file.sync(completion)
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -849,7 +833,7 @@ pub struct TableInteriorCell {
     pub rowid: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TableLeafCell {
     pub rowid: i64,
     /// Payload of cell, if it overflows it won't include overflowed payload.
@@ -857,6 +841,16 @@ pub struct TableLeafCell {
     /// This is the complete payload size including overflow pages.
     pub payload_size: u64,
     pub first_overflow_page: Option<u32>,
+}
+
+impl Debug for TableLeafCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TableLeafCell")
+            .field("rowid", &self.rowid)
+            .field("payload_size", &self.payload_size)
+            .field("first_overflow_page", &self.first_overflow_page)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
