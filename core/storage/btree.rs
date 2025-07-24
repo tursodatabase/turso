@@ -4029,28 +4029,38 @@ impl BTreeCursor {
 
     pub fn seek_end(&mut self) -> Result<IOResult<()>> {
         assert!(self.mv_cursor.is_none()); // unsure about this -_-
-        self.move_to_root()?;
-        loop {
-            let mem_page = self.stack.top();
-            let page_id = mem_page.get().get().id;
-            let page = self.read_page(page_id)?;
-            return_if_locked_maybe_load!(self.pager, page);
 
-            let page = page.get();
-            let contents = page.get().contents.as_ref().unwrap();
-            if contents.is_leaf() {
-                // set cursor just past the last cell to append
-                self.stack.set_cell_index(contents.cell_count() as i32);
-                return Ok(IOResult::Done(()));
+        // Reusing this state machine for convenience
+        let state = self.move_to_state;
+        match state {
+            MoveToState::Start => {
+                // move_to_root add the page to the stack and asks to load it
+                let c = self.move_to_root()?;
+                self.move_to_state = MoveToState::ProcessPage;
+                return Ok(IOResult::IO(IOCompletions::Single(c)));
             }
+            MoveToState::ProcessPage => {
+                let mem_page = self.stack.top();
 
-            match contents.rightmost_pointer() {
-                Some(right_most_pointer) => {
-                    self.stack.set_cell_index(contents.cell_count() as i32 + 1); // invalid on interior
-                    let child = self.read_page(right_most_pointer as usize)?;
-                    self.stack.push(child);
+                let page = mem_page.get();
+                turso_assert!(page.is_loaded(), "page should be loaded");
+                let contents = page.get().contents.as_ref().unwrap();
+                if contents.is_leaf() {
+                    // set cursor just past the last cell to append
+                    self.stack.set_cell_index(contents.cell_count() as i32);
+                    self.move_to_state = MoveToState::Start;
+                    return Ok(IOResult::Done(()));
                 }
-                None => unreachable!("interior page must have rightmost pointer"),
+
+                match contents.rightmost_pointer() {
+                    Some(right_most_pointer) => {
+                        self.stack.set_cell_index(contents.cell_count() as i32 + 1); // invalid on interior
+                        let (child, c) = self.read_page(right_most_pointer as usize)?;
+                        self.stack.push(child);
+                        return Ok(IOResult::IO(IOCompletions::Single(c)));
+                    }
+                    None => unreachable!("interior page must have rightmost pointer"),
+                }
             }
         }
     }
