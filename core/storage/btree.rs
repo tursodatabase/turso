@@ -4154,10 +4154,15 @@ impl BTreeCursor {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn last(&mut self) -> Result<IOResult<()>> {
         assert!(self.mv_cursor.is_none());
-        let cursor_has_record = return_if_io!(self.move_to_rightmost());
-        self.has_record.replace(cursor_has_record);
-        self.invalidate_record();
-        Ok(IOResult::Done(()))
+        let result = self.move_to_rightmost()?;
+        match result {
+            IOResult::Done(cursor_has_record) => {
+                self.invalidate_record();
+                self.has_record.replace(cursor_has_record);
+                Ok(IOResult::Done(()))
+            }
+            IOResult::IO(io) => Ok(IOResult::IO(io)),
+        }
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
