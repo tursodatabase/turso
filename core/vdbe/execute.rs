@@ -10,8 +10,8 @@ use crate::storage::wal::DummyWAL;
 use crate::storage::{self, header_accessor};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
-    compare_immutable, compare_records_generic, ImmutableRecord, RawSlice, SeekResult, Text,
-    TextRef, TextSubtype,
+    compare_immutable, compare_records_generic, Extendable, ImmutableRecord, RawSlice, SeekResult,
+    Text, TextRef, TextSubtype,
 };
 use crate::util::normalize_ident;
 use crate::vdbe::insn::InsertFlags;
@@ -1589,23 +1589,13 @@ pub fn op_column(
                 };
                 match (default, &mut state.registers[*dest]) {
                     (Value::Text(new_text), Register::Value(Value::Text(existing_text))) => {
-                        let new_text_str = new_text.as_str();
-                        if existing_text.value.capacity() >= new_text_str.len() {
-                            existing_text.value.clear();
-                            existing_text
-                                .value
-                                .extend_from_slice(new_text_str.as_bytes());
-                            existing_text.subtype = new_text.subtype;
-                        } else {
+                        if !existing_text.maybe_extend(new_text) {
                             state.registers[*dest] =
-                                Register::Value(Value::Text(Text::new(new_text_str)));
+                                Register::Value(Value::Text(Text::new(new_text.as_str())));
                         }
                     }
                     (Value::Blob(new_blob), Register::Value(Value::Blob(existing_blob))) => {
-                        if existing_blob.capacity() >= new_blob.len() {
-                            existing_blob.clear();
-                            existing_blob.extend_from_slice(new_blob);
-                        } else {
+                        if !existing_blob.maybe_extend(new_blob) {
                             state.registers[*dest] =
                                 Register::Value(Value::Blob(new_blob.to_vec()));
                         }
@@ -1621,26 +1611,15 @@ pub fn op_column(
             // Try to reuse the registers when allocation is not needed.
             match (&value, &mut state.registers[*dest]) {
                 (RefValue::Text(new_text), Register::Value(Value::Text(existing_text))) => {
-                    let new_text_str = new_text.as_str();
-                    if existing_text.value.capacity() >= new_text_str.len() {
-                        existing_text.value.clear();
-                        existing_text
-                            .value
-                            .extend_from_slice(new_text_str.as_bytes());
-                        existing_text.subtype = new_text.subtype;
-                    } else {
+                    if !existing_text.maybe_extend(new_text) {
                         state.registers[*dest] =
-                            Register::Value(Value::Text(Text::new(new_text_str)));
+                            Register::Value(Value::Text(Text::new(new_text.as_str())));
                     }
                 }
                 (RefValue::Blob(new_blob), Register::Value(Value::Blob(existing_blob))) => {
-                    let new_blob_slice = new_blob.to_slice();
-                    if existing_blob.capacity() >= new_blob_slice.len() {
-                        existing_blob.clear();
-                        existing_blob.extend_from_slice(new_blob_slice);
-                    } else {
+                    if !existing_blob.maybe_extend(new_blob) {
                         state.registers[*dest] =
-                            Register::Value(Value::Blob(new_blob_slice.to_vec()));
+                            Register::Value(Value::Blob(new_blob.to_slice().to_vec()));
                     }
                 }
                 _ => {
