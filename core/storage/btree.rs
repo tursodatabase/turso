@@ -4346,8 +4346,8 @@ impl BTreeCursor {
             };
         }
         let page = self.stack.top();
-        return_if_locked_maybe_load!(self.pager, page);
         let page = page.get();
+        turso_assert!(page.is_loaded(), "page should be loaded");
         let contents = page.get_contents();
         let cell_idx = self.stack.current_cell_index();
         let cell = contents.cell_get(cell_idx as usize, self.usable_space())?;
@@ -4372,7 +4372,10 @@ impl BTreeCursor {
             _ => unreachable!("unexpected page_type"),
         };
         if let Some(next_page) = first_overflow_page {
-            return_if_io!(self.process_overflow_read(payload, next_page, payload_size))
+            let ret = self.process_overflow_read(payload, next_page, payload_size)?;
+            if let IOResult::IO(io) = ret {
+                return Ok(IOResult::IO(io));
+            }
         } else {
             self.get_immutable_record_or_create()
                 .as_mut()
