@@ -63,28 +63,6 @@ pub enum DeleteState {
     TryAdvance,
 }
 
-/// State machine of a write operation.
-/// May involve balancing due to overflow.
-#[derive(Debug, Clone, Copy)]
-pub enum WriteState {
-    Start,
-    BalanceStart,
-    BalanceFreePages {
-        curr_page: usize,
-        sibling_count_new: usize,
-    },
-    /// Choose which sibling pages to balance (max 3).
-    /// Generally, the siblings involved will be the page that triggered the balancing and its left and right siblings.
-    /// The exceptions are:
-    /// 1. If the leftmost page triggered balancing, up to 3 leftmost pages will be balanced.
-    /// 2. If the rightmost page triggered balancing, up to 3 rightmost pages will be balanced.
-    BalanceNonRootPickSiblings,
-    /// Perform the actual balancing. This will result in 1-5 pages depending on the number of total cells to be distributed
-    /// from the source pages.
-    BalanceNonRootDoBalancing,
-    Finish,
-}
-
 pub enum PayloadOverflowWithOffset {
     SkipOverflowPages {
         next_page: BTreePage,
@@ -169,6 +147,7 @@ pub enum InsertIntoPageState {
 }
 
 #[derive(Debug, Clone, Copy)]
+/// May involve balancing due to overflow.
 pub enum BalanceState {
     Start,
     FreePages {

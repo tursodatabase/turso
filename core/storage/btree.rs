@@ -4091,12 +4091,14 @@ impl BTreeCursor {
             }
         }
         if self.has_record.get() {
-            let page = self.stack.top();
-            return_if_locked_maybe_load!(self.pager, page);
             // load record
-            let _ = return_if_io!(self.record());
-            let page_type = page.get().get_contents().page_type();
+            if let IOResult::IO(io) = self.record()? {
+                return Ok(IOResult::IO(io));
+            };
+            let page = self.stack.top();
             let page = page.get();
+            turso_assert!(page.is_loaded(), "page should be loaded");
+            let page_type = page.get_contents().page_type();
             let contents = page.get_contents();
             let cell_idx = self.stack.current_cell_index();
             let cell = contents.cell_get(cell_idx as usize, self.usable_space())?;
@@ -4207,6 +4209,8 @@ impl BTreeCursor {
             _ => unreachable!("unexpected page_type"),
         };
         if let Some(next_page) = first_overflow_page {
+            // Supposedly there is no need for a state machine as everything above this call should be reentrant
+            // This is assuming the caller of course is reentrant as well and does not modify the page stack
             let ret = self.process_overflow_read(payload, next_page, payload_size)?;
             if let IOResult::IO(io) = ret {
                 return Ok(IOResult::IO(io));
@@ -4385,9 +4389,14 @@ impl BTreeCursor {
                         page.get().get_contents().page_type(),
                         PageType::TableLeaf | PageType::TableInterior
                     ) {
-                        if return_if_io!(self.rowid()).is_none() {
-                            self.state = CursorState::None;
-                            return Ok(IOResult::Done(()));
+                        match self.rowid()? {
+                            IOResult::Done(rowid) => {
+                                if rowid.is_none() {
+                                    self.state = CursorState::None;
+                                    return Ok(IOResult::Done(()));
+                                }
+                            }
+                            IOResult::IO(io) => return Ok(IOResult::IO(io)),
                         }
                     } else if self.reusable_immutable_record.borrow().is_none() {
                         self.state = CursorState::None;
@@ -4403,18 +4412,26 @@ impl BTreeCursor {
                     // Right now we calculate the key every time for simplicity/debugging
                     // since it won't affect correctness which is more important
                     let page = self.stack.top();
-                    return_if_locked_maybe_load!(self.pager, page);
+                    turso_assert!(page.get().is_loaded(), "page should be loaded ");
                     let target_key = if page.get().is_index() {
-                        let record = match return_if_io!(self.record()) {
-                            Some(record) => record.clone(),
-                            None => unreachable!("there should've been a record"),
+                        let record = match self.record()? {
+                            IOResult::Done(record) => match record {
+                                Some(record) => record.clone(),
+                                None => unreachable!("there should've been a record"),
+                            },
+                            IOResult::IO(io) => return Ok(IOResult::IO(io)),
                         };
                         DeleteSavepoint::Payload(record)
                     } else {
-                        let Some(rowid) = return_if_io!(self.rowid()) else {
-                            panic!("cursor should be pointing to a record with a rowid");
-                        };
-                        DeleteSavepoint::Rowid(rowid)
+                        match self.rowid()? {
+                            IOResult::Done(rowid) => {
+                                let Some(rowid) = rowid else {
+                                    panic!("cursor should be pointing to a record with a rowid");
+                                };
+                                DeleteSavepoint::Rowid(rowid)
+                            }
+                            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                        }
                     };
 
                     let delete_info = self.state.mut_delete_info().unwrap();
@@ -4426,13 +4443,15 @@ impl BTreeCursor {
                 DeleteState::LoadPage {
                     post_balancing_seek_key,
                 } => {
+                    // TODO: Seems to be a redundant operation as if the page is on the stack it should have been loaded already
                     let page = self.stack.top();
-                    return_if_locked_maybe_load!(self.pager, page);
+                    let (page, c) = self.read_page(page.get().get().id)?;
 
                     let delete_info = self.state.mut_delete_info().unwrap();
                     delete_info.state = DeleteState::FindCell {
                         post_balancing_seek_key,
                     };
+                    return Ok(IOResult::IO(IOCompletions::Single(c)));
                 }
 
                 DeleteState::FindCell {
@@ -4442,6 +4461,7 @@ impl BTreeCursor {
                     let cell_idx = self.stack.current_cell_index() as usize;
 
                     let page = page.get();
+                    turso_assert!(page.is_loaded(), "page should be loaded");
                     let contents = page.get().contents.as_ref().unwrap();
                     if cell_idx >= contents.cell_count() {
                         return_corrupt!(format!(
@@ -4480,10 +4500,13 @@ impl BTreeCursor {
                     original_child_pointer,
                     post_balancing_seek_key,
                 } => {
-                    return_if_io!(self.clear_overflow_pages(&cell));
+                    if let IOResult::IO(io) = self.clear_overflow_pages(&cell)? {
+                        return Ok(IOResult::IO(io));
+                    }
 
                     let page = self.stack.top();
                     let page = page.get();
+                    turso_assert!(page.is_loaded(), "page should be loaded");
                     let contents = page.get_contents();
 
                     let delete_info = self.state.mut_delete_info().unwrap();
@@ -4521,10 +4544,10 @@ impl BTreeCursor {
                     // Step 1: Move cursor to the largest key in the left subtree.
                     // The largest key is always in a leaf, and so this traversal may involvegoing multiple pages downwards,
                     // so we store the page we are currently on.
-
                     // avoid calling prev() because it internally calls restore_context() which may cause unintended behavior.
-                    return_if_io!(self.get_prev_record());
-
+                    if let IOResult::IO(io) = self.get_prev_record()? {
+                        return Ok(IOResult::IO(io));
+                    }
                     // Ensure we keep the parent page at the same position as before the replacement.
                     self.stack
                         .node_states
@@ -4620,7 +4643,7 @@ impl BTreeCursor {
                     post_balancing_seek_key,
                 } => {
                     let page = self.stack.top();
-                    return_if_locked_maybe_load!(self.pager, page);
+                    turso_assert!(page.get().is_loaded(), "page should be loaded");
                     // Check if either the leaf page we took the replacement cell from underflows, or if the interior page we inserted it into overflows OR underflows.
                     // If the latter is true, we must always balance that level regardless of whether the leaf page (or any ancestor pages in between) need balancing.
 
@@ -4709,8 +4732,7 @@ impl BTreeCursor {
                                 balance_write_info: Some(write_info),
                             });
                         }
-
-                        IOResult::IO => {
+                        IOResult::IO(io) => {
                             // Move to seek state
                             // Save balance progress and return IO
                             let write_info = match &self.state {
@@ -4725,7 +4747,7 @@ impl BTreeCursor {
                                 },
                                 balance_write_info: Some(write_info),
                             });
-                            return Ok(IOResult::IO);
+                            return Ok(IOResult::IO(io));
                         }
                     }
                 }
@@ -4739,7 +4761,10 @@ impl BTreeCursor {
                     };
                     // We want to end up pointing at the row to the left of the position of the row we deleted, so
                     // that after we call next() in the loop,the next row we delete will again be the same position as this one.
-                    let seek_result = return_if_io!(self.seek(key, SeekOp::LT));
+                    let seek_result = match self.seek(key, SeekOp::LT)? {
+                        IOResult::Done(seek_result) => seek_result,
+                        IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                    };
 
                     if let SeekResult::TryAdvance = seek_result {
                         let CursorState::Delete(delete_info) = &self.state else {
@@ -4757,7 +4782,9 @@ impl BTreeCursor {
                 }
                 DeleteState::TryAdvance => {
                     // we use LT always for post-delete seeks, which uses backwards iteration, so we always call prev() here.
-                    return_if_io!(self.prev());
+                    if let IOResult::IO(io) = self.prev()? {
+                        return Ok(IOResult::IO(io));
+                    }
                     self.state = CursorState::None;
                     return Ok(IOResult::Done(()));
                 }
