@@ -11,8 +11,8 @@ use crate::{
             LEAF_PAGE_HEADER_SIZE_BYTES, LEFT_CHILD_PTR_SIZE_BYTES,
         },
         state_machines::btree::{
-            DeleteState, DestroyState, EmptyTableState, OverflowState, PayloadOverflowWithOffset,
-            SkipOverflowState, WriteState,
+            DeleteState, DestroyState, EmptyTableState, MoveToRightState, OverflowState,
+            PayloadOverflowWithOffset, SkipOverflowState, WriteState,
         },
     },
     translate::plan::IterationDirection,
@@ -434,8 +434,10 @@ pub struct BTreeCursor {
     /// - Moving to a different record/row
     /// - The underlying `ImmutableRecord` is modified
     pub record_cursor: RefCell<RecordCursor>,
-
-    empty_table_state: RefCell<EmptyTableState>,
+    /// State machine for `is_empty_table`
+    empty_table_state: EmptyTableState,
+    /// State machine for `move_to_rightmost`
+    move_to_right_state: MoveToRightState,
 }
 
 /// We store the cell index and cell count for each page in the stack.
@@ -490,7 +492,8 @@ impl BTreeCursor {
             read_overflow_state: RefCell::new(None),
             parse_record_state: RefCell::new(ParseRecordState::Init),
             record_cursor: RefCell::new(RecordCursor::with_capacity(num_columns)),
-            empty_table_state: RefCell::new(EmptyTableState::Start),
+            empty_table_state: EmptyTableState::Start,
+            move_to_right_state: MoveToRightState::Start,
         }
     }
 
@@ -1206,46 +1209,52 @@ impl BTreeCursor {
 
     /// Move the cursor to the root page of the btree.
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn move_to_root(&mut self) -> Result<()> {
+    fn move_to_root(&mut self) -> Result<Arc<Completion>> {
         self.seek_state = CursorSeekState::Start;
         self.going_upwards = false;
         tracing::trace!(root_page = self.root_page);
-        let mem_page = self.read_page(self.root_page)?;
+        let (mem_page, c) = self.read_page(self.root_page)?;
         self.stack.clear();
         self.stack.push(mem_page);
-        Ok(())
+        Ok(c)
     }
 
     /// Move the cursor to the rightmost record in the btree.
     #[instrument(skip(self), level = Level::DEBUG)]
     fn move_to_rightmost(&mut self) -> Result<IOResult<bool>> {
-        self.move_to_root()?;
-
-        loop {
-            let mem_page = self.stack.top();
-            let page_idx = mem_page.get().get().id;
-            let page = self.read_page(page_idx)?;
-            return_if_locked_maybe_load!(self.pager, page);
-            let page = page.get();
-            let contents = page.get().contents.as_ref().unwrap();
-            if contents.is_leaf() {
-                if contents.cell_count() > 0 {
-                    self.stack.set_cell_index(contents.cell_count() as i32 - 1);
-                    return Ok(IOResult::Done(true));
-                }
-                return Ok(IOResult::Done(false));
+        let state = self.move_to_right_state;
+        match state {
+            // `move_to_root` add the first page we want to the stack
+            MoveToRightState::Start => {
+                let c = self.move_to_root()?;
+                return Ok(IOResult::IO(IOCompletions::Single(c)));
             }
+            MoveToRightState::ProcessPage => {
+                let mem_page = self.stack.top();
 
-            match contents.rightmost_pointer() {
-                Some(right_most_pointer) => {
-                    self.stack.set_cell_index(contents.cell_count() as i32 + 1);
-                    let mem_page = self.read_page(right_most_pointer as usize)?;
-                    self.stack.push(mem_page);
-                    continue;
+                let page = mem_page.get();
+                turso_assert!(page.is_loaded(), "page should be loaded");
+                let contents = page.get().contents.as_ref().unwrap();
+                if contents.is_leaf() {
+                    self.move_to_right_state = MoveToRightState::Start;
+                    if contents.cell_count() > 0 {
+                        self.stack.set_cell_index(contents.cell_count() as i32 - 1);
+                        return Ok(IOResult::Done(true));
+                    }
+                    return Ok(IOResult::Done(false));
                 }
 
-                None => {
-                    unreachable!("interior page should have a rightmost pointer");
+                match contents.rightmost_pointer() {
+                    Some(right_most_pointer) => {
+                        self.stack.set_cell_index(contents.cell_count() as i32 + 1);
+                        let (mem_page, c) = self.read_page(right_most_pointer as usize)?;
+                        self.stack.push(mem_page);
+                        return Ok(IOResult::IO(IOCompletions::Single(c)));
+                    }
+
+                    None => {
+                        unreachable!("interior page should have a rightmost pointer");
+                    }
                 }
             }
         }

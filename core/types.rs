@@ -2249,6 +2249,7 @@ pub enum IOCompletions {
     Many(Vec<Arc<Completion>>),
 }
 
+#[must_use]
 pub enum IOResult<T> {
     Done(T),
     IO(IOCompletions),
