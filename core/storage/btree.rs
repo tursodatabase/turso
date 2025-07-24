@@ -6216,7 +6216,7 @@ fn defragment_page(page: &PageContent, usable_space: u16) {
 
     // Gather cell metadata.
     let cell_offset = page.cell_pointer_array_offset();
-    let mut cells_info = Vec::with_capacity(cell_count as usize);
+    let mut cells_info = Vec::with_capacity(cell_count);
     let mut is_physically_sorted = true;
     let mut last_offset = u16::MAX;
 
