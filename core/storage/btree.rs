@@ -4813,7 +4813,10 @@ impl BTreeCursor {
             _ => unreachable!("btree tables are indexed by integers!"),
         };
         let seek_result =
-            return_if_io!(self.seek(SeekKey::TableRowId(*int_key), SeekOp::GE { eq_only: true }));
+            match self.seek(SeekKey::TableRowId(*int_key), SeekOp::GE { eq_only: true })? {
+                IOResult::Done(seek_result) => seek_result,
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            };
         let exists = matches!(seek_result, SeekResult::Found);
         self.invalidate_record();
         Ok(IOResult::Done(exists))
