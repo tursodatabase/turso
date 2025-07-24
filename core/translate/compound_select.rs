@@ -2,7 +2,7 @@ use crate::schema::{Index, IndexColumn, Schema};
 use crate::translate::emitter::{emit_query, LimitCtx, TransactionMode, TranslateCtx};
 use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
-use crate::vdbe::insn::Insn;
+use crate::vdbe::insn::{IdxInsertFlags, Insn};
 use crate::vdbe::BranchOffset;
 use crate::SymbolTable;
 use std::sync::Arc;
@@ -461,7 +461,7 @@ fn read_intersect_rows(
             record_reg: row_content_reg,
             unpacked_start: Some(cols_start_reg),
             unpacked_count: Some(column_count as u16),
-            flags: Default::default(),
+            flags: IdxInsertFlags::new().require_seek(),
         });
     } else if let Some(yield_reg) = yield_reg {
         program.emit_insn(Insn::Yield {

@@ -107,7 +107,7 @@ pub fn emit_result_row_and_limit(
                     record_reg,
                     unpacked_start: None,
                     unpacked_count: None,
-                    flags: IdxInsertFlags::new().no_op_duplicate(),
+                    flags: IdxInsertFlags::new().no_op_duplicate().require_seek(),
                 });
             }
         }

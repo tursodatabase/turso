@@ -62,7 +62,7 @@ pub struct IdxInsertFlags(pub u8);
 impl IdxInsertFlags {
     pub const APPEND: u8 = 0x01; // Hint: insert likely at the end
     pub const NCHANGE: u8 = 0x02; // Increment the change counter
-    pub const USE_SEEK: u8 = 0x04; // Skip seek if last one was same key
+    pub const REQUIRE_SEEK: u8 = 0x04; // Cursor is not guaranteed to be positioned correctly, so we need to seek.
     pub const NO_OP_DUPLICATE: u8 = 0x08; // Do not error on duplicate key
     pub fn new() -> Self {
         IdxInsertFlags(0)
@@ -78,12 +78,8 @@ impl IdxInsertFlags {
         }
         self
     }
-    pub fn use_seek(mut self, seek: bool) -> Self {
-        if seek {
-            self.0 |= IdxInsertFlags::USE_SEEK;
-        } else {
-            self.0 &= !IdxInsertFlags::USE_SEEK;
-        }
+    pub fn require_seek(mut self) -> Self {
+        self.0 |= IdxInsertFlags::REQUIRE_SEEK;
         self
     }
     pub fn nchange(mut self, change: bool) -> Self {
