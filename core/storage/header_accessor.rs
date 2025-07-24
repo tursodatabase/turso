@@ -1,4 +1,8 @@
+use std::sync::Arc;
+
 use crate::storage::sqlite3_ondisk::MAX_PAGE_SIZE;
+use crate::types::IOCompletions;
+use crate::Completion;
 use crate::turso_assert;
 use crate::{
     storage::{
@@ -35,37 +39,30 @@ const HEADER_OFFSET_VERSION_VALID_FOR: usize = 92;
 const HEADER_OFFSET_VERSION_NUMBER: usize = 96;
 
 // Helper to get a read-only reference to the header page.
-fn get_header_page(pager: &Pager) -> Result<IOResult<PageRef>> {
+fn get_header_page(pager: &Pager) -> Result<(PageRef, Arc<Completion>)> {
     if !pager.db_state.is_initialized() {
         return Err(LimboError::InternalError(
             "Database is empty, header does not exist - page 1 should've been allocated before this".to_string(),
         ));
     }
-    let page = pager.read_page(DATABASE_HEADER_PAGE_ID)?;
-    if page.is_locked() {
-        return Ok(IOResult::IO);
-    }
-    Ok(IOResult::Done(page))
+    pager.read_page(DATABASE_HEADER_PAGE_ID)
 }
 
 // Helper to get a writable reference to the header page and mark it dirty.
-fn get_header_page_for_write(pager: &Pager) -> Result<IOResult<PageRef>> {
+fn get_header_page_for_write(pager: &Pager) -> Result<(PageRef, Arc<Completion>)> {
     if !pager.db_state.is_initialized() {
         // This should not be called on an empty DB for writing, as page 1 is allocated on first transaction.
         return Err(LimboError::InternalError(
             "Cannot write to header of an empty database - page 1 should've been allocated before this".to_string(),
         ));
     }
-    let page = pager.read_page(DATABASE_HEADER_PAGE_ID)?;
-    if page.is_locked() {
-        return Ok(IOResult::IO);
-    }
+    let (page, c) = pager.read_page(DATABASE_HEADER_PAGE_ID)?;
     turso_assert!(
         page.get().id == DATABASE_HEADER_PAGE_ID,
         "page must have number 1"
     );
     pager.add_dirty(&page);
-    Ok(IOResult::Done(page))
+    Ok((page, c))
 }
 
 /// Helper function to run async header accessors until completion
@@ -76,9 +73,14 @@ where
     loop {
         match accessor()? {
             IOResult::Done(value) => return Ok(value),
-            IOResult::IO => {
-                pager.io.run_once()?;
-            }
+            IOResult::IO(io) => match io {
+                IOCompletions::Single(c) => pager.io.wait_for_completion(c)?,
+                IOCompletions::Many(completions) => {
+                    for c in completions {
+                        pager.io.wait_for_completion(c)?
+                    }
+                }
+            },
         }
     }
 }
@@ -104,16 +106,17 @@ where
 macro_rules! impl_header_field_accessor {
     ($field_name:ident, $type:ty, $offset:expr $(, $ifzero:expr)?) => {
         paste::paste! {
-            // Async version
+            // Async version really does not exist anymore as we track completions now
+            // so the caller is reponsible for doing either wait for the completion
+            // or bubbling the completion up
+            // Sync version
             #[allow(dead_code)]
-            pub fn [<get_ $field_name _async>](pager: &Pager) -> Result<IOResult<$type>> {
+            pub fn [<get_ $field_name>](pager: &Pager) -> Result<$type> {
                 if !pager.db_state.is_initialized() {
                     return Err(LimboError::InternalError(format!("Database is empty, header does not exist - page 1 should've been allocated before this")));
                 }
-                let page = match get_header_page(pager)? {
-                    IOResult::Done(page) => page,
-                    IOResult::IO => return Ok(IOResult::IO),
-                };
+                let (page, c) = get_header_page(pager)?;
+                pager.io.wait_for_completion(c)?;
                 let page_inner = page.get();
                 let page_content = page_inner.contents.as_ref().unwrap();
                 let buf = page_content.buffer.borrow();
@@ -123,25 +126,17 @@ macro_rules! impl_header_field_accessor {
                 let value = <$type>::from_be_bytes(bytes);
                 $(
                     if value == 0 {
-                        return Ok(IOResult::Done($ifzero));
+                        return Ok($ifzero);
                     }
                 )?
-                Ok(IOResult::Done(value))
+                Ok(value)
             }
 
-            // Sync version
+            // Sync setter
             #[allow(dead_code)]
-            pub fn [<get_ $field_name>](pager: &Pager) -> Result<$type> {
-                run_header_accessor_until_done(pager, || [<get_ $field_name _async>](pager))
-            }
-
-            // Async setter
-            #[allow(dead_code)]
-            pub fn [<set_ $field_name _async>](pager: &Pager, value: $type) -> Result<IOResult<()>> {
-                let page = match get_header_page_for_write(pager)? {
-                    IOResult::Done(page) => page,
-                    IOResult::IO => return Ok(IOResult::IO),
-                };
+            pub fn [<set_ $field_name>](pager: &Pager, value: $type) -> Result<()> {
+                let (page, c) = get_header_page_for_write(pager)?;
+                pager.io.wait_for_completion(c)?;
                 let page_inner = page.get();
                 let page_content = page_inner.contents.as_ref().unwrap();
                 let mut buf = page_content.buffer.borrow_mut();
@@ -149,13 +144,7 @@ macro_rules! impl_header_field_accessor {
                 buf_slice[$offset..$offset + std::mem::size_of::<$type>()].copy_from_slice(&value.to_be_bytes());
                 turso_assert!(page.get().id == 1, "page must have number 1");
                 pager.add_dirty(&page);
-                Ok(IOResult::Done(()))
-            }
-
-            // Sync setter
-            #[allow(dead_code)]
-            pub fn [<set_ $field_name>](pager: &Pager, value: $type) -> Result<()> {
-                run_header_accessor_until_done(pager, || [<set_ $field_name _async>](pager, value))
+                Ok(())
             }
         }
     };
@@ -214,17 +203,4 @@ pub fn set_page_size(pager: &Pager, value: u32) -> Result<()> {
         value as u16
     };
     set_page_size_u16(pager, page_size)
-}
-
-#[allow(dead_code)]
-pub fn get_page_size_async(pager: &Pager) -> Result<IOResult<u32>> {
-    match get_page_size_u16_async(pager)? {
-        IOResult::Done(size) => {
-            if size == 1 {
-                return Ok(IOResult::Done(MAX_PAGE_SIZE));
-            }
-            Ok(IOResult::Done(size as u32))
-        }
-        IOResult::IO => Ok(IOResult::IO),
-    }
 }

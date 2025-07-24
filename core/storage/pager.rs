@@ -398,10 +398,7 @@ impl Pager {
     #[cfg(not(feature = "omit_autovacuum"))]
     pub fn ptrmap_get(&self, target_page_num: u32) -> Result<IOResult<Option<PtrmapEntry>>> {
         tracing::trace!("ptrmap_get(page_idx = {})", target_page_num);
-        let configured_page_size = match header_accessor::get_page_size_async(self)? {
-            IOResult::Done(size) => size as usize,
-            IOResult::IO => return Ok(IOResult::IO),
-        };
+        let configured_page_size = header_accessor::get_page_size(self)? as usize;
 
         if target_page_num < FIRST_PTRMAP_PAGE_NO
             || is_ptrmap_page(target_page_num, configured_page_size)
@@ -484,10 +481,7 @@ impl Pager {
             parent_page_no
         );
 
-        let page_size = match header_accessor::get_page_size_async(self)? {
-            IOResult::Done(size) => size as usize,
-            IOResult::IO => return Ok(IOResult::IO),
-        };
+        let page_size = header_accessor::get_page_size(self)? as usize;
 
         if db_page_no_to_update < FIRST_PTRMAP_PAGE_NO
             || is_ptrmap_page(db_page_no_to_update, page_size)
@@ -593,10 +587,7 @@ impl Pager {
                     root_page_num += 1;
                     assert!(root_page_num >= FIRST_PTRMAP_PAGE_NO); //  can never be less than 2 because we have already incremented
 
-                    let page_size = match header_accessor::get_page_size_async(self)? {
-                        IOResult::Done(size) => size as usize,
-                        IOResult::IO => return Ok(IOResult::IO),
-                    };
+                    let page_size = header_accessor::get_page_size(self)? as usize;
 
                     while is_ptrmap_page(root_page_num, page_size) {
                         root_page_num += 1;
