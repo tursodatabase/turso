@@ -1205,14 +1205,14 @@ impl BTreeCursor {
     /// or e.g. find the first record greater than the seek key in a range query (e.g. SELECT * FROM table WHERE col > 10).
     /// We don't include the rowid in the comparison and that's why the last value from the record is not included.
     fn do_seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>> {
-        let ret = return_if_io!(match key {
-            SeekKey::TableRowId(rowid) => {
-                self.tablebtree_seek(rowid, op)
-            }
-            SeekKey::IndexKey(index_key) => {
-                self.indexbtree_seek(index_key, op)
-            }
-        });
+        let ret = match key {
+            SeekKey::TableRowId(rowid) => self.tablebtree_seek(rowid, op),
+            SeekKey::IndexKey(index_key) => self.indexbtree_seek(index_key, op),
+        }?;
+        let ret = match ret {
+            IOResult::Done(ret) => ret,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
         self.valid_state = CursorValidState::Valid;
         Ok(IOResult::Done(ret))
     }
@@ -1551,11 +1551,11 @@ impl BTreeCursor {
                     };
 
                     if let Some(next_page) = first_overflow_page {
-                        return_if_io!(self.process_overflow_read(
-                            payload,
-                            *next_page,
-                            *payload_size
-                        ))
+                        let result =
+                            self.process_overflow_read(payload, *next_page, *payload_size)?;
+                        if let IOResult::IO(io) = result {
+                            return Ok(IOResult::IO(io));
+                        }
                     } else {
                         self.get_immutable_record_or_create()
                             .as_mut()
@@ -1567,6 +1567,7 @@ impl BTreeCursor {
                             .start_serialization(payload);
                         self.record_cursor.borrow_mut().invalidate();
                     };
+
                     let (target_leaf_page_is_in_left_subtree, is_eq) = {
                         let record = self.get_immutable_record();
                         let record = record.as_ref().unwrap();
@@ -1656,10 +1657,13 @@ impl BTreeCursor {
                 | CursorSeekState::InteriorPageBinarySearch { .. }
         ) {
             // No need for another move_to_root. Move_to already moves to root
-            return_if_io!(self.move_to(SeekKey::TableRowId(rowid), seek_op));
+            if let IOResult::IO(io) = self.move_to(SeekKey::TableRowId(rowid), seek_op)? {
+                return Ok(IOResult::IO(io));
+            }
+
             let page = self.stack.top();
-            return_if_locked_maybe_load!(self.pager, page);
             let page = page.get();
+            turso_assert!(page.is_loaded(), "page should be loaded");
             let contents = page.get().contents.as_ref().unwrap();
             turso_assert!(
                 contents.is_leaf(),
@@ -1702,8 +1706,8 @@ impl BTreeCursor {
         };
 
         let page = self.stack.top();
-        return_if_locked_maybe_load!(self.pager, page);
         let page = page.get();
+        turso_assert!(page.is_loaded(), "page should be loaded");
         let contents = page.get().contents.as_ref().unwrap();
 
         loop {
@@ -1816,7 +1820,9 @@ impl BTreeCursor {
                 | CursorSeekState::InteriorPageBinarySearch { .. }
         ) {
             // No need for another move_to_root. Move_to already moves to root
-            return_if_io!(self.move_to(SeekKey::IndexKey(key), seek_op));
+            if let IOResult::IO(io) = self.move_to(SeekKey::IndexKey(key), seek_op)? {
+                return Ok(IOResult::IO(io));
+            }
             let CursorSeekState::FoundLeaf { eq_seen } = &self.seek_state else {
                 unreachable!(
                     "We must still be in FoundLeaf state after move_to, got: {:?}",
@@ -1825,9 +1831,9 @@ impl BTreeCursor {
             };
             let eq_seen = eq_seen.get();
             let page = self.stack.top();
-            return_if_locked_maybe_load!(self.pager, page);
 
             let page = page.get();
+            turso_assert!(page.is_loaded(), "page should be loaded");
             let contents = page.get().contents.as_ref().unwrap();
             let cell_count = contents.cell_count();
             if cell_count == 0 {
@@ -1868,8 +1874,8 @@ impl BTreeCursor {
         };
 
         let page = self.stack.top();
-        return_if_locked_maybe_load!(self.pager, page);
         let page = page.get();
+        turso_assert!(page.is_loaded(), "page should be loaded");
         let contents = page.get().contents.as_ref().unwrap();
 
         let iter_dir = seek_op.iteration_direction();
@@ -1913,7 +1919,10 @@ impl BTreeCursor {
             };
 
             if let Some(next_page) = first_overflow_page {
-                return_if_io!(self.process_overflow_read(payload, *next_page, *payload_size))
+                let result = self.process_overflow_read(payload, *next_page, *payload_size)?;
+                if let IOResult::IO(io) = result {
+                    return Ok(IOResult::IO(io));
+                }
             } else {
                 self.get_immutable_record_or_create()
                     .as_mut()
@@ -2039,8 +2048,10 @@ impl BTreeCursor {
         let ret = match key {
             SeekKey::TableRowId(rowid_key) => self.tablebtree_move_to(rowid_key, cmp),
             SeekKey::IndexKey(index_key) => self.indexbtree_move_to(index_key, cmp),
-        };
-        return_if_io!(ret);
+        }?;
+        if let IOResult::IO(io) = ret {
+            return Ok(IOResult::IO(io));
+        }
         Ok(IOResult::Done(()))
     }
 
@@ -4279,7 +4290,11 @@ impl BTreeCursor {
         // because it might have been set to false by an unmatched left-join row during the previous iteration
         // on the outer loop.
         self.set_null_flag(false);
-        let seek_result = return_if_io!(self.do_seek(key, op));
+        let seek_result = self.do_seek(key, op)?;
+        let seek_result = match seek_result {
+            IOResult::Done(seek_result) => seek_result,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
         self.invalidate_record();
         // Reset seek state
         self.seek_state = CursorSeekState::Start;
