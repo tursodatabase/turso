@@ -12,7 +12,7 @@ use crate::{
         },
         state_machines::btree::{
             DeleteState, DestroyState, EmptyTableState, MoveToState, NextPrevState, OverflowState,
-            PayloadOverflowWithOffset, SeekToState, WriteState,
+            PayloadOverflowWithOffset, RewindState, SeekToState, WriteState,
         },
     },
     translate::plan::IterationDirection,
@@ -440,8 +440,10 @@ pub struct BTreeCursor {
     move_to_state: MoveToState,
     /// State machine for `next` and `prev`
     next_prev_state: NextPrevState,
-    /// State machine for move_to related functions
+    /// State machine for `seek_to_last` and seek_to_end related functions
     seek_to_state: SeekToState,
+    /// State machine for `rewind`
+    rewind_state: RewindState,
 }
 
 /// We store the cell index and cell count for each page in the stack.
@@ -500,6 +502,7 @@ impl BTreeCursor {
             move_to_state: MoveToState::Start,
             next_prev_state: NextPrevState::Start,
             seek_to_state: SeekToState::Start,
+            rewind_state: RewindState::Start,
         }
     }
 
@@ -4041,7 +4044,7 @@ impl BTreeCursor {
             SeekToState::Start => {
                 // move_to_root add the page to the stack and asks to load it
                 let c = self.move_to_root()?;
-                self.move_to_state = SeekToState::ProcessPage;
+                self.seek_to_state = SeekToState::ProcessPage;
                 return Ok(IOResult::IO(IOCompletions::Single(c)));
             }
             SeekToState::ProcessPage => {
@@ -4053,7 +4056,7 @@ impl BTreeCursor {
                 if contents.is_leaf() {
                     // set cursor just past the last cell to append
                     self.stack.set_cell_index(contents.cell_count() as i32);
-                    self.move_to_state = SeekToState::Start;
+                    self.seek_to_state = SeekToState::Start;
                     return Ok(IOResult::Done(()));
                 }
 
@@ -4116,22 +4119,36 @@ impl BTreeCursor {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn rewind(&mut self) -> Result<IOResult<()>> {
-        if let Some(mv_cursor) = &self.mv_cursor {
-            {
-                let mut mv_cursor = mv_cursor.borrow_mut();
-                mv_cursor.rewind();
+        let state = self.rewind_state;
+        loop {
+            match state {
+                RewindState::Start => {
+                    if let Some(mv_cursor) = &self.mv_cursor {
+                        {
+                            let mut mv_cursor = mv_cursor.borrow_mut();
+                            mv_cursor.rewind();
+                        }
+                        self.rewind_state = RewindState::NextRecord;
+                    } else {
+                        let c = self.move_to_root()?;
+                        self.rewind_state = RewindState::NextRecord;
+                        return Ok(IOResult::IO(IOCompletions::Single(c)));
+                    }
+                }
+                RewindState::NextRecord => {
+                    let result = self.get_next_record()?;
+                    match result {
+                        IOResult::Done(cursor_has_record) => {
+                            self.invalidate_record();
+                            self.has_record.replace(cursor_has_record);
+                            self.rewind_state = RewindState::Start;
+                            return Ok(IOResult::Done(()));
+                        }
+                        IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                    }
+                }
             }
-            let cursor_has_record = return_if_io!(self.get_next_record());
-            self.invalidate_record();
-            self.has_record.replace(cursor_has_record);
-        } else {
-            self.move_to_root()?;
-
-            let cursor_has_record = return_if_io!(self.get_next_record());
-            self.invalidate_record();
-            self.has_record.replace(cursor_has_record);
         }
-        Ok(IOResult::Done(()))
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]

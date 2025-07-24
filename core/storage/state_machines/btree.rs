@@ -133,3 +133,9 @@ pub enum SeekToState {
     Start,
     ProcessPage,
 }
+
+#[derive(Debug, Clone, Copy)]
+pub enum RewindState {
+    Start,
+    NextRecord,
+}
