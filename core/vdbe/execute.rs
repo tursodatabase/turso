@@ -1590,14 +1590,12 @@ pub fn op_column(
                 match (default, &mut state.registers[*dest]) {
                     (Value::Text(new_text), Register::Value(Value::Text(existing_text))) => {
                         if !existing_text.maybe_extend(new_text) {
-                            state.registers[*dest] =
-                                Register::Value(Value::Text(Text::new(new_text.as_str())));
+                            state.registers[*dest] = Register::Value(default.clone());
                         }
                     }
                     (Value::Blob(new_blob), Register::Value(Value::Blob(existing_blob))) => {
                         if !existing_blob.maybe_extend(new_blob) {
-                            state.registers[*dest] =
-                                Register::Value(Value::Blob(new_blob.to_vec()));
+                            state.registers[*dest] = Register::Value(default.clone());
                         }
                     }
                     _ => {
