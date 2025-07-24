@@ -164,3 +164,10 @@ pub enum BalanceState {
     /// from the source pages.
     NonRootDoBalancing,
 }
+
+#[derive(Debug, Clone, Copy)]
+pub enum CountState {
+    Start,
+    Loop,
+    Finish,
+}
