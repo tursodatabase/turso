@@ -147,3 +147,41 @@ pub enum InsertState {
     Advance,
     InsertIntoPage,
 }
+
+#[derive(Clone)]
+pub enum InsertIntoPageState {
+    Start,
+    /// Calls `record` function for the current record
+    Record {
+        page: BTreePage,
+        cell_idx: usize,
+    },
+    OverwriteCell {
+        page: BTreePage,
+        cell_idx: usize,
+    },
+    InsertCell {
+        page: PageRef,
+        cell_idx: usize,
+    },
+    Balance,
+    Finish,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BalanceState {
+    Start,
+    FreePages {
+        curr_page: usize,
+        sibling_count_new: usize,
+    },
+    /// Choose which sibling pages to balance (max 3).
+    /// Generally, the siblings involved will be the page that triggered the balancing and its left and right siblings.
+    /// The exceptions are:
+    /// 1. If the leftmost page triggered balancing, up to 3 leftmost pages will be balanced.
+    /// 2. If the rightmost page triggered balancing, up to 3 rightmost pages will be balanced.
+    NonRootPickSiblings,
+    /// Perform the actual balancing. This will result in 1-5 pages depending on the number of total cells to be distributed
+    /// from the source pages.
+    NonRootDoBalancing,
+}
