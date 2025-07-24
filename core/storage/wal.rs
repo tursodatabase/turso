@@ -748,12 +748,8 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn end_read_tx(&self) {
         let held = self.max_frame_read_lock_index.get();
-        turso_assert!(
-            held != NO_LOCK_HELD,
-            "We must have a read lock held to end a read transaction"
-        );
         tracing::debug!("end_read_tx(lock={})", held);
-        {
+        if held != NO_LOCK_HELD {
             let read_lock = &mut self.get_shared().read_locks[held];
             read_lock.unlock();
         }
