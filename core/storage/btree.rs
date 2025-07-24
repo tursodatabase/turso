@@ -11,8 +11,8 @@ use crate::{
             LEAF_PAGE_HEADER_SIZE_BYTES, LEFT_CHILD_PTR_SIZE_BYTES,
         },
         state_machines::btree::{
-            DeleteState, DestroyState, EmptyTableState, MoveToState, OverflowState,
-            PayloadOverflowWithOffset, SkipOverflowState, WriteState,
+            DeleteState, DestroyState, EmptyTableState, MoveToState, NextPrevState, OverflowState,
+            PayloadOverflowWithOffset, WriteState,
         },
     },
     translate::plan::IterationDirection,
@@ -438,6 +438,8 @@ pub struct BTreeCursor {
     empty_table_state: EmptyTableState,
     /// State machine for move_to related functions
     move_to_state: MoveToState,
+    /// State machine for `next` and `prev`
+    next_prev_state: NextPrevState,
 }
 
 /// We store the cell index and cell count for each page in the stack.
@@ -4106,11 +4108,31 @@ impl BTreeCursor {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn next(&mut self) -> Result<IOResult<bool>> {
-        return_if_io!(self.restore_context());
-        let cursor_has_record = return_if_io!(self.get_next_record());
-        self.has_record.replace(cursor_has_record);
-        self.invalidate_record();
-        Ok(IOResult::Done(cursor_has_record))
+        loop {
+            let state = self.next_prev_state;
+            match state {
+                NextPrevState::Start => {
+                    if let IOResult::IO(io) = self.restore_context()? {
+                        return Ok(IOResult::IO(io));
+                    }
+                    self.next_prev_state = NextPrevState::GetRecord;
+                }
+                NextPrevState::GetRecord => {
+                    let result = self.get_next_record()?;
+                    match result {
+                        IOResult::Done(cursor_has_record) => {
+                            self.has_record.replace(cursor_has_record);
+                            self.invalidate_record();
+                            self.next_prev_state = NextPrevState::Start;
+                            return Ok(IOResult::Done(cursor_has_record));
+                        }
+                        IOResult::IO(io) => {
+                            return Ok(IOResult::IO(io));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn invalidate_record(&mut self) {
@@ -4124,11 +4146,31 @@ impl BTreeCursor {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn prev(&mut self) -> Result<IOResult<bool>> {
         assert!(self.mv_cursor.is_none());
-        return_if_io!(self.restore_context());
-        let cursor_has_record = return_if_io!(self.get_prev_record());
-        self.has_record.replace(cursor_has_record);
-        self.invalidate_record();
-        Ok(IOResult::Done(cursor_has_record))
+        loop {
+            let state = self.next_prev_state;
+            match state {
+                NextPrevState::Start => {
+                    if let IOResult::IO(io) = self.restore_context()? {
+                        return Ok(IOResult::IO(io));
+                    }
+                    self.next_prev_state = NextPrevState::GetRecord;
+                }
+                NextPrevState::GetRecord => {
+                    let result = self.get_prev_record()?;
+                    match result {
+                        IOResult::Done(cursor_has_record) => {
+                            self.has_record.replace(cursor_has_record);
+                            self.invalidate_record();
+                            self.next_prev_state = NextPrevState::Start;
+                            return Ok(IOResult::Done(cursor_has_record));
+                        }
+                        IOResult::IO(io) => {
+                            return Ok(IOResult::IO(io));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[instrument(skip(self), level = Level::DEBUG)]
@@ -5263,38 +5305,49 @@ impl BTreeCursor {
         if self.context.is_none() || matches!(self.valid_state, CursorValidState::Valid) {
             return Ok(IOResult::Done(()));
         }
-        if let CursorValidState::RequireAdvance(direction) = self.valid_state {
-            let has_record = return_if_io!(match direction {
-                // Avoid calling next()/prev() directly because they immediately call restore_context()
-                IterationDirection::Forwards => self.get_next_record(),
-                IterationDirection::Backwards => self.get_prev_record(),
-            });
-            self.has_record.set(has_record);
-            self.invalidate_record();
-            self.context = None;
-            self.valid_state = CursorValidState::Valid;
-            return Ok(IOResult::Done(()));
-        }
-        let ctx = self.context.take().unwrap();
-        let seek_key = match ctx {
-            CursorContext::TableRowId(rowid) => SeekKey::TableRowId(rowid),
-            CursorContext::IndexKeyRowId(ref record) => SeekKey::IndexKey(record),
-        };
-        let res = self.seek(seek_key, SeekOp::GE { eq_only: true })?;
-        match res {
-            IOResult::Done(res) => {
-                if let SeekResult::TryAdvance = res {
-                    self.valid_state =
-                        CursorValidState::RequireAdvance(IterationDirection::Forwards);
-                    self.context = Some(ctx);
-                    return Ok(IOResult::IO);
+
+        loop {
+            if let CursorValidState::RequireAdvance(direction) = self.valid_state {
+                let result = match direction {
+                    // Avoid calling next()/prev() directly because they immediately call restore_context()
+                    IterationDirection::Forwards => self.get_next_record(),
+                    IterationDirection::Backwards => self.get_prev_record(),
+                }?;
+                match result {
+                    IOResult::Done(has_record) => {
+                        self.has_record.set(has_record);
+                        self.invalidate_record();
+                        self.context = None;
+                        self.valid_state = CursorValidState::Valid;
+                        return Ok(IOResult::Done(()));
+                    }
+                    IOResult::IO(io) => {
+                        return Ok(IOResult::IO(io));
+                    }
                 }
-                self.valid_state = CursorValidState::Valid;
-                Ok(IOResult::Done(()))
             }
-            IOResult::IO => {
-                self.context = Some(ctx);
-                Ok(IOResult::IO)
+            let ctx = self.context.take().unwrap();
+            let seek_key = match ctx {
+                CursorContext::TableRowId(rowid) => SeekKey::TableRowId(rowid),
+                CursorContext::IndexKeyRowId(ref record) => SeekKey::IndexKey(record),
+            };
+            let res = self.seek(seek_key, SeekOp::GE { eq_only: true })?;
+            match res {
+                IOResult::Done(res) => {
+                    if let SeekResult::TryAdvance = res {
+                        self.valid_state =
+                            CursorValidState::RequireAdvance(IterationDirection::Forwards);
+                        self.context = Some(ctx);
+                        // This will trigger the if statement above
+                        continue;
+                    }
+                    self.valid_state = CursorValidState::Valid;
+                    return Ok(IOResult::Done(()));
+                }
+                IOResult::IO(io) => {
+                    self.context = Some(ctx);
+                    return Ok(IOResult::IO(io));
+                }
             }
         }
     }
