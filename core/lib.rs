@@ -41,13 +41,11 @@ mod numeric;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use crate::storage::header_accessor::get_schema_cookie;
-use crate::storage::sqlite3_ondisk::is_valid_page_size;
-use crate::storage::{header_accessor, wal::DummyWAL};
+use crate::storage::wal::DummyWAL;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(feature = "fs")]
-use crate::util::{IOExt, OpenMode, OpenOptions};
+use crate::util::{OpenMode, OpenOptions};
 use crate::vtab::VirtualTable;
 use core::str;
 pub use error::LimboError;
@@ -78,6 +76,7 @@ use std::{
 use storage::database::DatabaseFile;
 use storage::page_cache::DumbLruPageCache;
 use storage::pager::{AtomicDbState, DbState};
+use storage::sqlite3_ondisk::PageSize;
 pub use storage::{
     buffer_pool::BufferPool,
     database::DatabaseStorage,
@@ -91,7 +90,7 @@ use turso_sqlite3_parser::{ast, ast::Cmd, lexer::sql::Parser};
 use types::IOResult;
 pub use types::RefValue;
 pub use types::Value;
-use util::parse_schema_rows;
+use util::{parse_schema_rows, IOExt as _};
 use vdbe::builder::QueryMode;
 use vdbe::builder::TableRefIdCounter;
 
@@ -289,10 +288,17 @@ impl Database {
     pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
         let pager = self.init_pager(None)?;
 
-        let page_size = header_accessor::get_page_size(&pager)
-            .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE);
-        let default_cache_size = header_accessor::get_default_page_cache_size(&pager)
-            .unwrap_or(storage::sqlite3_ondisk::DEFAULT_CACHE_SIZE);
+        let page_size = pager
+            .io
+            .block(|| pager.with_header(|header| header.page_size))
+            .unwrap_or_default()
+            .get();
+
+        let default_cache_size = pager
+            .io
+            .block(|| pager.with_header(|header| header.default_page_cache_size))
+            .unwrap_or_default()
+            .get();
 
         let conn = Arc::new(Connection {
             _db: self.clone(),
@@ -373,8 +379,11 @@ impl Database {
         let size = match page_size {
             Some(size) => size as u32,
             None => {
-                let size = header_accessor::get_page_size(&pager)
-                    .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE);
+                let size = pager
+                    .io
+                    .block(|| pager.with_header(|header| header.page_size))
+                    .unwrap_or_default()
+                    .get();
                 buffer_pool.set_page_size(size as usize);
                 size
             }
@@ -648,10 +657,12 @@ impl Connection {
         let pager = self.pager.borrow().clone();
 
         pager.begin_read_tx()?;
-        let db_cookie = get_schema_cookie(&pager);
+        let db_cookie = pager
+            .io
+            .block(|| pager.with_header(|header| header.schema_cookie));
         pager.end_read_tx().expect("read txn must be finished");
 
-        let db_cookie = db_cookie?;
+        let db_cookie = db_cookie?.get();
         let connection_cookie = self.schema.borrow().schema_version;
         turso_assert!(
             connection_cookie <= db_cookie,
@@ -1011,7 +1022,7 @@ impl Connection {
     /// is first created, if it does not already exist when the page_size pragma is issued,
     /// or at the next VACUUM command that is run on the same database connection while not in WAL mode.
     pub fn reset_page_size(&self, size: u32) -> Result<()> {
-        if !is_valid_page_size(size) {
+        if PageSize::new(size).is_none() {
             return Ok(());
         }
 

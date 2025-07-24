@@ -9,18 +9,17 @@ use turso_sqlite3_parser::ast::{PragmaName, QualifiedName};
 use crate::pragma::pragma_for;
 use crate::schema::Schema;
 use crate::storage::pager::AutoVacuumMode;
-use crate::storage::sqlite3_ondisk::MIN_PAGE_CACHE_SIZE;
+use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::schema::translate_create_table;
-use crate::util::{normalize_ident, parse_signed_number, parse_string};
+use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, storage, CaptureDataChangesMode, LimboError, Value};
+use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, Value};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
 use super::integrity_check::translate_integrity_check;
-use crate::storage::header_accessor;
 use crate::storage::pager::Pager;
 use crate::translate::emitter::TransactionMode;
 
@@ -416,7 +415,10 @@ fn query_pragma(
         }
         PragmaName::PageSize => {
             program.emit_int(
-                header_accessor::get_page_size(&pager).unwrap_or(connection.get_page_size()) as i64,
+                pager
+                    .io
+                    .block(|| pager.with_header(|header| header.page_size.get()))
+                    .unwrap_or(connection.get_page_size()) as i64,
                 register,
             );
             program.emit_result_row(register, 1);
@@ -467,7 +469,11 @@ fn update_auto_vacuum_mode(
     largest_root_page_number: u32,
     pager: Rc<Pager>,
 ) -> crate::Result<()> {
-    header_accessor::set_vacuum_mode_largest_root_page(&pager, largest_root_page_number)?;
+    pager.io.block(|| {
+        pager.with_header_mut(|header| {
+            header.vacuum_mode_largest_root_page = largest_root_page_number.into()
+        })
+    })?;
     pager.set_auto_vacuum_mode(auto_vacuum_mode);
     Ok(())
 }
@@ -481,8 +487,11 @@ fn update_cache_size(
 
     let mut cache_size = if cache_size_unformatted < 0 {
         let kb = cache_size_unformatted.abs().saturating_mul(1024);
-        let page_size = header_accessor::get_page_size(&pager)
-            .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as i64;
+        let page_size = pager
+            .io
+            .block(|| pager.with_header(|header| header.page_size))
+            .unwrap_or_default()
+            .get() as i64;
         if page_size == 0 {
             return Err(LimboError::InternalError(
                 "Page size cannot be zero".to_string(),
@@ -493,10 +502,7 @@ fn update_cache_size(
         value
     };
 
-    // SQLite uses this value as threshold for maximum cache size
-    const MAX_SAFE_CACHE_SIZE: i64 = 2147450880;
-
-    if cache_size > MAX_SAFE_CACHE_SIZE {
+    if cache_size > CacheSize::MAX_SAFE {
         cache_size = 0;
         cache_size_unformatted = 0;
     }
@@ -506,19 +512,17 @@ fn update_cache_size(
         cache_size_unformatted = 0;
     }
 
-    let cache_size_usize = cache_size as usize;
-
-    let final_cache_size = if cache_size_usize < MIN_PAGE_CACHE_SIZE {
-        cache_size_unformatted = MIN_PAGE_CACHE_SIZE as i64;
-        MIN_PAGE_CACHE_SIZE
+    let final_cache_size = if cache_size < CacheSize::MIN {
+        cache_size_unformatted = CacheSize::MIN;
+        CacheSize::MIN
     } else {
-        cache_size_usize
+        cache_size
     };
 
     connection.set_cache_size(cache_size_unformatted as i32);
 
     pager
-        .change_page_cache_size(final_cache_size)
+        .change_page_cache_size(final_cache_size as usize)
         .map_err(|e| LimboError::InternalError(format!("Failed to update page cache size: {e}")))?;
 
     Ok(())

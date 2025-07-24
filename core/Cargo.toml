@@ -70,6 +70,8 @@ serde = { workspace = true , optional = true, features = ["derive"] }
 paste = "1.0.15"
 uuid = { version = "1.11.0", features = ["v4", "v7"], optional = true }
 tempfile = "3.8.0"
+pack1 = { version = "1.0.0", features = ["bytemuck"] }
+bytemuck = "1.23.1"
 
 [build-dependencies]
 chrono = { version = "0.4.38", default-features = false }

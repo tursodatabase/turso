@@ -7,12 +7,11 @@ use crate::storage::page_cache::DumbLruPageCache;
 use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
 use crate::storage::sqlite3_ondisk::read_varint;
 use crate::storage::wal::DummyWAL;
-use crate::storage::{self, header_accessor};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
     compare_immutable, compare_records_generic, ImmutableRecord, SeekResult, Text, TextSubtype,
 };
-use crate::util::normalize_ident;
+use crate::util::{normalize_ident, IOExt as _};
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::registers_to_ref_values;
 use crate::{
@@ -3477,8 +3476,12 @@ pub fn op_sorter_open(
     };
     let cache_size = program.connection.get_cache_size();
     // Set the buffer size threshold to be roughly the same as the limit configured for the page-cache.
-    let page_size = header_accessor::get_page_size(pager)
-        .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as usize;
+    let page_size = pager
+        .io
+        .block(|| pager.with_header(|header| header.page_size))
+        .unwrap_or_default()
+        .get() as usize;
+
     let max_buffer_size_bytes = if cache_size < 0 {
         (cache_size.abs() * 1024) as usize
     } else {
@@ -4229,7 +4232,8 @@ pub fn op_function(
                 }
             }
             ScalarFunc::SqliteVersion => {
-                let version_integer: i64 = header_accessor::get_version_number(pager)? as i64;
+                let version_integer =
+                    return_if_io!(pager.with_header(|header| header.version_number)).get() as i64;
                 let version = execute_sqlite_version(version_integer);
                 state.registers[*dest] = Register::Value(Value::build_text(version));
             }
@@ -5841,7 +5845,9 @@ pub fn op_page_count(
         // TODO: implement temp databases
         todo!("temp databases not implemented yet");
     }
-    let count = header_accessor::get_database_size(pager)?.into();
+    let count = return_if_io!(pager.with_header(|header| header.database_size))
+        .get()
+        .into();
     state.registers[*dest] = Register::Value(Value::Integer(count));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -5901,15 +5907,16 @@ pub fn op_read_cookie(
         // TODO: implement temp databases
         todo!("temp databases not implemented yet");
     }
-    let cookie_value = match cookie {
-        Cookie::ApplicationId => header_accessor::get_application_id(pager)?.into(),
-        Cookie::UserVersion => header_accessor::get_user_version(pager)?.into(),
-        Cookie::SchemaVersion => header_accessor::get_schema_cookie(pager)?.into(),
-        Cookie::LargestRootPageNumber => {
-            header_accessor::get_vacuum_mode_largest_root_page(pager)?.into()
+
+    let cookie_value = return_if_io!(pager.with_header(|header| {
+        match cookie {
+            Cookie::ApplicationId => header.application_id.get().into(),
+            Cookie::UserVersion => header.user_version.get().into(),
+            Cookie::SchemaVersion => header.schema_cookie.get().into(),
+            Cookie::LargestRootPageNumber => header.vacuum_mode_largest_root_page.get().into(),
+            cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
         }
-        cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
-    };
+    }));
     state.registers[*dest] = Register::Value(Value::Integer(cookie_value));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -5934,37 +5941,37 @@ pub fn op_set_cookie(
     if *db > 0 {
         todo!("temp databases not implemented yet");
     }
-    match cookie {
-        Cookie::ApplicationId => {
-            header_accessor::set_application_id(pager, *value)?;
-        }
-        Cookie::UserVersion => {
-            header_accessor::set_user_version(pager, *value)?;
-        }
-        Cookie::LargestRootPageNumber => {
-            header_accessor::set_vacuum_mode_largest_root_page(pager, *value as u32)?;
-        }
-        Cookie::IncrementalVacuum => {
-            header_accessor::set_incremental_vacuum_enabled(pager, *value as u32)?;
-        }
-        Cookie::SchemaVersion => {
-            if mv_store.is_none() {
-                // we update transaction state to indicate that the schema has changed
-                match program.connection.transaction_state.get() {
-                    TransactionState::Write { schema_did_change } => {
-                        program.connection.transaction_state.set(TransactionState::Write { schema_did_change: true });
-                    },
-                    TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
-                    TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
-                }
+
+    return_if_io!(pager.with_header_mut(|header| {
+        match cookie {
+            Cookie::ApplicationId => header.application_id = (*value).into(),
+            Cookie::UserVersion => header.user_version = (*value).into(),
+            Cookie::LargestRootPageNumber => {
+                header.vacuum_mode_largest_root_page = (*value as u32).into();
             }
-            program
-                .connection
-                .with_schema_mut(|schema| schema.schema_version = *value as u32);
-            header_accessor::set_schema_cookie(pager, *value as u32)?;
-        }
-        cookie => todo!("{cookie:?} is not yet implement for SetCookie"),
-    }
+            Cookie::IncrementalVacuum => {
+                header.incremental_vacuum_enabled = (*value as u32).into()
+            }
+            Cookie::SchemaVersion => {
+                if mv_store.is_none() {
+                    // we update transaction state to indicate that the schema has changed
+                    match program.connection.transaction_state.get() {
+                        TransactionState::Write { schema_did_change } => {
+                            program.connection.transaction_state.set(TransactionState::Write { schema_did_change: true });
+                        },
+                        TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
+                        TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
+                    }
+                }
+                program
+                    .connection
+                    .with_schema_mut(|schema| schema.schema_version = *value as u32);
+                header.schema_cookie = (*value as u32).into();
+            }
+            cookie => todo!("{cookie:?} is not yet implement for SetCookie"),
+        };
+    }));
+
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -6171,9 +6178,11 @@ pub fn op_open_ephemeral(
                 Arc::new(Mutex::new(())),
             )?);
 
-            let page_size = header_accessor::get_page_size(&pager)
-                .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE)
-                as usize;
+            let page_size = pager
+                .io
+                .block(|| pager.with_header(|header| header.page_size))
+                .unwrap_or_default()
+                .get() as usize;
             buffer_pool.set_page_size(page_size);
 
             state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn { pager };
