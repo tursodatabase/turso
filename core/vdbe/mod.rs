@@ -235,6 +235,7 @@ pub struct Row {
 
 /// The program state describes the environment in which the program executes.
 pub struct ProgramState {
+    pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
     cursors: RefCell<Vec<Option<Cursor>>>,
     registers: Vec<Register>,
@@ -268,6 +269,7 @@ impl ProgramState {
             RefCell::new((0..max_cursors).map(|_| None).collect());
         let registers = vec![Register::Value(Value::Null); max_registers];
         Self {
+            io_completions: None,
             pc: 0,
             cursors,
             registers,
@@ -411,6 +413,17 @@ impl Program {
             if state.is_interrupted() {
                 return Ok(StepResult::Interrupt);
             }
+            if let Some(io) = &state.io_completions {
+                let completed = match io {
+                    IOCompletions::Single(c) => c.is_completed(),
+                    IOCompletions::Many(completions) => {
+                        completions.iter().all(|c| c.is_completed())
+                    }
+                };
+                if !completed {
+                    return Ok(StepResult::IO);
+                }
+            }
             // invalidate row
             let _ = state.result_row.take();
             let (insn, insn_function) = &self.insns[state.pc as usize];
@@ -419,7 +432,7 @@ impl Program {
                 Ok(InsnFunctionStepResult::Step) => {}
                 Ok(InsnFunctionStepResult::Done) => return Ok(StepResult::Done),
                 Ok(InsnFunctionStepResult::IO(io)) => {
-                    // TODO: save IO completion is program state
+                    state.io_completions = Some(io);
                     return Ok(StepResult::IO);
                 }
                 Ok(InsnFunctionStepResult::Row) => return Ok(StepResult::Row),
