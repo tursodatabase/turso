@@ -1407,6 +1407,7 @@ pub fn op_column(
                         table_cursor_id,
                     };
                 } else {
+                    state.op_column_state = OpColumnState::GetColumn;
                 }
             }
             OpColumnState::Rowid {

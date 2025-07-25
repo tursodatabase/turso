@@ -330,49 +330,47 @@ impl Sorter {
     }
 
     fn flush(&mut self) -> Result<IOResult<()>> {
-        loop {
-            let state = self.flush_state;
-            match state {
-                FlushState::Start => {
-                    if self.records.is_empty() {
-                        return Ok(IOResult::Done(()));
-                    }
-                    self.records.sort();
-
-                    if self.temp_dir.is_none() {
-                        self.temp_dir = Some(tempfile::tempdir().map_err(LimboError::IOError)?);
-                    }
-
-                    let chunk_file_path = self
-                        .temp_dir
-                        .as_ref()
-                        .unwrap()
-                        .path()
-                        .join(format!("chunk_{}", self.chunks.len()));
-                    let chunk_file = self.io.open_file(
-                        chunk_file_path.to_str().unwrap(),
-                        OpenFlags::Create,
-                        false,
-                    )?;
-
-                    // Make sure the chunk buffer size can fit the largest record and its size varint.
-                    let chunk_buffer_size = self
-                        .min_chunk_read_buffer_size
-                        .max(self.max_payload_size_in_buffer + 9);
-                    let mut chunk = SortedChunk::new(chunk_file.clone(), chunk_buffer_size);
-                    let c = chunk.write(&mut self.records)?;
-                    self.chunks.push(chunk);
-
-                    self.current_buffer_size = 0;
-                    self.max_payload_size_in_buffer = 0;
-
-                    self.flush_state = FlushState::Finish;
-                    return Ok(IOResult::IO(IOCompletions::Single(c)));
-                }
-                FlushState::Finish => {
-                    self.flush_state = FlushState::Start;
+        let state = self.flush_state;
+        match state {
+            FlushState::Start => {
+                if self.records.is_empty() {
                     return Ok(IOResult::Done(()));
                 }
+                self.records.sort();
+
+                if self.temp_dir.is_none() {
+                    self.temp_dir = Some(tempfile::tempdir().map_err(LimboError::IOError)?);
+                }
+
+                let chunk_file_path = self
+                    .temp_dir
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .join(format!("chunk_{}", self.chunks.len()));
+                let chunk_file = self.io.open_file(
+                    chunk_file_path.to_str().unwrap(),
+                    OpenFlags::Create,
+                    false,
+                )?;
+
+                // Make sure the chunk buffer size can fit the largest record and its size varint.
+                let chunk_buffer_size = self
+                    .min_chunk_read_buffer_size
+                    .max(self.max_payload_size_in_buffer + 9);
+                let mut chunk = SortedChunk::new(chunk_file.clone(), chunk_buffer_size);
+                let c = chunk.write(&mut self.records)?;
+                self.chunks.push(chunk);
+
+                self.current_buffer_size = 0;
+                self.max_payload_size_in_buffer = 0;
+
+                self.flush_state = FlushState::Finish;
+                Ok(IOResult::IO(IOCompletions::Single(c)))
+            }
+            FlushState::Finish => {
+                self.flush_state = FlushState::Start;
+                Ok(IOResult::Done(()))
             }
         }
     }
