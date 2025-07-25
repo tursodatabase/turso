@@ -58,6 +58,7 @@ pub type ReadComplete = dyn Fn(Arc<RefCell<Buffer>>, i32);
 pub type WriteComplete = dyn Fn(i32);
 pub type SyncComplete = dyn Fn(i32);
 
+#[must_use]
 pub struct Completion {
     pub completion_type: CompletionType,
     is_completed: Cell<bool>,

@@ -1225,6 +1225,7 @@ impl BTreeCursor {
             MoveToState::Start => {
                 // `move_to_root` add the first page we want to the stack
                 let c = self.move_to_root()?;
+                self.move_to_state = MoveToState::ProcessPage;
                 return Ok(IOResult::IO(IOCompletions::Single(c)));
             }
             MoveToState::ProcessPage => {
@@ -7105,7 +7106,7 @@ mod tests {
 
         let cursor = BTreeCursor::new_table(None, pager.clone(), page_idx, num_columns);
         let (page, c) = cursor.read_page(page_idx).unwrap();
-        pager.io.wait_for_completion(c);
+        pager.io.wait_for_completion(c).unwrap();
         let page = page.get();
         // Pin page in order to not drop it in between loading of different pages. If not contents will be a dangling reference.
         page.set_dirty();
@@ -7463,10 +7464,12 @@ mod tests {
                 }
                 pager.begin_read_tx().unwrap();
                 // FIXME: add sorted vector instead, should be okay for small amounts of keys for now :P, too lazy to fix right now
-                cursor.move_to_root().unwrap();
+                let c = cursor.move_to_root().unwrap();
+                pager.io.wait_for_completion(c).unwrap();
                 let mut valid = true;
                 if do_validate {
-                    cursor.move_to_root().unwrap();
+                    let c = cursor.move_to_root().unwrap();
+                    pager.io.wait_for_completion(c).unwrap();
                     for key in keys.iter() {
                         tracing::trace!("seeking key: {}", key);
                         run_until_done(|| cursor.next(), pager.deref()).unwrap();
@@ -7499,7 +7502,8 @@ mod tests {
             if matches!(validate_btree(pager.clone(), root_page), (_, false)) {
                 panic!("invalid btree");
             }
-            cursor.move_to_root().unwrap();
+            let c = cursor.move_to_root().unwrap();
+            pager.io.wait_for_completion(c).unwrap();
             for key in keys.iter() {
                 tracing::trace!("seeking key: {}", key);
                 run_until_done(|| cursor.next(), pager.deref()).unwrap();
@@ -7566,8 +7570,26 @@ mod tests {
             let mut keys = SortedVec::new();
             tracing::info!("seed: {seed}");
             for i in 0..inserts {
-                pager.begin_read_tx().unwrap();
-                pager.begin_write_tx().unwrap();
+                while let IOResult::IO(io) = pager.begin_read_tx().unwrap() {
+                    match io {
+                        IOCompletions::Single(c) => pager.io.wait_for_completion(c).unwrap(),
+                        IOCompletions::Many(completions) => {
+                            for c in completions {
+                                pager.io.wait_for_completion(c).unwrap();
+                            }
+                        }
+                    }
+                }
+                while let IOResult::IO(io) = pager.begin_write_tx().unwrap() {
+                    match io {
+                        IOCompletions::Single(c) => pager.io.wait_for_completion(c).unwrap(),
+                        IOCompletions::Many(completions) => {
+                            for c in completions {
+                                pager.io.wait_for_completion(c).unwrap();
+                            }
+                        }
+                    }
+                }
                 let key = {
                     let result;
                     loop {
@@ -7610,7 +7632,8 @@ mod tests {
                     pager.deref(),
                 )
                 .unwrap();
-                cursor.move_to_root().unwrap();
+                let c = cursor.move_to_root().unwrap();
+                pager.io.wait_for_completion(c).unwrap();
                 loop {
                     match pager.end_tx(false, false, &conn, false).unwrap() {
                         IOResult::Done(_) => break,
@@ -7627,8 +7650,18 @@ mod tests {
             }
 
             // Check that all keys can be found by seeking
-            pager.begin_read_tx().unwrap();
-            cursor.move_to_root().unwrap();
+            while let IOResult::IO(io) = pager.begin_read_tx().unwrap() {
+                match io {
+                    IOCompletions::Single(c) => pager.io.wait_for_completion(c).unwrap(),
+                    IOCompletions::Many(completions) => {
+                        for c in completions {
+                            pager.io.wait_for_completion(c).unwrap();
+                        }
+                    }
+                }
+            }
+            let c = cursor.move_to_root().unwrap();
+            pager.io.wait_for_completion(c).unwrap();
             for (i, key) in keys.iter().enumerate() {
                 tracing::info!("seeking key {}/{}: {:?}", i + 1, keys.len(), key);
                 let exists = run_until_done(
@@ -7652,7 +7685,8 @@ mod tests {
                 assert!(found, "key {key:?} is not found");
             }
             // Check that key count is right
-            cursor.move_to_root().unwrap();
+            let c = cursor.move_to_root().unwrap();
+            pager.io.wait_for_completion(c).unwrap();
             let mut count = 0;
             while run_until_done(|| cursor.next(), pager.deref()).unwrap() {
                 count += 1;
@@ -7665,7 +7699,8 @@ mod tests {
                 keys.len()
             );
             // Check that all keys can be found in-order, by iterating the btree
-            cursor.move_to_root().unwrap();
+            let c = cursor.move_to_root().unwrap();
+            pager.io.wait_for_completion(c).unwrap();
             let mut prev = None;
             for (i, key) in keys.iter().enumerate() {
                 tracing::info!("iterating key {}/{}: {:?}", i + 1, keys.len(), key);
@@ -9137,7 +9172,8 @@ mod tests {
             );
         }
         let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
-        cursor.move_to_root().unwrap();
+        let c = cursor.move_to_root().unwrap();
+        pager.io.wait_for_completion(c).unwrap();
         for i in 0..iterations {
             let has_next = run_until_done(|| cursor.next(), pager.deref()).unwrap();
             if !has_next {
