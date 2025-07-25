@@ -120,6 +120,12 @@ impl From<String> for Text {
     }
 }
 
+impl From<Text> for String {
+    fn from(value: Text) -> Self {
+        String::from_utf8(value.value).unwrap()
+    }
+}
+
 impl Display for TextRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
@@ -874,6 +880,12 @@ impl ImmutableRecord {
     pub fn new(payload_capacity: usize) -> Self {
         Self {
             payload: Value::Blob(Vec::with_capacity(payload_capacity)),
+        }
+    }
+
+    pub fn from_bin_record(payload: Vec<u8>) -> Self {
+        Self {
+            payload: Value::Blob(payload),
         }
     }
 
@@ -2354,6 +2366,22 @@ impl RawSlice {
             unsafe { std::slice::from_raw_parts(self.data, self.len) }
         }
     }
+}
+
+#[derive(Debug)]
+pub enum DatabaseChangeType {
+    Delete,
+    Update { bin_record: Vec<u8> },
+    Insert { bin_record: Vec<u8> },
+}
+
+#[derive(Debug)]
+pub struct DatabaseChange {
+    pub change_id: i64,
+    pub change_time: u64,
+    pub change: DatabaseChangeType,
+    pub table_name: String,
+    pub id: i64,
 }
 
 #[cfg(test)]

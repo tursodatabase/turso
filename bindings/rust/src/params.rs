@@ -217,6 +217,7 @@ macro_rules! named_tuple_into_params {
     }
 }
 
+named_tuple_into_params!(1: (0 A));
 named_tuple_into_params!(2: (0 A), (1 B));
 named_tuple_into_params!(3: (0 A), (1 B), (2 C));
 named_tuple_into_params!(4: (0 A), (1 B), (2 C), (3 D));
@@ -233,6 +234,7 @@ named_tuple_into_params!(14: (0 A), (1 B), (2 C), (3 D), (4 E), (5 F), (6 G), (7
 named_tuple_into_params!(15: (0 A), (1 B), (2 C), (3 D), (4 E), (5 F), (6 G), (7 H), (8 I), (9 J), (10 K), (11 L), (12 M), (13 N), (14 O));
 named_tuple_into_params!(16: (0 A), (1 B), (2 C), (3 D), (4 E), (5 F), (6 G), (7 H), (8 I), (9 J), (10 K), (11 L), (12 M), (13 N), (14 O), (15 P));
 
+tuple_into_params!(1: (0 A));
 tuple_into_params!(2: (0 A), (1 B));
 tuple_into_params!(3: (0 A), (1 B), (2 C));
 tuple_into_params!(4: (0 A), (1 B), (2 C), (3 D));

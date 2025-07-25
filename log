@@ -1,0 +1,595 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running `target/debug/tursodb ck.db`
+Turso v0.1.3-pre.3
+Enter ".help" for usage hints.
+This software is ALPHA, only use for development, testing, and experimentation.
+2025-07-21T07:15:27.277285Z  INFO ThreadId(01) tursodb: 53: Configuration: Config { table: TableConfig { header_color: LimboColor(Default), column_colors: [LimboColor(Default)] }, highlight: HighlightConfig { enable: true, theme: "base16-ocean.dark", prompt: LimboColor(Rgb(34, 197, 94)), hint: LimboColor(Rgb(107, 114, 128)), candidate: LimboColor(Green) } }
+[?2004h[Kturso> [7C[Kturso> CREATE TABLE t(x);[8C[Kturso> CREATE TABLE t(x);[9C[Kturso> CREATE TABLE t(x);[10C[Kturso> CREATE TABLE t(x);[11C[Kturso> CREATE TABLE t(x);[12C[Kturso> CREATE TABLE t(x);[13C[Kturso> CREATE TABLE t(x);[14C[Kturso> CREATE TABLE t(x);[15C[Kturso> CREATE TABLE t(x);[16C[Kturso> CREATE TABLE t(x);[17C[Kturso> CREATE TABLE t(x);[18C[Kturso> CREATE TABLE t(x);[19C[Kturso> CREATE TABLE t(x);[20C[Kturso> CREATE TABLE t(x);[21C[Kturso> CREATE TABLE tt[22C(x);[?2004l
+2025-07-21T07:15:31.927054Z TRACE ThreadId(01) run_cmd:translate: turso_core::translate: 67: querying CREATE TABLE tt(x);
+2025-07-21T07:15:31.927227Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=Init { target_pc: Label(0) }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.927296Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=CreateBtree { db: 0, root: 1, flags: CreateBTreeFlags(1) }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.927346Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=OpenWrite { cursor_id: 0, root_page: Literal(1), name: "tt" }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.927359Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=NewRowid { cursor: 0, rowid_reg: 2, prev_largest_reg: 0 }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.927371Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=String8 { value: "table", dest: 3 }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.927383Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=String8 { value: "tt", dest: 4 }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.927395Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=String8 { value: "tt", dest: 5 }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.927406Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=Copy { src_reg: 1, dst_reg: 6, extra_amount: 0 }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.927417Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=String8 { value: "CREATE TABLE tt (x)", dest: 7 }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.927429Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=MakeRecord { start_reg: 3, count: 5, dest_reg: 8, index_name: None }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.927441Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=Insert { cursor: 0, key_reg: 2, record_reg: 8, flag: InsertFlags(0), table_name: "tt" }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.927454Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=SetCookie { db: 0, cookie: SchemaVersion, value: 4, p5: 0 }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.927467Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=ParseSchema { db: 0, where_clause: Some("tbl_name = 'tt' AND type != 'trigger'") }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.927478Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=Halt { err_code: 0, description: "" }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.927489Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=Transaction { write: true }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.927506Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=Goto { target_pc: Offset(1) }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.927601Z TRACE ThreadId(01) step:trace_insn{addr=0 insn=Init { target_pc: Offset(14) }}: turso_core::vdbe: 585: 
+0     Init               0     14    0                    0   Start at 14
+2025-07-21T07:15:31.927619Z TRACE ThreadId(01) step:trace_insn{addr=14 insn=Transaction { write: true }}: turso_core::vdbe: 585: 
+14    Transaction        0     1     0                    0   write=true
+2025-07-21T07:15:31.927644Z TRACE ThreadId(01) step:begin_read_tx:begin_read_tx: turso_core::storage::wal: 150: read_lock(true)
+2025-07-21T07:15:31.927668Z TRACE ThreadId(01) step:begin_write_tx:begin_write_tx: turso_core::storage::wal: 174: write_lock(true)
+2025-07-21T07:15:31.927696Z DEBUG ThreadId(01) step:begin_write_tx:begin_write_tx: turso_core::storage::wal: 669: begin_write_transaction(busy=false)
+2025-07-21T07:15:31.927713Z TRACE ThreadId(01) step:trace_insn{addr=15 insn=Goto { target_pc: Offset(1) }}: turso_core::vdbe: 585: 
+15    Goto               0     1     0                    0   
+2025-07-21T07:15:31.927727Z TRACE ThreadId(01) step:trace_insn{addr=1 insn=CreateBtree { db: 0, root: 1, flags: CreateBTreeFlags(1) }}: turso_core::vdbe: 585: 
+1     CreateBtree        0     1     1                    0   r[1]=root iDb=0 flags=1
+2025-07-21T07:15:31.927747Z TRACE ThreadId(01) step:btree_create:allocate_page:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:31.927775Z TRACE ThreadId(01) step:btree_create:allocate_page:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:31.927786Z TRACE ThreadId(01) step:btree_create:allocate_page:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:31.927799Z DEBUG ThreadId(01) step:btree_create:allocate_page: turso_core::storage::pager: 1295: allocate_page(database_size=5)
+2025-07-21T07:15:31.927808Z TRACE ThreadId(01) step:btree_create:allocate_page:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:31.927817Z TRACE ThreadId(01) step:btree_create:allocate_page:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:31.927824Z TRACE ThreadId(01) step:btree_create:allocate_page:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:31.927837Z DEBUG ThreadId(01) step:btree_create:allocate_page: turso_core::storage::pager: 119: set_dirty(page=1)
+2025-07-21T07:15:31.927850Z DEBUG ThreadId(01) step:btree_create:allocate_page: turso_core::storage::pager: 119: set_dirty(page=1)
+2025-07-21T07:15:31.927884Z DEBUG ThreadId(01) step:btree_create:allocate_page: turso_core::storage::pager: 119: set_dirty(page=5)
+2025-07-21T07:15:31.927892Z TRACE ThreadId(01) step:btree_create:allocate_page: turso_core::storage::page_cache: 102: insert(key=PageCacheKey { pgno: 5 })
+2025-07-21T07:15:31.927897Z TRACE ThreadId(01) step:btree_create:allocate_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 5 })
+2025-07-21T07:15:31.927911Z TRACE ThreadId(01) step:btree_create:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:31.927938Z TRACE ThreadId(01) step:btree_create:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:31.927944Z TRACE ThreadId(01) step:btree_create:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:31.927956Z TRACE ThreadId(01) step:btree_create:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:31.927961Z TRACE ThreadId(01) step:btree_create:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:31.927968Z TRACE ThreadId(01) step:btree_create:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:31.927978Z DEBUG ThreadId(01) step:btree_create: turso_core::storage::btree: 5768: btree_init_page(id=5, offset=0)
+2025-07-21T07:15:31.927985Z TRACE ThreadId(01) step:btree_create: turso_core::storage::sqlite3_ondisk: 443: write_u8(pos=0, value=13)
+2025-07-21T07:15:31.927991Z TRACE ThreadId(01) step:btree_create: turso_core::storage::sqlite3_ondisk: 449: write_u16(pos=1, value=0)
+2025-07-21T07:15:31.927996Z TRACE ThreadId(01) step:btree_create: turso_core::storage::sqlite3_ondisk: 449: write_u16(pos=3, value=0)
+2025-07-21T07:15:31.928001Z TRACE ThreadId(01) step:btree_create: turso_core::storage::sqlite3_ondisk: 449: write_u16(pos=5, value=4096)
+2025-07-21T07:15:31.928005Z TRACE ThreadId(01) step:btree_create: turso_core::storage::sqlite3_ondisk: 443: write_u8(pos=7, value=0)
+2025-07-21T07:15:31.928011Z TRACE ThreadId(01) step:btree_create: turso_core::storage::sqlite3_ondisk: 461: write_u32(pos=8, value=0)
+2025-07-21T07:15:31.928017Z DEBUG ThreadId(01) step:btree_create: turso_core::storage::pager: 640: do_allocate_page(id=5, page_type=TableLeaf)
+2025-07-21T07:15:31.928034Z TRACE ThreadId(01) step:trace_insn{addr=2 insn=OpenWrite { cursor_id: 0, root_page: Literal(1), name: "tt" }}: turso_core::vdbe: 585: 
+2     OpenWrite          0     1     0                    0   root=1; tt
+2025-07-21T07:15:31.928073Z TRACE ThreadId(01) step:trace_insn{addr=3 insn=NewRowid { cursor: 0, rowid_reg: 2, prev_largest_reg: 0 }}: turso_core::vdbe: 585: 
+3     NewRowid           0     2     0                    0   r[2]=rowid
+2025-07-21T07:15:31.928092Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root: turso_core::storage::btree: 1301: root_page=1
+2025-07-21T07:15:31.928105Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:31.928112Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:31.928119Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:31.928138Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root:pagestack::push: turso_core::storage::btree: 5501: current=-1 new_page_id=1
+2025-07-21T07:15:31.928159Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:pagestack::top: turso_core::storage::btree: 5603: current=0 page_id=1
+2025-07-21T07:15:31.928191Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:31.928197Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:31.928204Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:31.928227Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root: turso_core::storage::btree: 1301: root_page=1
+2025-07-21T07:15:31.928235Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:31.928243Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:31.928253Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:31.928265Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root:pagestack::push: turso_core::storage::btree: 5501: current=-1 new_page_id=1
+2025-07-21T07:15:31.928300Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:pagestack::top: turso_core::storage::btree: 5603: current=0 page_id=1
+2025-07-21T07:15:31.928312Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:31.928317Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:31.928324Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:31.928342Z TRACE ThreadId(01) step:rowid:pagestack::top: turso_core::storage::btree: 5603: current=0 page_id=1
+2025-07-21T07:15:31.928358Z TRACE ThreadId(01) step:rowid:record:pagestack::top: turso_core::storage::btree: 5603: current=0 page_id=1
+2025-07-21T07:15:31.928391Z TRACE ThreadId(01) step:rowid:record:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:31.928397Z TRACE ThreadId(01) step:rowid:record:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:31.928403Z TRACE ThreadId(01) step:rowid:record:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:31.928412Z TRACE ThreadId(01) step:rowid:record: turso_core::storage::sqlite3_ondisk: 539: cell_get(idx=1)
+2025-07-21T07:15:31.928428Z TRACE ThreadId(01) step:rowid:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:31.928433Z TRACE ThreadId(01) step:rowid:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:31.928439Z TRACE ThreadId(01) step:rowid:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:31.928446Z TRACE ThreadId(01) step:rowid: turso_core::storage::sqlite3_ondisk: 539: cell_get(idx=1)
+2025-07-21T07:15:31.928468Z TRACE ThreadId(01) step:next:next:pagestack::top: turso_core::storage::btree: 5603: current=0 page_id=1
+2025-07-21T07:15:31.928498Z DEBUG ThreadId(01) step:next:next: turso_core::storage::btree: 1186: current_before_advance id=1 cell=1 cell_count=2
+2025-07-21T07:15:31.928512Z TRACE ThreadId(01) step:next:next:pagestack::advance: turso_core::storage::btree: 5632: curr_cell_index=1 node_states=[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+2025-07-21T07:15:31.928525Z DEBUG ThreadId(01) step:next:next: turso_core::storage::btree: 1213: current id=1 cell=2
+2025-07-21T07:15:31.928544Z TRACE ThreadId(01) step:trace_insn{addr=4 insn=String8 { value: "table", dest: 3 }}: turso_core::vdbe: 585: 
+4     String8            0     3     0     table          0   r[3]='table'
+2025-07-21T07:15:31.928576Z TRACE ThreadId(01) step:trace_insn{addr=5 insn=String8 { value: "tt", dest: 4 }}: turso_core::vdbe: 585: 
+5     String8            0     4     0     tt             0   r[4]='tt'
+2025-07-21T07:15:31.928588Z TRACE ThreadId(01) step:trace_insn{addr=6 insn=String8 { value: "tt", dest: 5 }}: turso_core::vdbe: 585: 
+6     String8            0     5     0     tt             0   r[5]='tt'
+2025-07-21T07:15:31.928601Z TRACE ThreadId(01) step:trace_insn{addr=7 insn=Copy { src_reg: 1, dst_reg: 6, extra_amount: 0 }}: turso_core::vdbe: 585: 
+7     Copy               1     6     0                    0   r[6]=r[1]
+2025-07-21T07:15:31.928632Z TRACE ThreadId(01) step:trace_insn{addr=8 insn=String8 { value: "CREATE TABLE tt (x)", dest: 7 }}: turso_core::vdbe: 585: 
+8     String8            0     7     0     CREATE TABLE tt (x)  0   r[7]='CREATE TABLE tt (x)'
+2025-07-21T07:15:31.928646Z TRACE ThreadId(01) step:trace_insn{addr=9 insn=MakeRecord { start_reg: 3, count: 5, dest_reg: 8, index_name: None }}: turso_core::vdbe: 585: 
+9     MakeRecord         3     5     8                    0   r[8]=mkrec(r[3..7])
+2025-07-21T07:15:31.928670Z TRACE ThreadId(01) step:trace_insn{addr=10 insn=Insert { cursor: 0, key_reg: 2, record_reg: 8, flag: InsertFlags(0), table_name: "tt" }}: turso_core::vdbe: 585: 
+10    Insert             0     8     2     tt             0   intkey=r[2] data=r[8]
+2025-07-21T07:15:31.928707Z DEBUG ThreadId(01) step:insert{key=TableRowId((4, Some(ImmutableRecord { payload: Blob([6, 23, 17, 17, 1, 51, 116, 97, 98, 108, 101, 116, 116, 116, 116, 5, 67, 82, 69, 65, 84, 69, 32, 84, 65, 66, 76, 69, 32, 116, 116, 32, 40, 120, 41]) }))) moved_before=true}: turso_core::storage::btree: 4159: valid_state=Valid cursor_state=None is_write_in_progress=false
+2025-07-21T07:15:31.928730Z TRACE ThreadId(01) step:insert{key=TableRowId((4, Some(ImmutableRecord { payload: Blob([6, 23, 17, 17, 1, 51, 116, 97, 98, 108, 101, 116, 116, 116, 116, 5, 67, 82, 69, 65, 84, 69, 32, 84, 65, 66, 76, 69, 32, 116, 116, 32, 40, 120, 41]) }))) moved_before=true}:insert_into_page:pagestack::top: turso_core::storage::btree: 5603: current=0 page_id=1
+2025-07-21T07:15:31.928761Z DEBUG ThreadId(01) step:insert{key=TableRowId((4, Some(ImmutableRecord { payload: Blob([6, 23, 17, 17, 1, 51, 116, 97, 98, 108, 101, 116, 116, 116, 116, 5, 67, 82, 69, 65, 84, 69, 32, 84, 65, 66, 76, 69, 32, 116, 116, 32, 40, 120, 41]) }))) moved_before=true}:insert_into_page: turso_core::storage::pager: 119: set_dirty(page=1)
+2025-07-21T07:15:31.928768Z DEBUG ThreadId(01) step:insert{key=TableRowId((4, Some(ImmutableRecord { payload: Blob([6, 23, 17, 17, 1, 51, 116, 97, 98, 108, 101, 116, 116, 116, 116, 5, 67, 82, 69, 65, 84, 69, 32, 84, 65, 66, 76, 69, 32, 116, 116, 32, 40, 120, 41]) }))) moved_before=true}:insert_into_page: turso_core::storage::btree: 2131: cell_idx=2
+2025-07-21T07:15:31.928777Z TRACE ThreadId(01) step:insert{key=TableRowId((4, Some(ImmutableRecord { payload: Blob([6, 23, 17, 17, 1, 51, 116, 97, 98, 108, 101, 116, 116, 116, 116, 5, 67, 82, 69, 65, 84, 69, 32, 84, 65, 66, 76, 69, 32, 116, 116, 32, 40, 120, 41]) }))) moved_before=true}:insert_into_page:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:31.928783Z TRACE ThreadId(01) step:insert{key=TableRowId((4, Some(ImmutableRecord { payload: Blob([6, 23, 17, 17, 1, 51, 116, 97, 98, 108, 101, 116, 116, 116, 116, 5, 67, 82, 69, 65, 84, 69, 32, 84, 65, 66, 76, 69, 32, 116, 116, 32, 40, 120, 41]) }))) moved_before=true}:insert_into_page:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:31.928789Z TRACE ThreadId(01) step:insert{key=TableRowId((4, Some(ImmutableRecord { payload: Blob([6, 23, 17, 17, 1, 51, 116, 97, 98, 108, 101, 116, 116, 116, 116, 5, 67, 82, 69, 65, 84, 69, 32, 84, 65, 66, 76, 69, 32, 116, 116, 32, 40, 120, 41]) }))) moved_before=true}:insert_into_page:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:31.928799Z DEBUG ThreadId(01) step:insert{key=TableRowId((4, Some(ImmutableRecord { payload: Blob([6, 23, 17, 17, 1, 51, 116, 97, 98, 108, 101, 116, 116, 116, 116, 5, 67, 82, 69, 65, 84, 69, 32, 84, 65, 66, 76, 69, 32, 116, 116, 32, 40, 120, 41]) }))) moved_before=true}:insert_into_page: turso_core::storage::btree: 6429: fill_cell_payload(record_size=35, payload_overflow_threshold_max=4061)
+2025-07-21T07:15:31.928807Z DEBUG ThreadId(01) step:insert{key=TableRowId((4, Some(ImmutableRecord { payload: Blob([6, 23, 17, 17, 1, 51, 116, 97, 98, 108, 101, 116, 116, 116, 116, 5, 67, 82, 69, 65, 84, 69, 32, 84, 65, 66, 76, 69, 32, 116, 116, 32, 40, 120, 41]) }))) moved_before=true}:insert_into_page: turso_core::storage::btree: 2217: cell_count=2
+2025-07-21T07:15:31.928815Z TRACE ThreadId(01) step:insert{key=TableRowId((4, Some(ImmutableRecord { payload: Blob([6, 23, 17, 17, 1, 51, 116, 97, 98, 108, 101, 116, 116, 116, 116, 5, 67, 82, 69, 65, 84, 69, 32, 84, 65, 66, 76, 69, 32, 116, 116, 32, 40, 120, 41]) }))) moved_before=true}:insert_into_page:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:31.928822Z TRACE ThreadId(01) step:insert{key=TableRowId((4, Some(ImmutableRecord { payload: Blob([6, 23, 17, 17, 1, 51, 116, 97, 98, 108, 101, 116, 116, 116, 116, 5, 67, 82, 69, 65, 84, 69, 32, 84, 65, 66, 76, 69, 32, 116, 116, 32, 40, 120, 41]) }))) moved_before=true}:insert_into_page:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:31.928829Z TRACE ThreadId(01) step:insert{key=TableRowId((4, Some(ImmutableRecord { payload: Blob([6, 23, 17, 17, 1, 51, 116, 97, 98, 108, 101, 116, 116, 116, 116, 5, 67, 82, 69, 65, 84, 69, 32, 84, 65, 66, 76, 69, 32, 116, 116, 32, 40, 120, 41]) }))) moved_before=true}:insert_into_page:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:31.928842Z TRACE ThreadId(01) step:insert{key=TableRowId((4, Some(ImmutableRecord { payload: Blob([6, 23, 17, 17, 1, 51, 116, 97, 98, 108, 101, 116, 116, 116, 116, 5, 67, 82, 69, 65, 84, 69, 32, 84, 65, 66, 76, 69, 32, 116, 116, 32, 40, 120, 41]) }))) moved_before=true}:insert_into_page: turso_core::storage::sqlite3_ondisk: 449: write_u16(pos=5, value=3991)
+2025-07-21T07:15:31.928849Z DEBUG ThreadId(01) step:insert{key=TableRowId((4, Some(ImmutableRecord { payload: Blob([6, 23, 17, 17, 1, 51, 116, 97, 98, 108, 101, 116, 116, 116, 116, 5, 67, 82, 69, 65, 84, 69, 32, 84, 65, 66, 76, 69, 32, 116, 116, 32, 40, 120, 41]) }))) moved_before=true}:insert_into_page: turso_core::storage::btree: 6237: insert_into_cell(idx=2, pc=3991, size=37)
+2025-07-21T07:15:31.928859Z TRACE ThreadId(01) step:insert{key=TableRowId((4, Some(ImmutableRecord { payload: Blob([6, 23, 17, 17, 1, 51, 116, 97, 98, 108, 101, 116, 116, 116, 116, 5, 67, 82, 69, 65, 84, 69, 32, 84, 65, 66, 76, 69, 32, 116, 116, 32, 40, 120, 41]) }))) moved_before=true}:insert_into_page: turso_core::storage::sqlite3_ondisk: 455: write_u16(pos=112, value=3991)
+2025-07-21T07:15:31.928864Z TRACE ThreadId(01) step:insert{key=TableRowId((4, Some(ImmutableRecord { payload: Blob([6, 23, 17, 17, 1, 51, 116, 97, 98, 108, 101, 116, 116, 116, 116, 5, 67, 82, 69, 65, 84, 69, 32, 84, 65, 66, 76, 69, 32, 116, 116, 32, 40, 120, 41]) }))) moved_before=true}:insert_into_page: turso_core::storage::sqlite3_ondisk: 449: write_u16(pos=3, value=3)
+2025-07-21T07:15:31.928889Z TRACE ThreadId(01) step:trace_insn{addr=11 insn=SetCookie { db: 0, cookie: SchemaVersion, value: 4, p5: 0 }}: turso_core::vdbe: 585: 
+11    SetCookie          0     1     4                    0   
+2025-07-21T07:15:31.928921Z TRACE ThreadId(01) step:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:31.928926Z TRACE ThreadId(01) step:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:31.928930Z TRACE ThreadId(01) step:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:31.928937Z DEBUG ThreadId(01) step: turso_core::storage::pager: 119: set_dirty(page=1)
+2025-07-21T07:15:31.928941Z DEBUG ThreadId(01) step: turso_core::storage::pager: 119: set_dirty(page=1)
+2025-07-21T07:15:31.928953Z TRACE ThreadId(01) step:trace_insn{addr=12 insn=ParseSchema { db: 0, where_clause: Some("tbl_name = 'tt' AND type != 'trigger'") }}: turso_core::vdbe: 585: 
+12    ParseSchema        0     0     0     tbl_name = 'tt' AND type != 'trigger'  0   tbl_name = 'tt' AND type != 'trigger'
+2025-07-21T07:15:31.928978Z TRACE ThreadId(01) step:prepare: turso_core: 540: Preparing: SELECT * FROM sqlite_schema WHERE tbl_name = 'tt' AND type != 'trigger'
+2025-07-21T07:15:31.929127Z TRACE ThreadId(01) step:prepare:translate: turso_core::translate: 67: querying SELECT * FROM sqlite_schema WHERE tbl_name = 'tt' AND type != 'trigger'
+2025-07-21T07:15:31.929158Z TRACE ThreadId(01) step:prepare:translate:emit_insn{insn=Init { target_pc: Label(0) }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929282Z DEBUG ThreadId(01) step:prepare:translate:optimize_plan: turso_core::translate::optimizer: 51: plan_sql="SELECT sqlite_schema.type, sqlite_schema.name, sqlite_schema.tbl_name, sqlite_schema.rootpage, sqlite_schema.sql FROM sqlite_schema WHERE sqlite_schema.tbl_name = 'tt' AND sqlite_schema.type != 'trigger'"
+2025-07-21T07:15:31.929340Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_query:emit_insn{insn=OpenRead { cursor_id: 0, root_page: 1 }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929360Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_query:emit_insn{insn=Rewind { cursor_id: 0, pc_if_empty: Label(3) }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929407Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_query:translate_condition_expr{condition_metadata=ConditionMetadata { jump_if_condition_is_true: false, jump_target_when_true: Label(5), jump_target_when_false: Label(2) }}:emit_insn{insn=Column { cursor_id: 0, column: 2, dest: 7, default: None }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929430Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_query:translate_condition_expr{condition_metadata=ConditionMetadata { jump_if_condition_is_true: false, jump_target_when_true: Label(5), jump_target_when_false: Label(2) }}:emit_insn{insn=String8 { value: "tt", dest: 8 }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929469Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_query:translate_condition_expr{condition_metadata=ConditionMetadata { jump_if_condition_is_true: false, jump_target_when_true: Label(5), jump_target_when_false: Label(2) }}:emit_insn{insn=Integer { value: 1, dest: 6 }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929485Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_query:translate_condition_expr{condition_metadata=ConditionMetadata { jump_if_condition_is_true: false, jump_target_when_true: Label(5), jump_target_when_false: Label(2) }}:emit_insn{insn=Eq { lhs: 7, rhs: 8, target_pc: Label(6), flags: CmpInsFlags(66), collation: Some(Binary) }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929500Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_query:translate_condition_expr{condition_metadata=ConditionMetadata { jump_if_condition_is_true: false, jump_target_when_true: Label(5), jump_target_when_false: Label(2) }}:emit_insn{insn=ZeroOrNull { rg1: 7, rg2: 8, dest: 6 }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929553Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_query:translate_condition_expr{condition_metadata=ConditionMetadata { jump_if_condition_is_true: false, jump_target_when_true: Label(5), jump_target_when_false: Label(2) }}:emit_cond_jump:emit_insn{insn=IfNot { reg: 6, target_pc: Label(2), jump_if_null: true }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929579Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_query:translate_condition_expr{condition_metadata=ConditionMetadata { jump_if_condition_is_true: false, jump_target_when_true: Label(7), jump_target_when_false: Label(2) }}:emit_insn{insn=Column { cursor_id: 0, column: 0, dest: 10, default: None }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929617Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_query:translate_condition_expr{condition_metadata=ConditionMetadata { jump_if_condition_is_true: false, jump_target_when_true: Label(7), jump_target_when_false: Label(2) }}:emit_insn{insn=String8 { value: "trigger", dest: 11 }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929633Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_query:translate_condition_expr{condition_metadata=ConditionMetadata { jump_if_condition_is_true: false, jump_target_when_true: Label(7), jump_target_when_false: Label(2) }}:emit_insn{insn=Integer { value: 1, dest: 9 }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929652Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_query:translate_condition_expr{condition_metadata=ConditionMetadata { jump_if_condition_is_true: false, jump_target_when_true: Label(7), jump_target_when_false: Label(2) }}:emit_insn{insn=Ne { lhs: 10, rhs: 11, target_pc: Label(8), flags: CmpInsFlags(66), collation: Some(Binary) }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929671Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_query:translate_condition_expr{condition_metadata=ConditionMetadata { jump_if_condition_is_true: false, jump_target_when_true: Label(7), jump_target_when_false: Label(2) }}:emit_insn{insn=ZeroOrNull { rg1: 10, rg2: 11, dest: 9 }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929692Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_query:translate_condition_expr{condition_metadata=ConditionMetadata { jump_if_condition_is_true: false, jump_target_when_true: Label(7), jump_target_when_false: Label(2) }}:emit_cond_jump:emit_insn{insn=IfNot { reg: 9, target_pc: Label(2), jump_if_null: true }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929737Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_query:emit_insn{insn=Column { cursor_id: 0, column: 0, dest: 1, default: None }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929755Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_query:emit_insn{insn=Column { cursor_id: 0, column: 1, dest: 2, default: None }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929780Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_query:emit_insn{insn=Column { cursor_id: 0, column: 2, dest: 3, default: None }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929795Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_query:emit_insn{insn=Column { cursor_id: 0, column: 3, dest: 4, default: None }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929810Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_query:emit_insn{insn=Column { cursor_id: 0, column: 4, dest: 5, default: None }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929827Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_query:emit_insn{insn=ResultRow { start_reg: 1, count: 5 }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929843Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_query:emit_insn{insn=Next { cursor_id: 0, pc_if_next: Label(1) }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929861Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_insn{insn=Halt { err_code: 0, description: "" }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929897Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_insn{insn=Transaction { write: false }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929923Z TRACE ThreadId(01) step:prepare:translate:emit_program:emit_program_for_select:emit_insn{insn=Goto { target_pc: Offset(1) }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:31.929967Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=0 insn=Init { target_pc: Offset(21) }}: turso_core::vdbe: 585: 
+0     Init               0     21    0                    0   Start at 21
+2025-07-21T07:15:31.930002Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=21 insn=Transaction { write: false }}: turso_core::vdbe: 585: 
+21    Transaction        0     0     0                    0   write=false
+2025-07-21T07:15:31.930016Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=22 insn=String8 { value: "tt", dest: 8 }}: turso_core::vdbe: 585: 
+22    String8            0     8     0     tt             0   r[8]='tt'
+2025-07-21T07:15:31.930030Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=23 insn=String8 { value: "trigger", dest: 11 }}: turso_core::vdbe: 585: 
+23    String8            0     11    0     trigger        0   r[11]='trigger'
+2025-07-21T07:15:31.930044Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=24 insn=Goto { target_pc: Offset(1) }}: turso_core::vdbe: 585: 
+24    Goto               0     1     0                    0   
+2025-07-21T07:15:31.930063Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=1 insn=OpenRead { cursor_id: 0, root_page: 1 }}: turso_core::vdbe: 585: 
+1     OpenRead           0     1     0                    0   table=sqlite_schema, root=1
+2025-07-21T07:15:31.930079Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=2 insn=Rewind { cursor_id: 0, pc_if_empty: Offset(20) }}: turso_core::vdbe: 585: 
+2     Rewind             0     20    0                    0   Rewind table sqlite_schema
+2025-07-21T07:15:31.930114Z TRACE ThreadId(01) step:parse_schema_rows:step:rewind:move_to_root: turso_core::storage::btree: 1301: root_page=1
+2025-07-21T07:15:31.930124Z TRACE ThreadId(01) step:parse_schema_rows:step:rewind:move_to_root:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:31.930132Z TRACE ThreadId(01) step:parse_schema_rows:step:rewind:move_to_root:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:31.930140Z TRACE ThreadId(01) step:parse_schema_rows:step:rewind:move_to_root:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:31.930152Z TRACE ThreadId(01) step:parse_schema_rows:step:rewind:move_to_root:pagestack::push: turso_core::storage::btree: 5501: current=-1 new_page_id=1
+2025-07-21T07:15:31.930173Z TRACE ThreadId(01) step:parse_schema_rows:step:rewind:next:pagestack::top: turso_core::storage::btree: 5603: current=0 page_id=1
+2025-07-21T07:15:31.930205Z DEBUG ThreadId(01) step:parse_schema_rows:step:rewind:next: turso_core::storage::btree: 1186: current_before_advance id=1 cell=-1 cell_count=3
+2025-07-21T07:15:31.930217Z TRACE ThreadId(01) step:parse_schema_rows:step:rewind:next:pagestack::advance: turso_core::storage::btree: 5632: curr_cell_index=-1 node_states=[-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+2025-07-21T07:15:31.930248Z DEBUG ThreadId(01) step:parse_schema_rows:step:rewind:next: turso_core::storage::btree: 1213: current id=1 cell=0
+2025-07-21T07:15:31.930258Z TRACE ThreadId(01) step:parse_schema_rows:step:rewind:next:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:31.930266Z TRACE ThreadId(01) step:parse_schema_rows:step:rewind:next:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:31.930274Z TRACE ThreadId(01) step:parse_schema_rows:step:rewind:next:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:31.930284Z TRACE ThreadId(01) step:parse_schema_rows:step:rewind:next: turso_core::storage::sqlite3_ondisk: 539: cell_get(idx=0)
+2025-07-21T07:15:31.930304Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=3 insn=Column { cursor_id: 0, column: 2, dest: 7, default: None }}: turso_core::vdbe: 585: 
+3     Column             0     2     7                    0   r[7]=sqlite_schema.tbl_name
+2025-07-21T07:15:31.930341Z TRACE ThreadId(01) step:parse_schema_rows:step:record:pagestack::top: turso_core::storage::btree: 5603: current=0 page_id=1
+2025-07-21T07:15:31.930353Z TRACE ThreadId(01) step:parse_schema_rows:step:record:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:31.930361Z TRACE ThreadId(01) step:parse_schema_rows:step:record:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:31.930368Z TRACE ThreadId(01) step:parse_schema_rows:step:record:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:31.930377Z TRACE ThreadId(01) step:parse_schema_rows:step:record: turso_core::storage::sqlite3_ondisk: 539: cell_get(idx=0)
+2025-07-21T07:15:31.930396Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=4 insn=Integer { value: 1, dest: 6 }}: turso_core::vdbe: 585: 
+4     Integer            1     6     0                    0   r[6]=1
+2025-07-21T07:15:31.930432Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=5 insn=Eq { lhs: 7, rhs: 8, target_pc: Offset(7), flags: CmpInsFlags(66), collation: Some(Binary) }}: turso_core::vdbe: 585: 
+5     Eq                 7     8     7     Binary         0   if r[7]==r[8] goto 7
+2025-07-21T07:15:31.930445Z DEBUG ThreadId(01) step:parse_schema_rows:step: turso_core::translate::collate: 32: collate=Binary lhs="a" rhs="tt"
+2025-07-21T07:15:31.930479Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=6 insn=ZeroOrNull { rg1: 7, rg2: 8, dest: 6 }}: turso_core::vdbe: 585: 
+6     ZeroOrNull         7     6     8                    0   ((r[7]=NULL)|(r[8]=NULL)) ? r[6]=NULL : r[6]=0
+2025-07-21T07:15:31.930494Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=7 insn=IfNot { reg: 6, target_pc: Offset(19), jump_if_null: true }}: turso_core::vdbe: 585: 
+7     IfNot              6     19    1                    0   if !r[6] goto 19
+2025-07-21T07:15:31.930509Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=19 insn=Next { cursor_id: 0, pc_if_next: Offset(3) }}: turso_core::vdbe: 585: 
+19    Next               0     3     0                    0   
+2025-07-21T07:15:31.930540Z TRACE ThreadId(01) step:parse_schema_rows:step:next:next:pagestack::top: turso_core::storage::btree: 5603: current=0 page_id=1
+2025-07-21T07:15:31.930554Z DEBUG ThreadId(01) step:parse_schema_rows:step:next:next: turso_core::storage::btree: 1186: current_before_advance id=1 cell=0 cell_count=3
+2025-07-21T07:15:31.930565Z TRACE ThreadId(01) step:parse_schema_rows:step:next:next:pagestack::advance: turso_core::storage::btree: 5632: curr_cell_index=0 node_states=[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+2025-07-21T07:15:31.930608Z DEBUG ThreadId(01) step:parse_schema_rows:step:next:next: turso_core::storage::btree: 1213: current id=1 cell=1
+2025-07-21T07:15:31.930618Z TRACE ThreadId(01) step:parse_schema_rows:step:next:next:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:31.930646Z TRACE ThreadId(01) step:parse_schema_rows:step:next:next:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:31.930654Z TRACE ThreadId(01) step:parse_schema_rows:step:next:next:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:31.930667Z TRACE ThreadId(01) step:parse_schema_rows:step:next:next: turso_core::storage::sqlite3_ondisk: 539: cell_get(idx=1)
+2025-07-21T07:15:31.930685Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=3 insn=Column { cursor_id: 0, column: 2, dest: 7, default: None }}: turso_core::vdbe: 585: 
+3     Column             0     2     7                    0   r[7]=sqlite_schema.tbl_name
+2025-07-21T07:15:31.930720Z TRACE ThreadId(01) step:parse_schema_rows:step:record:pagestack::top: turso_core::storage::btree: 5603: current=0 page_id=1
+2025-07-21T07:15:31.930732Z TRACE ThreadId(01) step:parse_schema_rows:step:record:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:31.930761Z TRACE ThreadId(01) step:parse_schema_rows:step:record:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:31.930769Z TRACE ThreadId(01) step:parse_schema_rows:step:record:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:31.930778Z TRACE ThreadId(01) step:parse_schema_rows:step:record: turso_core::storage::sqlite3_ondisk: 539: cell_get(idx=1)
+2025-07-21T07:15:31.930793Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=4 insn=Integer { value: 1, dest: 6 }}: turso_core::vdbe: 585: 
+4     Integer            1     6     0                    0   r[6]=1
+2025-07-21T07:15:31.930808Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=5 insn=Eq { lhs: 7, rhs: 8, target_pc: Offset(7), flags: CmpInsFlags(66), collation: Some(Binary) }}: turso_core::vdbe: 585: 
+5     Eq                 7     8     7     Binary         0   if r[7]==r[8] goto 7
+2025-07-21T07:15:31.930821Z DEBUG ThreadId(01) step:parse_schema_rows:step: turso_core::translate::collate: 32: collate=Binary lhs="t" rhs="tt"
+2025-07-21T07:15:31.930833Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=6 insn=ZeroOrNull { rg1: 7, rg2: 8, dest: 6 }}: turso_core::vdbe: 585: 
+6     ZeroOrNull         7     6     8                    0   ((r[7]=NULL)|(r[8]=NULL)) ? r[6]=NULL : r[6]=0
+2025-07-21T07:15:31.930869Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=7 insn=IfNot { reg: 6, target_pc: Offset(19), jump_if_null: true }}: turso_core::vdbe: 585: 
+7     IfNot              6     19    1                    0   if !r[6] goto 19
+2025-07-21T07:15:31.930882Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=19 insn=Next { cursor_id: 0, pc_if_next: Offset(3) }}: turso_core::vdbe: 585: 
+19    Next               0     3     0                    0   
+2025-07-21T07:15:31.930922Z TRACE ThreadId(01) step:parse_schema_rows:step:next:next:pagestack::top: turso_core::storage::btree: 5603: current=0 page_id=1
+2025-07-21T07:15:31.930933Z DEBUG ThreadId(01) step:parse_schema_rows:step:next:next: turso_core::storage::btree: 1186: current_before_advance id=1 cell=1 cell_count=3
+2025-07-21T07:15:31.930943Z TRACE ThreadId(01) step:parse_schema_rows:step:next:next:pagestack::advance: turso_core::storage::btree: 5632: curr_cell_index=1 node_states=[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+2025-07-21T07:15:31.930954Z DEBUG ThreadId(01) step:parse_schema_rows:step:next:next: turso_core::storage::btree: 1213: current id=1 cell=2
+2025-07-21T07:15:31.930964Z TRACE ThreadId(01) step:parse_schema_rows:step:next:next:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:31.930975Z TRACE ThreadId(01) step:parse_schema_rows:step:next:next:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:31.930983Z TRACE ThreadId(01) step:parse_schema_rows:step:next:next:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:31.930994Z TRACE ThreadId(01) step:parse_schema_rows:step:next:next: turso_core::storage::sqlite3_ondisk: 539: cell_get(idx=2)
+2025-07-21T07:15:31.931033Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=3 insn=Column { cursor_id: 0, column: 2, dest: 7, default: None }}: turso_core::vdbe: 585: 
+3     Column             0     2     7                    0   r[7]=sqlite_schema.tbl_name
+2025-07-21T07:15:31.931047Z TRACE ThreadId(01) step:parse_schema_rows:step:record:pagestack::top: turso_core::storage::btree: 5603: current=0 page_id=1
+2025-07-21T07:15:31.931080Z TRACE ThreadId(01) step:parse_schema_rows:step:record:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:31.931087Z TRACE ThreadId(01) step:parse_schema_rows:step:record:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:31.931094Z TRACE ThreadId(01) step:parse_schema_rows:step:record:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:31.931104Z TRACE ThreadId(01) step:parse_schema_rows:step:record: turso_core::storage::sqlite3_ondisk: 539: cell_get(idx=2)
+2025-07-21T07:15:31.931119Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=4 insn=Integer { value: 1, dest: 6 }}: turso_core::vdbe: 585: 
+4     Integer            1     6     0                    0   r[6]=1
+2025-07-21T07:15:31.931156Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=5 insn=Eq { lhs: 7, rhs: 8, target_pc: Offset(7), flags: CmpInsFlags(66), collation: Some(Binary) }}: turso_core::vdbe: 585: 
+5     Eq                 7     8     7     Binary         0   if r[7]==r[8] goto 7
+2025-07-21T07:15:31.931166Z DEBUG ThreadId(01) step:parse_schema_rows:step: turso_core::translate::collate: 32: collate=Binary lhs="tt" rhs="tt"
+2025-07-21T07:15:31.931177Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=7 insn=IfNot { reg: 6, target_pc: Offset(19), jump_if_null: true }}: turso_core::vdbe: 585: 
+7     IfNot              6     19    1                    0   if !r[6] goto 19
+2025-07-21T07:15:31.931192Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=8 insn=Column { cursor_id: 0, column: 0, dest: 10, default: None }}: turso_core::vdbe: 585: 
+8     Column             0     0     10                   0   r[10]=sqlite_schema.type
+2025-07-21T07:15:31.931212Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=9 insn=Integer { value: 1, dest: 9 }}: turso_core::vdbe: 585: 
+9     Integer            1     9     0                    0   r[9]=1
+2025-07-21T07:15:31.931249Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=10 insn=Ne { lhs: 10, rhs: 11, target_pc: Offset(12), flags: CmpInsFlags(66), collation: Some(Binary) }}: turso_core::vdbe: 585: 
+10    Ne                 10    11    12    Binary         0   if r[10]!=r[11] goto 12
+2025-07-21T07:15:31.931259Z DEBUG ThreadId(01) step:parse_schema_rows:step: turso_core::translate::collate: 32: collate=Binary lhs="table" rhs="trigger"
+2025-07-21T07:15:31.931270Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=12 insn=IfNot { reg: 9, target_pc: Offset(19), jump_if_null: true }}: turso_core::vdbe: 585: 
+12    IfNot              9     19    1                    0   if !r[9] goto 19
+2025-07-21T07:15:31.931285Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=13 insn=Column { cursor_id: 0, column: 0, dest: 1, default: None }}: turso_core::vdbe: 585: 
+13    Column             0     0     1                    0   r[1]=sqlite_schema.type
+2025-07-21T07:15:31.931342Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=14 insn=Column { cursor_id: 0, column: 1, dest: 2, default: None }}: turso_core::vdbe: 585: 
+14    Column             0     1     2                    0   r[2]=sqlite_schema.name
+2025-07-21T07:15:31.931361Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=15 insn=Column { cursor_id: 0, column: 2, dest: 3, default: None }}: turso_core::vdbe: 585: 
+15    Column             0     2     3                    0   r[3]=sqlite_schema.tbl_name
+2025-07-21T07:15:31.931380Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=16 insn=Column { cursor_id: 0, column: 3, dest: 4, default: None }}: turso_core::vdbe: 585: 
+16    Column             0     3     4                    0   r[4]=sqlite_schema.rootpage
+2025-07-21T07:15:31.931428Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=17 insn=Column { cursor_id: 0, column: 4, dest: 5, default: None }}: turso_core::vdbe: 585: 
+17    Column             0     4     5                    0   r[5]=sqlite_schema.sql
+2025-07-21T07:15:31.931473Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=18 insn=ResultRow { start_reg: 1, count: 5 }}: turso_core::vdbe: 585: 
+18    ResultRow          1     5     0                    0   output=r[1..5]
+2025-07-21T07:15:31.931552Z TRACE ThreadId(01) step:parse_schema_rows: turso_core::schema: 528: Creating table tt
+2025-07-21T07:15:31.931595Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=19 insn=Next { cursor_id: 0, pc_if_next: Offset(3) }}: turso_core::vdbe: 585: 
+19    Next               0     3     0                    0   
+2025-07-21T07:15:31.931616Z TRACE ThreadId(01) step:parse_schema_rows:step:next:next:pagestack::top: turso_core::storage::btree: 5603: current=0 page_id=1
+2025-07-21T07:15:31.931646Z DEBUG ThreadId(01) step:parse_schema_rows:step:next:next: turso_core::storage::btree: 1186: current_before_advance id=1 cell=2 cell_count=3
+2025-07-21T07:15:31.931658Z TRACE ThreadId(01) step:parse_schema_rows:step:next:next:pagestack::advance: turso_core::storage::btree: 5632: curr_cell_index=2 node_states=[2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+2025-07-21T07:15:31.931669Z DEBUG ThreadId(01) step:parse_schema_rows:step:next:next: turso_core::storage::btree: 1213: current id=1 cell=3
+2025-07-21T07:15:31.931687Z TRACE ThreadId(01) step:parse_schema_rows:step:trace_insn{addr=20 insn=Halt { err_code: 0, description: "" }}: turso_core::vdbe: 585: 
+20    Halt               0     0     0                    0   
+2025-07-21T07:15:31.931717Z TRACE ThreadId(01) step:parse_schema_rows:step: turso_core::vdbe::execute: 1872: op_halt(auto_commit=false)
+2025-07-21T07:15:31.931745Z TRACE ThreadId(01) step:trace_insn{addr=13 insn=Halt { err_code: 0, description: "" }}: turso_core::vdbe: 585: 
+13    Halt               0     0     0                    0   
+2025-07-21T07:15:31.931774Z TRACE ThreadId(01) step: turso_core::vdbe::execute: 1872: op_halt(auto_commit=true)
+2025-07-21T07:15:31.931782Z TRACE ThreadId(01) step:commit_txn: turso_core::vdbe: 454: Halt auto_commit true, state=Ready
+2025-07-21T07:15:31.931788Z TRACE ThreadId(01) step:commit_txn: turso_core::vdbe: 474: Auto-commit state: Write { schema_did_change: true }
+2025-07-21T07:15:31.931801Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx: turso_core::storage::pager: 725: end_tx(rollback=false)
+2025-07-21T07:15:31.931832Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages: turso_core::storage::pager: 889: state=Start
+2025-07-21T07:15:31.931842Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:31.931849Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:31.931857Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:31.931870Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:31.931878Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages: turso_core::storage::pager: 899: commit_dirty_pages(page=1, page_type=Some(TableLeaf)
+2025-07-21T07:15:31.931891Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages:append_frame: turso_core::storage::wal: 767: frame_id=1 offset=32 page_id=1
+2025-07-21T07:15:31.931927Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages:append_frame:begin_write_wal_frame{offset=32 page_size=4096 db_size=0}: turso_core::storage::sqlite3_ondisk: 1549: page_id=1
+2025-07-21T07:15:31.931986Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages:append_frame:begin_write_wal_frame{offset=32 page_size=4096 db_size=0}: turso_core::storage::sqlite3_ondisk: 1594: begin_write_wal_frame(checksum=(271132466, 2767314701))
+2025-07-21T07:15:31.932059Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages:append_frame:begin_write_wal_frame{offset=32 page_size=4096 db_size=0}:pwrite: turso_core::io::unix: 407: pwrite n: 4120
+2025-07-21T07:15:31.932092Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages:append_frame:begin_write_wal_frame{offset=32 page_size=4096 db_size=0}:pwrite: turso_core::storage::pager: 124: clear_dirty(page=1)
+2025-07-21T07:15:31.932107Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages:append_frame:begin_write_wal_frame{offset=32 page_size=4096 db_size=0}: turso_core::storage::sqlite3_ondisk: 1631: Frame written and synced
+2025-07-21T07:15:31.932128Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages: turso_core::storage::pager: 124: clear_dirty(page=1)
+2025-07-21T07:15:31.932156Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 5 })
+2025-07-21T07:15:31.932163Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages: turso_core::storage::pager: 899: commit_dirty_pages(page=5, page_type=Some(TableLeaf)
+2025-07-21T07:15:31.932173Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages:append_frame: turso_core::storage::wal: 767: frame_id=2 offset=4152 page_id=5
+2025-07-21T07:15:31.932186Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages:append_frame:begin_write_wal_frame{offset=4152 page_size=4096 db_size=5}: turso_core::storage::sqlite3_ondisk: 1549: page_id=5
+2025-07-21T07:15:31.932241Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages:append_frame:begin_write_wal_frame{offset=4152 page_size=4096 db_size=5}: turso_core::storage::sqlite3_ondisk: 1594: begin_write_wal_frame(checksum=(1496119196, 4127559968))
+2025-07-21T07:15:31.932300Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages:append_frame:begin_write_wal_frame{offset=4152 page_size=4096 db_size=5}:pwrite: turso_core::io::unix: 407: pwrite n: 4120
+2025-07-21T07:15:31.932332Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages:append_frame:begin_write_wal_frame{offset=4152 page_size=4096 db_size=5}:pwrite: turso_core::storage::pager: 124: clear_dirty(page=5)
+2025-07-21T07:15:31.932344Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages:append_frame:begin_write_wal_frame{offset=4152 page_size=4096 db_size=5}: turso_core::storage::sqlite3_ondisk: 1631: Frame written and synced
+2025-07-21T07:15:31.932359Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages: turso_core::storage::pager: 124: clear_dirty(page=5)
+2025-07-21T07:15:31.932389Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages: turso_core::storage::pager: 137: clear loaded 5
+2025-07-21T07:15:31.932397Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages: turso_core::storage::page_cache: 207: cleaning up page 5
+2025-07-21T07:15:31.932407Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages: turso_core::storage::pager: 137: clear loaded 1
+2025-07-21T07:15:31.932436Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}:end_tx:commit_dirty_pages: turso_core::storage::page_cache: 207: cleaning up page 1
+2025-07-21T07:15:31.932451Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=true}: turso_core::vdbe: 526: Cacheflush IO
+2025-07-21T07:15:31.932489Z TRACE ThreadId(01) step:trace_insn{addr=13 insn=Halt { err_code: 0, description: "" }}: turso_core::vdbe: 585: 
+13    Halt               0     0     0                    0   
+2025-07-21T07:15:31.932497Z TRACE ThreadId(01) step: turso_core::vdbe::execute: 1872: op_halt(auto_commit=true)
+2025-07-21T07:15:31.932503Z TRACE ThreadId(01) step:commit_txn: turso_core::vdbe: 454: Halt auto_commit true, state=Committing
+2025-07-21T07:15:31.932514Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=true}:end_tx: turso_core::storage::pager: 725: end_tx(rollback=false)
+2025-07-21T07:15:31.932543Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=true}:end_tx:commit_dirty_pages: turso_core::storage::pager: 889: state=WaitAppendFrames
+2025-07-21T07:15:31.932550Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=true}:end_tx:commit_dirty_pages: turso_core::storage::pager: 889: state=SyncWal
+2025-07-21T07:15:31.932562Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=true}:end_tx:commit_dirty_pages:sync: turso_core::storage::wal: 999: wal_sync
+2025-07-21T07:15:31.938432Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=true}:end_tx:commit_dirty_pages:sync:sync: turso_core::io::unix: 434: fsync
+2025-07-21T07:15:31.938517Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=true}:end_tx:commit_dirty_pages:sync:sync: turso_core::storage::wal: 1003: wal_sync finish
+2025-07-21T07:15:31.938559Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=true}: turso_core::vdbe: 526: Cacheflush IO
+2025-07-21T07:15:31.938646Z TRACE ThreadId(01) step:trace_insn{addr=13 insn=Halt { err_code: 0, description: "" }}: turso_core::vdbe: 585: 
+13    Halt               0     0     0                    0   
+2025-07-21T07:15:31.938677Z TRACE ThreadId(01) step: turso_core::vdbe::execute: 1872: op_halt(auto_commit=true)
+2025-07-21T07:15:31.938686Z TRACE ThreadId(01) step:commit_txn: turso_core::vdbe: 454: Halt auto_commit true, state=Committing
+2025-07-21T07:15:31.938701Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=true}:end_tx: turso_core::storage::pager: 725: end_tx(rollback=false)
+2025-07-21T07:15:31.938733Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=true}:end_tx:commit_dirty_pages: turso_core::storage::pager: 889: state=SyncWal
+2025-07-21T07:15:31.938759Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=true}:end_tx:commit_dirty_pages:finish_append_frames_commit: turso_core::storage::wal: 1065: self.max_frame=2 self.last_checksum=(1496119196, 4127559968)
+2025-07-21T07:15:31.938798Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=true}:end_tx:end_write_tx: turso_core::storage::wal: 676: end_write_txn
+2025-07-21T07:15:31.938808Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=true}:end_tx:end_write_tx: turso_core::storage::wal: 181: unlock(value=2)
+2025-07-21T07:15:31.938822Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=true}:end_tx:end_read_tx: turso_core::storage::wal: 652: end_read_tx(lock=0)
+2025-07-21T07:15:31.938829Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=true}:end_tx:end_read_tx: turso_core::storage::wal: 181: unlock(value=1)
+[?2004h[Kturso> [7C[Kturso> INSERT INTO a VALUES ('a');[8C[Kturso> INSERT INTO a VALUES ('a');[9C[Kturso> INSERT INTO a VALUES ('a');[10C[Kturso> INSERT INTO a VALUES ('a');[11C[Kturso> INSERT INTO a VALUES ('a');[12C[Kturso> INSERT INTO a VALUES ('a');[13C[Kturso> INSERT INTO a VALUES ('a');[14C[Kturso> INSERT INTO a VALUES ('a');[15C[Kturso> INSERT INTO a VALUES ('a');[16C[Kturso> INSERT INTO a VALUES ('a');[17C[Kturso> INSERT INTO a VALUES ('a');[18C[Kturso> INSERT INTO a VALUES ('a');[19C[Kturso> INSERT INTO t VALUES ('a');[20C[Kturso> INSERT INTO tt[21C VALUES ('a');[?2004l
+2025-07-21T07:15:35.071269Z TRACE ThreadId(01) run_cmd:translate: turso_core::translate: 67: querying INSERT INTO tt VALUES ('a');
+2025-07-21T07:15:35.071425Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=Init { target_pc: Label(0) }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:35.071562Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=OpenWrite { cursor_id: 0, root_page: Literal(5), name: "tt" }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:35.071625Z DEBUG ThreadId(01) run_cmd:translate: turso_core::translate::expr: 427: translate_expr_no_constant_opt: expr=Literal(String("'a'")), deopt_reason=RegisterReuse
+2025-07-21T07:15:35.071654Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=String8 { value: "a", dest: 2 }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:35.071678Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=NewRowid { cursor: 0, rowid_reg: 1, prev_largest_reg: 0 }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:35.071706Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=MakeRecord { start_reg: 2, count: 1, dest_reg: 3, index_name: None }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:35.071752Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=Insert { cursor: 0, key_reg: 1, record_reg: 3, flag: InsertFlags(0), table_name: "tt" }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:35.071770Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=Halt { err_code: 0, description: "" }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:35.071784Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=Transaction { write: true }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:35.071807Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=Goto { target_pc: Offset(1) }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:35.072006Z TRACE ThreadId(01) step:trace_insn{addr=0 insn=Init { target_pc: Offset(7) }}: turso_core::vdbe: 585: 
+0     Init               0     7     0                    0   Start at 7
+2025-07-21T07:15:35.072024Z TRACE ThreadId(01) step:trace_insn{addr=7 insn=Transaction { write: true }}: turso_core::vdbe: 585: 
+7     Transaction        0     1     0                    0   write=true
+2025-07-21T07:15:35.072062Z TRACE ThreadId(01) step:begin_read_tx:begin_read_tx: turso_core::storage::wal: 174: write_lock(true)
+2025-07-21T07:15:35.072102Z TRACE ThreadId(01) step:begin_read_tx:begin_read_tx: turso_core::storage::wal: 181: unlock(value=2)
+2025-07-21T07:15:35.072110Z TRACE ThreadId(01) step:begin_read_tx:begin_read_tx: turso_core::storage::wal: 622: begin_read_tx_read_lock(lock=1)
+2025-07-21T07:15:35.072117Z TRACE ThreadId(01) step:begin_read_tx:begin_read_tx: turso_core::storage::wal: 150: read_lock(true)
+2025-07-21T07:15:35.072126Z DEBUG ThreadId(01) step:begin_read_tx:begin_read_tx: turso_core::storage::wal: 638: begin_read_tx(min_frame=1, max_frame=2, lock=1, max_frame_in_wal=2)
+2025-07-21T07:15:35.072149Z TRACE ThreadId(01) step:begin_write_tx:begin_write_tx: turso_core::storage::wal: 174: write_lock(true)
+2025-07-21T07:15:35.072157Z DEBUG ThreadId(01) step:begin_write_tx:begin_write_tx: turso_core::storage::wal: 669: begin_write_transaction(busy=false)
+2025-07-21T07:15:35.072175Z TRACE ThreadId(01) step:trace_insn{addr=8 insn=Goto { target_pc: Offset(1) }}: turso_core::vdbe: 585: 
+8     Goto               0     1     0                    0   
+2025-07-21T07:15:35.072191Z TRACE ThreadId(01) step:trace_insn{addr=1 insn=OpenWrite { cursor_id: 0, root_page: Literal(5), name: "tt" }}: turso_core::vdbe: 585: 
+1     OpenWrite          0     5     0                    0   root=5; tt
+2025-07-21T07:15:35.072251Z TRACE ThreadId(01) step:trace_insn{addr=2 insn=String8 { value: "a", dest: 2 }}: turso_core::vdbe: 585: 
+2     String8            0     2     0     a              0   r[2]='a'
+2025-07-21T07:15:35.072268Z TRACE ThreadId(01) step:trace_insn{addr=3 insn=NewRowid { cursor: 0, rowid_reg: 1, prev_largest_reg: 0 }}: turso_core::vdbe: 585: 
+3     NewRowid           0     1     0                    0   r[1]=rowid
+2025-07-21T07:15:35.072293Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root: turso_core::storage::btree: 1301: root_page=5
+2025-07-21T07:15:35.072308Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root:read_page: turso_core::storage::pager: 760: read_page(page_idx = 5)
+2025-07-21T07:15:35.072321Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 5 })
+2025-07-21T07:15:35.072363Z DEBUG ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root:read_page:read_frame: turso_core::storage::wal: 702: read_frame(2)
+2025-07-21T07:15:35.072406Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root:read_page:read_frame: turso_core::storage::sqlite3_ondisk: 1522: begin_read_wal_frame(offset=4176)
+2025-07-21T07:15:35.072502Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root:read_page:read_frame:pread: turso_core::io::unix: 370: pread n: 4096
+2025-07-21T07:15:35.072547Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root:read_page:read_frame:pread:finish_read_page: turso_core::storage::sqlite3_ondisk: 759: page_idx=5
+2025-07-21T07:15:35.072575Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root:read_page: turso_core::storage::page_cache: 102: insert(key=PageCacheKey { pgno: 5 })
+2025-07-21T07:15:35.072582Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 5 })
+2025-07-21T07:15:35.072612Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root:pagestack::push: turso_core::storage::btree: 5501: current=-1 new_page_id=5
+2025-07-21T07:15:35.072634Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:pagestack::top: turso_core::storage::btree: 5603: current=0 page_id=5
+2025-07-21T07:15:35.072646Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:read_page: turso_core::storage::pager: 760: read_page(page_idx = 5)
+2025-07-21T07:15:35.072652Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 5 })
+2025-07-21T07:15:35.072661Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:read_page: turso_core::storage::pager: 764: read_page(page_idx = 5) = cached
+2025-07-21T07:15:35.072690Z TRACE ThreadId(01) step:seek_to_last:is_empty_table:read_page: turso_core::storage::pager: 760: read_page(page_idx = 5)
+2025-07-21T07:15:35.072696Z TRACE ThreadId(01) step:seek_to_last:is_empty_table:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 5 })
+2025-07-21T07:15:35.072721Z TRACE ThreadId(01) step:seek_to_last:is_empty_table:read_page: turso_core::storage::pager: 764: read_page(page_idx = 5) = cached
+2025-07-21T07:15:35.072788Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root: turso_core::storage::btree: 1301: root_page=5
+2025-07-21T07:15:35.072798Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root:read_page: turso_core::storage::pager: 760: read_page(page_idx = 5)
+2025-07-21T07:15:35.072841Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 5 })
+2025-07-21T07:15:35.072848Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root:read_page: turso_core::storage::pager: 764: read_page(page_idx = 5) = cached
+2025-07-21T07:15:35.072861Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:move_to_root:pagestack::push: turso_core::storage::btree: 5501: current=-1 new_page_id=5
+2025-07-21T07:15:35.072876Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:pagestack::top: turso_core::storage::btree: 5603: current=0 page_id=5
+2025-07-21T07:15:35.072887Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:read_page: turso_core::storage::pager: 760: read_page(page_idx = 5)
+2025-07-21T07:15:35.072894Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 5 })
+2025-07-21T07:15:35.072901Z TRACE ThreadId(01) step:seek_to_last:move_to_rightmost:read_page: turso_core::storage::pager: 764: read_page(page_idx = 5) = cached
+2025-07-21T07:15:35.072919Z TRACE ThreadId(01) step:seek_to_last:is_empty_table:read_page: turso_core::storage::pager: 760: read_page(page_idx = 5)
+2025-07-21T07:15:35.072925Z TRACE ThreadId(01) step:seek_to_last:is_empty_table:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 5 })
+2025-07-21T07:15:35.072932Z TRACE ThreadId(01) step:seek_to_last:is_empty_table:read_page: turso_core::storage::pager: 764: read_page(page_idx = 5) = cached
+2025-07-21T07:15:35.072971Z TRACE ThreadId(01) step:next:next:pagestack::top: turso_core::storage::btree: 5603: current=0 page_id=5
+2025-07-21T07:15:35.073013Z DEBUG ThreadId(01) step:next:next: turso_core::storage::btree: 1186: current_before_advance id=5 cell=-1 cell_count=0
+2025-07-21T07:15:35.073033Z TRACE ThreadId(01) step:next:next:pagestack::advance: turso_core::storage::btree: 5632: curr_cell_index=-1 node_states=[-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+2025-07-21T07:15:35.073049Z DEBUG ThreadId(01) step:next:next: turso_core::storage::btree: 1213: current id=5 cell=0
+2025-07-21T07:15:35.073075Z TRACE ThreadId(01) step:trace_insn{addr=4 insn=MakeRecord { start_reg: 2, count: 1, dest_reg: 3, index_name: None }}: turso_core::vdbe: 585: 
+4     MakeRecord         2     1     3                    0   r[3]=mkrec(r[2..2])
+2025-07-21T07:15:35.073112Z TRACE ThreadId(01) step:trace_insn{addr=5 insn=Insert { cursor: 0, key_reg: 1, record_reg: 3, flag: InsertFlags(0), table_name: "tt" }}: turso_core::vdbe: 585: 
+5     Insert             0     3     1     tt             0   intkey=r[1] data=r[3]
+2025-07-21T07:15:35.073139Z DEBUG ThreadId(01) step:insert{key=TableRowId((1, Some(ImmutableRecord { payload: Blob([2, 15, 97]) }))) moved_before=true}: turso_core::storage::btree: 4159: valid_state=Valid cursor_state=None is_write_in_progress=false
+2025-07-21T07:15:35.073174Z TRACE ThreadId(01) step:insert{key=TableRowId((1, Some(ImmutableRecord { payload: Blob([2, 15, 97]) }))) moved_before=true}:insert_into_page:pagestack::top: turso_core::storage::btree: 5603: current=0 page_id=5
+2025-07-21T07:15:35.073216Z DEBUG ThreadId(01) step:insert{key=TableRowId((1, Some(ImmutableRecord { payload: Blob([2, 15, 97]) }))) moved_before=true}:insert_into_page: turso_core::storage::pager: 119: set_dirty(page=5)
+2025-07-21T07:15:35.073231Z DEBUG ThreadId(01) step:insert{key=TableRowId((1, Some(ImmutableRecord { payload: Blob([2, 15, 97]) }))) moved_before=true}:insert_into_page: turso_core::storage::btree: 2131: cell_idx=0
+2025-07-21T07:15:35.073242Z TRACE ThreadId(01) step:insert{key=TableRowId((1, Some(ImmutableRecord { payload: Blob([2, 15, 97]) }))) moved_before=true}:insert_into_page:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:35.073249Z TRACE ThreadId(01) step:insert{key=TableRowId((1, Some(ImmutableRecord { payload: Blob([2, 15, 97]) }))) moved_before=true}:insert_into_page:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:35.073263Z DEBUG ThreadId(01) step:insert{key=TableRowId((1, Some(ImmutableRecord { payload: Blob([2, 15, 97]) }))) moved_before=true}:insert_into_page:read_page:read_frame: turso_core::storage::wal: 702: read_frame(1)
+2025-07-21T07:15:35.073271Z TRACE ThreadId(01) step:insert{key=TableRowId((1, Some(ImmutableRecord { payload: Blob([2, 15, 97]) }))) moved_before=true}:insert_into_page:read_page:read_frame: turso_core::storage::sqlite3_ondisk: 1522: begin_read_wal_frame(offset=56)
+2025-07-21T07:15:35.073291Z TRACE ThreadId(01) step:insert{key=TableRowId((1, Some(ImmutableRecord { payload: Blob([2, 15, 97]) }))) moved_before=true}:insert_into_page:read_page:read_frame:pread: turso_core::io::unix: 370: pread n: 4096
+2025-07-21T07:15:35.073301Z TRACE ThreadId(01) step:insert{key=TableRowId((1, Some(ImmutableRecord { payload: Blob([2, 15, 97]) }))) moved_before=true}:insert_into_page:read_page:read_frame:pread:finish_read_page: turso_core::storage::sqlite3_ondisk: 759: page_idx=1
+2025-07-21T07:15:35.073317Z TRACE ThreadId(01) step:insert{key=TableRowId((1, Some(ImmutableRecord { payload: Blob([2, 15, 97]) }))) moved_before=true}:insert_into_page:read_page: turso_core::storage::page_cache: 102: insert(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:35.073323Z TRACE ThreadId(01) step:insert{key=TableRowId((1, Some(ImmutableRecord { payload: Blob([2, 15, 97]) }))) moved_before=true}:insert_into_page:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:35.073339Z DEBUG ThreadId(01) step:insert{key=TableRowId((1, Some(ImmutableRecord { payload: Blob([2, 15, 97]) }))) moved_before=true}:insert_into_page: turso_core::storage::btree: 6429: fill_cell_payload(record_size=3, payload_overflow_threshold_max=4061)
+2025-07-21T07:15:35.073350Z DEBUG ThreadId(01) step:insert{key=TableRowId((1, Some(ImmutableRecord { payload: Blob([2, 15, 97]) }))) moved_before=true}:insert_into_page: turso_core::storage::btree: 2217: cell_count=0
+2025-07-21T07:15:35.073358Z TRACE ThreadId(01) step:insert{key=TableRowId((1, Some(ImmutableRecord { payload: Blob([2, 15, 97]) }))) moved_before=true}:insert_into_page:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:35.073366Z TRACE ThreadId(01) step:insert{key=TableRowId((1, Some(ImmutableRecord { payload: Blob([2, 15, 97]) }))) moved_before=true}:insert_into_page:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:35.073373Z TRACE ThreadId(01) step:insert{key=TableRowId((1, Some(ImmutableRecord { payload: Blob([2, 15, 97]) }))) moved_before=true}:insert_into_page:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:35.073389Z TRACE ThreadId(01) step:insert{key=TableRowId((1, Some(ImmutableRecord { payload: Blob([2, 15, 97]) }))) moved_before=true}:insert_into_page: turso_core::storage::sqlite3_ondisk: 449: write_u16(pos=5, value=4091)
+2025-07-21T07:15:35.073398Z DEBUG ThreadId(01) step:insert{key=TableRowId((1, Some(ImmutableRecord { payload: Blob([2, 15, 97]) }))) moved_before=true}:insert_into_page: turso_core::storage::btree: 6237: insert_into_cell(idx=0, pc=4091, size=5)
+2025-07-21T07:15:35.073405Z TRACE ThreadId(01) step:insert{key=TableRowId((1, Some(ImmutableRecord { payload: Blob([2, 15, 97]) }))) moved_before=true}:insert_into_page: turso_core::storage::sqlite3_ondisk: 455: write_u16(pos=8, value=4091)
+2025-07-21T07:15:35.073444Z TRACE ThreadId(01) step:insert{key=TableRowId((1, Some(ImmutableRecord { payload: Blob([2, 15, 97]) }))) moved_before=true}:insert_into_page: turso_core::storage::sqlite3_ondisk: 449: write_u16(pos=3, value=1)
+2025-07-21T07:15:35.073475Z TRACE ThreadId(01) step:trace_insn{addr=5 insn=Insert { cursor: 0, key_reg: 1, record_reg: 3, flag: InsertFlags(0), table_name: "tt" }}: turso_core::vdbe: 585: 
+5     Insert             0     3     1     tt             0   intkey=r[1] data=r[3]
+2025-07-21T07:15:35.073487Z TRACE ThreadId(01) step:rowid:pagestack::top: turso_core::storage::btree: 5603: current=0 page_id=5
+2025-07-21T07:15:35.073507Z TRACE ThreadId(01) step:rowid:record:pagestack::top: turso_core::storage::btree: 5603: current=0 page_id=5
+2025-07-21T07:15:35.073522Z TRACE ThreadId(01) step:rowid:record:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:35.073529Z TRACE ThreadId(01) step:rowid:record:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:35.073536Z TRACE ThreadId(01) step:rowid:record:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:35.073545Z TRACE ThreadId(01) step:rowid:record: turso_core::storage::sqlite3_ondisk: 539: cell_get(idx=0)
+2025-07-21T07:15:35.073564Z TRACE ThreadId(01) step:rowid:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:35.073617Z TRACE ThreadId(01) step:rowid:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:35.073623Z TRACE ThreadId(01) step:rowid:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:35.073631Z TRACE ThreadId(01) step:rowid: turso_core::storage::sqlite3_ondisk: 539: cell_get(idx=0)
+2025-07-21T07:15:35.073646Z TRACE ThreadId(01) step:trace_insn{addr=6 insn=Halt { err_code: 0, description: "" }}: turso_core::vdbe: 585: 
+6     Halt               0     0     0                    0   
+2025-07-21T07:15:35.073656Z TRACE ThreadId(01) step: turso_core::vdbe::execute: 1872: op_halt(auto_commit=true)
+2025-07-21T07:15:35.073668Z TRACE ThreadId(01) step:commit_txn: turso_core::vdbe: 454: Halt auto_commit true, state=Ready
+2025-07-21T07:15:35.073680Z TRACE ThreadId(01) step:commit_txn: turso_core::vdbe: 474: Auto-commit state: Write { schema_did_change: false }
+2025-07-21T07:15:35.073697Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=false}:end_tx: turso_core::storage::pager: 725: end_tx(rollback=false)
+2025-07-21T07:15:35.073740Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=false}:end_tx:commit_dirty_pages: turso_core::storage::pager: 889: state=Start
+2025-07-21T07:15:35.073752Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=false}:end_tx:commit_dirty_pages:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:35.073826Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=false}:end_tx:commit_dirty_pages:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:35.073835Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=false}:end_tx:commit_dirty_pages:read_page: turso_core::storage::pager: 764: read_page(page_idx = 1) = cached
+2025-07-21T07:15:35.073852Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=false}:end_tx:commit_dirty_pages: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 5 })
+2025-07-21T07:15:35.073893Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=false}:end_tx:commit_dirty_pages: turso_core::storage::pager: 899: commit_dirty_pages(page=5, page_type=Some(TableLeaf)
+2025-07-21T07:15:35.073908Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=false}:end_tx:commit_dirty_pages:append_frame: turso_core::storage::wal: 767: frame_id=3 offset=8272 page_id=5
+2025-07-21T07:15:35.073925Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=false}:end_tx:commit_dirty_pages:append_frame:begin_write_wal_frame{offset=8272 page_size=4096 db_size=5}: turso_core::storage::sqlite3_ondisk: 1549: page_id=5
+2025-07-21T07:15:35.073988Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=false}:end_tx:commit_dirty_pages:append_frame:begin_write_wal_frame{offset=8272 page_size=4096 db_size=5}: turso_core::storage::sqlite3_ondisk: 1594: begin_write_wal_frame(checksum=(1343973254, 1767581273))
+2025-07-21T07:15:35.074074Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=false}:end_tx:commit_dirty_pages:append_frame:begin_write_wal_frame{offset=8272 page_size=4096 db_size=5}:pwrite: turso_core::io::unix: 407: pwrite n: 4120
+2025-07-21T07:15:35.074115Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=false}:end_tx:commit_dirty_pages:append_frame:begin_write_wal_frame{offset=8272 page_size=4096 db_size=5}:pwrite: turso_core::storage::pager: 124: clear_dirty(page=5)
+2025-07-21T07:15:35.074132Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=false}:end_tx:commit_dirty_pages:append_frame:begin_write_wal_frame{offset=8272 page_size=4096 db_size=5}: turso_core::storage::sqlite3_ondisk: 1631: Frame written and synced
+2025-07-21T07:15:35.074184Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=false}:end_tx:commit_dirty_pages: turso_core::storage::pager: 124: clear_dirty(page=5)
+2025-07-21T07:15:35.074196Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=false}:end_tx:commit_dirty_pages: turso_core::storage::pager: 137: clear loaded 5
+2025-07-21T07:15:35.074213Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=false}:end_tx:commit_dirty_pages: turso_core::storage::page_cache: 207: cleaning up page 5
+2025-07-21T07:15:35.074225Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=false}:end_tx:commit_dirty_pages: turso_core::storage::pager: 137: clear loaded 1
+2025-07-21T07:15:35.074233Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=false}:end_tx:commit_dirty_pages: turso_core::storage::page_cache: 207: cleaning up page 1
+2025-07-21T07:15:35.074251Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Ready rollback=false schema_did_change=false}: turso_core::vdbe: 526: Cacheflush IO
+2025-07-21T07:15:35.074284Z TRACE ThreadId(01) step:trace_insn{addr=6 insn=Halt { err_code: 0, description: "" }}: turso_core::vdbe: 585: 
+6     Halt               0     0     0                    0   
+2025-07-21T07:15:35.074321Z TRACE ThreadId(01) step: turso_core::vdbe::execute: 1872: op_halt(auto_commit=true)
+2025-07-21T07:15:35.074327Z TRACE ThreadId(01) step:commit_txn: turso_core::vdbe: 454: Halt auto_commit true, state=Committing
+2025-07-21T07:15:35.074339Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=false}:end_tx: turso_core::storage::pager: 725: end_tx(rollback=false)
+2025-07-21T07:15:35.074347Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=false}:end_tx:commit_dirty_pages: turso_core::storage::pager: 889: state=WaitAppendFrames
+2025-07-21T07:15:35.074355Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=false}:end_tx:commit_dirty_pages: turso_core::storage::pager: 889: state=SyncWal
+2025-07-21T07:15:35.074369Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=false}:end_tx:commit_dirty_pages:sync: turso_core::storage::wal: 999: wal_sync
+2025-07-21T07:15:35.077911Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=false}:end_tx:commit_dirty_pages:sync:sync: turso_core::io::unix: 434: fsync
+2025-07-21T07:15:35.078004Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=false}:end_tx:commit_dirty_pages:sync:sync: turso_core::storage::wal: 1003: wal_sync finish
+2025-07-21T07:15:35.078048Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=false}: turso_core::vdbe: 526: Cacheflush IO
+2025-07-21T07:15:35.078139Z TRACE ThreadId(01) step:trace_insn{addr=6 insn=Halt { err_code: 0, description: "" }}: turso_core::vdbe: 585: 
+6     Halt               0     0     0                    0   
+2025-07-21T07:15:35.078151Z TRACE ThreadId(01) step: turso_core::vdbe::execute: 1872: op_halt(auto_commit=true)
+2025-07-21T07:15:35.078160Z TRACE ThreadId(01) step:commit_txn: turso_core::vdbe: 454: Halt auto_commit true, state=Committing
+2025-07-21T07:15:35.078175Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=false}:end_tx: turso_core::storage::pager: 725: end_tx(rollback=false)
+2025-07-21T07:15:35.078187Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=false}:end_tx:commit_dirty_pages: turso_core::storage::pager: 889: state=SyncWal
+2025-07-21T07:15:35.078212Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=false}:end_tx:commit_dirty_pages:finish_append_frames_commit: turso_core::storage::wal: 1065: self.max_frame=3 self.last_checksum=(1343973254, 1767581273)
+2025-07-21T07:15:35.078230Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=false}:end_tx:end_write_tx: turso_core::storage::wal: 676: end_write_txn
+2025-07-21T07:15:35.078238Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=false}:end_tx:end_write_tx: turso_core::storage::wal: 181: unlock(value=2)
+2025-07-21T07:15:35.078252Z DEBUG ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=false}:end_tx:end_read_tx: turso_core::storage::wal: 652: end_read_tx(lock=1)
+2025-07-21T07:15:35.078260Z TRACE ThreadId(01) step:commit_txn:step_end_write_txn{commit_state=Committing rollback=false schema_did_change=false}:end_tx:end_read_tx: turso_core::storage::wal: 181: unlock(value=1)
+[?2004h[Kturso> [7C[Kturso> PRAGMA wal_checkpoint(TRUNCATE);[8C[Kturso> PRAGMA wal_checkpoint(TRUNCATE);[9C[Kturso> PRAGMA wal_checkpoint(TRUNCATE);[10C[Kturso> PRAGMA wal_checkpoint(TRUNCATE);[11C[Kturso> PRAGMA wal_checkpoint(TRUNCATE);[12C[Kturso> PRAGMA wal_checkpoint(TRUNCATE);[13C[Kturso> PRAGMA wal_checkpoint(TRUNCATE);[14C[Kturso> PRAGMA wal_checkpoint(TRUNCATE);[39C[?2004l
+2025-07-21T07:15:36.518134Z TRACE ThreadId(01) run_cmd:translate: turso_core::translate: 67: querying PRAGMA wal_checkpoint(TRUNCATE);
+2025-07-21T07:15:36.518241Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=Init { target_pc: Label(0) }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:36.518282Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=Checkpoint { database: 0, checkpoint_mode: Truncate, dest: 1 }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:36.518299Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=ResultRow { start_reg: 1, count: 3 }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:36.518317Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=Halt { err_code: 0, description: "" }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:36.518340Z TRACE ThreadId(01) run_cmd:translate:emit_insn{insn=Goto { target_pc: Offset(1) }}: turso_core::vdbe::builder: 308: 
+2025-07-21T07:15:36.518441Z TRACE ThreadId(01) step:trace_insn{addr=0 insn=Init { target_pc: Offset(4) }}: turso_core::vdbe: 585: 
+0     Init               0     4     0                    0   Start at 4
+2025-07-21T07:15:36.518485Z TRACE ThreadId(01) step:trace_insn{addr=4 insn=Goto { target_pc: Offset(1) }}: turso_core::vdbe: 585: 
+4     Goto               0     1     0                    0   
+2025-07-21T07:15:36.518503Z TRACE ThreadId(01) step:trace_insn{addr=1 insn=Checkpoint { database: 0, checkpoint_mode: Truncate, dest: 1 }}: turso_core::vdbe: 585: 
+1     Checkpoint         0     1     0                    0   r[1]=~r[0]
+2025-07-21T07:15:36.518528Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 822: state=Start
+2025-07-21T07:15:36.518539Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 174: write_lock(true)
+2025-07-21T07:15:36.518546Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 174: write_lock(true)
+2025-07-21T07:15:36.518558Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint:sync: turso_core::storage::wal: 999: wal_sync
+2025-07-21T07:15:36.522535Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint:sync:sync: turso_core::io::unix: 434: fsync
+2025-07-21T07:15:36.522581Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint:sync:sync: turso_core::storage::wal: 1003: wal_sync finish
+2025-07-21T07:15:36.522635Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 822: state=Start
+2025-07-21T07:15:36.522653Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 174: write_lock(true)
+2025-07-21T07:15:36.522660Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 181: unlock(value=2)
+2025-07-21T07:15:36.522669Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 856: checkpoint_start(min_frame=1, max_frame=3)
+2025-07-21T07:15:36.522676Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 822: state=ReadFrame
+2025-07-21T07:15:36.522693Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 885: checkpoint page(state=ReadFrame, page=1, frame=1)
+2025-07-21T07:15:36.522705Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint:read_frame: turso_core::storage::wal: 702: read_frame(1)
+2025-07-21T07:15:36.522715Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint:read_frame: turso_core::storage::sqlite3_ondisk: 1522: begin_read_wal_frame(offset=56)
+2025-07-21T07:15:36.522751Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint:read_frame:pread: turso_core::io::unix: 370: pread n: 4096
+2025-07-21T07:15:36.522792Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint:read_frame:pread:finish_read_page: turso_core::storage::sqlite3_ondisk: 759: page_idx=1
+2025-07-21T07:15:36.522820Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 822: state=WaitReadFrame
+2025-07-21T07:15:36.522828Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 822: state=WritePage
+2025-07-21T07:15:36.522836Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::pager: 119: set_dirty(page=1)
+2025-07-21T07:15:36.522849Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint:begin_write_btree_page: turso_core::storage::sqlite3_ondisk: 781: begin_write_btree_page(page=1)
+2025-07-21T07:15:36.522862Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint:begin_write_btree_page: turso_core::storage::sqlite3_ondisk: 786: begin_write_btree_page(page_id=1)
+2025-07-21T07:15:36.522896Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint:begin_write_btree_page:write_page:pwrite: turso_core::io::unix: 407: pwrite n: 4096
+2025-07-21T07:15:36.522933Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint:begin_write_btree_page:write_page:pwrite: turso_core::storage::sqlite3_ondisk: 798: finish_write_btree_page
+2025-07-21T07:15:36.522944Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint:begin_write_btree_page:write_page:pwrite: turso_core::storage::pager: 124: clear_dirty(page=1)
+2025-07-21T07:15:36.522963Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 822: state=WaitWritePage
+2025-07-21T07:15:36.522976Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::pager: 817: read_page(page_idx = 1)
+2025-07-21T07:15:36.522984Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:36.522996Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::pager: 124: clear_dirty(page=1)
+2025-07-21T07:15:36.523007Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 822: state=ReadFrame
+2025-07-21T07:15:36.523015Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 885: checkpoint page(state=ReadFrame, page=5, frame=3)
+2025-07-21T07:15:36.523025Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint:read_frame: turso_core::storage::wal: 702: read_frame(3)
+2025-07-21T07:15:36.523037Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint:read_frame: turso_core::storage::sqlite3_ondisk: 1522: begin_read_wal_frame(offset=8296)
+2025-07-21T07:15:36.523052Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint:read_frame:pread: turso_core::io::unix: 370: pread n: 4096
+2025-07-21T07:15:36.523091Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint:read_frame:pread:finish_read_page: turso_core::storage::sqlite3_ondisk: 759: page_idx=5
+2025-07-21T07:15:36.523111Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 822: state=WaitReadFrame
+2025-07-21T07:15:36.523118Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 822: state=WritePage
+2025-07-21T07:15:36.523125Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::pager: 119: set_dirty(page=5)
+2025-07-21T07:15:36.523135Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint:begin_write_btree_page: turso_core::storage::sqlite3_ondisk: 781: begin_write_btree_page(page=5)
+2025-07-21T07:15:36.523143Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint:begin_write_btree_page: turso_core::storage::sqlite3_ondisk: 786: begin_write_btree_page(page_id=5)
+2025-07-21T07:15:36.523166Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint:begin_write_btree_page:write_page:pwrite: turso_core::io::unix: 407: pwrite n: 4096
+2025-07-21T07:15:36.523177Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint:begin_write_btree_page:write_page:pwrite: turso_core::storage::sqlite3_ondisk: 798: finish_write_btree_page
+2025-07-21T07:15:36.523186Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint:begin_write_btree_page:write_page:pwrite: turso_core::storage::pager: 124: clear_dirty(page=5)
+2025-07-21T07:15:36.523204Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 822: state=WaitWritePage
+2025-07-21T07:15:36.523214Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::pager: 817: read_page(page_idx = 5)
+2025-07-21T07:15:36.523220Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 5 })
+2025-07-21T07:15:36.523227Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::pager: 124: clear_dirty(page=5)
+2025-07-21T07:15:36.523234Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 822: state=ReadFrame
+2025-07-21T07:15:36.523241Z DEBUG ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 822: state=Done
+2025-07-21T07:15:36.523249Z  INFO ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 1172: restart_log(mode=Truncate)
+2025-07-21T07:15:36.523259Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 174: write_lock(true)
+2025-07-21T07:15:36.523266Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 174: write_lock(true)
+2025-07-21T07:15:36.523273Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 174: write_lock(true)
+2025-07-21T07:15:36.523280Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 174: write_lock(true)
+2025-07-21T07:15:36.523368Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint:truncate: turso_core::io::unix: 454: file truncated to len=(0)
+2025-07-21T07:15:36.523399Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint:truncate: turso_core::storage::wal: 1211: WAL file truncated to 0 B
+2025-07-21T07:15:36.523412Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::sqlite3_ondisk: 1636: begin_write_wal_header
+2025-07-21T07:15:36.523435Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint:pwrite: turso_core::io::unix: 407: pwrite n: 32
+2025-07-21T07:15:36.525998Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint:sync: turso_core::io::unix: 434: fsync
+2025-07-21T07:15:36.526099Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint:sync: turso_core::storage::wal: 1224: WAL file synced after truncation
+2025-07-21T07:15:36.526144Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 181: unlock(value=2)
+2025-07-21T07:15:36.526153Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 181: unlock(value=2)
+2025-07-21T07:15:36.526159Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 181: unlock(value=2)
+2025-07-21T07:15:36.526164Z TRACE ThreadId(01) step:wal_checkpoint:checkpoint: turso_core::storage::wal: 181: unlock(value=2)
+2025-07-21T07:15:36.526194Z TRACE ThreadId(01) step:wal_checkpoint:read_page: turso_core::storage::pager: 760: read_page(page_idx = 1)
+2025-07-21T07:15:36.526219Z TRACE ThreadId(01) step:wal_checkpoint:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:36.526247Z TRACE ThreadId(01) step:wal_checkpoint:read_page:begin_read_page: turso_core::storage::sqlite3_ondisk: 729: begin_read_btree_page(page_idx = 1)
+2025-07-21T07:15:36.526283Z TRACE ThreadId(01) step:wal_checkpoint:read_page:begin_read_page:read_page:pread: turso_core::io::unix: 370: pread n: 4096
+2025-07-21T07:15:36.526295Z TRACE ThreadId(01) step:wal_checkpoint:read_page:begin_read_page:read_page:pread:finish_read_page: turso_core::storage::sqlite3_ondisk: 759: page_idx=1
+2025-07-21T07:15:36.526318Z TRACE ThreadId(01) step:wal_checkpoint:read_page: turso_core::storage::page_cache: 102: insert(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:36.526323Z TRACE ThreadId(01) step:wal_checkpoint:read_page: turso_core::storage::page_cache: 162: cache_get(key=PageCacheKey { pgno: 1 })
+2025-07-21T07:15:36.526354Z TRACE ThreadId(01) step:wal_checkpoint: turso_core::storage::wal: 181: unlock(value=2)
+2025-07-21T07:15:36.526359Z TRACE ThreadId(01) step:wal_checkpoint: turso_core::storage::wal: 181: unlock(value=2)
+2025-07-21T07:15:36.526366Z DEBUG ThreadId(01) step:wal_checkpoint: turso_core::storage::pager: 137: clear loaded 1
+2025-07-21T07:15:36.526373Z DEBUG ThreadId(01) step:wal_checkpoint: turso_core::storage::page_cache: 207: cleaning up page 1
+2025-07-21T07:15:36.526414Z TRACE ThreadId(01) step:trace_insn{addr=2 insn=ResultRow { start_reg: 1, count: 3 }}: turso_core::vdbe: 585: 
+2     ResultRow          1     3     0                    0   output=r[1..3]
+2025-07-21T07:15:36.526479Z TRACE ThreadId(01) step:trace_insn{addr=3 insn=Halt { err_code: 0, description: "" }}: turso_core::vdbe: 585: 
+3     Halt               0     0     0                    0   
+2025-07-21T07:15:36.526488Z TRACE ThreadId(01) step: turso_core::vdbe::execute: 1872: op_halt(auto_commit=true)
+2025-07-21T07:15:36.526496Z TRACE ThreadId(01) step:commit_txn: turso_core::vdbe: 454: Halt auto_commit true, state=Ready
+2025-07-21T07:15:36.526501Z TRACE ThreadId(01) step:commit_txn: turso_core::vdbe: 474: Auto-commit state: None
+┌───┬───┬───┐
+│ 0 │ 3 │ 3 │
+└───┴───┴───┘
+[?2004h[Kturso> [7C[?2004l
+Use .quit to exit or press Ctrl-C again to force quit.
+[?2004h[Kturso> [7C[?2004l
+Interrupted. Exiting...
+2025-07-21T07:15:37.116192Z DEBUG ThreadId(01) sync: turso_core::storage::wal: 999: wal_sync
+2025-07-21T07:15:37.120313Z TRACE ThreadId(01) sync:sync: turso_core::io::unix: 434: fsync
+2025-07-21T07:15:37.120409Z DEBUG ThreadId(01) sync:sync: turso_core::storage::wal: 1003: wal_sync finish
+2025-07-21T07:15:37.120521Z DEBUG ThreadId(01) wal_checkpoint:checkpoint: turso_core::storage::wal: 822: state=Start

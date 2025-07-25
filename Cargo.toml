@@ -20,7 +20,7 @@ members = [
   "extensions/percentile",
   "extensions/regexp",
   "extensions/tests",
-  "macros",
+  "macros", "packages/turso-sync",
   "simulator",
   "sqlite3",
   "stress",
@@ -38,6 +38,7 @@ license = "MIT"
 repository = "https://github.com/tursodatabase/turso"
 
 [workspace.dependencies]
+turso = { path = "bindings/rust", version = "0.1.3-pre.4" }
 limbo_completion = { path = "extensions/completion", version = "0.1.3-pre.4" }
 turso_core = { path = "core", version = "0.1.3-pre.4" }
 limbo_crypto = { path = "extensions/crypto", version = "0.1.3-pre.4" }
