@@ -1,6 +1,7 @@
 use tracing::{instrument, Level};
 
 use crate::{
+    return_if_io,
     schema::Index,
     storage::{
         header_accessor,
@@ -13,7 +14,7 @@ use crate::{
         state_machines::btree::{
             BalanceState, CountState, DeleteState, DestroyState, EmptyTableState,
             InsertIntoPageState, InsertState, MoveToState, NextPrevState, OverflowState,
-            PayloadOverflowWithOffset, RewindState, SeekToState,
+            OverwriteCellState, PayloadOverflowWithOffset, RewindState, SeekToState,
         },
     },
     translate::plan::IterationDirection,
@@ -429,6 +430,7 @@ pub struct BTreeCursor {
     insert_into_page_state: InsertIntoPageState,
     /// State machine for `count`
     count_state: CountState,
+    overwrite_cell_state: OverwriteCellState,
 }
 
 /// We store the cell index and cell count for each page in the stack.
@@ -491,6 +493,7 @@ impl BTreeCursor {
             insert_state: InsertState::Start,
             insert_into_page_state: InsertIntoPageState::Start,
             count_state: CountState::Start,
+            overwrite_cell_state: OverwriteCellState::FillPayload,
         }
     }
 
@@ -5202,51 +5205,80 @@ impl BTreeCursor {
         cell_idx: usize,
         record: &ImmutableRecord,
     ) -> Result<IOResult<()>> {
-        let rowid = match self.rowid()? {
-            IOResult::Done(rowid) => rowid,
-            IOResult::IO(io) => return Ok(IOResult::IO(io)),
-        };
+        loop {
+            turso_assert!(
+                page_ref.get().is_loaded(),
+                "page {} is not loaded",
+                page_ref.get().get().id
+            );
+            let state = std::mem::take(&mut self.overwrite_cell_state);
+            match state {
+                OverwriteCellState::FillPayload => {
+                    let page = page_ref.get();
+                    let page_contents = page.get().contents.as_ref().unwrap();
+                    let serial_types_len = self.record_cursor.borrow_mut().len(record);
+                    let mut new_payload = Vec::with_capacity(serial_types_len);
+                    let rowid = return_if_io!(self.rowid());
+                    fill_cell_payload(
+                        page_contents,
+                        rowid,
+                        &mut new_payload,
+                        cell_idx,
+                        record,
+                        self.usable_space(),
+                        self.pager.clone(),
+                    );
+                    // figure out old cell offset & size
+                    let (old_offset, old_local_size) = {
+                        let page_ref = page_ref.get();
+                        let page = page_ref.get().contents.as_ref().unwrap();
+                        page.cell_get_raw_region(cell_idx, self.usable_space())
+                    };
+                    self.overwrite_cell_state =
+                        OverwriteCellState::ClearOverflowPagesAndOverwrite {
+                            new_payload,
+                            old_offset,
+                            old_local_size,
+                        };
+                    continue;
+                }
+                OverwriteCellState::ClearOverflowPagesAndOverwrite {
+                    new_payload,
+                    old_offset,
+                    old_local_size,
+                } => {
+                    let page = page_ref.get();
+                    let page_contents = page.get().contents.as_ref().unwrap();
+                    let cell = page_contents.cell_get(cell_idx, self.usable_space())?;
+                    if let IOResult::IO(io) = self.clear_overflow_pages(&cell)? {
+                        self.overwrite_cell_state =
+                            OverwriteCellState::ClearOverflowPagesAndOverwrite {
+                                new_payload,
+                                old_offset,
+                                old_local_size,
+                            };
+                        return Ok(IOResult::IO(io));
+                    }
+                    // if it all fits in local space and old_local_size is enough, do an in-place overwrite
+                    if new_payload.len() == old_local_size {
+                        self.overwrite_content(page_ref.clone(), old_offset, &new_payload)?;
+                        return Ok(IOResult::Done(()));
+                    }
 
-        // build the new payload
-        let page = page_ref.get();
-        let page_contents = page.get().contents.as_ref().unwrap();
-        let serial_types_len = self.record_cursor.borrow_mut().len(record);
-        let mut new_payload = Vec::with_capacity(serial_types_len);
-        fill_cell_payload(
-            page_contents,
-            rowid,
-            &mut new_payload,
-            cell_idx,
-            record,
-            self.usable_space(),
-            self.pager.clone(),
-        );
-
-        // figure out old cell offset & size
-        let (old_offset, old_local_size) = {
-            let page_ref = page_ref.get();
-            let page = page_ref.get().contents.as_ref().unwrap();
-            page.cell_get_raw_region(cell_idx, self.usable_space())
-        };
-
-        // if it all fits in local space and old_local_size is enough, do an in-place overwrite
-        if new_payload.len() == old_local_size {
-            self.overwrite_content(page_ref.clone(), old_offset, &new_payload)?;
-            Ok(IOResult::Done(()))
-        } else {
-            // doesn't fit, drop it and insert a new one
-            drop_cell(
-                page_ref.get().get_contents(),
-                cell_idx,
-                self.usable_space() as u16,
-            )?;
-            insert_into_cell(
-                page_ref.get().get_contents(),
-                &new_payload,
-                cell_idx,
-                self.usable_space() as u16,
-            )?;
-            Ok(IOResult::Done(()))
+                    drop_cell(
+                        page_ref.get().get_contents(),
+                        cell_idx,
+                        self.usable_space() as u16,
+                    )?;
+                    insert_into_cell(
+                        page_ref.get().get_contents(),
+                        &new_payload,
+                        cell_idx,
+                        self.usable_space() as u16,
+                    )?;
+                    return Ok(IOResult::Done(()));
+                }
+            }
         }
     }
 

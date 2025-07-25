@@ -171,3 +171,16 @@ pub enum CountState {
     Loop,
     Finish,
 }
+
+#[derive(Debug, Clone, Default)]
+pub enum OverwriteCellState {
+    /// Fill the cell payload with the new value.
+    #[default]
+    FillPayload,
+    /// Clear the overflow pages of the old celland overwrite the cell.
+    ClearOverflowPagesAndOverwrite {
+        new_payload: Vec<u8>,
+        old_offset: usize,
+        old_local_size: usize,
+    },
+}
