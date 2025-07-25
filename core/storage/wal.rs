@@ -352,14 +352,6 @@ impl Wal for DummyWAL {
     }
 }
 
-// Syncing requires a state machine because we need to schedule a sync and then wait until it is
-// finished. If we don't wait there will be undefined behaviour that no one wants to debug.
-#[derive(Copy, Clone, Debug)]
-enum SyncState {
-    NotSyncing,
-    Syncing,
-}
-
 #[derive(Debug, Copy, Clone)]
 pub enum CheckpointState {
     Start,
@@ -402,7 +394,6 @@ pub struct WalFile {
     buffer_pool: Arc<BufferPool>,
 
     syncing: Rc<Cell<bool>>,
-    sync_state: Cell<SyncState>,
 
     shared: Arc<UnsafeCell<WalFileShared>>,
     ongoing_checkpoint: OngoingCheckpoint,
@@ -429,7 +420,6 @@ impl fmt::Debug for WalFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WalFile")
             .field("syncing", &self.syncing.get())
-            .field("sync_state", &self.sync_state)
             .field("page_size", &self.page_size())
             .field("shared", &self.shared)
             .field("ongoing_checkpoint", &self.ongoing_checkpoint)
@@ -1056,7 +1046,6 @@ impl WalFile {
             checkpoint_threshold: 1000,
             buffer_pool,
             syncing: Rc::new(Cell::new(false)),
-            sync_state: Cell::new(SyncState::NotSyncing),
             min_frame: 0,
             max_frame_read_lock_index: 0,
             last_checksum,

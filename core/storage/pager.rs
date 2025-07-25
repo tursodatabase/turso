@@ -196,14 +196,6 @@ enum CommitState {
     SyncDbFile,
 }
 
-#[derive(Clone, Debug, Copy)]
-enum CheckpointState {
-    Checkpoint,
-    SyncDbFile,
-    WaitSyncDbFile,
-    CheckpointDone,
-}
-
 /// The mode of allocating a btree page.
 pub enum BtreePageAllocMode {
     /// Allocate any btree page

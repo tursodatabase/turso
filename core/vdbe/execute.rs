@@ -6341,7 +6341,7 @@ pub fn op_open_ephemeral(
             } else {
                 BTreeCursor::new_table(mv_cursor, pager.clone(), root_page as usize, num_columns)
             };
-            cursor.rewind()?; // Will never return io
+            return_if_io!(cursor.rewind()); // Will never return io
 
             let mut cursors: std::cell::RefMut<'_, Vec<Option<Cursor>>> =
                 state.cursors.borrow_mut();

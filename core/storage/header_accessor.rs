@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use crate::storage::sqlite3_ondisk::MAX_PAGE_SIZE;
-use crate::types::IOCompletions;
 use crate::Completion;
 use crate::turso_assert;
 use crate::{
@@ -10,7 +9,6 @@ use crate::{
         pager::{PageRef, Pager},
         sqlite3_ondisk::DATABASE_HEADER_PAGE_ID,
     },
-    types::IOResult,
     LimboError, Result,
 };
 
@@ -63,26 +61,6 @@ fn get_header_page_for_write(pager: &Pager) -> Result<(PageRef, Arc<Completion>)
     );
     pager.add_dirty(&page);
     Ok((page, c))
-}
-
-/// Helper function to run async header accessors until completion
-fn run_header_accessor_until_done<T, F>(pager: &Pager, mut accessor: F) -> Result<T>
-where
-    F: FnMut() -> Result<IOResult<T>>,
-{
-    loop {
-        match accessor()? {
-            IOResult::Done(value) => return Ok(value),
-            IOResult::IO(io) => match io {
-                IOCompletions::Single(c) => pager.io.wait_for_completion(c)?,
-                IOCompletions::Many(completions) => {
-                    for c in completions {
-                        pager.io.wait_for_completion(c)?
-                    }
-                }
-            },
-        }
-    }
 }
 
 /// Helper macro to implement getters and setters for header fields.

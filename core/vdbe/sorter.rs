@@ -558,10 +558,6 @@ impl SortedChunk {
         let c = Completion::new_write(write_complete);
         self.file.pwrite(0, buffer_ref, Arc::new(c))
     }
-
-    fn is_eof(&self) -> bool {
-        self.chunk_size - self.total_bytes_read.get() == 0
-    }
 }
 
 struct SortableImmutableRecord {
