@@ -2261,7 +2261,7 @@ macro_rules! return_if_io {
     ($expr:expr) => {
         match $expr? {
             IOResult::Done(v) => v,
-            IOResult::IO => return Ok(IOResult::IO),
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
         }
     };
 }

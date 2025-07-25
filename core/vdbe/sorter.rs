@@ -7,18 +7,25 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tempfile;
 
+use crate::return_if_io;
+use crate::types::IOCompletions;
 use crate::{
     error::LimboError,
-    io::{
-        Buffer, BufferData, Completion, CompletionType, File, OpenFlags, ReadCompletion,
-        WriteCompletion, IO,
-    },
+    io::{Buffer, BufferData, Completion, File, OpenFlags, IO},
     storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
     translate::collate::CollationSeq,
     turso_assert,
     types::{IOResult, ImmutableRecord, KeyInfo, RecordCursor, RefValue},
     Result,
 };
+
+#[derive(Debug, Clone, Copy)]
+enum SortState {
+    Start,
+    Flush,
+    InitChunkHeap,
+    Next,
+}
 
 pub struct Sorter {
     /// The records in the in-memory buffer.
@@ -48,6 +55,8 @@ pub struct Sorter {
     wait_for_read_complete: Vec<usize>,
     /// The temporary directory for chunk files.
     temp_dir: Option<tempfile::TempDir>,
+    /// State machine for Sort
+    sort_state: SortState,
 }
 
 impl Sorter {
@@ -82,6 +91,7 @@ impl Sorter {
             io,
             wait_for_read_complete: Vec::new(),
             temp_dir: None,
+            sort_state: SortState::Start,
         }
     }
 
@@ -95,16 +105,32 @@ impl Sorter {
 
     // We do the sorting here since this is what is called by the SorterSort instruction
     pub fn sort(&mut self) -> Result<IOResult<()>> {
-        if self.chunks.is_empty() {
-            self.records.sort();
-            self.records.reverse();
-        } else {
-            self.flush()?;
-            if let IOResult::IO = self.init_chunk_heap()? {
-                return Ok(IOResult::IO);
+        loop {
+            let state = self.sort_state;
+            match state {
+                SortState::Start => {
+                    if self.chunks.is_empty() {
+                        self.records.sort();
+                        self.records.reverse();
+                        self.sort_state = SortState::Next;
+                    } else {
+                        self.sort_state = SortState::Flush;
+                    }
+                }
+                SortState::Flush => {
+                    return_if_io!(self.flush());
+                    self.sort_state = SortState::InitChunkHeap;
+                }
+                SortState::InitChunkHeap => {
+                    return_if_io!(self.init_chunk_heap());
+                    self.sort_state = SortState::Next;
+                }
+                SortState::Next => {
+                    return_if_io!(self.next());
+                    self.sort_state = SortState::Start;
+                }
             }
         }
-        self.next()
     }
 
     pub fn next(&mut self) -> Result<IOResult<()>> {
@@ -158,7 +184,7 @@ impl Sorter {
                 SortedChunkIOState::WriteComplete => {
                     all_read_complete = false;
                     // Write complete, we can now read from the chunk.
-                    chunk.read()?;
+                    let c = chunk.read()?;
                 }
                 SortedChunkIOState::WaitingForWrite | SortedChunkIOState::WaitingForRead => {
                     all_read_complete = false;
@@ -226,9 +252,9 @@ impl Sorter {
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<()> {
+    fn flush(&mut self) -> Result<IOResult<()>> {
         if self.records.is_empty() {
-            return Ok(());
+            return Ok(IOResult::Done(()));
         }
 
         self.records.sort();
@@ -252,13 +278,13 @@ impl Sorter {
             .min_chunk_read_buffer_size
             .max(self.max_payload_size_in_buffer + 9);
         let mut chunk = SortedChunk::new(chunk_file.clone(), chunk_buffer_size);
-        chunk.write(&mut self.records)?;
+        let c = chunk.write(&mut self.records)?;
         self.chunks.push(chunk);
 
         self.current_buffer_size = 0;
         self.max_payload_size_in_buffer = 0;
 
-        Ok(())
+        Ok(IOResult::IO(IOCompletions::Single(c)))
     }
 }
 
@@ -296,10 +322,10 @@ impl SortedChunk {
         !self.records.is_empty() || self.io_state.get() != SortedChunkIOState::ReadEOF
     }
 
-    fn next(&mut self) -> Result<Option<ImmutableRecord>> {
+    fn next(&mut self) -> Result<IOResult<Option<ImmutableRecord>>> {
         let mut buffer_len = self.buffer_len.get();
         if self.records.is_empty() && buffer_len == 0 {
-            return Ok(None);
+            return Ok(IOResult::Done(None));
         }
 
         if self.records.is_empty() {
@@ -349,18 +375,18 @@ impl SortedChunk {
         let record = self.records.pop();
         if self.records.is_empty() && self.io_state.get() != SortedChunkIOState::ReadEOF {
             // We've consumed the last record. Read more payload into the buffer.
-            self.read()?;
+            let res = self.read()?;
         }
-        Ok(record)
+        Ok(IOResult::Done(record))
     }
 
-    fn read(&mut self) -> Result<()> {
+    fn read(&mut self) -> Result<IOResult<()>> {
         if self.io_state.get() == SortedChunkIOState::ReadEOF {
-            return Ok(());
+            return Ok(IOResult::Done(()));
         }
         if self.chunk_size - self.total_bytes_read.get() == 0 {
             self.io_state.set(SortedChunkIOState::ReadEOF);
-            return Ok(());
+            return Ok(IOResult::Done(()));
         }
         self.io_state.set(SortedChunkIOState::WaitingForRead);
 
@@ -398,15 +424,12 @@ impl SortedChunk {
             total_bytes_read_copy.set(total_bytes_read_copy.get() + bytes_read);
         });
 
-        let c = Completion::new(CompletionType::Read(ReadCompletion::new(
-            read_buffer_ref,
-            read_complete,
-        )));
-        self.file.pread(self.total_bytes_read.get(), Arc::new(c))?;
-        Ok(())
+        let c = Completion::new_read(read_buffer_ref, read_complete);
+        let c = self.file.pread(self.total_bytes_read.get(), Arc::new(c))?;
+        Ok(IOResult::IO(IOCompletions::Single(c)))
     }
 
-    fn write(&mut self, records: &mut Vec<SortableImmutableRecord>) -> Result<()> {
+    fn write(&mut self, records: &mut Vec<SortableImmutableRecord>) -> Result<Arc<Completion>> {
         assert!(self.io_state.get() == SortedChunkIOState::None);
         self.io_state.set(SortedChunkIOState::WaitingForWrite);
         self.chunk_size = 0;
@@ -447,9 +470,8 @@ impl SortedChunk {
             }
         });
 
-        let c = Completion::new(CompletionType::Write(WriteCompletion::new(write_complete)));
-        self.file.pwrite(0, buffer_ref, Arc::new(c))?;
-        Ok(())
+        let c = Completion::new_write(write_complete);
+        self.file.pwrite(0, buffer_ref, Arc::new(c))
     }
 }
 
