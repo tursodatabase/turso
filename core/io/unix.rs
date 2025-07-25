@@ -1,15 +1,15 @@
+use super::{Completion, File, MemoryIO, OpenFlags, IO};
 use crate::error::LimboError;
+use crate::io::clock::{Clock, Instant};
 use crate::io::common;
 use crate::Result;
-
-use super::{Completion, File, MemoryIO, OpenFlags, IO};
-use crate::io::clock::{Clock, Instant};
 use polling::{Event, Events, Poller};
 use rustix::{
     fd::{AsFd, AsRawFd},
     fs::{self, FlockOperation, OFlags, OpenOptionsExt},
     io::Errno,
 };
+use std::os::fd::RawFd;
 use std::{
     cell::{RefCell, UnsafeCell},
     mem::MaybeUninit,
@@ -37,11 +37,6 @@ impl OwnedCallbacks {
 
     fn is_empty(&self) -> bool {
         self.as_mut().inline_count == 0
-    }
-
-    fn get(&self, fd: usize) -> Option<&CompletionCallback> {
-        let callbacks = unsafe { &mut *self.0.get() };
-        callbacks.get(fd)
     }
 
     fn remove(&self, fd: usize) -> Option<CompletionCallback> {
@@ -134,16 +129,6 @@ impl Callbacks {
         }
     }
 
-    fn get(&self, fd: usize) -> Option<&CompletionCallback> {
-        if let Some(pos) = self.find_inline(fd) {
-            let (_, callback) = unsafe { self.inline_entries[pos].assume_init_ref() };
-            return Some(callback);
-        } else if let Some(pos) = self.heap_entries.iter().position(|&(k, _)| k == fd) {
-            return Some(&self.heap_entries[pos].1);
-        }
-        None
-    }
-
     fn remove(&mut self, fd: usize) -> Option<CompletionCallback> {
         if let Some(pos) = self.find_inline(fd) {
             let (_, callback) = unsafe { self.inline_entries[pos].assume_init_read() };
@@ -212,6 +197,35 @@ impl Clock for UnixIO {
     }
 }
 
+fn try_pwritev_raw(
+    fd: RawFd,
+    off: u64,
+    bufs: &[Arc<RefCell<crate::Buffer>>],
+    start_idx: usize,
+    start_off: usize,
+) -> std::io::Result<usize> {
+    const MAX_IOV: usize = 1024;
+    let iov_len = std::cmp::min(bufs.len() - start_idx, MAX_IOV);
+    let mut iov = Vec::with_capacity(iov_len);
+
+    for (i, b) in bufs.iter().enumerate().skip(start_idx).take(iov_len) {
+        let r = b.borrow(); // borrow just to get pointer/len
+        let s = r.as_slice();
+        let s = if i == start_idx { &s[start_off..] } else { s };
+        iov.push(libc::iovec {
+            iov_base: s.as_ptr() as *mut _,
+            iov_len: s.len(),
+        });
+    }
+
+    let n = unsafe { libc::pwritev(fd, iov.as_ptr(), iov.len() as i32, off as i64) };
+    if n < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
 impl IO for UnixIO {
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         trace!("open_file(path = {})", path);
@@ -242,46 +256,125 @@ impl IO for UnixIO {
         if self.callbacks.is_empty() {
             return Ok(());
         }
+
         self.events.clear();
         trace!("run_once() waits for events");
         self.poller.wait(self.events.as_mut(), None)?;
 
         for event in self.events.iter() {
-            if let Some(cf) = self.callbacks.get(event.key) {
-                let result = match cf {
-                    CompletionCallback::Read(ref file, ref c, pos) => {
-                        let file = file.borrow_mut();
-                        let r = c.as_read();
-                        let mut buf = r.buf_mut();
-                        rustix::io::pread(file.as_fd(), buf.as_mut_slice(), *pos as u64)
-                    }
-                    CompletionCallback::Write(ref file, _, ref buf, pos) => {
-                        let file = file.borrow_mut();
-                        let buf = buf.borrow();
-                        rustix::io::pwrite(file.as_fd(), buf.as_slice(), *pos as u64)
-                    }
-                };
-                match result {
-                    Ok(n) => {
-                        let cf = self
-                            .callbacks
-                            .remove(event.key)
-                            .expect("callback should exist");
-                        match cf {
-                            CompletionCallback::Read(_, c, _) => c.complete(0),
-                            CompletionCallback::Write(_, c, _, _) => c.complete(n as i32),
-                        }
-                    }
-                    Err(Errno::AGAIN) => (),
-                    Err(e) => {
-                        self.callbacks.remove(event.key);
+            let key = event.key;
 
-                        trace!("run_once() error: {}", e);
-                        return Err(e.into());
+            // 1) TAKE the callback – don't borrow it.
+            let cb = match self.callbacks.remove(key) {
+                Some(cb) => cb,
+                None => continue, // could have been completed/removed already
+            };
+
+            match cb {
+                CompletionCallback::Read(ref file, c, pos) => {
+                    let f = file.borrow_mut();
+                    let r = c.as_read();
+                    let mut buf = r.buf_mut();
+                    match rustix::io::pread(f.as_fd(), buf.as_mut_slice(), pos as u64) {
+                        Ok(n) => c.complete(n as i32),
+                        Err(Errno::AGAIN) => {
+                            // re-arm
+                            unsafe { self.poller.as_mut().add(&f.as_fd(), Event::readable(key))? };
+                            self.callbacks.as_mut().insert(
+                                key,
+                                CompletionCallback::Read(file.clone(), c.clone(), pos),
+                            );
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+
+                CompletionCallback::Write(ref file, c, buf, pos) => {
+                    let f = file.borrow_mut();
+                    let b = buf.borrow();
+                    match rustix::io::pwrite(f.as_fd(), b.as_slice(), pos as u64) {
+                        Ok(n) => c.complete(n as i32),
+                        Err(Errno::AGAIN) => {
+                            unsafe { self.poller.as_mut().add(&f.as_fd(), Event::writable(key))? };
+                            self.callbacks.as_mut().insert(
+                                key,
+                                CompletionCallback::Write(file.clone(), c, buf.clone(), pos),
+                            );
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+
+                CompletionCallback::Writev(file, c, bufs, mut pos, mut idx, mut off) => {
+                    let f = file.borrow_mut();
+                    // keep trying until WouldBlock or we're done with this event
+                    match try_pwritev_raw(f.as_raw_fd(), pos as u64, &bufs, idx, off) {
+                        Ok(written) => {
+                            // advance through buffers
+                            let mut rem = written;
+                            while rem > 0 {
+                                let len = {
+                                    let r = bufs[idx].borrow();
+                                    r.len()
+                                };
+                                let left = len - off;
+                                if rem < left {
+                                    off += rem;
+                                    rem = 0;
+                                } else {
+                                    rem -= left;
+                                    idx += 1;
+                                    off = 0;
+                                    if idx == bufs.len() {
+                                        break;
+                                    }
+                                }
+                            }
+                            pos += written;
+
+                            if idx == bufs.len() {
+                                c.complete(pos as i32);
+                            } else {
+                                // Not finished; re-arm and store updated state
+                                unsafe {
+                                    self.poller.as_mut().add(&f.as_fd(), Event::writable(key))?
+                                };
+                                self.callbacks.as_mut().insert(
+                                    key,
+                                    CompletionCallback::Writev(
+                                        file.clone(),
+                                        c.clone(),
+                                        bufs,
+                                        pos,
+                                        idx,
+                                        off,
+                                    ),
+                                );
+                            }
+                            break;
+                        }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                            // re-arm with same state
+                            unsafe { self.poller.as_mut().add(&f.as_fd(), Event::writable(key))? };
+                            self.callbacks.as_mut().insert(
+                                key,
+                                CompletionCallback::Writev(
+                                    file.clone(),
+                                    c.clone(),
+                                    bufs,
+                                    pos,
+                                    idx,
+                                    off,
+                                ),
+                            );
+                            break;
+                        }
+                        Err(e) => return Err(e.into()),
                     }
                 }
             }
         }
+
         Ok(())
     }
 
@@ -310,6 +403,14 @@ enum CompletionCallback {
         Arc<Completion>,
         Arc<RefCell<crate::Buffer>>,
         usize,
+    ),
+    Writev(
+        Arc<RefCell<std::fs::File>>,
+        Arc<Completion>,
+        Vec<Arc<RefCell<crate::Buffer>>>,
+        usize, // absolute file offset
+        usize, // buf index
+        usize, // intra-buf offset
     ),
 }
 
@@ -427,6 +528,49 @@ impl File for UnixFile<'_> {
                 Ok(c)
             }
             Err(e) => Err(e.into()),
+        }
+    }
+
+    #[instrument(err, skip_all, level = Level::TRACE)]
+    fn pwritev(
+        &self,
+        pos: usize,
+        buffers: Vec<Arc<RefCell<crate::Buffer>>>,
+        c: Arc<Completion>,
+    ) -> Result<Arc<Completion>> {
+        let file = self.file.borrow();
+
+        match try_pwritev_raw(file.as_raw_fd(), pos as u64, &buffers, 0, 0) {
+            Ok(written) => {
+                trace!("pwritev wrote {written}");
+                c.complete(written as i32);
+                Ok(c)
+            }
+            Err(e) => {
+                if e.kind() == ErrorKind::WouldBlock {
+                    trace!("pwritev blocks");
+                } else {
+                    return Err(e.into());
+                }
+                // Set up state so we can resume later
+                let fd = file.as_raw_fd();
+                self.poller
+                    .add(&file.as_fd(), Event::writable(fd as usize))?;
+                let buf_idx = 0;
+                let buf_offset = 0;
+                self.callbacks.insert(
+                    fd as usize,
+                    CompletionCallback::Writev(
+                        self.file.clone(),
+                        c.clone(),
+                        buffers,
+                        pos,
+                        buf_idx,
+                        buf_offset,
+                    ),
+                );
+                Ok(c)
+            }
         }
     }
 

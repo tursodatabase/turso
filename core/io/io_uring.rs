@@ -44,8 +44,6 @@ unsafe impl Sync for UringIO {}
 struct WrappedIOUring {
     ring: io_uring::IoUring,
     pending_ops: usize,
-    pub pending: [Option<Arc<Completion>>; ENTRIES as usize + 1],
-    key: u64,
 }
 
 struct InnerUringIO {
@@ -70,8 +68,6 @@ impl UringIO {
             ring: WrappedIOUring {
                 ring,
                 pending_ops: 0,
-                pending: [const { None }; ENTRIES as usize + 1],
-                key: 0,
             },
             free_files: (0..8).collect(),
         };
@@ -106,47 +102,45 @@ impl InnerUringIO {
 }
 
 impl WrappedIOUring {
-    fn submit_entry(&mut self, entry: &io_uring::squeue::Entry, c: Arc<Completion>) {
+    fn submit_entry(&mut self, entry: &io_uring::squeue::Entry) {
         trace!("submit_entry({:?})", entry);
-        self.pending[entry.get_user_data() as usize] = Some(c);
         unsafe {
-            self.ring
-                .submission()
-                .push(entry)
-                .expect("submission queue is full");
+            let mut sub = self.ring.submission_shared();
+            match sub.push(entry) {
+                Ok(_) => self.pending_ops += 1,
+                Err(e) => {
+                    tracing::error!("Failed to submit entry: {e}");
+                    self.ring.submit().expect("failed to submit entry");
+                    sub.push(entry).expect("failed to push entry after submit");
+                    self.pending_ops += 1;
+                }
+            }
         }
-        self.pending_ops += 1;
     }
 
     fn wait_for_completion(&mut self) -> Result<()> {
-        self.ring.submit_and_wait(1)?;
-        Ok(())
-    }
-
-    fn get_completion(&mut self) -> Option<io_uring::cqueue::Entry> {
-        // NOTE: This works because CompletionQueue's next function pops the head of the queue. This is not normal behaviour of iterators
-        let entry = self.ring.completion().next();
-        if entry.is_some() {
-            trace!("get_completion({:?})", entry);
-            // consumed an entry from completion queue, update pending_ops
-            self.pending_ops -= 1;
+        if self.pending_ops == 0 {
+            return Ok(());
         }
-        entry
+        let wants = std::cmp::min(self.pending_ops, 8);
+        tracing::info!("Waiting for {wants} pending operations to complete");
+        self.ring.submit_and_wait(wants)?;
+        Ok(())
     }
 
     fn empty(&self) -> bool {
         self.pending_ops == 0
     }
+}
 
-    fn get_key(&mut self) -> u64 {
-        self.key += 1;
-        if self.key == ENTRIES as u64 {
-            let key = self.key;
-            self.key = 0;
-            return key;
-        }
-        self.key
-    }
+#[inline(always)]
+fn get_key(c: Arc<Completion>) -> u64 {
+    Arc::into_raw(c) as u64
+}
+
+#[inline(always)]
+fn completion_from_key(key: u64) -> Arc<Completion> {
+    unsafe { Arc::from_raw(key as *const Completion) }
 }
 
 impl IO for UringIO {
@@ -199,7 +193,8 @@ impl IO for UringIO {
         }
 
         ring.wait_for_completion()?;
-        while let Some(cqe) = ring.get_completion() {
+        while let Some(cqe) = ring.ring.completion().next() {
+            ring.pending_ops -= 1;
             let result = cqe.result();
             if result < 0 {
                 return Err(LimboError::UringIOError(format!(
@@ -208,12 +203,14 @@ impl IO for UringIO {
                     cqe
                 )));
             }
-            {
-                if let Some(c) = ring.pending[cqe.user_data() as usize].as_ref() {
-                    c.complete(cqe.result());
-                }
+            let ud = cqe.user_data();
+            if ud == 0 {
+                // we currently don't have any linked timeouts or cancelations, but just in case
+                // lets guard against this case
+                tracing::error!("Received completion with user_data 0");
+                continue;
             }
-            ring.pending[cqe.user_data() as usize] = None;
+            completion_from_key(ud).complete(result);
         }
         Ok(())
     }
@@ -313,10 +310,10 @@ impl File for UringFile {
                 io_uring::opcode::Read::new(fd, buf, len as u32)
                     .offset(pos as u64)
                     .build()
-                    .user_data(io.ring.get_key())
+                    .user_data(get_key(c.clone()))
             })
         };
-        io.ring.submit_entry(&read_e, c.clone());
+        io.ring.submit_entry(&read_e);
         Ok(c)
     }
 
@@ -334,18 +331,56 @@ impl File for UringFile {
                 io_uring::opcode::Write::new(fd, buf.as_ptr(), buf.len() as u32)
                     .offset(pos as u64)
                     .build()
-                    .user_data(io.ring.get_key())
+                    .user_data(get_key(c.clone()))
             })
         };
-        let c_uring = c.clone();
-        io.ring.submit_entry(
-            &write,
-            Arc::new(Completion::new_write(move |result| {
-                c_uring.complete(result);
-                // NOTE: Explicitly reference buffer to ensure it lives until here
-                let _ = buffer.borrow();
-            })),
-        );
+        io.ring.submit_entry(&write);
+        Ok(c)
+    }
+
+    fn pwritev(
+        &self,
+        pos: usize,
+        bufs: Vec<Arc<RefCell<crate::Buffer>>>,
+        c: Arc<Completion>,
+    ) -> Result<Arc<Completion>> {
+        // build iovecs
+        let mut iovs: Vec<libc::iovec> = Vec::with_capacity(bufs.len());
+        for b in &bufs {
+            let rb = b.borrow();
+            iovs.push(libc::iovec {
+                iov_base: rb.as_ptr() as *mut _,
+                iov_len: rb.len(),
+            });
+        }
+        // keep iovecs alive until completion
+        let boxed_iovs = iovs.into_boxed_slice();
+        let iov_ptr = boxed_iovs.as_ptr();
+        let iov_len = boxed_iovs.len() as u32;
+        // leak now, free in completion
+        let raw_iovs = Box::into_raw(boxed_iovs);
+
+        let comp = {
+            // wrap original completion to free resources
+            let orig = c.clone();
+            Box::new(move |res: i32| {
+                // reclaim iovecs
+                unsafe {
+                    let _ = Box::from_raw(raw_iovs);
+                }
+                // forward to user closure
+                orig.complete(res);
+            })
+        };
+        let c = Arc::new(Completion::new_write(comp));
+        let mut io = self.io.borrow_mut();
+        let e = with_fd!(self, |fd| {
+            io_uring::opcode::Writev::new(fd, iov_ptr, iov_len)
+                .offset(pos as u64)
+                .build()
+                .user_data(get_key(c.clone()))
+        });
+        io.ring.submit_entry(&e);
         Ok(c)
     }
 
@@ -355,9 +390,9 @@ impl File for UringFile {
         let sync = with_fd!(self, |fd| {
             io_uring::opcode::Fsync::new(fd)
                 .build()
-                .user_data(io.ring.get_key())
+                .user_data(get_key(c.clone()))
         });
-        io.ring.submit_entry(&sync, c.clone());
+        io.ring.submit_entry(&sync);
         Ok(c)
     }
 

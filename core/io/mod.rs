@@ -21,6 +21,31 @@ pub trait File: Send + Sync {
         buffer: Arc<RefCell<Buffer>>,
         c: Arc<Completion>,
     ) -> Result<Arc<Completion>>;
+    fn pwritev(
+        &self,
+        pos: usize,
+        buffers: Vec<Arc<RefCell<Buffer>>>,
+        c: Arc<Completion>,
+    ) -> Result<Arc<Completion>> {
+        // FIXME: for now, stupid default so i dont have to impl for all backends
+        let counter = Rc::new(Cell::new(0));
+        let len = buffers.len();
+        let mut pos = pos;
+        for buf in buffers {
+            let _counter = counter.clone();
+            let _c = c.clone();
+            let default_c = Arc::new(Completion::new_write(move |_| {
+                _counter.set(_counter.get() + 1);
+                if _counter.get() == len {
+                    _c.complete(len as i32); // complete the original completion
+                }
+            }));
+            let len = buf.borrow().len();
+            self.pwrite(pos, buf, default_c)?;
+            pos += len;
+        }
+        Ok(c.clone())
+    }
     fn sync(&self, c: Arc<Completion>) -> Result<Arc<Completion>>;
     fn size(&self) -> Result<u64>;
 }

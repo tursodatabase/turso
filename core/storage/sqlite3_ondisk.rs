@@ -58,6 +58,7 @@ use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_thr
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::pager::Pager;
+use crate::storage::wal::{BatchItem, PendingFlush};
 use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
 use crate::{turso_assert, File, Result, WalFileShared};
 use std::cell::{RefCell, UnsafeCell};
@@ -820,6 +821,56 @@ pub fn begin_write_btree_page(
         *write_counter.borrow_mut() -= 1;
     }
     res
+}
+
+#[instrument(skip_all, level = Level::DEBUG)]
+pub fn begin_write_btree_pages_writev(
+    pager: &Pager,
+    batch: &[BatchItem],
+    write_counter: Rc<RefCell<usize>>,
+) -> Result<PendingFlush> {
+    if batch.is_empty() {
+        return Ok(PendingFlush::default());
+    }
+
+    let mut run = batch.to_vec();
+    run.sort_by_key(|b| b.id);
+
+    let page_sz = pager.page_size.get().unwrap_or(DEFAULT_PAGE_SIZE) as usize;
+    let done = Arc::new(AtomicBool::new(false));
+
+    let mut all_ids = Vec::with_capacity(run.len());
+    let mut start = 0;
+    while start < run.len() {
+        let mut end = start + 1;
+        while end < run.len() && run[end].id == run[end - 1].id + 1 {
+            end += 1;
+        }
+
+        // submit contiguous run
+        let first = run[start].id;
+        let bufs: Vec<_> = run[start..end].iter().map(|b| b.buf.clone()).collect();
+        all_ids.extend(run[start..end].iter().map(|b| b.id));
+
+        *write_counter.borrow_mut() += 1;
+        let wc = write_counter.clone();
+        let done_clone = done.clone();
+
+        let c = Completion::new_write(move |_| {
+            // one run finished
+            *wc.borrow_mut() -= 1;
+            if wc.borrow().eq(&0) {
+                // last run of this batch is done
+                done_clone.store(true, Ordering::Release);
+            }
+        });
+        pager.db_file.write_pages(first, page_sz, bufs, c)?;
+        start = end;
+    }
+    Ok(PendingFlush {
+        pages: all_ids,
+        done,
+    })
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
