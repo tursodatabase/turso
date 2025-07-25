@@ -2337,8 +2337,7 @@ impl BTreeCursor {
                         // to prevent panic in the asserts below due to -1 index
                         self.stack.advance();
                     }
-                    parent_page.set_dirty();
-                    self.pager.add_dirty(parent_page.get().id);
+                    self.pager.add_dirty(&parent_page);
                     let parent_contents = parent_page.get().contents.as_ref().unwrap();
                     let page_to_balance_idx = self.stack.current_cell_index() as usize;
 
@@ -2418,8 +2417,7 @@ impl BTreeCursor {
                         {
                             // mark as dirty
                             let sibling_page = page.get();
-                            sibling_page.set_dirty();
-                            self.pager.add_dirty(sibling_page.get().id);
+                            self.pager.add_dirty(&sibling_page);
                         }
                         completions.push(c);
                         pages_to_balance[i].replace(page);
@@ -7563,16 +7561,7 @@ mod tests {
             let mut keys = SortedVec::new();
             tracing::info!("seed: {seed}");
             for i in 0..inserts {
-                while let IOResult::IO(io) = pager.begin_read_tx().unwrap() {
-                    match io {
-                        IOCompletions::Single(c) => pager.io.wait_for_completion(c).unwrap(),
-                        IOCompletions::Many(completions) => {
-                            for c in completions {
-                                pager.io.wait_for_completion(c).unwrap();
-                            }
-                        }
-                    }
-                }
+                pager.begin_read_tx().unwrap();
                 while let IOResult::IO(io) = pager.begin_write_tx().unwrap() {
                     match io {
                         IOCompletions::Single(c) => pager.io.wait_for_completion(c).unwrap(),
@@ -7643,16 +7632,7 @@ mod tests {
             }
 
             // Check that all keys can be found by seeking
-            while let IOResult::IO(io) = pager.begin_read_tx().unwrap() {
-                match io {
-                    IOCompletions::Single(c) => pager.io.wait_for_completion(c).unwrap(),
-                    IOCompletions::Many(completions) => {
-                        for c in completions {
-                            pager.io.wait_for_completion(c).unwrap();
-                        }
-                    }
-                }
-            }
+            pager.begin_read_tx().unwrap();
             let c = cursor.move_to_root().unwrap();
             pager.io.wait_for_completion(c).unwrap();
             for (i, key) in keys.iter().enumerate() {
@@ -7741,7 +7721,7 @@ mod tests {
                 pager.btree_create(&CreateBTreeFlags::new_index()).unwrap();
             let index_root_page = match index_root_page_result {
                 crate::types::IOResult::Done(id) => id as usize,
-                crate::types::IOResult::IO => {
+                crate::types::IOResult::IO(..) => {
                     panic!("btree_create returned IO in test, unexpected")
                 }
             };
@@ -7865,9 +7845,14 @@ mod tests {
                 loop {
                     match pager.end_tx(false, false, &conn, false).unwrap() {
                         IOResult::Done(_) => break,
-                        IOResult::IO => {
-                            pager.io.run_once().unwrap();
-                        }
+                        IOResult::IO(io_c) => match io_c {
+                            IOCompletions::Single(c) => pager.io.wait_for_completion(c).unwrap(),
+                            IOCompletions::Many(completions) => {
+                                for c in completions {
+                                    pager.io.wait_for_completion(c).unwrap()
+                                }
+                            }
+                        },
                     }
                 }
             }
