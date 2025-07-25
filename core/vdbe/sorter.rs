@@ -27,6 +27,25 @@ enum SortState {
     Next,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum InitChunkState {
+    Start,
+    PushChunkIdx,
+    Finish,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FlushState {
+    Start,
+    Finish,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NextState {
+    Start,
+    Finish,
+}
+
 pub struct Sorter {
     /// The records in the in-memory buffer.
     records: Vec<SortableImmutableRecord>,
@@ -51,12 +70,16 @@ pub struct Sorter {
     max_payload_size_in_buffer: usize,
     /// The IO object.
     io: Arc<dyn IO>,
-    /// The indices of the chunks for which the read is not complete.
-    wait_for_read_complete: Vec<usize>,
     /// The temporary directory for chunk files.
     temp_dir: Option<tempfile::TempDir>,
-    /// State machine for Sort
+    /// State machine for `sort`
     sort_state: SortState,
+    /// State machine for `init_chunk_heap`
+    init_chunk_state: InitChunkState,
+    /// State machine for `flush`
+    flush_state: FlushState,
+    /// State machine for `next`
+    next_state: NextState,
 }
 
 impl Sorter {
@@ -89,9 +112,11 @@ impl Sorter {
             min_chunk_read_buffer_size: min_chunk_read_buffer_size_bytes,
             max_payload_size_in_buffer: 0,
             io,
-            wait_for_read_complete: Vec::new(),
             temp_dir: None,
             sort_state: SortState::Start,
+            init_chunk_state: InitChunkState::Start,
+            flush_state: FlushState::Start,
+            next_state: NextState::Start,
         }
     }
 
@@ -134,27 +159,50 @@ impl Sorter {
     }
 
     pub fn next(&mut self) -> Result<IOResult<()>> {
-        let record = if self.chunks.is_empty() {
-            // Serve from the in-memory buffer.
-            self.records.pop()
-        } else {
-            // Serve from sorted chunk files.
-            match self.next_from_chunk_heap()? {
-                IOResult::IO => return Ok(IOResult::IO),
-                IOResult::Done(record) => record,
-            }
-        };
-        match record {
-            Some(record) => {
-                if let Some(error) = record.deserialization_error.replace(None) {
-                    // If there was a key deserialization error during the comparison, return the error.
-                    return Err(error);
+        loop {
+            let state = self.next_state;
+            tracing::debug!(?state);
+            match state {
+                NextState::Start => {
+                    self.next_state = NextState::Finish;
+                    if self.chunks.is_empty() {
+                        // Serve from the in-memory buffer.
+                        let record = self.records.pop();
+                        match record {
+                            Some(record) => {
+                                if let Some(error) = record.deserialization_error.replace(None) {
+                                    // If there was a key deserialization error during the comparison, return the error.
+                                    return Err(error);
+                                }
+                                self.current = Some(record.record);
+                            }
+                            None => self.current = None,
+                        }
+                    } else {
+                        // Serve from sorted chunk files.
+                        let (record, c) = self.next_from_chunk_heap()?;
+                        match record {
+                            Some(record) => {
+                                if let Some(error) = record.deserialization_error.replace(None) {
+                                    // If there was a key deserialization error during the comparison, return the error.
+                                    return Err(error);
+                                }
+                                self.current = Some(record.record);
+                            }
+                            None => self.current = None,
+                        }
+
+                        if let Some(c) = c {
+                            return Ok(IOResult::IO(IOCompletions::Single(c)));
+                        }
+                    }
                 }
-                self.current = Some(record.record);
+                NextState::Finish => {
+                    self.next_state = NextState::Start;
+                    return Ok(IOResult::Done(()));
+                }
             }
-            None => self.current = None,
         }
-        Ok(IOResult::Done(()))
     }
 
     pub fn record(&self) -> Option<&ImmutableRecord> {
@@ -164,7 +212,7 @@ impl Sorter {
     pub fn insert(&mut self, record: &ImmutableRecord) -> Result<()> {
         let payload_size = record.get_payload().len();
         if self.current_buffer_size + payload_size > self.max_buffer_size {
-            self.flush()?;
+            let res = self.flush()?;
         }
         self.records.push(SortableImmutableRecord::new(
             record.clone(),
@@ -177,66 +225,72 @@ impl Sorter {
     }
 
     fn init_chunk_heap(&mut self) -> Result<IOResult<()>> {
-        let mut all_read_complete = true;
-        // Make sure all chunks read at least one record into their buffer.
-        for chunk in self.chunks.iter_mut() {
-            match chunk.io_state.get() {
-                SortedChunkIOState::WriteComplete => {
-                    all_read_complete = false;
-                    // Write complete, we can now read from the chunk.
-                    let c = chunk.read()?;
+        loop {
+            let state = self.init_chunk_state;
+            match state {
+                InitChunkState::Start => {
+                    // Make sure all chunks read at least one record into their buffer.
+                    let mut completions = Vec::with_capacity(self.chunks.len());
+                    for chunk in self.chunks.iter_mut() {
+                        match chunk.io_state.get() {
+                            SortedChunkIOState::WriteComplete => {
+                                // Write complete, we can now read from the chunk.
+                                if chunk.can_read_more() {
+                                    let c = chunk.read()?;
+                                    completions.push(c);
+                                }
+                            }
+                            SortedChunkIOState::ReadEOF | SortedChunkIOState::ReadComplete => {}
+                            _ => {
+                                unreachable!(
+                                    "Unexpected chunk IO state: {:?}",
+                                    chunk.io_state.get()
+                                )
+                            }
+                        }
+                    }
+                    self.init_chunk_state = InitChunkState::PushChunkIdx;
+                    if !completions.is_empty() {
+                        return Ok(IOResult::IO(IOCompletions::Many(completions)));
+                    }
                 }
-                SortedChunkIOState::WaitingForWrite | SortedChunkIOState::WaitingForRead => {
-                    all_read_complete = false;
+                InitChunkState::PushChunkIdx => {
+                    self.chunk_heap.reserve(self.chunks.len());
+                    let mut completions = Vec::new();
+                    for chunk_idx in 0..self.chunks.len() {
+                        if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {
+                            completions.push(c);
+                        }
+                    }
+                    self.init_chunk_state = InitChunkState::Finish;
+                    if !completions.is_empty() {
+                        return Ok(IOResult::IO(IOCompletions::Many(completions)));
+                    }
                 }
-                SortedChunkIOState::ReadEOF | SortedChunkIOState::ReadComplete => {}
-                _ => {
-                    unreachable!("Unexpected chunk IO state: {:?}", chunk.io_state.get())
+                InitChunkState::Finish => {
+                    self.init_chunk_state = InitChunkState::Start;
+                    return Ok(IOResult::Done(()));
                 }
             }
         }
-        if !all_read_complete {
-            return Ok(IOResult::IO);
-        }
-        self.chunk_heap.reserve(self.chunks.len());
-        for chunk_idx in 0..self.chunks.len() {
-            self.push_to_chunk_heap(chunk_idx)?;
-        }
-        Ok(IOResult::Done(()))
     }
 
-    fn next_from_chunk_heap(&mut self) -> Result<IOResult<Option<SortableImmutableRecord>>> {
-        let mut all_read_complete = true;
-        for chunk_idx in self.wait_for_read_complete.iter() {
-            let chunk_io_state = self.chunks[*chunk_idx].io_state.get();
-            match chunk_io_state {
-                SortedChunkIOState::ReadComplete | SortedChunkIOState::ReadEOF => {}
-                SortedChunkIOState::WaitingForRead => {
-                    all_read_complete = false;
-                }
-                _ => {
-                    unreachable!("Unexpected chunk IO state: {:?}", chunk_io_state)
-                }
-            }
-        }
-        if !all_read_complete {
-            return Ok(IOResult::IO);
-        }
-        self.wait_for_read_complete.clear();
-
+    fn next_from_chunk_heap(
+        &mut self,
+    ) -> Result<(Option<SortableImmutableRecord>, Option<Arc<Completion>>)> {
         if let Some((next_record, next_chunk_idx)) = self.chunk_heap.pop() {
-            self.push_to_chunk_heap(next_chunk_idx)?;
-            Ok(IOResult::Done(Some(next_record.0)))
+            let c = self.push_to_chunk_heap(next_chunk_idx)?;
+            Ok((Some(next_record.0), c))
         } else {
-            Ok(IOResult::Done(None))
+            Ok((None, None))
         }
     }
 
-    fn push_to_chunk_heap(&mut self, chunk_idx: usize) -> Result<()> {
+    fn push_to_chunk_heap(&mut self, chunk_idx: usize) -> Result<Option<Arc<Completion>>> {
         let chunk = &mut self.chunks[chunk_idx];
 
         if chunk.has_more() {
-            let record = chunk.next()?.unwrap();
+            let record = chunk.next_record()?.unwrap();
             self.chunk_heap.push((
                 Reverse(SortableImmutableRecord::new(
                     record,
@@ -245,46 +299,61 @@ impl Sorter {
                 )?),
                 chunk_idx,
             ));
-            if let SortedChunkIOState::WaitingForRead = chunk.io_state.get() {
-                self.wait_for_read_complete.push(chunk_idx);
+            if chunk.can_read_more() {
+                // We've consumed the last record. Read more payload into the buffer.
+                let c = chunk.read()?;
+                return Ok(Some(c));
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     fn flush(&mut self) -> Result<IOResult<()>> {
-        if self.records.is_empty() {
-            return Ok(IOResult::Done(()));
+        loop {
+            let state = self.flush_state;
+            match state {
+                FlushState::Start => {
+                    if self.records.is_empty() {
+                        return Ok(IOResult::Done(()));
+                    }
+                    self.records.sort();
+
+                    if self.temp_dir.is_none() {
+                        self.temp_dir = Some(tempfile::tempdir().map_err(LimboError::IOError)?);
+                    }
+
+                    let chunk_file_path = self
+                        .temp_dir
+                        .as_ref()
+                        .unwrap()
+                        .path()
+                        .join(format!("chunk_{}", self.chunks.len()));
+                    let chunk_file = self.io.open_file(
+                        chunk_file_path.to_str().unwrap(),
+                        OpenFlags::Create,
+                        false,
+                    )?;
+
+                    // Make sure the chunk buffer size can fit the largest record and its size varint.
+                    let chunk_buffer_size = self
+                        .min_chunk_read_buffer_size
+                        .max(self.max_payload_size_in_buffer + 9);
+                    let mut chunk = SortedChunk::new(chunk_file.clone(), chunk_buffer_size);
+                    let c = chunk.write(&mut self.records)?;
+                    self.chunks.push(chunk);
+
+                    self.current_buffer_size = 0;
+                    self.max_payload_size_in_buffer = 0;
+
+                    self.flush_state = FlushState::Finish;
+                    return Ok(IOResult::IO(IOCompletions::Single(c)));
+                }
+                FlushState::Finish => {
+                    self.flush_state = FlushState::Start;
+                    return Ok(IOResult::Done(()));
+                }
+            }
         }
-
-        self.records.sort();
-
-        if self.temp_dir.is_none() {
-            self.temp_dir = Some(tempfile::tempdir().map_err(LimboError::IOError)?);
-        }
-
-        let chunk_file_path = self
-            .temp_dir
-            .as_ref()
-            .unwrap()
-            .path()
-            .join(format!("chunk_{}", self.chunks.len()));
-        let chunk_file =
-            self.io
-                .open_file(chunk_file_path.to_str().unwrap(), OpenFlags::Create, false)?;
-
-        // Make sure the chunk buffer size can fit the largest record and its size varint.
-        let chunk_buffer_size = self
-            .min_chunk_read_buffer_size
-            .max(self.max_payload_size_in_buffer + 9);
-        let mut chunk = SortedChunk::new(chunk_file.clone(), chunk_buffer_size);
-        let c = chunk.write(&mut self.records)?;
-        self.chunks.push(chunk);
-
-        self.current_buffer_size = 0;
-        self.max_payload_size_in_buffer = 0;
-
-        Ok(IOResult::IO(IOCompletions::Single(c)))
     }
 }
 
@@ -322,10 +391,16 @@ impl SortedChunk {
         !self.records.is_empty() || self.io_state.get() != SortedChunkIOState::ReadEOF
     }
 
-    fn next(&mut self) -> Result<IOResult<Option<ImmutableRecord>>> {
+    fn can_read_more(&self) -> bool {
+        self.records.is_empty()
+            && self.chunk_size - self.total_bytes_read.get() != 0
+            && self.io_state.get() != SortedChunkIOState::ReadEOF
+    }
+
+    fn next_record(&mut self) -> Result<Option<ImmutableRecord>> {
         let mut buffer_len = self.buffer_len.get();
         if self.records.is_empty() && buffer_len == 0 {
-            return Ok(IOResult::Done(None));
+            return Ok(None);
         }
 
         if self.records.is_empty() {
@@ -373,22 +448,14 @@ impl SortedChunk {
         }
 
         let record = self.records.pop();
-        if self.records.is_empty() && self.io_state.get() != SortedChunkIOState::ReadEOF {
-            // We've consumed the last record. Read more payload into the buffer.
-            let res = self.read()?;
-        }
-        Ok(IOResult::Done(record))
+        Ok(record)
     }
 
-    fn read(&mut self) -> Result<IOResult<()>> {
-        if self.io_state.get() == SortedChunkIOState::ReadEOF {
-            return Ok(IOResult::Done(()));
-        }
-        if self.chunk_size - self.total_bytes_read.get() == 0 {
-            self.io_state.set(SortedChunkIOState::ReadEOF);
-            return Ok(IOResult::Done(()));
-        }
-        self.io_state.set(SortedChunkIOState::WaitingForRead);
+    fn read(&mut self) -> Result<Arc<Completion>> {
+        // if self.chunk_size - self.total_bytes_read.get() == 0 {
+        //     self.io_state.set(SortedChunkIOState::ReadEOF);
+        //     return Ok(IOResult::Done(()));
+        // }
 
         let read_buffer_size = self.buffer.borrow().len() - self.buffer_len.get();
         let read_buffer_size = read_buffer_size.min(self.chunk_size - self.total_bytes_read.get());
@@ -426,12 +493,11 @@ impl SortedChunk {
 
         let c = Completion::new_read(read_buffer_ref, read_complete);
         let c = self.file.pread(self.total_bytes_read.get(), Arc::new(c))?;
-        Ok(IOResult::IO(IOCompletions::Single(c)))
+        Ok(c)
     }
 
     fn write(&mut self, records: &mut Vec<SortableImmutableRecord>) -> Result<Arc<Completion>> {
         assert!(self.io_state.get() == SortedChunkIOState::None);
-        self.io_state.set(SortedChunkIOState::WaitingForWrite);
         self.chunk_size = 0;
 
         // Pre-compute varint lengths for record sizes to determine the total buffer size.
@@ -472,6 +538,10 @@ impl SortedChunk {
 
         let c = Completion::new_write(write_complete);
         self.file.pwrite(0, buffer_ref, Arc::new(c))
+    }
+
+    fn is_eof(&self) -> bool {
+        self.chunk_size - self.total_bytes_read.get() == 0
     }
 }
 
@@ -592,10 +662,8 @@ impl Eq for SortableImmutableRecord {}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum SortedChunkIOState {
-    WaitingForRead,
     ReadComplete,
     ReadEOF,
-    WaitingForWrite,
     WriteComplete,
     None,
 }
