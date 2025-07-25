@@ -46,6 +46,12 @@ enum NextState {
     Finish,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum InsertState {
+    Start,
+    Finish,
+}
+
 pub struct Sorter {
     /// The records in the in-memory buffer.
     records: Vec<SortableImmutableRecord>,
@@ -80,6 +86,8 @@ pub struct Sorter {
     flush_state: FlushState,
     /// State machine for `next`
     next_state: NextState,
+    /// State machine for `insert`
+    insert_state: InsertState,
 }
 
 impl Sorter {
@@ -117,6 +125,7 @@ impl Sorter {
             init_chunk_state: InitChunkState::Start,
             flush_state: FlushState::Start,
             next_state: NextState::Start,
+            insert_state: InsertState::Start,
         }
     }
 
@@ -209,19 +218,30 @@ impl Sorter {
         self.current.as_ref()
     }
 
-    pub fn insert(&mut self, record: &ImmutableRecord) -> Result<()> {
+    pub fn insert(&mut self, record: &ImmutableRecord) -> Result<IOResult<()>> {
         let payload_size = record.get_payload().len();
-        if self.current_buffer_size + payload_size > self.max_buffer_size {
-            let res = self.flush()?;
+        loop {
+            match self.insert_state {
+                InsertState::Start => {
+                    if self.current_buffer_size + payload_size > self.max_buffer_size {
+                        return_if_io!(self.flush());
+                    }
+                    self.insert_state = InsertState::Finish;
+                }
+                InsertState::Finish => {
+                    self.records.push(SortableImmutableRecord::new(
+                        record.clone(),
+                        self.key_len,
+                        self.index_key_info.clone(),
+                    )?);
+                    self.current_buffer_size += payload_size;
+                    self.max_payload_size_in_buffer =
+                        self.max_payload_size_in_buffer.max(payload_size);
+                    self.insert_state = InsertState::Start;
+                    return Ok(IOResult::Done(()));
+                }
+            }
         }
-        self.records.push(SortableImmutableRecord::new(
-            record.clone(),
-            self.key_len,
-            self.index_key_info.clone(),
-        )?);
-        self.current_buffer_size += payload_size;
-        self.max_payload_size_in_buffer = self.max_payload_size_in_buffer.max(payload_size);
-        Ok(())
     }
 
     fn init_chunk_heap(&mut self) -> Result<IOResult<()>> {
