@@ -2320,7 +2320,7 @@ impl BTreeCursor {
         loop {
             let state = self.state.write_info().expect("must be balancing").state;
             tracing::debug!(?state);
-            let next_write_state = match state {
+            match state {
                 BalanceState::Start => todo!(),
                 BalanceState::NonRootPickSiblings => {
                     let parent_page = self.stack.top();
@@ -2451,25 +2451,23 @@ impl BTreeCursor {
                         };
                     }
 
-                    self.state
-                        .write_info()
-                        .unwrap()
-                        .balance_info
-                        .replace(Some(BalanceInfo {
-                            pages_to_balance,
-                            rightmost_pointer: right_pointer,
-                            divider_cell_payloads: [const { None };
-                                MAX_SIBLING_PAGES_TO_BALANCE - 1],
-                            sibling_count,
-                            first_divider_cell: first_cell_divider,
-                        }));
-                    BalanceState::NonRootDoBalancing
+                    let write_info = self.state.mut_write_info().unwrap();
+
+                    write_info.balance_info.replace(Some(BalanceInfo {
+                        pages_to_balance,
+                        rightmost_pointer: right_pointer,
+                        divider_cell_payloads: [const { None }; MAX_SIBLING_PAGES_TO_BALANCE - 1],
+                        sibling_count,
+                        first_divider_cell: first_cell_divider,
+                    }));
+                    write_info.state = BalanceState::NonRootDoBalancing;
+                    return Ok(IOResult::IO(IOCompletions::Many(completions)));
                 }
                 BalanceState::NonRootDoBalancing => {
                     // Ensure all involved pages are in memory.
                     let write_info = self.state.write_info().unwrap();
-                    let mut balance_info = write_info.balance_info.borrow_mut();
-                    let balance_info = balance_info.as_mut().unwrap();
+                    let mut balance_info_ref = write_info.balance_info.borrow_mut();
+                    let balance_info = balance_info_ref.as_mut().unwrap();
 
                     #[cfg(debug_assertions)]
                     let page_type_of_siblings = balance_info.pages_to_balance[0]
@@ -3306,23 +3304,25 @@ impl BTreeCursor {
                         sibling_count_new,
                         right_page_id,
                     );
+                    drop(balance_info_ref);
 
-                    BalanceState::FreePages {
+                    let write_info = self.state.mut_write_info().unwrap();
+                    write_info.state = BalanceState::FreePages {
                         curr_page: sibling_count_new,
                         sibling_count_new,
-                    }
+                    };
                 }
                 BalanceState::FreePages {
                     curr_page,
                     sibling_count_new,
                 } => {
-                    let write_info = self.state.write_info().unwrap();
+                    let write_info = self.state.mut_write_info().unwrap();
                     let mut balance_info: std::cell::RefMut<'_, Option<BalanceInfo>> =
                         write_info.balance_info.borrow_mut();
                     let balance_info = balance_info.as_mut().unwrap();
                     // We have to free pages that are not used anymore
                     if !((sibling_count_new..balance_info.sibling_count).contains(&curr_page)) {
-                        BalanceState::Start
+                        write_info.state = BalanceState::Start;
                     } else {
                         let page = balance_info.pages_to_balance[curr_page].as_ref().unwrap();
                         let res = self
@@ -3332,16 +3332,15 @@ impl BTreeCursor {
                             return Ok(IOResult::IO(io));
                         };
 
-                        BalanceState::FreePages {
+                        write_info.state = BalanceState::FreePages {
                             curr_page: curr_page + 1,
                             sibling_count_new,
-                        }
+                        };
                     }
                 }
-            };
+            }
             let write_info = self.state.mut_write_info().unwrap();
-            write_info.state = next_write_state;
-            if matches!(next_write_state, BalanceState::Start) {
+            if matches!(write_info.state, BalanceState::Start) {
                 // reset balance state
                 let _ = self.state.mut_write_info().unwrap().balance_info.take();
                 return Ok(IOResult::Done(()));
