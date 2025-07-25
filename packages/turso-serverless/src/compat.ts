@@ -3,9 +3,9 @@ import { DatabaseError } from './error.js';
 
 /**
  * Configuration options for creating a libSQL-compatible client.
- * 
+ *
  * @remarks
- * This interface matches the libSQL client configuration but only `url` and `authToken` 
+ * This interface matches the libSQL client configuration but only `url` and `authToken`
  * are supported in the serverless compatibility layer. Other options will throw validation errors.
  */
 export interface Config {
@@ -92,7 +92,7 @@ export class LibsqlError extends Error {
 
 /**
  * Interactive transaction interface (not implemented in serverless mode).
- * 
+ *
  * @remarks
  * Transactions are not supported in the serverless compatibility layer.
  * Calling transaction() will throw a LibsqlError.
@@ -109,7 +109,7 @@ export interface Transaction {
 
 /**
  * libSQL-compatible client interface.
- * 
+ *
  * This interface matches the standard libSQL client API for drop-in compatibility.
  * Some methods are not implemented in the serverless compatibility layer.
  */
@@ -132,7 +132,7 @@ class LibSQLClient implements Client {
 
   constructor(config: Config) {
     this.validateConfig(config);
-    
+
     const tursoConfig: TursoConfig = {
       url: config.url,
       authToken: config.authToken || ''
@@ -198,12 +198,12 @@ class LibSQLClient implements Client {
     if (typeof stmt === 'string') {
       return { sql: stmt, args: [] };
     }
-    
+
     const args = stmt.args || [];
     if (Array.isArray(args)) {
       return { sql: stmt.sql, args };
     }
-    
+
     // Convert named args to positional args (simplified)
     return { sql: stmt.sql, args: Object.values(args) };
   }
@@ -238,7 +238,7 @@ class LibSQLClient implements Client {
       }
 
       let normalizedStmt: { sql: string; args: any[] };
-      
+
       if (typeof stmtOrSql === 'string') {
         const normalizedArgs = args ? (Array.isArray(args) ? args : Object.values(args)) : [];
         normalizedStmt = { sql: stmtOrSql, args: normalizedArgs };
@@ -265,7 +265,7 @@ class LibSQLClient implements Client {
       });
 
       const result = await this.connection.batch(sqlStatements, mode);
-      
+
       // Return array of result sets (simplified - actual implementation would be more complex)
       return [this.convertResult(result)];
     } catch (error: any) {
@@ -279,7 +279,15 @@ class LibSQLClient implements Client {
   }
 
   async transaction(mode?: TransactionMode): Promise<Transaction> {
-    throw new LibsqlError("Transactions not implemented", "NOT_IMPLEMENTED");
+    if (this._closed) {
+      throw new LibsqlError("Client is closed", "CLIENT_CLOSED");
+    }
+
+    const nativeTransaction = await this.connection.transaction(
+      mode || "deferred",
+    );
+
+    return new LibSQLTransaction(nativeTransaction);
   }
 
   async executeMultiple(sql: string): Promise<void> {
@@ -295,25 +303,152 @@ class LibSQLClient implements Client {
   }
 }
 
+class LibSQLTransaction implements Transaction {
+  private nativeTransaction: any;
+  private _closed = false;
+
+  constructor(nativeTransaction: any) {
+    this.nativeTransaction = nativeTransaction;
+  }
+
+  get closed(): boolean {
+    return this._closed || this.nativeTransaction.closed;
+  }
+
+  async execute(stmt: InStatement): Promise<ResultSet> {
+    try {
+      if (this.closed) {
+        throw new LibsqlError("Transaction is closed", "TRANSACTION_CLOSED");
+      }
+
+      const normalized = this.normalizeStatement(stmt);
+      const result = await this.nativeTransaction.execute(
+        normalized.sql,
+        normalized.args,
+      );
+      return this.convertResult(result);
+    } catch (error: any) {
+      throw new LibsqlError(error.message, "EXECUTE_ERROR");
+    }
+  }
+
+  async batch(stmts: Array<InStatement>): Promise<Array<ResultSet>> {
+    try {
+      if (this.closed) {
+        throw new LibsqlError("Transaction is closed", "TRANSACTION_CLOSED");
+      }
+
+      const sqlStatements = stmts.map((stmt) => {
+        const normalized = this.normalizeStatement(stmt);
+        return normalized.sql; // For now, ignore args in batch
+      });
+
+      const result = await this.nativeTransaction.batch(sqlStatements);
+
+      // Return array of result sets (simplified - actual implementation would be more complex)
+      return [this.convertResult(result)];
+    } catch (error: any) {
+      throw new LibsqlError(error.message, "BATCH_ERROR");
+    }
+  }
+
+  async executeMultiple(sql: string): Promise<void> {
+    throw new LibsqlError(
+      "Execute multiple not implemented",
+      "NOT_IMPLEMENTED",
+    );
+  }
+
+  async commit(): Promise<void> {
+    try {
+      if (this.closed) {
+        throw new LibsqlError("Transaction is closed", "TRANSACTION_CLOSED");
+      }
+
+      await this.nativeTransaction.commit();
+      this._closed = true;
+    } catch (error: any) {
+      throw new LibsqlError(error.message, "COMMIT_ERROR");
+    }
+  }
+
+  async rollback(): Promise<void> {
+    try {
+      if (this.closed) {
+        return; // Already closed
+      }
+
+      await this.nativeTransaction.rollback();
+      this._closed = true;
+    } catch (error: any) {
+      throw new LibsqlError(error.message, "ROLLBACK_ERROR");
+    }
+  }
+
+  close(): void {
+    if (!this._closed) {
+      this.nativeTransaction.close();
+      this._closed = true;
+    }
+  }
+
+  private normalizeStatement(stmt: InStatement): { sql: string; args: any[] } {
+    if (typeof stmt === "string") {
+      return { sql: stmt, args: [] };
+    }
+
+    const args = stmt.args || [];
+    if (Array.isArray(args)) {
+      return { sql: stmt.sql, args };
+    }
+
+    // Convert named args to positional args (simplified)
+    return { sql: stmt.sql, args: Object.values(args) };
+  }
+
+  private convertResult(result: any): ResultSet {
+    const resultSet: ResultSet = {
+      columns: result.columns || [],
+      columnTypes: result.columnTypes || [],
+      rows: result.rows || [],
+      rowsAffected: result.rowsAffected || 0,
+      lastInsertRowid: result.lastInsertRowid
+        ? BigInt(result.lastInsertRowid)
+        : undefined,
+      toJSON() {
+        return {
+          columns: this.columns,
+          columnTypes: this.columnTypes,
+          rows: this.rows,
+          rowsAffected: this.rowsAffected,
+          lastInsertRowid: this.lastInsertRowid?.toString(),
+        };
+      },
+    };
+
+    return resultSet;
+  }
+}
+
 /**
  * Create a libSQL-compatible client for Turso database access.
- * 
+ *
  * This function provides compatibility with the standard libSQL client API
  * while using the Turso serverless driver under the hood.
- * 
+ *
  * @param config - Configuration object (only url and authToken are supported)
  * @returns A Client instance compatible with libSQL API
  * @throws LibsqlError if unsupported configuration options are provided
- * 
+ *
  * @example
  * ```typescript
  * import { createClient } from "@tursodatabase/serverless/compat";
- * 
+ *
  * const client = createClient({
  *   url: process.env.TURSO_DATABASE_URL,
  *   authToken: process.env.TURSO_AUTH_TOKEN
  * });
- * 
+ *
  * const result = await client.execute("SELECT * FROM users");
  * console.log(result.rows);
  * ```

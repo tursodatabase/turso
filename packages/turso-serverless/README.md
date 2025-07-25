@@ -45,6 +45,38 @@ await conn.batch([
 ]);
 ```
 
+### Transactions
+
+The driver supports interactive transactions with commit and rollback:
+
+```javascript
+// Start a transaction
+const tx = await conn.transaction();
+
+try {
+  await tx.execute("INSERT INTO users (email) VALUES (?)", [
+    "user1@example.com",
+  ]);
+  await tx.execute("INSERT INTO users (email) VALUES (?)", [
+    "user2@example.com",
+  ]);
+
+  // Commit the transaction
+  await tx.commit();
+} catch (error) {
+  // Rollback on error
+  await tx.rollback();
+}
+```
+
+Transaction modes are supported:
+
+```javascript
+const writeTx = await conn.transaction("write"); // Immediate write lock
+const readTx = await conn.transaction("read"); // Read-only transaction
+const deferredTx = await conn.transaction("deferred"); // Default mode
+```
+
 ### Compatibility layer for libSQL API
 
 This driver supports the libSQL API as a compatibility layer.
