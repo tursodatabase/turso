@@ -48,9 +48,9 @@ use turso_core::types::{DatabaseChange, DatabaseChangeType, ImmutableRecord, Rec
 pub use value::Value;
 
 pub use params::params_from_iter;
+pub use params::IntoParams;
 use zerocopy::big_endian;
 
-use crate::params::*;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt::Debug;
@@ -286,6 +286,51 @@ impl Connection {
     pub async fn execute(&self, sql: &str, params: impl IntoParams) -> Result<u64> {
         let mut stmt = self.prepare(sql).await?;
         stmt.execute(params).await
+    }
+
+    pub fn wal_frame_count(&self) -> Result<u64> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        conn.wal_frame_count()
+            .map_err(|e| Error::InternalError(format!("wal_insert_begin failed: {}", e)))
+    }
+
+    pub fn wal_insert_begin(&self) -> Result<()> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        conn.wal_insert_begin()
+            .map_err(|e| Error::InternalError(format!("wal_insert_begin failed: {}", e)))
+    }
+
+    pub fn wal_insert_end(&self) -> Result<()> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        conn.wal_insert_end()
+            .map_err(|e| Error::InternalError(format!("wal_insert_end failed: {}", e)))
+    }
+
+    pub fn wal_insert_frame(&self, frame_no: u32, frame: &[u8]) -> Result<bool> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        conn.wal_insert_frame(frame_no, frame)
+            .map_err(|e| Error::InternalError(format!("wal_insert_frame failed: {}", e)))
+    }
+
+    pub fn wal_get_frame(&self, frame_no: u32, frame: &mut [u8]) -> Result<()> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        conn.wal_get_frame(frame_no, frame)
+            .map_err(|e| Error::InternalError(format!("wal_insert_frame failed: {}", e)))
     }
 
     /// Prepare a SQL statement for later execution.

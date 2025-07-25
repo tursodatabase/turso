@@ -858,15 +858,16 @@ impl Connection {
     }
 
     #[cfg(feature = "fs")]
-    pub fn wal_get_frame(&self, frame_no: u32, frame: &mut [u8]) -> Result<Arc<Completion>> {
-        self.pager.borrow().wal_get_frame(frame_no, frame)
+    pub fn wal_get_frame(&self, frame_no: u32, frame: &mut [u8]) -> Result<()> {
+        let c = self.pager.borrow().wal_get_frame(frame_no, frame)?;
+        self._db.io.wait_for_completion(c)
     }
 
     /// Insert `frame` (header included) at the position `frame_no` in the WAL
     /// If WAL already has frame at that position - turso-db will compare content of the page and either report conflict or return OK
     /// If attempt to write frame at the position `frame_no` will create gap in the WAL - method will return error
     #[cfg(feature = "fs")]
-    pub fn wal_insert_frame(&self, frame_no: u32, frame: &[u8]) -> Result<()> {
+    pub fn wal_insert_frame(&self, frame_no: u32, frame: &[u8]) -> Result<bool> {
         self.pager.borrow().wal_insert_frame(frame_no, frame)
     }
 

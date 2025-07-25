@@ -34,12 +34,16 @@ impl DatabaseChange {
             DatabaseChangeType::Delete => DatabaseTapeRowChangeType::Delete,
             DatabaseChangeType::Update => DatabaseTapeRowChangeType::Update {
                 bin_record: self.after.ok_or_else(|| {
-                    Error::ClientError(format!("cdc_mode must be set to either 'full' or 'after'"))
+                    Error::DatabaseTapeError(format!(
+                        "cdc_mode must be set to either 'full' or 'after'"
+                    ))
                 })?,
             },
             DatabaseChangeType::Insert => DatabaseTapeRowChangeType::Insert {
                 bin_record: self.after.ok_or_else(|| {
-                    Error::ClientError(format!("cdc_mode must be set to either 'full' or 'after'"))
+                    Error::DatabaseTapeError(format!(
+                        "cdc_mode must be set to either 'full' or 'after'"
+                    ))
                 })?,
             },
         };
@@ -56,12 +60,16 @@ impl DatabaseChange {
         let tape_change = match self.change_type {
             DatabaseChangeType::Delete => DatabaseTapeRowChangeType::Insert {
                 bin_record: self.before.ok_or_else(|| {
-                    Error::ClientError(format!("cdc_mode must be set to either 'full' or 'before'"))
+                    Error::DatabaseTapeError(format!(
+                        "cdc_mode must be set to either 'full' or 'before'"
+                    ))
                 })?,
             },
             DatabaseChangeType::Update => DatabaseTapeRowChangeType::Update {
                 bin_record: self.before.ok_or_else(|| {
-                    Error::ClientError(format!("cdc_mode must be set to either 'full' or 'before'"))
+                    Error::DatabaseTapeError(format!(
+                        "cdc_mode must be set to either 'full' or 'before'"
+                    ))
                 })?,
             },
             DatabaseChangeType::Insert => DatabaseTapeRowChangeType::Delete,
@@ -107,7 +115,7 @@ impl TryFrom<turso::Row> for DatabaseChange {
             0 => DatabaseChangeType::Update,
             1 => DatabaseChangeType::Insert,
             v => {
-                return Err(Error::ClientError(format!(
+                return Err(Error::DatabaseTapeError(format!(
                     "unexpected change type: expected -1|0|1, got '{v:?}'"
                 )))
             }
@@ -174,7 +182,7 @@ fn get_value_i64(row: &turso::Row, index: usize) -> Result<i64> {
     let v = get_value(row, index)?;
     match v {
         turso::Value::Integer(v) => Ok(v),
-        v => Err(Error::ClientError(format!(
+        v => Err(Error::DatabaseTapeError(format!(
             "column {index} type mismatch: expected integer, got '{v:?}'"
         ))),
     }
@@ -184,7 +192,7 @@ fn get_value_text(row: &turso::Row, index: usize) -> Result<String> {
     let v = get_value(row, index)?;
     match v {
         turso::Value::Text(x) => Ok(x),
-        v => Err(Error::ClientError(format!(
+        v => Err(Error::DatabaseTapeError(format!(
             "column {index} type mismatch: expected string, got '{v:?}'"
         ))),
     }
@@ -195,7 +203,7 @@ fn get_value_blob_or_null(row: &turso::Row, index: usize) -> Result<Option<Vec<u
     match v {
         turso::Value::Null => Ok(None),
         turso::Value::Blob(x) => Ok(Some(x)),
-        v => Err(Error::ClientError(format!(
+        v => Err(Error::DatabaseTapeError(format!(
             "column {index} type mismatch: expected blob, got '{v:?}'"
         ))),
     }

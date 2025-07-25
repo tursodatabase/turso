@@ -5,21 +5,21 @@ use tokio::io::AsyncWriteExt;
 
 use crate::{errors::Error, Result};
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub enum DatabaseTandemSelection {
-    Local,
-    Remote,
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub enum DatabasePrimary {
+    Draft,
+    Clean,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct SyncedDatabaseMetadata {
-    remote_copy_generation: usize,
-    remote_copy_frame_no: usize,
-    local_change_id: Option<i64>,
-    primary_db: DatabaseTandemSelection,
+pub struct DatabaseSyncMetadata {
+    pub(crate) clean_generation: usize,
+    pub(crate) clean_frame_no: usize,
+    pub(crate) draft_change_id: Option<i64>,
+    pub(crate) primary_db: DatabasePrimary,
 }
 
-impl SyncedDatabaseMetadata {
+impl DatabaseSyncMetadata {
     pub async fn read_from(path: &Path) -> Result<Option<Self>> {
         tracing::debug!("try read from: {:?}", path);
         let exists = Path::new(&path)
@@ -32,7 +32,7 @@ impl SyncedDatabaseMetadata {
         let contents = tokio::fs::read(&path)
             .await
             .map_err(|e| Error::MetadataError(format!("read error: {}", e)))?;
-        let meta = serde_json::from_slice::<SyncedDatabaseMetadata>(&contents[..])
+        let meta = serde_json::from_slice::<DatabaseSyncMetadata>(&contents[..])
             .map_err(|e| Error::MetadataError(format!("parse error: {}", e)))?;
         tracing::debug!("read from {:?}: {:?}", path, meta);
         Ok(Some(meta))
@@ -82,21 +82,21 @@ impl SyncedDatabaseMetadata {
 
 #[cfg(test)]
 mod tests {
-    use crate::metadata::{DatabaseTandemSelection, SyncedDatabaseMetadata};
+    use crate::metadata::{DatabaseSyncMetadata, DatabasePrimary};
 
     #[tokio::test]
     pub async fn metadata_simple_test() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("db-info");
-        let meta = SyncedDatabaseMetadata {
-            remote_copy_generation: 1,
-            remote_copy_frame_no: 2,
-            local_change_id: Some(3),
-            primary_db: DatabaseTandemSelection::Local,
+        let meta = DatabaseSyncMetadata {
+            clean_generation: 1,
+            clean_frame_no: 2,
+            draft_change_id: Some(3),
+            primary_db: DatabasePrimary::Draft,
         };
         meta.write_to(&path).await.unwrap();
 
-        let read = SyncedDatabaseMetadata::read_from(&path)
+        let read = DatabaseSyncMetadata::read_from(&path)
             .await
             .unwrap()
             .unwrap();

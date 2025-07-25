@@ -3,6 +3,8 @@ use std::io::Read;
 use http::request;
 use http_body_util::BodyExt;
 use hyper::body::{Buf, Bytes};
+use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::rt::TokioExecutor;
 
 use crate::{errors::Error, Result};
 
@@ -28,7 +30,6 @@ pub trait SyncServer {
         &self,
         generation_id: usize,
         start_frame: usize,
-        end_frame: usize,
     ) -> impl std::future::Future<Output = Result<hyper::body::Incoming>> + Send;
     fn wal_push(
         &self,
@@ -44,16 +45,19 @@ pub(crate) type Client = hyper_util::client::legacy::Client<
     http_body_util::Full<Bytes>,
 >;
 
-pub struct TursoSyncServerConfig {
+const DEFAULT_PULL_BATCH_SIZE: usize = 100;
+
+pub struct TursoSyncServerOpts {
     pub sync_url: String,
     pub auth_token: Option<String>,
     pub encryption_key: Option<String>,
+    pub pull_batch_size: Option<usize>,
 }
 
 pub struct TursoSyncServer {
     client: Client,
     auth_token_header: Option<hyper::header::HeaderValue>,
-    config: TursoSyncServerConfig,
+    opts: TursoSyncServerOpts,
 }
 
 fn sync_server_error(status: http::StatusCode, body: impl Buf) -> Error {
@@ -71,9 +75,20 @@ async fn aggregate_body(body: hyper::body::Incoming) -> Result<impl Buf> {
     Ok(chunks.aggregate())
 }
 
+pub fn create_client() -> Result<Client> {
+    let connector = HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .map_err(|e| Error::DatabaseSyncError(format!("unable to configure CA roots: {}", e)))?
+        .https_or_http()
+        .enable_http1()
+        .build();
+    let executor = TokioExecutor::new();
+    Ok(hyper_util::client::legacy::Builder::new(executor).build(connector))
+}
+
 impl TursoSyncServer {
-    pub fn new(client: Client, config: TursoSyncServerConfig) -> Result<Self> {
-        let auth_token_header = config
+    pub fn new(client: Client, opts: TursoSyncServerOpts) -> Result<Self> {
+        let auth_token_header = opts
             .auth_token
             .as_ref()
             .map(|token| hyper::header::HeaderValue::from_str(&format!("Bearer {}", token)))
@@ -81,7 +96,7 @@ impl TursoSyncServer {
             .map_err(|e| Error::Http(e.into()))?;
         Ok(Self {
             client,
-            config,
+            opts,
             auth_token_header,
         })
     }
@@ -96,7 +111,7 @@ impl TursoSyncServer {
         if let Some(auth_token_header) = &self.auth_token_header {
             request = request.header("Authorization", auth_token_header);
         }
-        if let Some(encryption_key) = &self.config.encryption_key {
+        if let Some(encryption_key) = &self.opts.encryption_key {
             request = request.header("x-turso-encryption-key", encryption_key);
         }
         let request = request.body(body).map_err(Error::Http)?;
@@ -109,7 +124,8 @@ impl TursoSyncServer {
 
 impl SyncServer for TursoSyncServer {
     async fn db_info(&self) -> Result<DbSyncInfo> {
-        let url = format!("{}/info", self.config.sync_url);
+        tracing::debug!("db_info");
+        let url = format!("{}/info", self.opts.sync_url);
         let empty = http_body_util::Full::new(Bytes::new());
         let (status, body) = self.send(http::Method::GET, &url, empty).await?;
         let body = aggregate_body(body).await?;
@@ -119,6 +135,7 @@ impl SyncServer for TursoSyncServer {
         }
 
         let info = serde_json::from_reader(body.reader()).map_err(Error::JsonDecode)?;
+        tracing::debug!("db_info response: {:?}", info);
         Ok(info)
     }
 
@@ -129,9 +146,10 @@ impl SyncServer for TursoSyncServer {
         end_frame: usize,
         frames: Vec<u8>,
     ) -> Result<DbSyncStatus> {
+        tracing::debug!("wal_push: {}/{}/{}", generation_id, start_frame, end_frame);
         let url = format!(
             "{}/sync/{}/{}/{}",
-            self.config.sync_url, generation_id, start_frame, end_frame
+            self.opts.sync_url, generation_id, start_frame, end_frame
         );
         let body = http_body_util::Full::new(Bytes::from(frames));
         let (status_code, body) = self.send(http::Method::POST, &url, body).await?;
@@ -153,7 +171,8 @@ impl SyncServer for TursoSyncServer {
     }
 
     async fn db_export(&self, generation_id: usize) -> Result<hyper::body::Incoming> {
-        let url = format!("{}/export/{}", self.config.sync_url, generation_id);
+        tracing::debug!("db_export: {}", generation_id);
+        let url = format!("{}/export/{}", self.opts.sync_url, generation_id);
         let empty = http_body_util::Full::new(Bytes::new());
         let (status, body) = self.send(http::Method::GET, &url, empty).await?;
         if !status.is_success() {
@@ -167,11 +186,13 @@ impl SyncServer for TursoSyncServer {
         &self,
         generation_id: usize,
         start_frame: usize,
-        end_frame: usize,
     ) -> Result<hyper::body::Incoming> {
+        let batch = self.opts.pull_batch_size.unwrap_or(DEFAULT_PULL_BATCH_SIZE);
+        let end_frame = start_frame + batch;
+        tracing::debug!("wall_pull: {}/{}/{}", generation_id, start_frame, end_frame);
         let url = format!(
             "{}/sync/{}/{}/{}",
-            self.config.sync_url, generation_id, start_frame, end_frame
+            self.opts.sync_url, generation_id, start_frame, end_frame
         );
         let empty = http_body_util::Full::new(Bytes::new());
         let (status, body) = self.send(http::Method::GET, &url, empty).await?;
@@ -180,7 +201,7 @@ impl SyncServer for TursoSyncServer {
             let status: DbSyncStatus;
             status = serde_json::from_reader(body.reader()).map_err(Error::JsonDecode)?;
             if status.status == "checkpoint_needed" {
-                return Err(Error::PullCheckpointNeeded(status));
+                return Err(Error::PullNeedCheckpoint(status));
             } else {
                 return Err(Error::SyncServerUnexpectedStatus(status));
             }

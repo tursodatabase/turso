@@ -18,14 +18,30 @@ pub enum Error {
     SyncServerError(http::StatusCode, String),
     #[error("unexpected sync server status: {0:?}")]
     SyncServerUnexpectedStatus(DbSyncStatus),
+    #[error("unexpected filesystem error: {0}")]
+    FilesystemError(std::io::Error),
     #[error("local metadata error: {0}")]
     MetadataError(String),
-    #[error("unexpected client error: {0}")]
-    ClientError(String),
+    #[error("database tape error: {0}")]
+    DatabaseTapeError(String),
+    #[error("database sync error: {0}")]
+    DatabaseSyncError(String),
     #[error("sync server pull error: checkpoint required: `{0:?}`")]
-    PullCheckpointNeeded(DbSyncStatus),
+    PullNeedCheckpoint(DbSyncStatus),
     #[error("sync server push error: wal conflict detected: `{0:?}`")]
     PushConflict(DbSyncStatus),
     #[error("sync server push error: inconsitent state on remote: `{0:?}`")]
     PushInconsistent(DbSyncStatus),
+}
+
+impl From<turso::Error> for Error {
+    fn from(value: turso::Error) -> Self {
+        Self::TursoError(value)
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(value: std::io::Error) -> Self {
+        Self::FilesystemError(value)
+    }
 }

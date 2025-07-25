@@ -42,8 +42,7 @@ fn test_wal_frame_transfer_no_schema_changes() {
     let mut frame = [0u8; 24 + 4096];
     conn2.wal_insert_begin().unwrap();
     for frame_id in 1..=conn1.wal_frame_count().unwrap() as u32 {
-        let c = conn1.wal_get_frame(frame_id, &mut frame).unwrap();
-        db1.io.wait_for_completion(c).unwrap();
+        conn1.wal_get_frame(frame_id, &mut frame).unwrap();
         conn2.wal_insert_frame(frame_id, &frame).unwrap();
     }
     conn2.wal_insert_end().unwrap();
@@ -77,8 +76,7 @@ fn test_wal_frame_transfer_schema_changes() {
     let mut frame = [0u8; 24 + 4096];
     conn2.wal_insert_begin().unwrap();
     for frame_id in 1..=conn1.wal_frame_count().unwrap() as u32 {
-        let c = conn1.wal_get_frame(frame_id, &mut frame).unwrap();
-        db1.io.wait_for_completion(c).unwrap();
+        conn1.wal_get_frame(frame_id, &mut frame).unwrap();
         conn2.wal_insert_frame(frame_id, &frame).unwrap();
     }
     conn2.wal_insert_end().unwrap();
@@ -112,8 +110,7 @@ fn test_wal_frame_transfer_no_schema_changes_rollback() {
     let mut frame = [0u8; 24 + 4096];
     conn2.wal_insert_begin().unwrap();
     for frame_id in 1..=(conn1.wal_frame_count().unwrap() as u32 - 1) {
-        let c = conn1.wal_get_frame(frame_id, &mut frame).unwrap();
-        db1.io.wait_for_completion(c).unwrap();
+        conn1.wal_get_frame(frame_id, &mut frame).unwrap();
         conn2.wal_insert_frame(frame_id, &frame).unwrap();
     }
     conn2.wal_insert_end().unwrap();
@@ -148,8 +145,7 @@ fn test_wal_frame_transfer_schema_changes_rollback() {
     let mut frame = [0u8; 24 + 4096];
     conn2.wal_insert_begin().unwrap();
     for frame_id in 1..=(conn1.wal_frame_count().unwrap() as u32 - 1) {
-        let c = conn1.wal_get_frame(frame_id, &mut frame).unwrap();
-        db1.io.wait_for_completion(c).unwrap();
+        conn1.wal_get_frame(frame_id, &mut frame).unwrap();
         conn2.wal_insert_frame(frame_id, &frame).unwrap();
     }
     conn2.wal_insert_end().unwrap();
@@ -183,8 +179,7 @@ fn test_wal_frame_conflict() {
     assert_eq!(conn1.wal_frame_count().unwrap(), 2);
     let mut frame = [0u8; 24 + 4096];
     conn2.wal_insert_begin().unwrap();
-    let c = conn1.wal_get_frame(1, &mut frame).unwrap();
-    db1.io.wait_for_completion(c).unwrap();
+    conn1.wal_get_frame(1, &mut frame).unwrap();
     assert!(conn2.wal_insert_frame(1, &frame).is_err());
 }
 
@@ -207,12 +202,10 @@ fn test_wal_frame_far_away_write() {
     let mut frame = [0u8; 24 + 4096];
     conn2.wal_insert_begin().unwrap();
 
-    let c = conn1.wal_get_frame(3, &mut frame).unwrap();
-    db1.io.wait_for_completion(c).unwrap();
+    conn1.wal_get_frame(3, &mut frame).unwrap();
     conn2.wal_insert_frame(3, &frame).unwrap();
 
-    let c = conn1.wal_get_frame(5, &mut frame).unwrap();
-    db1.io.wait_for_completion(c).unwrap();
+    conn1.wal_get_frame(5, &mut frame).unwrap();
     assert!(conn2.wal_insert_frame(5, &frame).is_err());
 }
 
@@ -251,8 +244,7 @@ fn test_wal_frame_api_no_schema_changes_fuzz() {
                 let mut frame = [0u8; 24 + 4096];
                 conn2.wal_insert_begin().unwrap();
                 for frame_no in (synced_frame + 1)..=next_frame {
-                    let c = conn1.wal_get_frame(frame_no as u32, &mut frame).unwrap();
-                    db1.io.wait_for_completion(c).unwrap();
+                    conn1.wal_get_frame(frame_no as u32, &mut frame).unwrap();
                     conn2.wal_insert_frame(frame_no as u32, &frame[..]).unwrap();
                 }
                 conn2.wal_insert_end().unwrap();

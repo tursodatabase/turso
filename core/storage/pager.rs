@@ -1143,7 +1143,7 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn wal_insert_frame(&self, frame_no: u32, frame: &[u8]) -> Result<()> {
+    pub fn wal_insert_frame(&self, frame_no: u32, frame: &[u8]) -> Result<bool> {
         let mut wal = self.wal.borrow_mut();
         let (header, raw_page) = parse_wal_frame_header(frame);
         wal.write_frame_raw(
@@ -1170,8 +1170,10 @@ impl Pager {
                 page.clear_dirty();
             }
             self.dirty_pages.borrow_mut().clear();
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        Ok(())
     }
 
     #[instrument(skip_all, level = Level::DEBUG, name = "pager_checkpoint",)]

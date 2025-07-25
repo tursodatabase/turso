@@ -195,11 +195,13 @@ impl DatabaseReplaySession {
         match operation {
             DatabaseTapeOperation::Commit => {
                 tracing::trace!("replay: commit replayed changes after transaction boundary");
-                self.conn
-                    .execute("COMMIT", ())
-                    .await
-                    .map_err(Error::TursoError)?;
-                self.in_txn = false;
+                if self.in_txn {
+                    self.conn
+                        .execute("COMMIT", ())
+                        .await
+                        .map_err(Error::TursoError)?;
+                    self.in_txn = false;
+                }
             }
             DatabaseTapeOperation::RowChange(change) => {
                 if !self.in_txn {
