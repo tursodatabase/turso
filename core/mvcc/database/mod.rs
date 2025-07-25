@@ -36,7 +36,11 @@ pub struct Row {
 
 impl Row {
     pub fn new(id: RowID, data: Vec<u8>, column_count: usize) -> Self {
-        Self { id, data, column_count }
+        Self {
+            id,
+            data,
+            column_count,
+        }
     }
 }
 
@@ -369,18 +373,20 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// Retrieves a row from the table with the given `id`.
     ///
     /// This operation is performed within the scope of the transaction identified
-    /// by `tx_id`.
+    /// by `tx_id`. If the row is not found in the in-memory MVCC index and a pager
+    /// is provided, it will attempt to read the row from disk.
     ///
     /// # Arguments
     ///
     /// * `tx_id` - The ID of the transaction to perform the read operation in.
     /// * `id` - The ID of the row to retrieve.
+    /// * `pager` - The pager to use for reading from disk if the row is not in memory.
     ///
     /// # Returns
     ///
     /// Returns `Some(row)` with the row data if the row with the given `id` exists,
     /// and `None` otherwise.
-    pub fn read(&self, tx_id: TxID, id: RowID) -> Result<Option<Row>> {
+    pub fn read(&self, tx_id: TxID, id: RowID, pager: Rc<Pager>) -> Result<Option<Row>> {
         tracing::trace!("read(tx_id={}, id={:?})", tx_id, id);
         let tx = self.txs.get(&tx_id).unwrap();
         let tx = tx.value().read().unwrap();
@@ -396,7 +402,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 return Ok(Some(rv.row.clone()));
             }
         }
-        Ok(None)
+
+        // If not found in memory, try lazy load from disk
+        self.lazy_read_from_pager(tx_id, id, pager)
     }
 
     /// Gets all row ids in the database.
@@ -407,21 +415,78 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 
     /// Gets all row ids in the database for a given table.
-    pub fn scan_row_ids_for_table(&self, table_id: u64) -> Result<Vec<RowID>> {
+    pub fn scan_row_ids_for_table(&self, table_id: u64, pager: Rc<Pager>) -> Result<Vec<RowID>> {
+        use crate::storage::btree::BTreeCursor;
+        use crate::types::{IOResult, SeekKey, SeekOp};
+        use std::collections::BTreeSet;
+
         tracing::trace!("scan_row_ids_for_table(table_id={})", table_id);
-        Ok(self
-            .rows
-            .range(
-                RowID {
-                    table_id,
-                    row_id: 0,
-                }..RowID {
-                    table_id,
-                    row_id: i64::MAX,
-                },
-            )
-            .map(|entry| *entry.key())
-            .collect())
+
+        let mut row_ids = BTreeSet::new();
+
+        // First, collect row IDs from the MVCC index
+        for entry in self.rows.range(
+            RowID {
+                table_id,
+                row_id: 0,
+            }..RowID {
+                table_id,
+                row_id: i64::MAX,
+            },
+        ) {
+            row_ids.insert(*entry.key());
+        }
+
+        // Then, scan the disk B-tree to find existing rows
+        let root_page = table_id as usize;
+        let mut cursor = BTreeCursor::new_table(
+            None, // No MVCC cursor for scanning
+            pager, root_page, 1, // We'll adjust this as needed
+        );
+
+        // Start from the beginning of the table
+        match cursor
+            .seek(SeekKey::TableRowId(0), SeekOp::GE { eq_only: false })
+            .map_err(|e| DatabaseError::Io(e.to_string()))?
+        {
+            IOResult::Done(_) => {
+                // Iterate through all records in the table
+                loop {
+                    match cursor
+                        .rowid()
+                        .map_err(|e| DatabaseError::Io(e.to_string()))?
+                    {
+                        IOResult::Done(Some(row_id)) => {
+                            row_ids.insert(RowID { table_id, row_id });
+                        }
+                        IOResult::Done(None) => break,
+                        IOResult::IO => break, // Stop on IO requirement
+                    }
+
+                    // Move to next record
+                    match cursor
+                        .next()
+                        .map_err(|e| DatabaseError::Io(e.to_string()))?
+                    {
+                        IOResult::Done(has_next) => {
+                            if !has_next {
+                                break;
+                            }
+                        }
+                        IOResult::IO => break, // Stop on IO requirement
+                    }
+                }
+            }
+            IOResult::IO => {
+                // If we can't scan the disk, just return the MVCC results
+                tracing::warn!(
+                    "Could not scan disk B-tree for table {}, returning MVCC results only",
+                    table_id
+                );
+            }
+        }
+
+        Ok(row_ids.into_iter().collect())
     }
 
     pub fn get_row_id_range(
@@ -632,9 +697,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.txs.remove(&tx_id);
 
         // Start write transaction before writing data to pager
-        if let crate::types::IOResult::Done(result) = pager.begin_write_tx().map_err(|e| DatabaseError::Io(e.to_string())).unwrap() {
+        if let crate::types::IOResult::Done(result) = pager
+            .begin_write_tx()
+            .map_err(|e| DatabaseError::Io(e.to_string()))
+            .unwrap()
+        {
             if let crate::result::LimboResult::Busy = result {
-                return Err(DatabaseError::Io("Pager write transaction busy".to_string()));
+                return Err(DatabaseError::Io(
+                    "Pager write transaction busy".to_string(),
+                ));
             }
         }
 
@@ -647,7 +718,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     if let TxTimestampOrID::Timestamp(ts) = row_version.begin {
                         if ts == end_ts {
                             // This is the version we just committed
-                            self.write_row_to_pager(pager.clone(), &row_version.row).unwrap();
+                            self.write_row_to_pager(pager.clone(), &row_version.row)
+                                .unwrap();
                             break;
                         }
                     }
@@ -661,13 +733,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // Similar to what step_end_write_txn does for legacy transactions
         loop {
             let result = pager
-            .end_tx(
-                false, // rollback = false since we're committing
-                false, // schema_did_change = false for now (could be improved)
-                connection,
-                connection.wal_checkpoint_disabled.get(),
-            )
-            .map_err(|e| DatabaseError::Io(e.to_string())).unwrap();
+                .end_tx(
+                    false, // rollback = false since we're committing
+                    false, // schema_did_change = false for now (could be improved)
+                    connection,
+                    connection.wal_checkpoint_disabled.get(),
+                )
+                .map_err(|e| DatabaseError::Io(e.to_string()))
+                .unwrap();
             if let crate::types::IOResult::Done(result) = result {
                 break;
             }
@@ -781,12 +854,86 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         dropped
     }
 
-    /// Writes a row to the pager for persistence.
-    fn write_row_to_pager(
+    /// Lazily reads a row from the pager when it's not in the MVCC index.
+    fn lazy_read_from_pager(
         &self,
+        tx_id: TxID,
+        id: RowID,
         pager: Rc<Pager>,
-        row: &Row,
-    ) -> Result<()> {
+    ) -> Result<Option<Row>> {
+        use crate::storage::btree::BTreeCursor;
+        use crate::types::{IOResult, SeekKey, SeekOp};
+
+        tracing::trace!("lazy_read_from_pager(tx_id={}, id={:?})", tx_id, id);
+
+        // Create a BTreeCursor to read from the B-tree
+        let root_page = id.table_id as usize;
+        let mut cursor = BTreeCursor::new_table(
+            None, // No MVCC cursor for direct B-tree read
+            pager, root_page, 1, // We'll determine column count from the record
+        );
+
+        // Seek to the specific row
+        let seek_key = SeekKey::TableRowId(id.row_id);
+        match cursor
+            .seek(seek_key, SeekOp::GE { eq_only: true })
+            .map_err(|e| DatabaseError::Io(e.to_string()))?
+        {
+            IOResult::Done(seek_result) => {
+                if !matches!(seek_result, crate::types::SeekResult::Found) {
+                    return Ok(None);
+                }
+            }
+            IOResult::IO => {
+                return Err(DatabaseError::Io(
+                    "IO operation required during lazy read".to_string(),
+                ));
+            }
+        }
+
+        // Read the record
+        let record = match cursor
+            .record()
+            .map_err(|e| DatabaseError::Io(e.to_string()))?
+        {
+            IOResult::Done(Some(record)) => record,
+            IOResult::Done(None) => return Ok(None),
+            IOResult::IO => {
+                return Err(DatabaseError::Io(
+                    "IO operation required during record read".to_string(),
+                ));
+            }
+        };
+
+        // Get the column count from the record using a record cursor
+        let mut record_cursor = crate::types::RecordCursor::with_capacity(10); // Estimate capacity
+        let column_count = record_cursor.count(&record);
+
+        // Convert the record to a Row
+        let data = record.get_payload().to_vec();
+        let row = Row::new(id, data, column_count);
+
+        // Create a row version that appears to be committed at timestamp 0
+        // This makes it visible to all transactions
+        let row_version = RowVersion {
+            begin: TxTimestampOrID::Timestamp(0),
+            end: None,
+            row: row.clone(),
+        };
+
+        // Insert the row version into the MVCC index for future reads
+        self.insert_version(id, row_version);
+
+        // Add to the transaction's read set
+        let tx = self.txs.get(&tx_id).unwrap();
+        let tx = tx.value().read().unwrap();
+        tx.insert_to_read_set(id);
+
+        Ok(Some(row))
+    }
+
+    /// Writes a row to the pager for persistence.
+    fn write_row_to_pager(&self, pager: Rc<Pager>, row: &Row) -> Result<()> {
         use crate::storage::btree::BTreeCursor;
         use crate::types::{IOResult, SeekKey, SeekOp};
 
@@ -826,13 +973,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .insert(&key, true)
             .map_err(|e| DatabaseError::Io(e.to_string()))?
         {
-            IOResult::Done(()) => {
-            }
+            IOResult::Done(()) => {}
             IOResult::IO => {
                 panic!("IOResult::IO not supported in write_row_to_pager insert");
             }
         }
-        
+
         tracing::trace!(
             "write_row_to_pager(table_id={}, row_id={})",
             row.id.table_id,

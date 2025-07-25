@@ -1,25 +1,30 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{MvStore, Result, Row, RowID};
 use crate::turso_assert;
-use std::fmt::Debug;
 use std::rc::Rc;
 
-#[derive(Debug)]
 pub struct ScanCursor<Clock: LogicalClock> {
     pub db: Rc<MvStore<Clock>>,
     pub row_ids: Vec<RowID>,
     pub index: usize,
     tx_id: u64,
+    pager: Rc<crate::storage::pager::Pager>,
 }
 
 impl<Clock: LogicalClock> ScanCursor<Clock> {
-    pub fn new(db: Rc<MvStore<Clock>>, tx_id: u64, table_id: u64) -> Result<ScanCursor<Clock>> {
-        let row_ids = db.scan_row_ids_for_table(table_id)?;
+    pub fn new(
+        db: Rc<MvStore<Clock>>,
+        tx_id: u64,
+        table_id: u64,
+        pager: Rc<crate::storage::pager::Pager>,
+    ) -> Result<ScanCursor<Clock>> {
+        let row_ids = db.scan_row_ids_for_table(table_id, pager.clone())?;
         Ok(Self {
             db,
             tx_id,
             row_ids,
             index: 0,
+            pager,
         })
     }
 
@@ -47,7 +52,7 @@ impl<Clock: LogicalClock> ScanCursor<Clock> {
             return Ok(None);
         }
         let id = self.row_ids[idx];
-        self.db.read(self.tx_id, id)
+        self.db.read(self.tx_id, id, self.pager.clone())
     }
 
     pub fn close(self) -> Result<()> {
@@ -65,17 +70,22 @@ impl<Clock: LogicalClock> ScanCursor<Clock> {
     }
 }
 
-#[derive(Debug)]
 pub struct LazyScanCursor<Clock: LogicalClock> {
     pub db: Rc<MvStore<Clock>>,
     pub current_pos: Option<RowID>,
     pub prev_pos: Option<RowID>,
     table_id: u64,
     tx_id: u64,
+    pager: Rc<crate::storage::pager::Pager>,
 }
 
 impl<Clock: LogicalClock> LazyScanCursor<Clock> {
-    pub fn new(db: Rc<MvStore<Clock>>, tx_id: u64, table_id: u64) -> Result<LazyScanCursor<Clock>> {
+    pub fn new(
+        db: Rc<MvStore<Clock>>,
+        tx_id: u64,
+        table_id: u64,
+        pager: Rc<crate::storage::pager::Pager>,
+    ) -> Result<LazyScanCursor<Clock>> {
         let current_pos = db.get_next_row_id_for_table(table_id, 0);
         Ok(Self {
             db,
@@ -83,6 +93,7 @@ impl<Clock: LogicalClock> LazyScanCursor<Clock> {
             current_pos,
             prev_pos: None,
             table_id,
+            pager,
         })
     }
 
@@ -96,7 +107,7 @@ impl<Clock: LogicalClock> LazyScanCursor<Clock> {
 
     pub fn current_row(&self) -> Result<Option<Row>> {
         if let Some(id) = self.current_pos {
-            self.db.read(self.tx_id, id)
+            self.db.read(self.tx_id, id, self.pager.clone())
         } else {
             Ok(None)
         }
@@ -123,7 +134,6 @@ impl<Clock: LogicalClock> LazyScanCursor<Clock> {
     }
 }
 
-#[derive(Debug)]
 pub struct BucketScanCursor<Clock: LogicalClock> {
     pub db: Rc<MvStore<Clock>>,
     pub bucket: Vec<RowID>,
@@ -131,6 +141,7 @@ pub struct BucketScanCursor<Clock: LogicalClock> {
     table_id: u64,
     tx_id: u64,
     index: usize,
+    pager: Rc<crate::storage::pager::Pager>,
 }
 
 impl<Clock: LogicalClock> BucketScanCursor<Clock> {
@@ -139,6 +150,7 @@ impl<Clock: LogicalClock> BucketScanCursor<Clock> {
         tx_id: u64,
         table_id: u64,
         size: u64,
+        pager: Rc<crate::storage::pager::Pager>,
     ) -> Result<BucketScanCursor<Clock>> {
         let mut bucket = Vec::with_capacity(size as usize);
         db.get_row_id_range(table_id, 0, &mut bucket, size)?;
@@ -149,6 +161,7 @@ impl<Clock: LogicalClock> BucketScanCursor<Clock> {
             bucket_size: size,
             table_id,
             index: 0,
+            pager,
         })
     }
 
@@ -168,7 +181,7 @@ impl<Clock: LogicalClock> BucketScanCursor<Clock> {
             return Ok(None);
         }
         let id = self.bucket[self.index];
-        self.db.read(self.tx_id, id)
+        self.db.read(self.tx_id, id, self.pager.clone())
     }
 
     pub fn close(self) -> Result<()> {

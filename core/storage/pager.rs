@@ -773,9 +773,7 @@ impl Pager {
         // we should have a unique API to begin transactions, something like sqlite3BtreeBeginTrans
         match self.maybe_allocate_page1()? {
             IOResult::Done(_) => {}
-            IOResult::IO => {
-                return Ok(IOResult::IO)
-            },
+            IOResult::IO => return Ok(IOResult::IO),
         }
         Ok(IOResult::Done(self.wal.borrow_mut().begin_write_tx()?))
     }

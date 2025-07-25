@@ -43,16 +43,16 @@ pub use database::MvStore;
 mod tests {
     use crate::mvcc::clock::LocalClock;
     use crate::mvcc::database::{MvStore, Row, RowID};
+    use crate::storage::database::FileMemoryStorage;
+    use crate::storage::page_cache::DumbLruPageCache;
+    use crate::storage::pager::Pager;
+    use crate::storage::sqlite3_ondisk::DatabaseHeader;
+    use crate::storage::wal::DummyWAL;
+    use crate::OpenFlags;
+    use std::rc::Rc;
     use std::sync::atomic::AtomicI64;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
-    use std::rc::Rc;
-    use crate::storage::sqlite3_ondisk::DatabaseHeader;
-    use crate::storage::pager::Pager;
-    use crate::storage::wal::DummyWAL;
-    use crate::storage::page_cache::DumbLruPageCache;
-    use crate::storage::database::FileMemoryStorage;
-    use crate::OpenFlags;
 
     fn dummy_pager() -> Rc<Pager> {
         let storage = FileMemoryStorage::new();
@@ -98,10 +98,12 @@ mod tests {
                         column_count: 1,
                     };
                     db.insert(tx, row.clone()).unwrap();
-                    db.commit_tx(tx, dummy_pager(), &dummy_connection()).unwrap();
+                    db.commit_tx(tx, dummy_pager(), &dummy_connection())
+                        .unwrap();
                     let tx = db.begin_tx();
-                    let committed_row = db.read(tx, id).unwrap();
-                    db.commit_tx(tx, dummy_pager(), &dummy_connection()).unwrap();
+                    let committed_row = db.read(tx, id, dummy_pager()).unwrap();
+                    db.commit_tx(tx, dummy_pager(), &dummy_connection())
+                        .unwrap();
                     assert_eq!(committed_row, Some(row));
                 }
             })
@@ -121,10 +123,12 @@ mod tests {
                         column_count: 1,
                     };
                     db.insert(tx, row.clone()).unwrap();
-                    db.commit_tx(tx, dummy_pager(), &dummy_connection()).unwrap();
+                    db.commit_tx(tx, dummy_pager(), &dummy_connection())
+                        .unwrap();
                     let tx = db.begin_tx();
-                    let committed_row = db.read(tx, id).unwrap();
-                    db.commit_tx(tx, dummy_pager(), &dummy_connection()).unwrap();
+                    let committed_row = db.read(tx, id, dummy_pager()).unwrap();
+                    db.commit_tx(tx, dummy_pager(), &dummy_connection())
+                        .unwrap();
                     assert_eq!(committed_row, Some(row));
                 }
             })
@@ -168,8 +172,9 @@ mod tests {
                         failed_upserts += 1;
                         continue;
                     }
-                    let committed_row = db.read(tx, id).unwrap();
-                    db.commit_tx(tx, dummy_pager(), &dummy_connection()).unwrap();
+                    let committed_row = db.read(tx, id, dummy_pager()).unwrap();
+                    db.commit_tx(tx, dummy_pager(), &dummy_connection())
+                        .unwrap();
                     assert_eq!(committed_row, Some(row));
                 }
                 tracing::info!(
