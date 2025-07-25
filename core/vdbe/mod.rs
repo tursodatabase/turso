@@ -30,7 +30,7 @@ use crate::{
     storage::{pager, sqlite3_ondisk::SmallVec},
     translate::plan::TableReferences,
     types::{IOResult, RawSlice, TextRef},
-    vdbe::execute::{OpIdxInsertState, OpInsertState, OpNewRowidState, OpSeekState},
+    vdbe::execute::{OpColumnState, OpIdxInsertState, OpInsertState, OpNewRowidState, OpSeekState},
     RefValue,
 };
 
@@ -256,6 +256,7 @@ pub struct ProgramState {
     op_idx_insert_state: OpIdxInsertState,
     op_insert_state: OpInsertState,
     seek_state: OpSeekState,
+    op_column_state: OpColumnState,
 }
 
 impl ProgramState {
@@ -286,6 +287,7 @@ impl ProgramState {
             op_idx_insert_state: OpIdxInsertState::SeekIfUnique,
             op_insert_state: OpInsertState::Insert,
             seek_state: OpSeekState::Start,
+            op_column_state: OpColumnState::Start,
         }
     }
 
