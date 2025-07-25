@@ -280,6 +280,16 @@ enum PtrMapGetState {
     },
 }
 
+#[derive(Debug, Clone)]
+enum PtrMapPutState {
+    Start,
+    GetEntry {
+        page: PageRef,
+        ptrmap_pg_no: u32,
+        offset_in_ptrmap_page: usize,
+    },
+}
+
 /// The pager interface implements the persistence layer by providing access
 /// to pages of the database file, including caching, concurrency control, and
 /// transaction management.
@@ -312,7 +322,8 @@ pub struct Pager {
     page_size: Cell<Option<u32>>,
     reserved_space: OnceCell<u8>,
     free_page_state: RefCell<FreePageState>,
-    ptrmap_get_state: Cell<PtrMapGetState>,
+    ptrmap_get_state: RefCell<PtrMapGetState>,
+    ptrmap_put_state: RefCell<PtrMapPutState>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -380,7 +391,8 @@ impl Pager {
             page_size: Cell::new(None),
             reserved_space: OnceCell::new(),
             free_page_state: RefCell::new(FreePageState::Start),
-            ptrmap_get_state: Cell::new(PtrMapGetState::Start),
+            ptrmap_get_state: RefCell::new(PtrMapGetState::Start),
+            ptrmap_put_state: RefCell::new(PtrMapPutState::Start),
         })
     }
 
@@ -403,7 +415,7 @@ impl Pager {
     pub fn ptrmap_get(&self, target_page_num: u32) -> Result<IOResult<Option<PtrmapEntry>>> {
         tracing::trace!("ptrmap_get(page_idx = {})", target_page_num);
 
-        match self.ptrmap_get_state.get_mut() {
+        match &*self.ptrmap_get_state.borrow() {
             PtrMapGetState::Start => {
                 let configured_page_size = header_accessor::get_page_size(self)? as usize;
 
@@ -423,7 +435,7 @@ impl Pager {
                 );
 
                 let (ptrmap_page, c) = self.read_page(ptrmap_pg_no as usize)?;
-                self.ptrmap_get_state.set(PtrMapGetState::GetEntry {
+                self.ptrmap_get_state.replace(PtrMapGetState::GetEntry {
                     page: ptrmap_page,
                     ptrmap_pg_no,
                     offset_in_ptrmap_page,
@@ -435,6 +447,8 @@ impl Pager {
                 ptrmap_pg_no,
                 offset_in_ptrmap_page,
             } => {
+                let ptrmap_pg_no = *ptrmap_pg_no;
+                let offset_in_ptrmap_page = *offset_in_ptrmap_page;
                 let ptrmap_page_inner = ptrmap_page.get();
 
                 let page_content: &PageContent = match ptrmap_page_inner.contents.as_ref() {
@@ -475,7 +489,7 @@ impl Pager {
                             "Failed to deserialize ptrmap entry for page {target_page_num} from ptrmap page {ptrmap_pg_no}"
                     ))),
                 };
-                self.ptrmap_get_state.set(PtrMapGetState::Start);
+                self.ptrmap_get_state.replace(PtrMapGetState::Start);
                 res
             }
         }
@@ -498,74 +512,86 @@ impl Pager {
             parent_page_no
         );
 
-        let page_size = header_accessor::get_page_size(self)? as usize;
+        match &*self.ptrmap_put_state.borrow() {
+            PtrMapPutState::Start => {
+                let page_size = header_accessor::get_page_size(self)? as usize;
 
-        if db_page_no_to_update < FIRST_PTRMAP_PAGE_NO
-            || is_ptrmap_page(db_page_no_to_update, page_size)
-        {
-            return Err(LimboError::InternalError(format!(
-                "Cannot set ptrmap entry for page {db_page_no_to_update}: it's a header/ptrmap page or invalid."
-            )));
-        }
+                if db_page_no_to_update < FIRST_PTRMAP_PAGE_NO
+                    || is_ptrmap_page(db_page_no_to_update, page_size)
+                {
+                    return Err(LimboError::InternalError(format!(
+                        "Cannot set ptrmap entry for page {db_page_no_to_update}: it's a header/ptrmap page or invalid."
+                    )));
+                }
 
-        let ptrmap_pg_no = get_ptrmap_page_no_for_db_page(db_page_no_to_update, page_size);
-        let offset_in_ptrmap_page =
-            get_ptrmap_offset_in_page(db_page_no_to_update, ptrmap_pg_no, page_size)?;
-        tracing::trace!(
-            "ptrmap_put(page_idx = {}, entry_type = {:?}, parent_page_no = {}) = ptrmap_pg_no = {}, offset_in_ptrmap_page = {}",
-            db_page_no_to_update,
-            entry_type,
-            parent_page_no,
-            ptrmap_pg_no,
-            offset_in_ptrmap_page
-        );
+                let ptrmap_pg_no = get_ptrmap_page_no_for_db_page(db_page_no_to_update, page_size);
+                let offset_in_ptrmap_page =
+                    get_ptrmap_offset_in_page(db_page_no_to_update, ptrmap_pg_no, page_size)?;
+                tracing::trace!(
+                    "ptrmap_put(page_idx = {}, entry_type = {:?}, parent_page_no = {}) = ptrmap_pg_no = {}, offset_in_ptrmap_page = {}",
+                    db_page_no_to_update,
+                    entry_type,
+                    parent_page_no,
+                    ptrmap_pg_no,
+                    offset_in_ptrmap_page
+                );
 
-        let ptrmap_page = self.read_page(ptrmap_pg_no as usize)?;
-        if ptrmap_page.is_locked() {
-            return Ok(IOResult::IO);
-        }
-        if !ptrmap_page.is_loaded() {
-            return Ok(IOResult::IO);
-        }
-        let ptrmap_page_inner = ptrmap_page.get();
-
-        let page_content = match ptrmap_page_inner.contents.as_ref() {
-            Some(content) => content,
-            None => {
-                return Err(LimboError::InternalError(format!(
-                    "Ptrmap page {ptrmap_pg_no} content not loaded"
-                )))
+                let (ptrmap_page, c) = self.read_page(ptrmap_pg_no as usize)?;
+                self.ptrmap_put_state.replace(PtrMapPutState::GetEntry {
+                    page: ptrmap_page,
+                    ptrmap_pg_no,
+                    offset_in_ptrmap_page,
+                });
+                Ok(IOResult::IO(IOCompletions::Single(c)))
             }
-        };
-
-        let mut page_buffer_guard = page_content.buffer.borrow_mut();
-        let full_buffer_slice = page_buffer_guard.as_mut_slice();
-
-        if offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE > full_buffer_slice.len() {
-            return Err(LimboError::InternalError(format!(
-                "Ptrmap offset {} + entry size {} out of bounds for page {} (actual data len {})",
-                offset_in_ptrmap_page,
-                PTRMAP_ENTRY_SIZE,
+            PtrMapPutState::GetEntry {
+                page: ptrmap_page,
                 ptrmap_pg_no,
-                full_buffer_slice.len()
-            )));
+                offset_in_ptrmap_page,
+            } => {
+                let ptrmap_pg_no = *ptrmap_pg_no;
+                let offset_in_ptrmap_page = *offset_in_ptrmap_page;
+                let ptrmap_page_inner = ptrmap_page.get();
+
+                let page_content = match ptrmap_page_inner.contents.as_ref() {
+                    Some(content) => content,
+                    None => {
+                        return Err(LimboError::InternalError(format!(
+                            "Ptrmap page {ptrmap_pg_no} content not loaded"
+                        )))
+                    }
+                };
+
+                let mut page_buffer_guard = page_content.buffer.borrow_mut();
+                let full_buffer_slice = page_buffer_guard.as_mut_slice();
+
+                if offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE > full_buffer_slice.len() {
+                    return Err(LimboError::InternalError(format!(
+                    "Ptrmap offset {} + entry size {} out of bounds for page {} (actual data len {})",
+                    offset_in_ptrmap_page,
+                    PTRMAP_ENTRY_SIZE,
+                    ptrmap_pg_no,
+                    full_buffer_slice.len()
+                )));
+                }
+
+                let entry = PtrmapEntry {
+                    entry_type,
+                    parent_page_no,
+                };
+                entry.serialize(
+                    &mut full_buffer_slice
+                        [offset_in_ptrmap_page..offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE],
+                )?;
+
+                turso_assert!(
+                    ptrmap_page.get().id == ptrmap_pg_no as usize,
+                    "ptrmap page has unexpected number"
+                );
+                self.add_dirty(&ptrmap_page);
+                Ok(IOResult::Done(()))
+            }
         }
-
-        let entry = PtrmapEntry {
-            entry_type,
-            parent_page_no,
-        };
-        entry.serialize(
-            &mut full_buffer_slice
-                [offset_in_ptrmap_page..offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE],
-        )?;
-
-        turso_assert!(
-            ptrmap_page.get().id == ptrmap_pg_no as usize,
-            "ptrmap page has unexpected number"
-        );
-        self.add_dirty(&ptrmap_page);
-        Ok(IOResult::Done(()))
     }
 
     /// This method is used to allocate a new root page for a btree, both for tables and indexes
@@ -596,10 +622,7 @@ impl Pager {
                 }
                 AutoVacuumMode::Full => {
                     let mut root_page_num =
-                        match header_accessor::get_vacuum_mode_largest_root_page_async(self)? {
-                            IOResult::Done(value) => value,
-                            IOResult::IO => return Ok(IOResult::IO),
-                        };
+                        header_accessor::get_vacuum_mode_largest_root_page(self)?;
                     assert!(root_page_num > 0); //  Largest root page number cannot be 0 because that is set to 1 when creating the database with autovacuum enabled
                     root_page_num += 1;
                     assert!(root_page_num >= FIRST_PTRMAP_PAGE_NO); //  can never be less than 2 because we have already incremented
@@ -627,7 +650,7 @@ impl Pager {
                     //  For now map allocated_page_id since we are not swapping it with root_page_num
                     match self.ptrmap_put(allocated_page_id, PtrmapType::RootPage, 0)? {
                         IOResult::Done(_) => Ok(IOResult::Done(allocated_page_id)),
-                        IOResult::IO => Ok(IOResult::IO),
+                        IOResult::IO(io) => Ok(IOResult::IO(io)),
                     }
                 }
                 AutoVacuumMode::Incremental => {
