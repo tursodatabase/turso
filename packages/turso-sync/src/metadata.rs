@@ -6,7 +6,7 @@ use tokio::io::AsyncWriteExt;
 use crate::{errors::Error, Result};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-enum DatabaseTandemSelection {
+pub enum DatabaseTandemSelection {
     Local,
     Remote,
 }
