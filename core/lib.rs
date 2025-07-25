@@ -949,15 +949,19 @@ impl Connection {
                         input,
                     )?;
 
-                    let mut state =
-                        vdbe::ProgramState::new(program.max_registers, program.cursor_ref.len());
+                    let mut stmt =
+                        Statement::new(Rc::new(program), self._db.mv_store.clone(), pager.clone());
+
                     loop {
-                        let res =
-                            program.step(&mut state, self._db.mv_store.clone(), pager.clone())?;
-                        if matches!(res, StepResult::Done) {
-                            break;
+                        let res = stmt.step()?;
+                        match res {
+                            vdbe::StepResult::Done => break,
+                            vdbe::StepResult::IO => self.run_once()?,
+                            vdbe::StepResult::Row => {}
+                            vdbe::StepResult::Busy | vdbe::StepResult::Interrupt => {
+                                return Err(LimboError::Busy)
+                            }
                         }
-                        self.run_once()?;
                     }
                 }
             }
