@@ -1646,7 +1646,14 @@ mod ptrmap_tests {
                 IOResult::Done(res) => {
                     return Ok(res);
                 }
-                IOResult::IO => pager.io.run_once().unwrap(),
+                IOResult::IO(io) => match io {
+                    IOCompletions::Single(c) => pager.io.wait_for_completion(c)?,
+                    IOCompletions::Many(completions) => {
+                        for c in completions {
+                            pager.io.wait_for_completion(c)?
+                        }
+                    }
+                },
             }
         }
     }
@@ -1693,7 +1700,7 @@ mod ptrmap_tests {
         for _ in 0..initial_db_pages {
             match pager.btree_create(&CreateBTreeFlags::new_table()) {
                 Ok(IOResult::Done(_root_page_id)) => (),
-                Ok(IOResult::IO) => {
+                Ok(IOResult::IO(..)) => {
                     panic!("test_pager_setup: btree_create returned IOResult::IO unexpectedly");
                 }
                 Err(e) => {
