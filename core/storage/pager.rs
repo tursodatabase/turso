@@ -798,7 +798,6 @@ impl Pager {
             IOResult::Done(_) => {
                 self.wal.borrow().end_write_tx();
                 self.wal.borrow().end_read_tx();
-
                 if schema_did_change {
                     let schema = connection.schema.borrow().clone();
                     connection._db.update_schema_if_newer(schema)?;

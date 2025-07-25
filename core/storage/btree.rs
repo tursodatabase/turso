@@ -559,6 +559,8 @@ pub struct BTreeCursor {
     /// - Moving to a different record/row
     /// - The underlying `ImmutableRecord` is modified
     pub record_cursor: RefCell<RecordCursor>,
+    /// Number of columns in the table/index
+    pub num_columns: usize,
 }
 
 /// We store the cell index and cell count for each page in the stack.
@@ -613,6 +615,7 @@ impl BTreeCursor {
             read_overflow_state: RefCell::new(None),
             parse_record_state: RefCell::new(ParseRecordState::Init),
             record_cursor: RefCell::new(RecordCursor::with_capacity(num_columns)),
+            num_columns,
         }
     }
 
@@ -4380,7 +4383,7 @@ impl BTreeCursor {
                 Some(rowid) => {
                     let row_id = crate::mvcc::database::RowID::new(self.table_id() as u64, rowid);
                     let record_buf = key.get_record().unwrap().get_payload().to_vec();
-                    let row = crate::mvcc::database::Row::new(row_id, record_buf);
+                    let row = crate::mvcc::database::Row::new(row_id, record_buf, self.num_columns);
                     mv_cursor.borrow_mut().insert(row).unwrap();
                 }
                 None => todo!("Support mvcc inserts with index btrees"),

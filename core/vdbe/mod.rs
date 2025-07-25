@@ -438,7 +438,7 @@ impl Program {
             if auto_commit {
                 let mut mv_transactions = conn.mv_transactions.borrow_mut();
                 for tx_id in mv_transactions.iter() {
-                    mv_store.commit_tx(*tx_id).unwrap();
+                    mv_store.commit_tx(*tx_id, pager.clone(), &conn).unwrap();
                 }
                 mv_transactions.clear();
             }

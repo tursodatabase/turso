@@ -1,10 +1,34 @@
 use super::*;
 use crate::mvcc::clock::LocalClock;
+use crate::storage::database::FileMemoryStorage;
+use crate::storage::page_cache::DumbLruPageCache;
+use crate::storage::pager::Pager;
+use crate::storage::sqlite3_ondisk::DatabaseHeader;
+use crate::storage::wal::DummyWAL;
+use crate::OpenFlags;
+use std::rc::Rc;
 
 fn test_db() -> MvStore<LocalClock> {
     let clock = LocalClock::new();
-    let storage = crate::mvcc::persistent_storage::Storage::new_noop();
-    MvStore::new(clock, storage)
+    MvStore::new(clock)
+}
+
+fn dummy_pager() -> Rc<Pager> {
+    let storage = FileMemoryStorage::new();
+    let cache = DumbLruPageCache::new(1024);
+    let wal = DummyWAL::new();
+    let header = DatabaseHeader::new(1024, 1, 1);
+    let pager = Pager::new(header, storage, cache, wal, OpenFlags::ReadWrite).unwrap();
+    Rc::new(pager)
+}
+
+fn dummy_connection() -> crate::Connection {
+    let storage = FileMemoryStorage::new();
+    let cache = DumbLruPageCache::new(1024);
+    let wal = DummyWAL::new();
+    let header = DatabaseHeader::new(1024, 1, 1);
+    let pager = Pager::new(header, storage, cache, wal, OpenFlags::ReadWrite).unwrap();
+    crate::Connection::new(pager).unwrap()
 }
 
 #[test]
@@ -18,6 +42,7 @@ fn test_insert_read() {
             row_id: 1,
         },
         data: "Hello".to_string().into_bytes(),
+        column_count: 1,
     };
     db.insert(tx1, tx1_row.clone()).unwrap();
     let row = db
@@ -31,7 +56,8 @@ fn test_insert_read() {
         .unwrap()
         .unwrap();
     assert_eq!(tx1_row, row);
-    db.commit_tx(tx1).unwrap();
+    db.commit_tx(tx1, dummy_pager(), &dummy_connection())
+        .unwrap();
 
     let tx2 = db.begin_tx();
     let row = db
@@ -57,6 +83,7 @@ fn test_read_nonexistent() {
             table_id: 1,
             row_id: 1,
         },
+        dummy_pager(),
     );
     assert!(row.unwrap().is_none());
 }
@@ -72,6 +99,7 @@ fn test_delete() {
             row_id: 1,
         },
         data: "Hello".to_string().into_bytes(),
+        column_count: 1,
     };
     db.insert(tx1, tx1_row.clone()).unwrap();
     let row = db
@@ -100,10 +128,12 @@ fn test_delete() {
                 table_id: 1,
                 row_id: 1,
             },
+            dummy_pager(),
         )
         .unwrap();
     assert!(row.is_none());
-    db.commit_tx(tx1).unwrap();
+    db.commit_tx(tx1, dummy_pager(), &dummy_connection())
+        .unwrap();
 
     let tx2 = db.begin_tx();
     let row = db
@@ -143,6 +173,7 @@ fn test_commit() {
             row_id: 1,
         },
         data: "Hello".to_string().into_bytes(),
+        column_count: 1,
     };
     db.insert(tx1, tx1_row.clone()).unwrap();
     let row = db
@@ -162,6 +193,7 @@ fn test_commit() {
             row_id: 1,
         },
         data: "World".to_string().into_bytes(),
+        column_count: 1,
     };
     db.update(tx1, tx1_updated_row.clone()).unwrap();
     let row = db
@@ -175,7 +207,8 @@ fn test_commit() {
         .unwrap()
         .unwrap();
     assert_eq!(tx1_updated_row, row);
-    db.commit_tx(tx1).unwrap();
+    db.commit_tx(tx1, dummy_pager(), &dummy_connection())
+        .unwrap();
 
     let tx2 = db.begin_tx();
     let row = db
@@ -188,7 +221,8 @@ fn test_commit() {
         )
         .unwrap()
         .unwrap();
-    db.commit_tx(tx2).unwrap();
+    db.commit_tx(tx2, dummy_pager(), &dummy_connection())
+        .unwrap();
     assert_eq!(tx1_updated_row, row);
     db.drop_unused_row_versions();
 }
@@ -203,6 +237,7 @@ fn test_rollback() {
             row_id: 1,
         },
         data: "Hello".to_string().into_bytes(),
+        column_count: 1,
     };
     db.insert(tx1, row1.clone()).unwrap();
     let row2 = db
@@ -222,6 +257,7 @@ fn test_rollback() {
             row_id: 1,
         },
         data: "World".to_string().into_bytes(),
+        column_count: 1,
     };
     db.update(tx1, row3.clone()).unwrap();
     let row4 = db
@@ -261,6 +297,7 @@ fn test_dirty_write() {
             row_id: 1,
         },
         data: "Hello".to_string().into_bytes(),
+        column_count: 1,
     };
     db.insert(tx1, tx1_row.clone()).unwrap();
     let row = db
@@ -283,6 +320,7 @@ fn test_dirty_write() {
             row_id: 1,
         },
         data: "World".to_string().into_bytes(),
+        column_count: 1,
     };
     assert!(!db.update(tx2, tx2_row).unwrap());
 
@@ -311,6 +349,7 @@ fn test_dirty_read() {
             row_id: 1,
         },
         data: "Hello".to_string().into_bytes(),
+        column_count: 1,
     };
     db.insert(tx1, row1).unwrap();
 
@@ -340,9 +379,11 @@ fn test_dirty_read_deleted() {
             row_id: 1,
         },
         data: "Hello".to_string().into_bytes(),
+        column_count: 1,
     };
     db.insert(tx1, tx1_row.clone()).unwrap();
-    db.commit_tx(tx1).unwrap();
+    db.commit_tx(tx1, dummy_pager(), &dummy_connection())
+        .unwrap();
 
     // T2 deletes row with ID 1, but does not commit.
     let tx2 = db.begin_tx();
@@ -383,6 +424,7 @@ fn test_fuzzy_read() {
             row_id: 1,
         },
         data: "First".to_string().into_bytes(),
+        column_count: 1,
     };
     db.insert(tx1, tx1_row.clone()).unwrap();
     let row = db
@@ -396,7 +438,8 @@ fn test_fuzzy_read() {
         .unwrap()
         .unwrap();
     assert_eq!(tx1_row, row);
-    db.commit_tx(tx1).unwrap();
+    db.commit_tx(tx1, dummy_pager(), &dummy_connection())
+        .unwrap();
 
     // T2 reads the row with ID 1 within an active transaction.
     let tx2 = db.begin_tx();
@@ -420,9 +463,11 @@ fn test_fuzzy_read() {
             row_id: 1,
         },
         data: "Second".to_string().into_bytes(),
+        column_count: 1,
     };
     db.update(tx3, tx3_row).unwrap();
-    db.commit_tx(tx3).unwrap();
+    db.commit_tx(tx3, dummy_pager(), &dummy_connection())
+        .unwrap();
 
     // T2 still reads the same version of the row as before.
     let row = db
@@ -445,6 +490,7 @@ fn test_fuzzy_read() {
             row_id: 1,
         },
         data: "Third".to_string().into_bytes(),
+        column_count: 1,
     };
     let update_result = db.update(tx2, tx2_newrow);
     assert_eq!(Err(DatabaseError::WriteWriteConflict), update_result);
@@ -462,6 +508,7 @@ fn test_lost_update() {
             row_id: 1,
         },
         data: "Hello".to_string().into_bytes(),
+        column_count: 1,
     };
     db.insert(tx1, tx1_row.clone()).unwrap();
     let row = db
@@ -475,7 +522,8 @@ fn test_lost_update() {
         .unwrap()
         .unwrap();
     assert_eq!(tx1_row, row);
-    db.commit_tx(tx1).unwrap();
+    db.commit_tx(tx1, dummy_pager(), &dummy_connection())
+        .unwrap();
 
     // T2 attempts to update row ID 1 within an active transaction.
     let tx2 = db.begin_tx();
@@ -485,6 +533,7 @@ fn test_lost_update() {
             row_id: 1,
         },
         data: "World".to_string().into_bytes(),
+        column_count: 1,
     };
     assert!(db.update(tx2, tx2_row.clone()).unwrap());
 
@@ -496,14 +545,19 @@ fn test_lost_update() {
             row_id: 1,
         },
         data: "Hello, world!".to_string().into_bytes(),
+        column_count: 1,
     };
     assert_eq!(
         Err(DatabaseError::WriteWriteConflict),
         db.update(tx3, tx3_row)
     );
 
-    db.commit_tx(tx2).unwrap();
-    assert_eq!(Err(DatabaseError::TxTerminated), db.commit_tx(tx3));
+    db.commit_tx(tx2, dummy_pager(), &dummy_connection())
+        .unwrap();
+    assert_eq!(
+        Err(DatabaseError::TxTerminated),
+        db.commit_tx(tx3, dummy_pager(), &dummy_connection())
+    );
 
     let tx4 = db.begin_tx();
     let row = db
@@ -533,9 +587,11 @@ fn test_committed_visibility() {
             row_id: 1,
         },
         data: "10".to_string().into_bytes(),
+        column_count: 1,
     };
     db.insert(tx1, tx1_row.clone()).unwrap();
-    db.commit_tx(tx1).unwrap();
+    db.commit_tx(tx1, dummy_pager(), &dummy_connection())
+        .unwrap();
 
     // but I like more money, so let me try adding $10 more
     let tx2 = db.begin_tx();
@@ -545,6 +601,7 @@ fn test_committed_visibility() {
             row_id: 1,
         },
         data: "20".to_string().into_bytes(),
+        column_count: 1,
     };
     assert!(db.update(tx2, tx2_row.clone()).unwrap());
     let row = db
@@ -588,6 +645,7 @@ fn test_future_row() {
             row_id: 1,
         },
         data: "10".to_string().into_bytes(),
+        column_count: 1,
     };
     db.insert(tx2, tx2_row).unwrap();
 
@@ -599,12 +657,14 @@ fn test_future_row() {
                 table_id: 1,
                 row_id: 1,
             },
+            dummy_pager(),
         )
         .unwrap();
     assert_eq!(row, None);
 
     // lets commit the transaction and check if tx1 can see it
-    db.commit_tx(tx2).unwrap();
+    db.commit_tx(tx2, dummy_pager(), &dummy_connection())
+        .unwrap();
     let row = db
         .read(
             tx1,
@@ -612,6 +672,7 @@ fn test_future_row() {
                 table_id: 1,
                 row_id: 1,
             },
+            dummy_pager(),
         )
         .unwrap();
     assert_eq!(row, None);
@@ -620,7 +681,6 @@ fn test_future_row() {
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{BucketScanCursor, LazyScanCursor, ScanCursor};
 use crate::mvcc::database::{MvStore, Row, RowID};
-use crate::mvcc::persistent_storage::Storage;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -652,8 +712,7 @@ impl LogicalClock for TestClock {
 
 fn setup_test_db() -> (Rc<MvStore<TestClock>>, u64) {
     let clock = TestClock::new(1);
-    let storage = Storage::new_noop();
-    let db = Rc::new(MvStore::new(clock, storage));
+    let db = Rc::new(MvStore::new(clock));
     let tx_id = db.begin_tx();
 
     let table_id = 1;
@@ -679,8 +738,7 @@ fn setup_test_db() -> (Rc<MvStore<TestClock>>, u64) {
 
 fn setup_sequential_db() -> (Rc<MvStore<TestClock>>, u64) {
     let clock = TestClock::new(1);
-    let storage = Storage::new_noop();
-    let db = Rc::new(MvStore::new(clock, storage));
+    let db = Rc::new(MvStore::new(clock));
     let tx_id = db.begin_tx();
 
     let table_id = 1;
@@ -702,7 +760,7 @@ fn test_lazy_scan_cursor_basic() {
     let (db, tx_id) = setup_sequential_db();
     let table_id = 1;
 
-    let mut cursor = LazyScanCursor::new(db.clone(), tx_id, table_id).unwrap();
+    let mut cursor = LazyScanCursor::new(db.clone(), tx_id, table_id, dummy_pager()).unwrap();
 
     // Check first row
     assert!(!cursor.is_empty());
@@ -730,7 +788,7 @@ fn test_lazy_scan_cursor_with_gaps() {
     let (db, tx_id) = setup_test_db();
     let table_id = 1;
 
-    let mut cursor = LazyScanCursor::new(db.clone(), tx_id, table_id).unwrap();
+    let mut cursor = LazyScanCursor::new(db.clone(), tx_id, table_id, dummy_pager()).unwrap();
 
     // Check first row
     assert!(!cursor.is_empty());
@@ -760,7 +818,7 @@ fn test_bucket_scan_cursor_basic() {
     let table_id = 1;
 
     // Create a bucket size that's smaller than the total rows
-    let mut cursor = BucketScanCursor::new(db.clone(), tx_id, table_id, 3).unwrap();
+    let mut cursor = BucketScanCursor::new(db.clone(), tx_id, table_id, 3, dummy_pager()).unwrap();
 
     // Check first row
     assert!(!cursor.is_empty());
@@ -792,7 +850,7 @@ fn test_bucket_scan_cursor_with_gaps() {
     let table_id = 1;
 
     // Create a bucket size of 2 to force multiple bucket loads
-    let mut cursor = BucketScanCursor::new(db.clone(), tx_id, table_id, 2).unwrap();
+    let mut cursor = BucketScanCursor::new(db.clone(), tx_id, table_id, 2, dummy_pager()).unwrap();
 
     // Check first row
     assert!(!cursor.is_empty());
@@ -821,7 +879,7 @@ fn test_scan_cursor_basic() {
     let (db, tx_id) = setup_sequential_db();
     let table_id = 1;
 
-    let mut cursor = ScanCursor::new(db.clone(), tx_id, table_id).unwrap();
+    let mut cursor = ScanCursor::new(db.clone(), tx_id, table_id, dummy_pager()).unwrap();
 
     cursor.forward();
 
@@ -849,23 +907,22 @@ fn test_scan_cursor_basic() {
 #[test]
 fn test_cursor_with_empty_table() {
     let clock = TestClock::new(1);
-    let storage = Storage::new_noop();
-    let db = Rc::new(MvStore::new(clock, storage));
+    let db = Rc::new(MvStore::new(clock));
     let tx_id = db.begin_tx();
     let table_id = 1; // Empty table
 
     // Test LazyScanCursor with empty table
-    let cursor = LazyScanCursor::new(db.clone(), tx_id, table_id).unwrap();
+    let cursor = LazyScanCursor::new(db.clone(), tx_id, table_id, dummy_pager()).unwrap();
     assert!(cursor.is_empty());
     assert!(cursor.current_row_id().is_none());
 
     // Test BucketScanCursor with empty table
-    let cursor = BucketScanCursor::new(db.clone(), tx_id, table_id, 10).unwrap();
+    let cursor = BucketScanCursor::new(db.clone(), tx_id, table_id, 10, dummy_pager()).unwrap();
     assert!(cursor.is_empty());
     assert!(cursor.current_row_id().is_none());
 
     // Test ScanCursor with empty table
-    let mut cursor = ScanCursor::new(db.clone(), tx_id, table_id).unwrap();
+    let mut cursor = ScanCursor::new(db.clone(), tx_id, table_id, dummy_pager()).unwrap();
     cursor.forward();
     assert!(cursor.is_empty());
     assert!(cursor.current_row_id().is_none());
@@ -876,7 +933,7 @@ fn test_cursor_modification_during_scan() {
     let (db, tx_id) = setup_sequential_db();
     let table_id = 1;
 
-    let mut cursor = LazyScanCursor::new(db.clone(), tx_id, table_id).unwrap();
+    let mut cursor = LazyScanCursor::new(db.clone(), tx_id, table_id, dummy_pager()).unwrap();
 
     // Read first row
     let first_row = cursor.current_row().unwrap().unwrap();
@@ -910,7 +967,7 @@ fn test_bucket_scan_cursor_next_bucket() {
     let table_id = 1;
 
     // Create a bucket size of 1 to force bucket loading for each row
-    let mut cursor = BucketScanCursor::new(db.clone(), tx_id, table_id, 1).unwrap();
+    let mut cursor = BucketScanCursor::new(db.clone(), tx_id, table_id, 1, dummy_pager()).unwrap();
 
     // Get the first row
     assert!(!cursor.is_empty());
@@ -1017,6 +1074,7 @@ fn test_snapshot_isolation_tx_visible1() {
                     row_id: 1,
                 },
                 data: "testme".to_string().into_bytes(),
+                column_count: 1,
             },
         };
         tracing::debug!("Testing visibility of {row_version:?}");

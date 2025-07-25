@@ -229,10 +229,7 @@ impl Database {
         let maybe_shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path.as_str())?;
 
         let mv_store = if enable_mvcc {
-            Some(Rc::new(MvStore::new(
-                mvcc::LocalClock::new(),
-                mvcc::persistent_storage::Storage::new_noop(),
-            )))
+            Some(Rc::new(MvStore::new(mvcc::LocalClock::new())))
         } else {
             None
         };
