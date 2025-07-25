@@ -29,47 +29,47 @@ pub struct DatabaseChange {
 
 impl DatabaseChange {
     /// Converts [DatabaseChange] into the operation which effect will be the application of the change
-    pub fn into_apply(self) -> Result<DatabaseReplayRowChange> {
-        let replay_change = match self.change_type {
-            DatabaseChangeType::Delete => DatabaseReplayRowChangeType::Delete,
-            DatabaseChangeType::Update => DatabaseReplayRowChangeType::Update {
+    pub fn into_apply(self) -> Result<DatabaseTapeRowChange> {
+        let tape_change = match self.change_type {
+            DatabaseChangeType::Delete => DatabaseTapeRowChangeType::Delete,
+            DatabaseChangeType::Update => DatabaseTapeRowChangeType::Update {
                 bin_record: self.after.ok_or_else(|| {
                     Error::ClientError(format!("cdc_mode must be set to either 'full' or 'after'"))
                 })?,
             },
-            DatabaseChangeType::Insert => DatabaseReplayRowChangeType::Insert {
+            DatabaseChangeType::Insert => DatabaseTapeRowChangeType::Insert {
                 bin_record: self.after.ok_or_else(|| {
                     Error::ClientError(format!("cdc_mode must be set to either 'full' or 'after'"))
                 })?,
             },
         };
-        Ok(DatabaseReplayRowChange {
+        Ok(DatabaseTapeRowChange {
             change_id: self.change_id,
             change_time: self.change_time,
-            change: replay_change,
+            change: tape_change,
             table_name: self.table_name,
             id: self.id,
         })
     }
     /// Converts [DatabaseChange] into the operation which effect will be the revert of the change
-    pub fn into_revert(self) -> Result<DatabaseReplayRowChange> {
-        let replay_change = match self.change_type {
-            DatabaseChangeType::Delete => DatabaseReplayRowChangeType::Insert {
+    pub fn into_revert(self) -> Result<DatabaseTapeRowChange> {
+        let tape_change = match self.change_type {
+            DatabaseChangeType::Delete => DatabaseTapeRowChangeType::Insert {
                 bin_record: self.before.ok_or_else(|| {
                     Error::ClientError(format!("cdc_mode must be set to either 'full' or 'before'"))
                 })?,
             },
-            DatabaseChangeType::Update => DatabaseReplayRowChangeType::Update {
+            DatabaseChangeType::Update => DatabaseTapeRowChangeType::Update {
                 bin_record: self.before.ok_or_else(|| {
                     Error::ClientError(format!("cdc_mode must be set to either 'full' or 'before'"))
                 })?,
             },
-            DatabaseChangeType::Insert => DatabaseReplayRowChangeType::Delete,
+            DatabaseChangeType::Insert => DatabaseTapeRowChangeType::Delete,
         };
-        Ok(DatabaseReplayRowChange {
+        Ok(DatabaseTapeRowChange {
             change_id: self.change_id,
             change_time: self.change_time,
-            change: replay_change,
+            change: tape_change,
             table_name: self.table_name,
             id: self.id,
         })
@@ -124,33 +124,33 @@ impl TryFrom<turso::Row> for DatabaseChange {
     }
 }
 
-pub enum DatabaseReplayRowChangeType {
+pub enum DatabaseTapeRowChangeType {
     Delete,
     Update { bin_record: Vec<u8> },
     Insert { bin_record: Vec<u8> },
 }
 
-/// [DatabaseReplayOperation] extends [DatabaseReplayRowChange] by adding information about transaction boundary
+/// [DatabaseTapeOperation] extends [DatabaseTapeRowChange] by adding information about transaction boundary
 ///
-/// This helps [DatabaseReplayContext] to properly maintain transaction state and COMMIT or ROLLBACK changes in appropriate time
-/// by consuming events from [DatabaseChangesIterator]
+/// This helps [crate::database_tape::DatabaseTapeSession] to properly maintain transaction state and COMMIT or ROLLBACK changes in appropriate time
+/// by consuming events from [crate::database_tape::DatabaseChangesIterator]
 #[derive(Debug)]
-pub enum DatabaseReplayOperation {
-    RowChange(DatabaseReplayRowChange),
+pub enum DatabaseTapeOperation {
+    RowChange(DatabaseTapeRowChange),
     Commit,
 }
 
-/// [DatabaseReplayRowChange] is the specific operation over single row which can be performed on database
+/// [DatabaseTapeRowChange] is the specific operation over single row which can be performed on database
 #[derive(Debug)]
-pub struct DatabaseReplayRowChange {
+pub struct DatabaseTapeRowChange {
     pub change_id: i64,
     pub change_time: u64,
-    pub change: DatabaseReplayRowChangeType,
+    pub change: DatabaseTapeRowChangeType,
     pub table_name: String,
     pub id: i64,
 }
 
-impl std::fmt::Debug for DatabaseReplayRowChangeType {
+impl std::fmt::Debug for DatabaseTapeRowChangeType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Delete => write!(f, "Delete"),

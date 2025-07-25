@@ -6,13 +6,14 @@ use std::{
 use crate::{
     errors::Error,
     types::{
-        DatabaseChange, DatabaseReplayOperation, DatabaseReplayRowChange,
-        DatabaseReplayRowChangeType,
+        DatabaseChange, DatabaseTapeOperation, DatabaseTapeRowChange, DatabaseTapeRowChangeType,
     },
     Result,
 };
 
-pub struct DatabaseLocalSync {
+/// Simple wrapper over [turso::Database] which extends its intereface with few methods
+/// to collect changes made to the database and apply/revert arbitrary changes to the database
+pub struct DatabaseTape {
     inner: turso::Database,
     cdc_table: Arc<String>,
     pragma_query: String,
@@ -24,20 +25,20 @@ const DEFAULT_CHANGES_BATCH_SIZE: usize = 100;
 const CDC_PRAGMA_NAME: &str = "unstable_capture_data_changes_conn";
 
 #[derive(Debug)]
-pub struct DatabaseLocalSyncOpts {
+pub struct DatabaseTapeOpts {
     pub cdc_table: Option<String>,
     pub cdc_mode: Option<String>,
 }
 
-impl DatabaseLocalSync {
+impl DatabaseTape {
     pub fn new(database: turso::Database) -> Self {
-        let opts = DatabaseLocalSyncOpts {
+        let opts = DatabaseTapeOpts {
             cdc_table: None,
             cdc_mode: None,
         };
         Self::new_with_opts(database, opts)
     }
-    pub fn new_with_opts(database: turso::Database, opts: DatabaseLocalSyncOpts) -> Self {
+    pub fn new_with_opts(database: turso::Database, opts: DatabaseTapeOpts) -> Self {
         tracing::debug!("create local sync database with options {:?}", opts);
         let cdc_table = opts.cdc_table.unwrap_or(DEFAULT_CDC_TABLE_NAME.to_string());
         let cdc_mode = opts.cdc_mode.unwrap_or(DEFAULT_CDC_MODE.to_string());
@@ -57,7 +58,7 @@ impl DatabaseLocalSync {
             .map_err(Error::TursoError)?;
         Ok(connection)
     }
-    /// Builds an iterator which emits [DatabaseReplayOperation] by extracting data from CDC table
+    /// Builds an iterator which emits [DatabaseTapeOperation] by extracting data from CDC table
     pub async fn iterate_changes(
         &self,
         opts: DatabaseChangesIteratorOpts,
@@ -74,13 +75,8 @@ impl DatabaseLocalSync {
             mode: opts.mode,
         })
     }
-    /// Start replay session which can apply [DatabaseReplayOperation] from [Self::iterate_change_operations]
-    ///
-    /// As replay session can open transaction under the hood, this method consumes Connection in order to avoid potential misuse of the API
-    /// (for example, if [DatabaseReplaySession] will be dropped in the middle of the replay, there will be a problem
-    /// as it needs to execute async ROLLBACK command in order to properly cleanup connection state, but async in Drop
-    /// is not directly possible)
-    pub async fn start_replay_session(&self) -> Result<DatabaseReplaySession> {
+    /// Start replay session which can apply [DatabaseTapeOperation] from [Self::iterate_changes]
+    pub async fn start_tape_session(&self) -> Result<DatabaseReplaySession> {
         tracing::debug!("opening replay session");
         Ok(DatabaseReplaySession {
             conn: self.connect().await?,
@@ -142,13 +138,13 @@ impl Default for DatabaseChangesIteratorOpts {
 pub struct DatabaseChangesIterator {
     query_stmt: turso::Statement,
     first_change_id: Option<i64>,
-    batch: VecDeque<DatabaseReplayRowChange>,
+    batch: VecDeque<DatabaseTapeRowChange>,
     txn_boundary_returned: bool,
     mode: DatabaseChangesIteratorMode,
 }
 
 impl DatabaseChangesIterator {
-    pub async fn next(&mut self) -> Result<Option<DatabaseReplayOperation>> {
+    pub async fn next(&mut self) -> Result<Option<DatabaseTapeOperation>> {
         if self.batch.is_empty() {
             self.refill().await?;
         }
@@ -156,10 +152,10 @@ impl DatabaseChangesIterator {
         // for now, if iterator reach the end of CDC table - we are sure that this is a transaction boundary
         if let Some(change) = self.batch.pop_front() {
             self.txn_boundary_returned = false;
-            Ok(Some(DatabaseReplayOperation::RowChange(change)))
+            Ok(Some(DatabaseTapeOperation::RowChange(change)))
         } else if !self.txn_boundary_returned {
             self.txn_boundary_returned = true;
-            Ok(Some(DatabaseReplayOperation::Commit))
+            Ok(Some(DatabaseTapeOperation::Commit))
         } else {
             Ok(None)
         }
@@ -173,11 +169,11 @@ impl DatabaseChangesIterator {
 
         while let Some(row) = rows.next().await.map_err(Error::TursoError)? {
             let database_change: DatabaseChange = row.try_into()?;
-            let replay_change = match self.mode {
+            let tape_change = match self.mode {
                 DatabaseChangesIteratorMode::Apply => database_change.into_apply()?,
                 DatabaseChangesIteratorMode::Revert => database_change.into_revert()?,
             };
-            self.batch.push_back(replay_change);
+            self.batch.push_back(tape_change);
         }
         let batch_len = self.batch.len();
         if batch_len > 0 {
@@ -195,9 +191,9 @@ pub struct DatabaseReplaySession {
 }
 
 impl DatabaseReplaySession {
-    pub async fn replay_operation(&mut self, replay_event: DatabaseReplayOperation) -> Result<()> {
-        match replay_event {
-            DatabaseReplayOperation::Commit => {
+    pub async fn replay(&mut self, operation: DatabaseTapeOperation) -> Result<()> {
+        match operation {
+            DatabaseTapeOperation::Commit => {
                 tracing::trace!("replay: commit replayed changes after transaction boundary");
                 self.conn
                     .execute("COMMIT", ())
@@ -205,7 +201,7 @@ impl DatabaseReplaySession {
                     .map_err(Error::TursoError)?;
                 self.in_txn = false;
             }
-            DatabaseReplayOperation::RowChange(change) => {
+            DatabaseTapeOperation::RowChange(change) => {
                 if !self.in_txn {
                     tracing::trace!("replay: start txn for replaying changes");
                     self.conn
@@ -217,15 +213,15 @@ impl DatabaseReplaySession {
                 tracing::trace!("replay: change={:?}", change);
                 let table_name = &change.table_name;
                 match change.change {
-                    DatabaseReplayRowChangeType::Delete => {
+                    DatabaseTapeRowChangeType::Delete => {
                         self.replay_delete(table_name, change.id).await?
                     }
-                    DatabaseReplayRowChangeType::Update { bin_record } => {
+                    DatabaseTapeRowChangeType::Update { bin_record } => {
                         self.replay_delete(table_name, change.id).await?;
                         let values = parse_bin_record(bin_record)?;
                         self.replay_insert(table_name, change.id, values).await?;
                     }
-                    DatabaseReplayRowChangeType::Insert { bin_record } => {
+                    DatabaseTapeRowChangeType::Insert { bin_record } => {
                         let values = parse_bin_record(bin_record)?;
                         self.replay_insert(table_name, change.id, values).await?;
                     }
@@ -332,7 +328,7 @@ fn parse_bin_record(bin_record: Vec<u8>) -> Result<Vec<turso::Value>> {
 mod tests {
     use tempfile::NamedTempFile;
 
-    use crate::database_local_sync::DatabaseLocalSync;
+    use crate::database_tape::DatabaseTape;
 
     async fn fetch_rows(conn: &turso::Connection, query: &str) -> Vec<Vec<turso::Value>> {
         let mut rows = vec![];
@@ -356,11 +352,11 @@ mod tests {
         let db_path2 = temp_file2.path().to_str().unwrap();
 
         let db1 = turso::Builder::new_local(db_path1).build().await.unwrap();
-        let db1 = DatabaseLocalSync::new(db1);
+        let db1 = DatabaseTape::new(db1);
         let conn1 = db1.connect().await.unwrap();
 
         let db2 = turso::Builder::new_local(db_path2).build().await.unwrap();
-        let db2 = DatabaseLocalSync::new(db2);
+        let db2 = DatabaseTape::new(db2);
         let conn2 = db2.connect().await.unwrap();
 
         conn1
@@ -395,9 +391,9 @@ mod tests {
 
         let mut iterator = db1.iterate_changes(Default::default()).await.unwrap();
         {
-            let mut replay = db2.start_replay_session().await.unwrap();
+            let mut replay = db2.start_tape_session().await.unwrap();
             while let Some(change) = iterator.next().await.unwrap() {
-                replay.replay_operation(change).await.unwrap();
+                replay.replay(change).await.unwrap();
             }
         }
         assert_eq!(
@@ -435,9 +431,9 @@ mod tests {
             .unwrap();
 
         {
-            let mut replay = db2.start_replay_session().await.unwrap();
+            let mut replay = db2.start_tape_session().await.unwrap();
             while let Some(change) = iterator.next().await.unwrap() {
-                replay.replay_operation(change).await.unwrap();
+                replay.replay(change).await.unwrap();
             }
         }
 
@@ -469,9 +465,9 @@ mod tests {
             .unwrap();
 
         {
-            let mut replay = db2.start_replay_session().await.unwrap();
+            let mut replay = db2.start_tape_session().await.unwrap();
             while let Some(change) = iterator.next().await.unwrap() {
-                replay.replay_operation(change).await.unwrap();
+                replay.replay(change).await.unwrap();
             }
         }
 

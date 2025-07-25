@@ -1,4 +1,4 @@
-pub mod database_local_sync;
+pub mod database_tape;
 pub mod errors;
 pub mod metadata;
 pub mod sync_server;

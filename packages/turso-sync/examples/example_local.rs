@@ -2,16 +2,14 @@ use std::io::{self, Write};
 
 use turso::Builder;
 use turso_sync::{
-    database_local_sync::{
-        DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts, DatabaseLocalSync,
-    },
-    types::DatabaseReplayOperation,
+    database_tape::{DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts, DatabaseTape},
+    types::DatabaseTapeOperation,
 };
 
 #[tokio::main]
 async fn main() {
     let db = Builder::new_local("local.db").build().await.unwrap();
-    let db = DatabaseLocalSync::new(db);
+    let db = DatabaseTape::new(db);
 
     let conn = db.connect().await.unwrap();
 
@@ -45,13 +43,10 @@ async fn main() {
                 })
                 .await
                 .unwrap();
-            let mut session = db.start_replay_session().await.unwrap();
+            let mut session = db.start_tape_session().await.unwrap();
             if let Some(change) = iterator.next().await.unwrap() {
-                session.replay_operation(change).await.unwrap();
-                session
-                    .replay_operation(DatabaseReplayOperation::Commit)
-                    .await
-                    .unwrap();
+                session.replay(change).await.unwrap();
+                session.replay(DatabaseTapeOperation::Commit).await.unwrap();
             }
             continue;
         }
