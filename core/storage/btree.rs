@@ -1,3 +1,4 @@
+use parking_lot::Mutex;
 use tracing::{instrument, Level};
 
 use crate::{
@@ -228,11 +229,20 @@ struct DeleteInfo {
 
 #[derive(Debug, Clone)]
 pub enum OverwriteCellState {
-    /// Fill the cell payload with the new value.
-    FillPayload,
-    /// Clear the overflow pages of the old celland overwrite the cell.
+    /// Allocate a new payload for the cell.
+    AllocatePayload,
+    /// Fill the cell payload with the new payload.
+    FillPayload {
+        /// Dumb double-indirection via Arc because we clone [WriteState] for some reason and we use unsafe in [FillCellPayloadState::AllocateOverflowPages]
+        /// so the underlying Vec must not be cloned in upper layers.
+        new_payload: Arc<Mutex<Vec<u8>>>,
+        rowid: Option<i64>,
+        fill_cell_payload_state: FillCellPayloadState,
+    },
+    /// Clear the old cell's overflow pages and add them to the freelist.
+    /// Overwrite the cell with the new payload.
     ClearOverflowPagesAndOverwrite {
-        new_payload: Vec<u8>,
+        new_payload: Arc<Mutex<Vec<u8>>>,
         old_offset: usize,
         old_local_size: usize,
     },
@@ -256,6 +266,8 @@ enum WriteState {
     Insert {
         page: Arc<BTreePageInner>,
         cell_idx: usize,
+        new_payload: Vec<u8>,
+        fill_cell_payload_state: FillCellPayloadState,
     },
     BalanceStart,
     BalanceFreePages {
@@ -2183,7 +2195,7 @@ impl BTreeCursor {
                                     write_info.state = WriteState::Overwrite {
                                         page: page.clone(),
                                         cell_idx,
-                                        state: OverwriteCellState::FillPayload,
+                                        state: OverwriteCellState::AllocatePayload,
                                     };
                                     continue;
                                 }
@@ -2208,7 +2220,7 @@ impl BTreeCursor {
                                     write_info.state = WriteState::Overwrite {
                                         page: page.clone(),
                                         cell_idx,
-                                        state: OverwriteCellState::FillPayload,
+                                        state: OverwriteCellState::AllocatePayload,
                                     };
                                     continue;
                                 } else {
@@ -2229,20 +2241,27 @@ impl BTreeCursor {
                     write_info.state = WriteState::Insert {
                         page: page.clone(),
                         cell_idx,
+                        new_payload: Vec::with_capacity(record_values.len() + 4),
+                        fill_cell_payload_state: FillCellPayloadState::Start,
                     };
                     continue;
                 }
-                WriteState::Insert { page, cell_idx } => {
-                    let mut cell_payload: Vec<u8> = Vec::with_capacity(record_values.len() + 4);
-                    fill_cell_payload(
+                WriteState::Insert {
+                    page,
+                    cell_idx,
+                    mut new_payload,
+                    mut fill_cell_payload_state,
+                } => {
+                    return_if_io!(fill_cell_payload(
                         page.get().get().contents.as_ref().unwrap(),
                         bkey.maybe_rowid(),
-                        &mut cell_payload,
+                        &mut new_payload,
                         cell_idx,
                         record,
                         self.usable_space(),
                         self.pager.clone(),
-                    );
+                        &mut fill_cell_payload_state,
+                    ));
 
                     {
                         let page = page.get();
@@ -2251,7 +2270,7 @@ impl BTreeCursor {
 
                         insert_into_cell(
                             contents,
-                            cell_payload.as_slice(),
+                            new_payload.as_slice(),
                             cell_idx,
                             self.usable_space() as u16,
                         )?;
@@ -3160,7 +3179,17 @@ impl BTreeCursor {
                         pages_to_balance_new[i].replace(page.clone());
                     } else {
                         // FIXME: handle page cache is full
-                        let page = self.allocate_page(page_type, 0)?;
+                        let mut page = self.allocate_page(page_type, 0)?;
+                        // FIXME: add new state machine state instead of this sync IO hack
+                        while matches!(page, IOResult::IO) {
+                            self.pager.io.run_once()?;
+                            page = self.allocate_page(page_type, 0)?;
+                        }
+                        let IOResult::Done(page) = page else {
+                            return Err(LimboError::InternalError(
+                                "Failed to allocate page".into(),
+                            ));
+                        };
                         pages_to_balance_new[i].replace(page);
                         // Since this page didn't exist before, we can set it to cells length as it
                         // marks them as empty since it is a prefix sum of cells.
@@ -4030,7 +4059,7 @@ impl BTreeCursor {
     /// Balance the root page.
     /// This is done when the root page overflows, and we need to create a new root page.
     /// See e.g. https://en.wikipedia.org/wiki/B-tree
-    fn balance_root(&mut self) -> Result<()> {
+    fn balance_root(&mut self) -> Result<IOResult<()>> {
         /* todo: balance deeper, create child and copy contents of root there. Then split root */
         /* if we are in root page then we just need to create a new root and push key there */
 
@@ -4045,9 +4074,19 @@ impl BTreeCursor {
         let root = root_btree.get();
         let root_contents = root.get_contents();
         // FIXME: handle page cache is full
-        let child_btree =
-            self.pager
-                .do_allocate_page(root_contents.page_type(), 0, BtreePageAllocMode::Any)?;
+        // FIXME: remove sync IO hack
+        let child_btree = loop {
+            match self.pager.do_allocate_page(
+                root_contents.page_type(),
+                0,
+                BtreePageAllocMode::Any,
+            )? {
+                IOResult::IO => {
+                    self.pager.io.run_once()?;
+                }
+                IOResult::Done(page) => break page,
+            }
+        };
 
         tracing::debug!(
             "balance_root(root={}, rightmost={}, page_type={:?})",
@@ -4108,7 +4147,7 @@ impl BTreeCursor {
         self.stack.push(root_btree.clone());
         self.stack.set_cell_index(0); // leave parent pointing at the rightmost pointer (in this case 0, as there are no cells), since we will be balancing the rightmost child page.
         self.stack.push(child_btree.clone());
-        Ok(())
+        Ok(IOResult::Done(()))
     }
 
     fn usable_space(&self) -> usize {
@@ -5157,21 +5196,38 @@ impl BTreeCursor {
                 page_ref.get().get().id
             );
             match state {
-                OverwriteCellState::FillPayload => {
+                OverwriteCellState::AllocatePayload => {
+                    let serial_types_len = self.record_cursor.borrow_mut().len(record);
+                    let new_payload = Vec::with_capacity(serial_types_len);
+                    let rowid = return_if_io!(self.rowid());
+                    *state = OverwriteCellState::FillPayload {
+                        new_payload: Arc::new(Mutex::new(new_payload)),
+                        rowid,
+                        fill_cell_payload_state: FillCellPayloadState::Start,
+                    };
+                    continue;
+                }
+                OverwriteCellState::FillPayload {
+                    new_payload,
+                    rowid,
+                    fill_cell_payload_state,
+                } => {
                     let page = page_ref.get();
                     let page_contents = page.get().contents.as_ref().unwrap();
-                    let serial_types_len = self.record_cursor.borrow_mut().len(record);
-                    let mut new_payload = Vec::with_capacity(serial_types_len);
-                    let rowid = return_if_io!(self.rowid());
-                    fill_cell_payload(
-                        page_contents,
-                        rowid,
-                        &mut new_payload,
-                        cell_idx,
-                        record,
-                        self.usable_space(),
-                        self.pager.clone(),
-                    );
+                    {
+                        let mut new_payload_mut = new_payload.lock();
+                        let new_payload_mut = &mut *new_payload_mut;
+                        return_if_io!(fill_cell_payload(
+                            page_contents,
+                            *rowid,
+                            new_payload_mut,
+                            cell_idx,
+                            record,
+                            self.usable_space(),
+                            self.pager.clone(),
+                            fill_cell_payload_state,
+                        ));
+                    }
                     // figure out old cell offset & size
                     let (old_offset, old_local_size) = {
                         let page_ref = page_ref.get();
@@ -5180,7 +5236,7 @@ impl BTreeCursor {
                     };
 
                     *state = OverwriteCellState::ClearOverflowPagesAndOverwrite {
-                        new_payload,
+                        new_payload: new_payload.clone(),
                         old_offset,
                         old_local_size,
                     };
@@ -5195,6 +5251,9 @@ impl BTreeCursor {
                     let page_contents = page.get().contents.as_ref().unwrap();
                     let cell = page_contents.cell_get(cell_idx, self.usable_space())?;
                     return_if_io!(self.clear_overflow_pages(&cell));
+
+                    let mut new_payload = new_payload.lock();
+                    let new_payload = &mut *new_payload;
                     // if it all fits in local space and old_local_size is enough, do an in-place overwrite
                     if new_payload.len() == *old_local_size {
                         self.overwrite_content(page_ref.clone(), *old_offset, new_payload)?;
@@ -5393,7 +5452,7 @@ impl BTreeCursor {
         btree_read_page(&self.pager, page_idx)
     }
 
-    pub fn allocate_page(&self, page_type: PageType, offset: usize) -> Result<BTreePage> {
+    pub fn allocate_page(&self, page_type: PageType, offset: usize) -> Result<IOResult<BTreePage>> {
         self.pager
             .do_allocate_page(page_type, offset, BtreePageAllocMode::Any)
     }
@@ -6701,8 +6760,26 @@ fn allocate_cell_space(page_ref: &PageContent, amount: u16, usable_space: u16) -
     Ok(top as u16)
 }
 
+#[derive(Debug, Clone)]
+pub enum FillCellPayloadState {
+    Start,
+    AllocateOverflowPages {
+        /// Dumb double-indirection via Arc because we clone [WriteState] for some reason and we use unsafe pointer dereferences in [FillCellPayloadState::AllocateOverflowPages]
+        /// so the underlying Vec must not be cloned in upper layers.
+        record_buf: Arc<Mutex<Vec<u8>>>,
+        space_left: usize,
+        to_copy_buffer_ptr: *const u8,
+        to_copy_buffer_len: usize,
+        pointer: *mut u8,
+        pointer_to_next: *mut u8,
+    },
+}
+
 /// Fill in the cell payload with the record.
 /// If the record is too large to fit in the cell, it will spill onto overflow pages.
+/// This function needs a separate [FillCellPayloadState] because allocating overflow pages
+/// may require I/O.
+#[allow(clippy::too_many_arguments)]
 fn fill_cell_payload(
     page_contents: &PageContent,
     int_key: Option<i64>,
@@ -6711,87 +6788,142 @@ fn fill_cell_payload(
     record: &ImmutableRecord,
     usable_space: usize,
     pager: Rc<Pager>,
-) {
-    // TODO: make record raw from start, having to serialize is not good
-    let record_buf = record.get_payload().to_vec();
-
-    let page_type = page_contents.page_type();
-    // fill in header
-    if matches!(page_type, PageType::IndexInterior) {
-        // if a write happened on an index interior page, it is always an overwrite.
-        // we must copy the left child pointer of the replaced cell to the new cell.
-        let left_child_page = page_contents.cell_interior_read_left_child_page(cell_idx);
-        cell_payload.extend_from_slice(&left_child_page.to_be_bytes());
-    }
-    if matches!(page_type, PageType::TableLeaf) {
-        let int_key = int_key.unwrap();
-        write_varint_to_vec(record_buf.len() as u64, cell_payload);
-        write_varint_to_vec(int_key as u64, cell_payload);
-    } else {
-        write_varint_to_vec(record_buf.len() as u64, cell_payload);
-    }
-
-    let payload_overflow_threshold_max = payload_overflow_threshold_max(page_type, usable_space);
-    tracing::debug!(
-        "fill_cell_payload(record_size={}, payload_overflow_threshold_max={})",
-        record_buf.len(),
-        payload_overflow_threshold_max
-    );
-    if record_buf.len() <= payload_overflow_threshold_max {
-        // enough allowed space to fit inside a btree page
-        cell_payload.extend_from_slice(record_buf.as_slice());
-        return;
-    }
-
-    let payload_overflow_threshold_min = payload_overflow_threshold_min(page_type, usable_space);
-    // see e.g. https://github.com/sqlite/sqlite/blob/9591d3fe93936533c8c3b0dc4d025ac999539e11/src/dbstat.c#L371
-    let mut space_left = payload_overflow_threshold_min
-        + (record_buf.len() - payload_overflow_threshold_min) % (usable_space - 4);
-
-    if space_left > payload_overflow_threshold_max {
-        space_left = payload_overflow_threshold_min;
-    }
-
-    // cell_size must be equal to first value of space_left as this will be the bytes copied to non-overflow page.
-    let cell_size = space_left + cell_payload.len() + 4; // 4 is the number of bytes of pointer to first overflow page
-    let mut to_copy_buffer = record_buf.as_slice();
-
-    let prev_size = cell_payload.len();
-    cell_payload.resize(prev_size + space_left + 4, 0);
-    let mut pointer = unsafe { cell_payload.as_mut_ptr().add(prev_size) };
-    let mut pointer_to_next = unsafe { cell_payload.as_mut_ptr().add(prev_size + space_left) };
-
+    state: &mut FillCellPayloadState,
+) -> Result<IOResult<()>> {
     loop {
-        let to_copy = space_left.min(to_copy_buffer.len());
-        unsafe { std::ptr::copy(to_copy_buffer.as_ptr(), pointer, to_copy) };
+        match state {
+            FillCellPayloadState::Start => {
+                // TODO: make record raw from start, having to serialize is not good
+                let record_buf = record.get_payload().to_vec();
 
-        let left = to_copy_buffer.len() - to_copy;
-        if left == 0 {
-            break;
+                let page_type = page_contents.page_type();
+                // fill in header
+                if matches!(page_type, PageType::IndexInterior) {
+                    // if a write happened on an index interior page, it is always an overwrite.
+                    // we must copy the left child pointer of the replaced cell to the new cell.
+                    let left_child_page =
+                        page_contents.cell_interior_read_left_child_page(cell_idx);
+                    cell_payload.extend_from_slice(&left_child_page.to_be_bytes());
+                }
+                if matches!(page_type, PageType::TableLeaf) {
+                    let int_key = int_key.unwrap();
+                    write_varint_to_vec(record_buf.len() as u64, cell_payload);
+                    write_varint_to_vec(int_key as u64, cell_payload);
+                } else {
+                    write_varint_to_vec(record_buf.len() as u64, cell_payload);
+                }
+
+                let payload_overflow_threshold_max =
+                    payload_overflow_threshold_max(page_type, usable_space);
+                tracing::debug!(
+                    "fill_cell_payload(record_size={}, payload_overflow_threshold_max={})",
+                    record_buf.len(),
+                    payload_overflow_threshold_max
+                );
+                if record_buf.len() <= payload_overflow_threshold_max {
+                    // enough allowed space to fit inside a btree page
+                    cell_payload.extend_from_slice(record_buf.as_slice());
+                    return Ok(IOResult::Done(()));
+                }
+
+                let payload_overflow_threshold_min =
+                    payload_overflow_threshold_min(page_type, usable_space);
+                // see e.g. https://github.com/sqlite/sqlite/blob/9591d3fe93936533c8c3b0dc4d025ac999539e11/src/dbstat.c#L371
+                let mut space_left = payload_overflow_threshold_min
+                    + (record_buf.len() - payload_overflow_threshold_min) % (usable_space - 4);
+
+                if space_left > payload_overflow_threshold_max {
+                    space_left = payload_overflow_threshold_min;
+                }
+
+                // cell_size must be equal to first value of space_left as this will be the bytes copied to non-overflow page.
+                let cell_size = space_left + cell_payload.len() + 4; // 4 is the number of bytes of pointer to first overflow page
+                let to_copy_buffer = record_buf.as_slice();
+
+                let prev_size = cell_payload.len();
+                cell_payload.resize(prev_size + space_left + 4, 0);
+                assert_eq!(
+                    cell_size,
+                    cell_payload.len(),
+                    "cell_size={} != cell_payload.len()={}",
+                    cell_size,
+                    cell_payload.len()
+                );
+
+                let pointer = unsafe { cell_payload.as_mut_ptr().add(prev_size) };
+                let pointer_to_next =
+                    unsafe { cell_payload.as_mut_ptr().add(prev_size + space_left) };
+
+                let to_copy_buffer_ptr = to_copy_buffer.as_ptr();
+                let to_copy_buffer_len = to_copy_buffer.len();
+
+                *state = FillCellPayloadState::AllocateOverflowPages {
+                    record_buf: Arc::new(Mutex::new(record_buf)),
+                    space_left,
+                    to_copy_buffer_ptr,
+                    to_copy_buffer_len,
+                    pointer,
+                    pointer_to_next,
+                };
+                continue;
+            }
+            FillCellPayloadState::AllocateOverflowPages {
+                record_buf: _record_buf,
+                space_left,
+                to_copy_buffer_ptr,
+                to_copy_buffer_len,
+                pointer,
+                pointer_to_next,
+            } => {
+                let to_copy;
+                {
+                    let to_copy_buffer_ptr = *to_copy_buffer_ptr;
+                    let to_copy_buffer_len = *to_copy_buffer_len;
+                    let pointer = *pointer;
+                    let space_left = *space_left;
+
+                    // SAFETY: we know to_copy_buffer_ptr is valid because it refers to record_buf which lives at least as long as this function.
+                    let to_copy_buffer = unsafe {
+                        std::slice::from_raw_parts(to_copy_buffer_ptr, to_copy_buffer_len)
+                    };
+                    to_copy = space_left.min(to_copy_buffer_len);
+                    // SAFETY: we know 'pointer' is valid because it refers to cell_payload which lives at least as long as this function.
+                    unsafe { std::ptr::copy(to_copy_buffer_ptr, pointer, to_copy) };
+
+                    let left = to_copy_buffer.len() - to_copy;
+                    if left == 0 {
+                        break;
+                    }
+                }
+
+                // we still have bytes to add, we will need to allocate new overflow page
+                // FIXME: handle page cache is full
+                let overflow_page = return_if_io!(pager.allocate_overflow_page());
+                turso_assert!(overflow_page.is_loaded(), "overflow page is not loaded");
+                {
+                    let id = overflow_page.get().id as u32;
+                    let contents = overflow_page.get_contents();
+
+                    // TODO: take into account offset here?
+                    let buf = contents.as_ptr();
+                    let as_bytes = id.to_be_bytes();
+                    // update pointer to new overflow page
+                    // SAFETY: we know 'pointer_to_next' is valid because it refers to an offset in cell_payload which is less than space_left + 4.
+                    unsafe { std::ptr::copy(as_bytes.as_ptr(), *pointer_to_next, 4) };
+
+                    *pointer = unsafe { buf.as_mut_ptr().add(4) };
+                    *pointer_to_next = buf.as_mut_ptr();
+                    *space_left = usable_space - 4;
+                }
+
+                *to_copy_buffer_len -= to_copy;
+                // SAFETY: we know 'to_copy_buffer_ptr' is valid because it refers to record_buf which lives at least as long as this function,
+                // and that the offset is less than its length.
+                *to_copy_buffer_ptr = unsafe { to_copy_buffer_ptr.add(to_copy) };
+            }
         }
-
-        // we still have bytes to add, we will need to allocate new overflow page
-        // FIXME: handle page cache is full
-        let overflow_page = pager.allocate_overflow_page();
-        {
-            let id = overflow_page.get().id as u32;
-            let contents = overflow_page.get().contents.as_mut().unwrap();
-
-            // TODO: take into account offset here?
-            let buf = contents.as_ptr();
-            let as_bytes = id.to_be_bytes();
-            // update pointer to new overflow page
-            unsafe { std::ptr::copy(as_bytes.as_ptr(), pointer_to_next, 4) };
-
-            pointer = unsafe { buf.as_mut_ptr().add(4) };
-            pointer_to_next = buf.as_mut_ptr();
-            space_left = usable_space - 4;
-        }
-
-        to_copy_buffer = &to_copy_buffer[to_copy..];
     }
-
-    assert_eq!(cell_size, cell_payload.len());
+    Ok(IOResult::Done(()))
 }
 
 /// Returns the maximum payload size (X) that can be stored directly on a b-tree page without spilling to overflow pages.
@@ -6960,15 +7092,23 @@ mod tests {
         conn: &Arc<Connection>,
     ) -> Vec<u8> {
         let mut payload: Vec<u8> = Vec::new();
-        fill_cell_payload(
-            page,
-            Some(id as i64),
-            &mut payload,
-            pos,
-            &record,
-            4096,
-            conn.pager.borrow().clone(),
-        );
+        let mut fill_cell_payload_state = FillCellPayloadState::Start;
+        run_until_done(
+            || {
+                fill_cell_payload(
+                    page,
+                    Some(id as i64),
+                    &mut payload,
+                    pos,
+                    &record,
+                    4096,
+                    conn.pager.borrow().clone(),
+                    &mut fill_cell_payload_state,
+                )
+            },
+            &conn.pager.borrow().clone(),
+        )
+        .unwrap();
         insert_into_cell(page, &payload, pos, 4096).unwrap();
         payload
     }
@@ -7209,7 +7349,7 @@ mod tests {
 
         // FIXME: handle page cache is full
         let _ = run_until_done(|| pager.allocate_page1(), &pager);
-        let page2 = pager.allocate_page().unwrap();
+        let page2 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
         let page2 = Arc::new(BTreePageInner {
             page: RefCell::new(page2),
         });
@@ -8320,11 +8460,20 @@ mod tests {
         let mut cursor = BTreeCursor::new_table(None, pager.clone(), 2, num_columns);
 
         // Initialize page 2 as a root page (interior)
-        let root_page = cursor.allocate_page(PageType::TableInterior, 0)?;
+        let root_page = run_until_done(
+            || cursor.allocate_page(PageType::TableInterior, 0),
+            &cursor.pager,
+        )?;
 
         // Allocate two leaf pages
-        let page3 = cursor.allocate_page(PageType::TableLeaf, 0)?;
-        let page4 = cursor.allocate_page(PageType::TableLeaf, 0)?;
+        let page3 = run_until_done(
+            || cursor.allocate_page(PageType::TableLeaf, 0),
+            &cursor.pager,
+        )?;
+        let page4 = run_until_done(
+            || cursor.allocate_page(PageType::TableLeaf, 0),
+            &cursor.pager,
+        )?;
 
         // Configure the root page to point to the two leaf pages
         {
@@ -8502,15 +8651,23 @@ mod tests {
                     let regs = &[Register::Value(Value::Integer(i as i64))];
                     let record = ImmutableRecord::from_registers(regs, regs.len());
                     let mut payload: Vec<u8> = Vec::new();
-                    fill_cell_payload(
-                        page,
-                        Some(i as i64),
-                        &mut payload,
-                        cell_idx,
-                        &record,
-                        4096,
-                        conn.pager.borrow().clone(),
-                    );
+                    let mut fill_cell_payload_state = FillCellPayloadState::Start;
+                    run_until_done(
+                        || {
+                            fill_cell_payload(
+                                page,
+                                Some(i as i64),
+                                &mut payload,
+                                cell_idx,
+                                &record,
+                                4096,
+                                conn.pager.borrow().clone(),
+                                &mut fill_cell_payload_state,
+                            )
+                        },
+                        &conn.pager.borrow().clone(),
+                    )
+                    .unwrap();
                     if (free as usize) < payload.len() + 2 {
                         // do not try to insert overflow pages because they require balancing
                         continue;
@@ -8576,15 +8733,23 @@ mod tests {
                         let regs = &[Register::Value(Value::Integer(i))];
                         let record = ImmutableRecord::from_registers(regs, regs.len());
                         let mut payload: Vec<u8> = Vec::new();
-                        fill_cell_payload(
-                            page,
-                            Some(i),
-                            &mut payload,
-                            cell_idx,
-                            &record,
-                            4096,
-                            conn.pager.borrow().clone(),
-                        );
+                        let mut fill_cell_payload_state = FillCellPayloadState::Start;
+                        run_until_done(
+                            || {
+                                fill_cell_payload(
+                                    page,
+                                    Some(i),
+                                    &mut payload,
+                                    cell_idx,
+                                    &record,
+                                    4096,
+                                    conn.pager.borrow().clone(),
+                                    &mut fill_cell_payload_state,
+                                )
+                            },
+                            &conn.pager.borrow().clone(),
+                        )
+                        .unwrap();
                         if (free as usize) < payload.len() - 2 {
                             // do not try to insert overflow pages because they require balancing
                             continue;
@@ -8941,15 +9106,23 @@ mod tests {
         let regs = &[Register::Value(Value::Integer(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
         let mut payload: Vec<u8> = Vec::new();
-        fill_cell_payload(
-            page.get().get_contents(),
-            Some(0),
-            &mut payload,
-            0,
-            &record,
-            4096,
-            conn.pager.borrow().clone(),
-        );
+        let mut fill_cell_payload_state = FillCellPayloadState::Start;
+        run_until_done(
+            || {
+                fill_cell_payload(
+                    page.get().get_contents(),
+                    Some(0),
+                    &mut payload,
+                    0,
+                    &record,
+                    4096,
+                    conn.pager.borrow().clone(),
+                    &mut fill_cell_payload_state,
+                )
+            },
+            &conn.pager.borrow().clone(),
+        )
+        .unwrap();
         let page = page.get();
         insert(0, page.get_contents());
         defragment(page.get_contents());
@@ -9019,15 +9192,23 @@ mod tests {
         let regs = &[Register::Value(Value::Blob(vec![0; 3600]))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
         let mut payload: Vec<u8> = Vec::new();
-        fill_cell_payload(
-            page.get().get_contents(),
-            Some(0),
-            &mut payload,
-            0,
-            &record,
-            4096,
-            conn.pager.borrow().clone(),
-        );
+        let mut fill_cell_payload_state = FillCellPayloadState::Start;
+        run_until_done(
+            || {
+                fill_cell_payload(
+                    page.get().get_contents(),
+                    Some(0),
+                    &mut payload,
+                    0,
+                    &record,
+                    4096,
+                    conn.pager.borrow().clone(),
+                    &mut fill_cell_payload_state,
+                )
+            },
+            &conn.pager.borrow().clone(),
+        )
+        .unwrap();
         insert_into_cell(page.get().get_contents(), &payload, 0, 4096).unwrap();
         let free = compute_free_space(page.get().get_contents(), usable_space);
         let total_size = payload.len() + 2;
@@ -9355,7 +9536,7 @@ mod tests {
             let mut cells_cloned = Vec::new();
             let (pager, _, _, _) = empty_btree();
             let page_type = PageType::TableLeaf;
-            let page = pager.allocate_page().unwrap();
+            let page = run_until_done(|| pager.allocate_page(), &pager).unwrap();
             let page = Arc::new(BTreePageInner {
                 page: RefCell::new(page),
             });
@@ -9427,15 +9608,23 @@ mod tests {
         let mut payload = Vec::new();
         let regs = &[Register::Value(Value::Blob(vec![0; size as usize]))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
-        fill_cell_payload(
-            contents,
-            Some(cell_idx as i64),
-            &mut payload,
-            cell_idx as usize,
-            &record,
-            pager.usable_space(),
-            pager.clone(),
-        );
+        let mut fill_cell_payload_state = FillCellPayloadState::Start;
+        run_until_done(
+            || {
+                fill_cell_payload(
+                    contents,
+                    Some(cell_idx as i64),
+                    &mut payload,
+                    cell_idx as usize,
+                    &record,
+                    pager.usable_space(),
+                    pager.clone(),
+                    &mut fill_cell_payload_state,
+                )
+            },
+            &pager,
+        )
+        .unwrap();
         insert_into_cell(
             contents,
             &payload,

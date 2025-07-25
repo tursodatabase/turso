@@ -221,6 +221,10 @@ enum CheckpointState {
 }
 
 /// The mode of allocating a btree page.
+/// SQLite defines the following:
+/// #define BTALLOC_ANY   0           /* Allocate any page */
+/// #define BTALLOC_EXACT 1           /* Allocate exact page if possible */
+/// #define BTALLOC_LE    2           /* Allocate any page <= the parameter */
 pub enum BtreePageAllocMode {
     /// Allocate any btree page
     Any,
@@ -335,6 +339,9 @@ pub struct Pager {
     pub db_state: Arc<AtomicDbState>,
     /// Mutex for synchronizing database initialization to prevent race conditions
     init_lock: Arc<Mutex<()>>,
+    /// The state of the current allocate page operation.
+    allocate_page_state: RefCell<AllocatePageState>,
+    /// The state of the current allocate page1 operation.
     allocate_page1_state: RefCell<AllocatePage1State>,
     /// Cache page_size and reserved_space at Pager init and reuse for subsequent
     /// `usable_space` calls. TODO: Invalidate reserved_space when we add the functionality
@@ -353,6 +360,34 @@ pub enum PagerCommitResult {
     /// The database file was then also fsynced.
     Checkpointed(CheckpointResult),
     Rollback,
+}
+
+#[derive(Debug, Clone)]
+enum AllocatePageState {
+    Start,
+    /// Load the first freelist trunk page into memory.
+    LoadFreelistTrunkPage {
+        current_trunk: u32,
+        current_db_size: u32,
+    },
+    /// Search the trunk page for an available free list leaf.
+    /// If none are found, there are two options:
+    /// - If there are no more trunk pages, the freelist is empty, so allocate a new page.
+    /// - If there are more trunk pages, use the current first trunk page as the new allocation,
+    ///   and set the next trunk page as the database's "first freelist trunk page".
+    SearchAvailableFreeListLeaf {
+        trunk_page: PageRef,
+        current_db_size: u32,
+    },
+    /// If a freelist leaf is found, reuse it for the page allocation and remove it from the trunk page.
+    ReuseFreelistLeaf {
+        trunk_page: PageRef,
+        number_of_freelist_leaves: u32,
+    },
+    /// If a suitable freelist leaf is not found, allocate an entirely new page.
+    AllocateNewPage {
+        current_db_size: u32,
+    },
 }
 
 #[derive(Clone)]
@@ -421,6 +456,7 @@ impl Pager {
                 dirty_pages: Vec::new(),
             }),
             free_page_state: RefCell::new(FreePageState::Start),
+            allocate_page_state: RefCell::new(AllocatePageState::Start),
         })
     }
 
@@ -612,9 +648,8 @@ impl Pager {
         };
         #[cfg(feature = "omit_autovacuum")]
         {
-            let page = self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any)?;
-            let page_id = page.get().get().id;
-            Ok(IOResult::Done(page_id as u32))
+            let page = return_if_io!(self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any));
+            Ok(IOResult::Done(page.get().get().id as u32))
         }
 
         //  If autovacuum is enabled, we need to allocate a new page number that is greater than the largest root page number
@@ -623,9 +658,9 @@ impl Pager {
             let auto_vacuum_mode = self.auto_vacuum_mode.borrow();
             match *auto_vacuum_mode {
                 AutoVacuumMode::None => {
-                    let page = self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any)?;
-                    let page_id = page.get().get().id;
-                    Ok(IOResult::Done(page_id as u32))
+                    let page =
+                        return_if_io!(self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any));
+                    Ok(IOResult::Done(page.get().get().id as u32))
                 }
                 AutoVacuumMode::Full => {
                     let mut root_page_num =
@@ -648,11 +683,11 @@ impl Pager {
                     assert!(root_page_num >= 3); //  the very first root page is page 3
 
                     //  root_page_num here is the desired root page
-                    let page = self.do_allocate_page(
+                    let page = return_if_io!(self.do_allocate_page(
                         page_type,
                         0,
                         BtreePageAllocMode::Exact(root_page_num),
-                    )?;
+                    ));
                     let allocated_page_id = page.get().get().id as u32;
                     if allocated_page_id != root_page_num {
                         //  TODO(Zaid): Handle swapping the allocated page with the desired root page
@@ -676,8 +711,8 @@ impl Pager {
     /// Allocate a new overflow page.
     /// This is done when a cell overflows and new space is needed.
     // FIXME: handle no room in page cache
-    pub fn allocate_overflow_page(&self) -> PageRef {
-        let page = self.allocate_page().unwrap();
+    pub fn allocate_overflow_page(&self) -> Result<IOResult<PageRef>> {
+        let page = return_if_io!(self.allocate_page());
         tracing::debug!("Pager::allocate_overflow_page(id={})", page.get().id);
 
         // setup overflow page
@@ -685,7 +720,7 @@ impl Pager {
         let buf = contents.as_ptr();
         buf.fill(0);
 
-        page
+        Ok(IOResult::Done(page))
     }
 
     /// Allocate a new page to the btree via the pager.
@@ -696,8 +731,8 @@ impl Pager {
         page_type: PageType,
         offset: usize,
         _alloc_mode: BtreePageAllocMode,
-    ) -> Result<BTreePage> {
-        let page = self.allocate_page()?;
+    ) -> Result<IOResult<BTreePage>> {
+        let page = return_if_io!(self.allocate_page());
         let page = Arc::new(BTreePageInner {
             page: RefCell::new(page),
         });
@@ -707,7 +742,7 @@ impl Pager {
             page.get().get().id,
             page.get().get_contents().page_type()
         );
-        Ok(page)
+        Ok(IOResult::Done(page))
     }
 
     /// The "usable size" of a database page is the page size specified by the 2-byte integer at offset 16
@@ -1412,7 +1447,7 @@ impl Pager {
                 if let Some(size) = self.page_size.get() {
                     default_header.update_page_size(size);
                 }
-                let page = allocate_page(1, &self.buffer_pool, 0);
+                let page = allocate_new_page(1, &self.buffer_pool, 0);
 
                 let contents = page.get_contents();
                 contents.write_database_header(&default_header);
@@ -1470,63 +1505,249 @@ impl Pager {
         )
     }
 
-    /*
-        Gets a new page that increasing the size of the page or uses a free page.
-        Currently free list pages are not yet supported.
-    */
-    // FIXME: handle no room in page cache
+    /// Tries to reuse a page from the freelist if available.
+    /// If not, allocates a new page which increases the database size.
+    ///
+    /// FIXME: implement sqlite's 'nearby' parameter and use AllocMode.
+    ///        SQLite's allocate_page() equivalent has a parameter 'nearby' which is a hint about the page number we want to have for the allocated page.
+    ///        We should use this parameter to allocate the page in the same way as SQLite does; instead now we just either take the first available freelist page
+    ///        or allocate a new page.
+    /// FIXME: handle no room in page cache
     #[allow(clippy::readonly_write_lock)]
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn allocate_page(&self) -> Result<PageRef> {
-        let old_db_size = header_accessor::get_database_size(self)?;
-        #[allow(unused_mut)]
-        let mut new_db_size = old_db_size + 1;
+    pub fn allocate_page(&self) -> Result<IOResult<PageRef>> {
+        const FREELIST_TRUNK_OFFSET_NEXT_TRUNK: usize = 0;
+        const FREELIST_TRUNK_OFFSET_LEAF_COUNT: usize = 4;
+        const FREELIST_TRUNK_OFFSET_FIRST_LEAF: usize = 8;
 
-        tracing::debug!("allocate_page(database_size={})", new_db_size);
+        loop {
+            let mut state = self.allocate_page_state.borrow_mut();
+            tracing::debug!("allocate_page(state={:?})", state);
+            match &mut *state {
+                AllocatePageState::Start => {
+                    let old_db_size = header_accessor::get_database_size(self)?;
+                    #[cfg(not(feature = "omit_autovacuum"))]
+                    let mut new_db_size = old_db_size;
+                    #[cfg(feature = "omit_autovacuum")]
+                    let new_db_size = old_db_size;
 
-        #[cfg(not(feature = "omit_autovacuum"))]
-        {
-            //  If the following conditions are met, allocate a pointer map page, add to cache and increment the database size
-            //  - autovacuum is enabled
-            //  - the last page is a pointer map page
-            if matches!(*self.auto_vacuum_mode.borrow(), AutoVacuumMode::Full)
-                && is_ptrmap_page(new_db_size, header_accessor::get_page_size(self)? as usize)
-            {
-                let page = allocate_page(new_db_size as usize, &self.buffer_pool, 0);
-                self.add_dirty(&page);
+                    tracing::debug!("allocate_page(database_size={})", new_db_size);
+                    #[cfg(not(feature = "omit_autovacuum"))]
+                    {
+                        //  If the following conditions are met, allocate a pointer map page, add to cache and increment the database size
+                        //  - autovacuum is enabled
+                        //  - the last page is a pointer map page
+                        if matches!(*self.auto_vacuum_mode.borrow(), AutoVacuumMode::Full)
+                            && is_ptrmap_page(
+                                new_db_size + 1,
+                                header_accessor::get_page_size(self)? as usize,
+                            )
+                        {
+                            // we will allocate a ptrmap page, so increment size
+                            new_db_size += 1;
+                            let page =
+                                allocate_new_page(new_db_size as usize, &self.buffer_pool, 0);
+                            self.add_dirty(&page);
+                            let page_key = PageCacheKey::new(page.get().id);
+                            let mut cache = self.page_cache.write();
+                            match cache.insert(page_key, page.clone()) {
+                                Ok(_) => (),
+                                Err(CacheError::Full) => return Err(LimboError::CacheFull),
+                                Err(_) => {
+                                    return Err(LimboError::InternalError(
+                                        "Unknown error inserting page to cache".into(),
+                                    ))
+                                }
+                            }
+                        }
+                    }
 
-                let page_key = PageCacheKey::new(page.get().id);
-                let mut cache = self.page_cache.write();
-                match cache.insert(page_key, page.clone()) {
-                    Ok(_) => (),
-                    Err(CacheError::Full) => return Err(LimboError::CacheFull),
-                    Err(_) => {
-                        return Err(LimboError::InternalError(
-                            "Unknown error inserting page to cache".into(),
-                        ))
+                    let first_freelist_trunk_page_id =
+                        header_accessor::get_freelist_trunk_page(self)?;
+                    if first_freelist_trunk_page_id == 0 {
+                        *state = AllocatePageState::AllocateNewPage {
+                            current_db_size: new_db_size,
+                        };
+                        continue;
+                    }
+                    *state = AllocatePageState::LoadFreelistTrunkPage {
+                        current_trunk: first_freelist_trunk_page_id,
+                        current_db_size: new_db_size,
+                    };
+                    continue;
+                }
+                AllocatePageState::LoadFreelistTrunkPage {
+                    current_trunk,
+                    current_db_size,
+                } => {
+                    let page = self.read_page(*current_trunk as usize)?;
+                    if page.is_locked() {
+                        return Ok(IOResult::IO);
+                    }
+                    *state = AllocatePageState::SearchAvailableFreeListLeaf {
+                        trunk_page: page,
+                        current_db_size: *current_db_size,
+                    };
+                    continue;
+                }
+                AllocatePageState::SearchAvailableFreeListLeaf {
+                    trunk_page,
+                    current_db_size,
+                } => {
+                    turso_assert!(
+                        trunk_page.is_loaded(),
+                        "Freelist trunk page {} is not loaded",
+                        trunk_page.get().id
+                    );
+                    let page_contents = trunk_page.get().contents.as_ref().unwrap();
+                    let next_trunk_page_id =
+                        page_contents.read_u32(FREELIST_TRUNK_OFFSET_NEXT_TRUNK);
+                    let number_of_freelist_leaves =
+                        page_contents.read_u32(FREELIST_TRUNK_OFFSET_LEAF_COUNT);
+
+                    // There are leaf pointers on this trunk page, so we can reuse one of the pages
+                    // for the allocation.
+                    if number_of_freelist_leaves != 0 {
+                        *state = AllocatePageState::ReuseFreelistLeaf {
+                            trunk_page: trunk_page.clone(),
+                            number_of_freelist_leaves,
+                        };
+                        continue;
+                    }
+
+                    // No freelist leaves on this trunk page.
+                    // If the freelist is completely empty, allocate a new page.
+                    if next_trunk_page_id == 0 {
+                        *state = AllocatePageState::AllocateNewPage {
+                            current_db_size: *current_db_size,
+                        };
+                        continue;
+                    }
+
+                    // Freelist is not empty, so we can reuse the trunk itself as a new page
+                    // and update the database's first freelist trunk page to the next trunk page.
+                    header_accessor::set_freelist_trunk_page(self, next_trunk_page_id)?;
+                    header_accessor::set_freelist_pages(
+                        self,
+                        header_accessor::get_freelist_pages(self)? - 1,
+                    )?;
+                    self.add_dirty(trunk_page);
+                    // zero out the page
+                    turso_assert!(
+                        trunk_page.get_contents().overflow_cells.is_empty(),
+                        "Freelist leaf page {} has overflow cells",
+                        trunk_page.get().id
+                    );
+                    trunk_page.get().contents.as_ref().unwrap().as_ptr().fill(0);
+                    let page_key = PageCacheKey::new(trunk_page.get().id);
+                    {
+                        let mut page_cache = self.page_cache.write();
+                        turso_assert!(
+                            page_cache.contains_key(&page_key),
+                            "page {} is not in cache",
+                            trunk_page.get().id
+                        );
+                    }
+                    let trunk_page = trunk_page.clone();
+                    *state = AllocatePageState::Start;
+                    return Ok(IOResult::Done(trunk_page));
+                }
+                AllocatePageState::ReuseFreelistLeaf {
+                    trunk_page,
+                    number_of_freelist_leaves,
+                } => {
+                    turso_assert!(
+                        trunk_page.is_loaded(),
+                        "Freelist trunk page {} is not loaded",
+                        trunk_page.get().id
+                    );
+                    turso_assert!(
+                        *number_of_freelist_leaves > 0,
+                        "Freelist trunk page {} has no leaves",
+                        trunk_page.get().id
+                    );
+                    let page_contents = trunk_page.get().contents.as_ref().unwrap();
+                    let next_leaf_page_id =
+                        page_contents.read_u32(FREELIST_TRUNK_OFFSET_FIRST_LEAF);
+                    let leaf_page = self.read_page(next_leaf_page_id as usize)?;
+                    if leaf_page.is_locked() {
+                        return Ok(IOResult::IO);
+                    }
+                    self.add_dirty(&leaf_page);
+                    // zero out the page
+                    turso_assert!(
+                        leaf_page.get_contents().overflow_cells.is_empty(),
+                        "Freelist leaf page {} has overflow cells",
+                        leaf_page.get().id
+                    );
+                    leaf_page.get().contents.as_ref().unwrap().as_ptr().fill(0);
+                    let page_key = PageCacheKey::new(leaf_page.get().id);
+                    {
+                        let mut page_cache = self.page_cache.write();
+                        turso_assert!(
+                            page_cache.contains_key(&page_key),
+                            "page {} is not in cache",
+                            leaf_page.get().id
+                        );
+                    }
+
+                    // Shift left all the other leaf pages in the trunk page and subtract 1 from the leaf count
+                    let remaining_leaves_count = (*number_of_freelist_leaves - 1) as usize;
+                    {
+                        let buf = page_contents.as_ptr();
+                        // use copy within the same page
+                        const LEAF_PTR_SIZE_BYTES: usize = 4;
+                        let offset_remaining_leaves_start =
+                            FREELIST_TRUNK_OFFSET_FIRST_LEAF + LEAF_PTR_SIZE_BYTES;
+                        let offset_remaining_leaves_end = offset_remaining_leaves_start
+                            + remaining_leaves_count * LEAF_PTR_SIZE_BYTES;
+                        buf.copy_within(
+                            offset_remaining_leaves_start..offset_remaining_leaves_end,
+                            FREELIST_TRUNK_OFFSET_FIRST_LEAF,
+                        );
+                    }
+                    // write the new leaf count
+                    page_contents.write_u32(
+                        FREELIST_TRUNK_OFFSET_LEAF_COUNT,
+                        remaining_leaves_count as u32,
+                    );
+                    self.add_dirty(trunk_page);
+
+                    header_accessor::set_freelist_pages(
+                        self,
+                        header_accessor::get_freelist_pages(self)? - 1,
+                    )?;
+
+                    *state = AllocatePageState::Start;
+                    return Ok(IOResult::Done(leaf_page));
+                }
+                AllocatePageState::AllocateNewPage { current_db_size } => {
+                    let new_db_size = *current_db_size + 1;
+                    // FIXME: should reserve page cache entry before modifying the database
+                    let page = allocate_new_page(new_db_size as usize, &self.buffer_pool, 0);
+                    {
+                        // setup page and add to cache
+                        self.add_dirty(&page);
+
+                        let page_key = PageCacheKey::new(page.get().id);
+                        {
+                            // Run in separate block to avoid deadlock on page cache write lock
+                            let mut cache = self.page_cache.write();
+                            match cache.insert(page_key, page.clone()) {
+                                Err(CacheError::Full) => return Err(LimboError::CacheFull),
+                                Err(_) => {
+                                    return Err(LimboError::InternalError(
+                                        "Unknown error inserting page to cache".into(),
+                                    ))
+                                }
+                                Ok(_) => {}
+                            };
+                        }
+                        header_accessor::set_database_size(self, new_db_size)?;
+                        *state = AllocatePageState::Start;
+                        return Ok(IOResult::Done(page));
                     }
                 }
-                // we allocated a ptrmap page, so the next data page will be at new_db_size + 1
-                new_db_size += 1;
-            }
-        }
-
-        header_accessor::set_database_size(self, new_db_size)?;
-
-        // FIXME: should reserve page cache entry before modifying the database
-        let page = allocate_page(new_db_size as usize, &self.buffer_pool, 0);
-        {
-            // setup page and add to cache
-            self.add_dirty(&page);
-
-            let page_key = PageCacheKey::new(page.get().id);
-            let mut cache = self.page_cache.write();
-            match cache.insert(page_key, page.clone()) {
-                Err(CacheError::Full) => Err(LimboError::CacheFull),
-                Err(_) => Err(LimboError::InternalError(
-                    "Unknown error inserting page to cache".into(),
-                )),
-                Ok(_) => Ok(page),
             }
         }
     }
@@ -1597,7 +1818,7 @@ impl Pager {
     }
 }
 
-pub fn allocate_page(page_id: usize, buffer_pool: &Arc<BufferPool>, offset: usize) -> PageRef {
+pub fn allocate_new_page(page_id: usize, buffer_pool: &Arc<BufferPool>, offset: usize) -> PageRef {
     let page = Arc::new(Page::new(page_id));
     {
         let buffer = buffer_pool.get();
@@ -1913,11 +2134,14 @@ mod ptrmap_tests {
         pager.set_auto_vacuum_mode(AutoVacuumMode::Full);
 
         //  Allocate all the pages as btree root pages
-        for _ in 0..initial_db_pages {
-            match pager.btree_create(&CreateBTreeFlags::new_table()) {
-                Ok(IOResult::Done(_root_page_id)) => (),
-                Ok(IOResult::IO) => {
-                    panic!("test_pager_setup: btree_create returned IOResult::IO unexpectedly");
+        const EXPECTED_FIRST_ROOT_PAGE_ID: u32 = 3; // page1 = 1,  first ptrmap page = 2, root page = 3
+        for i in 0..initial_db_pages {
+            match run_until_done(
+                || pager.btree_create(&CreateBTreeFlags::new_table()),
+                &pager,
+            ) {
+                Ok(root_page_id) => {
+                    assert_eq!(root_page_id, EXPECTED_FIRST_ROOT_PAGE_ID + i);
                 }
                 Err(e) => {
                     panic!("test_pager_setup: btree_create failed: {e:?}");
