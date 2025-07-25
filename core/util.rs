@@ -27,7 +27,7 @@ impl<I: ?Sized + IO> IOExt for I {
                 IOResult::IO(io) => match io {
                     crate::types::IOCompletions::Single(c) => self.wait_for_completion(c)?,
                     crate::types::IOCompletions::Many(completions) => {
-                        for completion in completions {
+                        for c in completions {
                             self.wait_for_completion(c)?;
                         }
                     }

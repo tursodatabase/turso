@@ -88,7 +88,6 @@ pub use storage::{
 use tracing::{instrument, Level};
 use translate::select::prepare_select_plan;
 use turso_sqlite3_parser::{ast, ast::Cmd, lexer::sql::Parser};
-use types::IOResult;
 pub use types::RefValue;
 pub use types::Value;
 use util::parse_schema_rows;
@@ -1088,7 +1087,7 @@ impl Connection {
     }
 
     /// Flush dirty pages to disk.
-    pub fn cacheflush(&self) -> Result<IOResult<()>> {
+    pub fn cacheflush(&self) -> Result<Vec<Arc<Completion>>> {
         if self.closed.get() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
