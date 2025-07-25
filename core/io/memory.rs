@@ -53,7 +53,10 @@ impl IO for MemoryIO {
         Ok(())
     }
 
-    fn wait_for_completion(&self, _c: Arc<Completion>) -> Result<()> {
+    fn wait_for_completion(&self, c: Arc<Completion>) -> Result<()> {
+        while !c.is_completed() {
+            self.run_once()?;
+        }
         Ok(())
     }
 
