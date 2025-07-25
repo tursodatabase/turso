@@ -1,6 +1,7 @@
 use crate::Result;
 use bitflags::bitflags;
 use cfg_block::cfg_block;
+use std::cell::UnsafeCell;
 use std::fmt;
 use std::sync::Arc;
 use std::{
@@ -47,11 +48,31 @@ pub trait IO: Clock + Send + Sync {
 
     fn run_once(&self) -> Result<()>;
 
-    fn wait_for_completion(&self, c: Arc<Completion>) -> Result<()>;
+    fn wait_for_completion(&self, c: Arc<Completion>) -> Result<()> {
+        while !c.is_completed() {
+            self.run_once()?;
+        }
+        Ok(())
+    }
 
-    fn generate_random_number(&self) -> i64;
+    fn generate_random_number(&self) -> i64 {
+        let mut buf = [0u8; 8];
+        getrandom::getrandom(&mut buf).unwrap();
+        i64::from_ne_bytes(buf)
+    }
 
-    fn get_memory_io(&self) -> Arc<MemoryIO>;
+    fn get_memory_io(&self) -> Arc<MemoryIO> {
+        Arc::new(MemoryIO::new())
+    }
+
+    #[doc(hidden)]
+    fn open_wal(
+        &self,
+        shared: Arc<UnsafeCell<crate::WalFileShared>>,
+        buffer_pool: Arc<crate::BufferPool>,
+    ) -> Rc<RefCell<dyn crate::Wal>> {
+        Rc::new(RefCell::new(crate::WalFile::new(shared, buffer_pool)))
+    }
 }
 
 pub type Complete = dyn Fn(Arc<RefCell<Buffer>>, i32);

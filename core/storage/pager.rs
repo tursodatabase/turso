@@ -1887,7 +1887,6 @@ mod ptrmap_tests {
         )));
 
         let wal = Rc::new(RefCell::new(WalFile::new(
-            io.clone(),
             WalFileShared::new_shared(
                 page_size,
                 &io,

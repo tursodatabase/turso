@@ -398,9 +398,7 @@ impl fmt::Debug for OngoingCheckpoint {
     }
 }
 
-#[allow(dead_code)]
 pub struct WalFile {
-    io: Arc<dyn IO>,
     buffer_pool: Arc<BufferPool>,
 
     syncing: Rc<Cell<bool>>,
@@ -1055,11 +1053,7 @@ impl Wal for WalFile {
 }
 
 impl WalFile {
-    pub fn new(
-        io: Arc<dyn IO>,
-        shared: Arc<UnsafeCell<WalFileShared>>,
-        buffer_pool: Arc<BufferPool>,
-    ) -> Self {
+    pub fn new(shared: Arc<UnsafeCell<WalFileShared>>, buffer_pool: Arc<BufferPool>) -> Self {
         let checkpoint_page = Arc::new(Page::new(0));
         let buffer = buffer_pool.get();
         {
@@ -1076,7 +1070,6 @@ impl WalFile {
         let header = unsafe { shared.get().as_mut().unwrap().wal_header.lock() };
         let last_checksum = unsafe { (*shared.get()).last_checksum };
         Self {
-            io,
             // default to max frame in WAL, so that when we read schema we can read from WAL too if it's there.
             max_frame: unsafe { (*shared.get()).max_frame.load(Ordering::SeqCst) },
             shared,

@@ -294,25 +294,8 @@ impl turso_core::IO for PlatformIO {
         }))
     }
 
-    fn wait_for_completion(&self, c: Arc<turso_core::Completion>) -> Result<()> {
-        while !c.is_completed() {
-            self.run_once()?;
-        }
-        Ok(())
-    }
-
     fn run_once(&self) -> Result<()> {
         Ok(())
-    }
-
-    fn generate_random_number(&self) -> i64 {
-        let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).unwrap();
-        i64::from_ne_bytes(buf)
-    }
-
-    fn get_memory_io(&self) -> Arc<turso_core::MemoryIO> {
-        Arc::new(turso_core::MemoryIO::new())
     }
 }
 

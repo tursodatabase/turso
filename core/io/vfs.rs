@@ -1,4 +1,4 @@
-use super::{Buffer, Completion, File, MemoryIO, OpenFlags, IO};
+use super::{Buffer, Completion, File, OpenFlags, IO};
 use crate::ext::VfsMod;
 use crate::io::clock::{Clock, Instant};
 use crate::io::CompletionType;
@@ -44,20 +44,12 @@ impl IO for VfsMod {
         Ok(())
     }
 
-    fn wait_for_completion(&self, _c: Arc<Completion>) -> Result<()> {
-        todo!();
-    }
-
     fn generate_random_number(&self) -> i64 {
         if self.ctx.is_null() {
             return -1;
         }
         let vfs = unsafe { &*self.ctx };
         unsafe { (vfs.gen_random_number)() }
-    }
-
-    fn get_memory_io(&self) -> Arc<MemoryIO> {
-        Arc::new(MemoryIO::new())
     }
 }
 
