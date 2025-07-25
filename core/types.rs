@@ -2249,6 +2249,15 @@ pub enum IOCompletions {
     Many(Vec<Arc<Completion>>),
 }
 
+impl Debug for IOCompletions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Single(..) => f.debug_tuple("Single").finish(),
+            Self::Many(..) => f.debug_tuple("Many").finish(),
+        }
+    }
+}
+
 #[must_use]
 pub enum IOResult<T> {
     Done(T),

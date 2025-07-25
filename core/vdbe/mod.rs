@@ -29,7 +29,7 @@ use crate::{
     function::{AggFunc, FuncCtx},
     storage::{pager, sqlite3_ondisk::SmallVec},
     translate::plan::TableReferences,
-    types::{IOResult, RawSlice, TextRef},
+    types::{IOCompletions, IOResult, RawSlice, TextRef},
     vdbe::execute::{
         OpColumnState, OpIdxInsertState, OpInsertState, OpNewRowidState, OpRowIdState, OpSeekState,
     },
@@ -418,7 +418,10 @@ impl Program {
             match insn_function(self, state, insn, &pager, mv_store.as_ref()) {
                 Ok(InsnFunctionStepResult::Step) => {}
                 Ok(InsnFunctionStepResult::Done) => return Ok(StepResult::Done),
-                Ok(InsnFunctionStepResult::IO) => return Ok(StepResult::IO),
+                Ok(InsnFunctionStepResult::IO(io)) => {
+                    // TODO: save IO completion is program state
+                    return Ok(StepResult::IO);
+                }
                 Ok(InsnFunctionStepResult::Row) => return Ok(StepResult::Row),
                 Ok(InsnFunctionStepResult::Interrupt) => return Ok(StepResult::Interrupt),
                 Ok(InsnFunctionStepResult::Busy) => return Ok(StepResult::Busy),
@@ -437,7 +440,7 @@ impl Program {
         program_state: &mut ProgramState,
         mv_store: Option<&Rc<MvStore>>,
         rollback: bool,
-    ) -> Result<StepResult> {
+    ) -> Result<IOResult<()>> {
         if let Some(mv_store) = mv_store {
             let conn = self.connection.clone();
             let auto_commit = conn.auto_commit.get();
@@ -448,7 +451,7 @@ impl Program {
                 }
                 mv_transactions.clear();
             }
-            Ok(StepResult::Done)
+            Ok(IOResult::Done(()))
         } else {
             let connection = self.connection.clone();
             let auto_commit = connection.auto_commit.get();
@@ -484,15 +487,15 @@ impl Program {
                     TransactionState::Read => {
                         connection.transaction_state.replace(TransactionState::None);
                         pager.end_read_tx()?;
-                        Ok(StepResult::Done)
+                        Ok(IOResult::Done(()))
                     }
-                    TransactionState::None => Ok(StepResult::Done),
+                    TransactionState::None => Ok(IOResult::Done(())),
                 }
             } else {
                 if self.change_cnt_on {
                     self.connection.set_changes(self.n_change.get());
                 }
-                Ok(StepResult::Done)
+                Ok(IOResult::Done(()))
             }
         }
     }
@@ -505,7 +508,7 @@ impl Program {
         connection: &Connection,
         rollback: bool,
         schema_did_change: bool,
-    ) -> Result<StepResult> {
+    ) -> Result<IOResult<()>> {
         let cacheflush_status = pager.end_tx(
             rollback,
             schema_did_change,
@@ -523,13 +526,13 @@ impl Program {
                 connection.transaction_state.replace(TransactionState::None);
                 *commit_state = CommitState::Ready;
             }
-            IOResult::IO => {
+            IOResult::IO(io) => {
                 tracing::trace!("Cacheflush IO");
                 *commit_state = CommitState::Committing;
-                return Ok(StepResult::IO);
+                return Ok(IOResult::IO(io));
             }
         }
-        Ok(StepResult::Done)
+        Ok(IOResult::Done(()))
     }
 
     #[rustfmt::skip]
