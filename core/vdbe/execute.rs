@@ -13,7 +13,7 @@ use crate::types::{
     compare_immutable, compare_records_generic, IOCompletions, ImmutableRecord, SeekResult, Text,
     TextSubtype,
 };
-use crate::util::normalize_ident;
+use crate::util::{normalize_ident, IOExt};
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::registers_to_ref_values;
 use crate::{
@@ -2021,17 +2021,10 @@ pub fn op_transaction(
         }
 
         if updated && matches!(new_transaction_state, TransactionState::Write { .. }) {
-            match pager.begin_write_tx()? {
-                IOResult::Done(r) => {
-                    if let LimboResult::Busy = r {
-                        pager.end_read_tx()?;
-                        return Ok(InsnFunctionStepResult::Busy);
-                    }
-                }
-                IOResult::IO(io) => {
-                    pager.end_read_tx()?;
-                    return Ok(InsnFunctionStepResult::IO(io));
-                }
+            let r = pager.io.block(|| pager.begin_write_tx())?;
+            if let LimboResult::Busy = r {
+                pager.end_read_tx()?;
+                return Ok(InsnFunctionStepResult::Busy);
             }
         }
         if updated {

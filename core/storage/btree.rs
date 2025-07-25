@@ -2109,8 +2109,7 @@ impl BTreeCursor {
                 }
                 InsertIntoPageState::Record { page, cell_idx } => {
                     {
-                        let res = self.record()?;
-                        if let IOResult::IO(io) = res {
+                        if let IOResult::IO(io) = self.record()? {
                             return Ok(IOResult::IO(io));
                         }
                     }
@@ -2147,6 +2146,11 @@ impl BTreeCursor {
                     };
                 }
                 InsertIntoPageState::OverwriteCell { page, cell_idx } => {
+                    turso_assert!(
+                        page.get().is_loaded(),
+                        "page {} is not loaded",
+                        page.get().get().id
+                    );
                     if let IOResult::IO(io) = self.overwrite_cell(page.clone(), cell_idx, record)? {
                         return Ok(IOResult::IO(io));
                     }
@@ -2188,7 +2192,7 @@ impl BTreeCursor {
                     );
 
                     // insert
-                    let overflow = {
+                    {
                         let contents = page.get().contents.as_mut().unwrap();
                         tracing::debug!(name: "overflow", cell_count = contents.cell_count());
 
@@ -2198,10 +2202,10 @@ impl BTreeCursor {
                             cell_idx,
                             self.usable_space() as u16,
                         )?;
-                        !contents.overflow_cells.is_empty()
                     };
                     self.stack.set_cell_index(cell_idx as i32);
-                    if overflow {
+                    let overflows = !page.get_contents().overflow_cells.is_empty();
+                    if overflows {
                         // A balance will happen so save the key we were inserting
                         tracing::debug!(page = page.get().id, cell_idx, "balance triggered:");
                         self.save_context(match bkey {
@@ -4041,8 +4045,8 @@ impl BTreeCursor {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn seek_to_last(&mut self) -> Result<IOResult<()>> {
         assert!(self.mv_cursor.is_none());
-        let state = self.seek_to_state;
         loop {
+            let state = self.seek_to_state;
             match state {
                 SeekToState::Start => {
                     let result = self.move_to_rightmost()?;
@@ -4508,14 +4512,9 @@ impl BTreeCursor {
                         page.get().get_contents().page_type(),
                         PageType::TableLeaf | PageType::TableInterior
                     ) {
-                        match self.rowid()? {
-                            IOResult::Done(rowid) => {
-                                if rowid.is_none() {
-                                    self.state = CursorState::None;
-                                    return Ok(IOResult::Done(()));
-                                }
-                            }
-                            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                        if return_if_io!(self.rowid()).is_none() {
+                            self.state = CursorState::None;
+                            return Ok(IOResult::Done(()));
                         }
                     } else if self.reusable_immutable_record.borrow().is_none() {
                         self.state = CursorState::None;
@@ -4533,24 +4532,16 @@ impl BTreeCursor {
                     let page = self.stack.top();
                     turso_assert!(page.get().is_loaded(), "page should be loaded ");
                     let target_key = if page.get().is_index() {
-                        let record = match self.record()? {
-                            IOResult::Done(record) => match record {
-                                Some(record) => record.clone(),
-                                None => unreachable!("there should've been a record"),
-                            },
-                            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                        let record = match return_if_io!(self.record()) {
+                            Some(record) => record.clone(),
+                            None => unreachable!("there should've been a record"),
                         };
                         DeleteSavepoint::Payload(record)
                     } else {
-                        match self.rowid()? {
-                            IOResult::Done(rowid) => {
-                                let Some(rowid) = rowid else {
-                                    panic!("cursor should be pointing to a record with a rowid");
-                                };
-                                DeleteSavepoint::Rowid(rowid)
-                            }
-                            IOResult::IO(io) => return Ok(IOResult::IO(io)),
-                        }
+                        let Some(rowid) = return_if_io!(self.rowid()) else {
+                            panic!("cursor should be pointing to a record with a rowid");
+                        };
+                        DeleteSavepoint::Rowid(rowid)
                     };
 
                     let delete_info = self.state.mut_delete_info().unwrap();
@@ -4677,6 +4668,7 @@ impl BTreeCursor {
                     let (cell_payload, leaf_cell_idx) = {
                         let leaf_page_ref = self.stack.top();
                         let leaf_page = leaf_page_ref.get();
+                        turso_assert!(leaf_page.is_loaded(), "page should be loaded");
                         let leaf_contents = leaf_page.get().contents.as_ref().unwrap();
                         assert!(leaf_contents.is_leaf());
                         assert!(leaf_contents.cell_count() > 0);
@@ -4783,6 +4775,7 @@ impl BTreeCursor {
                             .get_page_at_level(btree_depth)
                             .expect("ancestor page should be on the stack");
                         let interior_page = interior_page.get();
+                        turso_assert!(interior_page.is_loaded(), "page should be loaded");
                         let interior_contents = interior_page.get_contents();
                         let overflows = !interior_contents.overflow_cells.is_empty();
                         if overflows {
@@ -4880,10 +4873,7 @@ impl BTreeCursor {
                     };
                     // We want to end up pointing at the row to the left of the position of the row we deleted, so
                     // that after we call next() in the loop,the next row we delete will again be the same position as this one.
-                    let seek_result = match self.seek(key, SeekOp::LT)? {
-                        IOResult::Done(seek_result) => seek_result,
-                        IOResult::IO(io) => return Ok(IOResult::IO(io)),
-                    };
+                    let seek_result = return_if_io!(self.seek(key, SeekOp::LT));
 
                     if let SeekResult::TryAdvance = seek_result {
                         let CursorState::Delete(delete_info) = &self.state else {
@@ -7304,7 +7294,7 @@ mod tests {
         let pager = conn.pager.borrow().clone();
 
         // FIXME: handle page cache is full
-        let _ = run_until_done(|| pager.allocate_page1(), &pager);
+        let _ = run_until_done(|| pager.allocate_page1(), &pager).unwrap();
         let page2 = pager.allocate_page().unwrap();
         let page2 = Arc::new(BTreePageInner {
             page: RefCell::new(page2),
@@ -7865,14 +7855,11 @@ mod tests {
 
         for _ in 0..attempts {
             let (pager, _, _db, conn) = empty_btree();
-            let index_root_page_result =
-                pager.btree_create(&CreateBTreeFlags::new_index()).unwrap();
-            let index_root_page = match index_root_page_result {
-                crate::types::IOResult::Done(id) => id as usize,
-                crate::types::IOResult::IO(..) => {
-                    panic!("btree_create returned IO in test, unexpected")
-                }
-            };
+            let index_root_page = run_until_done(
+                || pager.btree_create(&CreateBTreeFlags::new_index()),
+                &pager,
+            )
+            .unwrap() as usize;
             let index_def = Index {
                 name: "testindex".to_string(),
                 columns: vec![IndexColumn {
@@ -7898,16 +7885,7 @@ mod tests {
             for i in 0..operations {
                 let print_progress = i % 100 == 0;
                 pager.begin_read_tx().unwrap();
-                while let IOResult::IO(io_c) = pager.begin_write_tx().unwrap() {
-                    match io_c {
-                        IOCompletions::Single(c) => pager.io.wait_for_completion(c).unwrap(),
-                        IOCompletions::Many(completions) => {
-                            for c in completions {
-                                pager.io.wait_for_completion(c).unwrap()
-                            }
-                        }
-                    }
-                }
+                pager.io.block(|| pager.begin_write_tx()).unwrap();
 
                 // Decide whether to insert or delete (80% chance of insert)
                 let is_insert = rng.next_u64() % 100 < (insert_chance * 100.0) as u64;
@@ -7998,20 +7976,12 @@ mod tests {
                     }
                 }
 
-                cursor.move_to_root().unwrap();
-                loop {
-                    match pager.end_tx(false, false, &conn, false).unwrap() {
-                        IOResult::Done(_) => break,
-                        IOResult::IO(io_c) => match io_c {
-                            IOCompletions::Single(c) => pager.io.wait_for_completion(c).unwrap(),
-                            IOCompletions::Many(completions) => {
-                                for c in completions {
-                                    pager.io.wait_for_completion(c).unwrap()
-                                }
-                            }
-                        },
-                    }
-                }
+                let c = cursor.move_to_root().unwrap();
+                pager.io.wait_for_completion(c).unwrap();
+                pager
+                    .io
+                    .block(|| pager.end_tx(false, false, &conn, false))
+                    .unwrap();
             }
 
             // Final validation
