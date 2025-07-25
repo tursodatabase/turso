@@ -11,12 +11,15 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
-    let path = PathBuf::try_from("sync.db").unwrap();
+    let sync_url = std::env::var("TURSO_SYNC_URL").unwrap();
+    let auth_token = std::env::var("TURSO_AUTH_TOKEN").unwrap();
+    let local_path = std::env::var("TURSO_LOCAL_PATH").unwrap();
+    let path = PathBuf::try_from(local_path).unwrap();
     let mut db = DatabaseSync::new(
         &path,
         TursoSyncServerOpts {
-            sync_url: "https://flowing-cat-sivukhin.aws-eu-north-1.turso.io".into(),
-            auth_token: Some("".into()),
+            sync_url: sync_url.into(),
+            auth_token: Some(auth_token.into()),
             encryption_key: None,
             pull_batch_size: None,
         },

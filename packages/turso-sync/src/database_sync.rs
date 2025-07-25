@@ -249,6 +249,7 @@ impl DatabaseSync {
             self.transfer_clean_to_draft().await?;
         }
 
+        self.sync_from_remote().await?;
         Ok(())
     }
 
