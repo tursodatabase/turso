@@ -2028,9 +2028,9 @@ pub fn op_transaction(
                         return Ok(InsnFunctionStepResult::Busy);
                     }
                 }
-                IOResult::IO => {
+                IOResult::IO(io) => {
                     pager.end_read_tx()?;
-                    return Ok(InsnFunctionStepResult::IO);
+                    return Ok(InsnFunctionStepResult::IO(io));
                 }
             }
         }

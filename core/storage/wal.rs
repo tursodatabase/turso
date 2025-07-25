@@ -1092,7 +1092,6 @@ impl WalFile {
         self.ongoing_checkpoint.min_frame = 0;
         self.ongoing_checkpoint.max_frame = 0;
         self.ongoing_checkpoint.current_page = 0;
-        self.sync_state.set(SyncState::NotSyncing);
         self.syncing.set(false);
     }
 }

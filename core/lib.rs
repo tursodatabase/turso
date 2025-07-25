@@ -46,6 +46,7 @@ use crate::storage::sqlite3_ondisk::is_valid_page_size;
 use crate::storage::{header_accessor, wal::DummyWAL};
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
+use crate::types::IOResult;
 #[cfg(feature = "fs")]
 use crate::util::{IOExt, OpenMode, OpenOptions};
 use crate::vtab::VirtualTable;
@@ -1626,7 +1627,7 @@ impl Statement {
                     .set(TransactionState::None);
                 assert!(
                     matches!(end_tx_res, IOResult::Done(_)),
-                    "end_tx should not return IO as it should just end txn without flushing anything. Got {end_tx_res:?}"
+                    "end_tx should not return IO as it should just end txn without flushing anything"
                 );
             }
         }
