@@ -2280,6 +2280,20 @@ pub fn op_row_data(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum OpRowIdState {
+    Start,
+    Record {
+        index_cursor_id: usize,
+        table_cursor_id: usize,
+    },
+    Seek {
+        rowid: i64,
+        table_cursor_id: usize,
+    },
+    GetRowid,
+}
+
 pub fn op_row_id(
     program: &Program,
     state: &mut ProgramState,
@@ -2290,56 +2304,79 @@ pub fn op_row_id(
     let Insn::RowId { cursor_id, dest } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seeks[*cursor_id].take() {
-        let deferred_seek = 'd: {
-            let rowid = {
-                let mut index_cursor = state.get_cursor(index_cursor_id);
-                let index_cursor = index_cursor.as_btree_mut();
-                let record = match index_cursor.record()? {
-                    IOResult::IO => {
-                        break 'd Some((index_cursor_id, table_cursor_id));
-                    }
-                    IOResult::Done(record) => record,
-                };
-                let record = record.as_ref().unwrap();
-                let mut record_cursor_ref = index_cursor.record_cursor.borrow_mut();
-                let record_cursor = record_cursor_ref.deref_mut();
-                let rowid = record.last_value(record_cursor).unwrap();
-                match rowid {
-                    Ok(RefValue::Integer(rowid)) => rowid,
-                    _ => unreachable!(),
+    loop {
+        match state.op_row_id_state {
+            OpRowIdState::Start => {
+                if let Some((index_cursor_id, table_cursor_id)) =
+                    state.deferred_seeks[*cursor_id].take()
+                {
+                    state.op_row_id_state = OpRowIdState::Record {
+                        index_cursor_id,
+                        table_cursor_id,
+                    };
+                } else {
+                    state.op_row_id_state = OpRowIdState::GetRowid;
                 }
-            };
-            let mut table_cursor = state.get_cursor(table_cursor_id);
-            let table_cursor = table_cursor.as_btree_mut();
-            match table_cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })? {
-                IOResult::Done(_) => None,
-                IOResult::IO => Some((index_cursor_id, table_cursor_id)),
             }
-        };
-        if let Some(deferred_seek) = deferred_seek {
-            state.deferred_seeks[*cursor_id] = Some(deferred_seek);
-            return Ok(InsnFunctionStepResult::IO);
+            OpRowIdState::Record {
+                index_cursor_id,
+                table_cursor_id,
+            } => {
+                let rowid = {
+                    let mut index_cursor = state.get_cursor(index_cursor_id);
+                    let index_cursor = index_cursor.as_btree_mut();
+                    let record = return_if_io!(index_cursor.record());
+                    let record = record.as_ref().unwrap();
+                    let mut record_cursor_ref = index_cursor.record_cursor.borrow_mut();
+                    let record_cursor = record_cursor_ref.deref_mut();
+                    let rowid = record.last_value(record_cursor).unwrap();
+                    match rowid {
+                        Ok(RefValue::Integer(rowid)) => rowid,
+                        _ => unreachable!(),
+                    }
+                };
+                state.op_row_id_state = OpRowIdState::Seek {
+                    rowid,
+                    table_cursor_id,
+                }
+            }
+            OpRowIdState::Seek {
+                rowid,
+                table_cursor_id,
+            } => {
+                let mut table_cursor = state.get_cursor(table_cursor_id);
+                let table_cursor = table_cursor.as_btree_mut();
+                return_if_io!(
+                    table_cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
+                );
+                state.op_row_id_state = OpRowIdState::GetRowid;
+            }
+            OpRowIdState::GetRowid => {
+                let mut cursors = state.cursors.borrow_mut();
+                if let Some(Cursor::BTree(btree_cursor)) = cursors.get_mut(*cursor_id).unwrap() {
+                    if let Some(ref rowid) = return_if_io!(btree_cursor.rowid()) {
+                        state.registers[*dest] = Register::Value(Value::Integer(*rowid));
+                    } else {
+                        state.registers[*dest] = Register::Value(Value::Null);
+                    }
+                } else if let Some(Cursor::Virtual(virtual_cursor)) =
+                    cursors.get_mut(*cursor_id).unwrap()
+                {
+                    let rowid = virtual_cursor.rowid();
+                    if rowid != 0 {
+                        state.registers[*dest] = Register::Value(Value::Integer(rowid));
+                    } else {
+                        state.registers[*dest] = Register::Value(Value::Null);
+                    }
+                } else {
+                    return Err(LimboError::InternalError(
+                        "RowId: cursor is not a table or virtual cursor".to_string(),
+                    ));
+                }
+                state.op_row_id_state = OpRowIdState::Start;
+                break;
+            }
         }
-    }
-    let mut cursors = state.cursors.borrow_mut();
-    if let Some(Cursor::BTree(btree_cursor)) = cursors.get_mut(*cursor_id).unwrap() {
-        if let Some(ref rowid) = return_if_io!(btree_cursor.rowid()) {
-            state.registers[*dest] = Register::Value(Value::Integer(*rowid));
-        } else {
-            state.registers[*dest] = Register::Value(Value::Null);
-        }
-    } else if let Some(Cursor::Virtual(virtual_cursor)) = cursors.get_mut(*cursor_id).unwrap() {
-        let rowid = virtual_cursor.rowid();
-        if rowid != 0 {
-            state.registers[*dest] = Register::Value(Value::Integer(rowid));
-        } else {
-            state.registers[*dest] = Register::Value(Value::Null);
-        }
-    } else {
-        return Err(LimboError::InternalError(
-            "RowId: cursor is not a table or virtual cursor".to_string(),
-        ));
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
