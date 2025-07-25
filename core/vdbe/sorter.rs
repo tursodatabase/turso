@@ -141,6 +141,7 @@ impl Sorter {
     pub fn sort(&mut self) -> Result<IOResult<()>> {
         loop {
             let state = self.sort_state;
+            tracing::trace!(?state);
             match state {
                 SortState::Start => {
                     if self.chunks.is_empty() {
@@ -162,6 +163,7 @@ impl Sorter {
                 SortState::Next => {
                     return_if_io!(self.next());
                     self.sort_state = SortState::Start;
+                    return Ok(IOResult::Done(()));
                 }
             }
         }
