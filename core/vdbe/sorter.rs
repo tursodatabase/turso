@@ -364,13 +364,12 @@ impl Sorter {
                 let c = chunk.write(&mut self.records)?;
                 self.chunks.push(chunk);
 
-                self.current_buffer_size = 0;
-                self.max_payload_size_in_buffer = 0;
-
                 self.flush_state = FlushState::Finish;
                 Ok(IOResult::IO(IOCompletions::Single(c)))
             }
             FlushState::Finish => {
+                self.current_buffer_size = 0;
+                self.max_payload_size_in_buffer = 0;
                 self.flush_state = FlushState::Start;
                 Ok(IOResult::Done(()))
             }
