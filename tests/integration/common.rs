@@ -246,7 +246,7 @@ pub(crate) fn rng_from_time() -> (ChaCha8Rng, u64) {
 mod tests {
     use std::{sync::Arc, vec};
     use tempfile::{NamedTempFile, TempDir};
-    use turso_core::{types::IOResult, Database, StepResult, IO};
+    use turso_core::{Database, StepResult, IO};
 
     use super::{limbo_exec_rows, limbo_exec_rows_error, TempDatabase};
     use rusqlite::types::Value;

@@ -2084,6 +2084,7 @@ impl BTreeCursor {
                             BTreeCell::TableLeafCell(tbl_leaf) => {
                                 if tbl_leaf.rowid == bkey.to_rowid() {
                                     tracing::debug!("TableLeafCell: found exact match with cell_idx={cell_idx}, overwriting");
+                                    self.has_record.set(true);
                                     self.insert_into_page_state = InsertIntoPageState::OverwriteCell {
                                         page: page.clone(),
                                         cell_idx,
@@ -2146,14 +2147,27 @@ impl BTreeCursor {
                     if let IOResult::IO(io) = self.overwrite_cell(page.clone(), cell_idx, record)? {
                         return Ok(IOResult::IO(io));
                     }
-                    if page.get().get_contents().overflow_cells.is_empty() {
-                        self.insert_into_page_state = InsertIntoPageState::Finish;
-                    } else {
+
+                    let usable_space = self.usable_space();
+                    let overflows = !page.get().get_contents().overflow_cells.is_empty();
+                    let underflows = !overflows && {
+                        let free_space =
+                            compute_free_space(page.get().get_contents(), usable_space as u16);
+                        free_space as usize * 3 > usable_space * 2
+                    };
+                    if overflows || underflows {
                         self.insert_into_page_state = InsertIntoPageState::Balance;
                         // If we balance, we must save the cursor position and seek to it later.
                         // FIXME: we shouldn't have both DeleteState::SeekAfterBalancing and
                         // save_context()/restore/context(), they are practically the same thing.
-                        self.save_context(CursorContext::IndexKeyRowId((*record).clone()));
+                        self.save_context(match bkey {
+                            BTreeKey::TableRowId(rowid) => CursorContext::TableRowId(rowid.0),
+                            BTreeKey::IndexKey(record) => {
+                                CursorContext::IndexKeyRowId((*record).clone())
+                            }
+                        });
+                    } else {
+                        self.insert_into_page_state = InsertIntoPageState::Finish;
                     }
                 }
                 InsertIntoPageState::InsertCell { page, cell_idx } => {
@@ -2181,6 +2195,7 @@ impl BTreeCursor {
                             cell_idx,
                             self.usable_space() as u16,
                         )?;
+                        !contents.overflow_cells.is_empty()
                     };
                     self.stack.set_cell_index(cell_idx as i32);
                     if overflow {
@@ -2326,16 +2341,38 @@ impl BTreeCursor {
                     let parent_page = self.stack.top();
                     let parent_page = parent_page.get();
                     turso_assert!(parent_page.is_loaded(), "parent page should be loaded");
-                    // If `move_to` moved to rightmost page, cell index will be out of bounds. Meaning cell_count+1.
-                    // In any other case, `move_to` will stay in the correct index.
-                    if self.stack.current_cell_index() as usize
-                        == parent_page.get_contents().cell_count() + 1
-                    {
+                    let parent_contents = parent_page.get_contents();
+                    let page_type = parent_contents.page_type();
+                    turso_assert!(
+                        matches!(page_type, PageType::IndexInterior | PageType::TableInterior),
+                        "expected index or table interior page"
+                    );
+                    let number_of_cells_in_parent =
+                        parent_contents.cell_count() + parent_contents.overflow_cells.len();
+
+                    // If `seek` moved to rightmost page, cell index will be out of bounds. Meaning cell_count+1.
+                    // In any other case, `seek` will stay in the correct index.
+                    let past_rightmost_pointer =
+                        self.stack.current_cell_index() as usize == number_of_cells_in_parent + 1;
+                    if past_rightmost_pointer {
                         self.stack.retreat();
-                    } else if self.stack.current_cell_index() == -1 {
-                        // We might've retreated in CheckRequiresBalancing, so advance to the next cell
-                        // to prevent panic in the asserts below due to -1 index
-                        self.stack.advance();
+                    } else if !parent_contents.overflow_cells.is_empty() {
+                        // The ONLY way we can have an overflow cell in the parent is if we replaced an interior cell from a cell in the child, and that replacement did not fit.
+                        // This can only happen on index btrees.
+                        if matches!(page_type, PageType::IndexInterior) {
+                            turso_assert!(parent_contents.overflow_cells.len() == 1, "index interior page must have no more than 1 overflow cell, as a result of InteriorNodeReplacement");
+                        } else {
+                            turso_assert!(false, "{page_type:?} must have no overflow cells");
+                        }
+                        let overflow_cell = parent_contents.overflow_cells.first().unwrap();
+                        let parent_page_cell_idx = self.stack.current_cell_index() as usize;
+                        // Parent page must be positioned at the divider cell that overflowed due to the replacement.
+                        turso_assert!(
+                            overflow_cell.index == parent_page_cell_idx,
+                            "overflow cell index must be the result of InteriorNodeReplacement that leaves both child and parent (id={}) unbalanced, and hence parent page's position must = overflow_cell.index. Instead got: parent_page_cell_idx={parent_page_cell_idx} overflow_cell.index={}",
+                            parent_page.get().id,
+                            overflow_cell.index
+                        );
                     }
                     self.pager.add_dirty(&parent_page);
                     let parent_contents = parent_page.get().contents.as_ref().unwrap();
@@ -2346,23 +2383,9 @@ impl BTreeCursor {
                         parent_page.get().id,
                         page_to_balance_idx
                     );
-                    turso_assert!(
-                        matches!(
-                            parent_contents.page_type(),
-                            PageType::IndexInterior | PageType::TableInterior
-                        ),
-                        "expected index or table interior page"
-                    );
                     // Part 1: Find the sibling pages to balance
                     let mut pages_to_balance: [Option<BTreePage>; MAX_SIBLING_PAGES_TO_BALANCE] =
                         [const { None }; MAX_SIBLING_PAGES_TO_BALANCE];
-                    let number_of_cells_in_parent =
-                        parent_contents.cell_count() + parent_contents.overflow_cells.len();
-
-                    turso_assert!(
-                        parent_contents.overflow_cells.is_empty(),
-                        "balancing child page with overflowed parent not yet implemented"
-                    );
                     turso_assert!(
                     page_to_balance_idx <= parent_contents.cell_count(),
                     "page_to_balance_idx={page_to_balance_idx} is out of bounds for parent cell count {number_of_cells_in_parent}"
@@ -2399,10 +2422,42 @@ impl BTreeCursor {
                     let right_pointer = if last_sibling_is_right_pointer {
                         parent_contents.rightmost_pointer_raw().unwrap()
                     } else {
-                        let (start_of_cell, _) = parent_contents.cell_get_raw_region(
-                            first_cell_divider + sibling_pointer,
-                            self.usable_space(),
+                        let max_overflow_cells = if matches!(page_type, PageType::IndexInterior) {
+                            1
+                        } else {
+                            0
+                        };
+                        turso_assert!(
+                            parent_contents.overflow_cells.len() <= max_overflow_cells,
+                            "must have at most {max_overflow_cells} overflow cell in the parent"
                         );
+                        // OVERFLOW CELL ADJUSTMENT:
+                        // Let there be parent with cells [0,1,2,3,4].
+                        // Let's imagine the cell at idx 2 gets replaced with a new payload that causes it to overflow.
+                        // See handling of InteriorNodeReplacement in btree.rs.
+                        //
+                        // In this case the rightmost divider is going to be 3 (2 is the middle one and we pick neighbors 1-3).
+                        // drop_cell(): [0,1,2,3,4] -> [0,1,3,4]   <-- cells on right side get shifted left!
+                        // insert_into_cell(): [0,1,3,4] -> [0,1,3,4] + overflow cell (2)  <-- crucially, no physical shifting happens, overflow cell is stored separately
+                        //
+                        // This means '3' is actually physically located at index '2'.
+                        // So IF the parent has an overflow cell, we need to subtract 1 to get the actual rightmost divider cell idx to physically read from.
+                        // The formula for the actual cell idx is:
+                        // first_cell_divider + sibling_pointer - parent_contents.overflow_cells.len()
+                        // so in the above case:
+                        // actual_cell_idx = 1 + 2 - 1 = 2
+                        //
+                        // In the case where the last divider cell is the overflow cell, there would be no left-shifting of cells in drop_cell(),
+                        // because they are still positioned correctly (imagine .pop() from a vector).
+                        // However, note that we are always looking for the _rightmost_ child page pointer between the (max 2) dividers, and for any case where the last divider cell is the overflow cell,
+                        // the 'last_sibling_is_right_pointer' condition will also be true (since the overflow cell's left child will be the middle page), so we won't enter this code branch.
+                        //
+                        // Hence: when we enter this branch with overflow_cells.len() == 1, we know that left-shifting has happened and we need to subtract 1.
+                        let actual_cell_idx = first_cell_divider + sibling_pointer
+                            - parent_contents.overflow_cells.len();
+                        let (start_of_cell, _) = parent_contents
+                            .cell_get_raw_region(actual_cell_idx, self.usable_space());
+
                         let buf = parent_contents.as_ptr().as_mut_ptr();
                         unsafe { buf.add(start_of_cell) }
                     };
@@ -2421,32 +2476,61 @@ impl BTreeCursor {
                         }
                         completions.push(c);
                         pages_to_balance[i].replace(page);
-                        turso_assert!(
-                            parent_contents.overflow_cells.is_empty(),
-                            "overflow in parent is not yet implented while balancing it"
-                        );
                         if i == 0 {
                             break;
                         }
                         let next_cell_divider = i + first_cell_divider - 1;
-                        pgno = match parent_contents
-                            .cell_get(next_cell_divider, self.usable_space())?
-                        {
-                            BTreeCell::TableInteriorCell(TableInteriorCell {
-                                left_child_page,
-                                ..
-                            })
-                            | BTreeCell::IndexInteriorCell(IndexInteriorCell {
-                                left_child_page,
-                                ..
-                            }) => left_child_page,
-                            other => {
-                                crate::bail_corrupt_error!(
-                                    "expected interior cell, got {:?}",
-                                    other
-                                )
-                            }
-                        };
+                        let divider_is_overflow_cell = parent_contents
+                            .overflow_cells
+                            .first()
+                            .is_some_and(|overflow_cell| overflow_cell.index == next_cell_divider);
+                        if divider_is_overflow_cell {
+                            turso_assert!(
+                                matches!(parent_contents.page_type(), PageType::IndexInterior),
+                                "expected index interior page, got {:?}",
+                                parent_contents.page_type()
+                            );
+                            turso_assert!(
+                             parent_contents.overflow_cells.len() == 1,
+                             "must have a single overflow cell in the parent, as a result of InteriorNodeReplacement"
+                         );
+                            let overflow_cell = parent_contents.overflow_cells.first().unwrap();
+                            pgno =
+                                u32::from_be_bytes(overflow_cell.payload[0..4].try_into().unwrap());
+                        } else {
+                            // grep for 'OVERFLOW CELL ADJUSTMENT' for explanation.
+                            // here we only subtract 1 if the divider cell has been shifted left, i.e. the overflow cell was placed to the left
+                            // this cell.
+                            let actual_cell_idx = if let Some(overflow_cell) =
+                                parent_contents.overflow_cells.first()
+                            {
+                                if next_cell_divider < overflow_cell.index {
+                                    next_cell_divider
+                                } else {
+                                    next_cell_divider - 1
+                                }
+                            } else {
+                                next_cell_divider
+                            };
+                            pgno = match parent_contents
+                                .cell_get(actual_cell_idx, self.usable_space())?
+                            {
+                                BTreeCell::TableInteriorCell(TableInteriorCell {
+                                    left_child_page,
+                                    ..
+                                })
+                                | BTreeCell::IndexInteriorCell(IndexInteriorCell {
+                                    left_child_page,
+                                    ..
+                                }) => left_child_page,
+                                other => {
+                                    crate::bail_corrupt_error!(
+                                        "expected interior cell, got {:?}",
+                                        other
+                                    )
+                                }
+                            };
+                        }
                     }
 
                     let write_info = self.state.mut_write_info().unwrap();
@@ -2496,11 +2580,6 @@ impl BTreeCursor {
                     let parent_contents = parent_page.get_contents();
                     let parent_is_root = !self.stack.has_parent();
 
-                    turso_assert!(
-                        parent_contents.overflow_cells.is_empty(),
-                        "overflow parent not yet implemented"
-                    );
-
                     // 1. Collect cell data from divider cells, and count the total number of cells to be distributed.
                     // The count includes: all cells and overflow cells from the sibling pages, and divider cells from the parent page,
                     // excluding the rightmost divider, which will not be dropped from the parent; instead it will be updated at the end.
@@ -2524,11 +2603,33 @@ impl BTreeCursor {
                         }
                         // Since we know we have a left sibling, take the divider that points to left sibling of this page
                         let cell_idx = balance_info.first_divider_cell + i;
-                        let (cell_start, cell_len) =
-                            parent_contents.cell_get_raw_region(cell_idx, self.usable_space());
-                        let buf = parent_contents.as_ptr();
-                        let cell_buf = &buf[cell_start..cell_start + cell_len];
-                        // Count the divider cell itself (which will be dropped from the parent)
+                        let divider_is_overflow_cell = parent_contents
+                            .overflow_cells
+                            .first()
+                            .is_some_and(|overflow_cell| overflow_cell.index == cell_idx);
+                        let cell_buf = if divider_is_overflow_cell {
+                            turso_assert!(
+                                matches!(parent_contents.page_type(), PageType::IndexInterior),
+                                "expected index interior page, got {:?}",
+                                parent_contents.page_type()
+                            );
+                            turso_assert!(
+                             parent_contents.overflow_cells.len() == 1,
+                             "must have a single overflow cell in the parent, as a result of InteriorNodeReplacement"
+                         );
+                            let overflow_cell = parent_contents.overflow_cells.first().unwrap();
+                            &overflow_cell.payload
+                        } else {
+                            // grep for 'OVERFLOW CELL ADJUSTMENT' for explanation.
+                            // here we can subtract overflow_cells.len() every time, because we are iterating right-to-left,
+                            // so if we are to the left of the overflow cell, it has already been cleared from the parent and overflow_cells.len() is 0.
+                            let actual_cell_idx = cell_idx - parent_contents.overflow_cells.len();
+                            let (cell_start, cell_len) = parent_contents
+                                .cell_get_raw_region(actual_cell_idx, self.usable_space());
+                            let buf = parent_contents.as_ptr();
+                            &buf[cell_start..cell_start + cell_len]
+                        };
+
                         total_cells_to_redistribute += 1;
 
                         tracing::debug!(
@@ -2540,12 +2641,28 @@ impl BTreeCursor {
 
                         // TODO(pere): make this reference and not copy
                         balance_info.divider_cell_payloads[i].replace(cell_buf.to_vec());
-                        tracing::trace!(
-                            "dropping divider cell from parent cell_idx={} count={}",
-                            cell_idx,
-                            parent_contents.cell_count()
-                        );
-                        drop_cell(parent_contents, cell_idx, self.usable_space() as u16)?;
+                        if divider_is_overflow_cell {
+                            tracing::debug!(
+                                "clearing overflow cells from parent cell_idx={}",
+                                cell_idx
+                            );
+                            parent_contents.overflow_cells.clear();
+                        } else {
+                            // grep for 'OVERFLOW CELL ADJUSTMENT' for explanation.
+                            // here we can subtract overflow_cells.len() every time, because we are iterating right-to-left,
+                            // so if we are to the left of the overflow cell, it has already been cleared from the parent and overflow_cells.len() is 0.
+                            let actual_cell_idx = cell_idx - parent_contents.overflow_cells.len();
+                            tracing::trace!(
+                                "dropping divider cell from parent cell_idx={} count={}",
+                                actual_cell_idx,
+                                parent_contents.cell_count()
+                            );
+                            drop_cell(
+                                parent_contents,
+                                actual_cell_idx,
+                                self.usable_space() as u16,
+                            )?;
+                        }
                     }
 
                     /* 2. Initialize CellArray with all the cells used for distribution, this includes divider cells if !leaf. */
@@ -5084,7 +5201,6 @@ impl BTreeCursor {
         page_ref: BTreePage,
         cell_idx: usize,
         record: &ImmutableRecord,
-        state: &mut OverwriteCellState,
     ) -> Result<IOResult<()>> {
         let rowid = match self.rowid()? {
             IOResult::Done(rowid) => rowid,
@@ -7750,7 +7866,16 @@ mod tests {
             for i in 0..operations {
                 let print_progress = i % 100 == 0;
                 pager.begin_read_tx().unwrap();
-                pager.begin_write_tx().unwrap();
+                while let IOResult::IO(io_c) = pager.begin_write_tx().unwrap() {
+                    match io_c {
+                        IOCompletions::Single(c) => pager.io.wait_for_completion(c).unwrap(),
+                        IOCompletions::Many(completions) => {
+                            for c in completions {
+                                pager.io.wait_for_completion(c).unwrap()
+                            }
+                        }
+                    }
+                }
 
                 // Decide whether to insert or delete (80% chance of insert)
                 let is_insert = rng.next_u64() % 100 < (insert_chance * 100.0) as u64;

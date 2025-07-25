@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::storage::sqlite3_ondisk::MAX_PAGE_SIZE;
-use crate::Completion;
 use crate::turso_assert;
+use crate::Completion;
 use crate::{
     storage::{
         self,
