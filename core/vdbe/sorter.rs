@@ -256,8 +256,9 @@ impl Sorter {
                             SortedChunkIOState::WriteComplete => {
                                 // Write complete, we can now read from the chunk.
                                 if chunk.can_read_more() {
-                                    let c = chunk.read()?;
-                                    completions.push(c);
+                                    if let Some(c) = chunk.read()? {
+                                        completions.push(c);
+                                    }
                                 }
                             }
                             SortedChunkIOState::ReadEOF | SortedChunkIOState::ReadComplete => {}
@@ -322,7 +323,7 @@ impl Sorter {
             if chunk.can_read_more() {
                 // We've consumed the last record. Read more payload into the buffer.
                 let c = chunk.read()?;
-                return Ok(Some(c));
+                return Ok(c);
             }
         }
         Ok(None)
@@ -412,9 +413,7 @@ impl SortedChunk {
     }
 
     fn can_read_more(&self) -> bool {
-        self.records.is_empty()
-            && self.chunk_size - self.total_bytes_read.get() != 0
-            && self.io_state.get() != SortedChunkIOState::ReadEOF
+        self.records.is_empty() && self.io_state.get() != SortedChunkIOState::ReadEOF
     }
 
     fn next_record(&mut self) -> Result<Option<ImmutableRecord>> {
@@ -471,11 +470,11 @@ impl SortedChunk {
         Ok(record)
     }
 
-    fn read(&mut self) -> Result<Arc<Completion>> {
-        // if self.chunk_size - self.total_bytes_read.get() == 0 {
-        //     self.io_state.set(SortedChunkIOState::ReadEOF);
-        //     return Ok(IOResult::Done(()));
-        // }
+    fn read(&mut self) -> Result<Option<Arc<Completion>>> {
+        if self.chunk_size - self.total_bytes_read.get() == 0 {
+            self.io_state.set(SortedChunkIOState::ReadEOF);
+            return Ok(None);
+        }
 
         let read_buffer_size = self.buffer.borrow().len() - self.buffer_len.get();
         let read_buffer_size = read_buffer_size.min(self.chunk_size - self.total_bytes_read.get());
@@ -513,7 +512,7 @@ impl SortedChunk {
 
         let c = Completion::new_read(read_buffer_ref, read_complete);
         let c = self.file.pread(self.total_bytes_read.get(), Arc::new(c))?;
-        Ok(c)
+        Ok(Some(c))
     }
 
     fn write(&mut self, records: &mut Vec<SortableImmutableRecord>) -> Result<Arc<Completion>> {
