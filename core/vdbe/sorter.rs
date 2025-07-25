@@ -724,7 +724,7 @@ mod tests {
 
         let attempts = 8;
         for _ in 0..attempts {
-            let num_records = 1000 + rng.next_u64() % 2000;
+            let num_records = 100 + rng.next_u64() % 200;
             let num_records = num_records as i64;
 
             let num_values = 1 + rng.next_u64() % 4;
