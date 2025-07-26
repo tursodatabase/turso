@@ -218,6 +218,7 @@ impl Connection {
             .inner
             .lock()
             .map_err(|e| Error::MutexError(e.to_string()))?;
+        // TODO: should be marked as async and yield every poll of completions
         conn.cacheflush()?;
         Ok(())
     }

@@ -29,8 +29,10 @@ use crate::{
     function::{AggFunc, FuncCtx},
     storage::{pager, sqlite3_ondisk::SmallVec},
     translate::plan::TableReferences,
-    types::{IOResult, RawSlice, TextRef},
-    vdbe::execute::{OpIdxInsertState, OpInsertState, OpNewRowidState, OpSeekState},
+    types::{IOCompletions, IOResult, RawSlice, TextRef},
+    vdbe::execute::{
+        OpColumnState, OpIdxInsertState, OpInsertState, OpNewRowidState, OpRowIdState, OpSeekState,
+    },
     RefValue,
 };
 
@@ -233,6 +235,7 @@ pub struct Row {
 
 /// The program state describes the environment in which the program executes.
 pub struct ProgramState {
+    pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
     cursors: RefCell<Vec<Option<Cursor>>>,
     registers: Vec<Register>,
@@ -256,6 +259,8 @@ pub struct ProgramState {
     op_idx_insert_state: OpIdxInsertState,
     op_insert_state: OpInsertState,
     seek_state: OpSeekState,
+    op_column_state: OpColumnState,
+    op_row_id_state: OpRowIdState,
 }
 
 impl ProgramState {
@@ -264,6 +269,7 @@ impl ProgramState {
             RefCell::new((0..max_cursors).map(|_| None).collect());
         let registers = vec![Register::Value(Value::Null); max_registers];
         Self {
+            io_completions: None,
             pc: 0,
             cursors,
             registers,
@@ -286,6 +292,8 @@ impl ProgramState {
             op_idx_insert_state: OpIdxInsertState::SeekIfUnique,
             op_insert_state: OpInsertState::Insert,
             seek_state: OpSeekState::Start,
+            op_column_state: OpColumnState::Start,
+            op_row_id_state: OpRowIdState::Start,
         }
     }
 
@@ -405,6 +413,17 @@ impl Program {
             if state.is_interrupted() {
                 return Ok(StepResult::Interrupt);
             }
+            if let Some(io) = &state.io_completions {
+                let completed = match io {
+                    IOCompletions::Single(c) => c.is_completed(),
+                    IOCompletions::Many(completions) => {
+                        completions.iter().all(|c| c.is_completed())
+                    }
+                };
+                if !completed {
+                    return Ok(StepResult::IO);
+                }
+            }
             // invalidate row
             let _ = state.result_row.take();
             let (insn, insn_function) = &self.insns[state.pc as usize];
@@ -412,7 +431,10 @@ impl Program {
             match insn_function(self, state, insn, &pager, mv_store.as_ref()) {
                 Ok(InsnFunctionStepResult::Step) => {}
                 Ok(InsnFunctionStepResult::Done) => return Ok(StepResult::Done),
-                Ok(InsnFunctionStepResult::IO) => return Ok(StepResult::IO),
+                Ok(InsnFunctionStepResult::IO(io)) => {
+                    state.io_completions = Some(io);
+                    return Ok(StepResult::IO);
+                }
                 Ok(InsnFunctionStepResult::Row) => return Ok(StepResult::Row),
                 Ok(InsnFunctionStepResult::Interrupt) => return Ok(StepResult::Interrupt),
                 Ok(InsnFunctionStepResult::Busy) => return Ok(StepResult::Busy),
@@ -431,7 +453,7 @@ impl Program {
         program_state: &mut ProgramState,
         mv_store: Option<&Rc<MvStore>>,
         rollback: bool,
-    ) -> Result<StepResult> {
+    ) -> Result<IOResult<()>> {
         if let Some(mv_store) = mv_store {
             let conn = self.connection.clone();
             let auto_commit = conn.auto_commit.get();
@@ -442,7 +464,7 @@ impl Program {
                 }
                 mv_transactions.clear();
             }
-            Ok(StepResult::Done)
+            Ok(IOResult::Done(()))
         } else {
             let connection = self.connection.clone();
             let auto_commit = connection.auto_commit.get();
@@ -478,15 +500,15 @@ impl Program {
                     TransactionState::Read => {
                         connection.transaction_state.replace(TransactionState::None);
                         pager.end_read_tx()?;
-                        Ok(StepResult::Done)
+                        Ok(IOResult::Done(()))
                     }
-                    TransactionState::None => Ok(StepResult::Done),
+                    TransactionState::None => Ok(IOResult::Done(())),
                 }
             } else {
                 if self.change_cnt_on {
                     self.connection.set_changes(self.n_change.get());
                 }
-                Ok(StepResult::Done)
+                Ok(IOResult::Done(()))
             }
         }
     }
@@ -499,7 +521,7 @@ impl Program {
         connection: &Connection,
         rollback: bool,
         schema_did_change: bool,
-    ) -> Result<StepResult> {
+    ) -> Result<IOResult<()>> {
         let cacheflush_status = pager.end_tx(
             rollback,
             schema_did_change,
@@ -517,13 +539,13 @@ impl Program {
                 connection.transaction_state.replace(TransactionState::None);
                 *commit_state = CommitState::Ready;
             }
-            IOResult::IO => {
+            IOResult::IO(io) => {
                 tracing::trace!("Cacheflush IO");
                 *commit_state = CommitState::Committing;
-                return Ok(StepResult::IO);
+                return Ok(IOResult::IO(io));
             }
         }
-        Ok(StepResult::Done)
+        Ok(IOResult::Done(()))
     }
 
     #[rustfmt::skip]
