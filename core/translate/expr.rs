@@ -1,5 +1,5 @@
 use tracing::{instrument, Level};
-use turso_sqlite3_parser::ast::{self, Expr, UnaryOperator};
+use turso_sqlite3_parser::ast::{self, As, Expr, UnaryOperator};
 
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
@@ -25,6 +25,16 @@ pub struct ConditionMetadata {
     pub jump_if_condition_is_true: bool,
     pub jump_target_when_true: BranchOffset,
     pub jump_target_when_false: BranchOffset,
+}
+
+/// Container for register locations of values that can be referenced in RETURNING expressions
+pub struct ReturningValueRegisters {
+    /// Register containing the rowid/primary key
+    pub rowid_register: usize,
+    /// Starting register for column values (in column order)
+    pub columns_start_register: usize,
+    /// Number of columns available
+    pub num_columns: usize,
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -708,12 +718,10 @@ pub fn translate_expr(
                             )?;
                         }
                     }
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg: regs,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
+
+                    // Use shared function call helper
+                    let arg_registers: Vec<usize> = (regs..regs + args_count).collect();
+                    emit_function_call(program, func_ctx, &arg_registers, target_register)?;
 
                     Ok(target_register)
                 }
@@ -874,36 +882,24 @@ pub fn translate_expr(
                         let args = expect_arguments_exact!(args, 1, vector_func);
                         let start_reg = program.alloc_register();
                         translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
-                        program.emit_insn(Insn::Function {
-                            constant_mask: 0,
-                            start_reg,
-                            dest: target_register,
-                            func: func_ctx,
-                        });
+
+                        emit_function_call(program, func_ctx, &[start_reg], target_register)?;
                         Ok(target_register)
                     }
                     VectorFunc::Vector64 => {
                         let args = expect_arguments_exact!(args, 1, vector_func);
                         let start_reg = program.alloc_register();
                         translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
-                        program.emit_insn(Insn::Function {
-                            constant_mask: 0,
-                            start_reg,
-                            dest: target_register,
-                            func: func_ctx,
-                        });
+
+                        emit_function_call(program, func_ctx, &[start_reg], target_register)?;
                         Ok(target_register)
                     }
                     VectorFunc::VectorExtract => {
                         let args = expect_arguments_exact!(args, 1, vector_func);
                         let start_reg = program.alloc_register();
                         translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
-                        program.emit_insn(Insn::Function {
-                            constant_mask: 0,
-                            start_reg,
-                            dest: target_register,
-                            func: func_ctx,
-                        });
+
+                        emit_function_call(program, func_ctx, &[start_reg], target_register)?;
                         Ok(target_register)
                     }
                     VectorFunc::VectorDistanceCos => {
@@ -911,12 +907,8 @@ pub fn translate_expr(
                         let regs = program.alloc_registers(2);
                         translate_expr(program, referenced_tables, &args[0], regs, resolver)?;
                         translate_expr(program, referenced_tables, &args[1], regs + 1, resolver)?;
-                        program.emit_insn(Insn::Function {
-                            constant_mask: 0,
-                            start_reg: regs,
-                            dest: target_register,
-                            func: func_ctx,
-                        });
+
+                        emit_function_call(program, func_ctx, &[regs, regs + 1], target_register)?;
                         Ok(target_register)
                     }
                     VectorFunc::VectorDistanceEuclidean => {
@@ -924,12 +916,8 @@ pub fn translate_expr(
                         let regs = program.alloc_registers(2);
                         translate_expr(program, referenced_tables, &args[0], regs, resolver)?;
                         translate_expr(program, referenced_tables, &args[1], regs + 1, resolver)?;
-                        program.emit_insn(Insn::Function {
-                            constant_mask: 0,
-                            start_reg: regs,
-                            dest: target_register,
-                            func: func_ctx,
-                        });
+
+                        emit_function_call(program, func_ctx, &[regs, regs + 1], target_register)?;
                         Ok(target_register)
                     }
                 },
@@ -2089,79 +2077,7 @@ pub fn translate_expr(
             }
             Ok(target_register)
         }
-        ast::Expr::Literal(lit) => match lit {
-            ast::Literal::Numeric(val) => {
-                match parse_numeric_literal(val)? {
-                    Value::Integer(int_value) => {
-                        program.emit_insn(Insn::Integer {
-                            value: int_value,
-                            dest: target_register,
-                        });
-                    }
-                    Value::Float(real_value) => {
-                        program.emit_insn(Insn::Real {
-                            value: real_value,
-                            dest: target_register,
-                        });
-                    }
-                    _ => unreachable!(),
-                }
-                Ok(target_register)
-            }
-            ast::Literal::String(s) => {
-                program.emit_insn(Insn::String8 {
-                    value: sanitize_string(s),
-                    dest: target_register,
-                });
-                Ok(target_register)
-            }
-            ast::Literal::Blob(s) => {
-                let bytes = s
-                    .as_bytes()
-                    .chunks_exact(2)
-                    .map(|pair| {
-                        // We assume that sqlite3-parser has already validated that
-                        // the input is valid hex string, thus unwrap is safe.
-                        let hex_byte = std::str::from_utf8(pair).unwrap();
-                        u8::from_str_radix(hex_byte, 16).unwrap()
-                    })
-                    .collect();
-                program.emit_insn(Insn::Blob {
-                    value: bytes,
-                    dest: target_register,
-                });
-                Ok(target_register)
-            }
-            ast::Literal::Keyword(_) => todo!(),
-            ast::Literal::Null => {
-                program.emit_insn(Insn::Null {
-                    dest: target_register,
-                    dest_end: None,
-                });
-                Ok(target_register)
-            }
-            ast::Literal::CurrentDate => {
-                program.emit_insn(Insn::String8 {
-                    value: datetime::exec_date(&[]).to_string(),
-                    dest: target_register,
-                });
-                Ok(target_register)
-            }
-            ast::Literal::CurrentTime => {
-                program.emit_insn(Insn::String8 {
-                    value: datetime::exec_time(&[]).to_string(),
-                    dest: target_register,
-                });
-                Ok(target_register)
-            }
-            ast::Literal::CurrentTimestamp => {
-                program.emit_insn(Insn::String8 {
-                    value: datetime::exec_datetime_full(&[]).to_string(),
-                    dest: target_register,
-                });
-                Ok(target_register)
-            }
-        },
+        ast::Expr::Literal(lit) => emit_literal(program, lit, target_register),
         ast::Expr::Name(_) => todo!(),
         ast::Expr::NotNull(expr) => {
             let reg = program.alloc_register();
@@ -3236,4 +3152,372 @@ pub fn compare_affinity(
             Affinity::Blob
         }
     }
+}
+
+/// Evaluate a RETURNING expression using register-based evaluation instead of cursor-based.
+/// This is used for RETURNING clauses where we have register values instead of cursor data.
+pub fn translate_expr_for_returning(
+    program: &mut ProgramBuilder,
+    expr: &Expr,
+    value_registers: &ReturningValueRegisters,
+    target_register: usize,
+) -> Result<usize> {
+    match expr {
+        Expr::Column {
+            column,
+            is_rowid_alias,
+            ..
+        } => {
+            if *is_rowid_alias {
+                // For rowid references, copy from the rowid register
+                program.emit_insn(Insn::Copy {
+                    src_reg: value_registers.rowid_register,
+                    dst_reg: target_register,
+                    extra_amount: 0,
+                });
+            } else {
+                // For regular column references, copy from the appropriate column register
+                let column_idx = *column;
+                if column_idx < value_registers.num_columns {
+                    let column_reg = value_registers.columns_start_register + column_idx;
+                    program.emit_insn(Insn::Copy {
+                        src_reg: column_reg,
+                        dst_reg: target_register,
+                        extra_amount: 0,
+                    });
+                } else {
+                    crate::bail_parse_error!("Column index out of bounds in RETURNING clause");
+                }
+            }
+            Ok(target_register)
+        }
+        Expr::RowId { .. } => {
+            // For ROWID expressions, copy from the rowid register
+            program.emit_insn(Insn::Copy {
+                src_reg: value_registers.rowid_register,
+                dst_reg: target_register,
+                extra_amount: 0,
+            });
+            Ok(target_register)
+        }
+        Expr::Literal(literal) => emit_literal(program, literal, target_register),
+        Expr::Binary(lhs, op, rhs) => {
+            let lhs_reg = program.alloc_register();
+            let rhs_reg = program.alloc_register();
+
+            // Recursively evaluate left-hand side
+            translate_expr_for_returning(program, lhs, value_registers, lhs_reg)?;
+
+            // Recursively evaluate right-hand side
+            translate_expr_for_returning(program, rhs, value_registers, rhs_reg)?;
+
+            // Use the shared emit_binary_insn function
+            emit_binary_insn(
+                program,
+                op,
+                lhs_reg,
+                rhs_reg,
+                target_register,
+                lhs,
+                rhs,
+                None, // No table references needed for RETURNING
+            )?;
+
+            Ok(target_register)
+        }
+        Expr::FunctionCall { name, args, .. } => {
+            // Evaluate arguments into registers
+            let mut arg_regs = Vec::new();
+            if let Some(args) = args {
+                for arg in args.iter() {
+                    let arg_reg = program.alloc_register();
+                    translate_expr_for_returning(program, arg, value_registers, arg_reg)?;
+                    arg_regs.push(arg_reg);
+                }
+            }
+
+            // Resolve and call the function using shared helper
+            let func = Func::resolve_function(name.as_str(), arg_regs.len())?;
+            let func_ctx = FuncCtx {
+                func,
+                arg_count: arg_regs.len(),
+            };
+
+            emit_function_call(program, func_ctx, &arg_regs, target_register)?;
+            Ok(target_register)
+        }
+        _ => {
+            crate::bail_parse_error!(
+                "Unsupported expression type in RETURNING clause: {:?}",
+                expr
+            );
+        }
+    }
+}
+
+/// Emit literal values - shared between regular and RETURNING expression evaluation
+pub fn emit_literal(
+    program: &mut ProgramBuilder,
+    literal: &ast::Literal,
+    target_register: usize,
+) -> Result<usize> {
+    match literal {
+        ast::Literal::Numeric(val) => {
+            match parse_numeric_literal(val)? {
+                Value::Integer(int_value) => {
+                    program.emit_insn(Insn::Integer {
+                        value: int_value,
+                        dest: target_register,
+                    });
+                }
+                Value::Float(real_value) => {
+                    program.emit_insn(Insn::Real {
+                        value: real_value,
+                        dest: target_register,
+                    });
+                }
+                _ => unreachable!(),
+            }
+            Ok(target_register)
+        }
+        ast::Literal::String(s) => {
+            program.emit_insn(Insn::String8 {
+                value: sanitize_string(s),
+                dest: target_register,
+            });
+            Ok(target_register)
+        }
+        ast::Literal::Blob(s) => {
+            let bytes = s
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| {
+                    // We assume that sqlite3-parser has already validated that
+                    // the input is valid hex string, thus unwrap is safe.
+                    let hex_byte = std::str::from_utf8(pair).unwrap();
+                    u8::from_str_radix(hex_byte, 16).unwrap()
+                })
+                .collect();
+            program.emit_insn(Insn::Blob {
+                value: bytes,
+                dest: target_register,
+            });
+            Ok(target_register)
+        }
+        ast::Literal::Keyword(_) => todo!(),
+        ast::Literal::Null => {
+            program.emit_insn(Insn::Null {
+                dest: target_register,
+                dest_end: None,
+            });
+            Ok(target_register)
+        }
+        ast::Literal::CurrentDate => {
+            program.emit_insn(Insn::String8 {
+                value: datetime::exec_date(&[]).to_string(),
+                dest: target_register,
+            });
+            Ok(target_register)
+        }
+        ast::Literal::CurrentTime => {
+            program.emit_insn(Insn::String8 {
+                value: datetime::exec_time(&[]).to_string(),
+                dest: target_register,
+            });
+            Ok(target_register)
+        }
+        ast::Literal::CurrentTimestamp => {
+            program.emit_insn(Insn::String8 {
+                value: datetime::exec_datetime_full(&[]).to_string(),
+                dest: target_register,
+            });
+            Ok(target_register)
+        }
+    }
+}
+
+/// Emit a function call instruction with pre-allocated argument registers
+/// This is shared between different function call contexts
+pub fn emit_function_call(
+    program: &mut ProgramBuilder,
+    func_ctx: FuncCtx,
+    arg_registers: &[usize],
+    target_register: usize,
+) -> Result<()> {
+    let start_reg = if arg_registers.is_empty() {
+        target_register // If no arguments, use target register as start
+    } else {
+        arg_registers[0] // Use first argument register as start
+    };
+
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg,
+        dest: target_register,
+        func: func_ctx,
+    });
+
+    Ok(())
+}
+
+/// Process a RETURNING clause, converting ResultColumn expressions into ResultSetColumn structures
+/// with proper column binding and alias handling.
+pub fn process_returning_clause(
+    returning: &mut [ast::ResultColumn],
+    table: &Table,
+    table_name: &str,
+    program: &mut ProgramBuilder,
+    connection: &std::sync::Arc<crate::Connection>,
+) -> Result<(
+    Vec<super::plan::ResultSetColumn>,
+    super::plan::TableReferences,
+)> {
+    use super::plan::{
+        ColumnUsedMask, IterationDirection, JoinedTable, Operation, ResultSetColumn,
+        TableReferences,
+    };
+    use super::planner::bind_column_references;
+
+    let mut result_columns = vec![];
+
+    let internal_id = program.table_reference_counter.next();
+    let mut table_references = TableReferences::new(
+        vec![JoinedTable {
+            table: match table {
+                Table::Virtual(vtab) => Table::Virtual(vtab.clone()),
+                Table::BTree(btree_table) => Table::BTree(btree_table.clone()),
+                _ => unreachable!(),
+            },
+            identifier: table_name.to_string(),
+            internal_id,
+            op: Operation::Scan {
+                iter_dir: IterationDirection::Forwards,
+                index: None,
+            },
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            database_id: 0,
+        }],
+        vec![],
+    );
+
+    for rc in returning.iter_mut() {
+        match rc {
+            ast::ResultColumn::Expr(expr, alias) => {
+                let column_alias = determine_column_alias(expr, alias, table);
+
+                bind_column_references(expr, &mut table_references, None, connection)?;
+
+                result_columns.push(ResultSetColumn {
+                    expr: expr.clone(),
+                    alias: column_alias,
+                    contains_aggregates: false,
+                });
+            }
+            ast::ResultColumn::Star => {
+                // Handle RETURNING * by expanding to all table columns
+                // Use the shared internal_id for all columns
+                for (column_index, column) in table.columns().iter().enumerate() {
+                    let column_expr = Expr::Column {
+                        database: None,
+                        table: internal_id,
+                        column: column_index,
+                        is_rowid_alias: false,
+                    };
+
+                    result_columns.push(ResultSetColumn {
+                        expr: column_expr,
+                        alias: column.name.clone(),
+                        contains_aggregates: false,
+                    });
+                }
+            }
+            ast::ResultColumn::TableStar(_table_name) => {
+                // Handle RETURNING table.* by expanding to all table columns
+                // For single table RETURNING, this is equivalent to *
+                for (column_index, column) in table.columns().iter().enumerate() {
+                    let column_expr = Expr::Column {
+                        database: None,
+                        table: internal_id,
+                        column: column_index,
+                        is_rowid_alias: false,
+                    };
+
+                    result_columns.push(ResultSetColumn {
+                        expr: column_expr,
+                        alias: column.name.clone(),
+                        contains_aggregates: false,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok((result_columns, table_references))
+}
+
+/// Determine the appropriate alias for a RETURNING column expression
+fn determine_column_alias(
+    expr: &Expr,
+    explicit_alias: &Option<ast::As>,
+    table: &Table,
+) -> Option<String> {
+    // First check for explicit alias
+    if let Some(As::As(name)) = explicit_alias {
+        return Some(name.to_string());
+    }
+
+    // For ROWID expressions, use "rowid" as the alias
+    if let Expr::RowId { .. } = expr {
+        return Some("rowid".to_string());
+    }
+
+    // For column references, use special handling
+    if let Expr::Column {
+        column,
+        is_rowid_alias,
+        ..
+    } = expr
+    {
+        if *is_rowid_alias {
+            return Some("rowid".to_string());
+        } else {
+            // Get the column name from the table
+            return table
+                .columns()
+                .get(*column)
+                .and_then(|col| col.name.clone());
+        }
+    }
+
+    // For other expressions, use the expression string representation
+    Some(expr.to_string())
+}
+
+/// Emit bytecode to evaluate RETURNING expressions and produce result rows.
+/// This function handles the actual evaluation of expressions using the values
+/// from the DML operation.
+pub(crate) fn emit_returning_results(
+    program: &mut ProgramBuilder,
+    result_columns: &[super::plan::ResultSetColumn],
+    value_registers: &ReturningValueRegisters,
+) -> Result<()> {
+    if result_columns.is_empty() {
+        return Ok(());
+    }
+
+    let result_start_reg = program.alloc_registers(result_columns.len());
+
+    for (i, result_column) in result_columns.iter().enumerate() {
+        let reg = result_start_reg + i;
+
+        translate_expr_for_returning(program, &result_column.expr, value_registers, reg)?;
+    }
+
+    program.emit_insn(Insn::ResultRow {
+        start_reg: result_start_reg,
+        count: result_columns.len(),
+    });
+
+    Ok(())
 }

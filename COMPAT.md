@@ -77,7 +77,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | REINDEX                   | No      |                                                                                   |
 | RELEASE SAVEPOINT         | No      |                                                                                   |
 | REPLACE                   | No      |                                                                                   |
-| RETURNING clause          | No      |                                                                                   |
+| RETURNING clause          | Partial | DELETE is missing                                                                 |
 | ROLLBACK TRANSACTION      | Yes     |                                                                                   |
 | SAVEPOINT                 | No      |                                                                                   |
 | SELECT                    | Yes     |                                                                                   |

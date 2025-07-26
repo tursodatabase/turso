@@ -156,6 +156,7 @@ pub fn translate_inner(
                 tbl_name,
                 where_clause,
                 limit,
+                returning,
                 ..
             } = *delete;
             translate_delete(
@@ -163,6 +164,7 @@ pub fn translate_inner(
                 &tbl_name,
                 where_clause,
                 limit,
+                returning,
                 syms,
                 program,
                 connection,

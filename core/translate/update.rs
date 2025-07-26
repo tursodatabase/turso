@@ -13,9 +13,10 @@ use crate::{
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
     SymbolTable,
 };
-use turso_sqlite3_parser::ast::{self, Expr, ResultColumn, SortOrder, Update};
+use turso_sqlite3_parser::ast::{Expr, SortOrder, Update};
 
 use super::emitter::emit_program;
+use super::expr::process_returning_clause;
 use super::optimizer::optimize_plan;
 use super::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Plan, ResultSetColumn, TableReferences,
@@ -171,27 +172,21 @@ pub fn prepare_update_plan(
         }
     }
 
-    let mut result_columns = vec![];
-    if let Some(returning) = &mut body.returning {
-        for rc in returning.iter_mut() {
-            if let ResultColumn::Expr(expr, alias) = rc {
-                bind_column_references(expr, &mut table_references, None, connection)?;
-                result_columns.push(ResultSetColumn {
-                    expr: expr.clone(),
-                    alias: alias.as_ref().and_then(|a| {
-                        if let ast::As::As(name) = a {
-                            Some(name.to_string())
-                        } else {
-                            None
-                        }
-                    }),
-                    contains_aggregates: false,
-                });
-            } else {
-                bail_parse_error!("Only expressions are allowed in RETURNING clause");
-            }
-        }
-    }
+    let (result_columns, _table_references) = if let Some(returning) = &mut body.returning {
+        process_returning_clause(
+            returning,
+            &table,
+            body.tbl_name.name.as_str(),
+            program,
+            connection,
+        )?
+    } else {
+        (
+            vec![],
+            crate::translate::plan::TableReferences::new(vec![], vec![]),
+        )
+    };
+
     let order_by = body.order_by.as_ref().map(|order| {
         order
             .iter()
@@ -342,7 +337,11 @@ pub fn prepare_update_plan(
         table_references,
         set_clauses,
         where_clause,
-        returning: Some(result_columns),
+        returning: if result_columns.is_empty() {
+            None
+        } else {
+            Some(result_columns)
+        },
         order_by,
         limit,
         offset,

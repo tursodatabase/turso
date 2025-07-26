@@ -6521,7 +6521,12 @@ impl Value {
 
     pub fn exec_length(&self) -> Self {
         match self {
-            Value::Text(_) | Value::Integer(_) | Value::Float(_) => {
+            Value::Text(t) => {
+                // Count Unicode scalar values (characters)
+                Value::Integer(t.as_str().chars().count() as i64)
+            }
+            Value::Integer(_) | Value::Float(_) => {
+                // For numbers, SQLite returns the length of the string representation
                 Value::Integer(self.to_string().chars().count() as i64)
             }
             Value::Blob(blob) => Value::Integer(blob.len() as i64),

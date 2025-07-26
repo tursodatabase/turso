@@ -517,3 +517,65 @@ do_execsql_test_in_memory_error_content insert-explicit-rowid-conflict {
     insert into t(rowid, x) values (1, 1);
     insert into t(rowid, x) values (1, 2);
 } {UNIQUE constraint failed: t.rowid (19)}
+
+# RETURNING clause tests
+do_execsql_test_on_specific_db {:memory:} returning-basic-column {
+    CREATE TABLE test (id INTEGER, name TEXT, value REAL);
+    INSERT INTO test (id, name, value) VALUES (1, 'test', 10.5) RETURNING id;
+} {1}
+
+do_execsql_test_on_specific_db {:memory:} returning-multiple-columns {
+    CREATE TABLE test (id INTEGER, name TEXT, value REAL);
+    INSERT INTO test (id, name, value) VALUES (1, 'test', 10.5) RETURNING id, name;
+} {1|test}
+
+do_execsql_test_on_specific_db {:memory:} returning-all-columns {
+    CREATE TABLE test (id INTEGER, name TEXT, value REAL);
+    INSERT INTO test (id, name, value) VALUES (1, 'test', 10.5) RETURNING *;
+} {1|test|10.5}
+
+do_execsql_test_on_specific_db {:memory:} returning-literal {
+    CREATE TABLE test (id INTEGER);
+    INSERT INTO test (id) VALUES (1) RETURNING 42;
+} {42}
+
+do_execsql_test_on_specific_db {:memory:} returning-arithmetic {
+    CREATE TABLE test (id INTEGER, value INTEGER);
+    INSERT INTO test (id, value) VALUES (1, 10) RETURNING 2 * value;
+} {20}
+
+do_execsql_test_on_specific_db {:memory:} returning-complex-expression {
+    CREATE TABLE test (id INTEGER, x INTEGER, y INTEGER);
+    INSERT INTO test (id, x, y) VALUES (1, 5, 3) RETURNING x + y * 2;
+} {11}
+
+do_execsql_test_on_specific_db {:memory:} returning-function-call {
+    CREATE TABLE test (id INTEGER, name TEXT);
+    INSERT INTO test (id, name) VALUES (1, 'hello') RETURNING upper(name);
+} {HELLO}
+
+do_execsql_test_on_specific_db {:memory:} returning-mixed-expressions {
+    CREATE TABLE test (id INTEGER, name TEXT, value INTEGER);
+    INSERT INTO test (id, name, value) VALUES (1, 'test', 10) RETURNING id, upper(name), value * 3;
+} {1|TEST|30}
+
+do_execsql_test_on_specific_db {:memory:} returning-multiple-rows {
+    CREATE TABLE test (id INTEGER, name TEXT);
+    INSERT INTO test (id, name) VALUES (1, 'first'), (2, 'second') RETURNING id, name;
+} {1|first
+2|second}
+
+do_execsql_test_on_specific_db {:memory:} returning-with-autoincrement {
+    CREATE TABLE test (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
+    INSERT INTO test (name) VALUES ('test') RETURNING id, name;
+} {1|test}
+
+do_execsql_test_on_specific_db {:memory:} returning-rowid {
+    CREATE TABLE test (name TEXT);
+    INSERT INTO test (name) VALUES ('test') RETURNING rowid, name;
+} {1|test}
+
+do_execsql_test_on_specific_db {:memory:} returning-null-values {
+    CREATE TABLE test (id INTEGER, name TEXT, value INTEGER);
+    INSERT INTO test (id, name, value) VALUES (1, NULL, NULL) RETURNING id, name, value;
+} {1||}

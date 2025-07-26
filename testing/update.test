@@ -270,3 +270,78 @@ do_execsql_test_on_specific_db {:memory:} update-single-rowid {
     UPDATE t SET x = 2 WHERE x = 1;
     SELECT * FROM t;
 } {2}
+
+# RETURNING clause tests for UPDATE
+do_execsql_test_on_specific_db {:memory:} update-returning-basic-column {
+    CREATE TABLE test (id INTEGER, name TEXT, value REAL);
+    INSERT INTO test (id, name, value) VALUES (1, 'test', 10.5);
+    UPDATE test SET value = 20.5 WHERE id = 1 RETURNING id;
+} {1}
+
+do_execsql_test_on_specific_db {:memory:} update-returning-multiple-columns {
+    CREATE TABLE test (id INTEGER, name TEXT, value REAL);
+    INSERT INTO test (id, name, value) VALUES (1, 'test', 10.5);
+    UPDATE test SET value = 20.5 WHERE id = 1 RETURNING id, name, value;
+} {1|test|20.5}
+
+do_execsql_test_on_specific_db {:memory:} update-returning-all-columns {
+    CREATE TABLE test (id INTEGER, name TEXT, value REAL);
+    INSERT INTO test (id, name, value) VALUES (1, 'test', 10.5);
+    UPDATE test SET value = 20.5 WHERE id = 1 RETURNING *;
+} {1|test|20.5}
+
+do_execsql_test_on_specific_db {:memory:} update-returning-literal {
+    CREATE TABLE test (id INTEGER, value INTEGER);
+    INSERT INTO test (id, value) VALUES (1, 10);
+    UPDATE test SET value = 20 WHERE id = 1 RETURNING 42;
+} {42}
+
+do_execsql_test_on_specific_db {:memory:} update-returning-arithmetic {
+    CREATE TABLE test (id INTEGER, value INTEGER);
+    INSERT INTO test (id, value) VALUES (1, 10);
+    UPDATE test SET value = 20 WHERE id = 1 RETURNING 2 * value;
+} {40}
+
+do_execsql_test_on_specific_db {:memory:} update-returning-complex-expression {
+    CREATE TABLE test (id INTEGER, x INTEGER, y INTEGER);
+    INSERT INTO test (id, x, y) VALUES (1, 5, 3);
+    UPDATE test SET x = 8 WHERE id = 1 RETURNING x + y * 2;
+} {14}
+
+do_execsql_test_on_specific_db {:memory:} update-returning-function-call {
+    CREATE TABLE test (id INTEGER, name TEXT);
+    INSERT INTO test (id, name) VALUES (1, 'hello');
+    UPDATE test SET name = 'world' WHERE id = 1 RETURNING upper(name);
+} {WORLD}
+
+do_execsql_test_on_specific_db {:memory:} update-returning-mixed-expressions {
+    CREATE TABLE test (id INTEGER, name TEXT, value INTEGER);
+    INSERT INTO test (id, name, value) VALUES (1, 'test', 10);
+    UPDATE test SET name = 'updated', value = 30 WHERE id = 1 RETURNING id, upper(name), value * 2;
+} {1|UPDATED|60}
+
+do_execsql_test_on_specific_db {:memory:} update-returning-multiple-rows {
+    CREATE TABLE test (id INTEGER, name TEXT);
+    INSERT INTO test (id, name) VALUES (1, 'first'), (2, 'second');
+    UPDATE test SET name = 'updated' RETURNING id, name;
+} {1|updated
+2|updated}
+
+do_execsql_test_on_specific_db {:memory:} update-returning-with-where {
+    CREATE TABLE test (id INTEGER, name TEXT, active INTEGER);
+    INSERT INTO test (id, name, active) VALUES (1, 'first', 1), (2, 'second', 0), (3, 'third', 1);
+    UPDATE test SET name = 'updated' WHERE active = 1 RETURNING id, name;
+} {1|updated
+3|updated}
+
+do_execsql_test_on_specific_db {:memory:} update-returning-old-vs-new-values {
+    CREATE TABLE test (id INTEGER, counter INTEGER);
+    INSERT INTO test (id, counter) VALUES (1, 5);
+    UPDATE test SET counter = counter + 10 WHERE id = 1 RETURNING id, counter;
+} {1|15}
+
+do_execsql_test_on_specific_db {:memory:} update-returning-null-values {
+    CREATE TABLE test (id INTEGER, name TEXT, value INTEGER);
+    INSERT INTO test (id, name, value) VALUES (1, 'test', 10);
+    UPDATE test SET name = NULL, value = NULL WHERE id = 1 RETURNING id, name, value;
+} {1||}

@@ -8,6 +8,10 @@ use turso_sqlite3_parser::ast::{
 use crate::error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY};
 use crate::schema::{self, IndexColumn, Table};
 use crate::translate::emitter::{emit_cdc_insns, emit_cdc_patch_record, OperationMode};
+use crate::translate::expr::{
+    emit_returning_results, process_returning_clause, ReturningValueRegisters,
+};
+use crate::translate::plan::TableReferences;
 use crate::translate::planner::ROWID;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::ProgramBuilderOpts;
@@ -42,7 +46,7 @@ pub fn translate_insert(
     tbl_name: QualifiedName,
     columns: Option<DistinctNames>,
     mut body: InsertBody,
-    _returning: Option<Vec<ResultColumn>>,
+    mut returning: Option<Vec<ResultColumn>>,
     syms: &SymbolTable,
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
@@ -139,6 +143,24 @@ pub fn translate_insert(
     } else {
         None
     };
+
+    // Process RETURNING clause using shared module
+    let (result_columns, _) = if let Some(returning) = &mut returning {
+        process_returning_clause(
+            returning,
+            &table,
+            table_name.as_str(),
+            &mut program,
+            connection,
+        )?
+    } else {
+        (vec![], TableReferences::new(vec![], vec![]))
+    };
+
+    // Set up the program to return result columns if RETURNING is specified
+    if !result_columns.is_empty() {
+        program.result_columns = result_columns.clone();
+    }
 
     let mut yield_reg_opt = None;
     let mut temp_table_ctx = None;
@@ -577,6 +599,17 @@ pub fn translate_insert(
             after_record_reg,
             table_name.as_str(),
         )?;
+    }
+
+    // Emit RETURNING results if specified
+    if !result_columns.is_empty() {
+        let value_registers = ReturningValueRegisters {
+            rowid_register: rowid_and_columns_start_register,
+            columns_start_register,
+            num_columns: table.columns().len(),
+        };
+
+        emit_returning_results(&mut program, &result_columns, &value_registers)?;
     }
 
     if inserting_multiple_rows {
