@@ -20,8 +20,8 @@ use crate::fast_lock::SpinLock;
 use crate::io::{File, IO};
 use crate::result::LimboResult;
 use crate::storage::sqlite3_ondisk::{
-    begin_read_wal_frame, begin_read_wal_frame_raw, begin_write_btree_pages_writev,
-    finish_read_page, prepare_wal_frame, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
+    begin_read_wal_frame, begin_read_wal_frame_raw, finish_read_page, prepare_wal_frame,
+    write_pages_vectored, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
 };
 use crate::types::IOResult;
 use crate::{turso_assert, Buffer, LimboError, Result};
@@ -372,7 +372,7 @@ pub enum CheckpointState {
     Done,
 }
 
-const CKPT_BATCH_PAGES: usize = 512;
+pub const CKPT_BATCH_PAGES: usize = 1024;
 
 #[derive(Clone)]
 pub(super) struct BatchItem {
@@ -525,27 +525,28 @@ impl fmt::Debug for WalFileShared {
 }
 
 fn take_page_into_batch(scratch: &PageRef, pool: &Arc<BufferPool>, batch: &mut Vec<BatchItem>) {
-    // grab id and buffer
-    let id = scratch.get().id;
-    let buf = scratch.get_contents().buffer.clone();
-    scratch.pin(); // ensure it isnt evicted
-    batch.push(BatchItem { id, buf });
-    // give scratch a brand-new empty buffer for the next read
-    reinit_scratch_buffer(scratch, pool);
-}
+    let (id, buf_clone) = unsafe {
+        let inner = &*scratch.inner.get();
+        let id = inner.id;
+        let contents = inner.contents.as_ref().expect("scratch has contents");
+        let buf = contents.buffer.clone();
+        (id, buf)
+    };
 
-fn reinit_scratch_buffer(scratch: &PageRef, pool: &Arc<BufferPool>) {
+    // Push into batch
+    batch.push(BatchItem { id, buf: buf_clone });
+
+    // Re-initialize scratch with a fresh buffer
     let raw = pool.get();
     let pool_clone = pool.clone();
-    let drop_fn = Rc::new(move |b| {
-        pool_clone.put(b);
-    });
+    let drop_fn = Rc::new(move |b| pool_clone.put(b));
     let new_buf = Arc::new(RefCell::new(Buffer::new(raw, drop_fn)));
-    // replace contents
+
     unsafe {
         let inner = &mut *scratch.inner.get();
         inner.contents = Some(PageContent::new(0, new_buf));
-        inner.flags.store(0, Ordering::Relaxed);
+        // reset flags on scratch so it won't be cleared later with the real page
+        inner.flags.store(0, Ordering::SeqCst);
     }
 }
 
@@ -859,15 +860,16 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn should_checkpoint(&self) -> bool {
         let shared = self.get_shared();
+        let nbackfills = shared.nbackfills.load(Ordering::SeqCst) as usize;
         let frame_id = shared.max_frame.load(Ordering::SeqCst) as usize;
-        frame_id >= self.checkpoint_threshold
+        frame_id > self.checkpoint_threshold && frame_id > nbackfills
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
     fn checkpoint(
         &mut self,
         pager: &Pager,
-        write_counter: Rc<RefCell<usize>>,
+        _write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
         assert!(
@@ -880,7 +882,22 @@ impl Wal for WalFile {
             match state {
                 CheckpointState::Start => {
                     // TODO(pere): check what frames are safe to checkpoint between many readers!
-                    self.ongoing_checkpoint.min_frame = self.min_frame;
+                    let (shared_max, nbackfills) = {
+                        let shared = self.get_shared();
+                        (
+                            shared.max_frame.load(Ordering::SeqCst),
+                            shared.nbackfills.load(Ordering::SeqCst),
+                        )
+                    };
+                    self.ongoing_checkpoint.min_frame = nbackfills + 1;
+                    if shared_max <= nbackfills {
+                        tracing::debug!(
+                            "checkpoint_start: max_frame={} < min_frame={}",
+                            shared_max,
+                            self.ongoing_checkpoint.min_frame
+                        );
+                        return Ok(IOResult::Done(CheckpointResult::default()));
+                    }
                     let shared = self.get_shared();
                     let busy = !shared.checkpoint_lock.write();
                     if busy {
@@ -908,6 +925,7 @@ impl Wal for WalFile {
                     self.ongoing_checkpoint.current_page = 0;
                     self.ongoing_checkpoint.state = CheckpointState::ReadFrame;
                     self.ongoing_checkpoint.batch.clear();
+                    self.ongoing_checkpoint.pending_flushes.clear();
                     tracing::trace!(
                         "checkpoint_start(min_frame={}, max_frame={})",
                         self.ongoing_checkpoint.min_frame,
@@ -925,7 +943,14 @@ impl Wal for WalFile {
                     let frame_cache = frame_cache.lock();
                     assert!(self.ongoing_checkpoint.current_page as usize <= pages_in_frames.len());
                     if self.ongoing_checkpoint.current_page as usize == pages_in_frames.len() {
-                        self.ongoing_checkpoint.state = CheckpointState::Done;
+                        if self.ongoing_checkpoint.batch.is_empty() {
+                            // no more pages to checkpoint, we are done
+                            tracing::info!("checkpoint done, no more pages to checkpoint");
+                            self.ongoing_checkpoint.state = CheckpointState::Done;
+                        } else {
+                            // flush the batch
+                            self.ongoing_checkpoint.state = CheckpointState::FlushBatch;
+                        }
                         continue 'checkpoint_loop;
                     }
                     let page = pages_in_frames[self.ongoing_checkpoint.current_page as usize];
@@ -983,16 +1008,10 @@ impl Wal for WalFile {
                     tracing::trace!("started checkpoint backfilling batch");
                     self.ongoing_checkpoint
                         .pending_flushes
-                        .push(begin_write_btree_pages_writev(
-                            pager,
-                            &self.ongoing_checkpoint.batch,
-                            Rc::new(Cell::new(0)),
-                        )?);
-                    *write_counter.borrow_mut() += 1;
+                        .push(write_pages_vectored(pager, &self.ongoing_checkpoint.batch)?);
                     // batch is queued
                     self.ongoing_checkpoint.batch.clear();
                     self.ongoing_checkpoint.state = CheckpointState::WaitFlush;
-                    return Ok(IOResult::IO);
                 }
                 CheckpointState::WaitFlush => {
                     if self
@@ -1003,9 +1022,12 @@ impl Wal for WalFile {
                     {
                         return Ok(IOResult::IO);
                     }
-                    tracing::trace!("finished checkpoint backfilling batch");
-                    *write_counter.borrow_mut() -= 1;
-                    for pf in self.ongoing_checkpoint.pending_flushes.drain(..) {
+                    tracing::debug!("finished checkpoint backfilling batch");
+                    for pf in self
+                        .ongoing_checkpoint
+                        .pending_flushes
+                        .drain(std::ops::RangeFull)
+                    {
                         for id in pf.pages {
                             if let Some(p) = pager.cache_get(id) {
                                 p.clear_dirty();
@@ -1020,16 +1042,13 @@ impl Wal for WalFile {
                         self.ongoing_checkpoint.current_page += 1;
                         self.ongoing_checkpoint.state = CheckpointState::ReadFrame;
                     } else {
+                        tracing::info!("transitioning checkpoint to done");
                         self.ongoing_checkpoint.state = CheckpointState::Done;
                     }
                 }
                 CheckpointState::Done => {
-                    if *write_counter.borrow() > 0 {
-                        return Ok(IOResult::IO);
-                    }
                     let shared = self.get_shared();
                     shared.checkpoint_lock.unlock();
-
                     // Record two num pages fields to return as checkpoint result to caller.
                     // Ref: pnLog, pnCkpt on https://www.sqlite.org/c3ref/wal_checkpoint_v2.html
                     let checkpoint_result = CheckpointResult {
@@ -1038,6 +1057,11 @@ impl Wal for WalFile {
                     };
                     let everything_backfilled = shared.max_frame.load(Ordering::SeqCst)
                         == self.ongoing_checkpoint.max_frame;
+                    let new_min = self.ongoing_checkpoint.max_frame + 1;
+                    shared
+                        .nbackfills
+                        .store(self.ongoing_checkpoint.max_frame, Ordering::SeqCst);
+                    shared.min_frame.store(new_min, Ordering::SeqCst);
                     if everything_backfilled {
                         // TODO: Even in Passive mode, if everything was backfilled we should
                         // truncate and fsync the *db file*
@@ -1055,11 +1079,13 @@ impl Wal for WalFile {
                             // TODO: if all frames were backfilled into the db file, calls fsync
                             // TODO(pere): truncate wal file here.
                         }
-                    } else {
-                        shared
-                            .nbackfills
-                            .store(self.ongoing_checkpoint.max_frame, Ordering::SeqCst);
                     }
+                    self.min_frame = self.ongoing_checkpoint.max_frame + 1;
+                    self.ongoing_checkpoint.scratch_page.clear_dirty();
+                    self.ongoing_checkpoint.scratch_page.get().id = 0;
+                    self.ongoing_checkpoint.scratch_page.get().contents = None;
+                    self.ongoing_checkpoint.pending_flushes.clear();
+                    self.ongoing_checkpoint.batch.clear();
                     self.ongoing_checkpoint.state = CheckpointState::Start;
                     return Ok(IOResult::Done(checkpoint_result));
                 }
@@ -1232,6 +1258,8 @@ impl WalFile {
         self.ongoing_checkpoint.min_frame = 0;
         self.ongoing_checkpoint.max_frame = 0;
         self.ongoing_checkpoint.current_page = 0;
+        self.ongoing_checkpoint.batch.clear();
+        self.ongoing_checkpoint.pending_flushes.clear();
         self.sync_state.set(SyncState::NotSyncing);
         self.syncing.set(false);
     }
