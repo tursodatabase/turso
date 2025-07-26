@@ -13,7 +13,7 @@ from typing import Dict
 from cli_tests.console import error, info, test
 from cli_tests.test_turso_cli import TestTursoShell
 
-LIMBO_BIN = Path("./target/debug/tursodb")
+LIMBO_BIN = Path("./target/release/tursodb")
 DB_FILE = Path("testing/temp.db")
 vfs_list = ["syscall"]
 if platform.system() == "Linux":

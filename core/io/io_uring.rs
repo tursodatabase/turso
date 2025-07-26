@@ -3,7 +3,7 @@
 use super::{common, Completion, File, OpenFlags, IO};
 use crate::io::clock::{Clock, Instant};
 use crate::storage::wal::CKPT_BATCH_PAGES;
-use crate::{turso_assert, LimboError, MemoryIO, Result};
+use crate::{LimboError, MemoryIO, Result};
 use rustix::fs::{self, FlockOperation, OFlags};
 use std::{
     cell::RefCell,
@@ -115,8 +115,8 @@ struct WritevState {
     current_buffer_offset: usize,
     total_written: usize,
     bufs: Vec<Arc<RefCell<crate::Buffer>>>,
-    // we keep the last iovec allocation alive until CQE:
-    // raw ptr to Box<[iovec]>
+    // we keep the last iovec allocation alive until CQE.
+    // pointer to the beginning of the iovec array
     last_iov: *mut libc::iovec,
     last_iov_len: usize,
 }
@@ -178,10 +178,10 @@ impl WritevState {
     fn free_last_iov(&mut self) {
         if !self.last_iov.is_null() {
             unsafe {
-                drop(Box::from_raw(core::slice::from_raw_parts_mut(
+                let _ = Box::from_raw(core::slice::from_raw_parts_mut(
                     self.last_iov,
                     self.last_iov_len,
-                )))
+                ));
             };
             self.last_iov = core::ptr::null_mut();
             self.last_iov_len = 0;
@@ -341,6 +341,7 @@ impl IO for UringIO {
     }
 
     fn run_once(&self) -> Result<()> {
+        trace!("run_once()");
         let mut inner = self.inner.borrow_mut();
         let ring = &mut inner.ring;
         if ring.empty() {
@@ -368,10 +369,6 @@ impl IO for UringIO {
         for i in 0..count {
             let user_data = uds[i];
             let result = ress[i];
-            turso_assert!(
-                user_data != 0,
-                "user_data must not be zero, we dont submit linked timeouts or cancelations that would cause this"
-            );
             if let Some(mut st) = ring.writev_states.remove(&user_data) {
                 if let Some(c) = ring.pending[user_data as usize].as_ref() {
                     if result < 0 {
