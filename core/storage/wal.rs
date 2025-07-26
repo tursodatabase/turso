@@ -527,7 +527,8 @@ impl fmt::Debug for WalFileShared {
 fn take_page_into_batch(scratch: &PageRef, pool: &Arc<BufferPool>, batch: &mut Vec<BatchItem>) {
     // grab id and buffer
     let id = scratch.get().id;
-    let buf = scratch.get_contents().buffer.clone(); // current data
+    let buf = scratch.get_contents().buffer.clone();
+    scratch.pin(); // ensure it isnt evicted
     batch.push(BatchItem { id, buf });
     // give scratch a brand-new empty buffer for the next read
     reinit_scratch_buffer(scratch, pool);
