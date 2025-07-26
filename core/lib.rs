@@ -616,7 +616,6 @@ impl Connection {
     }
 
     #[instrument(skip_all, level = Level::INFO)]
-    pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
     pub fn prepare_execute_batch(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
         if self.closed.get() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
