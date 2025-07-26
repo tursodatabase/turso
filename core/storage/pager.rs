@@ -1262,11 +1262,11 @@ impl Pager {
                 num_checkpointed_frames: 0,
             });
         }
-
+        let write_counter = Rc::new(RefCell::new(0));
         let checkpoint_result = self.io.block(|| {
             self.wal
                 .borrow_mut()
-                .checkpoint(self, Rc::new(RefCell::new(0)), CheckpointMode::Passive)
+                .checkpoint(self, write_counter.clone(), CheckpointMode::Passive)
                 .map_err(|err| panic!("error while clearing cache {err}"))
         })?;
 

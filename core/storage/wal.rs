@@ -372,7 +372,7 @@ pub enum CheckpointState {
     Done,
 }
 
-const CKPT_BATCH_PAGES: usize = 256;
+const CKPT_BATCH_PAGES: usize = 512;
 
 #[derive(Clone)]
 pub(super) struct BatchItem {
@@ -389,7 +389,7 @@ pub(super) struct BatchItem {
 // current_page is a helper to iterate through all the pages that might have a frame in the safe
 // range. This is inefficient for now.
 struct OngoingCheckpoint {
-    scratch: PageRef,
+    scratch_page: PageRef,
     batch: Vec<BatchItem>,
     state: CheckpointState,
     pending_flushes: Vec<PendingFlush>,
@@ -940,11 +940,11 @@ impl Wal for WalFile {
                                 page,
                                 *frame
                             );
-                            self.ongoing_checkpoint.scratch.get().id = page as usize;
+                            self.ongoing_checkpoint.scratch_page.get().id = page as usize;
 
                             self.read_frame(
                                 *frame,
-                                self.ongoing_checkpoint.scratch.clone(),
+                                self.ongoing_checkpoint.scratch_page.clone(),
                                 self.buffer_pool.clone(),
                             )?;
                             self.ongoing_checkpoint.state = CheckpointState::WaitReadFrame;
@@ -954,7 +954,7 @@ impl Wal for WalFile {
                     self.ongoing_checkpoint.current_page += 1;
                 }
                 CheckpointState::WaitReadFrame => {
-                    if self.ongoing_checkpoint.scratch.is_locked() {
+                    if self.ongoing_checkpoint.scratch_page.is_locked() {
                         return Ok(IOResult::IO);
                     } else {
                         self.ongoing_checkpoint.state = CheckpointState::AccumulatePage;
@@ -962,17 +962,16 @@ impl Wal for WalFile {
                 }
                 CheckpointState::AccumulatePage => {
                     // mark before batching
-                    self.ongoing_checkpoint.scratch.set_dirty();
+                    self.ongoing_checkpoint.scratch_page.set_dirty();
                     take_page_into_batch(
-                        &self.ongoing_checkpoint.scratch,
+                        &self.ongoing_checkpoint.scratch_page,
                         &self.buffer_pool,
                         &mut self.ongoing_checkpoint.batch,
                     );
-
                     let more_pages = (self.ongoing_checkpoint.current_page as usize)
                         < self.get_shared().pages_in_frames.lock().len() - 1;
 
-                    if self.ongoing_checkpoint.batch.len() < CKPT_BATCH_PAGES && more_pages {
+                    if more_pages {
                         self.ongoing_checkpoint.current_page += 1;
                         self.ongoing_checkpoint.state = CheckpointState::ReadFrame;
                     } else {
@@ -980,13 +979,15 @@ impl Wal for WalFile {
                     }
                 }
                 CheckpointState::FlushBatch => {
+                    tracing::trace!("started checkpoint backfilling batch");
                     self.ongoing_checkpoint
                         .pending_flushes
                         .push(begin_write_btree_pages_writev(
                             pager,
                             &self.ongoing_checkpoint.batch,
-                            write_counter.clone(),
+                            Rc::new(Cell::new(0)),
                         )?);
+                    *write_counter.borrow_mut() += 1;
                     // batch is queued
                     self.ongoing_checkpoint.batch.clear();
                     self.ongoing_checkpoint.state = CheckpointState::WaitFlush;
@@ -1001,6 +1002,8 @@ impl Wal for WalFile {
                     {
                         return Ok(IOResult::IO);
                     }
+                    tracing::trace!("finished checkpoint backfilling batch");
+                    *write_counter.borrow_mut() -= 1;
                     for pf in self.ongoing_checkpoint.pending_flushes.drain(..) {
                         for id in pf.pages {
                             if let Some(p) = pager.cache_get(id) {
@@ -1170,7 +1173,7 @@ impl WalFile {
             max_frame: unsafe { (*shared.get()).max_frame.load(Ordering::SeqCst) },
             shared,
             ongoing_checkpoint: OngoingCheckpoint {
-                scratch: checkpoint_page,
+                scratch_page: checkpoint_page,
                 batch: Vec::new(),
                 pending_flushes: Vec::new(),
                 state: CheckpointState::Start,
