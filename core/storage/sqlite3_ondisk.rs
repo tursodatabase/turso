@@ -61,12 +61,12 @@ use crate::storage::pager::Pager;
 use crate::storage::wal::{BatchItem, PendingFlush};
 use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
 use crate::{turso_assert, File, Result, WalFileShared};
-use std::cell::{Cell, RefCell, UnsafeCell};
+use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// The size of the database header in bytes.
@@ -824,61 +824,55 @@ pub fn begin_write_btree_page(
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-pub fn begin_write_btree_pages_writev(
-    pager: &Pager,
-    batch: &[BatchItem],
-    // track writes for each flush series
-    write_counter: Rc<Cell<usize>>,
-) -> Result<PendingFlush> {
+pub fn write_pages_vectored(pager: &Pager, batch: &[BatchItem]) -> Result<PendingFlush> {
     if batch.is_empty() {
         return Ok(PendingFlush::default());
     }
-
     let mut run = batch.to_vec();
     run.sort_by_key(|b| b.id);
 
     let page_sz = pager.page_size.get().unwrap_or(DEFAULT_PAGE_SIZE) as usize;
-    let done = Arc::new(AtomicBool::new(false));
-
     let mut all_ids = Vec::with_capacity(run.len());
+    // count runs
+    let mut starts = Vec::with_capacity(5); // arbitrary initialization
     let mut start = 0;
     while start < run.len() {
         let mut end = start + 1;
         while end < run.len() && run[end].id == run[end - 1].id + 1 {
             end += 1;
         }
-
-        // submit contiguous run
+        starts.push((start, end));
+        start = end;
+    }
+    let runs = starts.len();
+    let runs_left = Arc::new(AtomicUsize::new(runs));
+    let done = Arc::new(AtomicBool::new(false));
+    for (start, end) in starts {
         let first_id = run[start].id;
         let bufs: Vec<_> = run[start..end].iter().map(|b| b.buf.clone()).collect();
         all_ids.extend(run[start..end].iter().map(|b| b.id));
 
-        write_counter.set(write_counter.get() + 1);
-        let wc = write_counter.clone();
-        let done_clone = done.clone();
+        let runs_left_cl = runs_left.clone();
+        let done_cl = done.clone();
 
         let c = Completion::new_write(move |_| {
-            // one run finished
-            wc.set(wc.get() - 1);
-            if wc.get().eq(&0) {
-                // last run of this batch is done
-                done_clone.store(true, Ordering::Release);
+            if runs_left_cl.fetch_sub(1, Ordering::AcqRel) == 1 {
+                done_cl.store(true, Ordering::Release);
             }
         });
-        pager
-            .db_file
-            .write_pages(first_id, page_sz, bufs, c)
-            .inspect_err(|e| {
-                tracing::error!(
-                    "Failed to write pages {}-{}: {}",
-                    first_id,
-                    first_id + (end - start) - 1,
-                    e
-                );
-                write_counter.set(write_counter.get() - 1);
-            })?;
-        start = end;
+        // submit, roll back on error
+        if let Err(e) = pager.db_file.write_pages(first_id, page_sz, bufs, c) {
+            if runs_left.fetch_sub(1, Ordering::AcqRel) == 1 {
+                done.store(true, Ordering::Release);
+            }
+            return Err(e);
+        }
     }
+    tracing::debug!(
+        "write_pages_vectored: {} pages to write, runs: {runs}",
+        all_ids.len()
+    );
+
     Ok(PendingFlush {
         pages: all_ids,
         done,
