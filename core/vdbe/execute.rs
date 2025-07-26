@@ -309,17 +309,18 @@ pub fn op_checkpoint(
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Checkpoint {
         database: _,
-        checkpoint_mode: _,
+        checkpoint_mode,
         dest,
     } = insn
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    let result = program.connection.checkpoint();
+    let result = program.connection.checkpoint(*checkpoint_mode);
     match result {
         Ok(CheckpointResult {
             num_wal_frames: num_wal_pages,
             num_checkpointed_frames: num_checkpointed_pages,
+            ..
         }) => {
             // https://sqlite.org/pragma.html#pragma_wal_checkpoint
             // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).

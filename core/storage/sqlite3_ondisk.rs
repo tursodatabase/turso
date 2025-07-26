@@ -1631,7 +1631,7 @@ pub fn prepare_wal_frame(
     (final_checksum, Arc::new(RefCell::new(buffer)))
 }
 
-pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<()> {
+pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<Arc<Completion>> {
     tracing::trace!("begin_write_wal_header");
     let buffer = {
         let drop_fn = Rc::new(|_buf| {});
@@ -1660,8 +1660,8 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new_write(write_complete);
-    io.pwrite(0, buffer.clone(), c.into())?;
-    Ok(())
+    let c = io.pwrite(0, buffer.clone(), c.into())?;
+    Ok(c)
 }
 
 /// Checks if payload will overflow a cell based on the maximum allowed size.

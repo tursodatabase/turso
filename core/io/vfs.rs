@@ -45,7 +45,8 @@ impl IO for VfsMod {
     }
 
     fn wait_for_completion(&self, _c: Arc<Completion>) -> Result<()> {
-        todo!();
+        // for the moment anyway, this is currently a sync api
+        Ok(())
     }
 
     fn generate_random_number(&self) -> i64 {
@@ -164,6 +165,20 @@ impl File for VfsFileImpl {
             Err(LimboError::ExtensionError("size failed".to_string()))
         } else {
             Ok(result as u64)
+        }
+    }
+
+    fn truncate(&self, len: usize, c: Arc<Completion>) -> Result<Arc<Completion>> {
+        if self.vfs.is_null() {
+            return Err(LimboError::ExtensionError("VFS is null".to_string()));
+        }
+        let vfs = unsafe { &*self.vfs };
+        let result = unsafe { (vfs.truncate)(self.file, len as i64) };
+        if result.is_error() {
+            Err(LimboError::ExtensionError("truncate failed".to_string()))
+        } else {
+            c.complete(0);
+            Ok(c)
         }
     }
 }

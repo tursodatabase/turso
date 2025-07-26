@@ -3,7 +3,9 @@ use crate::common::{compare_string, do_flush, TempDatabase};
 use log::debug;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
-use turso_core::{Connection, Database, LimboError, Row, Statement, StepResult, Value};
+use turso_core::{
+    CheckpointMode, Connection, Database, LimboError, Row, Statement, StepResult, Value,
+};
 
 const WAL_HEADER_SIZE: usize = 32;
 const WAL_FRAME_HEADER_SIZE: usize = 24;
@@ -285,7 +287,7 @@ fn test_wal_checkpoint() -> anyhow::Result<()> {
     for i in 0..iterations {
         let insert_query = format!("INSERT INTO test VALUES ({i})");
         do_flush(&conn, &tmp_db)?;
-        conn.checkpoint()?;
+        conn.checkpoint(CheckpointMode::Passive)?;
         run_query(&tmp_db, &conn, &insert_query)?;
     }
 

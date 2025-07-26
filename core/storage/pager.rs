@@ -4,7 +4,7 @@ use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::header_accessor;
 use crate::storage::sqlite3_ondisk::{
-    self, parse_wal_frame_header, DatabaseHeader, PageContent, PageType,
+    self, parse_wal_frame_header, DatabaseHeader, PageContent, PageType, DEFAULT_PAGE_SIZE,
 };
 use crate::storage::wal::{CheckpointResult, Wal};
 use crate::types::IOResult;
@@ -344,7 +344,7 @@ pub struct Pager {
     free_page_state: RefCell<FreePageState>,
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 /// The status of the current cache flush.
 pub enum PagerCommitResult {
     /// The WAL was written to disk and fsynced.
@@ -1250,25 +1250,48 @@ impl Pager {
                 _attempts += 1;
             }
         }
-        self.wal_checkpoint(wal_checkpoint_disabled)?;
+        self.wal_checkpoint(wal_checkpoint_disabled, CheckpointMode::Passive)?;
         Ok(())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn wal_checkpoint(&self, wal_checkpoint_disabled: bool) -> Result<CheckpointResult> {
+    pub fn wal_checkpoint(
+        &self,
+        wal_checkpoint_disabled: bool,
+        mode: CheckpointMode,
+    ) -> Result<CheckpointResult> {
         if wal_checkpoint_disabled {
-            return Ok(CheckpointResult {
-                num_wal_frames: 0,
-                num_checkpointed_frames: 0,
-            });
+            return Ok(CheckpointResult::default());
         }
 
-        let checkpoint_result = self.io.block(|| {
+        let counter = Rc::new(RefCell::new(0));
+        let mut checkpoint_result = self.io.block(|| {
             self.wal
                 .borrow_mut()
-                .checkpoint(self, Rc::new(RefCell::new(0)), CheckpointMode::Passive)
-                .map_err(|err| panic!("error while clearing cache {err}"))
+                .checkpoint(self, counter.clone(), mode)
         })?;
+
+        if checkpoint_result.everything_backfilled() {
+            let db_size = header_accessor::get_database_size(self)?;
+            let page_size = self.page_size.get().unwrap_or(DEFAULT_PAGE_SIZE);
+            let expected = (db_size * page_size) as u64;
+            if expected < self.db_file.size()? {
+                self.db_file.truncate(
+                    expected as usize,
+                    Completion::new_trunc(move |_| {
+                        tracing::trace!(
+                            "Database file truncated to expected size: {} bytes",
+                            expected
+                        );
+                    })
+                    .into(),
+                )?;
+                self.db_file.sync(Completion::new_sync(move |_| {
+                    tracing::trace!("Database file syncd after truncation");
+                }))?;
+            }
+            checkpoint_result.release_guard();
+        }
 
         // TODO: only clear cache of things that are really invalidated
         self.page_cache

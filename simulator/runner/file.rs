@@ -229,6 +229,29 @@ impl File for SimulatorFile {
     fn size(&self) -> Result<u64> {
         self.inner.size()
     }
+
+    fn truncate(
+        &self,
+        len: usize,
+        c: Arc<turso_core::Completion>,
+    ) -> Result<Arc<turso_core::Completion>> {
+        if self.fault.get() {
+            return Err(turso_core::LimboError::InternalError(
+                FAULT_ERROR_MSG.into(),
+            ));
+        }
+        let c = if let Some(latency) = self.generate_latency_duration() {
+            let cloned_c = c.clone();
+            let op = Box::new(move |file: &SimulatorFile| file.inner.truncate(len, cloned_c));
+            self.queued_io
+                .borrow_mut()
+                .push(DelayedIo { time: latency, op });
+            c
+        } else {
+            self.inner.truncate(len, c)?
+        };
+        Ok(c)
+    }
 }
 
 impl Drop for SimulatorFile {
