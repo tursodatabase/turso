@@ -30,6 +30,8 @@ struct WrappedIOUring {
     ring: io_uring::IoUring,
     pending_ops: usize,
     writev_states: HashMap<u64, WritevState>,
+    pending: [Option<Arc<Completion>>; ENTRIES as usize + 1],
+    key: u64,
 }
 
 struct InnerUringIO {
@@ -55,6 +57,8 @@ impl UringIO {
                 ring,
                 pending_ops: 0,
                 writev_states: HashMap::new(),
+                pending: [const { None }; ENTRIES as usize + 1],
+                key: 0,
             },
             free_files: (0..8).collect(),
         };
@@ -209,8 +213,9 @@ impl InnerUringIO {
 }
 
 impl WrappedIOUring {
-    fn submit_entry(&mut self, entry: &io_uring::squeue::Entry) {
+    fn submit_entry(&mut self, entry: &io_uring::squeue::Entry, c: Arc<Completion>) {
         trace!("submit_entry({:?})", entry);
+        self.pending[entry.get_user_data() as usize] = Some(c);
         unsafe {
             let mut sub = self.ring.submission_shared();
             match sub.push(entry) {
@@ -239,7 +244,7 @@ impl WrappedIOUring {
         self.pending_ops == 0
     }
 
-    fn submit_writev(&mut self, key: u64) {
+    fn submit_writev(&mut self, key: u64, c: Arc<Completion>) {
         let st = self.writev_states.get_mut(&key).expect("state must exist");
         // the likelyhood of the whole batch size being contiguous is very low, so lets not pre-allocate more than half
         let max = CKPT_BATCH_PAGES / 2;
@@ -282,23 +287,19 @@ impl WrappedIOUring {
                 .build()
                 .user_data(key)
         });
-        self.submit_entry(&entry);
+        self.submit_entry(&entry, c.clone());
+    }
+
+    fn get_key(&mut self) -> u64 {
+        self.key += 1;
+        if self.key == ENTRIES as u64 {
+            let key = self.key;
+            self.key = 0;
+            return key;
+        }
+        self.key
     }
 }
-
-#[inline(always)]
-/// use the callback pointer as the user_data for the operation as is
-/// common practice for io_uring to prevent more indirection
-fn get_key(c: Arc<Completion>) -> u64 {
-    Arc::into_raw(c) as u64
-}
-
-#[inline(always)]
-/// convert the user_data back to an Arc<Completion> pointer
-fn completion_from_key(key: u64) -> Arc<Completion> {
-    unsafe { Arc::from_raw(key as *const Completion) }
-}
-
 impl IO for UringIO {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
         trace!("open_file(path = {})", path);
@@ -372,22 +373,25 @@ impl IO for UringIO {
                 "user_data must not be zero, we dont submit linked timeouts or cancelations that would cause this"
             );
             if let Some(mut st) = ring.writev_states.remove(&user_data) {
-                if result < 0 {
-                    st.free_last_iov();
-                    completion_from_key(user_data).complete(result);
-                } else {
-                    let written = result as usize;
-                    st.free_last_iov();
-                    st.advance(written);
-                    if st.remaining() == 0 {
-                        completion_from_key(user_data).complete(st.total_written as i32);
+                if let Some(c) = ring.pending[user_data as usize].as_ref() {
+                    if result < 0 {
+                        st.free_last_iov();
+                        c.complete(result);
                     } else {
-                        ring.writev_states.insert(user_data, st);
-                        ring.submit_writev(user_data);
+                        let written = result as usize;
+                        st.free_last_iov();
+                        st.advance(written);
+                        if st.remaining() == 0 {
+                            c.complete(st.total_written as i32);
+                        } else {
+                            ring.writev_states.insert(user_data, st);
+                            ring.submit_writev(user_data, c.clone());
+                        }
                     }
                 }
-            } else {
-                completion_from_key(user_data).complete(result);
+            } else if let Some(c) = ring.pending[user_data as usize].as_ref() {
+                c.complete(result);
+                ring.pending[user_data as usize] = None;
             }
         }
         Ok(())
@@ -486,10 +490,10 @@ impl File for UringFile {
                 io_uring::opcode::Read::new(fd, buf, len as u32)
                     .offset(pos as u64)
                     .build()
-                    .user_data(get_key(c.clone()))
+                    .user_data(io.ring.get_key())
             })
         };
-        io.ring.submit_entry(&read_e);
+        io.ring.submit_entry(&read_e, c.clone());
         Ok(c)
     }
 
@@ -507,10 +511,10 @@ impl File for UringFile {
                 io_uring::opcode::Write::new(fd, buf.as_ptr(), buf.len() as u32)
                     .offset(pos as u64)
                     .build()
-                    .user_data(get_key(c.clone()))
+                    .user_data(io.ring.get_key())
             })
         };
-        io.ring.submit_entry(&write);
+        io.ring.submit_entry(&write, c.clone());
         Ok(c)
     }
 
@@ -525,14 +529,13 @@ impl File for UringFile {
             return self.pwrite(pos, bufs[0].clone(), c.clone());
         }
         tracing::trace!("pwritev(pos = {}, bufs.len() = {})", pos, bufs.len());
-        // create state
-        let key = get_key(c.clone());
         let mut io = self.io.borrow_mut();
-
+        let key = io.ring.get_key();
+        // create state to track ongoing writev operation
         let state = WritevState::new(self, pos, bufs);
         io.ring.writev_states.insert(key, state);
-        io.ring.submit_writev(key);
-        Ok(c.clone())
+        io.ring.submit_writev(key, c.clone());
+        Ok(c)
     }
 
     fn sync(&self, c: Arc<Completion>) -> Result<Arc<Completion>> {
@@ -541,9 +544,9 @@ impl File for UringFile {
         let sync = with_fd!(self, |fd| {
             io_uring::opcode::Fsync::new(fd)
                 .build()
-                .user_data(get_key(c.clone()))
+                .user_data(io.ring.get_key())
         });
-        io.ring.submit_entry(&sync);
+        io.ring.submit_entry(&sync, c.clone());
         Ok(c)
     }
 
