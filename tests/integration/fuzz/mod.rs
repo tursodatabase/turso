@@ -7,7 +7,7 @@ mod tests {
 
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
-    use rusqlite::params;
+    use rusqlite::{params, types::Value};
 
     use crate::{
         common::{limbo_exec_rows, rng_from_time, sqlite_exec_rows, TempDatabase},
@@ -1415,6 +1415,51 @@ mod tests {
                     "query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?}, seed: {seed}, values: {values:?}, schema: {create_table}"
                 );
             }
+        }
+    }
+    #[test]
+    // Simple fuzz test for SUM with floats
+    pub fn sum_agg_fuzz_floats() {
+        let _ = env_logger::try_init();
+
+        let (mut rng, seed) = rng_from_time();
+        log::info!("seed: {seed}");
+
+        for _ in 0..100 {
+            let db = TempDatabase::new_empty(false);
+            let limbo_conn = db.connect_limbo();
+            let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+            limbo_exec_rows(&db, &limbo_conn, "CREATE TABLE t(x)");
+            sqlite_exec_rows(&sqlite_conn, "CREATE TABLE t(x)");
+
+            // Insert 50-100 mixed values: floats, text, NULL
+            let mut values = Vec::new();
+            for _ in 0..rng.random_range(50..=100) {
+                let value = rng.random_range(-100.0..100.0).to_string();
+                values.push(format!("({value})"));
+            }
+
+            let insert = format!("INSERT INTO t VALUES {}", values.join(","));
+            limbo_exec_rows(&db, &limbo_conn, &insert);
+            sqlite_exec_rows(&sqlite_conn, &insert);
+
+            let query = "SELECT sum(x) FROM t ORDER BY x";
+            let limbo_result = limbo_exec_rows(&db, &limbo_conn, query);
+            let sqlite_result = sqlite_exec_rows(&sqlite_conn, query);
+
+            let limbo_val = match limbo_result.first().and_then(|row| row.first()) {
+                Some(Value::Real(f)) => *f,
+                Some(Value::Null) | None => 0.0,
+                _ => panic!("Unexpected type in limbo result: {limbo_result:?}"),
+            };
+
+            let sqlite_val = match sqlite_result.first().and_then(|row| row.first()) {
+                Some(Value::Real(f)) => *f,
+                Some(Value::Null) | None => 0.0,
+                _ => panic!("Unexpected type in limbo result: {limbo_result:?}"),
+            };
+            assert_eq!(limbo_val, sqlite_val, "seed: {seed}, values: {values:?}");
         }
     }
 

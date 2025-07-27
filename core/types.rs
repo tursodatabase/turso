@@ -259,6 +259,13 @@ impl Value {
             _ => panic!("as_blob must be called only for Value::Blob"),
         }
     }
+    pub fn as_float(&self) -> f64 {
+        match self {
+            Value::Float(f) => *f,
+            Value::Integer(i) => *i as f64,
+            _ => panic!("as_float must be called only for Value::Float or Value::Integer"),
+        }
+    }
 
     pub fn from_text(text: &str) -> Self {
         Value::Text(Text::new(text))
@@ -496,9 +503,25 @@ impl Value {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct SumAggState {
+    pub r_err: f64,   // Error term for Kahan-Babushka-Neumaier summation
+    pub approx: bool, // True if any non-integer value was input to the sum
+    pub ovrfl: bool,  // Integer overflow seen
+}
+impl Default for SumAggState {
+    fn default() -> Self {
+        Self {
+            r_err: 0.0,
+            approx: false,
+            ovrfl: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum AggContext {
     Avg(Value, Value), // acc and count
-    Sum(Value),
+    Sum(Value, SumAggState),
     Count(Value),
     Max(Option<Value>),
     Min(Option<Value>),
@@ -522,7 +545,7 @@ impl AggContext {
     pub fn final_value(&self) -> &Value {
         match self {
             Self::Avg(acc, _count) => acc,
-            Self::Sum(acc) => acc,
+            Self::Sum(acc, _) => acc,
             Self::Count(count) => count,
             Self::Max(max) => max.as_ref().unwrap_or(&NULL),
             Self::Min(min) => min.as_ref().unwrap_or(&NULL),
@@ -596,7 +619,7 @@ impl PartialOrd<AggContext> for AggContext {
     fn partial_cmp(&self, other: &AggContext) -> Option<std::cmp::Ordering> {
         match (self, other) {
             (Self::Avg(a, _), Self::Avg(b, _)) => a.partial_cmp(b),
-            (Self::Sum(a), Self::Sum(b)) => a.partial_cmp(b),
+            (Self::Sum(a, _), Self::Sum(b, _)) => a.partial_cmp(b),
             (Self::Count(a), Self::Count(b)) => a.partial_cmp(b),
             (Self::Max(a), Self::Max(b)) => a.partial_cmp(b),
             (Self::Min(a), Self::Min(b)) => a.partial_cmp(b),
