@@ -7940,8 +7940,9 @@ mod tests {
 
         for _ in 0..attempts {
             let (pager, _, _db, conn) = empty_btree();
-            let index_root_page_result =
-                pager.btree_create(&CreateBTreeFlags::new_index()).unwrap();
+            let index_root_page_result = pager
+                .btree_create(&CreateBTreeFlags::new_index(), &mut Vec::new())
+                .unwrap();
             let index_root_page = match index_root_page_result {
                 crate::types::IOResult::Done(id) => id as usize,
                 crate::types::IOResult::IO => {
