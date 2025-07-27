@@ -249,6 +249,22 @@ impl turso_core::File for File {
         #[allow(clippy::arc_with_non_send_sync)]
         Ok(c)
     }
+    fn pwritev(
+        &self,
+        pos: usize,
+        buffers: Vec<Arc<RefCell<turso_core::Buffer>>>,
+        c: Arc<turso_core::Completion>,
+    ) -> Result<Arc<turso_core::Completion>> {
+        let mut total_written = 0;
+        for buffer in buffers {
+            let buf = buffer.borrow();
+            let buf: &[u8] = buf.as_slice();
+            total_written += self.vfs.pwrite(self.fd, buf, pos + total_written) as usize;
+        }
+        c.complete(total_written as i32);
+        #[allow(clippy::arc_with_non_send_sync)]
+        Ok(c)
+    }
 
     fn sync(&self, c: Arc<turso_core::Completion>) -> Result<Arc<turso_core::Completion>> {
         self.vfs.sync(self.fd);
@@ -368,6 +384,17 @@ impl turso_core::DatabaseStorage for DatabaseFile {
         let size = buffer.borrow().len();
         let pos = (page_idx - 1) * size;
         self.file.pwrite(pos, buffer, c.into())?;
+        Ok(())
+    }
+    fn write_pages(
+        &self,
+        page_idx: usize,
+        page_size: usize,
+        buffers: Vec<Arc<RefCell<turso_core::Buffer>>>,
+        c: turso_core::Completion,
+    ) -> Result<()> {
+        let pos = (page_idx - 1) * page_size;
+        self.file.pwritev(pos, buffers, c.into())?;
         Ok(())
     }
 

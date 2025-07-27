@@ -339,7 +339,7 @@ pub struct Pager {
     /// Cache page_size and reserved_space at Pager init and reuse for subsequent
     /// `usable_space` calls. TODO: Invalidate reserved_space when we add the functionality
     /// to change it.
-    page_size: Cell<Option<u32>>,
+    pub(crate) page_size: Cell<Option<u32>>,
     reserved_space: OnceCell<u8>,
     free_page_state: RefCell<FreePageState>,
 }
@@ -1262,11 +1262,11 @@ impl Pager {
                 num_checkpointed_frames: 0,
             });
         }
-
+        let write_counter = Rc::new(RefCell::new(0));
         let checkpoint_result = self.io.block(|| {
             self.wal
                 .borrow_mut()
-                .checkpoint(self, Rc::new(RefCell::new(0)), CheckpointMode::Passive)
+                .checkpoint(self, write_counter.clone(), CheckpointMode::Passive)
                 .map_err(|err| panic!("error while clearing cache {err}"))
         })?;
 

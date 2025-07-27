@@ -699,6 +699,17 @@ impl turso_core::DatabaseStorage for DatabaseFile {
         self.file.pwrite(pos, buffer, c.into())?;
         Ok(())
     }
+    fn write_pages(
+        &self,
+        page_idx: usize,
+        page_size: usize,
+        buffers: Vec<Arc<RefCell<turso_core::Buffer>>>,
+        c: turso_core::Completion,
+    ) -> turso_core::Result<()> {
+        let pos = (page_idx - 1) * page_size;
+        self.file.pwritev(pos, buffers, c.into())?;
+        Ok(())
+    }
 
     fn sync(&self, c: turso_core::Completion) -> turso_core::Result<()> {
         let _ = self.file.sync(c.into())?;

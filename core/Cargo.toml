@@ -19,7 +19,7 @@ default = ["fs", "uuid", "time", "json", "series"]
 fs = ["turso_ext/vfs"]
 json = []
 uuid = ["dep:uuid"]
-io_uring = ["dep:io-uring", "rustix/io_uring", "dep:libc"]
+io_uring = ["dep:io-uring", "rustix/io_uring"]
 time = []
 fuzz = []
 omit_autovacuum = []
@@ -29,10 +29,12 @@ series = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7.5", optional = true }
+libc = { version = "0.2.172" }
 
 [target.'cfg(target_family = "unix")'.dependencies]
 polling = "3.7.4"
 rustix = { version = "1.0.5", features = ["fs"] }
+libc = { version = "0.2.172" }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 mimalloc = { version = "0.1.46", default-features = false }
@@ -44,7 +46,6 @@ turso_ext = { workspace = true, features = ["core_only"] }
 cfg_block = "0.1.1"
 fallible-iterator = "0.3.0"
 hex = "0.4.3"
-libc = { version = "0.2.172", optional = true }
 turso_sqlite3_parser = { workspace = true }
 thiserror = "1.0.61"
 getrandom = { version = "0.2.15" }

@@ -165,6 +165,49 @@ impl File for MemoryFile {
         Ok(c)
     }
 
+    fn pwritev(
+        &self,
+        pos: usize,
+        buffers: Vec<Arc<RefCell<Buffer>>>,
+        c: Arc<Completion>,
+    ) -> Result<Arc<Completion>> {
+        let mut offset = pos;
+        let mut total_written = 0;
+
+        for buffer in buffers {
+            let buf = buffer.borrow();
+            let buf_len = buf.len();
+            if buf_len == 0 {
+                continue;
+            }
+
+            let mut remaining = buf_len;
+            let mut buf_offset = 0;
+            let data = &buf.as_slice();
+
+            while remaining > 0 {
+                let page_no = offset / PAGE_SIZE;
+                let page_offset = offset % PAGE_SIZE;
+                let bytes_to_write = remaining.min(PAGE_SIZE - page_offset);
+
+                {
+                    let page = self.get_or_allocate_page(page_no);
+                    page[page_offset..page_offset + bytes_to_write]
+                        .copy_from_slice(&data[buf_offset..buf_offset + bytes_to_write]);
+                }
+
+                offset += bytes_to_write;
+                buf_offset += bytes_to_write;
+                remaining -= bytes_to_write;
+            }
+            total_written += buf_len;
+        }
+        self.size
+            .set(core::cmp::max(pos + total_written, self.size.get()));
+        c.complete(total_written as i32);
+        Ok(c)
+    }
+
     fn sync(&self, c: Arc<Completion>) -> Result<Arc<Completion>> {
         // no-op
         c.complete(0);

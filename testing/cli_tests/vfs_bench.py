@@ -79,11 +79,13 @@ def main() -> None:
     averages: Dict[str, float] = {}
 
     for vfs in vfs_list:
+        setup_temp_db()
         test(f"\n### VFS: {vfs} ###")
         times = bench_one(vfs, sql, iterations)
         info(f"All times ({vfs}):", " ".join(f"{t:.6f}" for t in times))
         avg = statistics.mean(times)
         averages[vfs] = avg
+        cleanup_temp_db()
 
     info("\n" + "-" * 60)
     info("Average runtime per VFS")
@@ -106,7 +108,6 @@ def main() -> None:
             faster_slower = "slower" if pct > 0 else "faster"
             info(f"{vfs:<{name_pad}} : {avg:.6f}  ({abs(pct):.1f}% {faster_slower} than {baseline})")
         info("-" * 60)
-    cleanup_temp_db()
 
 
 if __name__ == "__main__":
