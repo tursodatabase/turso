@@ -837,6 +837,57 @@ impl Connection {
     }
 
     #[instrument(skip_all, level = Level::INFO)]
+    pub fn prepare_execute_batch(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
+        if self.closed.get() {
+            return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
+        if sql.as_ref().is_empty() {
+            return Err(LimboError::InvalidArgument(
+                "The supplied SQL string contains no statements".to_string(),
+            ));
+        }
+        let sql = sql.as_ref();
+        tracing::trace!("Preparing and executing batch: {}", sql);
+        let mut parser = Parser::new(sql.as_bytes());
+        while let Some(cmd) = parser.next()? {
+            dbg!(&cmd);
+            let syms = self.syms.borrow();
+            let pager = self.pager.borrow().clone();
+            let byte_offset_end = parser.offset();
+            let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+                .unwrap()
+                .trim();
+            dbg!(&self.schema);
+            match cmd {
+                Cmd::Stmt(stmt) => {
+                    let program = translate::translate(
+                        self.schema.borrow().deref(),
+                        stmt,
+                        pager.clone(),
+                        self.clone(),
+                        &syms,
+                        QueryMode::Normal,
+                        input,
+                    )?;
+
+                    let mut state =
+                        vdbe::ProgramState::new(program.max_registers, program.cursor_ref.len());
+                    loop {
+                        let res =
+                            program.step(&mut state, self._db.mv_store.clone(), pager.clone())?;
+                        if matches!(res, StepResult::Done) {
+                            break;
+                        }
+                        self.run_once()?;
+                    }
+                }
+                _ => todo!(),
+            }
+        }
+        Ok(())
+    }
+
+    #[instrument(skip_all, level = Level::INFO)]
     pub fn query(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Option<Statement>> {
         if self.closed.get() {
             return Err(LimboError::InternalError("Connection closed".to_string()));

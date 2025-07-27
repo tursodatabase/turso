@@ -170,6 +170,12 @@ impl Connection {
         stmt.execute(params).await
     }
 
+    /// Execute a batch of SQL statements on the database.
+    pub async fn execute_batch(&self, sql: &str) -> Result<()> {
+        self.prepare_execute_batch(sql).await?;
+        Ok(())
+    }
+
     /// Prepare a SQL statement for later execution.
     pub async fn prepare(&self, sql: &str) -> Result<Statement> {
         let conn = self
@@ -184,6 +190,15 @@ impl Connection {
             inner: Arc::new(Mutex::new(stmt)),
         };
         Ok(statement)
+    }
+
+    async fn prepare_execute_batch(&self, sql: impl AsRef<str>) -> Result<()> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        conn.prepare_execute_batch(sql)?;
+        Ok(())
     }
 
     /// Query a pragma.
