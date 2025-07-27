@@ -159,10 +159,10 @@ pub fn prepare_update_plan(
     for set in &mut body.sets {
         let ident = normalize_ident(set.col_names[0].as_str());
         let Some(col_index) = column_lookup.get(&ident) else {
-            bail_parse_error!("Parse error: no such column: {}", ident);
+            bail_parse_error!("no such column: {}", ident);
         };
 
-        let _ = bind_column_references(&mut set.expr, &mut table_references, None, connection);
+        bind_column_references(&mut set.expr, &mut table_references, None, connection)?;
 
         if let Some(idx) = set_clauses.iter().position(|(idx, _)| *idx == *col_index) {
             set_clauses[idx].1 = set.expr.clone();

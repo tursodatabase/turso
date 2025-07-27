@@ -270,3 +270,8 @@ do_execsql_test_on_specific_db {:memory:} update-single-rowid {
     UPDATE t SET x = 2 WHERE x = 1;
     SELECT * FROM t;
 } {2}
+
+do_execsql_test_in_memory_error_content update-set-expression-missing-identifier {
+    CREATE TABLE t0 (c0 INT);
+    UPDATE t0 SET c0 = 1, c0 = c1;
+} {".*no such column: c1.*"}

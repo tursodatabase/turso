@@ -726,7 +726,7 @@ def test_csv():
     )
     limbo.run_test_fn(
         "SELECT c1 FROM t1;",
-        lambda res: "Parse error: Column c1 not found" in res,
+        lambda res: "Parse error: no such column: c1" in res,
         "Empty CSV table without header should not have columns other than 'c0'",
     )
 
@@ -738,7 +738,7 @@ def test_csv():
     )
     limbo.run_test_fn(
         "SELECT c0 FROM t2;",
-        lambda res: "Parse error: Column c0 not found" in res,
+        lambda res: "Parse error: no such column: c0" in res,
         "Empty CSV table with header should not have columns other than '(NULL)'",
     )
 

@@ -212,7 +212,7 @@ pub fn bind_column_references(
                     Ok(())
                 } else {
                     // Unquoted identifiers must resolve to columns - no fallback
-                    crate::bail_parse_error!("Column {} not found", id.as_str())
+                    crate::bail_parse_error!("no such column: {}", id.as_str())
                 }
             }
             Expr::Qualified(tbl, id) => {
@@ -236,7 +236,7 @@ pub fn bind_column_references(
                         .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
                 });
                 let Some(col_idx) = col_idx else {
-                    crate::bail_parse_error!("Column {} not found", normalized_id);
+                    crate::bail_parse_error!("no such column: {}", normalized_id);
                 };
                 let col = tbl.columns().get(col_idx).unwrap();
                 *expr = Expr::Column {
