@@ -4,12 +4,15 @@ use std::cell::{RefCell, RefMut};
 use std::num::{NonZero, NonZeroUsize};
 
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 
+use dashmap::DashMap;
 use napi::bindgen_prelude::{JsObjectValue, Null, Object, ToNapiValue};
 use napi::{bindgen_prelude::ObjectFinalize, Env, JsValue, Unknown};
 use napi_derive::napi;
 use turso_core::{LimboError, StepResult};
+
+static DATABASE_MANAGER: OnceLock<DashMap<String, Weak<turso_core::Database>>> = OnceLock::new();
 
 #[derive(Default)]
 #[napi(object)]
@@ -80,13 +83,49 @@ impl Database {
         } else {
             turso_core::OpenFlags::Create
         };
-        let file = io
-            .open_file(&path, flag, false)
-            .map_err(|err| into_napi_error_with_message("SQLITE_CANTOPEN".to_owned(), err))?;
 
-        let db_file = Arc::new(DatabaseFile::new(file));
-        let db = turso_core::Database::open(io.clone(), &path, db_file, false, false)
-            .map_err(into_napi_sqlite_error)?;
+        let db = if memory {
+            let file = io
+                .open_file(&path, flag, false)
+                .map_err(|err| into_napi_error_with_message("SQLITE_CANTOPEN".to_owned(), err))?;
+            let db_file = Arc::new(DatabaseFile::new(file));
+
+            turso_core::Database::open(io.clone(), &path, db_file, false, false)
+                .map_err(into_napi_sqlite_error)?
+        } else {
+            let registry = DATABASE_MANAGER.get_or_init(DashMap::new);
+
+            let canonical_path = std::fs::canonicalize(&path)
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| path.clone());
+
+            let open_db = || -> napi::Result<Arc<turso_core::Database>, String> {
+                let file = io.open_file(&path, flag, false).map_err(|err| {
+                    into_napi_error_with_message("SQLITE_CANTOPEN".to_owned(), err)
+                })?;
+                let db_file = Arc::new(DatabaseFile::new(file));
+                let db = turso_core::Database::open(io.clone(), &path, db_file, false, false)
+                    .map_err(into_napi_sqlite_error)?;
+                Ok(db)
+            };
+
+            if let Some(entry) = registry.get(&canonical_path) {
+                if let Some(db) = entry.upgrade() {
+                    db
+                } else {
+                    registry.remove(&path);
+                    let db = open_db()?;
+                    registry.insert(canonical_path, Arc::downgrade(&db));
+                    db
+                }
+            } else {
+                let db = open_db()?;
+                registry.insert(canonical_path, Arc::downgrade(&db));
+                db
+            }
+        };
+
         let conn = db.connect().map_err(into_napi_sqlite_error)?;
 
         Ok(Self {
