@@ -31,6 +31,7 @@ jobs:
             build: yarn build --target x86_64-apple-darwin
           - host: windows-latest
             build: |
+              export RUST_BACKTRACE=1
               yarn build --target x86_64-pc-windows-msvc
               yarn test
             target: x86_64-pc-windows-msvc
@@ -43,6 +44,8 @@ jobs:
             build: yarn build --target aarch64-apple-darwin
     name: stable - ${{ matrix.settings.target }} - node@20
     runs-on: ${{ matrix.settings.host }}
+    env:
+      RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@v4
       - name: Setup node
