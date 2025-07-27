@@ -835,7 +835,7 @@ impl Pager {
         //  Set the page number on the source page as the new page number and mark it dirty
         source_page.get().id = dest_page_num as usize;
         source_page.set_dirty();
-        self.add_dirty(source_page.get().id);
+        self.add_dirty(&source_page);
 
         //  Update the pointer map pages for the source_page since the page id has changed
         match source_page_ptr_map_entry.entry_type {
@@ -959,7 +959,7 @@ impl Pager {
             assert_eq!(overflow_ptr, prev_child_page_num as u32);
             contents.write_u32(0, new_child_page_num as u32);
             parent_page.set_dirty();
-            self.add_dirty(parent_page.get().id);
+            self.add_dirty(&parent_page);
             return Ok(());
         }
 
@@ -975,8 +975,7 @@ impl Pager {
                         && table_interior_cell.left_child_page == prev_child_page_num as u32
                     {
                         contents.write_u32(cell_start, new_child_page_num as u32);
-                        parent_page.set_dirty();
-                        self.add_dirty(parent_page.get().id);
+                        self.add_dirty(&parent_page);
                         return Ok(());
                     }
                 }
@@ -988,8 +987,7 @@ impl Pager {
                                     cell_start + cell_len - 4,
                                     new_child_page_num as u32,
                                 );
-                                parent_page.set_dirty();
-                                self.add_dirty(parent_page.get().id);
+                                self.add_dirty(&parent_page);
                                 return Ok(());
                             }
                         }
@@ -1004,7 +1002,7 @@ impl Pager {
                                     new_child_page_num as u32,
                                 );
                                 parent_page.set_dirty();
-                                self.add_dirty(parent_page.get().id);
+                                self.add_dirty(&parent_page);
                                 return Ok(());
                             }
                         }
@@ -1012,8 +1010,7 @@ impl Pager {
                         && index_interior_cell.left_child_page == prev_child_page_num as u32
                     {
                         contents.write_u32(cell_start, new_child_page_num as u32);
-                        parent_page.set_dirty();
-                        self.add_dirty(parent_page.get().id);
+                        self.add_dirty(&parent_page);
                         return Ok(());
                     }
                 }
@@ -1025,8 +1022,7 @@ impl Pager {
                                     cell_start + cell_len - 4,
                                     new_child_page_num as u32,
                                 );
-                                parent_page.set_dirty();
-                                self.add_dirty(parent_page.get().id);
+                                self.add_dirty(&parent_page);
                                 return Ok(());
                             }
                         }
@@ -1042,8 +1038,7 @@ impl Pager {
         let current = contents.read_u32(offset::BTREE_RIGHTMOST_PTR);
         assert_eq!(current, prev_child_page_num as u32);
         contents.write_u32(offset::BTREE_RIGHTMOST_PTR, new_child_page_num as u32);
-        parent_page.set_dirty();
-        self.add_dirty(parent_page.get().id);
+        self.add_dirty(&parent_page);
 
         Ok(())
     }
@@ -2651,8 +2646,7 @@ mod ptrmap_tests {
         insert_into_cell(contents, &cell_bytes, 0, pager.usable_space() as u16).unwrap();
         contents.write_u32(offset::BTREE_RIGHTMOST_PTR, page_5.get().id as u32);
 
-        root_page.set_dirty();
-        pager.add_dirty(3);
+        pager.add_dirty(&root_page);
 
         //  create the pointer map entries for the two children
         pager
@@ -2829,8 +2823,7 @@ mod ptrmap_tests {
             )
             .unwrap();
             page4_contents.write_u32(offset::BTREE_RIGHTMOST_PTR, page_7.get().id as u32);
-            page_4.set_dirty();
-            pager.add_dirty(page_4.get().id);
+            pager.add_dirty(&page_4);
         }
 
         // ------------------------------------------------------------------
@@ -2854,8 +2847,7 @@ mod ptrmap_tests {
             )
             .unwrap();
             root_contents.write_u32(offset::BTREE_RIGHTMOST_PTR, page_5.get().id as u32);
-            root_page_ref.set_dirty();
-            pager.add_dirty(3);
+            pager.add_dirty(&root_page_ref);
         }
 
         // ------------------------------------------------------------------
@@ -2885,8 +2877,8 @@ mod ptrmap_tests {
         // Flush all dirty pages so they are clean prior to relocation
         loop {
             match pager.cacheflush().unwrap() {
-                PagerCacheflushStatus::Done(_) => break,
-                PagerCacheflushStatus::IO => pager.io.run_once().unwrap(),
+                IOResult::Done(_) => break,
+                IOResult::IO => pager.io.run_once().unwrap(),
             }
         }
 

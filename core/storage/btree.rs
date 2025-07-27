@@ -6685,7 +6685,7 @@ fn _insert_into_cell(
     Ok(())
 }
 
-fn insert_into_cell(
+pub fn insert_into_cell(
     page: &mut PageContent,
     payload: &[u8],
     cell_idx: usize,
