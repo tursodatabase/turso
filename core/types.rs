@@ -14,8 +14,9 @@ use crate::translate::plan::IterationDirection;
 use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
-use crate::{turso_assert, Result};
+use crate::{turso_assert, Completion, Result};
 use std::fmt::{Debug, Display};
+use std::sync::Arc;
 
 const MAX_REAL_SIZE: u8 = 15;
 
@@ -2266,10 +2267,24 @@ impl Cursor {
     }
 }
 
-#[derive(Debug)]
+pub enum IOCompletions {
+    Single(Arc<Completion>),
+    Many(Vec<Arc<Completion>>),
+}
+
+impl Debug for IOCompletions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Single(..) => f.debug_tuple("Single").finish(),
+            Self::Many(..) => f.debug_tuple("Many").finish(),
+        }
+    }
+}
+
+#[must_use]
 pub enum IOResult<T> {
     Done(T),
-    IO,
+    IO(IOCompletions),
 }
 
 /// Evaluate a Result<IOResult<T>>, if IO return IO.
@@ -2278,7 +2293,7 @@ macro_rules! return_if_io {
     ($expr:expr) => {
         match $expr? {
             IOResult::Done(v) => v,
-            IOResult::IO => return Ok(IOResult::IO),
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
         }
     };
 }

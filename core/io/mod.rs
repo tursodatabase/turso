@@ -1,4 +1,4 @@
-use crate::Result;
+use crate::{LimboError, Result};
 use bitflags::bitflags;
 use cfg_block::cfg_block;
 use std::fmt;
@@ -54,13 +54,15 @@ pub trait IO: Clock + Send + Sync {
     fn get_memory_io(&self) -> Arc<MemoryIO>;
 }
 
-pub type Complete = dyn Fn(Arc<RefCell<Buffer>>, i32);
+pub type ReadComplete = dyn Fn(Arc<RefCell<Buffer>>, i32);
 pub type WriteComplete = dyn Fn(i32);
 pub type SyncComplete = dyn Fn(i32);
 
+#[must_use]
 pub struct Completion {
     pub completion_type: CompletionType,
     is_completed: Cell<bool>,
+    error: RefCell<Option<LimboError>>,
 }
 
 pub enum CompletionType {
@@ -69,16 +71,12 @@ pub enum CompletionType {
     Sync(SyncCompletion),
 }
 
-pub struct ReadCompletion {
-    pub buf: Arc<RefCell<Buffer>>,
-    pub complete: Box<Complete>,
-}
-
 impl Completion {
     pub fn new(completion_type: CompletionType) -> Self {
         Self {
             completion_type,
             is_completed: Cell::new(false),
+            error: RefCell::new(None),
         }
     }
 
@@ -130,6 +128,22 @@ impl Completion {
             _ => unreachable!(),
         }
     }
+
+    pub fn has_error(&self) -> bool {
+        self.error.borrow().is_some()
+    }
+
+    /// Creates dummy write completion that does nothing is already complete
+    pub fn dummy_complete() -> Self {
+        let write = Self::new_write(|_| {});
+        write.complete(0);
+        write
+    }
+}
+
+pub struct ReadCompletion {
+    pub buf: Arc<RefCell<Buffer>>,
+    pub complete: Box<ReadComplete>,
 }
 
 pub struct WriteCompletion {
@@ -141,7 +155,7 @@ pub struct SyncCompletion {
 }
 
 impl ReadCompletion {
-    pub fn new(buf: Arc<RefCell<Buffer>>, complete: Box<Complete>) -> Self {
+    pub fn new(buf: Arc<RefCell<Buffer>>, complete: Box<ReadComplete>) -> Self {
         Self { buf, complete }
     }
 

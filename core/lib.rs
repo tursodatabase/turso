@@ -46,6 +46,7 @@ use crate::storage::sqlite3_ondisk::is_valid_page_size;
 use crate::storage::{header_accessor, wal::DummyWAL};
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
+use crate::types::IOResult;
 #[cfg(feature = "fs")]
 use crate::util::{IOExt, OpenMode, OpenOptions};
 use crate::vtab::VirtualTable;
@@ -88,7 +89,6 @@ pub use storage::{
 use tracing::{instrument, Level};
 use translate::select::prepare_select_plan;
 use turso_sqlite3_parser::{ast, ast::Cmd, lexer::sql::Parser};
-use types::IOResult;
 pub use types::RefValue;
 pub use types::Value;
 use util::parse_schema_rows;
@@ -949,15 +949,19 @@ impl Connection {
                         input,
                     )?;
 
-                    let mut state =
-                        vdbe::ProgramState::new(program.max_registers, program.cursor_ref.len());
+                    let mut stmt =
+                        Statement::new(Rc::new(program), self._db.mv_store.clone(), pager.clone());
+
                     loop {
-                        let res =
-                            program.step(&mut state, self._db.mv_store.clone(), pager.clone())?;
-                        if matches!(res, StepResult::Done) {
-                            break;
+                        let res = stmt.step()?;
+                        match res {
+                            vdbe::StepResult::Done => break,
+                            vdbe::StepResult::IO => self.run_once()?,
+                            vdbe::StepResult::Row => {}
+                            vdbe::StepResult::Busy | vdbe::StepResult::Interrupt => {
+                                return Err(LimboError::Busy)
+                            }
                         }
-                        self.run_once()?;
                     }
                 }
             }
@@ -1088,7 +1092,7 @@ impl Connection {
     }
 
     /// Flush dirty pages to disk.
-    pub fn cacheflush(&self) -> Result<IOResult<()>> {
+    pub fn cacheflush(&self) -> Result<Vec<Arc<Completion>>> {
         if self.closed.get() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -1627,7 +1631,7 @@ impl Statement {
                     .set(TransactionState::None);
                 assert!(
                     matches!(end_tx_res, IOResult::Done(_)),
-                    "end_tx should not return IO as it should just end txn without flushing anything. Got {end_tx_res:?}"
+                    "end_tx should not return IO as it should just end txn without flushing anything"
                 );
             }
         }

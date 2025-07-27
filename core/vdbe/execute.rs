@@ -10,9 +10,10 @@ use crate::storage::wal::DummyWAL;
 use crate::storage::{self, header_accessor};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
-    compare_immutable, compare_records_generic, ImmutableRecord, SeekResult, Text, TextSubtype,
+    compare_immutable, compare_records_generic, IOCompletions, ImmutableRecord, SeekResult, Text,
+    TextSubtype,
 };
-use crate::util::normalize_ident;
+use crate::util::{normalize_ident, IOExt};
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::registers_to_ref_values;
 use crate::{
@@ -29,6 +30,7 @@ use crate::{
     },
     IO,
 };
+use std::fmt::Debug;
 use std::ops::DerefMut;
 use std::{
     borrow::BorrowMut,
@@ -60,7 +62,7 @@ use crate::{
     vector::{vector32, vector64, vector_distance_cos, vector_distance_l2, vector_extract},
 };
 
-use crate::{info, BufferPool, MvCursor, OpenFlags, RefValue, Row, StepResult, TransactionState};
+use crate::{info, BufferPool, MvCursor, OpenFlags, RefValue, Row, TransactionState};
 
 use super::{
     insn::{Cookie, RegisterOrLiteral},
@@ -101,7 +103,7 @@ macro_rules! return_if_io {
     ($expr:expr) => {
         match $expr? {
             IOResult::Done(v) => v,
-            IOResult::IO => return Ok(InsnFunctionStepResult::IO),
+            IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
         }
     };
 }
@@ -115,7 +117,7 @@ pub type InsnFunction = fn(
 
 pub enum InsnFunctionStepResult {
     Done,
-    IO,
+    IO(IOCompletions),
     Row,
     Interrupt,
     Busy,
@@ -1367,6 +1369,20 @@ fn read_integer_fast(buf: &[u8], len: usize) -> i64 {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum OpColumnState {
+    Start,
+    Rowid {
+        index_cursor_id: usize,
+        table_cursor_id: usize,
+    },
+    Seek {
+        rowid: i64,
+        table_cursor_id: usize,
+    },
+    GetColumn,
+}
+
 pub fn op_column(
     program: &Program,
     state: &mut ProgramState,
@@ -1383,256 +1399,295 @@ pub fn op_column(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seeks[*cursor_id].take() {
-        let deferred_seek = 'd: {
-            let rowid = {
-                let mut index_cursor = state.get_cursor(index_cursor_id);
-                let index_cursor = index_cursor.as_btree_mut();
-                match index_cursor.rowid()? {
-                    IOResult::IO => {
-                        break 'd Some((index_cursor_id, table_cursor_id));
-                    }
-                    IOResult::Done(rowid) => rowid,
-                }
-            };
-            let mut table_cursor = state.get_cursor(table_cursor_id);
-            let table_cursor = table_cursor.as_btree_mut();
-            match table_cursor.seek(
-                SeekKey::TableRowId(rowid.unwrap()),
-                SeekOp::GE { eq_only: true },
-            )? {
-                IOResult::Done(_) => None,
-                IOResult::IO => Some((index_cursor_id, table_cursor_id)),
-            }
-        };
-        if let Some(deferred_seek) = deferred_seek {
-            state.deferred_seeks[*cursor_id] = Some(deferred_seek);
-            return Ok(InsnFunctionStepResult::IO);
-        }
-    }
 
-    let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
-    match cursor_type {
-        CursorType::BTreeTable(_) | CursorType::BTreeIndex(_) => {
-            let value = 'value: {
-                let mut cursor =
-                    must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Column");
-                let cursor = cursor.as_btree_mut();
-
-                if cursor.get_null_flag() {
-                    break 'value Value::Null;
-                }
-
-                let record_result = return_if_io!(cursor.record());
-                let Some(record) = record_result.as_ref() else {
-                    break 'value default.clone().unwrap_or(Value::Null);
-                };
-
-                let payload = record.get_payload();
-
-                if payload.is_empty() {
-                    break 'value default.clone().unwrap_or(Value::Null);
-                }
-
-                let mut record_cursor = cursor.record_cursor.borrow_mut();
-
-                if record_cursor.serial_types.is_empty() && record_cursor.offsets.is_empty() {
-                    let (header_size, header_len_bytes) = read_varint_fast(payload)?;
-                    let header_size = header_size as usize;
-
-                    if header_size > payload.len() || header_size > 98307 {
-                        return Err(LimboError::Corrupt("Header size exceeds bounds".into()));
-                    }
-
-                    record_cursor.header_size = header_size;
-                    record_cursor.header_offset = header_len_bytes;
-
-                    record_cursor.offsets.push(header_size);
-                }
-
-                let target_column = *column;
-                let mut parse_pos = record_cursor.header_offset;
-                let mut data_offset = record_cursor
-                    .offsets
-                    .last()
-                    .copied()
-                    .unwrap_or(record_cursor.header_size);
-
-                // Adjust data_offset if we already have some columns parsed
-                if !record_cursor.serial_types.is_empty() && !record_cursor.offsets.is_empty() {
-                    data_offset = *record_cursor.offsets.last().unwrap();
-                }
-
-                // Parse the header for serial types incrementally until we have the target column
-                while record_cursor.serial_types.len() <= target_column
-                    && parse_pos < record_cursor.header_size
-                    && parse_pos < payload.len()
+    loop {
+        match state.op_column_state {
+            OpColumnState::Start => {
+                if let Some((index_cursor_id, table_cursor_id)) =
+                    state.deferred_seeks[*cursor_id].take()
                 {
-                    let (serial_type, varint_len) = read_varint_fast(&payload[parse_pos..])?;
-
-                    record_cursor.serial_types.push(serial_type);
-                    parse_pos += varint_len;
-                    let data_size = match serial_type {
-                        0 => 0,
-                        1 => 1,
-                        2 => 2,
-                        3 => 3,
-                        4 => 4,
-                        5 => 6,
-                        6 => 8,
-                        7 => 8,
-                        8 => 0,
-                        9 => 0,
-                        n if n >= 12 && n % 2 == 0 => (n - 12) / 2,
-                        n if n >= 13 && n % 2 == 1 => (n - 13) / 2,
-                        10 | 11 => {
-                            return Err(LimboError::Corrupt(format!(
-                                "Reserved serial type: {serial_type}"
-                            )))
-                        }
-                        _ => {
-                            return Err(LimboError::Corrupt(format!(
-                                "Invalid serial type: {serial_type}"
-                            )))
-                        }
-                    } as usize;
-                    data_offset += data_size;
-                    record_cursor.offsets.push(data_offset);
+                    state.op_column_state = OpColumnState::Rowid {
+                        index_cursor_id,
+                        table_cursor_id,
+                    };
+                } else {
+                    state.op_column_state = OpColumnState::GetColumn;
                 }
-
-                record_cursor.header_offset = parse_pos;
-
-                if parse_pos > record_cursor.header_size || data_offset > payload.len() {
-                    record_cursor.serial_types.clear();
-                    record_cursor.offsets.clear();
-                    record_cursor.header_offset = 0;
-                    record_cursor.header_size = 0;
-                    break 'value default.clone().unwrap_or(Value::Null);
+            }
+            OpColumnState::Rowid {
+                index_cursor_id,
+                table_cursor_id,
+            } => {
+                let rowid = {
+                    let mut index_cursor = state.get_cursor(index_cursor_id);
+                    let index_cursor = index_cursor.as_btree_mut();
+                    return_if_io!(index_cursor.rowid())
+                };
+                state.op_column_state = OpColumnState::Seek {
+                    rowid: rowid.unwrap(),
+                    table_cursor_id,
+                };
+            }
+            OpColumnState::Seek {
+                rowid,
+                table_cursor_id,
+            } => {
+                {
+                    let mut table_cursor = state.get_cursor(table_cursor_id);
+                    let table_cursor = table_cursor.as_btree_mut();
+                    return_if_io!(
+                        table_cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
+                    );
                 }
+                state.op_column_state = OpColumnState::GetColumn;
+            }
+            OpColumnState::GetColumn => {
+                let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
+                match cursor_type {
+                    CursorType::BTreeTable(_) | CursorType::BTreeIndex(_) => {
+                        let value = 'value: {
+                            let mut cursor = must_be_btree_cursor!(
+                                *cursor_id,
+                                program.cursor_ref,
+                                state,
+                                "Column"
+                            );
+                            let cursor = cursor.as_btree_mut();
 
-                if target_column >= record_cursor.serial_types.len() {
-                    break 'value default.clone().unwrap_or(Value::Null);
-                }
+                            if cursor.get_null_flag() {
+                                break 'value Value::Null;
+                            }
 
-                let serial_type = record_cursor.serial_types[target_column];
+                            let record_result = return_if_io!(cursor.record());
+                            let Some(record) = record_result.as_ref() else {
+                                break 'value default.clone().unwrap_or(Value::Null);
+                            };
 
-                // Fast path for common constant cases
-                match serial_type {
-                    0 => break 'value Value::Null,
-                    8 => break 'value Value::Integer(0),
-                    9 => break 'value Value::Integer(1),
-                    _ => {}
-                }
+                            let payload = record.get_payload();
 
-                if target_column + 1 >= record_cursor.offsets.len() {
-                    break 'value default.clone().unwrap_or(Value::Null);
-                }
+                            if payload.is_empty() {
+                                break 'value default.clone().unwrap_or(Value::Null);
+                            }
 
-                let start_offset = record_cursor.offsets[target_column];
-                let end_offset = record_cursor.offsets[target_column + 1];
+                            let mut record_cursor = cursor.record_cursor.borrow_mut();
 
-                let data_slice = &payload[start_offset..end_offset];
-                let data_len = end_offset - start_offset;
+                            if record_cursor.serial_types.is_empty()
+                                && record_cursor.offsets.is_empty()
+                            {
+                                let (header_size, header_len_bytes) = read_varint_fast(payload)?;
+                                let header_size = header_size as usize;
 
-                match serial_type {
-                    1..=6 => {
-                        let expected_len = match serial_type {
-                            1 => 1,
-                            2 => 2,
-                            3 => 3,
-                            4 => 4,
-                            5 => 6,
-                            6 => 8,
-                            _ => 0,
-                        };
+                                if header_size > payload.len() || header_size > 98307 {
+                                    return Err(LimboError::Corrupt(
+                                        "Header size exceeds bounds".into(),
+                                    ));
+                                }
 
-                        if data_len >= expected_len {
-                            Value::Integer(read_integer_fast(data_slice, expected_len))
-                        } else {
-                            return Err(LimboError::Corrupt(format!(
+                                record_cursor.header_size = header_size;
+                                record_cursor.header_offset = header_len_bytes;
+
+                                record_cursor.offsets.push(header_size);
+                            }
+
+                            let target_column = *column;
+                            let mut parse_pos = record_cursor.header_offset;
+                            let mut data_offset = record_cursor
+                                .offsets
+                                .last()
+                                .copied()
+                                .unwrap_or(record_cursor.header_size);
+
+                            // Adjust data_offset if we already have some columns parsed
+                            if !record_cursor.serial_types.is_empty()
+                                && !record_cursor.offsets.is_empty()
+                            {
+                                data_offset = *record_cursor.offsets.last().unwrap();
+                            }
+
+                            // Parse the header for serial types incrementally until we have the target column
+                            while record_cursor.serial_types.len() <= target_column
+                                && parse_pos < record_cursor.header_size
+                                && parse_pos < payload.len()
+                            {
+                                let (serial_type, varint_len) =
+                                    read_varint_fast(&payload[parse_pos..])?;
+
+                                record_cursor.serial_types.push(serial_type);
+                                parse_pos += varint_len;
+                                let data_size = match serial_type {
+                                    0 => 0,
+                                    1 => 1,
+                                    2 => 2,
+                                    3 => 3,
+                                    4 => 4,
+                                    5 => 6,
+                                    6 => 8,
+                                    7 => 8,
+                                    8 => 0,
+                                    9 => 0,
+                                    n if n >= 12 && n % 2 == 0 => (n - 12) / 2,
+                                    n if n >= 13 && n % 2 == 1 => (n - 13) / 2,
+                                    10 | 11 => {
+                                        return Err(LimboError::Corrupt(format!(
+                                            "Reserved serial type: {serial_type}"
+                                        )))
+                                    }
+                                    _ => {
+                                        return Err(LimboError::Corrupt(format!(
+                                            "Invalid serial type: {serial_type}"
+                                        )))
+                                    }
+                                } as usize;
+                                data_offset += data_size;
+                                record_cursor.offsets.push(data_offset);
+                            }
+
+                            record_cursor.header_offset = parse_pos;
+
+                            if parse_pos > record_cursor.header_size || data_offset > payload.len()
+                            {
+                                record_cursor.serial_types.clear();
+                                record_cursor.offsets.clear();
+                                record_cursor.header_offset = 0;
+                                record_cursor.header_size = 0;
+                                break 'value default.clone().unwrap_or(Value::Null);
+                            }
+
+                            if target_column >= record_cursor.serial_types.len() {
+                                break 'value default.clone().unwrap_or(Value::Null);
+                            }
+
+                            let serial_type = record_cursor.serial_types[target_column];
+
+                            // Fast path for common constant cases
+                            match serial_type {
+                                0 => break 'value Value::Null,
+                                8 => break 'value Value::Integer(0),
+                                9 => break 'value Value::Integer(1),
+                                _ => {}
+                            }
+
+                            if target_column + 1 >= record_cursor.offsets.len() {
+                                break 'value default.clone().unwrap_or(Value::Null);
+                            }
+
+                            let start_offset = record_cursor.offsets[target_column];
+                            let end_offset = record_cursor.offsets[target_column + 1];
+
+                            let data_slice = &payload[start_offset..end_offset];
+                            let data_len = end_offset - start_offset;
+
+                            match serial_type {
+                                1..=6 => {
+                                    let expected_len = match serial_type {
+                                        1 => 1,
+                                        2 => 2,
+                                        3 => 3,
+                                        4 => 4,
+                                        5 => 6,
+                                        6 => 8,
+                                        _ => 0,
+                                    };
+
+                                    if data_len >= expected_len {
+                                        Value::Integer(read_integer_fast(data_slice, expected_len))
+                                    } else {
+                                        return Err(LimboError::Corrupt(format!(
                                 "Insufficient data for integer type {serial_type}: expected {expected_len}, got {data_len}"
                             )));
-                        }
-                    }
-                    7 => {
-                        if data_len >= 8 {
-                            let bytes = [
-                                data_slice[0],
-                                data_slice[1],
-                                data_slice[2],
-                                data_slice[3],
-                                data_slice[4],
-                                data_slice[5],
-                                data_slice[6],
-                                data_slice[7],
-                            ];
-                            Value::Float(f64::from_be_bytes(bytes))
-                        } else {
-                            default.clone().unwrap_or(Value::Null)
-                        }
-                    }
-                    n if n >= 12 && n % 2 == 0 => Value::Blob(data_slice.to_vec()),
-                    n if n >= 13 && n % 2 == 1 => Value::Text(Text {
-                        value: data_slice.to_vec(),
-                        subtype: TextSubtype::Text,
-                    }),
-                    _ => default.clone().unwrap_or(Value::Null),
-                }
-            };
+                                    }
+                                }
+                                7 => {
+                                    if data_len >= 8 {
+                                        let bytes = [
+                                            data_slice[0],
+                                            data_slice[1],
+                                            data_slice[2],
+                                            data_slice[3],
+                                            data_slice[4],
+                                            data_slice[5],
+                                            data_slice[6],
+                                            data_slice[7],
+                                        ];
+                                        Value::Float(f64::from_be_bytes(bytes))
+                                    } else {
+                                        default.clone().unwrap_or(Value::Null)
+                                    }
+                                }
+                                n if n >= 12 && n % 2 == 0 => Value::Blob(data_slice.to_vec()),
+                                n if n >= 13 && n % 2 == 1 => Value::Text(Text {
+                                    value: data_slice.to_vec(),
+                                    subtype: TextSubtype::Text,
+                                }),
+                                _ => default.clone().unwrap_or(Value::Null),
+                            }
+                        };
 
-            // Try to reuse the registers when allocation is not needed.
-            match (&value, &mut state.registers[*dest]) {
-                (Value::Text(new_text), Register::Value(Value::Text(existing_text))) => {
-                    if existing_text.value.capacity() >= new_text.value.len() {
-                        existing_text.value.clear();
-                        existing_text.value.extend_from_slice(&new_text.value);
-                        existing_text.subtype = new_text.subtype;
-                    } else {
+                        // Try to reuse the registers when allocation is not needed.
+                        match (&value, &mut state.registers[*dest]) {
+                            (
+                                Value::Text(new_text),
+                                Register::Value(Value::Text(existing_text)),
+                            ) => {
+                                if existing_text.value.capacity() >= new_text.value.len() {
+                                    existing_text.value.clear();
+                                    existing_text.value.extend_from_slice(&new_text.value);
+                                    existing_text.subtype = new_text.subtype;
+                                } else {
+                                    state.registers[*dest] = Register::Value(value);
+                                }
+                            }
+                            (
+                                Value::Blob(new_blob),
+                                Register::Value(Value::Blob(existing_blob)),
+                            ) => {
+                                if existing_blob.capacity() >= new_blob.len() {
+                                    existing_blob.clear();
+                                    existing_blob.extend_from_slice(new_blob);
+                                } else {
+                                    state.registers[*dest] = Register::Value(value);
+                                }
+                            }
+                            _ => {
+                                state.registers[*dest] = Register::Value(value);
+                            }
+                        }
+                    }
+                    CursorType::Sorter => {
+                        let record = {
+                            let mut cursor = state.get_cursor(*cursor_id);
+                            let cursor = cursor.as_sorter_mut();
+                            cursor.record().cloned()
+                        };
+                        if let Some(record) = record {
+                            state.registers[*dest] =
+                                Register::Value(match record.get_value_opt(*column) {
+                                    Some(val) => val.to_owned(),
+                                    None => default.clone().unwrap_or(Value::Null),
+                                });
+                        } else {
+                            state.registers[*dest] = Register::Value(Value::Null);
+                        }
+                    }
+                    CursorType::Pseudo(_) => {
+                        let value = {
+                            let mut cursor = state.get_cursor(*cursor_id);
+                            let cursor = cursor.as_pseudo_mut();
+                            if let Some(record) = cursor.record() {
+                                record.get_value(*column)?.to_owned()
+                            } else {
+                                Value::Null
+                            }
+                        };
                         state.registers[*dest] = Register::Value(value);
                     }
-                }
-                (Value::Blob(new_blob), Register::Value(Value::Blob(existing_blob))) => {
-                    if existing_blob.capacity() >= new_blob.len() {
-                        existing_blob.clear();
-                        existing_blob.extend_from_slice(new_blob);
-                    } else {
-                        state.registers[*dest] = Register::Value(value);
+                    CursorType::VirtualTable(_) => {
+                        panic!("Insn:Column on virtual table cursor, use Insn:VColumn instead");
                     }
                 }
-                _ => {
-                    state.registers[*dest] = Register::Value(value);
-                }
+                state.op_column_state = OpColumnState::Start;
+                break;
             }
-        }
-        CursorType::Sorter => {
-            let record = {
-                let mut cursor = state.get_cursor(*cursor_id);
-                let cursor = cursor.as_sorter_mut();
-                cursor.record().cloned()
-            };
-            if let Some(record) = record {
-                state.registers[*dest] = Register::Value(match record.get_value_opt(*column) {
-                    Some(val) => val.to_owned(),
-                    None => default.clone().unwrap_or(Value::Null),
-                });
-            } else {
-                state.registers[*dest] = Register::Value(Value::Null);
-            }
-        }
-        CursorType::Pseudo(_) => {
-            let value = {
-                let mut cursor = state.get_cursor(*cursor_id);
-                let cursor = cursor.as_pseudo_mut();
-                if let Some(record) = cursor.record() {
-                    record.get_value(*column)?.to_owned()
-                } else {
-                    Value::Null
-                }
-            };
-            state.registers[*dest] = Register::Value(value);
-        }
-        CursorType::VirtualTable(_) => {
-            panic!("Insn:Column on virtual table cursor, use Insn:VColumn instead");
         }
     }
 
@@ -1836,11 +1891,8 @@ pub fn halt(
         }
     }
     match program.commit_txn(pager.clone(), state, mv_store, false)? {
-        StepResult::Done => Ok(InsnFunctionStepResult::Done),
-        StepResult::IO => Ok(InsnFunctionStepResult::IO),
-        StepResult::Row => Ok(InsnFunctionStepResult::Row),
-        StepResult::Interrupt => Ok(InsnFunctionStepResult::Interrupt),
-        StepResult::Busy => Ok(InsnFunctionStepResult::Busy),
+        IOResult::Done(_) => Ok(InsnFunctionStepResult::Done),
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
     }
 }
 
@@ -1884,11 +1936,8 @@ pub fn op_halt(
     tracing::trace!("op_halt(auto_commit={})", auto_commit);
     if auto_commit {
         match program.commit_txn(pager.clone(), state, mv_store, false)? {
-            StepResult::Done => Ok(InsnFunctionStepResult::Done),
-            StepResult::IO => Ok(InsnFunctionStepResult::IO),
-            StepResult::Row => Ok(InsnFunctionStepResult::Row),
-            StepResult::Interrupt => Ok(InsnFunctionStepResult::Interrupt),
-            StepResult::Busy => Ok(InsnFunctionStepResult::Busy),
+            IOResult::Done(_) => Ok(InsnFunctionStepResult::Done),
+            IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
         }
     } else {
         Ok(InsnFunctionStepResult::Done)
@@ -1975,17 +2024,10 @@ pub fn op_transaction(
         }
 
         if updated && matches!(new_transaction_state, TransactionState::Write { .. }) {
-            match pager.begin_write_tx()? {
-                IOResult::Done(r) => {
-                    if let LimboResult::Busy = r {
-                        pager.end_read_tx()?;
-                        return Ok(InsnFunctionStepResult::Busy);
-                    }
-                }
-                IOResult::IO => {
-                    pager.end_read_tx()?;
-                    return Ok(InsnFunctionStepResult::IO);
-                }
+            let r = pager.io.block(|| pager.begin_write_tx())?;
+            if let LimboResult::Busy = r {
+                pager.end_read_tx()?;
+                return Ok(InsnFunctionStepResult::Busy);
             }
         }
         if updated {
@@ -2013,11 +2055,8 @@ pub fn op_auto_commit(
     let conn = program.connection.clone();
     if state.commit_state == CommitState::Committing {
         return match program.commit_txn(pager.clone(), state, mv_store, *rollback)? {
-            super::StepResult::Done => Ok(InsnFunctionStepResult::Done),
-            super::StepResult::IO => Ok(InsnFunctionStepResult::IO),
-            super::StepResult::Row => Ok(InsnFunctionStepResult::Row),
-            super::StepResult::Interrupt => Ok(InsnFunctionStepResult::Interrupt),
-            super::StepResult::Busy => Ok(InsnFunctionStepResult::Busy),
+            IOResult::Done(_) => Ok(InsnFunctionStepResult::Done),
+            IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
         };
     }
     let schema_did_change =
@@ -2049,11 +2088,8 @@ pub fn op_auto_commit(
         ));
     }
     match program.commit_txn(pager.clone(), state, mv_store, *rollback)? {
-        super::StepResult::Done => Ok(InsnFunctionStepResult::Done),
-        super::StepResult::IO => Ok(InsnFunctionStepResult::IO),
-        super::StepResult::Row => Ok(InsnFunctionStepResult::Row),
-        super::StepResult::Interrupt => Ok(InsnFunctionStepResult::Interrupt),
-        super::StepResult::Busy => Ok(InsnFunctionStepResult::Busy),
+        IOResult::Done(_) => Ok(InsnFunctionStepResult::Done),
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
     }
 }
 
@@ -2230,6 +2266,20 @@ pub fn op_row_data(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum OpRowIdState {
+    Start,
+    Record {
+        index_cursor_id: usize,
+        table_cursor_id: usize,
+    },
+    Seek {
+        rowid: i64,
+        table_cursor_id: usize,
+    },
+    GetRowid,
+}
+
 pub fn op_row_id(
     program: &Program,
     state: &mut ProgramState,
@@ -2240,56 +2290,81 @@ pub fn op_row_id(
     let Insn::RowId { cursor_id, dest } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seeks[*cursor_id].take() {
-        let deferred_seek = 'd: {
-            let rowid = {
-                let mut index_cursor = state.get_cursor(index_cursor_id);
-                let index_cursor = index_cursor.as_btree_mut();
-                let record = match index_cursor.record()? {
-                    IOResult::IO => {
-                        break 'd Some((index_cursor_id, table_cursor_id));
-                    }
-                    IOResult::Done(record) => record,
-                };
-                let record = record.as_ref().unwrap();
-                let mut record_cursor_ref = index_cursor.record_cursor.borrow_mut();
-                let record_cursor = record_cursor_ref.deref_mut();
-                let rowid = record.last_value(record_cursor).unwrap();
-                match rowid {
-                    Ok(RefValue::Integer(rowid)) => rowid,
-                    _ => unreachable!(),
+    loop {
+        match state.op_row_id_state {
+            OpRowIdState::Start => {
+                if let Some((index_cursor_id, table_cursor_id)) =
+                    state.deferred_seeks[*cursor_id].take()
+                {
+                    state.op_row_id_state = OpRowIdState::Record {
+                        index_cursor_id,
+                        table_cursor_id,
+                    };
+                } else {
+                    state.op_row_id_state = OpRowIdState::GetRowid;
                 }
-            };
-            let mut table_cursor = state.get_cursor(table_cursor_id);
-            let table_cursor = table_cursor.as_btree_mut();
-            match table_cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })? {
-                IOResult::Done(_) => None,
-                IOResult::IO => Some((index_cursor_id, table_cursor_id)),
             }
-        };
-        if let Some(deferred_seek) = deferred_seek {
-            state.deferred_seeks[*cursor_id] = Some(deferred_seek);
-            return Ok(InsnFunctionStepResult::IO);
+            OpRowIdState::Record {
+                index_cursor_id,
+                table_cursor_id,
+            } => {
+                let rowid = {
+                    let mut index_cursor = state.get_cursor(index_cursor_id);
+                    let index_cursor = index_cursor.as_btree_mut();
+                    let record = return_if_io!(index_cursor.record());
+                    let record = record.as_ref().unwrap();
+                    let mut record_cursor_ref = index_cursor.record_cursor.borrow_mut();
+                    let record_cursor = record_cursor_ref.deref_mut();
+                    let rowid = record.last_value(record_cursor).unwrap();
+                    match rowid {
+                        Ok(RefValue::Integer(rowid)) => rowid,
+                        _ => unreachable!(),
+                    }
+                };
+                state.op_row_id_state = OpRowIdState::Seek {
+                    rowid,
+                    table_cursor_id,
+                }
+            }
+            OpRowIdState::Seek {
+                rowid,
+                table_cursor_id,
+            } => {
+                {
+                    let mut table_cursor = state.get_cursor(table_cursor_id);
+                    let table_cursor = table_cursor.as_btree_mut();
+                    return_if_io!(
+                        table_cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
+                    );
+                }
+                state.op_row_id_state = OpRowIdState::GetRowid;
+            }
+            OpRowIdState::GetRowid => {
+                let mut cursors = state.cursors.borrow_mut();
+                if let Some(Cursor::BTree(btree_cursor)) = cursors.get_mut(*cursor_id).unwrap() {
+                    if let Some(ref rowid) = return_if_io!(btree_cursor.rowid()) {
+                        state.registers[*dest] = Register::Value(Value::Integer(*rowid));
+                    } else {
+                        state.registers[*dest] = Register::Value(Value::Null);
+                    }
+                } else if let Some(Cursor::Virtual(virtual_cursor)) =
+                    cursors.get_mut(*cursor_id).unwrap()
+                {
+                    let rowid = virtual_cursor.rowid();
+                    if rowid != 0 {
+                        state.registers[*dest] = Register::Value(Value::Integer(rowid));
+                    } else {
+                        state.registers[*dest] = Register::Value(Value::Null);
+                    }
+                } else {
+                    return Err(LimboError::InternalError(
+                        "RowId: cursor is not a table or virtual cursor".to_string(),
+                    ));
+                }
+                state.op_row_id_state = OpRowIdState::Start;
+                break;
+            }
         }
-    }
-    let mut cursors = state.cursors.borrow_mut();
-    if let Some(Cursor::BTree(btree_cursor)) = cursors.get_mut(*cursor_id).unwrap() {
-        if let Some(ref rowid) = return_if_io!(btree_cursor.rowid()) {
-            state.registers[*dest] = Register::Value(Value::Integer(*rowid));
-        } else {
-            state.registers[*dest] = Register::Value(Value::Null);
-        }
-    } else if let Some(Cursor::Virtual(virtual_cursor)) = cursors.get_mut(*cursor_id).unwrap() {
-        let rowid = virtual_cursor.rowid();
-        if rowid != 0 {
-            state.registers[*dest] = Register::Value(Value::Integer(rowid));
-        } else {
-            state.registers[*dest] = Register::Value(Value::Null);
-        }
-    } else {
-        return Err(LimboError::InternalError(
-            "RowId: cursor is not a table or virtual cursor".to_string(),
-        ));
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2498,16 +2573,15 @@ pub fn op_seek(
             state.pc = target_pc.as_offset_int();
             Ok(InsnFunctionStepResult::Step)
         }
-        Ok(SeekInternalResult::IO) => Ok(InsnFunctionStepResult::IO),
+        Ok(SeekInternalResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
         Err(e) => Err(e),
     }
 }
 
-#[derive(Debug, PartialEq)]
 pub enum SeekInternalResult {
     Found,
     NotFound,
-    IO,
+    IO(IOCompletions),
 }
 pub enum RecordSource {
     Unpacked { start_reg: usize, num_regs: usize },
@@ -2661,16 +2735,16 @@ pub fn seek_internal(
                         let mut cursor = state.get_cursor(cursor_id);
                         let cursor = cursor.as_btree_mut();
                         let seek_key = match key {
-                        OpSeekKey::TableRowId(rowid) => SeekKey::TableRowId(*rowid),
-                        OpSeekKey::IndexKeyOwned(record) => SeekKey::IndexKey(record),
-                        OpSeekKey::IndexKeyFromRegister(record_reg) => match &state.registers[*record_reg] {
-                            Register::Record(ref record) => SeekKey::IndexKey(record),
-                            _ => unreachable!("op_seek: record_reg should be a Record register when OpSeekKey::IndexKeyFromRegister is used"),
-                        }
-                    };
+                            OpSeekKey::TableRowId(rowid) => SeekKey::TableRowId(*rowid),
+                            OpSeekKey::IndexKeyOwned(record) => SeekKey::IndexKey(record),
+                            OpSeekKey::IndexKeyFromRegister(record_reg) => match &state.registers[*record_reg] {
+                                Register::Record(ref record) => SeekKey::IndexKey(record),
+                                _ => unreachable!("op_seek: record_reg should be a Record register when OpSeekKey::IndexKeyFromRegister is used"),
+                            }
+                        };
                         match cursor.seek(seek_key, *op)? {
                             IOResult::Done(seek_result) => seek_result,
-                            IOResult::IO => return Ok(SeekInternalResult::IO),
+                            IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
                         }
                     };
                     let found = match seek_result {
@@ -2716,7 +2790,7 @@ pub fn seek_internal(
                         };
                         match result {
                             IOResult::Done(found) => found,
-                            IOResult::IO => return Ok(SeekInternalResult::IO),
+                            IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
                         }
                     };
                     return Ok(if found {
@@ -2730,7 +2804,7 @@ pub fn seek_internal(
                     let cursor = cursor.as_btree_mut();
                     match cursor.last()? {
                         IOResult::Done(()) => {}
-                        IOResult::IO => return Ok(SeekInternalResult::IO),
+                        IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
                     }
                     // the MoveLast variant is only used for SeekOp::LT and SeekOp::LE when the seek condition is always true,
                     // so we have always found what we were looking for.
@@ -2750,7 +2824,7 @@ pub fn seek_internal(
         is_index,
         op,
     );
-    if !matches!(result, Ok(SeekInternalResult::IO)) {
+    if !matches!(result, Ok(SeekInternalResult::IO(..))) {
         state.seek_state = OpSeekState::Start;
     }
     result
@@ -3620,7 +3694,10 @@ pub fn op_sorter_insert(
             Register::Record(record) => record,
             _ => unreachable!("SorterInsert on non-record register"),
         };
-        cursor.insert(record)?;
+        match cursor.insert(record)? {
+            IOResult::Done(_) => {}
+            IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
+        }
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -3645,8 +3722,8 @@ pub fn op_sorter_sort(
         let cursor = cursor.as_sorter_mut();
         let is_empty = cursor.is_empty();
         if !is_empty {
-            if let IOResult::IO = cursor.sort()? {
-                return Ok(InsnFunctionStepResult::IO);
+            if let IOResult::IO(io) = cursor.sort()? {
+                return Ok(InsnFunctionStepResult::IO(io));
             }
         }
         is_empty
@@ -3677,8 +3754,8 @@ pub fn op_sorter_next(
     let has_more = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_sorter_mut();
-        if let IOResult::IO = cursor.next()? {
-            return Ok(InsnFunctionStepResult::IO);
+        if let IOResult::IO(io) = cursor.next()? {
+            return Ok(InsnFunctionStepResult::IO(io));
         }
         cursor.has_more()
     };
@@ -5163,7 +5240,7 @@ pub fn op_idx_delete(
                 ) {
                     Ok(SeekInternalResult::Found) => true,
                     Ok(SeekInternalResult::NotFound) => false,
-                    Ok(SeekInternalResult::IO) => return Ok(InsnFunctionStepResult::IO),
+                    Ok(SeekInternalResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
                     Err(e) => return Err(e),
                 };
 
@@ -5284,7 +5361,7 @@ pub fn op_idx_insert(
                     state.op_idx_insert_state = OpIdxInsertState::Insert { moved_before: true };
                     Ok(InsnFunctionStepResult::Step)
                 }
-                SeekInternalResult::IO => Ok(InsnFunctionStepResult::IO),
+                SeekInternalResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
             }
         }
         OpIdxInsertState::UniqueConstraintCheck => {
@@ -5638,7 +5715,7 @@ pub fn op_no_conflict(
             state.pc = target_pc.as_offset_int();
             Ok(InsnFunctionStepResult::Step)
         }
-        SeekInternalResult::IO => Ok(InsnFunctionStepResult::IO),
+        SeekInternalResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
     }
 }
 
@@ -6241,7 +6318,20 @@ pub enum OpOpenEphemeralState {
     Start,
     StartingTxn { pager: Rc<Pager> },
     CreateBtree { pager: Rc<Pager> },
+    Rewind { cursor: Option<BTreeCursor> },
 }
+
+impl Debug for OpOpenEphemeralState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Start => write!(f, "Start"),
+            Self::StartingTxn { .. } => f.debug_struct("StartingTxn").finish(),
+            Self::CreateBtree { .. } => f.debug_struct("CreateBtree").finish(),
+            Self::Rewind { .. } => f.debug_struct("Rewind").finish(),
+        }
+    }
+}
+
 pub fn op_open_ephemeral(
     program: &Program,
     state: &mut ProgramState,
@@ -6257,114 +6347,131 @@ pub fn op_open_ephemeral(
         Insn::OpenAutoindex { cursor_id } => (*cursor_id, false),
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
-    match &state.op_open_ephemeral_state {
-        OpOpenEphemeralState::Start => {
-            tracing::trace!("Start");
-            let conn = program.connection.clone();
-            let io = conn.pager.borrow().io.get_memory_io();
+    loop {
+        tracing::trace!(?state.op_open_ephemeral_state);
+        match &mut state.op_open_ephemeral_state {
+            OpOpenEphemeralState::Start => {
+                tracing::trace!("Start");
+                let conn = program.connection.clone();
+                let io = conn.pager.borrow().io.get_memory_io();
 
-            let file = io.open_file("", OpenFlags::Create, true)?;
-            let db_file = Arc::new(FileMemoryStorage::new(file));
+                let file = io.open_file("", OpenFlags::Create, true)?;
+                let db_file = Arc::new(FileMemoryStorage::new(file));
 
-            let buffer_pool = Arc::new(BufferPool::new(None));
-            let page_cache = Arc::new(RwLock::new(DumbLruPageCache::default()));
+                let buffer_pool = Arc::new(BufferPool::new(None));
+                let page_cache = Arc::new(RwLock::new(DumbLruPageCache::default()));
 
-            let pager = Rc::new(Pager::new(
-                db_file,
-                Rc::new(RefCell::new(DummyWAL)),
-                io,
-                page_cache,
-                buffer_pool.clone(),
-                Arc::new(AtomicDbState::new(DbState::Uninitialized)),
-                Arc::new(Mutex::new(())),
-            )?);
+                let pager = Rc::new(Pager::new(
+                    db_file,
+                    Rc::new(RefCell::new(DummyWAL)),
+                    io,
+                    page_cache,
+                    buffer_pool.clone(),
+                    Arc::new(AtomicDbState::new(DbState::Uninitialized)),
+                    Arc::new(Mutex::new(())),
+                )?);
 
-            let page_size = header_accessor::get_page_size(&pager)
-                .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE)
-                as usize;
-            buffer_pool.set_page_size(page_size);
+                let page_size = header_accessor::get_page_size(&pager)
+                    .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE)
+                    as usize;
+                buffer_pool.set_page_size(page_size);
 
-            state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn { pager };
-        }
-        OpOpenEphemeralState::StartingTxn { pager } => {
-            tracing::trace!("StartingTxn");
-            return_if_io!(pager.begin_write_tx());
-            state.op_open_ephemeral_state = OpOpenEphemeralState::CreateBtree {
-                pager: pager.clone(),
-            };
-        }
-        OpOpenEphemeralState::CreateBtree { pager } => {
-            tracing::trace!("CreateBtree");
-            // FIXME: handle page cache is full
-            let flag = if is_table {
-                &CreateBTreeFlags::new_table()
-            } else {
-                &CreateBTreeFlags::new_index()
-            };
-            let root_page = return_if_io!(pager.btree_create(flag));
-
-            let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
-            let mv_cursor = match state.mv_tx_id {
-                Some(tx_id) => {
-                    let table_id = root_page as u64;
-                    let mv_store = mv_store.unwrap().clone();
-                    let mv_cursor = Rc::new(RefCell::new(
-                        MvCursor::new(mv_store.clone(), tx_id, table_id).unwrap(),
-                    ));
-                    Some(mv_cursor)
-                }
-                None => None,
-            };
-
-            let num_columns = match cursor_type {
-                CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
-                CursorType::BTreeIndex(index_arc) => index_arc.columns.len(),
-                _ => unreachable!("This should not have happened"),
-            };
-
-            let mut cursor = if let CursorType::BTreeIndex(index) = cursor_type {
-                BTreeCursor::new_index(
-                    mv_cursor,
-                    pager.clone(),
-                    root_page as usize,
-                    index,
-                    num_columns,
-                )
-            } else {
-                BTreeCursor::new_table(mv_cursor, pager.clone(), root_page as usize, num_columns)
-            };
-            cursor.rewind()?; // Will never return io
-
-            let mut cursors: std::cell::RefMut<'_, Vec<Option<Cursor>>> =
-                state.cursors.borrow_mut();
-
-            // Table content is erased if the cursor already exists
-            match cursor_type {
-                CursorType::BTreeTable(_) => {
-                    cursors
-                        .get_mut(cursor_id)
-                        .unwrap()
-                        .replace(Cursor::new_btree(cursor));
-                }
-                CursorType::BTreeIndex(_) => {
-                    cursors
-                        .get_mut(cursor_id)
-                        .unwrap()
-                        .replace(Cursor::new_btree(cursor));
-                }
-                CursorType::Pseudo(_) => {
-                    panic!("OpenEphemeral on pseudo cursor");
-                }
-                CursorType::Sorter => {
-                    panic!("OpenEphemeral on sorter cursor");
-                }
-                CursorType::VirtualTable(_) => {
-                    panic!("OpenEphemeral on virtual table cursor, use Insn::VOpen instead");
-                }
+                state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn { pager };
             }
+            OpOpenEphemeralState::StartingTxn { pager } => {
+                tracing::trace!("StartingTxn");
+                return_if_io!(pager.begin_write_tx());
+                state.op_open_ephemeral_state = OpOpenEphemeralState::CreateBtree {
+                    pager: pager.clone(),
+                };
+            }
+            OpOpenEphemeralState::CreateBtree { pager } => {
+                tracing::trace!("CreateBtree");
+                // FIXME: handle page cache is full
+                let flag = if is_table {
+                    &CreateBTreeFlags::new_table()
+                } else {
+                    &CreateBTreeFlags::new_index()
+                };
+                let root_page = return_if_io!(pager.btree_create(flag));
 
-            state.pc += 1;
-            state.op_open_ephemeral_state = OpOpenEphemeralState::Start;
+                let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
+                let mv_cursor = match state.mv_tx_id {
+                    Some(tx_id) => {
+                        let table_id = root_page as u64;
+                        let mv_store = mv_store.unwrap().clone();
+                        let mv_cursor = Rc::new(RefCell::new(
+                            MvCursor::new(mv_store.clone(), tx_id, table_id).unwrap(),
+                        ));
+                        Some(mv_cursor)
+                    }
+                    None => None,
+                };
+
+                let num_columns = match cursor_type {
+                    CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
+                    CursorType::BTreeIndex(index_arc) => index_arc.columns.len(),
+                    _ => unreachable!("This should not have happened"),
+                };
+
+                let cursor = if let CursorType::BTreeIndex(index) = cursor_type {
+                    BTreeCursor::new_index(
+                        mv_cursor,
+                        pager.clone(),
+                        root_page as usize,
+                        index,
+                        num_columns,
+                    )
+                } else {
+                    BTreeCursor::new_table(
+                        mv_cursor,
+                        pager.clone(),
+                        root_page as usize,
+                        num_columns,
+                    )
+                };
+                state.op_open_ephemeral_state = OpOpenEphemeralState::Rewind {
+                    cursor: Some(cursor),
+                };
+            }
+            OpOpenEphemeralState::Rewind { cursor: cursor_opt } => {
+                let cursor = cursor_opt.as_mut().unwrap();
+                return_if_io!(cursor.rewind());
+
+                let mut cursors: std::cell::RefMut<'_, Vec<Option<Cursor>>> =
+                    state.cursors.borrow_mut();
+
+                let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
+                // Table content is erased if the cursor already exists
+                let cursor = cursor_opt.take().unwrap();
+                match cursor_type {
+                    CursorType::BTreeTable(_) => {
+                        cursors
+                            .get_mut(cursor_id)
+                            .unwrap()
+                            .replace(Cursor::new_btree(cursor));
+                    }
+                    CursorType::BTreeIndex(_) => {
+                        cursors
+                            .get_mut(cursor_id)
+                            .unwrap()
+                            .replace(Cursor::new_btree(cursor));
+                    }
+                    CursorType::Pseudo(_) => {
+                        panic!("OpenEphemeral on pseudo cursor");
+                    }
+                    CursorType::Sorter => {
+                        panic!("OpenEphemeral on sorter cursor");
+                    }
+                    CursorType::VirtualTable(_) => {
+                        panic!("OpenEphemeral on virtual table cursor, use Insn::VOpen instead");
+                    }
+                }
+
+                state.pc += 1;
+                state.op_open_ephemeral_state = OpOpenEphemeralState::Start;
+                break;
+            }
         }
     }
 
@@ -6446,7 +6553,7 @@ pub fn op_found(
     ) {
         Ok(SeekInternalResult::Found) => SeekResult::Found,
         Ok(SeekInternalResult::NotFound) => SeekResult::NotFound,
-        Ok(SeekInternalResult::IO) => return Ok(InsnFunctionStepResult::IO),
+        Ok(SeekInternalResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
         Err(e) => return Err(e),
     };
 
