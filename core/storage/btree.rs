@@ -6422,57 +6422,87 @@ fn free_cell_range(
 /// Defragment a page. This means packing all the cells to the end of the page.
 fn defragment_page(page: &PageContent, usable_space: u16) {
     debug_validate_cells!(page, usable_space);
-    tracing::debug!("defragment_page");
-    let cloned_page = page.clone();
-    // TODO(pere): usable space should include offset probably
-    let mut cbrk = usable_space;
+    tracing::debug!("defragment_page (optimized in-place)");
 
-    // TODO: implement fast algorithm
-
-    let last_cell = usable_space - 4;
-    let first_cell = cloned_page.unallocated_region_start() as u16;
-
-    if cloned_page.cell_count() > 0 {
-        let read_buf = cloned_page.as_ptr();
-        let write_buf = page.as_ptr();
-
-        for i in 0..cloned_page.cell_count() {
-            let (cell_offset, _) = page.cell_pointer_array_offset_and_size();
-            let cell_idx = cell_offset + (i * 2);
-
-            let pc = cloned_page.read_u16_no_offset(cell_idx);
-            if pc > last_cell {
-                unimplemented!("corrupted page");
-            }
-
-            assert!(pc <= last_cell);
-
-            let (_, size) = cloned_page.cell_get_raw_region(i, usable_space as usize);
-            let size = size as u16;
-            cbrk -= size;
-            if cbrk < first_cell || pc + size > usable_space {
-                todo!("corrupt");
-            }
-            assert!(cbrk + size <= usable_space && cbrk >= first_cell);
-            // set new pointer
-            page.write_u16_no_offset(cell_idx, cbrk);
-            // copy payload
-            write_buf[cbrk as usize..cbrk as usize + size as usize]
-                .copy_from_slice(&read_buf[pc as usize..pc as usize + size as usize]);
-        }
+    let cell_count = page.cell_count();
+    if cell_count == 0 {
+        page.write_u16(offset::BTREE_CELL_CONTENT_AREA, usable_space);
+        page.write_u16(offset::BTREE_FIRST_FREEBLOCK, 0);
+        page.write_u8(offset::BTREE_FRAGMENTED_BYTES_COUNT, 0);
+        debug_validate_cells!(page, usable_space);
+        return;
     }
 
-    // assert!( nfree >= 0 );
-    // if( data[hdr+7]+cbrk-iCellFirst!=pPage->nFree ){
-    //   return SQLITE_CORRUPT_PAGE(pPage);
-    // }
-    assert!(cbrk >= first_cell);
+    // A small struct to hold cell metadata for sorting.
+    struct CellInfo {
+        old_offset: u16,
+        size: u16,
+        pointer_index: usize,
+    }
 
-    // set new first byte of cell content
+    // Gather cell metadata.
+    let cell_offset = page.cell_pointer_array_offset();
+    let mut cells_info = Vec::with_capacity(cell_count);
+    let mut is_physically_sorted = true;
+    let mut last_offset = u16::MAX;
+
+    for i in 0..cell_count {
+        let pc = page.read_u16_no_offset(cell_offset + (i * 2));
+        let (_, size) = page.cell_get_raw_region(i, usable_space as usize);
+
+        if pc > last_offset {
+            // Enable a fast path preventing the sort operation
+            // for cells that are already in a sorted order
+            is_physically_sorted = false;
+        }
+
+        last_offset = pc;
+        cells_info.push(CellInfo {
+            old_offset: pc,
+            size: size as u16,
+            pointer_index: i,
+        });
+    }
+
+    if !is_physically_sorted {
+        // Sort cells by old physical offset in descending order.
+        // Using unstable sort is fine as the original order doesn't matter.
+        cells_info.sort_unstable_by(|a, b| b.old_offset.cmp(&a.old_offset));
+    }
+
+    // Get direct mutable access to the page buffer.
+    let buffer = page.as_ptr();
+    let cell_pointer_area_offset = page.cell_pointer_array_offset();
+    let first_cell_content_byte = page.unallocated_region_start() as u16;
+
+    // Move data and update pointers.
+    let mut cbrk = usable_space;
+    for cell in cells_info {
+        cbrk -= cell.size;
+        let new_offset = cbrk;
+        let old_offset = cell.old_offset;
+
+        // Basic corruption check.
+        if new_offset < first_cell_content_byte || old_offset + cell.size > usable_space {
+            todo!("corrupt page detected during defragmentation");
+        }
+
+        // Move the cell data. `copy_within` is the idiomatic and safe
+        // way to perform a `memmove` operation on a slice.
+        if new_offset != old_offset {
+            let src_range = old_offset as usize..(old_offset + cell.size) as usize;
+            buffer.copy_within(src_range, new_offset as usize);
+        }
+
+        // Update the pointer in the cell pointer array to the new offset.
+        let pointer_location = cell_pointer_area_offset + (cell.pointer_index * 2);
+        page.write_u16_no_offset(pointer_location, new_offset);
+    }
+
     page.write_u16(offset::BTREE_CELL_CONTENT_AREA, cbrk);
-    // set free block to 0, unused spaced can be retrieved from gap between cell pointer end and content start
     page.write_u16(offset::BTREE_FIRST_FREEBLOCK, 0);
     page.write_u8(offset::BTREE_FRAGMENTED_BYTES_COUNT, 0);
+
     debug_validate_cells!(page, usable_space);
 }
 
