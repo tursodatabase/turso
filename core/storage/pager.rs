@@ -705,13 +705,10 @@ impl Pager {
                             }
                         }
 
-                        let ptrmap_entry = match self.ptrmap_get(root_page_num)? {
-                            IOResult::Done(result) => match result {
-                                Some(entry) => entry,
-                                None => panic!("something went wrong"),
-                            },
-                            IOResult::IO => return Ok(IOResult::IO),
-                        };
+                        let ptrmap_entry = return_if_io!(self.ptrmap_get(root_page_num))
+                            .ok_or_else(|| {
+                                LimboError::InternalError("Ptrmap entry not found".into())
+                            })?;
 
                         //  These conditions shouldn't be possible because:
                         //  1. If the root_page_num is a RootPage then it should have already been allocated and vacuum_mode_largest_root_page should have been updated appropriately. Something is broken in the header
@@ -742,10 +739,8 @@ impl Pager {
 
                     //  Update the header metadata to reflect the new root page number and map the new root page in pointer pages
                     header_accessor::set_vacuum_mode_largest_root_page(self, root_page_num)?;
-                    match self.ptrmap_put(root_page_num, PtrmapType::RootPage, 0)? {
-                        IOResult::Done(_) => Ok(IOResult::Done(root_page_num as u32)),
-                        IOResult::IO => Ok(IOResult::IO),
-                    }
+                    return_if_io!(self.ptrmap_put(root_page_num, PtrmapType::RootPage, 0));
+                    Ok(IOResult::Done(root_page_num as u32))
                 }
                 AutoVacuumMode::Incremental => {
                     unimplemented!()
@@ -2611,8 +2606,8 @@ mod ptrmap_tests {
         );
 
         //  allocate two leaf children
-        let page_4 = pager.allocate_page().unwrap();
-        let page_5 = pager.allocate_page().unwrap();
+        let page_4 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
+        let page_5 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
         let btree_page_4 = Arc::new(BTreePageInner {
             page: RefCell::new(Arc::clone(&page_4)),
         });
@@ -2755,12 +2750,12 @@ mod ptrmap_tests {
         );
 
         // Allocate pages 4 & 5 (children of root)
-        let page_4 = pager.allocate_page().unwrap(); // will become interior
-        let page_5 = pager.allocate_page().unwrap(); // leaf child of root
+        let page_4 = run_until_done(|| pager.allocate_page(), &pager).unwrap(); // will become interior
+        let page_5 = run_until_done(|| pager.allocate_page(), &pager).unwrap(); // leaf child of root
 
         // Allocate pages 6 & 7 (children of page 4)
-        let page_6 = pager.allocate_page().unwrap(); // leaf child of page 4
-        let page_7 = pager.allocate_page().unwrap(); // leaf child of page 4
+        let page_6 = run_until_done(|| pager.allocate_page(), &pager).unwrap(); // leaf child of page 4
+        let page_7 = run_until_done(|| pager.allocate_page(), &pager).unwrap(); // leaf child of page 4
 
         // Initialise structural page types
         let btree_page_4 = Arc::new(BTreePageInner {
