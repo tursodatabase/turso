@@ -409,7 +409,6 @@ enum FreePageState {
 }
 
 impl Pager {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db_file: Arc<dyn DatabaseStorage>,
         wal: Rc<RefCell<dyn Wal>>,
