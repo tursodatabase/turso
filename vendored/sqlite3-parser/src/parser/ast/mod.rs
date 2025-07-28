@@ -1812,6 +1812,8 @@ pub enum PragmaName {
     LegacyFileFormat,
     /// Set or get the maximum number of pages in the database file.
     MaxPageCount,
+    /// `module_list` praagma
+    ModuleList,
     /// Return the total number of pages in the database file.
     PageCount,
     /// Return the page size of the database in bytes.
