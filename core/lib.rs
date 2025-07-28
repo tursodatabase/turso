@@ -119,15 +119,6 @@ pub enum DatabaseMode {
     File,
 }
 
-/// The different modes that a database can run in
-#[derive(Clone, Copy)]
-pub enum DatabaseMode {
-    /// The database is a trasient database, running in in-memory mode
-    Memory,
-    /// The database is a persistent database, which will write its changes to disk
-    File,
-}
-
 /// The database manager ensures that there is a single, shared
 /// `Database` object per a database file. We need because it is not safe
 /// to have multiple independent WAL files open because coordination
