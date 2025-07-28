@@ -1,5 +1,8 @@
 use super::MemoryIO;
-use crate::{Clock, Completion, CompletionType, File, Instant, LimboError, OpenFlags, Result, IO};
+use crate::{
+    Clock, Completion, CompletionType, DatabaseMode, File, Instant, LimboError, OpenFlags, Result,
+    IO,
+};
 use std::cell::RefCell;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
@@ -54,6 +57,10 @@ impl IO for GenericIO {
 
     fn get_memory_io(&self) -> Arc<MemoryIO> {
         Arc::new(MemoryIO::new())
+    }
+
+    fn database_mode(&self) -> crate::DatabaseMode {
+        DatabaseMode::File
     }
 }
 

@@ -1,6 +1,6 @@
-use crate::error::LimboError;
 use crate::io::common;
 use crate::Result;
+use crate::{error::LimboError, DatabaseMode};
 
 use super::{Completion, File, MemoryIO, OpenFlags, IO};
 use crate::io::clock::{Clock, Instant};
@@ -301,6 +301,10 @@ impl IO for UnixIO {
 
     fn get_memory_io(&self) -> Arc<MemoryIO> {
         Arc::new(MemoryIO::new())
+    }
+
+    fn database_mode(&self) -> crate::DatabaseMode {
+        DatabaseMode::File
     }
 }
 

@@ -2,7 +2,7 @@
 
 use super::{common, Completion, File, OpenFlags, IO};
 use crate::io::clock::{Clock, Instant};
-use crate::{turso_assert, LimboError, MemoryIO, Result};
+use crate::{turso_assert, DatabaseMode, LimboError, MemoryIO, Result};
 use rustix::fs::{self, FlockOperation, OFlags};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -209,6 +209,10 @@ impl IO for UringIO {
 
     fn get_memory_io(&self) -> Arc<MemoryIO> {
         Arc::new(MemoryIO::new())
+    }
+
+    fn database_mode(&self) -> crate::DatabaseMode {
+        DatabaseMode::File
     }
 }
 

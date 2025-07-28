@@ -225,7 +225,11 @@ fn update_pragma(
             program.emit_insn(Insn::SetCookie {
                 db: 0,
                 cookie: Cookie::IncrementalVacuum,
-                value: auto_vacuum_mode - 1,
+                value: if auto_vacuum_mode == AutoVacuumMode::Incremental as i32 {
+                    1
+                } else {
+                    0
+                },
                 p5: 0,
             });
             Ok((program, TransactionMode::None))
