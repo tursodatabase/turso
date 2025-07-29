@@ -22,6 +22,7 @@ pub mod execute;
 pub mod explain;
 pub mod insn;
 pub mod likeop;
+pub mod rowset;
 pub mod sorter;
 
 use crate::{

@@ -65,6 +65,7 @@ use crate::{info, BufferPool, MvCursor, OpenFlags, RefValue, Row, StepResult, Tr
 
 use super::{
     insn::{Cookie, RegisterOrLiteral},
+    rowset::RowSet,
     CommitState,
 };
 use fallible_iterator::FallibleIterator;
@@ -6608,6 +6609,162 @@ pub fn op_integrity_check(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_rowset_add(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Rc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    let Insn::RowSetAdd {
+        rowset_reg,
+        rowid_reg,
+    } = insn
+    else {
+        unreachable!("unexpected Insn {:?}", insn)
+    };
+
+    let rowid = match &state.registers[*rowid_reg].get_owned_value() {
+        Value::Integer(i) => *i,
+        _ => {
+            return Err(LimboError::InternalError(
+                "RowSetAdd: P2 is not an integer".to_string(),
+            ))
+        }
+    };
+
+    let rowset_bytes = match &state.registers[*rowset_reg] {
+        Register::Value(Value::Blob(bytes)) => {
+            if let Some(mut rowset) = RowSet::from_bytes(bytes) {
+                rowset.insert(rowid);
+                rowset.to_bytes()
+            } else {
+                let mut rowset = RowSet::new();
+                rowset.insert(rowid);
+                rowset.to_bytes()
+            }
+        }
+        _ => {
+            let mut rowset = RowSet::new();
+            rowset.insert(rowid);
+            rowset.to_bytes()
+        }
+    };
+
+    state.registers[*rowset_reg] = Register::Value(Value::Blob(rowset_bytes));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_rowset_read(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Rc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    let Insn::RowSetRead {
+        rowset_reg,
+        target_pc,
+        dest_reg,
+    } = insn
+    else {
+        unreachable!("unexpected Insn {:?}", insn)
+    };
+
+    let (next_value, updated_rowset_bytes) = match &state.registers[*rowset_reg] {
+        Register::Value(Value::Blob(bytes)) => {
+            if let Some(mut rowset) = RowSet::from_bytes(bytes) {
+                let next_value = rowset.next();
+                (next_value, rowset.to_bytes())
+            } else {
+                (None, bytes.clone())
+            }
+        }
+        _ => (None, vec![]),
+    };
+
+    if let Some(value) = next_value {
+        state.registers[*dest_reg] = Register::Value(Value::Integer(value));
+        state.registers[*rowset_reg] = Register::Value(Value::Blob(updated_rowset_bytes));
+        state.pc += 1;
+    } else {
+        assert!(target_pc.is_offset());
+        state.pc = target_pc.as_offset_int();
+    }
+
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_rowset_test(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Rc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    let Insn::RowSetTest {
+        rowset_reg,
+        target_pc,
+        rowid_reg,
+        batch,
+    } = insn
+    else {
+        unreachable!("unexpected Insn {:?}", insn)
+    };
+
+    let rowid = match &state.registers[*rowid_reg].get_owned_value() {
+        Value::Integer(i) => *i,
+        _ => {
+            return Err(LimboError::InternalError(
+                "RowSetTest: P3 is not an integer".to_string(),
+            ))
+        }
+    };
+
+    let (found, updated_rowset_bytes) = match &state.registers[*rowset_reg] {
+        Register::Value(Value::Blob(bytes)) => {
+            if let Some(mut rowset) = RowSet::from_bytes(bytes) {
+                let found = if *batch != 0 {
+                    rowset.test(*batch, rowid)
+                } else {
+                    false
+                };
+
+                if *batch >= 0 {
+                    rowset.insert(rowid);
+                }
+
+                (found, rowset.to_bytes())
+            } else {
+                let mut rowset = RowSet::new();
+                if *batch >= 0 {
+                    rowset.insert(rowid);
+                }
+                (false, rowset.to_bytes())
+            }
+        }
+        _ => {
+            let mut rowset = RowSet::new();
+            if *batch >= 0 {
+                rowset.insert(rowid);
+            }
+            (false, rowset.to_bytes())
+        }
+    };
+
+    state.registers[*rowset_reg] = Register::Value(Value::Blob(updated_rowset_bytes));
+
+    if found {
+        assert!(target_pc.is_offset());
+        state.pc = target_pc.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
+
+    Ok(InsnFunctionStepResult::Step)
+}
+
 impl Value {
     pub fn exec_lower(&self) -> Option<Self> {
         match self {
@@ -9374,4 +9531,8 @@ mod tests {
             assert!(!bitfield.get(i));
         }
     }
+
+    // TODO: Add VDBE instruction tests once test setup is fixed
+    // The tests would verify op_rowset_add, op_rowset_read, and op_rowset_test
+    // functionality but require proper Database/Connection setup
 }

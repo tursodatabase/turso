@@ -525,9 +525,9 @@ Modifiers:
 | RowData        | Yes     |         |
 | RowId          | Yes    |         |
 | RowKey         | No     |         |
-| RowSetAdd      | No     |         |
-| RowSetRead     | No     |         |
-| RowSetTest     | No     |         |
+| RowSetAdd      | Yes    | Not yet optimized for big sets, slow |
+| RowSetRead     | Yes    | Not yet optimized for big sets, slow |
+| RowSetTest     | Yes    | Not yet optimized for big sets, slow |
 | Rowid          | Yes    |         |
 | SCopy          | No     |         |
 | Savepoint      | No     |         |
