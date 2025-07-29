@@ -175,7 +175,7 @@ fn watch_mode(env: SimulatorEnv) -> notify::Result<()> {
                             // });
 
                             let env = Arc::new(Mutex::new(env.clone_without_connections()));
-                            watch::run_simulation(env, &mut [plan], last_execution_.clone())
+                            watch::run_simulation(env, vec![Arc::new(plan)], last_execution_)
                         }),
                         last_execution.clone(),
                     );
@@ -224,7 +224,11 @@ fn run_simulator(
     let env = Arc::new(Mutex::new(env));
     let result = SandboxedResult::from(
         std::panic::catch_unwind(|| {
-            run_simulation(env.clone(), &mut plans.clone(), last_execution.clone())
+            run_simulation(
+                env.clone(),
+                plans.iter().map(|p| Arc::new(p.clone())).collect(),
+                last_execution.clone(),
+            )
         }),
         last_execution.clone(),
     );
@@ -305,7 +309,7 @@ fn run_simulator(
                     std::panic::catch_unwind(|| {
                         run_simulation(
                             env.clone(),
-                            &mut shrunk_plans.clone(),
+                            shrunk_plans.iter().map(|p| Arc::new(p.clone())).collect(),
                             last_execution.clone(),
                         )
                     }),
@@ -527,8 +531,9 @@ fn setup_simulation(
 
         tracing::info!("Generating database interaction plan...");
 
+        let rng = env.rng.clone();
         let plans = (1..=env.opts.max_connections)
-            .map(|_| InteractionPlan::arbitrary_from(&mut env.rng.clone(), &mut env))
+            .map(|_| InteractionPlan::arbitrary_from(&mut *rng.lock().unwrap(), &mut env))
             .collect::<Vec<_>>();
 
         // todo: for now, we only use 1 connection, so it's safe to use the first plan.
@@ -547,7 +552,7 @@ fn setup_simulation(
 
 fn run_simulation(
     env: Arc<Mutex<SimulatorEnv>>,
-    plans: &mut [InteractionPlan],
+    plans: Vec<Arc<InteractionPlan>>,
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
     let simulation_type = {
@@ -580,12 +585,12 @@ fn run_simulation(
 
 fn run_simulation_default(
     env: Arc<Mutex<SimulatorEnv>>,
-    plans: &mut [InteractionPlan],
+    plans: Vec<Arc<InteractionPlan>>,
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
     tracing::info!("Executing database interaction plan...");
 
-    let mut states = plans
+    let states = plans
         .iter()
         .map(|_| InteractionPlanState {
             stack: vec![],
@@ -593,8 +598,11 @@ fn run_simulation_default(
             secondary_pointer: 0,
         })
         .collect::<Vec<_>>();
-
-    let result = execute_plans(env.clone(), plans, &mut states, last_execution);
+    let states = states
+        .into_iter()
+        .map(|s| Arc::new(Mutex::new(s)))
+        .collect::<Vec<_>>();
+    let result = execute_plans(env.clone(), plans, states, last_execution);
 
     let env = env.lock().unwrap();
     env.io.print_stats();
