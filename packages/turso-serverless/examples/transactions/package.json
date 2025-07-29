@@ -1,0 +1,7 @@
+{
+  "name": "transactions",
+  "private": true,
+  "dependencies": {
+    "@tursodatabase/serverless": "../.."
+  }
+}
