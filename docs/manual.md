@@ -4,35 +4,38 @@ Welcome to Turso database manual!
 
 ## Table of contents
 
-* [Introduction](#introduction)
-  * [Getting Started](#getting-started)
-  * [Limitations](#limitations)
-* [The SQL language](#the-sql-language)
-  * [`ALTER TABLE` — change table definition](#alter-table--change-table-definition)
-  * [`BEGIN TRANSACTION` — start a transaction](#begin-transaction--start-a-transaction)
-  * [`COMMIT TRANSACTION` — commit the current transaction](#commit-transaction--commit-the-current-transaction)
-  * [`CREATE INDEX` — define a new index](#create-index--define-a-new-index)
-  * [`CREATE TABLE` — define a new table](#create-table--define-a-new-table)
-  * [`DELETE` - delete rows from a table](#delete---delete-rows-from-a-table)
-  * [`DROP INDEX` - remove an index](#drop-index---remove-an-index)
-  * [`DROP TABLE` — remove a table](#drop-table--remove-a-table)
-  * [`END TRANSACTION` — commit the current transaction](#end-transaction--commit-the-current-transaction)
-  * [`INSERT` — create new rows in a table](#insert--create-new-rows-in-a-table)
-  * [`ROLLBACK TRANSACTION` — abort the current transaction](#rollback-transaction--abort-the-current-transaction)
-  * [`SELECT` — retrieve rows from a table](#select--retrieve-rows-from-a-table)
-  * [`UPDATE` — update rows of a table](#update--update-rows-of-a-table)
-* [SQLite C API](#sqlite-c-api)
-  * [WAL manipulation](#wal-manipulation)
-    * [`libsql_wal_frame_count`](#libsql_wal_frame_count)
-* [SQL Commands](#sql-commands)
-* [Appendix A: Turso Internals](#appendix-a-turso-internals)
-  * [Frontend](#frontend)
-    * [Parser](#parser)
-    * [Code generator](#code-generator)
-    * [Query optimizer](#query-optimizer)
-  * [Virtual Machine](#virtual-machine)
-  * [Pager](#pager)
-  * [I/O](#io)
+- [Turso Database Manual](#turso-database-manual)
+  - [Table of contents](#table-of-contents)
+  - [Introduction](#introduction)
+    - [Getting Started](#getting-started)
+  - [Limitations](#limitations)
+  - [The SQL language](#the-sql-language)
+    - [`ALTER TABLE` — change table definition](#alter-table--change-table-definition)
+    - [`BEGIN TRANSACTION` — start a transaction](#begin-transaction--start-a-transaction)
+    - [`COMMIT TRANSACTION` — commit the current transaction](#commit-transaction--commit-the-current-transaction)
+    - [`CREATE INDEX` — define a new index](#create-index--define-a-new-index)
+    - [`CREATE TABLE` — define a new table](#create-table--define-a-new-table)
+    - [`DELETE` - delete rows from a table](#delete---delete-rows-from-a-table)
+    - [`DROP INDEX` - remove an index](#drop-index---remove-an-index)
+    - [`DROP TABLE` — remove a table](#drop-table--remove-a-table)
+    - [`END TRANSACTION` — commit the current transaction](#end-transaction--commit-the-current-transaction)
+    - [`INSERT` — create new rows in a table](#insert--create-new-rows-in-a-table)
+    - [`ROLLBACK TRANSACTION` — abort the current transaction](#rollback-transaction--abort-the-current-transaction)
+    - [`SELECT` — retrieve rows from a table](#select--retrieve-rows-from-a-table)
+    - [`UPDATE` — update rows of a table](#update--update-rows-of-a-table)
+  - [SQLite C API](#sqlite-c-api)
+    - [WAL manipulation](#wal-manipulation)
+      - [`libsql_wal_frame_count`](#libsql_wal_frame_count)
+  - [SQL Commands](#sql-commands)
+  - [Appendix A: Turso Internals](#appendix-a-turso-internals)
+    - [Frontend](#frontend)
+      - [Parser](#parser)
+      - [Code generator](#code-generator)
+      - [Query optimizer](#query-optimizer)
+    - [Virtual Machine](#virtual-machine)
+    - [Pager](#pager)
+    - [I/O](#io)
+      - [Prosposed I/O Model](#prosposed-io-model)
 
 ## Introduction
 
@@ -472,5 +475,59 @@ TODO
 ### I/O
 
 TODO
+#### Prosposed I/O Model
+
+- Every I/O operation shall be tracked by a corresponding `Completion`
+- To advance the Program State Machines, you must first wait for the tracked completions to complete. This can be done either by busy polling (`io.wait_for_completion`) or polling once and then yielding - e.g
+  ```rust
+  if !completion.is_completed {
+    io.run_once();
+    return StepResult::IO;
+  }
+  ```
+  This allows us to be flexible in this in-progress refactoring. We can block in certain places to avoid bigger refactorings, which opens up the opportunity for new refactorings in separate PRs.
+- `IOResult` should change to the following enum:
+  ```rust
+  pub enum IOCompletions {
+    Single(Arc<Completion>),
+    Many(Vec<Arc<Completion>>),
+  }
+
+  #[must_use]
+  pub enum IOResult<T> {
+    Done(T),
+    IO(IOCompletions),
+  }
+  ```
+  This implies that when a function returns an IOResult, it must be called again until it returns an `IOResult::Done` variant. This similarl with how `Future`s are polled in rust. When you receive a `Poll::Ready(None)`, it means that the future stopped it's execution. In a similar vein, if we receive `IOResult::Done`, the function/state machine has reached the end of it's execution. `IOCompletions` is here to signal that, if we are executing any I/O operation, that we need to propagate the completions that are generated from it. This design forces us to handle the fact that a function is asynchronous in nature. This is essentially [function coloring](https://www.tedinski.com/2018/11/13/function-coloring.html), but done at the application level instead of the compiler level.
+  - I/O interfaces should be changed to be truly asynchronous, and not allow synchronous code by its very design. If instead of returning a in places where we return a `Result<Arc<Completion>>`, we should return an `Arc<Completion>`, indicating that no I/O operation should happen in those interfaces (as every I/O operation is fallible by nature):
+  ```rust
+  pub trait File: Send + Sync {
+      fn lock_file(&self, exclusive: bool) -> Result<()>;
+      fn unlock_file(&self) -> Result<()>;
+      fn pread(&self, pos: usize, c: Arc<Completion>) -> Arc<Completion>; // <- Here
+      fn pwrite(
+          &self,
+          pos: usize,
+          buffer: Arc<RefCell<Buffer>>,
+          c: Arc<Completion>, // <- Here
+      ) -> Arc<Completion>;
+      fn sync(&self, c: Arc<Completion>) -> Arc<Completion>; // <- Here
+      fn size(&self) -> Result<u64>; 
+  }
+  ```
+  This means that to implement our I/O interfaces, implementers must queue I/O to be executed at some later point in time. This can take the form of `io_uring`, `epoll`, `kqueue` , Overlapped I/O (Windows), or synchronous execution in `run_once`.
+  - `Completion`s should track the errors of their corresponding I/O executions and must track whether they were aborted or not. Therefore completions could expand to become something like this: 
+  ```rust
+  pub struct Completion {
+    pub completion_type: CompletionType,
+    is_completed: Cell<bool>,
+    is_aborted: Cell<bool>,
+    error: RefCell<Option<LimboError>>,
+  }
+  ```
+  The aborted field could be eliminated if we chose to create an `LimboError::Aborted` variant.
+  This change is intended to simplify the I/O execution by delegating error propagation and handling to the programs that are tracking the `Completion`. This makes the job of I/O executer easier, as it only has to ensure that the I/O operation is ran and to modify the error field inside the completion as needed. 
+  This change also means that the `run_once` method from the `IO` trait should become infallible. 
 
 [SQLite]: https://www.sqlite.org/
