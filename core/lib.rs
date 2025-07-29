@@ -1157,16 +1157,18 @@ impl Connection {
 
         match self.transaction_state.get() {
             TransactionState::Write { schema_did_change } => {
-                let _result = self.pager.borrow().end_tx(
+                while let IOResult::IO = self.pager.borrow().end_tx(
                     true, // rollback = true for close
                     schema_did_change,
                     self,
                     self.wal_checkpoint_disabled.get(),
-                );
+                )? {
+                    self.run_once()?;
+                }
                 self.transaction_state.set(TransactionState::None);
             }
             TransactionState::Read => {
-                let _result = self.pager.borrow().end_read_tx();
+                self.pager.borrow().end_read_tx()?;
                 self.transaction_state.set(TransactionState::None);
             }
             TransactionState::None => {
