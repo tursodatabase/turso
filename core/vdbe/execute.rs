@@ -114,7 +114,7 @@ pub type InsnFunction = fn(
     &Program,
     &mut ProgramState,
     &Insn,
-    &Rc<Pager>,
+    &Arc<Pager>,
     Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult>;
 
@@ -143,7 +143,7 @@ pub fn op_init(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Init { target_pc } = insn else {
@@ -158,7 +158,7 @@ pub fn op_add(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Add { lhs, rhs, dest } = insn else {
@@ -177,7 +177,7 @@ pub fn op_subtract(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Subtract { lhs, rhs, dest } = insn else {
@@ -196,7 +196,7 @@ pub fn op_multiply(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Multiply { lhs, rhs, dest } = insn else {
@@ -215,7 +215,7 @@ pub fn op_divide(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Divide { lhs, rhs, dest } = insn else {
@@ -234,7 +234,7 @@ pub fn op_drop_index(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::DropIndex { index, db: _ } = insn else {
@@ -251,7 +251,7 @@ pub fn op_remainder(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Remainder { lhs, rhs, dest } = insn else {
@@ -270,7 +270,7 @@ pub fn op_bit_and(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::BitAnd { lhs, rhs, dest } = insn else {
@@ -289,7 +289,7 @@ pub fn op_bit_or(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::BitOr { lhs, rhs, dest } = insn else {
@@ -308,7 +308,7 @@ pub fn op_bit_not(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::BitNot { reg, dest } = insn else {
@@ -324,7 +324,7 @@ pub fn op_checkpoint(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Checkpoint {
@@ -362,7 +362,7 @@ pub fn op_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     match insn {
@@ -385,7 +385,7 @@ pub fn op_null_row(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::NullRow { cursor_id } = insn else {
@@ -404,7 +404,7 @@ pub fn op_compare(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Compare {
@@ -450,7 +450,7 @@ pub fn op_jump(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Jump {
@@ -483,7 +483,7 @@ pub fn op_move(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Move {
@@ -511,7 +511,7 @@ pub fn op_if_pos(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::IfPos {
@@ -546,7 +546,7 @@ pub fn op_not_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::NotNull { reg, target_pc } = insn else {
@@ -633,7 +633,7 @@ pub fn op_comparison(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let (lhs, rhs, target_pc, flags, collation, op) = match insn {
@@ -840,7 +840,7 @@ pub fn op_if(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::If {
@@ -867,7 +867,7 @@ pub fn op_if_not(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::IfNot {
@@ -894,7 +894,7 @@ pub fn op_open_read(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Rc<Pager>,
+    _pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::OpenRead {
@@ -966,7 +966,7 @@ pub fn op_vopen(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::VOpen { cursor_id } = insn else {
@@ -991,7 +991,7 @@ pub fn op_vcreate(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::VCreate {
@@ -1032,7 +1032,7 @@ pub fn op_vfilter(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::VFilter {
@@ -1072,7 +1072,7 @@ pub fn op_vcolumn(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::VColumn {
@@ -1097,7 +1097,7 @@ pub fn op_vupdate(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::VUpdate {
@@ -1161,7 +1161,7 @@ pub fn op_vnext(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::VNext {
@@ -1188,7 +1188,7 @@ pub fn op_vdestroy(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::VDestroy { db, table_name } = insn else {
@@ -1212,7 +1212,7 @@ pub fn op_open_pseudo(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::OpenPseudo {
@@ -1239,7 +1239,7 @@ pub fn op_rewind(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Rewind {
@@ -1268,7 +1268,7 @@ pub fn op_last(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Last {
@@ -1389,7 +1389,7 @@ pub fn op_column(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Column {
@@ -1684,7 +1684,7 @@ pub fn op_type_check(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::TypeCheck {
@@ -1746,7 +1746,7 @@ pub fn op_make_record(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::MakeRecord {
@@ -1768,7 +1768,7 @@ pub fn op_result_row(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::ResultRow { start_reg, count } = insn else {
@@ -1787,7 +1787,7 @@ pub fn op_next(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Next {
@@ -1818,7 +1818,7 @@ pub fn op_prev(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Prev {
@@ -1848,7 +1848,7 @@ pub fn op_prev(
 pub fn halt(
     program: &Program,
     state: &mut ProgramState,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
     err_code: usize,
     description: &str,
@@ -1888,7 +1888,7 @@ pub fn op_halt(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Halt {
@@ -1939,7 +1939,7 @@ pub fn op_halt_if_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::HaltIfNull {
@@ -1962,7 +1962,7 @@ pub fn op_transaction(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Rc<Pager>,
+    _pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Transaction { db, write } = insn else {
@@ -2060,7 +2060,7 @@ pub fn op_auto_commit(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::AutoCommit {
@@ -2114,7 +2114,7 @@ pub fn op_goto(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Goto { target_pc } = insn else {
@@ -2129,7 +2129,7 @@ pub fn op_gosub(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Gosub {
@@ -2149,7 +2149,7 @@ pub fn op_return(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Return {
@@ -2179,7 +2179,7 @@ pub fn op_integer(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Integer { value, dest } = insn else {
@@ -2194,7 +2194,7 @@ pub fn op_real(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Real { value, dest } = insn else {
@@ -2209,7 +2209,7 @@ pub fn op_real_affinity(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::RealAffinity { register } = insn else {
@@ -2226,7 +2226,7 @@ pub fn op_string8(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::String8 { value, dest } = insn else {
@@ -2241,7 +2241,7 @@ pub fn op_blob(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Blob { value, dest } = insn else {
@@ -2256,7 +2256,7 @@ pub fn op_row_data(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::RowData { cursor_id, dest } = insn else {
@@ -2287,7 +2287,7 @@ pub fn op_row_id(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::RowId { cursor_id, dest } = insn else {
@@ -2352,7 +2352,7 @@ pub fn op_idx_row_id(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::IdxRowId { cursor_id, dest } = insn else {
@@ -2374,7 +2374,7 @@ pub fn op_seek_rowid(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::SeekRowid {
@@ -2430,7 +2430,7 @@ pub fn op_deferred_seek(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::DeferredSeek {
@@ -2472,7 +2472,7 @@ pub fn op_seek(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let (cursor_id, is_index, record_source, target_pc) = match insn {
@@ -2578,7 +2578,7 @@ pub enum RecordSource {
 pub fn seek_internal(
     program: &Program,
     state: &mut ProgramState,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
     record_source: RecordSource,
     cursor_id: usize,
@@ -2589,7 +2589,7 @@ pub fn seek_internal(
     fn inner(
         program: &Program,
         state: &mut ProgramState,
-        pager: &Rc<Pager>,
+        pager: &Arc<Pager>,
         mv_store: Option<&Rc<MvStore>>,
         record_source: RecordSource,
         cursor_id: usize,
@@ -2855,7 +2855,7 @@ pub fn op_idx_ge(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::IdxGE {
@@ -2906,7 +2906,7 @@ pub fn op_seek_end(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     if let Insn::SeekEnd { cursor_id } = *insn {
@@ -2925,7 +2925,7 @@ pub fn op_idx_le(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::IdxLE {
@@ -2976,7 +2976,7 @@ pub fn op_idx_gt(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::IdxGT {
@@ -3027,7 +3027,7 @@ pub fn op_idx_lt(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::IdxLT {
@@ -3078,7 +3078,7 @@ pub fn op_decr_jump_zero(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::DecrJumpZero { reg, target_pc } = insn else {
@@ -3131,7 +3131,7 @@ pub fn op_agg_step(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::AggStep {
@@ -3436,7 +3436,7 @@ pub fn op_agg_final(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::AggFinal { register, func } = insn else {
@@ -3576,7 +3576,7 @@ pub fn op_sorter_open(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::SorterOpen {
@@ -3620,7 +3620,7 @@ pub fn op_sorter_data(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::SorterData {
@@ -3656,7 +3656,7 @@ pub fn op_sorter_insert(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::SorterInsert {
@@ -3683,7 +3683,7 @@ pub fn op_sorter_sort(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::SorterSort {
@@ -3716,7 +3716,7 @@ pub fn op_sorter_next(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::SorterNext {
@@ -3747,7 +3747,7 @@ pub fn op_function(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Function {
@@ -4964,7 +4964,7 @@ pub fn op_init_coroutine(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::InitCoroutine {
@@ -4992,7 +4992,7 @@ pub fn op_end_coroutine(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::EndCoroutine { yield_reg } = insn else {
@@ -5014,7 +5014,7 @@ pub fn op_yield(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Yield {
@@ -5057,7 +5057,7 @@ pub fn op_insert(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Insert {
@@ -5138,7 +5138,7 @@ pub fn op_int_64(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Int64 {
@@ -5159,7 +5159,7 @@ pub fn op_delete(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Delete { cursor_id } = insn else {
@@ -5186,7 +5186,7 @@ pub fn op_idx_delete(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::IdxDelete {
@@ -5293,7 +5293,7 @@ pub fn op_idx_insert(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::IdxInsert {
@@ -5441,7 +5441,7 @@ pub fn op_new_rowid(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::NewRowid {
@@ -5572,7 +5572,7 @@ pub fn op_must_be_int(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::MustBeInt { reg } = insn else {
@@ -5607,7 +5607,7 @@ pub fn op_soft_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::SoftNull { reg } = insn else {
@@ -5626,7 +5626,7 @@ pub fn op_no_conflict(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::NoConflict {
@@ -5708,7 +5708,7 @@ pub fn op_not_exists(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::NotExists {
@@ -5736,7 +5736,7 @@ pub fn op_offset_limit(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::OffsetLimit {
@@ -5781,7 +5781,7 @@ pub fn op_open_write(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Rc<Pager>,
+    _pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::OpenWrite {
@@ -5865,7 +5865,7 @@ pub fn op_copy(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Copy {
@@ -5887,7 +5887,7 @@ pub fn op_create_btree(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::CreateBtree { db, root, flags } = insn else {
@@ -5914,7 +5914,7 @@ pub fn op_destroy(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Destroy {
@@ -5943,7 +5943,7 @@ pub fn op_drop_table(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::DropTable { db, table_name, .. } = insn else {
@@ -5967,7 +5967,7 @@ pub fn op_close(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Close { cursor_id } = insn else {
@@ -5983,7 +5983,7 @@ pub fn op_is_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::IsNull { reg, target_pc } = insn else {
@@ -6001,7 +6001,7 @@ pub fn op_page_count(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::PageCount { db, dest } = insn else {
@@ -6021,7 +6021,7 @@ pub fn op_parse_schema(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::ParseSchema {
@@ -6061,7 +6061,7 @@ pub fn op_read_cookie(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::ReadCookie { db, dest, cookie } = insn else {
@@ -6089,7 +6089,7 @@ pub fn op_set_cookie(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::SetCookie {
@@ -6144,7 +6144,7 @@ pub fn op_shift_right(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::ShiftRight { lhs, rhs, dest } = insn else {
@@ -6163,7 +6163,7 @@ pub fn op_shift_left(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::ShiftLeft { lhs, rhs, dest } = insn else {
@@ -6182,7 +6182,7 @@ pub fn op_variable(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Variable { index, dest } = insn else {
@@ -6197,7 +6197,7 @@ pub fn op_zero_or_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::ZeroOrNull { rg1, rg2, dest } = insn else {
@@ -6218,7 +6218,7 @@ pub fn op_not(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Not { reg, dest } = insn else {
@@ -6234,7 +6234,7 @@ pub fn op_concat(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Concat { lhs, rhs, dest } = insn else {
@@ -6253,7 +6253,7 @@ pub fn op_and(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::And { lhs, rhs, dest } = insn else {
@@ -6272,7 +6272,7 @@ pub fn op_or(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Or { lhs, rhs, dest } = insn else {
@@ -6291,7 +6291,7 @@ pub fn op_noop(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     // Do nothing
@@ -6302,14 +6302,14 @@ pub fn op_noop(
 
 pub enum OpOpenEphemeralState {
     Start,
-    StartingTxn { pager: Rc<Pager> },
-    CreateBtree { pager: Rc<Pager> },
+    StartingTxn { pager: Arc<Pager> },
+    CreateBtree { pager: Arc<Pager> },
 }
 pub fn op_open_ephemeral(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let (cursor_id, is_table) = match insn {
@@ -6332,7 +6332,7 @@ pub fn op_open_ephemeral(
             let buffer_pool = Arc::new(BufferPool::new(None));
             let page_cache = Arc::new(RwLock::new(DumbLruPageCache::default()));
 
-            let pager = Rc::new(Pager::new(
+            let pager = Arc::new(Pager::new(
                 db_file,
                 Rc::new(RefCell::new(DummyWAL)),
                 io,
@@ -6445,7 +6445,7 @@ pub fn op_once(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Once {
@@ -6469,7 +6469,7 @@ pub fn op_found(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let (cursor_id, target_pc, record_reg, num_regs) = match insn {
@@ -6531,7 +6531,7 @@ pub fn op_affinity(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Affinity {
@@ -6565,7 +6565,7 @@ pub fn op_count(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Count {
@@ -6602,7 +6602,7 @@ pub fn op_integrity_check(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::IntegrityCk {

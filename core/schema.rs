@@ -151,7 +151,7 @@ impl Schema {
     pub fn make_from_btree(
         &mut self,
         mv_cursor: Option<Rc<RefCell<MvCursor>>>,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         syms: &SymbolTable,
     ) -> Result<()> {
         let mut cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), 1, 10);

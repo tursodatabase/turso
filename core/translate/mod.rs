@@ -47,7 +47,6 @@ use insert::translate_insert;
 use rollback::translate_rollback;
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
 use select::translate_select;
-use std::rc::Rc;
 use std::sync::Arc;
 use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
@@ -59,7 +58,7 @@ use update::translate_update;
 pub fn translate(
     schema: &Schema,
     stmt: ast::Stmt,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     connection: Arc<Connection>,
     syms: &SymbolTable,
     query_mode: QueryMode,
