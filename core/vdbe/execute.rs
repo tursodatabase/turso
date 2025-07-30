@@ -1983,104 +1983,107 @@ pub fn op_transaction(
             conn.mv_transactions.borrow_mut().push(tx_id);
             state.mv_tx_id = Some(tx_id);
         }
-    } else {
-        let current_state = conn.transaction_state.get();
-        let (new_transaction_state, updated) = match (current_state, write) {
-            // pending state means that we tried beginning a tx and the method returned IO.
-            // instead of ending the read tx, just update the state to pending.
-            (TransactionState::PendingUpgrade { auto_commit }, write) => {
-                turso_assert!(
-                    *write,
-                    "pending upgrade should only be set for write transactions"
-                );
-                (
-                    TransactionState::Write {
-                        schema_did_change: false,
-                        auto_commit,
-                    },
-                    true,
-                )
-            }
-            (
-                TransactionState::Write {
-                    schema_did_change,
-                    auto_commit,
-                },
-                true,
-            ) => (
-                TransactionState::Write {
-                    schema_did_change,
-                    auto_commit,
-                },
-                false,
-            ),
-            (
-                TransactionState::Write {
-                    schema_did_change,
-                    auto_commit,
-                },
-                false,
-            ) => (
-                TransactionState::Write {
-                    schema_did_change,
-                    auto_commit,
-                },
-                false,
-            ),
-            (TransactionState::Read { auto_commit }, true) => (
-                TransactionState::Write {
-                    schema_did_change: false,
-                    auto_commit,
-                },
-                true,
-            ),
-            (TransactionState::Read { auto_commit }, false) => {
-                (TransactionState::Read { auto_commit }, false)
-            }
-            (TransactionState::None, true) => (
-                TransactionState::Write {
-                    schema_did_change: false,
-                    auto_commit: conn.get_auto_commit(),
-                },
-                true,
-            ),
-            (TransactionState::None, false) => (
-                TransactionState::Read {
-                    auto_commit: conn.get_auto_commit(),
-                },
-                true,
-            ),
-        };
-        if updated && matches!(current_state, TransactionState::None) {
-            if let LimboResult::Busy = pager.begin_read_tx()? {
-                return Ok(InsnFunctionStepResult::Busy);
-            }
-        }
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
 
-        if updated && matches!(new_transaction_state, TransactionState::Write { .. }) {
-            match pager.begin_write_tx()? {
-                IOResult::Done(r) => {
-                    if let LimboResult::Busy = r {
-                        pager.end_read_tx()?;
-                        conn.transaction_state.replace(TransactionState::None);
-                        return Ok(InsnFunctionStepResult::Busy);
-                    }
-                }
-                IOResult::IO => {
-                    // set the transaction state to pending so we don't have to
-                    // end the read transaction.
-                    program.connection.transaction_state.replace(
-                        TransactionState::PendingUpgrade {
-                            auto_commit: conn.get_auto_commit(),
-                        },
-                    );
-                    return Ok(InsnFunctionStepResult::IO);
+    let current_state = conn.transaction_state.get();
+    let (new_transaction_state, updated) = match (current_state, write) {
+        // pending state means that we tried beginning a tx and the method returned IO.
+        // instead of ending the read tx, just update the state to pending.
+        (TransactionState::PendingUpgrade { auto_commit }, write) => {
+            turso_assert!(
+                *write,
+                "pending upgrade should only be set for write transactions"
+            );
+            (
+                TransactionState::Write {
+                    schema_did_change: false,
+                    auto_commit,
+                },
+                true,
+            )
+        }
+        (
+            TransactionState::Write {
+                schema_did_change,
+                auto_commit,
+            },
+            true,
+        ) => (
+            TransactionState::Write {
+                schema_did_change,
+                auto_commit,
+            },
+            false,
+        ),
+        (
+            TransactionState::Write {
+                schema_did_change,
+                auto_commit,
+            },
+            false,
+        ) => (
+            TransactionState::Write {
+                schema_did_change,
+                auto_commit,
+            },
+            false,
+        ),
+        (TransactionState::Read { auto_commit }, true) => (
+            TransactionState::Write {
+                schema_did_change: false,
+                auto_commit,
+            },
+            true,
+        ),
+        (TransactionState::Read { auto_commit }, false) => {
+            (TransactionState::Read { auto_commit }, false)
+        }
+        (TransactionState::None, true) => (
+            TransactionState::Write {
+                schema_did_change: false,
+                auto_commit: conn.get_auto_commit(),
+            },
+            true,
+        ),
+        (TransactionState::None, false) => (
+            TransactionState::Read {
+                auto_commit: conn.get_auto_commit(),
+            },
+            true,
+        ),
+    };
+    if updated && matches!(current_state, TransactionState::None) {
+        if let LimboResult::Busy = pager.begin_read_tx()? {
+            return Ok(InsnFunctionStepResult::Busy);
+        }
+    }
+
+    if updated && matches!(new_transaction_state, TransactionState::Write { .. }) {
+        match pager.begin_write_tx()? {
+            IOResult::Done(r) => {
+                if let LimboResult::Busy = r {
+                    pager.end_read_tx()?;
+                    conn.transaction_state.replace(TransactionState::None);
+                    return Ok(InsnFunctionStepResult::Busy);
                 }
             }
+            IOResult::IO => {
+                // set the transaction state to pending so we don't have to
+                // end the read transaction.
+                program
+                    .connection
+                    .transaction_state
+                    .replace(TransactionState::PendingUpgrade {
+                        auto_commit: conn.get_auto_commit(),
+                    });
+                return Ok(InsnFunctionStepResult::IO);
+            }
         }
-        if updated {
-            conn.transaction_state.replace(new_transaction_state);
-        }
+    }
+    if updated {
+        conn.transaction_state.replace(new_transaction_state);
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
