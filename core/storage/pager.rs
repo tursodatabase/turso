@@ -7,7 +7,7 @@ use crate::storage::sqlite3_ondisk::{
     self, parse_wal_frame_header, DatabaseHeader, PageContent, PageType,
 };
 use crate::storage::wal::{CheckpointResult, Wal};
-use crate::types::{IOResult, WalInsertInfo};
+use crate::types::{IOResult, WalFrameInfo};
 use crate::util::IOExt as _;
 use crate::{return_if_io, Completion};
 use crate::{turso_assert, Buffer, Connection, LimboError, Result};
@@ -844,6 +844,40 @@ impl Pager {
         Ok(())
     }
 
+    #[tracing::instrument(skip_all, level = Level::DEBUG)]
+    pub fn read_page_no_cache(
+        &self,
+        frame_watermark: Option<u64>,
+        page_idx: usize,
+    ) -> Result<(PageRef, Completion)> {
+        tracing::trace!("read_page_no_cache(page_idx = {})", page_idx);
+        let page = Arc::new(Page::new(page_idx));
+        page.set_locked();
+        let wal_frame_id = {
+            let wal = self.wal.borrow();
+            let max_frame = frame_watermark.unwrap_or_else(|| wal.get_max_frame());
+            self.wal.borrow().find_frame(max_frame, page_idx as u64)?
+        };
+        if let Some(frame_id) = wal_frame_id {
+            let c =
+                self.wal
+                    .borrow()
+                    .read_frame(frame_id, page.clone(), self.buffer_pool.clone())?;
+            page.set_uptodate();
+            // TODO(pere) should probably first insert to page cache, and if successful,
+            // read frame or page
+            return Ok((page, c));
+        }
+
+        let c = sqlite3_ondisk::begin_read_page(
+            self.db_file.clone(),
+            self.buffer_pool.clone(),
+            page.clone(),
+            page_idx,
+        )?;
+        Ok((page, c))
+    }
+
     /// Reads a page from the database.
     #[tracing::instrument(skip_all, level = Level::DEBUG)]
     pub fn read_page(&self, page_idx: usize) -> Result<(PageRef, Completion)> {
@@ -855,38 +889,10 @@ impl Pager {
             // Dummy completion being passed, as we do not need to read from database or wal
             return Ok((page.clone(), Completion::new_write(|_| {})));
         }
-        let page = Arc::new(Page::new(page_idx));
-        page.set_locked();
+        let (page, c) = self.read_page_no_cache(None, page_idx)?;
 
-        if let Some(frame_id) = self.wal.borrow().find_frame(page_idx as u64)? {
-            let c =
-                self.wal
-                    .borrow()
-                    .read_frame(frame_id, page.clone(), self.buffer_pool.clone())?;
-            page.set_uptodate();
-            // TODO(pere) should probably first insert to page cache, and if successful,
-            // read frame or page
-            match page_cache.insert(page_key, page.clone()) {
-                Ok(_) => {}
-                Err(CacheError::Full) => return Err(LimboError::CacheFull),
-                Err(CacheError::KeyExists) => {
-                    unreachable!("Page should not exist in cache after get() miss")
-                }
-                Err(e) => {
-                    return Err(LimboError::InternalError(format!(
-                        "Failed to insert page into cache: {e:?}"
-                    )))
-                }
-            }
-            return Ok((page, c));
-        }
-
-        let c = sqlite3_ondisk::begin_read_page(
-            self.db_file.clone(),
-            self.buffer_pool.clone(),
-            page.clone(),
-            page_idx,
-        )?;
+        // TODO(pere) should probably first insert to page cache, and if successful,
+        // read frame or page
         match page_cache.insert(page_key, page.clone()) {
             Ok(_) => {}
             Err(CacheError::Full) => return Err(LimboError::CacheFull),
@@ -1167,13 +1173,19 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
+    pub fn wal_changed_pages_after(&self, frame_watermark: u32) -> Result<Vec<u32>> {
+        let wal = self.wal.borrow();
+        wal.changed_pages_after(frame_watermark)
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn wal_get_frame(&self, frame_no: u32, frame: &mut [u8]) -> Result<Completion> {
         let wal = self.wal.borrow();
         wal.read_frame_raw(frame_no.into(), frame)
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn wal_insert_frame(&self, frame_no: u32, frame: &[u8]) -> Result<WalInsertInfo> {
+    pub fn wal_insert_frame(&self, frame_no: u32, frame: &[u8]) -> Result<WalFrameInfo> {
         let mut wal = self.wal.borrow_mut();
         let (header, raw_page) = parse_wal_frame_header(frame);
         wal.write_frame_raw(
@@ -1201,9 +1213,9 @@ impl Pager {
             }
             self.dirty_pages.borrow_mut().clear();
         }
-        Ok(WalInsertInfo {
-            page_no: header.page_number as usize,
-            is_commit: header.is_commit_frame(),
+        Ok(WalFrameInfo {
+            page_no: header.page_number,
+            db_size: header.db_size,
         })
     }
 

@@ -3,7 +3,7 @@
 
 use std::array;
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use strum::EnumString;
 use tracing::{instrument, Level};
 
@@ -203,7 +203,7 @@ pub trait Wal {
     fn end_write_tx(&self);
 
     /// Find the latest frame containing a page.
-    fn find_frame(&self, page_id: u64) -> Result<Option<u64>>;
+    fn find_frame(&self, frame_watermark: u64, page_id: u64) -> Result<Option<u64>>;
 
     /// Read a frame from the WAL.
     fn read_frame(
@@ -226,6 +226,8 @@ pub trait Wal {
         db_size: u64,
         page: &[u8],
     ) -> Result<()>;
+
+    fn changed_pages_after(&self, frame_watermark: u32) -> Result<Vec<u32>>;
 
     /// Write a frame to the WAL.
     /// db_size is the database size in pages after the transaction finishes.
@@ -276,7 +278,7 @@ impl Wal for DummyWAL {
 
     fn end_write_tx(&self) {}
 
-    fn find_frame(&self, _page_id: u64) -> Result<Option<u64>> {
+    fn find_frame(&self, _frame_watermark: u64, _page_id: u64) -> Result<Option<u64>> {
         Ok(None)
     }
 
@@ -303,6 +305,10 @@ impl Wal for DummyWAL {
         _page: &[u8],
     ) -> Result<()> {
         todo!();
+    }
+
+    fn changed_pages_after(&self, _frame_watermark: u32) -> Result<Vec<u32>> {
+        todo!()
     }
 
     fn append_frame(
@@ -600,7 +606,7 @@ impl Wal for WalFile {
 
     /// Find the latest frame containing a page.
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn find_frame(&self, page_id: u64) -> Result<Option<u64>> {
+    fn find_frame(&self, frame_watermark: u64, page_id: u64) -> Result<Option<u64>> {
         let shared = self.get_shared();
         let frames = shared.frame_cache.lock();
         let frames = frames.get(&page_id);
@@ -609,7 +615,7 @@ impl Wal for WalFile {
         }
         let frames = frames.unwrap();
         for frame in frames.iter().rev() {
-            if *frame <= self.max_frame {
+            if *frame <= frame_watermark {
                 return Ok(Some(*frame));
             }
         }
@@ -665,6 +671,23 @@ impl Wal for WalFile {
         let c =
             begin_read_wal_frame_raw(&self.get_shared().file, offset, self.page_size(), complete)?;
         Ok(c)
+    }
+
+    fn changed_pages_after(&self, frame_watermark: u32) -> Result<Vec<u32>> {
+        let frame_count = self.get_max_frame() as u32;
+        let page_size = self.page_size();
+        let mut frame = vec![0u8; page_size as usize + WAL_FRAME_HEADER_SIZE];
+        let mut seen = HashSet::new();
+        let mut pages = Vec::with_capacity((frame_count - frame_watermark) as usize);
+        for frame_no in frame_watermark + 1..=frame_count {
+            let c = self.read_frame_raw(frame_no as u64, &mut frame)?;
+            self.io.wait_for_completion(c)?;
+            let (header, _) = sqlite3_ondisk::parse_wal_frame_header(&frame);
+            if seen.insert(header.page_number) {
+                pages.push(header.page_number);
+            }
+        }
+        Ok(pages)
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
