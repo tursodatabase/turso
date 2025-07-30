@@ -803,14 +803,13 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn end_read_tx(&self) {
         let slot = self.max_frame_read_lock_index.get();
-        if slot != NO_LOCK_HELD {
-            let rl = &mut self.get_shared().read_locks[slot];
-            rl.unlock();
-            self.max_frame_read_lock_index.set(NO_LOCK_HELD);
-            tracing::debug!("end_read_tx(slot={slot})");
-        } else {
-            tracing::debug!("end_read_tx(slot=no_lock)");
-        }
+        turso_assert!(
+            slot != NO_LOCK_HELD,
+            "we must hold a read lock to end a read transaction"
+        );
+        let rl = &mut self.get_shared().read_locks[slot];
+        rl.unlock();
+        self.max_frame_read_lock_index.set(NO_LOCK_HELD);
     }
 
     /// Begin a write transaction
@@ -852,7 +851,10 @@ impl Wal for WalFile {
     /// End a write transaction
     #[instrument(skip_all, level = Level::DEBUG)]
     fn end_write_tx(&self) {
-        tracing::debug!("end_write_txn");
+        turso_assert!(
+            self.max_frame_read_lock_index.get() != NO_LOCK_HELD,
+            "must have a read transaction to end a write transaction"
+        );
         self.get_shared().write_lock.unlock();
     }
 

@@ -771,10 +771,15 @@ pub fn handle_program_error(
                         }
                     }
                 }
-            } else if let Err(e) = pager.end_read_tx() {
-                tracing::error!("end_read_tx failed: {e}");
+            } else if matches!(
+                state,
+                TransactionState::Read | TransactionState::PendingUpgrade
+            ) {
+                if let Err(e) = pager.end_read_tx() {
+                    tracing::error!("end_read_tx failed: {e}");
+                }
+                connection.transaction_state.replace(TransactionState::None);
             }
-            connection.transaction_state.replace(TransactionState::None);
         }
     }
     Ok(())
