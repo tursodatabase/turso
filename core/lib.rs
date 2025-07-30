@@ -111,6 +111,8 @@ enum TransactionState {
         /// Whether to automatically commit transaction
         auto_commit: bool,
     },
+    /// Pending state means that we tried beginning a tx and the method returned IO.
+    /// Instead of ending the read tx, just update the state to pending.
     PendingUpgrade {
         /// Whether to automatically commit transaction
         auto_commit: bool,
@@ -125,6 +127,45 @@ impl TransactionState {
             TransactionState::Read { auto_commit, .. } => *auto_commit,
             TransactionState::PendingUpgrade { auto_commit, .. } => *auto_commit,
             TransactionState::None => true,
+        }
+    }
+
+    fn not_in_transaction(&self) -> bool {
+        matches!(self, TransactionState::None)
+    }
+
+    fn is_write(&self) -> bool {
+        matches!(self, TransactionState::Write { .. })
+    }
+
+    fn is_read(&self) -> bool {
+        matches!(self, TransactionState::Read { .. })
+    }
+
+    /// Get a new state for a transaction based on the old state and whether the transaction indicates it will write.
+    /// Returns the new state and whether the transaction state changed.
+    fn get_new_state(self, write: bool) -> (Self, bool) {
+        if write {
+            match self {
+                TransactionState::Write { .. } => (self, false),
+                _ => (
+                    TransactionState::Write {
+                        auto_commit: self.is_auto_commit(),
+                        schema_did_change: false,
+                    },
+                    true,
+                ),
+            }
+        } else {
+            match self {
+                TransactionState::PendingUpgrade { .. } => {
+                    panic!("Cannot transition from pending upgrade to read")
+                }
+                TransactionState::Read { .. } => (self, false),
+                // Ignore state change from write to read -- if an interactive write was started earlier it's still a write.
+                TransactionState::Write { .. } => (self, false),
+                TransactionState::None => (TransactionState::Read { auto_commit: true }, true),
+            }
         }
     }
 }
@@ -892,7 +933,7 @@ impl Connection {
         );
         // close opened transaction if it was kept open
         // (in most cases, it will be automatically closed if stmt was executed properly)
-        if matches!(previous, TransactionState::Read { .. }) {
+        if previous.is_read() {
             pager.end_read_tx().expect("read txn must be finished");
         }
         // now we can safely propagate error after ensured that transaction state is reset

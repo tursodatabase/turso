@@ -1988,79 +1988,14 @@ pub fn op_transaction(
     }
 
     let current_state = conn.transaction_state.get();
-    let (new_transaction_state, updated) = match (current_state, write) {
-        // pending state means that we tried beginning a tx and the method returned IO.
-        // instead of ending the read tx, just update the state to pending.
-        (TransactionState::PendingUpgrade { auto_commit }, write) => {
-            turso_assert!(
-                *write,
-                "pending upgrade should only be set for write transactions"
-            );
-            (
-                TransactionState::Write {
-                    schema_did_change: false,
-                    auto_commit,
-                },
-                true,
-            )
-        }
-        (
-            TransactionState::Write {
-                schema_did_change,
-                auto_commit,
-            },
-            true,
-        ) => (
-            TransactionState::Write {
-                schema_did_change,
-                auto_commit,
-            },
-            false,
-        ),
-        (
-            TransactionState::Write {
-                schema_did_change,
-                auto_commit,
-            },
-            false,
-        ) => (
-            TransactionState::Write {
-                schema_did_change,
-                auto_commit,
-            },
-            false,
-        ),
-        (TransactionState::Read { auto_commit }, true) => (
-            TransactionState::Write {
-                schema_did_change: false,
-                auto_commit,
-            },
-            true,
-        ),
-        (TransactionState::Read { auto_commit }, false) => {
-            (TransactionState::Read { auto_commit }, false)
-        }
-        (TransactionState::None, true) => (
-            TransactionState::Write {
-                schema_did_change: false,
-                auto_commit: conn.get_auto_commit(),
-            },
-            true,
-        ),
-        (TransactionState::None, false) => (
-            TransactionState::Read {
-                auto_commit: conn.get_auto_commit(),
-            },
-            true,
-        ),
-    };
-    if updated && matches!(current_state, TransactionState::None) {
+    let (new_transaction_state, updated) = current_state.get_new_state(*write);
+    if updated && current_state.not_in_transaction() {
         if let LimboResult::Busy = pager.begin_read_tx()? {
             return Ok(InsnFunctionStepResult::Busy);
         }
     }
 
-    if updated && matches!(new_transaction_state, TransactionState::Write { .. }) {
+    if updated && new_transaction_state.is_write() {
         match pager.begin_write_tx()? {
             IOResult::Done(r) => {
                 if let LimboResult::Busy = r {
@@ -6068,8 +6003,9 @@ pub fn op_parse_schema(
     let conn = program.connection.clone();
     // set auto commit to false in order for parse schema to not commit changes as transaction state is stored in connection,
     // and we use the same connection for nested query.
-    let previous_auto_commit = conn.get_auto_commit();
-    conn.set_auto_commit(false);
+    let previous_tx_state = conn.transaction_state.get();
+    conn.transaction_state
+        .replace(TransactionState::Read { auto_commit: false });
 
     if let Some(where_clause) = where_clause {
         let stmt = conn.prepare(format!("SELECT * FROM sqlite_schema WHERE {where_clause}"))?;
@@ -6086,7 +6022,7 @@ pub fn op_parse_schema(
             parse_schema_rows(stmt, schema, &conn.syms.borrow(), state.mv_tx_id)
         })?;
     }
-    conn.set_auto_commit(previous_auto_commit);
+    conn.transaction_state.replace(previous_tx_state);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
