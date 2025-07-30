@@ -17,7 +17,7 @@ path = "integration/mod.rs"
 [dependencies]
 anyhow.workspace = true
 env_logger = "0.10.1"
-turso_core = { path = "../core" }
+turso_core = { path = "../core", features = ["conn_raw_api"] }
 rusqlite = { version = "0.34", features = ["bundled"] }
 tempfile = "3.0.7"
 log = "0.4.22"
