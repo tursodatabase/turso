@@ -1609,6 +1609,33 @@ pub fn insn_to_str(
                 0,
                 format!("r[{}] = data", *dest),
             ),
+            Insn::RowSetAdd { rowset_reg, rowid_reg } => (
+                "RowSetAdd",
+                *rowset_reg as i32,
+                *rowid_reg as i32,
+                0,
+                Value::build_text(""),
+                0,
+                format!("rowset(r[{}])=r[{}]", *rowset_reg, *rowid_reg),
+            ),
+            Insn::RowSetRead { rowset_reg, target_pc, dest_reg } => (
+                "RowSetRead",
+                *rowset_reg as i32,
+                target_pc.as_debug_int(),
+                *dest_reg as i32,
+                Value::build_text(""),
+                0,
+                format!("r[{}]=rowset(r[{}])", *dest_reg, *rowset_reg),
+            ),
+            Insn::RowSetTest { rowset_reg, target_pc, rowid_reg, batch } => (
+                "RowSetTest",
+                *rowset_reg as i32,
+                target_pc.as_debug_int(),
+                *rowid_reg as i32,
+                Value::Integer(*batch as i64),
+                0,
+                format!("if r[{}] in rowset(r[{}]) goto {}", *rowid_reg, *rowset_reg, target_pc.as_debug_int()),
+            ),
         };
     format!(
         "{:<4}  {:<17}  {:<4}  {:<4}  {:<4}  {:<13}  {:<2}  {}",

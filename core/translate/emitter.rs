@@ -22,10 +22,12 @@ use super::select::emit_simple_count;
 use super::subquery::emit_subqueries;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::function::Func;
-use crate::schema::{Schema, Table};
+use crate::schema::{BTreeTable, Column, Schema, Table, Type};
 use crate::translate::compound_select::emit_program_for_compound_select;
-use crate::translate::expr::{emit_returning_results, ReturningValueRegisters};
-use crate::translate::plan::{DeletePlan, Plan, QueryDestination, Search};
+use crate::translate::expr::{
+    emit_returning_results, translate_expr_for_returning, ReturningValueRegisters,
+};
+use crate::translate::plan::{ColumnUsedMask, DeletePlan, Plan, QueryDestination, Search};
 use crate::translate::values::emit_values;
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
@@ -424,6 +426,28 @@ fn emit_program_for_delete(
 
     init_limit(program, &mut t_ctx, plan.limit, None);
 
+    // We will follow SQLite here, and do a two-pass delete if there is a returning clause.  If
+    // there isn't, we can delete straight from the write cursor. If there are columns to return,
+    // we first move them to a set to make sure nothing changes in the middle of the deletion, and
+    // then delete from the set.
+    if !plan.result_columns.is_empty() {
+        emit_delete_with_returning(program, &plan, &mut t_ctx)?;
+    } else {
+        emit_delete_without_returning(program, &plan, &mut t_ctx)?;
+    }
+
+    // Finalize program
+    program.epilogue(TransactionMode::Write);
+    program.result_columns = plan.result_columns;
+    program.table_references.extend(plan.table_references);
+    Ok(())
+}
+
+fn emit_delete_without_returning(
+    program: &mut ProgramBuilder,
+    plan: &DeletePlan,
+    t_ctx: &mut TranslateCtx,
+) -> Result<()> {
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
@@ -436,7 +460,7 @@ fn emit_program_for_delete(
     // Initialize cursors and other resources needed for query execution
     init_loop(
         program,
-        &mut t_ctx,
+        t_ctx,
         &plan.table_references,
         &mut [],
         None,
@@ -447,34 +471,183 @@ fn emit_program_for_delete(
     // Set up main query execution loop
     open_loop(
         program,
-        &mut t_ctx,
+        t_ctx,
         &plan.table_references,
         &[JoinOrderMember::default()],
         &plan.where_clause,
         None,
     )?;
 
-    emit_delete_insns(
-        program,
-        &mut t_ctx,
-        &plan.table_references,
-        &plan.result_columns,
-    )?;
+    emit_delete_insns(program, t_ctx, &plan.table_references, &plan.result_columns)?;
 
     // Clean up and close the main execution loop
     close_loop(
         program,
-        &mut t_ctx,
+        t_ctx,
         &plan.table_references,
         &[JoinOrderMember::default()],
         None,
     )?;
     program.preassign_label_to_next_insn(after_main_loop_label);
+    Ok(())
+}
 
-    // Finalize program
-    program.epilogue(TransactionMode::Write);
-    program.result_columns = plan.result_columns;
-    program.table_references.extend(plan.table_references);
+fn emit_delete_with_returning(
+    program: &mut ProgramBuilder,
+    plan: &DeletePlan,
+    t_ctx: &mut TranslateCtx,
+) -> Result<()> {
+    // Allocate a register to hold the rowset
+    let rowset_reg = program.alloc_register();
+    program.emit_insn(Insn::Null {
+        dest: rowset_reg,
+        dest_end: None,
+    });
+
+    // Create ephemeral table for storing RETURNING results
+    // We need to create a dummy BTreeTable for the ephemeral cursor
+    let dummy_columns = (0..plan.result_columns.len())
+        .map(|i| Column {
+            name: Some(format!("col_{i}")),
+            ty: Type::Text,
+            ty_str: "TEXT".to_string(),
+            primary_key: false,
+            is_rowid_alias: false,
+            notnull: false,
+            default: None,
+            unique: false,
+            collation: None,
+            hidden: false,
+        })
+        .collect();
+
+    let dummy_table = Arc::new(BTreeTable {
+        name: "ephemeral_returning".to_string(),
+        columns: dummy_columns,
+        root_page: 0, // Will be set by OpenEphemeral
+        primary_key_columns: vec![],
+        has_rowid: true,
+        is_strict: false,
+        unique_sets: None,
+    });
+
+    let ephemeral_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(dummy_table));
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: ephemeral_cursor_id,
+        is_table: true,
+    });
+
+    // PASS 1: Read-only pass to collect rowids and RETURNING data
+    let after_read_pass_label = program.allocate_label();
+    t_ctx.label_main_loop_end = Some(after_read_pass_label);
+
+    if plan.contains_constant_false_condition {
+        program.emit_insn(Insn::Goto {
+            target_pc: after_read_pass_label,
+        });
+    }
+
+    // Initialize cursors for read pass (read-only)
+    let mut read_table_refs = plan.table_references.clone();
+    // Force read-only access by changing operation to SELECT mode
+    for joined_table in read_table_refs.joined_tables_mut() {
+        joined_table.col_used_mask = ColumnUsedMask::default();
+    }
+
+    init_loop(
+        program,
+        t_ctx,
+        &read_table_refs,
+        &mut [],
+        None,
+        OperationMode::SELECT, // Use SELECT mode for read-only pass
+        &plan.where_clause,
+    )?;
+
+    // Use a custom loop that handles WHERE clause and collects rowids
+    emit_delete_read_loop(
+        program,
+        t_ctx,
+        &read_table_refs,
+        &plan.where_clause,
+        rowset_reg,
+        ephemeral_cursor_id,
+        &plan.result_columns,
+    )?;
+
+    // PASS 2: Write pass to delete rows using rowset
+    let after_delete_pass_label = program.allocate_label();
+
+    // Open table for writing
+    let table_reference = plan.table_references.joined_tables().first().unwrap();
+    let write_cursor_id = program.resolve_cursor_id(&CursorKey::table(table_reference.internal_id));
+
+    // Reopen as writable cursor
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: write_cursor_id,
+        root_page: RegisterOrLiteral::Literal(match &table_reference.table {
+            crate::schema::Table::BTree(btree) => btree.root_page,
+            _ => unreachable!("DELETE with RETURNING only supports btree tables for now"),
+        }),
+        db: table_reference.database_id,
+    });
+
+    // Loop through rowset and delete each row
+    let delete_loop_start = program.allocate_label();
+    program.preassign_label_to_next_insn(delete_loop_start);
+
+    let rowid_reg = program.alloc_register(); // Register to hold rowid from rowset
+    program.emit_insn(Insn::RowSetRead {
+        rowset_reg,
+        target_pc: after_delete_pass_label,
+        dest_reg: rowid_reg,
+    });
+
+    program.emit_insn(Insn::NotExists {
+        cursor: write_cursor_id,
+        rowid_reg,
+        target_pc: delete_loop_start,
+    });
+
+    program.emit_insn(Insn::Delete {
+        cursor_id: write_cursor_id,
+    });
+
+    program.emit_insn(Insn::Goto {
+        target_pc: delete_loop_start,
+    });
+
+    // Now both passes are done, output results from ephemeral table
+    let output_loop_start = program.allocate_label();
+    let after_output_label = program.allocate_label();
+
+    // Resolve the after_delete_pass_label to point to the start of Pass 3
+    program.resolve_label(after_delete_pass_label, program.offset());
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: ephemeral_cursor_id,
+        pc_if_empty: after_output_label,
+    });
+
+    program.preassign_label_to_next_insn(output_loop_start);
+
+    // Output each column from the ephemeral table
+    let output_reg_start = program.alloc_registers(plan.result_columns.len());
+    for i in 0..plan.result_columns.len() {
+        program.emit_column(ephemeral_cursor_id, i, output_reg_start + i);
+    }
+
+    program.emit_insn(Insn::ResultRow {
+        start_reg: output_reg_start,
+        count: plan.result_columns.len(),
+    });
+
+    program.emit_insn(Insn::Next {
+        cursor_id: ephemeral_cursor_id,
+        pc_if_next: output_loop_start,
+    });
+
+    program.preassign_label_to_next_insn(after_output_label);
     Ok(())
 }
 
@@ -1483,4 +1656,115 @@ fn init_limit(
             combined_reg,
         });
     }
+}
+
+fn emit_delete_read_loop(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    table_refs: &TableReferences,
+    where_clause: &[super::plan::WhereTerm],
+    rowset_reg: usize,
+    ephemeral_cursor_id: usize,
+    result_columns: &[super::plan::ResultSetColumn],
+) -> Result<()> {
+    use super::expr::translate_condition_expr;
+    use super::expr::ConditionMetadata;
+    use super::main_loop::{close_loop, open_loop};
+
+    // Set up read loop with proper WHERE clause handling
+    open_loop(
+        program,
+        t_ctx,
+        table_refs,
+        &[JoinOrderMember::default()],
+        &[], // We'll handle WHERE clause manually after opening the loop
+        None,
+    )?;
+
+    // Handle WHERE clause conditions manually
+    let table_reference = table_refs.joined_tables().first().unwrap();
+    let read_cursor_id = program.resolve_cursor_id(&CursorKey::table(table_reference.internal_id));
+
+    // Process WHERE clause - if any condition fails, skip this row
+    for cond in where_clause {
+        let continue_label = program.allocate_label();
+        let meta = ConditionMetadata {
+            jump_if_condition_is_true: false,
+            jump_target_when_true: continue_label,
+            jump_target_when_false: t_ctx.labels_main_loop[0].next,
+        };
+        translate_condition_expr(program, table_refs, &cond.expr, meta, &t_ctx.resolver)?;
+        program.preassign_label_to_next_insn(continue_label);
+    }
+
+    // Get rowid and add to rowset
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::RowId {
+        cursor_id: read_cursor_id,
+        dest: rowid_reg,
+    });
+    program.emit_insn(Insn::RowSetAdd {
+        rowset_reg,
+        rowid_reg,
+    });
+
+    // Collect RETURNING data and store in ephemeral table
+    let columns_start_reg = program.alloc_registers(table_reference.columns().len());
+    for (i, _column) in table_reference.columns().iter().enumerate() {
+        program.emit_column(read_cursor_id, i, columns_start_reg + i);
+    }
+
+    // Create RETURNING result values
+    let returning_values_reg = program.alloc_registers(result_columns.len());
+    let value_registers = ReturningValueRegisters {
+        rowid_register: rowid_reg,
+        columns_start_register: columns_start_reg,
+        num_columns: table_reference.columns().len(),
+    };
+
+    // Emit values for each RETURNING column
+    for (i, result_col) in result_columns.iter().enumerate() {
+        translate_expr_for_returning(
+            program,
+            &result_col.expr,
+            &value_registers,
+            returning_values_reg + i,
+        )?;
+    }
+
+    // Create record and insert into ephemeral table
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: returning_values_reg,
+        count: result_columns.len(),
+        dest_reg: record_reg,
+        index_name: None,
+    });
+
+    let ephemeral_rowid_reg = program.alloc_register();
+    let prev_largest_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: ephemeral_cursor_id,
+        rowid_reg: ephemeral_rowid_reg,
+        prev_largest_reg,
+    });
+
+    program.emit_insn(Insn::Insert {
+        cursor: ephemeral_cursor_id,
+        key_reg: ephemeral_rowid_reg,
+        record_reg,
+        flag: InsertFlags::default(),
+        table_name: "".to_string(),
+    });
+
+    // Close read loop
+    close_loop(
+        program,
+        t_ctx,
+        table_refs,
+        &[JoinOrderMember::default()],
+        None,
+    )?;
+
+    Ok(())
 }

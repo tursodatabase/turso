@@ -77,7 +77,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | REINDEX                   | No      |                                                                                   |
 | RELEASE SAVEPOINT         | No      |                                                                                   |
 | REPLACE                   | No      |                                                                                   |
-| RETURNING clause          | Partial | DELETE is missing                                                                 |
+| RETURNING clause          | Yes     |                                                                                   |
 | ROLLBACK TRANSACTION      | Yes     |                                                                                   |
 | SAVEPOINT                 | No      |                                                                                   |
 | SELECT                    | Yes     |                                                                                   |
@@ -525,9 +525,9 @@ Modifiers:
 | RowData        | Yes     |         |
 | RowId          | Yes    |         |
 | RowKey         | No     |         |
-| RowSetAdd      | No     |         |
-| RowSetRead     | No     |         |
-| RowSetTest     | No     |         |
+| RowSetAdd      | Yes    | Not yet optimized for big sets, slow |
+| RowSetRead     | Yes    | Not yet optimized for big sets, slow |
+| RowSetTest     | Yes    | Not yet optimized for big sets, slow |
 | Rowid          | Yes    |         |
 | SCopy          | No     |         |
 | Savepoint      | No     |         |

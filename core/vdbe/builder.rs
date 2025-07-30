@@ -694,6 +694,15 @@ impl ProgramBuilder {
                 Insn::NotFound { target_pc, .. } => {
                     resolve(target_pc, "NotFound");
                 }
+                Insn::RowSetAdd { .. } => {
+                    // No target_pc to resolve
+                }
+                Insn::RowSetRead { target_pc, .. } => {
+                    resolve(target_pc, "RowSetRead");
+                }
+                Insn::RowSetTest { target_pc, .. } => {
+                    resolve(target_pc, "RowSetTest");
+                }
                 _ => {}
             }
         }

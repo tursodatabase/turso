@@ -990,6 +990,31 @@ pub enum Insn {
         roots: Vec<usize>,
         message_register: usize,
     },
+
+    /// Insert the integer value held by register P2 into a RowSet object held in register P1.
+    /// An assertion fails if P2 is not an integer.
+    RowSetAdd {
+        rowset_reg: usize,
+        rowid_reg: usize,
+    },
+
+    /// Extract the smallest value from the RowSet object in P1 and put that value into register P3.
+    /// Or, if RowSet object P1 is initially empty, leave P3 unchanged and jump to instruction P2.
+    RowSetRead {
+        rowset_reg: usize,
+        target_pc: BranchOffset,
+        dest_reg: usize,
+    },
+
+    /// Register P3 is assumed to hold a 64-bit integer value. If register P1 contains a RowSet object
+    /// and that RowSet object contains the value held in P3, jump to register P2. Otherwise, insert the
+    /// integer in P3 into the RowSet and continue on to the next opcode.
+    RowSetTest {
+        rowset_reg: usize,
+        target_pc: BranchOffset,
+        rowid_reg: usize,
+        batch: i32,
+    },
 }
 
 impl Insn {
@@ -1116,6 +1141,9 @@ impl Insn {
             Insn::IdxDelete { .. } => execute::op_idx_delete,
             Insn::Count { .. } => execute::op_count,
             Insn::IntegrityCk { .. } => execute::op_integrity_check,
+            Insn::RowSetAdd { .. } => execute::op_rowset_add,
+            Insn::RowSetRead { .. } => execute::op_rowset_read,
+            Insn::RowSetTest { .. } => execute::op_rowset_test,
         }
     }
 }

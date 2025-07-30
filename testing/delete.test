@@ -86,3 +86,101 @@ do_execsql_test_on_specific_db {:memory:} doubly-qualified-delete {
    delete from test where main.test.col = 2;
    select col from test;
 } {1}
+
+# RETURNING clause tests for DELETE
+do_execsql_test_on_specific_db {:memory:} delete-returning-basic-column {
+    CREATE TABLE test (id INTEGER, name TEXT, value REAL);
+    INSERT INTO test (id, name, value) VALUES (1, 'first', 10.5), (2, 'second', 20.5), (3, 'third', 30.5);
+    DELETE FROM test WHERE id = 2 RETURNING id;
+} {2}
+
+do_execsql_test_on_specific_db {:memory:} delete-returning-multiple-columns {
+    CREATE TABLE test (id INTEGER, name TEXT, value REAL);
+    INSERT INTO test (id, name, value) VALUES (1, 'first', 10.5), (2, 'second', 20.5), (3, 'third', 30.5);
+    DELETE FROM test WHERE id = 2 RETURNING id, name, value;
+} {2|second|20.5}
+
+do_execsql_test_on_specific_db {:memory:} delete-returning-all-columns {
+    CREATE TABLE test (id INTEGER, name TEXT, value REAL);
+    INSERT INTO test (id, name, value) VALUES (1, 'first', 10.5), (2, 'second', 20.5), (3, 'third', 30.5);
+    DELETE FROM test WHERE id = 2 RETURNING *;
+} {2|second|20.5}
+
+do_execsql_test_on_specific_db {:memory:} delete-returning-literal {
+    CREATE TABLE test (id INTEGER, value INTEGER);
+    INSERT INTO test (id, value) VALUES (1, 10), (2, 20), (3, 30);
+    DELETE FROM test WHERE id = 2 RETURNING 42;
+} {42}
+
+do_execsql_test_on_specific_db {:memory:} delete-returning-arithmetic {
+    CREATE TABLE test (id INTEGER, value INTEGER);
+    INSERT INTO test (id, value) VALUES (1, 10), (2, 20), (3, 30);
+    DELETE FROM test WHERE id = 2 RETURNING 2 * value;
+} {40}
+
+do_execsql_test_on_specific_db {:memory:} delete-returning-complex-expression {
+    CREATE TABLE test (id INTEGER, x INTEGER, y INTEGER);
+    INSERT INTO test (id, x, y) VALUES (1, 5, 3), (2, 8, 4), (3, 2, 9);
+    DELETE FROM test WHERE id = 2 RETURNING x + y * 2;
+} {16}
+
+do_execsql_test_on_specific_db {:memory:} delete-returning-function-call {
+    CREATE TABLE test (id INTEGER, name TEXT);
+    INSERT INTO test (id, name) VALUES (1, 'hello'), (2, 'world'), (3, 'test');
+    DELETE FROM test WHERE id = 2 RETURNING upper(name);
+} {WORLD}
+
+do_execsql_test_on_specific_db {:memory:} delete-returning-mixed-expressions {
+    CREATE TABLE test (id INTEGER, name TEXT, value INTEGER);
+    INSERT INTO test (id, name, value) VALUES (1, 'first', 10), (2, 'second', 20), (3, 'third', 30);
+    DELETE FROM test WHERE id = 2 RETURNING id, upper(name), value * 3;
+} {2|SECOND|60}
+
+do_execsql_test_on_specific_db {:memory:} delete-returning-multiple-rows {
+    CREATE TABLE test (id INTEGER, name TEXT);
+    INSERT INTO test (id, name) VALUES (1, 'first'), (2, 'second'), (3, 'third'), (4, 'fourth');
+    DELETE FROM test WHERE id IN (2, 3) RETURNING id, name;
+} {2|second
+3|third}
+
+do_execsql_test_on_specific_db {:memory:} delete-returning-with-where-condition {
+    CREATE TABLE test (id INTEGER, name TEXT, active INTEGER);
+    INSERT INTO test (id, name, active) VALUES (1, 'first', 1), (2, 'second', 0), (3, 'third', 1), (4, 'fourth', 0);
+    DELETE FROM test WHERE active = 0 RETURNING id, name;
+} {2|second
+4|fourth}
+
+do_execsql_test_on_specific_db {:memory:} delete-returning-rowid {
+    CREATE TABLE test (name TEXT, value INTEGER);
+    INSERT INTO test (name, value) VALUES ('first', 10), ('second', 20), ('third', 30);
+    DELETE FROM test WHERE value = 20 RETURNING rowid, name, value;
+} {2|second|20}
+
+do_execsql_test_on_specific_db {:memory:} delete-returning-null-values {
+    CREATE TABLE test (id INTEGER, name TEXT, value INTEGER);
+    INSERT INTO test (id, name, value) VALUES (1, 'first', 10), (2, NULL, NULL), (3, 'third', 30);
+    DELETE FROM test WHERE id = 2 RETURNING id, name, value;
+} {2||}
+
+do_execsql_test_on_specific_db {:memory:} delete-returning-no-matches {
+    CREATE TABLE test (id INTEGER, name TEXT);
+    INSERT INTO test (id, name) VALUES (1, 'first'), (2, 'second'), (3, 'third');
+    DELETE FROM test WHERE id = 999 RETURNING id, name;
+} {}
+
+do_execsql_test_on_specific_db {:memory:} delete-returning-all-rows {
+    CREATE TABLE test (id INTEGER, name TEXT);
+    INSERT INTO test (id, name) VALUES (1, 'first'), (2, 'second'), (3, 'third');
+    DELETE FROM test RETURNING id;
+} {1
+2
+3}
+
+do_execsql_test_on_specific_db {:memory:} delete-returning-verify-table-state {
+    CREATE TABLE test (id INTEGER, name TEXT, value INTEGER);
+    INSERT INTO test (id, name, value) VALUES (1, 'keep1', 10), (2, 'delete', 20), (3, 'keep2', 30);
+    DELETE FROM test WHERE name = 'delete' RETURNING id, name, value;
+    SELECT * FROM test ORDER BY id;
+} {2|delete|20
+1|keep1|10
+3|keep2|30}
