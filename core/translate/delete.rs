@@ -1,5 +1,6 @@
 use crate::schema::Table;
 use crate::translate::emitter::emit_program;
+use crate::translate::expr::process_returning_clause;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{DeletePlan, Operation, Plan};
 use crate::translate::planner::{parse_limit, parse_where};
@@ -29,14 +30,22 @@ pub fn translate_delete(
         );
     }
 
-    // FIXME: SQLite's delete using Returning is complex. It scans the table in read mode first, building
-    // the result set, and only after that it opens the table for writing and deletes the rows. It
-    // also uses a couple of instructions that we don't implement yet (i.e.: RowSetAdd, RowSetRead,
-    // RowSetTest). So for now I'll just defer it altogether.
-    if returning.is_some() {
-        crate::bail_parse_error!("RETURNING currently not implemented for DELETE statements.");
-    }
-    let result_columns = vec![];
+    let result_columns = if let Some(mut returning_cols) = returning {
+        let table = match schema.get_table(tbl_name.name.as_str()) {
+            Some(table) => table,
+            None => crate::bail_parse_error!("no such table: {}", tbl_name),
+        };
+        let (result_columns, _table_refs) = process_returning_clause(
+            &mut returning_cols,
+            &table,
+            &tbl_name.name.to_string(),
+            &mut program,
+            connection,
+        )?;
+        result_columns
+    } else {
+        vec![]
+    };
 
     let mut delete_plan = prepare_delete_plan(
         schema,
