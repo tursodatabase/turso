@@ -2,6 +2,7 @@
 mod dynamic;
 mod vtab_xconnect;
 use crate::schema::{Schema, Table};
+use crate::vtab::SafeVTabModuleImpl;
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
 use crate::UringIO;
 use crate::{function::ExternalFunc, Connection, Database};
@@ -45,10 +46,10 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
     };
 
     let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };
-    let module = Arc::new(module);
+    let safe_module = Arc::new(SafeVTabModuleImpl::new(module));
     let vmodule = VTabImpl {
         module_kind: kind,
-        implementation: module,
+        implementation: safe_module,
     };
 
     unsafe {
@@ -76,7 +77,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
 #[derive(Clone)]
 pub struct VTabImpl {
     pub module_kind: VTabKind,
-    pub implementation: Arc<VTabModuleImpl>,
+    pub implementation: Arc<SafeVTabModuleImpl>,
 }
 
 pub(crate) unsafe extern "C" fn register_scalar_function(

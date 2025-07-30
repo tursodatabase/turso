@@ -10,6 +10,31 @@ use std::sync::Arc;
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VTabModuleImpl};
 use turso_sqlite3_parser::{ast, lexer::sql::Parser};
 
+/// Wrapper for VTabModuleImpl to make it Send/Sync
+/// The *const c_char field should be pointing to static strings or properly managed memory
+#[derive(Debug, Clone)]
+pub struct SafeVTabModuleImpl(VTabModuleImpl);
+
+unsafe impl Send for SafeVTabModuleImpl {}
+unsafe impl Sync for SafeVTabModuleImpl {}
+
+impl SafeVTabModuleImpl {
+    pub(crate) fn new(module: VTabModuleImpl) -> Self {
+        Self(module)
+    }
+
+    pub(crate) fn inner(&self) -> &VTabModuleImpl {
+        &self.0
+    }
+
+    pub(crate) fn create_schema(
+        &self,
+        args: Vec<turso_ext::Value>,
+    ) -> turso_ext::ExtResult<String> {
+        self.0.create_schema(args)
+    }
+}
+
 /// Wrapper for *mut turso_ext::Conn to make it Send/Sync
 #[derive(Debug, Clone)]
 struct SafeConnPtr(*mut turso_ext::Conn);
@@ -202,7 +227,7 @@ impl VirtualTableCursor {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ExtVirtualTable {
-    implementation: Arc<VTabModuleImpl>,
+    implementation: Arc<SafeVTabModuleImpl>,
     table_ptr: *const c_void,
     connection_ptr: RefCell<Option<SafeConnPtr>>,
 }
@@ -224,11 +249,11 @@ impl Drop for ExtVirtualTable {
 
 impl ExtVirtualTable {
     pub(crate) fn readonly(&self) -> bool {
-        self.implementation.readonly
+        self.implementation.inner().readonly
     }
     fn best_index(&self, constraints: &[ConstraintInfo], order_by: &[OrderByInfo]) -> IndexInfo {
         unsafe {
-            IndexInfo::from_ffi((self.implementation.best_idx)(
+            IndexInfo::from_ffi((self.implementation.inner().best_idx)(
                 constraints.as_ptr(),
                 constraints.len() as i32,
                 order_by.as_ptr(),
@@ -256,7 +281,7 @@ impl ExtVirtualTable {
                 "{module_name} is not a {expected} module"
             )));
         }
-        let (schema, table_ptr) = module.implementation.create(args)?;
+        let (schema, table_ptr) = module.implementation.inner().create(args)?;
         let vtab = ExtVirtualTable {
             connection_ptr: RefCell::new(None),
             implementation: module.implementation.clone(),
@@ -279,7 +304,7 @@ impl ExtVirtualTable {
         let ext_conn_ptr = Box::into_raw(Box::new(conn));
         // store the leaked connection pointer on the table so it can be freed on drop
         *self.connection_ptr.borrow_mut() = Some(SafeConnPtr::new(ext_conn_ptr));
-        let cursor = unsafe { (self.implementation.open)(self.table_ptr, ext_conn_ptr) };
+        let cursor = unsafe { (self.implementation.inner().open)(self.table_ptr, ext_conn_ptr) };
         ExtVirtualTableCursor::new(cursor, self.implementation.clone())
     }
 
@@ -288,7 +313,7 @@ impl ExtVirtualTable {
         let ext_args = args.iter().map(|arg| arg.to_ffi()).collect::<Vec<_>>();
         let newrowid = 0i64;
         let rc = unsafe {
-            (self.implementation.update)(
+            (self.implementation.inner().update)(
                 self.table_ptr,
                 arg_count as i32,
                 ext_args.as_ptr(),
@@ -308,7 +333,7 @@ impl ExtVirtualTable {
     }
 
     fn destroy(&self) -> crate::Result<()> {
-        let rc = unsafe { (self.implementation.destroy)(self.table_ptr) };
+        let rc = unsafe { (self.implementation.inner().destroy)(self.table_ptr) };
         match rc {
             ResultCode::OK => Ok(()),
             _ => Err(LimboError::ExtensionError(rc.to_string())),
@@ -318,11 +343,11 @@ impl ExtVirtualTable {
 
 pub struct ExtVirtualTableCursor {
     cursor: *const c_void,
-    implementation: Arc<VTabModuleImpl>,
+    implementation: Arc<SafeVTabModuleImpl>,
 }
 
 impl ExtVirtualTableCursor {
-    fn new(cursor: *const c_void, implementation: Arc<VTabModuleImpl>) -> crate::Result<Self> {
+    fn new(cursor: *const c_void, implementation: Arc<SafeVTabModuleImpl>) -> crate::Result<Self> {
         if cursor.is_null() {
             return Err(LimboError::InternalError(
                 "VirtualTableCursor: cursor is null".into(),
@@ -335,7 +360,7 @@ impl ExtVirtualTableCursor {
     }
 
     fn rowid(&self) -> i64 {
-        unsafe { (self.implementation.rowid)(self.cursor) }
+        unsafe { (self.implementation.inner().rowid)(self.cursor) }
     }
 
     #[tracing::instrument(skip(self))]
@@ -353,7 +378,7 @@ impl ExtVirtualTableCursor {
             .map(|cstr| cstr.into_raw())
             .unwrap_or(std::ptr::null_mut());
         let rc = unsafe {
-            (self.implementation.filter)(
+            (self.implementation.inner().filter)(
                 self.cursor,
                 arg_count as i32,
                 ext_args.as_ptr(),
@@ -374,12 +399,12 @@ impl ExtVirtualTableCursor {
     }
 
     fn column(&self, column: usize) -> crate::Result<Value> {
-        let val = unsafe { (self.implementation.column)(self.cursor, column as u32) };
+        let val = unsafe { (self.implementation.inner().column)(self.cursor, column as u32) };
         Value::from_ffi(val)
     }
 
     fn next(&self) -> crate::Result<bool> {
-        let rc = unsafe { (self.implementation.next)(self.cursor) };
+        let rc = unsafe { (self.implementation.inner().next)(self.cursor) };
         match rc {
             ResultCode::OK => Ok(true),
             ResultCode::EOF => Ok(false),
@@ -390,7 +415,7 @@ impl ExtVirtualTableCursor {
 
 impl Drop for ExtVirtualTableCursor {
     fn drop(&mut self) {
-        let result = unsafe { (self.implementation.close)(self.cursor) };
+        let result = unsafe { (self.implementation.inner().close)(self.cursor) };
         if !result.is_ok() {
             tracing::error!("Failed to close virtual table cursor");
         }
