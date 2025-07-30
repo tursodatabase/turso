@@ -765,7 +765,7 @@ pub fn begin_read_page(
 ) -> Result<Completion> {
     tracing::trace!("begin_read_btree_page(page_idx = {})", page_idx);
     let buf = buffer_pool.get();
-    let drop_fn = Rc::new(move |buf| {
+    let drop_fn = Arc::new(move |buf| {
         let buffer_pool = buffer_pool.clone();
         buffer_pool.put(buf);
     });
@@ -1362,7 +1362,7 @@ pub fn write_varint_to_vec(value: u64, payload: &mut Vec<u8>) {
 
 /// We need to read the WAL file on open to reconstruct the WAL frame cache.
 pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFileShared>>> {
-    let drop_fn = Rc::new(|_buf| {});
+    let drop_fn = Arc::new(|_buf| {});
     let size = file.size()?;
     #[allow(clippy::arc_with_non_send_sync)]
     let buf_for_pread = Arc::new(RefCell::new(Buffer::allocate(size as usize, drop_fn)));
@@ -1579,7 +1579,7 @@ pub fn begin_read_wal_frame_raw(
     complete: Box<dyn Fn(Arc<RefCell<Buffer>>, i32)>,
 ) -> Result<Completion> {
     tracing::trace!("begin_read_wal_frame_raw(offset={})", offset);
-    let drop_fn = Rc::new(|_buf| {});
+    let drop_fn = Arc::new(|_buf| {});
     let buf = Arc::new(RefCell::new(Buffer::allocate(
         page_size as usize + WAL_FRAME_HEADER_SIZE,
         drop_fn,
@@ -1598,7 +1598,7 @@ pub fn begin_read_wal_frame(
 ) -> Result<Completion> {
     tracing::trace!("begin_read_wal_frame(offset={})", offset);
     let buf = buffer_pool.get();
-    let drop_fn = Rc::new(move |buf| {
+    let drop_fn = Arc::new(move |buf| {
         let buffer_pool = buffer_pool.clone();
         buffer_pool.put(buf);
     });
@@ -1638,7 +1638,7 @@ pub fn prepare_wal_frame(
 ) -> ((u32, u32), Arc<RefCell<Buffer>>) {
     tracing::trace!(page_number);
 
-    let drop_fn = Rc::new(|_buf| {});
+    let drop_fn = Arc::new(|_buf| {});
     let mut buffer = Buffer::allocate(page_size as usize + WAL_FRAME_HEADER_SIZE, drop_fn);
     let frame = buffer.as_mut_slice();
     frame[WAL_FRAME_HEADER_SIZE..].copy_from_slice(page);
@@ -1666,7 +1666,7 @@ pub fn prepare_wal_frame(
 pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<Completion> {
     tracing::trace!("begin_write_wal_header");
     let buffer = {
-        let drop_fn = Rc::new(|_buf| {});
+        let drop_fn = Arc::new(|_buf| {});
 
         let mut buffer = Buffer::allocate(WAL_HEADER_SIZE, drop_fn);
         let buf = buffer.as_mut_slice();

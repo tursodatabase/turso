@@ -367,7 +367,7 @@ impl SortedChunk {
         let read_buffer_size = self.buffer.borrow().len() - self.buffer_len.get();
         let read_buffer_size = read_buffer_size.min(self.chunk_size - self.total_bytes_read.get());
 
-        let drop_fn = Rc::new(|_buffer: BufferData| {});
+        let drop_fn = Arc::new(|_buffer: BufferData| {});
         let read_buffer = Buffer::allocate(read_buffer_size, drop_fn);
         let read_buffer_ref = Arc::new(RefCell::new(read_buffer));
 
@@ -420,7 +420,7 @@ impl SortedChunk {
             self.chunk_size += size_len + record_size;
         }
 
-        let drop_fn = Rc::new(|_buffer: BufferData| {});
+        let drop_fn = Arc::new(|_buffer: BufferData| {});
         let mut buffer = Buffer::allocate(self.chunk_size, drop_fn);
 
         let mut buf_pos = 0;

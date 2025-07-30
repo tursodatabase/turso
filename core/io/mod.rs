@@ -8,7 +8,6 @@ use std::{
     fmt::Debug,
     mem::ManuallyDrop,
     pin::Pin,
-    rc::Rc,
 };
 
 pub trait File: Send + Sync {
@@ -219,7 +218,7 @@ impl TruncateCompletion {
 
 pub type BufferData = Pin<Vec<u8>>;
 
-pub type BufferDropFn = Rc<dyn Fn(BufferData)>;
+pub type BufferDropFn = Arc<dyn Fn(BufferData) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Buffer {

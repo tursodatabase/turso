@@ -1847,7 +1847,7 @@ pub fn allocate_new_page(page_id: usize, buffer_pool: &Arc<BufferPool>, offset: 
     {
         let buffer = buffer_pool.get();
         let bp = buffer_pool.clone();
-        let drop_fn = Rc::new(move |buf| {
+        let drop_fn = Arc::new(move |buf| {
             bp.put(buf);
         });
         let buffer = Arc::new(RefCell::new(Buffer::new(buffer, drop_fn)));

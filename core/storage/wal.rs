@@ -1187,7 +1187,7 @@ impl WalFile {
         let buffer = buffer_pool.get();
         {
             let buffer_pool = buffer_pool.clone();
-            let drop_fn = Rc::new(move |buf| {
+            let drop_fn = Arc::new(move |buf| {
                 buffer_pool.put(buf);
             });
             checkpoint_page.get().contents = Some(PageContent::new(

@@ -7056,7 +7056,7 @@ mod tests {
     fn get_page(id: usize) -> BTreePage {
         let page = Arc::new(Page::new(id));
 
-        let drop_fn = Rc::new(|_| {});
+        let drop_fn = Arc::new(|_| {});
         let inner = PageContent::new(
             0,
             Arc::new(RefCell::new(Buffer::new(
@@ -8334,7 +8334,7 @@ mod tests {
         // Setup overflow pages (2, 3, 4) with linking
         let mut current_page = 2u32;
         while current_page <= 4 {
-            let drop_fn = Rc::new(|_buf| {});
+            let drop_fn = Arc::new(|_buf| {});
             #[allow(clippy::arc_with_non_send_sync)]
             let buf = Arc::new(RefCell::new(Buffer::allocate(
                 header_accessor::get_page_size(&pager)? as usize,
