@@ -3,10 +3,15 @@ use std::{
     sync::Arc,
 };
 
+use turso_core::{types::WalFrameInfo, Wal};
+
 use crate::{
+    database_inner::WAL_FRAME_HEADER,
+    errors::Error,
     types::{
         DatabaseChange, DatabaseTapeOperation, DatabaseTapeRowChange, DatabaseTapeRowChangeType,
     },
+    wal_session::WalSession,
     Result,
 };
 
@@ -71,8 +76,13 @@ impl DatabaseTape {
             mode: opts.mode,
         })
     }
+    /// Start raw WAL edit session which can append or rollback pages directly in the current WAL
+    pub async fn start_wal_session(&self) -> Result<DatabaseWalSession> {
+        let conn = self.connect().await?;
+        Ok(DatabaseWalSession::new(conn).await?)
+    }
     /// Start replay session which can apply [DatabaseTapeOperation] from [Self::iterate_changes]
-    pub async fn start_tape_session(&self) -> Result<DatabaseReplaySession> {
+    pub async fn start_replay_session(&self) -> Result<DatabaseReplaySession> {
         tracing::debug!("opening replay session");
         Ok(DatabaseReplaySession {
             conn: self.connect().await?,
@@ -80,6 +90,111 @@ impl DatabaseTape {
             cached_insert_stmt: HashMap::new(),
             in_txn: false,
         })
+    }
+}
+
+pub struct DatabaseWalSession {
+    page_size: usize,
+    next_wal_frame_no: u64,
+    wal_session: WalSession,
+    prepared_frame: Option<(u32, Vec<u8>)>,
+}
+
+impl DatabaseWalSession {
+    pub async fn new(conn: turso::Connection) -> Result<Self> {
+        let mut wal_session = WalSession::new(conn);
+        wal_session.begin()?;
+
+        let conn = wal_session.conn();
+        let frames_count = conn.wal_frame_count()?;
+        let mut page_size = conn.query("PRAGMA page_size", ()).await?;
+        let Some(page_size) = page_size.next().await? else {
+            return Err(Error::DatabaseTapeError(
+                "unable to get database page size".to_string(),
+            ));
+        };
+        if page_size.column_count() != 1 {
+            return Err(Error::DatabaseTapeError(
+                "unexpected columns count for PRAGMA page_size query".to_string(),
+            ));
+        }
+        let turso::Value::Integer(page_size) = page_size.get_value(0)? else {
+            return Err(Error::DatabaseTapeError(
+                "unexpected column type for PRAGMA page_size query".to_string(),
+            ));
+        };
+
+        Ok(Self {
+            page_size: page_size as usize,
+            next_wal_frame_no: frames_count + 1,
+            wal_session,
+            prepared_frame: None,
+        })
+    }
+
+    pub fn append_page(&mut self, page_no: u32, page: &[u8]) -> Result<()> {
+        if page.len() != self.page_size {
+            return Err(Error::DatabaseTapeError(format!(
+                "page.len() must be equal to page_size: {} != {}",
+                page.len(),
+                self.page_size
+            )));
+        }
+        self.flush_prepared_frame(0)?;
+
+        let mut frame = vec![0u8; WAL_FRAME_HEADER + self.page_size];
+        frame[WAL_FRAME_HEADER..].copy_from_slice(page);
+        self.prepared_frame = Some((page_no, frame));
+
+        Ok(())
+    }
+
+    pub fn rollback_page(&mut self, page_no: u32, frame_watermark: u32) -> Result<()> {
+        self.flush_prepared_frame(0)?;
+
+        let conn = self.wal_session.conn();
+        let mut frame = vec![0u8; WAL_FRAME_HEADER + self.page_size];
+        if conn.wal_watermark_read_page(frame_watermark, page_no, &mut frame[WAL_FRAME_HEADER..])? {
+            self.prepared_frame = Some((page_no, frame));
+        }
+
+        Ok(())
+    }
+
+    pub fn rollback_changes_after(&mut self, frame_watermark: u32) -> Result<WalFrameInfo> {
+        let conn = self.wal_session.conn();
+        let mut frame = vec![0u8; WAL_FRAME_HEADER + self.page_size];
+        let frame_info = conn.wal_get_frame(frame_watermark, &mut frame)?;
+        if !frame_info.is_commit_frame() {
+            return Err(Error::DatabaseTapeError(
+                "rollback_changes_after only possible with commit frame as frame_watermark"
+                    .to_string(),
+            ));
+        }
+        let pages = conn.wal_changed_pages_after(frame_watermark)?;
+        for page_no in pages {
+            self.rollback_page(page_no, frame_watermark)?;
+        }
+        Ok(frame_info)
+    }
+
+    pub fn commit(&mut self, db_size: u32) -> Result<()> {
+        self.flush_prepared_frame(db_size)
+    }
+
+    fn flush_prepared_frame(&mut self, db_size: u32) -> Result<()> {
+        let Some((page_no, mut frame)) = self.prepared_frame.take() else {
+            return Ok(());
+        };
+
+        let frame_info = WalFrameInfo { db_size, page_no };
+        frame_info.put_to_frame_header(&mut frame);
+
+        let frame_no = self.next_wal_frame_no as u32;
+        self.wal_session.conn().wal_insert_frame(frame_no, &frame)?;
+        self.next_wal_frame_no += 1;
+
+        Ok(())
     }
 }
 
@@ -330,7 +445,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_database_cdc_single_iteration() {
+    async fn test_database_cdc() {
         let temp_file1 = NamedTempFile::new().unwrap();
         let db_path1 = temp_file1.path().to_str().unwrap();
 
@@ -377,7 +492,7 @@ mod tests {
 
         let mut iterator = db1.iterate_changes(Default::default()).await.unwrap();
         {
-            let mut replay = db2.start_tape_session().await.unwrap();
+            let mut replay = db2.start_replay_session().await.unwrap();
             while let Some(change) = iterator.next().await.unwrap() {
                 replay.replay(change).await.unwrap();
             }
@@ -417,7 +532,7 @@ mod tests {
             .unwrap();
 
         {
-            let mut replay = db2.start_tape_session().await.unwrap();
+            let mut replay = db2.start_replay_session().await.unwrap();
             while let Some(change) = iterator.next().await.unwrap() {
                 replay.replay(change).await.unwrap();
             }
@@ -451,7 +566,7 @@ mod tests {
             .unwrap();
 
         {
-            let mut replay = db2.start_tape_session().await.unwrap();
+            let mut replay = db2.start_replay_session().await.unwrap();
             while let Some(change) = iterator.next().await.unwrap() {
                 replay.replay(change).await.unwrap();
             }
@@ -525,7 +640,7 @@ mod tests {
                 .await
                 .unwrap();
             {
-                let mut replay = db2.start_tape_session().await.unwrap();
+                let mut replay = db2.start_replay_session().await.unwrap();
                 while let Some(change) = iterator.next().await.unwrap() {
                     if let DatabaseTapeOperation::RowChange(change) = &change {
                         next_change_id = Some(change.change_id + 1);
@@ -536,5 +651,83 @@ mod tests {
             let conn2 = db2.connect().await.unwrap();
             assert_eq!(fetch_rows(&conn2, "SELECT * FROM a").await, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn test_database_tape_wal_session() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let (_, temp_file1) = temp_file1.keep().unwrap();
+        let db_path1 = temp_file1.to_str().unwrap();
+        println!("db_path: {:?}", db_path1);
+
+        let db1 = turso::Builder::new_local(db_path1).build().await.unwrap();
+        let db1 = DatabaseTape::new(db1);
+        let conn1 = db1.connect().await.unwrap();
+
+        conn1.execute("CREATE TABLE t(x)", ()).await.unwrap();
+        let rollback2 = conn1.wal_frame_count().unwrap() as u32;
+
+        conn1
+            .execute("INSERT INTO t VALUES ('first'), ('second'), ('third')", ())
+            .await
+            .unwrap();
+        let rollback3 = conn1.wal_frame_count().unwrap() as u32;
+
+        conn1
+            .execute("INSERT INTO t VALUES ('fourth'), ('fifth')", ())
+            .await
+            .unwrap();
+
+        let rollback4 = conn1.wal_frame_count().unwrap() as u32;
+        assert_eq!(
+            fetch_rows(&conn1, "SELECT * FROM t").await,
+            vec![
+                vec![turso::Value::Text("first".into())],
+                vec![turso::Value::Text("second".into())],
+                vec![turso::Value::Text("third".into())],
+                vec![turso::Value::Text("fourth".into())],
+                vec![turso::Value::Text("fifth".into())],
+            ]
+        );
+
+        {
+            let mut wal_session = db1.start_wal_session().await.unwrap();
+            let frame_info = wal_session.rollback_changes_after(rollback4).unwrap();
+            wal_session.commit(frame_info.db_size).unwrap();
+        }
+        assert_eq!(
+            fetch_rows(&conn1, "SELECT * FROM t").await,
+            vec![
+                vec![turso::Value::Text("first".into())],
+                vec![turso::Value::Text("second".into())],
+                vec![turso::Value::Text("third".into())],
+                vec![turso::Value::Text("fourth".into())],
+                vec![turso::Value::Text("fifth".into())],
+            ]
+        );
+
+        {
+            let mut wal_session = db1.start_wal_session().await.unwrap();
+            let frame_info = wal_session.rollback_changes_after(rollback3).unwrap();
+            wal_session.commit(frame_info.db_size).unwrap();
+        }
+        assert_eq!(
+            fetch_rows(&conn1, "SELECT * FROM t").await,
+            vec![
+                vec![turso::Value::Text("first".into())],
+                vec![turso::Value::Text("second".into())],
+                vec![turso::Value::Text("third".into())],
+            ]
+        );
+
+        {
+            let mut wal_session = db1.start_wal_session().await.unwrap();
+            let frame_info = wal_session.rollback_changes_after(rollback2).unwrap();
+            wal_session.commit(frame_info.db_size).unwrap();
+        }
+        assert_eq!(
+            fetch_rows(&conn1, "SELECT * FROM t").await,
+            vec![] as Vec<Vec<Value>>
+        );
     }
 }

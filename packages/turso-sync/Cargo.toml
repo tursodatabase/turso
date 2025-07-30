@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 turso_core = { workspace = true }
-turso = { workspace = true }
+turso = { workspace = true, features = ["conn_raw_api"] }
 thiserror = "2.0.12"
 tracing = "0.1.41"
 hyper = { version = "1.6.0", features = ["client", "http1"] }

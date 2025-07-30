@@ -43,7 +43,7 @@ async fn main() {
                 })
                 .await
                 .unwrap();
-            let mut session = db.start_tape_session().await.unwrap();
+            let mut session = db.start_replay_session().await.unwrap();
             if let Some(change) = iterator.next().await.unwrap() {
                 session.replay(change).await.unwrap();
                 session.replay(DatabaseTapeOperation::Commit).await.unwrap();
