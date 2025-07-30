@@ -5,7 +5,7 @@ use crate::io::clock::Instant;
 use std::{
     cell::{Cell, RefCell, UnsafeCell},
     collections::BTreeMap,
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 use tracing::debug;
 
@@ -130,10 +130,10 @@ impl File for MemoryFile {
     fn pwrite(
         &self,
         pos: usize,
-        buffer: Arc<RefCell<Buffer>>,
+        buffer: Arc<parking_lot::RwLock<Buffer>>,
         c: Completion,
     ) -> Result<Completion> {
-        let buf = buffer.borrow();
+        let buf = buffer.read();
         let buf_len = buf.len();
         if buf_len == 0 {
             c.complete(0);

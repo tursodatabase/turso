@@ -4,7 +4,7 @@ use crate::io::clock::{Clock, Instant};
 use crate::{LimboError, Result};
 use std::cell::RefCell;
 use std::ffi::{c_void, CString};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use turso_ext::{VfsFileImpl, VfsImpl};
 
 impl Clock for VfsMod {
@@ -117,10 +117,10 @@ impl File for VfsFileImpl {
     fn pwrite(
         &self,
         pos: usize,
-        buffer: Arc<RefCell<Buffer>>,
+        buffer: Arc<parking_lot::RwLock<Buffer>>,
         c: Completion,
     ) -> Result<Completion> {
-        let buf = buffer.borrow();
+        let buf = buffer.read();
         let count = buf.as_slice().len();
         if self.vfs.is_null() {
             return Err(LimboError::ExtensionError("VFS is null".to_string()));

@@ -320,12 +320,12 @@ impl File for UringFile {
     fn pwrite(
         &self,
         pos: usize,
-        buffer: Arc<RefCell<crate::Buffer>>,
+        buffer: Arc<RwLock<crate::Buffer>>,
         c: Completion,
     ) -> Result<Completion> {
         let mut io = self.io.borrow_mut();
         let write = {
-            let buf = buffer.borrow();
+            let buf = buffer.read();
             trace!("pwrite(pos = {}, length = {})", pos, buf.len());
             with_fd!(self, |fd| {
                 io_uring::opcode::Write::new(fd, buf.as_ptr(), buf.len() as u32)

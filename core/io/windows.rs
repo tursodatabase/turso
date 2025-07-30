@@ -102,15 +102,15 @@ impl File for WindowsFile {
     fn pwrite(
         &self,
         pos: usize,
-        buffer: Arc<RefCell<crate::Buffer>>,
+        buffer: Arc<RwLock<crate::Buffer>>,
         c: Completion,
     ) -> Result<Completion> {
         let mut file = self.file.write();
         file.seek(std::io::SeekFrom::Start(pos as u64))?;
-        let buf = buffer.borrow();
+        let buf = buffer.read();
         let buf = buf.as_slice();
         file.write_all(buf)?;
-        c.complete(buffer.borrow().len() as i32);
+        c.complete(buffer.read().len() as i32);
         Ok(c)
     }
 

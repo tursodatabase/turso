@@ -1,5 +1,6 @@
 use turso_sqlite3_parser::ast::SortOrder;
 
+use parking_lot::RwLock;
 use std::cell::{Cell, RefCell};
 use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
 use std::collections::BinaryHeap;
@@ -369,14 +370,14 @@ impl SortedChunk {
 
         let drop_fn = Arc::new(|_buffer: BufferData| {});
         let read_buffer = Buffer::allocate(read_buffer_size, drop_fn);
-        let read_buffer_ref = Arc::new(RefCell::new(read_buffer));
+        let read_buffer_ref = Arc::new(RwLock::new(read_buffer));
 
         let chunk_io_state_copy = self.io_state.clone();
         let stored_buffer_copy = self.buffer.clone();
         let stored_buffer_len_copy = self.buffer_len.clone();
         let total_bytes_read_copy = self.total_bytes_read.clone();
-        let read_complete = Box::new(move |buf: Arc<RefCell<Buffer>>, bytes_read: i32| {
-            let read_buf_ref = buf.borrow();
+        let read_complete = Box::new(move |buf: Arc<RwLock<Buffer>>, bytes_read: i32| {
+            let read_buf_ref = buf.read();
             let read_buf = read_buf_ref.as_slice();
 
             let bytes_read = bytes_read as usize;
@@ -435,13 +436,13 @@ impl SortedChunk {
             buf_pos += payload.len();
         }
 
-        let buffer_ref = Arc::new(RefCell::new(buffer));
+        let buffer_ref = Arc::new(RwLock::new(buffer));
 
         let buffer_ref_copy = buffer_ref.clone();
         let chunk_io_state_copy = self.io_state.clone();
         let write_complete = Box::new(move |bytes_written: i32| {
             chunk_io_state_copy.set(SortedChunkIOState::WriteComplete);
-            let buf_len = buffer_ref_copy.borrow().len();
+            let buf_len = buffer_ref_copy.read().len();
             if bytes_written < buf_len as i32 {
                 tracing::error!("wrote({bytes_written}) less than expected({buf_len})");
             }

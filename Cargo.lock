@@ -4309,6 +4309,7 @@ dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
+ "parking_lot",
  "tracing-subscriber",
  "turso_core",
 ]

@@ -511,7 +511,7 @@ impl Pager {
             }
         };
 
-        let page_buffer_guard: std::cell::Ref<IoBuffer> = page_content.buffer.borrow();
+        let page_buffer_guard = page_content.buffer.read();
         let full_buffer_slice: &[u8] = page_buffer_guard.as_slice();
 
         // Ptrmap pages are not page 1, so their internal offset within their buffer should be 0.
@@ -602,7 +602,7 @@ impl Pager {
             }
         };
 
-        let mut page_buffer_guard = page_content.buffer.borrow_mut();
+        let mut page_buffer_guard = page_content.buffer.write();
         let full_buffer_slice = page_buffer_guard.as_mut_slice();
 
         if offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE > full_buffer_slice.len() {
@@ -1850,7 +1850,7 @@ pub fn allocate_new_page(page_id: usize, buffer_pool: &Arc<BufferPool>, offset: 
         let drop_fn = Arc::new(move |buf| {
             bp.put(buf);
         });
-        let buffer = Arc::new(RefCell::new(Buffer::new(buffer, drop_fn)));
+        let buffer = Arc::new(RwLock::new(Buffer::new(buffer, drop_fn)));
         page.set_loaded();
         page.get().contents = Some(PageContent::new(offset, buffer));
     }

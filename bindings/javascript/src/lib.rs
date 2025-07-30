@@ -9,6 +9,9 @@ use std::sync::{Arc, OnceLock};
 use napi::bindgen_prelude::{JsObjectValue, Null, Object, ToNapiValue};
 use napi::{bindgen_prelude::ObjectFinalize, Env, JsValue, Unknown};
 use napi_derive::napi;
+use parking_lot::RwLock;
+use parking_lot::RwLockWriteGuard;
+use std::sync::{Arc, OnceLock};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
 use turso_core::{LimboError, StepResult};
@@ -487,7 +490,12 @@ impl Statement {
 
     #[napi]
     pub fn bind(&mut self, env: Env, args: Option<Vec<Unknown>>) -> napi::Result<Self, String> {
+<<<<<<< HEAD
         self.check_and_bind(&env, args)
+=======
+        let _ = self
+            .check_and_bind(&env, args)
+>>>>>>> 97b17263 (buffer)
             .map_err(with_sqlite_error_message)?;
         self.binded = true;
 
@@ -711,10 +719,10 @@ impl turso_core::DatabaseStorage for DatabaseFile {
     fn write_page(
         &self,
         page_idx: usize,
-        buffer: Arc<std::cell::RefCell<turso_core::Buffer>>,
+        buffer: Arc<parking_lot::RwLock<turso_core::Buffer>>,
         c: turso_core::Completion,
     ) -> turso_core::Result<turso_core::Completion> {
-        let size = buffer.borrow().len();
+        let size = buffer.read().len();
         let pos = (page_idx - 1) * size;
         self.file.pwrite(pos, buffer, c)
     }

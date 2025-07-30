@@ -31,6 +31,7 @@ use crate::{
     },
     IO,
 };
+use parking_lot::RwLock;
 use std::ops::DerefMut;
 use std::{
     borrow::BorrowMut,
@@ -72,7 +73,6 @@ use super::{
     CommitState,
 };
 use fallible_iterator::FallibleIterator;
-use parking_lot::RwLock;
 use rand::{thread_rng, Rng};
 use turso_sqlite3_parser::ast;
 use turso_sqlite3_parser::ast::fmt::ToTokens;

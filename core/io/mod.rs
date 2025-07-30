@@ -1,6 +1,7 @@
 use crate::Result;
 use bitflags::bitflags;
 use cfg_block::cfg_block;
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::fmt;
 use std::sync::Arc;
 use std::{
@@ -8,14 +9,14 @@ use std::{
     fmt::Debug,
     mem::ManuallyDrop,
     pin::Pin,
+    rc::Rc,
 };
 
 pub trait File: Send + Sync {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
     fn pread(&self, pos: usize, c: Completion) -> Result<Completion>;
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<Buffer>>, c: Completion)
-        -> Result<Completion>;
+    fn pwrite(&self, pos: usize, buffer: Arc<RwLock<Buffer>>, c: Completion) -> Result<Completion>;
     fn sync(&self, c: Completion) -> Result<Completion>;
     fn size(&self) -> Result<u64>;
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion>;
@@ -50,7 +51,7 @@ pub trait IO: Clock + Send + Sync {
     fn get_memory_io(&self) -> Arc<MemoryIO>;
 }
 
-pub type Complete = dyn Fn(Arc<RefCell<Buffer>>, i32);
+pub type Complete = dyn Fn(Arc<RwLock<Buffer>>, i32);
 pub type WriteComplete = dyn Fn(i32);
 pub type SyncComplete = dyn Fn(i32);
 pub type TruncateComplete = dyn Fn(i32);
@@ -74,7 +75,7 @@ pub enum CompletionType {
 }
 
 pub struct ReadCompletion {
-    pub buf: Arc<RefCell<Buffer>>,
+    pub buf: Arc<RwLock<Buffer>>,
     pub complete: Box<Complete>,
 }
 
@@ -97,9 +98,9 @@ impl Completion {
         ))))
     }
 
-    pub fn new_read<F>(buf: Arc<RefCell<Buffer>>, complete: F) -> Self
+    pub fn new_read<F>(buf: Arc<RwLock<Buffer>>, complete: F) -> Self
     where
-        F: Fn(Arc<RefCell<Buffer>>, i32) + 'static,
+        F: Fn(Arc<RwLock<Buffer>>, i32) + 'static,
     {
         Self::new(CompletionType::Read(ReadCompletion::new(
             buf,
@@ -165,16 +166,16 @@ pub struct SyncCompletion {
 }
 
 impl ReadCompletion {
-    pub fn new(buf: Arc<RefCell<Buffer>>, complete: Box<Complete>) -> Self {
+    pub fn new(buf: Arc<RwLock<Buffer>>, complete: Box<Complete>) -> Self {
         Self { buf, complete }
     }
 
-    pub fn buf(&self) -> Ref<'_, Buffer> {
-        self.buf.borrow()
+    pub fn buf(&self) -> RwLockReadGuard<'_, Buffer> {
+        self.buf.read()
     }
 
-    pub fn buf_mut(&self) -> RefMut<'_, Buffer> {
-        self.buf.borrow_mut()
+    pub fn buf_mut(&self) -> RwLockWriteGuard<'_, Buffer> {
+        self.buf.write()
     }
 
     pub fn complete(&self, bytes_read: i32) {

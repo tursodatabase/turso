@@ -60,6 +60,7 @@ use crate::storage::database::DatabaseStorage;
 use crate::storage::pager::Pager;
 use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
 use crate::{turso_assert, File, Result, WalFileShared};
+use parking_lot::RwLock;
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
@@ -409,7 +410,7 @@ pub struct PageContent {
     /// the position where page content starts. it's 100 for page 1(database file header is 100 bytes),
     /// 0 for all other pages.
     pub offset: usize,
-    pub buffer: Arc<RefCell<Buffer>>,
+    pub buffer: Arc<RwLock<Buffer>>,
     pub overflow_cells: Vec<OverflowCell>,
 }
 
@@ -418,14 +419,14 @@ impl Clone for PageContent {
         #[allow(clippy::arc_with_non_send_sync)]
         Self {
             offset: self.offset,
-            buffer: Arc::new(RefCell::new((*self.buffer.borrow()).clone())),
+            buffer: Arc::new(RwLock::new((*self.buffer.read()).clone())),
             overflow_cells: self.overflow_cells.clone(),
         }
     }
 }
 
 impl PageContent {
-    pub fn new(offset: usize, buffer: Arc<RefCell<Buffer>>) -> Self {
+    pub fn new(offset: usize, buffer: Arc<RwLock<Buffer>>) -> Self {
         Self {
             offset,
             buffer,
@@ -443,61 +444,67 @@ impl PageContent {
 
     #[allow(clippy::mut_from_ref)]
     pub fn as_ptr(&self) -> &mut [u8] {
-        unsafe {
-            // unsafe trick to borrow twice
-            let buf_pointer = &self.buffer.as_ptr();
-            let buf = (*buf_pointer).as_mut().unwrap().as_mut_slice();
-            buf
-        }
+        // This method is problematic with RwLock as it can't return a borrowed reference
+        // Individual read/write methods should be used instead
+        unimplemented!("Use read_with or write_with methods instead")
+    }
+
+    pub fn read_with<T>(&self, f: impl FnOnce(&[u8]) -> T) -> T {
+        let buf = self.buffer.read();
+        f(buf.as_slice())
+    }
+
+    pub fn write_with<T>(&self, f: impl FnOnce(&mut [u8]) -> T) -> T {
+        let mut buf = self.buffer.write();
+        f(buf.as_mut_slice())
     }
 
     pub fn read_u8(&self, pos: usize) -> u8 {
-        let buf = self.as_ptr();
-        buf[self.offset + pos]
+        self.read_with(|buf| buf[self.offset + pos])
     }
 
     pub fn read_u16(&self, pos: usize) -> u16 {
-        let buf = self.as_ptr();
-        u16::from_be_bytes([buf[self.offset + pos], buf[self.offset + pos + 1]])
+        self.read_with(|buf| {
+            u16::from_be_bytes([buf[self.offset + pos], buf[self.offset + pos + 1]])
+        })
     }
 
     pub fn read_u16_no_offset(&self, pos: usize) -> u16 {
-        let buf = self.as_ptr();
-        u16::from_be_bytes([buf[pos], buf[pos + 1]])
+        self.read_with(|buf| u16::from_be_bytes([buf[pos], buf[pos + 1]]))
     }
 
     pub fn read_u32_no_offset(&self, pos: usize) -> u32 {
-        let buf = self.as_ptr();
-        u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]])
+        self.read_with(|buf| {
+            u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]])
+        })
     }
 
     pub fn read_u32(&self, pos: usize) -> u32 {
-        let buf = self.as_ptr();
-        read_u32(buf, self.offset + pos)
+        self.read_with(|buf| read_u32(buf, self.offset + pos))
     }
 
     pub fn write_u8(&self, pos: usize, value: u8) {
         tracing::trace!("write_u8(pos={}, value={})", pos, value);
-        let buf = self.as_ptr();
-        buf[self.offset + pos] = value;
+        self.write_with(|buf| buf[self.offset + pos] = value);
     }
 
     pub fn write_u16(&self, pos: usize, value: u16) {
         tracing::trace!("write_u16(pos={}, value={})", pos, value);
-        let buf = self.as_ptr();
-        buf[self.offset + pos..self.offset + pos + 2].copy_from_slice(&value.to_be_bytes());
+        self.write_with(|buf| {
+            buf[self.offset + pos..self.offset + pos + 2].copy_from_slice(&value.to_be_bytes())
+        });
     }
 
     pub fn write_u16_no_offset(&self, pos: usize, value: u16) {
         tracing::trace!("write_u16(pos={}, value={})", pos, value);
-        let buf = self.as_ptr();
-        buf[pos..pos + 2].copy_from_slice(&value.to_be_bytes());
+        self.write_with(|buf| buf[pos..pos + 2].copy_from_slice(&value.to_be_bytes()));
     }
 
     pub fn write_u32(&self, pos: usize, value: u32) {
         tracing::trace!("write_u32(pos={}, value={})", pos, value);
-        let buf = self.as_ptr();
-        buf[self.offset + pos..self.offset + pos + 4].copy_from_slice(&value.to_be_bytes());
+        self.write_with(|buf| {
+            buf[self.offset + pos..self.offset + pos + 4].copy_from_slice(&value.to_be_bytes())
+        });
     }
 
     /// The offset of the first freeblock, or zero if there are no freeblocks on the page.
@@ -770,9 +777,9 @@ pub fn begin_read_page(
         buffer_pool.put(buf);
     });
     #[allow(clippy::arc_with_non_send_sync)]
-    let buf = Arc::new(RefCell::new(Buffer::new(buf, drop_fn)));
-    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>, bytes_read: i32| {
-        let buf_len = buf.borrow().len();
+    let buf = Arc::new(RwLock::new(Buffer::new(buf, drop_fn)));
+    let complete = Box::new(move |buf: Arc<RwLock<Buffer>>, bytes_read: i32| {
+        let buf_len = buf.read().len();
         turso_assert!(
             bytes_read == buf_len as i32,
             "read({bytes_read}) != expected({buf_len})"
@@ -789,7 +796,7 @@ pub fn begin_read_page(
 #[instrument(skip_all, level = Level::INFO)]
 pub fn finish_read_page(
     page_idx: usize,
-    buffer_ref: Arc<RefCell<Buffer>>,
+    buffer_ref: Arc<RwLock<Buffer>>,
     page: PageRef,
 ) -> Result<()> {
     tracing::trace!(page_idx);
@@ -833,7 +840,7 @@ pub fn begin_write_btree_page(
         Box::new(move |bytes_written: i32| {
             tracing::trace!("finish_write_btree_page");
             let buf_copy = buf_copy.clone();
-            let buf_len = buf_copy.borrow().len();
+            let buf_len = buf_copy.read().len();
             *clone_counter.borrow_mut() -= 1;
 
             page_finish.clear_dirty();
@@ -1365,7 +1372,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
     let drop_fn = Arc::new(|_buf| {});
     let size = file.size()?;
     #[allow(clippy::arc_with_non_send_sync)]
-    let buf_for_pread = Arc::new(RefCell::new(Buffer::allocate(size as usize, drop_fn)));
+    let buf_for_pread = Arc::new(RwLock::new(Buffer::allocate(size as usize, drop_fn)));
     let header = Arc::new(SpinLock::new(WalHeader::default()));
     #[allow(clippy::arc_with_non_send_sync)]
     let wal_file_shared_ret = Arc::new(UnsafeCell::new(WalFileShared {
@@ -1390,8 +1397,8 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
     }));
     let wal_file_shared_for_completion = wal_file_shared_ret.clone();
 
-    let complete: Box<Complete> = Box::new(move |buf: Arc<RefCell<Buffer>>, bytes_read: i32| {
-        let buf = buf.borrow();
+    let complete: Box<Complete> = Box::new(move |buf: Arc<RwLock<Buffer>>, bytes_read: i32| {
+        let buf = buf.read();
         let buf_slice = buf.as_slice();
         turso_assert!(
             bytes_read == buf_slice.len() as i32,
@@ -1576,11 +1583,11 @@ pub fn begin_read_wal_frame_raw(
     io: &Arc<dyn File>,
     offset: usize,
     page_size: u32,
-    complete: Box<dyn Fn(Arc<RefCell<Buffer>>, i32)>,
+    complete: Box<dyn Fn(Arc<RwLock<Buffer>>, i32)>,
 ) -> Result<Completion> {
     tracing::trace!("begin_read_wal_frame_raw(offset={})", offset);
     let drop_fn = Arc::new(|_buf| {});
-    let buf = Arc::new(RefCell::new(Buffer::allocate(
+    let buf = Arc::new(RwLock::new(Buffer::allocate(
         page_size as usize + WAL_FRAME_HEADER_SIZE,
         drop_fn,
     )));
@@ -1594,7 +1601,7 @@ pub fn begin_read_wal_frame(
     io: &Arc<dyn File>,
     offset: usize,
     buffer_pool: Arc<BufferPool>,
-    complete: Box<dyn Fn(Arc<RefCell<Buffer>>, i32)>,
+    complete: Box<dyn Fn(Arc<RwLock<Buffer>>, i32)>,
 ) -> Result<Completion> {
     tracing::trace!("begin_read_wal_frame(offset={})", offset);
     let buf = buffer_pool.get();
@@ -1602,7 +1609,7 @@ pub fn begin_read_wal_frame(
         let buffer_pool = buffer_pool.clone();
         buffer_pool.put(buf);
     });
-    let buf = Arc::new(RefCell::new(Buffer::new(buf, drop_fn)));
+    let buf = Arc::new(RwLock::new(Buffer::new(buf, drop_fn)));
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new_read(buf, complete);
     let c = io.pread(offset, c)?;
@@ -1635,7 +1642,7 @@ pub fn prepare_wal_frame(
     page_number: u32,
     db_size: u32,
     page: &[u8],
-) -> ((u32, u32), Arc<RefCell<Buffer>>) {
+) -> ((u32, u32), Arc<RwLock<Buffer>>) {
     tracing::trace!(page_number);
 
     let drop_fn = Arc::new(|_buf| {});
@@ -1660,7 +1667,7 @@ pub fn prepare_wal_frame(
     frame[16..20].copy_from_slice(&final_checksum.0.to_be_bytes());
     frame[20..24].copy_from_slice(&final_checksum.1.to_be_bytes());
 
-    (final_checksum, Arc::new(RefCell::new(buffer)))
+    (final_checksum, Arc::new(RwLock::new(buffer)))
 }
 
 pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<Completion> {
@@ -1681,13 +1688,13 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
         buf[28..32].copy_from_slice(&header.checksum_2.to_be_bytes());
 
         #[allow(clippy::arc_with_non_send_sync)]
-        Arc::new(RefCell::new(buffer))
+        Arc::new(RwLock::new(buffer))
     };
 
     let cloned = buffer.clone();
     let write_complete = move |bytes_written: i32| {
         // make sure to reference buffer so it's alive for async IO
-        let _buf = cloned.borrow();
+        let _buf = cloned.read();
         turso_assert!(
             bytes_written == WAL_HEADER_SIZE as i32,
             "wal header wrote({bytes_written}) != expected({WAL_HEADER_SIZE})"

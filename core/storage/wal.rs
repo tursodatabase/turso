@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use strum::EnumString;
 use tracing::{instrument, Level};
 
+use parking_lot::RwLock;
 use std::fmt::Formatter;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::{
@@ -886,8 +887,8 @@ impl Wal for WalFile {
         let offset = self.frame_offset(frame_id);
         page.set_locked();
         let frame = page.clone();
-        let complete = Box::new(move |buf: Arc<RefCell<Buffer>>, bytes_read: i32| {
-            let buf_len = buf.borrow().len();
+        let complete = Box::new(move |buf: Arc<RwLock<Buffer>>, bytes_read: i32| {
+            let buf_len = buf.read().len();
             turso_assert!(
                 bytes_read == buf_len as i32,
                 "read({bytes_read}) less than expected({buf_len})"
@@ -908,8 +909,8 @@ impl Wal for WalFile {
         tracing::debug!("read_frame({})", frame_id);
         let offset = self.frame_offset(frame_id);
         let (frame_ptr, frame_len) = (frame.as_mut_ptr(), frame.len());
-        let complete = Box::new(move |buf: Arc<RefCell<Buffer>>, bytes_read: i32| {
-            let buf = buf.borrow();
+        let complete = Box::new(move |buf: Arc<RwLock<Buffer>>, bytes_read: i32| {
+            let buf = buf.read();
             let buf_len = buf.len();
             turso_assert!(
                 bytes_read == buf_len as i32,
@@ -956,8 +957,8 @@ impl Wal for WalFile {
             let (page_ptr, page_len) = (page.as_ptr(), page.len());
             let complete = Box::new({
                 let conflict = conflict.clone();
-                move |buf: Arc<RefCell<Buffer>>, bytes_read: i32| {
-                    let buf = buf.borrow();
+                move |buf: Arc<RwLock<Buffer>>, bytes_read: i32| {
+                    let buf = buf.read();
                     let buf_len = buf.len();
                     turso_assert!(
                         bytes_read == buf_len as i32,
@@ -1046,7 +1047,7 @@ impl Wal for WalFile {
                 let frame_bytes = frame_bytes.clone();
                 let write_counter = write_counter.clone();
                 move |bytes_written| {
-                    let frame_len = frame_bytes.borrow().len();
+                    let frame_len = frame_bytes.read().len();
                     turso_assert!(
                         bytes_written == frame_len as i32,
                         "wrote({bytes_written}) != expected({frame_len})"
@@ -1192,7 +1193,7 @@ impl WalFile {
             });
             checkpoint_page.get().contents = Some(PageContent::new(
                 0,
-                Arc::new(RefCell::new(Buffer::new(buffer, drop_fn))),
+                Arc::new(RwLock::new(Buffer::new(buffer, drop_fn))),
             ));
         }
 
